@@ -171,13 +171,12 @@ fn observe_steering_boundary(
     result_alloc: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),
     turn_id: u64,
-    origin: runtime_config.TurnOrigin,
     kind: worker_runtime.SteeringBoundaryKind,
 ) !SteeringBoundaryAction {
     const boundary = try take_steering_boundary(deps, result_alloc, turn_id, kind);
     switch (boundary) {
         .continue_turn => |guidance| {
-            try append_steering_guidance(arena, within_turn_suffix, guidance, origin);
+            try append_steering_guidance(arena, within_turn_suffix, guidance);
             return .continued;
         },
         .handoff => return .handoff,
@@ -185,19 +184,18 @@ fn observe_steering_boundary(
     }
 }
 
+/// Adds each boundary message to the turn, framed by who wrote it: the
+/// user's as a live user update, a parent agent's as that agent's feedback,
+/// never the user's.
 fn append_steering_guidance(
     arena: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),
-    guidance: []const []const u8,
-    origin: runtime_config.TurnOrigin,
+    guidance: []const worker_runtime.SteeringMessage,
 ) !void {
-    for (guidance) |text| {
+    for (guidance) |message| {
         try within_turn_suffix.append(arena, .{
             .role = .user,
-            .content = if (origin == .subagent)
-                try runtime_execution_memory.parentSteeringMessage(arena, text)
-            else
-                try runtime_execution_memory.steeringMessage(arena, text),
+            .content = try framedMessage(arena, message.author, message.text),
         });
     }
 }
@@ -227,7 +225,6 @@ fn append_pending_steering_after_assistant(
     turn_id: u64,
     assistant_text: []const u8,
     provider_replay: ?types.ProviderReplay,
-    origin: runtime_config.TurnOrigin,
     boundary_kind: worker_runtime.SteeringBoundaryKind,
 ) !bool {
     const boundary = try take_steering_boundary(deps, arena, turn_id, boundary_kind);
@@ -241,8 +238,16 @@ fn append_pending_steering_after_assistant(
         .content = assistant_text,
         .provider_replay = provider_replay,
     });
-    try append_steering_guidance(arena, within_turn_suffix, guidance, origin);
+    try append_steering_guidance(arena, within_turn_suffix, guidance);
     return true;
+}
+
+/// A message an agent receives mid-turn, framed by its author.
+fn framedMessage(arena: Allocator, author: worker_runtime.MessageAuthor, text: []const u8) ![]u8 {
+    return switch (author) {
+        .user => runtime_execution_memory.steeringMessage(arena, text),
+        .parent => runtime_execution_memory.parentSteeringMessage(arena, text),
+    };
 }
 
 fn append_immediate_steering_after_cancel(
@@ -264,7 +269,7 @@ fn append_immediate_steering_after_cancel(
             .content = try arena.dupe(u8, assistant_text),
         });
     }
-    try append_steering_guidance(arena, within_turn_suffix, guidance, .root);
+    try append_steering_guidance(arena, within_turn_suffix, guidance);
     return true;
 }
 
@@ -277,10 +282,9 @@ fn continue_steering_after_stop(
     arena: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),
     turn_id: u64,
-    origin: runtime_config.TurnOrigin,
     stop_state: *CommonStopState,
 ) !bool {
-    const action = try observe_steering_boundary(deps, arena, arena, within_turn_suffix, turn_id, origin, .finalizing);
+    const action = try observe_steering_boundary(deps, arena, arena, within_turn_suffix, turn_id, .finalizing);
     if (action != .continued) return false;
     stop_state.retained_candidate = null;
     stop_state.latest_partial = null;
@@ -492,6 +496,28 @@ fn projectLegacyTerminalExecArguments(
     std.json.Stringify.value(run, .{}, &out.writer) catch
         return error.OutOfMemory;
     return try out.toOwnedSlice();
+}
+
+test "boundary messages are framed by who wrote them, whatever the turn" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    const guidance = [_]worker_runtime.SteeringMessage{
+        .{ .text = @constCast("typed on the subagent's screen"), .author = .user },
+        .{ .text = @constCast("from the parent"), .author = .parent },
+    };
+    try append_steering_guidance(arena, &suffix, &guidance);
+    try std.testing.expectEqual(@as(usize, 2), suffix.items.len);
+    const user = suffix.items[0].content.?;
+    try std.testing.expect(std.mem.startsWith(u8, user, "<user_steering>"));
+    try std.testing.expect(std.mem.find(u8, user, "typed on the subagent's screen") != null);
+    const parent = suffix.items[1].content.?;
+    try std.testing.expect(std.mem.startsWith(u8, parent, "<parent_agent_steering>"));
+    try std.testing.expect(std.mem.find(u8, parent, "not new user authority") != null);
+    try std.testing.expect(std.mem.find(u8, parent, "<user_steering>") == null);
+    // Neither is permission feedback, so the reviewer never counts it as the user's request.
+    for (suffix.items) |message| try std.testing.expect(!message.permission_feedback);
 }
 
 test "legacy exec argument projection releases temporary allocations" {
@@ -5760,7 +5786,7 @@ fn processQueuedPromptInner(
     const current_user_message: ChatMessage = .{
         .role = .user,
         .content = if (job.delivery.isContinuation())
-            try runtime_execution_memory.steeringMessage(arena, job.prompt)
+            try framedMessage(arena, job.author, job.prompt)
         else
             job.prompt,
         .images = job.images,
@@ -6932,15 +6958,7 @@ fn processQueuedPromptLoop(
             try within_turn_suffix.append(arena, .{ .role = .system, .content = note, .context_note = true });
             debug_trace.logf("context", "runtime context update queued step={d} bytes={d}", .{ current_step_index, note.len });
         }
-        const steering_action = try observe_steering_boundary(
-            deps,
-            arena,
-            overlay_arena,
-            &within_turn_suffix,
-            turn_id,
-            config.origin,
-            .model,
-        );
+        const steering_action = try observe_steering_boundary(deps, arena, overlay_arena, &within_turn_suffix, turn_id, .model);
         if (steering_action == .handoff) {
             try finish_steering_handoff(
                 deps,
@@ -7596,15 +7614,7 @@ fn processQueuedPromptLoop(
                         skip_next_preflight_refresh = true;
                         // A message queued while the compaction ran must ride the
                         // rebuilt request, not wait for the reply after it.
-                        const post_compaction_action = try observe_steering_boundary(
-                            deps,
-                            arena,
-                            overlay_arena,
-                            &within_turn_suffix,
-                            turn_id,
-                            config.origin,
-                            .model,
-                        );
+                        const post_compaction_action = try observe_steering_boundary(deps, arena, overlay_arena, &within_turn_suffix, turn_id, .model);
                         if (post_compaction_action == .handoff) {
                             try finish_steering_handoff(
                                 deps,
@@ -8909,16 +8919,7 @@ fn processQueuedPromptLoop(
                 completion.tool_calls.len,
             });
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try append_pending_steering_after_assistant(
-                    deps,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    assistant_text,
-                    provider_replay,
-                    config.origin,
-                    .finalizing,
-                ))
+                try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, assistant_text, provider_replay, .finalizing))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue :agent_steps_loop;
@@ -8999,16 +9000,7 @@ fn processQueuedPromptLoop(
             const history_replay = if (has_content) final_provider_replay else try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
 
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try append_pending_steering_after_assistant(
-                    deps,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    history_text,
-                    history_replay,
-                    config.origin,
-                    if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
-                ))
+                try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, history_text, history_replay, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue;
@@ -9123,7 +9115,7 @@ fn processQueuedPromptLoop(
             switch (stop_outcome) {
                 .allow => {
                     if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, config.origin, stop_state))
+                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, stop_state))
                         continue :agent_steps_loop;
                     stop_state.terminal_materializing = true;
                     try finishCommonAssistantTerminal(
@@ -11714,15 +11706,7 @@ fn processQueuedPromptLoop(
         );
         if (malformed_arguments_retry.finishBatch()) {
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
-                const terminal_action = try observe_steering_boundary(
-                    deps,
-                    arena,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    config.origin,
-                    .finalizing,
-                );
+                const terminal_action = try observe_steering_boundary(deps, arena, arena, &within_turn_suffix, turn_id, .finalizing);
                 switch (terminal_action) {
                     // The turn is already ending; an ineligible prompt runs as
                     // the next turn after the normal terminal finish.
@@ -11753,15 +11737,7 @@ fn processQueuedPromptLoop(
         }
         if (terminal_validation_retry.finishBatch()) {
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
-                const terminal_action = try observe_steering_boundary(
-                    deps,
-                    arena,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    config.origin,
-                    .finalizing,
-                );
+                const terminal_action = try observe_steering_boundary(deps, arena, arena, &within_turn_suffix, turn_id, .finalizing);
                 switch (terminal_action) {
                     .handoff, .none => {},
                     .continued => continue :agent_steps_loop,
@@ -11798,15 +11774,7 @@ fn processQueuedPromptLoop(
         }
         if (shell_execution_failure_retry.finishBatch()) {
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
-                const terminal_action = try observe_steering_boundary(
-                    deps,
-                    arena,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    config.origin,
-                    .finalizing,
-                );
+                const terminal_action = try observe_steering_boundary(deps, arena, arena, &within_turn_suffix, turn_id, .finalizing);
                 switch (terminal_action) {
                     .handoff, .none => {},
                     .continued => continue :agent_steps_loop,
@@ -11839,16 +11807,7 @@ fn processQueuedPromptLoop(
             const rendered = if (final_text.len > 0) final_text else "Done.";
 
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try append_pending_steering_after_assistant(
-                    deps,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    raw_final,
-                    final_provider_replay,
-                    config.origin,
-                    if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
-                ))
+                try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, raw_final, final_provider_replay, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue;
@@ -11956,7 +11915,7 @@ fn processQueuedPromptLoop(
             switch (stop_outcome) {
                 .allow => {
                     if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, config.origin, stop_state))
+                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, stop_state))
                         continue :agent_steps_loop;
                     stop_state.terminal_materializing = true;
                     try finishCommonAssistantTerminal(

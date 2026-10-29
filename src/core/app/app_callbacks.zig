@@ -898,14 +898,11 @@ pub fn Bindings(comptime App: type) type {
             };
         }
 
-        fn copyOwnedSteering(arena: std.mem.Allocator, owned: [][]u8) ![][]u8 {
+        fn copyOwnedSteering(arena: std.mem.Allocator, owned: []worker_runtime.SteeringMessage) ![]worker_runtime.SteeringMessage {
             if (owned.len == 0) return &.{};
-            defer {
-                for (owned) |text| std.heap.c_allocator.free(text);
-                std.heap.c_allocator.free(owned);
-            }
-            const result = try arena.alloc([]u8, owned.len);
-            for (owned, result) |text, *dest| dest.* = try arena.dupe(u8, text);
+            defer worker_runtime.freeSteeringMessages(std.heap.c_allocator, owned);
+            const result = try arena.alloc(worker_runtime.SteeringMessage, owned.len);
+            for (owned, result) |message, *dest| dest.* = .{ .text = try arena.dupe(u8, message.text), .author = message.author };
             return result;
         }
 
