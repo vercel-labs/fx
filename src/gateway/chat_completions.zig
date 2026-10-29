@@ -354,8 +354,8 @@ test "configured request headers keep accept, add literals, and resolve environm
     var map = std.process.Environ.Map.init(alloc);
     defer map.deinit();
     try map.put("FX_TEST_REQUEST_HEADER", "header-value");
-    const previous = io.environMap();
-    defer if (previous) |environ| io.setEnvironMap(environ);
+    const previous = io.saveEnvironForTest();
+    defer previous.restore();
     io.setEnvironMap(&map);
 
     var headers = try request_headers(alloc, registry.get("local").?);
