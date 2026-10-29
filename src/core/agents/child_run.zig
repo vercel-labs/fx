@@ -52,6 +52,10 @@ pub const ChildRun = struct {
     /// Its turn was interrupted only to hand off to the user's image or
     /// `$skill`, so the work ends done rather than cancelled.
     handed_off: bool = false,
+    /// The work a turn the user started opened in the parent's log, until
+    /// that turn ends. Never `work_id`: the user's turn is not the parent's.
+    /// Owned.
+    user_work_id: []u8 = &.{},
 
     /// True while the run's turn is in flight on the child agent.
     pub fn inFlight(self: *const ChildRun) bool {
@@ -79,6 +83,7 @@ pub const ChildRun = struct {
         self.finish(.cancelled);
         alloc.free(self.child_id);
         alloc.free(self.work_id);
+        alloc.free(self.user_work_id);
         self.admission.deinit(alloc);
         alloc.free(self.system_prompt);
         if (self.credential) |*credential| credential.deinit(alloc);

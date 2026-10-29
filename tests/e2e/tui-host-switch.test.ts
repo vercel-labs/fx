@@ -342,6 +342,41 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "a turn typed on a subagent's screen reports to main when the subagent reports every turn",
+    async () => {
+      let mainCalls = 0;
+      await withFx((body) => {
+        if (!isMainRequest(body)) {
+          if (latestUserText(body).includes("SWITCH_TYPED_ON_CHILD")) return text("child_typed", "SWITCH_CHILD_ANSWERED_TYPED");
+          return text("child_answer", "SWITCH_CHILD_FIRST");
+        }
+        mainCalls += 1;
+        if (body.includes("SWITCH_CHILD_ANSWERED_TYPED")) return text("main_saw_typed", "SWITCH_MAIN_SAW_TYPED");
+        if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
+        if (mainCalls === 1) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "reviewer", message: "SWITCH_TASK look for nothing", report: "every_turn" },
+          });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
+        await session.waitForComposer(15_000);
+        await moveAgent(session, 1);
+        await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("SWITCH_TYPED_ON_CHILD please");
+        await session.waitForText("SWITCH_CHILD_ANSWERED_TYPED", 30_000);
+        await moveAgent(session, -1);
+        // The turn typed there was the subagent's work too, and reported.
+        await session.waitForText("SWITCH_MAIN_SAW_TYPED", 30_000);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a subagent's approval can be answered on its own screen, and main's clears",
     async () => {
       let mainCalls = 0;
