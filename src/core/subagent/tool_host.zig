@@ -1508,6 +1508,36 @@ test "a message to a busy subagent waits and runs as its next work, in order" {
     try std.testing.expectEqual(@as(usize, 0), runtime.work_calls.items.len);
 }
 
+test "a message past a busy subagent's full queue is refused to its sender" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-0", null);
+    try waitForRuns(&fixture, 1);
+    for (0..Runtime.max_pending_per_child) |index| {
+        const call_id = try arena.print("call-{d}", .{index + 1});
+        const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "more" } }, call_id, null);
+        try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    }
+    const refused = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "one too many" } }, "call-full", null);
+    try std.testing.expect(std.mem.find(u8, refused, "\"error_code\":\"queue_full\"") != null);
+    // The refused message was never remembered as work.
+    for (runtime.work_calls.items) |entry| try std.testing.expect(!std.mem.eql(u8, entry.call_id, "call-full"));
+
+    _ = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-stop", null);
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+}
+
 test "stop ends a subagent's turn without a report and drops what waits for it" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
