@@ -381,6 +381,7 @@ pub fn Runtime(comptime App: type) type {
                 .begin_presented_prompt,
                 .begin_resumed_prompt,
                 .append_user_feedback,
+                .append_agent_message,
                 .notification,
                 .question_requested,
                 .clear_route_recovery_status,
@@ -1082,13 +1083,15 @@ pub fn Runtime(comptime App: type) type {
                         app.shell.render_requests.request(.footer);
                         try handlers.semantic_notice(handlers.ctx, session_notices.resumed_request_notice);
                     },
-                    .append_user_feedback => |text| {
+                    .append_user_feedback, .append_agent_message => |text| {
                         if (!try requireAssistantTextDrain(handlers)) {
                             try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                             drain_owns_current = false;
                             break :events;
                         }
-                        try handlers.write_user_prompt(handlers.ctx, .{ .text = text });
+                        // A subagent's message draws as its card.
+                        const author: types.MessageAuthor = if (event == .append_agent_message) .child else .user;
+                        try handlers.write_user_prompt(handlers.ctx, .{ .text = text, .author = author });
                         if (agent.stream.active and agent.stream.phase != .thinking) {
                             agent.stream.phase = .thinking;
                             app.shell.render_requests.request(.footer);

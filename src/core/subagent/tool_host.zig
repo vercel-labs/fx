@@ -747,6 +747,32 @@ pub const Runtime = struct {
     fn deliverEnd(self: *Runtime, end: managed_owner.WorkEnd) void {
         debug_trace.eventf("mailbox", "child_end", .{}, "child={s} work_id={s} outcome={s} report={}", .{ end.child_id, end.work_id, @tagName(end.outcome), end.report_owed });
         if (!end.report_owed) return self.nudgeWaiter();
+        self.postReport(end);
+    }
+
+    /// Posts the reports `session`'s log still owes its owner, oldest first,
+    /// as each would have been posted when its work ended (`Mailbox.tla`
+    /// `Resume`): a restart, or an exit, left them untaken. Once per open of
+    /// the session. Call it after the report sink is in place.
+    pub fn resumeReports(self: *Runtime, parent: *session_adapter.Session) void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const lines = (parent.pendingReportLines(a) catch |err| {
+            debug_trace.eventf("mailbox", "resume_reports_failed", .{}, "session={s} err={s}", .{ parent.id(), @errorName(err) });
+            return;
+        }) orelse return;
+        const pending = reports.pendingReports(a, lines) catch |err| {
+            debug_trace.eventf("mailbox", "resume_reports_failed", .{}, "session={s} err={s}", .{ parent.id(), @errorName(err) });
+            return;
+        };
+        for (pending) |item| {
+            debug_trace.eventf("mailbox", "report_resumed", .{}, "session={s} child={s} work_id={s} outcome={s}", .{ parent.id(), item.child_id, item.work_id, @tagName(item.outcome) });
+            self.postReport(.{ .child_id = item.child_id, .work_id = item.work_id, .outcome = item.outcome, .report_owed = true });
+        }
+    }
+
+    fn postReport(self: *Runtime, end: managed_owner.WorkEnd) void {
         const sink = self.report_sink orelse {
             // Nothing here can take it; it stays owed in the log.
             debug_trace.eventf("mailbox", "report_held", .{}, "child={s} work_id={s} reason=no_sink", .{ end.child_id, end.work_id });
