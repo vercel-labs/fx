@@ -40,6 +40,7 @@ const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const auto_classifier_context = @import("../../permissions/auto_classifier_context.zig");
 const subagent_model_contract = @import("../../subagent/model_contract.zig");
+const subagent_reports = @import("../../subagent/reports.zig");
 
 const runtime_config = @import("config.zig");
 const runtime_finalization = @import("finalization.zig");
@@ -198,6 +199,7 @@ fn append_steering_guidance(
             .role = .user,
             .content = try framedMessage(arena, message.author, message.text),
         });
+        if (message.author == .child) subagent_reports.traceTaken(arena, .{}, message.text);
     }
 }
 
@@ -5551,6 +5553,7 @@ fn processQueuedPromptInner(
     var interrupted_persisted = false;
 
     debug_trace.eventf("agent", "prompt_start", finish_trace.ctx, "prompt_bytes={d} model={s}", .{ job.prompt.len, job.model });
+    if (job.author == .child) subagent_reports.traceTaken(arena, finish_trace.ctx, job.prompt);
 
     const vision_fallback_available = config.provider_capabilities.vision_fallback and
         deps.tool_registry.lookup("vision") != null;

@@ -5,6 +5,7 @@ const std = @import("std");
 const child_state = @import("child_state.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -126,6 +127,44 @@ pub fn cardTitle(alloc: Allocator, text: []const u8) error{OutOfMemory}!?[]u8 {
     const agent = if (parsed.value.agent.len > 0) parsed.value.agent else "a subagent";
     if (is_report) return try alloc.print("Report from {s}: {s}", .{ agent, parsed.value.outcome });
     return try alloc.print("Message from {s}", .{agent});
+}
+
+const Sender = struct { child_id: []const u8 = "", work_id: []const u8 = "" };
+
+/// The subagent and work a report framed in `text` came from, or null when
+/// `text` is not a report. Free with `deinit`.
+fn reportSender(alloc: Allocator, text: []const u8) error{OutOfMemory}!?std.json.Parsed(Sender) {
+    if (!std.mem.startsWith(u8, text, header)) return null;
+    const json_line = std.mem.trimEnd(u8, text[header.len..], "\n");
+    return std.json.parseFromSlice(Sender, alloc, json_line, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    };
+}
+
+/// Traces a report when the agent it was sent to takes it into its history:
+/// a turn starts with it, or a step boundary takes it. That is when it is
+/// delivered; reaching the agent's queue is not.
+pub fn traceTaken(alloc: Allocator, ctx: debug_trace.TraceContext, text: []const u8) void {
+    if (!debug_trace.isEnabled()) return;
+    const parsed = (reportSender(alloc, text) catch return) orelse return;
+    defer parsed.deinit();
+    debug_trace.eventf("mailbox", "deliver", ctx, "from={s} kind=report work={s}", .{ parsed.value.child_id, parsed.value.work_id });
+}
+
+test "a report's sender is read back from its frame, and other text has none" {
+    const alloc = std.testing.allocator;
+    const text = try message(alloc, .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .completed, .output = "done" }, 4096);
+    defer alloc.free(text);
+    const parsed = (try reportSender(alloc, text)).?;
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("c1", parsed.value.child_id);
+    try std.testing.expectEqualStrings("w1", parsed.value.work_id);
+
+    const note = try messageText(alloc, "reviewer", "c1", "a question", 4096);
+    defer alloc.free(note);
+    try std.testing.expect((try reportSender(alloc, note)) == null);
+    try std.testing.expect((try reportSender(alloc, "typed by the user")) == null);
 }
 
 /// What a screen shows for a turn a report or message started, live or
