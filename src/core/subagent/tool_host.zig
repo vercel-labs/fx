@@ -769,7 +769,7 @@ pub const Runtime = struct {
             debug_trace.eventf("mailbox", "report_held", .{}, "child={s} work_id={s} reason={s}", .{ end.child_id, end.work_id, @errorName(err) });
             return self.nudgeWaiter();
         };
-        debug_trace.eventf("mailbox", "deliver", .{}, "to={s} from={s} kind=report work={s}", .{ self.ownerName(), end.child_id, end.work_id });
+        debug_trace.eventf("mailbox", "report_queued", .{}, "to={s} from={s} work={s}", .{ self.ownerName(), end.child_id, end.work_id });
     }
 
     /// What a report says about the work: the child's reply, or how it
