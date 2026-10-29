@@ -49,6 +49,9 @@ pub const ChildRun = struct {
     /// How the run's turn ended, when that is known before the turn is
     /// saved. The run ends once nothing of the turn is left to save.
     ended_as: ?types.TurnPresentationOutcome = null,
+    /// Its turn was interrupted only to hand off to the user's image or
+    /// `$skill`, so the work ends done rather than cancelled.
+    handed_off: bool = false,
 
     /// True while the run's turn is in flight on the child agent.
     pub fn inFlight(self: *const ChildRun) bool {

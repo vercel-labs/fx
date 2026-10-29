@@ -18,6 +18,7 @@ const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const compactor = @import("../compactor/compactor.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const types = @import("../shared/types.zig");
+const agent_frame = @import("../shared/agent_frame.zig");
 const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("assistant_presentation.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
@@ -124,6 +125,9 @@ pub const QueuedPrompt = struct {
     steering_receipt: ?*SteeringReceipt = null,
     /// Who wrote the prompt, which decides how the turn frames it.
     author: MessageAuthor = .user,
+    /// Another agent's report or message, which `agent_frame.queue_cap`
+    /// counts (messages only).
+    mail: agent_frame.MailKind = .none,
     /// Runtime-derived delivery state. The worker retains ownership in every state.
     delivery: PromptDelivery = .ordinary,
     prompt: []u8,
@@ -591,6 +595,12 @@ pub const WorkerRuntime = struct {
     /// Set by `nudgeWaiter` and cleared by `waitForPostOrNudge`, so a nudge
     /// sent before the wait starts still ends it. Guarded by `worker_mutex`.
     mail_nudged: bool = false,
+    /// Places held for other agents' messages on their way to this queue
+    /// (`reserveAgentMessage`), which the cap counts as waiting.
+    reserved_agent_messages: usize = 0,
+    /// The last turn a boundary ended so a waiting image or `$skill` could
+    /// run as the next turn (`handedOff`).
+    handed_off_turn_id: u64 = 0,
     /// When true, queued work will not start.
     turn_start_held: bool = false,
     /// Independent of a pending submission's turn-start hold; protects queued
@@ -786,9 +796,17 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         self.steering_cancel_turn_id = null;
+        self.clearHandoffLocked();
         self.worker_cancel_requested.store(true, .seq_cst);
         self.stopCompactionActivityLocked();
         self.worker_cond.broadcast(io_mod.getIo());
+    }
+
+    /// An explicit cancel of the running turn ends it as cancelled, even if
+    /// it was ending for an image or `$skill`. A cancel of the next turn
+    /// leaves the hand-off before it alone.
+    fn clearHandoffLocked(self: *WorkerRuntime) void {
+        if (self.handed_off_turn_id == self.active_turn_id) self.handed_off_turn_id = 0;
     }
 
     pub fn requestInteractiveCancel(self: *WorkerRuntime) void {
@@ -810,6 +828,7 @@ pub const WorkerRuntime = struct {
             if (steering_pending) "true" else "false",
         });
         self.steering_cancel_turn_id = null;
+        self.clearHandoffLocked();
         self.worker_cancel_requested.store(true, .seq_cst);
         self.stopCompactionActivityLocked();
         self.worker_cond.broadcast(io_mod.getIo());
@@ -820,6 +839,7 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
 
         self.steering_cancel_turn_id = null;
+        self.clearHandoffLocked();
         self.worker_cancel_requested.store(true, .seq_cst);
         self.stopCompactionActivityLocked();
         _ = self.resolvePendingPermissionLocked(
@@ -998,20 +1018,72 @@ pub const WorkerRuntime = struct {
     /// Posts a message from another agent. It joins the running turn when
     /// nothing older waits, and otherwise waits for the next turn, which
     /// takes it in when it starts; an idle worker starts that turn. It never
-    /// interrupts the model. Takes ownership of `prompt` on success.
+    /// interrupts the model. Another agent's message past
+    /// `agent_frame.queue_cap` is refused with `error.QueueFull`; a report
+    /// never is. Takes ownership of `prompt` on success.
     pub fn postMail(self: *WorkerRuntime, alloc: std.mem.Allocator, prompt: QueuedPrompt) !void {
+        return self.postMailWith(alloc, prompt, false);
+    }
+
+    /// As `postMail`, for a message whose place `reserveAgentMessage` held:
+    /// it takes that place, and the place is spent whatever happens.
+    pub fn postReservedMail(self: *WorkerRuntime, alloc: std.mem.Allocator, prompt: QueuedPrompt) !void {
+        return self.postMailWith(alloc, prompt, true);
+    }
+
+    fn postMailWith(self: *WorkerRuntime, alloc: std.mem.Allocator, prompt: QueuedPrompt, reserved: bool) !void {
         var queued = prompt;
         if (queued.turn_id == 0) queued.turn_id = debug_trace.nextTurnId();
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
+        if (reserved and self.reserved_agent_messages > 0) self.reserved_agent_messages -= 1;
         if (self.finalization_failure != null) return error.TurnFinalizationDeliveryFailed;
         if (self.worker_stop_requested) return error.WorkerStopped;
+        if (!reserved and queued.mail == .message and self.agentMessageCountLocked() >= agent_frame.queue_cap) {
+            return error.QueueFull;
+        }
         const joins = self.worker_processing and self.active_turn_id != 0 and
             !self.direct_steering_closed and !self.worker_cancel_requested.load(.seq_cst) and
             !self.olderMailWaitsLocked();
         queued.delivery = if (joins) .{ .active_turn = self.active_turn_id } else .continuation;
         queued.agent_settings = self.agent_turn_settings;
         try self.enqueuePromptLocked(alloc, queued);
+    }
+
+    /// Holds a place in this queue for another agent's message that is on
+    /// its way, so the sender can be told at once (`Mailbox.tla` `Room`).
+    /// False when the queue already holds `agent_frame.queue_cap` of them,
+    /// waiting or on their way. `postMail` of that message uses the place;
+    /// `releaseAgentMessage` gives it back when the message never comes.
+    pub fn reserveAgentMessage(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.agentMessageCountLocked() >= agent_frame.queue_cap) return false;
+        self.reserved_agent_messages += 1;
+        return true;
+    }
+
+    pub fn releaseAgentMessage(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (self.reserved_agent_messages > 0) self.reserved_agent_messages -= 1;
+    }
+
+    /// Other agents' messages waiting in this queue or on their way to it.
+    /// Reports and notices don't count.
+    fn agentMessageCountLocked(self: *const WorkerRuntime) usize {
+        var count = self.reserved_agent_messages;
+        for (self.queued_prompts.items) |prompt| count += @intFromBool(prompt.mail == .message);
+        return count;
+    }
+
+    /// Whether turn `turn_id` ended by handing off to a waiting image or
+    /// `$skill`, rather than by a cancel. A subagent's work then ends as
+    /// done, as an instance's turn does (`Mailbox.tla` `ChildTurnEnd`).
+    pub fn handedOff(self: *WorkerRuntime, turn_id: u64) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        return turn_id != 0 and self.handed_off_turn_id == turn_id;
     }
 
     pub const PostWake = enum { posted, nudged, stopped };
@@ -1203,10 +1275,10 @@ pub const WorkerRuntime = struct {
             debug_trace.eventf("worker", "steering_admission", .{ .turn_id = self.active_turn_id }, "queued_turn_id={d} targeted={} plain={} tool_boundary={} compaction_active={} interrupt_model={}", .{ queued.turn_id, queued.delivery.activeTurnId() == self.active_turn_id, sameTurnSteeringEligible(queued), self.hasActiveToolBoundaryLocked(), self.compactionInFlightLocked(), interrupt_after_admission });
         }
         if (interrupt_after_admission) {
-            self.steering_cancel_turn_id = if (sameTurnSteeringEligible(queued))
-                self.active_turn_id
-            else
-                null;
+            const joins = sameTurnSteeringEligible(queued);
+            self.steering_cancel_turn_id = if (joins) self.active_turn_id else null;
+            // An image or `$skill` ends the turn so it can run next.
+            if (!joins) self.handed_off_turn_id = self.active_turn_id;
             self.worker_cancel_requested.store(true, .seq_cst);
         }
     }
@@ -1322,8 +1394,10 @@ pub const WorkerRuntime = struct {
             .model, .finalizing => {
                 if (cancel_requested) return .none;
                 for (self.queued_prompts.items) |prompt| {
-                    if (prompt.delivery.activeTurnId() == turn_id and
-                        !sameTurnSteeringEligible(prompt)) return .handoff;
+                    if (prompt.delivery.activeTurnId() == turn_id and !sameTurnSteeringEligible(prompt)) {
+                        self.handed_off_turn_id = turn_id;
+                        return .handoff;
+                    }
                 }
                 const messages = try self.takeSteeringLocked(alloc, result_alloc, turn_id);
                 if (kind == .finalizing and messages.len == 0) self.direct_steering_closed = true;
@@ -1444,6 +1518,38 @@ pub const WorkerRuntime = struct {
             if (queued.turn_id == turn_id) return queued.stale_shell_handles;
         }
         return false;
+    }
+
+    /// What a user's stop on a subagent's screen dropped from its queue.
+    pub const MessageDrop = struct { from_parent: usize = 0, total: usize = 0 };
+
+    /// A user's stop on this subagent's own screen (decision 10): drops the
+    /// other agents' messages still waiting in its queue, also the parent's
+    /// waiting to join the turn the stop ends, whose receipt then reads not
+    /// applied. Reports stay, since they are owed, and so do the user's own
+    /// prompts, as on main. `alloc` is the queue's.
+    pub fn dropAgentMessages(self: *WorkerRuntime, alloc: std.mem.Allocator) MessageDrop {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        var drop: MessageDrop = .{};
+        var index: usize = 0;
+        while (index < self.queued_prompts.items.len) {
+            const queued = self.queued_prompts.items[index];
+            if (queued.mail != .message and queued.author != .parent) {
+                index += 1;
+                continue;
+            }
+            const prompt = self.queued_prompts.orderedRemove(index);
+            debug_trace.eventf("worker", "agent_message_dropped", .{ .turn_id = prompt.turn_id }, "author={s} reason=stopped_by_user", .{@tagName(prompt.author)});
+            drop.total += 1;
+            if (prompt.author == .parent) drop.from_parent += 1;
+            freeQueuedPrompt(alloc, prompt);
+        }
+        if (drop.total > 0 and self.queued_prompts.items.len == 0) {
+            types.freeHistoryTurnSlice(alloc, self.queued_history);
+            self.queued_history = &.{};
+        }
+        return drop;
     }
 
     pub fn removeQueuedPrompt(
@@ -5503,6 +5609,85 @@ test "a posted message joins a turn the worker started after an earlier turn clo
     defer freeQueuedPrompt(alloc, second);
     try runtime.postMail(alloc, try makePrompt(alloc, "report", "model"));
     try std.testing.expectEqual(@as(?u64, second.turn_id), runtime.queued_prompts.items[0].delivery.activeTurnId());
+}
+
+test "another agent's messages past the cap are refused, and reports never are" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    // Places held on the way count, and a posted message uses its place.
+    for (0..agent_frame.queue_cap - 1) |_| try std.testing.expect(runtime.reserveAgentMessage());
+    var held = try makePrompt(alloc, "held", "model");
+    held.mail = .message;
+    try runtime.postReservedMail(alloc, held);
+    try std.testing.expect(runtime.reserveAgentMessage());
+    try std.testing.expect(!runtime.reserveAgentMessage());
+    var direct = try makePrompt(alloc, "past the cap", "model");
+    direct.mail = .message;
+    try std.testing.expectError(error.QueueFull, runtime.postMail(alloc, direct));
+    freeQueuedPrompt(alloc, direct);
+
+    // A report always gets in, and a released place frees room.
+    var report = try makePrompt(alloc, "a report", "model");
+    report.mail = .report;
+    try runtime.postMail(alloc, report);
+    runtime.releaseAgentMessage();
+    try std.testing.expect(runtime.reserveAgentMessage());
+    try std.testing.expectEqual(@as(usize, 2), runtime.queuedPromptCount());
+}
+
+test "a user's stop drops other agents' messages waiting in the queue, and keeps reports and the user's prompts" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    const queued = [_]struct { text: []const u8, author: types.MessageAuthor, mail: agent_frame.MailKind }{
+        .{ .text = "from the parent", .author = .parent, .mail = .message },
+        // The parent's message joining the running turn carries no kind.
+        .{ .text = "joining the turn", .author = .parent, .mail = .none },
+        .{ .text = "a report", .author = .child, .mail = .report },
+        .{ .text = "typed by the user", .author = .user, .mail = .none },
+        .{ .text = "from its own subagent", .author = .child, .mail = .message },
+    };
+    for (queued) |entry| {
+        var prompt = try makePrompt(alloc, entry.text, "model");
+        prompt.author = entry.author;
+        prompt.mail = entry.mail;
+        try runtime.postMail(alloc, prompt);
+    }
+    const drop = runtime.dropAgentMessages(alloc);
+    try std.testing.expectEqual(@as(usize, 2), drop.from_parent);
+    try std.testing.expectEqual(@as(usize, 3), drop.total);
+    try std.testing.expectEqual(@as(usize, 2), runtime.queuedPromptCount());
+    try std.testing.expectEqualStrings("a report", runtime.queued_prompts.items[0].prompt);
+    try std.testing.expectEqualStrings("typed by the user", runtime.queued_prompts.items[1].prompt);
+}
+
+test "a turn ended for an image or $skill is a hand-off, and an explicit cancel is not" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+
+    try runtime.admitInteractivePrompt(alloc, try makeImagePrompt(alloc, "look at this", "model"));
+    try std.testing.expect(runtime.handedOff(9));
+    try std.testing.expect(!runtime.handedOff(8));
+
+    // Esc on the turn the image starts leaves the hand-off before it.
+    runtime.active_turn_id = 10;
+    runtime.requestInteractiveCancel();
+    try std.testing.expect(runtime.handedOff(9));
+
+    // Esc while the turn is still ending makes it a cancel.
+    runtime.active_turn_id = 9;
+    runtime.requestInteractiveCancel();
+    try std.testing.expect(!runtime.handedOff(9));
 }
 
 test "waiting for a post returns on a post, on a nudge sent before it, and on a cancel" {

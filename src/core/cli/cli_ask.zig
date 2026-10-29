@@ -429,9 +429,14 @@ fn postAskReport(
         .history = &.{},
         .grants = &.{},
         .author = .child,
+        .mail = if (delivery == .report) .report else .message,
     }) catch |err| {
         alloc.free(text);
-        return if (err == error.OutOfMemory) error.OutOfMemory else error.AgentGone;
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.QueueFull => error.QueueFull,
+            else => error.AgentGone,
+        };
     };
 }
 
