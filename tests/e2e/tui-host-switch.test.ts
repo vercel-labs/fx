@@ -294,6 +294,54 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "Esc on a subagent's screen drops the message main sent it while it worked, and its report counts it",
+    async () => {
+      let mainCalls = 0;
+      let childCalls = 0;
+      const first = held();
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          // The subagent's first turn waits here until Esc ends it.
+          if (childCalls === 1) await first.promise;
+          return text("child_answer", "SWITCH_CHILD_RAN");
+        }
+        mainCalls += 1;
+        if (mainCalls === 1) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "worker", message: "SWITCH_STOP_TASK work slowly" },
+          });
+        }
+        if (mainCalls === 2) {
+          return toolCall("main_more", "subagent", {
+            request: { action: "message", agent: "worker", message: "SWITCH_MORE one more thing" },
+          });
+        }
+        if (body.includes('\\"dropped\\":1')) return text("main_saw", "SWITCH_MAIN_SAW_DROP");
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+        expect(childCalls).toBe(1);
+        await moveAgent(session, 1);
+        await session.waitForPane((pane) => pane.includes("SWITCH_STOP_TASK") && pane.includes("worker \u2193"), 15_000);
+        await session.sendKeys("Escape");
+        await session.waitForText("esc again to interrupt", 10_000);
+        await session.sendKeys("Escape");
+        // The stop shows before the next key, which must not join the Esc.
+        await session.waitForText("What can fx do differently?", 15_000);
+        await moveAgent(session, -1);
+        // Main hears of the dropped message from the stopped work's report.
+        await session.waitForText("SWITCH_MAIN_SAW_DROP", 30_000);
+        first.release();
+        // The message main sent while it worked never ran.
+        expect(childCalls).toBe(1);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a subagent's approval can be answered on its own screen, and main's clears",
     async () => {
       let mainCalls = 0;
