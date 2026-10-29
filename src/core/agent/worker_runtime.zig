@@ -95,14 +95,7 @@ pub const SteeringReceipt = struct {
     state: std.atomic.Value(SteeringDelivery) = .init(.queued),
 };
 
-/// Who wrote a message an agent receives. A model frames each message by its
-/// author, and only the user's words carry the user's authority.
-pub const MessageAuthor = enum {
-    /// The person at fx: typed on the agent's screen, or sent by an ACP client.
-    user,
-    /// The agent that started this one, as its subagent.
-    parent,
-};
+pub const MessageAuthor = types.MessageAuthor;
 
 /// One message a turn takes at a steering boundary, with who wrote it.
 pub const SteeringMessage = struct {
