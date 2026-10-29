@@ -95,9 +95,30 @@ pub const SteeringReceipt = struct {
     state: std.atomic.Value(SteeringDelivery) = .init(.queued),
 };
 
+/// Who wrote a message an agent receives. A model frames each message by its
+/// author, and only the user's words carry the user's authority.
+pub const MessageAuthor = enum {
+    /// The person at fx: typed on the agent's screen, or sent by an ACP client.
+    user,
+    /// The agent that started this one, as its subagent.
+    parent,
+};
+
+/// One message a turn takes at a steering boundary, with who wrote it.
+pub const SteeringMessage = struct {
+    text: []u8,
+    author: MessageAuthor = .user,
+};
+
+/// Frees boundary messages and the slice, all from `alloc`.
+pub fn freeSteeringMessages(alloc: std.mem.Allocator, messages: []SteeringMessage) void {
+    for (messages) |message| alloc.free(message.text);
+    alloc.free(messages);
+}
+
 pub const SteeringBoundaryResult = union(enum) {
     none,
-    continue_turn: [][]u8,
+    continue_turn: []SteeringMessage,
     handoff,
     interrupt,
 };
@@ -108,6 +129,8 @@ pub const QueuedPrompt = struct {
     /// turn is saved with it, and main finds the answer by it. Owned.
     work_id: ?[]u8 = null,
     steering_receipt: ?*SteeringReceipt = null,
+    /// Who wrote the prompt, which decides how the turn frames it.
+    author: MessageAuthor = .user,
     /// Runtime-derived delivery state. The worker retains ownership in every state.
     delivery: PromptDelivery = .ordinary,
     prompt: []u8,
@@ -1279,7 +1302,7 @@ pub const WorkerRuntime = struct {
         }
     }
 
-    fn takeSteeringLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, result_alloc: std.mem.Allocator, turn_id: u64) ![][]u8 {
+    fn takeSteeringLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, result_alloc: std.mem.Allocator, turn_id: u64) ![]SteeringMessage {
         var steering_count: usize = 0;
         for (self.queued_prompts.items) |prompt| {
             if (prompt.delivery.activeTurnId() != turn_id) continue;
@@ -1288,10 +1311,10 @@ pub const WorkerRuntime = struct {
         }
         if (steering_count == 0) return &.{};
 
-        const messages = try result_alloc.alloc([]u8, steering_count);
+        const messages = try result_alloc.alloc(SteeringMessage, steering_count);
         var copied: usize = 0;
         errdefer {
-            for (messages[0..copied]) |text| result_alloc.free(text);
+            for (messages[0..copied]) |message| result_alloc.free(message.text);
             result_alloc.free(messages);
         }
         const events = try alloc.alloc(WorkerEvent, steering_count);
@@ -1302,7 +1325,7 @@ pub const WorkerRuntime = struct {
         }
         for (self.queued_prompts.items) |prompt| {
             if (prompt.delivery.activeTurnId() != turn_id) continue;
-            messages[copied] = try result_alloc.dupe(u8, prompt.prompt);
+            messages[copied] = .{ .text = try result_alloc.dupe(u8, prompt.prompt), .author = prompt.author };
             copied += 1;
             if (prompt.steering_receipt == null) {
                 events[event_count] = .{
@@ -4393,7 +4416,7 @@ test "direct steering applies at the boundary without cancellation and seals bef
     var output = std.heap.ArenaAllocator.init(alloc);
     defer output.deinit();
     const boundary = try runtime.takeSteeringBoundaryInto(alloc, output.allocator(), 41, .finalizing);
-    try std.testing.expectEqualStrings("review feedback", boundary.continue_turn[0]);
+    try std.testing.expectEqualStrings("review feedback", boundary.continue_turn[0].text);
     try std.testing.expectEqual(SteeringDelivery.applied, receipt.state.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 0), runtime.worker_events.items.len);
     try std.testing.expect((try runtime.takeSteeringBoundary(alloc, 41, .finalizing)) == .none);
@@ -4451,7 +4474,29 @@ fn freeEventList(alloc: std.mem.Allocator, events: *std.ArrayList(WorkerEvent)) 
     events.deinit(alloc);
 }
 
-fn expectContinuedSteering(result: SteeringBoundaryResult) ![]const []const u8 {
+test "a boundary returns each message with its author" {
+    const alloc = std.testing.allocator;
+    var runtime: WorkerRuntime = .{};
+    defer runtime.deinit(alloc);
+    try std.testing.expect(runtime.beginDirectProcessing(41));
+    var parent = try makePrompt(alloc, "from the parent", "model");
+    parent.author = .parent;
+    if (!try runtime.admitActiveSteering(alloc, parent)) {
+        freeQueuedPrompt(alloc, parent);
+        return error.TestUnexpectedResult;
+    }
+    // The user's message cancels the in-flight request, as typing does.
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "from the user", "model"));
+    const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 41, .cancelled));
+    defer freeSteeringMessages(alloc, guidance);
+    try std.testing.expectEqual(@as(usize, 2), guidance.len);
+    try std.testing.expectEqualStrings("from the parent", guidance[0].text);
+    try std.testing.expectEqual(MessageAuthor.parent, guidance[0].author);
+    try std.testing.expectEqualStrings("from the user", guidance[1].text);
+    try std.testing.expectEqual(MessageAuthor.user, guidance[1].author);
+}
+
+fn expectContinuedSteering(result: SteeringBoundaryResult) ![]SteeringMessage {
     return switch (result) {
         .continue_turn => |messages| messages,
         .none, .handoff, .interrupt => error.TestExpectedContinuedSteering,
@@ -4478,11 +4523,10 @@ test "subagent steering peek preserves the existing queue consumer" {
     try std.testing.expectEqual(@as(usize, 2), runtime.queued_prompts.items.len);
     const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 41, .cancelled));
     defer {
-        for (guidance) |text| alloc.free(text);
-        alloc.free(guidance);
+        freeSteeringMessages(alloc, guidance);
     }
-    try std.testing.expectEqualStrings("first", guidance[0]);
-    try std.testing.expectEqualStrings("second", guidance[1]);
+    try std.testing.expectEqualStrings("first", guidance[0].text);
+    try std.testing.expectEqualStrings("second", guidance[1].text);
     try std.testing.expect(!runtime.hasPendingPlainSteering());
 }
 
@@ -4499,11 +4543,10 @@ test "interactive prompt admission derives steering from active worker state" {
         try runtime.takeSteeringBoundary(alloc, 41, .cancelled),
     );
     defer {
-        for (guidance) |text| alloc.free(text);
-        alloc.free(guidance);
+        freeSteeringMessages(alloc, guidance);
     }
     try std.testing.expectEqual(@as(usize, 1), guidance.len);
-    try std.testing.expectEqualStrings("steer", guidance[0]);
+    try std.testing.expectEqualStrings("steer", guidance[0].text);
 }
 
 test "interactive prompt during running manual compaction waits without cancelling" {
@@ -4566,11 +4609,10 @@ test "interactive prompt during in-turn compaction activity waits without cancel
     // The next model boundary drains the waiting steer as same-turn guidance.
     const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 41, .model));
     defer {
-        for (guidance) |text| alloc.free(text);
-        alloc.free(guidance);
+        freeSteeringMessages(alloc, guidance);
     }
     try std.testing.expectEqual(@as(usize, 1), guidance.len);
-    try std.testing.expectEqualStrings("steer", guidance[0]);
+    try std.testing.expectEqualStrings("steer", guidance[0].text);
 
     runtime.settleCompactionActivity(operation, .{
         .outcome = .succeeded,
@@ -4602,11 +4644,10 @@ test "interactive prompt after in-turn compaction settled steers immediately" {
     try std.testing.expectEqual(@as(?u64, 41), runtime.steering_cancel_turn_id);
     const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 41, .cancelled));
     defer {
-        for (guidance) |text| alloc.free(text);
-        alloc.free(guidance);
+        freeSteeringMessages(alloc, guidance);
     }
     try std.testing.expectEqual(@as(usize, 1), guidance.len);
-    try std.testing.expectEqualStrings("steer", guidance[0]);
+    try std.testing.expectEqualStrings("steer", guidance[0].text);
 }
 
 test "active prompt admission drains steering in FIFO order" {
@@ -4622,12 +4663,11 @@ test "active prompt admission drains steering in FIFO order" {
         try runtime.takeSteeringBoundary(alloc, 41, .cancelled),
     );
     defer {
-        for (guidance) |text| alloc.free(text);
-        alloc.free(guidance);
+        freeSteeringMessages(alloc, guidance);
     }
     try std.testing.expectEqual(@as(usize, 2), guidance.len);
-    try std.testing.expectEqualStrings("first", guidance[0]);
-    try std.testing.expectEqualStrings("second", guidance[1]);
+    try std.testing.expectEqualStrings("first", guidance[0].text);
+    try std.testing.expectEqualStrings("second", guidance[1].text);
     try std.testing.expectEqual(@as(usize, 0), runtime.queued_prompts.items.len);
     try std.testing.expectEqual(@as(usize, 2), runtime.worker_events.items.len);
     try std.testing.expectEqualStrings("first", runtime.worker_events.items[0].append_user_feedback);
@@ -4654,12 +4694,11 @@ test "immediate steering owns and clears only its cancellation" {
         try runtime.takeSteeringBoundary(alloc, 41, .cancelled),
     );
     defer {
-        for (guidance) |text| alloc.free(text);
-        alloc.free(guidance);
+        freeSteeringMessages(alloc, guidance);
     }
     try std.testing.expectEqual(@as(usize, 2), guidance.len);
-    try std.testing.expectEqualStrings("first", guidance[0]);
-    try std.testing.expectEqualStrings("second", guidance[1]);
+    try std.testing.expectEqualStrings("first", guidance[0].text);
+    try std.testing.expectEqualStrings("second", guidance[1].text);
     try std.testing.expect(!runtime.isCancelRequested());
     try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
 }
@@ -4816,11 +4855,10 @@ test "subagent wait phase preserves steering control and existing tool boundarie
                 if (tool_step == null) .cancelled else .model,
             ));
             defer {
-                for (guidance) |item| alloc.free(item);
-                alloc.free(guidance);
+                freeSteeringMessages(alloc, guidance);
             }
             try std.testing.expectEqual(@as(usize, 1), guidance.len);
-            try std.testing.expectEqualStrings(text, guidance[0]);
+            try std.testing.expectEqualStrings(text, guidance[0].text);
             try std.testing.expect(!runtime.isCancelRequested());
         }
         runtime.requestCancel();
@@ -4857,10 +4895,9 @@ test "tool handoff phase holds steering only through its model step" {
         try runtime.takeSteeringBoundary(alloc, 41, .model),
     );
     defer {
-        for (guidance) |text| alloc.free(text);
-        alloc.free(guidance);
+        freeSteeringMessages(alloc, guidance);
     }
-    try std.testing.expectEqualStrings("wait for pending tools", guidance[0]);
+    try std.testing.expectEqualStrings("wait for pending tools", guidance[0].text);
 
     try runtime.pushEvent(alloc, .{ .turn_phase_update = .{
         .turn_id = 41,
@@ -4963,11 +5000,10 @@ test "queued steer waiting at a tool boundary pops back for editing" {
         try runtime.takeSteeringBoundary(alloc, 41, .model),
     );
     defer {
-        for (guidance) |text| alloc.free(text);
-        alloc.free(guidance);
+        freeSteeringMessages(alloc, guidance);
     }
     try std.testing.expectEqual(@as(usize, 1), guidance.len);
-    try std.testing.expectEqualStrings("first steer", guidance[0]);
+    try std.testing.expectEqualStrings("first steer", guidance[0].text);
     try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
     try std.testing.expect(try runtime.popQueuedSteerForEdit(alloc) == null);
 }
@@ -4989,11 +5025,10 @@ test "immediate steer already committed to an interrupt is not retractable" {
         try runtime.takeSteeringBoundary(alloc, 41, .cancelled),
     );
     defer {
-        for (guidance) |text| alloc.free(text);
-        alloc.free(guidance);
+        freeSteeringMessages(alloc, guidance);
     }
     try std.testing.expectEqual(@as(usize, 1), guidance.len);
-    try std.testing.expectEqualStrings("steer", guidance[0]);
+    try std.testing.expectEqualStrings("steer", guidance[0].text);
 }
 
 test "steer retraction skips handoff prompts and takes the newest text steer" {
@@ -5096,8 +5131,7 @@ test "steering presentation survives queue to feedback transfer without duplicat
 
     const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 41, .cancelled));
     defer {
-        for (guidance) |message| alloc.free(message);
-        alloc.free(guidance);
+        freeSteeringMessages(alloc, guidance);
     }
     var consumed = try runtime.snapshotSteeringPresentation(alloc);
     defer consumed.deinit(alloc);
@@ -5202,11 +5236,10 @@ test "promoted steering retargets remaining guidance without exposing a queue" {
         try runtime.takeSteeringBoundary(alloc, promoted.turn_id, .model),
     );
     defer {
-        for (guidance) |text| alloc.free(text);
-        alloc.free(guidance);
+        freeSteeringMessages(alloc, guidance);
     }
     try std.testing.expectEqual(@as(usize, 1), guidance.len);
-    try std.testing.expectEqualStrings("second", guidance[0]);
+    try std.testing.expectEqualStrings("second", guidance[0].text);
     try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
 }
 
@@ -5267,11 +5300,10 @@ test "a message behind waiting work rides into that work's turn instead of passi
     try std.testing.expectEqualStrings("older work", work.prompt);
     const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, work.turn_id, .model));
     defer {
-        for (guidance) |text| alloc.free(text);
-        alloc.free(guidance);
+        freeSteeringMessages(alloc, guidance);
     }
     try std.testing.expectEqual(@as(usize, 1), guidance.len);
-    try std.testing.expectEqualStrings("newer message", guidance[0]);
+    try std.testing.expectEqualStrings("newer message", guidance[0].text);
     try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
 }
 
@@ -5323,11 +5355,10 @@ test "a turn takes in only the messages right behind it, so none passes older wo
     try std.testing.expectEqualStrings("work", work.prompt);
     const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, work.turn_id, .model));
     defer {
-        for (guidance) |text| alloc.free(text);
-        alloc.free(guidance);
+        freeSteeringMessages(alloc, guidance);
     }
     try std.testing.expectEqual(@as(usize, 1), guidance.len);
-    try std.testing.expectEqualStrings("third", guidance[0]);
+    try std.testing.expectEqualStrings("third", guidance[0].text);
 }
 
 test "a parent's message joins the running turn only while nothing older waits" {
@@ -5358,12 +5389,11 @@ test "a boundary takes the turn's messages in one pass and keeps the rest in ord
     runtime.queued_prompts.items[2].delivery = .{ .active_turn = 9 };
     const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 9, .model));
     defer {
-        for (guidance) |text| alloc.free(text);
-        alloc.free(guidance);
+        freeSteeringMessages(alloc, guidance);
     }
     try std.testing.expectEqual(@as(usize, 2), guidance.len);
-    try std.testing.expectEqualStrings("a", guidance[0]);
-    try std.testing.expectEqualStrings("b", guidance[1]);
+    try std.testing.expectEqualStrings("a", guidance[0].text);
+    try std.testing.expectEqualStrings("b", guidance[1].text);
     try std.testing.expectEqual(@as(usize, 2), runtime.queuedPromptCount());
     try std.testing.expectEqualStrings("x", runtime.queued_prompts.items[0].prompt);
     try std.testing.expectEqualStrings("y", runtime.queued_prompts.items[1].prompt);
@@ -5411,8 +5441,7 @@ test "waiting for a post returns on a post, on a nudge sent before it, and on a 
     try std.testing.expectEqual(WorkerRuntime.PostWake.posted, runtime.waitForPostOrNudge());
     const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 9, .model));
     defer {
-        for (guidance) |text| alloc.free(text);
-        alloc.free(guidance);
+        freeSteeringMessages(alloc, guidance);
     }
 
     runtime.requestCancel();
@@ -5535,11 +5564,8 @@ fn placementBoundary(alloc: std.mem.Allocator, runtime: *WorkerRuntime, log: *Pl
     const kind: SteeringBoundaryKind = if (runtime.worker_cancel_requested.load(.seq_cst)) .cancelled else .model;
     switch (try runtime.takeSteeringBoundary(alloc, runtime.active_turn_id, kind)) {
         .continue_turn => |messages| {
-            defer {
-                for (messages) |text| alloc.free(text);
-                alloc.free(messages);
-            }
-            for (messages) |text| try log.deliver(text);
+            defer freeSteeringMessages(alloc, messages);
+            for (messages) |message| try log.deliver(message.text);
         },
         .none => {},
         .handoff, .interrupt => runtime.finishProcessing(),
@@ -5694,11 +5720,10 @@ test "takeEventBatch keeps the steering tail live before boundary adoption" {
 
     const guidance = try expectContinuedSteering(try runtime.takeSteeringBoundary(alloc, 41, .cancelled));
     defer {
-        for (guidance) |text| alloc.free(text);
-        alloc.free(guidance);
+        freeSteeringMessages(alloc, guidance);
     }
     try std.testing.expectEqual(@as(usize, 1), guidance.len);
-    try std.testing.expectEqualStrings("steer", guidance[0]);
+    try std.testing.expectEqualStrings("steer", guidance[0].text);
     try std.testing.expect(!runtime.isCancelRequested());
     try std.testing.expectEqual(@as(?u64, null), batch.cancelled_turn_id);
     var feedback = runtime.takeEventBatch();

@@ -663,6 +663,8 @@ pub const FakeAgentRuntimeDeps = struct {
     cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
     route_recovery_status_error_attempt: ?usize = null,
     steering_messages: []const []const u8 = &.{},
+    /// Who wrote the fake's steering messages.
+    steering_author: worker_runtime.MessageAuthor = .user,
     steering_take_at: usize = 1,
     steering_take_count: usize = 0,
     immediate_steering_messages: []const []const u8 = &.{},
@@ -933,8 +935,8 @@ pub const FakeAgentRuntimeDeps = struct {
             },
         };
         if (source.len == 0) return if (kind == .cancelled) .interrupt else .none;
-        const messages = try arena.alloc([]u8, source.len);
-        for (source, messages) |text, *copy| copy.* = try arena.dupe(u8, text);
+        const messages = try arena.alloc(worker_runtime.SteeringMessage, source.len);
+        for (source, messages) |text, *copy| copy.* = .{ .text = try arena.dupe(u8, text), .author = self.steering_author };
         return .{ .continue_turn = messages };
     }
 
@@ -950,12 +952,9 @@ pub const FakeAgentRuntimeDeps = struct {
         const result = try self.steering_worker.?.takeSteeringBoundary(self.alloc, turn_id, kind);
         return switch (result) {
             .continue_turn => |owned| blk: {
-                defer {
-                    for (owned) |text| self.alloc.free(text);
-                    self.alloc.free(owned);
-                }
-                const messages = try arena.alloc([]u8, owned.len);
-                for (owned, messages) |text, *copy| copy.* = try arena.dupe(u8, text);
+                defer worker_runtime.freeSteeringMessages(self.alloc, owned);
+                const messages = try arena.alloc(worker_runtime.SteeringMessage, owned.len);
+                for (owned, messages) |message, *copy| copy.* = .{ .text = try arena.dupe(u8, message.text), .author = message.author };
                 break :blk .{ .continue_turn = messages };
             },
             .none => .none,

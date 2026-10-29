@@ -1995,12 +1995,12 @@ fn takeSteeringBoundary(
             // As on native, an interrupt this boundary beat is spent here.
             if (kind != .cancelled) server.releaseSteeringInterrupt(ctx.state);
             try acceptHostSteering(ctx, taken);
-            const texts = try arena.alloc([]u8, taken.len);
-            for (taken, texts) |entry, *text| {
-                text.* = entry.text;
+            const messages = try arena.alloc(worker_runtime.SteeringMessage, taken.len);
+            for (taken, messages) |entry, *message| {
+                message.* = .{ .text = entry.text };
                 try publishSteeringReplay(ctx, entry.text, null, entry.id);
             }
-            return .{ .continue_turn = texts };
+            return .{ .continue_turn = messages };
         }
         if (steered) return .{ .continue_turn = &.{} };
         if (close_if_empty) js_host_steering.close();
@@ -2033,7 +2033,10 @@ fn takeSteeringBoundary(
         const input_id: ?[]const u8 = if (index < drained.input_ids.len) drained.input_ids[index] else null;
         try publishSteeringReplay(ctx, text, request_id, input_id);
     }
-    return .{ .continue_turn = drained.texts };
+    // An ACP client's steering is the user's own.
+    const messages = try arena.alloc(worker_runtime.SteeringMessage, drained.texts.len);
+    for (drained.texts, messages) |text, *message| message.* = .{ .text = text };
+    return .{ .continue_turn = messages };
 }
 
 /// The web core's cooperative pulse while a model reply streams: steering its
