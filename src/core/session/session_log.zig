@@ -1278,6 +1278,13 @@ pub const ConversationTurnBuilder = struct {
         });
     }
 
+    /// Marks who wrote the message that opened the turn being built.
+    pub fn setUserAuthor(self: *ConversationTurnBuilder, author: types.MessageAuthor) !void {
+        if (self.user) |*user| {
+            user.author = author;
+        } else return error.InvalidConversationFrame;
+    }
+
     pub fn appendAssistant(self: *ConversationTurnBuilder, value: session_event.ConversationAssistant) !void {
         if (self.calls.items.len == 0 and self.results.items.len == 0) try self.finishStandalone();
         if (self.user == null or self.pending_assistant != null or self.calls.items.len != 0) {

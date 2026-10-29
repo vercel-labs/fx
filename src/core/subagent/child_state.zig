@@ -131,6 +131,9 @@ pub const Child = struct {
     last_request_fingerprint: ?[32]u8 = null,
     last_outcome: ?Outcome = null,
     last_failure: ?types.ModelFailureDiagnostic = null,
+    /// Whether the last finished work owes the parent a report, recorded
+    /// on its `child_finished` line.
+    last_report_owed: bool = false,
     /// The agent profile the child started in, or null for fx's `agent`.
     /// Fixed when the child is created. Owned.
     profile: ?[]u8 = null,
@@ -173,6 +176,7 @@ pub const Child = struct {
             .last_request_fingerprint = self.last_request_fingerprint,
             .last_outcome = self.last_outcome,
             .last_failure = self.last_failure,
+            .last_report_owed = self.last_report_owed,
         };
     }
 
@@ -388,6 +392,20 @@ pub const Registry = struct {
         outcome: Outcome,
         failure: ?types.ModelFailureDiagnostic,
     ) !void {
+        return self.finishWithReport(alloc, child_id, work_id, outcome, failure, false);
+    }
+
+    /// Finishes `work_id`, recording whether its end owes the parent a
+    /// report (`reports.reportable`).
+    pub fn finishWithReport(
+        self: *Registry,
+        alloc: Allocator,
+        child_id: []const u8,
+        work_id: []const u8,
+        outcome: Outcome,
+        failure: ?types.ModelFailureDiagnostic,
+        report_owed: bool,
+    ) !void {
         const child = self.findById(child_id) orelse return error.ChildNotFound;
         const active = child.active orelse return error.StaleWork;
         if (!std.mem.eql(u8, active.id, work_id)) return error.StaleWork;
@@ -398,6 +416,7 @@ pub const Registry = struct {
         child.last_request_fingerprint = active.request_fingerprint;
         child.last_outcome = outcome;
         child.last_failure = failure;
+        child.last_report_owed = report_owed;
         child.active.?.deinit(alloc);
         child.active = null;
         child.phase = switch (child.kind) {
@@ -620,10 +639,25 @@ const SpawnData = struct {
     profile: ?[]const u8 = null,
 };
 
-/// fx's data on a `child_finished` line.
+/// fx's data on a `child_finished` line. Older fx skips `report`, and a
+/// line without it owes nothing, so an upgrade wakes no parent.
 const FinishData = struct {
     failure: ?[]const u8 = null,
+    report: ?bool = null,
 };
+
+/// The data for a finish with `failure` and `report_owed`, or null when it
+/// has neither, so a finish that owes nothing is written as before.
+fn finishData(arena: Allocator, failure: ?[]const u8, report_owed: bool) !?[]const u8 {
+    if (failure == null and !report_owed) return null;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(
+        FinishData{ .failure = failure, .report = if (report_owed) true else null },
+        .{ .emit_null_optional_fields = false },
+        &out.writer,
+    );
+    return out.written();
+}
 
 /// Pure: the registry a v2 parent's folded children describe. The
 /// manager's reopen repair has finished every open item, so an open one
@@ -698,6 +732,7 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
         .last_request_fingerprint = fingerprint,
         .last_outcome = last_outcome,
         .last_failure = if (finish.failure) |text| types.ModelFailureDiagnostic.init(text) else null,
+        .last_report_owed = finish.report orelse false,
     };
 }
 
@@ -720,7 +755,7 @@ fn planLines(arena: Allocator, old: Registry, next: Registry) ![]session_adapter
                     .child = after.id,
                     .work_id = work_id,
                     .outcome = try v2Outcome(after.last_outcome orelse return error.InvalidState),
-                    .data = if (after.last_failure) |failure| try stringifyAlloc(arena, FinishData{ .failure = failure.view() }) else null,
+                    .data = try finishData(arena, if (after.last_failure) |failure| failure.view() else null, after.last_report_owed),
                 } });
             }
         }
@@ -770,7 +805,7 @@ pub fn v1ImportLines(arena: Allocator, registry: Registry, has_log: []const bool
             .child = child.id,
             .work_id = work_id,
             .outcome = outcome,
-            .data = if (failure) |text| try stringifyAlloc(arena, FinishData{ .failure = text }) else null,
+            .data = try finishData(arena, failure, false),
         } });
     }
     return lines.toOwnedSlice(arena);
@@ -1395,6 +1430,74 @@ test "a v2 registry change writes only the child lines it implies (D22)" {
     try lost.finish(alloc, named, "work-3", .completed, null);
     lost.children[1].last_outcome = .lost;
     try std.testing.expectError(error.InvalidState, planLines(a, old, lost));
+}
+
+test "a finish that owes a report says so on its line, and the fold reads it back" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parent_id = "01J00000000000000000000000";
+    const named = "01J00000000000000000000002";
+    var old = try Registry.init(alloc, parent_id);
+    defer old.deinit(alloc);
+    var next = try old.clone(alloc);
+    var first = try testWork(alloc, "work-1", 0xab);
+    defer first.deinit(alloc);
+    try next.appendPersistent(alloc, named, "reviewer", "", first);
+    advance(alloc, &old, next);
+
+    // Owed, with and without a failure; a failure alone is written as before.
+    const cases = [_]struct { failure: ?[]const u8, owed: bool, data: ?[]const u8 }{
+        .{ .failure = null, .owed = true, .data = "{\"report\":true}" },
+        .{ .failure = "boom", .owed = true, .data = "{\"failure\":\"boom\",\"report\":true}" },
+        .{ .failure = "boom", .owed = false, .data = "{\"failure\":\"boom\"}" },
+        .{ .failure = null, .owed = false, .data = null },
+    };
+    for (cases, 0..) |case, index| {
+        const work_id = try a.print("work-{d}", .{index + 1});
+        next = try old.clone(alloc);
+        const outcome: Outcome = if (case.failure != null) .failed else .completed;
+        const failure: ?types.ModelFailureDiagnostic = if (case.failure) |text| types.ModelFailureDiagnostic.init(text) else null;
+        try next.finishWithReport(alloc, named, work_id, outcome, failure, case.owed);
+        var copy = try next.children[0].clone(alloc);
+        defer copy.deinit(alloc);
+        try std.testing.expectEqual(case.owed, copy.last_report_owed);
+        var later = try testWork(alloc, try a.print("work-{d}", .{index + 2}), 0xcd);
+        defer later.deinit(alloc);
+        _ = try next.startPersistentWork(alloc, "reviewer", null, later);
+        const lines = try planLines(a, old, next);
+        if (case.data) |data| {
+            try std.testing.expectEqualStrings(data, lines[0].finished.data.?);
+        } else {
+            try std.testing.expect(lines[0].finished.data == null);
+        }
+        advance(alloc, &old, next);
+    }
+
+    // The fold reads the flag back; a line older fx wrote owes nothing.
+    const fingerprint = text_utils.repeat("ab", 32);
+    const spawn = "{\"agent\":\"reviewer\",\"fingerprint\":\"" ++ fingerprint ++ "\"}";
+    const folds = [_]struct { outcome: session_adapter.ChildOutcome, data: ?[]const u8, owed: bool }{
+        .{ .outcome = .ok, .data = "{\"report\":true}", .owed = true },
+        .{ .outcome = .failed, .data = "{\"failure\":\"boom\",\"report\":true}", .owed = true },
+        .{ .outcome = .failed, .data = "{\"failure\":\"boom\"}", .owed = false },
+        .{ .outcome = .ok, .data = null, .owed = false },
+    };
+    for (folds) |fold| {
+        const entry = session_adapter.Child{
+            .id = @constCast(named),
+            .work_id = @constCast("w1"),
+            .open = false,
+            .outcome = fold.outcome,
+            .spawn_data = @constCast(spawn),
+            .finish_data = if (fold.data) |data| @constCast(data) else null,
+            .seq = 3,
+        };
+        var registry = try registryFromChildren(alloc, parent_id, &.{entry});
+        defer registry.deinit(alloc);
+        try std.testing.expectEqual(fold.owed, registry.children[0].last_report_owed);
+    }
 }
 
 test "a v2 parent's folded children rebuild the registry v1 would hold (D22)" {
