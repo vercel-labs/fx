@@ -428,6 +428,15 @@ const AcpContext = struct {
         }
     }
 
+    /// Shows a subagent's report on the call that sent its work, after that
+    /// call's own result (decision 26).
+    fn sendReportUpdate(self: *AcpContext, tool_call_id: []const u8, text: []const u8) !void {
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try acp_types.writeToolCallUpdate(&out.writer, tool_call_id, .completed, text);
+        try self.sendUpdate(out.writer.buffered());
+    }
+
     fn sendToolCallProgressText(self: *AcpContext, tool_call_id: []const u8, text: ?[]const u8) !void {
         const plain = if (text) |value| try stripAnsiAlloc(self.alloc, value) else null;
         defer if (plain) |value| if (text) |original| {
@@ -1180,6 +1189,10 @@ pub fn handlePrompt(
         }
     };
     try endJournalTurn(alloc, state.alloc, session);
+    if (try runReportTurns(state, session, alloc, &ctx, &deps, agent_config, job)) |outcome| {
+        prompt_input.retainImageSnapshots();
+        return outcome;
+    }
     prompt_input.retainImageSnapshots();
     completeAcpTitleTask(state, session);
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
@@ -2896,6 +2909,96 @@ fn handBackUnplacedSteersLocked(alloc: Allocator, backing: Allocator, session: *
 /// failed left no history entry, so its progress is cleared: resuming is for
 /// turns a stopped process left open. Inputs it took and never placed are
 /// settled. `session_alloc` owns the journal's state.
+/// The prompt ends once its whole tree is quiet (decision 17): each report
+/// or message a subagent sends runs as the session's next turn, and a report
+/// shows on the subagent call that sent the work (decision 26). A turn
+/// started this way is the child's, never the user's, so its root context
+/// stays the user's own request. Returns the prompt's outcome when a turn
+/// ends it early.
+fn runReportTurns(
+    state: *server.ServerState,
+    session: *server.ActiveSessionState,
+    alloc: Allocator,
+    ctx: *AcpContext,
+    deps: *const agent_runtime.AgentRuntimeDeps,
+    agent_config: agent_runtime.Config,
+    base: worker_runtime.QueuedPrompt,
+) !?TerminalOutcome {
+    const tree = state.subagent_host orelse return null;
+    while (true) {
+        switch (tree.awaitMailOrQuiet(&state.worker, &session.cancel_flag)) {
+            .quiet, .stopped => return null,
+            .mail => {},
+        }
+        const next = state.worker.takeQueuedPrompt(std.heap.c_allocator) orelse continue;
+        defer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, next);
+        var answered = server.takeReportCall(state);
+        defer if (answered) |*call| call.deinit(std.heap.c_allocator);
+        const call_id = if (answered) |call| call.call_id else "";
+        if (answered) |call| if (call.call_id.len > 0) {
+            ctx.sendReportUpdate(call.call_id, next.prompt) catch |err| {
+                debug_trace.logf("acp", "report update not sent call_id={s} err={s}", .{ call.call_id, @errorName(err) });
+            };
+            // A hook client learns how the work ended, as it learned it began.
+            if (ctx.observer) |observer| if (call.outcome) |outcome| observer.emit(.{ .delegation = .{
+                .call_id = call.call_id,
+                .child_id = call.child_id,
+                .work_id = call.work_id,
+                .phase = switch (outcome) {
+                    .completed => .completed,
+                    .cancelled => .cancelled,
+                    .failed, .interrupted, .lost => .failed,
+                },
+            } });
+        };
+        if (session.journal) |*journal| {
+            session.session_write_mutex.lockUncancelable(io_mod.getIo());
+            defer session.session_write_mutex.unlock(io_mod.getIo());
+            journal.barrier_next_progress = !journal.inputs_durable;
+            journal.nameNextTurn(null);
+        }
+        if (session.v2) |v2| {
+            session.session_write_mutex.lockUncancelable(io_mod.getIo());
+            defer session.session_write_mutex.unlock(io_mod.getIo());
+            try v2.beginTurn();
+        }
+        const history = try session.session_rt.snapshotHistory(alloc);
+        defer types.freeHistoryTurnSlice(alloc, history);
+        var job = base;
+        job.turn_id = 0;
+        job.prompt = next.prompt;
+        job.author = next.author;
+        job.delivery = .continuation;
+        job.images = &.{};
+        job.authorized_image_catalog = &.{};
+        job.history = history;
+        job.unversioned_history_count = session.session_rt.unversionedHistoryEnd();
+        job.recovery_checkpoint = null;
+        job.recovery_source_already_presented = false;
+        debug_trace.eventf("mailbox", "acp_next_turn", .{}, "author={s} call_id={s}", .{ @tagName(next.author), call_id });
+        agent_runtime.processAgentPrompt(&session.session_rt.agent, deps, null, .{
+            .view = state.lifecycle_view,
+            .scope = .{
+                .kind = .acp,
+                .workspace_root = session.workspace_root,
+                .session_id = session.session_id,
+            },
+            .outcome_allocator = alloc,
+        }, agent_config, job) catch |err| {
+            endJournalTurn(alloc, state.alloc, session) catch |end_err| {
+                debug_trace.logf("session", "event=libfx_journal_turn_end_failed err={s} turn_err={s}", .{ @errorName(end_err), @errorName(err) });
+            };
+            if (err == error.NonInteractivePermissionRequired) {
+                ctx.stop_reason = .refused;
+                return null;
+            }
+            if (err == error.Cancelled and session.cancel_flag.load(.seq_cst)) return null;
+            return try promptExecutionFailure(err);
+        };
+        try endJournalTurn(alloc, state.alloc, session);
+    }
+}
+
 fn endJournalTurn(alloc: Allocator, session_alloc: Allocator, session: *server.ActiveSessionState) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
@@ -3701,7 +3804,7 @@ test "ACP subagent titles and terminal descriptions share request projection" {
     try std.testing.expectEqualStrings("reviewer · Check replay", title);
     const completed = (try tool_presentation.formatSubagentPlainAction(alloc, call, .completed)).?;
     defer alloc.free(completed);
-    try std.testing.expectEqualStrings("reviewer replied · Check replay", completed);
+    try std.testing.expectEqualStrings("sent to reviewer · Check replay", completed);
     const interrupted = (try tool_presentation.formatSubagentPlainAction(alloc, call, .{ .stopped = "Interrupted" })).?;
     defer alloc.free(interrupted);
     try std.testing.expectEqualStrings("reviewer interrupted · Check replay", interrupted);
@@ -5102,8 +5205,6 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
         deps.context_registry.?.defaultProvider().id,
     );
     try std.testing.expect(deps.request_prepared_file_mutation_permission != null);
-    try std.testing.expect(deps.prepare_parent_turn_context == null);
-    try std.testing.expect(deps.acknowledge_parent_turn_context == null);
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();

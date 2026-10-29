@@ -52,6 +52,7 @@ const session_catalog_cache = @import("../session/session_catalog_cache.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
+const subagent_reports = @import("../subagent/reports.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const builtin_tools = @import("../../builtins/tools.zig");
@@ -2907,6 +2908,12 @@ pub fn Runtime(comptime App: type) type {
                 }
 
                 fn appendUserTurn(self: *Self, user: types.UserTurn, _: bool) !void {
+                    // A report's turn comes back as its card, as it showed live.
+                    if (try subagent_reports.card(self.projection.alloc, user)) |shown| {
+                        defer shown.deinit(self.projection.alloc);
+                        for (shown.notices()) |notice| _ = try self.projection.appendNotice(notice);
+                        return;
+                    }
                     _ = try self.projection.appendUserTurn(user);
                 }
 
@@ -4257,7 +4264,10 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.v2_children = children;
             // Its children report to this agent, through the main loop.
             if (comptime @hasDecl(App, "postSubagentReport")) {
-                agent.session_persistence.subagent_host.?.report_sink = .{ .context = app, .post_fn = App.postSubagentReport };
+                const host = agent.session_persistence.subagent_host.?;
+                host.report_sink = .{ .context = app, .post_fn = App.postSubagentReport };
+                // A subagent's own host can message the subagent's parent.
+                host.owner_has_parent = agent.role == .subagent;
             }
         }
 

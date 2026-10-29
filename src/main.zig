@@ -1419,6 +1419,13 @@ const App = struct {
         has_prior_turns: bool,
         skill_tokens: []const registered_entities.SkillTokenSpan,
     ) !void {
+        // A turn a subagent's report or message started is not the user's
+        // words, so it shows as a short card rather than as a prompt.
+        if (try subagent_reports.card(self.alloc, user)) |shown| {
+            defer shown.deinit(self.alloc);
+            for (shown.notices()) |notice| try self.writeDomainNotice(notice, true);
+            return;
+        }
         _ = try self.shell.writeUserPromptCard(
             self.alloc,
             &self.metrics,
@@ -2023,17 +2030,15 @@ const App = struct {
         return AgentAppRuntime.runSubagentChild(raw, turn, message, admission, cancel);
     }
 
-    /// The subagent host's report sink (`subagent_tool_host.ReportSink`),
-    /// called on a slot thread: the main loop gives the report to the agent
-    /// that owns `reporting_host`, and this waits for that.
+    /// The subagent host's report sink (`subagent_tool_host.ReportSink`):
+    /// queues the delivery for the main loop, which gives it to its agent.
     pub fn postSubagentReport(
         raw: ?*anyopaque,
         reporting_host: *subagent_tool_host.Runtime,
-        report: subagent_reports.Report,
+        delivery: subagent_tool_host.Delivery,
     ) subagent_tool_host.PostReportError!void {
         const self: *App = @ptrCast(@alignCast(raw.?));
-        var post: app_agents_runtime.ReportPost = .{ .host = reporting_host, .report = report };
-        return app_agents_runtime.postReportAndWait(&self.child_handoffs, &post);
+        return app_agents_runtime.postDelivery(&self.child_handoffs, reporting_host, delivery);
     }
 
     /// Sends `agent` a message another agent wrote, such as its subagent's

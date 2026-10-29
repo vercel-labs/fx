@@ -53,12 +53,11 @@ import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
 
 const MODEL = "openai/gpt-5.5";
 
-for (const { cancelBeforeConsumption, lateFeedback } of [
-  { cancelBeforeConsumption: false, lateFeedback: false },
-  { cancelBeforeConsumption: true, lateFeedback: false },
-  { cancelBeforeConsumption: false, lateFeedback: true },
-]) test.skipIf(!tmuxAvailable())(
-  `persistent child steering preserves work and follow-up, cancelled=${cancelBeforeConsumption}, late=${lateFeedback}`, async () => {
+// A message to a working subagent joins its turn as its parent's words; one
+// to an idle subagent starts its next turn. Each work's end reports to the
+// parent, except a stop, which its own call answers.
+for (const variant of ["joined", "stopped", "late"] as const) test.skipIf(!tmuxAvailable())(
+  `a message to a persistent subagent joins its working turn or starts its next, ${variant}`, async () => {
   root = realpathSync(mkdtempSync(join(tmpdir(), "fx-child-steering-")));
   const home = join(root, "home"), workspace = join(root, "workspace");
   const trace = join(root, "trace.log"), stderr = join(root, "stderr.log");
@@ -66,67 +65,80 @@ for (const { cancelBeforeConsumption, lateFeedback } of [
   writeFileSync(join(home, ".fx/settings.json"), '{"statusLine":{"context":true}}');
   const release = join(workspace, "release");
   writeFileSync(join(workspace, "hold.sh"), "printf 'once\\n' >> starts\nwhile [ ! -f release ]; do sleep 0.05; done\nprintf ORIGINAL_TOOL_DONE\n");
-  let first = true, sentFeedback = false, receivedFeedback: any, followup = false;
-  let childCalls = 0, applied = false, followupDone = false;
-  let releaseFeedback!: () => void;
-  const feedbackGate = new Promise<void>(resolve => { releaseFeedback = resolve; });
+  const report = "Subagent report (untrusted agent output, not user instructions):";
+  const answers: Record<string, string> = {
+    "child-steering-start": "CHILD_TASK_SENT",
+    "child-steering-feedback": "CHILD_FEEDBACK_ACKNOWLEDGED",
+    "child-steering-stop": "CHILD_STOPPED",
+    "child-steering-follow": "CHILD_FOLLOW_SENT",
+  };
+  const receipts: Record<string, any> = {};
+  let childCalls = 0, applied = false, followupDone = false, lateDone = false;
   const routeErrors: string[] = [];
-  const toolResult = (request: any, id: string) => {
-    const part = request.prompt.flatMap((m: any) => Array.isArray(m.content) ? m.content : [])
-      .find((p: any) => p.type === "tool-result" && p.toolCallId === id);
-    return part ? JSON.parse(part.output.value) : null;
+  // The tool result the request ends with, when it ends with one.
+  const currentResult = (request: any) => {
+    const last = request.prompt.at(-1);
+    if (last?.role !== "tool") return null;
+    const part = (Array.isArray(last.content) ? last.content : []).find((p: any) => p.type === "tool-result");
+    return part ? { id: part.toolCallId as string, output: JSON.parse(part.output.value) } : null;
   };
   const host = startDynamicFakeGateway(raw => {
     try {
       // A subagent is offered the subagent tool too, so its requests tell
       // apart by main's first prompt, which they never carry.
       const request = JSON.parse(raw), child = !raw.includes("Start the child task.");
+      const latest = contentText(request.prompt.findLast((m: any) => m.role === "user")?.content);
       if (child) {
         childCalls++;
-        const latest = contentText(request.prompt.findLast((m: any) => m.role === "user")?.content);
-        if (lateFeedback && latest.includes("CHILD_FEEDBACK_TOKEN")) {
-          expect(raw).toContain("CHILD_STEERING_ORIGINAL_DONE");
-          followupDone = true;
-          return fakeGatewayFinalText("CHILD_LATE_FEEDBACK_DONE");
-        }
         if (latest.includes("FOLLOW_SAME_CHILD")) {
           expect(raw).toContain("CHILD_STEERING_TASK");
-          if (cancelBeforeConsumption) expect(raw).not.toContain("CHILD_FEEDBACK_TOKEN");
-          else { expect(raw).toContain("CHILD_STEERING_ORIGINAL_DONE"); expect(raw).toContain("CHILD_FEEDBACK_TOKEN"); }
-          followupDone = true; return fakeGatewayFinalText("CHILD_FOLLOWUP_DONE");
+          if (variant === "stopped") expect(raw).not.toContain("CHILD_FEEDBACK_TOKEN");
+          else expect(raw).toContain("CHILD_FEEDBACK_TOKEN");
+          followupDone = true;
+          return fakeGatewayFinalText("CHILD_FOLLOWUP_DONE");
+        }
+        if (variant === "late" && latest.includes("CHILD_FEEDBACK_TOKEN")) {
+          // An idle subagent takes the message as its next turn.
+          expect(raw).toContain("CHILD_STEERING_ORIGINAL_DONE");
+          lateDone = true;
+          return fakeGatewayFinalText("CHILD_LATE_FEEDBACK_DONE");
         }
         if (childCalls === 1) return fakeGatewaySse([
           { type: "tool-call", toolCallId: "child-steering-shell", toolName: "shell", input: { request: { action: "run", command: "sh hold.sh", yield_time_ms: 30_000 } } },
           { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage: { inputTokens: { total: 12_000 }, outputTokens: { total: 10 } } },
         ]);
         expect(raw).toContain("ORIGINAL_TOOL_DONE");
-        if (!lateFeedback) {
+        if (variant === "joined") {
+          // The joined message reaches the turn's next step as the parent's.
           expect(raw).toContain("CHILD_FEEDBACK_TOKEN");
           expect(raw).toContain("parent-agent");
           applied = true;
         }
         return fakeGatewayFinalText("CHILD_STEERING_ORIGINAL_DONE");
       }
-      if (first) { first = false; return fakeGatewayToolCall("child-steering-start", "subagent",
-        { request: { action: "message", agent: "reviewer", message: "CHILD_STEERING_TASK: run the prepared command." } }); }
-      if (toolResult(request, "child-steering-follow")) return fakeGatewayFinalText("CHILD_STEERING_ALL_DONE");
-      const receipt = toolResult(request, "child-steering-feedback");
-      if (receipt) receivedFeedback = receipt;
-      if (lateFeedback && receipt) {
-        expect(receipt.result).toBe("CHILD_LATE_FEEDBACK_DONE");
-        expect(raw).toContain("CHILD_STEERING_ORIGINAL_DONE");
-        return fakeGatewayFinalText("CHILD_STEERING_ALL_DONE");
+      const current = currentResult(request);
+      if (current && answers[current.id]) {
+        receipts[current.id] = current.output;
+        return fakeGatewayFinalText(answers[current.id]!);
       }
-      const latestParent = contentText(request.prompt.findLast((m: any) => m.role === "user")?.content);
-      if ((raw.includes("CHILD_STEERING_ORIGINAL_DONE") || latestParent.includes("FOLLOWUP_AFTER_CANCELLATION")) && !followup) {
-        followup = true; return fakeGatewayToolCall("child-steering-follow", "subagent",
-          { request: { action: "message", agent: "reviewer", message: "FOLLOW_SAME_CHILD: retain the original work and feedback." } });
+      if (latest.includes(report)) {
+        if (latest.includes("CHILD_FOLLOWUP_DONE") || latest.includes("CHILD_LATE_FEEDBACK_DONE")) return fakeGatewayFinalText("CHILD_STEERING_ALL_DONE");
+        if (latest.includes("CHILD_STEERING_ORIGINAL_DONE")) {
+          if (variant === "late") return fakeGatewayFinalText("ORIGINAL_REPORT_SEEN");
+          return fakeGatewayToolCall("child-steering-follow", "subagent",
+            { request: { action: "message", agent: "reviewer", message: "FOLLOW_SAME_CHILD: retain the original work and feedback." } });
+        }
+        throw new Error(`unexpected report: ${latest}`);
       }
-      if (receipt) return fakeGatewayFinalText("CHILD_FEEDBACK_ACKNOWLEDGED");
-      expect(sentFeedback).toBe(false); sentFeedback = true;
-      const feedback = fakeGatewayToolCall("child-steering-feedback", "subagent",
+      if (latest.includes("Start the child task.")) return fakeGatewayToolCall("child-steering-start", "subagent",
+        { request: { action: "message", agent: "reviewer", message: "CHILD_STEERING_TASK: run the prepared command." } });
+      if (latest.includes("Send the child useful review feedback.")) return fakeGatewayToolCall("child-steering-feedback", "subagent",
         { request: { action: "message", agent: "reviewer", message: "CHILD_FEEDBACK_TOKEN: report the command result and continue." } });
-      return lateFeedback ? feedbackGate.then(() => feedback) : feedback;
+      if (latest.includes("Stop the child.")) return fakeGatewayToolCall("child-steering-stop", "subagent",
+        { request: { action: "stop", agent: "reviewer" } });
+      if (latest.includes("FOLLOWUP_AFTER_STOP")) return fakeGatewayToolCall("child-steering-follow", "subagent",
+        { request: { action: "message", agent: "reviewer", message: "FOLLOW_SAME_CHILD: retain the original work and feedback." } });
+      throw new Error(`unexpected parent request: ${latest}`);
     } catch (error) { routeErrors.push(String(error)); return new Response("fixture route error", { status: 422 }); }
   }, { classifierDecision: "clear" });
   gateway = host;
@@ -134,7 +146,7 @@ for (const { cancelBeforeConsumption, lateFeedback } of [
     env: { HOME: home, AI_GATEWAY_API_KEY: "fake-child-steering", FX_DISABLE_KEYCHAIN: "1",
       FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access",
       FX_GATEWAY_BASE_URL: host.baseUrl, FX_GATEWAY_CHAT_URL: host.chatUrl, FX_E2E_GATEWAY_CHAT_URL: host.chatUrl,
-      FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "agent,worker,tool,subagent,permission,session,input,interrupt" } };
+      FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "agent,worker,tool,subagent,permission,session,input,interrupt,mailbox" } };
   session = await TmuxSession.create(options);
   let parentId = "";
   // The parent's newest record of its child's work; `outcome` stays null
@@ -150,70 +162,78 @@ for (const { cancelBeforeConsumption, lateFeedback } of [
     await session.waitForStableComposer(TIMEOUT);
     await session.sendText("Start the child task.");
     await waitForPath(join(workspace, "starts"));
-    await session.waitForPane(
-      pane => /reviewer working[^\n]*CHILD_STEERING_TASK[^\n]*\n[^\n]*gpt-5\.5/.test(pane),
-      TIMEOUT,
-    ).catch(error => {
-      throw new Error(`${error}\n${readFileSync(trace, "utf8").slice(-16_000)}`);
-    });
+    // The parent's turn ends with the receipt while its subagent works.
+    await session.waitForText("CHILD_TASK_SENT", TIMEOUT);
     const original = childState();
-    await session.sendText("Send the child useful review feedback.");
-    if (lateFeedback) {
-      await waitForCondition(() => sentFeedback, "parent request before child completion");
+    expect(original.outcome).toBeNull();
+    if (variant === "late") {
       writeFileSync(release, "go");
-      await waitForCondition(() => childState().outcome !== null, "child completion before feedback delivery");
-      releaseFeedback();
+      await session.waitForText("ORIGINAL_REPORT_SEEN", TIMEOUT);
+      expect(childState().outcome).toBe("ok");
     }
-    await waitForCondition(() => receivedFeedback != null, "steering receipt");
-    expect(receivedFeedback).toMatchObject(lateFeedback ? { ok: true, result: "CHILD_LATE_FEEDBACK_DONE" } : { ok: true, delivery: "queued" });
-    expect(childState().child).toBe(original.child);
-    if (!lateFeedback) {
+    await session.waitForStableComposer(TIMEOUT);
+    await session.sendText("Send the child useful review feedback.");
+    await session.waitForText("CHILD_FEEDBACK_ACKNOWLEDGED", TIMEOUT);
+    if (variant === "late") {
+      expect(receipts["child-steering-feedback"]).toMatchObject({ ok: true });
+      expect(receipts["child-steering-feedback"].result).toContain("Sent to reviewer");
+    } else {
+      // It joined the working turn: the same work, still open.
+      expect(receipts["child-steering-feedback"]).toMatchObject({ ok: true, delivery: "queued" });
       expect(childState().work).toBe(original.work);
       expect(childState().outcome).toBeNull();
       expect(childCalls).toBe(1);
     }
-    if (cancelBeforeConsumption) {
-      await session.waitForText("CHILD_FEEDBACK_ACKNOWLEDGED", TIMEOUT);
-      await session.waitForPane(pane => /^[• ] Running \([^\n]+$/m.test(pane), TIMEOUT);
-      await session.sendInterruptEscapePair(TIMEOUT);
-      await waitForCondition(() => childState().outcome === "cancelled", "child cancellation").catch(async error => {
-        throw new Error(`${error}\n${JSON.stringify(childState())}\n${await session!.capturePane()}\n${readFileSync(trace, "utf8").slice(-16000)}`);
-      });
+    expect(childState().child).toBe(original.child);
+    if (variant === "stopped") {
       await session.waitForStableComposer(TIMEOUT);
-      await session.sendText("FOLLOWUP_AFTER_CANCELLATION: continue the same child.");
-    } else writeFileSync(release, "go");
+      await session.sendText("Stop the child.");
+      await session.waitForText("CHILD_STOPPED", TIMEOUT);
+      await waitForCondition(() => childState().outcome === "cancelled", "child cancellation");
+      expect(receipts["child-steering-stop"].result).toContain("Stopped reviewer");
+      await session.waitForStableComposer(TIMEOUT);
+      await session.sendText("FOLLOWUP_AFTER_STOP: continue the same child.");
+    } else if (variant === "joined") writeFileSync(release, "go");
     await session.waitForText("CHILD_STEERING_ALL_DONE", TIMEOUT);
-    expect(applied).toBe(!cancelBeforeConsumption && !lateFeedback); expect(followupDone).toBe(true);
-    expect(childCalls).toBe(cancelBeforeConsumption ? 2 : 3);
+    expect(applied).toBe(variant === "joined");
+    expect(followupDone).toBe(variant !== "late");
+    expect(lateDone).toBe(variant === "late");
+    expect(childCalls).toBe(variant === "stopped" ? 2 : 3);
     expect(readFileSync(join(workspace, "starts"), "utf8")).toBe("once\n");
     const final = childState();
     expect(final.child).toBe(original.child); expect(final.outcome).not.toBeNull();
     const journal = savedText(home, original.child!);
-    if (cancelBeforeConsumption) {
+    const traceText = readFileSync(trace, "utf8");
+    if (variant === "stopped") {
       expect(journal).not.toContain("CHILD_FEEDBACK_TOKEN");
-      expect(readFileSync(trace, "utf8")).toContain("event=feedback_not_applied");
+      expect(traceText).toContain("event=feedback_not_applied");
+      // A stop is answered by its call, never by a report.
+      expect(traceText).toMatch(/event=child_end .*outcome=cancelled report=false/);
     } else {
       expect(journal).toContain("CHILD_FEEDBACK_TOKEN"); expect(journal).toContain("CHILD_STEERING_ORIGINAL_DONE");
-      if (!lateFeedback) expect(readFileSync(trace, "utf8")).toContain("event=feedback_applied");
+      if (variant === "joined") expect(traceText).toContain("event=feedback_applied");
     }
     expect(await session.captureFullScrollback()).not.toContain("reviewer failed");
     expect(routeErrors).toEqual([]);
     await session.waitForStableComposer(TIMEOUT); await session.sendText("/quit");
     await waitForCondition(() => session!.paneStatus().dead, "fx exit");
     expect(session.paneStatus().status).toBe(0); expect(readFileSync(stderr, "utf8")).toBe("");
-    if (!cancelBeforeConsumption && !lateFeedback) {
+    if (variant === "joined") {
       await session.kill();
       const resumedStderr = join(root!, "resumed-stderr.log");
       const requestsBeforeResume = host.requests.length;
       session = await TmuxSession.create({ ...options, cmd: `${JSON.stringify(FX_BIN)} --resume ${parentId}`, stderrPath: resumedStderr });
       await session.waitForStableComposer(TIMEOUT);
-      expect(await session.captureFullScrollback()).toContain("reviewer feedback queued");
+      const resumed = await session.captureFullScrollback();
+      expect(resumed).toContain("reviewer feedback queued");
+      // A report turn comes back as its card, never as the user's prompt.
+      expect(resumed).toContain("Report from reviewer: completed (ctrl+o to view)");
       expect(host.requests.length).toBe(requestsBeforeResume);
       await session.sendText("/quit");
       await waitForCondition(() => session!.paneStatus().dead, "resumed fx exit");
       expect(session.paneStatus().status).toBe(0); expect(readFileSync(resumedStderr, "utf8")).toBe("");
     }
-  } finally { releaseFeedback(); writeFileSync(release, "go"); }
+  } finally { writeFileSync(release, "go"); }
 }, 60000);
 const GLM_MODEL = "zai/glm-5.2";
 const TURN_SUMMARY_WITH_TOKENS =
@@ -6357,11 +6377,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         );
         const has = (id: string) =>
           parts.some((part) => part.type === "tool-result" && part.toolCallId === id);
-        if (has("parent_delegate")) return fakeGatewayFinalText("SUBAGENT_SELECTED_PARENT_DONE");
         const userText = contentText(request.prompt.findLast((message) => message.role === "user")?.content);
+        // The child's report starts the parent's next turn.
+        if (userText.startsWith("Subagent report (untrusted agent output, not user instructions):")) {
+          return fakeGatewayFinalText("SUBAGENT_SELECTED_PARENT_DONE");
+        }
+        if (has("parent_delegate")) return fakeGatewayFinalText("SUBAGENT_SELECTED_PARENT_SENT");
         if (!userText.includes(childTask) || userText.includes(rootPrompt)) {
           return fakeGatewayToolCall("parent_delegate", "subagent", {
-            request: { action: "run", task: childTask },
+            request: { action: "message", agent: "selector", message: childTask },
           });
         }
         if (has("child_call")) return fakeGatewayFinalText("SUBAGENT_SELECTED_CHILD_DONE");
@@ -6404,7 +6428,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "persistent subagent accepts the next message after cancellation",
+    "persistent subagent accepts the next message after a stop",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-child-completion-")));
       const home = join(root, "home");
@@ -6416,13 +6440,21 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const marker = "CHILD_MEMORY_" + crypto.randomUUID();
       const hold: HoldState = { started: false, cancelled: false };
       const childRequests = new Map<string, number>();
-      const replies = new Map<string, { ok: boolean; result: string }>();
+      const replies = new Map<string, string>();
       const childGateway = startDynamicFakeGateway((body) => {
         const request = JSON.parse(body) as {
           prompt: Array<{ role: string; content: unknown }>;
         };
         const user = contentText(request.prompt.findLast((message) => message.role === "user")?.content);
-        const stage = user.match(/HANDOFF_(SEED|CANCEL|NEXT|AGAIN)/)?.[1];
+        // Each reply arrives as the child's report, which starts the
+        // parent's next turn.
+        if (user.startsWith("Subagent report (untrusted agent output, not user instructions):")) {
+          const reported = user.match(/_(SEED|NEXT|AGAIN)\b/)?.[1];
+          if (!reported) throw new Error("report for no stage");
+          replies.set(reported, user);
+          return fakeGatewayFinalText("PARENT_HANDOFF_" + reported + "_DONE");
+        }
+        const stage = user.match(/HANDOFF_(SEED|CANCEL|STOP|NEXT|AGAIN)/)?.[1];
         if (!stage) throw new Error("missing handoff request stage");
         if (user.startsWith("CHILD_HANDOFF_")) {
           childRequests.set(stage, (childRequests.get(stage) ?? 0) + 1);
@@ -6437,10 +6469,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         const result = parts.findLast((part) =>
           part.type === "tool-result" && part.toolCallId === id,
         );
-        if (result) {
-          replies.set(stage, JSON.parse(result.output.value));
-          return fakeGatewayFinalText("PARENT_HANDOFF_" + stage + "_DONE");
-        }
+        if (result) return fakeGatewayFinalText("PARENT_HANDOFF_" + stage + "_SENT");
+        if (stage === "STOP") return fakeGatewayToolCall(id, "subagent", { request: { action: "stop", agent: "reviewer" } });
         return fakeGatewayToolCall(id, "subagent", {
           request: {
             action: "message",
@@ -6468,7 +6498,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         await session.waitForComposer(TIMEOUT);
         await session.sendText("PARENT_HANDOFF_SEED");
         await session.waitForText("PARENT_HANDOFF_SEED_DONE", TIMEOUT);
-        expect(replies.get("SEED")).toMatchObject({ ok: true, result: marker + "_SEED" });
+        expect(replies.get("SEED")).toContain(marker + "_SEED");
         const roots = rootSessionIds(home);
         expect(roots).toHaveLength(1);
         const parentId = roots[0]!;
@@ -6478,15 +6508,18 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         await session.waitForStableComposer(TIMEOUT);
         await session.sendText("PARENT_HANDOFF_CANCEL");
         await waitForCondition(() => childRequests.get("CANCEL") === 1, "child request held");
-        await session.waitForText("reviewer working", TIMEOUT);
-        await session.sendKeys("C-c");
+        await session.waitForText("PARENT_HANDOFF_CANCEL_SENT", TIMEOUT);
+        // The parent stops its working child.
+        await session.waitForStableComposer(TIMEOUT);
+        await session.sendText("PARENT_HANDOFF_STOP");
+        await session.waitForText("PARENT_HANDOFF_STOP_SENT", TIMEOUT);
         await waitForCondition(() => work().spawns === 2 && work().outcome !== null, "child cancellation saved");
         expect(work().outcome).toBe("cancelled");
         for (const stage of ["NEXT", "AGAIN"]) {
           await session.waitForStableComposer(TIMEOUT);
           await session.sendText("PARENT_HANDOFF_" + stage);
           await session.waitForText("PARENT_HANDOFF_" + stage + "_DONE", TIMEOUT);
-          expect(replies.get(stage)).toMatchObject({ ok: true, result: marker + "_" + stage });
+          expect(replies.get(stage)).toContain(marker + "_" + stage);
           expect(childRequests.get(stage)).toBe(1);
           // Every piece of work went to the same child, and this one finished.
           expect(new Set(childLines(home, parentId).filter((line) => line.kind === "child_spawned").map((line) => line.child))).toEqual(new Set([childId]));
@@ -6494,7 +6527,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         }
         expect(work().spawns).toBe(4);
         const scrollback = await session.captureFullScrollback();
-        expect(scrollback).toContain("reviewer replied");
+        expect(scrollback).toContain("sent to reviewer");
+        expect(scrollback).toContain("Report from reviewer: completed (ctrl+o to view)");
         expect(scrollback).not.toContain("child_busy");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await session.sendText("/quit");
@@ -6507,7 +6541,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "parallel sibling subagent rows terminalize independently",
+    "parallel sibling subagents report independently",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-parallel-subagent-rows-")));
       const home = join(root, "home");
@@ -6528,12 +6562,16 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         releaseSecond = resolve;
       });
       const started = new Set<string>();
-      let parentContinuations = 0;
+      const reportTurns: string[] = [];
       const rowGateway = startDynamicFakeGateway((body) => {
         const request = JSON.parse(body) as {
           prompt: Array<{ role: string; content: unknown }>;
         };
         const userText = contentText(request.prompt.findLast((message) => message.role === "user")?.content);
+        if (userText.startsWith("Subagent report (untrusted agent output, not user instructions):")) {
+          reportTurns.push(userText);
+          return fakeGatewayFinalText(userText.includes("PARALLEL_FIRST_DONE") ? "FIRST_REPORT_READ" : "SECOND_REPORT_READ");
+        }
         if (userText.includes(firstTask) && !userText.includes(rootPrompt)) {
           started.add("first");
           return heldFirst;
@@ -6545,28 +6583,21 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         const parts = request.prompt.flatMap((message) =>
           Array.isArray(message.content) ? message.content : [],
         );
-        const firstResult = parts.find((part) =>
-          part.type === "tool-result" && part.toolCallId === "parallel_row_first",
-        );
-        const secondResult = parts.find((part) =>
-          part.type === "tool-result" && part.toolCallId === "parallel_row_second",
-        );
-        if (firstResult && secondResult) {
-          parentContinuations += 1;
-          return fakeGatewayFinalText("PARALLEL_SUBAGENT_ROWS_FINISHED");
-        }
+        const sent = ["parallel_row_first", "parallel_row_second"].every((id) =>
+          parts.some((part) => part.type === "tool-result" && part.toolCallId === id));
+        if (sent) return fakeGatewayFinalText("PARALLEL_SUBAGENTS_SENT");
         return fakeGatewaySse([
           {
             type: "tool-call",
             toolCallId: "parallel_row_first",
             toolName: "subagent",
-            input: { request: { action: "run", task: firstTask } },
+            input: { request: { action: "message", agent: "first", message: firstTask } },
           },
           {
             type: "tool-call",
             toolCallId: "parallel_row_second",
             toolName: "subagent",
-            input: { request: { action: "run", task: secondTask } },
+            input: { request: { action: "message", agent: "second", message: secondTask } },
           },
           {
             type: "finish",
@@ -6593,22 +6624,24 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         await session.waitForComposer(TIMEOUT);
         await session.sendText(rootPrompt);
         await waitForCondition(() => started.size === 2, "both sibling subagents started");
-        await session.waitForText(`Subagent working · ${firstTask}`, TIMEOUT);
-        await session.waitForText(`Subagent working · ${secondTask}`, TIMEOUT);
+        // Both messages are sent at once, and the parent's turn ends.
+        await session.waitForText(`sent to first · ${firstTask}`, TIMEOUT);
+        await session.waitForText(`sent to second · ${secondTask}`, TIMEOUT);
+        await session.waitForText("PARALLEL_SUBAGENTS_SENT", TIMEOUT);
 
         releaseFirst(fakeGatewayFinalText("PARALLEL_FIRST_DONE"));
-        await session.waitForText(`Subagent finished · ${firstTask}`, TIMEOUT);
+        await session.waitForText("FIRST_REPORT_READ", TIMEOUT);
         const partial = await session.captureFullScrollback();
-        expect(partial).toContain(`Subagent working · ${secondTask}`);
-        expect(partial).not.toContain(`Subagent finished · ${secondTask}`);
-        expect(parentContinuations).toBe(0);
+        expect(partial).toContain("Report from first: completed (ctrl+o to view)");
+        expect(partial).not.toContain("Report from second");
+        expect(reportTurns).toHaveLength(1);
 
         releaseSecond(fakeGatewayFinalText("PARALLEL_SECOND_DONE"));
-        await session.waitForText("PARALLEL_SUBAGENT_ROWS_FINISHED", TIMEOUT);
+        await session.waitForText("SECOND_REPORT_READ", TIMEOUT);
         const completed = await session.captureFullScrollback();
-        expect(countOccurrences(completed, `Subagent finished · ${firstTask}`)).toBe(1);
-        expect(countOccurrences(completed, `Subagent finished · ${secondTask}`)).toBe(1);
-        expect(parentContinuations).toBe(1);
+        expect(countOccurrences(completed, "Report from first: completed")).toBe(1);
+        expect(countOccurrences(completed, "Report from second: completed")).toBe(1);
+        expect(reportTurns).toHaveLength(2);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -6632,14 +6665,23 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
       writeFileSync(join(workspace, "fixture.txt"), "ROW_FILE_CONTENT");
       const tasks = ["Check one-off cleanup", "Check provider replay", "Check replay again"];
+      // A busy subagent may take a second message into its running turn, so
+      // each task goes to its own subagent and every row reads the same.
+      const rowAgents = ["helper", "reviewer", "checker"];
       const rootPrompt = "SUBAGENT_ROW_FIXTURE";
       const finalText = "SUBAGENT_ROWS_FINISHED";
       let parentStep = 0;
       const releases: Array<() => void> = [];
       const childGates = tasks.map(() => new Promise<void>((resolve) => releases.push(resolve)));
+      const reportTurns: string[] = [];
       const rowGateway = startDynamicFakeGateway(async (body) => {
         const request = JSON.parse(body) as { prompt?: Array<{ role?: string; content?: unknown }> };
         const userText = contentText(request.prompt?.findLast((message) => message.role === "user")?.content);
+        // Each child's report starts a parent turn of its own.
+        if (userText.startsWith("Subagent report (untrusted agent output, not user instructions):")) {
+          reportTurns.push(userText);
+          return fakeGatewayFinalText(`ROW_REPORT_READ_${reportTurns.length}`);
+        }
         const child = tasks.findIndex((task) => userText.includes(task));
         if (child >= 0 && !userText.includes(rootPrompt)) {
           await childGates[child];
@@ -6648,9 +6690,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         if (parentStep < tasks.length) {
           const step = parentStep++;
           return fakeGatewayToolCall(`row_child_${step}`, "subagent", {
-            request: step === 0
-              ? { action: "run", task: tasks[step] }
-              : { action: "message", agent: "reviewer", message: tasks[step] },
+            request: { action: "message", agent: rowAgents[step]!, message: tasks[step] },
           });
         }
         if (parentStep === tasks.length) {
@@ -6680,50 +6720,61 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       try {
         await session.waitForComposer(TIMEOUT);
         await session.sendText(rootPrompt);
-        for (let index = 0; index < tasks.length; index += 1) {
-          await session.waitForText(`${index === 0 ? "Subagent" : "reviewer"} working`, TIMEOUT);
-          const active = await session.captureFullScrollback();
-          expect(active).toContain(tasks[index]);
-          releases[index]();
-          await session.waitForText(`${index === 0 ? "Subagent finished" : "reviewer replied"} · ${tasks[index]}`, TIMEOUT);
-        }
+        // Every message is sent at once, while the children still work.
         await session.waitForText(finalText, TIMEOUT);
+        const rowSent = (index: number) => `sent to ${rowAgents[index]} · ${tasks[index]}`;
+        await session.waitForPane((pane) => tasks.every((_, index) => pane.includes(rowSent(index))), TIMEOUT);
+        const sentRows = await session.captureFullScrollback();
+        for (let index = 0; index < tasks.length; index += 1) {
+          expect(countOccurrences(sentRows, rowSent(index))).toBe(1);
+        }
+        // Each work's end reports on its own.
+        for (let index = 0; index < tasks.length; index += 1) {
+          releases[index]();
+          await session.waitForText(`ROW_REPORT_READ_${index + 1}`, TIMEOUT);
+        }
         const compact = await session.captureFullScrollback();
         expect(compact).toContain("● 5 tool calls · 4 subagents · 1 read");
         expect(compact).toContain("Invalid Agent failed · Check failure visibility");
-        expect(compact).not.toContain("Invalid Agent replied");
+        expect(compact).not.toContain("sent to Invalid Agent");
         for (let index = 0; index < tasks.length; index += 1) {
-          expect(countOccurrences(compact, `${index === 0 ? "Subagent finished" : "reviewer replied"} · ${tasks[index]}`)).toBe(1);
+          expect(countOccurrences(compact, rowSent(index))).toBe(1);
+          expect(countOccurrences(compact, `Report from ${rowAgents[index]}: completed (ctrl+o to view)`)).toBe(1);
         }
         expect(compact).not.toContain("Managed subagent");
         await session.resizeWindow(45, 30);
-        await session.waitForText(finalText, TIMEOUT);
-        const narrow = await session.capturePane();
-        expect(narrow).toContain("reviewer replied · Check replay again");
+        await session.waitForText("ROW_REPORT_READ_3", TIMEOUT);
+        const narrow = await session.captureFullScrollback();
+        expect(narrow).toContain("sent to checker · Check replay again");
         await session.resizeWindow(110, 35);
         await session.sendKeys("C-o");
         await session.waitForText("full detail", TIMEOUT);
         let details = await session.capturePane();
-        for (let page = 0; page < 8 && !details.includes("CHILD_ROW_REPLY_0"); page += 1) {
+        for (let page = 0; page < 12 && !(details.includes("CHILD_ROW_REPLY_0") && details.includes("Check one-off cleanup")); page += 1) {
           await session.sendKeys("PPage");
           details += await session.capturePane();
         }
+        // The full transcript holds each report's whole text.
         expect(details).toContain("CHILD_ROW_REPLY_0");
         expect(details).toContain("Check one-off cleanup");
         await session.sendKeys("C-o");
         const requestCount = rowGateway.requests.length;
-        expect(requestCount).toBe(9);
+        // Six parent steps, three children, and three report turns.
+        expect(requestCount).toBe(12);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
         await session.kill();
         session = await TmuxSession.create({ cmd: `${FX_BIN} --resume-last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
-        await session.waitForText(finalText, TIMEOUT);
+        await session.waitForText("ROW_REPORT_READ_3", TIMEOUT);
         const resumed = await session.captureFullScrollback();
         expect(resumed).toContain("● 5 tool calls · 4 subagents · 1 read");
         expect(resumed).toContain("Invalid Agent failed · Check failure visibility");
-        expect(resumed).toContain("Subagent finished · Check one-off cleanup");
-        expect(resumed).toContain("reviewer replied · Check replay again");
+        expect(resumed).toContain("sent to helper · Check one-off cleanup");
+        expect(resumed).toContain("sent to checker · Check replay again");
+        for (const agent of rowAgents) {
+          expect(countOccurrences(resumed, `Report from ${agent}: completed (ctrl+o to view)`)).toBe(1);
+        }
         expect(rowGateway.requests.length).toBe(requestCount);
         expect(readFileSync(join(root, "resumed-stderr.log"), "utf8")).toBe("");
       } finally {

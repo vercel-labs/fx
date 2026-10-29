@@ -201,24 +201,6 @@ fn append_steering_guidance(
     }
 }
 
-fn continue_pending_subagent(
-    deps: *const AgentRuntimeDeps,
-    arena: Allocator,
-    suffix: *std.ArrayList(ChatMessage),
-    turn_id: u64,
-    step_id: u64,
-    text: []const u8,
-    replay: ?types.ProviderReplay,
-) !bool {
-    const wait = deps.wait_for_subagent orelse return false;
-    if (!try wait(deps.ctx, turn_id, step_id)) return false;
-    try suffix.append(arena, .{ .role = .assistant, .content = try arena.dupe(u8, text), .provider_replay = replay, .standalone_response = true });
-    const steered = try append_immediate_steering_after_cancel(deps, arena, suffix, turn_id, "");
-    debug_trace.eventf("agent", "subagent_parent_continuation", .{ .turn_id = turn_id }, "steering_consumed={} retained_messages={d}", .{ steered, suffix.items.len });
-    try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
-    return true;
-}
-
 fn append_pending_steering_after_assistant(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -2849,49 +2831,6 @@ fn candidateHasApplicableContextDelta(
     });
     defer selected.deinit(arena);
     return selected.content != null;
-}
-
-const ParentTurnDeliveryState = struct {
-    acknowledgements: []const runtime_deps.ParentTurnDeliveryAck = &.{},
-    acknowledged: bool = false,
-
-    /// `possibly_sent` is the delivery-certainty boundary: successful requests
-    /// cross it before their first body write, and failures after it are
-    /// ambiguous. Acknowledging both prevents duplicate parent context after a
-    /// request may have reached the model. Definitely-unsent attempts stay
-    /// pending so the next parent turn projects the same deliveries again.
-    fn observeGatewayDelivery(
-        self: *ParentTurnDeliveryState,
-        deps: *const AgentRuntimeDeps,
-        arena: Allocator,
-        delivery: runtime_gateway_step.DeliveryCertainty.State,
-    ) void {
-        if (self.acknowledged or
-            self.acknowledgements.len == 0 or
-            delivery == .definitely_unsent)
-        {
-            return;
-        }
-        const acknowledge = deps.acknowledge_parent_turn_context orelse return;
-        acknowledge(deps.ctx, arena, self.acknowledgements);
-        self.acknowledged = true;
-    }
-};
-
-fn appendPreparedParentTurnContext(
-    deps: *const AgentRuntimeDeps,
-    arena: Allocator,
-    messages: *std.ArrayList(ChatMessage),
-) !ParentTurnDeliveryState {
-    const prepare = deps.prepare_parent_turn_context orelse return .{};
-    const prepared = try prepare(deps.ctx, arena) orelse return .{};
-    if (prepared.content.len == 0) return .{};
-    try messages.ensureUnusedCapacity(arena, 1);
-    messages.appendAssumeCapacity(.{
-        .role = .system,
-        .content = prepared.content,
-    });
-    return .{ .acknowledgements = prepared.acknowledgements };
 }
 
 fn appendNotExecutedToolResult(
@@ -6978,11 +6917,6 @@ fn processQueuedPromptLoop(
         }
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
         try ephemeral_overlay.appendSlice(overlay_arena, runtime_context.messages());
-        var parent_turn_delivery = try appendPreparedParentTurnContext(
-            deps,
-            overlay_arena,
-            &ephemeral_overlay,
-        );
         var provider_prompt = try build_provider_prompt_with_response_language_control(
             overlay_arena,
             stable_prefix,
@@ -7719,11 +7653,6 @@ fn processQueuedPromptLoop(
             const streamed = streamMainCompletion(deps, arena, model_request);
             request_recovery.endSend();
             stream_result = streamed catch |err| {
-                parent_turn_delivery.observeGatewayDelivery(
-                    deps,
-                    overlay_arena,
-                    gateway_delivery.load(),
-                );
                 runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, summary_accumulator.finishTokenRequestWithoutUsage(gateway_delivery.load() == .possibly_sent)) catch |progress_err| {
                     debug_trace.logf("agent", "token progress publication failed source=gateway_error err={s}", .{@errorName(progress_err)});
                 };
@@ -7917,11 +7846,6 @@ fn processQueuedPromptLoop(
                 }
                 return err;
             };
-            parent_turn_delivery.observeGatewayDelivery(
-                deps,
-                overlay_arena,
-                gateway_delivery.load(),
-            );
             stream_result_set = true;
             pushNetworkRecord(deps, job.provider, gateway_model, gateway_wait_started_ms, &stream_result);
             const first_failure = streamFailure(stream_result);
@@ -7952,11 +7876,6 @@ fn processQueuedPromptLoop(
                     const replay_wait_started_ms = io_mod.milliTimestamp();
                     stream_result = try streamMainCompletion(deps, arena, model_request);
                     pushNetworkRecord(deps, job.provider, gateway_model, replay_wait_started_ms, &stream_result);
-                    parent_turn_delivery.observeGatewayDelivery(
-                        deps,
-                        overlay_arena,
-                        replay_delivery.load(),
-                    );
                     debug_trace.eventf(
                         "auth",
                         "authenticated_request_replayed",
@@ -9008,9 +8927,6 @@ fn processQueuedPromptLoop(
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue;
             }
-
-            if (disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, history_text, history_replay)) continue;
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 if (!has_content) {
@@ -11815,9 +11731,6 @@ fn processQueuedPromptLoop(
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue;
             }
-
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, raw_final, final_provider_replay)) continue;
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });

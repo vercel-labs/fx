@@ -36,6 +36,7 @@ const session_title_generation = @import("../core/session/session_title_generati
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const terminal_client_runtime = @import("../core/terminal/client.zig");
 const subagent_tool_host = @import("../core/subagent/tool_host.zig");
+const subagent_reports = @import("../core/subagent/reports.zig");
 const subagent_child_state = @import("../core/subagent/child_state.zig");
 const subagent_authority = @import("../core/subagent/authority.zig");
 const types = @import("../core/shared/types.zig");
@@ -355,6 +356,12 @@ pub const ServerState = struct {
     skills: skill_runtime.Runtime = .{},
     context_snapshot: context_contract.GatheredContextSnapshot = .{},
     worker: worker_runtime.WorkerRuntime = .{},
+    /// What each report queued in `worker` answers, oldest first, so the
+    /// prompt can show it on the subagent call that sent the work (decision
+    /// 26). Guarded by `report_mutex`, which also covers posting the report,
+    /// so both stay in the same order.
+    report_calls: std.ArrayList(ReportCall) = .empty,
+    report_mutex: std.Io.Mutex = .init,
     terminal_client: terminal_client_runtime.Runtime = .{},
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
     /// A v2 session's children (D22), borrowed by `subagent_host`.
@@ -407,6 +414,8 @@ pub const ServerState = struct {
         self.skills.deinit(self.alloc);
         self.context_snapshot.deinit(self.alloc);
         self.worker.deinit(std.heap.c_allocator);
+        for (self.report_calls.items) |*call| call.deinit(std.heap.c_allocator);
+        self.report_calls.deinit(std.heap.c_allocator);
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         self.lifecycle_runtime.deinit();
@@ -788,7 +797,93 @@ fn enableSubagentHostV2(state: *ServerState, active: *ActiveSessionState, v2: *s
         state.alloc.destroy(children);
         return;
     };
+    state.subagent_host.?.report_sink = .{ .context = state, .post_fn = postAcpReport };
     state.subagent_v2_children = children;
+}
+
+/// The host's report sink: queues the report or message for the prompt,
+/// which runs it as the session's next turn once its own turn ends.
+fn postAcpReport(
+    raw: ?*anyopaque,
+    _: *subagent_tool_host.Runtime,
+    delivery: subagent_tool_host.Delivery,
+) subagent_tool_host.PostReportError!void {
+    const state: *ServerState = @ptrCast(@alignCast(raw.?));
+    const alloc = std.heap.c_allocator;
+    const text = switch (delivery) {
+        .report => |report| try subagent_reports.message(alloc, report, state.max_tool_result_bytes),
+        .message => |message| try subagent_reports.messageText(alloc, message.agent, message.child_id, message.text, state.max_tool_result_bytes),
+    };
+    var owns_text = true;
+    defer if (owns_text) alloc.free(text);
+    var call = try ReportCall.init(alloc, delivery);
+    var owns_call = true;
+    defer if (owns_call) call.deinit(alloc);
+    state.report_mutex.lockUncancelable(io_mod.getIo());
+    defer state.report_mutex.unlock(io_mod.getIo());
+    try state.report_calls.append(alloc, call);
+    owns_call = false;
+    state.worker.postMail(alloc, .{
+        .prompt = text,
+        .images = &.{},
+        .model = &.{},
+        .api_key = &.{},
+        .permission_mode = .ask,
+        .history = &.{},
+        .grants = &.{},
+        .author = .child,
+    }) catch |err| {
+        var dropped = state.report_calls.pop().?;
+        dropped.deinit(alloc);
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.AgentGone;
+    };
+    owns_text = false;
+}
+
+/// What a queued report answers. All strings are owned (`std.heap.c_allocator`).
+pub const ReportCall = struct {
+    /// The subagent call that sent the work; empty for a message a child sent.
+    call_id: []u8,
+    child_id: []u8,
+    work_id: []u8,
+    /// How the work ended; null for a message.
+    outcome: ?subagent_child_state.Outcome,
+
+    fn init(alloc: Allocator, delivery: subagent_tool_host.Delivery) !ReportCall {
+        const call_id = try alloc.dupe(u8, switch (delivery) {
+            .report => |report| report.call_id,
+            .message => "",
+        });
+        errdefer alloc.free(call_id);
+        const child_id = try alloc.dupe(u8, switch (delivery) {
+            .report => |report| report.child_id,
+            .message => |message| message.child_id,
+        });
+        errdefer alloc.free(child_id);
+        const work_id = try alloc.dupe(u8, switch (delivery) {
+            .report => |report| report.work_id,
+            .message => "",
+        });
+        return .{ .call_id = call_id, .child_id = child_id, .work_id = work_id, .outcome = switch (delivery) {
+            .report => |report| report.outcome,
+            .message => null,
+        } };
+    }
+
+    pub fn deinit(self: *ReportCall, alloc: Allocator) void {
+        alloc.free(self.call_id);
+        alloc.free(self.child_id);
+        alloc.free(self.work_id);
+    }
+};
+
+/// What the oldest queued report answers, owned by the caller. Null when
+/// the queue holds none.
+pub fn takeReportCall(state: *ServerState) ?ReportCall {
+    state.report_mutex.lockUncancelable(io_mod.getIo());
+    defer state.report_mutex.unlock(io_mod.getIo());
+    if (state.report_calls.items.len == 0) return null;
+    return state.report_calls.orderedRemove(0);
 }
 
 fn resolveSubagentAuthority(
@@ -3277,6 +3372,8 @@ fn handleCancel(state: *ServerState, notify_client: bool) void {
     if (state.active_session) |*session| {
         debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=acp active_tool_known=false", .{});
         session.cancel_flag.store(true, .seq_cst);
+        // A prompt waiting for its subagents' reports stops waiting.
+        state.worker.nudgeWaiter();
         // A libfx turn keeps its queued steering until it ends, which hands
         // back what never reached the model.
         if (state.cfg.minimal_kernel) session.steering.cancelForUser(&session.cancel_flag);

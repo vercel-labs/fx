@@ -1996,12 +1996,23 @@ const isChildRequest = (body: string) => !body.includes('"name":"subagent"');
 /// requests tell apart by what was typed to main, which they never carry.
 const isAppChildRequest = (body: string, typed: string[]) => !typed.some((text) => body.includes(text));
 
-test("fx ask runs a one-off subagent as a v2 child with its own log, recorded in the parent's log", async () => {
+/// A parent's turn that its subagent's report started: the report is its
+/// latest user message (`src/core/subagent/reports.zig`).
+const isReportTurn = (body: string) => {
+  const latest = JSON.stringify(JSON.parse(body).prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
+  return latest.includes("Subagent report (untrusted agent output, not user instructions):");
+};
+
+test("fx ask runs a subagent as a v2 child with its own log, recorded in the parent's log", async () => {
   const fixture = createFixture("fx-v2-subagent-run-");
   const gateway = startDynamicFakeGateway((body) => {
     if (isChildRequest(body)) return fakeGatewayFinalText("CHILD_ANSWER_5521");
-    if (body.includes("CHILD_ANSWER_5521")) return fakeGatewayFinalText("PARENT_DONE");
-    return fakeGatewayToolCall("delegate-run", "subagent", { request: { action: "run", task: "Report the child marker." } });
+    if (isReportTurn(body)) {
+      expect(body).toContain("CHILD_ANSWER_5521");
+      return fakeGatewayFinalText("PARENT_DONE");
+    }
+    if (body.includes("delegate-run")) return fakeGatewayFinalText("PARENT_SENT");
+    return fakeGatewayToolCall("delegate-run", "subagent", { request: { action: "message", agent: "marker", message: "Report the child marker." } });
   }, { classifierDecision: "clear" });
   try {
     // A subagent run prints its progress on stderr.
@@ -2009,14 +2020,18 @@ test("fx ask runs a one-off subagent as a v2 child with its own log, recorded in
     expect(result.code).toBe(0);
     expect(result.stderr).not.toContain("panic");
     const output = JSON.parse(result.stdout);
-    expect(output.output).toBe("PARENT_DONE");
+    // The parent's turn ends with the receipt, and the report starts its next.
+    expect(output.output).toContain("PARENT_SENT");
+    expect(output.output).toContain("PARENT_DONE");
     const id = output.session_id;
     const lines = childLines(fixture.home, id);
     expect(lines.map((line) => [line.kind, line.outcome ?? null])).toEqual([["child_spawned", null], ["child_finished", "ok"]]);
     const childId = lines[0].child;
     expect(lines[1].child).toBe(childId);
     expect(lines[1].work_id).toBe(lines[0].work_id);
-    expect(lines[0].data.agent ?? null).toBe(null);
+    expect(lines[0].data.agent).toBe("marker");
+    // The finish line records that the work owed its parent a report.
+    expect(lines[1].data.report).toBe(true);
     expect(lines[0].data.fingerprint).toMatch(/^[0-9a-f]{64}$/);
 
     // The child's own log names its parent and holds its answer.
@@ -2047,31 +2062,31 @@ test("fx ask runs a one-off subagent as a v2 child with its own log, recorded in
 test("a named subagent keeps its id, history and instructions across fx ask runs", async () => {
   const fixture = createFixture("fx-v2-subagent-named-");
   const childBodies: string[] = [];
-  let parentRequests = 0;
+  let round: 1 | 2 = 1;
   const gateway = startDynamicFakeGateway((body) => {
     if (isChildRequest(body)) {
       childBodies.push(body);
       return fakeGatewayFinalText(childBodies.length === 1 ? "REVIEW_ONE" : "REVIEW_TWO");
     }
-    parentRequests += 1;
-    switch (parentRequests) {
-      case 1:
-        return fakeGatewayToolCall("delegate-one", "subagent", { request: { action: "message", agent: "reviewer", message: "Review round one.", instructions: "Follow REVIEWER_RULES." } });
-      case 3:
-        return fakeGatewayToolCall("delegate-two", "subagent", { request: { action: "message", agent: "reviewer", message: "Review round two." } });
-      default:
-        return fakeGatewayFinalText(parentRequests === 2 ? "FIRST_DONE" : "SECOND_DONE");
-    }
+    if (isReportTurn(body)) return fakeGatewayFinalText(round === 1 ? "FIRST_REPORT_READ" : "SECOND_REPORT_READ");
+    const call = round === 1 ? "delegate-one" : "delegate-two";
+    if (body.includes(call)) return fakeGatewayFinalText(round === 1 ? "FIRST_DONE" : "SECOND_DONE");
+    return round === 1
+      ? fakeGatewayToolCall(call, "subagent", { request: { action: "message", agent: "reviewer", message: "Review round one.", instructions: "Follow REVIEWER_RULES." } })
+      : fakeGatewayToolCall(call, "subagent", { request: { action: "message", agent: "reviewer", message: "Review round two." } });
   }, { classifierDecision: "clear" });
   try {
     const first = await ask(fixture, gateway, ["First review."]);
     expect(first.code).toBe(0);
-    expect(JSON.parse(first.stdout).output).toBe("FIRST_DONE");
+    expect(JSON.parse(first.stdout).output).toContain("FIRST_DONE");
+    expect(JSON.parse(first.stdout).output).toContain("FIRST_REPORT_READ");
     const id = JSON.parse(first.stdout).session_id;
+    round = 2;
     const second = await ask(fixture, gateway, ["--resume-id", id, "Second review."]);
     expect(second.code).toBe(0);
     expect(second.stderr).not.toContain("panic");
-    expect(JSON.parse(second.stdout).output).toBe("SECOND_DONE");
+    expect(JSON.parse(second.stdout).output).toContain("SECOND_DONE");
+    expect(JSON.parse(second.stdout).output).toContain("SECOND_REPORT_READ");
 
     const lines = childLines(fixture.home, id);
     expect(lines.map((line) => [line.kind, line.outcome ?? null])).toEqual([
@@ -2113,7 +2128,8 @@ test("a crash while a named subagent works records it interrupted, and its next 
       }
       return fakeGatewayFinalText("FRESH_CHILD_ANSWER");
     }
-    if (body.includes("FRESH_CHILD_ANSWER")) return fakeGatewayFinalText("AFTER_LOST_DONE");
+    if (isReportTurn(body)) return fakeGatewayFinalText("AFTER_LOST_DONE");
+    if (body.includes(phase === "crash" ? "delegate-lost" : "delegate-again")) return fakeGatewayFinalText("PARENT_SENT");
     return fakeGatewayToolCall(phase === "crash" ? "delegate-lost" : "delegate-again", "subagent", {
       request: { action: "message", agent: "worker", message: phase === "crash" ? "Start the long job." : "Start it again." },
     });
@@ -2134,7 +2150,7 @@ test("a crash while a named subagent works records it interrupted, and its next 
     const resumed = await ask(fixture, gateway, ["--resume-id", id, "Try the job again."]);
     expect(resumed.code).toBe(0);
     expect(resumed.stderr).not.toContain("panic");
-    expect(JSON.parse(resumed.stdout).output).toBe("AFTER_LOST_DONE");
+    expect(JSON.parse(resumed.stdout).output).toContain("AFTER_LOST_DONE");
 
     // The reopen recorded the started work as interrupted, as
     // `tests/tla/session_manager/Subagents.tla` repairs a child with a
@@ -2163,8 +2179,9 @@ test.skipIf(!tmuxAvailable())("the interactive app runs a subagent on v2 and rec
   const fixture = createFixture("fx-v2-app-subagent-");
   const gateway = startDynamicFakeGateway((body) => {
     if (isAppChildRequest(body, ["Delegate from the app."])) return fakeGatewayFinalText("APP_CHILD_ANSWER");
-    if (body.includes("APP_CHILD_ANSWER")) return fakeGatewayFinalText("APP_PARENT_DONE");
-    return fakeGatewayToolCall("app-delegate", "subagent", { request: { action: "run", task: "Report from the app child." } });
+    if (isReportTurn(body)) return fakeGatewayFinalText("APP_PARENT_DONE");
+    if (body.includes("app-delegate")) return fakeGatewayFinalText("APP_PARENT_SENT");
+    return fakeGatewayToolCall("app-delegate", "subagent", { request: { action: "message", agent: "reporter", message: "Report from the app child." } });
   }, { classifierDecision: "clear" });
   try {
     const app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "auto" });
@@ -2196,8 +2213,9 @@ test("ACP runs a subagent on v2, and load replays the delegation", async () => {
   const fixture = createFixture("fx-v2-acp-subagent-");
   const gateway = startDynamicFakeGateway((body) => {
     if (isChildRequest(body)) return fakeGatewayFinalText("ACP_CHILD_ANSWER");
-    if (body.includes("ACP_CHILD_ANSWER")) return fakeGatewayFinalText("ACP_PARENT_DONE");
-    return fakeGatewayToolCall("acp-delegate", "subagent", { request: { action: "run", task: "Report from the ACP child." } });
+    if (isReportTurn(body)) return fakeGatewayFinalText("ACP_PARENT_DONE");
+    if (body.includes("acp-delegate")) return fakeGatewayFinalText("ACP_PARENT_SENT");
+    return fakeGatewayToolCall("acp-delegate", "subagent", { request: { action: "message", agent: "reporter", message: "Report from the ACP child." } });
   }, { classifierDecision: "clear" });
   let client: AcpRpc | undefined;
   try {
@@ -2216,9 +2234,11 @@ test("ACP runs a subagent on v2, and load replays the delegation", async () => {
 
     client = await AcpRpc.start(fixture, gateway);
     await client.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
-    const replay = JSON.stringify(client.updates);
-    expect(replay).toContain("ACP_CHILD_ANSWER");
-    expect(client.texts("agent_message_chunk")).toEqual(["ACP_PARENT_DONE"]);
+    // The report turn's reply replays; the report never replays as the
+    // user's. The saved turn names no call to show the report on, so the
+    // report itself is not replayed.
+    expect(client.texts("agent_message_chunk")).toEqual(["ACP_PARENT_SENT", "ACP_PARENT_DONE"]);
+    expect(client.texts("user_message_chunk")).toEqual(["Delegate over ACP."]);
     // Children stay out of the list.
     const listed = await client.ok("session/list", { cwd: fixture.workspace });
     expect(listed.sessions.map((s: any) => s.sessionId)).toEqual([id]);
@@ -2905,8 +2925,8 @@ test("a parent killed while a named child runs a tool records that work interrup
       if (phase === "crash") return fakeShellRun("child-crash-shell", `echo $$ > '${started}'; exec sleep 300`);
       return fakeGatewayFinalText("CHILD_AGAIN_DONE");
     }
-    if (phase === "first" && body.includes("CHILD_FIRST_DONE")) return fakeGatewayFinalText("PARENT_FIRST_DONE");
-    if (phase === "again" && body.includes("CHILD_AGAIN_DONE")) return fakeGatewayFinalText("PARENT_AGAIN_DONE");
+    if (isReportTurn(body)) return fakeGatewayFinalText(phase === "first" ? "PARENT_FIRST_DONE" : "PARENT_AGAIN_DONE");
+    if (body.includes(`delegate-${phase}`)) return fakeGatewayFinalText(`PARENT_${phase.toUpperCase()}_SENT`);
     return fakeGatewayToolCall(`delegate-${phase}`, "subagent", {
       request: { action: "message", agent: "worker", message: `Child work ${phase}.` },
     });
@@ -2914,7 +2934,7 @@ test("a parent killed while a named child runs a tool records that work interrup
   try {
     const first = await ask(fixture, gateway, ["Start the worker."]);
     expect(first.code).toBe(0);
-    expect(JSON.parse(first.stdout).output).toBe("PARENT_FIRST_DONE");
+    expect(JSON.parse(first.stdout).output).toContain("PARENT_FIRST_DONE");
     const id = JSON.parse(first.stdout).session_id;
     const childId = childLines(fixture.home, id)[0].child;
     const childBefore = readFileSync(join(storeRoot(fixture.home), childId, "log.jsonl"));
@@ -2942,7 +2962,7 @@ test("a parent killed while a named child runs a tool records that work interrup
     const again = await ask(fixture, gateway, ["--resume-id", id, "Ask the worker again."]);
     expect(again.code).toBe(0);
     expect(again.stderr).not.toContain("panic");
-    expect(JSON.parse(again.stdout).output).toBe("PARENT_AGAIN_DONE");
+    expect(JSON.parse(again.stdout).output).toContain("PARENT_AGAIN_DONE");
     const lines = childLines(fixture.home, id);
     expect(lines.map((line) => [line.kind, line.outcome ?? null])).toEqual([
       ["child_spawned", null], ["child_finished", "ok"],
@@ -2963,117 +2983,98 @@ test("a parent killed while a named child runs a tool records that work interrup
 }, TIMEOUT * 4);
 
 
-// v1's steering test: the user keeps talking to the parent while its child
-// runs, and the child's result arrives later.
-for (const action of ["run", "message"] as const) {
-  test.skipIf(!tmuxAvailable())(`the app talks to the user while a child runs, and records it done, ${action}`, async () => {
-    const fixture = createFixture("fx-v2-app-child-steering-");
-    const held = heldFakeGatewayFinalText();
-    const parentReply = heldFakeGatewayFinalText();
-    const activity = (pane: string) => pane.match(/^[• ] (?:Thinking|Generating|Running) \([^\n]+$/gm)?.at(-1)?.slice(2) ?? "";
-    const requests: string[] = [];
-    let childRequests = 0;
-    let delegated = false;
-    let afterChildTool = false;
-    writeFileSync(join(fixture.workspace, "after-child.txt"), "AFTER_CHILD_TOOL_OK");
-    const gateway = startDynamicFakeGateway((raw) => {
-      const body = JSON.parse(raw);
-      const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
-      if (latest.includes("STEERING_CHILD")) {
-        childRequests++;
-        return held.response;
-      }
-      requests.push(raw);
-      if (!delegated) {
-        delegated = true;
-        return fakeGatewayToolCall("steering-delegation", "subagent", { request: action === "run"
-          ? { action, task: "STEERING_CHILD" }
-          : { action, agent: "worker", message: "STEERING_CHILD" } });
-      }
-      if (latest.includes("STEERING_LATER")) return fakeGatewayFinalText("LATER_OK");
-      if (raw.includes("HELD_CHILD_RESULT")) {
-        if (!afterChildTool) {
-          afterChildTool = true;
-          return fakeGatewayToolCall("after-child", "read_file", { path: "after-child.txt" });
-        }
-        return fakeGatewayFinalText("CHILD_COMPLETE");
-      }
-      if (latest.includes("STEERING_SECOND")) return fakeGatewayFinalText("SECOND_ACCEPTED");
-      return new Response(parentReply.response.body!.pipeThrough(new TransformStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode(
-            'data: {"type":"text-start","id":"answer_1"}\n\n' +
-              `data: ${JSON.stringify({ type: "text-delta", id: "answer_1", delta: "FIRST_STREAMING\n\nStill composing the first reply. " })}\n\n`,
-          ));
-        },
-      })), { headers: parentReply.response.headers });
-    }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }] });
-    const tracePath = join(fixture.root, "trace.log");
-    const stderrPath = join(fixture.root, "stderr.log");
-    let tui: TmuxSession | undefined;
-    try {
-      tui = await TmuxSession.create({
-        cmd: JSON.stringify(FX_BIN), cwd: fixture.workspace, isolated: true, remainOnExit: true, stderrPath,
-        env: {
-          ...env(fixture, gateway), NO_COLOR: "1", FX_PERMISSION_MODE: "full-access", FX_MAX_AGENT_STEPS: "5",
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-          FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "subagent,worker,agent,tool",
-        },
-      });
-      await tui.waitForStableComposer(15000);
-      await tui.sendText("STEERING_START");
-      await tui.waitForPane(() => childRequests === 1, 10000);
-      const parent = rootSessionIds(fixture.home)[0]!;
-      await until(() => childWork(fixture.home, parent).spawns === 1, "the child's spawn in the parent's log");
-      const original = childWork(fixture.home, parent);
-      expect(original.outcome).toBeNull();
-
-      await tui.sendText("STEERING_FIRST");
-      const streaming = await tui.waitForText("FIRST_STREAMING", 10000);
-      expect(activity(streaming)).toMatch(/^Generating \(/);
-      parentReply.release("FIRST_ACCEPTED");
-      await tui.waitForText("FIRST_ACCEPTED", 10000);
-      await tui.waitForPane((pane) => activity(pane).startsWith("Running ("), 10000);
-      await tui.sendText("STEERING_SECOND");
-      await tui.waitForText("SECOND_ACCEPTED", 10000);
-      expect(childRequests).toBe(1);
-      // Still the one piece of work, still running.
-      expect(childWork(fixture.home, parent)).toEqual(original);
-      expect(requests.some((raw) => raw.includes(original.child!) && raw.includes(original.work!))).toBe(true);
-      expect(await tui.captureFullScrollback()).toContain("still running");
-
-      held.release("HELD_CHILD_RESULT");
-      await tui.waitForText("CHILD_COMPLETE", 10000);
-      expect(requests.filter((raw) => raw.includes("HELD_CHILD_RESULT"))).toHaveLength(2);
-      await until(() => childWork(fixture.home, parent).outcome === "ok", "the child's work to be recorded done");
-      await tui.waitForStableComposer(10000);
-      await tui.sendText("STEERING_LATER");
-      await tui.waitForText("LATER_OK", 10000);
-      expect(childRequests).toBe(1);
-      await tui.sendText("/quit");
-      await tui.waitForPane(() => tui!.paneStatus().dead, 10000);
-      expect(tui.paneStatus().status).toBe(0);
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-
-      // One result for the delegation, and the child's work ends once.
-      const results = logLines(fixture.home, parent).filter((line: any) =>
-        line.kind === "item" && line.type === "tool_result" && JSON.stringify(line).includes("steering-delegation"));
-      expect(results).toHaveLength(1);
-      expect(childLines(fixture.home, parent).filter((line) => line.kind === "child_finished")).toHaveLength(1);
-      expect(childWork(fixture.home, parent)).toEqual({ ...original, outcome: "ok" });
-      const trace = readFileSync(tracePath, "utf8");
-      expect(trace).toContain("event=steering_wait_yielded ");
-      expect(trace.split("\n").filter((line) => line.includes("event=steering_result_delivered "))).toHaveLength(1);
-      expectWholeLog(fixture, parent);
-    } finally {
-      parentReply.dispose();
-      held.dispose();
-      await tui?.kill();
-      gateway.stop();
-      rmSync(fixture.root, { recursive: true, force: true });
+// The user keeps talking to the parent while its child works, and the
+// child's report arrives on its own when the work ends.
+test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and its report arrives after", async () => {
+  const fixture = createFixture("fx-v2-app-child-steering-");
+  const held = heldFakeGatewayFinalText();
+  const requests: string[] = [];
+  let childRequests = 0;
+  let afterChildTool = false;
+  writeFileSync(join(fixture.workspace, "after-child.txt"), "AFTER_CHILD_TOOL_OK");
+  const gateway = startDynamicFakeGateway((raw) => {
+    const body = JSON.parse(raw);
+    const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
+    if (latest.includes("STEERING_CHILD")) {
+      childRequests++;
+      return held.response;
     }
-  }, 60000);
-}
+    requests.push(raw);
+    // The report's turn may use tools, as any turn does.
+    if (isReportTurn(raw)) {
+      if (!afterChildTool) {
+        afterChildTool = true;
+        return fakeGatewayToolCall("after-child", "read_file", { path: "after-child.txt" });
+      }
+      return fakeGatewayFinalText("CHILD_COMPLETE");
+    }
+    if (latest.includes("STEERING_LATER")) return fakeGatewayFinalText("LATER_OK");
+    if (latest.includes("STEERING_FIRST")) return fakeGatewayFinalText("FIRST_ACCEPTED");
+    if (raw.includes("steering-delegation")) return fakeGatewayFinalText("START_SENT");
+    return fakeGatewayToolCall("steering-delegation", "subagent", { request: { action: "message", agent: "worker", message: "STEERING_CHILD" } });
+  }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }] });
+  const tracePath = join(fixture.root, "trace.log");
+  const stderrPath = join(fixture.root, "stderr.log");
+  let tui: TmuxSession | undefined;
+  try {
+    tui = await TmuxSession.create({
+      cmd: JSON.stringify(FX_BIN), cwd: fixture.workspace, isolated: true, remainOnExit: true, stderrPath,
+      env: {
+        ...env(fixture, gateway), NO_COLOR: "1", FX_PERMISSION_MODE: "full-access", FX_MAX_AGENT_STEPS: "5",
+        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "subagent,worker,agent,tool,mailbox",
+      },
+    });
+    await tui.waitForStableComposer(15000);
+    await tui.sendText("STEERING_START");
+    await tui.waitForPane(() => childRequests === 1, 10000);
+    // The parent's turn ends with the receipt while its child works.
+    await tui.waitForText("START_SENT", 10000);
+    const parent = rootSessionIds(fixture.home)[0]!;
+    await until(() => childWork(fixture.home, parent).spawns === 1, "the child's spawn in the parent's log");
+    const original = childWork(fixture.home, parent);
+    expect(original.outcome).toBeNull();
+
+    await tui.waitForStableComposer(10000);
+    await tui.sendText("STEERING_FIRST");
+    await tui.waitForText("FIRST_ACCEPTED", 10000);
+    expect(childRequests).toBe(1);
+    // Still the one piece of work, still running.
+    expect(childWork(fixture.home, parent)).toEqual(original);
+
+    held.release("HELD_CHILD_RESULT");
+    const reported = await tui.waitForText("CHILD_COMPLETE", 10000);
+    expect(reported).toContain("Report from worker: completed (ctrl+o to view)");
+    // The report's turn: its tool call, then its reply.
+    expect(requests.filter((raw) => isReportTurn(raw) && raw.includes("HELD_CHILD_RESULT"))).toHaveLength(2);
+    await until(() => childWork(fixture.home, parent).outcome === "ok", "the child's work to be recorded done");
+    await tui.waitForStableComposer(10000);
+    await tui.sendText("STEERING_LATER");
+    await tui.waitForText("LATER_OK", 10000);
+    expect(childRequests).toBe(1);
+    await tui.sendText("/quit");
+    await tui.waitForPane(() => tui!.paneStatus().dead, 10000);
+    expect(tui.paneStatus().status).toBe(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+    // One result for the delegation, and the child's work ends once.
+    const results = logLines(fixture.home, parent).filter((line: any) =>
+      line.kind === "item" && line.type === "tool_result" && JSON.stringify(line).includes("steering-delegation"));
+    expect(results).toHaveLength(1);
+    expect(childLines(fixture.home, parent).filter((line) => line.kind === "child_finished")).toHaveLength(1);
+    expect(childWork(fixture.home, parent)).toEqual({ ...original, outcome: "ok" });
+    // The report turn is saved as the child's, never the user's.
+    expect(logLines(fixture.home, parent).filter((line: any) => line.kind === "item" && line.type === "author")).toHaveLength(1);
+    const trace = readFileSync(tracePath, "utf8");
+    expect(trace).toContain("event=deliver to=main ");
+    expectWholeLog(fixture, parent);
+  } finally {
+    held.dispose();
+    await tui?.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, 60000);
 
 // ---------------------------------------------------------------------------
 // The fault matrix beyond fx ask: kills between turns, a damaged or missing
@@ -3719,13 +3720,13 @@ test("a named child whose log is damaged fails that message, and the parent turn
   let phase = 1;
   const gateway = startDynamicFakeGateway(async (body) => {
     if (isChildRequest(body)) return fakeGatewayFinalText(`CHILD_ANSWER_${phase}`);
-    if (phase === 1 && body.includes("CHILD_ANSWER_1")) return fakeGatewayFinalText("PARENT_FIRST_DONE");
-    if (phase === 2 && body.includes("delegate-2")) return fakeGatewayFinalText("PARENT_AFTER_CHILD_FAILED");
+    if (isReportTurn(body)) return fakeGatewayFinalText(phase === 1 ? "PARENT_FIRST_DONE" : "PARENT_AFTER_CHILD_FAILED");
+    if (body.includes(`delegate-${phase}`)) return fakeGatewayFinalText(phase === 1 ? "PARENT_FIRST_SENT" : "PARENT_SECOND_SENT");
     return fakeGatewayToolCall(`delegate-${phase}`, "subagent", { request: { action: "message", agent: "worker", message: `Child work ${phase}.` } });
   }, { classifierDecision: "clear" });
   try {
     const first = await ask(fixture, gateway, ["Start the worker."]);
-    expect(JSON.parse(first.stdout).output).toBe("PARENT_FIRST_DONE");
+    expect(JSON.parse(first.stdout).output).toContain("PARENT_FIRST_DONE");
     const id = JSON.parse(first.stdout).session_id;
     const childId = childLines(fixture.home, id)[0].child;
     const childLog = join(storeRoot(fixture.home), childId, "log.jsonl");
@@ -3735,8 +3736,10 @@ test("a named child whose log is damaged fails that message, and the parent turn
     phase = 2;
     const again = await ask(fixture, gateway, ["--resume-id", id, "Ask the worker again."]);
     expect(again.code).toBe(0);
-    expect(JSON.parse(again.stdout).output).toBe("PARENT_AFTER_CHILD_FAILED");
-    expect(JSON.parse(again.stdout).tool_calls).toEqual([{ name: "subagent", status: "error" }]);
+    // The message is sent; the child fails as it opens its log, and the
+    // failure reaches the parent as a report that starts its next turn.
+    expect(JSON.parse(again.stdout).output).toContain("PARENT_AFTER_CHILD_FAILED");
+    expect(JSON.parse(again.stdout).tool_calls).toEqual([{ name: "subagent", status: "success" }]);
     const lines = childLines(fixture.home, id);
     expect(lines.map((line) => [line.kind, line.outcome ?? null])).toEqual([
       ["child_spawned", null], ["child_finished", "ok"], ["child_spawned", null], ["child_finished", "failed"],

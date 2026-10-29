@@ -34,8 +34,6 @@ const Allocator = std.mem.Allocator;
 /// and how long the polling loops take to see a child change. The terminal
 /// result wait also wakes on child state changes. Status publishing is rate
 /// limited separately, so a short pulse only adds cheap wakeups.
-const terminal_wait_pulse_ms: u64 = 20;
-
 pub const Defaults = struct {
     provider: model_provider.ProviderId,
     model: []const u8,
@@ -88,13 +86,21 @@ test "managed execution receipts retain the pending contract" {
 /// request as root context. It never interrupts the model.
 pub const ReportSink = struct {
     context: ?*anyopaque = null,
-    /// Called on the slot thread that ran the child's turn, with the host
-    /// whose owner the report is for.
-    post_fn: *const fn (?*anyopaque, *Runtime, reports.Report) PostReportError!void,
+    /// Called with the host the delivery comes from. It never blocks: the
+    /// runtime copies what it keeps and delivers it later.
+    post_fn: *const fn (?*anyopaque, *Runtime, Delivery) PostReportError!void,
 
-    pub fn post(self: ReportSink, host: *Runtime, report: reports.Report) PostReportError!void {
-        return self.post_fn(self.context, host, report);
+    pub fn post(self: ReportSink, host: *Runtime, delivery: Delivery) PostReportError!void {
+        return self.post_fn(self.context, host, delivery);
     }
+};
+
+/// What a host hands its runtime to deliver, borrowed for the call.
+pub const Delivery = union(enum) {
+    /// A child's report, for the agent that owns the host.
+    report: reports.Report,
+    /// A subagent's message to its parent.
+    message: reports.Message,
 };
 
 pub const PostReportError = error{ OutOfMemory, AgentGone };
@@ -141,7 +147,8 @@ pub const ExecuteOptions = struct {
     timestamp_ms: i64,
     identity_epoch: u64 = 0,
     cancel_flag: ?*std.atomic.Value(bool) = null,
-    steering_worker: ?*worker_runtime.WorkerRuntime = null,
+    /// The caller's own worker, which `wait` blocks on.
+    caller_worker: ?*worker_runtime.WorkerRuntime = null,
     progress: ?ProgressSink = null,
     model_capability_resolver: ?model_capabilities.Resolver = null,
     model_override_resolver: ?ModelOverrideResolver = null,
@@ -169,12 +176,22 @@ pub const Runtime = struct {
     /// The profile each child started in, for its authority and prompt.
     profile_cache: ?authority.ProfileCache = null,
     managed: managed_owner.Owner,
+    /// Guards admission, `pending`, and `busy`. Taken before the registry's
+    /// lock and before the managed owner's.
     admission_mutex: std.Io.Mutex = .init,
-    yielded_mutex: std.Io.Mutex = .init,
-    yielded: std.ArrayList(YieldedWork) = .empty,
-
-    const YieldedWork = struct { child_id: []u8, work_id: []u8, max_result_bytes: usize, result: ?ManagedExecutionResult = null, delivered: bool = false };
-    pub const YieldedResult = struct { child_id: []const u8, work_id: []const u8, body: []const u8, max_result_bytes: usize, delivered: bool, receipt_sequence: u64 = 0 };
+    /// Messages for busy children, in the order they were sent.
+    pending: std.ArrayList(Pending) = .empty,
+    /// The children whose slot is running their work, between works too.
+    busy: std.ArrayList([]u8) = .empty,
+    /// The tool call that sent each work still running or waiting, so its
+    /// report can point back at it. Guarded by `admission_mutex`.
+    work_calls: std.ArrayList(WorkCall) = .empty,
+    waiter_mutex: std.Io.Mutex = .init,
+    /// The owner's worker while it waits in `wait`.
+    waiter: ?*worker_runtime.WorkerRuntime = null,
+    /// Whether this host's owner is itself a subagent, so a message to its
+    /// parent has somewhere to go. Set by its runtime.
+    owner_has_parent: bool = false,
 
     /// A host over a parent whose children live in its log (D22), returned
     /// only after abandoned child work has been recovered. Borrows
@@ -214,6 +231,7 @@ pub const Runtime = struct {
             .profiles = &runtime.profile_cache.?,
         };
         runtime.managed = runtime.managedOwnerValue();
+        runtime.managed.on_end = .{ .context = runtime, .end_fn = workEnded };
         errdefer runtime.approvals.deinit();
         errdefer runtime.managed.deinit();
         try runtime.managed.recoverInterrupted();
@@ -221,9 +239,16 @@ pub const Runtime = struct {
     }
 
     pub fn deinit(self: *Runtime) void {
-        self.cancelYielded();
-        self.yielded.deinit(self.alloc);
         self.managed.deinit();
+        for (self.pending.items) |*item| {
+            debug_trace.eventf("mailbox", "dropped", .{}, "child={s} work_id={s} reason=host_closed", .{ item.child_id, item.work.id });
+            item.deinit(self.alloc);
+        }
+        self.pending.deinit(self.alloc);
+        for (self.busy.items) |id| self.alloc.free(id);
+        self.busy.deinit(self.alloc);
+        for (self.work_calls.items) |*call| call.deinit(self.alloc);
+        self.work_calls.deinit(self.alloc);
         self.approvals.deinit();
         if (self.profile_cache) |*cache| cache.deinit();
         self.alloc.free(self.root_id);
@@ -232,21 +257,24 @@ pub const Runtime = struct {
         alloc.destroy(self);
     }
 
-    /// Points the host's callbacks at a host context that moved; the
-    /// children stay as they are.
+    /// Points the host's callbacks, its child runner and its report sink,
+    /// at a host context that moved; the children stay as they are. A sink
+    /// left on the old context would post into memory no longer in use.
     pub fn rebindHost(
         self: *Runtime,
-        child_runner_context: ?*anyopaque,
+        host_context: ?*anyopaque,
         host_authority: authority.HostResolver,
     ) void {
         self.host_authority = host_authority;
-        self.child_runner.context = child_runner_context;
+        self.child_runner.context = host_context;
+        if (self.report_sink) |*sink| sink.context = host_context;
         self.authority_resolver.children = self.children;
         self.authority_resolver.root_id = self.root_id;
         self.authority_resolver.host = host_authority;
         self.managed.children = self.children;
         self.managed.state_store.children = self.children;
         self.managed.services.context = self;
+        self.managed.on_end = .{ .context = self, .end_fn = workEnded };
         self.managed.authority_resolver = &self.authority_resolver;
         self.managed.approvals = &self.approvals;
     }
@@ -381,145 +409,523 @@ pub const Runtime = struct {
             identity_epoch,
         );
         defer alloc.free(operation_id);
+        const from_root = std.mem.eql(u8, options.caller_id, self.root_id);
 
-        return switch (request.*) {
-            .run, .message => blk: {
-                if (!std.mem.eql(u8, options.caller_id, self.root_id)) {
-                    break :blk self.encodeManaged(alloc, .{
-                        .ok = false,
-                        .error_code = "caller_unavailable",
-                    });
-                }
-                // A new child's profile sets its model and effort unless the
-                // request names them. Loading it here refuses an unknown
-                // profile, or one that would nest subagents, before any child
-                // exists.
-                var profile_arena = std.heap.ArenaAllocator.init(alloc);
-                defer profile_arena.deinit();
-                var profiled = options;
-                var model_override = request.override();
-                if (model_override.profile) |name| {
-                    const profile = switch (try loadChildProfile(profile_arena.allocator(), name)) {
-                        .rejected => |failure| break :blk try self.encodeManaged(alloc, failure),
-                        .loaded => |value| value,
-                    };
-                    if (model_override.model == null) model_override.model = profile.model;
-                    if (model_override.effort == null) {
-                        if (profile.effort) |effort| profiled.defaults.effort = effort;
-                    }
-                }
-                const resolved_model: ?[]const u8 = switch (try resolveOverrideModel(alloc, model_override, profiled)) {
-                    .rejected => |failure| break :blk try self.encodeManaged(alloc, failure),
-                    .accepted => |model| model,
-                };
-                if (request.override().model == null) {
-                    if (model_override.model) |raw| profiled.defaults.model = resolved_model orelse raw;
-                }
-                var admission_arena = std.heap.ArenaAllocator.init(self.alloc);
-                defer admission_arena.deinit();
-                var queued_receipt: ?ManagedExecutionResult = null;
-                defer if (queued_receipt) |queued| alloc.free(queued.body);
-                while (true) {
-                    _ = admission_arena.reset(.retain_capacity);
-                    const admission_alloc = admission_arena.allocator();
-                    if (options.cancel_flag) |cancel| if (cancel.load(.seq_cst)) return error.Cancelled;
-                    if (self.managed.feedbackReplay(operation_id, model_contract.requestFingerprint(request.*))) |replay| {
-                        break :blk try self.encodeManaged(alloc, switch (replay) {
-                            .receipt => |delivery| model_contract.feedbackResult(delivery),
-                            else => .{ .ok = false, .error_code = "operation_conflict" },
-                        });
-                    }
-                    var admitted = try self.admitAndStartManagedWork(
-                        admission_alloc,
-                        request.*,
-                        operation_id,
-                        profiled,
-                        resolved_model,
-                    );
-                    defer admitted.deinit(admission_alloc);
-                    switch (admitted) {
-                        .feedback => |target| {
-                            // Allocate the receipt before handing any text to the worker.
-                            if (queued_receipt == null) queued_receipt = try self.encodeManaged(alloc, model_contract.feedbackResult(.queued));
-                            const result = steer: {
-                                self.admission_mutex.lockUncancelable(io_mod.getIo());
-                                defer self.admission_mutex.unlock(io_mod.getIo());
-                                if (options.cancel_flag) |cancel| if (cancel.load(.seq_cst)) return error.Cancelled;
-                                break :steer try self.managed.steer(target.child_id, target.work_id, operation_id, model_contract.requestFingerprint(request.*), request.message.message);
-                            };
-                            switch (result) {
-                                .receipt => |delivery| {
-                                    if (options.observer) |observer| observer.emit(.{ .delegation = .{
-                                        .call_id = options.invocation_id,
-                                        .child_id = target.child_id,
-                                        .work_id = target.work_id,
-                                        .operation_id = operation_id,
-                                        .phase = switch (delivery) {
-                                            .queued => .feedback_queued,
-                                            .applied => .feedback_applied,
-                                            .not_applied => .feedback_not_applied,
-                                        },
-                                    } });
-                                    if (delivery == .queued) {
-                                        const queued = queued_receipt.?;
-                                        queued_receipt = null;
-                                        break :blk queued;
-                                    }
-                                    break :blk try self.encodeManaged(alloc, model_contract.feedbackResult(delivery));
-                                },
-                                .waiting => {
-                                    io_mod.sleep(terminal_wait_pulse_ms * std.time.ns_per_ms);
-                                    continue;
-                                },
-                                .unavailable, .cancelled, .conflict, .capacity => break :blk try self.encodeManaged(alloc, .{
-                                    .ok = false,
-                                    .error_code = switch (result) {
-                                        .unavailable => "state_unavailable",
-                                        .cancelled => "child_cancelled",
-                                        .conflict => "operation_conflict",
-                                        .capacity => "feedback_capacity",
-                                        else => unreachable,
-                                    },
-                                }),
-                            }
-                        },
-                        .rejected => |failure| {
-                            break :blk self.encodeManaged(alloc, .{
-                                .ok = false,
-                                .error_code = failure.code,
-                            });
-                        },
-                        .ready => |ready| {
-                            if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = .dispatched } });
-                            const result = self.observeManagedState(
-                                alloc,
-                                ready.child_id,
-                                operation_id,
-                                effectiveDefaults(profiled.defaults, request.override(), resolved_model),
-                                options.progress,
-                                options.cancel_flag,
-                                options.steering_worker,
-                                options.model_capability_resolver,
-                            ) catch |err| {
-                                if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = if (err == error.Cancelled) .cancelled else .failed } });
-                                return err;
-                            };
-                            if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = if (result.pending) .yielded else if (result.success) .completed else .failed } });
-                            break :blk result;
-                        },
-                        .completed => |completed| {
-                            if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = completed.child_id, .work_id = operation_id, .phase = .replayed } });
-                            break :blk self.completeManagedResult(
-                                alloc,
-                                completed.child_id,
-                                operation_id,
-                                completed.observation,
-                            );
-                        },
-                    }
-                }
+        switch (request.*) {
+            .wait => return self.waitForMail(alloc, options),
+            .status => {
+                if (!from_root) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "caller_unavailable" });
+                return self.statusOf(alloc, request.status.agent);
             },
+            .stop => {
+                if (!from_root) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "caller_unavailable" });
+                return self.stopChild(alloc, request.stop.agent);
+            },
+            .message => {},
+        }
+        if (request.toParent()) return self.messageParent(alloc, request.message.message, options, from_root);
+        if (!from_root) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "caller_unavailable" });
+
+        // A new child's profile sets its model and effort unless the
+        // request names them. Loading it here refuses an unknown profile, or
+        // one that would nest subagents, before any child exists.
+        var profile_arena = std.heap.ArenaAllocator.init(alloc);
+        defer profile_arena.deinit();
+        var profiled = options;
+        var model_override = request.override();
+        if (model_override.profile) |name| {
+            const profile = switch (try loadChildProfile(profile_arena.allocator(), name)) {
+                .rejected => |failure| return self.encodeManaged(alloc, failure),
+                .loaded => |value| value,
+            };
+            if (model_override.model == null) model_override.model = profile.model;
+            if (model_override.effort == null) {
+                if (profile.effort) |effort| profiled.defaults.effort = effort;
+            }
+        }
+        const resolved_model: ?[]const u8 = switch (try resolveOverrideModel(alloc, model_override, profiled)) {
+            .rejected => |failure| return self.encodeManaged(alloc, failure),
+            .accepted => |model| model,
         };
+        if (request.override().model == null) {
+            if (model_override.model) |raw| profiled.defaults.model = resolved_model orelse raw;
+        }
+        if (options.cancel_flag) |cancel| if (cancel.load(.seq_cst)) return error.Cancelled;
+        const fingerprint = model_contract.requestFingerprint(request.*);
+        if (self.managed.feedbackReplay(operation_id, fingerprint)) |replay| {
+            return self.encodeManaged(alloc, switch (replay) {
+                .receipt => |delivery| model_contract.feedbackResult(delivery),
+                else => .{ .ok = false, .error_code = "operation_conflict" },
+            });
+        }
+        // Remembered before admission, which can start the work and see it
+        // end before returning. Only a started or waiting work keeps it.
+        try self.rememberCall(operation_id, options.invocation_id);
+        var keep_call = false;
+        defer if (!keep_call) self.forgetCall(operation_id);
+        var admission_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer admission_arena.deinit();
+        const admission_alloc = admission_arena.allocator();
+        var admitted = try self.admitAndStartManagedWork(admission_alloc, request.*, operation_id, profiled, resolved_model);
+        defer admitted.deinit(admission_alloc);
+        const agent = request.message.agent;
+        switch (admitted) {
+            .feedback => |target| {
+                const delivery = steer: {
+                    self.admission_mutex.lockUncancelable(io_mod.getIo());
+                    defer self.admission_mutex.unlock(io_mod.getIo());
+                    // Older messages for this child wait their turn; a new one
+                    // never joins the running turn past them.
+                    if (!self.hasPendingLocked(target.child_id)) {
+                        const result = try self.managed.steer(target.child_id, target.work_id, operation_id, fingerprint, request.message.message);
+                        switch (result) {
+                            .receipt => |delivery| break :steer delivery,
+                            .waiting => {},
+                            .unavailable, .cancelled, .conflict, .capacity => return self.encodeManaged(alloc, .{
+                                .ok = false,
+                                .error_code = switch (result) {
+                                    .unavailable => "state_unavailable",
+                                    .cancelled => "child_cancelled",
+                                    .conflict => "operation_conflict",
+                                    .capacity => "feedback_capacity",
+                                    else => unreachable,
+                                },
+                            }),
+                        }
+                    }
+                    // It waits, and starts the child's next turn.
+                    self.queuePendingLocked(target.child_id, agent, operation_id, fingerprint, request.*, profiled, resolved_model) catch |err| {
+                        if (err == error.QueueFull) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "queue_full" });
+                        return err;
+                    };
+                    keep_call = true;
+                    if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = target.child_id, .work_id = operation_id, .phase = .dispatched } });
+                    var buf: [sent_result_bytes]u8 = undefined;
+                    return self.encodeManaged(alloc, .{ .ok = true, .result = queuedResult(&buf, agent) });
+                };
+                debug_trace.eventf("mailbox", "message", .{}, "child={s} work_id={s} delivery=joined receipt={s}", .{ target.child_id, target.work_id, @tagName(delivery) });
+                if (options.observer) |observer| observer.emit(.{ .delegation = .{
+                    .call_id = options.invocation_id,
+                    .child_id = target.child_id,
+                    .work_id = target.work_id,
+                    .operation_id = operation_id,
+                    .phase = switch (delivery) {
+                        .queued => .feedback_queued,
+                        .applied => .feedback_applied,
+                        .not_applied => .feedback_not_applied,
+                    },
+                } });
+                return self.encodeManaged(alloc, model_contract.feedbackResult(delivery));
+            },
+            .rejected => |failure| return self.encodeManaged(alloc, .{
+                .ok = false,
+                .error_code = failure.code,
+            }),
+            .ready => |ready| {
+                keep_call = true;
+                if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = ready.child_id, .work_id = operation_id, .phase = .dispatched } });
+                var buf: [sent_result_bytes]u8 = undefined;
+                return self.encodeManaged(alloc, .{ .ok = true, .result = sentResult(&buf, agent) });
+            },
+            .completed => |completed| {
+                if (options.observer) |observer| observer.emit(.{ .delegation = .{ .call_id = options.invocation_id, .child_id = completed.child_id, .work_id = operation_id, .phase = .replayed } });
+                return self.encodeManaged(alloc, .{ .ok = true, .result = "This message was sent earlier, and the subagent's work on it has ended. Its report went to you then." });
+            },
+        }
+    }
+
+    const WorkCall = struct {
+        work_id: []u8,
+        call_id: []u8,
+
+        fn deinit(self: *WorkCall, alloc: Allocator) void {
+            alloc.free(self.work_id);
+            alloc.free(self.call_id);
+        }
+    };
+
+    fn rememberCall(self: *Runtime, work_id: []const u8, call_id: []const u8) !void {
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        for (self.work_calls.items) |call| if (std.mem.eql(u8, call.work_id, work_id)) return;
+        const owned_work = try self.alloc.dupe(u8, work_id);
+        errdefer self.alloc.free(owned_work);
+        const owned_call = try self.alloc.dupe(u8, call_id);
+        errdefer self.alloc.free(owned_call);
+        try self.work_calls.append(self.alloc, .{ .work_id = owned_work, .call_id = owned_call });
+    }
+
+    fn forgetCall(self: *Runtime, work_id: []const u8) void {
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        self.forgetCallLocked(work_id);
+    }
+
+    fn forgetCallLocked(self: *Runtime, work_id: []const u8) void {
+        for (self.work_calls.items, 0..) |*call, i| {
+            if (!std.mem.eql(u8, call.work_id, work_id)) continue;
+            call.deinit(self.alloc);
+            _ = self.work_calls.swapRemove(i);
+            return;
+        }
+    }
+
+    /// The call that sent `work_id`, copied into `a`, or empty.
+    fn callOf(self: *Runtime, a: Allocator, work_id: []const u8) []const u8 {
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        for (self.work_calls.items) |call| {
+            if (std.mem.eql(u8, call.work_id, work_id)) return a.dupe(u8, call.call_id) catch "";
+        }
+        return "";
+    }
+
+    /// A message for a busy child, waiting to start its next turn.
+    const Pending = struct {
+        child_id: []u8,
+        agent: []u8,
+        work: child_state.ActiveWork,
+
+        fn deinit(self: *Pending, alloc: Allocator) void {
+            alloc.free(self.child_id);
+            alloc.free(self.agent);
+            self.work.deinit(alloc);
+        }
+    };
+
+    /// How many messages may wait for one busy child.
+    const max_pending_per_child: usize = 64;
+
+    fn hasPendingLocked(self: *const Runtime, child_id: []const u8) bool {
+        for (self.pending.items) |item| if (std.mem.eql(u8, item.child_id, child_id)) return true;
+        return false;
+    }
+
+    /// Queues a message behind the child's running turn. A call replayed
+    /// with the same operation is queued once.
+    fn queuePendingLocked(
+        self: *Runtime,
+        child_id: []const u8,
+        agent: []const u8,
+        operation_id: []const u8,
+        fingerprint: [32]u8,
+        request: model_contract.Request,
+        options: ExecuteOptions,
+        resolved_model: ?[]const u8,
+    ) !void {
+        var waiting: usize = 0;
+        for (self.pending.items) |item| {
+            if (std.mem.eql(u8, item.work.id, operation_id)) return;
+            if (std.mem.eql(u8, item.child_id, child_id)) waiting += 1;
+        }
+        if (waiting >= max_pending_per_child) return error.QueueFull;
+        try self.ensureManagedChildSession(child_id, operation_id, effectiveDefaults(options.defaults, request.override(), resolved_model));
+        var work = try makeManagedWork(self.alloc, operation_id, fingerprint, request, options);
+        errdefer work.deinit(self.alloc);
+        const owned_child = try self.alloc.dupe(u8, child_id);
+        errdefer self.alloc.free(owned_child);
+        const owned_agent = try self.alloc.dupe(u8, agent);
+        errdefer self.alloc.free(owned_agent);
+        try self.pending.append(self.alloc, .{ .child_id = owned_child, .agent = owned_agent, .work = work });
+        debug_trace.eventf("mailbox", "message", .{}, "child={s} work_id={s} delivery=queued waiting={d}", .{ child_id, operation_id, waiting + 1 });
+    }
+
+    /// Drops every message waiting for `child_id`, returning how many.
+    fn dropPendingLocked(self: *Runtime, child_id: []const u8, reason: []const u8) usize {
+        var dropped: usize = 0;
+        var index: usize = 0;
+        while (index < self.pending.items.len) {
+            if (!std.mem.eql(u8, self.pending.items[index].child_id, child_id)) {
+                index += 1;
+                continue;
+            }
+            var item = self.pending.orderedRemove(index);
+            debug_trace.eventf("mailbox", "dropped", .{}, "child={s} work_id={s} reason={s}", .{ child_id, item.work.id, reason });
+            self.forgetCallLocked(item.work.id);
+            item.deinit(self.alloc);
+            dropped += 1;
+        }
+        return dropped;
+    }
+
+    fn isBusyLocked(self: *const Runtime, child_id: []const u8) bool {
+        for (self.busy.items) |id| if (std.mem.eql(u8, id, child_id)) return true;
+        return false;
+    }
+
+    fn markBusyLocked(self: *Runtime, child_id: []const u8) !void {
+        if (self.isBusyLocked(child_id)) return;
+        try self.busy.append(self.alloc, try self.alloc.dupe(u8, child_id));
+    }
+
+    fn clearBusyLocked(self: *Runtime, child_id: []const u8) void {
+        for (self.busy.items, 0..) |id, index| if (std.mem.eql(u8, id, child_id)) {
+            self.alloc.free(self.busy.swapRemove(index));
+            return;
+        };
+    }
+
+    /// Whether any child is working, or a message waits for one.
+    fn anyWorking(self: *Runtime) bool {
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        return self.busy.items.len > 0 or self.pending.items.len > 0;
+    }
+
+    /// Whether nothing in this host's tree can still post to its owner:
+    /// no child works and no message waits for one. `fx ask` and ACP finish
+    /// only then.
+    pub fn quiet(self: *Runtime) bool {
+        return !self.anyWorking();
+    }
+
+    pub const TreeWake = enum { mail, quiet, stopped };
+    const cancel_poll: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } };
+
+    /// For a runtime that finishes only once its tree is quiet, as `fx ask`
+    /// does: blocks until mail is queued for `worker`, nothing in this host
+    /// can still post, or `worker` is stopped. A child posts its report
+    /// before it stops counting as working, so `quiet` never leaves one
+    /// behind.
+    /// A set `cancel` stops it too. It is rechecked every `cancel_poll`, so
+    /// a signal handler may set it without waking anything.
+    pub fn awaitMailOrQuiet(self: *Runtime, worker: *worker_runtime.WorkerRuntime, cancel: ?*const std.atomic.Value(bool)) TreeWake {
+        self.setWaiter(worker);
+        defer self.setWaiter(null);
+        while (true) {
+            if (cancel) |flag| if (flag.load(.seq_cst)) return .stopped;
+            if (worker.queuedPromptCount() > 0) return .mail;
+            if (!self.anyWorking()) return .quiet;
+            const wake = if (cancel != null)
+                worker.waitForPostOrNudgeTimeout(cancel_poll) orelse continue
+            else
+                worker.waitForPostOrNudge();
+            switch (wake) {
+                .posted => return .mail,
+                .nudged => continue,
+                .stopped => return .stopped,
+            }
+        }
+    }
+
+    /// How trace lines name this host's owner: `main` for a root host, as the
+    /// mailbox trace contract reads it, or the owner's own id.
+    fn ownerName(self: *const Runtime) []const u8 {
+        return if (self.owner_has_parent) self.root_id else "main";
+    }
+
+    fn setWaiter(self: *Runtime, worker: ?*worker_runtime.WorkerRuntime) void {
+        self.waiter_mutex.lockUncancelable(io_mod.getIo());
+        defer self.waiter_mutex.unlock(io_mod.getIo());
+        self.waiter = worker;
+    }
+
+    /// Ends the owner's `wait` when a child's work ended with nothing to
+    /// post, so it can look again.
+    fn nudgeWaiter(self: *Runtime) void {
+        self.waiter_mutex.lockUncancelable(io_mod.getIo());
+        defer self.waiter_mutex.unlock(io_mod.getIo());
+        if (self.waiter) |worker| worker.nudgeWaiter();
+    }
+
+    /// The owner's hook for a child's work ending (`managed_owner.EndHook`),
+    /// on the child's slot thread: the report goes to the owner, or the
+    /// owner's wait is nudged, and the next waiting message, if any, becomes
+    /// the child's next work. Returns whether it did.
+    fn workEnded(raw: *anyopaque, end: managed_owner.WorkEnd) bool {
+        const self: *Runtime = @ptrCast(@alignCast(raw));
+        self.deliverEnd(end);
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        self.forgetCallLocked(end.work_id);
+        if (self.startNextPendingLocked(end.child_id)) return true;
+        self.clearBusyLocked(end.child_id);
+        self.managed.markEnding(end.child_id);
+        return false;
+    }
+
+    fn deliverEnd(self: *Runtime, end: managed_owner.WorkEnd) void {
+        debug_trace.eventf("mailbox", "child_end", .{}, "child={s} work_id={s} outcome={s} report={}", .{ end.child_id, end.work_id, @tagName(end.outcome), end.report_owed });
+        if (!end.report_owed) return self.nudgeWaiter();
+        const sink = self.report_sink orelse {
+            // Nothing here can take it; it stays owed in the log.
+            debug_trace.eventf("mailbox", "report_held", .{}, "child={s} work_id={s} reason=no_sink", .{ end.child_id, end.work_id });
+            return self.nudgeWaiter();
+        };
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const output = self.reportOutput(a, end) catch "";
+        const agent = self.childName(a, end.child_id) catch end.child_id;
+        sink.post(self, .{ .report = .{
+            .agent = agent,
+            .child_id = end.child_id,
+            .work_id = end.work_id,
+            .call_id = self.callOf(a, end.work_id),
+            .outcome = end.outcome,
+            .output = output,
+        } }) catch |err| {
+            // It stays owed in the log.
+            debug_trace.eventf("mailbox", "report_held", .{}, "child={s} work_id={s} reason={s}", .{ end.child_id, end.work_id, @errorName(err) });
+            return self.nudgeWaiter();
+        };
+        debug_trace.eventf("mailbox", "deliver", .{}, "to={s} from={s} kind=report work={s}", .{ self.ownerName(), end.child_id, end.work_id });
+    }
+
+    /// What a report says about the work: the child's reply, or how it
+    /// ended, with any text it had written.
+    fn reportOutput(self: *Runtime, a: Allocator, end: managed_owner.WorkEnd) ![]const u8 {
+        const text = self.managedResultText(a, end.child_id, end.work_id) catch null;
+        return switch (end.outcome) {
+            .completed => text orelse "The subagent ended its turn without a reply.",
+            .failed => formatFailedResult(a, if (end.failure) |*failure| failure.view() else null, text),
+            .cancelled => withPartial(a, "Its turn was cancelled before it finished.", text),
+            .interrupted => withPartial(a, "fx stopped before it finished.", text),
+            .lost => lost_result,
+        };
+    }
+
+    fn childName(self: *Runtime, a: Allocator, child_id: []const u8) ![]const u8 {
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try self.managed.state_store.load(a);
+        const child = registry.findById(child_id) orelse return child_id;
+        return a.dupe(u8, child.agentName() orelse child_id);
+    }
+
+    /// Makes the next message waiting for `child_id` its next work, which
+    /// the child's slot runs at once. False when none waits or it could not
+    /// be started, which drops it.
+    fn startNextPendingLocked(self: *Runtime, child_id: []const u8) bool {
+        const index = for (self.pending.items, 0..) |item, i| {
+            if (std.mem.eql(u8, item.child_id, child_id)) break i;
+        } else return false;
+        var item = self.pending.orderedRemove(index);
+        defer item.deinit(self.alloc);
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = self.managed.state_store.load(self.alloc) catch |err| return self.dropStart(item, err);
+        defer registry.deinit(self.alloc);
+        _ = registry.startPersistentWork(self.alloc, item.agent, null, item.work) catch |err| return self.dropStart(item, err);
+        self.managed.state_store.save(self.alloc, registry) catch |err| return self.dropStart(item, err);
+        debug_trace.eventf("mailbox", "next_turn", .{}, "child={s} work_id={s}", .{ child_id, item.work.id });
+        return true;
+    }
+
+    fn dropStart(self: *Runtime, item: Pending, err: anyerror) bool {
+        debug_trace.eventf("mailbox", "dropped", .{}, "child={s} work_id={s} reason={s}", .{ item.child_id, item.work.id, @errorName(err) });
+        self.forgetCallLocked(item.work.id);
+        return false;
+    }
+
+    /// `wait`: blocks on the caller's own worker until a report or message
+    /// is queued for it, a child's work ends with nothing to post, or the
+    /// caller is stopped. Returns at once when nothing can still arrive.
+    fn waitForMail(self: *Runtime, alloc: Allocator, options: ExecuteOptions) !ManagedExecutionResult {
+        const worker = options.caller_worker orelse return self.encodeManaged(alloc, .{ .ok = false, .error_code = "wait_unavailable" });
+        // Registered first, so a child that ends before the wait starts
+        // still ends it.
+        self.setWaiter(worker);
+        defer self.setWaiter(null);
+        if (worker.queuedPromptCount() == 0 and !self.anyWorking()) {
+            debug_trace.eventf("mailbox", "wait_skipped", .{}, "agent={s} reason=quiet", .{self.ownerName()});
+            return self.encodeManaged(alloc, .{ .ok = true, .result = "No subagent is working and no message is waiting, so nothing more will arrive. Continue, or end your turn." });
+        }
+        debug_trace.eventf("mailbox", "wait_begin", .{}, "agent={s}", .{self.ownerName()});
+        const wake = worker.waitForPostOrNudge();
+        debug_trace.eventf("mailbox", "wait_end", .{}, "agent={s} reason={s}", .{ self.ownerName(), @tagName(wake) });
+        return switch (wake) {
+            .posted => self.encodeManaged(alloc, .{ .ok = true, .result = "A report or message arrived. It follows this result." }),
+            .nudged => self.encodeManaged(alloc, .{ .ok = true, .result = "A subagent's turn ended without a report. Call status to see where things stand, or wait again." }),
+            .stopped => error.Cancelled,
+        };
+    }
+
+    /// `status`: each subagent, or the one named, with what it is doing.
+    fn statusOf(self: *Runtime, alloc: Allocator, agent: ?[]const u8) !ManagedExecutionResult {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var out: std.Io.Writer.Allocating = .init(a);
+        var listed: usize = 0;
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        const registry = try self.managed.state_store.load(a);
+        for (registry.children) |child| {
+            const name = child.agentName() orelse continue;
+            if (agent) |wanted| if (!std.mem.eql(u8, wanted, name)) continue;
+            var waiting: usize = 0;
+            for (self.pending.items) |item| {
+                if (std.mem.eql(u8, item.child_id, child.id)) waiting += 1;
+            }
+            const state = if (child.phase == .awaiting_approval) "waiting for an approval" else if (self.isBusyLocked(child.id)) "working" else switch (child.phase) {
+                .interrupted => "interrupted",
+                .finished => "finished",
+                else => "idle",
+            };
+            if (listed > 0) try out.writer.writeByte('\n');
+            try out.writer.print("{s}: {s}", .{ name, state });
+            if (waiting > 0) try out.writer.print(", {d} waiting message{s}", .{ waiting, if (waiting == 1) "" else "s" });
+            if (child.last_outcome) |outcome| try out.writer.print(", last work {s}", .{@tagName(outcome)});
+            try out.writer.print(", reports {s}", .{@tagName(child.report_rule)});
+            listed += 1;
+        }
+        if (agent != null and listed == 0) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_unavailable" });
+        if (listed == 0) try out.writer.writeAll("No subagents yet.");
+        return self.encodeManaged(alloc, .{ .ok = true, .result = out.written() });
+    }
+
+    /// `stop`: ends the named child's running turn, which then owes no
+    /// report, and drops the messages waiting for it (decision 10).
+    fn stopChild(self: *Runtime, alloc: Allocator, agent: []const u8) !ManagedExecutionResult {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const child_id = blk: {
+            var lock = self.managed.state_store.acquireLock();
+            defer lock.release();
+            var registry = try self.managed.state_store.load(a);
+            const child = registry.findPersistent(agent) orelse return self.encodeManaged(alloc, .{ .ok = false, .error_code = "child_unavailable" });
+            break :blk try a.dupe(u8, child.id);
+        };
+        const dropped, const stopped = blk: {
+            self.admission_mutex.lockUncancelable(io_mod.getIo());
+            defer self.admission_mutex.unlock(io_mod.getIo());
+            const dropped = self.dropPendingLocked(child_id, "stopped");
+            break :blk .{ dropped, self.managed.stop(child_id) };
+        };
+        debug_trace.eventf("mailbox", "stop", .{}, "target={s} by=parent running={} dropped={d}", .{ child_id, stopped, dropped });
+        const dropped_text = switch (dropped) {
+            0 => "",
+            1 => "the message waiting for it was dropped",
+            else => try a.print("the {d} messages waiting for it were dropped", .{dropped}),
+        };
+        const text = if (stopped)
+            try a.print("Stopped {s}: its turn ended{s}{s}.", .{ agent, if (dropped > 0) ", and " else "", dropped_text })
+        else
+            try a.print("{s} was not working{s}{s}.", .{ agent, if (dropped > 0) "; " else "", dropped_text });
+        return self.encodeManaged(alloc, .{ .ok = true, .result = text });
+    }
+
+    /// `message{agent: "parent"}`: a child of this host writes to the
+    /// host's owner, and the owner, when it is a subagent, writes to its
+    /// own parent. The message arrives framed as the subagent's.
+    fn messageParent(self: *Runtime, alloc: Allocator, text: []const u8, options: ExecuteOptions, from_root: bool) !ManagedExecutionResult {
+        const sink = self.report_sink orelse return self.encodeManaged(alloc, .{ .ok = false, .error_code = "no_parent" });
+        if (from_root and !self.owner_has_parent) return self.encodeManaged(alloc, .{ .ok = false, .error_code = "no_parent" });
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const agent = if (from_root) "" else self.childName(arena.allocator(), options.caller_id) catch options.caller_id;
+        sink.post(self, .{ .message = .{
+            .to = if (from_root) .owners_parent else .owner,
+            .agent = agent,
+            .child_id = options.caller_id,
+            .text = text,
+        } }) catch return self.encodeManaged(alloc, .{ .ok = false, .error_code = "no_parent" });
+        debug_trace.eventf("mailbox", "post", .{}, "from={s} to={s}", .{ options.caller_id, if (from_root) "owners_parent" else self.ownerName() });
+        return self.encodeManaged(alloc, .{ .ok = true, .result = "Sent to your parent. It arrives as your message, never as the user's." });
     }
 
     const ChildProfile = union(enum) {
@@ -637,7 +1043,8 @@ pub const Runtime = struct {
     }
 
     const ManagedAdmission = union(enum) {
-        ready: struct { child_id: []u8 },
+        /// `created` when this admission made the child.
+        ready: struct { child_id: []u8, created: bool = false },
         feedback: struct { child_id: []u8, work_id: []u8 },
         completed: struct {
             child_id: []u8,
@@ -681,12 +1088,16 @@ pub const Runtime = struct {
         errdefer admitted.deinit(alloc);
         if (admitted == .ready) {
             const child_id = admitted.ready.child_id;
-            try self.retainYielded(child_id, operation_id, options.max_result_bytes, if (options.steering_worker != null) 64 else child_state.max_children);
+            try self.markBusyLocked(child_id);
             _ = self.managed.start(child_id) catch |err| {
-                debug_trace.eventf("subagent", "steering_wait_registration_dropped", .{}, "child_id={s} work_id={s} reason=start_failed error={s}", .{ child_id, operation_id, @errorName(err) });
-                self.removeYielded(child_id, operation_id);
+                debug_trace.eventf("mailbox", "start_failed", .{}, "child={s} work_id={s} error={s}", .{ child_id, operation_id, @errorName(err) });
+                self.clearBusyLocked(child_id);
                 return err;
             };
+            if (admitted.ready.created)
+                debug_trace.eventf("mailbox", "launch", .{}, "child={s} work_id={s}", .{ child_id, operation_id })
+            else
+                debug_trace.eventf("mailbox", "message", .{}, "child={s} work_id={s} delivery=next_turn", .{ child_id, operation_id });
         }
         return admitted;
     }
@@ -751,7 +1162,7 @@ pub const Runtime = struct {
                     },
                 } };
             }
-            return managedAdmissionReady(alloc, existing.id);
+            return managedAdmissionReady(alloc, existing.id, false);
         }
 
         var active = try makeManagedWork(
@@ -763,18 +1174,7 @@ pub const Runtime = struct {
         );
         defer active.deinit(alloc);
         switch (request) {
-            .run => {
-                const child_id = try session_store.generateSessionId(alloc);
-                defer alloc.free(child_id);
-                try registry.appendOneOff(alloc, child_id, active);
-                if (request.override().profile) |name| try registry.setProfile(alloc, child_id, name);
-                try self.managed.state_store.save(alloc, registry);
-                try self.ensureManagedChildSession(child_id, active.id, defaults);
-                return managedAdmissionReady(
-                    alloc,
-                    registry.children[registry.children.len - 1].id,
-                );
-            },
+            .wait, .status, .stop => unreachable,
             .message => |message| {
                 if (registry.findPersistent(message.agent)) |child| {
                     if (request.override().present()) {
@@ -789,18 +1189,27 @@ pub const Runtime = struct {
                             "override_after_create",
                         );
                     }
-                    switch (model_contract.plan(request, .{ .kind = .persistent, .phase = child.phase })) {
+                    // A child whose slot still runs works between turns too:
+                    // the message joins or waits, never starts a second run.
+                    const phase: child_state.Phase = if (self.isBusyLocked(child.id)) .running else child.phase;
+                    const plan = model_contract.plan(request, .{ .kind = .persistent, .phase = phase });
+                    if (plan != .reject) if (message.report) |rule| {
+                        try registry.setReportRule(child.id, rule);
+                        try self.managed.state_store.save(alloc, registry);
+                    };
+                    switch (plan) {
                         .steer_persistent => {
-                            const active_work = child.active orelse return managedAdmissionRejected(alloc, child.id, "state_unavailable");
                             const id = try alloc.dupe(u8, child.id);
                             errdefer alloc.free(id);
-                            return .{ .feedback = .{ .child_id = id, .work_id = try alloc.dupe(u8, active_work.id) } };
+                            // Between works there is no turn to join, so the
+                            // message waits for the next one.
+                            const work_id = if (child.active) |active_work| active_work.id else "";
+                            return .{ .feedback = .{ .child_id = id, .work_id = try alloc.dupe(u8, work_id) } };
                         },
                         .reject => |code| return managedAdmissionRejected(alloc, child.id, @tagName(code)),
                         .continue_persistent => {},
-                        .create_one_off, .create_persistent => unreachable,
+                        .create_persistent => unreachable,
                     }
-                    if (self.hasYieldedChild(child.id)) try self.capturePriorYielded(child.*);
                     const started = try registry.startPersistentWork(
                         alloc,
                         message.agent,
@@ -811,7 +1220,7 @@ pub const Runtime = struct {
                     // A child lost before its first turn has no log to
                     // resume, so its next work starts it fresh (D33).
                     try self.ensureManagedChildSession(started.id, active.id, defaults);
-                    return managedAdmissionReady(alloc, started.id);
+                    return managedAdmissionReady(alloc, started.id, false);
                 }
                 const child_id = try session_store.generateSessionId(alloc);
                 defer alloc.free(child_id);
@@ -823,11 +1232,13 @@ pub const Runtime = struct {
                     active,
                 );
                 if (request.override().profile) |name| try registry.setProfile(alloc, child_id, name);
+                if (message.report) |rule| try registry.setReportRule(child_id, rule);
                 try self.managed.state_store.save(alloc, registry);
                 try self.ensureManagedChildSession(child_id, active.id, defaults);
                 return managedAdmissionReady(
                     alloc,
                     registry.children[registry.children.len - 1].id,
+                    true,
                 );
             },
         }
@@ -856,254 +1267,6 @@ pub const Runtime = struct {
             "child session reserved child_id={s} work_id={s} provider={s} model={s} effort={s} fast_mode={} ultrafast_mode={}",
             .{ child_id, work_id, @tagName(defaults.provider), defaults.model, defaults.effort.label(), defaults.fast_mode, defaults.ultrafast_mode },
         );
-    }
-
-    fn observeManagedState(
-        self: *Runtime,
-        alloc: Allocator,
-        child_id: []const u8,
-        work_id: []const u8,
-        fallback_defaults: Defaults,
-        progress: ?ProgressSink,
-        cancel_flag: ?*std.atomic.Value(bool),
-        steering_worker: ?*worker_runtime.WorkerRuntime,
-        model_capability_resolver: ?model_capabilities.Resolver,
-    ) !ManagedExecutionResult {
-        var status = self.startStatusPublisher(alloc, child_id, fallback_defaults, progress, model_capability_resolver) catch StatusPublisher{
-            .model = fallback_defaults.model,
-            .effort = fallback_defaults.effort,
-        };
-        defer status.deinit(alloc);
-        status.tick(.{}, io_mod.milliTimestamp());
-        while (true) {
-            if (cancel_flag) |flag| {
-                if (flag.load(.seq_cst)) {
-                    debug_trace.eventf("subagent", "parent_cancel_propagated", .{}, "child_id={s} work_id={s}", .{ child_id, work_id });
-                    self.managed.cancel(child_id) catch |err| switch (err) {
-                        error.ChildUnavailable => {},
-                    };
-                    return error.Cancelled;
-                }
-            }
-            if (try self.takeCapturedResult(alloc, child_id, work_id)) |result| return result;
-            const observation = self.managed.wait(child_id, .{
-                .clock = .awake,
-                .raw = .fromMilliseconds(terminal_wait_pulse_ms),
-            }) catch |err| {
-                if (try self.takeCapturedResult(alloc, child_id, work_id)) |result| return result;
-                if (!self.managed.hasRunningChild(child_id)) {
-                    // A timed-out observation can leave a completed slot to drain.
-                    self.managed.cancelAndJoin(child_id);
-                    debug_trace.eventf("subagent", "steering_wait_registration_dropped", .{}, "child_id={s} work_id={s} reason=observation_failed_no_runner error={s}", .{ child_id, work_id, @errorName(err) });
-                    self.removeYielded(child_id, work_id);
-                }
-                return self.encodeManaged(alloc, .{
-                    .ok = false,
-                    .error_code = switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        error.ChildUnavailable => "child_unavailable",
-                        error.StateUnavailable => "state_unavailable",
-                    },
-                });
-            };
-            if (try self.takeCapturedResult(alloc, child_id, work_id)) |result| return result;
-            switch (observation.phase) {
-                .running, .awaiting_approval => {
-                    status.tick(observation.metrics, io_mod.milliTimestamp());
-                    if (steering_worker) |worker| {
-                        if (worker.hasPendingPlainSteering()) {
-                            debug_trace.eventf("subagent", "steering_wait_yielded", .{}, "child_id={s} work_id={s} child_cancelled=false", .{ child_id, work_id });
-                            const pending_text = try alloc.print("{s}\nchild_id={s} work_id={s}", .{ model_contract.steering_pending_result, child_id, work_id });
-                            defer alloc.free(pending_text);
-                            var pending = try self.encodeManaged(alloc, .{ .ok = true, .pending = true, .result = pending_text });
-                            if (status.sink != null) attachStatusPresentation(alloc, &pending, status.current(observation.metrics));
-                            return pending;
-                        }
-                    }
-                    continue;
-                },
-                .idle, .finished, .interrupted => {},
-            }
-            var result = try self.completeManagedResult(alloc, child_id, work_id, observation);
-            if (status.sink != null) attachStatusPresentation(alloc, &result, status.current(observation.metrics));
-            self.removeYielded(child_id, work_id);
-            return result;
-        }
-    }
-
-    fn hasYieldedChild(self: *Runtime, child_id: []const u8) bool {
-        self.yielded_mutex.lockUncancelable(io_mod.getIo());
-        defer self.yielded_mutex.unlock(io_mod.getIo());
-        for (self.yielded.items) |item| if (!item.delivered and std.mem.eql(u8, item.child_id, child_id)) return true;
-        return false;
-    }
-
-    // Registry is held by admission. Preserve the old work's result before a
-    // newer generation can become observable through this child ID.
-    fn capturePriorYielded(self: *Runtime, child: child_state.Child) !void {
-        self.yielded_mutex.lockUncancelable(io_mod.getIo());
-        defer self.yielded_mutex.unlock(io_mod.getIo());
-        for (self.yielded.items) |*item| {
-            if (item.delivered or item.result != null or !std.mem.eql(u8, item.child_id, child.id)) continue;
-            if (!std.mem.eql(u8, item.work_id, child.last_work_id orelse return error.StaleWork)) return error.StaleWork;
-            item.result = try self.completeManagedResult(self.alloc, child.id, item.work_id, .{
-                .phase = child.phase,
-                .outcome = child.last_outcome,
-                .failure = child.last_failure,
-            });
-        }
-    }
-
-    fn takeCapturedResult(self: *Runtime, alloc: Allocator, child_id: []const u8, work_id: []const u8) !?ManagedExecutionResult {
-        self.yielded_mutex.lockUncancelable(io_mod.getIo());
-        defer self.yielded_mutex.unlock(io_mod.getIo());
-        for (self.yielded.items, 0..) |item, index| {
-            if (!std.mem.eql(u8, item.child_id, child_id) or !std.mem.eql(u8, item.work_id, work_id)) continue;
-            const stored = item.result orelse return null;
-            const result = ManagedExecutionResult{ .success = stored.success, .body = try alloc.dupe(u8, stored.body) };
-            _ = self.yielded.orderedRemove(index);
-            self.alloc.free(item.child_id);
-            self.alloc.free(item.work_id);
-            self.alloc.free(stored.body);
-            return result;
-        }
-        return null;
-    }
-
-    fn retainYielded(self: *Runtime, child_id: []const u8, work_id: []const u8, max_result_bytes: usize, capacity: usize) !void {
-        self.yielded_mutex.lockUncancelable(io_mod.getIo());
-        defer self.yielded_mutex.unlock(io_mod.getIo());
-        for (self.yielded.items) |item| if (std.mem.eql(u8, item.work_id, work_id)) return;
-        if (self.yielded.items.len >= capacity) return error.TooManyYieldedChildren;
-        const child = try self.alloc.dupe(u8, child_id);
-        errdefer self.alloc.free(child);
-        const work = try self.alloc.dupe(u8, work_id);
-        errdefer self.alloc.free(work);
-        try self.yielded.append(self.alloc, .{ .child_id = child, .work_id = work, .max_result_bytes = max_result_bytes });
-        debug_trace.eventf("subagent", "steering_wait_registered", .{}, "child_id={s} work_id={s} tracked={d}", .{ child_id, work_id, self.yielded.items.len });
-    }
-
-    /// Main-loop-only; callers finish tool dispatch before inspecting completions.
-    /// Returned values belong to arena. Acknowledged results remain context until
-    /// the main execution ends; they are not delivered as a second tool response.
-    pub fn prepareYielded(self: *Runtime, arena: Allocator) ![]YieldedResult {
-        var results: std.ArrayList(YieldedResult) = .empty;
-        for (self.yielded.items) |*item| {
-            if (item.result == null) {
-                const state = try self.managed.wait(item.child_id, .{ .clock = .awake, .raw = .fromMilliseconds(0) });
-                if (state.phase == .running or state.phase == .awaiting_approval) continue;
-                item.result = try self.completeManagedResult(self.alloc, item.child_id, item.work_id, state);
-                debug_trace.eventf("subagent", "steering_result_captured", .{}, "child_id={s} work_id={s} phase={s} result_bytes={d}", .{ item.child_id, item.work_id, @tagName(state.phase), item.result.?.body.len });
-            }
-            try results.append(arena, .{
-                .child_id = try arena.dupe(u8, item.child_id),
-                .work_id = try arena.dupe(u8, item.work_id),
-                .body = try arena.dupe(u8, item.result.?.body),
-                .max_result_bytes = item.max_result_bytes,
-                .delivered = item.delivered,
-            });
-        }
-        for (try self.managed.feedbackUpdates(arena)) |update| {
-            try results.append(arena, .{
-                .child_id = update.child_id,
-                .work_id = update.operation_id,
-                .body = try model_contract.encodeResultAlloc(arena, model_contract.feedbackResult(update.delivery)),
-                .max_result_bytes = tool_result_limits.min_configured_tool_result_bytes,
-                .delivered = false,
-                .receipt_sequence = @as(u64, @backingInt(update.delivery)) + 1,
-            });
-        }
-        return results.toOwnedSlice(arena);
-    }
-
-    pub fn acknowledgeFeedback(self: *Runtime, child_id: []const u8, operation_id: []const u8, sequence: u64) void {
-        const delivery = std.enums.fromInt(types.SteeringDelivery, sequence -| 1) orelse return;
-        self.managed.acknowledgeFeedback(child_id, operation_id, delivery);
-    }
-
-    pub fn acknowledgeYielded(self: *Runtime, child_id: []const u8, work_id: []const u8) void {
-        for (self.yielded.items) |*item| {
-            if (item.delivered or !std.mem.eql(u8, item.child_id, child_id) or !std.mem.eql(u8, item.work_id, work_id)) continue;
-            item.delivered = true;
-            debug_trace.eventf("subagent", "steering_result_delivered", .{}, "child_id={s} work_id={s}", .{ child_id, work_id });
-            return;
-        }
-    }
-
-    fn removeYielded(self: *Runtime, child_id: []const u8, work_id: []const u8) void {
-        self.yielded_mutex.lockUncancelable(io_mod.getIo());
-        defer self.yielded_mutex.unlock(io_mod.getIo());
-        for (self.yielded.items, 0..) |item, index| {
-            if (!std.mem.eql(u8, item.child_id, child_id) or !std.mem.eql(u8, item.work_id, work_id)) continue;
-            _ = self.yielded.orderedRemove(index);
-            self.alloc.free(item.child_id);
-            self.alloc.free(item.work_id);
-            if (item.result) |result| self.alloc.free(result.body);
-            return;
-        }
-    }
-
-    /// Main-loop-only after tool dispatch drains; completed but undelivered work counts.
-    pub fn hasPendingYielded(self: *const Runtime) bool {
-        for (self.yielded.items) |item| {
-            if (!item.delivered) return true;
-        }
-        return false;
-    }
-
-    pub fn waitYielded(self: *Runtime, worker: *worker_runtime.WorkerRuntime) !bool {
-        if (!self.hasPendingYielded()) return false;
-        debug_trace.eventf("subagent", "steering_parent_waiting", .{}, "pending={d}", .{self.yielded.items.len});
-        while (true) {
-            const cancelled = worker.worker_cancel_requested.load(.seq_cst);
-            const steering = worker.hasPendingPlainSteering();
-            if (cancelled or steering) {
-                debug_trace.eventf("subagent", "steering_parent_woken", .{ .turn_id = worker.activeTurnId() }, "cancel_requested={} plain_steering={}", .{ cancelled, steering });
-                return true;
-            }
-            for (self.yielded.items) |item| {
-                if (item.delivered) continue;
-                const state = try self.managed.wait(item.child_id, .{ .clock = .awake, .raw = .fromMilliseconds(0) });
-                if (state.phase != .running and state.phase != .awaiting_approval) {
-                    debug_trace.eventf("subagent", "steering_parent_woken", .{ .turn_id = worker.activeTurnId() }, "child_id={s} work_id={s} phase={s}", .{ item.child_id, item.work_id, @tagName(state.phase) });
-                    return true;
-                }
-            }
-            io_mod.sleep(terminal_wait_pulse_ms * std.time.ns_per_ms);
-        }
-    }
-
-    /// Drain before the main execution releases context borrowed by child runners.
-    pub fn cancelYielded(self: *Runtime) void {
-        for (self.yielded.items) |item| {
-            if (item.delivered) continue;
-            self.managed.cancel(item.child_id) catch |err| debug_trace.logf("subagent", "steering cancellation child_id={s} error={s}", .{ item.child_id, @errorName(err) });
-        }
-        for (self.yielded.items) |item| {
-            if (!item.delivered) self.managed.cancelAndJoin(item.child_id);
-            if (item.result) |result| self.alloc.free(result.body);
-            debug_trace.eventf("subagent", "steering_continuation_released", .{}, "child_id={s} work_id={s} delivered={} reason=parent_turn_end", .{ item.child_id, item.work_id, item.delivered });
-            self.alloc.free(item.child_id);
-            self.alloc.free(item.work_id);
-        }
-        self.yielded.clearRetainingCapacity();
-    }
-
-    fn completeManagedResult(
-        self: *Runtime,
-        alloc: Allocator,
-        child_id: []const u8,
-        work_id: []const u8,
-        observation: managed_owner.Observation,
-    ) !ManagedExecutionResult {
-        const result = try self.managedResultText(alloc, child_id, work_id);
-        defer if (result) |text| alloc.free(text);
-        const failure_text = if (observation.outcome == .failed)
-            try formatFailedResult(alloc, if (observation.failure) |*failure| failure.view() else null, result)
-        else
-            null;
-        defer if (failure_text) |text| alloc.free(text);
-        return self.encodeManaged(alloc, terminalResult(observation, failure_text orelse result));
     }
 
     fn managedResultText(
@@ -1135,98 +1298,7 @@ pub const Runtime = struct {
             .body = try model_contract.encodeResultAlloc(alloc, result),
         };
     }
-
-    fn startStatusPublisher(
-        self: *Runtime,
-        alloc: Allocator,
-        child_id: []const u8,
-        fallback: Defaults,
-        sink: ?ProgressSink,
-        model_capability_resolver: ?model_capabilities.Resolver,
-    ) Allocator.Error!StatusPublisher {
-        var model: []u8 = undefined;
-        var effort: types.ReasoningEffort = undefined;
-        if (self.childPreferences(alloc, child_id)) |loaded| {
-            var preferences = loaded;
-            defer preferences.deinit(alloc);
-            model = try alloc.dupe(u8, preferences.model);
-            effort = preferences.effort;
-        } else |err| {
-            debug_trace.eventf("subagent", "status_publisher_fallback", .{}, "child_id={s} reason=session_load_failed error={s}", .{ child_id, @errorName(err) });
-            model = try alloc.dupe(u8, fallback.model);
-            effort = fallback.effort;
-        }
-        var context_window: ?u32 = null;
-        if (model_capability_resolver) |resolver| {
-            var resolve_arena = std.heap.ArenaAllocator.init(alloc);
-            defer resolve_arena.deinit();
-            if (resolver.resolve(resolve_arena.allocator(), model)) |caps| {
-                context_window = caps.context_window;
-            } else |_| {}
-        }
-        return .{
-            .sink = sink,
-            .model = model,
-            .owns_model = true,
-            .effort = effort,
-            .context_window = context_window,
-        };
-    }
 };
-
-const StatusPublisher = struct {
-    sink: ?ProgressSink = null,
-    model: []const u8,
-    owns_model: bool = false,
-    effort: types.ReasoningEffort,
-    context_window: ?u32 = null,
-    last_publish_ms: ?i64 = null,
-    last_metrics: ?live_metrics.Snapshot = null,
-
-    fn deinit(self: *StatusPublisher, alloc: Allocator) void {
-        if (self.owns_model) alloc.free(@constCast(self.model));
-        self.* = undefined;
-    }
-
-    fn current(self: *const StatusPublisher, metrics: live_metrics.Snapshot) types.SubagentStatus {
-        return .{
-            .model = self.model,
-            .effort = self.effort,
-            .input_tokens = metrics.input_tokens,
-            .context_window = self.context_window,
-        };
-    }
-
-    fn tick(self: *StatusPublisher, metrics: live_metrics.Snapshot, now_ms: i64) void {
-        const changed = if (self.last_metrics) |last| !std.meta.eql(metrics, last) else true;
-        if (!shouldPublish(self.last_publish_ms, now_ms, changed)) return;
-        if (self.sink) |sink| sink.publish(self.current(metrics));
-        self.last_publish_ms = now_ms;
-        self.last_metrics = metrics;
-    }
-};
-
-fn attachStatusPresentation(
-    alloc: Allocator,
-    result: *ManagedExecutionResult,
-    status: types.SubagentStatus,
-) void {
-    const model = alloc.dupe(u8, status.model) catch return;
-    result.final_status = .{
-        .model = model,
-        .effort = status.effort,
-        .input_tokens = status.input_tokens,
-        .context_window = status.context_window,
-    };
-}
-
-const status_min_publish_interval_ms: i64 = 250;
-
-fn shouldPublish(last_publish_ms: ?i64, now_ms: i64, changed: bool) bool {
-    const last = last_publish_ms orelse return true;
-    if (now_ms < last) return false;
-    return changed and now_ms - last >= status_min_publish_interval_ms;
-}
 
 fn operationIdAlloc(
     alloc: Allocator,
@@ -1237,326 +1309,6 @@ fn operationIdAlloc(
     std.crypto.hash.sha2.Sha256.hash(invocation_id, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
     return alloc.print("fxop:2:m:{d}:{s}", .{ epoch, &hex });
-}
-
-fn checkYieldedOwnership(alloc: Allocator) !void {
-    var runtime = Runtime{ .alloc = alloc, .children = undefined, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
-    runtime.managed = .{ .alloc = alloc, .children = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
-    defer runtime.yielded.deinit(alloc);
-    defer while (runtime.yielded.items.len > 0) {
-        const item = runtime.yielded.items[0];
-        runtime.removeYielded(item.child_id, item.work_id);
-    };
-    try std.testing.expect(!runtime.hasPendingYielded());
-    try runtime.retainYielded("child", "work", 4096, 64);
-    try runtime.retainYielded("child", "work", 4096, 64);
-    try std.testing.expect(runtime.hasPendingYielded());
-    try std.testing.expectEqual(@as(usize, 1), runtime.yielded.items.len);
-    runtime.acknowledgeYielded("other", "work");
-    try std.testing.expect(runtime.hasYieldedChild("child"));
-    runtime.yielded.items[0].result = .{ .success = true, .body = try alloc.dupe(u8, "saved result") };
-    runtime.acknowledgeYielded("child", "work");
-    try std.testing.expect(!runtime.hasYieldedChild("child"));
-    try std.testing.expect(!runtime.hasPendingYielded());
-    var arena = std.heap.ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const retained = try runtime.prepareYielded(arena.allocator());
-    try std.testing.expect(retained[0].delivered);
-    try std.testing.expectEqualStrings("saved result", retained[0].body);
-}
-
-test "subagent yielded identity is owned and allocation failures do not leak" {
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkYieldedOwnership, .{});
-}
-
-test "subagent admission preserves an undelivered result before advancing its child" {
-    const alloc = std.testing.allocator;
-    var parent: child_state.TestParent = undefined;
-    try parent.init(alloc);
-    defer parent.deinit();
-    var history = [_]types.HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("old task"), .work_id = @constCast("old-work") },
-        .assistant = @constCast("ORIGINAL_RESULT"),
-    } }};
-    (try parent.openChild("frozen-child", &history)).close();
-    var runtime = Runtime{ .alloc = alloc, .children = &parent.children, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
-    defer runtime.yielded.deinit(alloc);
-    try runtime.retainYielded("frozen-child", "old-work", 4096, 64);
-    defer runtime.removeYielded("frozen-child", "old-work");
-    var child = child_state.Child{ .id = @constCast("frozen-child"), .kind = .{ .persistent = .{ .agent = @constCast("reviewer"), .instructions = &.{} } }, .phase = .idle, .last_work_id = @constCast("old-work"), .last_outcome = .completed };
-    try runtime.capturePriorYielded(child);
-    const original = try alloc.dupe(u8, runtime.yielded.items[0].result.?.body);
-    defer alloc.free(original);
-    try std.testing.expect(std.mem.find(u8, original, "ORIGINAL_RESULT") != null);
-    child.last_work_id = @constCast("new-work");
-    try runtime.capturePriorYielded(child);
-    try std.testing.expectEqualStrings(original, runtime.yielded.items[0].result.?.body);
-    const captured = (try runtime.takeCapturedResult(alloc, "frozen-child", "old-work")).?;
-    defer alloc.free(captured.body);
-    try std.testing.expect(captured.success);
-    try std.testing.expectEqualStrings(original, captured.body);
-    try std.testing.expect((try runtime.takeCapturedResult(alloc, "frozen-child", "old-work")) == null);
-    try runtime.retainYielded("frozen-child", "old-work", 4096, 64);
-    try std.testing.expectError(error.StaleWork, runtime.capturePriorYielded(child));
-}
-
-test "parallel subagent wait bookkeeping stays serialized" {
-    const alloc = std.testing.allocator;
-    var runtime = Runtime{ .alloc = alloc, .children = undefined, .root_id = undefined, .host_authority = undefined, .child_runner = undefined, .approvals = undefined, .authority_resolver = undefined, .managed = undefined };
-    defer runtime.yielded.deinit(alloc);
-    const Writer = struct {
-        runtime: *Runtime,
-        id: []const u8,
-        failure: ?anyerror = null,
-        fn run(self: *@This()) void {
-            for (0..100) |_| {
-                self.runtime.retainYielded(self.id, self.id, 4096, 64) catch |err| {
-                    self.failure = err;
-                    return;
-                };
-                self.runtime.removeYielded(self.id, self.id);
-            }
-        }
-    };
-    var first = Writer{ .runtime = &runtime, .id = "first" };
-    var second = Writer{ .runtime = &runtime, .id = "second" };
-    const a = try std.Thread.spawn(.{}, Writer.run, .{&first});
-    var joined = false;
-    defer if (!joined) a.join();
-    const b = try std.Thread.spawn(.{}, Writer.run, .{&second});
-    b.join();
-    a.join();
-    joined = true;
-    try std.testing.expect(first.failure == null);
-    try std.testing.expect(second.failure == null);
-    try std.testing.expectEqual(@as(usize, 0), runtime.yielded.items.len);
-}
-
-test "subagent feedback waits for admitted work to install its worker" {
-    const Fixture = struct {
-        release: std.Io.Event = .unset,
-        runs: usize = 0,
-        consumed: usize = 0,
-
-        fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
-            return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
-        }
-
-        fn run(raw: ?*anyopaque, turn: *execution.TurnContext, message: domain.QueuedMessage, _: domain.AdmissionSnapshot, _: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            self.runs += 1;
-            if (!turn.worker.beginDirectProcessing(1)) return error.ProviderFailed;
-            self.release.waitUncancelable(io_mod.getIo());
-            var arena = std.heap.ArenaAllocator.init(turn.alloc);
-            defer arena.deinit();
-            const feedback = try turn.worker.takeSteeringBoundaryInto(turn.alloc, arena.allocator(), 1, .model);
-            self.consumed = if (feedback == .continue_turn) feedback.continue_turn.len else 0;
-            turn.commit(turn.active_work_id.?, .{ .assistant = .{
-                .user = .{ .text = message.content },
-                .assistant = @constCast("ORIGINAL_RESULT"),
-            } }) catch return error.ProviderFailed;
-            return .completed;
-        }
-    };
-    const Call = struct {
-        runtime: *Runtime,
-        text: []const u8,
-        entered: std.Io.Event = .unset,
-        done: std.Io.Event = .unset,
-        result: ?ManagedExecutionResult = null,
-        failure: ?anyerror = null,
-
-        fn run(self: *@This()) void {
-            self.entered.set(io_mod.getIo());
-            defer self.done.set(io_mod.getIo());
-            self.result = self.execute() catch |err| {
-                self.failure = err;
-                return;
-            };
-        }
-
-        fn execute(self: *@This()) !ManagedExecutionResult {
-            var request = try model_contract.validateRequest(self.runtime.alloc, .{ .message = .{ .agent = "reviewer", .message = self.text } });
-            defer request.deinit(self.runtime.alloc);
-            return self.runtime.executeManaged(self.runtime.alloc, &request, .{
-                .caller_id = self.runtime.root_id,
-                .invocation_id = self.text,
-                .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
-                .max_result_bytes = 4096,
-                .timestamp_ms = 1,
-            });
-        }
-    };
-    const alloc = std.testing.allocator;
-    var parent: child_state.TestParent = undefined;
-    try parent.init(alloc);
-    defer parent.deinit();
-    var fixture = Fixture{};
-    const runtime = try Runtime.create(alloc, &parent.children, .{ .resolve_fn = Fixture.resolve }, .{ .context = &fixture, .run_fn = Fixture.run });
-    defer runtime.deinit();
-    var first = Call{ .runtime = runtime, .text = "original task" };
-    var second = Call{ .runtime = runtime, .text = "parent feedback" };
-    var first_thread: ?std.Thread = null;
-    var second_thread: ?std.Thread = null;
-    runtime.yielded_mutex.lockUncancelable(io_mod.getIo());
-    var held = true;
-    defer {
-        if (held) runtime.yielded_mutex.unlock(io_mod.getIo());
-        fixture.release.set(io_mod.getIo());
-        if (first_thread) |thread| thread.join();
-        if (second_thread) |thread| thread.join();
-        if (first.result) |result| alloc.free(result.body);
-        if (second.result) |result| alloc.free(result.body);
-    }
-    first_thread = try std.Thread.spawn(.{}, Call.run, .{&first});
-    // Hold result registration after durable admission, before Slot publication.
-    var admitted = false;
-    for (0..1000) |_| {
-        admitted = blk: {
-            var lock = runtime.managed.state_store.acquireLock();
-            defer lock.release();
-            var registry = try runtime.managed.state_store.load(alloc);
-            defer registry.deinit(alloc);
-            break :blk registry.findPersistent("reviewer") != null;
-        };
-        if (admitted) break;
-        io_mod.sleep(std.time.ns_per_ms);
-    }
-    try std.testing.expect(admitted);
-    second_thread = try std.Thread.spawn(.{}, Call.run, .{&second});
-    try second.entered.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
-    try std.testing.expectError(error.Timeout, second.done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(100) } }));
-    runtime.yielded_mutex.unlock(io_mod.getIo());
-    held = false;
-    try second.done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
-    try std.testing.expect(second.failure == null);
-    const expected = try model_contract.encodeResultAlloc(alloc, model_contract.feedbackResult(.queued));
-    defer alloc.free(expected);
-    try std.testing.expectEqualStrings(expected, second.result.?.body);
-    fixture.release.set(io_mod.getIo());
-    try first.done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
-    try std.testing.expect(first.failure == null);
-    try std.testing.expect(first.result.?.success);
-    try std.testing.expect(std.mem.find(u8, first.result.?.body, "ORIGINAL_RESULT") != null);
-    try std.testing.expectEqual(@as(usize, 1), fixture.runs);
-    try std.testing.expectEqual(@as(usize, 1), fixture.consumed);
-}
-
-fn checkFailedStartBookkeeping(action: model_contract.Action) !void {
-    const Fixture = struct {
-        runs: std.atomic.Value(usize) = .init(0),
-
-        fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
-            return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
-        }
-
-        fn run(raw: ?*anyopaque, _: *execution.TurnContext, _: domain.QueuedMessage, _: domain.AdmissionSnapshot, _: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
-            const self: *@This() = @ptrCast(@alignCast(raw.?));
-            _ = self.runs.fetchAdd(1, .seq_cst);
-            return error.ProviderFailed;
-        }
-    };
-    const alloc = std.testing.allocator;
-    var parent: child_state.TestParent = undefined;
-    try parent.init(alloc);
-    defer parent.deinit();
-    var fixture = Fixture{};
-    const runtime = try Runtime.create(alloc, &parent.children, .{ .resolve_fn = Fixture.resolve }, .{ .context = &fixture, .run_fn = Fixture.run });
-    defer runtime.deinit();
-    var worker = worker_runtime.WorkerRuntime{};
-    defer worker.deinit(alloc);
-    runtime.managed.closed = true;
-    try runtime.retainYielded("other-child", "other-work", 2048, 64);
-
-    var request = try model_contract.validateRequest(alloc, switch (action) {
-        .run => .{ .run = .{ .task = "review this" } },
-        .message => .{ .message = .{ .agent = "reviewer", .message = "review this" } },
-    });
-    defer request.deinit(alloc);
-    const options = ExecuteOptions{
-        .caller_id = parent.parent.id(),
-        .invocation_id = "failed-start",
-        .identity_epoch = 1,
-        .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
-        .max_result_bytes = 4096,
-        .timestamp_ms = 1,
-        .steering_worker = &worker,
-    };
-    try std.testing.expectError(error.OwnerClosed, runtime.executeManaged(alloc, &request, options));
-    try std.testing.expectEqual(@as(usize, 0), runtime.managed.slots.items.len);
-    try std.testing.expectEqual(@as(usize, 0), fixture.runs.load(.seq_cst));
-
-    const work_id = try operationIdAlloc(alloc, options.invocation_id, options.identity_epoch);
-    defer alloc.free(work_id);
-    var registry = try runtime.managed.state_store.load(alloc);
-    defer registry.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), registry.children.len);
-    const child = registry.findByOperation(work_id).?;
-    try std.testing.expectEqual(child_state.Phase.running, child.phase);
-    // The child is reserved: its settings wait for its first turn (D34).
-    var seed = (try parent.children.seedFor(alloc, child.id)).?;
-    defer seed.preferences.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), runtime.yielded.items.len);
-    try std.testing.expect(!runtime.hasYieldedChild(child.id));
-    const retained = runtime.yielded.items[0];
-    try std.testing.expectEqualStrings("other-child", retained.child_id);
-    try std.testing.expectEqualStrings("other-work", retained.work_id);
-    try std.testing.expectEqual(@as(usize, 2048), retained.max_result_bytes);
-    try std.testing.expect(!retained.delivered);
-    if (action == .message) {
-        var feedback_options = options;
-        feedback_options.invocation_id = "feedback-after-failed-start";
-        const feedback = try runtime.executeManaged(alloc, &request, feedback_options);
-        defer alloc.free(feedback.body);
-        const expected = try model_contract.encodeResultAlloc(alloc, .{ .ok = false, .error_code = "state_unavailable" });
-        defer alloc.free(expected);
-        try std.testing.expectEqualStrings(expected, feedback.body);
-    }
-    runtime.removeYielded("other-child", "other-work");
-    // Keep the regression bounded even when failed starts leave pending work.
-    try std.testing.expectEqual(@as(usize, 0), runtime.yielded.items.len);
-    try std.testing.expect(!try runtime.waitYielded(&worker));
-}
-
-test "subagent failed start removes only its pending tuple for run" {
-    try checkFailedStartBookkeeping(.run);
-}
-
-test "subagent failed start removes only its pending tuple for message" {
-    try checkFailedStartBookkeeping(.message);
-}
-
-test "subagent status publisher carries actual child facts and throttles unchanged metrics" {
-    const Capture = struct {
-        statuses: std.ArrayList(types.SubagentStatus) = .empty,
-
-        fn publish(raw: *anyopaque, status: types.SubagentStatus) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.statuses.append(std.testing.allocator, status) catch {};
-        }
-    };
-    var capture = Capture{};
-    defer capture.statuses.deinit(std.testing.allocator);
-    var publisher = StatusPublisher{
-        .sink = .{ .context = &capture, .publish_fn = Capture.publish },
-        .model = try std.testing.allocator.dupe(u8, "openai/gpt-5.5"),
-        .owns_model = true,
-        .effort = types.ReasoningEffort.literal("high"),
-        .context_window = 100_000,
-    };
-    defer publisher.deinit(std.testing.allocator);
-
-    publisher.tick(.{ .input_tokens = 12_000 }, 1_000);
-    publisher.tick(.{ .input_tokens = 12_000 }, 2_000);
-    publisher.tick(.{ .input_tokens = 13_000 }, 2_001);
-    publisher.tick(.{ .input_tokens = 13_000 }, 2_250);
-
-    try std.testing.expectEqual(@as(usize, 2), capture.statuses.items.len);
-    try std.testing.expectEqualStrings("openai/gpt-5.5", capture.statuses.items[1].model);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), capture.statuses.items[1].effort);
-    try std.testing.expectEqual(@as(u64, 13_000), capture.statuses.items[1].input_tokens);
-    try std.testing.expectEqual(@as(?u32, 100_000), capture.statuses.items[1].context_window);
 }
 
 test "internal operation identity is deterministic and invocation-bound" {
@@ -1599,6 +1351,290 @@ test "creation defaults keep parent values unless the request overrides them" {
     // Without an override there is nothing to resolve.
     const no_override = effectiveDefaults(parent, .{}, "openai/gpt-5.6-terra-fast");
     try std.testing.expectEqualStrings("parent-model", no_override.model);
+}
+
+/// A host whose children run until released, and whose reports and
+/// messages are recorded, for the mailbox tests below.
+const MailboxFixture = struct {
+    /// While set, a run waits for `release` or its cancel.
+    hold: bool = false,
+    release: std.Io.Event = .unset,
+    runs: std.atomic.Value(usize) = .init(0),
+    mutex: std.Io.Mutex = .init,
+    /// "agent work_id outcome output" per report, in arrival order. Owned.
+    reports: std.ArrayList([]u8) = .empty,
+    /// When set, each report is also posted to this worker, as `fx ask`'s sink does.
+    worker: ?*worker_runtime.WorkerRuntime = null,
+
+    fn deinit(self: *MailboxFixture) void {
+        for (self.reports.items) |line| std.testing.allocator.free(line);
+        self.reports.deinit(std.testing.allocator);
+    }
+
+    fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
+        return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
+    }
+
+    fn run(raw: ?*anyopaque, turn: *execution.TurnContext, message: domain.QueuedMessage, _: domain.AdmissionSnapshot, cancel: *std.atomic.Value(bool)) execution.ServiceError!execution.RunOutcome {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        _ = self.runs.fetchAdd(1, .seq_cst);
+        while (self.hold and !self.release.isSet() and !cancel.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+        if (cancel.load(.seq_cst)) return error.Cancelled;
+        const reply = std.testing.allocator.print("DONE {s}", .{message.content}) catch return error.ProviderFailed;
+        defer std.testing.allocator.free(reply);
+        turn.commit(turn.active_work_id.?, .{ .assistant = .{
+            .user = .{ .text = message.content },
+            .assistant = reply,
+        } }) catch return error.ProviderFailed;
+        return .completed;
+    }
+
+    fn post(raw: ?*anyopaque, _: *Runtime, delivery: Delivery) PostReportError!void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        const report = delivery.report;
+        const line = try std.testing.allocator.print("{s} {s} {s} {s} {s}", .{ report.agent, report.call_id, report.work_id, @tagName(report.outcome), report.output });
+        errdefer std.testing.allocator.free(line);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        try self.reports.append(std.testing.allocator, line);
+        if (self.worker) |worker| {
+            worker.postMail(std.testing.allocator, .{
+                .prompt = try std.testing.allocator.dupe(u8, line),
+                .images = &.{},
+                .model = &.{},
+                .api_key = &.{},
+                .permission_mode = .ask,
+                .history = &.{},
+                .grants = &.{},
+                .author = .child,
+            }) catch return error.AgentGone;
+        }
+    }
+
+    fn reportCount(self: *MailboxFixture) usize {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.reports.items.len;
+    }
+};
+
+fn mailboxRuntime(alloc: Allocator, fixture: *MailboxFixture, parent: *child_state.TestParent) !*Runtime {
+    const runtime = try Runtime.create(alloc, &parent.children, .{ .resolve_fn = MailboxFixture.resolve }, .{ .context = fixture, .run_fn = MailboxFixture.run });
+    runtime.report_sink = .{ .context = fixture, .post_fn = MailboxFixture.post };
+    return runtime;
+}
+
+/// One call of the subagent tool from the root, as its model would make it.
+fn callTool(runtime: *Runtime, arena: Allocator, input: model_contract.RequestInput, invocation_id: []const u8, worker: ?*worker_runtime.WorkerRuntime) ![]const u8 {
+    var request = try model_contract.validateRequest(std.testing.allocator, input);
+    defer request.deinit(std.testing.allocator);
+    const result = try runtime.executeManaged(arena, &request, .{
+        .caller_id = runtime.root_id,
+        .invocation_id = invocation_id,
+        .defaults = .{ .provider = .gateway, .model = "test", .effort = .auto, .conversation_language = session.ConversationLanguage.literal("en") },
+        .max_result_bytes = 4096,
+        .timestamp_ms = 1,
+        .caller_worker = worker,
+    });
+    return result.body;
+}
+
+fn waitForRuns(fixture: *MailboxFixture, count: usize) !void {
+    for (0..5000) |_| {
+        if (fixture.runs.load(.seq_cst) >= count) return;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
+
+test "a message returns at once, and the subagent's report reaches its parent on its own" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const body = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "check" } }, "call-1", null);
+    try std.testing.expect(std.mem.find(u8, body, "Sent to reviewer") != null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    const line = fixture.reports.items[0];
+    // It points back at the call that sent the work.
+    try std.testing.expect(std.mem.startsWith(u8, line, "reviewer call-1 "));
+    try std.testing.expect(std.mem.find(u8, line, " completed DONE check") != null);
+    // The finish line records that the report was owed.
+    var registry = try runtime.managed.state_store.load(alloc);
+    defer registry.deinit(alloc);
+    try std.testing.expect(registry.findPersistent("reviewer").?.last_report_owed);
+
+    const status = try callTool(runtime, arena, .{ .status = .{} }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, status, "reviewer: idle, last work completed, reports final") != null);
+}
+
+test "a message to a busy subagent waits and runs as its next work, in order" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const queued = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, queued, "is busy") != null);
+    const status = try callTool(runtime, arena, .{ .status = .{ .agent = "reviewer" } }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, status, "reviewer: working, 1 waiting message") != null);
+    fixture.release.set(io_mod.getIo());
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 2), fixture.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
+    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[0], "DONE first"));
+    try std.testing.expect(std.mem.startsWith(u8, fixture.reports.items[0], "reviewer call-1 "));
+    try std.testing.expect(std.mem.endsWith(u8, fixture.reports.items[1], "DONE second"));
+    try std.testing.expect(std.mem.startsWith(u8, fixture.reports.items[1], "reviewer call-2 "));
+    // Nothing is left remembered once both works ended.
+    try std.testing.expectEqual(@as(usize, 0), runtime.work_calls.items.len);
+}
+
+test "stop ends a subagent's turn without a report and drops what waits for it" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "second" } }, "call-2", null);
+    const stopped = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-3", null);
+    try std.testing.expect(std.mem.find(u8, stopped, "Stopped reviewer: its turn ended, and the message waiting for it was dropped.") != null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 1), fixture.runs.load(.seq_cst));
+    try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
+    var registry = try runtime.managed.state_store.load(alloc);
+    defer registry.deinit(alloc);
+    const child = registry.findPersistent("reviewer").?;
+    try std.testing.expectEqual(child_state.Outcome.cancelled, child.last_outcome.?);
+    try std.testing.expect(!child.last_report_owed);
+    const again = try callTool(runtime, arena, .{ .stop = .{ .agent = "reviewer" } }, "call-4", null);
+    try std.testing.expect(std.mem.find(u8, again, "reviewer was not working.") != null);
+    const missing = try callTool(runtime, arena, .{ .stop = .{ .agent = "nobody" } }, "call-5", null);
+    try std.testing.expect(std.mem.find(u8, missing, "child_unavailable") != null);
+}
+
+test "wait returns at once when nothing works, and when a report arrives" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var worker = worker_runtime.WorkerRuntime{};
+    defer worker.deinit(alloc);
+    var fixture = MailboxFixture{ .hold = true, .worker = &worker };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    const quiet = try callTool(runtime, arena, .wait, "call-1", &worker);
+    try std.testing.expect(std.mem.find(u8, quiet, "nothing more will arrive") != null);
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "first" } }, "call-2", &worker);
+    try waitForRuns(&fixture, 1);
+    const Releaser = struct {
+        fn run(target: *MailboxFixture) void {
+            io_mod.sleep(20 * std.time.ns_per_ms);
+            target.release.set(io_mod.getIo());
+        }
+    };
+    const releaser = try std.Thread.spawn(.{}, Releaser.run, .{&fixture});
+    defer releaser.join();
+    const woken = try callTool(runtime, arena, .wait, "call-3", &worker);
+    try std.testing.expect(std.mem.find(u8, woken, "A report or message arrived") != null);
+    try std.testing.expectEqual(@as(usize, 1), worker.queuedPromptCount());
+    const queued = worker.takeQueuedPrompt(alloc).?;
+    defer worker_runtime.freeQueuedPrompt(alloc, queued);
+    try std.testing.expectEqual(types.MessageAuthor.child, queued.author);
+}
+
+test "a subagent that reports never stays quiet when its work completes" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "quiet", .message = "go", .report = "never" } }, "call-1", null);
+    try waitUntilQuiet(runtime);
+    try std.testing.expectEqual(@as(usize, 0), fixture.reportCount());
+    const status = try callTool(runtime, arena, .{ .status = .{} }, "call-2", null);
+    try std.testing.expect(std.mem.find(u8, status, "quiet: idle, last work completed, reports never") != null);
+}
+
+test "rebinding a moved host context moves its report sink too" {
+    const alloc = std.testing.allocator;
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var before = MailboxFixture{};
+    defer before.deinit();
+    var after = MailboxFixture{};
+    defer after.deinit();
+    const runtime = try mailboxRuntime(alloc, &before, &parent);
+    defer runtime.deinit();
+    runtime.rebindHost(&after, .{ .resolve_fn = MailboxFixture.resolve });
+    try std.testing.expectEqual(@as(?*anyopaque, &after), runtime.report_sink.?.context);
+    try std.testing.expectEqual(@as(?*anyopaque, &after), runtime.child_runner.context);
+}
+
+test "the root has no parent to message" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+    const body = try callTool(runtime, arena, .{ .message = .{ .agent = "parent", .message = "done" } }, "call-1", null);
+    try std.testing.expect(std.mem.find(u8, body, "no_parent") != null);
+}
+
+/// Waits, in a test, until no child of `runtime` works.
+fn waitUntilQuiet(runtime: *Runtime) !void {
+    for (0..5000) |_| {
+        if (runtime.quiet()) return;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    return error.Timeout;
 }
 
 const OverrideResolverFixture = struct {
@@ -1651,7 +1687,7 @@ test "model override resolves against the catalog before child creation" {
     const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &parent);
     defer runtime.deinit();
 
-    var request = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "terra-fast" } });
+    var request = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "probe", .model = "terra-fast" } });
     defer request.deinit(alloc);
     const result = try runtime.executeManaged(arena, &request, .{
         .caller_id = parent.parent.id(),
@@ -1662,8 +1698,10 @@ test "model override resolves against the catalog before child creation" {
         .model_override_resolver = .{ .context = &fixture, .resolve_fn = OverrideResolverFixture.resolveModel },
     });
 
+    // The message returns at once; the child runs on its own.
     try std.testing.expect(result.success);
-    try std.testing.expect(std.mem.find(u8, result.body, "CHILD_OK") != null);
+    try std.testing.expect(std.mem.find(u8, result.body, "Sent to probe") != null);
+    try waitUntilQuiet(runtime);
     try std.testing.expectEqual(@as(usize, 1), fixture.runs);
     try std.testing.expectEqualStrings("openai/gpt-5.6-terra-fast", fixture.observed_model.?);
 }
@@ -1690,7 +1728,7 @@ test "unknown and ambiguous model overrides reject before any child session" {
         .model_override_resolver = .{ .context = &fixture, .resolve_fn = OverrideResolverFixture.resolveModel },
     };
 
-    var unknown = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "skldjf" } });
+    var unknown = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "probe", .model = "skldjf" } });
     defer unknown.deinit(alloc);
     const unknown_result = try runtime.executeManaged(arena, &unknown, options);
     try std.testing.expect(!unknown_result.success);
@@ -1698,7 +1736,7 @@ test "unknown and ambiguous model overrides reject before any child session" {
     try std.testing.expect(std.mem.find(u8, unknown_result.body, "skldjf") != null);
     try std.testing.expect(std.mem.find(u8, unknown_result.body, "omit model to inherit") != null);
 
-    var ambiguous = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "terra" } });
+    var ambiguous = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "probe", .model = "terra" } });
     defer ambiguous.deinit(alloc);
     const ambiguous_result = try runtime.executeManaged(arena, &ambiguous, options);
     try std.testing.expect(!ambiguous_result.success);
@@ -1728,7 +1766,7 @@ test "model override passes through for non-gateway providers" {
     const runtime = try overrideResolverFixtureRuntime(alloc, &fixture, &parent);
     defer runtime.deinit();
 
-    var request = try model_contract.validateRequest(alloc, .{ .run = .{ .task = "probe", .model = "unknown-model" } });
+    var request = try model_contract.validateRequest(alloc, .{ .message = .{ .agent = "probe", .message = "probe", .model = "unknown-model" } });
     defer request.deinit(alloc);
     const result = try runtime.executeManaged(arena, &request, .{
         .caller_id = parent.parent.id(),
@@ -1742,6 +1780,7 @@ test "model override passes through for non-gateway providers" {
     // The configured provider accepts arbitrary model IDs, so the raw override
     // reaches the child even though the gateway catalog lacks it.
     try std.testing.expect(result.success);
+    try waitUntilQuiet(runtime);
     try std.testing.expectEqual(@as(usize, 1), fixture.runs);
     try std.testing.expectEqualStrings("unknown-model", fixture.observed_model.?);
 }
@@ -1807,6 +1846,24 @@ fn terminalResult(
     };
 }
 
+const sent_result_bytes = 256 + domain.max_agent_name_bytes;
+
+/// `message`'s answer when the child takes it now.
+fn sentResult(buf: []u8, agent: []const u8) []const u8 {
+    return std.mem.print(buf, "Sent to {s}, which works on it now. Its report arrives on its own when the work ends; keep working or end your turn.", .{agent}) catch "Sent.";
+}
+
+/// `message`'s answer when the child is busy and the message waits.
+fn queuedResult(buf: []u8, agent: []const u8) []const u8 {
+    return std.mem.print(buf, "{s} is busy, so the message waits and starts its next turn. Its report arrives on its own.", .{agent}) catch "Queued.";
+}
+
+/// `note`, then the text the subagent had written, when it wrote any.
+fn withPartial(a: Allocator, note: []const u8, partial: ?[]const u8) ![]const u8 {
+    const text = partial orelse return note;
+    return a.print("{s}\n\nWhat it had written:\n{s}", .{ note, text });
+}
+
 /// A crash lost the work before the child started it (D33).
 const lost_result = "fx stopped before this message reached the subagent, so it never ran. Send it again if it is still needed.";
 
@@ -1855,8 +1912,9 @@ test "terminal result projects every managed outcome without a lifecycle phase" 
 fn managedAdmissionReady(
     alloc: Allocator,
     child_id: []const u8,
+    created: bool,
 ) !Runtime.ManagedAdmission {
-    return .{ .ready = .{ .child_id = try alloc.dupe(u8, child_id) } };
+    return .{ .ready = .{ .child_id = try alloc.dupe(u8, child_id), .created = created } };
 }
 
 fn managedAdmissionRejected(
@@ -1877,10 +1935,7 @@ fn makeManagedWork(
     request: model_contract.Request,
     options: ExecuteOptions,
 ) !child_state.ActiveWork {
-    const message = switch (request) {
-        .run => |value| value.task,
-        .message => |value| value.message,
-    };
+    const message = request.message.message;
     const id = try alloc.dupe(u8, operation_id);
     errdefer alloc.free(id);
     const owned_message = try alloc.dupe(u8, message);
