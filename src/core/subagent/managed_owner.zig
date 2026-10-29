@@ -164,6 +164,7 @@ pub const Owner = struct {
             .history = &.{},
             .grants = &.{},
             .steering_receipt = &item.receipt,
+            .author = .parent,
         };
         defer if (!accepted) {
             item.receipt.state.store(.not_applied, .seq_cst);
@@ -480,6 +481,8 @@ test "child feedback deduplicates operations and bounds queued receipts" {
     defer arena.deinit();
     const result = try worker.takeSteeringBoundaryInto(alloc, arena.allocator(), 7, .model);
     try std.testing.expectEqual(@as(usize, 64), result.continue_turn.len);
+    // The parent wrote every one, so the child's turn never reads it as the user's.
+    for (result.continue_turn) |message| try std.testing.expectEqual(worker_runtime.MessageAuthor.parent, message.author);
     try std.testing.expectEqual(types.SteeringDelivery.applied, owner.feedbackReplay("first", fingerprint).?.receipt);
     try std.testing.expectEqual(@as(usize, 64), (try owner.feedbackUpdates(arena.allocator())).len);
     owner.acknowledgeFeedback("other-child", "first", .applied);
