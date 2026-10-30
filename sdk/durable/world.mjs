@@ -23,10 +23,16 @@ const durabilityTag = Symbol.for("libfx.durability");
  *   which message and which delivery of it each handler call carries. A
  *   worker with no deadline renews its lease all the same.
  * - `runInRequest`: with `queueLeases`, a prompt runs in the request that
- *   took it when no worker holds the session, saving a queue hop. The queue
- *   keeps the prompt as a backstop it delivers only after that request's
- *   deadline, and the request's lease names it, so if the request died the
- *   backstop takes the session over. Default true with `queueLeases`.
+ *   took it when no worker holds the session, saving a queue hop. On a World
+ *   whose queue holds a message for its sender
+ *   (`capabilities.experimental_queueHold`), the request sends the prompt
+ *   asking for a hold and runs it as the message's first delivery, whose
+ *   lease the queue renews while it runs; a prompt the queue does not hold,
+ *   the queue delivers. On any other World, the queue keeps the prompt as a
+ *   backstop it delivers only after that request's deadline. Either way the
+ *   request's lease names the message, so if the request died the queue's
+ *   next delivery of it takes the session over. Default true with
+ *   `queueLeases`.
  * - `waitUntil(work)`: keeps the request alive until `work`, a turn it runs
  *   after its response, settles, as Vercel's `waitUntil` or Next's `after()`.
  * - `leaseMs`: how long a lease lasts after it was taken or last renewed,

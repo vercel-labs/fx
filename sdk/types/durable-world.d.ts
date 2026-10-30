@@ -23,6 +23,15 @@ export interface World {
     getChunks(runId: string, name: string, options?: { limit?: number; cursor?: string }): unknown;
     getInfo(runId: string, name: string): unknown;
   };
+  /**
+   * What the World supports. With `experimental_queueHold`, a prompt that runs in the request that took it (see
+   * `WorldOptions.runInRequest`) is sent with `experimental_hold` and run through the result's
+   * `experimental_held.consume()`.
+   */
+  readonly capabilities?: {
+    readonly experimental_queueHold?: boolean;
+    readonly inBandFence?: boolean;
+  };
   queue(queueName: string, message: unknown, options?: unknown): unknown;
   createQueueHandler(prefix: string, handler: (message: unknown, meta: any) => Promise<unknown>): (request: Request) => Promise<Response>;
   /** A World with `registerHandler` delivers to the agent in its process; any other delivers over HTTP to `agent.wakeHandler()`. */
@@ -63,9 +72,12 @@ export type WorldOptions = {
    */
   queueLeases?: boolean;
   /**
-   * With `queueLeases`: a prompt runs in the request that took it when no worker holds the session, and the queue keeps
-   * the prompt as a backstop it delivers only after that request's deadline. The request's lease names the backstop, so
-   * if the request died, the backstop takes the session over. Default true with `queueLeases`.
+   * With `queueLeases`: a prompt runs in the request that took it when no worker holds the session. On a World with
+   * `capabilities.experimental_queueHold`, the request sends the prompt asking the queue to hold it and runs it as the
+   * message's first delivery, whose lease the queue renews while it runs; a prompt the queue does not hold, the queue
+   * delivers. On any other World, the queue keeps the prompt as a backstop it delivers only after that request's
+   * deadline. Either way the request's lease names the message, so if the request died, the queue's next delivery of it
+   * takes the session over. Default true with `queueLeases`.
    */
   runInRequest?: boolean;
   /** Keeps the request alive until `work`, a turn it runs after its response, settles, such as Vercel's `waitUntil` or Next's `after()`. */

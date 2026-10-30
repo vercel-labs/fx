@@ -943,6 +943,8 @@ if (durabilityKind === "queue") {
       // ran before any delivery of it.
       const [backstop, ...after] = broker.sent.filter((message) => message.payload?.input?.messageId === `turn-${input}`);
       assert.equal(backstop.attempt, 0, "the backstop waited");
+      assert.ok(backstop.options.delaySeconds > 0, "the backstop waits past the request's deadline");
+      assert.equal(backstop.options.experimental_hold, undefined, "a World that cannot hold messages is not asked to");
       if (maxDurationMs < 1000) {
         assert.ok(after.length > 0, "a turn longer than the request went on in a fresh message");
       } else {
@@ -1011,6 +1013,107 @@ if (durabilityKind === "queue") {
       assert.equal(seen.length, 1, "the backstop ran nothing");
       await agent.close();
     }
+  });
+
+  test("where the queue holds a prompt for the request that sent it, the request runs it as the message's first delivery, with no backstop", async () => {
+    const internals = (agent) => agent[Symbol.for("libfx.durableInternals")];
+    for (const [input, maxDurationMs] of [["held", 60_000], ["held3", 300]]) {
+      const dir = await mkdtemp(join(tmpdir(), "libfx-in-request-held-"));
+      dirs.push(dir);
+      const waited = [];
+      const { durability, broker } = await queueWorldAt(dir, { hold: "held", queueLeases: true, runInRequest: true, maxDurationMs, reserveMs: 100, waitUntil: (work) => waited.push(work) });
+      const agent = createAgent({ durability });
+      const session = agent.session();
+      // With the short deadline, a step outlasts the request.
+      if (maxDurationMs < 1000) {
+        const slow = holdStep(`${input}-1`);
+        void slow.holding.then(() => setTimeout(slow.release, 600));
+      }
+      const { text, result } = await textOf(session.prompt(input, { messageId: `turn-${input}` }));
+      assert.equal(result.stopReason, "end_turn");
+      assert.equal(text, [0, 1, 2].map((step) => `${input}-${step}`).join(" "));
+      const [first, ...after] = broker.sent.filter((message) => message.payload?.input?.messageId === `turn-${input}`);
+      assert.deepEqual(first.options.experimental_hold, {}, "the prompt was sent asking for a hold");
+      assert.equal(first.options.delaySeconds, undefined, "undelayed");
+      assert.equal(first.options.idempotencyKey, `${session.id}:prompt:turn-${input}`, "with its idempotency key");
+      assert.equal(first.consumed, true, "the request consumed the held message");
+      assert.ok(broker.sent.every((message) => !(message.options.delaySeconds > 0)), "no delayed backstop was sent");
+      assert.equal(waited.length, 1, "the request's run went to waitUntil");
+      assert.equal(await waited[0], undefined);
+      if (maxDurationMs < 1000) {
+        // The request stopped at its deadline, and the queue continued the
+        // turn as it continues any delivery's.
+        assert.ok(after.length > 0, "a turn longer than the request went on through the queue");
+      } else {
+        assert.equal(after.length, 0, "the request ran the whole turn");
+        // The lease names the held message's first delivery, so the queue's
+        // next delivery of it takes the session over.
+        const leases = (await logEntries(durability, session.id)).filter((entry) => entry.k === "lease");
+        assert.deepEqual(leases.map((lease) => lease.delivery), [{ messageId: first.id, attempt: 1 }]);
+      }
+      for (let tries = 0; broker.held(() => true).some((message) => message.id === first.id); tries += 1) {
+        assert.ok(tries < 200, "the held message was never acknowledged");
+        await sleep(10);
+      }
+      assert.equal(first.attempt, 1, "the held message was delivered once");
+      assert.deepEqual(JSON.parse(decoder.decode(await session.checkpoint())), [0, 1, 2].map((step) => `${input}-${step}`));
+      await agent.close();
+    }
+  });
+
+  test("if the request running a held prompt dies, the queue's next delivery of the message takes the session over", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-in-request-held-lapse-"));
+    dirs.push(dir);
+    const { durability, broker } = await queueWorldAt(dir, { hold: "held", queueLeases: true, runInRequest: true, maxDurationMs: 600_000, waitUntil: () => {} });
+    const fenced = [];
+    // The route takes the redelivery to the first agent, as to another
+    // process; the second takes the prompt in its request.
+    const first = createAgent({ durability });
+    const agent = createAgent({ durability, onEvent: (event) => { if (event.type === "session.fenced") fenced.push(event); } });
+    await first.newSessionId();
+    await agent.newSessionId();
+    const held = holdStep("lapsed-1");
+    const before = ran.length;
+    const session = agent.session();
+    const turn = session.prompt("lapsed", { messageId: "turn-lapsed" });
+    await held.holding;
+    // The request's process is gone as far as the queue can tell, so it
+    // delivers the held message again, to the route.
+    const holders = globalThis[Symbol.for("libfx.liveHolders")];
+    for (const holder of [...holders]) holders.delete(holder);
+    holds.delete("lapsed-1");
+    const [message] = broker.held((input) => input.messageId === "turn-lapsed");
+    assert.equal(message.consumed, true, "the request consumed the held message");
+    broker.lapse(message);
+    const { text, result } = await textOf(turn);
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "lapsed-0 lapsed-1 lapsed-2");
+    assert.deepEqual(ran.slice(before), ["turn-lapsed:0", "turn-lapsed:1", "turn-lapsed:2"], "the redelivery continued the turn from its held step");
+    held.release();
+    for (let waited = 0; fenced.length === 0 && waited < 5000; waited += 20) await sleep(20);
+    assert.equal(fenced.length, 1, "the request's replaced worker stopped at its next write");
+    await agent.close();
+    await first.close();
+  });
+
+  test("where the queue does not hold a prompt, the request runs nothing and the queue delivers it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-in-request-not-held-"));
+    dirs.push(dir);
+    const waited = [];
+    const { durability, broker } = await queueWorldAt(dir, { hold: "notHeld", queueLeases: true, runInRequest: true, maxDurationMs: 60_000, waitUntil: (work) => waited.push(work) });
+    const agent = createAgent({ durability });
+    const session = agent.session();
+    const { text, result } = await textOf(session.prompt("unheld", { messageId: "turn-unheld" }));
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "unheld-0 unheld-1 unheld-2");
+    const sent = broker.sent.filter((message) => message.payload?.input?.messageId === "turn-unheld");
+    assert.equal(sent.length, 1, "one message, and no backstop");
+    assert.deepEqual(sent[0].options.experimental_hold, {}, "the prompt was sent asking for a hold");
+    assert.equal(sent[0].options.delaySeconds, undefined, "undelayed");
+    assert.equal(sent[0].consumed, undefined, "the request did not run it");
+    assert.equal(sent[0].attempt, 1, "the queue delivered it");
+    assert.equal(waited.length, 0, "the request kept nothing alive");
+    await agent.close();
   });
 }
 

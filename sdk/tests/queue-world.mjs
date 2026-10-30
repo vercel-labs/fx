@@ -12,7 +12,12 @@
 //   `rerun(message)` runs its delivery again, attempt and all, as Vercel
 //   does when a function's process exits mid-delivery; and `adopt(message)`
 //   delivers here a message another of these Worlds held, as one queue
-//   shared by two processes hands a message on.
+//   shared by two processes hands a message on;
+// - with `hold`, it declares `capabilities.experimental_queueHold`, as
+//   world-vercel does, and a send with `experimental_hold` comes back with
+//   `experimental_held`, whose `consume(handler)` runs the message's first
+//   delivery in the sender, or with `experimental_notHeld`, when `hold` is
+//   "notHeld" or the hold is refused, and the queue delivers it as usual.
 //
 // The test starts the World and passes it to world(), so it stays the
 // test's: `closeQueueWorlds()` closes them after the agents.
@@ -21,7 +26,7 @@ import { world } from "../durable/world.mjs";
 const { createWorld } = await import(new URL("../durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
 const opened = [];
 
-function createBroker({ retryMs }) {
+function createBroker({ retryMs, hold }) {
   const handlers = new Map();
   const inner = Symbol("handler");
   const timers = new Set();
@@ -42,24 +47,52 @@ function createBroker({ retryMs }) {
     messages.delete(message.id);
     if (message.key !== undefined && keys.get(message.key) === message.id) keys.delete(message.key);
   };
-  const send = async (queueName, payload, { delaySeconds = 0, idempotencyKey } = {}) => {
-    if (idempotencyKey !== undefined && keys.has(idempotencyKey)) return { messageId: keys.get(idempotencyKey) };
+  const send = async (queueName, payload, options = {}) => {
+    const { delaySeconds = 0, idempotencyKey } = options;
+    const holding = hold !== undefined && options.experimental_hold !== undefined;
+    if (holding && delaySeconds > 0) throw new Error("experimental_hold cannot be combined with delaySeconds");
+    if (idempotencyKey !== undefined && keys.has(idempotencyKey)) {
+      return { messageId: keys.get(idempotencyKey), ...(holding ? { experimental_notHeld: { reason: "duplicate" } } : {}) };
+    }
     count += 1;
-    const message = { id: `msg_${tag}${String(count).padStart(8, "0")}`, queueName, payload, attempt: 0, key: idempotencyKey };
+    const message = { id: `msg_${tag}${String(count).padStart(8, "0")}`, queueName, payload, attempt: 0, key: idempotencyKey, options };
     messages.set(message.id, message);
     if (idempotencyKey !== undefined) keys.set(idempotencyKey, message.id);
     sent.push(message);
+    if (holding && hold === "held") {
+      message.held = true;
+      return { messageId: message.id, experimental_held: heldHandle(message) };
+    }
     later(() => deliver(message), delaySeconds * 1000);
-    return { messageId: message.id };
+    return { messageId: message.id, ...(holding ? { experimental_notHeld: { reason: "lost" } } : {}) };
   };
-  const deliver = (message, again = false) => {
-    if (closed || !messages.has(message.id)) return;
-    const prefix = [...handlers.keys()].find((name) => message.queueName.startsWith(name));
-    if (prefix === undefined) return later(() => deliver(message, again), 10);
+  // A message held for its sender: its first delivery runs in `consume()`,
+  // with what a delivery's handler returns meaning what it means there. One
+  // given back or never consumed is delivered as usual.
+  const heldHandle = (message) => {
+    let used = false;
+    return {
+      messageId: message.id,
+      leaseExpiresAt: new Date(Date.now() + 30_000),
+      async consume(handler) {
+        if (used) throw new Error("a held message is consumed once");
+        used = true;
+        message.consumed = true;
+        await run(message, handler);
+      },
+      async release(delaySeconds = 0) {
+        if (used) throw new Error("a held message is consumed once");
+        used = true;
+        later(() => deliver(message), delaySeconds * 1000);
+      },
+    };
+  };
+  // One delivery of `message` to `handler`, then its acknowledgement.
+  const run = (message, handler, again = false) => {
     if (!again) message.attempt += 1;
     const attempt = message.attempt;
-    Promise.resolve()
-      .then(() => handlers.get(prefix)(message.payload, { queueName: message.queueName, messageId: message.id, attempt }))
+    return Promise.resolve()
+      .then(() => handler(message.payload, { queueName: message.queueName, messageId: message.id, attempt, deliveryCount: attempt }))
       .then((result) => {
         // world-vercel sends the next message before it acknowledges this
         // one, so a delivery the queue has since handed on still sends it.
@@ -68,6 +101,12 @@ function createBroker({ retryMs }) {
       }, () => {
         if (attempt === message.attempt) later(() => deliver(message), retryMs);
       });
+  };
+  const deliver = (message, again = false) => {
+    if (closed || !messages.has(message.id)) return;
+    const prefix = [...handlers.keys()].find((name) => message.queueName.startsWith(name));
+    if (prefix === undefined) return later(() => deliver(message, again), 10);
+    void run(message, handlers.get(prefix), again);
   };
   return {
     sent,
@@ -161,15 +200,18 @@ function withInBandFence(stored, { settleMs = 0 } = {}) {
  * The durability, a World at `dir` with that queue passed to world(), and its
  * broker. With `inBandFence`, `true` or `{ settleMs }`, the World has the
  * in-band writer fence, and `fence.creates` holds what each create was asked.
+ * With `hold`, "held" or "notHeld", the World's queue holds messages for
+ * their sender, and a send that asks for a hold gets it or is refused.
  */
-export async function queueWorldAt(dir, { retryMs = 20, inBandFence = false, ...options } = {}) {
+export async function queueWorldAt(dir, { retryMs = 20, inBandFence = false, hold, ...options } = {}) {
   const stored = createWorld({ dataDir: dir, recoverActiveRuns: false });
   await stored.start();
-  const broker = createBroker({ retryMs });
+  const broker = createBroker({ retryMs, hold });
   const fence = inBandFence ? withInBandFence(stored, inBandFence === true ? {} : inBandFence) : null;
   const instance = {
     ...stored,
     ...(fence ? { events: fence.events, capabilities: fence.capabilities } : {}),
+    ...(hold === undefined ? {} : { capabilities: { ...(fence?.capabilities ?? stored.capabilities), experimental_queueHold: true } }),
     queue: broker.queue,
     createQueueHandler: broker.createQueueHandler,
     registerHandler: broker.registerHandler,
