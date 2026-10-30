@@ -3109,20 +3109,22 @@ fn appendHistoryTurnProjection(
 }
 
 /// Copies one leftover steered message into `taken`, marking its receipt
-/// not_applied; it drops and traces the message when it can't.
+/// not_applied, as a discarded one's is; it drops and traces the message
+/// when it can't.
 fn keepLeftover(alloc: std.mem.Allocator, taken: *std.ArrayList(WorkerRuntime.LeftoverMessage), prompt: QueuedPrompt) void {
     const receipt = prompt.steering_receipt.?;
-    receipt.state.store(.not_applied, .seq_cst);
-    const item = copyLeftover(alloc, receipt.operation_id, prompt.prompt) catch {
-        debug_trace.eventf("worker", "leftover_steering_dropped", .{ .turn_id = prompt.turn_id }, "operation={s} reason=out_of_memory", .{receipt.operation_id});
-        return;
+    const kept = blk: {
+        const item = copyLeftover(alloc, receipt.operation_id, prompt.prompt) catch break :blk false;
+        taken.append(alloc, item) catch {
+            item.deinit(alloc);
+            break :blk false;
+        };
+        break :blk true;
     };
-    taken.append(alloc, item) catch {
-        debug_trace.eventf("worker", "leftover_steering_dropped", .{ .turn_id = prompt.turn_id }, "operation={s} reason=out_of_memory", .{receipt.operation_id});
-        item.deinit(alloc);
-        return;
-    };
-    debug_trace.eventf("subagent", "feedback_handed_back", .{}, "operation={s}", .{receipt.operation_id});
+    if (!kept) debug_trace.eventf("worker", "leftover_steering_dropped", .{ .turn_id = prompt.turn_id }, "operation={s} reason=out_of_memory", .{receipt.operation_id});
+    if (receipt.state.cmpxchgStrong(.queued, .not_applied, .seq_cst, .seq_cst) == null) {
+        debug_trace.eventf("subagent", "feedback_not_applied", .{}, "operation={s} reason={s}", .{ receipt.operation_id, if (kept) "handed_back" else "out_of_memory" });
+    }
 }
 
 fn copyLeftover(alloc: std.mem.Allocator, operation_id: []const u8, text: []const u8) !WorkerRuntime.LeftoverMessage {
