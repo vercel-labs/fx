@@ -441,6 +441,49 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "a subagent knows who started it, so a turn typed on its screen can message main",
+    async () => {
+      await withFx((body) => {
+        if (!isMainRequest(body)) {
+          if (latestUserText(body).includes("SWITCH_TELL_MAIN") || body.includes('"child_up"')) {
+            // It reaches main through "parent" only once its prompt says who started it.
+            if (!body.includes('You are the subagent \\"reviewer\\", started by \\"main\\"')) {
+              return text("child_lost", "SWITCH_CHILD_NO_ROLE");
+            }
+            if (!body.includes('"child_up"')) {
+              return toolCall("child_up", "subagent", {
+                request: { action: "message", agent: "parent", message: "SWITCH_HI_FROM_CHILD" },
+              });
+            }
+            return text("child_told", "SWITCH_CHILD_TOLD_MAIN");
+          }
+          return text("child_answer", "SWITCH_CHILD_FIRST");
+        }
+        if (body.includes("SWITCH_HI_FROM_CHILD")) return text("main_got_hi", "SWITCH_MAIN_GOT_HI");
+        if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "reviewer", message: "SWITCH_TASK look for nothing" },
+          });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
+        await session.waitForComposer(15_000);
+        await moveAgent(session, 1);
+        await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("SWITCH_TELL_MAIN tell main I said hi");
+        await session.waitForText("SWITCH_CHILD_TOLD_MAIN", 30_000);
+        await moveAgent(session, -1);
+        await session.waitForText("SWITCH_MAIN_GOT_HI", 30_000);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a message main sent into a subagent's turn whose request fails still reaches the subagent",
     async () => {
       let childCalls = 0;
@@ -492,13 +535,17 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     "a report from a subagent's own subagent wakes it, and what it does then reaches main",
     async () => {
       let leadReported = false;
+      let helperRole = false;
+      let leadRole = false;
       await withFx(async (body) => {
         if (!isMainRequest(body)) {
           if (userTexts(body).some((text) => text.includes("SWITCH_HELPER_TASK"))) {
+            helperRole ||= body.includes('You are the subagent \\"helper\\", started by \\"lead\\"');
             // The helper answers once lead's turn has ended, so its report wakes lead.
             await until("lead's report", () => leadReported);
             return text("helper", "SWITCH_HELPER_DONE");
           }
+          leadRole ||= body.includes('You are the subagent \\"lead\\", started by \\"main\\"');
           if (body.includes("SWITCH_HELPER_DONE")) return text("lead_after", "SWITCH_LEAD_SAW_HELPER");
           if (!body.includes('"lead_sub"')) {
             return toolCall("lead_sub", "subagent", {
@@ -520,6 +567,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // Lead's woken turn was its work too, and reported to main.
         await session.waitForText("SWITCH_MAIN_SAW_LEAD_AFTER", 30_000);
       });
+      // Each subagent's system prompt names it and the agent that started it.
+      expect(leadRole).toBe(true);
+      expect(helperRole).toBe(true);
     },
     TIMEOUT,
   );

@@ -1441,6 +1441,7 @@ pub fn Runtime(comptime App: type) type {
                 prompt_arena.allocator(),
                 subagent_agent_adapter.childProfile(resolver, child_id),
                 app.promptPolicy(root).system_prompt,
+                try childRole(app, prompt_arena.allocator(), child_id, resolver, turn),
                 overlay,
             ));
             errdefer alloc.free(system_prompt);
@@ -1454,6 +1455,33 @@ pub fn Runtime(comptime App: type) type {
         /// The instance at the top of child `child_id`'s tree, or the first
         /// instance while the child is not yet bound to the host that
         /// started it. Takes the authority lock, which guards the list.
+        /// A subagent's name and its parent's, for its system prompt. The
+        /// parent is the agent whose own subagent host has `resolver`: `main`
+        /// for main or an instance, otherwise that subagent. Names belong to
+        /// `arena`.
+        fn childRole(
+            app: *App,
+            arena: Allocator,
+            child_id: []const u8,
+            resolver: *subagent_authority.Resolver,
+            turn: ?*subagent_execution.TurnContext,
+        ) Allocator.Error!subagent_agent_adapter.Role {
+            var role: subagent_agent_adapter.Role = .{
+                .name = if (turn) |value| value.child_name orelse child_id else child_id,
+                .parent = profiles.main_name,
+            };
+            if (comptime !@hasField(App, "child_agents")) return role;
+            app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+            defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+            for (app.child_agents.items) |child| {
+                if (std.mem.eql(u8, child.id, child_id) and child.name.len > 0) role.name = try arena.dupe(u8, child.name);
+                if (child.agent.role != .subagent) continue;
+                const own_host = child.agent.session_persistence.subagent_host orelse continue;
+                if (own_host.authorityResolver() == resolver) role.parent = try arena.dupe(u8, child.displayName());
+            }
+            return role;
+        }
+
         fn rootInstanceOfChild(app: *App, child_id: []const u8) *AppAgent {
             if (comptime !@hasField(App, "child_agents")) return &app.main_agent;
             app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
