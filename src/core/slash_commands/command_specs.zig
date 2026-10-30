@@ -1962,9 +1962,7 @@ test "top-level help index covers visible commands once" {
     const registry = testTopLevelRegistry();
     for (registry.specs) |spec| {
         const expected: usize = if (spec.hidden_from_top_level_help) 0 else 1;
-        const got = topLevelIndexOccurrences(registry, spec.kind);
-        if (got != expected) std.debug.print("DEBUG index kind={any} token={s} hidden={} expected={d} got={d}\n", .{ spec.kind, spec.token, spec.hidden_from_top_level_help, expected, got });
-        try std.testing.expectEqual(expected, got);
+        try std.testing.expectEqual(expected, topLevelIndexOccurrences(registry, spec.kind));
     }
 }
 
@@ -2199,11 +2197,9 @@ test "top-level help renders every visible command token" {
 
     for (registry.specs) |spec| {
         if (spec.hidden_from_top_level_help) continue;
-        if (!topLevelHelpContainsCommandToken(text, spec.token)) std.debug.print("DEBUG token missing kind={any} token={s}\n", .{ spec.kind, spec.token });
         try std.testing.expect(topLevelHelpContainsCommandToken(text, spec.token));
     }
     for (registry.notes) |note| {
-        if (std.mem.find(u8, text, note) == null) std.debug.print("DEBUG note missing={s}\n", .{note});
         try std.testing.expect(std.mem.find(u8, text, note) != null);
     }
 }
