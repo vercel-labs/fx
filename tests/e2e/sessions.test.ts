@@ -169,6 +169,22 @@ async function waitForLog(fixture: Fixture, id: string, needle: string, timeoutM
   throw new Error(`log never contained ${needle}`);
 }
 
+/// Waits until the parent's log holds `children` child finishes, a commit
+/// after the last of them, and no open turn: a child's report starts a turn
+/// of its own or joins a running one, so the parent is idle only then.
+async function waitForSettledChild(fixture: Fixture, id: string, children: number, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  let kinds: string[] = [];
+  while (Date.now() < deadline) {
+    kinds = logLines(fixture.home, id).map((line) => line.kind);
+    const finished = kinds.lastIndexOf("child_finished");
+    const count = (kind: string) => kinds.filter((value) => value === kind).length;
+    if (count("child_finished") >= children && kinds.lastIndexOf("turn_committed") > finished && count("turn_started") === count("turn_committed")) return;
+    await Bun.sleep(25);
+  }
+  throw new Error(`the parent never settled after its child: ${kinds.join(",")}`);
+}
+
 function spawnAsk(fixture: Fixture, gateway: any, args: string[]) {
   const child = spawn(FX_BIN, ["ask", "--json", "--auto", ...args], {
     cwd: fixture.workspace,
@@ -3449,7 +3465,8 @@ test.skipIf(!tmuxAvailable())("an app killed after a named child finished resume
     const roots = rootSessionIds(fixture.home);
     expect(roots).toHaveLength(1);
     const id = roots[0]!;
-    await waitForLog(fixture, id, "turn_committed");
+    // The child's report runs on main too; kill once that is saved.
+    await waitForSettledChild(fixture, id, 1);
     Bun.spawnSync(["kill", "-9", String(app.session.processPid())]);
     await app.session.kill();
 
@@ -3457,6 +3474,7 @@ test.skipIf(!tmuxAvailable())("an app killed after a named child finished resume
     const resumed = await startApp(fixture, gateway, ["--resume", id], true, { FX_PERMISSION_MODE: "auto" });
     await resumed.session.sendText("Ask the worker again.");
     await scrollbackContains(resumed.session, "PARENT_2_DONE");
+    await waitForSettledChild(fixture, id, 2);
     await resumed.session.waitForComposer(TIMEOUT);
     await quitApp(resumed);
 
