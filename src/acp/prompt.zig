@@ -429,7 +429,7 @@ const AcpContext = struct {
     }
 
     /// Shows a subagent's report on the call that sent its work, after that
-    /// call's own result (decision 26).
+    /// call's own result.
     fn sendReportUpdate(self: *AcpContext, tool_call_id: []const u8, text: []const u8) !void {
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
@@ -2909,9 +2909,9 @@ fn handBackUnplacedSteersLocked(alloc: Allocator, backing: Allocator, session: *
 /// failed left no history entry, so its progress is cleared: resuming is for
 /// turns a stopped process left open. Inputs it took and never placed are
 /// settled. `session_alloc` owns the journal's state.
-/// The prompt ends once its whole tree is quiet (decision 17): each report
+/// The prompt ends once its whole tree is quiet: each report
 /// or message a subagent sends runs as the session's next turn, and a report
-/// shows on the subagent call that sent the work (decision 26). A turn
+/// shows on the subagent call that sent the work. A turn
 /// started this way is the child's, never the user's, so its root context
 /// stays the user's own request. Returns the prompt's outcome when a turn
 /// ends it early.

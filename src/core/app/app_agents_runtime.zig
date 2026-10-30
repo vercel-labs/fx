@@ -566,7 +566,7 @@ pub fn Runtime(comptime App: type) type {
             // A user turn the last run opened and never saw end ends now.
             if (child.agent.child_run) |*previous| endUserWork(app.alloc, host, previous, .cancelled, "");
             // The turn is a work in the parent's log, as every child turn is.
-            if (host.beginUserWork(app.alloc, child.id)) |work_id| run.user_work_id = work_id;
+            if (host.beginUserWork(app.alloc, child.id, &child.agent.worker)) |work_id| run.turn_work_id = work_id;
             installChildRun(app, child, run);
             debug_trace.eventf("host", "own_turn_admitted", .{}, "agent={s} model={s} permission_mode={s}", .{
                 child.id,
@@ -762,7 +762,7 @@ pub fn Runtime(comptime App: type) type {
         /// restart can be shown too. One added here starts its
         /// worker on its first run.
         fn syncChildList(app: *App) !void {
-            // Every instance's tree, a restored one's too (decision 20): the
+            // Every instance's tree, a restored one's too: the
             // first instance's host, then each later instance's own. Taken
             // first, since adding a child grows the list.
             var hosts: std.ArrayList(*subagent_tool_host.Runtime) = .empty;
@@ -1432,7 +1432,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// Holds a place for a subagent's message in the queue it goes to,
         /// on the subagent's thread, so a full queue refuses it while its
-        /// call waits (`Mailbox.tla` `Refuse`). `deliverReport` uses the
+        /// call waits. `deliverReport` uses the
         /// place; `releaseMessagePlace` gives it back.
         pub fn reserveMessagePlace(app: *App, host: *subagent_tool_host.Runtime, from_owner: bool) subagent_tool_host.PostReportError!void {
             const receiver = blk: {
@@ -1870,14 +1870,14 @@ pub fn Runtime(comptime App: type) type {
             const run = if (agent.child_run) |*value| value else return;
             const saved_work = session_mod.historyTurnWorkId(finished.turn);
             debug_trace.eventf("host", "child_turn_saved", .{}, "agent={s} work_id={s}", .{ run.child_id, saved_work orelse "none" });
-            if (saved_work == null and run.user_work_id.len > 0) {
+            if (saved_work == null and run.turn_work_id.len > 0) {
                 const host = hostOf(app, hostedOf(app, agent) orelse return) orelse return;
                 const reply = switch (finished.turn) {
                     .assistant => |value| value.assistant,
                     .interrupted => |value| value.assistant orelse "",
                     .compacted_summary => "",
                 };
-                endAndFollowUserWork(app.alloc, host, run, userWorkOutcome(run, finished.terminal_outcome orelse .completed), reply);
+                endAndFollowUserWork(app.alloc, host, run, &agent.worker, userWorkOutcome(run, finished.terminal_outcome orelse .completed), reply);
                 return;
             }
             if (!run.inFlight()) return;
@@ -1894,11 +1894,30 @@ pub fn Runtime(comptime App: type) type {
         /// (`subagent_tool_host.Runtime.userStopped`). A turn the user
         /// started there has no parent's messages behind it.
         pub fn noteUserStop(app: *App, agent: *AppAgent) void {
-            const run = runInFlight(app, agent) orelse return;
+            const run = runInFlight(app, agent) orelse userWorkRun(app, agent) orelse return;
             const child = hostedOf(app, agent) orelse return;
             const host = hostOf(app, child) orelse return;
             const drop = agent.worker.dropAgentMessages(std.heap.c_allocator);
             host.userStopped(run.child_id, drop.from_parent);
+        }
+
+        /// Opens the work for a turn `agent`'s worker began on a subagent with
+        /// none going for it: the user's prompt it
+        /// took after a hand-off, or a report from the subagent's own child.
+        /// The parent's messages and the user's turns started on an idle
+        /// subagent open theirs where they are admitted.
+        pub fn noteChildTurnBegun(app: *App, agent: *AppAgent, author: types.MessageAuthor) void {
+            if (runInFlight(app, agent) != null or userWorkRun(app, agent) != null) return;
+            const child = hostedOf(app, agent) orelse return;
+            if (child.agent.role != .subagent) return;
+            const run = if (child.agent.child_run) |*value| value else return;
+            const started_by: subagent_reports.StartedBy = switch (author) {
+                .user => .user,
+                .child => .child,
+                else => return,
+            };
+            const host = hostOf(app, child) orelse return;
+            if (host.beginTurnWork(app.alloc, child.id, started_by, &child.agent.worker)) |work_id| run.turn_work_id = work_id;
         }
 
         /// Records how a child's turn ended. The finished turn can still be
@@ -1922,9 +1941,9 @@ pub fn Runtime(comptime App: type) type {
                 const run = if (child.agent.child_run) |*value| value else continue;
                 const outcome = run.ended_as orelse continue;
                 if (hasPendingWork(child) or child.agent.worker.isProcessing()) continue;
-                if (run.user_work_id.len > 0) {
+                if (run.turn_work_id.len > 0) {
                     const host = hostOf(app, child) orelse continue;
-                    endAndFollowUserWork(app.alloc, host, run, userWorkOutcome(run, outcome), "");
+                    endAndFollowUserWork(app.alloc, host, run, &child.agent.worker, userWorkOutcome(run, outcome), "");
                     continue;
                 }
                 if (!run.inFlight()) continue;
@@ -1932,12 +1951,12 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// The run of a turn the user started on a subagent's screen, while
-        /// the work it opened in the parent's log is open.
+        /// The run of a turn the parent didn't start, while the work it
+        /// opened in the parent's log is open.
         fn userWorkRun(app: *App, agent: *AppAgent) ?*agents.ChildRun {
             if (agent == &app.main_agent) return null;
             const run = if (agent.child_run) |*value| value else return null;
-            return if (run.user_work_id.len > 0) run else null;
+            return if (run.turn_work_id.len > 0) run else null;
         }
 
         fn userWorkOutcome(run: *const agents.ChildRun, outcome: types.TurnPresentationOutcome) subagent_child_state.Outcome {
@@ -1952,19 +1971,19 @@ pub fn Runtime(comptime App: type) type {
         /// Ends a user's turn's work. When the turn handed off to the user's
         /// image or `$skill`, that prompt runs next as the user's own turn,
         /// so it opens the next work.
-        fn endAndFollowUserWork(alloc: std.mem.Allocator, host: *subagent_tool_host.Runtime, run: *agents.ChildRun, outcome: subagent_child_state.Outcome, reply: []const u8) void {
+        fn endAndFollowUserWork(alloc: std.mem.Allocator, host: *subagent_tool_host.Runtime, run: *agents.ChildRun, worker: *worker_runtime.WorkerRuntime, outcome: subagent_child_state.Outcome, reply: []const u8) void {
             const handed_off = run.handed_off;
             endUserWork(alloc, host, run, outcome, reply);
-            if (handed_off) if (host.beginUserWork(alloc, run.child_id)) |work_id| {
-                run.user_work_id = work_id;
+            if (handed_off) if (host.beginUserWork(alloc, run.child_id, worker)) |work_id| {
+                run.turn_work_id = work_id;
             };
         }
 
         /// Ends the work a user's turn opened, once.
         fn endUserWork(alloc: std.mem.Allocator, host: *subagent_tool_host.Runtime, run: *agents.ChildRun, outcome: subagent_child_state.Outcome, reply: []const u8) void {
-            if (run.user_work_id.len == 0) return;
-            const work_id = run.user_work_id;
-            run.user_work_id = &.{};
+            if (run.turn_work_id.len == 0) return;
+            const work_id = run.turn_work_id;
+            run.turn_work_id = &.{};
             run.ended_as = null;
             run.handed_off = false;
             defer alloc.free(work_id);

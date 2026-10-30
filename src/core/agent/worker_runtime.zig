@@ -612,11 +612,14 @@ pub const WorkerRuntime = struct {
     pending_permission_review: ?*const diff_mod.FileReview = null,
     pending_permission_waiting: bool = false,
     /// Set for a subagent's agent. Feedback main steered into a turn, which
-    /// carries a receipt, goes back to the subagent host when the turn ends
-    /// without taking it, and the host delivers it as new work. Any other
-    /// steering left over, such as the user's, runs as the next turn, as it
-    /// does on main.
+    /// carries a receipt, is set aside when the turn ends without taking it,
+    /// and the subagent's owner takes it back (`takeLeftoverMessages`) to run
+    /// as new work. Any other steering left over, such as the user's, runs
+    /// as the next turn, as it does on main.
     hands_back_leftover_feedback: bool = false,
+    /// The feedback `hands_back_leftover_feedback` set aside, oldest first,
+    /// until the owner takes it.
+    held_back_feedback: std.ArrayList(QueuedPrompt) = .empty,
     pending_question_shared: ?OwnedQuestionBatch = null,
     pending_question_response: QuestionResponse = .pending,
     agent_turn_settings: AgentTurnSettings = .{},
@@ -715,6 +718,8 @@ pub const WorkerRuntime = struct {
 
         for (self.queued_prompts.items) |prompt| discardQueuedPrompt(alloc, prompt, &.{});
         self.queued_prompts.deinit(alloc);
+        for (self.held_back_feedback.items) |prompt| freeQueuedPrompt(alloc, prompt);
+        self.held_back_feedback.deinit(alloc);
         types.freeHistoryTurnSlice(alloc, self.queued_history);
         if (self.queued_context_compaction) |task| freeContextCompactionTask(alloc, task);
 
@@ -1051,7 +1056,7 @@ pub const WorkerRuntime = struct {
     }
 
     /// Holds a place in this queue for another agent's message that is on
-    /// its way, so the sender can be told at once (`Mailbox.tla` `Room`).
+    /// its way, so the sender can be told at once.
     /// False when the queue already holds `agent_frame.queue_cap` of them,
     /// waiting or on their way. `postMail` of that message uses the place;
     /// `releaseAgentMessage` gives it back when the message never comes.
@@ -1079,7 +1084,7 @@ pub const WorkerRuntime = struct {
 
     /// Whether turn `turn_id` ended by handing off to a waiting image or
     /// `$skill`, rather than by a cancel. A subagent's work then ends as
-    /// done, as an instance's turn does (`Mailbox.tla` `ChildTurnEnd`).
+    /// done, as an instance's turn does.
     pub fn handedOff(self: *WorkerRuntime, turn_id: u64) bool {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
@@ -1523,7 +1528,7 @@ pub const WorkerRuntime = struct {
     /// What a user's stop on a subagent's screen dropped from its queue.
     pub const MessageDrop = struct { from_parent: usize = 0, total: usize = 0 };
 
-    /// A user's stop on this subagent's own screen (decision 10): drops the
+    /// A user's stop on this subagent's own screen: drops the
     /// other agents' messages still waiting in its queue, also the parent's
     /// waiting to join the turn the stop ends, whose receipt then reads not
     /// applied. Reports stay, since they are owed, and so do the user's own
@@ -1532,6 +1537,13 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         var drop: MessageDrop = .{};
+        for (self.held_back_feedback.items) |prompt| {
+            debug_trace.eventf("worker", "agent_message_dropped", .{ .turn_id = prompt.turn_id }, "author={s} reason=stopped_by_user", .{@tagName(prompt.author)});
+            drop.total += 1;
+            if (prompt.author == .parent) drop.from_parent += 1;
+            freeQueuedPrompt(alloc, prompt);
+        }
+        self.held_back_feedback.clearRetainingCapacity();
         var index: usize = 0;
         while (index < self.queued_prompts.items.len) {
             const queued = self.queued_prompts.items[index];
@@ -1550,6 +1562,57 @@ pub const WorkerRuntime = struct {
             self.queued_history = &.{};
         }
         return drop;
+    }
+
+    /// A message main steered into a turn that the turn never took.
+    pub const LeftoverMessage = struct {
+        operation_id: []u8,
+        text: []u8,
+
+        pub fn deinit(self: LeftoverMessage, alloc: std.mem.Allocator) void {
+            alloc.free(self.operation_id);
+            alloc.free(self.text);
+        }
+    };
+
+    /// Takes the feedback main steered into the turn that just ended and the
+    /// turn never took, oldest first: what `hands_back_leftover_feedback` set
+    /// aside, then what still waits in the queue. Their receipts read
+    /// not_applied. A message it can't copy is dropped and traced. Caller
+    /// owns the result.
+    pub fn takeLeftoverMessages(self: *WorkerRuntime, alloc: std.mem.Allocator) []LeftoverMessage {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        var taken: std.ArrayList(LeftoverMessage) = .empty;
+        for (self.held_back_feedback.items) |prompt| {
+            keepLeftover(alloc, &taken, prompt);
+            freeQueuedPrompt(alloc, prompt);
+        }
+        self.held_back_feedback.clearRetainingCapacity();
+        var index: usize = 0;
+        var removed = false;
+        while (index < self.queued_prompts.items.len) {
+            const prompt = self.queued_prompts.items[index];
+            if (!prompt.delivery.isSteering() or prompt.steering_receipt == null) {
+                index += 1;
+                continue;
+            }
+            keepLeftover(alloc, &taken, prompt);
+            freeQueuedPrompt(alloc, self.queued_prompts.orderedRemove(index));
+            removed = true;
+        }
+        if (removed and self.queued_prompts.items.len == 0) {
+            types.freeHistoryTurnSlice(alloc, self.queued_history);
+            self.queued_history = &.{};
+        }
+        return taken.toOwnedSlice(alloc) catch {
+            for (taken.items) |item| {
+                debug_trace.eventf("worker", "leftover_steering_dropped", .{}, "operation={s} reason=out_of_memory", .{item.operation_id});
+                item.deinit(alloc);
+            }
+            taken.deinit(alloc);
+            return &.{};
+        };
     }
 
     pub fn removeQueuedPrompt(
@@ -1680,9 +1743,14 @@ pub const WorkerRuntime = struct {
                 index += 1;
                 continue;
             }
-            debug_trace.eventf("worker", "leftover_steering_dropped", .{ .turn_id = prompt.turn_id }, "bytes={d} reason=turn_ended", .{prompt.prompt.len});
-            freeQueuedPrompt(alloc, self.queued_prompts.orderedRemove(index));
+            const held = self.queued_prompts.orderedRemove(index);
             dropped = true;
+            self.held_back_feedback.append(alloc, held) catch {
+                debug_trace.eventf("worker", "leftover_steering_dropped", .{ .turn_id = held.turn_id }, "bytes={d} reason=out_of_memory", .{held.prompt.len});
+                freeQueuedPrompt(alloc, held);
+                continue;
+            };
+            debug_trace.eventf("worker", "leftover_steering_held", .{ .turn_id = held.turn_id }, "bytes={d} reason=turn_ended", .{held.prompt.len});
         }
         // The queue's history belongs to its first prompt. With none left the
         // next prompt queued supplies its own; otherwise it stays with the
@@ -3038,6 +3106,29 @@ fn appendHistoryTurnProjection(
     }
     next[retained.len] = try types.dupeHistoryTurn(alloc, turn);
     return next;
+}
+
+/// Copies one leftover steered message into `taken`, marking its receipt
+/// not_applied; it drops and traces the message when it can't.
+fn keepLeftover(alloc: std.mem.Allocator, taken: *std.ArrayList(WorkerRuntime.LeftoverMessage), prompt: QueuedPrompt) void {
+    const receipt = prompt.steering_receipt.?;
+    receipt.state.store(.not_applied, .seq_cst);
+    const item = copyLeftover(alloc, receipt.operation_id, prompt.prompt) catch {
+        debug_trace.eventf("worker", "leftover_steering_dropped", .{ .turn_id = prompt.turn_id }, "operation={s} reason=out_of_memory", .{receipt.operation_id});
+        return;
+    };
+    taken.append(alloc, item) catch {
+        debug_trace.eventf("worker", "leftover_steering_dropped", .{ .turn_id = prompt.turn_id }, "operation={s} reason=out_of_memory", .{receipt.operation_id});
+        item.deinit(alloc);
+        return;
+    };
+    debug_trace.eventf("subagent", "feedback_handed_back", .{}, "operation={s}", .{receipt.operation_id});
+}
+
+fn copyLeftover(alloc: std.mem.Allocator, operation_id: []const u8, text: []const u8) !WorkerRuntime.LeftoverMessage {
+    const operation = try alloc.dupe(u8, operation_id);
+    errdefer alloc.free(operation);
+    return .{ .operation_id = operation, .text = try alloc.dupe(u8, text) };
 }
 
 pub fn freeQueuedPrompt(alloc: std.mem.Allocator, prompt: QueuedPrompt) void {
@@ -7996,7 +8087,7 @@ fn makePromptWithHistory(alloc: std.mem.Allocator, text: []const u8, earlier: []
 
 test "a subagent's worker hands back feedback its cancelled turn left and starts the next run with that run's history" {
     const alloc = std.testing.allocator;
-    var receipt = SteeringReceipt{};
+    var receipt = SteeringReceipt{ .operation_id = "op-1" };
     var runtime = WorkerRuntime{ .hands_back_leftover_feedback = true };
     defer runtime.deinit(alloc);
     runtime.worker_processing = true;
@@ -8007,12 +8098,23 @@ test "a subagent's worker hands back feedback its cancelled turn left and starts
     try runtime.admitInteractivePrompt(alloc, feedback);
     runtime.finishProcessing();
 
-    // Not run as a turn of its own: the host sends it again, and the queue's
-    // history goes with it.
+    // Not run as a turn of its own: it waits for the subagent's owner to
+    // take it back and send it again, and the queue's history goes with it.
     try std.testing.expectEqual(@as(?QueuedPrompt, null), try runtime.tryTakeNextPrompt(alloc));
-    try std.testing.expectEqual(SteeringDelivery.not_applied, receipt.state.load(.seq_cst));
+    try std.testing.expectEqual(SteeringDelivery.queued, receipt.state.load(.seq_cst));
     try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
     try std.testing.expectEqual(@as(usize, 0), runtime.queued_history.len);
+    {
+        const taken = runtime.takeLeftoverMessages(alloc);
+        defer {
+            for (taken) |item| item.deinit(alloc);
+            alloc.free(taken);
+        }
+        try std.testing.expectEqual(@as(usize, 1), taken.len);
+        try std.testing.expectEqualStrings("op-1", taken[0].operation_id);
+        try std.testing.expectEqualStrings("feedback", taken[0].text);
+        try std.testing.expectEqual(SteeringDelivery.not_applied, receipt.state.load(.seq_cst));
+    }
 
     // The next run's prompt heads the queue with its own history.
     try runtime.admitInteractivePrompt(alloc, try makePromptWithHistory(alloc, "next run", "current"));
@@ -8022,6 +8124,54 @@ test "a subagent's worker hands back feedback its cancelled turn left and starts
     try std.testing.expect(!job.delivery.isSteering());
     try std.testing.expectEqual(@as(usize, 1), job.history.len);
     try std.testing.expectEqualStrings("current", job.history[0].interrupted.user.text);
+}
+
+test "the owner takes back main's feedback a turn never took, and leaves the user's" {
+    const alloc = std.testing.allocator;
+    var receipt = SteeringReceipt{ .operation_id = "op-2" };
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+    var feedback = try makePrompt(alloc, "from main", "model");
+    feedback.steering_receipt = &receipt;
+    try runtime.admitInteractivePrompt(alloc, feedback);
+    try runtime.admitInteractivePrompt(alloc, try makePrompt(alloc, "from the user", "model"));
+    runtime.finishProcessing();
+
+    const taken = runtime.takeLeftoverMessages(alloc);
+    defer {
+        for (taken) |item| item.deinit(alloc);
+        alloc.free(taken);
+    }
+    try std.testing.expectEqual(@as(usize, 1), taken.len);
+    try std.testing.expectEqualStrings("op-2", taken[0].operation_id);
+    try std.testing.expectEqualStrings("from main", taken[0].text);
+    try std.testing.expectEqual(SteeringDelivery.not_applied, receipt.state.load(.seq_cst));
+    // The user's text stays for the next turn.
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+}
+
+test "the user's stop drops main's feedback a subagent's worker set aside" {
+    const alloc = std.testing.allocator;
+    var receipt = SteeringReceipt{ .operation_id = "op-3" };
+    var runtime = WorkerRuntime{ .hands_back_leftover_feedback = true };
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+    var feedback = try makePrompt(alloc, "from main", "model");
+    feedback.steering_receipt = &receipt;
+    feedback.author = .parent;
+    try runtime.admitInteractivePrompt(alloc, feedback);
+    runtime.finishProcessing();
+    try std.testing.expectEqual(@as(?QueuedPrompt, null), try runtime.tryTakeNextPrompt(alloc));
+
+    const drop = runtime.dropAgentMessages(alloc);
+    try std.testing.expectEqual(@as(usize, 1), drop.from_parent);
+    const taken = runtime.takeLeftoverMessages(alloc);
+    defer alloc.free(taken);
+    try std.testing.expectEqual(@as(usize, 0), taken.len);
+    try std.testing.expectEqual(SteeringDelivery.not_applied, receipt.state.load(.seq_cst));
 }
 
 test "a subagent's worker runs the user's steering its turn left as the next turn, as main does" {

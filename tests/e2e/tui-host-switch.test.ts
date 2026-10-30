@@ -67,6 +67,14 @@ async function until(what: string, done: () => boolean, ms = 30_000) {
   }
 }
 
+// A provider outage fx waits out and then sends the request again.
+function unavailable(): Response {
+  return new Response(JSON.stringify({ error: { message: "provider temporarily unavailable" } }), {
+    status: 503,
+    headers: { "content-type": "application/json", "retry-after": "1" },
+  });
+}
+
 // A reply the test holds back until it calls `release`.
 function held() {
   let release!: () => void;
@@ -428,6 +436,140 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // The turn typed there was the subagent's work too, and reported.
         await session.waitForText("SWITCH_MAIN_SAW_TYPED", 30_000);
       });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a message main sent into a subagent's turn whose request fails still reaches the subagent",
+    async () => {
+      let childCalls = 0;
+      let mainCalls = 0;
+      let resentAsItWas = false;
+      const first = held();
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          // The first request fails after main's second message joins the turn.
+          if (childCalls === 1) {
+            await first.promise;
+            return unavailable();
+          }
+          const took = userTexts(body).some((t) => t.includes("SWITCH_MORE"));
+          if (childCalls === 2) resentAsItWas = !took;
+          return text("child_more", took ? "SWITCH_CHILD_DID_MORE" : "SWITCH_CHILD_OTHER");
+        }
+        mainCalls += 1;
+        if (body.includes("SWITCH_CHILD_DID_MORE")) return text("main_saw_more", "SWITCH_MAIN_SAW_MORE");
+        if (mainCalls === 1) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "worker", message: "SWITCH_TASK work slowly" },
+          });
+        }
+        if (mainCalls === 2) {
+          // Sent while the subagent's turn runs, so it joins that turn.
+          await until("the subagent's turn", () => childCalls >= 1);
+          return toolCall("main_more", "subagent", {
+            request: { action: "message", agent: "worker", message: "SWITCH_MORE one more thing" },
+          });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+        first.release();
+        // fx waits out the outage and sends the same request again, then the
+        // turn takes main's message, and the subagent's report says so.
+        await session.waitForText("SWITCH_MAIN_SAW_MORE", 30_000);
+        expect(resentAsItWas).toBe(true);
+        expect(childCalls).toBe(3);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a report from a subagent's own subagent wakes it, and what it does then reaches main",
+    async () => {
+      let leadReported = false;
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          if (userTexts(body).some((text) => text.includes("SWITCH_HELPER_TASK"))) {
+            // The helper answers once lead's turn has ended, so its report wakes lead.
+            await until("lead's report", () => leadReported);
+            return text("helper", "SWITCH_HELPER_DONE");
+          }
+          if (body.includes("SWITCH_HELPER_DONE")) return text("lead_after", "SWITCH_LEAD_SAW_HELPER");
+          if (!body.includes('"lead_sub"')) {
+            return toolCall("lead_sub", "subagent", {
+              request: { action: "message", agent: "helper", message: "SWITCH_HELPER_TASK" },
+            });
+          }
+          return text("lead_started", "SWITCH_LEAD_STARTED");
+        }
+        if (body.includes("SWITCH_LEAD_STARTED")) leadReported = true;
+        if (body.includes("SWITCH_LEAD_SAW_HELPER")) return text("main_saw_after", "SWITCH_MAIN_SAW_LEAD_AFTER");
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "lead", message: "SWITCH_LEAD_TASK" },
+          });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        // Lead's woken turn was its work too, and reported to main.
+        await session.waitForText("SWITCH_MAIN_SAW_LEAD_AFTER", 30_000);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's stop ends a turn typed on a subagent's screen, which then owes no report",
+    async () => {
+      const typed = held();
+      let typedAsked = false;
+      const bodies = await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          if (latestUserText(body).includes("SWITCH_TYPED_SLOW")) {
+            typedAsked = true;
+            await typed.promise;
+            return text("child_typed", "SWITCH_CHILD_LATE");
+          }
+          return text("child_answer", "SWITCH_CHILD_FIRST");
+        }
+        if (body.includes("Stopped reviewer: its turn ended")) return text("main_stopped", "SWITCH_MAIN_STOPPED");
+        if (body.includes("reviewer was not working")) return text("main_not", "SWITCH_MAIN_NOT_STOPPED");
+        if (latestUserText(body).includes("SWITCH_USER_STOP")) {
+          return toolCall("main_stop", "subagent", { request: { action: "stop", agent: "reviewer" } });
+        }
+        if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "reviewer", message: "SWITCH_TASK look", report: "every_turn" },
+          });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
+        await session.waitForComposer(15_000);
+        await moveAgent(session, 1);
+        await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("SWITCH_TYPED_SLOW please");
+        await until("the typed turn", () => typedAsked);
+        await moveAgent(session, -1);
+        await session.waitForComposer(15_000);
+        await session.sendText("SWITCH_USER_STOP stop the reviewer");
+        await session.waitForText("SWITCH_MAIN_STOPPED", 30_000);
+        typed.release();
+        await session.waitForComposer(15_000);
+        await Bun.sleep(1_000);
+      });
+      // Main's own stop answers the typed turn, though the subagent reports every turn.
+      expect(bodies.some((body) => body.includes('\\"outcome\\":\\"cancelled\\"'))).toBe(false);
+      expect(bodies.some((body) => body.includes("SWITCH_MAIN_NOT_STOPPED"))).toBe(false);
     },
     TIMEOUT,
   );
