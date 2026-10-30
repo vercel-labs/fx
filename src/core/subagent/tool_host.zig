@@ -771,6 +771,12 @@ pub const Runtime = struct {
 
     const UserDrop = struct { child_id: []u8, count: usize };
 
+    /// fx is quitting: the works its quit cancels say so in their reports.
+    /// Call before the quit stops any of this host's children.
+    pub fn noteQuitting(self: *Runtime) void {
+        self.managed.noteQuitting();
+    }
+
     /// Esc on a subagent's own screen while it works for its parent
     /// (decision 10, `Mailbox.tla` `StopChild` by the user): the turn ends as
     /// the Esc ends it, and the parent's messages waiting for the subagent
@@ -778,6 +784,7 @@ pub const Runtime = struct {
     /// and `from_queue` the subagent's own queue already dropped. The parent
     /// learns of the drop from the stopped work's report, or else a notice.
     pub fn userStopped(self: *Runtime, child_id: []const u8, from_queue: usize) void {
+        self.managed.noteUserStop(child_id);
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
         const dropped = self.dropPendingLocked(child_id, "stopped_by_user") + from_queue;
@@ -840,7 +847,7 @@ pub const Runtime = struct {
         };
         for (pending) |item| {
             debug_trace.eventf("mailbox", "report_resumed", .{}, "session={s} child={s} work_id={s} outcome={s}", .{ parent.id(), item.child_id, item.work_id, @tagName(item.outcome) });
-            self.postReport(.{ .child_id = item.child_id, .work_id = item.work_id, .outcome = item.outcome, .report_owed = true });
+            self.postReport(.{ .child_id = item.child_id, .work_id = item.work_id, .outcome = item.outcome, .report_owed = true, .end = item.end });
         }
     }
 
@@ -873,6 +880,7 @@ pub const Runtime = struct {
             .outcome = end.outcome,
             .output = output,
             .dropped = dropped,
+            .end = end.end,
         } }) catch |err| {
             // A report stays owed in the log; a notice is lost.
             debug_trace.eventf("mailbox", "report_held", .{}, "child={s} work_id={s} reason={s} notice={}", .{ end.child_id, end.work_id, @errorName(err), notice });
@@ -881,7 +889,14 @@ pub const Runtime = struct {
         if (notice) {
             debug_trace.eventf("mailbox", "notice_queued", .{}, "to={s} from={s} dropped={d}", .{ self.ownerName(), end.child_id, dropped });
         } else {
-            debug_trace.eventf("mailbox", "report_queued", .{}, "to={s} from={s} work={s} dropped={d}", .{ self.ownerName(), end.child_id, end.work_id, dropped });
+            debug_trace.eventf("mailbox", "report_queued", .{}, "to={s} from={s} work={s} dropped={d} started_by={s} cause={s}", .{
+                self.ownerName(),
+                end.child_id,
+                end.work_id,
+                dropped,
+                @tagName(end.end.started_by),
+                if (end.end.cause) |cause| @tagName(cause) else "none",
+            });
         }
     }
 
@@ -895,7 +910,7 @@ pub const Runtime = struct {
         return switch (end.outcome) {
             .completed => text orelse "The subagent ended its turn without a reply.",
             .failed => formatFailedResult(a, if (end.failure) |*failure| failure.view() else null, text),
-            .cancelled => withPartial(a, "Its turn was cancelled before it finished.", text),
+            .cancelled => withPartial(a, cancelledSentence(end.end.cause), text),
             .interrupted => withPartial(a, "fx stopped before it finished.", text),
             .lost => lost_result,
         };
@@ -1011,8 +1026,8 @@ pub const Runtime = struct {
     /// Ends the work `beginUserWork` opened, with the turn's `reply`, and
     /// starts the parent's next message waiting for the child.
     pub fn endUserWork(self: *Runtime, child_id: []const u8, work_id: []const u8, outcome: child_state.Outcome, reply: []const u8) void {
-        const owed = self.managed.finishUserWork(child_id, work_id, outcome);
-        self.deliverEnd(.{ .child_id = child_id, .work_id = work_id, .outcome = outcome, .report_owed = owed, .reply = reply });
+        const finished = self.managed.finishUserWork(child_id, work_id, outcome);
+        self.deliverEnd(.{ .child_id = child_id, .work_id = work_id, .outcome = outcome, .report_owed = finished.report_owed, .reply = reply, .end = finished.end });
         self.admission_mutex.lockUncancelable(io_mod.getIo());
         defer self.admission_mutex.unlock(io_mod.getIo());
         for (self.user_works.items, 0..) |id, index| {
@@ -1584,12 +1599,15 @@ const MailboxFixture = struct {
     mutex: std.Io.Mutex = .init,
     /// "agent work_id outcome output" per report, in arrival order. Owned.
     reports: std.ArrayList([]u8) = .empty,
+    /// Each report's facts, in the same order.
+    ends: std.ArrayList(child_state.EndFacts) = .empty,
     /// When set, each report is also posted to this worker, as `fx ask`'s sink does.
     worker: ?*worker_runtime.WorkerRuntime = null,
 
     fn deinit(self: *MailboxFixture) void {
         for (self.reports.items) |line| std.testing.allocator.free(line);
         self.reports.deinit(std.testing.allocator);
+        self.ends.deinit(std.testing.allocator);
     }
 
     fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
@@ -1620,7 +1638,9 @@ const MailboxFixture = struct {
         errdefer std.testing.allocator.free(line);
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
+        try self.ends.ensureUnusedCapacity(std.testing.allocator, 1);
         try self.reports.append(std.testing.allocator, line);
+        self.ends.appendAssumeCapacity(report.end);
         if (self.worker) |worker| {
             worker.postMail(std.testing.allocator, .{
                 .prompt = try std.testing.allocator.dupe(u8, line),
@@ -1800,6 +1820,39 @@ test "a user's stop drops the parent's messages waiting for a subagent, and its 
     try std.testing.expect(std.mem.find(u8, line, " cancelled ") != null);
     try std.testing.expect(std.mem.endsWith(u8, line, " dropped=2"));
     try std.testing.expectEqual(@as(usize, 0), runtime.user_dropped.items.len);
+    // It says who stopped it, so the parent needn't guess.
+    try std.testing.expectEqual(child_state.EndFacts{ .cause = .user_stop }, fixture.ends.items[0]);
+    try std.testing.expect(std.mem.find(u8, line, "The user stopped its turn before it finished.") != null);
+}
+
+test "a work fx's quit cancels says so in its report" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{ .hold = true };
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "working" } }, "call-1", null);
+    try waitForRuns(&fixture, 1);
+    const child_id = try reviewerId(runtime, arena);
+    runtime.noteQuitting();
+    try runtime.managed.cancel(child_id);
+    try waitUntilQuiet(runtime);
+
+    try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
+    try std.testing.expectEqual(child_state.EndFacts{ .cause = .fx_quit }, fixture.ends.items[0]);
+    try std.testing.expect(std.mem.find(u8, fixture.reports.items[0], " cancelled fx quit before it finished.") != null);
+    // The log keeps the cause for a report posted after a restart.
+    var lock = runtime.managed.state_store.acquireLock();
+    defer lock.release();
+    var registry = try runtime.managed.state_store.load(arena);
+    try std.testing.expectEqual(child_state.EndFacts{ .cause = .fx_quit }, registry.findPersistent("reviewer").?.last_end);
 }
 
 test "a user's stop of a work that owes no report tells the parent of its dropped messages" {
@@ -1868,6 +1921,9 @@ test "a turn the user starts on an idle subagent is a work, and reports its repl
     try std.testing.expect(std.mem.find(u8, line, work_id) != null);
     try std.testing.expect(std.mem.endsWith(u8, line, " completed USER_TURN_REPLY"));
     try std.testing.expect(!runtime.anyWorking());
+    // The parent learns the user started it, not the parent.
+    try std.testing.expectEqual(reports.StartedBy.parent, fixture.ends.items[0].started_by);
+    try std.testing.expectEqual(child_state.EndFacts{ .started_by = .user }, fixture.ends.items[1]);
 }
 
 test "a user's turn under the final rule reports only when it fails" {
@@ -2331,6 +2387,15 @@ fn queuedResult(buf: []u8, agent: []const u8) []const u8 {
 }
 
 /// `note`, then the text the subagent had written, when it wrote any.
+/// What a cancelled work's report says about its end.
+fn cancelledSentence(cause: ?child_state.Cause) []const u8 {
+    const known = cause orelse return "Its turn was cancelled before it finished.";
+    return switch (known) {
+        .user_stop => "The user stopped its turn before it finished.",
+        .fx_quit => "fx quit before it finished.",
+    };
+}
+
 fn withPartial(a: Allocator, note: []const u8, partial: ?[]const u8) ![]const u8 {
     const text = partial orelse return note;
     return a.print("{s}\n\nWhat it had written:\n{s}", .{ note, text });

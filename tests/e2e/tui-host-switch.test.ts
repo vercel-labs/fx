@@ -317,7 +317,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
             request: { action: "message", agent: "worker", message: "SWITCH_MORE one more thing" },
           });
         }
-        if (body.includes('\\"dropped\\":1')) return text("main_saw", "SWITCH_MAIN_SAW_DROP");
+        // The report counts the drop and says the user stopped the turn.
+        if (body.includes('\\"dropped\\":1') && body.includes('\\"cause\\":\\"user_stop\\"')) {
+          return text("main_saw", "SWITCH_MAIN_SAW_DROP");
+        }
         return text("main_done", "SWITCH_MAIN_DONE");
       }, async (session) => {
         await session.sendText("SWITCH_USER");
@@ -342,6 +345,56 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
+    "a subagent's work that /quit cuts short reports after a resume, saying fx quit",
+    async () => {
+      let mainCalls = 0;
+      let childCalls = 0;
+      const child = held();
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          // The subagent's turn is still waiting when fx quits.
+          await child.promise;
+          return text("child_answer", "SWITCH_CHILD_LATE");
+        }
+        mainCalls += 1;
+        if (body.includes('\\"cause\\":\\"fx_quit\\"')) return text("main_saw_quit", "SWITCH_MAIN_SAW_QUIT");
+        if (mainCalls === 1) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "worker", message: "SWITCH_QUIT_TASK work slowly" },
+          });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session, { home, launch }) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_DONE", 30_000);
+        const deadline = Date.now() + 15_000;
+        while (childCalls === 0 && Date.now() < deadline) await Bun.sleep(50);
+        expect(childCalls).toBe(1);
+        await session.waitForComposer(15_000);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+        child.release();
+
+        // The parent is the saved session that holds main's answer.
+        const sessions = join(home, ".fx", "sessions", "v2");
+        const holds = (path: string, marker: string): boolean => readdirSync(path).some((entry) => {
+          const full = join(path, entry);
+          return statSync(full).isDirectory() ? holds(full, marker) : readFileSync(full, "latin1").includes(marker);
+        });
+        const parents = readdirSync(sessions).filter((id) =>
+          !id.startsWith(".") && statSync(join(sessions, id)).isDirectory() && holds(join(sessions, id), "SWITCH_MAIN_DONE"));
+        expect(parents.length).toBe(1);
+
+        // The resumed session delivers the report the quit left owed.
+        const resumed = await launch(`--resume ${parents[0]}`);
+        await resumed.waitForText("SWITCH_MAIN_SAW_QUIT", 30_000);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a turn typed on a subagent's screen reports to main when the subagent reports every turn",
     async () => {
       let mainCalls = 0;
@@ -351,7 +404,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           return text("child_answer", "SWITCH_CHILD_FIRST");
         }
         mainCalls += 1;
-        if (body.includes("SWITCH_CHILD_ANSWERED_TYPED")) return text("main_saw_typed", "SWITCH_MAIN_SAW_TYPED");
+        // The report says the user started that turn, not main.
+        if (body.includes("SWITCH_CHILD_ANSWERED_TYPED") && body.includes('\\"started_by\\":\\"user\\"')) {
+          return text("main_saw_typed", "SWITCH_MAIN_SAW_TYPED");
+        }
         if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
         if (mainCalls === 1) {
           return toolCall("main_sub", "subagent", {

@@ -213,6 +213,8 @@ pub const ReportPost = struct {
     text: []u8,
     /// A report's count of the parent's messages a user's stop dropped.
     dropped: usize = 0,
+    /// Who started a report's work and why it was cancelled.
+    end: subagent_child_state.EndFacts = .{},
 
     fn create(host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery) !*ReportPost {
         const post = try handoff_alloc.create(ReportPost);
@@ -237,6 +239,7 @@ pub const ReportPost = struct {
             .outcome = if (delivery == .report) delivery.report.outcome else .completed,
             .text = try handoff_alloc.dupe(u8, text),
             .dropped = if (delivery == .report) delivery.report.dropped else 0,
+            .end = if (delivery == .report) delivery.report.end else .{},
         };
         return post;
     }
@@ -250,13 +253,15 @@ pub const ReportPost = struct {
     }
 };
 
-test "a report's hand-off keeps the count of messages a user's stop dropped" {
+test "a report's hand-off keeps the count a user's stop dropped, and who started and stopped its work" {
     // Only the host's address is kept, so any will do.
     var host: subagent_tool_host.Runtime = undefined;
-    const post = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .cancelled, .output = "", .dropped = 2 } });
+    const end: subagent_child_state.EndFacts = .{ .started_by = .user, .cause = .user_stop };
+    const post = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .cancelled, .output = "", .dropped = 2, .end = end } });
     defer post.destroy();
     try std.testing.expectEqual(@as(usize, 2), post.dropped);
     try std.testing.expectEqual(subagent_child_state.Outcome.cancelled, post.outcome);
+    try std.testing.expectEqual(end, post.end);
 }
 
 /// Queues a host's delivery for the main loop, without waiting.
@@ -1334,6 +1339,7 @@ pub fn Runtime(comptime App: type) type {
         /// The list is in start order, so walking it backwards closes each
         /// subagent's own subagents before it.
         pub fn shutdownChildren(app: *App) void {
+            noteQuitting(app);
             attach(app, null);
             closeHandoffs(app);
             var index = app.child_agents.items.len;
@@ -1359,6 +1365,7 @@ pub fn Runtime(comptime App: type) type {
         /// worker is joined before its run ends, so no worker still uses the
         /// run's turn context once the slot thread frees it.
         pub fn stopChildren(app: *App, comptime mode: enum { cooperative, force }) void {
+            noteQuitting(app);
             // Main's own shutdown writes to its transcript, so it goes back on
             // screen first.
             attach(app, null);
@@ -1465,6 +1472,7 @@ pub fn Runtime(comptime App: type) type {
                     .outcome = post.outcome,
                     .output = post.text,
                     .dropped = post.dropped,
+                    .end = post.end,
                 }, limit),
                 .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit) catch |err| {
                     target.worker.releaseAgentMessage();
@@ -1531,6 +1539,16 @@ pub fn Runtime(comptime App: type) type {
             defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
             child.parent_host = host;
             if (child.agent.root_instance == null) child.agent.root_instance = rootInstance(app, child);
+        }
+
+        /// Tells every subagent host that fx is quitting, before any child
+        /// stops, so the works the quit cancels say so in their reports.
+        fn noteQuitting(app: *App) void {
+            if (app_session_runtime.Runtime(App).subagentHost(app)) |host| host.noteQuitting();
+            for (app.child_agents.items) |child| {
+                const host = child.agent.session_persistence.subagent_host orelse continue;
+                host.noteQuitting();
+            }
         }
 
         /// The host whose resolver is `resolver`: main's, or one of the

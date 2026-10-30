@@ -48,7 +48,12 @@ pub fn reportable(rule: Rule, started_by: StartedBy, outcome: child_state.Outcom
 
 /// A report a subagent owes its parent that the parent has not taken.
 /// Strings borrow from the report lines it was folded from.
-pub const Pending = struct { child_id: []const u8, work_id: []const u8, outcome: child_state.Outcome };
+pub const Pending = struct {
+    child_id: []const u8,
+    work_id: []const u8,
+    outcome: child_state.Outcome,
+    end: child_state.EndFacts = .{},
+};
 
 /// Folds a parent's report lines, oldest first, into the reports it is
 /// still owed (`Mailbox.tla` `OwedReports`). A finish owes one when its
@@ -83,6 +88,7 @@ pub const PendingFold = struct {
                     .child_id = finished.child,
                     .work_id = finished.work_id,
                     .outcome = child_state.fxOutcome(finished.outcome),
+                    .end = child_state.finishEndFacts(finished.data),
                 });
             },
             .taken => |taken| if (self.findPending(taken.child, taken.work_id)) |index| {
@@ -135,6 +141,9 @@ pub const Report = struct {
     /// stop dropped (decision 10). A report with no `work_id` is the notice
     /// of that drop when the stopped work owed no report.
     dropped: usize = 0,
+    /// Who started the work and why it was cancelled, so the parent
+    /// needn't guess.
+    end: child_state.EndFacts = .{},
 };
 
 const header = agent_frame.report_header;
@@ -185,6 +194,10 @@ pub fn message(alloc: Allocator, report: Report, max_output_bytes: usize) error{
         .outcome = @tagName(report.outcome),
         .output = output,
         .dropped = if (report.dropped > 0) @as(?usize, report.dropped) else null,
+        // A turn the child's own child woke works for the parent, as one
+        // the parent sent would, so only the user's turns are named.
+        .started_by = if (report.end.started_by == .user) @as(?[]const u8, "user") else null,
+        .cause = if (report.end.cause) |cause| @as(?[]const u8, @tagName(cause)) else null,
     }, .{ .emit_null_optional_fields = false }, &out.writer) catch return error.OutOfMemory;
     out.writer.writeByte('\n') catch return error.OutOfMemory;
     return out.toOwnedSlice();
@@ -270,6 +283,37 @@ pub fn card(alloc: Allocator, user: types.UserTurn) error{OutOfMemory}!?Card {
     const title = (try cardTitle(alloc, user.text)) orelse return null;
     defer alloc.free(title);
     return .{ .line = try alloc.print("{s} (ctrl+o to view)", .{title}), .text = user.text };
+}
+
+test "a report names a turn the user started and why its work was cancelled" {
+    const alloc = std.testing.allocator;
+    const named = try message(alloc, .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .cancelled, .output = "", .end = .{ .started_by = .user, .cause = .user_stop } }, 4096);
+    defer alloc.free(named);
+    try std.testing.expect(std.mem.find(u8, named, "\"started_by\":\"user\"") != null);
+    try std.testing.expect(std.mem.find(u8, named, "\"cause\":\"user_stop\"") != null);
+    // The parent's own work, or a turn the child's child woke, names neither.
+    for ([_]StartedBy{ .parent, .child }) |started_by| {
+        const plain = try message(alloc, .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .completed, .output = "done", .end = .{ .started_by = started_by } }, 4096);
+        defer alloc.free(plain);
+        try std.testing.expect(std.mem.find(u8, plain, "started_by") == null);
+        try std.testing.expect(std.mem.find(u8, plain, "cause") == null);
+    }
+}
+
+test "a pending report keeps who started its work and why it was cancelled" {
+    const alloc = std.testing.allocator;
+    const L = session_adapter.ReportLine;
+    var lines = [_]L{
+        .{ .spawned = .{ .child = "c1", .work_id = "w1", .data = marked_spawn } },
+        .{ .finished = .{ .child = "c1", .work_id = "w1", .outcome = .cancelled, .data = "{\"report\":true,\"by\":\"user\",\"cause\":\"fx_quit\"}" } },
+        .{ .spawned = .{ .child = "c1", .work_id = "w2", .data = marked_spawn } },
+        .{ .finished = .{ .child = "c1", .work_id = "w2", .outcome = .ok, .data = "{\"report\":true}" } },
+    };
+    const pending = try pendingReports(alloc, &lines);
+    defer alloc.free(pending);
+    try std.testing.expectEqual(@as(usize, 2), pending.len);
+    try std.testing.expectEqual(child_state.EndFacts{ .started_by = .user, .cause = .fx_quit }, pending[0].end);
+    try std.testing.expectEqual(child_state.EndFacts{}, pending[1].end);
 }
 
 test "a card names who sent a report or message, and how the work ended" {
