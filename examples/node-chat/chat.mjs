@@ -1,8 +1,8 @@
 import { createInterface } from 'node:readline'
 import { stdin, stdout } from 'node:process'
-import { createFxAgent } from 'libfx'
+import { createFxEngine } from 'libfx'
 
-const agent = await createFxAgent({
+const agent = await createFxEngine({
   apiKey: process.env.AI_GATEWAY_API_KEY,
   model: 'openai/gpt-4.1-nano',
 })
