@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const approval_registry = @import("approval_registry.zig");
 const reports = @import("reports.zig");
@@ -222,6 +223,9 @@ pub const Owner = struct {
     }
 
     pub fn start(self: *Owner, child_id: []const u8) StartError!StartResult {
+        // A single-threaded build, such as the WebAssembly terminal, has no
+        // slot threads, and its subagent tool is off, so no child is started.
+        if (comptime builtin.single_threaded) return error.ThreadSpawnFailed;
         start_attempt: while (true) {
             const finished = blk: {
                 self.mutex.lockUncancelable(io_mod.getIo());
