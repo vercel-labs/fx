@@ -289,7 +289,7 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
       const pane = await session.waitForText("←→ change", 5_000);
       expect(pane).toContain("Settings");
       expect(pane).toContain("↑↓ navigate");
-      expect(pane).not.toContain("[All]");
+      expect(pane).toContain("[All]");
     },
     TIMEOUT,
   );
@@ -309,16 +309,16 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
     "unknown and removed commands show errors",
     async () => {
       session = await launchAndWait();
-      for (const [index, command] of [
+      const unknown = [
         "/foo",
         "/changes",
         "/review",
-        "/pr",
         "/issue",
         "/history",
         "/rules",
         "/models",
-      ].entries()) {
+      ];
+      for (const [index, command] of unknown.entries()) {
         await session.sendText(command);
         const expectedCount = index + 1;
         const deadline = Date.now() + 5_000;
@@ -333,6 +333,14 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
           scrollback.split("Unknown command. Try /help.").length - 1,
         ).toBe(expectedCount);
       }
+
+      // `/pr` is a prefix of `/provider`, so Enter takes that command from
+      // the slash menu instead of reporting an unknown one.
+      await session.sendText("/pr");
+      await session.waitForPane((pane) => /^┃ \/provider$/m.test(pane) && pane.includes("codex"), 5_000);
+      expect(
+        (await session.captureFullScrollback()).split("Unknown command. Try /help.").length - 1,
+      ).toBe(unknown.length);
     },
     TIMEOUT,
   );
