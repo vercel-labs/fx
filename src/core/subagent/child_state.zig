@@ -51,6 +51,18 @@ pub const Phase = enum { idle, running, awaiting_approval, interrupted, finished
 /// v2 parent's reopen repair records it (D33).
 pub const Outcome = enum { completed, failed, cancelled, interrupted, lost };
 
+/// Why a work ended cancelled, when fx knows: the user stopped its turn,
+/// or fx quit while it ran.
+pub const Cause = enum { user_stop, fx_quit };
+
+/// Who started a finished work and why it was cancelled. A finish that
+/// owes a report saves them, so a report posted after a restart still
+/// says so.
+pub const EndFacts = struct {
+    started_by: reports.StartedBy = .parent,
+    cause: ?Cause = null,
+};
+
 pub const ActiveWork = struct {
     id: []u8,
     request_fingerprint: [32]u8 = @splat(0),
@@ -135,6 +147,9 @@ pub const Child = struct {
     /// Whether the last finished work owes the parent a report, recorded
     /// on its `child_finished` line.
     last_report_owed: bool = false,
+    /// Who started the last finished work and why it was cancelled, kept
+    /// only when it owes a report.
+    last_end: EndFacts = .{},
     /// When the child reports back on its own. Set by its parent's
     /// messages, and recorded on each spawn line.
     report_rule: reports.Rule = .final,
@@ -181,6 +196,7 @@ pub const Child = struct {
             .last_outcome = self.last_outcome,
             .last_failure = self.last_failure,
             .last_report_owed = self.last_report_owed,
+            .last_end = self.last_end,
             .report_rule = self.report_rule,
         };
     }
@@ -404,11 +420,11 @@ pub const Registry = struct {
         outcome: Outcome,
         failure: ?types.ModelFailureDiagnostic,
     ) !void {
-        return self.finishWithReport(alloc, child_id, work_id, outcome, failure, false);
+        return self.finishWithReport(alloc, child_id, work_id, outcome, failure, false, .{});
     }
 
     /// Finishes `work_id`, recording whether its end owes the parent a
-    /// report (`reports.reportable`).
+    /// report (`reports.reportable`), and for one that does, `end`.
     pub fn finishWithReport(
         self: *Registry,
         alloc: Allocator,
@@ -417,6 +433,7 @@ pub const Registry = struct {
         outcome: Outcome,
         failure: ?types.ModelFailureDiagnostic,
         report_owed: bool,
+        end: EndFacts,
     ) !void {
         const child = self.findById(child_id) orelse return error.ChildNotFound;
         const active = child.active orelse return error.StaleWork;
@@ -429,6 +446,7 @@ pub const Registry = struct {
         child.last_outcome = outcome;
         child.last_failure = failure;
         child.last_report_owed = report_owed;
+        child.last_end = if (report_owed) end else .{};
         child.active.?.deinit(alloc);
         child.active = null;
         child.phase = switch (child.kind) {
@@ -693,23 +711,69 @@ pub fn finishOwesFlag(data: ?[]const u8) ?bool {
 }
 
 /// fx's data on a `child_finished` line. Older fx skips `report`, and a
-/// line without it owes nothing, so an upgrade wakes no parent.
+/// line without it owes nothing, so an upgrade wakes no parent. `by` names
+/// who started a work the parent didn't, and `cause` why it was
+/// cancelled; a line that owes no report has neither.
 const FinishData = struct {
     failure: ?[]const u8 = null,
     report: ?bool = null,
+    by: ?[]const u8 = null,
+    cause: ?[]const u8 = null,
 };
+
+/// Pure: the facts a finish line's `by` and `cause` name. A value this fx
+/// doesn't know reads as the default.
+fn endFactsOf(by: ?[]const u8, cause: ?[]const u8) EndFacts {
+    return .{
+        .started_by = if (by) |name| std.meta.stringToEnum(reports.StartedBy, name) orelse .parent else .parent,
+        .cause = if (cause) |name| std.meta.stringToEnum(Cause, name) else null,
+    };
+}
+
+/// Pure: who started the work a `child_finished` line's `data` ends, and
+/// why it was cancelled.
+pub fn finishEndFacts(data: ?[]const u8) EndFacts {
+    const bytes = data orelse return .{};
+    var buf: [256]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const Wire = struct { by: ?[]const u8 = null, cause: ?[]const u8 = null };
+    const wire = std.json.parseFromSliceLeaky(Wire, fba.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return .{};
+    return endFactsOf(wire.by, wire.cause);
+}
 
 /// The data for a finish with `failure` and `report_owed`, or null when it
 /// has neither, so a finish that owes nothing is written as before.
-fn finishData(arena: Allocator, failure: ?[]const u8, report_owed: bool) !?[]const u8 {
+fn finishData(arena: Allocator, failure: ?[]const u8, report_owed: bool, end: EndFacts) !?[]const u8 {
     if (failure == null and !report_owed) return null;
     var out: std.Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(
-        FinishData{ .failure = failure, .report = if (report_owed) true else null },
+        FinishData{
+            .failure = failure,
+            .report = if (report_owed) true else null,
+            .by = if (report_owed and end.started_by != .parent) @tagName(end.started_by) else null,
+            .cause = if (!report_owed) null else if (end.cause) |cause| @tagName(cause) else null,
+        },
         .{ .emit_null_optional_fields = false },
         &out.writer,
     );
     return out.written();
+}
+
+test "a finish that owes a report saves who started its work and why it was cancelled" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const end: EndFacts = .{ .started_by = .user, .cause = .fx_quit };
+    try std.testing.expectEqual(end, finishEndFacts((try finishData(arena, null, true, end)).?));
+    // A finish that owes nothing is written as before, and saves neither.
+    try std.testing.expect((try finishData(arena, null, false, end)) == null);
+    try std.testing.expectEqual(EndFacts{}, finishEndFacts((try finishData(arena, "boom", false, end)).?));
+    // The parent's own work writes no `by`.
+    try std.testing.expect(std.mem.find(u8, (try finishData(arena, null, true, .{})).?, "by") == null);
+    // An older fx's line, a value this fx doesn't know, and no data read as unknown.
+    try std.testing.expectEqual(EndFacts{}, finishEndFacts("{\"report\":true}"));
+    try std.testing.expectEqual(EndFacts{}, finishEndFacts("{\"report\":true,\"by\":\"robot\",\"cause\":\"meteor\"}"));
+    try std.testing.expectEqual(EndFacts{}, finishEndFacts(null));
 }
 
 /// Pure: the registry a v2 parent's folded children describe. The
@@ -786,6 +850,7 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
         .last_outcome = last_outcome,
         .last_failure = if (finish.failure) |text| types.ModelFailureDiagnostic.init(text) else null,
         .last_report_owed = finish.report orelse false,
+        .last_end = if (finish.report orelse false) endFactsOf(finish.by, finish.cause) else .{},
         .report_rule = if (spawn.report) |name| std.meta.stringToEnum(reports.Rule, name) orelse .final else .final,
     };
 }
@@ -809,7 +874,7 @@ fn planLines(arena: Allocator, old: Registry, next: Registry) ![]session_adapter
                     .child = after.id,
                     .work_id = work_id,
                     .outcome = try v2Outcome(after.last_outcome orelse return error.InvalidState),
-                    .data = try finishData(arena, if (after.last_failure) |failure| failure.view() else null, after.last_report_owed),
+                    .data = try finishData(arena, if (after.last_failure) |failure| failure.view() else null, after.last_report_owed, after.last_end),
                 } });
             }
         }
@@ -859,7 +924,7 @@ pub fn v1ImportLines(arena: Allocator, registry: Registry, has_log: []const bool
             .child = child.id,
             .work_id = work_id,
             .outcome = outcome,
-            .data = try finishData(arena, failure, false),
+            .data = try finishData(arena, failure, false, .{}),
         } });
     }
     return lines.toOwnedSlice(arena);
@@ -1513,7 +1578,7 @@ test "a finish that owes a report says so on its line, and the fold reads it bac
         next = try old.clone(alloc);
         const outcome: Outcome = if (case.failure != null) .failed else .completed;
         const failure: ?types.ModelFailureDiagnostic = if (case.failure) |text| types.ModelFailureDiagnostic.init(text) else null;
-        try next.finishWithReport(alloc, named, work_id, outcome, failure, case.owed);
+        try next.finishWithReport(alloc, named, work_id, outcome, failure, case.owed, .{});
         var copy = try next.children[0].clone(alloc);
         defer copy.deinit(alloc);
         try std.testing.expectEqual(case.owed, copy.last_report_owed);

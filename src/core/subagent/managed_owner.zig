@@ -39,6 +39,9 @@ const Slot = struct {
     shutdown: std.atomic.Value(bool) = .init(false),
     /// Set by the parent's `stop`, so the end owes no report.
     stopped_by_parent: bool = false,
+    /// Set when the user stops the turn on the child's screen, so its
+    /// report says who cancelled it.
+    stopped_by_user: bool = false,
     /// Set by the host once it has no next work for the slot, which then
     /// finishes. A start for the child waits for that.
     ending: bool = false,
@@ -99,6 +102,8 @@ pub const WorkEnd = struct {
     /// The work's reply, for a work the host can't find by its id: a turn
     /// the user started carries none in the child's log. Borrowed.
     reply: ?[]const u8 = null,
+    /// Who started the work and why it was cancelled, for its report.
+    end: child_state.EndFacts = .{},
 };
 
 /// The host's hook for a work's end, called on the child's slot thread with
@@ -127,6 +132,9 @@ pub const Owner = struct {
     /// report, since nobody is left to take one (`Mailbox.tla`
     /// `CloseInstance`). A quit leaves it false, so its reports stay owed.
     tree_closed: bool = false,
+    /// Set when fx starts to quit, so a work its quit cancels says so in
+    /// its report.
+    quitting: std.atomic.Value(bool) = .init(false),
     /// Told each time a work ends, set by the host.
     on_end: ?EndHook = null,
 
@@ -317,11 +325,43 @@ pub const Owner = struct {
         self.tree_closed = true;
     }
 
+    /// How a turn the user started ended: whether it owes the parent a
+    /// report, and what that report says of it.
+    pub const UserWorkEnd = struct { report_owed: bool, end: child_state.EndFacts };
+
     /// Finishes the work a turn the user started on the child's own screen
     /// opened (`tool_host.Runtime.beginUserWork`). Whether it owes the parent
     /// a report follows the child's rule for the user's turns.
-    pub fn finishUserWork(self: *Owner, child_id: []const u8, work_id: []const u8, outcome: child_state.Outcome) bool {
-        return self.finish(child_id, work_id, outcome, null, false, .user).report_owed;
+    pub fn finishUserWork(self: *Owner, child_id: []const u8, work_id: []const u8, outcome: child_state.Outcome) UserWorkEnd {
+        // Only the user's own stop or fx's quit cancels a turn the user started.
+        const end: child_state.EndFacts = .{ .started_by = .user, .cause = self.cancelCause(outcome, true) };
+        return .{ .report_owed = self.finish(child_id, work_id, outcome, null, false, end).report_owed, .end = end };
+    }
+
+    /// The user stopped the child's running turn on its screen, which its
+    /// report names as the cause.
+    pub fn noteUserStop(self: *Owner, child_id: []const u8) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
+            if (slot.completion == .running) slot.stopped_by_user = true;
+            return;
+        }
+    }
+
+    /// fx is quitting: the works its quit cancels say so in their reports.
+    pub fn noteQuitting(self: *Owner) void {
+        self.quitting.store(true, .seq_cst);
+    }
+
+    /// Why a work that ended with `outcome` was cancelled, when fx knows.
+    /// The user's stop wins over a quit that came after it.
+    fn cancelCause(self: *const Owner, outcome: child_state.Outcome, stopped_by_user: bool) ?child_state.Cause {
+        if (outcome != .cancelled) return null;
+        if (stopped_by_user) return .user_stop;
+        if (self.quitting.load(.seq_cst)) return .fx_quit;
+        return null;
     }
 
     /// The parent's `stop`: ends the child's running turn, which owes no
@@ -464,7 +504,8 @@ pub const Owner = struct {
 
     /// Finishes the work in the registry, recording whether its end owes
     /// the parent a report under the child's report rule and who started
-    /// it, unless the parent stopped it or the tree closed.
+    /// it, unless the parent stopped it or the tree closed, and for one
+    /// that does, `end`.
     fn finish(
         self: *Owner,
         child_id: []const u8,
@@ -472,7 +513,7 @@ pub const Owner = struct {
         outcome: child_state.Outcome,
         failure: ?types.ModelFailureDiagnostic,
         stopped_by_parent: bool,
-        started_by: reports.StartedBy,
+        end: child_state.EndFacts,
     ) Finished {
         var lock = self.state_store.acquireLock();
         defer lock.release();
@@ -482,8 +523,8 @@ pub const Owner = struct {
         };
         defer registry.deinit(self.alloc);
         const rule = if (registry.findById(child_id)) |child| child.report_rule else .final;
-        const owed = !self.tree_closed and reports.reportable(rule, started_by, outcome, stopped_by_parent);
-        registry.finishWithReport(self.alloc, child_id, work_id, outcome, failure, owed) catch |err| {
+        const owed = !self.tree_closed and reports.reportable(rule, end.started_by, outcome, stopped_by_parent);
+        registry.finishWithReport(self.alloc, child_id, work_id, outcome, failure, owed, end) catch |err| {
             debugFailure(child_id, "state_finish", err);
             return .{ .observation = null, .report_owed = false };
         };
@@ -504,6 +545,20 @@ fn destroySlot(owner: *Owner, slot: *Slot) void {
     std.debug.assert(slot.route_refs == 0);
     owner.alloc.free(slot.child_id);
     owner.alloc.destroy(slot);
+}
+
+test "a cancelled work's cause is the user's stop, else fx's quit, else unknown" {
+    var owner = Owner{ .alloc = std.testing.allocator, .children = undefined, .state_store = undefined, .services = undefined, .authority_resolver = undefined, .approvals = undefined };
+    const none: ?child_state.Cause = null;
+    try std.testing.expectEqual(none, owner.cancelCause(.cancelled, false));
+    try std.testing.expectEqual(@as(?child_state.Cause, .user_stop), owner.cancelCause(.cancelled, true));
+    try std.testing.expectEqual(none, owner.cancelCause(.completed, true));
+    owner.noteQuitting();
+    try std.testing.expectEqual(@as(?child_state.Cause, .fx_quit), owner.cancelCause(.cancelled, false));
+    // The user's stop came first.
+    try std.testing.expectEqual(@as(?child_state.Cause, .user_stop), owner.cancelCause(.cancelled, true));
+    // A crash or a lost child is its own outcome.
+    try std.testing.expectEqual(none, owner.cancelCause(.interrupted, false));
 }
 
 test "child feedback deduplicates operations and bounds queued receipts" {
@@ -578,7 +633,8 @@ fn slotMain(slot: *Slot) void {
         // Startup must not inspect the old slot between saved and in-memory completion.
         // Take owner before registry, matching cancellation and approval lock ordering.
         owner.mutex.lockUncancelable(io_mod.getIo());
-        const finished = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure, slot.stopped_by_parent, .parent);
+        const end: child_state.EndFacts = .{ .cause = owner.cancelCause(outcome.outcome, slot.stopped_by_user) };
+        const finished = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure, slot.stopped_by_parent, end);
         const closing = owner.closed or slot.shutdown.load(.seq_cst);
         owner.mutex.unlock(io_mod.getIo());
         const next = if (owner.on_end) |hook| hook.end_fn(hook.context, .{
@@ -587,12 +643,14 @@ fn slotMain(slot: *Slot) void {
             .outcome = outcome.outcome,
             .failure = outcome.failure,
             .report_owed = finished.report_owed,
+            .end = end,
         }) else false;
         owner.mutex.lockUncancelable(io_mod.getIo());
         if (next and !closing and !owner.closed and !slot.shutdown.load(.seq_cst)) {
             // The next work starts afresh: this one's stop is spent.
             slot.cancel.store(false, .seq_cst);
             slot.stopped_by_parent = false;
+            slot.stopped_by_user = false;
             slot.metrics = .{};
             owner.mutex.unlock(io_mod.getIo());
             continue;
