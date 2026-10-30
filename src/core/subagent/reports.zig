@@ -11,7 +11,7 @@ const agent_frame = @import("../shared/agent_frame.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// When a child reports back on its own (decision 8). Failures always report.
+/// When a child reports back on its own. Failures always report.
 pub const Rule = enum {
     /// When work its parent, or its own child, gave it ends. The default.
     final,
@@ -56,7 +56,7 @@ pub const Pending = struct {
 };
 
 /// Folds a parent's report lines, oldest first, into the reports it is
-/// still owed (`Mailbox.tla` `OwedReports`). A finish owes one when its
+/// still owed. A finish owes one when its
 /// line says so, or when crash repair closed a work this fx started as
 /// interrupted or lost: repair writes no fx data, and `Repair` always
 /// reports. A finish older fx wrote owes nothing, so an upgrade wakes no
@@ -132,13 +132,13 @@ pub const Report = struct {
     child_id: []const u8,
     work_id: []const u8,
     /// The tool call that sent the work, so a client can show the report on
-    /// it (decision 26). Empty when the host no longer knows it.
+    /// it. Empty when the host no longer knows it.
     call_id: []const u8 = "",
     outcome: child_state.Outcome,
     /// The child's last reply for the work, as it wrote it.
     output: []const u8,
     /// How many of the parent's messages waiting for the child the user's
-    /// stop dropped (decision 10). A report with no `work_id` is the notice
+    /// stop dropped. A report with no `work_id` is the notice
     /// of that drop when the stopped work owed no report.
     dropped: usize = 0,
     /// Who started the work and why it was cancelled, so the parent
@@ -204,7 +204,7 @@ pub fn message(alloc: Allocator, report: Report, max_output_bytes: usize) error{
 }
 
 /// The one line a screen shows for a report or message it received, such
-/// as "Report from reviewer: completed" (decision 25). Null when `text` is
+/// as "Report from reviewer: completed". Null when `text` is
 /// neither. Caller owns the result.
 pub fn cardTitle(alloc: Allocator, text: []const u8) error{OutOfMemory}!?[]u8 {
     const is_report = std.mem.startsWith(u8, text, header);
@@ -258,7 +258,7 @@ test "a report's sender is read back from its frame, and other text has none" {
 }
 
 /// What a screen shows for a turn a report or message started, live or
-/// resumed (decision 25): one short line, and the whole text in the full
+/// resumed: one short line, and the whole text in the full
 /// transcript. Free with `deinit`.
 pub const Card = struct {
     line: []u8,

@@ -846,7 +846,9 @@ pub fn Runtime(comptime App: type) type {
             return entry.question;
         }
 
-        fn noteTurnStarted(app: *App, agent: *AppAgent) void {
+        /// A turn began with `author`'s prompt.
+        fn noteTurnStarted(app: *App, agent: *AppAgent, author: types.MessageAuthor) void {
+            if (comptime @hasDecl(App, "noteChildTurnBegun")) App.noteChildTurnBegun(app, agent, author);
             if (offScreen(app, agent)) return;
             if (comptime @hasField(App, "program_status")) app.program_status.noteTurnStarted();
         }
@@ -1030,7 +1032,7 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         resetStream(app, agent, true);
-                        noteTurnStarted(app, agent);
+                        noteTurnStarted(app, agent, prompt.author);
                         agent.stream.active = true;
                         agent.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
@@ -1043,7 +1045,7 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         resetStream(app, agent, true);
-                        noteTurnStarted(app, agent);
+                        noteTurnStarted(app, agent, begin.prompt.author);
                         agent.stream.active = true;
                         agent.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
@@ -1060,7 +1062,7 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         resetStream(app, agent, true);
-                        noteTurnStarted(app, agent);
+                        noteTurnStarted(app, agent, .user);
                         agent.stream.active = true;
                         agent.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
@@ -1077,7 +1079,8 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         resetStream(app, agent, true);
-                        noteTurnStarted(app, agent);
+                        // A resumed request is the user's own, resent on resume.
+                        noteTurnStarted(app, agent, .user);
                         agent.stream.active = true;
                         agent.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
