@@ -9552,7 +9552,7 @@ describe("acp: model-independent", () => {
         // The parent's call, the child, the parent after its receipt, and the report turn.
         expect(gateway.requests).toHaveLength(4);
         expect(gateway.requests[0]!.body).toContain('"name":"subagent"');
-        // The report shows on the call that sent the work (decision 26).
+        // The report shows on the call that sent the work.
         const reportUpdate = reportUpdatesFor(result.messages, createId).at(-1);
         expect(JSON.stringify(reportUpdate)).toContain("child inspection complete");
         const dispatched = client.hookEvents.find(event => event.type === "delegation" && event.data.phase === "dispatched");

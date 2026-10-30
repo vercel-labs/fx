@@ -1848,7 +1848,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             null,
     };
     if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, job)) |early| return early;
-    // The ask ends once its whole tree is quiet (decision 17): each report
+    // The ask ends once its whole tree is quiet: each report
     // that arrives runs as the ask's next turn, as one wakes an idle main.
     while (ctx.subagent_host) |tree| {
         switch (tree.awaitMailOrQuiet(&ctx.worker, ctx.cancelFlag())) {

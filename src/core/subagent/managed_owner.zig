@@ -46,6 +46,9 @@ const Slot = struct {
     /// Set by the host once it has no next work for the slot, which then
     /// finishes. A start for the child waits for that.
     ending: bool = false,
+    /// The parent's messages the ended turn never took, as works of their
+    /// own, for the host to queue next. Owned; emptied after each work.
+    leftovers: std.ArrayList(child_state.ActiveWork) = .empty,
     worker: ?*worker_runtime.WorkerRuntime = null,
     /// True when `worker` is the child agent's own, which runs its later
     /// turns too: stopping the turn cancels it instead of shutting it down.
@@ -105,6 +108,10 @@ pub const WorkEnd = struct {
     reply: ?[]const u8 = null,
     /// Who started the work and why it was cancelled, for its report.
     end: child_state.EndFacts = .{},
+    /// The parent's messages the turn never took, for the host to queue as
+    /// the child's next work.
+    /// Borrowed for the call.
+    leftovers: []const child_state.ActiveWork = &.{},
 };
 
 /// The host's hook for a work's end, called on the child's slot thread with
@@ -130,8 +137,8 @@ pub const Owner = struct {
     feedback: std.ArrayList(*Feedback) = .empty,
     closed: bool = false,
     /// `/close` closed this owner's tree: works that end from now on owe no
-    /// report, since nobody is left to take one (`Mailbox.tla`
-    /// `CloseInstance`). A quit leaves it false, so its reports stay owed.
+    /// report, since nobody is left to take one. A quit leaves it false, so
+    /// its reports stay owed.
     tree_closed: bool = false,
     /// Set when fx starts to quit, so a work its quit cancels says so in
     /// its report.
@@ -329,17 +336,31 @@ pub const Owner = struct {
         self.tree_closed = true;
     }
 
-    /// How a turn the user started ended: whether it owes the parent a
-    /// report, and what that report says of it.
-    pub const UserWorkEnd = struct { report_owed: bool, end: child_state.EndFacts };
+    /// How a turn its parent didn't start ended: whether it owes the parent
+    /// a report, and what that report says of it.
+    pub const TurnWorkEnd = struct { report_owed: bool, end: child_state.EndFacts };
 
-    /// Finishes the work a turn the user started on the child's own screen
-    /// opened (`tool_host.Runtime.beginUserWork`). Whether it owes the parent
-    /// a report follows the child's rule for the user's turns.
-    pub fn finishUserWork(self: *Owner, child_id: []const u8, work_id: []const u8, outcome: child_state.Outcome) UserWorkEnd {
-        // Only the user's own stop or fx's quit cancels a turn the user started.
-        const end: child_state.EndFacts = .{ .started_by = .user, .cause = self.cancelCause(outcome, true) };
-        return .{ .report_owed = self.finish(child_id, work_id, outcome, null, false, end).report_owed, .end = end };
+    /// Who stopped a turn its parent didn't start.
+    pub const StoppedBy = enum { none, parent, user };
+
+    /// Finishes a work its parent didn't start (`tool_host.Runtime.beginTurnWork`):
+    /// the user's turn on the child's own screen, or one its own child's
+    /// report woke. Whether it owes the parent a report follows the child's
+    /// rule for that starter, and the parent's own stop owes none.
+    pub fn finishTurnWork(
+        self: *Owner,
+        child_id: []const u8,
+        work_id: []const u8,
+        outcome: child_state.Outcome,
+        started_by: reports.StartedBy,
+        stopped_by: StoppedBy,
+    ) TurnWorkEnd {
+        // Only the user, the parent, or fx's quit cancels a turn the user
+        // started, so one with no stop recorded is the user's.
+        const cause: ?child_state.Cause = if (stopped_by == .parent) null else self.cancelCause(outcome, stopped_by == .user) orelse
+            if (outcome == .cancelled and started_by == .user) .user_stop else null;
+        const end: child_state.EndFacts = .{ .started_by = started_by, .cause = cause };
+        return .{ .report_owed = self.finish(child_id, work_id, outcome, null, stopped_by == .parent, end).report_owed, .end = end };
     }
 
     /// The user stopped the child's running turn on its screen, which its
@@ -547,6 +568,7 @@ fn destroySlot(owner: *Owner, slot: *Slot) void {
     while (slot.waiters != 0) owner.waiters_changed.waitUncancelable(io_mod.getIo(), &owner.mutex);
     owner.mutex.unlock(io_mod.getIo());
     std.debug.assert(slot.route_refs == 0);
+    freeLeftovers(owner.alloc, slot);
     owner.alloc.free(slot.child_id);
     owner.alloc.destroy(slot);
 }
@@ -640,6 +662,10 @@ fn slotMain(slot: *Slot) void {
         const end: child_state.EndFacts = .{ .cause = owner.cancelCause(outcome.outcome, slot.stopped_by_user) };
         const finished = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure, slot.stopped_by_parent, end);
         const closing = owner.closed or slot.shutdown.load(.seq_cst);
+        // A stop drops the parent's messages, as do a quit and `/close`.
+        if (slot.stopped_by_parent or slot.stopped_by_user or closing or owner.tree_closed or owner.quitting.load(.seq_cst)) {
+            dropLeftovers(owner.alloc, slot, "stopped");
+        }
         owner.mutex.unlock(io_mod.getIo());
         const next = if (owner.on_end) |hook| hook.end_fn(hook.context, .{
             .child_id = slot.child_id,
@@ -648,8 +674,10 @@ fn slotMain(slot: *Slot) void {
             .failure = outcome.failure,
             .report_owed = finished.report_owed,
             .end = end,
+            .leftovers = slot.leftovers.items,
         }) else false;
         owner.mutex.lockUncancelable(io_mod.getIo());
+        freeLeftovers(owner.alloc, slot);
         if (next and !closing and !owner.closed and !slot.shutdown.load(.seq_cst)) {
             // The next work starts afresh: this one's stop is spent.
             slot.cancel.store(false, .seq_cst);
@@ -724,7 +752,7 @@ fn runOne(slot: *Slot) OneOutcome {
     if (slot.cancel.load(.seq_cst)) stopTurn(slot, .shutdown);
     owner.mutex.unlock(io_mod.getIo());
     turn.approval_worker_route = workerRoute(slot);
-    defer detachWorker(slot);
+    defer detachWorker(slot, &snapshot.active);
 
     var message = snapshot.active.queuedMessage(
         owner.alloc,
@@ -937,7 +965,57 @@ fn releaseWorkerRoute(raw: *anyopaque) void {
     if (slot.route_refs == 0) slot.route_changed.broadcast(io_mod.getIo());
 }
 
-fn detachWorker(slot: *Slot) void {
+/// Keeps the parent's messages the ended turn never took as works of their
+/// own, each with the ended work's evidence, for the host to queue next.
+/// Call with the owner's lock held.
+fn keepLeftovers(alloc: Allocator, slot: *Slot, worker: *worker_runtime.WorkerRuntime, active: *const child_state.ActiveWork) void {
+    const taken = worker.takeLeftoverMessages(alloc);
+    defer {
+        for (taken) |item| item.deinit(alloc);
+        alloc.free(taken);
+    }
+    for (taken) |item| {
+        var work = leftoverWork(alloc, active, item) catch {
+            debug_trace.eventf("mailbox", "dropped", .{}, "child={s} work_id={s} reason=out_of_memory", .{ slot.child_id, item.operation_id });
+            continue;
+        };
+        slot.leftovers.append(alloc, work) catch {
+            debug_trace.eventf("mailbox", "dropped", .{}, "child={s} work_id={s} reason=out_of_memory", .{ slot.child_id, item.operation_id });
+            work.deinit(alloc);
+        };
+    }
+}
+
+fn leftoverWork(alloc: Allocator, active: *const child_state.ActiveWork, item: worker_runtime.WorkerRuntime.LeftoverMessage) !child_state.ActiveWork {
+    var work = try active.clone(alloc);
+    errdefer work.deinit(alloc);
+    const id = try alloc.dupe(u8, item.operation_id);
+    errdefer alloc.free(id);
+    const message = try alloc.dupe(u8, item.text);
+    alloc.free(work.id);
+    alloc.free(work.message);
+    work.id = id;
+    work.message = message;
+    work.request_fingerprint = @splat(0);
+    work.created_at_ms = io_mod.milliTimestamp();
+    return work;
+}
+
+/// Drops the leftovers a stop, quit, or close ended, tracing each. Call
+/// with the owner's lock held.
+fn dropLeftovers(alloc: Allocator, slot: *Slot, reason: []const u8) void {
+    for (slot.leftovers.items) |work| {
+        debug_trace.eventf("mailbox", "dropped", .{}, "child={s} work_id={s} reason={s}", .{ slot.child_id, work.id, reason });
+    }
+    freeLeftovers(alloc, slot);
+}
+
+fn freeLeftovers(alloc: Allocator, slot: *Slot) void {
+    for (slot.leftovers.items) |*work| work.deinit(alloc);
+    slot.leftovers.clearAndFree(alloc);
+}
+
+fn detachWorker(slot: *Slot, active: *const child_state.ActiveWork) void {
     const owner = slot.owner;
     _ = owner.approvals.invalidateChild(slot.child_id) catch |err|
         debugFailure(slot.child_id, "approval_invalidate", err);
@@ -945,6 +1023,7 @@ fn detachWorker(slot: *Slot) void {
     while (slot.route_refs > 0) {
         slot.route_changed.waitUncancelable(io_mod.getIo(), &owner.mutex);
     }
+    if (slot.worker) |worker| keepLeftovers(owner.alloc, slot, worker, active);
     slot.worker = null;
     slot.hosted = false;
     slot.work_id = null;
@@ -1392,7 +1471,8 @@ test "worker detach invalidates approval routes before worker deinit" {
         1,
     );
 
-    detachWorker(&slot);
+    const active = child_state.ActiveWork{ .id = @constCast("work"), .message = @constCast(""), .created_at_ms = 0 };
+    detachWorker(&slot, &active);
     try std.testing.expect(slot.worker == null);
     var pending = try approvals.firstPendingRequest(alloc, "root");
     defer if (pending) |*request| request.deinit(alloc);

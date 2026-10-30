@@ -2048,6 +2048,17 @@ const App = struct {
         };
     }
 
+    /// The user stopped `agent`'s turn on its own screen.
+    pub fn noteUserStop(self: *App, agent: *agents.Agent) void {
+        AgentsAppRuntime.noteUserStop(self, agent);
+    }
+
+    /// `agent`'s worker began a turn with `author`'s prompt; a subagent's
+    /// turn the parent didn't start opens its work in the parent's log.
+    pub fn noteChildTurnBegun(self: *App, agent: *agents.Agent, author: types.MessageAuthor) void {
+        AgentsAppRuntime.noteChildTurnBegun(self, agent, author);
+    }
+
     /// Sends `agent` a message another agent wrote, such as its subagent's
     /// report. It joins a running turn when nothing older waits, or starts
     /// the agent's next turn, and never interrupts the model. That turn
@@ -2055,11 +2066,6 @@ const App = struct {
     /// and takes none of the images waiting in the composer.
     /// `mail` names what it is; a `.message` uses the place
     /// `reserveMessagePlace` held for it.
-    /// The user stopped `agent`'s turn on its own screen.
-    pub fn noteUserStop(self: *App, agent: *agents.Agent) void {
-        AgentsAppRuntime.noteUserStop(self, agent);
-    }
-
     pub fn postAgentMessage(self: *App, agent: *agents.Agent, text: []const u8, author: types.MessageAuthor, mail: agent_frame.MailKind) !void {
         std.debug.assert(author != .user);
         // Until the worker takes it, a message still holds its place.
