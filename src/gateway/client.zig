@@ -5985,7 +5985,7 @@ test "consumeSseStream ignores conflicting and late stream events without mutati
     const payload =
         "data: {\"type\":\"tool-input-start\",\"id\":\"X\",\"toolName\":\"read_file\"}\n\n" ++
         "data: {\"type\":\"tool-input-start\",\"id\":\"X\",\"toolName\":\"read_file\"}\n\n" ++
-        "data: {\"type\":\"tool-input-start\",\"id\":\"X\",\"toolName\":\"read_file\"}\n\n" ++
+        "data: {\"type\":\"tool-input-start\",\"id\":\"X\",\"toolName\":\"web_search\"}\n\n" ++
         "data: {\"type\":\"tool-input-delta\",\"id\":\"X\",\"delta\":\"{\\\"path\\\":\\\"stable.txt\\\"}\"}\n\n" ++
         "data: {\"type\":\"tool-input-end\",\"id\":\"X\"}\n\n" ++
         "data: {\"type\":\"tool-input-delta\",\"id\":\"X\",\"delta\":\"LATE_PREFIX_SENTINEL\"}\n\n" ++
@@ -6711,7 +6711,7 @@ test "consumeSseStream unfiltered trace excludes all payload keys and values" {
         "data: {\"type\":\"FX_UNKNOWN_TYPE_SENTINEL\",\"FX_DYNAMIC_KEY_SENTINEL\":\"FX_UNKNOWN_VALUE_SENTINEL\"}\n\n" ++
         "data: {\"type\":\"text-delta\",\"id\":\"text\",\"delta\":\"FX_MODEL_TEXT_SENTINEL\"}\n\n" ++
         "data: {\"type\":\"tool-input-start\",\"id\":\"safe_call\",\"toolName\":\"read_file\"}\n\n" ++
-        "data: {\"type\":\"tool-input-start\",\"id\":\"safe_call\",\"toolName\":\"read_file\"}\n\n" ++
+        "data: {\"type\":\"tool-input-start\",\"id\":\"safe_call\",\"toolName\":\"web_search\"}\n\n" ++
         "data: {\"type\":\"tool-input-delta\",\"id\":\"safe_call\",\"delta\":\"{\\\"FX_ARGUMENT_KEY_SENTINEL\\\":\\\"FX_PATH_VALUE_SENTINEL\\\"}\"}\n\n" ++
         "data: {\"type\":\"tool-input-end\",\"id\":\"safe_call\"}\n\n" ++
         "data: {\"type\":\"tool-input-delta\",\"id\":\"safe_call\",\"delta\":\"FX_LATE_PREFIX_SENTINEL\"}\n\n" ++

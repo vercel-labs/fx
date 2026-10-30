@@ -1324,14 +1324,14 @@ test "a member folder another process removes after it is opened and before it i
     const io = io_mod.getIo();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, ".fx/sessions/v1memberid01");
+    try tmp.dir.createDirPath(io, ".proto-fx/sessions/v1memberid01");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(home);
     var store = try session_store.Store.initReadOnlyFromHome(alloc, home, "/");
     defer store.deinit(alloc);
     const opened = (try openMemberDir(&store, "v1memberid01")).?;
     // The other process's conversion removes the folder.
-    try tmp.dir.deleteTree(io, ".fx/sessions/v1memberid01");
+    try tmp.dir.deleteTree(io, ".proto-fx/sessions/v1memberid01");
     try std.testing.expectEqual(@as(?Locked, null), try lockOpened(alloc, &store, "v1memberid01", opened, io_mod.milliTimestamp(), 0));
 }
 

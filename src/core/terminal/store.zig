@@ -477,10 +477,10 @@ pub const ProfileStore = struct {
     sessions_dir: io_mod.VerifiedDir,
     display_sessions_path: []u8,
     /// `~/.fx`, kept open to reach the folders v2 sessions keep terminal
-    /// state in, in v1's layout: `~/.fx/terminal/{id}` (D45), or the side
+    /// state in, in v1's layout: `~/.proto-fx/terminal/{id}` (D45), or the side
     /// folder of a session not moved yet (D27, D47).
     fx_dir: io_mod.VerifiedDir,
-    /// `~/.fx/terminal` and `~/.fx/session-files`, as `outside_roots`.
+    /// `~/.proto-fx/terminal` and `~/.proto-fx/session-files`, as `outside_roots`.
     display_outside_paths: [outside_roots.len][]u8,
     options: Options,
     mutex: std.Io.Mutex = .init,
@@ -644,13 +644,13 @@ pub const ProfileStore = struct {
     };
 
     /// Where v2 sessions keep terminal state outside the session manager,
-    /// in order: `~/.fx/terminal` (D45), then side folders not moved yet
+    /// in order: `~/.proto-fx/terminal` (D45), then side folders not moved yet
     /// (D27, D47). A new owner folder is made only in the first.
     const outside_roots = [_][]const u8{ profile_paths.terminal_dir_name, profile_paths.session_files_dir_name };
 
     /// The folder an owner keeps its terminal state in: its v1 session
     /// folder, or a v2 session's folder outside the manager. `create` makes
-    /// `~/.fx/terminal/{id}` (`0700`) when the owner has none.
+    /// `~/.proto-fx/terminal/{id}` (`0700`) when the owner has none.
     fn open_owner(self: *ProfileStore, owner_session_id: []const u8, create: bool) !OwnerFolder {
         const zio = io_mod.getIo();
         const options: std.Io.Dir.OpenOptions = .{ .iterate = true, .follow_symlinks = false };
@@ -682,7 +682,7 @@ pub const ProfileStore = struct {
         return .{ .dir = made.dir, .display_path = try session_layout.sessionDirPath(self.alloc, self.display_outside_paths[0], owner_session_id) };
     }
 
-    /// `~/.fx/{root_name}`, or null when nothing has made it yet. Opened
+    /// `~/.proto-fx/{root_name}`, or null when nothing has made it yet. Opened
     /// for each use: it can appear after this store opened.
     fn open_outside_root(self: *ProfileStore, root_name: []const u8, create: bool) !?io_mod.VerifiedDir {
         if (create) return try io_mod.openOrCreateVerifiedPrivateDir(&self.fx_dir, root_name);
@@ -5923,7 +5923,7 @@ fn testSignalProcess(
 test "a v2 session's terminal folder owns its terminal state, an unmoved side folder still counts, and every scan sees each owner once (D45)" {
     var fixture = try TestStoreFixture.init(std.testing.allocator, .{});
     defer fixture.deinit();
-    var root = io_mod.VerifiedDir{ .dir = try fixture.tmp.dir.openDir(std.testing.io, ".fx", .{ .iterate = true, .follow_symlinks = false }) };
+    var root = io_mod.VerifiedDir{ .dir = try fixture.tmp.dir.openDir(std.testing.io, ".proto-fx", .{ .iterate = true, .follow_symlinks = false }) };
     defer root.close();
     // Made after the store opened: an older session's side folder (D27),
     // and one that also has a v1 folder.
@@ -5934,7 +5934,7 @@ test "a v2 session's terminal folder owns its terminal state, an unmoved side fo
         owner.close();
     }
 
-    // Only a new terminal makes a v2 owner's folder, in ~/.fx/terminal.
+    // Only a new terminal makes a v2 owner's folder, in ~/.proto-fx/terminal.
     try std.testing.expectError(error.FileNotFound, fixture.profile.open_capability("v2-new-owner", false, false));
     try std.testing.expectError(error.FileNotFound, root.dir.statFile(std.testing.io, profile_paths.terminal_dir_name, .{}));
     var made = try fixture.profile.open_capability("v2-new-owner", false, true);
@@ -6009,7 +6009,7 @@ const TestStoreFixture = struct {
             .{ .iterate = true, .follow_symlinks = false },
         ) };
         defer root.close();
-        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&root, ".fx");
+        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&root, ".proto-fx");
         defer fx.close();
         var sessions = try io_mod.openOrCreateVerifiedPrivateDir(&fx, "sessions");
         defer sessions.close();

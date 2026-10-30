@@ -1,6 +1,6 @@
 //! Sign-in credentials the engine hands fx to keep (AUTH-21): one opaque blob per
 //! server name and URL, so a changed URL never gets an old token. They live in
-//! the macOS Keychain, or in a private file under `~/.fx/mcp-credentials/`.
+//! the macOS Keychain, or in a private file under `~/.proto-fx/mcp-credentials/`.
 //! Either way the directory's advisory lock is held while the store is read
 //! and rewritten, so two fx processes don't overwrite each other's entries.
 //! A store this fx can't read, damaged or saved by a newer fx, is never
@@ -503,8 +503,8 @@ test "credentials-v2.json's logins aren't taken over, and an older fx rewriting 
     defer testing.allocator.free(home);
     const store: Store = .{ .home = home, .backend = .file };
     const plain: Key = .{ .name = "plain", .url = "https://mcp.plain.com/mcp" };
-    const v2_path = ".fx/" ++ profile_paths.mcp_credentials_dir_name ++ "/credentials-v2.json";
-    try tmp.dir.createDirPath(testing.io, ".fx/" ++ profile_paths.mcp_credentials_dir_name);
+    const v2_path = ".proto-fx/" ++ profile_paths.mcp_credentials_dir_name ++ "/credentials-v2.json";
+    try tmp.dir.createDirPath(testing.io, ".proto-fx/" ++ profile_paths.mcp_credentials_dir_name);
     const v2 = "{\"version\":2,\"servers\":[{\"name\":\"plain\",\"url\":\"https://mcp.plain.com/mcp\",\"credential\":\"{\\\"access\\\":\\\"v2\\\"}\"}]}";
     try tmp.dir.writeFile(testing.io, .{ .sub_path = v2_path, .data = v2 });
 
@@ -532,7 +532,7 @@ test "the store is the one no older fx opens" {
     try testing.expectEqualStrings("credentials-v3.lock", lock_file_name);
     try testing.expectEqualStrings("FX_MCP_OAUTH_CREDENTIALS_V3", native_keychain.mcp_host_credentials_service_name);
     try testing.expectEqualStrings("the Keychain item FX_MCP_OAUTH_CREDENTIALS_V3", (Store{ .home = "/Users/example", .backend = .keychain }).place());
-    try testing.expectEqualStrings("~/.fx/mcp-credentials/credentials-v3.json", (Store{ .home = "/Users/example", .backend = .file }).place());
+    try testing.expectEqualStrings("~/.proto-fx/mcp-credentials/credentials-v3.json", (Store{ .home = "/Users/example", .backend = .file }).place());
 }
 
 /// A document that parses is saved as version 2 and reads back the same, so
@@ -602,7 +602,7 @@ test "one fx holds a login's refresh lock at a time, and each login has its own"
     again.release();
 }
 
-const test_path = ".fx/" ++ profile_paths.mcp_credentials_dir_name ++ "/" ++ file_name;
+const test_path = ".proto-fx/" ++ profile_paths.mcp_credentials_dir_name ++ "/" ++ file_name;
 
 test "the credential file is private, and one this fx can't read is never written over" {
     var tmp = testing.tmpDir(.{});

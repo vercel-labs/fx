@@ -287,7 +287,7 @@ fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator) !void {
         try appendCheckOwned(checks, alloc, "session", .warn, detail);
     }
     if (report.keeps_left_out > 0) {
-        const detail = try alloc.print("{d} earlier session folder(s) under ~/.fx/sessions keep files their conversion left out", .{report.keeps_left_out});
+        const detail = try alloc.print("{d} earlier session folder(s) under ~/.proto-fx/sessions keep files their conversion left out", .{report.keeps_left_out});
         try appendCheckOwned(checks, alloc, "sessions", .ok, detail);
     }
     const convertible = report.unconverted - report.stuck.items.len;
@@ -406,7 +406,7 @@ fn appendMcpConfigCheck(
             var out: std.Io.Writer.Allocating = .init(alloc);
             defer out.deinit();
             try out.writer.print(
-                "~/.fx/mcp.json warning: {s}",
+                "~/.proto-fx/mcp.json warning: {s}",
                 .{@tagName(warning.cause)},
             );
             if (warning.key()) |key| try out.writer.print(" key={s}", .{key});
@@ -425,7 +425,7 @@ fn appendMcpConfigCheck(
         },
         .failed => |err| {
             const detail = try alloc.print(
-                "failed to load ~/.fx/mcp.json: {s}",
+                "failed to load ~/.proto-fx/mcp.json: {s}",
                 .{@errorName(err)},
             );
             try appendCheckOwned(checks, alloc, "mcp_config", .fail, detail);
@@ -443,7 +443,7 @@ fn formatConfigPresence(alloc: Allocator, user_exists: bool, repo_exists: bool) 
     if (user_exists) {
         if (!first) try out.writer.writeAll(", ");
         first = false;
-        try out.writer.writeAll("~/.fx/settings.json");
+        try out.writer.writeAll("~/.proto-fx/settings.json");
     }
     if (repo_exists) {
         if (!first) try out.writer.writeAll(", ");
@@ -538,7 +538,7 @@ test "format config presence names existing layers" {
     const detail = try formatConfigPresence(std.testing.allocator, true, false);
     defer std.testing.allocator.free(detail);
 
-    try std.testing.expectEqualStrings("loaded config from ~/.fx/settings.json", detail);
+    try std.testing.expectEqualStrings("loaded config from ~/.proto-fx/settings.json", detail);
 }
 
 test "MCP config diagnostic maps only failures to one doctor check" {
@@ -561,7 +561,7 @@ test "MCP config diagnostic maps only failures to one doctor check" {
     try std.testing.expectEqualStrings("mcp_config", checks.items[0].name);
     try std.testing.expectEqual(CheckStatus.fail, checks.items[0].status);
     try std.testing.expectEqualStrings(
-        "failed to load ~/.fx/mcp.json: McpConfigInvalidJson",
+        "failed to load ~/.proto-fx/mcp.json: McpConfigInvalidJson",
         checks.items[0].detail,
     );
 }
@@ -570,9 +570,9 @@ test "config check handles user and workspace config files together" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try writeDoctorFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"permission_mode\":\"ask\"}");
+    try writeDoctorFixtureFile(tmp.dir, "home/.proto-fx/settings.json", "{\"permission_mode\":\"ask\"}");
     try writeDoctorFixtureFile(tmp.dir, "workspace/.fx.json", "{\"permission_mode\":\"auto\"}");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -593,7 +593,7 @@ test "config check handles user and workspace config files together" {
 
     try std.testing.expectEqual(@as(usize, 1), checks.items.len);
     try std.testing.expectEqual(CheckStatus.ok, checks.items[0].status);
-    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, "~/.fx/settings.json") != null);
+    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, "~/.proto-fx/settings.json") != null);
     try std.testing.expect(std.mem.find(u8, checks.items[0].detail, ".fx.json") != null);
 }
 
@@ -601,9 +601,9 @@ test "config check does not claim rejected user settings loaded" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try writeDoctorFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"permission_mode\":\"ask\"}");
+    try writeDoctorFixtureFile(tmp.dir, "home/.proto-fx/settings.json", "{\"permission_mode\":\"ask\"}");
     try writeDoctorFixtureFile(tmp.dir, "workspace/.fx.json", "{\"permission_mode\":\"auto\"}");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -630,7 +630,7 @@ test "config check does not claim rejected user settings loaded" {
 
     try std.testing.expectEqual(@as(usize, 1), checks.items.len);
     try std.testing.expectEqual(CheckStatus.ok, checks.items[0].status);
-    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, "~/.fx/settings.json") == null);
+    try std.testing.expect(std.mem.find(u8, checks.items[0].detail, "~/.proto-fx/settings.json") == null);
     try std.testing.expect(std.mem.find(u8, checks.items[0].detail, ".fx.json") != null);
 }
 

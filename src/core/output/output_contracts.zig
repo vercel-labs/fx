@@ -2527,14 +2527,14 @@ test "core status snapshot includes selected team when present" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=proto-fx login\n[status] auth_refreshable=true\n[status] team=example-team\n[status] permission_mode=ask\n[status] workspace=/tmp/proto-fx\n[status] history_turns=0\n[status] session_permission_grants=0\n[status] agent_step_limit=24\n[status] ultrafast_requested=false\n",
+        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=fx login\n[status] auth_refreshable=true\n[status] team=example-team\n[status] permission_mode=ask\n[status] workspace=/tmp/proto-fx\n[status] history_turns=0\n[status] session_permission_grants=0\n[status] agent_step_limit=24\n[status] ultrafast_requested=false\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"proto-fx login\",\"auth_refreshable\":true,\"team\":\"example-team\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/proto-fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":24,\"ultrafast_requested\":false}",
+        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"fx login\",\"auth_refreshable\":true,\"team\":\"example-team\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/proto-fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":24,\"ultrafast_requested\":false}",
         json,
     );
 }
@@ -3643,7 +3643,7 @@ test "core upgrade snapshot identifies dev revisions" {
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
         "upgraded to dev abcdef012345 (v0.3.66)\n" ++
-            "changes: https://github.com/vercel-labs/proto-fx/compare/111111111111...abcdef0123456789abcdef0123456789abcdef01\n",
+            "changes: https://github.com/vercel-labs/fx/compare/111111111111...abcdef0123456789abcdef0123456789abcdef01\n",
         text,
     );
 

@@ -30,7 +30,7 @@ pub const Projection = struct {
     /// While the open server's sign-in waits for the browser, its address.
     sign_in_url: ?[]const u8 = null,
     /// The two config files, as shown.
-    profile_file: []const u8 = "~/.fx/mcp.json",
+    profile_file: []const u8 = "~/.proto-fx/mcp.json",
     project_file: []const u8 = ".mcp.json",
 
     pub fn active(p: Projection) bool {
@@ -648,7 +648,7 @@ test "a server's screen: facts, choices with their commands, then tools" {
     try testing.expectEqualStrings(
         \\  github
         \\  http      https://api.githubcopilot.com/mcp/
-        \\  file      ~/.fx/mcp.json
+        \\  file      ~/.proto-fx/mcp.json
         \\  status    ready
         \\  protocol  2025-11-25
         \\
@@ -725,7 +725,7 @@ test "Remove asks on its own row, at the same size" {
     // the server screen's.
     const text = try render(p, 88);
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.find(u8, text, "› Remove github and its login from ~/.fx/mcp.json?   yes  no\n") != null);
+    try testing.expect(std.mem.find(u8, text, "› Remove github and its login from ~/.proto-fx/mcp.json?   yes  no\n") != null);
     try testing.expect(std.mem.find(u8, text, "  Log out       /mcp logout github\n") != null);
     try testing.expectEqualStrings("↑↓ navigate     enter run     esc back", hintVariants(p)[0]);
     var asked = try composeRow(testing.allocator, p, 6, 88, menuRowCount(p, 88, 40));
@@ -862,7 +862,7 @@ test "a login under way says so until its address comes" {
     try testing.expectEqualStrings(
         \\  linear
         \\  http      https://mcp.linear.app/mcp
-        \\  file      ~/.fx/mcp.json
+        \\  file      ~/.proto-fx/mcp.json
         \\  status    needs login
         \\
         \\› Log in        /mcp login linear
@@ -934,7 +934,7 @@ test "a server that needs a login says so, once" {
     try testing.expectEqualStrings(
         \\  linear
         \\  http      https://mcp.linear.app/mcp
-        \\  file      ~/.fx/mcp.json
+        \\  file      ~/.proto-fx/mcp.json
         \\  status    needs login
         \\
         \\› Log in        /mcp login linear

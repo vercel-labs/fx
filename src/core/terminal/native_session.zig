@@ -4027,7 +4027,7 @@ const TestDurableFixture = struct {
             .{ .iterate = true, .follow_symlinks = false },
         ) };
         defer root.close();
-        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&root, ".fx");
+        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&root, ".proto-fx");
         defer fx.close();
         var sessions = try io_mod.openOrCreateVerifiedPrivateDir(&fx, "sessions");
         defer sessions.close();

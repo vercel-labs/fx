@@ -1,4 +1,4 @@
-//! The shared usage cache: one file per identity under `~/.fx/usage-cache/`.
+//! The shared usage cache: one file per identity under `~/.proto-fx/usage-cache/`.
 //! Every fx process reads it without a lock (writes land by rename) and
 //! writes it under an exclusive lock as read, merge, write, rename, so a
 //! newer answer is never replaced by an older one (`CacheNeverRegresses`).

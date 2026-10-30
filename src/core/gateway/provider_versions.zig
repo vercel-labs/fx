@@ -181,7 +181,7 @@ test "provider version cache creates its profile from a fresh home" {
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(home);
     try saveCacheAtHome(alloc, .grok, .{ .version = Version.parse("1.0.13").?, .checked_at_ms = 500 }, home);
-    var dir = try tmp.dir.openDir(std.testing.io, ".fx/provider-versions", .{});
+    var dir = try tmp.dir.openDir(std.testing.io, ".proto-fx/provider-versions", .{});
     defer dir.close(std.testing.io);
     const cached = (try readCached(alloc, dir, .grok)).?;
     try std.testing.expectEqualStrings("1.0.13", cached.version.slice());

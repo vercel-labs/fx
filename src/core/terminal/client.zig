@@ -1110,7 +1110,7 @@ const LiveTerminalFixture = struct {
             .{ .iterate = true, .follow_symlinks = false },
         ) };
         defer root.close();
-        var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&root, ".fx");
+        var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&root, ".proto-fx");
         defer fx_dir.close();
         var sessions = try io_mod.openOrCreateVerifiedPrivateDir(&fx_dir, "sessions");
         defer sessions.close();
@@ -1261,7 +1261,7 @@ const LiveTerminalFixture = struct {
         const name = try alloc.print("record-{s}.json", .{session_id});
         defer alloc.free(name);
         const path = try std.Io.Dir.path.join(alloc, &.{
-            ".fx", "sessions", owner_session_id, "terminal", "state", name,
+            ".proto-fx", "sessions", owner_session_id, "terminal", "state", name,
         });
         defer alloc.free(path);
         const bytes = try fixture.tmp.dir.readFileAlloc(
@@ -1288,7 +1288,7 @@ const LiveTerminalFixture = struct {
         const name = try alloc.print("record-{s}.json", .{session_id});
         defer alloc.free(name);
         const path = try std.Io.Dir.path.join(alloc, &.{
-            ".fx", "sessions", owner_session_id, "terminal", "state", name,
+            ".proto-fx", "sessions", owner_session_id, "terminal", "state", name,
         });
         defer alloc.free(path);
         const bytes = try fixture.tmp.dir.readFileAlloc(

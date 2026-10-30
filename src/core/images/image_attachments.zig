@@ -3458,7 +3458,7 @@ test "requests name the saved file of each attached image, never its source" {
     // (D89); the note names the blob, never the temporary snapshot.
     var in_blob = inline_bytes;
     in_blob.id = 7;
-    in_blob.blob_path = @constCast("/Users/example/.fx/sessions/v2/s/blobs/0123abcd");
+    in_blob.blob_path = @constCast("/Users/example/.proto-fx/sessions/v2/s/blobs/0123abcd");
 
     const images = [_]types.ImageAttachment{ attached, pasted, recalled_file, recalled_paste, inline_bytes, in_memory, in_blob };
     const prompt = "[Image #1] [Image #2] [Image #3] [Image #4] [Image #5] [Image #6] [Image #7]";
@@ -3650,12 +3650,12 @@ test "a withheld prompt image's notice names the blob the note names (D89)" {
     const wide = image_data.testPngHeader(9000, 10);
     var saved = try captureInlineImageBytesInMemory(arena, 1, "image/png", &wide);
     saved.snapshot_path = @constCast("/tmp/fx-image-snapshots-0123456789abcdef/image-1.bin");
-    saved.blob_path = @constCast("/Users/example/.fx/sessions/v2/s/blobs/0123abcd");
+    saved.blob_path = @constCast("/Users/example/.proto-fx/sessions/v2/s/blobs/0123abcd");
     var cache: AttachmentDimensionCache = .empty;
     const in_blob = [_]types.ChatMessage{.{ .role = .user, .content = "look", .images = &.{saved} }};
     const named = try withholdOversizedAttachments(arena, arena, &cache, &in_blob, 8000);
     try std.testing.expectEqual(@as(usize, 0), named.messages[0].images.len);
-    try std.testing.expect(std.mem.find(u8, named.messages[0].content.?, "The original is saved at /Users/example/.fx/sessions/v2/s/blobs/0123abcd. ") != null);
+    try std.testing.expect(std.mem.find(u8, named.messages[0].content.?, "The original is saved at /Users/example/.proto-fx/sessions/v2/s/blobs/0123abcd. ") != null);
     // Inline bytes without a blob have no saved file, and the temporary
     // snapshot beside them is never named.
     var unsaved = saved;

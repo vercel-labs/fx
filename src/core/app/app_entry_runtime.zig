@@ -918,7 +918,7 @@ test "app entry returns after handled CLI success without initializing app" {
     try std.testing.expectEqual(RunOutcome.returned, outcome);
     try std.testing.expectEqual(@as(usize, 1), capture.cli_calls);
     try std.testing.expectEqualStrings("0.2.10", capture.seen_config.?.version);
-    try std.testing.expectEqualStrings("help", capture.seen_config.?.command_catalog.specs[0].token);
+    try std.testing.expectEqualStrings(test_builtin_commands.top_level_registry.specs[0].token, capture.seen_config.?.command_catalog.specs[0].token);
     try std.testing.expectEqualStrings("test.entry_context", capture.seen_config.?.context_registry.defaultProvider().id);
     try std.testing.expectEqualStrings("entry", capture.seen_config.?.mode_registry.default_mode_id);
     try std.testing.expectEqualStrings("entry_test_tool", capture.seen_config.?.tool_set.order[0]);

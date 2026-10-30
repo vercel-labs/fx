@@ -20,7 +20,7 @@ pub fn explicitThemeOverride() ?bool {
 }
 
 /// FX_THEME values other than light/dark name a user theme under
-/// `~/.fx/themes/<name>.json`.
+/// `~/.proto-fx/themes/<name>.json`.
 pub fn explicitThemeName() ?[]const u8 {
     const override = io_mod.getenv("FX_THEME") orelse return null;
     if (override.len == 0) return null;

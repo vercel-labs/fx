@@ -609,9 +609,9 @@ test "a server whose name a terminal can't show is skipped with a note that esca
     try std.testing.expectEqualStrings("caf\u{e9} two", loaded.configs.items[0].name);
     try std.testing.expectEqual(@as(usize, 3), loaded.diagnostics.items.len);
     const expected = [_][]const u8{
-        "~/.fx/mcp.json server 'bad\\xff' was skipped: its name has a character fx won't print.",
-        "~/.fx/mcp.json server 'evil\\x1b]0;x\\x07' was skipped: its name has a character fx won't print.",
-        "~/.fx/mcp.json server 'rtl\\u{202e}txt' was skipped: its name has a character fx won't print.",
+        "~/.proto-fx/mcp.json server 'bad\\xff' was skipped: its name has a character fx won't print.",
+        "~/.proto-fx/mcp.json server 'evil\\x1b]0;x\\x07' was skipped: its name has a character fx won't print.",
+        "~/.proto-fx/mcp.json server 'rtl\\u{202e}txt' was skipped: its name has a character fx won't print.",
     };
     for (loaded.diagnostics.items, expected) |diagnostic, want| {
         const note = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic);
@@ -627,11 +627,11 @@ test "saving MCP config replaces the file durably" {
     defer tmp.cleanup();
 
     const original = "{\"mcp\":{\"stale\":{\"command\":\"echo\"}}}";
-    try writeTempFile(&tmp, "home/.fx/mcp.json", original);
-    const path = try tmpDirPath(alloc, tmp.dir, "home/.fx/mcp.json");
+    try writeTempFile(&tmp, "home/.proto-fx/mcp.json", original);
+    const path = try tmpDirPath(alloc, tmp.dir, "home/.proto-fx/mcp.json");
     defer alloc.free(path);
 
-    var fx_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{ .iterate = true });
+    var fx_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.proto-fx", .{ .iterate = true });
     defer fx_dir.close(io_mod.getIo());
 
     // Seed a group-readable mode so the 0600 assertion below cannot pass just
@@ -706,7 +706,7 @@ test "MCP config diagnostic treats nonblocking profile states as clear" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     const home_path = try tmpDirPath(alloc, tmp.dir, "home");
     defer alloc.free(home_path);
 
@@ -720,7 +720,7 @@ test "MCP config diagnostic treats nonblocking profile states as clear" {
         }
     }
 
-    try writeTempFile(&tmp, "home/.fx/mcp.json", "{\"mcp\":{}}");
+    try writeTempFile(&tmp, "home/.proto-fx/mcp.json", "{\"mcp\":{}}");
     {
         const test_home = try TestHome.install(alloc, home_path);
         defer test_home.deinit();
@@ -798,7 +798,7 @@ test "fx mcp approve saves the approval of a project server" {
     const mcp_verbs = @import("../core/mcp_host/verbs.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     try writeTempFile(&tmp, "workspace/.mcp.json",
         \\{"mcpServers":{"fixture":{"command":"fixture-server"}}}
     );
@@ -860,12 +860,12 @@ test "saving MCP config refuses a symlinked target" {
 
     const external = "{\"mcp\":{\"fs\":{\"command\":\"node\"}}}";
     try writeTempFile(&tmp, "home/external.json", external);
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     const external_path = try tmpDirPath(alloc, tmp.dir, "home/external.json");
     defer alloc.free(external_path);
-    try tmp.dir.symLink(io_mod.getIo(), external_path, "home/.fx/mcp.json", .{ .is_directory = false });
+    try tmp.dir.symLink(io_mod.getIo(), external_path, "home/.proto-fx/mcp.json", .{ .is_directory = false });
 
-    const path = try std.Io.Dir.path.join(alloc, &.{ std.Io.Dir.path.dirname(external_path).?, ".fx", "mcp.json" });
+    const path = try std.Io.Dir.path.join(alloc, &.{ std.Io.Dir.path.dirname(external_path).?, ".proto-fx", "mcp.json" });
     defer alloc.free(path);
 
     // The durable helper refuses a target that is not a plain private file, so

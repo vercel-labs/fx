@@ -4346,7 +4346,7 @@ test "the image catalog keeps each image's handle and bytes, so Vision can read 
         .path = @constCast("/Users/example/old.png"),
         .media_type = @constCast("image/png"),
         .snapshot_sha256 = @constCast(digest),
-        .blob_path = @constCast("/Users/example/.fx/sessions/v2/s/blobs/" ++ digest),
+        .blob_path = @constCast("/Users/example/.proto-fx/sessions/v2/s/blobs/" ++ digest),
     }};
     const history = [_]HistoryTurn{.{ .assistant = .{
         .user = .{ .text = @constCast("old image"), .images = &resumed },

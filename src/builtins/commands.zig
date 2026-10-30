@@ -201,6 +201,8 @@ pub const top_level_specs = [_]TopLevelSpec{
         .token = "teams",
         .usage = "teams",
         .summary = "Show direct endpoint setup guidance",
+        // Direct endpoints have no teams; the command only explains that.
+        .hidden_from_top_level_help = true,
     },
     .{
         .kind = .session,
@@ -249,6 +251,8 @@ pub const top_level_specs = [_]TopLevelSpec{
         .usage = "credits [--json]",
         .summary = "Show the AI Gateway credit balance",
         .options = &.{json_option},
+        // Billing belongs to the configured endpoint; the command only says so.
+        .hidden_from_top_level_help = true,
     },
     .{
         .kind = .usage,
@@ -264,6 +268,8 @@ pub const top_level_specs = [_]TopLevelSpec{
             "With Codex, reads your ChatGPT plan's limits and activity; with Grok, your plan's allowance and credits.",
             "Finished days are cached under ~/.proto-fx and fetched at most once a day.",
         },
+        // Usage and billing belong to the configured endpoint; the command only says so.
+        .hidden_from_top_level_help = true,
     },
     .{
         .kind = .update,

@@ -797,11 +797,13 @@ test "provider column lists every provider and marks the active one" {
     const alloc = std.testing.allocator;
     var app = ColumnTestApp.init(alloc);
     defer app.deinit();
-    app.auth.source = .ai_gateway_api_key;
+    // The gateway is not a picker row; a subscription provider is.
+    app.provider_selection.active_provider = .codex;
+    app.auth.source = .chatgpt_subscription;
 
     const column = columnFor(&app, .provider, "");
     try std.testing.expect(column.count >= 2);
-    try std.testing.expectEqualStrings("vercel", column.labels[0]);
+    try std.testing.expectEqualStrings("codex", column.labels[0]);
     try std.testing.expectEqualStrings("current", column.annotations[0]);
     for (column.annotations[1..column.count]) |annotation| {
         try std.testing.expectEqualStrings("", annotation);
@@ -818,6 +820,9 @@ test "provider column requires matching authentication for a current annotation"
             try std.testing.expectEqualStrings("", annotation);
         }
     }
+    // A host-managed credential marks whichever provider is active; the
+    // gateway itself never appears as a row.
+    app.provider_selection.active_provider = .codex;
     app.auth.source = .host_managed;
     try std.testing.expectEqualStrings("current", columnFor(&app, .provider, "").annotations[0]);
 }

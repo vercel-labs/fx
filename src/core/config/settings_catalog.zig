@@ -388,7 +388,7 @@ fn matches(snapshot: Snapshot, spec: Spec, category: Category, query: []const u8
 /// Settings only the engine can apply to the live conversation.
 fn hostOwnedSetting(id: SettingId) bool {
     return switch (id) {
-        .model, .effort, .fast_mode, .ultrafast_mode, .permission_mode => true,
+        .model, .effort, .fast_mode, .ultrafast_mode, .permission_mode, .session_titles => true,
         else => false,
     };
 }

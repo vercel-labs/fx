@@ -6691,9 +6691,11 @@ test "compact command completion keeps restored history footer stable" {
     const completed_row = try findRowContaining(&h, "Ran sleep 5");
     const completed_thinking_row = try findRowContaining(&h, "Thinking");
     const completed_footer_row = try findFirstDividerRowAfter(&h, completed_thinking_row);
-    try std.testing.expectEqual(running_row, completed_row);
-    try std.testing.expectEqual(running_thinking_row, completed_thinking_row);
-    try std.testing.expectEqual(running_footer_row, completed_footer_row);
+    // A lone completed call collapses to one row: its group header goes away,
+    // so the rows below it move up by that row.
+    try std.testing.expectEqual(running_row - 1, completed_row);
+    try std.testing.expectEqual(running_thinking_row - 1, completed_thinking_row);
+    try std.testing.expectEqual(running_footer_row - 1, completed_footer_row);
     try expectExactlyOneBlankRowBetween(&h, completed_row, completed_thinking_row);
     try expectExactlyOneBlankRowBetween(&h, completed_thinking_row, completed_footer_row);
 }

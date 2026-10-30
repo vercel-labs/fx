@@ -218,7 +218,7 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
             \\usage: {s} add [--project] [--header K=V]... NAME URL
             \\       {s} add [--project] [--env K=V]... NAME -- COMMAND [ARGS...]
             \\       {s} add [--project] slack
-            \\  --project  write ./.mcp.json instead of ~/.fx/mcp.json
+            \\  --project  write ./.mcp.json instead of ~/.proto-fx/mcp.json
             \\
         , .{ p, p, p }),
         .remove => try w.print("usage: {s} remove [--project | --profile] NAME\n", .{p}),
@@ -320,9 +320,9 @@ fn describe(err: anyerror) []const u8 {
         error.HomeNotSet => "HOME isn't set",
         error.AccessDenied => "permission denied",
         error.Timeout, error.LockTimeout => "another fx is changing the MCP config; try again",
-        error.McpConfigInvalidJson => "~/.fx/mcp.json isn't valid JSON",
-        error.McpConfigInvalidHeaders, error.McpConfigAuthorizationHeader => "a server in ~/.fx/mcp.json has headers fx won't send; put a token in bearer_token_env, or sign in with login",
-        else => if (std.mem.startsWith(u8, @errorName(err), "McpConfig")) "~/.fx/mcp.json has a server entry fx can't read" else "something went wrong",
+        error.McpConfigInvalidJson => "~/.proto-fx/mcp.json isn't valid JSON",
+        error.McpConfigInvalidHeaders, error.McpConfigAuthorizationHeader => "a server in ~/.proto-fx/mcp.json has headers fx won't send; put a token in bearer_token_env, or sign in with login",
+        else => if (std.mem.startsWith(u8, @errorName(err), "McpConfig")) "~/.proto-fx/mcp.json has a server entry fx can't read" else "something went wrong",
     };
 }
 
@@ -337,7 +337,7 @@ fn paths(c: Context, arena: Allocator) !Paths {
 
 fn fileLabel(file: config_file.File) []const u8 {
     return switch (file) {
-        .profile => "~/.fx/mcp.json",
+        .profile => "~/.proto-fx/mcp.json",
         .project => ".mcp.json",
     };
 }
@@ -585,7 +585,7 @@ fn add(c: Context, arena: Allocator, name: []const u8, file: config_file.File, e
     try c.out.print("Added {s} to {s}.\n", .{ name, fileLabel(file) });
     const other: config_file.File = if (file == .project) .profile else .project;
     if (try defines(c, arena, other, if (other == .project) p.project else p.profile, name)) {
-        try c.out.print("{s} is also in {s}; the one in ~/.fx/mcp.json is used.\n", .{ name, fileLabel(other) });
+        try c.out.print("{s} is also in {s}; the one in ~/.proto-fx/mcp.json is used.\n", .{ name, fileLabel(other) });
     }
     return 0;
 }
@@ -601,11 +601,11 @@ fn remove(c: Context, arena: Allocator, name: []const u8, only: ?config_file.Fil
     const in_profile = (only == null or only == .profile) and try defines(c, arena, .profile, p.profile, name);
     const in_project = (only == null or only == .project) and try defines(c, arena, .project, p.project, name);
     if (in_profile and in_project) {
-        try c.err.print("{s} is in both ~/.fx/mcp.json and .mcp.json. Add --profile or --project.\n", .{try safe(arena, name)});
+        try c.err.print("{s} is in both ~/.proto-fx/mcp.json and .mcp.json. Add --profile or --project.\n", .{try safe(arena, name)});
         return 2;
     }
     if (!in_profile and !in_project) {
-        const where = if (only) |f| fileLabel(f) else "~/.fx/mcp.json or .mcp.json";
+        const where = if (only) |f| fileLabel(f) else "~/.proto-fx/mcp.json or .mcp.json";
         try c.err.print("No MCP server named {s} in {s}.\n", .{ try safe(arena, name), where });
         return 1;
     }
@@ -993,16 +993,16 @@ test "list lines up its columns and keeps hostile names inert" {
     var out: Writer.Allocating = .init(a);
     try writeList(&out.writer, a, &statuses);
     try testing.expectEqualStrings(
-        \\NAME      SOURCE          TRANSPORT  STATUS
-        \\context7  ~/.fx/mcp.json  http       ready, 2 tools
-        \\x\x1b[2J  .mcp.json       stdio      waiting for approval
+        \\NAME      SOURCE                TRANSPORT  STATUS
+        \\context7  ~/.proto-fx/mcp.json  http       ready, 2 tools
+        \\x\x1b[2J  .mcp.json             stdio      waiting for approval
         \\
     , out.written());
 
     var json: Writer.Allocating = .init(a);
-    try writeListJson(&json.writer, statuses[0..1], .{ .profile = "/h/.fx/mcp.json", .project = "/w/.mcp.json" });
+    try writeListJson(&json.writer, statuses[0..1], .{ .profile = "/h/.proto-fx/mcp.json", .project = "/w/.mcp.json" });
     try testing.expectEqualStrings(
-        \\{"servers":[{"name":"context7","source":"profile","file":"/h/.fx/mcp.json","transport":"http","status":"ready","error":null,"tools":2}]}
+        \\{"servers":[{"name":"context7","source":"profile","file":"/h/.proto-fx/mcp.json","transport":"http","status":"ready","error":null,"tools":2}]}
         \\
     , json.written());
 }

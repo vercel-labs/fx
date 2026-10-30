@@ -99,7 +99,7 @@ pub const Storage = struct {
         const name = std.Io.Dir.path.basename(path);
         const cwd = Io.Dir.cwd();
         // Missing parents are the manager's own folders, so private too, for
-        // example `~/.fx/sessions` on a machine that never ran v1 (D19).
+        // example `~/.proto-fx/sessions` on a machine that never ran v1 (D19).
         // Existing ones are left as they are.
         _ = cwd.createDirPathStatus(s.io, parent_path, .fromMode(folder_mode)) catch |err| return translate(err);
         var parent = cwd.openDir(s.io, parent_path, .{}) catch |err| return translate(err);
@@ -478,7 +478,7 @@ test "openRoot creates the root 0700 and refuses a symlinked root" {
     const s: Storage = .{ .io = io };
     const base = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(base);
-    // Like `~/.fx/sessions/v2` where neither parent exists yet: all three
+    // Like `~/.proto-fx/sessions/v2` where neither parent exists yet: all three
     // folders are created private.
     const root_path = try std.Io.Dir.path.join(testing.allocator, &.{ base, "a", "sessions", "v2" });
     defer testing.allocator.free(root_path);

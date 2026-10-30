@@ -7205,7 +7205,7 @@ test "saved ask classifies unsafe store failure by request mode" {
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "home");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    var blocker = try tmp.dir.createFile(io_mod.getIo(), "home/.fx", .{});
+    var blocker = try tmp.dir.createFile(io_mod.getIo(), "home/.proto-fx", .{});
     blocker.close(io_mod.getIo());
 
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");

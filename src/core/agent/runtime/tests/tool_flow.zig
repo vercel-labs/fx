@@ -727,6 +727,7 @@ test "parallel skill admission binds identities preserves denies and isolates fa
     try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "allowed/SKILL.md", .data = "---\nname: allowed-name\n---\nMAIN\n" });
     try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "allowed/reference.md", .data = "PARALLEL_ALLOWED_REFERENCE\n" });
     try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "denied/SKILL.md", .data = "---\nname: denied-name\n---\nDENIED_BODY_MUST_NOT_LOAD\n" });
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "README.md", .data = "readme\n" });
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
     const allowed_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "allowed");

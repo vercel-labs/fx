@@ -1139,14 +1139,14 @@ const skill_group_count: usize = 3;
 
 pub fn skillSourceLabel(source: SkillSource) []const u8 {
     return switch (source) {
-        .workspace_fx => "workspace .fx/skills",
+        .workspace_fx => "workspace .proto-fx/skills",
         .workspace_shared => "workspace skills/",
         .workspace_opencode => "workspace .opencode/skills",
         .workspace_codex => "workspace .codex/skills",
         .workspace_claude => "workspace .claude/skills",
         .workspace_agents => "workspace .agents/skills",
         .workspace_claw => "workspace .claw/skills",
-        .global_fx => "global ~/.fx/skills",
+        .global_fx => "global ~/.proto-fx/skills",
         .global_opencode => "global ~/.config/opencode/skills",
         .global_codex => "global ~/.codex/skills",
         .global_claude => "global ~/.claude/skills",
@@ -1157,14 +1157,14 @@ pub fn skillSourceLabel(source: SkillSource) []const u8 {
 
 pub fn skillSourceShortLabel(source: SkillSource) []const u8 {
     return switch (source) {
-        .workspace_fx => "workspace .fx",
+        .workspace_fx => "workspace .proto-fx",
         .workspace_shared => "workspace skills/",
         .workspace_opencode => "workspace .opencode",
         .workspace_codex => "workspace .codex",
         .workspace_claude => "workspace .claude",
         .workspace_agents => "workspace .agents",
         .workspace_claw => "workspace .claw",
-        .global_fx => "global .fx",
+        .global_fx => "global .proto-fx",
         .global_opencode => "global opencode",
         .global_codex => "global .codex",
         .global_claude => "global .claude",
@@ -3694,13 +3694,13 @@ test "skill refresh publishes one generation and coalesces one latest request" {
     defer tmp.cleanup();
     try writeTempFile(
         &tmp,
-        "home/.fx/skills/refreshable/SKILL.md",
+        "home/.proto-fx/skills/refreshable/SKILL.md",
         "---\nname: refreshable\ndescription: refreshed off-thread\n---\nbody\n",
     );
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills/added");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx/skills/added");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
-    const managed = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "skills" });
+    const managed = try std.Io.Dir.path.join(alloc, &.{ home, ".proto-fx", "skills" });
     defer alloc.free(managed);
     var runtime = Runtime{ .dir = try alloc.dupe(u8, managed) };
     defer runtime.deinit(alloc);
@@ -3738,7 +3738,7 @@ test "skill refresh publishes one generation and coalesces one latest request" {
 
     try writeTempFile(
         &tmp,
-        "home/.fx/skills/refreshable/SKILL.md",
+        "home/.proto-fx/skills/refreshable/SKILL.md",
         "---\nname: refreshable-v2\ndescription: one-file delta refresh with a new size\n---\nbody changed\n",
     );
     _ = try runtime.requestRefresh(alloc, home, home, policy);
@@ -3752,7 +3752,7 @@ test "skill refresh publishes one generation and coalesces one latest request" {
 
     try writeTempFile(
         &tmp,
-        "home/.fx/skills/added/SKILL.md",
+        "home/.proto-fx/skills/added/SKILL.md",
         "---\nname: added\ndescription: root manifest changed\n---\nbody\n",
     );
     _ = try runtime.requestRefresh(alloc, home, home, policy);
@@ -3771,7 +3771,7 @@ test "an empty launch catalog fills from a refresh before its startup notice is 
     defer tmp.cleanup();
     try writeTempFile(
         &tmp,
-        "home/.fx/skills/launch/SKILL.md",
+        "home/.proto-fx/skills/launch/SKILL.md",
         "---\nname: launch\ndescription: discovered after the first frame\n---\nbody\n",
     );
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -3781,7 +3781,7 @@ test "an empty launch catalog fills from a refresh before its startup notice is 
     const policy: skill_contract.RootPolicy = .{ .managed_root_source = .global_fx };
 
     // The launch records only the managed directory, then refreshes into it.
-    try runtime.replaceLoaded(alloc, try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "skills" }), &.{}, &.{});
+    try runtime.replaceLoaded(alloc, try std.Io.Dir.path.join(alloc, &.{ home, ".proto-fx", "skills" }), &.{}, &.{});
     const generation = try runtime.requestRefresh(alloc, home, home, policy);
     try runtime.queueRefreshAction(alloc, generation, .startup_notice);
     try std.testing.expectEqual(@as(usize, 0), runtime.items.len);
@@ -4428,7 +4428,7 @@ test "listSkillsSummary with skills" {
         \\Visible skills (3):
         \\
         \\Managed installs (1):
-        \\  - managed: installed [global ~/.fx/skills]
+        \\  - managed: installed [global ~/.proto-fx/skills]
         \\
         \\Workspace skills (1):
         \\  - local [workspace skills/]
@@ -4450,7 +4450,7 @@ test "listSkillsSummaryStyled dims only source labels" {
     });
     defer alloc.free(result);
 
-    try std.testing.expect(std.mem.find(u8, result, "  - managed: installed \x1b[38;5;245m[global ~/.fx/skills]\x1b[0m\n") != null);
+    try std.testing.expect(std.mem.find(u8, result, "  - managed: installed \x1b[38;5;245m[global ~/.proto-fx/skills]\x1b[0m\n") != null);
     try std.testing.expect(std.mem.find(u8, result, "\x1b[38;5;245mmanaged") == null);
     try std.testing.expect(std.mem.find(u8, result, "\x1b[38;5;245minstalled") == null);
 }
@@ -4721,13 +4721,13 @@ test "loadVisibleSkills scans only roots supplied by policy" {
 
     try writeTempFile(&tmp, "home/workspace/app/custom-skills/injected/SKILL.md", "---\nname: injected\ndescription: selected by policy\n---\nbody\n");
     try writeTempFile(&tmp, "home/workspace/app/skills/ignored/SKILL.md", "---\nname: ignored\ndescription: not selected\n---\nbody\n");
-    try writeTempFile(&tmp, "home/.fx/skills/ignored-managed/SKILL.md", "---\nname: ignored-managed\ndescription: not selected\n---\nbody\n");
+    try writeTempFile(&tmp, "home/.proto-fx/skills/ignored-managed/SKILL.md", "---\nname: ignored-managed\ndescription: not selected\n---\nbody\n");
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace/app");
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
 
     const workspace_roots = [_]skill_contract.RootSpec{
@@ -4755,14 +4755,14 @@ test "loadVisibleSkills preserves root-distinct duplicate skill names" {
 
     try writeTempFile(&tmp, "home/workspace/app/.agents/skills/review/SKILL.md", "---\nname: review\ndescription: closest\n---\n\nclosest body\n");
     try writeTempFile(&tmp, "home/workspace/.agents/skills/review/SKILL.md", "---\nname: review\ndescription: ancestor\n---\n\nancestor body\n");
-    try writeTempFile(&tmp, "home/.fx/skills/review/SKILL.md", "---\nname: review\ndescription: managed\n---\n\nmanaged body\n");
+    try writeTempFile(&tmp, "home/.proto-fx/skills/review/SKILL.md", "---\nname: review\ndescription: managed\n---\n\nmanaged body\n");
     try writeTempFile(&tmp, "home/.agents/skills/review/SKILL.md", "---\nname: review\ndescription: global compatibility\n---\n\nglobal body\n");
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace/app");
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
 
     var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
@@ -4817,7 +4817,7 @@ test "loadVisibleSkills deduplicates symlinked workspace and global roots while 
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const unused_managed_root = try std.Io.Dir.path.join(alloc, &.{ home_root, ".fx/skills" });
+    const unused_managed_root = try std.Io.Dir.path.join(alloc, &.{ home_root, ".proto-fx/skills" });
     defer alloc.free(unused_managed_root);
 
     const workspace_roots = [_]skill_contract.RootSpec{
@@ -4873,13 +4873,13 @@ test "loadVisibleSkills stops ancestor walking before home and keeps home agents
     try writeTempFile(&tmp, "home/skills/home-shared/SKILL.md", "---\nname: home-shared\ndescription: should not load\n---\n\nbody\n");
     try writeTempFile(&tmp, "home/.agents/skills/review/SKILL.md", "---\nname: review\ndescription: global agents\n---\n\nbody\n");
     try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace/app");
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx/skills");
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace/app");
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
 
     var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
@@ -4898,13 +4898,13 @@ test "loadVisibleSkills discovers workspace and global codex roots" {
 
     try writeTempFile(&tmp, "home/workspace/app/.codex/skills/local-codex/SKILL.md", "---\nname: local-codex\ndescription: workspace codex\n---\n\nbody\n");
     try writeTempFile(&tmp, "home/.codex/skills/global-codex/SKILL.md", "---\nname: global-codex\ndescription: global codex\n---\n\nbody\n");
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx/skills");
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace/app");
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
 
     var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
@@ -4931,13 +4931,13 @@ test "loadVisibleSkills discovers and reopens contained linked metadata" {
         "../../../skill-source/linked-leaf/SKILL.md",
         "home/workspace/.codex/skills/linked-leaf/SKILL.md",
     );
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx/skills");
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
     const logical_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".codex/skills/linked-leaf" });
     defer alloc.free(logical_path);
@@ -5239,13 +5239,13 @@ test "loadVisibleSkills discovers and reopens a contained linked workspace candi
         "../../skill-source/linked-skill",
         "home/workspace/.codex/skills/linked-skill",
     );
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx/skills");
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
     const logical_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".codex/skills/linked-skill" });
     defer alloc.free(logical_path);
@@ -5297,13 +5297,13 @@ test "loadVisibleSkills diagnoses an unavailable linked workspace candidate" {
         "../../skill-source/missing-skill",
         "home/workspace/.codex/skills/missing-skill",
     );
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx/skills");
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
     const logical_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".codex/skills/missing-skill" });
     defer alloc.free(logical_path);
@@ -5340,13 +5340,13 @@ test "loadVisibleSkills discovers a contained linked workspace root" {
         "../skill-root",
         "home/workspace/.codex/skills",
     );
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx/skills");
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
 
     var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
@@ -5373,13 +5373,13 @@ test "loadVisibleSkills diagnoses an escaping linked workspace candidate" {
         "../../../outside-skill",
         "home/workspace/.codex/skills/escaping-skill",
     );
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx/skills");
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
     const logical_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".codex/skills/escaping-skill" });
     defer alloc.free(logical_path);
@@ -5421,13 +5421,13 @@ test "loadVisibleSkills cleans contained-link authority allocation failures" {
         "../../skill-source/linked-skill",
         "home/workspace/.codex/skills/linked-skill",
     );
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx/skills");
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
 
     try std.testing.checkAllAllocationFailures(
@@ -5552,7 +5552,7 @@ test "skill discovery rejects symlinked ancestors inside an automatic root" {
 
     try writeTempFile(&tmp, "outside/skills/external/SKILL.md", "---\nname: external\ndescription: must not load\n---\nbody\n");
     try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace");
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx/skills");
     if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     tmp.dir.symLink(std.testing.io, "../../outside", "home/workspace/.agents", .{ .is_directory = true }) catch |err| {
         if (err == error.AccessDenied or err == error.FileSystem) return error.SkipZigTest;
@@ -5563,7 +5563,7 @@ test "skill discovery rejects symlinked ancestors inside an automatic root" {
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
 
     var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
@@ -5581,7 +5581,7 @@ test "skill discovery reports a symlinked automatic root whose target lacks the 
 
     try tmp.dir.createDirPath(io_mod.getIo(), "outside");
     try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace");
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx/skills");
     if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     tmp.dir.symLink(std.testing.io, "../../outside", "home/workspace/.agents", .{ .is_directory = true }) catch |err| {
         if (err == error.AccessDenied or err == error.FileSystem) return error.SkipZigTest;
@@ -5592,7 +5592,7 @@ test "skill discovery reports a symlinked automatic root whose target lacks the 
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
 
     var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
@@ -5715,17 +5715,17 @@ test "loadVisibleSkills cleans every partial allocation failure" {
 
     try writeTempFile(
         &tmp,
-        "home/.fx/skills/review/SKILL.md",
+        "home/.proto-fx/skills/review/SKILL.md",
         "---\nname: review\ndescription: >-\n  allocation\n  cleanup\n---\nbody\n",
     );
-    try writeTempFile(&tmp, "home/.fx/skills/bad/SKILL.md", "---\nname: first\nname: duplicate\n---\nbad body\n");
+    try writeTempFile(&tmp, "home/.proto-fx/skills/bad/SKILL.md", "---\nname: first\nname: duplicate\n---\nbad body\n");
     try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace");
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
 
     try std.testing.checkAllAllocationFailures(
@@ -5768,13 +5768,13 @@ test "linked metadata cleans every partial allocation failure" {
         "../../../source/SKILL.md",
         "home/workspace/.codex/skills/linked/SKILL.md",
     );
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx/skills");
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
 
     const descriptor_count_before = try openFileDescriptorCount();
@@ -5859,13 +5859,13 @@ test "loadVisibleSkills discovers linked metadata through external authority" {
         "../../../../../external-store/linked-leaf/SKILL.md",
         "home/workspace/.codex/skills/linked-leaf/SKILL.md",
     );
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx/skills");
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
     const external_authority = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external-store");
     defer alloc.free(external_authority);
@@ -5904,13 +5904,13 @@ test "loadVisibleSkills discovers a linked candidate resolved via external symli
         "../../../../external-store/linked-skill",
         "home/workspace/.codex/skills/linked-skill",
     );
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx/skills");
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
     const external_authority = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external-store");
     defer alloc.free(external_authority);
@@ -5948,13 +5948,13 @@ test "loadVisibleSkills discovers a linked candidate through configured symlink 
         "../../../../external-store/configured-skill",
         "home/workspace/.codex/skills/configured-skill",
     );
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx/skills");
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
     const external_authority = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external-store");
     defer alloc.free(external_authority);
@@ -6013,13 +6013,13 @@ test "loadVisibleSkills still rejects external symlinks without an authority" {
         "../../../../external-store/escaping-skill",
         "home/workspace/.codex/skills/escaping-skill",
     );
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx/skills");
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.proto-fx/skills");
     defer alloc.free(managed_root);
     const logical_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".codex/skills/escaping-skill" });
     defer alloc.free(logical_path);

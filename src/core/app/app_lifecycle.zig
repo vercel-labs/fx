@@ -951,7 +951,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     // Theme selection: FX_THEME wins over the settings "theme" key; an empty
     // FX_THEME counts as unset per the codebase convention. light/dark pin the
     // builtin variant and skip the OSC 11 probe; any other value names a theme
-    // file under ~/.fx/themes.
+    // file under ~/.proto-fx/themes.
     var configured_theme: ?[]const u8 = state.theme;
     if (io_mod.getenv("FX_THEME")) |value| {
         if (value.len > 0) configured_theme = value;
@@ -1624,7 +1624,7 @@ test "loadSavedPermissionMode reads the mode saved after startup" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
@@ -1635,10 +1635,10 @@ test "loadSavedPermissionMode reads the mode saved after startup" {
     defer env.deinit();
     try std.testing.expectEqual(default_permission_mode, try loadSavedPermissionMode(alloc, null, workspace_root));
 
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"permission_mode\":\"ask\"}\n");
+    try writeFixtureFile(tmp.dir, "home/.proto-fx/settings.json", "{\"permission_mode\":\"ask\"}\n");
     try std.testing.expectEqual(PermissionMode.ask, try loadSavedPermissionMode(alloc, null, workspace_root));
 
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"permission_mode\":\"yolo\"}\n");
+    try writeFixtureFile(tmp.dir, "home/.proto-fx/settings.json", "{\"permission_mode\":\"yolo\"}\n");
     try std.testing.expectEqual(PermissionMode.yolo, try loadSavedPermissionMode(alloc, home_root, workspace_root));
 }
 
@@ -1646,10 +1646,10 @@ test "loadSavedPermissionMode keeps the FX_PERMISSION_MODE override" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"permission_mode\":\"yolo\"}\n");
+    try writeFixtureFile(tmp.dir, "home/.proto-fx/settings.json", "{\"permission_mode\":\"yolo\"}\n");
 
     var env = try TestEnv.install(alloc, &.{
         .{ .key = "HOME", .value = home_root },
@@ -1674,7 +1674,7 @@ fn initialModelId(default_model: []const u8, configured: ?[]const u8) []const u8
 test "loadStartupState starts Codex from FX_PROVIDER and FX_MODEL without a saved model" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_root);
@@ -1712,7 +1712,7 @@ test "loadStartupState seeds a provider without a saved model from the launch --
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
@@ -1749,7 +1749,7 @@ test "loadStartupStatus reports where the selected model came from" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
 
@@ -1780,12 +1780,13 @@ test "loadStartupStatus reports where the selected model came from" {
     {
         var env = try TestEnv.install(alloc, &.{.{ .key = "HOME", .value = home_root }});
         defer env.deinit();
-        var status = try loadStartupStatusWithAuthMode(alloc, host.unavailable_secret_store, "default/model", 25, .host_managed);
-        defer status.deinit(alloc);
-        try std.testing.expectEqualStrings("default/model", status.selected_model);
-        try std.testing.expectEqual(ModelOrigin.default, status.model_origin);
+        // proto-fx reaches a model only through a configured endpoint.
+        try std.testing.expectError(
+            error.ProviderNotConfigured,
+            loadStartupStatusWithAuthMode(alloc, host.unavailable_secret_store, "default/model", 25, .host_managed),
+        );
     }
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"provider\":\"codex\",\"models\":{\"codex\":\"gpt-saved\"}}\n");
+    try writeFixtureFile(tmp.dir, "home/.proto-fx/settings.json", "{\"provider\":\"codex\",\"models\":{\"codex\":\"gpt-saved\"}}\n");
     {
         var env = try TestEnv.install(alloc, &.{.{ .key = "HOME", .value = home_root }});
         defer env.deinit();
@@ -2547,30 +2548,35 @@ test "startup credential modes select a refresh policy, never a narrower source 
 }
 
 test "loadStartupState applies core env overrides" {
-    var env = try TestEnv.install(std.testing.allocator, &.{
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeEndpointProfile(tmp.dir, "", "default-model");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home_root);
+
+    var env = try TestEnv.install(alloc, &.{
+        .{ .key = "HOME", .value = home_root },
         .{ .key = "FX_MODEL", .value = "  env-model  " },
-        .{ .key = "AI_GATEWAY_API_KEY", .value = "gateway-key" },
         .{ .key = "FX_PERMISSION_MODE", .value = "auto" },
         .{ .key = "FX_MAX_AGENT_STEPS", .value = "37" },
     });
     defer env.deinit();
 
     var state = try loadStartupState(
-        std.testing.allocator,
+        alloc,
         oauth_transport.unavailable_provider,
         host.unavailable_secret_store,
         "default-model",
         12,
     );
-    defer state.deinit(std.testing.allocator);
+    defer state.deinit(alloc);
 
     try std.testing.expect(state.workspace_root.len > 0);
     try std.testing.expectEqualStrings("env-model", state.selected_model);
     try std.testing.expectEqualStrings("default-model", state.configured_model);
     try std.testing.expectEqual(config_runtime.ModelSource.process_override, state.model_source);
     try std.testing.expect(!state.fast_mode);
-    try std.testing.expectEqualStrings("gateway-key", state.apiKey().?);
-    try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, state.credential.?.source);
     try std.testing.expectEqual(PermissionMode.auto, state.permission_mode);
     try std.testing.expectEqual(@as(usize, 37), state.agent_step_limit);
 }
@@ -2579,7 +2585,7 @@ test "ultrafast startup separates profile preferences from process overrides" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "profile-off");
     try tmp.dir.createDirPath(io_mod.getIo(), "profile-on");
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
@@ -2589,11 +2595,11 @@ test "ultrafast startup separates profile preferences from process overrides" {
     const profile_on_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "profile-on");
     defer alloc.free(profile_on_root);
     const settings = try alloc.print(
-        "{{\"workspaces\":{{\"{s}\":{{\"ultrafast_mode\":false}},\"{s}\":{{\"ultrafast_mode\":true}}}}}}\n",
+        "{{\"providers\":{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1\",\"auth\":{{\"type\":\"none\"}}}}}},\"provider\":\"local\",\"models\":{{\"local\":\"default/model\"}},\"workspaces\":{{\"{s}\":{{\"ultrafast_mode\":false}},\"{s}\":{{\"ultrafast_mode\":true}}}}}}\n",
         .{ profile_off_root, profile_on_root },
     );
     defer alloc.free(settings);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", settings);
+    try writeFixtureFile(tmp.dir, "home/.proto-fx/settings.json", settings);
 
     const env = try TestEnv.install(alloc, &.{
         .{ .key = "HOME", .value = home_root },
@@ -2621,7 +2627,15 @@ test "ultrafast startup separates profile preferences from process overrides" {
 }
 
 test "host-managed startup skips every local credential source" {
-    var env = try TestEnv.install(std.testing.allocator, &.{
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeEndpointProfile(tmp.dir, "", "default-model");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home_root);
+
+    var env = try TestEnv.install(alloc, &.{
+        .{ .key = "HOME", .value = home_root },
         .{ .key = "AI_GATEWAY_API_KEY", .value = "must-not-load" },
     });
     defer env.deinit();
@@ -2646,7 +2660,7 @@ test "loadStartupState defaults fast mode off and requires bound explicit prefer
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "configured");
     try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
@@ -2670,11 +2684,11 @@ test "loadStartupState defaults fast mode off and requires bound explicit prefer
     defer std.testing.allocator.free(codex_root);
 
     const fixture = try std.testing.allocator.print(
-        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"openai/gpt-5\"}},\"{s}\":{{\"fast_mode\":false}},\"{s}\":{{\"model\":\"zai/glm-5.3\",\"fast_mode\":true}},\"{s}\":{{\"model\":\"provider/fast-toggle\",\"fast_mode\":true,\"fast_mode_model_bound\":true}},\"{s}\":{{\"provider\":\"codex\",\"codex_model\":\"gpt-5.4-mini\"}}}}}}\n",
+        "{{\"providers\":{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1\",\"auth\":{{\"type\":\"none\"}}}}}},\"provider\":\"local\",\"models\":{{\"local\":\"zai/glm-5.2\"}},\"workspaces\":{{\"{s}\":{{\"models\":{{\"local\":\"openai/gpt-5\"}}}},\"{s}\":{{\"fast_mode\":false}},\"{s}\":{{\"models\":{{\"local\":\"zai/glm-5.3\"}},\"fast_mode\":true}},\"{s}\":{{\"models\":{{\"local\":\"provider/fast-toggle\"}},\"fast_mode\":true,\"fast_mode_model_bound\":true}},\"{s}\":{{\"provider\":\"codex\",\"codex_model\":\"gpt-5.4-mini\"}}}}}}\n",
         .{ configured_root, disabled_root, legacy_fast_root, bound_fast_root, codex_root },
     );
     defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeFixtureFile(tmp.dir, "home/.proto-fx/settings.json", fixture);
 
     var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
     defer env.deinit();
@@ -2721,7 +2735,7 @@ test "loadStartupState resolves startup scrollback default and explicit false" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "disabled");
 
@@ -2733,11 +2747,11 @@ test "loadStartupState resolves startup scrollback default and explicit false" {
     defer std.testing.allocator.free(disabled_root);
 
     const fixture = try std.testing.allocator.print(
-        "{{\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n",
-        .{disabled_root},
+        "{{\"providers\":{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1\",\"auth\":{{\"type\":\"none\"}}}}}},\"provider\":\"local\",\"models\":{{\"local\":\"{s}\"}},\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}\n",
+        .{ "default-model", disabled_root },
     );
     defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeFixtureFile(tmp.dir, "home/.proto-fx/settings.json", fixture);
 
     var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
     defer env.deinit();
@@ -2755,8 +2769,9 @@ test "loadStartupState resolves slash menu categories default and explicit false
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeEndpointProfile(tmp.dir, "home", "default-model");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
     defer std.testing.allocator.free(home_root);
@@ -2770,18 +2785,22 @@ test "loadStartupState resolves slash menu categories default and explicit false
     defer initial.deinit(std.testing.allocator);
     try std.testing.expect(initial.slash_menu_categories);
 
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"slash_menu_categories\":false}\n");
+    try writeFixtureFile(tmp.dir, "home/.proto-fx/settings.json", "{\"providers\":{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1\",\"auth\":{\"type\":\"none\"}}},\"provider\":\"local\",\"models\":{\"local\":\"default-model\"},\"slash_menu_categories\":false}\n");
     var hidden = try loadStartupStateForWorkspace(std.testing.allocator, workspace_root, "default-model", 25);
     defer hidden.deinit(std.testing.allocator);
     try std.testing.expect(!hidden.slash_menu_categories);
 }
 
 test "loadStartupState resolves max_agent_steps default zero and positive values" {
-    var env = try TestEnv.install(std.testing.allocator, &.{});
-    defer env.deinit();
-
+    const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try writeEndpointProfile(tmp.dir, "", "default-model");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home_root);
+
+    var env = try TestEnv.install(alloc, &.{.{ .key = "HOME", .value = home_root }});
+    defer env.deinit();
 
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "zero");
@@ -2810,11 +2829,15 @@ test "loadStartupState resolves max_agent_steps default zero and positive values
 }
 
 test "loadStartupState resolves max_tool_result_bytes default and explicit values" {
-    var env = try TestEnv.install(std.testing.allocator, &.{});
-    defer env.deinit();
-
+    const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try writeEndpointProfile(tmp.dir, "", "default-model");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home_root);
+
+    var env = try TestEnv.install(alloc, &.{.{ .key = "HOME", .value = home_root }});
+    defer env.deinit();
 
     try tmp.dir.createDirPath(io_mod.getIo(), "absent");
     try tmp.dir.createDirPath(io_mod.getIo(), "explicit");
@@ -2835,11 +2858,15 @@ test "loadStartupState resolves max_tool_result_bytes default and explicit value
 }
 
 test "loadStartupState falls back to auto for invalid first_call_tool_choice" {
-    var env = try TestEnv.install(std.testing.allocator, &.{});
-    defer env.deinit();
-
+    const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try writeEndpointProfile(tmp.dir, "", "default-model");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home_root);
+
+    var env = try TestEnv.install(alloc, &.{.{ .key = "HOME", .value = home_root }});
+    defer env.deinit();
 
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"first_call_tool_choice\":\"required\"}");
@@ -2856,7 +2883,7 @@ test "loadStartupState falls back to auto for invalid first_call_tool_choice" {
 test "loadStartupState diagnoses the retired fuzzy skill setting" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -2864,7 +2891,7 @@ test "loadStartupState diagnoses the retired fuzzy skill setting" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"skill_match_fuzzy\":true}");
+    try writeFixtureFile(tmp.dir, "home/.proto-fx/settings.json", "{\"providers\":{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1\",\"auth\":{\"type\":\"none\"}}},\"provider\":\"local\",\"models\":{\"local\":\"default-model\"},\"skill_match_fuzzy\":true}");
 
     var env = try TestEnv.install(std.testing.allocator, &.{.{ .key = "HOME", .value = home_root }});
     defer env.deinit();
@@ -2903,13 +2930,13 @@ fn keychainEnabledForTest(_: ?*anyopaque) bool {
     return false;
 }
 
-test "interactive launch leaves a Keychain credential unresolved for the caller" {
+test "interactive launch never defers a configured endpoint's credential" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"credential_source\":\"fx_login\"}");
+    try writeFixtureFile(tmp.dir, "home/.proto-fx/settings.json", "{\"providers\":{\"local\":{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1\",\"auth\":{\"type\":\"none\"}}},\"provider\":\"local\",\"models\":{\"local\":\"default/model\"},\"credential_source\":\"fx_login\"}");
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
@@ -2927,17 +2954,13 @@ test "interactive launch leaves a Keychain credential unresolved for the caller"
     for ([_]KeychainRead{ .blocking, .deferred }) |keychain_read| {
         var state = try loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, keychain_store, try alloc.dupe(u8, workspace_root), "default/model", 25, .local, null, .stored, null, null, keychain_read);
         defer state.deinit(alloc);
-        try std.testing.expect(state.credential == null);
-        if (keychain_read == .deferred and builtin.target.os.tag == .macos) {
-            const request = state.deferred_credential orelse return error.TestExpectedDeferredCredential;
-            try std.testing.expectEqual(model_provider.ProviderId.gateway, request.provider);
-            try std.testing.expectEqual(@as(?credentials.Source, .fx_login), request.preferred);
-            try std.testing.expectEqual(credentials.FxLoginReadStatus.not_attempted, state.fx_login_status);
-        } else {
-            // Test builds keep the fx login in the profile, where it is absent.
-            try std.testing.expect(state.deferred_credential == null);
-            try std.testing.expectEqual(credentials.FxLoginReadStatus.absent, state.fx_login_status);
-        }
+        try std.testing.expect(std.meta.activeTag(state.provider) == .configured);
+        try std.testing.expectEqual(credentials.Source.configured, state.credential.?.source);
+        // Only a gateway credential waits for a Keychain read after the first
+        // frame; a configured endpoint's credential resolves at startup and
+        // never reads the fx login.
+        try std.testing.expect(state.deferred_credential == null);
+        try std.testing.expectEqual(credentials.FxLoginReadStatus.not_attempted, state.fx_login_status);
     }
 }
 
@@ -2945,4 +2968,24 @@ fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !vo
     var file = try dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), text);
+}
+
+/// proto-fx reaches a model only through a configured endpoint, so startup
+/// fixtures save one in the profile before loading state.
+fn writeEndpointProfile(dir: std.Io.Dir, home_prefix: []const u8, model: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const root = if (home_prefix.len == 0)
+        try alloc.dupe(u8, ".proto-fx")
+    else
+        try alloc.print("{s}/.proto-fx", .{home_prefix});
+    defer alloc.free(root);
+    try dir.createDirPath(io_mod.getIo(), root);
+    const path = try alloc.print("{s}/settings.json", .{root});
+    defer alloc.free(path);
+    const text = try alloc.print(
+        "{{\"providers\":{{\"local\":{{\"protocol\":\"openai-chat-completions\",\"base_url\":\"http://localhost:11434/v1\",\"auth\":{{\"type\":\"none\"}}}}}},\"provider\":\"local\",\"models\":{{\"local\":\"{s}\"}}}}\n",
+        .{model},
+    );
+    defer alloc.free(text);
+    try writeFixtureFile(dir, path, text);
 }

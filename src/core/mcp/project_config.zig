@@ -140,7 +140,7 @@ fn entryProblem(err: anyerror) EntryProblem {
 }
 
 pub const WorkspaceDiagnostic = struct {
-    /// About `~/.fx/mcp.json` rather than `.mcp.json`.
+    /// About `~/.proto-fx/mcp.json` rather than `.mcp.json`.
     profile: bool = false,
     server_name: ?[]u8 = null,
     environment_variable: ?[]u8 = null,
@@ -235,7 +235,7 @@ pub fn noteIgnoredKeys(
 }
 
 fn diagnosticFile(diagnostic: WorkspaceDiagnostic) []const u8 {
-    return if (diagnostic.profile) "~/.fx/mcp.json" else ".mcp.json";
+    return if (diagnostic.profile) "~/.proto-fx/mcp.json" else ".mcp.json";
 }
 
 pub const WorkspaceParseResult = struct {
@@ -1474,7 +1474,7 @@ test "a server that sets required or a non-default restart_limit gets a note nam
     try std.testing.expectEqual(@as(usize, 2), notes.items.len);
     const first = try renderWorkspaceDiagnostic(alloc, notes.items[0]);
     defer alloc.free(first);
-    try std.testing.expectEqualStrings("~/.fx/mcp.json server 'gated' sets \"required\", which fx ignores; remove it.", first);
+    try std.testing.expectEqualStrings("~/.proto-fx/mcp.json server 'gated' sets \"required\", which fx ignores; remove it.", first);
     const second = try renderWorkspaceDiagnostic(alloc, notes.items[1]);
     defer alloc.free(second);
     try std.testing.expectEqualStrings(".mcp.json server 'retry' sets \"restart_limit\", which fx ignores; remove it.", second);
@@ -1531,7 +1531,7 @@ test "profile servers note each one ignored under mcpServers beside mcp" {
     const text = try renderWorkspaceDiagnostic(alloc, notes.items[0]);
     defer alloc.free(text);
     try std.testing.expectEqualStrings(
-        "~/.fx/mcp.json server 'beta' was skipped: the file has both \"mcp\" and \"mcpServers\", and fx reads only \"mcp\"; merge them into one.",
+        "~/.proto-fx/mcp.json server 'beta' was skipped: the file has both \"mcp\" and \"mcpServers\", and fx reads only \"mcp\"; merge them into one.",
         text,
     );
 }
@@ -2063,8 +2063,8 @@ test "a profile entry fx can't read is skipped with a note naming it, and the re
     try std.testing.expectEqualStrings("ok", configs.items[0].name);
     try std.testing.expectEqual(@as(usize, 2), skipped.items.len);
     const expected = [_][]const u8{
-        "~/.fx/mcp.json server 'webonly' was skipped: it has a \"url\" but no \"type\"; add \"type\": \"http\".",
-        "~/.fx/mcp.json server 'bad' was skipped: its \"enabled\" isn't valid.",
+        "~/.proto-fx/mcp.json server 'webonly' was skipped: it has a \"url\" but no \"type\"; add \"type\": \"http\".",
+        "~/.proto-fx/mcp.json server 'bad' was skipped: its \"enabled\" isn't valid.",
     };
     for (skipped.items, expected) |note, words| {
         const said = try renderWorkspaceDiagnostic(alloc, note);

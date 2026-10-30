@@ -285,10 +285,10 @@ test "withheld snapshot attachments point at their saved file" {
         .id = 3,
         .path = try arena.dupe(u8, "screen.png"),
         .media_type = try arena.dupe(u8, "image/png"),
-        .snapshot_path = try arena.dupe(u8, "/home/u/.fx/sessions/s/images/3.bin"),
+        .snapshot_path = try arena.dupe(u8, "/home/u/.proto-fx/sessions/s/images/3.bin"),
     });
     try std.testing.expectEqualStrings(
-        "[Image #3 not sent to keep the request under the provider's size limit. The original is saved at /home/u/.fx/sessions/s/images/3.bin; read_file it to see it again.]\n",
+        "[Image #3 not sent to keep the request under the provider's size limit. The original is saved at /home/u/.proto-fx/sessions/s/images/3.bin; read_file it to see it again.]\n",
         notice.written(),
     );
 }
@@ -299,11 +299,11 @@ test "a prompt image left out for size names its session's blob (D89)" {
     const arena = arena_state.allocator();
     var image = try image_attachments.captureInlineImageBytesInMemory(arena, 1, "image/png", &image_data.testPngHeader(10, 10));
     image.snapshot_path = try arena.dupe(u8, "/tmp/fx-image-snapshots-0123456789abcdef/image-1.bin");
-    image.blob_path = try arena.dupe(u8, "/Users/example/.fx/sessions/v2/s/blobs/0123abcd");
+    image.blob_path = try arena.dupe(u8, "/Users/example/.proto-fx/sessions/v2/s/blobs/0123abcd");
     const in_blob = [_]ChatMessage{.{ .role = .user, .content = "look", .images = &.{image} }};
     const named = try withholdImagesPastLimit(arena, &in_blob, 1, 4096);
     try std.testing.expectEqual(@as(usize, 1), named.withheld);
-    try std.testing.expect(std.mem.find(u8, named.messages[0].content.?, "The original is saved at /Users/example/.fx/sessions/v2/s/blobs/0123abcd;") != null);
+    try std.testing.expect(std.mem.find(u8, named.messages[0].content.?, "The original is saved at /Users/example/.proto-fx/sessions/v2/s/blobs/0123abcd;") != null);
     // Inline bytes without a blob have no saved file to name.
     var unsaved = image;
     unsaved.blob_path = null;

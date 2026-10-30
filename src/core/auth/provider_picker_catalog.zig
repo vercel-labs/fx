@@ -180,7 +180,8 @@ test "provider options expose the catalog slugs the composer accepts" {
     const count = providerOptions(&buf);
 
     try std.testing.expect(count >= 2);
-    try std.testing.expectEqualStrings("vercel", buf[0]);
+    // The gateway is a direct-endpoint setting, not a picker row.
+    try std.testing.expectEqualStrings("codex", buf[0]);
     for (buf[0..count]) |slug| {
         try std.testing.expect(provider_catalog.parse(slug) != null);
         try std.testing.expect(std.mem.findScalar(u8, slug, ' ') == null);

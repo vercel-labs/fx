@@ -229,7 +229,7 @@ const CapabilityImpl = struct {
     /// and has no side folder (D48).
     session_dir: ?io_mod.VerifiedDir,
     blobs: ?Blobs = null,
-    /// A v2 session's terminal folder, `~/.fx/terminal/{id}` (D45), where
+    /// A v2 session's terminal folder, `~/.proto-fx/terminal/{id}` (D45), where
     /// its terminal kinds route; opened on first use and made only by a
     /// write. `display_session_path` is its path.
     terminal_dir: ?io_mod.VerifiedDir = null,
@@ -774,7 +774,7 @@ pub const SessionChildCapability = struct {
     }
 
     /// A v2 session's capability: its bodies are that session's blobs, its
-    /// terminal kinds route to `terminal_path`, its `~/.fx/terminal/{id}`
+    /// terminal kinds route to `terminal_path`, its `~/.proto-fx/terminal/{id}`
     /// (D45), and it has no side folder, so every other kind is absent
     /// (D44, D48). An empty `terminal_path` gives no terminal kinds.
     pub fn initBlobs(alloc: Allocator, blobs: Blobs, terminal_path: []const u8, mode: Mode) !SessionChildCapability {

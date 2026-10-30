@@ -863,7 +863,7 @@ fn loadGeneration(
     return .ready;
 }
 
-/// `<home>/.fx/file-index/<sha256>.idx`, or null without an absolute home
+/// `<home>/.proto-fx/file-index/<sha256>.idx`, or null without an absolute home
 /// directory. The digest covers the roots and every variable that locates git
 /// config, so a listing built under one config is never reused under another.
 fn snapshotPath(alloc: Allocator, roots: []const []const u8) Allocator.Error!?[]const u8 {
@@ -892,7 +892,7 @@ fn snapshotPathIn(
     var sum: [sha256_digest_len]u8 = undefined;
     digest.final(&sum);
     const hex = std.fmt.bytesToHex(sum, .lower);
-    return alloc.print("{s}/.fx/file-index/{s}.idx", .{ home, &hex });
+    return alloc.print("{s}/.proto-fx/file-index/{s}.idx", .{ home, &hex });
 }
 
 /// The trees for the available roots of a scope, in root order. Trees reused
@@ -4339,5 +4339,5 @@ test "snapshot path changes with where git config is located" {
     const again = try snapshotPathIn(alloc, "/home/u", &roots, &cases[1]);
     defer alloc.free(again);
     try std.testing.expectEqualStrings(paths[1], again);
-    try std.testing.expect(std.mem.startsWith(u8, again, "/home/u/.fx/file-index/"));
+    try std.testing.expect(std.mem.startsWith(u8, again, "/home/u/.proto-fx/file-index/"));
 }

@@ -1,4 +1,4 @@
-//! `~/.fx/mcp.json` and `.mcp.json` edited in place. `add` and
+//! `~/.proto-fx/mcp.json` and `.mcp.json` edited in place. `add` and
 //! `remove` change one entry of the file's JSON tree, so keys fx doesn't
 //! know, the other top-level keys, the order, the spelling, and the text of
 //! numbers all stay as written.
@@ -381,11 +381,11 @@ test "the profile's first write creates ~/.fx readable only by its owner" {
     defer tmp.cleanup();
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(home);
-    const path = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "mcp.json" });
+    const path = try std.Io.Dir.path.join(alloc, &.{ home, ".proto-fx", "mcp.json" });
     defer alloc.free(path);
     try write(alloc, .profile, path, "{\"mcpServers\":{}}");
-    const dir = try tmp.dir.statFile(io, ".fx", .{});
+    const dir = try tmp.dir.statFile(io, ".proto-fx", .{});
     try testing.expectEqual(@as(std.posix.mode_t, 0o700), dir.permissions.toMode() & 0o777);
-    const file = try tmp.dir.statFile(io, ".fx/mcp.json", .{});
+    const file = try tmp.dir.statFile(io, ".proto-fx/mcp.json", .{});
     try testing.expectEqual(@as(std.posix.mode_t, 0o600), file.permissions.toMode() & 0o777);
 }

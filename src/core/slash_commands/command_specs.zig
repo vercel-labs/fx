@@ -1627,20 +1627,21 @@ test "rendered top-level help is a complete CLI navigation page" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.startsWith(u8, text, "proto-fx v9.8.7\nFast, native coding agent for the terminal."));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "proto-fx"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "proto-fx v9.8.7"));
     try std.testing.expect(std.mem.find(u8, text, "proto-fx starts an interactive session by default.") != null);
     try std.testing.expect(std.mem.find(u8, text, "proto-fx <command> [...flags] [...args]") != null);
     try std.testing.expect(std.mem.find(u8, text, "Commands:") != null);
+    try std.testing.expect(std.mem.find(u8, text, "sessions                        List saved sessions") != null);
+    try std.testing.expect(std.mem.find(u8, text, "daemon [status|stop] [--json]") != null);
+    try std.testing.expect(std.mem.find(u8, text, "setup --base-url URL            Discover models and connect directly") != null);
+    try std.testing.expect(std.mem.find(u8, text, "ttsr <list|test|scan>") != null);
+    try std.testing.expect(std.mem.find(u8, text, "read <target>") != null);
     try std.testing.expect(std.mem.find(u8, text, "ask <prompt>") != null);
     try std.testing.expect(std.mem.find(u8, text, "Run one noninteractive request") != null);
     try std.testing.expect(std.mem.find(u8, text, "Draft or publish a GitHub issue") != null);
-    try std.testing.expect(std.mem.find(u8, text, "credits|balance") != null);
     try std.testing.expect(std.mem.find(u8, text, "Sign in to a model provider") != null);
     try std.testing.expect(std.mem.find(u8, text, "Sign out of a model provider") != null);
     try std.testing.expect(std.mem.find(u8, text, "Choose the active model provider") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Configure a Vercel AI Gateway API key") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Choose a Vercel AI Gateway team") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Show Vercel AI Gateway credits") != null);
     try std.testing.expect(std.mem.find(u8, text, "Sign in to Vercel or a selected provider") == null);
     try std.testing.expect(std.mem.find(u8, text, "Flags:") != null);
     try std.testing.expect(std.mem.find(u8, text, "--context-limit <spec>") != null);
@@ -1664,8 +1665,6 @@ test "rendered top-level help is a complete CLI navigation page" {
     try std.testing.expect(std.mem.find(u8, text, "Run `proto-fx <command> --help` for command-specific usage and options.") != null);
     try std.testing.expect(std.mem.find(u8, text, "command-specific options and examples") == null);
     try std.testing.expect(std.mem.find(u8, text, "Run `/help` inside an interactive session for slash commands.") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Learn more about proto-fx:  https://fx.sh/docs") != null);
-    try std.testing.expect(std.mem.find(u8, text, "\nReport a problem:     run `/feedback` inside proto-fx\n") != null);
     try std.testing.expect(std.mem.find(u8, text, "\n\n\nRun `proto-fx <command> --help`") == null);
     try std.testing.expect(std.mem.find(u8, text, "Start:") == null);
     try std.testing.expect(std.mem.find(u8, text, "  Work      ") == null);
@@ -1678,7 +1677,7 @@ test "top-level help summary overrides do not change command-specific help" {
     const login = try renderTopLevelCommandHelp(std.testing.allocator, testTopLevelRegistry(), .login);
     defer std.testing.allocator.free(login);
 
-    try std.testing.expect(std.mem.find(u8, login, "Sign in to Vercel or a selected provider") != null);
+    try std.testing.expect(std.mem.find(u8, login, "Sign in to a subscription or a built-in API provider") != null);
     try std.testing.expect(std.mem.find(u8, login, "Sign in to a model provider") == null);
 }
 
@@ -1695,8 +1694,7 @@ test "terminal top-level help adds styling without changing visible content" {
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[1mUsage:\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mask <prompt>\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;243mFast, native coding agent") != null);
-    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[4mhttps://fx.sh/docs\x1b[0m") != null);
-    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[39mrun `/feedback` inside proto-fx\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;243mRun `/help` inside an interactive session for slash commands.\x1b[0m") != null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;252m") == null);
     try std.testing.expect(std.mem.find(u8, terminal, "\x1b[38;5;245m") == null);
     try std.testing.expectEqualStrings(plain, stripped);
@@ -1716,7 +1714,7 @@ test "top-level help renders flags as compact aligned rows" {
     try std.testing.expect(lineContainsBoth(wide, "--resume-last", "Resume the latest workspace session"));
     try std.testing.expect(std.mem.find(u8, wide, "Print the proto-fx version and exit\n\nExamples:") != null);
     try std.testing.expect(std.mem.find(u8, wide, "List available models\n\n  setup") != null);
-    try std.testing.expect(std.mem.find(u8, wide, "Show Vercel AI Gateway credits\n\n  usage") != null);
+    try std.testing.expect(std.mem.find(u8, wide, "Discover models and connect directly\n\n  status") != null);
     try expectAllLinesFit(narrow, 60);
 }
 
@@ -1964,7 +1962,9 @@ test "top-level help index covers visible commands once" {
     const registry = testTopLevelRegistry();
     for (registry.specs) |spec| {
         const expected: usize = if (spec.hidden_from_top_level_help) 0 else 1;
-        try std.testing.expectEqual(expected, topLevelIndexOccurrences(registry, spec.kind));
+        const got = topLevelIndexOccurrences(registry, spec.kind);
+        if (got != expected) std.debug.print("DEBUG index kind={any} token={s} hidden={} expected={d} got={d}\n", .{ spec.kind, spec.token, spec.hidden_from_top_level_help, expected, got });
+        try std.testing.expectEqual(expected, got);
     }
 }
 
@@ -2199,9 +2199,11 @@ test "top-level help renders every visible command token" {
 
     for (registry.specs) |spec| {
         if (spec.hidden_from_top_level_help) continue;
+        if (!topLevelHelpContainsCommandToken(text, spec.token)) std.debug.print("DEBUG token missing kind={any} token={s}\n", .{ spec.kind, spec.token });
         try std.testing.expect(topLevelHelpContainsCommandToken(text, spec.token));
     }
     for (registry.notes) |note| {
+        if (std.mem.find(u8, text, note) == null) std.debug.print("DEBUG note missing={s}\n", .{note});
         try std.testing.expect(std.mem.find(u8, text, note) != null);
     }
 }

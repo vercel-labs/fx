@@ -878,8 +878,8 @@ const OAuthHttpOperation = struct {
 };
 
 test "oauth transport user agent uses the product version" {
-    try std.testing.expect(std.mem.startsWith(u8, gateway_client.user_agent, "fx/"));
-    try std.testing.expect(gateway_client.user_agent.len > "fx/".len);
+    try std.testing.expect(std.mem.startsWith(u8, gateway_client.user_agent, "proto-fx/"));
+    try std.testing.expect(gateway_client.user_agent.len > "proto-fx/".len);
     try std.testing.expect(std.mem.find(u8, gateway_client.user_agent, "zig") == null);
     try std.testing.expect(std.mem.find(u8, gateway_client.user_agent, "std.http") == null);
 }

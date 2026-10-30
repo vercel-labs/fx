@@ -88,7 +88,7 @@ pub const RebuildError = error{ Busy, OutOfMemory } || storage.IoFault;
 pub const Backend = enum { posix };
 
 pub const InitOptions = struct {
-    /// The sessions root, `~/.fx/sessions/v2` in fx (D19); created on first
+    /// The sessions root, `~/.proto-fx/sessions/v2` in fx (D19); created on first
     /// use, with any missing parent folders, all `0700`.
     root: []const u8,
     backend: Backend = .posix,

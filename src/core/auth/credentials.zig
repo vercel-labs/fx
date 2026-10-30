@@ -1357,7 +1357,7 @@ test "credential source presence reads metadata without parsing session secrets"
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), ".proto-fx");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
     defer alloc.free(home);
     const env = try CredentialTestEnv.install(alloc, &.{.{ "HOME", home }});
@@ -1375,7 +1375,7 @@ test "credential source presence reads metadata without parsing session secrets"
         var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const relative_path = try std.mem.print(
             &path_buffer,
-            ".fx/{s}",
+            ".proto-fx/{s}",
             .{case.file_name},
         );
         var file = try tmp.dir.createFile(io_mod.getIo(), relative_path, .{
@@ -1476,8 +1476,8 @@ const ExpiredFxLoginFixture = struct {
         const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "");
         errdefer alloc.free(home);
 
-        try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
-        const auth_path = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "auth.json" });
+        try tmp.dir.createDirPath(io_mod.getIo(), ".proto-fx");
+        const auth_path = try std.Io.Dir.path.join(alloc, &.{ home, ".proto-fx", "auth.json" });
         defer alloc.free(auth_path);
         var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), auth_path, .{
             .truncate = true,
@@ -1619,7 +1619,7 @@ test "an fx login refresh retires the consumed token when durable replacement fa
     const alloc = std.testing.allocator;
     var fixture = try ExpiredFxLoginFixture.install(alloc);
     defer fixture.deinit();
-    const auth_path = try std.Io.Dir.path.join(alloc, &.{ fixture.home, ".fx", "auth.json" });
+    const auth_path = try std.Io.Dir.path.join(alloc, &.{ fixture.home, ".proto-fx", "auth.json" });
     defer alloc.free(auth_path);
     var refresh = FxLoginRefreshProbe{
         .token_disposition = .accepted,

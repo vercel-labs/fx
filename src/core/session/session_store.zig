@@ -972,7 +972,7 @@ const TempStore = struct {
 
 fn initTempStore(alloc: Allocator, tmp: *std.testing.TmpDir) !TempStore {
     // The read-only store only sees a sessions folder that already exists.
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/sessions");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx/sessions");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     errdefer alloc.free(home);
@@ -1081,7 +1081,7 @@ test "reads of an empty or missing home find nothing and create nothing" {
         try std.testing.expect((try candidates.nextId(alloc, null)) == null);
         try std.testing.expectError(error.SessionNotFound, store.loadReadOnly(alloc, "missing"));
     }
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io_mod.getIo(), "home/.fx", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io_mod.getIo(), "home/.proto-fx", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.access(io_mod.getIo(), "missing-home", .{}));
 }
 

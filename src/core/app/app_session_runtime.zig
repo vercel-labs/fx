@@ -6611,12 +6611,12 @@ test "session runtime owns temporary interactive image snapshot capture" {
 }
 
 fn testPaths(alloc: Allocator, tmp: *std.testing.TmpDir) !struct { home: []u8, workspace: []u8 } {
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     errdefer alloc.free(home);
     // fx keeps `.fx` private, and resuming a session verifies that.
-    const fx_dir = try std.Io.Dir.path.joinZ(alloc, &.{ home, ".fx" });
+    const fx_dir = try std.Io.Dir.path.joinZ(alloc, &.{ home, ".proto-fx" });
     defer alloc.free(fx_dir);
     if (std.c.chmod(fx_dir.ptr, 0o700) != 0) return error.TestChmodFailed;
     return .{ .home = home, .workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace") };
@@ -10393,7 +10393,7 @@ test "session picker current mode filters workspace and all mode includes every 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-a");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace-b");
     const home_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");

@@ -268,7 +268,7 @@ test "shared workspace mutation owns staging persistence metadata" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.proto-fx");
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "shared", .default_dir);
 
@@ -310,7 +310,7 @@ test "shared workspace mutations apply stale actions to the latest durable roots
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.proto-fx");
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "added", .default_dir);
     try tmp.dir.createDir(std.testing.io, "launch", .default_dir);
@@ -352,7 +352,7 @@ test "shared workspace mutations apply stale actions to the latest durable roots
     try writeWorkspaceDirectoriesFixture(
         alloc,
         tmp.dir,
-        "home/.fx/settings.json",
+        "home/.proto-fx/settings.json",
         primary,
         &saved,
     );
@@ -397,7 +397,7 @@ test "workspace add rejects effective capacity before changing settings" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.proto-fx");
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "added", .default_dir);
     try tmp.dir.createDir(std.testing.io, "launch", .default_dir);
@@ -436,11 +436,11 @@ test "workspace add rejects effective capacity before changing settings" {
     try writeWorkspaceDirectoriesFixture(
         alloc,
         tmp.dir,
-        "home/.fx/settings.json",
+        "home/.proto-fx/settings.json",
         primary,
         &saved,
     );
-    const before = try readFixtureFile(alloc, tmp.dir, "home/.fx/settings.json");
+    const before = try readFixtureFile(alloc, tmp.dir, "home/.proto-fx/settings.json");
     defer alloc.free(before);
 
     var failure_phase: FailurePhase = .stage;
@@ -449,7 +449,7 @@ test "workspace add rejects effective capacity before changing settings" {
         execute(alloc, primary, &current, .{ .add = added }, &failure_phase),
     );
 
-    const after = try readFixtureFile(alloc, tmp.dir, "home/.fx/settings.json");
+    const after = try readFixtureFile(alloc, tmp.dir, "home/.proto-fx/settings.json");
     defer alloc.free(after);
     try std.testing.expectEqualStrings(before, after);
     try std.testing.expectEqual(FailurePhase.commit, failure_phase);
@@ -463,7 +463,7 @@ test "shared workspace mutation removes command line only access without a durab
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.proto-fx");
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "launch", .default_dir);
 
@@ -559,7 +559,7 @@ test "workspace access reconciliation accepts only intended or previous saved st
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.proto-fx");
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "previous", .default_dir);
     try tmp.dir.createDir(std.testing.io, "launch", .default_dir);
@@ -589,7 +589,7 @@ test "workspace access reconciliation accepts only intended or previous saved st
     var env = try TestEnv.install(alloc, &.{.{ .key = "HOME", .value = home }});
     defer env.deinit();
 
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{}\n");
+    try writeFixtureFile(tmp.dir, "home/.proto-fx/settings.json", "{}\n");
     var intended_result = try reconcileWorkspaceAccess(alloc, primary, &current, &intended);
     defer intended_result.deinit(alloc);
     switch (intended_result) {
@@ -602,7 +602,7 @@ test "workspace access reconciliation accepts only intended or previous saved st
         .{ primary, previous },
     );
     defer alloc.free(previous_fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", previous_fixture);
+    try writeFixtureFile(tmp.dir, "home/.proto-fx/settings.json", previous_fixture);
     var previous_result = try reconcileWorkspaceAccess(alloc, primary, &current, &intended);
     defer previous_result.deinit(alloc);
     switch (previous_result) {
@@ -618,7 +618,7 @@ test "workspace access reconciliation accepts only intended or previous saved st
         .{ primary, third },
     );
     defer alloc.free(third_fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", third_fixture);
+    try writeFixtureFile(tmp.dir, "home/.proto-fx/settings.json", third_fixture);
     var third_result = try reconcileWorkspaceAccess(alloc, primary, &current, &intended);
     defer third_result.deinit(alloc);
     try std.testing.expect(third_result == .unconfirmed);
@@ -628,7 +628,7 @@ test "workspace access reconciliation accepts only intended or previous saved st
         .{ primary, previous, previous },
     );
     defer alloc.free(invalid_fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", invalid_fixture);
+    try writeFixtureFile(tmp.dir, "home/.proto-fx/settings.json", invalid_fixture);
     var invalid_result = try reconcileWorkspaceAccess(alloc, primary, &current, &intended);
     defer invalid_result.deinit(alloc);
     try std.testing.expect(invalid_result == .unconfirmed);
@@ -638,7 +638,7 @@ test "workspace access reconciliation rejects a retargeted durable source" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "home/.fx");
+    try tmp.dir.createDirPath(std.testing.io, "home/.proto-fx");
     try tmp.dir.createDir(std.testing.io, "primary", .default_dir);
     try tmp.dir.createDir(std.testing.io, "first", .default_dir);
     try tmp.dir.createDir(std.testing.io, "second", .default_dir);
@@ -671,7 +671,7 @@ test "workspace access reconciliation rejects a retargeted durable source" {
         .{ primary, source },
     );
     defer alloc.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", fixture);
+    try writeFixtureFile(tmp.dir, "home/.proto-fx/settings.json", fixture);
     try tmp.dir.deleteFile(std.testing.io, "saved-link");
     try tmp.dir.symLink(std.testing.io, "second", "saved-link", .{ .is_directory = true });
 
