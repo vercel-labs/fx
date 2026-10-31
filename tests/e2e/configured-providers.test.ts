@@ -177,6 +177,130 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 25000);
 
+  test("resumes with equivalent reordered and recased header sets", async () => {
+    const f = fixture();
+    const env = { ...f.env, FX_TEST_HEADER_KEY: "synthetic-header-key", FX_TEST_HEADER_PROJECT: "test-project" };
+    try {
+      Object.assign(f.settings.providers.local, {
+        headers: { "X-Tenant": "one", "x-region": "two" },
+        header_env: { "X-Api-Key": "FX_TEST_HEADER_KEY", "x-project": "FX_TEST_HEADER_PROJECT" },
+      });
+      f.save();
+      const first = await runFx(["ask", "--json", "hello"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      const saved = JSON.parse(first.stdout);
+
+      Object.assign(f.settings.providers.local, {
+        headers: { "X-Region": "two", "x-tenant": "one" },
+        header_env: { "X-Project": "FX_TEST_HEADER_PROJECT", "x-api-key": "FX_TEST_HEADER_KEY" },
+      });
+      f.save();
+      const resumed = await runFx(["ask", "--json", "--resume", saved.session_id, "continue"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
+      expect(JSON.parse(resumed.stdout).session_id).toBe(saved.session_id);
+      expect(resumed.stderr).toBe("");
+      expect(f.requests).toHaveLength(2);
+      for (const request of f.requests) {
+        expect(request.headers["x-tenant"]).toBe("one");
+        expect(request.headers["x-region"]).toBe("two");
+        expect(request.headers["api-key"]).toBeUndefined();
+        expect(request.headers["x-api-key"]).toBe("synthetic-header-key");
+        expect(request.headers["x-project"]).toBe("test-project");
+      }
+    } finally { f.close(); }
+  }, 45000);
+
+  test.each(["literal", "environment"])("refuses implicit resume after changing a %s header binding", async source => {
+    const f = fixture();
+    const env = { ...f.env, FX_TEST_HEADER_KEY: "synthetic-first-key", FX_TEST_OTHER_HEADER_KEY: "synthetic-second-key" };
+    try {
+      Object.assign(f.settings.providers.local, {
+        headers: { "x-tenant": "one" },
+        header_env: { "x-api-key": "FX_TEST_HEADER_KEY" },
+      });
+      f.save();
+      const first = await runFx(["ask", "--json", "hello"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      const saved = JSON.parse(first.stdout);
+      Object.assign(f.settings.providers.local, source === "literal"
+        ? { headers: { "x-tenant": "two" } }
+        : { header_env: { "x-api-key": "FX_TEST_OTHER_HEADER_KEY" } });
+      f.save();
+      const resumed = await runFx(["ask", "--json", "--resume", saved.session_id, "continue"], { cwd: f.workspace, env, timeoutMs: 20000 });
+      expect(resumed.code).not.toBe(0);
+      expect(f.requests).toHaveLength(1);
+    } finally { f.close(); }
+  }, 45000);
+
+  test("sends configured literal and environment-backed request headers", async () => {
+    const f = fixture();
+    try {
+      Object.assign(f.settings.providers.local, {
+        headers: { "x-opencode-session": "fx-verify-0001" },
+        header_env: { "api-key": "FX_TEST_PROVIDER_HEADER_TOKEN" },
+      });
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: { ...f.env, FX_TEST_PROVIDER_HEADER_TOKEN: "header-secret" }, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(`fx ask failed: ${result.stdout} ${result.stderr}`);
+      expect(f.requests).toHaveLength(1);
+      const headers = f.requests[0].headers;
+      expect(headers["x-opencode-session"]).toBe("fx-verify-0001");
+      expect(headers["api-key"]).toBe("header-secret");
+      expect(headers["accept"]).toBe("text/event-stream");
+      expect(headers["authorization"]).toBeUndefined();
+    } finally { f.close(); }
+  }, 25000);
+
+  test("a missing header environment credential fails before sending", async () => {
+    const f = fixture();
+    try {
+      Object.assign(f.settings.providers.local, { header_env: { "api-key": "FX_TEST_PROVIDER_HEADER_TOKEN" } });
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: { ...f.env, FX_TEST_PROVIDER_HEADER_TOKEN: undefined }, timeoutMs: 10000 });
+      expect(result.code).not.toBe(0);
+      expect(f.requests).toHaveLength(0);
+      expect(result.stdout + result.stderr).toContain("MissingConfiguredProviderHeaderEnvironment");
+    } finally { f.close(); }
+  }, 15000);
+
+  test("invalid environment-backed header bytes are rejected before sending", async () => {
+    const f = fixture();
+    try {
+      Object.assign(f.settings.providers.local, { header_env: { "api-key": "FX_TEST_PROVIDER_HEADER_TOKEN" } });
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: { ...f.env, FX_TEST_PROVIDER_HEADER_TOKEN: "bad\nheader" }, timeoutMs: 10000 });
+      expect(result.code).not.toBe(0);
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  }, 15000);
+
+  test("provider error diagnostics redact environment-backed header credentials", async () => {
+    const secret = "header-secret-token";
+    const f = fixture(() => Response.json({ error: { message: `rejected ${secret}` } }, { status: 401 }));
+    try {
+      Object.assign(f.settings.providers.local, { header_env: { "api-key": "FX_TEST_PROVIDER_HEADER_TOKEN" } });
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_TEST_PROVIDER_HEADER_TOKEN: secret }, timeoutMs: 10000 });
+      expect(result.code).toBe(1);
+      expect(result.stdout + result.stderr).not.toContain(secret);
+      expect(f.requests).toHaveLength(1);
+    } finally { f.close(); }
+  }, 15000);
+
+  test("provider error diagnostics redact configured literal header credentials", async () => {
+    const secret = "literal-secret-value";
+    const f = fixture(() => Response.json({ error: { message: `rejected ${secret}` } }, { status: 401 }));
+    try {
+      Object.assign(f.settings.providers.local, { headers: { "x-literal-secret": secret } });
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 10000 });
+      expect(result.code).toBe(1);
+      expect(result.stdout + result.stderr).not.toContain(secret);
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].headers["x-literal-secret"]).toBe(secret);
+    } finally { f.close(); }
+  }, 15000);
+
   test("terminal usage may repeat an empty matching finished choice", async () => {
     const f = fixture(async body => {
       const response = completion(body.model);
