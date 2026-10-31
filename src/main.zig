@@ -3330,15 +3330,17 @@ const App = struct {
         return child.displayName();
     }
 
-    /// The footer note for a hidden agent waiting on an answer, such as
-    /// "reviewer needs approval · Alt+→", or empty. fx never switches
-    /// on its own. `buf` backs the returned text.
+    /// The footer note for a hidden agent waiting on the user, such as
+    /// "reviewer needs approval · Alt+→", or empty. It waits on an approval,
+    /// a question, or a request only the user can continue, such as one out
+    /// of credits. fx never switches on its own. `buf` backs the returned
+    /// text.
     pub fn hiddenAgentWaitingNote(self: *App, buf: []u8) []const u8 {
+        const Wait = enum { approval, question, request };
         // The first waiting agent the note names, null for the first
         // instance, which `main_agent` holds.
         var first: ?*app_agents_runtime.ChildAgent = null;
-        var found = false;
-        var asks = false;
+        var first_wait: ?Wait = null;
         var count: usize = 0;
         if (self.agent_on_screen != null and AgentsAppRuntime.firstOpen(self)) {
             // Main's own request, not a subagent's that main also shows.
@@ -3346,33 +3348,51 @@ const App = struct {
                 request.origin == .active_session
             else
                 false;
-            if (main_waiting or self.main_agent.question_prompt.isActive()) {
-                found = true;
-                asks = !main_waiting;
+            const wait: ?Wait = if (main_waiting)
+                .approval
+            else if (self.main_agent.question_prompt.isActive())
+                .question
+            else if (requestWaitsForUser(&self.main_screen))
+                .request
+            else
+                null;
+            if (wait) |value| {
+                first_wait = value;
                 count += 1;
             }
         }
         for (self.child_agents.items) |child| {
             if (child == self.agent_on_screen) continue;
-            const approval = child.agent.approval_prompt.isActive();
-            if (!approval and !child.agent.question_prompt.isActive()) continue;
-            if (!found) {
+            const wait: Wait = if (child.agent.approval_prompt.isActive())
+                .approval
+            else if (child.agent.question_prompt.isActive())
+                .question
+            else if (requestWaitsForUser(&child.screen))
+                .request
+            else
+                continue;
+            if (first_wait == null) {
                 first = child;
-                found = true;
-                asks = !approval;
+                first_wait = wait;
             }
             count += 1;
         }
-        if (!found) return "";
+        const wait = first_wait orelse return "";
         var name_buf: [32]u8 = undefined;
         const name = AgentsAppRuntime.noteName(self, first, &name_buf);
         const key = AgentsAppRuntime.keyToward(self, first);
-        return if (count > 1)
-            std.mem.print(buf, "{s} and {d} more need you · {s}", .{ name, count - 1, key }) catch ""
-        else if (asks)
-            std.mem.print(buf, "{s} has a question · {s}", .{ name, key }) catch ""
-        else
-            std.mem.print(buf, "{s} needs approval · {s}", .{ name, key }) catch "";
+        if (count > 1) return std.mem.print(buf, "{s} and {d} more need you · {s}", .{ name, count - 1, key }) catch "";
+        return switch (wait) {
+            .approval => std.mem.print(buf, "{s} needs approval · {s}", .{ name, key }) catch "",
+            .question => std.mem.print(buf, "{s} has a question · {s}", .{ name, key }) catch "",
+            .request => std.mem.print(buf, "{s} needs you · {s}", .{ name, key }) catch "",
+        };
+    }
+
+    /// Whether a hidden agent's status row, kept with its transcript off
+    /// screen, shows a request that waits for the user.
+    fn requestWaitsForUser(screen: *const app_agents_runtime.ScreenSlot) bool {
+        return screen.transcript.notebook.worker_status.waitsForUser();
     }
 
     /// Handles the events and paced text of the agent in context.
@@ -5556,6 +5576,35 @@ test "the footer notes a hidden agent waiting on an approval, never the one on s
     try App.AgentsAppRuntime.show(&app, reviewer);
     _ = try app.main_agent.approval_prompt.syncRequest(alloc, .{ .label = "shell" });
     try std.testing.expectEqualStrings("main and 1 more need you · Alt+←", app.hiddenAgentWaitingNote(&buf));
+}
+
+test "the footer notes a hidden agent whose request waits for the user" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const writer = try addTestChildAgent(&app, "writer-id");
+    writer.name = try alloc.dupe(u8, "writer");
+    const reviewer = try addTestChildAgent(&app, "reviewer-id");
+    reviewer.name = try alloc.dupe(u8, "reviewer");
+    defer _ = reviewer.agent.approval_prompt.syncRequest(alloc, null) catch {};
+    var buf: [128]u8 = undefined;
+
+    // A hidden subagent out of credits waits on its own screen, where
+    // the status row says why; the screen the user is on says who.
+    writer.screen.transcript.notebook.worker_status.set_route_recovery(.{ .kind = .need_user, .need = .quota });
+    try std.testing.expectEqualStrings("writer needs you · Alt+→", app.hiddenAgentWaitingNote(&buf));
+
+    // On its own screen the status row shows instead of a note.
+    try App.AgentsAppRuntime.show(&app, writer);
+    try std.testing.expectEqualStrings("", app.hiddenAgentWaitingNote(&buf));
+
+    // It counts with the agents waiting on an answer.
+    try App.AgentsAppRuntime.show(&app, null);
+    _ = try reviewer.agent.approval_prompt.syncRequest(alloc, .{ .label = "write" });
+    try std.testing.expectEqualStrings("writer and 1 more need you · Alt+→", app.hiddenAgentWaitingNote(&buf));
 }
 
 test "a hidden subagent's approval is lent to main's screen, answered on its worker, and goes back" {
