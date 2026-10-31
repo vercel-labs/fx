@@ -286,7 +286,7 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
     // Every verb but help reads or writes under `~/.fx`. The shell passes an
     // empty home when `io_mod.homeDir` has none, and a path built from it
     // would land under the current folder.
-    if (command != .help and io_mod.absoluteHome(c.home) == null) return error.HomeNotSet;
+    if (command != .help and !std.Io.Dir.path.isAbsolute(c.home)) return error.HomeNotSet;
     return switch (command) {
         .help => |verb| {
             try writeUsage(c.out, c.surface, verb);
