@@ -32,6 +32,9 @@ TARGET = "aarch64-macos"
 DISPLAY_NAME = "macOS arm64"
 HOST_ARCH = "arm64"
 LIBLLVM_NAME = "libLLVM.dylib"
+# The candidate may be at most this size, and needs 0.250 MiB of headroom
+# below it, which leaves about 140 KB of growth above a 5.61 MiB build.
+SIZE_CEILING_MIB = 6.000
 # The ordinary control build already records everything the links reuse.
 CONTROL_BUILD_FLAGS: tuple[str, ...] = ()
 # Apple ld's dead-code stripping for `zig cc` links.

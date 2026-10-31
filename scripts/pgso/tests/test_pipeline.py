@@ -7,7 +7,7 @@ import pathlib
 import tempfile
 import unittest
 
-from scripts.pgso import macos
+from scripts.pgso import linux, macos
 from scripts.pgso.model import PgsoError, sha256_file
 from scripts.pgso.macos import (
     CandidateMetadata,
@@ -1414,14 +1414,18 @@ sys.stderr.write('optimizer warning')""",
                         expected_contract=self.good_link_contract(),
                     )
 
-    def test_candidate_size_rejects_more_than_7_000_mib(self) -> None:
+    def test_candidate_size_rejects_more_than_the_ceiling(self) -> None:
         candidate = self.root / "candidate"
         candidate.write_bytes(b"")
         with candidate.open("r+b") as stream:
-            stream.truncate(7_340_033)
+            stream.truncate(6_291_457)
 
-        with self.assertRaisesRegex(PgsoError, "exceeds 7.000 MiB"):
-            validate_candidate_size(candidate)
+        with self.assertRaisesRegex(PgsoError, "exceeds 6.000 MiB"):
+            validate_candidate_size(candidate, 6.000)
+
+    def test_each_platform_sets_its_size_ceiling(self) -> None:
+        self.assertEqual(6.000, macos.SIZE_CEILING_MIB)
+        self.assertEqual(6.250, linux.SIZE_CEILING_MIB)
 
     def test_candidate_must_not_create_an_adversarial_profile_file(self) -> None:
         before: set[pathlib.Path] = set()

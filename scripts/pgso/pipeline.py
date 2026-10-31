@@ -1308,9 +1308,9 @@ def link_candidate(
     return paths.candidate_binary
 
 
-def validate_candidate_size(candidate: pathlib.Path) -> ArtifactEvidence:
+def validate_candidate_size(candidate: pathlib.Path, ceiling_mib: float) -> ArtifactEvidence:
     _require_nonempty_file(candidate, "candidate executable")
-    return size_gate(candidate.stat().st_size)
+    return size_gate(candidate.stat().st_size, ceiling_mib)
 
 
 def reject_profile_outputs(
@@ -1330,7 +1330,10 @@ def verify_candidate(
 ) -> CandidateEvidence:
     _require_nonempty_file(paths.candidate_binary, "candidate executable")
     metadata = toolchain.platform.inspect_candidate(toolchain, paths, control)
-    artifact = validate_candidate_size(paths.candidate_binary)
+    artifact = validate_candidate_size(
+        paths.candidate_binary,
+        toolchain.platform.SIZE_CEILING_MIB,
+    )
 
     before = set(paths.candidate_profiles.glob("*.profraw"))
     environment = _runtime_environment(paths)

@@ -87,23 +87,23 @@ class PgsoModelTests(unittest.TestCase):
             self.assertEqual(sha256_file(path), evidence["sha256"])
 
     def test_size_gate_reports_exact_mib_and_preferred_headroom(self) -> None:
-        evidence = size_gate(6_887_888)
+        evidence = size_gate(5_886_560, 6.000)
 
         self.assertEqual(1.0, bytes_to_mib(1_048_576))
-        self.assertEqual(6_887_888, evidence.size_bytes)
-        self.assertEqual(6.5688018798828125, evidence.size_mib)
-        self.assertEqual(7.000, evidence.ceiling_mib)
-        self.assertEqual(0.4311981201171875, evidence.headroom_mib)
+        self.assertEqual(5_886_560, evidence.size_bytes)
+        self.assertEqual(5.613861083984375, evidence.size_mib)
+        self.assertEqual(6.000, evidence.ceiling_mib)
+        self.assertEqual(0.386138916015625, evidence.headroom_mib)
         self.assertEqual(0.250, evidence.preferred_headroom_mib)
         self.assertTrue(evidence.preferred_headroom_met)
 
     def test_size_gate_enforces_the_integral_byte_boundary(self) -> None:
-        self.assertEqual(7_340_032, size_gate(7_340_032).size_bytes)
-        with self.assertRaisesRegex(PgsoError, "exceeds 7.000 MiB"):
-            size_gate(7_340_033)
+        self.assertEqual(6_291_456, size_gate(6_291_456, 6.000).size_bytes)
+        with self.assertRaisesRegex(PgsoError, "exceeds 6.000 MiB"):
+            size_gate(6_291_457, 6.000)
 
     def test_size_gate_records_insufficient_preferred_headroom(self) -> None:
-        evidence = size_gate(7_200_000)
+        evidence = size_gate(6_100_000, 6.000)
 
         self.assertFalse(evidence.preferred_headroom_met)
         self.assertGreater(evidence.headroom_mib, 0)
@@ -112,7 +112,7 @@ class PgsoModelTests(unittest.TestCase):
         for byte_count in (0, -1):
             with self.subTest(byte_count=byte_count):
                 with self.assertRaisesRegex(PgsoError, "artifact is empty"):
-                    size_gate(byte_count)
+                    size_gate(byte_count, 6.000)
 
     def test_require_empty_stderr_rejects_unexpected_output(self) -> None:
         require_empty_stderr("profile use", "")

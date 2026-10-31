@@ -37,6 +37,9 @@ TARGET = "aarch64-linux"
 DISPLAY_NAME = "Linux arm64"
 HOST_ARCH = "aarch64"
 LIBLLVM_NAME = "libLLVM.so"
+# The candidate may be at most this size, and needs 0.250 MiB of headroom
+# below it, which leaves about 150 KB of growth above a 5.86 MiB build.
+SIZE_CEILING_MIB = 6.250
 # Record Zig's own link of the control, which the other links reuse.
 CONTROL_BUILD_FLAGS = ("--verbose-link",)
 # Profile use compiles the cold functions for size, which on Linux slows these
