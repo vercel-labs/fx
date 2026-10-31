@@ -40,7 +40,8 @@ pub const Command = union(enum) {
     help: ?Verb,
     list: struct { json: bool = false },
     show: struct { name: []const u8, json: bool = false },
-    add: struct { name: []const u8, file: config_file.File, entry: config_file.Entry },
+    /// `login`: sign in to a new HTTP server that needs a login.
+    add: struct { name: []const u8, file: config_file.File, entry: config_file.Entry, login: bool = true },
     remove: struct { name: []const u8, file: ?config_file.File },
     login: struct { name: []const u8, browser: bool },
     logout: []const u8,
@@ -86,6 +87,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
     var profile = false;
     var all = false;
     var no_browser = false;
+    var no_login = false;
     var i: usize = 0;
     while (i < dash) : (i += 1) {
         const a = rest[i];
@@ -96,7 +98,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
         }
         const allowed = switch (verb) {
             .list, .show => surface == .cli and std.mem.eql(u8, a, "--json"),
-            .add => std.mem.eql(u8, a, "--project") or std.mem.eql(u8, a, "--env") or std.mem.eql(u8, a, "--header"),
+            .add => std.mem.eql(u8, a, "--project") or std.mem.eql(u8, a, "--env") or std.mem.eql(u8, a, "--header") or std.mem.eql(u8, a, "--no-login"),
             .remove => std.mem.eql(u8, a, "--project") or std.mem.eql(u8, a, "--profile"),
             .login => std.mem.eql(u8, a, "--no-browser"),
             .approve => std.mem.eql(u8, a, "--all"),
@@ -119,6 +121,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
         if (std.mem.eql(u8, a, "--profile")) profile = true;
         if (std.mem.eql(u8, a, "--all")) all = true;
         if (std.mem.eql(u8, a, "--no-browser")) no_browser = true;
+        if (std.mem.eql(u8, a, "--no-login")) no_login = true;
     }
     if (dash < rest.len and verb != .add) return usage(arena, verb, "{s} {s} takes no command after --.", .{ p, @tagName(verb) });
     const n = names.items;
@@ -149,7 +152,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
             if (!std.mem.startsWith(u8, url, "https://") and !std.mem.startsWith(u8, url, "http://"))
                 return usage(arena, verb, "'{s}' isn't a URL. A stdio server's command goes after --.", .{url});
             if (pair_flag != null and std.mem.eql(u8, pair_flag.?, "--env")) return usage(arena, verb, "--env is for stdio servers; use --header for HTTP.", .{});
-            return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .http = .{ .url = url, .headers = pairs.items } } } } };
+            return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .http = .{ .url = url, .headers = pairs.items } }, .login = !no_login } } };
         },
         .approve => {
             if (all and n.len > 0) return usage(arena, verb, "{s} approve takes a NAME or --all, not both.", .{p});
@@ -215,10 +218,11 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
         .list => try w.print("usage: {s} list{s}\n", .{ p, json }),
         .show => try w.print("usage: {s} show NAME{s}\n", .{ p, json }),
         .add => try w.print(
-            \\usage: {s} add [--project] [--header K=V]... NAME URL
+            \\usage: {s} add [--project] [--no-login] [--header K=V]... NAME URL
             \\       {s} add [--project] [--env K=V]... NAME -- COMMAND [ARGS...]
-            \\       {s} add [--project] slack
-            \\  --project  write ./.mcp.json instead of ~/.fx/mcp.json
+            \\       {s} add [--project] [--no-login] slack
+            \\  --project   write ./.mcp.json instead of ~/.fx/mcp.json
+            \\  --no-login  don't sign in to an HTTP server that needs a login
             \\
         , .{ p, p, p }),
         .remove => try w.print("usage: {s} remove [--project | --profile] NAME\n", .{p}),
@@ -239,6 +243,10 @@ pub const Hosts = struct {
     release: *const fn (context: *anyopaque, host: *Host) void,
     /// Config or trust changed, so a live host should reload.
     changed: *const fn (context: *anyopaque) void,
+    /// `add` wrote an HTTP server that may need a login, for a surface whose
+    /// live host loads it after `changed` and signs in once it asks for one.
+    /// Null: `add` connects and signs in itself.
+    sign_in_when_loaded: ?*const fn (context: *anyopaque, name: []const u8) void = null,
 };
 
 pub const Context = struct {
@@ -290,7 +298,7 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
         },
         .list => |l| list(c, arena, l.json),
         .show => |s| show(c, arena, s.name, s.json),
-        .add => |a| add(c, arena, a.name, a.file, a.entry),
+        .add => |a| add(c, arena, a.name, a.file, a.entry, a.login),
         .remove => |r| remove(c, arena, r.name, r.file),
         .login => |l| login(c, arena, l.name, l.browser),
         .logout => |name| logout(c, arena, name),
@@ -574,7 +582,7 @@ pub fn toolDescription(arena: Allocator, raw: []const u8) !?[]const u8 {
     return line;
 }
 
-fn add(c: Context, arena: Allocator, name: []const u8, file: config_file.File, entry: config_file.Entry) !u8 {
+fn add(c: Context, arena: Allocator, name: []const u8, file: config_file.File, entry: config_file.Entry, login_after: bool) !u8 {
     const p = try paths(c, arena);
     const path = if (file == .project) p.project else p.profile;
     _ = config_file.update(c.gpa, p.profile, file, path, .{ .add = .{ .name = name, .entry = entry } }) catch |err| {
@@ -587,7 +595,44 @@ fn add(c: Context, arena: Allocator, name: []const u8, file: config_file.File, e
     if (try defines(c, arena, other, if (other == .project) p.project else p.profile, name)) {
         try c.out.print("{s} is also in {s}; the one in ~/.fx/mcp.json is used.\n", .{ name, fileLabel(other) });
     }
+    // A project server waits for approval before it can ask for a login.
+    if (login_after and file == .profile and entry == .http) {
+        if (c.hosts.sign_in_when_loaded) |later| {
+            later(c.hosts.context, name);
+            return 0;
+        }
+        signInAfterAdd(c, arena, name) catch |err| {
+            debug_trace.logf("mcp", "MCP sign-in after add failed server={s} err={s}", .{ name, @errorName(err) });
+            try c.err.print("Couldn't check whether {s} needs a login: {s}. {s} login {s} signs in.\n", .{ name, describe(err), c.surface.prog(), name });
+        };
+    }
     return 0;
+}
+
+/// After `fx mcp add`: connects to the new server and, when it needs a
+/// login, signs in the way `login` does, waiting for the browser. Without a
+/// browser to open, it names the command instead, since taking a pasted
+/// address back is `login`'s. The server stays added whatever happens here.
+fn signInAfterAdd(c: Context, arena: Allocator, name: []const u8) !void {
+    var waiter: Waiter = .{ .gpa = c.gpa, .name = name };
+    defer waiter.deinit();
+    const host = (try c.hosts.get(c.hosts.context, waiter.notify())) orelse return;
+    defer c.hosts.release(c.hosts.context, host);
+    const server = findServer(host, name) orelse return;
+    const listed = host.runtime.tools(arena, name, c.cancel) catch |err| switch (err) {
+        // Such as by a variable a header names that isn't set; `show` says why.
+        error.Held => return,
+        else => return err,
+    };
+    if (listed != .needs_login) return;
+    if (!canOpenBrowser()) {
+        try c.out.print("{s} needs a login. Sign in with: {s} login {s}\n", .{ name, c.surface.prog(), name });
+        return;
+    }
+    try c.out.print("{s} needs a login.\n", .{name});
+    try c.out.flush();
+    const code = (try beginLogin(c, arena, host, server, name, true)) orelse try waitForLogin(c, arena, host, &waiter, true);
+    if (code != 0) try c.err.print("{s} is added. Sign in later with: {s} login {s}\n", .{ name, c.surface.prog(), name });
 }
 
 fn defines(c: Context, arena: Allocator, file: config_file.File, path: []const u8, name: []const u8) !bool {
@@ -762,10 +807,15 @@ const Waiter = struct {
     }
 };
 
+/// Whether fx can open a browser here: not over SSH or with
+/// FX_NO_OPEN_BROWSER set, and off macOS only with a display.
+pub fn canOpenBrowser() bool {
+    if (io_mod.getenv("FX_NO_OPEN_BROWSER") != null or io_mod.getenv("SSH_CONNECTION") != null) return false;
+    return @import("builtin").target.os.tag == .macos or io_mod.getenv("DISPLAY") != null or io_mod.getenv("WAYLAND_DISPLAY") != null;
+}
+
 fn login(c: Context, arena: Allocator, name: []const u8, browser: bool) !u8 {
-    const no_display = io_mod.getenv("FX_NO_OPEN_BROWSER") != null or io_mod.getenv("SSH_CONNECTION") != null or
-        (@import("builtin").target.os.tag != .macos and io_mod.getenv("DISPLAY") == null and io_mod.getenv("WAYLAND_DISPLAY") == null);
-    const open = browser and !no_display;
+    const open = browser and canOpenBrowser();
     var waiter: Waiter = .{ .gpa = c.gpa, .name = name };
     defer waiter.deinit();
     const host = (try c.hosts.get(c.hosts.context, if (c.surface == .cli) waiter.notify() else null)) orelse return missing(c, arena, name);
@@ -775,24 +825,31 @@ fn login(c: Context, arena: Allocator, name: []const u8, browser: bool) !u8 {
         try c.err.print("{s} runs a command, so it has no login.\n", .{try safe(arena, name)});
         return 1;
     }
+    if (try beginLogin(c, arena, host, server, name, open)) |code| return code;
+    // The shell's host reports the address and the outcome in the transcript.
+    if (c.surface == .shell) return 0;
+    return waitForLogin(c, arena, host, &waiter, open);
+}
+
+/// Starts signing in to `server`. Null once it has started; else the exit
+/// code, having said why it couldn't.
+fn beginLogin(c: Context, arena: Allocator, host: *Host, server: @import("config.zig").Server, name: []const u8, open: bool) !?u8 {
     host.runtime.login(name, open) catch |err| switch (err) {
         error.Held => {
-            const status = findStatus(try host.runtime.statuses(arena), name) orelse return missing(c, arena, name);
+            const status = findStatus(try host.runtime.statuses(arena), name) orelse return try missing(c, arena, name);
             try c.err.print("{s} is {s}", .{ try safe(arena, name), try statusText(arena, status) });
             if (status.state == .waiting_for_approval) try c.err.print(": {s} approve {s}", .{ c.surface.prog(), try safe(arena, name) });
             try c.err.writeAll(".\n");
             return 1;
         },
-        error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign in to", name),
+        error.CredentialStoreUnreadable => return try unreadableLogins(c, arena, "sign in to", name),
         error.CallbackPortInUse => {
             try c.err.print("Couldn't sign in to {s}: port {d} is in use, maybe by another app signing in. Try again once it's free.\n", .{ try safe(arena, name), server.callback_port.? });
             return 1;
         },
         else => return err,
     };
-    // The shell's host reports the address and the outcome in the transcript.
-    if (c.surface == .shell) return 0;
-    return waitForLogin(c, arena, host, &waiter, open);
+    return null;
 }
 
 fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open: bool) !u8 {
@@ -905,6 +962,10 @@ test "parse reads every verb, with flags before --" {
     try testing.expectEqualStrings("https://w/mcp", http.entry.http.url);
     try testing.expectEqualStrings("X-Key", http.entry.http.headers[0].key);
     try testing.expectEqualStrings("${K}", http.entry.http.headers[0].value);
+    // An HTTP server is signed in to when it needs a login, unless --no-login.
+    try testing.expect(http.login);
+    try testing.expect(!(try parseCli(a, &.{ "add", "--no-login", "web", "https://w/mcp" })).command.add.login);
+    try testing.expect(!(try parse(a, .shell, &.{ "add", "slack", "--no-login" })).command.add.login);
 
     // Slack needs no URL; any other server does.
     try testing.expectEqualStrings("https://mcp.slack.com/mcp", (try parseCli(a, &.{ "add", "slack" })).command.add.entry.http.url);

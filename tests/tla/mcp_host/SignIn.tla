@@ -102,9 +102,10 @@ Ended(k) == [phase EXCEPT ![k] = "closed"]
 \* The host's login, while it's under way.
 SigningIn(h) == live[h] # 0 /\ Open(live[h])
 
-\* `/mcp login NAME` or `fx mcp login NAME` on the current host. It waits
-\* while any other host is alive. The engine starts a flow only when none
-\* is running.
+\* `/mcp login NAME` or `fx mcp login NAME` on the current host, or the same
+\* login `add` starts for a new server that asks for one (verbs.zig
+\* signInAfterAdd, app_mcp_runtime.zig signInAfterAdd). It waits while any
+\* other host is alive. The engine starts a flow only when none is running.
 StartLogin ==
     /\ alive[cur] /\ next <= MaxLogins
     /\ \A h \in Hosts : alive[h] => h = cur

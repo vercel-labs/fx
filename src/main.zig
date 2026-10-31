@@ -1717,6 +1717,7 @@ const App = struct {
 
     pub fn applyMcpHostReload(self: *App) void {
         _ = self.mcp.refreshHost(self.alloc, io_mod.homeDir(), self.workspace_root, self.toolRegistry(), .requested);
+        self.mcp.signInAfterAdd();
     }
 
     fn refreshMcpHostFromFiles(self: *App) bool {
@@ -3559,8 +3560,8 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
     const command = effective_args[0];
     if (std.mem.eql(u8, command, "mcp")) {
         if (effective_args.len < 2) return false;
-        return (effective_args.len == 3 and std.mem.eql(u8, effective_args[1], "add") and
-            std.mem.eql(u8, effective_args[2], "slack")) or
+        // `add` connects to a new HTTP server to sign in when it needs a login.
+        return (effective_args.len >= 3 and std.mem.eql(u8, effective_args[1], "add")) or
             std.mem.eql(u8, effective_args[1], "auth") or
             std.mem.eql(u8, effective_args[1], "list") or
             std.mem.eql(u8, effective_args[1], "logout") or
@@ -3627,7 +3628,8 @@ test "credential-reading commands use early threaded io without full entry confi
 
 test "MCP credential commands use early threaded io" {
     try std.testing.expect(needsEarlyThreadedIo(&.{ "mcp", "add", "slack" }));
-    try std.testing.expect(!needsEarlyThreadedIo(&.{ "mcp", "add", "slack", "node" }));
+    try std.testing.expect(needsEarlyThreadedIo(&.{ "mcp", "add", "web", "https://w.example/mcp" }));
+    try std.testing.expect(needsEarlyThreadedIo(&.{ "mcp", "add", "--no-login", "web", "https://w.example/mcp" }));
     for ([_][:0]const u8{ "auth", "list", "logout", "show", "login", "remove", "approve", "reject" }) |operation| {
         try std.testing.expect(needsEarlyThreadedIo(&.{
             @as([:0]const u8, "mcp"),
