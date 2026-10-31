@@ -2567,6 +2567,11 @@ pub const Runtime = struct {
         return self.sign_in_flow.browserUrlAlloc(alloc);
     }
 
+    /// True once when the sign-in worker has the device code ready.
+    pub fn takeSignInBrowserPending(self: *Self) bool {
+        return self.sign_in_flow.takeBrowserPending() and self.signInEntryActive();
+    }
+
     pub fn pollSignInTransition(self: *Self, alloc: Allocator) login_flow.SignInTransition {
         return self.sign_in_flow.pollTransition(alloc);
     }

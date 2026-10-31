@@ -799,6 +799,12 @@ pub fn Runtime(comptime App: type) type {
             else
                 .fx_login;
             app.auth.pulseSignIn(app.alloc);
+            if (comptime @hasDecl(@TypeOf(app.auth), "takeSignInBrowserPending")) {
+                if (app.auth.takeSignInBrowserPending()) {
+                    app.shell.render_requests.request(.footer);
+                    if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+                }
+            }
             switch (app.auth.pollSignInTransition(app.alloc)) {
                 .none => {},
                 .cancelled => {

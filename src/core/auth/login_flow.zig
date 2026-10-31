@@ -191,6 +191,8 @@ pub const SignInState = enum {
 
 pub const SignInSnapshot = struct {
     state: SignInState = .idle,
+    /// The flow is polling but its device code is still being requested.
+    preparing: bool = false,
     verification_uri: []const u8 = "",
     verification_uri_complete: ?[]const u8 = null,
     user_code: []const u8 = "",
@@ -326,16 +328,56 @@ pub const SignInRuntime = struct {
     failure: ?anyerror = null,
     poll_state: ?LoginPollState = null,
     deps: SignInRuntimeDeps = .{},
+    /// Set once when a device code requested on the worker becomes ready, so
+    /// the input loop can open the browser for it.
+    browser_pending: bool = false,
 
+    /// Starts an fx login sign-in. On native hosts the issuer discovery and
+    /// device-code request run on the sign-in worker, so the input loop never
+    /// waits on them; `snapshot().preparing` holds until the code arrives.
     pub fn start(
         self: *Self,
         alloc: Allocator,
         transport: oauth_transport.Provider,
     ) !bool {
-        const prepared = try prepareLogin(alloc, transport);
-        return self.startPrepared(alloc, prepared, .{
-            .oauth_transport = transport,
-        });
+        if (comptime host_target.is_wasm) {
+            const prepared = try prepareLogin(alloc, transport);
+            return self.startPrepared(alloc, prepared, .{
+                .oauth_transport = transport,
+            });
+        }
+        self.mutex.lockUncancelable(io_mod.getIo());
+        if (self.thread != null or self.state == .polling or self.completion != null) {
+            self.mutex.unlock(io_mod.getIo());
+            return false;
+        }
+        self.state = .polling;
+        self.failure = null;
+        self.flow = null;
+        self.poll_state = null;
+        self.browser_pending = false;
+        self.deps = .{ .oauth_transport = transport };
+        self.deps.poll.cancel_flag = &self.cancel_requested;
+        self.cancel_requested.store(false, .seq_cst);
+        self.mutex.unlock(io_mod.getIo());
+
+        self.thread = std.Thread.spawn(.{}, prepareThenPollMain, .{ self, alloc }) catch |err| {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            self.state = .idle;
+            self.mutex.unlock(io_mod.getIo());
+            self.clearFlow(alloc);
+            return err;
+        };
+        return true;
+    }
+
+    /// Returns true once after the worker publishes a device code.
+    pub fn takeBrowserPending(self: *Self) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const pending = self.browser_pending;
+        self.browser_pending = false;
+        return pending;
     }
 
     pub fn startPrepared(
@@ -428,7 +470,10 @@ pub const SignInRuntime = struct {
         const mutable = @constCast(self);
         mutable.mutex.lockUncancelable(io_mod.getIo());
         defer mutable.mutex.unlock(io_mod.getIo());
-        const flow = self.flow orelse return .{ .state = self.state };
+        const flow = self.flow orelse return .{
+            .state = self.state,
+            .preparing = self.state == .polling,
+        };
         return .{
             .state = self.state,
             .verification_uri = flow.device.verification_uri,
@@ -489,6 +534,43 @@ pub const SignInRuntime = struct {
             .cancelled => .cancelled,
             .idle, .polling => .none,
         };
+    }
+
+    fn prepareThenPollMain(self: *Self, alloc: Allocator) void {
+        const prepared = prepareLogin(alloc, self.cancellableTransport()) catch |err| {
+            self.publishFailure(err);
+            self.finishAttempt(alloc);
+            return;
+        };
+        self.mutex.lockUncancelable(io_mod.getIo());
+        if (self.state != .polling or self.cancel_requested.load(.seq_cst)) {
+            self.mutex.unlock(io_mod.getIo());
+            debug_trace.logf("auth", "sign-in dropped prepared device code reason=cancelled", .{});
+            var discarded = prepared;
+            discarded.deinit(alloc);
+            self.finishAttempt(alloc);
+            return;
+        }
+        self.flow = prepared;
+        self.browser_pending = true;
+        self.mutex.unlock(io_mod.getIo());
+        self.workerMain(alloc);
+    }
+
+    /// Lets `cancel` stop the discovery and device-code requests.
+    fn cancellableTransport(self: *Self) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = executeCancellable };
+    }
+
+    fn executeCancellable(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        request: oauth_transport.Request,
+    ) !oauth_transport.Response {
+        const self: *Self = @ptrCast(@alignCast(raw.?));
+        var bounded = request;
+        bounded.cancel_flag = &self.cancel_requested;
+        return self.deps.oauth_transport.execute(alloc, bounded);
     }
 
     fn workerMain(self: *Self, alloc: Allocator) void {
@@ -611,6 +693,7 @@ pub const SignInRuntime = struct {
         self.flow = null;
         self.poll_state = null;
         self.deps = .{};
+        self.browser_pending = false;
         self.mutex.unlock(io_mod.getIo());
         if (flow) |*prepared| prepared.deinit(alloc);
         if (deps.deinit_ctx) |deinit_ctx| deinit_ctx(deps.ctx, alloc);
@@ -2098,6 +2181,26 @@ test "sign-in runtime releases an owned provider context exactly once" {
     try std.testing.expect(runtime.cancel(alloc));
     runtime.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), cleanup_count);
+}
+
+test "sign-in snapshot reports preparing only until the device code exists" {
+    const alloc = std.testing.allocator;
+    var runtime: SignInRuntime = .{};
+    try std.testing.expect(!runtime.snapshot().preparing);
+
+    // `start` on a native host polls before its worker has the device code.
+    runtime.state = .polling;
+    try std.testing.expect(runtime.snapshot().preparing);
+    try std.testing.expect(!runtime.takeBrowserPending());
+    runtime.state = .idle;
+
+    try std.testing.expect(try runtime.startPreparedCooperative(alloc, try makeTestPreparedLogin(alloc), .{}));
+    const prepared = runtime.snapshot();
+    try std.testing.expectEqual(SignInState.polling, prepared.state);
+    try std.testing.expect(!prepared.preparing);
+    try std.testing.expect(prepared.verification_uri.len > 0);
+    try std.testing.expect(runtime.cancel(alloc));
+    runtime.deinit(alloc);
 }
 
 const WithholdingTokenFixture = struct {
