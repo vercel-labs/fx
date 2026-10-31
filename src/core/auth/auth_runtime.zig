@@ -344,7 +344,7 @@ fn prepareResolvedCredential(
     };
     resolution.credential = null;
 
-    const blocked = (credential.token.len == 0 and !(provider == .configured and credential.source == .configured)) or
+    const blocked = (credential.token.len == 0 and !credentials.sourceMayBeTokenless(credential.source)) or
         !model_provider.authorizesCredential(provider, credential.source) or
         credential.needsRefreshAt(now_ms) or
         (credential.source == .fx_login and
@@ -1564,6 +1564,10 @@ pub const StatusSnapshot = struct {
                 .cli => credentials.missing_grok_credential_message,
                 .interactive => credentials.missing_grok_interactive_credential_message,
             },
+            .claude_cli => switch (surface) {
+                .cli => credentials.missing_claude_credential_message,
+                .interactive => credentials.missing_claude_interactive_credential_message,
+            },
             .host_managed => automatic_help,
             .configured => "The configured provider credential is unavailable. Check its auth environment variable in settings.json; no other provider was selected.",
         };
@@ -1642,9 +1646,9 @@ pub fn loadStatusSnapshotForProvider(
         },
     };
     const resolved_source = if (resolution.credential) |credential| credential.source else null;
-    var gateway_connected = resolved_source != null and resolved_source != .chatgpt_subscription and resolved_source != .grok_subscription and resolved_source != .configured;
-    const gateway_probe_required = (provider != null and (provider.? == .codex or provider.? == .grok)) or
-        resolved_source == .chatgpt_subscription or resolved_source == .grok_subscription;
+    var gateway_connected = resolved_source != null and resolved_source != .chatgpt_subscription and resolved_source != .grok_subscription and resolved_source != .claude_cli and resolved_source != .configured;
+    const gateway_probe_required = (provider != null and (provider.? == .codex or provider.? == .grok or provider.? == .claude)) or
+        resolved_source == .chatgpt_subscription or resolved_source == .grok_subscription or resolved_source == .claude_cli;
     if (gateway_probe_required) {
         for ([_]credentials.Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key }) |source| {
             if (credentials.sourceExists(alloc, secret_store, source) catch |err| switch (err) {

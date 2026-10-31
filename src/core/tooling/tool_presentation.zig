@@ -253,6 +253,77 @@ pub fn isProviderSearchAlias(name: []const u8) bool {
         std.mem.eql(u8, name, "parallel_search");
 }
 
+/// How a tool that Claude Code ran appears in the transcript. These names are
+/// Claude Code's own and never collide with fx's snake_case tool names.
+pub const ProviderToolRow = struct {
+    activity: types.ToolActivityKind,
+    active_label: []const u8,
+    completed_label: []const u8,
+    /// The argument whose value follows the label.
+    detail_key: []const u8,
+};
+
+pub fn providerToolRow(name: []const u8) ?ProviderToolRow {
+    const rows = [_]struct { name: []const u8, row: ProviderToolRow }{
+        .{ .name = "Read", .row = .{ .activity = .read, .active_label = "Reading", .completed_label = "Read", .detail_key = "file_path" } },
+        .{ .name = "Glob", .row = .{ .activity = .list, .active_label = "Listing", .completed_label = "Listed", .detail_key = "pattern" } },
+        .{ .name = "Grep", .row = .{ .activity = .read, .active_label = "Searching", .completed_label = "Searched", .detail_key = "pattern" } },
+        .{ .name = "Bash", .row = .{ .activity = .command, .active_label = "Running", .completed_label = "Ran", .detail_key = "command" } },
+        .{ .name = "Edit", .row = .{ .activity = .edit, .active_label = "Editing", .completed_label = "Edited", .detail_key = "file_path" } },
+        .{ .name = "MultiEdit", .row = .{ .activity = .edit, .active_label = "Editing", .completed_label = "Edited", .detail_key = "file_path" } },
+        .{ .name = "NotebookEdit", .row = .{ .activity = .edit, .active_label = "Editing", .completed_label = "Edited", .detail_key = "notebook_path" } },
+        .{ .name = "Write", .row = .{ .activity = .write, .active_label = "Writing", .completed_label = "Wrote", .detail_key = "file_path" } },
+        .{ .name = "WebFetch", .row = .{ .activity = .read, .active_label = "Fetching", .completed_label = "Fetched", .detail_key = "url" } },
+        .{ .name = "WebSearch", .row = .{ .activity = .read, .active_label = "Searching", .completed_label = "Searched", .detail_key = "query" } },
+        .{ .name = "Task", .row = .{ .activity = .read, .active_label = "Delegating", .completed_label = "Delegated", .detail_key = "description" } },
+        .{ .name = "Agent", .row = .{ .activity = .read, .active_label = "Delegating", .completed_label = "Delegated", .detail_key = "description" } },
+    };
+    for (rows) |entry| {
+        if (std.mem.eql(u8, name, entry.name)) return entry.row;
+    }
+    return null;
+}
+
+/// The value shown after a provider tool's label: the tool's main argument, or
+/// the tool name when the arguments do not carry it. The caller owns the result.
+pub fn providerToolDetail(alloc: Allocator, call: ToolCall, row: ProviderToolRow) ![]const u8 {
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer mem_utils.deinit_arena(scratch_state);
+    const scratch = scratch_state.allocator();
+    const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch return alloc.dupe(u8, call.name);
+    const value = tool_args.optionalStringArg(args, row.detail_key) orelse return alloc.dupe(u8, call.name);
+    const first_line = if (std.mem.findScalar(u8, value, '\n')) |end| value[0..end] else value;
+    var buf: [160]u8 = undefined;
+    const clipped = text_utils.clippedLabel(&buf, first_line, 120);
+    const encoded = try text_utils.encodeTerminalSafe(alloc, clipped, std.math.maxInt(usize));
+    return encoded.bytes;
+}
+
+test "claude tool rows cover Claude Code's tools and ignore fx's own" {
+    try std.testing.expectEqual(types.ToolActivityKind.command, providerToolRow("Bash").?.activity);
+    try std.testing.expectEqualStrings("Ran", providerToolRow("Bash").?.completed_label);
+    try std.testing.expectEqual(types.ToolActivityKind.edit, providerToolRow("Edit").?.activity);
+    try std.testing.expect(providerToolRow("shell") == null);
+    try std.testing.expect(providerToolRow("read_file") == null);
+    try std.testing.expect(providerToolRow("TodoWrite") == null);
+}
+
+test "claude tool detail shows the main argument, one line, terminal safe" {
+    const alloc = std.testing.allocator;
+    const row = providerToolRow("Bash").?;
+    const detail = try providerToolDetail(alloc, .{ .id = "t", .name = "Bash", .arguments_json = "{\"command\":\"echo hi\\nsecond\"}" }, row);
+    defer alloc.free(detail);
+    try std.testing.expectEqualStrings("echo hi", detail);
+
+    const fallback = try providerToolDetail(alloc, .{ .id = "t", .name = "Bash", .arguments_json = "{}" }, row);
+    defer alloc.free(fallback);
+    try std.testing.expectEqualStrings("Bash", fallback);
+
+    const unsafe = try providerToolDetail(alloc, .{ .id = "t", .name = "Read", .arguments_json = "{\"file_path\":\"a\\u001b[31mb\"}" }, providerToolRow("Read").?);
+    defer alloc.free(unsafe);
+    try std.testing.expect(std.mem.findScalar(u8, unsafe, 0x1b) == null);
+}
+
 fn projectRunCommandActivitySource(
     command: []const u8,
     workspace_root_input: []const u8,

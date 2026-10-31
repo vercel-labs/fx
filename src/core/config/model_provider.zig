@@ -7,6 +7,7 @@ pub const ProviderId = union(enum) {
     gateway,
     codex,
     grok,
+    claude,
     configured: struct {
         bytes: [configured_provider.max_id_bytes]u8 = @splat(0),
         len: u8,
@@ -19,6 +20,7 @@ pub const ProviderId = union(enum) {
             .gateway => "gateway",
             .codex => "codex",
             .grok => "grok",
+            .claude => "claude",
             .configured => |*value| value.bytes[0..value.len],
         };
     }
@@ -107,6 +109,7 @@ pub fn parse(value: []const u8) ?ProviderId {
     if (std.ascii.eqlIgnoreCase(value, "gateway")) return .gateway;
     if (std.ascii.eqlIgnoreCase(value, "codex")) return .codex;
     if (std.ascii.eqlIgnoreCase(value, "grok")) return .grok;
+    if (std.ascii.eqlIgnoreCase(value, "claude")) return .claude;
     configured_provider.validate_id(value) catch return null;
     var result: ProviderId = .{ .configured = .{ .len = @intCast(value.len) } };
     @memcpy(result.configured.bytes[0..value.len], value);
@@ -135,10 +138,11 @@ pub fn authorizesCredential(provider: ProviderId, source: ?types.CredentialSourc
     const selected = source orelse return false;
     if (selected == .host_managed) return true;
     return switch (provider) {
-        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription and selected != .configured,
+        .gateway => selected != .chatgpt_subscription and selected != .grok_subscription and selected != .claude_cli and selected != .configured,
         .configured => selected == .configured,
         .codex => selected == .chatgpt_subscription,
         .grok => selected == .grok_subscription,
+        .claude => selected == .claude_cli,
     };
 }
 
@@ -152,6 +156,11 @@ test "explicit providers authorize only their own credential origins" {
     try std.testing.expect(authorizesCredential(.grok, .grok_subscription));
     try std.testing.expect(!authorizesCredential(.grok, .chatgpt_subscription));
     try std.testing.expect(!authorizesCredential(.gateway, .grok_subscription));
+    try std.testing.expect(authorizesCredential(.claude, .claude_cli));
+    try std.testing.expect(!authorizesCredential(.claude, .grok_subscription));
+    try std.testing.expect(!authorizesCredential(.codex, .claude_cli));
+    try std.testing.expect(!authorizesCredential(.gateway, .claude_cli));
+    try std.testing.expect(!authorizesCredential(.claude, null));
 }
 
 test "configured provider identity serializes its binding and rejects rebinding" {

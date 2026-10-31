@@ -6,6 +6,7 @@
   { "file": "ask-presentation.test.ts", "weight": 5 },
   { "file": "auth-refresh.test.ts", "weight": 2 },
   { "file": "ci-shards.test.ts", "weight": 15 },
+  { "file": "claude-cli.test.ts", "weight": 30 },
   { "file": "cli.test.ts", "weight": 19 },
   { "file": "compaction-policy.test.ts", "weight": 1 },
   { "file": "config-persistence.test.ts", "weight": 64 },

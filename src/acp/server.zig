@@ -437,7 +437,7 @@ fn credentialReadyAt(
     refresh_after_ms: ?i64,
     now_ms: i64,
 ) bool {
-    if (source == null or (token.len == 0 and source != .configured)) return false;
+    if (source == null or (token.len == 0 and !credentials.sourceMayBeTokenless(source.?))) return false;
     if (credentials.sourceRefreshable(source.?) and
         refresh_after_ms != null and refresh_after_ms.? <= now_ms)
     {
@@ -2879,7 +2879,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
             }
             break :routed &routed_credential.?;
         };
-        if (credential.token.len == 0 and credential.source != .configured) {
+        if (credential.token.len == 0 and !credentials.sourceMayBeTokenless(credential.source)) {
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_request,
                 .message = if (state.provider == .codex)

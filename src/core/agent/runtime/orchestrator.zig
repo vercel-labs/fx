@@ -7723,6 +7723,8 @@ fn processQueuedPromptLoop(
                 .admission = .{ .context = &provider_admission, .admit_fn = ProviderAdmission.admit },
                 .cancel_flag = config.cancel_flag,
                 .provider_attempt_owner = .agent,
+                .permission_mode = permissionModeForAction(job.permission_mode, snapshotRootPermissionMode(deps), null),
+                .workspace_root = config.workspace_root,
             };
             request_recovery.beginSend();
             const streamed = streamMainCompletion(deps, arena, model_request);

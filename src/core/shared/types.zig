@@ -112,6 +112,7 @@ pub const CredentialSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    claude_cli,
     host_managed,
     configured,
 };
