@@ -5481,6 +5481,21 @@ describe("cli: MCP profile", () => {
     expect(missingHome.code).toBe(1);
     expect(missingHome.stderr).toBe("fx mcp: HOME isn't set\n");
 
+    // A relative HOME counts as unset: fx fails the same way and saves
+    // nothing under the folder it runs in.
+    const cwd = mkdtempSync(join(tmpdir(), "fx-e2e-mcp-relative-home-"));
+    try {
+      const relativeHome = await runFx(["mcp", "add", "fixture", "--", "node"], {
+        cwd,
+        env: { HOME: "relative/home", ...NO_GATEWAY_AUTH },
+      });
+      expect(relativeHome.code).toBe(1);
+      expect(relativeHome.stderr).toBe("fx mcp: HOME isn't set\n");
+      expect(readdirSync(cwd)).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+
     const flagged = await runFx(
       ["mcp", "add", "--transport", "sse", "fixture", "https://example.test"],
       { env: { HOME: tmpdir(), ...NO_GATEWAY_AUTH } },
