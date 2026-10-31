@@ -342,14 +342,12 @@ const LoadStartupStatusFn = *const fn (Allocator, host.SecretStore, []const u8, 
 const LoadStartupStateWithAuthModeFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupState;
 const LoadCatalogStartupStateWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode, ?model_provider.ProviderId, ?[]const u8) anyerror!app_lifecycle.StartupState;
 const LoadStartupStatusWithAuthModeFn = *const fn (Allocator, host.SecretStore, []const u8, usize, credentials.AuthMode) anyerror!app_lifecycle.StartupStatus;
-const GetenvFn = *const fn (?*anyopaque, []const u8) ?[]const u8;
 const EnvironMapFn = *const fn (?*anyopaque) ?*const std.process.Environ.Map;
 const ReadMaskedKeyFn = *const fn (?*anyopaque, Allocator, WriteFn, ?*anyopaque) anyerror![]u8;
 const SetupTerminalAvailableFn = *const fn (?*anyopaque) bool;
 const RunDeps = struct {
     stdout_ctx: ?*anyopaque = null,
     stderr_ctx: ?*anyopaque = null,
-    env_ctx: ?*anyopaque = null,
     setup_ctx: ?*anyopaque = null,
     write_stdout: WriteFn = writeRealStdout,
     write_stderr: WriteFn = writeRealStderr,
@@ -359,7 +357,6 @@ const RunDeps = struct {
     load_startup_state_with_auth_mode: LoadStartupStateWithAuthModeFn = app_lifecycle.loadStartupStateWithAuthMode,
     load_catalog_startup_state_with_auth_mode: LoadCatalogStartupStateWithAuthModeFn = app_lifecycle.loadCatalogStartupStateWithAuthMode,
     load_startup_status_with_auth_mode: LoadStartupStatusWithAuthModeFn = app_lifecycle.loadStartupStatusWithAuthMode,
-    getenv: GetenvFn = getenvDefault,
     environ_map: EnvironMapFn = environMapDefault,
     read_masked_key: ReadMaskedKeyFn = readMaskedKeyDefault,
     setup_terminal_available: SetupTerminalAvailableFn = setupTerminalAvailableDefault,
@@ -1709,7 +1706,7 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .usage, "usage", err, rest);
                 return .handled_failure;
             };
-            const home = homeDir(deps) orelse {
+            const home = io_mod.homeDir() orelse {
                 try writeUsageCommandFailure(alloc, deps, error.HomeNotSet, opts.format);
                 return .handled_failure;
             };
@@ -2222,16 +2219,6 @@ fn writeFdAll(fd: std.posix.fd_t, text: []const u8) !void {
     }
 }
 
-fn getenvDefault(_: ?*anyopaque, key: []const u8) ?[]const u8 {
-    return io_mod.getenv(key);
-}
-
-/// `HOME` as `deps` reads it, under `io_mod.homeDir`'s rule: an empty or
-/// relative value counts as unset.
-fn homeDir(deps: RunDeps) ?[]const u8 {
-    return io_mod.absoluteHome(deps.getenv(deps.env_ctx, "HOME"));
-}
-
 fn environMapDefault(_: ?*anyopaque) ?*const std.process.Environ.Map {
     return io_mod.environMap();
 }
@@ -2263,7 +2250,7 @@ fn runTopLevelMcp(
 
 /// `fx mcp`: the verbs `/mcp` shares.
 fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
-    const home = homeDir(deps) orelse {
+    const home = io_mod.homeDir() orelse {
         try writeStderr(deps, "fx mcp: HOME is not set to an absolute path\n");
         return .handled_failure;
     };
