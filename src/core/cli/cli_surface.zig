@@ -1592,6 +1592,13 @@ fn runNonInteractiveWithDeps(
                 };
                 return runSessionConvert(alloc, deps, format);
             }
+            if (rest.len > 0 and std.mem.eql(u8, rest[0], "import")) {
+                const format = parseSessionImportArgs(rest[1..]) catch |err| {
+                    try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
+                    return .handled_failure;
+                };
+                return runSessionImport(alloc, cfg, deps, format);
+            }
             const opts = parseSessionListArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
                 return .handled_failure;
@@ -2794,6 +2801,68 @@ fn runSessionConvert(alloc: Allocator, deps: RunDeps, format: output_contracts.O
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, format);
     return if (skipped.len == 0) .handled_success else .handled_failure;
+}
+
+/// `fx sessions import --opencode [--json]`. `--opencode` names the source
+/// and is required, so another source can be added beside it.
+fn parseSessionImportArgs(args: []const [:0]const u8) !output_contracts.OutputFormat {
+    var opencode = false;
+    var format: output_contracts.OutputFormat = .text;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--opencode") and !opencode) {
+            opencode = true;
+        } else if (std.mem.eql(u8, arg, "--json") and format == .text) {
+            format = .json;
+        } else return error.InvalidLocalSurfaceArgs;
+    }
+    if (!opencode) return error.InvalidLocalSurfaceArgs;
+    return format;
+}
+
+/// `fx sessions import --opencode`: imports the OpenCode sessions of the
+/// project in the current folder with the configured model, and fails when
+/// any of them could not be imported.
+fn runSessionImport(alloc: Allocator, cfg: Config, deps: RunDeps, format: output_contracts.OutputFormat) !RunResult {
+    var startup = deps.load_startup_state_without_credentials(alloc, cfg.default_model, cfg.default_agent_step_limit) catch |err| {
+        try writeCommandFailure(alloc, deps, "sessions", err, format);
+        return .handled_failure;
+    };
+    defer startup.deinit(alloc);
+    try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
+    debug_trace.configureFromEnv(alloc, startup.workspace_root);
+    var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
+        try writeLookupFailure(alloc, deps, "sessions", session_adapter.commandError(err), format);
+        return .handled_failure;
+    };
+    defer store.deinit(alloc);
+    const preferences: session_codec.DurableSessionPreferences = .{
+        .provider = startup.provider,
+        .model = startup.selected_model,
+        .effort = startup.effort,
+        .fast_mode = startup.fast_mode,
+        .ultrafast_mode = startup.ultrafast_mode,
+    };
+    var report_arena = std.heap.ArenaAllocator.init(alloc);
+    defer report_arena.deinit();
+    const ra = report_arena.allocator();
+    const report = session_adapter.importOpenCodeProject(&store, alloc, ra, io_mod.getIo(), startup.workspace_root, preferences) catch |err| {
+        try writeLookupFailure(alloc, deps, "sessions", session_adapter.commandError(err), format);
+        return .handled_failure;
+    };
+    const imported = try ra.alloc(output_contracts.SessionImportSnapshot.Imported, report.imported.len);
+    for (report.imported, imported) |from, *to| to.* = .{ .source = from.source, .id = from.id, .workspace = from.workspace, .turns = from.turns };
+    const failed = try ra.alloc(output_contracts.SessionImportSnapshot.Failed, report.failed.len);
+    for (report.failed, failed) |from, *to| to.* = .{ .source = from.source, .code = from.code, .reason = from.reason };
+    const snapshot: output_contracts.SessionImportSnapshot = .{
+        .imported = imported,
+        .already_imported = report.already_imported,
+        .empty = report.empty,
+        .failed = failed,
+    };
+    const text = try snapshot.render(alloc, format);
+    defer alloc.free(text);
+    try writeFormattedOutput(deps, text, format);
+    return if (failed.len == 0) .handled_success else .handled_failure;
 }
 
 /// `fx session last|{id}` on v2, read without the session's lock (D37).

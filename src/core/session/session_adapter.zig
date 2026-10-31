@@ -54,6 +54,7 @@ const session_display_metadata = @import("session_display_metadata.zig");
 const session_store = @import("session_store.zig");
 const session_summary_codec = @import("session_summary_codec.zig");
 const v1_conversion = @import("v1_conversion.zig");
+const opencode_import = @import("opencode_import.zig");
 const child_state = @import("../subagent/child_state.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
@@ -3884,6 +3885,216 @@ pub const ConvertReport = struct {
     }
 };
 
+/// How `importOpenCode` left one OpenCode session.
+pub const OpenCodeImport = enum { imported, already_imported, empty };
+
+/// `fx sessions import --opencode`, for one session: saves `source` as the
+/// new root session `opencode-<id>`, in the folder OpenCode ran it in, or
+/// `workspace` when the export names none. Each turn keeps its original
+/// time, and nothing is visible until the whole session is published
+/// (D59). A session imported before, or deleted since, is left as it is.
+/// The session takes `preferences`, because the model OpenCode used may
+/// not be one fx can call.
+pub fn importOpenCode(
+    store: *Store,
+    alloc: Allocator,
+    source: opencode_import.Export,
+    workspace: []const u8,
+    preferences: session_codec.DurableSessionPreferences,
+) !OpenCodeImport {
+    io_mod.e2eFailIfDurableMutationAttempted();
+    if (source.turns.len == 0) return .empty;
+    const id = try alloc.print("{s}{s}", .{ opencode_import.id_prefix, source.id });
+    defer alloc.free(id);
+    const handle = store.manager.openImport(.{
+        .id = id,
+        .workspace = source.directory orelse workspace,
+        .host = .app,
+        .created_ms = source.created_ms,
+    }) catch |err| switch (err) {
+        error.Exists => return .already_imported,
+        error.Busy => return error.SessionBusy,
+        error.InvalidArgument => return error.InvalidSessionId,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return conversionStorageFailed("opencode", err),
+    };
+    const session = Session.init(alloc, store, handle, false) catch |err| {
+        handle.release();
+        discardOpenCodeStaging(store, id);
+        return err;
+    };
+    session.root = false;
+    defer session.dropImport();
+    errdefer discardOpenCodeStaging(store, id);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Each turn is encoded in its own scratch, as a conversion's are (D62).
+    var turn_arena = std.heap.ArenaAllocator.init(alloc);
+    defer turn_arena.deinit();
+    var newest = source.created_ms;
+    for (source.turns) |turn| {
+        _ = turn_arena.reset(.retain_capacity);
+        const ta = turn_arena.allocator();
+        newest = @max(newest, turn.started_ms);
+        session.import_ts = newest;
+        try session.importWhole(ta, .{ .assistant = .{
+            .user = .{ .text = try ta.dupe(u8, turn.user) },
+            .assistant = try ta.dupe(u8, turn.assistant),
+        } });
+        newest = @max(newest, turn.ended_ms);
+    }
+    // Every session holds its preferences: an open refuses one without.
+    var settings: std.ArrayList(sm.Event) = .empty;
+    try settings.append(a, .{ .set = .{ .key = .prefs, .value = try encodePreferences(a, preferences, null) } });
+    if (source.title) |title| try settings.append(a, .{ .set = .{ .key = .title, .value = try jsonString(a, title) } });
+    session.import_ts = newest;
+    _ = try session.write(settings.items);
+    try session.handle.publishImport();
+    debug_trace.logf("session", "event=opencode_imported session={s} turns={d}", .{ id, source.turns.len });
+    return .imported;
+}
+
+fn discardOpenCodeStaging(store: *Store, id: []const u8) void {
+    store.manager.discardImport(id) catch |err| debug_trace.logf("session", "event=opencode_discard_failed session={s} err={s}", .{ id, @errorName(err) });
+}
+
+/// What `importOpenCodeProject` did. Its strings live in the arena the
+/// caller passed.
+pub const OpenCodeReport = struct {
+    imported: []const Imported = &.{},
+    already_imported: usize = 0,
+    /// Sessions without a single prompt, which save nothing.
+    empty: usize = 0,
+    failed: []const Failed = &.{},
+
+    pub const Imported = struct {
+        /// The OpenCode session id.
+        source: []const u8,
+        id: []const u8,
+        workspace: []const u8,
+        turns: usize,
+    };
+
+    pub const Failed = struct {
+        /// The OpenCode session id, or `opencode` when listing failed.
+        source: []const u8,
+        code: []const u8,
+        reason: []const u8,
+    };
+};
+
+/// `fx sessions import --opencode`: imports every top-level session that
+/// `opencode session list` names for the project in the current folder
+/// (`importOpenCode`). A session that can't be exported, read or saved is
+/// reported and the rest go on; only running out of memory stops the run.
+pub fn importOpenCodeProject(
+    store: *Store,
+    alloc: Allocator,
+    out: Allocator,
+    io: std.Io,
+    workspace: []const u8,
+    preferences: session_codec.DurableSessionPreferences,
+) !OpenCodeReport {
+    var imported: std.ArrayList(OpenCodeReport.Imported) = .empty;
+    var failed: std.ArrayList(OpenCodeReport.Failed) = .empty;
+    var report: OpenCodeReport = .{};
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    // `opencode`'s output goes through files here, never through pipes.
+    const tmp_path = io_mod.getenv("TMPDIR") orelse "/tmp";
+    var files = (if (std.Io.Dir.path.isAbsolute(tmp_path)) std.Io.Dir.openDirAbsolute(io, tmp_path, .{}) else error.NotAbsolute) catch |err| {
+        try failed.append(out, .{ .source = "opencode", .code = "SessionStoreUnavailable", .reason = try out.print("fx could not open the temporary folder {s}: {s}", .{ tmp_path, @errorName(err) }) });
+        report.failed = failed.items;
+        return report;
+    };
+    defer files.close(io);
+    const listing = opencode_import.run(scratch.allocator(), io, files, &opencode_import.list_argv, opencode_import.list_output_limit) catch |err| switch (err) {
+        error.OpenCodeNotFound => {
+            try failed.append(out, .{ .source = "opencode", .code = "OpenCodeNotFound", .reason = "the opencode command is not on PATH" });
+            report.failed = failed.items;
+            return report;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    const listed_bytes = switch (listing) {
+        .stdout => |bytes| bytes,
+        .failed => |reason| {
+            try failed.append(out, .{ .source = "opencode", .code = "OpenCodeFailed", .reason = try out.print("opencode session list failed: {s}", .{reason}) });
+            report.failed = failed.items;
+            return report;
+        },
+    };
+    const listed = opencode_import.parseList(scratch.allocator(), listed_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidOpenCodeExport => {
+            try failed.append(out, .{ .source = "opencode", .code = "InvalidOpenCodeExport", .reason = "opencode session list did not print a list of sessions" });
+            report.failed = failed.items;
+            return report;
+        },
+    };
+    // Each export is read in its own scratch, since one can be large.
+    var per_session = std.heap.ArenaAllocator.init(alloc);
+    defer per_session.deinit();
+    for (listed) |entry| {
+        _ = per_session.reset(.retain_capacity);
+        const a = per_session.allocator();
+        if (!opencode_import.validSessionId(entry.id)) {
+            try failed.append(out, .{ .source = try out.dupe(u8, entry.id), .code = "InvalidSessionId", .reason = "it is not an id fx can import" });
+            continue;
+        }
+        // An import of a session saved before would only find it taken.
+        const id = try a.print("{s}{s}", .{ opencode_import.id_prefix, entry.id });
+        if (store.manager.peek(alloc, id)) |found| {
+            var peeked = found;
+            peeked.deinit(alloc);
+            report.already_imported += 1;
+            continue;
+        } else |_| {}
+        const exported = opencode_import.run(a, io, files, &opencode_import.exportArgv(entry.id), opencode_import.export_output_limit) catch |err| switch (err) {
+            error.OpenCodeNotFound => {
+                try failed.append(out, .{ .source = try out.dupe(u8, entry.id), .code = "OpenCodeNotFound", .reason = "the opencode command is not on PATH" });
+                continue;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        const bytes = switch (exported) {
+            .stdout => |value| value,
+            .failed => |reason| {
+                try failed.append(out, .{ .source = try out.dupe(u8, entry.id), .code = "OpenCodeFailed", .reason = try out.print("opencode session export failed: {s}", .{reason}) });
+                continue;
+            },
+        };
+        var source = opencode_import.parseExport(a, bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidOpenCodeExport => {
+                try failed.append(out, .{ .source = try out.dupe(u8, entry.id), .code = "InvalidOpenCodeExport", .reason = "its export is not in OpenCode's session format" });
+                continue;
+            },
+        };
+        // The id fx saves it under is the one it was listed by.
+        source.id = entry.id;
+        const outcome = importOpenCode(store, alloc, source, workspace, preferences) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            try failed.append(out, .{ .source = try out.dupe(u8, entry.id), .code = @errorName(commandError(err)), .reason = try out.print("fx could not save it: {s}", .{@errorName(err)}) });
+            continue;
+        };
+        switch (outcome) {
+            .imported => try imported.append(out, .{
+                .source = try out.dupe(u8, entry.id),
+                .id = try out.dupe(u8, id),
+                .workspace = try out.dupe(u8, source.directory orelse workspace),
+                .turns = source.turns.len,
+            }),
+            .already_imported => report.already_imported += 1,
+            .empty => report.empty += 1,
+        }
+    }
+    report.imported = imported.items;
+    report.failed = failed.items;
+    return report;
+}
+
 /// Converts every v1 family v2 does not hold, opening none (TLA
 /// `Request("all")`), and cleans what an earlier conversion left of those
 /// it does. A busy family is skipped at once, and one that cannot be
@@ -5908,6 +6119,52 @@ test "a crash answers only the running calls its turn does not already hold" {
     try testing.expectEqualStrings("call_2", step.tool_calls[0].id);
     try testing.expectEqualStrings("call_2", step.tool_results[0].tool_call_id);
     try testing.expectEqualStrings(unfinished_tool_output, step.tool_results[0].output);
+}
+
+test "an OpenCode import resumes in its own folder with every turn, its title, and the given preferences" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const source = try opencode_import.parseExport(arena.allocator(),
+        \\{"info":{"id":"ses_sample","title":"Track a dotfile","time":{"created":1000},
+        \\  "location":{"directory":"/Users/example/project"}},"messages":[
+        \\ {"type":"user","time":{"created":1001},"text":"Can we track it?"},
+        \\ {"type":"assistant","time":{"created":1002,"completed":1500},"content":[{"type":"text","text":"Yes."}]},
+        \\ {"type":"user","time":{"created":2000},"text":"Thanks"},
+        \\ {"type":"assistant","time":{"created":2001,"completed":2500},"content":[{"type":"text","text":"Anytime."}]}]}
+    );
+    var model = "anthropic/claude-sonnet-4.5".*;
+    const preferences: session_codec.DurableSessionPreferences = .{ .model = &model, .effort = .auto, .fast_mode = false };
+    try testing.expectEqual(OpenCodeImport.imported, try importOpenCode(&t.store, testing.allocator, source, "/Users/example/other", preferences));
+    try testing.expectEqual(OpenCodeImport.already_imported, try importOpenCode(&t.store, testing.allocator, source, "/Users/example/other", preferences));
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = "opencode-ses_sample" }, "/Users/example/project", .app);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqualStrings("Can we track it?", restored.history[0].assistant.user.text);
+    try testing.expectEqualStrings("Yes.", restored.history[0].assistant.assistant);
+    try testing.expectEqualStrings("Anytime.", restored.history[1].assistant.assistant);
+    try testing.expectEqualStrings("Track a dotfile", restored.title.?);
+    try testing.expectEqualStrings("anthropic/claude-sonnet-4.5", restored.preferences.?.model);
+
+    var peeked = try t.store.manager.peek(testing.allocator, "opencode-ses_sample");
+    defer peeked.deinit(testing.allocator);
+    try testing.expectEqualStrings("/Users/example/project", peeked.workspace);
+}
+
+test "an OpenCode export without a prompt saves nothing" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "anthropic/claude-sonnet-4.5".*;
+    const preferences: session_codec.DurableSessionPreferences = .{ .model = &model, .effort = .auto, .fast_mode = false };
+    const source: opencode_import.Export = .{ .id = "ses_empty", .created_ms = 1000, .turns = &.{} };
+    try testing.expectEqual(OpenCodeImport.empty, try importOpenCode(&t.store, testing.allocator, source, "/Users/example/project", preferences));
+    try testing.expectError(error.NotFound, t.store.manager.peek(testing.allocator, "opencode-ses_empty"));
 }
 
 fn countTitleSets(manager: *sm.Manager, id: []const u8) !usize {
