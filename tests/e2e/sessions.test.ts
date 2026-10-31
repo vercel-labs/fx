@@ -317,6 +317,100 @@ test("fx ask saves to v2, resumes by id and by last, and never writes v1", async
   }
 }, TIMEOUT * 3);
 
+/// An `opencode` on PATH that lists the sessions in `list.json` and exports
+/// each from `exports/<id>.json`, failing as OpenCode does for any other id.
+function fakeOpenCode(fixture: Fixture): string {
+  const bin = join(fixture.root, "bin");
+  mkdirSync(join(fixture.root, "exports"), { recursive: true });
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(
+    join(bin, "opencode"),
+    `#!/bin/sh
+if [ "$1" = session ] && [ "$2" = list ]; then exec cat "${fixture.root}/list.json"; fi
+if [ "$1" = session ] && [ "$2" = export ] && [ -f "${fixture.root}/exports/$3.json" ]; then exec cat "${fixture.root}/exports/$3.json"; fi
+echo "Session not found: $3" >&2
+exit 1
+`,
+  );
+  chmodSync(join(bin, "opencode"), 0o755);
+  return bin;
+}
+
+function openCodeExport(id: string, directory: string, prompt: string, answer: string) {
+  return {
+    info: { id, title: `Title of ${id}`, time: { created: 1_700_000_000_000 }, location: { directory } },
+    messages: [
+      { id: `${id}-1`, type: "synthetic", time: { created: 1_700_000_000_001 }, text: "<system-reminder>left out</system-reminder>" },
+      { id: `${id}-2`, type: "user", time: { created: 1_700_000_000_002 }, text: prompt, files: [] },
+      {
+        id: `${id}-3`,
+        type: "assistant",
+        time: { created: 1_700_000_000_003, completed: 1_700_000_000_500 },
+        content: [
+          { type: "reasoning", text: "left out" },
+          { type: "tool", name: "bash", state: { status: "completed", input: { command: "ls" }, content: [{ type: "text", text: "notes.md" }] } },
+          { type: "text", text: answer },
+        ],
+      },
+    ],
+  };
+}
+
+test("fx sessions import --opencode saves each session in its own folder, reports a failed export, skips imports on a second run, and resumes", async () => {
+  const fixture = createFixture("fx-v2-opencode-");
+  const gateway = startFakeGateway([fakeGatewayFinalText("AFTER_IMPORT_ANSWER")]);
+  try {
+    mkdirSync(join(fixture.root, "other"));
+    const other = realpathSync(join(fixture.root, "other"));
+    const bin = fakeOpenCode(fixture);
+    writeFileSync(join(fixture.root, "exports", "ses_one.json"), JSON.stringify(openCodeExport("ses_one", fixture.workspace, "OPENCODE_PROMPT_ONE", "OPENCODE_ANSWER_ONE")));
+    writeFileSync(join(fixture.root, "exports", "ses_two.json"), JSON.stringify(openCodeExport("ses_two", other, "OPENCODE_PROMPT_TWO", "OPENCODE_ANSWER_TWO")));
+    writeFileSync(join(fixture.root, "list.json"), JSON.stringify([{ id: "ses_one" }, { id: "ses_two" }, { id: "ses_gone" }]));
+    const importEnv = { ...env(fixture, gateway), PATH: `${bin}:${process.env.PATH ?? ""}` };
+    const run = () => runFx(["sessions", "import", "--opencode", "--json"], { cwd: fixture.workspace, env: importEnv, timeoutMs: TIMEOUT });
+
+    const first = await run();
+    expect(first.code).toBe(1);
+    expect(first.stderr).toBe("");
+    const report = JSON.parse(first.stdout);
+    expect(report).toMatchObject({ kind: "sessions_import", source: "opencode", imported: 2, already_imported: 0, empty: 0, failed: 1, error: "OpenCodeFailed" });
+    expect(report.sessions).toEqual([
+      { source: "ses_one", id: "opencode-ses_one", workspace: fixture.workspace, turns: 1 },
+      { source: "ses_two", id: "opencode-ses_two", workspace: other, turns: 1 },
+    ]);
+    expect(report.failures).toEqual([{ source: "ses_gone", error: "OpenCodeFailed", reason: "opencode session export failed: it exited with status 1: Session not found: ses_gone" }]);
+
+    expectWholeLog(fixture, "opencode-ses_one");
+    expect(shape(logLines(fixture.home, "opencode-ses_one"))).toEqual(["session_created", "turn_started", "item:user", "item:assistant", "item:turn_end", "turn_committed", "closed"]);
+    const assistant = logLines(fixture.home, "opencode-ses_one").find((line) => line.kind === "item" && line.type === "assistant")!;
+    expect(JSON.stringify(assistant.data)).toContain("[tool `bash` (completed)]");
+    expect(JSON.stringify(assistant.data)).toContain("OPENCODE_ANSWER_ONE");
+    expect(JSON.stringify(assistant.data)).not.toContain("left out");
+
+    // Each session lists in the folder OpenCode ran it in.
+    const here = JSON.parse((await command(fixture, gateway, ["sessions", "--json"])).stdout);
+    expect(here.sessions.map((session: any) => session.id)).toEqual(["opencode-ses_one"]);
+    expect(here.sessions[0].title).toBe("Title of ses_one");
+    const there = JSON.parse((await command(fixture, gateway, ["sessions", "--json"], other)).stdout);
+    expect(there.sessions.map((session: any) => session.id)).toEqual(["opencode-ses_two"]);
+
+    writeFileSync(join(fixture.root, "list.json"), JSON.stringify([{ id: "ses_one" }, { id: "ses_two" }]));
+    const second = await run();
+    expect(second.code).toBe(0);
+    expect(JSON.parse(second.stdout)).toMatchObject({ imported: 0, already_imported: 2, failed: 0, sessions: [], failures: [] });
+
+    const resumed = await ask(fixture, gateway, ["--resume-id", "opencode-ses_one", "Go on."]);
+    expect(resumed.code).toBe(0);
+    expect(resumed.stderr).toBe("");
+    expect(JSON.parse(resumed.stdout).output).toBe("AFTER_IMPORT_ANSWER");
+    expect(gateway.requests[0]!.body).toContain("OPENCODE_PROMPT_ONE");
+    expect(gateway.requests[0]!.body).toContain("OPENCODE_ANSWER_ONE");
+  } finally {
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 3);
+
 test("an ask saves only to the store, and --no-save writes nothing", async () => {
   const fixture = createFixture("fx-v2-flag-");
   const gateway = startFakeGateway([
