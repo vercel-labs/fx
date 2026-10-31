@@ -477,9 +477,15 @@ fn liveLibcEnviron() ?RawEnviron {
 /// unset, so fx never builds profile paths relative to the current folder.
 /// Child processes still inherit `HOME` unchanged.
 pub fn homeDir() ?[]const u8 {
-    const home = getenv("HOME") orelse return null;
-    if (!std.Io.Dir.path.isAbsolute(home)) return null;
-    return home;
+    return absoluteHome(getenv("HOME"));
+}
+
+/// `home` when it is an absolute path, otherwise null: `homeDir`'s rule, for
+/// code that reads `HOME` through its own environment hook.
+pub fn absoluteHome(home: ?[]const u8) ?[]const u8 {
+    const value = home orelse return null;
+    if (!std.Io.Dir.path.isAbsolute(value)) return null;
+    return value;
 }
 
 pub fn e2eFailIfDurableMutationAttempted() void {
