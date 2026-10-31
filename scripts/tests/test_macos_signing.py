@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import pathlib
@@ -19,6 +20,9 @@ PUBLISH_LIBFX_WORKFLOW_PATH = (
 )
 PGSO_WORKFLOW_PATH = (
     REPO_ROOT / ".github" / "workflows" / "pgso-macos-arm64.yml"
+)
+PGSO_LINUX_WORKFLOW_PATH = (
+    REPO_ROOT / ".github" / "workflows" / "pgso-linux-arm64.yml"
 )
 DEV_RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "dev-release.yml"
 PGSO_SETUP_ACTION_PATH = REPO_ROOT / ".github" / "actions" / "setup-pgso" / "action.yml"
@@ -601,6 +605,7 @@ class MacosSigningWorkflowTests(unittest.TestCase):
     def test_stable_release_is_the_only_workflow_with_signing_secrets(self) -> None:
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
         pgso = PGSO_WORKFLOW_PATH.read_text(encoding="utf-8")
+        pgso_linux = PGSO_LINUX_WORKFLOW_PATH.read_text(encoding="utf-8")
         dev_release = DEV_RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
 
         self.assertIn("build-macos-x86_64:", release)
@@ -627,7 +632,8 @@ class MacosSigningWorkflowTests(unittest.TestCase):
         self.assertIn("needs: [check-version, build-macos-arm64]", sign_release)
         self.assertIn("environment: apple-signing", sign_release)
         self.assertIn(
-            "needs: [check-version, build-linux, build-macos-x86_64, sign-macos-arm64]",
+            "needs: [check-version, build-linux, package-linux-aarch64, "
+            "build-macos-x86_64, sign-macos-arm64]",
             release,
         )
         workflow_call = pgso.split("  workflow_dispatch:\n", 1)[0]
@@ -658,24 +664,113 @@ class MacosSigningWorkflowTests(unittest.TestCase):
             self.assertNotIn(secret_name, workflow_call)
             self.assertNotIn(secret_name, aggregate)
             self.assertNotIn(secret_name, pgso)
+            self.assertNotIn(secret_name, pgso_linux)
             self.assertNotIn(secret_name, dev_release)
         self.assertNotIn("sign-and-notarize-macos", pgso)
         self.assertNotIn("sign-and-notarize-macos", dev_release)
 
     def test_pgso_release_chain_pins_every_external_action(self) -> None:
         mutable_references: list[str] = []
-        for path in (PGSO_WORKFLOW_PATH, PGSO_SETUP_ACTION_PATH):
+        pending = [RELEASE_WORKFLOW_PATH]
+        checked: set[pathlib.Path] = set()
+        while pending:
+            path = pending.pop()
+            if path in checked:
+                continue
+            checked.add(path)
             for line_number, line in enumerate(
                 path.read_text(encoding="utf-8").splitlines(),
                 start=1,
             ):
+                local = re.search(r"uses:\s+\./(\S+)", line)
+                if local:
+                    target = REPO_ROOT / local.group(1)
+                    pending.append(target if target.suffix == ".yml" else target / "action.yml")
+                    continue
                 match = re.search(r"uses:\s+([^\s@]+)@([^\s#]+)", line)
                 if match and not re.fullmatch(r"[0-9a-f]{40}", match.group(2)):
                     mutable_references.append(
                         f"{path.relative_to(REPO_ROOT)}:{line_number}: {line.strip()}"
                     )
 
+        for path in (PGSO_WORKFLOW_PATH, PGSO_LINUX_WORKFLOW_PATH, PGSO_SETUP_ACTION_PATH):
+            self.assertIn(path, checked)
         self.assertEqual([], mutable_references)
+
+
+class LinuxReleaseWorkflowTests(unittest.TestCase):
+    def release_job(self, name: str) -> str:
+        release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        return re.split(
+            r"\n  (?=\S)", release.split(f"\n  {name}:\n", 1)[1], maxsplit=1
+        )[0]
+
+    def test_release_ships_the_qualified_pgso_candidate_for_linux_arm64(self) -> None:
+        build_linux = self.release_job("build-linux")
+        self.assertIn("target: x86_64-linux", build_linux)
+        self.assertNotIn("aarch64-linux", build_linux)
+
+        caller = self.release_job("build-linux-aarch64")
+        self.assertIn("uses: ./.github/workflows/pgso-linux-arm64.yml", caller)
+        self.assertIn("evidence-retention-days: 90", caller)
+        self.assertNotIn("secrets:", caller)
+
+        package = self.release_job("package-linux-aarch64")
+        self.assertIn("needs: [check-version, build-linux-aarch64]", package)
+        self.assertIn("runs-on: ubuntu-24.04-arm", package)
+        self.assertIn(
+            "artifact-ids: ${{ needs.build-linux-aarch64.outputs.artifact-id }}",
+            package,
+        )
+        self.assertNotIn("environment:", package)
+        report = package.index("python3 -m scripts.pgso report")
+        digest = package.index("- name: Confirm the candidate is the qualified binary")
+        smoke = package.index('candidate/fx" --version')
+        archive = package.index("tar -czf")
+        self.assertLess(report, digest)
+        self.assertLess(digest, smoke)
+        self.assertLess(smoke, archive)
+        self.assertIn("          name: fx-linux-aarch64\n", package)
+
+        workflow = PGSO_LINUX_WORKFLOW_PATH.read_text(encoding="utf-8")
+        triggers = workflow.split("\njobs:\n", 1)[0]
+        self.assertIn("  workflow_call:\n", triggers)
+        self.assertIn("value: ${{ jobs.candidate.outputs.artifact-id }}", triggers)
+        self.assertIn("artifact-id: ${{ steps.upload.outputs.artifact-id }}", workflow)
+        self.assertIn(
+            "retention-days: ${{ inputs.evidence-retention-days || 14 }}", workflow
+        )
+
+    def test_release_rejects_a_candidate_that_is_not_the_qualified_binary(self) -> None:
+        package = self.release_job("package-linux-aarch64")
+        step = package.split(
+            "      - name: Confirm the candidate is the qualified binary\n", 1
+        )[1].split("\n      - name:", 1)[0]
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        qualified = hashlib.sha256(b"qualified").hexdigest()
+        for shipped, expected_exit in ((b"qualified", 0), (b"rebuilt", 1)):
+            with self.subTest(shipped=shipped):
+                with tempfile.TemporaryDirectory(prefix="fx-linux-release-") as tmp:
+                    root = pathlib.Path(tmp)
+                    candidate = root / "fx-pgso/candidate/fx"
+                    candidate.parent.mkdir(parents=True)
+                    candidate.write_bytes(shipped)
+                    (root / "fx-pgso/manifest.json").write_text(
+                        json.dumps(
+                            {"evidence": {"artifacts": {"candidate": {"sha256": qualified}}}}
+                        ),
+                        encoding="utf-8",
+                    )
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", script],
+                        cwd=root,
+                        env=dict(os.environ, RUNNER_TEMP=str(root)),
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(expected_exit, result.returncode, result.stderr)
+                    if expected_exit:
+                        self.assertIn("is not the qualified", result.stderr)
 
 
 if __name__ == "__main__":

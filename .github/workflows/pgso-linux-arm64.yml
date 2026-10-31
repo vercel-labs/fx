@@ -1,10 +1,21 @@
 name: Linux arm64 PGSO candidate
 
 # Pull requests run PGSO only when the PGSO pipeline itself changes. Dispatch
-# this workflow on any branch to qualify other changes. One job builds and
-# qualifies the candidate, because distributed builds don't carry the startup
-# profiles that Linux candidates need.
+# this workflow on any branch to qualify other changes; the stable release
+# always runs it. One job builds and qualifies the candidate, because
+# distributed builds don't carry the startup profiles that Linux candidates
+# need.
 on:
+  workflow_call:
+    inputs:
+      evidence-retention-days:
+        description: Days to keep the qualified evidence
+        type: number
+        default: 14
+    outputs:
+      artifact-id:
+        description: Qualified PGSO evidence artifact ID
+        value: ${{ jobs.candidate.outputs.artifact-id }}
   workflow_dispatch:
   pull_request:
     paths:
@@ -30,6 +41,8 @@ jobs:
     name: Linux arm64 PGSO candidate
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 345
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -67,6 +80,7 @@ jobs:
             --hyperfine "${{ steps.setup.outputs.hyperfine-bin }}"
 
       - name: Upload evidence
+        id: upload
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -77,4 +91,4 @@ jobs:
             ${{ runner.temp }}/fx-pgso/measurements
             ${{ runner.temp }}/fx-pgso/candidate/fx
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: ${{ inputs.evidence-retention-days || 14 }}

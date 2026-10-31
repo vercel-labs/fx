@@ -239,7 +239,7 @@ Other workflows and benchmark jobs also report on pull requests, such as the `Ex
 
 - The binary size workflow builds each release target for the pull request and its base commit on native runners, reports the size change, and smoke-tests every target's binary. Growth of 52,429 bytes (0.05 MiB) or more on a platform adds a warning. Investigate growth you can't explain.
 - The macOS arm64 PGSO workflow runs on a pull request only when the PGSO pipeline itself changes: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or `.github/workflows/pgso-macos-arm64.yml`. Stable releases always run it. [scripts/pgso/README.md](scripts/pgso/README.md) explains the pipeline and its acceptance gates.
-- The Linux arm64 PGSO workflow runs on the same pull request paths, with `.github/workflows/pgso-linux-arm64.yml` in place of the macOS workflow file. It qualifies a Linux candidate in one job, which takes several hours. Releases don't use it yet.
+- The Linux arm64 PGSO workflow runs on the same pull request paths, with `.github/workflows/pgso-linux-arm64.yml` in place of the macOS workflow file. It qualifies a Linux candidate in one job, which takes several hours. The stable release always runs it and ships its candidate as the Linux arm64 binary.
 
 Other runs start only on request:
 

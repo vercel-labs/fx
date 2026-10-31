@@ -42,7 +42,7 @@ runs:
 
     - name: Setup Zig
       if: runner.os == 'Linux' && (inputs.zig == 'true' || inputs.llvm == 'true')
-      uses: ./.github/actions/setup-zig
+      uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       with:
         version: "0.17.0"
         cache-key: pgso-linux-arm64
