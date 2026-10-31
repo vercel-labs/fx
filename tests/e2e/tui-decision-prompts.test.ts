@@ -2766,6 +2766,39 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
+    "question freeform rejects blank answers and accepts text afterward",
+    async () => {
+      const ctx = await openQuestionPrompt("question blank freeform");
+
+      await ctx.session.sendKeys("Up");
+      await waitForQuestionPane(ctx.session, "question blank freeform selected", (value) =>
+        hasQuestionSelection(value, 3, ""),
+      );
+      await ctx.session.sendKeys("Enter");
+      await ctx.session.sendLiteralText("   ");
+      await ctx.session.sendKeys("Enter");
+
+      const answer = "verify the focused tests";
+      await ctx.session.sendHexBytes(["15"]);
+      await ctx.session.sendLiteralText(answer);
+      await waitForQuestionPane(ctx.session, "question remains editable after blank Enter", (value) =>
+        hasQuestionSelection(value, 3, answer),
+      );
+      expect(ctx.gateway.requests).toHaveLength(1);
+
+      await ctx.session.sendKeys("Enter");
+      await ctx.session.waitForText("question blank freeform handled", TIMEOUT);
+      expect(ctx.gateway.requests).toHaveLength(2);
+      expect(requestContainsExactString(ctx.gateway.requests[1]!.body, answer)).toBe(true);
+      await assertProcessAliveAndClean(ctx);
+      await ctx.session.sendText("/quit");
+      expect(await ctx.session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      expect(readFileSync(ctx.stderrPath, "utf8")).toBe("");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "question freeform ordinal keeps following digits as text",
     async () => {
       const ctx = await openQuestionPrompt("question freeform digits");
