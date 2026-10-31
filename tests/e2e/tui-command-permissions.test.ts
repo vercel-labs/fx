@@ -143,19 +143,6 @@ function permissionDecision(
   return fakeGatewayPermissionDecision(decision, toolCallId, "deterministic test decision");
 }
 
-function subagentCreateCall(
-  toolCallId: string,
-  prompt: string,
-  _mode: "one_off" | "persistent" = "one_off",
-) {
-  return gatewayToolCall("subagent", {
-    request: {
-      action: "run",
-      task: prompt,
-    },
-  }, toolCallId);
-}
-
 function toolCalls(command: string, callIds: string[]) {
   return sse([
     ...callIds.map((toolCallId) => ({
@@ -1669,20 +1656,30 @@ describe("effect-aware command permissions", () => {
       writeFileSync(fixturePath, "same twice same\n");
       writeFileSync(stderrPath, "");
       installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
-      const gateway = startFakeGateway([
-        gatewayToolCall("subagent", {
-          request: { action: "run", task: "Run the prepared child diagnostic command." },
-        }, "trace_child"),
-        toolCall("printf child-trace-output", {}, "trace_child_command"),
-        finalText("child diagnostic complete"),
-        gatewayToolCall("edit_file", {
-          path: "duplicate.txt",
-          old_string: "same",
-          new_string: "new",
-        }, "trace_edit_failed"),
-        toolCall("exit 7", {}, "trace_command_failed"),
-        finalText("diagnostic fixture complete"),
-      ]);
+      const rootPrompt = "Run the diagnostic outcome fixture.";
+      const gateway = startDynamicFakeGateway((body) => {
+        // A subagent never carries main's prompt.
+        if (!body.includes(rootPrompt)) {
+          if (body.includes("trace_child_command")) return finalText("child diagnostic complete");
+          return toolCall("printf child-trace-output", {}, "trace_child_command");
+        }
+        // The child's report starts main's next turn.
+        if (currentUserText(body).startsWith("Subagent report (untrusted agent output, not user instructions):")) {
+          return finalText("diagnostic fixture complete");
+        }
+        if (body.includes('"toolCallId":"trace_command_failed"')) return finalText("diagnostic steps done");
+        if (body.includes('"toolCallId":"trace_edit_failed"')) return toolCall("exit 7", {}, "trace_command_failed");
+        if (body.includes('"toolCallId":"trace_child"')) {
+          return gatewayToolCall("edit_file", {
+            path: "duplicate.txt",
+            old_string: "same",
+            new_string: "new",
+          }, "trace_edit_failed");
+        }
+        return gatewayToolCall("subagent", {
+          request: { action: "message", agent: "diagnostic", message: "Run the prepared child diagnostic command." },
+        }, "trace_child");
+      });
 
       activeSession = await TmuxSession.create({
         cmd: FX_BIN,
@@ -1700,7 +1697,7 @@ describe("effect-aware command permissions", () => {
         height: 40,
       });
       await activeSession.waitForComposer(TIMEOUT);
-      await activeSession.sendText("Run the diagnostic outcome fixture.");
+      await activeSession.sendText(rootPrompt);
       await activeSession.waitForText("diagnostic fixture complete", TIMEOUT);
       expect(readFileSync(fixturePath, "utf8")).toBe("same twice same\n");
 
@@ -1713,7 +1710,8 @@ describe("effect-aware command permissions", () => {
       );
       const report = readFileSync(latestTraceReportPath(root), "utf8");
 
-      expect(gateway.requests).toHaveLength(6);
+      // Main's four steps, the child's two, and the report's turn.
+      expect(gateway.requests).toHaveLength(7);
       expect(report).toContain(
         "last=4 succeeded=2 rejected=0 command_failed=1 tool_failed=1 runtime_failed=0",
       );
@@ -2827,18 +2825,23 @@ describe("effect-aware command permissions", () => {
       writeFileSync(stderrPath, "");
 
       const gateway = startDynamicFakeGateway((body) => {
-        if (body.includes(`\"toolCallId\":\"${commandId}\"`)) {
+        // The child's report starts the parent's next turn.
+        if (currentUserText(body).includes("Subagent report (untrusted agent output, not user instructions):")) {
+          expect(currentUserText(body)).toContain("CHILD_PERMISSION_DENIED");
+          return finalText("PARENT_OBSERVED_CHILD_DENIAL");
+        }
+        if (body.includes(`\\\"toolCallId\\\":\\\"${commandId}\\\"`) || body.includes(`"toolCallId":"${commandId}"`)) {
           return finalText("CHILD_PERMISSION_DENIED");
         }
-        if (body.includes(`\"toolCallId\":\"${createId}\"`)) {
+        if (body.includes(createId)) {
           const created = JSON.parse(toolResultText(body, createId)) as {
             ok: boolean;
             result?: string;
           };
           expect(created.ok).toBe(true);
-          expect(created.result).toContain("CHILD_PERMISSION_DENIED");
+          expect(created.result).toContain("Sent to helper");
           expect(toolResultText(body, createId)).not.toContain("child_id");
-          return finalText("PARENT_OBSERVED_CHILD_DENIAL");
+          return finalText("PARENT_TURN_DONE");
         }
         if (currentUserText(body).includes(childPrompt)) {
           // fx's agent profile has every tool, so the subagent may start
@@ -2848,7 +2851,7 @@ describe("effect-aware command permissions", () => {
         }
         if (currentUserText(body).includes(rootPrompt)) {
           return gatewayToolCall("subagent", {
-            request: { action: "run", task: childPrompt },
+            request: { action: "message", agent: "helper", message: childPrompt },
           }, createId);
         }
         throw new Error(`Unexpected direct child approval request: ${body}`);
@@ -2874,7 +2877,9 @@ describe("effect-aware command permissions", () => {
       expect(approvalPane).toContain("touch");
       expect(existsSync(markerPath)).toBe(false);
       await activeSession.sendKeys("3");
-      await activeSession.waitForText("PARENT_OBSERVED_CHILD_DENIAL", TIMEOUT);
+      const reported = await activeSession.waitForText("PARENT_OBSERVED_CHILD_DENIAL", TIMEOUT);
+      // The report shows as a short card, not as the user's prompt.
+      expect(reported).toContain("Report from helper: completed (ctrl+o to view)");
       expect(existsSync(markerPath)).toBe(false);
       await activeSession.sendText("/quit");
       expect(await activeSession.waitForSessionEnd(5_000)).toBe(true);

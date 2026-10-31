@@ -100,6 +100,7 @@ pub fn InterruptRuntime(comptime App: type) type {
             const tool_active = activeToolStatusCount(app) > 0;
             debug_trace.logf("input", "cancel active operation queued={d}", .{agent.worker.queuedPromptCount()});
             traceInterruptRequested(app, agent, "input_active_stream");
+            if (comptime @hasDecl(App, "noteUserStop")) app.noteUserStop(agent);
             if (comptime @hasDecl(@TypeOf(agent.worker), "requestInteractiveCancel")) {
                 agent.worker.requestInteractiveCancel();
             } else {

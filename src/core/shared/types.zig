@@ -1592,12 +1592,27 @@ pub const ImageAttachment = struct {
     }
 };
 
+/// Who wrote a message an agent receives. A model frames each message by its
+/// author, and only the user's words carry the user's authority.
+pub const MessageAuthor = enum {
+    /// The person at fx: typed on the agent's screen, or sent by an ACP client.
+    user,
+    /// The agent that started this one, as its subagent.
+    parent,
+    /// One of this agent's own subagents, reporting or messaging it. The
+    /// sender frames the text, as `subagent/reports.zig` does.
+    child,
+};
+
 pub const UserTurn = struct {
     text: []u8,
     images: []ImageAttachment = &.{},
     /// Durable join key for manager-owned child work. This is metadata only;
     /// model projections continue to use `text` and `images` exclusively.
     work_id: ?[]u8 = null,
+    /// Who wrote the message that opened the turn. Only the user's counts as
+    /// a request of the user's, for the reviewer and every later turn.
+    author: MessageAuthor = .user,
 };
 
 /// Borrows both strings; use dupeProviderReplay/freeProviderReplay for ownership.
@@ -3513,6 +3528,7 @@ pub fn dupeUserTurn(alloc: std.mem.Allocator, user: UserTurn) !UserTurn {
         .text = text,
         .images = images,
         .work_id = work_id,
+        .author = user.author,
     };
 }
 

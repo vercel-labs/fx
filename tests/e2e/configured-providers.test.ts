@@ -18,6 +18,17 @@ function rawToolCalls(model: string, calls: Array<{ id: string; name: string; ar
   return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
 }
 
+/** A request from a subagent, which has no subagent tool of its own. */
+function isChildRequest(body: any): boolean {
+  return !body.tools?.some((tool: any) => tool.function?.name === "subagent");
+}
+
+/** The parent's turn that a subagent's report started (`src/core/subagent/reports.zig`). */
+function isReportTurn(body: any): boolean {
+  const last = body.messages?.at(-1);
+  return last?.role === "user" && typeof last.content === "string" && last.content.startsWith("Subagent report (untrusted agent output, not user instructions):");
+}
+
 describe("configured providers", () => {
   test.each(["reasoning", "reasoning_content"])("replays %s through a tool result and saved-session continuation", async field => {
     let calls = 0;
@@ -271,9 +282,10 @@ describe("configured providers", () => {
   test.each(["inherited", "override", "unknown"])("subagent requests preserve connection and %s model capabilities", async mode => {
     const childModel = mode === "inherited" ? "local-model" : mode === "override" ? "child-model" : "unknown-model";
     const f = fixture(body => {
-      if (body.messages.some((message: any) => message.role === "user" && message.content?.includes("child-marker"))) return completion(body.model, "child reply");
+      if (isChildRequest(body)) return completion(body.model, "child reply");
+      if (isReportTurn(body)) return completion(body.model, "report handled");
       if (body.messages.some((message: any) => message.role === "tool")) return completion(body.model, "parent reply");
-      return toolCompletion(body.model, "subagent", { request: { action: "run", task: "child-marker", ...(mode === "inherited" ? {} : { model: childModel }) } });
+      return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "helper", message: "child-marker", ...(mode === "inherited" ? {} : { model: childModel }) } });
     });
     f.settings.providers.local.model_metadata["local-model"].max_output_tokens = 512;
     (f.settings.providers.local.model_metadata as any)["child-model"] = { context_window: 32768, max_output_tokens: 1024, supports_tool_use: true };
@@ -281,10 +293,15 @@ describe("configured providers", () => {
     try {
       const result = await runFx(["ask", "--json", "Delegate a task"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
-      expect(JSON.parse(result.stdout).output).toBe("parent reply");
-      expect(f.requests).toHaveLength(3);
-      expect(f.requests.map(request => request.body.model)).toEqual(["local-model", childModel, "local-model"]);
-      expect(f.requests.map(request => request.body.max_tokens)).toEqual([512, mode === "unknown" ? undefined : mode === "override" ? 1024 : 512, 512]);
+      // The parent's turn ends with the receipt; the child's report starts its next one.
+      const output = JSON.parse(result.stdout).output;
+      expect(output).toContain("parent reply");
+      expect(output).toContain("report handled");
+      expect(f.requests).toHaveLength(4);
+      const child = f.requests.filter(request => isChildRequest(request.body));
+      const parent = f.requests.filter(request => !isChildRequest(request.body));
+      expect(child.map(request => [request.body.model, request.body.max_tokens])).toEqual([[childModel, mode === "unknown" ? undefined : mode === "override" ? 1024 : 512]]);
+      expect(parent.map(request => [request.body.model, request.body.max_tokens])).toEqual([["local-model", 512], ["local-model", 512], ["local-model", 512]]);
       expect(f.requests.every(request => request.authorization === null)).toBe(true);
     } finally { f.close(); }
   }, 35000);
@@ -292,7 +309,8 @@ describe("configured providers", () => {
   test("persistent child capabilities stay bound when the parent changes providers", async () => {
     let callId = 0;
     const f = fixture(body => {
-      if (!body.tools?.some((tool: any) => tool.function?.name === "subagent")) return completion(body.model, "child reply");
+      if (isChildRequest(body)) return completion(body.model, "child reply");
+      if (isReportTurn(body)) return completion(body.model, "report handled");
       if (body.messages.at(-1)?.role === "tool") return completion(body.model, "parent reply");
       return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: "read the child fixture" } }, `child-call-${++callId}`);
     });
@@ -305,22 +323,30 @@ describe("configured providers", () => {
       const first = await runFx(["ask", "--json", "Create the named child"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "remote" }, timeoutMs: 30000 });
       if (first.code !== 0) throw new Error(first.stdout + first.stderr);
       const id = JSON.parse(first.stdout).session_id;
-      expect(f.requests.map(request => request.body.max_tokens)).toEqual([1024, 1024, 1024]);
+      // Parent call, the child and the parent after its receipt, then the report turn.
+      expect(f.requests.map(request => request.body.max_tokens)).toEqual([1024, 1024, 1024, 1024]);
       const resumed = await runFx(["ask", "--json", "--resume", id, "Continue the named child"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "local" }, timeoutMs: 30000 });
       if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
-      const resumedResult = f.requests.at(-1)!.body.messages.at(-1).content;
+      const resumedRequests = f.requests.slice(4);
+      const resumedResult = resumedRequests.find(request => request.body.messages.at(-1)?.role === "tool")!.body.messages.at(-1).content;
       if (!JSON.parse(resumedResult).ok) throw new Error(resumedResult);
-      expect(f.requests.map(request => request.body.max_tokens)).toEqual([1024, 1024, 1024, 512, 1024, 512]);
-      expect(f.requests[3].authorization).toBeNull();
-      expect(f.requests[4].authorization).toBe(`Bearer ${f.env.FX_TEST_PROVIDER_TOKEN}`);
-      expect(f.requests[5].authorization).toBeNull();
+      expect(resumedRequests).toHaveLength(4);
+      // The child keeps the connection it was made with; the parent uses its new one.
+      const resumedChild = resumedRequests.filter(request => isChildRequest(request.body));
+      const resumedParent = resumedRequests.filter(request => !isChildRequest(request.body));
+      expect(resumedChild.map(request => [request.body.max_tokens, request.authorization])).toEqual([[1024, `Bearer ${f.env.FX_TEST_PROVIDER_TOKEN}`]]);
+      expect(resumedParent.map(request => [request.body.max_tokens, request.authorization])).toEqual([[512, null], [512, null], [512, null]]);
       f.settings.providers.remote.base_url += "/changed";
       f.save();
       const rebound = await runFx(["ask", "--json", "--resume", id, "Continue the named child again"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "local" }, timeoutMs: 30000 });
       if (rebound.code !== 0) throw new Error(rebound.stdout + rebound.stderr);
-      expect(f.requests).toHaveLength(8);
-      expect(f.requests.slice(6).every(request => request.authorization === null && request.path === "/v1/chat/completions")).toBe(true);
-      expect(f.requests[7].body.messages.at(-1).content).toContain("child_failed");
+      // The child cannot reach its rebound endpoint, so it never asks, and its
+      // failure reaches the parent as a report.
+      const reboundRequests = f.requests.slice(8);
+      expect(reboundRequests.every(request => !isChildRequest(request.body) && request.authorization === null && request.path === "/v1/chat/completions")).toBe(true);
+      const report = reboundRequests.find(request => isReportTurn(request.body));
+      expect(report).toBeDefined();
+      expect(report!.body.messages.at(-1).content).toContain("failed");
     } finally { f.close(); }
   }, 100000);
 
@@ -332,6 +358,7 @@ describe("configured providers", () => {
         // them word for word, shortening the longest, so it needs no model call.
         return completion(body.model, "child reply " + "detail ".repeat(2000), Math.ceil(JSON.stringify(body).length / 4));
       }
+      if (isReportTurn(body)) return completion(body.model, "report handled");
       if (body.messages.at(-1)?.role === "tool") return completion(body.model, "parent reply");
       parentTurns++;
       return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: `child context ${parentTurns}`, ...(parentTurns === 1 ? { model: "child-model" } : {}) } }, `context-call-${parentTurns}`);
@@ -344,7 +371,7 @@ describe("configured providers", () => {
         const result = await runFx(["ask", "--json", ...(id ? ["--resume", id] : []), "Continue the child context"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
         if (result.code !== 0) throw new Error(result.stdout + result.stderr);
         id = JSON.parse(result.stdout).session_id;
-        const returned = f.requests.filter(request => request.body.model === "local-model").at(-1)!.body.messages.at(-1).content;
+        const returned = f.requests.filter(request => request.body.model === "local-model" && request.body.messages.at(-1)?.role === "tool").at(-1)!.body.messages.at(-1).content;
         if (!JSON.parse(returned).ok) throw new Error(returned);
         expect(JSON.parse(returned).ok).toBe(true);
       }

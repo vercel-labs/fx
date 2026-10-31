@@ -23,6 +23,8 @@ const app_process_runtime = @import("app_process_runtime.zig");
 const subagent_execution = @import("../subagent/execution.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_authority = @import("../subagent/authority.zig");
+const subagent_reports = @import("../subagent/reports.zig");
+const subagent_child_state = @import("../subagent/child_state.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const io_mod = @import("../shared/io.zig");
@@ -77,6 +79,12 @@ pub const ChildAgent = struct {
     /// The name its parent gave it, such as `reviewer`, from its first run.
     /// Empty for a one-off. Owned.
     name: []u8 = &.{},
+    /// Where its current approval and question come in the order its tree's
+    /// prompts were asked (`App.prompt_order`), so the instance's screen
+    /// shows the oldest first. Meaningful only while that prompt is active.
+    /// Main loop only.
+    approval_asked: u64 = 0,
+    question_asked: u64 = 0,
     /// Backs `footerLabel`.
     label_buf: [160]u8 = undefined,
 
@@ -165,23 +173,112 @@ fn turnInFlight(agent: *agents.Agent) bool {
     return agent.worker.isProcessing() or agent.worker.queuedPromptCount() > 0;
 }
 
-/// Slot threads and the main loop both use the mailbox's list.
-const mailbox_alloc = std.heap.c_allocator;
+/// Slot threads and the main loop both use the hand-off list.
+const handoff_alloc = std.heap.c_allocator;
 
 /// Hand-offs from the subagent host's slot threads to the main loop. A slot
 /// thread posts and waits; only the main loop takes, once each pass.
-pub const Mailbox = struct {
+pub const Handoffs = struct {
     mutex: std.Io.Mutex = .init,
     /// Set when the app shuts down: nothing more is posted or taken, and
     /// every slot thread waiting for a hand-off is released.
     closed: bool = false,
     posts: std.ArrayList(*Post) = .empty,
+    /// Children's reports for the agents that own their hosts, in the order
+    /// they were posted.
+    reports: std.ArrayList(*ReportPost) = .empty,
 
-    pub fn deinit(self: *Mailbox) void {
-        self.posts.deinit(mailbox_alloc);
+    pub fn deinit(self: *Handoffs) void {
+        self.posts.deinit(handoff_alloc);
+        self.reports.deinit(handoff_alloc);
         self.* = .{};
     }
 };
+
+/// A host's delivery on its way to the main loop: a child's report for the
+/// agent that owns `host`, or a subagent's message to its parent. It owns
+/// copies of what it carries, so the poster never waits: a slot thread that
+/// waited on the loop could deadlock with a `/close` that joins it.
+pub const ReportPost = struct {
+    host: *subagent_tool_host.Runtime,
+    kind: enum { report, message },
+    /// For a message: whether the host's owner sent it, so it goes to the
+    /// owner's own parent.
+    from_owner: bool = false,
+    agent: []u8,
+    child_id: []u8,
+    work_id: []u8,
+    outcome: subagent_child_state.Outcome = .completed,
+    /// The report's output, or the message's text.
+    text: []u8,
+    /// A report's count of the parent's messages a user's stop dropped.
+    dropped: usize = 0,
+    /// Who started a report's work and why it was cancelled.
+    end: subagent_child_state.EndFacts = .{},
+
+    fn create(host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery) !*ReportPost {
+        const post = try handoff_alloc.create(ReportPost);
+        errdefer handoff_alloc.destroy(post);
+        const agent, const child_id, const work_id, const text = switch (delivery) {
+            .report => |report| .{ report.agent, report.child_id, report.work_id, report.output },
+            .message => |message| .{ message.agent, message.child_id, "", message.text },
+        };
+        const owned_agent = try handoff_alloc.dupe(u8, agent);
+        errdefer handoff_alloc.free(owned_agent);
+        const owned_child = try handoff_alloc.dupe(u8, child_id);
+        errdefer handoff_alloc.free(owned_child);
+        const owned_work = try handoff_alloc.dupe(u8, work_id);
+        errdefer handoff_alloc.free(owned_work);
+        post.* = .{
+            .host = host,
+            .kind = if (delivery == .report) .report else .message,
+            .from_owner = delivery == .message and delivery.message.to == .owners_parent,
+            .agent = owned_agent,
+            .child_id = owned_child,
+            .work_id = owned_work,
+            .outcome = if (delivery == .report) delivery.report.outcome else .completed,
+            .text = try handoff_alloc.dupe(u8, text),
+            .dropped = if (delivery == .report) delivery.report.dropped else 0,
+            .end = if (delivery == .report) delivery.report.end else .{},
+        };
+        return post;
+    }
+
+    fn destroy(self: *ReportPost) void {
+        handoff_alloc.free(self.agent);
+        handoff_alloc.free(self.child_id);
+        handoff_alloc.free(self.work_id);
+        handoff_alloc.free(self.text);
+        handoff_alloc.destroy(self);
+    }
+};
+
+test "a report's hand-off keeps the count a user's stop dropped, and who started and stopped its work" {
+    // Only the host's address is kept, so any will do.
+    var host: subagent_tool_host.Runtime = undefined;
+    const end: subagent_child_state.EndFacts = .{ .started_by = .user, .cause = .user_stop };
+    const post = try ReportPost.create(&host, .{ .report = .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .cancelled, .output = "", .dropped = 2, .end = end } });
+    defer post.destroy();
+    try std.testing.expectEqual(@as(usize, 2), post.dropped);
+    try std.testing.expectEqual(subagent_child_state.Outcome.cancelled, post.outcome);
+    try std.testing.expectEqual(end, post.end);
+}
+
+/// Queues a host's delivery for the main loop, without waiting.
+/// `AgentGone` once the app is shutting down; a report then stays owed.
+pub fn postDelivery(handoffs: *Handoffs, host: *subagent_tool_host.Runtime, delivery: subagent_tool_host.Delivery) subagent_tool_host.PostReportError!void {
+    const post = try ReportPost.create(host, delivery);
+    handoffs.mutex.lockUncancelable(io_mod.getIo());
+    defer handoffs.mutex.unlock(io_mod.getIo());
+    if (handoffs.closed) {
+        post.destroy();
+        return error.AgentGone;
+    }
+    handoffs.reports.append(handoff_alloc, post) catch {
+        post.destroy();
+        return error.OutOfMemory;
+    };
+}
 
 /// One hand-off, on the posting slot thread's stack until the loop takes it.
 pub const Post = struct {
@@ -215,12 +312,12 @@ pub const PostError = error{ OutOfMemory, Cancelled, Failed };
 
 /// Posts `post` and waits until the main loop takes it. Fails with
 /// `Cancelled` when `cancel` is set first or the app shuts down.
-pub fn postAndWait(mailbox: *Mailbox, post: *Post, cancel: *std.atomic.Value(bool)) PostError!void {
+pub fn postAndWait(handoffs: *Handoffs, post: *Post, cancel: *std.atomic.Value(bool)) PostError!void {
     {
-        mailbox.mutex.lockUncancelable(io_mod.getIo());
-        defer mailbox.mutex.unlock(io_mod.getIo());
-        if (mailbox.closed) return error.Cancelled;
-        try mailbox.posts.append(mailbox_alloc, post);
+        handoffs.mutex.lockUncancelable(io_mod.getIo());
+        defer handoffs.mutex.unlock(io_mod.getIo());
+        if (handoffs.closed) return error.Cancelled;
+        try handoffs.posts.append(handoff_alloc, post);
     }
     while (true) {
         switch (post.state.load(.acquire)) {
@@ -229,7 +326,7 @@ pub fn postAndWait(mailbox: *Mailbox, post: *Post, cancel: *std.atomic.Value(boo
             .closed => return error.Cancelled,
             .posted => {},
         }
-        if (cancel.load(.seq_cst) and withdraw(mailbox, post)) return error.Cancelled;
+        if (cancel.load(.seq_cst) and withdraw(handoffs, post)) return error.Cancelled;
         // Settling wakes this at once; the timeout only rechecks `cancel`,
         // which its setter does not signal.
         post.settled.waitTimeout(io_mod.getIo(), wake_check) catch {};
@@ -244,11 +341,11 @@ const wake_check: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(50
 const release_timeout_ms: i64 = 5_000;
 
 /// Takes `post` back if the loop has not taken it yet.
-fn withdraw(mailbox: *Mailbox, post: *Post) bool {
-    mailbox.mutex.lockUncancelable(io_mod.getIo());
-    defer mailbox.mutex.unlock(io_mod.getIo());
-    for (mailbox.posts.items, 0..) |item, index| if (item == post) {
-        _ = mailbox.posts.orderedRemove(index);
+fn withdraw(handoffs: *Handoffs, post: *Post) bool {
+    handoffs.mutex.lockUncancelable(io_mod.getIo());
+    defer handoffs.mutex.unlock(io_mod.getIo());
+    for (handoffs.posts.items, 0..) |item, index| if (item == post) {
+        _ = handoffs.posts.orderedRemove(index);
         return true;
     };
     return false;
@@ -466,6 +563,10 @@ pub fn Runtime(comptime App: type) type {
             var run = try app_agent_runtime.Runtime(App).prepareOwnTurnRun(app, child.id, host.authorityResolver(), admitted.instructions, admitted.admission);
             errdefer run.deinit(app.alloc);
             try setUserRequests(app, agent, &run);
+            // A user turn the last run opened and never saw end ends now.
+            if (child.agent.child_run) |*previous| endUserWork(app.alloc, host, previous, .cancelled, "");
+            // The turn is a work in the parent's log, as every child turn is.
+            if (host.beginUserWork(app.alloc, child.id, &child.agent.worker)) |work_id| run.turn_work_id = work_id;
             installChildRun(app, child, run);
             debug_trace.eventf("host", "own_turn_admitted", .{}, "agent={s} model={s} permission_mode={s}", .{
                 child.id,
@@ -482,25 +583,59 @@ pub fn Runtime(comptime App: type) type {
             return if (on_screen.agent.role == .instance) &on_screen.agent else null;
         }
 
-        /// While an instance is on screen with no question or approval
-        /// showing, a hidden question from a subagent of its tree is lent to
-        /// the instance's prompt, named for the subagent, so it shows on the
-        /// instance's screen too. It goes back before anything but the input
-        /// that edits it touches it.
-        pub fn lendQuestion(app: *App) void {
-            if (app.question_lender != null) return;
+        pub const PromptKind = enum { approval, question };
+
+        /// Notes that subagent `agent`'s approval or question just showed,
+        /// so its tree's prompts reach the instance's screen in the order
+        /// they were asked.
+        pub fn notePromptAsked(app: *App, agent: *const agents.Agent, kind: PromptKind) void {
+            const child = for (app.child_agents.items) |child| {
+                if (&child.agent == agent) break child;
+            } else return;
+            app.prompt_order += 1;
+            switch (kind) {
+                .approval => child.approval_asked = app.prompt_order,
+                .question => child.question_asked = app.prompt_order,
+            }
+        }
+
+        /// While an instance is on screen with no approval or question
+        /// showing, the oldest one waiting in its tree, approval or
+        /// question, is lent to the instance's prompt, so it shows on the
+        /// instance's screen too. One is lent at a time, so the next shows
+        /// once that one is answered or goes back. A rule a subagent's
+        /// `/permissions remember` would save is its own, so it isn't lent.
+        pub fn lendPrompt(app: *App) void {
+            if (app.approval_lender != null or app.question_lender != null) return;
             const borrower = instanceOnScreen(app) orelse return;
-            if (borrower.question_prompt.isActive() or borrower.approval_prompt.isActive()) return;
+            if (borrower.approval_prompt.isActive() or borrower.question_prompt.isActive()) return;
+            var oldest: ?struct { child: *ChildAgent, kind: PromptKind, asked: u64 } = null;
             for (app.child_agents.items) |child| {
                 if (!lendsTo(app, child, borrower)) continue;
-                if (!child.agent.question_prompt.isActive()) continue;
-                std.mem.swap(question_prompt.QuestionPrompt, &borrower.question_prompt, &child.agent.question_prompt);
-                borrower.question_prompt.asker = child.displayName();
-                app.question_lender = child;
-                debug_trace.eventf("host", "question_lent", .{}, "agent={s}", .{child.id});
-                app.shell.render_requests.request(.modal);
-                return;
+                const approval = &child.agent.approval_prompt;
+                if (approval.isActive() and approval.rule_management == null) {
+                    if (oldest == null or child.approval_asked < oldest.?.asked) oldest = .{ .child = child, .kind = .approval, .asked = child.approval_asked };
+                }
+                if (child.agent.question_prompt.isActive()) {
+                    if (oldest == null or child.question_asked < oldest.?.asked) oldest = .{ .child = child, .kind = .question, .asked = child.question_asked };
+                }
             }
+            const lent = oldest orelse return;
+            switch (lent.kind) {
+                .approval => lendApproval(app, borrower, lent.child),
+                .question => lendQuestion(app, borrower, lent.child),
+            }
+            app.shell.render_requests.request(.modal);
+        }
+
+        /// Lends `child`'s question to `borrower`'s prompt, named for the
+        /// subagent. It goes back before anything but the input that edits
+        /// it touches it.
+        fn lendQuestion(app: *App, borrower: *AppAgent, child: *ChildAgent) void {
+            std.mem.swap(question_prompt.QuestionPrompt, &borrower.question_prompt, &child.agent.question_prompt);
+            borrower.question_prompt.asker = child.displayName();
+            app.question_lender = child;
+            debug_trace.eventf("host", "question_lent", .{}, "agent={s}", .{child.id});
         }
 
         /// Gives a lent question back to the subagent that asked it, and
@@ -539,28 +674,14 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// While an instance is on screen with no approval or question
-        /// showing, a hidden approval from a subagent of its tree is lent to
-        /// the instance's prompt, so it shows on the instance's screen too.
-        /// Its request comes from its own worker and stays labeled with its
-        /// name. It goes back when the subagent is shown, the instance gets
-        /// its own, or the subagent stops waiting (`keepLentApproval`). A
-        /// rule a subagent's `/permissions remember` would save is its own,
-        /// so it isn't lent.
-        pub fn lendApproval(app: *App) void {
-            if (app.approval_lender != null) return;
-            const borrower = instanceOnScreen(app) orelse return;
-            if (borrower.approval_prompt.isActive() or borrower.question_prompt.isActive()) return;
-            for (app.child_agents.items) |child| {
-                if (!lendsTo(app, child, borrower)) continue;
-                const prompt = &child.agent.approval_prompt;
-                if (!prompt.isActive() or prompt.rule_management != null) continue;
-                std.mem.swap(@TypeOf(child.agent.approval_prompt), &borrower.approval_prompt, prompt);
-                app.approval_lender = child;
-                debug_trace.eventf("host", "approval_lent", .{}, "agent={s}", .{child.id});
-                app.shell.render_requests.request(.modal);
-                return;
-            }
+        /// Lends `child`'s approval to `borrower`'s prompt. Its request comes
+        /// from the subagent's own worker and stays labeled with its name.
+        /// It goes back when the subagent is shown, the instance gets its
+        /// own, or the subagent stops waiting (`keepLentApproval`).
+        fn lendApproval(app: *App, borrower: *AppAgent, child: *ChildAgent) void {
+            std.mem.swap(@TypeOf(child.agent.approval_prompt), &borrower.approval_prompt, &child.agent.approval_prompt);
+            app.approval_lender = child;
+            debug_trace.eventf("host", "approval_lent", .{}, "agent={s}", .{child.id});
         }
 
         /// Gives a lent approval back to the subagent it came from, and
@@ -641,15 +762,40 @@ pub fn Runtime(comptime App: type) type {
         /// restart can be shown too. One added here starts its
         /// worker on its first run.
         fn syncChildList(app: *App) !void {
-            const host = app_session_runtime.Runtime(App).subagentHost(app) orelse return;
-            const listing = try host.listChildren(app.alloc);
-            defer subagent_tool_host.Runtime.freeChildListing(app.alloc, listing);
-            for (listing) |entry| {
-                const child = findChild(app, entry.id) orelse try addChild(app, entry.id);
-                if (child.name.len == 0 and entry.name.len > 0) child.name = try app.alloc.dupe(u8, entry.name);
-                if (child.parent_host == null) setParentHost(app, child, host);
+            // Every instance's tree, a restored one's too: the
+            // first instance's host, then each later instance's own. Taken
+            // first, since adding a child grows the list.
+            var hosts: std.ArrayList(*subagent_tool_host.Runtime) = .empty;
+            defer hosts.deinit(app.alloc);
+            if (app_session_runtime.Runtime(App).subagentHost(app)) |host| try hosts.append(app.alloc, host);
+            if (comptime agents.hasAgentField(App, "session_persistence")) {
+                for (app.child_agents.items) |hosted| {
+                    if (hosted.agent.role != .instance) continue;
+                    if (hosted.agent.session_persistence.subagent_host) |host| try hosts.append(app.alloc, host);
+                }
             }
-            orderByListing(app.child_agents.items, listing);
+            const Listed = struct { id: []const u8 };
+            var order: std.ArrayList(Listed) = .empty;
+            defer order.deinit(app.alloc);
+            var listings: std.ArrayList([]subagent_tool_host.Runtime.ChildListing) = .empty;
+            defer {
+                for (listings.items) |listing| subagent_tool_host.Runtime.freeChildListing(app.alloc, listing);
+                listings.deinit(app.alloc);
+            }
+            for (hosts.items) |host| {
+                const listing = try host.listChildren(app.alloc);
+                listings.append(app.alloc, listing) catch |err| {
+                    subagent_tool_host.Runtime.freeChildListing(app.alloc, listing);
+                    return err;
+                };
+                for (listing) |entry| {
+                    const child = findChild(app, entry.id) orelse try addChild(app, entry.id);
+                    if (child.name.len == 0 and entry.name.len > 0) child.name = try app.alloc.dupe(u8, entry.name);
+                    if (child.parent_host == null) setParentHost(app, child, host);
+                    try order.append(app.alloc, .{ .id = entry.id });
+                }
+            }
+            orderByListing(app.child_agents.items, order.items);
         }
 
         /// The agent list's rows, in order: the instances in launch order,
@@ -1193,8 +1339,9 @@ pub fn Runtime(comptime App: type) type {
         /// The list is in start order, so walking it backwards closes each
         /// subagent's own subagents before it.
         pub fn shutdownChildren(app: *App) void {
+            noteQuitting(app);
             attach(app, null);
-            closeMailbox(app);
+            closeHandoffs(app);
             var index = app.child_agents.items.len;
             while (index > 0) {
                 index -= 1;
@@ -1218,10 +1365,11 @@ pub fn Runtime(comptime App: type) type {
         /// worker is joined before its run ends, so no worker still uses the
         /// run's turn context once the slot thread frees it.
         pub fn stopChildren(app: *App, comptime mode: enum { cooperative, force }) void {
+            noteQuitting(app);
             // Main's own shutdown writes to its transcript, so it goes back on
             // screen first.
             attach(app, null);
-            closeMailbox(app);
+            closeHandoffs(app);
             for (app.child_agents.items) |child| {
                 child.agent.worker.requestCancel();
                 child.agent.worker.requestShutdown();
@@ -1237,34 +1385,124 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// Closes the mailbox at shutdown, releasing every slot thread still
+        /// Closes the hand-offs at shutdown, releasing every slot thread still
         /// waiting for a hand-off.
-        fn closeMailbox(app: *App) void {
-            app.child_mailbox.mutex.lockUncancelable(io_mod.getIo());
-            defer app.child_mailbox.mutex.unlock(io_mod.getIo());
-            app.child_mailbox.closed = true;
-            for (app.child_mailbox.posts.items) |post| post.settle(.closed);
-            app.child_mailbox.posts.clearRetainingCapacity();
+        fn closeHandoffs(app: *App) void {
+            app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+            defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+            app.child_handoffs.closed = true;
+            for (app.child_handoffs.posts.items) |post| post.settle(.closed);
+            app.child_handoffs.posts.clearRetainingCapacity();
+            for (app.child_handoffs.reports.items) |post| {
+                debug_trace.eventf("host", "child_delivery_dropped", .{}, "child={s} work_id={s} reason=shutdown", .{ post.child_id, post.work_id });
+                post.destroy();
+            }
+            app.child_handoffs.reports.clearRetainingCapacity();
         }
 
-        /// Takes every hand-off waiting in the mailbox. Runs on the main loop
-        /// each pass, before the children's events are handled.
+        /// Gives each posted delivery to its agent, in the order they were
+        /// posted (`App.postAgentMessage`). One whose agent is gone is
+        /// dropped; a report stays owed in the log.
+        fn deliverReports(app: *App) void {
+            var posted: std.ArrayList(*ReportPost) = .empty;
+            {
+                app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+                defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+                if (app.child_handoffs.closed) return;
+                std.mem.swap(std.ArrayList(*ReportPost), &posted, &app.child_handoffs.reports);
+            }
+            defer posted.deinit(handoff_alloc);
+            for (posted.items) |post| {
+                defer post.destroy();
+                deliverReport(app, post) catch |err| {
+                    debug_trace.eventf("host", "child_delivery_dropped", .{}, "child={s} work_id={s} kind={s} reason={s}", .{ post.child_id, post.work_id, @tagName(post.kind), @errorName(err) });
+                };
+            }
+        }
+
+        /// The agent a subagent's delivery from `host` goes to: the host's
+        /// owner, or with `from_owner` that owner's own parent. Call with
+        /// `authority_mutex` held, or on the main loop.
+        fn receiverOf(app: *App, host: *subagent_tool_host.Runtime, from_owner: bool) ?*AppAgent {
+            const owner = ownerOf(app, host) orelse return null;
+            if (!from_owner) return owner;
+            const child = hostedOf(app, owner) orelse return null;
+            return ownerOf(app, hostOf(app, child));
+        }
+
+        /// Holds a place for a subagent's message in the queue it goes to,
+        /// on the subagent's thread, so a full queue refuses it while its
+        /// call waits. `deliverReport` uses the
+        /// place; `releaseMessagePlace` gives it back.
+        pub fn reserveMessagePlace(app: *App, host: *subagent_tool_host.Runtime, from_owner: bool) subagent_tool_host.PostReportError!void {
+            const receiver = blk: {
+                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+                defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                break :blk receiverOf(app, host, from_owner) orelse return error.AgentGone;
+            };
+            // The receiver outlives the sender's call: a tree closes its
+            // subagents' threads before the agents that started them.
+            if (!receiver.worker.reserveAgentMessage()) return error.QueueFull;
+        }
+
+        pub fn releaseMessagePlace(app: *App, host: *subagent_tool_host.Runtime, from_owner: bool) void {
+            const receiver = blk: {
+                app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+                defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+                break :blk receiverOf(app, host, from_owner) orelse return;
+            };
+            receiver.worker.releaseAgentMessage();
+        }
+
+        fn deliverReport(app: *App, post: *ReportPost) !void {
+            const message = post.kind == .message;
+            const target = receiverOf(app, post.host, message and post.from_owner) orelse return error.AgentGone;
+            // A message sent by the owner names the owner, its own subagent.
+            const sender = if (message and post.from_owner) blk: {
+                const owner = ownerOf(app, post.host) orelse return error.AgentGone;
+                const child = hostedOf(app, owner) orelse return error.AgentGone;
+                break :blk if (child.name.len > 0) child.name else child.id;
+            } else post.agent;
+            const limit = target.worker.effectiveAgentTurnSettings().max_tool_result_bytes;
+            const text = switch (post.kind) {
+                .report => try subagent_reports.message(app.alloc, .{
+                    .agent = sender,
+                    .child_id = post.child_id,
+                    .work_id = post.work_id,
+                    .outcome = post.outcome,
+                    .output = post.text,
+                    .dropped = post.dropped,
+                    .end = post.end,
+                }, limit),
+                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit) catch |err| {
+                    target.worker.releaseAgentMessage();
+                    return err;
+                },
+            };
+            defer app.alloc.free(text);
+            try app.postAgentMessage(target, text, .child, if (message) .message else .report);
+            debug_trace.eventf("host", "child_delivery_posted", .{}, "child={s} work_id={s} kind={s}", .{ post.child_id, post.work_id, @tagName(post.kind) });
+        }
+
+        /// Takes every waiting hand-off. Runs on the main loop each pass,
+        /// before the children's events are handled.
         pub fn takePosts(app: *App) void {
+            deliverReports(app);
             var posts: std.ArrayList(*Post) = .empty;
             {
-                app.child_mailbox.mutex.lockUncancelable(io_mod.getIo());
-                defer app.child_mailbox.mutex.unlock(io_mod.getIo());
-                if (app.child_mailbox.closed) return;
-                std.mem.swap(std.ArrayList(*Post), &posts, &app.child_mailbox.posts);
+                app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+                defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+                if (app.child_handoffs.closed) return;
+                std.mem.swap(std.ArrayList(*Post), &posts, &app.child_handoffs.posts);
             }
-            defer posts.deinit(mailbox_alloc);
+            defer posts.deinit(handoff_alloc);
             var held: std.ArrayList(*Post) = .empty;
-            defer held.deinit(mailbox_alloc);
+            defer held.deinit(handoff_alloc);
             for (posts.items) |post| {
                 // A run waits while a turn of its child's is going: the run
                 // replaces the child's installed run, which that turn reads.
                 if (post.run != null) if (findChild(app, post.turn.child_id orelse "")) |child| if (turnGoing(app, child)) {
-                    held.append(mailbox_alloc, post) catch {
+                    held.append(handoff_alloc, post) catch {
                         debug_trace.eventf("host", "child_handoff_failed", .{}, "agent={s} kind=run reason=OutOfMemory", .{child.id});
                         post.settle(.failed);
                         continue;
@@ -1284,11 +1522,11 @@ pub fn Runtime(comptime App: type) type {
             }
             if (held.items.len == 0) return;
             // Back at the front, in order, to be offered again next pass.
-            app.child_mailbox.mutex.lockUncancelable(io_mod.getIo());
-            defer app.child_mailbox.mutex.unlock(io_mod.getIo());
-            if (app.child_mailbox.closed) {
+            app.child_handoffs.mutex.lockUncancelable(io_mod.getIo());
+            defer app.child_handoffs.mutex.unlock(io_mod.getIo());
+            if (app.child_handoffs.closed) {
                 for (held.items) |post| post.settle(.closed);
-            } else app.child_mailbox.posts.insertSlice(mailbox_alloc, 0, held.items) catch {
+            } else app.child_handoffs.posts.insertSlice(handoff_alloc, 0, held.items) catch {
                 for (held.items) |post| post.settle(.failed);
             };
         }
@@ -1301,6 +1539,16 @@ pub fn Runtime(comptime App: type) type {
             defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
             child.parent_host = host;
             if (child.agent.root_instance == null) child.agent.root_instance = rootInstance(app, child);
+        }
+
+        /// Tells every subagent host that fx is quitting, before any child
+        /// stops, so the works the quit cancels say so in their reports.
+        fn noteQuitting(app: *App) void {
+            if (app_session_runtime.Runtime(App).subagentHost(app)) |host| host.noteQuitting();
+            for (app.child_agents.items) |child| {
+                const host = child.agent.session_persistence.subagent_host orelse continue;
+                host.noteQuitting();
+            }
         }
 
         /// The host whose resolver is `resolver`: main's, or one of the
@@ -1522,6 +1770,11 @@ pub fn Runtime(comptime App: type) type {
             if (app.question_lender) |lender| if (std.mem.findScalar(*ChildAgent, tree.items, lender) != null) {
                 _ = returnQuestion(app);
             };
+            // First, so no work the close ends owes a report into the tree.
+            if (comptime agents.hasAgentField(App, "session_persistence")) {
+                if (root.session_persistence.subagent_host) |host| host.closeTree();
+                for (tree.items) |entry| if (entry.agent.session_persistence.subagent_host) |host| host.closeTree();
+            }
             for (tree.items) |entry| {
                 entry.agent.worker.requestCancel();
                 entry.agent.worker.requestShutdown();
@@ -1530,7 +1783,11 @@ pub fn Runtime(comptime App: type) type {
             for (tree.items) |entry| {
                 if (entry.agent.worker_thread) |thread| thread.join();
                 entry.agent.worker_thread = null;
-                if (entry.agent.child_run) |*run| finishRun(run, .cancelled);
+                if (entry.agent.child_run) |*run| {
+                    finishRun(run, .cancelled);
+                    // A turn the user started ends with the tree, owing nothing.
+                    if (hostOf(app, entry)) |host| endUserWork(app.alloc, host, run, .cancelled, "");
+                }
             }
             root.worker.requestCancel();
             debug_trace.eventf("host", "instance_closed", .{}, "agent={s} subagents={d}", .{ label, tree.items.len });
@@ -1606,13 +1863,23 @@ pub fn Runtime(comptime App: type) type {
         /// after the save, on the main loop in the child's context. Only the
         /// turn carrying the run's work id ends it: the parent finds its
         /// answer by that id, and a turn the user started carries none.
-        pub fn commitChildTurn(_: *App, agent: *AppAgent, finished: types.FinishedPrompt) void {
+        pub fn commitChildTurn(app: *App, agent: *AppAgent, finished: types.FinishedPrompt) void {
             if (comptime !@hasField(App, "screen_owner")) return;
             if (agent.role != .subagent) return;
             // A subagent never runs a turn without a run installed.
             const run = if (agent.child_run) |*value| value else return;
             const saved_work = session_mod.historyTurnWorkId(finished.turn);
             debug_trace.eventf("host", "child_turn_saved", .{}, "agent={s} work_id={s}", .{ run.child_id, saved_work orelse "none" });
+            if (saved_work == null and run.turn_work_id.len > 0) {
+                const host = hostOf(app, hostedOf(app, agent) orelse return) orelse return;
+                const reply = switch (finished.turn) {
+                    .assistant => |value| value.assistant,
+                    .interrupted => |value| value.assistant orelse "",
+                    .compacted_summary => "",
+                };
+                endAndFollowUserWork(app.alloc, host, run, &agent.worker, userWorkOutcome(run, finished.terminal_outcome orelse .completed), reply);
+                return;
+            }
             if (!run.inFlight()) return;
             if (!std.mem.eql(u8, saved_work orelse return, run.work_id)) return;
             const outcome = finished.terminal_outcome orelse .completed;
@@ -1620,12 +1887,49 @@ pub fn Runtime(comptime App: type) type {
             endRun(run, outcome);
         }
 
+        /// The user stops a subagent's turn on its own screen (Esc, or
+        /// cancelling its approval or question) while it works for its
+        /// parent: the other agents' messages waiting in its queue are
+        /// dropped, and its parent's host drops those waiting there
+        /// (`subagent_tool_host.Runtime.userStopped`). A turn the user
+        /// started there has no parent's messages behind it.
+        pub fn noteUserStop(app: *App, agent: *AppAgent) void {
+            const run = runInFlight(app, agent) orelse userWorkRun(app, agent) orelse return;
+            const child = hostedOf(app, agent) orelse return;
+            const host = hostOf(app, child) orelse return;
+            const drop = agent.worker.dropAgentMessages(std.heap.c_allocator);
+            host.userStopped(run.child_id, drop.from_parent);
+        }
+
+        /// Opens the work for a turn `agent`'s worker began on a subagent with
+        /// none going for it: the user's prompt it
+        /// took after a hand-off, or a report from the subagent's own child.
+        /// The parent's messages and the user's turns started on an idle
+        /// subagent open theirs where they are admitted.
+        pub fn noteChildTurnBegun(app: *App, agent: *AppAgent, author: types.MessageAuthor) void {
+            if (runInFlight(app, agent) != null or userWorkRun(app, agent) != null) return;
+            const child = hostedOf(app, agent) orelse return;
+            if (child.agent.role != .subagent) return;
+            const run = if (child.agent.child_run) |*value| value else return;
+            const started_by: subagent_reports.StartedBy = switch (author) {
+                .user => .user,
+                .child => .child,
+                else => return,
+            };
+            const host = hostOf(app, child) orelse return;
+            if (host.beginTurnWork(app.alloc, child.id, started_by, &child.agent.worker)) |work_id| run.turn_work_id = work_id;
+        }
+
         /// Records how a child's turn ended. The finished turn can still be
         /// on its way, held by the pacer or not yet drained, so the run ends
         /// when it is saved, or in `settleChildRuns` once nothing is left.
-        pub fn noteChildTurnFinished(app: *App, agent: *AppAgent, outcome: types.TurnPresentationOutcome) void {
-            const run = runInFlight(app, agent) orelse return;
-            run.ended_as = outcome;
+        pub fn noteChildTurnFinished(app: *App, agent: *AppAgent, finished: types.TurnFinished) void {
+            const run = runInFlight(app, agent) orelse userWorkRun(app, agent) orelse return;
+            run.ended_as = finished.outcome;
+            if (finished.outcome == .interrupted and agent.worker.handedOff(finished.turn_id)) {
+                run.handed_off = true;
+                debug_trace.eventf("host", "child_turn_handed_off", .{}, "agent={s} work_id={s} turn_id={d}", .{ run.child_id, run.work_id, finished.turn_id });
+            }
         }
 
         /// Ends each child's run whose turn has finished and left nothing to
@@ -1635,11 +1939,56 @@ pub fn Runtime(comptime App: type) type {
         pub fn settleChildRuns(app: *App) void {
             for (app.child_agents.items) |child| {
                 const run = if (child.agent.child_run) |*value| value else continue;
-                if (!run.inFlight()) continue;
                 const outcome = run.ended_as orelse continue;
                 if (hasPendingWork(child) or child.agent.worker.isProcessing()) continue;
+                if (run.turn_work_id.len > 0) {
+                    const host = hostOf(app, child) orelse continue;
+                    endAndFollowUserWork(app.alloc, host, run, &child.agent.worker, userWorkOutcome(run, outcome), "");
+                    continue;
+                }
+                if (!run.inFlight()) continue;
                 endRun(run, outcome);
             }
+        }
+
+        /// The run of a turn the parent didn't start, while the work it
+        /// opened in the parent's log is open.
+        fn userWorkRun(app: *App, agent: *AppAgent) ?*agents.ChildRun {
+            if (agent == &app.main_agent) return null;
+            const run = if (agent.child_run) |*value| value else return null;
+            return if (run.turn_work_id.len > 0) run else null;
+        }
+
+        fn userWorkOutcome(run: *const agents.ChildRun, outcome: types.TurnPresentationOutcome) subagent_child_state.Outcome {
+            return switch (outcome) {
+                .completed => .completed,
+                .failed => .failed,
+                .interrupted => if (run.handed_off) .completed else .cancelled,
+                .paused => .cancelled,
+            };
+        }
+
+        /// Ends a user's turn's work. When the turn handed off to the user's
+        /// image or `$skill`, that prompt runs next as the user's own turn,
+        /// so it opens the next work.
+        fn endAndFollowUserWork(alloc: std.mem.Allocator, host: *subagent_tool_host.Runtime, run: *agents.ChildRun, worker: *worker_runtime.WorkerRuntime, outcome: subagent_child_state.Outcome, reply: []const u8) void {
+            const handed_off = run.handed_off;
+            endUserWork(alloc, host, run, outcome, reply);
+            if (handed_off) if (host.beginUserWork(alloc, run.child_id, worker)) |work_id| {
+                run.turn_work_id = work_id;
+            };
+        }
+
+        /// Ends the work a user's turn opened, once.
+        fn endUserWork(alloc: std.mem.Allocator, host: *subagent_tool_host.Runtime, run: *agents.ChildRun, outcome: subagent_child_state.Outcome, reply: []const u8) void {
+            if (run.turn_work_id.len == 0) return;
+            const work_id = run.turn_work_id;
+            run.turn_work_id = &.{};
+            run.ended_as = null;
+            run.handed_off = false;
+            defer alloc.free(work_id);
+            debug_trace.eventf("host", "user_work_ended", .{}, "agent={s} work_id={s} outcome={s}", .{ run.child_id, work_id, @tagName(outcome) });
+            host.endUserWork(run.child_id, work_id, outcome, reply);
         }
 
         /// Keeps a child's terminal provider error for the parent.
@@ -1667,7 +2016,9 @@ pub fn Runtime(comptime App: type) type {
                     };
                     finishRun(run, .failed);
                 },
-                .interrupted, .paused => finishRun(run, .cancelled),
+                // Handed off to the user's image or `$skill`: the work is done.
+                .interrupted => finishRun(run, if (run.handed_off) .completed else .cancelled),
+                .paused => finishRun(run, .cancelled),
             }
         }
 
@@ -1751,19 +2102,19 @@ pub fn Runtime(comptime App: type) type {
             app.child_agents = .empty;
             app.main_screen.deinit(app.alloc);
             app.main_screen = .{};
-            app.child_mailbox.deinit();
+            app.child_handoffs.deinit();
         }
     };
 }
 
 test "a slot thread's hand-off returns once the main loop takes it" {
-    var mailbox: Mailbox = .{};
-    defer mailbox.deinit();
+    var handoffs: Handoffs = .{};
+    defer handoffs.deinit();
     var cancel = std.atomic.Value(bool).init(false);
     // The loop side never runs here, so the turn is never read.
     var post = Post{ .turn = undefined };
     const Loop = struct {
-        fn take(box: *Mailbox) void {
+        fn take(box: *Handoffs) void {
             while (true) {
                 box.mutex.lockUncancelable(io_mod.getIo());
                 if (box.posts.pop()) |taken| {
@@ -1776,24 +2127,24 @@ test "a slot thread's hand-off returns once the main loop takes it" {
             }
         }
     };
-    const thread = try std.Thread.spawn(.{}, Loop.take, .{&mailbox});
-    try postAndWait(&mailbox, &post, &cancel);
+    const thread = try std.Thread.spawn(.{}, Loop.take, .{&handoffs});
+    try postAndWait(&handoffs, &post, &cancel);
     thread.join();
     try std.testing.expectEqual(Post.State.taken, post.state.load(.acquire));
 }
 
 test "a hand-off withdrawn on cancel, or posted after shutdown, never reaches the main loop" {
-    var mailbox: Mailbox = .{};
-    defer mailbox.deinit();
+    var handoffs: Handoffs = .{};
+    defer handoffs.deinit();
     var cancel = std.atomic.Value(bool).init(true);
     var post = Post{ .turn = undefined };
-    try std.testing.expectError(error.Cancelled, postAndWait(&mailbox, &post, &cancel));
-    try std.testing.expectEqual(@as(usize, 0), mailbox.posts.items.len);
+    try std.testing.expectError(error.Cancelled, postAndWait(&handoffs, &post, &cancel));
+    try std.testing.expectEqual(@as(usize, 0), handoffs.posts.items.len);
 
-    mailbox.closed = true;
+    handoffs.closed = true;
     cancel.store(false, .seq_cst);
-    try std.testing.expectError(error.Cancelled, postAndWait(&mailbox, &post, &cancel));
-    try std.testing.expectEqual(@as(usize, 0), mailbox.posts.items.len);
+    try std.testing.expectError(error.Cancelled, postAndWait(&handoffs, &post, &cancel));
+    try std.testing.expectEqual(@as(usize, 0), handoffs.posts.items.len);
 }
 
 test "the switch list follows the registry's start order, with an unlisted agent kept after it" {

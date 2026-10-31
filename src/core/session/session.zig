@@ -1,4 +1,5 @@
 const std = @import("std");
+const agent_frame = @import("../shared/agent_frame.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const kernel_agent = @import("../agent/runtime/agent.zig");
 const core_types = @import("../shared/types.zig");
@@ -2420,15 +2421,22 @@ fn appendContextNoteChatMessages(
 }
 
 /// Steering comes from whoever drives this session, so compaction keeps it as
-/// user text rather than a generated notice. Empty entries only mark a
-/// checkpoint boundary. Borrows `text`.
+/// user text rather than a generated notice. A subagent's report or message
+/// a boundary took is not the user's, so it stays ordinary text in its own
+/// frame. Empty entries only mark a checkpoint boundary. Borrows `text`.
 fn restoredSteeringChatMessage(text: []const u8) core_types.ChatMessage {
     return .{
         .role = .user,
         .content = text,
         .restored_steering = true,
-        .context_origin = if (text.len > 0) .user_turn else .ordinary,
+        .context_origin = if (text.len > 0 and !agent_frame.isFrame(text)) .user_turn else .ordinary,
     };
+}
+
+test "a restored subagent frame is never the user's text" {
+    const report = agent_frame.report_header ++ "{\"child_id\":\"c1\",\"work_id\":\"w1\"}\n";
+    try std.testing.expect(restoredSteeringChatMessage(report).context_origin == .ordinary);
+    try std.testing.expect(restoredSteeringChatMessage("focus on rendering").context_origin == .user_turn);
 }
 
 fn toolResultMemory(result: core_types.PersistedToolResult) core_types.ToolResultMemory {

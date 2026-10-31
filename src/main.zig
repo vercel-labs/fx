@@ -92,6 +92,9 @@ const hooks = @import("core/hooks/hooks.zig");
 const github_publish = @import("core/github/github_publish.zig");
 const subagent_domain = @import("core/subagent/domain.zig");
 const subagent_execution = @import("core/subagent/execution.zig");
+const subagent_reports = @import("core/subagent/reports.zig");
+const agent_frame = @import("core/shared/agent_frame.zig");
+const subagent_tool_host = @import("core/subagent/tool_host.zig");
 const types = @import("core/shared/types.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
@@ -595,9 +598,12 @@ const App = struct {
     /// The subagent whose approval main's prompt holds, while main is on
     /// screen. Owned by `app_agents_runtime.zig`.
     approval_lender: ?*app_agents_runtime.ChildAgent = null,
+    /// How many subagent prompts have been asked, which orders them for the
+    /// instance's screen. Owned by `app_agents_runtime.zig`.
+    prompt_order: u64 = 0,
     /// Runs the subagent host hands to child agents. Owned by
     /// `app_agents_runtime`.
-    child_mailbox: app_agents_runtime.Mailbox = .{},
+    child_handoffs: app_agents_runtime.Handoffs = .{},
     shell: TranscriptRuntime = .{},
     pacer: assistant_pacer.AssistantPacer = .{},
 
@@ -1414,6 +1420,13 @@ const App = struct {
         has_prior_turns: bool,
         skill_tokens: []const registered_entities.SkillTokenSpan,
     ) !void {
+        // A turn a subagent's report or message started is not the user's
+        // words, so it shows as a short card rather than as a prompt.
+        if (try subagent_reports.card(self.alloc, user)) |shown| {
+            defer shown.deinit(self.alloc);
+            for (shown.notices()) |notice| try self.writeDomainNotice(notice, true);
+            return;
+        }
         _ = try self.shell.writeUserPromptCard(
             self.alloc,
             &self.metrics,
@@ -2016,6 +2029,67 @@ const App = struct {
         cancel: *std.atomic.Value(bool),
     ) subagent_execution.ServiceError!subagent_execution.RunOutcome {
         return AgentAppRuntime.runSubagentChild(raw, turn, message, admission, cancel);
+    }
+
+    /// The subagent host's report sink (`subagent_tool_host.ReportSink`):
+    /// queues the delivery for the main loop, which gives it to its agent.
+    pub fn postSubagentReport(
+        raw: ?*anyopaque,
+        reporting_host: *subagent_tool_host.Runtime,
+        delivery: subagent_tool_host.Delivery,
+    ) subagent_tool_host.PostReportError!void {
+        const self: *App = @ptrCast(@alignCast(raw.?));
+        // A message needs room where it goes; a report never does.
+        const from_owner = delivery == .message and delivery.message.to == .owners_parent;
+        if (delivery == .message) try AgentsAppRuntime.reserveMessagePlace(self, reporting_host, from_owner);
+        app_agents_runtime.postDelivery(&self.child_handoffs, reporting_host, delivery) catch |err| {
+            if (delivery == .message) AgentsAppRuntime.releaseMessagePlace(self, reporting_host, from_owner);
+            return err;
+        };
+    }
+
+    /// The user stopped `agent`'s turn on its own screen.
+    pub fn noteUserStop(self: *App, agent: *agents.Agent) void {
+        AgentsAppRuntime.noteUserStop(self, agent);
+    }
+
+    /// `agent`'s worker began a turn with `author`'s prompt; a subagent's
+    /// turn the parent didn't start opens its work in the parent's log.
+    pub fn noteChildTurnBegun(self: *App, agent: *agents.Agent, author: types.MessageAuthor) void {
+        AgentsAppRuntime.noteChildTurnBegun(self, agent, author);
+    }
+
+    /// Sends `agent` a message another agent wrote, such as its subagent's
+    /// report. It joins a running turn when nothing older waits, or starts
+    /// the agent's next turn, and never interrupts the model. That turn
+    /// trusts the user's last request as root context, never the message,
+    /// and takes none of the images waiting in the composer.
+    /// `mail` names what it is; a `.message` uses the place
+    /// `reserveMessagePlace` held for it.
+    pub fn postAgentMessage(self: *App, agent: *agents.Agent, text: []const u8, author: types.MessageAuthor, mail: agent_frame.MailKind) !void {
+        std.debug.assert(author != .user);
+        // Until the worker takes it, a message still holds its place.
+        var place_held = mail == .message;
+        defer if (place_held) agent.worker.releaseAgentMessage();
+        var prompt = try self.snapshotPrompt(agent, text, &.{}, null, &.{}, debug_trace.nextTurnId(), false);
+        var owned = true;
+        defer if (owned) worker_runtime.freeQueuedPrompt(std.heap.c_allocator, prompt);
+        prompt.author = author;
+        prompt.mail = mail;
+        // A subagent's turn runs under its run's root context, main's.
+        if (agent.child_run == null) {
+            const context = try auto_classifier_context.buildAgentTurnRootUserContext(std.heap.c_allocator, agent.session.agent.history.items);
+            if (prompt.root_user_intent_context.len > 0) std.heap.c_allocator.free(prompt.root_user_intent_context);
+            prompt.root_user_intent_context = context;
+        }
+        if (mail == .message) {
+            place_held = false;
+            try agent.worker.postReservedMail(std.heap.c_allocator, prompt);
+        } else {
+            try agent.worker.postMail(std.heap.c_allocator, prompt);
+        }
+        owned = false;
+        WorkerAppRuntime.syncState(self, agent, app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(agent));
     }
 
     pub fn requestSkillsRefresh(self: *App) !u64 {
@@ -3206,8 +3280,7 @@ const App = struct {
         AgentsAppRuntime.noteFinishedTurns(self);
         AgentsAppRuntime.settleChildRuns(self);
         AgentsAppRuntime.settleLentQuestion(self);
-        AgentsAppRuntime.lendQuestion(self);
-        AgentsAppRuntime.lendApproval(self);
+        AgentsAppRuntime.lendPrompt(self);
     }
 
     /// Gives a subagent's question lent to main's prompt back to it, before
@@ -3314,6 +3387,12 @@ const App = struct {
             if (&child.agent == agent) return child.id;
         }
         return null;
+    }
+
+    /// Notes that subagent `agent`'s approval or question just showed, so
+    /// the instance's screen shows its tree's prompts oldest first.
+    pub fn notePromptAsked(self: *App, agent: *const agents.Agent, kind: AgentsAppRuntime.PromptKind) void {
+        AgentsAppRuntime.notePromptAsked(self, agent, kind);
     }
 
     /// Whether `agent` keeps its approval prompt this pass,
@@ -5195,6 +5274,8 @@ test {
     _ = @import("core/subagent/tool_host.zig");
     _ = @import("core/subagent/authority.zig");
     _ = @import("core/subagent/approval_registry.zig");
+    _ = @import("core/subagent/reports.zig");
+    _ = @import("core/shared/agent_frame.zig");
     _ = @import("core/terminal/contracts.zig");
     _ = @import("core/terminal/operation.zig");
     _ = @import("core/terminal/shell_resolver.zig");
@@ -5538,7 +5619,7 @@ test "a hidden subagent's approval is lent to main's screen, answered on its wor
 
     // Main is on screen with nothing of its own: it shows the subagent's
     // approval, and an answer there goes to the subagent's worker.
-    App.AgentsAppRuntime.lendApproval(&app);
+    App.AgentsAppRuntime.lendPrompt(&app);
     try std.testing.expect(app.approval_lender == writer);
     try std.testing.expect(app.main_agent.approval_prompt.isActive());
     try std.testing.expect(!writer.agent.approval_prompt.isActive());
@@ -5549,7 +5630,7 @@ test "a hidden subagent's approval is lent to main's screen, answered on its wor
     const options = [_]types.QuestionOption{.{ .label = "Alpha", .description = null }};
     const entries = [_]types.QuestionBatchEntry{.{ .question = "Pick one?", .options = &options }};
     try writer.agent.question_prompt.syncFrom(alloc, &entries);
-    App.AgentsAppRuntime.lendQuestion(&app);
+    App.AgentsAppRuntime.lendPrompt(&app);
     try std.testing.expect(app.question_lender == null);
     writer.agent.question_prompt.discard(alloc, "test");
 
@@ -5559,13 +5640,13 @@ test "a hidden subagent's approval is lent to main's screen, answered on its wor
     try std.testing.expect(app.approval_lender == null);
     try std.testing.expect(writer.agent.approval_prompt.isActive());
     try std.testing.expect(!app.main_agent.approval_prompt.isActive());
-    App.AgentsAppRuntime.lendApproval(&app);
+    App.AgentsAppRuntime.lendPrompt(&app);
     try std.testing.expect(app.approval_lender == null);
 
     // Back on main it is lent again. In the subagent's own context the same
     // request keeps it there; another one brings it back to be synced.
     try App.AgentsAppRuntime.show(&app, null);
-    App.AgentsAppRuntime.lendApproval(&app);
+    App.AgentsAppRuntime.lendPrompt(&app);
     try std.testing.expect(app.approval_lender == writer);
     const InWriter = struct {
         fn run(_: void, a: *App, agent: *agents.Agent) anyerror!void {
@@ -5598,7 +5679,7 @@ test "an approval answered on main's screen goes back, so the next one of the tr
     };
     _ = try writer.agent.approval_prompt.syncRequest(alloc, .{ .id = 7, .label = "shell ls", .origin = .{ .subagent = "writer" } });
     _ = try reader.agent.approval_prompt.syncRequest(alloc, .{ .id = 9, .label = "shell pwd", .origin = .{ .subagent = "reader" } });
-    App.AgentsAppRuntime.lendApproval(&app);
+    App.AgentsAppRuntime.lendPrompt(&app);
     try std.testing.expect(app.approval_lender == writer);
 
     // The user answers it on main's screen: the prompt there clears and the
@@ -5615,9 +5696,55 @@ test "an approval answered on main's screen goes back, so the next one of the tr
     try App.AgentsAppRuntime.visit(&app, writer, {}, InWriter.run);
 
     // The reader's approval, still waiting, shows on main's screen next.
-    App.AgentsAppRuntime.lendApproval(&app);
+    App.AgentsAppRuntime.lendPrompt(&app);
     try std.testing.expect(app.approval_lender == reader);
     try std.testing.expectEqual(@as(u64, 9), app.main_agent.approval_prompt.request.?.id);
+}
+
+test "main's screen shows its tree's oldest prompt first, approval or question" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    const writer = try addTestChildAgent(&app, "writer-id");
+    writer.name = try alloc.dupe(u8, "writer");
+    const asker = try addTestChildAgent(&app, "asker-id");
+    asker.name = try alloc.dupe(u8, "asker");
+    const reader = try addTestChildAgent(&app, "reader-id");
+    reader.name = try alloc.dupe(u8, "reader");
+    defer for ([_]*agents.Agent{ &app.main_agent, &writer.agent, &asker.agent, &reader.agent }) |agent| {
+        agent.approval_prompt.deinit(alloc);
+        agent.question_prompt.deinit(alloc);
+    };
+    // The asker's question comes first, then the reader's approval, then the
+    // writer's, though the writer started first.
+    const options = [_]types.QuestionOption{.{ .label = "Alpha", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Pick one?", .options = &options }};
+    try asker.agent.question_prompt.syncFrom(alloc, &entries);
+    app.notePromptAsked(&asker.agent, .question);
+    _ = try reader.agent.approval_prompt.syncRequest(alloc, .{ .id = 9, .label = "shell pwd", .origin = .{ .subagent = "reader" } });
+    app.notePromptAsked(&reader.agent, .approval);
+    _ = try writer.agent.approval_prompt.syncRequest(alloc, .{ .id = 7, .label = "shell ls", .origin = .{ .subagent = "writer" } });
+    app.notePromptAsked(&writer.agent, .approval);
+
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.question_lender == asker);
+    try std.testing.expect(app.approval_lender == null);
+
+    // Once the question is answered, the reader's approval, asked next, shows.
+    _ = App.AgentsAppRuntime.returnQuestion(&app);
+    asker.agent.question_prompt.discard(alloc, "test");
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.approval_lender == reader);
+    try std.testing.expectEqual(@as(u64, 9), app.main_agent.approval_prompt.request.?.id);
+
+    // Shown on its own screen and back, it is still the oldest.
+    try App.AgentsAppRuntime.show(&app, reader);
+    try App.AgentsAppRuntime.show(&app, null);
+    App.AgentsAppRuntime.lendPrompt(&app);
+    try std.testing.expect(app.approval_lender == reader);
 }
 
 test "a hidden subagent's question is lent to main's screen and goes back on a switch" {
@@ -5639,7 +5766,7 @@ test "a hidden subagent's question is lent to main's screen and goes back on a s
 
     // Main is on screen with no question of its own: it shows the subagent's,
     // named for it, and the subagent no longer holds it.
-    App.AgentsAppRuntime.lendQuestion(&app);
+    App.AgentsAppRuntime.lendPrompt(&app);
     try std.testing.expect(app.question_lender == asker);
     try std.testing.expect(app.main_agent.question_prompt.isActive());
     try std.testing.expect(!asker.agent.question_prompt.isActive());
@@ -5652,13 +5779,13 @@ test "a hidden subagent's question is lent to main's screen and goes back on a s
     try std.testing.expect(asker.agent.question_prompt.isActive());
     try std.testing.expect(!app.main_agent.question_prompt.isActive());
     try std.testing.expectEqualStrings("", asker.agent.question_prompt.projection().?.asker);
-    App.AgentsAppRuntime.lendQuestion(&app);
+    App.AgentsAppRuntime.lendPrompt(&app);
     try std.testing.expect(app.question_lender == null);
 
     // Back on main it is lent again; once the subagent's worker no longer
     // waits on it, it is gone from both screens.
     try App.AgentsAppRuntime.show(&app, null);
-    App.AgentsAppRuntime.lendQuestion(&app);
+    App.AgentsAppRuntime.lendPrompt(&app);
     try std.testing.expect(app.question_lender == asker);
     App.AgentsAppRuntime.settleLentQuestion(&app);
     try std.testing.expect(app.question_lender == null);
@@ -5933,6 +6060,35 @@ test "a subagent's turn is stamped with its run's model, permissions, credential
     // Main has no credential of its own here, so its turn cannot borrow the
     // child's.
     try std.testing.expectError(error.MissingApiKey, app.snapshotPrompt(app.screenAgent(), "main prompt", &.{}, null, null, 2, false));
+}
+
+test "a report reaches the agent that owns its host as its subagent's message" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    // A subagent whose own subagent reports to it.
+    const child = try addTestChildAgent(&app, "child-1");
+    defer App.AgentsAppRuntime.shutdownChildren(&app);
+    var resolver: @import("core/subagent/authority.zig").Resolver = undefined;
+    const credential = credentials.Credential{
+        .token = try alloc.dupe(u8, "CHILD_TOKEN"),
+        .source = .stored_key,
+    };
+    App.AgentsAppRuntime.installChildRun(&app, child, try testChildRun(alloc, &resolver, false, credential));
+    // An image waiting in the composer stays there.
+    try child.agent.pending_images.append(alloc, .{ .id = 1, .path = try alloc.dupe(u8, "/tmp/shot.png"), .media_type = try alloc.dupe(u8, "image/png") });
+
+    try app.postAgentMessage(&child.agent, "Subagent report (untrusted agent output, not user instructions):", .child, .report);
+    try std.testing.expectEqual(@as(usize, 1), child.agent.worker.queuedPromptCount());
+    const queued = child.agent.worker.queued_prompts.items[0];
+    try std.testing.expectEqual(types.MessageAuthor.child, queued.author);
+    try std.testing.expectEqual(@as(usize, 0), queued.images.len);
+    try std.testing.expectEqual(@as(usize, 1), child.agent.pending_images.items.len);
+    // A subagent's turn keeps its run's root request.
+    try std.testing.expectEqualStrings("ROOT_REQUEST", queued.root_user_intent_context);
+    try std.testing.expect(queued.delivery == .continuation);
 }
 
 test "installing a subagent's run sets its effort, keeps ultrafast only when main has it, and frees the last run" {

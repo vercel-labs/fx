@@ -2609,7 +2609,7 @@ test "subagent completion preview updates progress without publishing a terminal
     const call = ToolCall{
         .id = "child",
         .name = "subagent",
-        .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}",
+        .arguments_json = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"inspect auth\"}",
     };
 
     try std.testing.expect(try publishSubagentCompletionPreview(
@@ -2626,7 +2626,7 @@ test "subagent completion preview updates progress without publishing a terminal
         .progress => |progress| {
             try std.testing.expectEqual(@as(u64, 3), progress.id.turn_id);
             try std.testing.expectEqualStrings("child", progress.id.call_id);
-            try std.testing.expectEqualStrings("● Subagent still running · inspect auth", progress.text);
+            try std.testing.expectEqualStrings("● reviewer still running · inspect auth", progress.text);
         },
         else => return error.TestExpectedEqual,
     }
