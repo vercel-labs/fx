@@ -61,6 +61,16 @@ function letterOf(body: string): string {
   return userTexts(body).at(-1)?.match(/HOST_([A-Z])/)?.[1] ?? "X";
 }
 
+// A provider refusal fx can't retry on its own, so the request waits for
+// the user.
+function rejected(): Response {
+  const message = "Your team has restricted access to this provider.";
+  return new Response(
+    JSON.stringify({ error: { message, type: "no_providers_available", param: { name: "RestrictedProvidersError", message } } }),
+    { status: 403, headers: { "content-type": "application/json" } },
+  );
+}
+
 function answerByLetter(body: string): Response {
   const letter = letterOf(body);
   return text(`answer_${letter}`, `HOST_ANSWER_${letter}`);
@@ -1327,6 +1337,40 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
         await Bun.sleep(300);
         expect(await session.capturePane()).not.toContain("finished ·");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a hidden instance whose request waits for you is named in the footer and the list",
+    async () => {
+      await withHost((body) => {
+        if (userTexts(body).join("\n").includes("HOST_R")) return rejected();
+        return answerByLetter(body);
+      }, { instances: 2 }, async ({ session }) => {
+        await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+        await switchAgent(session, "next");
+        await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("HOST_R refused");
+        // The provider refuses it, so it waits on fx 2's screen for Esc.
+        await session.waitForText("The provider rejected this request · press Esc", 30_000);
+        await switchAgent(session, "previous");
+        await session.waitForPane((pane) => pane.includes("fx 1/2") && pane.includes("fx 2 needs you · fx 1/2 \u2193"), 15_000);
+        await session.sendText("/agents");
+        const list = await session.waitForPane((pane) => pane.includes("fx 2 ·"), 15_000);
+        expect(list).toMatch(/fx 2 · .* · main · needs you/);
+        await session.sendKeys("Escape");
+        // Esc on its own screen ends the request, and the note goes.
+        await switchAgent(session, "next");
+        await session.waitForPane((pane) => pane.includes("fx 2/2") && pane.includes("press Esc"), 15_000);
+        await session.sendKeys("Escape");
+        await session.waitForPane((pane) => !pane.includes("The provider rejected this request"), 15_000);
+        await switchAgent(session, "previous");
+        await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+        await Bun.sleep(300);
+        expect(await session.capturePane()).not.toContain("needs you");
       });
     },
     TIMEOUT,
