@@ -73,7 +73,7 @@ again on each preparation (`src/ui/transcript/tool_group_projection.zig:1164`).
 Measured on this machine during the investigation that led here, not committed:
 
 - 677 saved sessions, 68 with compactions, 345 cycles that ended in a compaction.
-  Text you and the assistant wrote per cycle: typical 1.1 MB, 9 in 10 under
+  Prompt and reply text per cycle: typical 1.1 MB, 9 in 10 under
   1.4 MB, largest 3.9 MB. Tool calls per cycle: typical about 330, largest 1,243.
 - A 40-turn workload with 2,400 tool calls: once past the cap, each streamed
   chunk of the last answer took the slow path, about 50 commits of 37 to 39 ms.
