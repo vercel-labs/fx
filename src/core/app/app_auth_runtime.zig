@@ -1909,7 +1909,13 @@ pub fn Runtime(comptime App: type) type {
             if (!try ensurePromptCredential(app)) return .rejected;
             if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
                 if (app.auth.credentialFailure()) |failure| {
-                    if (!failure.retryable()) {
+                    // Neither case reaches the network: a sign-in failure opens
+                    // the repair, and a source fx cannot refresh only rereads
+                    // what it holds. Every other source refreshes on the
+                    // background task below, which reports its own failure.
+                    if (!failure.retryable() and
+                        (failure.requiresSignIn() or !credentials.sourceRefreshable(failure.source)))
+                    {
                         return if (try preparePromptCredential(app)) .current else .rejected;
                     }
                 }
@@ -3617,6 +3623,54 @@ test "prompt credential refresh falls back when its task cannot start" {
         try Runtime(TestApp).retryPendingPromptCredential(&app),
     );
     try std.testing.expectEqual(@as(usize, 2), app.auth.refresh_count);
+}
+
+test "retrying a refreshable source after a non-retryable failure refreshes in the background" {
+    for ([_]auth_runtime.CredentialFailureReason{ .invalid_storage, .authority_changed }) |reason| {
+        var app: TestApp = .{};
+        defer app.deinit();
+        app.auth.active_source = .fx_login;
+        app.auth.credential_failure = .{ .source = .fx_login, .reason = reason };
+        app.auth.prompt_refresh_start = .started;
+
+        try std.testing.expectEqual(
+            PendingPromptCredentialReadiness.pending,
+            try Runtime(TestApp).retryPendingPromptCredential(&app),
+        );
+        try std.testing.expectEqual(@as(usize, 0), app.auth.refresh_count);
+        try std.testing.expectEqual(@as(usize, 1), app.auth.prompt_refresh_start_count);
+    }
+}
+
+test "retrying after a sign-in failure opens the repair without refreshing" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = .fx_login;
+    app.auth.credential_failure = .{ .source = .fx_login, .reason = .invalid_credential };
+    app.auth.prompt_refresh_start = .started;
+
+    try std.testing.expectEqual(
+        PendingPromptCredentialReadiness.rejected,
+        try Runtime(TestApp).retryPendingPromptCredential(&app),
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.auth.refresh_count);
+    try std.testing.expectEqual(@as(usize, 0), app.auth.prompt_refresh_start_count);
+    try std.testing.expectEqual(@as(usize, 1), app.auth.sign_in_start_count);
+}
+
+test "retrying a source fx cannot refresh rereads it in place" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = .stored_key;
+    app.auth.credential_failure = .{ .source = .stored_key, .reason = .invalid_storage };
+    app.auth.prompt_refresh_start = .started;
+
+    try std.testing.expectEqual(
+        PendingPromptCredentialReadiness.current,
+        try Runtime(TestApp).retryPendingPromptCredential(&app),
+    );
+    try std.testing.expectEqual(@as(usize, 1), app.auth.refresh_count);
+    try std.testing.expectEqual(@as(usize, 0), app.auth.prompt_refresh_start_count);
 }
 
 /// Installs exactly `entries` with the Keychain disabled, so the launch lookup
