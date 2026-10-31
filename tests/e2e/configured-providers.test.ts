@@ -177,6 +177,28 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 25000);
 
+  test.each(["", "served-model"])("accepts empty model chunks before and after model %j", async model => {
+    const f = fixture(async () => {
+      const response = completion("");
+      const prefix = [
+        { id: "chat-local", model: "", created: 0, usage: null, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] },
+        { id: "chat-local", model, choices: [{ index: 0, delta: {} }] },
+      ].map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join("");
+      return new Response(prefix + await response.text(), { headers: response.headers });
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "say hello"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      expect(result.stderr).toBe("");
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.final_output).toBe("local reply");
+      expect(parsed.usage).toMatchObject({ input_tokens: 12, output_tokens: 3 });
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].authorization).toBeNull();
+      expect(f.requests[0].body.model).toBe("local-model");
+    } finally { f.close(); }
+  }, 25000);
+
   test("terminal usage may repeat an empty matching finished choice", async () => {
     const f = fixture(async body => {
       const response = completion(body.model);

@@ -688,7 +688,10 @@ pub const Reducer = struct {
         const root = try object(parsed.value);
         if (non_null(root, "error") != null) return error.ProviderError;
         try self.accept_identity(&self.generation_id, non_null(root, "id"), self.limits.identity_bytes);
-        try self.accept_identity(&self.response_model, non_null(root, "model"), configured_provider.max_model_bytes);
+        // An empty model carries no identity, like an omitted or null model.
+        if (non_null(root, "model")) |model| {
+            if ((try string(model)).len != 0) try self.accept_identity(&self.response_model, model, configured_provider.max_model_bytes);
+        }
         const choices_value = root.get("choices") orelse return error.InvalidChunk;
         if (choices_value != .array) return error.InvalidChunk;
         const choices = choices_value.array.items;
@@ -2491,6 +2494,44 @@ test "chat completions accepts empty name fragments without losing arguments" {
     defer result.deinit(alloc);
     try std.testing.expectEqualStrings("read_file", result.completed.completion.tool_calls[0].name);
     try std.testing.expectEqualStrings("{\"path\":\"x\"}", result.completed.completion.tool_calls[0].arguments_json);
+}
+
+test "chat completions empty models carry no identity" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |with_model| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, "{\"id\":\"a\",\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}");
+        try std.testing.expectEqual(null, reducer.response_model);
+        if (with_model) try test_accept(&reducer, "{\"id\":\"a\",\"model\":\"served-model\",\"choices\":[{\"index\":0,\"delta\":{}}]}");
+        try test_accept(&reducer, "{\"id\":\"a\",\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}");
+        try test_accept(&reducer, "{\"id\":\"a\",\"model\":\"\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":15}}");
+        if (with_model) {
+            try std.testing.expectEqualStrings("served-model", reducer.response_model.?);
+        } else try std.testing.expectEqual(null, reducer.response_model);
+        try test_accept(&reducer, "[DONE]");
+        var result = try reducer.finish(false);
+        defer result.deinit(alloc);
+        try std.testing.expectEqualStrings("ok", result.completed.completion.content.?);
+        try std.testing.expectEqual(@as(?u64, 12), result.completed.completion.usage.input_tokens);
+        try std.testing.expectEqual(@as(?u64, 3), result.completed.completion.usage.output_tokens);
+    }
+}
+
+test "chat completions empty models preserve identity validation" {
+    const alloc = std.testing.allocator;
+    for ([_]struct { chunk: []const u8, failure: Error }{
+        .{ .chunk = "{\"model\":7,\"choices\":[{\"index\":0,\"delta\":{}}]}", .failure = error.InvalidChunk },
+        .{ .chunk = "{\"id\":\"\",\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{}}]}", .failure = error.InvalidChunk },
+        .{ .chunk = "{\"model\":\"" ++ text_utils.repeat("m", configured_provider.max_model_bytes + 1) ++ "\",\"choices\":[{\"index\":0,\"delta\":{}}]}", .failure = error.IdentityTooLarge },
+        .{ .chunk = "{\"model\":\"other\",\"choices\":[{\"index\":0,\"delta\":{}}]}", .failure = error.ConflictingIdentity },
+    }) |case| {
+        var reducer = try Reducer.init(alloc, test_request(), .{});
+        defer reducer.deinit();
+        try test_accept(&reducer, test_text);
+        try test_accept(&reducer, "{\"model\":\"\",\"choices\":[{\"index\":0,\"delta\":{}}]}");
+        try std.testing.expectError(case.failure, reducer.accept(case.chunk, false));
+    }
 }
 
 test "chat completions accepts echoed models up to the request model limit" {
