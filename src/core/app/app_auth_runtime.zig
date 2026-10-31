@@ -1878,7 +1878,7 @@ pub fn Runtime(comptime App: type) type {
                     return switch (app.auth.beginPromptCredentialRefresh()) {
                         .started, .pending => .pending,
                         .not_needed => if (app.auth.gatewayCredential() != null) .current else .rejected,
-                        .failed => if (try admitPromptCredential(app)) .current else .rejected,
+                        .failed => return refreshTaskUnavailable(app),
                     };
                 },
                 .pending => return .pending,
@@ -1924,8 +1924,16 @@ pub fn Runtime(comptime App: type) type {
             return switch (app.auth.beginPromptCredentialRefresh()) {
                 .started, .pending => .pending,
                 .not_needed => if (app.auth.gatewayCredential() != null) .current else .rejected,
-                .failed => if (try preparePromptCredential(app)) .current else .rejected,
+                .failed => refreshTaskUnavailable(app),
             };
+        }
+
+        /// The refresh thread could not start. Refreshing here instead would
+        /// hold the input loop on the network, so the prompt waits for the
+        /// user to retry, as after any temporary refresh failure.
+        fn refreshTaskUnavailable(app: *App) !PendingPromptCredentialReadiness {
+            _ = try recoverPromptCredentialRefreshFailure(app, error.CredentialRefreshTaskUnavailable);
+            return .rejected;
         }
 
         fn preparePromptCredential(app: *App) !bool {
@@ -3602,27 +3610,25 @@ test "compaction credential failure preserves the first ordinary recovery notice
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
 }
 
-test "prompt credential refresh falls back when its task cannot start" {
+test "prompt credential refresh reports a task that cannot start instead of refreshing inline" {
     var app: TestApp = .{};
     defer app.deinit();
     app.auth.active_source = .fx_login;
     app.auth.prompt_refresh_start = .failed;
     app.auth.gateway_ready = false;
-    app.auth.gateway_ready_after_refresh_count = 1;
 
     try std.testing.expectEqual(
-        PendingPromptCredentialReadiness.current,
+        PendingPromptCredentialReadiness.rejected,
         try Runtime(TestApp).collectPendingPromptCredential(&app),
     );
-    try std.testing.expectEqual(@as(usize, 1), app.auth.refresh_count);
-
-    app.auth.gateway_ready = false;
-    app.auth.gateway_ready_after_refresh_count = 2;
     try std.testing.expectEqual(
-        PendingPromptCredentialReadiness.current,
+        PendingPromptCredentialReadiness.rejected,
         try Runtime(TestApp).retryPendingPromptCredential(&app),
     );
-    try std.testing.expectEqual(@as(usize, 2), app.auth.refresh_count);
+    try std.testing.expectEqual(@as(usize, 0), app.auth.refresh_count);
+    try std.testing.expectEqual(@as(usize, 2), app.auth.prompt_refresh_start_count);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, app.transcript.items, "press enter to retry."));
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Your prompt is saved.") != null);
 }
 
 test "retrying a refreshable source after a non-retryable failure refreshes in the background" {

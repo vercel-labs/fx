@@ -2894,7 +2894,10 @@ pub const Runtime = struct {
             self.oauth_transport,
             credential.source,
             credential.accountId(),
-        ) catch return .failed;
+        ) catch |err| {
+            debug_trace.logf("auth", "prompt credential refresh task unavailable err={s}", .{@errorName(err)});
+            return .failed;
+        };
         return .started;
     }
 
