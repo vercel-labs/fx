@@ -78,7 +78,9 @@ for (const { cancelBeforeConsumption, lateFeedback } of [
   };
   const host = startDynamicFakeGateway(raw => {
     try {
-      const request = JSON.parse(raw), child = !raw.includes('"name":"subagent"');
+      // A subagent is offered the subagent tool too, so its requests tell
+      // apart by main's first prompt, which they never carry.
+      const request = JSON.parse(raw), child = !raw.includes("Start the child task.");
       if (child) {
         childCalls++;
         const latest = contentText(request.prompt.findLast((m: any) => m.role === "user")?.content);
@@ -1416,7 +1418,7 @@ async function runCanonicalLifecycleFixture(
     reachedFinal = settled.matched;
     if (reachedFinal) {
       await session.sendText("/help");
-      const help = await waitForPaneOrDone(session, "Commands 38", donePath);
+      const help = await waitForPaneOrDone(session, "Commands 40", donePath);
       helpVisible = help.matched;
       requestCountAfterHelp = queuedGateway.requests.length;
       if (helpVisible) {

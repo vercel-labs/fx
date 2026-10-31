@@ -167,14 +167,14 @@ pub fn rowForEntryIdInSelection(
 ) !?u16 {
     const entry_line = try transcript_blocks.renderedEntryStartLine(
         alloc,
-        self.entries.items,
+        self.notebook.entries.items,
         entry_id,
         self.layout.cols,
         self.command_output_render.styles,
     ) orelse return null;
     return rowForLineIndex(.{
         .selection = selection,
-        .bytes = self.transcript.items,
+        .bytes = self.notebook.transcript.items,
         .line_index = entry_line,
         .cols = self.layout.cols,
         .max_row = selection.bottom_row,
@@ -182,10 +182,10 @@ pub fn rowForEntryIdInSelection(
 }
 
 pub fn transientAssistantGapRows(self: anytype) u16 {
-    var index = self.entries.items.len;
+    var index = self.notebook.entries.items.len;
     while (index > 0) {
         index -= 1;
-        const entry = self.entries.items[index];
+        const entry = self.notebook.entries.items[index];
         if (!transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
         switch (entry) {
             .raw_bytes => |e| {
@@ -248,7 +248,7 @@ fn footerGapOffsetForVisibleTail(self: anytype) u16 {
 pub fn preservedBottomReservationRows(self: anytype) u16 {
     if (self.last_paint_bottom_reserved_rows == 0) return 0;
     if (self.pending_scroll_compact) return 0;
-    if (!idleFooterGapAppliesTo(compactTailVisibleBlockKind(self.entries.items))) return 0;
+    if (!idleFooterGapAppliesTo(compactTailVisibleBlockKind(self.notebook.entries.items))) return 0;
     return self.last_paint_bottom_reserved_rows;
 }
 

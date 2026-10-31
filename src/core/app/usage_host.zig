@@ -36,7 +36,7 @@ pub fn cooperativeHost(comptime App: type, app: *App, home: []const u8) usage.Ho
 
         fn pulse(ctx: *anyopaque) anyerror!void {
             const owner: *App = @ptrCast(@alignCast(ctx));
-            try owner.cooperativeTransportPulse();
+            try owner.cooperativeTransportPulse(owner.screenAgent());
             if (owner.should_exit) return error.Cancelled;
         }
     };

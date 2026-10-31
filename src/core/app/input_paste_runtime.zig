@@ -1,4 +1,5 @@
 const std = @import("std");
+const agents = @import("../agents/agents.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -96,25 +97,26 @@ test "pasted image slash removes only a prefix before a captured path" {
 
 pub fn PasteEditRuntime(comptime App: type) type {
     return struct {
+        const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
         fn authCodeEntryActive(app: *const App) bool {
             if (comptime !@hasField(App, "auth") or
                 !@hasDecl(@TypeOf(app.auth), "signInCodeEntryActive")) return false;
             return app.auth.signInCodeEntryActive();
         }
 
-        pub fn beginPaste(app: *App, max_input_len: usize) void {
-            const owner: paste_framing.Owner = if (app.question_prompt.isActive())
-                if (app.question_prompt.isFreeformSelected()) .question_freeform else .decision_prompt
-            else if (app.approval_prompt.isAmending())
+        pub fn beginPaste(app: *App, agent: *AppAgent, max_input_len: usize) void {
+            const owner: paste_framing.Owner = if (agent.question_prompt.isActive())
+                if (agent.question_prompt.isFreeformSelected()) .question_freeform else .decision_prompt
+            else if (agent.approval_prompt.isAmending())
                 .approval_amendment
-            else if (app.approval_prompt.isActive())
+            else if (agent.approval_prompt.isActive())
                 .decision_prompt
             else if (authCodeEntryActive(app))
                 .auth_code
             else
                 .composer;
             const buffer_limit = switch (owner) {
-                .composer => app.input_runtime.replacementState(&app.pending_images).availableBytesForSelectionOrInsertion(max_input_len),
+                .composer => app.input_runtime.replacementState(&agent.pending_images).availableBytesForSelectionOrInsertion(max_input_len),
                 .auth_code => login_flow.max_manual_code_bytes,
                 .none, .decision_prompt, .question_freeform, .approval_amendment => max_input_len,
             };
@@ -165,7 +167,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
             try app.input_runtime.paste.consumeByte(app.alloc, byte);
         }
 
-        pub fn settlePasteDeliveryEpoch(app: *App, max_input_len: usize) !bool {
+        pub fn settlePasteDeliveryEpoch(app: *App, agent: *AppAgent, max_input_len: usize) !bool {
             const finish = switch (app.input_runtime.paste.settleDeliveryEpoch()) {
                 .none => return false,
                 .finish => |finish| finish,
@@ -186,7 +188,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     .{ @tagName(owner), finish.dropped_suffix_bytes },
                 );
             }
-            try finishPaste(app, max_input_len);
+            try finishPaste(app, agent, max_input_len);
             if (finish.dropped_suffix_bytes > 0) {
                 try app.writeDomainNotice(.{
                     .topic = "input",
@@ -206,7 +208,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
             return err;
         }
 
-        pub fn finishPaste(app: *App, max_input_len: usize) !void {
+        pub fn finishPaste(app: *App, agent: *AppAgent, max_input_len: usize) !void {
             if (app.input_runtime.paste.overflow_bytes > 0) {
                 const attempted_bytes = app.input_runtime.paste.attemptedBytes();
                 if (app.input_runtime.paste.owner == .auth_code) {
@@ -269,8 +271,8 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 .none => {},
                 .decision_prompt => app.input_runtime.paste.resetWithTrace(.decision_prompt_active),
                 .question_freeform => {
-                    if (comptime @hasField(App, "question_prompt")) {
-                        const outcome = app.question_prompt.insertFreeformSlice(
+                    if (comptime agents.hasAgentField(App, "question_prompt")) {
+                        const outcome = agent.question_prompt.insertFreeformSlice(
                             app.alloc,
                             app.input_runtime.paste.buffer.items,
                             max_input_len,
@@ -295,7 +297,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 },
                 .composer => {
                     app.input_runtime.paste.beginHandling();
-                    finalizePastedBlock(app, max_input_len) catch |err| {
+                    finalizePastedBlock(app, agent, max_input_len) catch |err| {
                         app.input_runtime.paste.resetWithTrace(.{ .finalize_failed = .{
                             .owner = .composer,
                             .error_name = @errorName(err),
@@ -306,8 +308,8 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     app.shell.render_requests.request(.footer);
                 },
                 .approval_amendment => {
-                    if (comptime @hasField(App, "approval_prompt")) {
-                        const outcome = app.approval_prompt.decision.insertAmendmentSlice(
+                    if (comptime agents.hasAgentField(App, "approval_prompt")) {
+                        const outcome = agent.approval_prompt.decision.insertAmendmentSlice(
                             app.alloc,
                             app.input_runtime.paste.buffer.items,
                             max_input_len,
@@ -370,13 +372,13 @@ pub fn PasteEditRuntime(comptime App: type) type {
             return app.model_cache.menu.active;
         }
 
-        pub fn finalizePastedBlock(app: *App, max_input_len: usize) !void {
+        pub fn finalizePastedBlock(app: *App, agent: *AppAgent, max_input_len: usize) !void {
             if (app.input_runtime.paste.buffer.items.len == 0) return;
 
             // Inline image paths create pending attachments, not pasted-text blocks.
             if (image_attachments.hasImagePathToken(app.input_runtime.paste.buffer.items)) {
                 if (!modelPickerBorrowsComposer(app)) {
-                    try handlePastedBytes(app, app.input_runtime.paste.buffer.items, max_input_len);
+                    try handlePastedBytes(app, agent, app.input_runtime.paste.buffer.items, max_input_len);
                     app.input_runtime.paste.buffer.clearRetainingCapacity();
                     return;
                 }
@@ -392,7 +394,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                     selection.start
                 else
                     app.input_runtime.edit_state.cursor;
-                switch (try app.input_runtime.replacementState(&app.pending_images).replaceSelectionOrInsertSliceBounded(
+                switch (try app.input_runtime.replacementState(&agent.pending_images).replaceSelectionOrInsertSliceBounded(
                     app.alloc,
                     text,
                     max_input_len,
@@ -412,7 +414,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
 
             var buf: [64]u8 = undefined;
             const placeholder = try paste_blocks.formatPlaceholder(&buf, id, line_count);
-            const replacement = app.input_runtime.replacementState(&app.pending_images);
+            const replacement = app.input_runtime.replacementState(&agent.pending_images);
             if (!replacement.canReplaceSelectionOrInsert(text.len, max_input_len)) {
                 try input_limit_feedback.report(App, app, .composer, text.len);
                 app.input_runtime.paste.buffer.clearRetainingCapacity();
@@ -449,11 +451,11 @@ pub fn PasteEditRuntime(comptime App: type) type {
             app.input_runtime.paste.buffer.clearRetainingCapacity();
         }
 
-        pub fn handlePastedBytes(app: *App, bytes: []const u8, max_input_len: usize) !void {
+        pub fn handlePastedBytes(app: *App, agent: *AppAgent, bytes: []const u8, max_input_len: usize) !void {
             var stage: ImagePasteStage = .{};
             defer stage.deinit(app.alloc);
 
-            const first_image_id = app.peekNextImageId();
+            const first_image_id = app.peekNextImageId(agent);
             var prev: usize = 0;
             var i: usize = 0;
             while (i < bytes.len) {
@@ -514,7 +516,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
             }
             try stage.replacement.appendSlice(app.alloc, bytes[prev..]);
             if (app.input_runtime.edit_state.input.items.len == 0 and
-                app.pending_images.items.len == 0 and
+                agent.pending_images.items.len == 0 and
                 stripPastedImageSlashPrefix(&stage))
             {
                 debug_trace.logf("input", "event=image_slash_prefix_consumed reason=pasted_slash_command", .{});
@@ -526,7 +528,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
             else
                 app.input_runtime.edit_state.cursor;
             if (image_count == 0) {
-                switch (try app.input_runtime.replacementState(&app.pending_images).replaceSelectionOrInsertSliceBounded(
+                switch (try app.input_runtime.replacementState(&agent.pending_images).replaceSelectionOrInsertSliceBounded(
                     app.alloc,
                     stage.replacement.items,
                     max_input_len,
@@ -551,7 +553,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 return;
             }
 
-            const replacement = app.input_runtime.replacementState(&app.pending_images);
+            const replacement = app.input_runtime.replacementState(&agent.pending_images);
             if (!replacement.canReplaceSelectionOrInsert(
                 stage.replacement.items.len,
                 max_input_len,
@@ -567,17 +569,17 @@ pub fn PasteEditRuntime(comptime App: type) type {
             ) catch return error.ImageIdOverflow;
 
             try app.input_runtime.edit_state.input.ensureUnusedCapacity(app.alloc, stage.replacement.items.len);
-            try app.pending_images.ensureUnusedCapacity(app.alloc, image_count);
+            try agent.pending_images.ensureUnusedCapacity(app.alloc, image_count);
             try app.input_runtime.entities.image_tokens.ensureUnusedCapacity(app.alloc, image_count);
 
-            if (image_count > 0 and app.pending_images.items.len > 0) {
+            if (image_count > 0 and agent.pending_images.items.len > 0) {
                 std.debug.assert(
-                    app.pending_images.items[app.pending_images.items.len - 1].id <
+                    agent.pending_images.items[agent.pending_images.items.len - 1].id <
                         stage.images.items[0].id,
                 );
             }
 
-            const consume_image_slash = app.pending_images.items.len == 0 and
+            const consume_image_slash = agent.pending_images.items.len == 0 and
                 app.input_runtime.edit_state.selectionRange() == null and
                 start == app.input_runtime.edit_state.input.items.len and
                 isBareImageSlashPrefix(app.input_runtime.edit_state.input.items);
@@ -593,7 +595,7 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 .preserve,
             ) == .inserted);
             for (stage.images.items) |image| {
-                app.pending_images.appendAssumeCapacity(image);
+                agent.pending_images.appendAssumeCapacity(image);
             }
             stage.images.clearRetainingCapacity();
             for (stage.tokens.items) |token| {
@@ -607,10 +609,10 @@ pub fn PasteEditRuntime(comptime App: type) type {
             }
 
             for (0..image_count) |offset| {
-                const committed_id = app.nextImageId();
+                const committed_id = app.nextImageId(agent);
                 std.debug.assert(committed_id == first_image_id + offset);
             }
-            std.debug.assert(app.peekNextImageId() == next_image_id);
+            std.debug.assert(app.peekNextImageId(agent) == next_image_id);
 
             if (image_count > 0) {
                 if (comptime @hasDecl(@TypeOf(app.input_runtime), "historyBoundary")) {

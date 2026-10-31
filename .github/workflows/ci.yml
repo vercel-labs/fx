@@ -55,6 +55,9 @@ jobs:
       - name: Check indexer boundary
         run: ./scripts/check-indexer-boundary.sh
 
+      - name: Check agents boundary
+        run: ./scripts/check-agents-boundary.sh
+
       - name: Check recovery boundary
         run: ./scripts/check-recovery-boundary.sh
 
@@ -885,6 +888,7 @@ jobs:
         run: |
           scripts=(
             benchmarks/startup.sh
+            scripts/check-agents-boundary.sh
             scripts/check-compactor-boundary.sh
             scripts/check-indexer-boundary.sh
             scripts/check-public-surface.sh
