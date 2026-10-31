@@ -3235,7 +3235,7 @@ test "ask_user_question worker bridge preserves allocator ownership" {
     var snapshot = try waitForQuestionBridgeSnapshot(&worker);
     defer snapshot.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("Choose next step?", snapshot.entries[0].question);
-    try worker.submitQuestionBatchAnswer(worker_alloc, &.{"Run tests"});
+    try worker.submitQuestionBatchAnswer(worker_alloc, &.{"Run tests"}, null);
     thread.join();
     thread_joined = true;
     defer freeQuestionAnswers(std.testing.allocator, state.answers);
@@ -3335,7 +3335,7 @@ test "ask_user_question carries a full batch from model arguments through the wo
     }
     var labels: [batch_len][]const u8 = undefined;
     for (&labels, prompt.entries.items) |*label, entry| label.* = entry.answer.?;
-    try rt.worker.submitQuestionBatchAnswer(std.heap.c_allocator, &labels);
+    try rt.worker.submitQuestionBatchAnswer(std.heap.c_allocator, &labels, null);
     thread.join();
     thread_joined = true;
 

@@ -811,6 +811,10 @@ const App = struct {
         NotificationAppRuntime.playMaxCue(self, .toggle);
     }
 
+    pub fn reportWorking(self: *App) void {
+        HerdrAppRuntime.reportWorking(self);
+    }
+
     pub fn dispatchAttentionRequired(
         self: *App,
         turn_id: u64,
