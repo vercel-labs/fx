@@ -461,6 +461,33 @@ pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, pat
     };
 }
 
+/// `fetchGatewayGetResult` with bounds: it fails with `error.Cancelled` once
+/// `cancel_flag` is set and with `error.Timeout` after
+/// `gateway_json_fetch_timeout_ms`, so a stalled endpoint cannot hold the caller.
+pub fn fetchGatewayGetResultCancellable(
+    alloc: std.mem.Allocator,
+    api_key: ?[]const u8,
+    path: []const u8,
+    cancel_flag: *std.atomic.Value(bool),
+) !GetResult {
+    var operation = GatewayGetOperation{ .alloc = alloc, .api_key = api_key, .path = path };
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(gateway_json_fetch_timeout_ms),
+    });
+    return runBoundedHttpOperation(GetResult, alloc, cancel_flag, deadline, &operation);
+}
+
+const GatewayGetOperation = struct {
+    alloc: std.mem.Allocator,
+    api_key: ?[]const u8,
+    path: []const u8,
+
+    fn run(self: *@This()) !GetResult {
+        return fetchGatewayGetResult(self.alloc, self.api_key, self.path);
+    }
+};
+
 pub fn fetchGatewayJsonCancellable(
     alloc: std.mem.Allocator,
     api_key: ?[]const u8,

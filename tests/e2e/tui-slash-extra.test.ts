@@ -91,7 +91,7 @@ describe.skipIf(!tmuxAvailable())("tui: skills command recovery", () => {
   );
 });
 
-function startFakeCreditsGateway() {
+function startFakeCreditsGateway(options: { delayMs?: number } = {}) {
   const requests: Array<{
     method: string;
     path: string;
@@ -100,7 +100,8 @@ function startFakeCreditsGateway() {
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    fetch(request) {
+    idleTimeout: 0,
+    async fetch(request) {
       requests.push({
         method: request.method,
         path: new URL(request.url).pathname,
@@ -108,6 +109,7 @@ function startFakeCreditsGateway() {
           request.headers.get("authorization") ===
           "Bearer credits-fake-key",
       });
+      if (options.delayMs) await Bun.sleep(options.delayMs);
       return Response.json(
         { error: { code: "credit_card_required", message: "Buy credits to use AI Gateway." } },
         { status: 403 },
@@ -156,6 +158,55 @@ describe.skipIf(!tmuxAvailable())("tui: credits slash command", () => {
         expect(scrollback).toContain("HTTP 403");
         expect(scrollback).toContain("Buy credits to use AI Gateway.");
         expect(hasEmptyComposer(scrollback)).toBe(true);
+      } finally {
+        gateway.stop();
+        try {
+          if (session) {
+            await session.kill();
+            session = null;
+          }
+        } finally {
+          cleanupIsolatedTestHome(home);
+        }
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/credits keeps the composer responsive while the Gateway answers slowly",
+    async () => {
+      // Before the lookup moved off the input loop, fx froze for this long.
+      const gateway = startFakeCreditsGateway({ delayMs: 3_000 });
+      const home = createIsolatedTestHome();
+      const stderrPath = join(home, "stderr.log");
+      try {
+        session = await TmuxSession.create({
+          env: {
+            HOME: home,
+            AI_GATEWAY_API_KEY: "credits-fake-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_E2E_GATEWAY_CREDITS_URL: gateway.url,
+          },
+          stderrPath,
+          width: 120,
+          height: 40,
+        });
+        await session.waitForComposer(10_000);
+
+        await session.sendText("/credits");
+        const draft = "TYPING_WHILE_CREDITS_LOAD";
+        await session.sendLiteral(draft);
+        await session.waitForPane((pane) => pane.includes(draft), 1_000);
+        await session.sendKeys("C-u");
+        await session.sendKeys("C-k");
+        await session.sendText("/credits");
+        await session.waitForText("Credits are still loading.", 1_000);
+
+        await session.waitForText("Buy credits to use AI Gateway.", 10_000);
+        await session.waitForComposer(10_000);
+        expect(gateway.requests).toHaveLength(1);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         gateway.stop();
         try {

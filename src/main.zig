@@ -17,6 +17,7 @@ const secret = @import("core/auth/secret.zig");
 const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
 const usage = @import("usage/usage.zig");
 const usage_host = @import("core/app/usage_host.zig");
+const credits_lookup = @import("core/app/credits_lookup.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
 const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
@@ -531,6 +532,8 @@ const App = struct {
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
     /// Replaced in `init` with the real home directory.
     usage_dashboard: usage.Dashboard = usage.Dashboard.init(std.heap.c_allocator, usage_host.host("")),
+    /// The `/credits` lookup in flight, if any.
+    credits_lookup: credits_lookup.Lookup = .{},
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
     workspace_host: WorkspaceHostRuntime = .{},
@@ -890,8 +893,9 @@ const App = struct {
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
             SessionAppRuntime.recordShutdownFailure(self, err);
         };
-        // Cancel a /usage fetch in flight before shutdown continues.
+        // Cancel a /usage or /credits fetch in flight before shutdown continues.
         self.usage_dashboard.deinit();
+        self.credits_lookup.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
         const resume_handoff = SessionAppRuntime.finalizePersistenceWithResumeHandoff(self);
         const shutdown_failure = self.session_persistence.shutdown_failure;
@@ -962,6 +966,7 @@ const App = struct {
         self.managed_executions.deinit();
         self.model_cache.deinit();
         self.usage_dashboard.deinit();
+        self.credits_lookup.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
         SessionAppRuntime.finalizePersistence(self);
         shutdown_trace.mark("persistence_finalized");
@@ -2923,6 +2928,7 @@ const App = struct {
         }
         try app_commands.Handlers(App).collectMcpHostFacts(self);
         try app_commands.Handlers(App).collectShellSnapshotFacts(self);
+        try app_commands.Handlers(App).collectCreditsFacts(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
             try AuthAppRuntime.collectProviderPreparationFacts(self);
             try AuthAppRuntime.collectSourceInventoryFacts(self);
@@ -4734,6 +4740,7 @@ test {
     _ = @import("core/app/app_bootstrap_runtime.zig");
     _ = @import("core/app/app_callbacks.zig");
     _ = @import("core/app/app_commands.zig");
+    _ = credits_lookup;
     _ = @import("core/app/app_entry_runtime.zig");
     _ = @import("core/app/app_input_runtime.zig");
     _ = input_submit_runtime;

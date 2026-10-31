@@ -1262,15 +1262,52 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandShowCredits(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            var snapshot = app.creditsProvider().fetch(app.alloc, .{
+            const input: gateway_provider.CreditsLookupInput = .{
                 .credential = app.auth.apiKey(),
                 .credential_source = if (comptime @hasDecl(@TypeOf(app.auth), "credentialSource"))
                     app.auth.credentialSource()
                 else
                     null,
                 .tenant = app.auth.gatewayTeam(),
-            });
+            };
+            // The lookup runs on a worker so a slow Gateway never holds the
+            // input loop; `collectCreditsFacts` writes its result.
+            if (comptime @hasField(App, "credits_lookup") and !@import("builtin").single_threaded) {
+                const started = app.credits_lookup.start(app.creditsProvider(), input) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {
+                        debug_trace.logf("credits", "lookup start failed err={s}", .{@errorName(err)});
+                        try app.writeDomainNotice(.{
+                            .topic = "credits",
+                            .tone = .@"error",
+                            .body = "Could not check credits. Try again.",
+                        }, true);
+                        return;
+                    },
+                };
+                if (started == .busy) {
+                    try app.writeDomainNotice(.{
+                        .topic = "credits",
+                        .tone = .neutral,
+                        .body = "Credits are still loading.",
+                    }, true);
+                }
+                return;
+            }
+            var snapshot = app.creditsProvider().fetch(app.alloc, input);
             defer snapshot.deinit(app.alloc);
+            try writeCreditsNotice(app, snapshot);
+        }
+
+        /// Writes the `/credits` result once its background lookup finishes.
+        pub fn collectCreditsFacts(app: *App) !void {
+            if (comptime !@hasField(App, "credits_lookup")) return;
+            var snapshot = app.credits_lookup.take() orelse return;
+            defer snapshot.deinit(std.heap.c_allocator);
+            try writeCreditsNotice(app, snapshot);
+        }
+
+        fn writeCreditsNotice(app: *App, snapshot: output_contracts.CreditsSnapshot) !void {
             const text = snapshot.renderInteractiveBody(app.alloc) catch {
                 try app.writeDomainNotice(.{
                     .topic = "credits",
