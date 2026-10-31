@@ -1,9 +1,11 @@
-"""The PGSO targets and the platform module that builds each one.
+"""The PGSO targets and the platform that builds each one.
 
-A platform module provides, for its target:
+A platform, either a module such as `macos` or a `linux.Platform`, provides,
+for its target:
 
 - `TARGET`, `DISPLAY_NAME`, `HOST_ARCH`, the only host architecture it
   builds on, and `LIBLLVM_NAME`, the LLVM C library `ir_size.py` loads;
+- `SIZE_CEILING_MIB`, the largest candidate it accepts;
 - `check_host()`, which returns the host architecture after checking the host
   can build and run the target natively;
 - `discover_tools(zig, clang)`, which returns the platform's native tools and
@@ -36,10 +38,12 @@ from types import ModuleType
 from scripts.pgso import linux, macos
 from scripts.pgso.model import PgsoError
 
-_PLATFORMS: dict[str, ModuleType] = {module.TARGET: module for module in (macos, linux)}
+_PLATFORMS: dict[str, ModuleType | linux.Platform] = {
+    module.TARGET: module for module in (macos, linux.ARM64, linux.X86_64)
+}
 
 
-def for_target(target: str) -> ModuleType:
+def for_target(target: str) -> ModuleType | linux.Platform:
     try:
         return _PLATFORMS[target]
     except KeyError:

@@ -32,6 +32,7 @@ TARGET = "aarch64-macos"
 DISPLAY_NAME = "macOS arm64"
 HOST_ARCH = "arm64"
 LIBLLVM_NAME = "libLLVM.dylib"
+SIZE_CEILING_MIB = 7.000
 # The ordinary control build already records everything the links reuse.
 CONTROL_BUILD_FLAGS: tuple[str, ...] = ()
 # Apple ld's dead-code stripping for `zig cc` links.

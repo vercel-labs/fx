@@ -1,5 +1,5 @@
 name: Setup PGSO tools
-description: Install the pinned tools required by one PGSO phase on macOS or Linux arm64
+description: Install the pinned tools required by one PGSO phase on macOS or Linux
 
 inputs:
   zig:
@@ -45,7 +45,7 @@ runs:
       uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
       with:
         version: "0.17.0"
-        cache-key: pgso-linux-arm64
+        cache-key: ${{ runner.arch == 'ARM64' && 'pgso-linux-arm64' || 'pgso-linux-x86_64' }}
 
     - name: Install pinned LLVM
       id: llvm
@@ -66,13 +66,25 @@ runs:
       run: |
         sudo apt-get update -qq
         sudo apt-get install -y -qq --no-install-recommends g++ zlib1g-dev libzstd-dev libxml2-dev
-        archive="$RUNNER_TEMP/LLVM-22.1.8-Linux-ARM64.tar.xz"
+        case "$RUNNER_ARCH" in
+          ARM64)
+            name=LLVM-22.1.8-Linux-ARM64
+            digest=805efad2bb91cb4967fa569e0881d10c0f69c04461cf671cccbae19f547acc34
+            ;;
+          X64)
+            name=LLVM-22.1.8-Linux-X64
+            digest=df0e1ecf16caf3489a272a5eea4eec9b0d82878f6477fa309504f918a0006384
+            ;;
+          *)
+            echo "::error::no pinned LLVM for Linux $RUNNER_ARCH"
+            exit 1
+            ;;
+        esac
+        archive="$RUNNER_TEMP/$name.tar.xz"
         curl -fsSL \
-          https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-Linux-ARM64.tar.xz \
+          "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/$name.tar.xz" \
           -o "$archive"
-        printf '%s  %s\n' \
-          805efad2bb91cb4967fa569e0881d10c0f69c04461cf671cccbae19f547acc34 \
-          "$archive" | sha256sum -c -
+        printf '%s  %s\n' "$digest" "$archive" | sha256sum -c -
         llvm="$RUNNER_TEMP/llvm"
         mkdir -p "$llvm"
         tar -xJf "$archive" -C "$llvm" --strip-components=1
@@ -149,14 +161,26 @@ runs:
       if: runner.os == 'Linux' && inputs.hyperfine == 'true'
       shell: bash
       run: |
-        archive="$RUNNER_TEMP/hyperfine-v1.20.0-aarch64-unknown-linux-gnu.tar.gz"
+        case "$RUNNER_ARCH" in
+          ARM64)
+            name=hyperfine-v1.20.0-aarch64-unknown-linux-gnu
+            digest=90875cb1db7a1d797c311174d061728361e58fc70e3b62262a00635ac3b1997c
+            ;;
+          X64)
+            name=hyperfine-v1.20.0-x86_64-unknown-linux-gnu
+            digest=63ad53934062118f5b0be11785e0bb1603d4b91667d1921f2fd8df9a8712040a
+            ;;
+          *)
+            echo "::error::no pinned Hyperfine for Linux $RUNNER_ARCH"
+            exit 1
+            ;;
+        esac
+        archive="$RUNNER_TEMP/$name.tar.gz"
         curl -fsSL \
-          https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/hyperfine-v1.20.0-aarch64-unknown-linux-gnu.tar.gz \
+          "https://github.com/sharkdp/hyperfine/releases/download/v1.20.0/$name.tar.gz" \
           -o "$archive"
-        printf '%s  %s\n' \
-          90875cb1db7a1d797c311174d061728361e58fc70e3b62262a00635ac3b1997c \
-          "$archive" | sha256sum -c -
+        printf '%s  %s\n' "$digest" "$archive" | sha256sum -c -
         tar -xzf "$archive" -C "$RUNNER_TEMP"
-        binary="$RUNNER_TEMP/hyperfine-v1.20.0-aarch64-unknown-linux-gnu/hyperfine"
+        binary="$RUNNER_TEMP/$name/hyperfine"
         test "$("$binary" --version)" = "hyperfine 1.20.0"
         echo "path=$binary" >> "$GITHUB_OUTPUT"
