@@ -432,12 +432,38 @@ pub const LogoutResult = struct {
 };
 
 pub fn logout(alloc: Allocator, transport: oauth_transport.Provider) !LogoutResult {
-    var mutation = (try grok_session.beginExistingMutation()) orelse return .{
+    const local = try logoutLocally(alloc);
+    defer if (local.refresh_token) |token| secret.zeroAndFree(alloc, token);
+    var result = local.result;
+    if (local.refresh_token) |token| {
+        revokeToken(alloc, transport, token) catch {
+            result.revocation_failed = true;
+        };
+    }
+    return result;
+}
+
+/// The outcome of deleting the saved Grok session, with its refresh token kept
+/// so it can still be revoked.
+pub const LocalLogout = struct {
+    result: LogoutResult,
+    /// Owned by the caller when set; release it with `secret.zeroAndFree`
+    /// using the allocator passed to `logoutLocally`.
+    refresh_token: ?[]u8 = null,
+};
+
+/// Deletes the saved Grok session without contacting xAI. Revoke the returned
+/// refresh token with `revokeToken`, then release it. The session is deleted
+/// first, so a failed deletion never leaves a revoked token on disk.
+pub fn logoutLocally(alloc: Allocator) !LocalLogout {
+    var mutation = (try grok_session.beginExistingMutation()) orelse return .{ .result = .{
         .deletion = .missing,
         .revocation_failed = false,
-    };
+    } };
     defer mutation.deinit();
     var revocation_failed = false;
+    var refresh_token: ?[]u8 = null;
+    errdefer if (refresh_token) |token| secret.zeroAndFree(alloc, token);
     const loaded_session = mutation.load(alloc) catch |err| blk: {
         debug_trace.logf("auth", "Grok logout could not load the saved credential err={s}", .{@errorName(err)});
         revocation_failed = true;
@@ -446,13 +472,14 @@ pub fn logout(alloc: Allocator, transport: oauth_transport.Provider) !LogoutResu
     if (loaded_session) |loaded| {
         var session = loaded;
         defer session.deinit(alloc);
-        revokeToken(alloc, transport, session.refresh_token) catch {
-            revocation_failed = true;
-        };
+        refresh_token = try alloc.dupe(u8, session.refresh_token);
     }
     return .{
-        .deletion = try mutation.delete(),
-        .revocation_failed = revocation_failed,
+        .result = .{
+            .deletion = try mutation.delete(),
+            .revocation_failed = revocation_failed,
+        },
+        .refresh_token = refresh_token,
     };
 }
 
@@ -726,7 +753,7 @@ fn fetchAccountId(
     return account_id;
 }
 
-fn revokeToken(
+pub fn revokeToken(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     token: []const u8,

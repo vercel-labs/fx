@@ -387,6 +387,7 @@ function startFakeOAuth(
     deviceError?: string;
     rejectAllDeviceClients?: boolean;
     tokenDelayMs?: number;
+    revokeDelayMs?: number;
     rejectRefreshGrant?: boolean;
     beforeRefreshResponse?: () => void | Promise<void>;
     teams?: Array<{ id: string; slug: string; name: string }>;
@@ -477,6 +478,7 @@ function startFakeOAuth(
         case "/v2/teams":
           return Response.json({ teams: options.teams ?? [] });
         case "/oauth/revoke": {
+          if (options.revokeDelayMs) await Bun.sleep(options.revokeDelayMs);
           const form = await request.formData();
           const tokenTypeHint = form.get("token_type_hint");
           const token = form.get("token");
@@ -3701,16 +3703,14 @@ tmuxTest(
     expect(gateway.requests).toHaveLength(4);
     expect(gateway.requests[3].headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
 
+    const revokedBefore = completedRevocations(oauth).length;
     await session.sendText("/logout");
-    const loggedOut = await session.waitForText("Signed out of fx.", TIMEOUT);
-    expect(loggedOut).not.toContain("remote session could not be revoked");
+    await session.waitForText("Signed out of fx.", TIMEOUT);
     expect(existsSync(authPath)).toBe(false);
-    expect(
-      oauth.requests
-        .filter((request) => request.path === "/oauth/revoke")
-        .map((request) => request.revocation)
-        .slice(-2),
-    ).toEqual([
+    // The issuer revocation runs after the local sign-out, off the input loop.
+    await waitForRevocations(oauth, revokedBefore + 2);
+    expect(await session.captureFullScrollback()).not.toContain("remote session could not be revoked");
+    expect(completedRevocations(oauth).slice(-2)).toEqual([
       { tokenTypeHint: "refresh_token", validForm: true },
       { tokenTypeHint: "access_token", validForm: true },
     ]);
@@ -6586,6 +6586,58 @@ tmuxTest(
       expect(trace).not.toContain(secret);
       expect(tape.includes(Buffer.from(secret))).toBe(false);
     }
+  },
+  60_000,
+);
+
+function completedRevocations(fakeOAuth: ReturnType<typeof startFakeOAuth>) {
+  return fakeOAuth.requests
+    .filter((request) => request.path === "/oauth/revoke" && request.revocation)
+    .map((request) => request.revocation);
+}
+
+async function waitForRevocations(
+  fakeOAuth: ReturnType<typeof startFakeOAuth>,
+  count: number,
+): Promise<void> {
+  const deadline = Date.now() + TIMEOUT;
+  while (completedRevocations(fakeOAuth).length < count) {
+    if (Date.now() > deadline) {
+      throw new Error(`Timed out waiting for ${count} token revocations; saw ${completedRevocations(fakeOAuth).length}`);
+    }
+    await Bun.sleep(25);
+  }
+}
+
+tmuxTest(
+  "logout signs out at once while the issuer revokes the session slowly",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-logout-slow-revoke-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    // Revoking inline would hold the terminal for both of these delays.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { revokeDelayMs: 3_000 });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/logout");
+    await session.waitForText("Signed out of fx.", 1_000);
+    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    const draft = "TYPING_WHILE_LOGOUT_REVOKES";
+    await session.sendLiteral(draft);
+    await session.waitForPane((pane) => pane.includes(draft), 1_000);
+    await session.sendKeys("C-u");
+    await session.sendKeys("C-k");
+
+    await waitForRevocations(oauth, 2);
+    expect(completedRevocations(oauth)).toEqual([
+      { tokenTypeHint: "refresh_token", validForm: true },
+      { tokenTypeHint: "access_token", validForm: true },
+    ]);
+    expect(await session.captureFullScrollback()).not.toContain("remote session could not be revoked");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
 );

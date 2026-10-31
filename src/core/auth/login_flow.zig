@@ -838,9 +838,31 @@ pub fn logout(
     alloc: Allocator,
     transport: oauth_transport.Provider,
 ) !LogoutResult {
+    var local = try logoutLocally(alloc);
+    defer if (local.session) |*session| session.deinit(alloc);
+    var result = local.result;
+    if (local.session) |session| {
+        revokeLoggedOutSession(alloc, transport, session) catch {
+            result.remote_revocation_failed = true;
+        };
+    }
+    return result;
+}
+
+/// The outcome of deleting the saved fx login session, with the deleted
+/// session kept so its tokens can still be revoked.
+pub const LocalLogout = struct {
+    result: LogoutResult = .{},
+    /// Owned by the caller when set; release it with `Session.deinit` using
+    /// the allocator passed to `logoutLocally`.
+    session: ?oauth_session.Session = null,
+};
+
+/// Deletes the saved fx login session without contacting the issuer. Revoke
+/// the returned session with `revokeLoggedOutSession`, then release it.
+pub fn logoutLocally(alloc: Allocator) LogoutError!LocalLogout {
     var session: ?oauth_session.Session = null;
     var session_load_failed = false;
-    defer if (session) |*loaded| loaded.deinit(alloc);
     const delete_result = blk: {
         var mutation = (oauth_session.beginExistingMutation() catch {
             return LogoutError.SessionDeleteFailed;
@@ -857,23 +879,18 @@ pub fn logout(
             .local_cleanup_failed = true,
         };
     };
-
-    var remote_revocation_failed = session_load_failed;
-    if (session != null) {
-        const loaded = session.?;
-        revokeLogoutSession(alloc, transport, loaded) catch {
-            remote_revocation_failed = true;
-        };
-    }
-
     return .{
-        .session_deleted = delete_result.session_deleted,
-        .local_durability_failed = delete_result.local_cleanup_failed,
-        .remote_revocation_failed = remote_revocation_failed,
+        .result = .{
+            .session_deleted = delete_result.session_deleted,
+            .local_durability_failed = delete_result.local_cleanup_failed,
+            .remote_revocation_failed = session_load_failed,
+        },
+        .session = session,
     };
 }
 
-fn revokeLogoutSession(
+/// Revokes a signed-out session's refresh and access tokens at its issuer.
+pub fn revokeLoggedOutSession(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     session: oauth_session.Session,

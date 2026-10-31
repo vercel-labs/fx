@@ -8,6 +8,7 @@ const grok_oauth = @import("grok_oauth.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const login_flow = @import("login_flow.zig");
+const oauth_session = @import("oauth_session.zig");
 const oauth = @import("oauth.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
@@ -860,6 +861,75 @@ const PromptCredentialRefreshTask = struct {
         if (self.expected_account_id) |account_id| alloc.free(account_id);
         self.expected_account_id = null;
         alloc.destroy(self);
+    }
+};
+
+/// The tokens of a session the user signed out of, to revoke at its issuer.
+pub const RemoteRevocation = union(enum) {
+    /// Owned; allocated with `std.heap.c_allocator`.
+    fx_login: oauth_session.Session,
+    /// The Grok refresh token. Owned; allocated with `std.heap.c_allocator`.
+    grok: []u8,
+
+    pub fn source(self: RemoteRevocation) credentials.Source {
+        return switch (self) {
+            .fx_login => .fx_login,
+            .grok => .grok_subscription,
+        };
+    }
+
+    pub fn deinit(self: *RemoteRevocation) void {
+        const alloc = std.heap.c_allocator;
+        switch (self.*) {
+            .fx_login => |*session| session.deinit(alloc),
+            .grok => |token| secret.zeroAndFree(alloc, token),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const RemoteRevocationOutcome = struct {
+    source: credentials.Source,
+    failed: bool,
+};
+
+const RemoteRevocationTask = struct {
+    transport: oauth_transport.Provider,
+    target: RemoteRevocation,
+    thread: std.Thread = undefined,
+    done: std.atomic.Value(bool) = .init(false),
+    failed: bool = false,
+
+    /// Takes ownership of `target` only when the thread starts.
+    fn start(transport: oauth_transport.Provider, target: RemoteRevocation) !*RemoteRevocationTask {
+        const alloc = std.heap.c_allocator;
+        const task = try alloc.create(RemoteRevocationTask);
+        errdefer alloc.destroy(task);
+        task.* = .{ .transport = transport, .target = target };
+        task.thread = try std.Thread.spawn(.{}, workerMain, .{task});
+        return task;
+    }
+
+    fn workerMain(self: *RemoteRevocationTask) void {
+        const alloc = std.heap.c_allocator;
+        const revoked: anyerror!void = switch (self.target) {
+            .fx_login => |session| login_flow.revokeLoggedOutSession(alloc, self.transport, session),
+            .grok => |token| grok_oauth.revokeToken(alloc, self.transport, token),
+        };
+        revoked catch |err| {
+            debug_trace.logf("auth", "remote revocation failed source={t} err={s}", .{ self.target.source(), @errorName(err) });
+            self.failed = true;
+        };
+        self.done.store(true, .release);
+    }
+
+    /// Waits for the thread, releases the task, and returns its outcome.
+    fn finish(self: *RemoteRevocationTask) RemoteRevocationOutcome {
+        self.thread.join();
+        const outcome: RemoteRevocationOutcome = .{ .source = self.target.source(), .failed = self.failed };
+        self.target.deinit();
+        std.heap.c_allocator.destroy(self);
+        return outcome;
     }
 };
 
@@ -1758,6 +1828,8 @@ pub const Runtime = struct {
     api_key_save: ApiKeySaveRuntime = .{},
     inventory_refresh_task: ?*InventoryRefreshTask = null,
     prompt_credential_refresh_task: ?*PromptCredentialRefreshTask = null,
+    /// Revocations of signed-out sessions still talking to their issuer.
+    remote_revocation_tasks: std.ArrayList(*RemoteRevocationTask) = .empty,
     provider_preparation: ?*ProviderPreparation = null,
     startup_credential_task: ?*StartupCredentialTask = null,
     /// The launch source inventory waits for the first frame.
@@ -1804,7 +1876,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (@typeInfo(Self).@"struct".field_names.len != 33) {
+            if (@typeInfo(Self).@"struct".field_names.len != 34) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -1839,6 +1911,7 @@ pub const Runtime = struct {
         storage.api_key_save = .{};
         storage.inventory_refresh_task = null;
         storage.prompt_credential_refresh_task = null;
+        storage.remote_revocation_tasks = .empty;
         storage.provider_preparation = null;
         storage.startup_credential_task = null;
         storage.startup_inventory_deferred = false;
@@ -1852,6 +1925,15 @@ pub const Runtime = struct {
         self.inventory_refresh_task = null;
         if (self.prompt_credential_refresh_task) |task| task.deinit();
         self.prompt_credential_refresh_task = null;
+        // The user asked to end these sessions at their issuer, and every
+        // request has a deadline, so shutdown waits instead of cancelling.
+        for (self.remote_revocation_tasks.items) |task| {
+            if (!task.done.load(.acquire)) {
+                debug_trace.logf("auth", "shutdown waits for remote revocation source={t}", .{task.target.source()});
+            }
+            _ = task.finish();
+        }
+        self.remote_revocation_tasks.deinit(std.heap.c_allocator);
         self.api_key_save.deinit(alloc);
         self.sign_in_flow.deinit(alloc);
         self.clearSignInCodeInput(alloc, .runtime_deinit);
@@ -2912,6 +2994,38 @@ pub const Runtime = struct {
         const task = self.prompt_credential_refresh_task orelse return;
         self.prompt_credential_refresh_task = null;
         task.deinit();
+    }
+
+    /// Revokes a signed-out session's tokens on a worker and takes ownership
+    /// of `target`. Returns false, after releasing `target`, when the worker
+    /// cannot start; the revocation then did not happen.
+    pub fn beginRemoteRevocation(self: *Self, target: RemoteRevocation) bool {
+        var owned = target;
+        if (comptime builtin.single_threaded) {
+            owned.deinit();
+            return false;
+        }
+        self.remote_revocation_tasks.ensureUnusedCapacity(std.heap.c_allocator, 1) catch {
+            owned.deinit();
+            return false;
+        };
+        const task = RemoteRevocationTask.start(self.oauth_transport, owned) catch |err| {
+            debug_trace.logf("auth", "remote revocation task unavailable source={t} err={s}", .{ owned.source(), @errorName(err) });
+            owned.deinit();
+            return false;
+        };
+        self.remote_revocation_tasks.appendAssumeCapacity(task);
+        return true;
+    }
+
+    /// Returns one finished revocation's outcome, or null when none finished.
+    pub fn takeRemoteRevocation(self: *Self) ?RemoteRevocationOutcome {
+        for (self.remote_revocation_tasks.items, 0..) |task, index| {
+            if (!task.done.load(.acquire)) continue;
+            _ = self.remote_revocation_tasks.swapRemove(index);
+            return task.finish();
+        }
+        return null;
     }
 
     /// Starts resolving the launch credential on a worker. Returns false when
@@ -5254,4 +5368,52 @@ test "request-path credential verification stamp gates only within the window" {
 
     request_path_verified_ms.store(stampNowMs() -% request_path_verified_window_ms -% 1, .seq_cst);
     try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
+}
+
+const RevocationTestTransport = struct {
+    accept: bool,
+    calls: std.atomic.Value(usize) = .init(0),
+
+    fn provider(self: *RevocationTestTransport) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn execute(raw: ?*anyopaque, alloc: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+        const self: *RevocationTestTransport = @ptrCast(@alignCast(raw.?));
+        _ = self.calls.fetchAdd(1, .seq_cst);
+        if (!self.accept) return error.OAuthRequestFailed;
+        return .{ .disposition = .accepted, .body = try alloc.dupe(u8, "{}") };
+    }
+};
+
+test "auth runtime revokes a signed-out Grok session on a worker" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    for ([_]bool{ true, false }) |accept| {
+        var transport: RevocationTestTransport = .{ .accept = accept };
+        var runtime: Runtime = .{ .oauth_transport = transport.provider() };
+        defer runtime.deinit(std.testing.allocator);
+
+        const token = try std.heap.c_allocator.dupe(u8, "grok-refresh-token");
+        try std.testing.expect(runtime.beginRemoteRevocation(.{ .grok = token }));
+        const outcome = while (true) {
+            if (runtime.takeRemoteRevocation()) |finished| break finished;
+            std.Thread.yield() catch {};
+        };
+        try std.testing.expectEqual(credentials.Source.grok_subscription, outcome.source);
+        try std.testing.expectEqual(!accept, outcome.failed);
+        try std.testing.expectEqual(@as(usize, 1), transport.calls.load(.seq_cst));
+        try std.testing.expect(runtime.takeRemoteRevocation() == null);
+    }
+}
+
+test "auth runtime shutdown waits for a remote revocation in flight" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var transport: RevocationTestTransport = .{ .accept = true };
+    var runtime: Runtime = .{ .oauth_transport = transport.provider() };
+
+    const token = try std.heap.c_allocator.dupe(u8, "grok-refresh-token");
+    try std.testing.expect(runtime.beginRemoteRevocation(.{ .grok = token }));
+    runtime.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), transport.calls.load(.seq_cst));
 }

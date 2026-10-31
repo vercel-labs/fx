@@ -302,7 +302,7 @@ pub fn Runtime(comptime App: type) type {
             }
             defer if (hold_turn_start) app.worker.releaseTurnStartHold();
             if (logout_provider == .grok) {
-                const outcome = grok_oauth.logout(app.alloc, app.auth.oauthTransport()) catch {
+                const local = grok_oauth.logoutLocally(std.heap.c_allocator) catch {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
                         .tone = .@"error",
@@ -310,6 +310,9 @@ pub fn Runtime(comptime App: type) type {
                     });
                     return;
                 };
+                var revocation: ?auth_runtime.RemoteRevocation = if (local.refresh_token) |token| .{ .grok = token } else null;
+                defer if (revocation) |pending| releaseRemoteRevocation(pending);
+                const outcome = local.result;
                 const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterGrokLogout"))
                     try app.auth.reconcileAfterGrokLogout(app.alloc)
                 else
@@ -321,13 +324,13 @@ pub fn Runtime(comptime App: type) type {
                     .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Grok, but could not confirm the profile directory update." },
                 });
                 if (outcome.revocation_failed) {
-                    try writeAuthNotice(app, .{
-                        .topic = "auth",
-                        .tone = .warning,
-                        .body = "The local Grok session was removed, but remote revocation could not be confirmed.",
-                    });
+                    try writeRemoteRevocationWarning(app, .grok_subscription);
                 }
                 try reconcileSubscriptionLogout(app, .grok);
+                if (revocation) |pending| {
+                    revocation = null;
+                    try startRemoteRevocation(app, pending);
+                }
                 return;
             }
             if (logout_provider == .codex) {
@@ -352,7 +355,7 @@ pub fn Runtime(comptime App: type) type {
                 try reconcileSubscriptionLogout(app, .codex);
                 return;
             }
-            const result = login_flow.logout(app.alloc, app.auth.oauthTransport()) catch |err| switch (err) {
+            const local = login_flow.logoutLocally(std.heap.c_allocator) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
@@ -362,7 +365,46 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 },
             };
-            try applyLogoutResult(app, result);
+            var revocation: ?auth_runtime.RemoteRevocation = if (local.session) |session| .{ .fx_login = session } else null;
+            defer if (revocation) |pending| releaseRemoteRevocation(pending);
+            try applyLogoutResult(app, local.result);
+            if (revocation) |pending| {
+                revocation = null;
+                try startRemoteRevocation(app, pending);
+            }
+        }
+
+        /// The local sign-out is already done. Revoking the session at its
+        /// issuer can take seconds, so it runs off the input loop, and a
+        /// failure is reported when `collectRemoteRevocationFacts` sees it.
+        fn startRemoteRevocation(app: *App, revocation: auth_runtime.RemoteRevocation) !void {
+            const source = revocation.source();
+            if (!app.auth.beginRemoteRevocation(revocation)) {
+                try writeRemoteRevocationWarning(app, source);
+            }
+        }
+
+        fn releaseRemoteRevocation(revocation: auth_runtime.RemoteRevocation) void {
+            var owned = revocation;
+            owned.deinit();
+        }
+
+        /// Reports a remote revocation that finished with a failure.
+        pub fn collectRemoteRevocationFacts(app: *App) !void {
+            while (app.auth.takeRemoteRevocation()) |outcome| {
+                if (outcome.failed) try writeRemoteRevocationWarning(app, outcome.source);
+            }
+        }
+
+        fn writeRemoteRevocationWarning(app: *App, source: credentials.Source) !void {
+            try writeAuthNotice(app, .{
+                .topic = "auth",
+                .tone = .warning,
+                .body = if (source == .grok_subscription)
+                    "The local Grok session was removed, but remote revocation could not be confirmed."
+                else
+                    login_flow.remote_revocation_warning,
+            });
         }
 
         fn reconcileSubscriptionLogout(app: *App, removed: model_provider.ProviderId) !void {
