@@ -9,6 +9,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
@@ -2292,6 +2293,83 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await resolveApprovalWithDeny(ctx.session);
       await ctx.session.waitForText("delimiter boundary handled", TIMEOUT);
       await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test.each(["option", "freeform", "immediate"] as const)(
+    "Herdr returns to working after a question's %s answer before the turn ends",
+    async (answerKind) => {
+      const socketRoot = createIsolatedRoot();
+      const socketPath = join(socketRoot.root, "herdr.sock");
+      const reports: string[] = [];
+      const sockets = new Set<Socket>();
+      const server = createServer((socket) => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+        let input = "";
+        socket.on("data", (chunk) => {
+          input += chunk.toString();
+          const newline = input.indexOf("\n");
+          if (newline < 0) return;
+          const request = JSON.parse(input.slice(0, newline));
+          if (request.method === "pane.report_agent") {
+            expect(request.params.source).toBe("custom:fx");
+            expect(request.params.agent).toBe("fx");
+            expect(request.params.pane_id).toBe("w1:p1");
+            reports.push(request.params.state);
+          }
+          socket.end(`${JSON.stringify({ id: request.id, result: {} })}\n`);
+        });
+      });
+      const continuation = controlledGatewayResponse(outerText("Herdr question continued"));
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(socketPath, resolve);
+        });
+        const ctx = await launchScenario(
+          [outerQuestionCall(), continuation.next],
+          "input",
+          { FX_HERDR: "1", HERDR_SOCKET_PATH: socketPath, HERDR_PANE_ID: "w1:p1" },
+        );
+        const waitForReports = async (expected: string[]) => {
+          const deadline = Date.now() + 5_000;
+          while (reports.length < expected.length && Date.now() < deadline) await sleep(25);
+          expect(reports).toEqual(expected);
+        };
+
+        await ctx.session.sendText("Ask me which path to take.");
+        await ctx.session.waitForText(QUESTION_PROMPT, TIMEOUT);
+        await waitForReports(["idle", "working", "blocked"]);
+        if (answerKind === "immediate") continuation.release();
+        if (answerKind === "freeform") {
+          await ctx.session.sendLiteralText("3");
+          await expectQuestionSelection(ctx.session, 3, "");
+          await ctx.session.sendLiteralText("Inspect the integration");
+          await ctx.session.sendKeys("Enter");
+        } else {
+          await resolveQuestionWithSecondOption(ctx.session);
+        }
+        await continuation.requested;
+        if (answerKind !== "immediate") {
+          await waitForReports(["idle", "working", "blocked", "working"]);
+          await assertProcessAliveAndClean(ctx);
+        }
+
+        continuation.release();
+        await ctx.session.waitForText("Herdr question continued", TIMEOUT);
+        await waitForReports(["idle", "working", "blocked", "working", "idle"]);
+        await assertProcessAliveAndClean(ctx);
+      } finally {
+        continuation.release();
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        for (const socket of sockets) socket.destroy();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
     },
     TIMEOUT,
   );
