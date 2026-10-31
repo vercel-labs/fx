@@ -130,7 +130,7 @@ pub fn prepare(
     url_completions: ?tool_mcp_runtime.LegacyUrlCompletionSink,
 ) Allocator.Error!Preparation {
     if (configs.items.items.len == 0) return .none;
-    const home = io_mod.homeDir() orelse return .{ .failed = try alloc.dupe(u8, "MCP servers need HOME to be set.") };
+    const home = io_mod.homeDir() orelse return .{ .failed = try alloc.dupe(u8, "MCP servers: " ++ io_mod.no_home_dir_reason ++ ".") };
     // Read only while the host starts.
     var inherited = io_mod.cloneEnvironMap(alloc) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

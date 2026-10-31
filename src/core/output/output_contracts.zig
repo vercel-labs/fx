@@ -2,6 +2,7 @@ const std = @import("std");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const doctor_runtime = @import("../cli/doctor_runtime.zig");
+const io_mod = @import("../shared/io.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
@@ -415,7 +416,7 @@ pub fn workspaceErrorMessage(err: anyerror) ?[]const u8 {
         error.UnknownAdditionalDirectory => "directory is not configured as an additional workspace",
         error.PrimaryDirectory => "the primary workspace cannot be added or removed",
         error.TooManyDirectories => "additional directory limit reached",
-        error.HomeNotSet => "HOME is not set",
+        error.HomeNotSet => io_mod.no_home_dir_reason,
         error.SettingsStoreUnavailable => "settings are unavailable",
         error.DurablePathUnsafe, error.PrivateStatePermissionsUnsupported => "settings path is unsafe",
         else => "workspace update failed",

@@ -733,6 +733,25 @@ describe("/mcp in the shell", () => {
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toBeUndefined();
     expect(await tui.captureFullScrollback()).not.toContain("Removed web");
   }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp names HOME and writes nothing when HOME is not absolute", async () => {
+    // fx treats a relative HOME as unset, and the shell's /mcp must not build
+    // `.fx/mcp.json` against the workspace instead.
+    const root = createRoot();
+    gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, HOME: "relative/home", FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp add web https://w.example/mcp");
+    await tui.waitForText("/mcp: HOME is not set to an absolute path", 10_000);
+    expect(existsSync(join(root.workspace, ".fx"))).toBe(false);
+    expect(existsSync(join(root.workspace, "relative"))).toBe(false);
+  }, 60_000);
 });
 
 describe("fx ask", () => {

@@ -472,6 +472,10 @@ fn liveLibcEnviron() ?RawEnviron {
     return @ptrCast(std.c.environ);
 }
 
+/// What fx tells the user when `homeDir` returns null, after a prefix such as
+/// `fx mcp: `.
+pub const no_home_dir_reason = "HOME is not set to an absolute path";
+
 /// The home directory fx keeps its own files under: `HOME` when it is an
 /// absolute path, otherwise null. An empty or relative `HOME` counts as
 /// unset, so fx never builds profile paths relative to the current folder.
