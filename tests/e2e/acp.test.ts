@@ -1119,6 +1119,34 @@ test("ACP shell completed and replayed updates show the command output", async (
   }
 }, 45000);
 
+test("ACP shell progress preserves a character split at the output buffer boundary", async () => {
+  const command = "printf '%4095s' ' '; printf '\\320'; sleep 0.25; printf '\\257\\n'";
+  const fixture = createConfiguredProviderFixture(body => body.messages.some((message: any) => message.role === "tool")
+    ? configuredCompletion(body.model, "done")
+    : configuredToolCompletion(body.model, "shell", { request: { action: "run", command } }, "call_utf8"));
+  const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+  try {
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }, 2);
+    await client.request("session/set_mode", { modeId: "full-access" }, 3);
+    const prompt = await runPrompt(client, "Run the command.", TIMEOUT);
+    expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+    const progress = prompt.messages
+      .map((message: any) => message.params?.update)
+      .filter((update: any) => update?.toolCallId === "call_utf8" && update.status === "in_progress")
+      .flatMap((update: any) => update.content ?? [])
+      .map((item: any) => item.content?.text ?? "")
+      .join("");
+    expect(progress).toBe(" ".repeat(4095) + "Я\n");
+    expect(client.stderr).toBe("");
+    client.endStdin();
+    expect(await client.waitForExit()).toBe(0);
+  } finally {
+    await client.close();
+    fixture.close();
+  }
+}, 45000);
+
 test("ACP finishes tool calls that a cancel stopped before they ran", async () => {
   const root = createIsolatedRoot("fx-acp-cancel-cards-");
   const gateway = startFakeGateway([
