@@ -1766,6 +1766,106 @@ test "fx sessions convert names each subagent it keeps as it is, in text and JSO
     );
 }
 
+/// What `fx sessions import --opencode` did: counts, then one line per
+/// session it saved and one per session it couldn't.
+pub const SessionImportSnapshot = struct {
+    imported: []const Imported,
+    already_imported: usize,
+    /// Sessions without a single prompt, which save nothing.
+    empty: usize,
+    failed: []const Failed,
+
+    pub const Imported = struct {
+        /// The OpenCode session id.
+        source: []const u8,
+        id: []const u8,
+        workspace: []const u8,
+        turns: usize,
+    };
+
+    pub const Failed = struct {
+        /// The OpenCode session id, or `opencode` when listing failed.
+        source: []const u8,
+        code: []const u8,
+        reason: []const u8,
+    };
+
+    pub fn render(self: SessionImportSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    fn renderText(self: SessionImportSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.print("imported {d}, already imported {d}, without prompts {d}, failed {d}\n", .{ self.imported.len, self.already_imported, self.empty, self.failed.len });
+        for (self.imported) |session| {
+            try out.writer.print("{s}: imported as {s}, {d} {s}, in {s}\n", .{ session.source, session.id, session.turns, if (session.turns == 1) "turn" else "turns", session.workspace });
+        }
+        for (self.failed) |failed| try out.writer.print("{s}: failed: {s}\n", .{ failed.source, failed.reason });
+        return out.toOwnedSlice();
+    }
+
+    fn renderJson(self: SessionImportSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.print("{{\"kind\":\"sessions_import\",\"source\":\"opencode\",\"imported\":{d},\"already_imported\":{d},\"empty\":{d},\"failed\":{d}", .{ self.imported.len, self.already_imported, self.empty, self.failed.len });
+        // A failure fails the command; its error names the first one.
+        if (self.failed.len > 0) {
+            try out.writer.writeAll(",\"error\":");
+            try std.json.Stringify.value(self.failed[0].code, .{}, &out.writer);
+        }
+        try out.writer.writeAll(",\"sessions\":");
+        try std.json.Stringify.value(self.imported, .{}, &out.writer);
+        try out.writer.writeAll(",\"failures\":[");
+        for (self.failed, 0..) |failed, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"source\":");
+            try std.json.Stringify.value(failed.source, .{}, &out.writer);
+            try out.writer.writeAll(",\"error\":");
+            try std.json.Stringify.value(failed.code, .{}, &out.writer);
+            try out.writer.writeAll(",\"reason\":");
+            try std.json.Stringify.value(failed.reason, .{}, &out.writer);
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeAll("]}");
+        return out.toOwnedSlice();
+    }
+};
+
+test "fx sessions import renders each import and each failure as text and JSON from one snapshot" {
+    const alloc = std.testing.allocator;
+    const snapshot: SessionImportSnapshot = .{
+        .imported = &.{
+            .{ .source = "ses_a", .id = "opencode-ses_a", .workspace = "/Users/example/project", .turns = 1 },
+            .{ .source = "ses_b", .id = "opencode-ses_b", .workspace = "/Users/example/project", .turns = 3 },
+        },
+        .already_imported = 4,
+        .empty = 1,
+        .failed = &.{.{ .source = "ses_c", .code = "OpenCodeFailed", .reason = "opencode session export failed: it exited with status 1" }},
+    };
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "imported 2, already imported 4, without prompts 1, failed 1\n" ++
+            "ses_a: imported as opencode-ses_a, 1 turn, in /Users/example/project\n" ++
+            "ses_b: imported as opencode-ses_b, 3 turns, in /Users/example/project\n" ++
+            "ses_c: failed: opencode session export failed: it exited with status 1\n",
+        text,
+    );
+    const json = try snapshot.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"sessions_import\",\"source\":\"opencode\",\"imported\":2,\"already_imported\":4,\"empty\":1,\"failed\":1,\"error\":\"OpenCodeFailed\"," ++
+            "\"sessions\":[{\"source\":\"ses_a\",\"id\":\"opencode-ses_a\",\"workspace\":\"/Users/example/project\",\"turns\":1}," ++
+            "{\"source\":\"ses_b\",\"id\":\"opencode-ses_b\",\"workspace\":\"/Users/example/project\",\"turns\":3}]," ++
+            "\"failures\":[{\"source\":\"ses_c\",\"error\":\"OpenCodeFailed\",\"reason\":\"opencode session export failed: it exited with status 1\"}]}",
+        json,
+    );
+}
+
 pub const DoctorSnapshot = struct {
     workspace_root: []const u8,
     model: []const u8,

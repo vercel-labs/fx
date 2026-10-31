@@ -4840,6 +4840,7 @@ test {
     _ = @import("core/session/session_store.zig");
     _ = @import("core/session/session_adapter.zig");
     _ = @import("core/session/v1_conversion.zig");
+    _ = @import("core/session/opencode_import.zig");
     _ = @import("core/session/session_catalog_cache.zig");
     _ = @import("core/session/session_layout.zig");
     _ = @import("core/session/prompt_history_store.zig");
