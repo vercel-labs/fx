@@ -7668,6 +7668,47 @@ tmuxTest(
 );
 
 tmuxTest(
+  "/credits renews a login that falls due without holding the terminal",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-auth-credits-renewal-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    // A renewal on the input loop would hold the terminal this long.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { tokenDelayMs: 3_000 });
+    creditsGateway = startFakeCreditsGateway();
+    // fx renews an fx login one minute before it expires, so this one is
+    // current at launch and falls due a few seconds later.
+    const refreshDueAt = Date.now() + 5_000;
+    writeSeededFxLogin(home, refreshDueAt + 60_000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_E2E_GATEWAY_CREDITS_URL: creditsGateway.url,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await Bun.sleep(Math.max(0, refreshDueAt - Date.now()) + 250);
+
+    await session.sendText("/credits");
+    const draft = "TYPING_WHILE_CREDITS_RENEW";
+    await session.sendLiteral(draft);
+    await session.waitForPane((pane) => pane.includes(draft), 1_000);
+    await session.sendKeys("C-u");
+    await session.sendKeys("C-k");
+
+    await session.waitForText("* credits: balance=42", TIMEOUT);
+    expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(1);
+    expect(creditsGateway.requests).toEqual([{
+      method: "GET",
+      path: "/v1/credits",
+      authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}`,
+    }]);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
   "expired login refresh failure keeps one anonymous catalog request and blocks credits",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-expired-startup-"));

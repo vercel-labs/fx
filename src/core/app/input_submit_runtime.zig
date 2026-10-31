@@ -719,7 +719,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             const left_trimmed = std.mem.trimStart(u8, expanded.text, " \t\r\n");
             const resolved_slash_submission = resolvedSlashSubmission(app, left_trimmed);
             if (knownSlashCommand(app, resolved_slash_submission)) |command| {
-                if (requiresPromptCredential(command, resolved_slash_submission) and !try preflightPrompt(app)) return;
+                if (requiresPromptCredential(command, resolved_slash_submission) and !try preflightQueuedPrompt(app)) return;
                 try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
                 return;
             }
@@ -736,7 +736,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             )) |command_start| {
                 const command_text = expanded.text[command_start..];
                 if (knownSlashCommand(app, command_text)) |command| {
-                    if (requiresPromptCredential(command, command_text) and !try preflightPrompt(app)) return;
+                    if (requiresPromptCredential(command, command_text) and !try preflightQueuedPrompt(app)) return;
                     try submitSlashCommand(
                         app,
                         command_text,
@@ -916,9 +916,10 @@ pub fn SubmitRuntime(comptime App: type) type {
             return true;
         }
 
-        /// A prompt that queues behind active work must not wait on a
-        /// credential refresh: the input loop would freeze until the network
-        /// answers. The worker refreshes before the turn's first request.
+        /// A prompt that queues behind active work, or a command that needs a
+        /// credential, must not wait on a credential refresh: the input loop
+        /// would freeze until the network answers. The turn's worker, or the
+        /// command's own background lookup, renews a due token.
         fn preflightQueuedPrompt(app: *App) !bool {
             if (comptime @hasDecl(App, "admitQueuedPromptCredential")) {
                 return App.admitQueuedPromptCredential(app);

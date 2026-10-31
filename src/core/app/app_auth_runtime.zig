@@ -1835,6 +1835,19 @@ pub fn Runtime(comptime App: type) type {
             applyCredentialRefreshChange(app, change);
         }
 
+        /// Adopts a credential a background task renewed off the input loop.
+        /// A renewal that switched account authority is dropped; the next
+        /// prompt's own check then reports the change.
+        pub fn adoptRenewedCredential(app: *App, renewed: *const credentials.Credential) !void {
+            if (app.auth.preparedCredentialChange(renewed.*) == .authority) {
+                debug_trace.logf("auth", "renewed credential dropped reason=authority_changed source={t}", .{renewed.source});
+                return;
+            }
+            var owned = try renewed.clone(app.alloc);
+            defer owned.deinit(app.alloc);
+            applyCredentialRefreshChange(app, app.auth.adoptPreparedCredential(app.alloc, &owned));
+        }
+
         fn applyCredentialRefreshChange(
             app: *App,
             change: auth_transition.CredentialChange,

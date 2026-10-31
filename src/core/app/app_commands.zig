@@ -8,6 +8,7 @@ const io_mod = @import("../shared/io.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const credits_lookup = @import("credits_lookup.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
@@ -1270,10 +1271,26 @@ pub fn Handlers(comptime App: type) type {
                     null,
                 .tenant = app.auth.gatewayTeam(),
             };
-            // The lookup runs on a worker so a slow Gateway never holds the
-            // input loop; `collectCreditsFacts` writes its result.
+            // The lookup runs on a worker so a slow Gateway or issuer never
+            // holds the input loop; `collectCreditsFacts` writes its result.
             if (comptime @hasField(App, "credits_lookup") and !@import("builtin").single_threaded) {
-                const started = app.credits_lookup.start(app.creditsProvider(), input) catch |err| switch (err) {
+                // A due token still names the session; the worker renews it
+                // before asking for credits.
+                const queued = app.auth.queuedPromptCredential();
+                const source = app.auth.credentialSource();
+                const renewal: ?credits_lookup.Renewal = if (source) |active|
+                    if (credentials.sourceRefreshable(active) and app.auth.credentialNeedsRefresh())
+                        .{ .transport = app.auth.oauthTransport(), .source = active, .account_id = app.auth.accountId() }
+                    else
+                        null
+                else
+                    null;
+                const worker_input: gateway_provider.CreditsLookupInput = .{
+                    .credential = if (queued) |credential| credential.api_key else null,
+                    .credential_source = source,
+                    .tenant = if (queued) |credential| credential.gateway_team else null,
+                };
+                const started = app.credits_lookup.start(app.creditsProvider(), worker_input, renewal) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => {
                         debug_trace.logf("credits", "lookup start failed err={s}", .{@errorName(err)});
@@ -1299,12 +1316,14 @@ pub fn Handlers(comptime App: type) type {
             try writeCreditsNotice(app, snapshot);
         }
 
-        /// Writes the `/credits` result once its background lookup finishes.
+        /// Writes the `/credits` result once its background lookup finishes,
+        /// after adopting a credential the lookup renewed.
         pub fn collectCreditsFacts(app: *App) !void {
             if (comptime !@hasField(App, "credits_lookup")) return;
-            var snapshot = app.credits_lookup.take() orelse return;
-            defer snapshot.deinit(std.heap.c_allocator);
-            try writeCreditsNotice(app, snapshot);
+            var result = app.credits_lookup.take() orelse return;
+            defer result.deinit();
+            if (result.renewed) |*renewed| try app.adoptRenewedCredential(renewed);
+            try writeCreditsNotice(app, result.snapshot);
         }
 
         fn writeCreditsNotice(app: *App, snapshot: output_contracts.CreditsSnapshot) !void {

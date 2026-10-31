@@ -1073,6 +1073,10 @@ const App = struct {
         return AuthAppRuntime.admitQueuedPromptCredential(self);
     }
 
+    pub fn adoptRenewedCredential(self: *App, renewed: *const credentials.Credential) !void {
+        try AuthAppRuntime.adoptRenewedCredential(self, renewed);
+    }
+
     pub fn restoreSessionCredential(self: *App, previous_provider: model_provider.ProviderId) !void {
         try AuthAppRuntime.restoreSessionCredential(self, previous_provider);
     }
