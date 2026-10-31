@@ -135,9 +135,9 @@ for (const action of ["run", "message"] as const) {
         env: {
           PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root.home,
           AI_GATEWAY_API_KEY: "synthetic-steering", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
-          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_SKIP_ONBOARDING: "1", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access", FX_MAX_AGENT_STEPS: "5",
+          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TEST_SKIP_ONBOARDING: "1", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access", FX_MAX_AGENT_STEPS: "5",
           FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_TRACE_LOG: join(root.root, "trace.log"), FX_TRACE_SCOPES: "subagent,worker,agent,tool",
         },
       });
@@ -486,7 +486,7 @@ function fixtureEnv(
     VERCEL_OIDC_TOKEN: undefined,
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_MODEL: MODEL,
     FX_TRACE_LOG: tracePath,
     FX_TRACE_SCOPES: "agent,core,gateway,stream",
@@ -902,7 +902,7 @@ describe("gateway stream lifecycle", () => {
       ]));
       expect(gateway.requestCount()).toBe(3);
       expect(result.stderr).not.toContain("panic");
-      const resume = () => runFx(["ask", "--auto", "--json", "--resume-id", output.session_id, "Continue with the saved context."], {
+      const resume = () => runFx(["ask", "--auto", "--json", "--resume", output.session_id, "Continue with the saved context."], {
         cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 30_000,
       });
       const restored = await resume();
@@ -1296,7 +1296,7 @@ describe("gateway stream lifecycle", () => {
           env: {
             ...fixtureEnv(root, gateway, tracePath),
             FX_MODEL: undefined,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           timeoutMs: 30_000,
         },
@@ -1353,7 +1353,7 @@ describe("gateway stream lifecycle", () => {
           env: {
             ...fixtureEnv(root, gateway, tracePath),
             FX_MODEL: undefined,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           timeoutMs: 30_000,
         },
@@ -1370,6 +1370,103 @@ describe("gateway stream lifecycle", () => {
       );
       const request = JSON.parse(gateway.requests[0]!.body);
       expect(request).toMatchObject({
+        reasoning: "high",
+        providerOptions: { gateway: { speed: "fast" } },
+      });
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("ask --config overrides the settings files and yields to dedicated flags", async () => {
+    const root = createFixtureRoot("ask-config-overrides");
+    const tracePath = join(root.root, "trace.log");
+    const settingsPath = join(root.home, ".fx", "settings.json");
+    writeFileSync(settingsPath, JSON.stringify({ effort: "low", fast_mode: false }) + "\n");
+    const settingsBefore = readFileSync(settingsPath, "utf8");
+    const gateway = startDynamicFakeGateway(
+      () => fakeGatewayFinalText("CONFIG_OVERRIDES_COMPLETE"),
+      {
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["tool-use", "reasoning"],
+          fast_options: [{ type: "toggle" }],
+          reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+        }],
+      },
+    );
+    const env = {
+      ...fixtureEnv(root, gateway, tracePath),
+      FX_MODEL: undefined,
+      FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    };
+    const ask = (flags: string[]) =>
+      runFx(["ask", "--json", "--auto", "--no-save", "--model", MODEL, ...flags, "Use the settings overrides."], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 30_000,
+      });
+
+    try {
+      const overridden = await ask(["--config", "effort=low", "--config", "effort=high", "--config", "fast_mode=on"]);
+      expect(overridden.code).toBe(0);
+      expect(parseAskJson(overridden.stdout).output).toContain("CONFIG_OVERRIDES_COMPLETE");
+      expect(overridden.stderr).toBe("");
+      expect(JSON.parse(gateway.requests[0]!.body)).toMatchObject({
+        reasoning: "high",
+        providerOptions: { gateway: { speed: "fast" } },
+      });
+
+      const flagWins = await ask(["--config", "fast_mode=on", "--no-fast"]);
+      expect(flagWins.code).toBe(0);
+      const second = JSON.parse(gateway.requests[1]!.body);
+      expect(second).toMatchObject({ reasoning: "low" });
+      expect(second).not.toHaveProperty("providerOptions.gateway.speed");
+
+      expect(readFileSync(settingsPath, "utf8")).toBe(settingsBefore);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("issue applies the agent-run flags to the gateway request", async () => {
+    const root = createFixtureRoot("issue-agent-run-flags");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startDynamicFakeGateway(
+      () => fakeGatewayFinalText("ISSUE_FLAGS_COMPLETE"),
+      {
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["tool-use", "reasoning"],
+          fast_options: [{ type: "toggle" }],
+          reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+        }],
+      },
+    );
+
+    try {
+      const result = await runFx(
+        ["issue", "--auto", "--model", MODEL, "--effort", "high", "--fast", "Login fails after an upgrade"],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MODEL: undefined,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("ISSUE_FLAGS_COMPLETE");
+      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(MODEL);
+      expect(JSON.parse(gateway.requests[0]!.body)).toMatchObject({
         reasoning: "high",
         providerOptions: { gateway: { speed: "fast" } },
       });
@@ -1402,7 +1499,7 @@ describe("gateway stream lifecycle", () => {
           env: {
             ...fixtureEnv(root, gateway, tracePath),
             FX_MODEL: undefined,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           timeoutMs: 30_000,
         },
@@ -1453,7 +1550,7 @@ describe("gateway stream lifecycle", () => {
       const env = {
         ...fixtureEnv(root, gateway, tracePath),
         FX_MODEL: undefined,
-        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
       };
       const first = await runFx(
         ["ask", "--json", "--auto", "Start the saved session."],
@@ -1466,7 +1563,7 @@ describe("gateway stream lifecycle", () => {
       const overridden = await runFx(
         [
           "ask", "--json", "--auto",
-          "--resume-id", sessionId,
+          "--resume", sessionId,
           "--model", MODEL,
           "--effort", "high",
           "--no-fast",
@@ -1484,7 +1581,7 @@ describe("gateway stream lifecycle", () => {
       expect(overriddenRequest).not.toHaveProperty("providerOptions.gateway.speed");
 
       const restored = await runFx(
-        ["ask", "--json", "--auto", "--resume-id", sessionId, "Continue without flags."],
+        ["ask", "--json", "--auto", "--resume", sessionId, "Continue without flags."],
         { cwd: root.workspace, env, timeoutMs: 30_000 },
       );
       expect(restored.code).toBe(0);
@@ -1526,7 +1623,7 @@ describe("gateway stream lifecycle", () => {
           env: {
             ...fixtureEnv(root, gateway, tracePath),
             FX_MODEL: undefined,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           timeoutMs: 30_000,
         },
@@ -2799,7 +2896,7 @@ describe("gateway stream lifecycle", () => {
       rmSync(skillDirectory, { recursive: true, force: true });
       const resumeStderr = join(root.root, "resume-stderr.log");
       tui = await TmuxSession.create({
-        cmd: `${binary} --resume-last`,
+        cmd: `${binary} --resume last`,
         cwd: root.workspace,
         env: fixtureEnv(root, gateway, join(root.root, "resume-trace.log")),
         stderrPath: resumeStderr,
@@ -3346,7 +3443,7 @@ describe("gateway stream lifecycle", () => {
       expect(first.stderr).not.toContain("Reading");
       expect(gateway.requests).toHaveLength(2);
 
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", firstJson.session_id, "Continue."], {
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", firstJson.session_id, "Continue."], {
         cwd: root.workspace,
         env: { ...fixtureEnv(root, gateway, join(root.root, "resume.log")), FX_MODEL: DEFAULT_MODEL },
         timeoutMs: 20_000,
@@ -3850,7 +3947,7 @@ describe("gateway stream lifecycle", () => {
           "ask",
           "--json",
           "--auto",
-          "--resume-id",
+          "--resume",
           firstJson.session_id,
           "Persist the second ordinary turn.",
         ],
@@ -3923,7 +4020,7 @@ describe("gateway stream lifecycle", () => {
           { ...completed, seq: 4 },
         ];
         writeFileSync(path, frames.map((frame) => JSON.stringify(frame)).join("\n") + "\n");
-        const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", seed.session_id, "Continue without tools."], {
+        const resumed = await runFx(["ask", "--json", "--auto", "--resume", seed.session_id, "Continue without tools."], {
           cwd: root.workspace,
           env: fixtureEnv(root, gateway, join(root.root, "resume.log")),
           timeoutMs: 15_000,
@@ -3946,7 +4043,7 @@ describe("gateway stream lifecycle", () => {
         if (tmuxAvailable()) {
           const stderrPath = join(root.root, "tui-stderr.log");
           const tui = await TmuxSession.create({
-            cmd: `${FX_BIN} --resume-last`,
+            cmd: `${FX_BIN} --resume last`,
             cwd: root.workspace,
             env: fixtureEnv(root, gateway, join(root.root, "tui-trace.log")),
             stderrPath,
@@ -4003,7 +4100,7 @@ describe("gateway stream lifecycle", () => {
       expect(result.output).toBe(`${commentary}\n\n${answer}`);
       expect(result.final_output).toBe(`${commentary}\n\n${answer}`);
 
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Say it again."], {
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", result.session_id, "Say it again."], {
         cwd: root.workspace,
         env: fixtureEnv(root, gateway, join(root.root, "resume.log")),
         timeoutMs: 15_000,
@@ -4078,7 +4175,7 @@ describe("gateway stream lifecycle", () => {
           "ask",
           "--json",
           "--auto",
-          "--resume-id",
+          "--resume",
           firstJson.session_id,
           "Confirm what the saved session contains.",
         ],
@@ -4154,7 +4251,7 @@ describe("gateway stream lifecycle", () => {
             const kept = savedText(root.home, result.session_id);
             expect(kept).toContain("removed_call");
             if (metadata) expect(kept).toContain("removed-signature");
-            const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Confirm the saved result without running tools."], {
+            const resumed = await runFx(["ask", "--json", "--auto", "--resume", result.session_id, "Confirm the saved result without running tools."], {
               cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
             });
             expect(resumed.code).toBe(0);
@@ -4211,13 +4308,13 @@ describe("gateway stream lifecycle", () => {
       const sessionId = parseAskJson(first.stdout).session_id;
       const logPath = join(sessionDir(root.home, sessionId), "log.jsonl");
       const originalLog = readFileSync(logPath, "utf8");
-      const second = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Exercise the second fixture."], {
+      const second = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Exercise the second fixture."], {
         cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
       });
       expect(second.code).toBe(0);
       expect(parseAskJson(second.stdout).final_output).toBe("Second turn stored.");
       expect(gateway.requestCount()).toBe(4);
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Confirm the stored results without running tools."], {
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Confirm the stored results without running tools."], {
         cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
       });
       expect(resumed.code).toBe(0);
@@ -4295,7 +4392,7 @@ describe("gateway stream lifecycle", () => {
           "ask",
           "--json",
           "--auto",
-          "--resume-id",
+          "--resume",
           firstJson.session_id,
           "Continue after the saved malformed recovery.",
         ],
@@ -4441,7 +4538,7 @@ describe("gateway stream lifecycle", () => {
           cwd: root.workspace,
           env: {
             ...fixtureEnv(root, gateway, tracePath),
-            FX_COMMAND_TEST_INDETERMINATE_AFTER_EXIT: "1",
+            FX_TEST_COMMAND_INDETERMINATE_AFTER_EXIT: "1",
           },
           timeoutMs: 15_000,
         },
@@ -4521,7 +4618,7 @@ describe("gateway stream lifecycle", () => {
           cwd: root.workspace,
           env: {
             ...fixtureEnv(root, gateway, tracePath),
-            FX_COMMAND_TEST_OUTPUT_INCOMPLETE_AFTER_EXIT: "1",
+            FX_TEST_COMMAND_OUTPUT_INCOMPLETE_AFTER_EXIT: "1",
           },
           timeoutMs: 15_000,
         },
@@ -5682,7 +5779,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             "ask",
             "--json",
             "--yolo",
-            "--resume-id",
+            "--resume",
             firstJson.session_id,
             "Read the saved replay again.",
           ],
@@ -5829,7 +5926,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         reasoning_tokens: 2,
       });
 
-      const resumed = await runFx(["ask", "--yolo", "--json", "--resume-id", id!, "--", "Finish up."], {
+      const resumed = await runFx(["ask", "--yolo", "--json", "--resume", id!, "--", "Finish up."], {
         cwd: root.workspace,
         env: fixtureEnv(root, gateway, join(root.root, "resume-trace.log")),
         timeoutMs: 15_000,
@@ -6194,7 +6291,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "ask",
           "--json",
           "--yolo",
-          "--resume-id",
+          "--resume",
           sessionId,
           "Inspect the cancelled command output.",
         ],
@@ -6247,7 +6344,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
                 "ask",
                 "--json",
                 "--auto",
-                "--resume-id",
+                "--resume",
                 sessionId,
                 `canonical turn ${turn}`,
               ];
@@ -6299,7 +6396,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             "ask",
             "--json",
             "--auto",
-            "--resume-id",
+            "--resume",
             sessionId,
             "canonical projection probe",
           ],
@@ -6450,7 +6547,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const compacted = await runFx(["session", "--id", id, "--json"], { cwd: root.workspace, env });
       expect(compacted.code).toBe(0);
       expect(JSON.parse(compacted.stdout).history.at(-1)?.summary).toContain("\"earlier\":\"The prior reads completed.");
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", id, "Continue with the saved result."], { cwd: root.workspace, env, timeoutMs: 30_000 });
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", id, "Continue with the saved result."], { cwd: root.workspace, env, timeoutMs: 30_000 });
       expect(resumed.code, resumed.stderr || resumed.stdout).toBe(0);
       expect(JSON.parse(resumed.stdout).final_output).toBe("COLD_REPLAY_DONE");
       expect(ordinary).toBe(9);
@@ -6580,7 +6677,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(savedText(root.home, sessionId)).toContain(pages[0]!.hash);
           // The compacted command is saved as T1 with the handle of its whole output.
           expect(readFileSync(compactionRecordPath(root.home, sessionId, "compacted-T1.txt")!, "utf8")).toContain(sourceHandle);
-          const resumed = await runFx(["ask", "--json", "--resume-id", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
+          const resumed = await runFx(["ask", "--json", "--resume", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
           expect(resumed.code).toBe(0);
           // Compaction folded the command into T1, so the read has no call
           // left to name.
@@ -6734,7 +6831,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             "ask",
             "--json",
             "--auto",
-            "--resume-id",
+            "--resume",
             sessionId,
             "compaction restart probe",
           ],
@@ -7373,7 +7470,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               HOME: root.home,
               AI_GATEWAY_API_KEY: "fake-gateway-lifecycle-key",
               VERCEL_OIDC_TOKEN: undefined,
-              FX_E2E_GATEWAY_CHAT_URL:
+              FX_TEST_GATEWAY_CHAT_URL:
                 `http://127.0.0.1:${address.port}/v1/ai/chat/completions`,
               FX_MODEL: MODEL,
               FX_TRACE_LOG: tracePath,
@@ -7512,7 +7609,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               HOME: root.home,
               AI_GATEWAY_API_KEY: "fake-gateway-lifecycle-key",
               VERCEL_OIDC_TOKEN: undefined,
-              FX_E2E_GATEWAY_CHAT_URL:
+              FX_TEST_GATEWAY_CHAT_URL:
                 `http://127.0.0.1:${address.port}/v1/ai/chat/completions`,
               FX_MODEL: MODEL,
               FX_TRACE_LOG: tracePath,
@@ -7634,7 +7731,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             HOME: root.home,
             AI_GATEWAY_API_KEY: "fake-gateway-lifecycle-key",
             VERCEL_OIDC_TOKEN: undefined,
-            FX_E2E_GATEWAY_CHAT_URL:
+            FX_TEST_GATEWAY_CHAT_URL:
               `http://127.0.0.1:${address.port}/v1/ai/chat/completions`,
             FX_MODEL: MODEL,
             FX_TRACE_LOG: tracePath,
@@ -8192,7 +8289,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const originalLog = readFileSync(logPath, "utf8");
 
       phase = 1;
-      const resumed = await runFx(["ask", "--json", "--resume-id", id, "Continue without delegation."], {
+      const resumed = await runFx(["ask", "--json", "--resume", id, "Continue without delegation."], {
         cwd: root.workspace, env, timeoutMs: 15_000,
       });
       expect(resumed.code).toBe(0);
@@ -8207,7 +8304,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(readFileSync(tracePath, "utf8")).toContain(`child_id=${child} reason=session_load_failed error=NotFound`);
 
       phase = 2;
-      const reopened = await runFx(["ask", "--json", "--resume-id", id, "Continue again without delegation."], {
+      const reopened = await runFx(["ask", "--json", "--resume", id, "Continue again without delegation."], {
         cwd: root.workspace, env, timeoutMs: 15_000,
       });
       expect(reopened.code).toBe(0);
@@ -8680,7 +8777,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const first = await runFx(["ask", "--json", "--auto", `Run the ${outcome} delegation.`], { cwd: root.workspace, env, timeoutMs: 10_000 });
         expect(first.code).toBe(0);
         const sessionId = parseAskJson(first.stdout).session_id;
-        const repeat = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Observe that same delegation again."], { cwd: root.workspace, env, timeoutMs: 10_000 });
+        const repeat = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Observe that same delegation again."], { cwd: root.workspace, env, timeoutMs: 10_000 });
         expect(repeat.code).toBe(0);
         expect(seen[outcome]).toHaveLength(2);
         expect(seen[outcome][1]).toEqual(seen[outcome][0]);
@@ -8934,7 +9031,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "ask",
           "--json",
           "--auto",
-          "--resume-id",
+          "--resume",
           firstJson.session_id,
           "RESUME_PERSISTENT_SECOND",
         ],
@@ -8966,7 +9063,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         [
           "ask",
           "--auto",
-          "--resume-id",
+          "--resume",
           internalChildId,
           "DIRECT_CHILD_RESUME_MUST_FAIL",
         ],
@@ -9101,7 +9198,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "ask",
           "--json",
           "--auto",
-          "--resume-id",
+          "--resume",
           parentId!,
           resumePrompt,
         ],
@@ -9872,7 +9969,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(step.tool_results.map((result: { tool_call_id: string }) => result.tool_call_id)).toEqual(ids);
 
       responses.push(fakeGatewayFinalText("Resumed without more tools."));
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", json.session_id, "What did you read?"], {
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", json.session_id, "What did you read?"], {
         cwd: root.workspace,
         env: { ...fixtureEnv(root, gateway, tracePath), FX_MODEL: DEFAULT_MODEL },
         timeoutMs: 15_000,
@@ -9940,7 +10037,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(readFileSync(tracePath, "utf8")).toContain(`field=${field} failure=${kind.startsWith("long-") ? "too_long" : "empty"}`);
 
         responses.push(fakeGatewayFinalText("The prior write is retained."));
-        const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", json.session_id, "What was completed?"], {
+        const resumed = await runFx(["ask", "--json", "--auto", "--resume", json.session_id, "What was completed?"], {
           cwd: root.workspace, env, timeoutMs: 15_000,
         });
         expect(resumed.code).toBe(0);
@@ -10019,7 +10116,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       responses.push(fakeGatewayFinalText("Resume complete."));
       const resumed = await runFx(
-        ["ask", "--json", "--auto", "--resume-id", json.session_id, "What did you just read?"],
+        ["ask", "--json", "--auto", "--resume", json.session_id, "What did you just read?"],
         { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
       );
       expect(resumed.code).toBe(0);
@@ -10718,7 +10815,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const seedRequests = gateway.requests.length;
       phase = "attempt";
 
-      const result = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Continue."], {
+      const result = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Continue."], {
         cwd: root.workspace,
         env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,core,gateway,stream,context_compaction" },
         timeoutMs: 15_000,

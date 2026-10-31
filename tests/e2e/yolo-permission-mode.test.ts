@@ -164,7 +164,7 @@ describe("yolo permission mode", () => {
       const configured = await runFx(["status", "--json"], { cwd: fixture.workspace, env });
       expect(configured.code).toBe(0);
       expect(configured.stderr).toBe("");
-      expect(JSON.parse(configured.stdout).permission_mode).toBe("yolo");
+      expect(JSON.parse(configured.stdout).permission_mode).toBe("full-access");
       const fake = startFakeGateway([fakeGatewayFinalText("ALIAS_WRITE_DONE")]);
       gateway = fake;
       const request = await runFx(["ask", "--no-save", "--json", "Reply once."], {
@@ -191,7 +191,7 @@ describe("yolo permission mode", () => {
         env: { ...env, FX_PERMISSION_MODE: mode },
       });
       expect(overridden.code).toBe(0);
-      expect(JSON.parse(overridden.stdout).permission_mode).toBe("yolo");
+      expect(JSON.parse(overridden.stdout).permission_mode).toBe("full-access");
       const text = await runFx(["permissions"], {
         cwd: fixture.workspace,
         env: { ...env, FX_PERMISSION_MODE: mode },
@@ -228,7 +228,7 @@ describe("yolo permission mode", () => {
 
       expect(result.code).toBe(0);
       const status = JSON.parse(result.stdout.trim());
-      expect(status).toMatchObject({ permission_mode: "yolo" });
+      expect(status).toMatchObject({ permission_mode: "full-access" });
       expect(status).not.toHaveProperty("sandbox");
       expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).sandbox).toBe(
         CONFIGURED_SANDBOX,
@@ -343,7 +343,7 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
 
       const stored = JSON.parse(readFileSync(fixture.settingsPath, "utf8"));
       expect(stored).toMatchObject({
-        permission_mode: "yolo",
+        permission_mode: "full-access",
         sandbox: CONFIGURED_SANDBOX,
         yolo_acknowledged: true,
       });
@@ -360,7 +360,7 @@ describe.skipIf(!tmuxAvailable())("yolo interactive mode", () => {
         await session.sendText(`/permissions ${mode}`);
         await session.waitForText("mode set to full access", TIMEOUT);
         await session.waitForText("full access ·", TIMEOUT);
-        expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).permission_mode).toBe("yolo");
+        expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).permission_mode).toBe("full-access");
         await session.sendKeys("BTab");
         await session.waitForText("ask ·", TIMEOUT);
       }

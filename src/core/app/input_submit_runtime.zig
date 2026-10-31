@@ -81,6 +81,9 @@ pub const PendingSkillRefresh = enum {
 
 pub const State = struct {
     pending: ?PendingSubmission = null,
+    /// The prompt from `fx "<prompt>"`, sent once the first frame is on
+    /// screen. Owned by the app allocator.
+    launch_prompt: ?[]u8 = null,
     retry_after_auth: bool = false,
     compaction_pending: bool = false,
     /// Identity only; auth retains its existing pending execution flag.
@@ -306,6 +309,45 @@ pub fn SubmitRuntime(comptime App: type) type {
                     .{@errorName(err)},
                 );
             };
+        }
+
+        /// Sends the `fx "<prompt>"` prompt once the first frame is on screen,
+        /// through the same path as typing it and pressing Enter.
+        pub fn collectLaunchPromptFacts(app: *App, max_prompt_history: usize) !void {
+            if (comptime !@hasField(App, "submission")) return;
+            const prompt = app.submission.launch_prompt orelse return;
+            if (app.shell.render_requests.hasReason(.first_frame)) return;
+            // Typed input waits out a live session switch; so does this.
+            if (comptime @hasField(App, "session_persistence")) {
+                if (app.session_persistence.pending_live_session_policy != null) return;
+            }
+            app.submission.launch_prompt = null;
+            defer app.alloc.free(prompt);
+            if (app.input_runtime.edit_state.input.items.len != 0) {
+                debug_trace.logf(
+                    "input",
+                    "event=launch_prompt_dropped reason=composer_not_empty prompt_bytes={d}",
+                    .{prompt.len},
+                );
+                return;
+            }
+            debug_trace.logf("input", "event=launch_prompt_submit prompt_bytes={d}", .{prompt.len});
+            try app.input_runtime.edit_state.setText(app.alloc, prompt);
+            try submit(app, max_prompt_history);
+        }
+
+        /// Frees a launch prompt that was never sent, such as when fx exits
+        /// before its first frame.
+        pub fn discardLaunchPrompt(app: *App, reason: []const u8) void {
+            if (comptime !@hasField(App, "submission")) return;
+            const prompt = app.submission.launch_prompt orelse return;
+            app.submission.launch_prompt = null;
+            debug_trace.logf(
+                "input",
+                "event=launch_prompt_dropped reason={s} prompt_bytes={d}",
+                .{ reason, prompt.len },
+            );
+            app.alloc.free(prompt);
         }
 
         pub fn collectPendingSubmissionFacts(app: *App) void {

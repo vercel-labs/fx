@@ -1,4 +1,5 @@
 const std = @import("std");
+const command_specs = @import("../slash_commands/command_specs.zig");
 const build_options = @import("build_options");
 const app_permission_runtime = @import("../app/app_permission_runtime.zig");
 const app_session_runtime = @import("../app/app_session_runtime.zig");
@@ -10,6 +11,7 @@ const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
 const model_cache_runtime = @import("../app/model_cache_runtime.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -72,7 +74,7 @@ pub fn reportUserSettingsCommit(
     var out: std.Io.Writer.Allocating = .init(app.alloc);
     defer out.deinit();
 
-    const benign_commit = "saved to user settings (scope=user)";
+    const benign_commit = "saved to global settings (scope=global)";
     try out.writer.writeAll(benign_commit);
     try appendShadowedUserSources(&out.writer, patch, detailed.sources);
     try appendCommitCleanup(&out.writer, outcome);
@@ -99,7 +101,7 @@ fn writeUserSettingsCommitUnknownSource(
     defer out.deinit();
 
     try out.writer.print(
-        "saved to user settings (scope=user); next-startup source unknown ({s})",
+        "saved to global settings (scope=global); next-startup source unknown ({s})",
         .{@errorName(resolution_error)},
     );
     try appendCommitCleanup(&out.writer, outcome);
@@ -123,12 +125,12 @@ pub fn reportUserSettingsFailure(
 
     if (err == error.SettingsCommitIndeterminate) {
         try out.writer.print(
-            "user settings persistence uncertain (scope=user, error={s})",
+            "global settings persistence uncertain (scope=global, error={s})",
             .{@errorName(err)},
         );
     } else {
         try out.writer.print(
-            "{s}not saved to user settings ({s})",
+            "{s}not saved to global settings ({s})",
             .{ if (runtime_changed) "active for this process but " else "", @errorName(err) },
         );
     }
@@ -309,6 +311,8 @@ pub fn Commands(comptime App: type) type {
         fn statusSnapshot(app: *App, preferred: ?types.CredentialSource, settings_error: ?[]const u8) !info_panel.Snapshot {
             const provider = provider_runtime.provider(app);
             const auth = app.auth.statusSnapshot(provider, preferred);
+            const fx_home = try profile_paths.activeRoot(app.alloc, io_mod.getenv("HOME"));
+            defer if (fx_home) |path| app.alloc.free(path);
             const session = shellSession(app);
             const status: output_contracts.StatusSnapshot = .{
                 .model = provider_runtime.model(app),
@@ -326,6 +330,7 @@ pub fn Commands(comptime App: type) type {
                 .workspace_root = app.workspace_root,
                 .session = session,
                 .settings_error = settings_error,
+                .fx_home = fx_home,
                 .history_turns = app.session.historyLen(),
                 .session_permission_grants = permissions.liveSessionGrantCount(app.permission_engine.grants.items),
                 .agent_step_limit = app.agent_step_limit,
@@ -499,6 +504,10 @@ pub fn Commands(comptime App: type) type {
             }
 
             const first = splitFirstWord(trimmed).?;
+            const scope_word = if (std.ascii.eqlIgnoreCase(first.word, "view")) std.mem.trim(u8, first.rest, " \t") else first.word;
+            if (oldAllowlistWarning(scope_word)) |warning| {
+                try app.writeDomainNotice(.{ .topic = "", .tone = .warning, .body = warning }, true);
+            }
             if (std.ascii.eqlIgnoreCase(first.word, "view")) {
                 const view = parseAllowlistView(first.rest) orelse {
                     try writeAllowlistUsage(app);
@@ -510,10 +519,8 @@ pub fn Commands(comptime App: type) type {
 
             var permission_scope: config_runtime.PermissionScope = .local;
             var action = first;
-            if (std.ascii.eqlIgnoreCase(first.word, "user") or
-                std.ascii.eqlIgnoreCase(first.word, "local"))
-            {
-                permission_scope = if (std.ascii.eqlIgnoreCase(first.word, "user")) .user else .local;
+            if (allowlistScope(first.word)) |scope| {
+                permission_scope = scope;
                 action = splitFirstWord(first.rest) orelse {
                     try writeAllowlistUsage(app);
                     return;
@@ -610,7 +617,7 @@ pub fn Commands(comptime App: type) type {
             try app.writeDomainNotice(.{
                 .topic = "",
                 .tone = .@"error",
-                .body = "usage: /allowlist [view [effective|local|user]|[local|user] add|remove|reset ...]",
+                .body = "usage: /allowlist [view [effective|workspace|global]|[workspace|global] add|remove|reset ...]",
             }, true);
         }
 
@@ -639,14 +646,14 @@ pub fn Commands(comptime App: type) type {
             ) catch |err| {
                 const notice_rule_write_fail = try app.alloc.print(
                     "failed to add rule to settings (scope={s}, error={s})",
-                    .{ @tagName(permission_scope), @errorName(err) },
+                    .{ allowlistScopeWord(permission_scope), @errorName(err) },
                 );
                 defer app.alloc.free(notice_rule_write_fail);
                 try app.writeDomainNotice(.{ .topic = "allowlist", .tone = .@"error", .body = notice_rule_write_fail }, true);
                 debug_trace.logf(
                     "config",
                     "allowlist add failed scope={s} err={s}",
-                    .{ @tagName(permission_scope), @errorName(err) },
+                    .{ allowlistScopeWord(permission_scope), @errorName(err) },
                 );
                 return;
             };
@@ -679,14 +686,14 @@ pub fn Commands(comptime App: type) type {
             ) catch |err| {
                 const notice = try app.alloc.print(
                     "failed to remove rule from settings (scope={s}, error={s})",
-                    .{ @tagName(permission_scope), @errorName(err) },
+                    .{ allowlistScopeWord(permission_scope), @errorName(err) },
                 );
                 defer app.alloc.free(notice);
                 try app.writeDomainNotice(.{ .topic = "allowlist", .tone = .@"error", .body = notice }, true);
                 debug_trace.logf(
                     "config",
                     "allowlist remove failed scope={s} err={s}",
-                    .{ @tagName(permission_scope), @errorName(err) },
+                    .{ allowlistScopeWord(permission_scope), @errorName(err) },
                 );
                 return;
             };
@@ -723,14 +730,14 @@ pub fn Commands(comptime App: type) type {
             ) catch |err| {
                 const notice_reset_fail = try app.alloc.print(
                     "failed to reset rules in settings (scope={s}, error={s})",
-                    .{ @tagName(permission_scope), @errorName(err) },
+                    .{ allowlistScopeWord(permission_scope), @errorName(err) },
                 );
                 defer app.alloc.free(notice_reset_fail);
                 try app.writeDomainNotice(.{ .topic = "allowlist", .tone = .@"error", .body = notice_reset_fail }, true);
                 debug_trace.logf(
                     "config",
                     "allowlist reset failed scope={s} err={s}",
-                    .{ @tagName(permission_scope), @errorName(err) },
+                    .{ allowlistScopeWord(permission_scope), @errorName(err) },
                 );
                 return;
             };
@@ -747,7 +754,7 @@ pub fn Commands(comptime App: type) type {
                         allowlistResetScopeLabel(reset_scope),
                         removed,
                         if (removed == 1) "" else "s",
-                        @tagName(permission_scope),
+                        allowlistScopeWord(permission_scope),
                         @errorName(err),
                     },
                 );
@@ -763,7 +770,7 @@ pub fn Commands(comptime App: type) type {
                         allowlistResetScopeLabel(reset_scope),
                         removed,
                         if (removed == 1) "" else "s",
-                        @tagName(permission_scope),
+                        allowlistScopeWord(permission_scope),
                         @errorName(err),
                     },
                 );
@@ -780,8 +787,8 @@ pub fn Commands(comptime App: type) type {
                     allowlistResetScopeLabel(reset_scope),
                     removed,
                     if (removed == 1) "" else "s",
-                    @tagName(permission_scope),
-                    if (shadow.len > 0) "; user rules shadowed by " else "",
+                    allowlistScopeWord(permission_scope),
+                    if (shadow.len > 0) "; global rules shadowed by " else "",
                     shadow,
                 },
             );
@@ -791,6 +798,25 @@ pub fn Commands(comptime App: type) type {
 
         pub fn toggleFast(app: *App) !void {
             try toggleFastForModel(app, provider_runtime.model(app), true);
+        }
+
+        /// `/fast` toggles; `/fast on` and `/fast off` set the mode and are
+        /// idempotent. Turning it on still checks that the model supports it.
+        pub fn handleFast(app: *App, rest: []const u8) !void {
+            const command = std.mem.trim(u8, rest, " \t");
+            if (command.len == 0) return toggleFast(app);
+            if (std.ascii.eqlIgnoreCase(command, "on")) {
+                if (app.fast_mode) return applyFastMode(app, true, true, true);
+                return toggleFast(app);
+            }
+            if (std.ascii.eqlIgnoreCase(command, "off")) {
+                return applyFastMode(app, false, true, true);
+            }
+            try app.writeDomainNotice(.{
+                .topic = "",
+                .tone = .@"error",
+                .body = "usage: /fast [on|off]",
+            }, true);
         }
 
         pub fn handleUltrafast(app: *App, rest: []const u8) !void {
@@ -1129,7 +1155,7 @@ pub fn Commands(comptime App: type) type {
 
             const shadow = permissionShadowLabel(detailed.permission_sources, permission_scope);
             const detail = if (shadow.len > 0)
-                try app.alloc.print("user rules shadowed by {s}", .{shadow})
+                try app.alloc.print("global rules shadowed by {s}", .{shadow})
             else
                 try app.alloc.dupe(u8, "");
             defer app.alloc.free(detail);
@@ -1169,17 +1195,17 @@ pub fn Commands(comptime App: type) type {
             defer out.deinit();
 
             if (hasAllowlistRules(rules)) {
-                try out.writer.print("{s} persistent allow rules:\n", .{@tagName(view)});
+                try out.writer.print("{s} persistent allow rules:\n", .{allowlistViewWord(view)});
                 try writeAllowlistRuleGroups(&out.writer, rules);
             } else {
-                try out.writer.print("{s} persistent allow rules: (none)\n", .{@tagName(view)});
+                try out.writer.print("{s} persistent allow rules: (none)\n", .{allowlistViewWord(view)});
             }
             const shadow = permissionShadowLabel(detailed.permission_sources, .user);
             if ((view == .effective or view == .user) and
                 detailed.permission_sources.user.rules.len > 0 and
                 shadow.len > 0)
             {
-                try out.writer.print("user rules are shadowed by {s}\n", .{shadow});
+                try out.writer.print("global rules are shadowed by {s}\n", .{shadow});
             }
             const web_fetch_warning_count = permissions.webFetchRuleWarningCount(rules);
             if (web_fetch_warning_count > 0) {
@@ -1586,9 +1612,43 @@ const AllowlistView = enum {
 fn parseAllowlistView(raw: []const u8) ?AllowlistView {
     const trimmed = std.mem.trim(u8, raw, " \t");
     if (trimmed.len == 0 or std.ascii.eqlIgnoreCase(trimmed, "effective")) return .effective;
-    if (std.ascii.eqlIgnoreCase(trimmed, "local")) return .local;
-    if (std.ascii.eqlIgnoreCase(trimmed, "user")) return .user;
+    const scope = allowlistScope(trimmed) orelse return null;
+    return switch (scope) {
+        .local => .local,
+        .user => .user,
+    };
+}
+
+/// The scope words `/allowlist` shows: `global` for the profile's
+/// top level, `workspace` for this folder's entry in the profile.
+fn allowlistScopeWord(scope: config_runtime.PermissionScope) []const u8 {
+    return switch (scope) {
+        .user => "global",
+        .local => "workspace",
+    };
+}
+
+/// The warning for the older scope words `user` and `local`, which still work
+/// until fx drops old spellings; null for any other word.
+fn oldAllowlistWarning(word: []const u8) ?[]const u8 {
+    if (std.ascii.eqlIgnoreCase(word, "user")) return "/allowlist user " ++ command_specs.deprecated_until ++ "; use /allowlist global";
+    if (std.ascii.eqlIgnoreCase(word, "local")) return "/allowlist local " ++ command_specs.deprecated_until ++ "; use /allowlist workspace";
     return null;
+}
+
+/// `global` and `workspace`, and the older `user` and `local`, which still work.
+fn allowlistScope(word: []const u8) ?config_runtime.PermissionScope {
+    if (std.ascii.eqlIgnoreCase(word, "global") or std.ascii.eqlIgnoreCase(word, "user")) return .user;
+    if (std.ascii.eqlIgnoreCase(word, "workspace") or std.ascii.eqlIgnoreCase(word, "local")) return .local;
+    return null;
+}
+
+fn allowlistViewWord(view: AllowlistView) []const u8 {
+    return switch (view) {
+        .effective => "effective",
+        .local => "workspace",
+        .user => "global",
+    };
 }
 
 fn permissionShadowLabel(
@@ -1596,7 +1656,7 @@ fn permissionShadowLabel(
     permission_scope: config_runtime.PermissionScope,
 ) []const u8 {
     if (permission_scope != .user or views.user.rules.len == 0) return "";
-    if (views.user_shadowed_by_local) return "local settings";
+    if (views.user_shadowed_by_local) return "workspace settings";
     return "";
 }
 
@@ -1750,7 +1810,7 @@ fn formatAllowlistChange(
         .tool => try out.writer.print("tool {s}: \"{s}\"", .{ target.category, target.pattern }),
         .web_fetch_domain => try out.writer.print("web-fetch-domain: \"{s}\"", .{target.pattern}),
     }
-    try out.writer.print(" (scope={s})", .{@tagName(permission_scope)});
+    try out.writer.print(" (scope={s})", .{allowlistScopeWord(permission_scope)});
     if (detail.len > 0) try out.writer.print("; {s}", .{detail});
     return out.toOwnedSlice();
 }
@@ -2457,7 +2517,7 @@ test "session_commands handleSettings reports usage and save failures" {
 
     app.clearTranscript();
     try Commands(FakeApp).handleSettings(&app, "startup-scrollback off");
-    try expectTranscriptContains(&app, "✗ startup-scrollback: not saved to user settings (HomeNotSet)");
+    try expectTranscriptContains(&app, "✗ startup-scrollback: not saved to global settings (HomeNotSet)");
     try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
 }
 
@@ -2708,6 +2768,37 @@ test "session_commands handleAllowlist adds lists and removes workspace rules" {
     try expectTranscriptContains(&app, "* allowlist: effective persistent allow rules: (none)");
 }
 
+test "allowlist scopes are global and workspace, and the older user and local still work" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    var app = try FakeApp.init(std.testing.allocator, workspace_root, "anthropic/claude-opus-4.6");
+    defer app.deinit();
+
+    // `global` is the profile's top level, `workspace` this folder's entry.
+    try Commands(FakeApp).handleAllowlist(&app, "global add command \"global *\"");
+    try expectTranscriptContains(&app, "command: \"global *\" (scope=global)");
+    try Commands(FakeApp).handleAllowlist(&app, "workspace add command \"workspace *\"");
+    try expectTranscriptContains(&app, "command: \"workspace *\" (scope=workspace)");
+    try Commands(FakeApp).handleAllowlist(&app, "view global");
+    try expectTranscriptContains(&app, "* allowlist: global persistent allow rules:");
+    try expectTranscriptContains(&app, "global *");
+    try Commands(FakeApp).handleAllowlist(&app, "view workspace");
+    try expectTranscriptContains(&app, "* allowlist: workspace persistent allow rules:");
+    try expectTranscriptContains(&app, "workspace *");
+    try Commands(FakeApp).handleAllowlist(&app, "nowhere add command \"x *\"");
+    try expectTranscriptContains(&app, "usage: /allowlist [view [effective|workspace|global]|[workspace|global] add|remove|reset ...]");
+}
+
 test "session_commands allowlist scopes expose and mutate hidden user rules independently" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2725,22 +2816,22 @@ test "session_commands allowlist scopes expose and mutate hidden user rules inde
     defer app.deinit();
 
     try Commands(FakeApp).handleAllowlist(&app, "user add command \"user *\"");
-    try expectTranscriptContains(&app, "(scope=user)");
+    try expectTranscriptContains(&app, "(scope=global)");
     try std.testing.expect(std.mem.find(u8, app.text(), "shadowed") == null);
 
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "add command \"local *\"");
-    try expectTranscriptContains(&app, "(scope=local)");
+    try expectTranscriptContains(&app, "(scope=workspace)");
 
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "view user");
-    try expectTranscriptContains(&app, "* allowlist: user persistent allow rules:");
+    try expectTranscriptContains(&app, "* allowlist: global persistent allow rules:");
     try expectTranscriptContains(&app, "user *");
-    try expectTranscriptContains(&app, "user rules are shadowed by local settings");
+    try expectTranscriptContains(&app, "global rules are shadowed by workspace settings");
 
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "view local");
-    try expectTranscriptContains(&app, "* allowlist: local persistent allow rules:");
+    try expectTranscriptContains(&app, "* allowlist: workspace persistent allow rules:");
     try expectTranscriptContains(&app, "local *");
     try std.testing.expect(std.mem.find(u8, app.text(), "user *") == null);
 
@@ -2752,7 +2843,7 @@ test "session_commands allowlist scopes expose and mutate hidden user rules inde
 
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "user remove command \"user *\"");
-    try expectTranscriptContains(&app, "(scope=user)");
+    try expectTranscriptContains(&app, "(scope=global)");
     try std.testing.expect(std.mem.find(u8, app.text(), "shadowed") == null);
 
     var after_remove = try config_runtime.loadMergedSettingsDetailed(
@@ -2767,7 +2858,7 @@ test "session_commands allowlist scopes expose and mutate hidden user rules inde
     try Commands(FakeApp).handleAllowlist(&app, "user add command \"user-again *\"");
     app.clearTranscript();
     try Commands(FakeApp).handleAllowlist(&app, "user reset all");
-    try expectTranscriptContains(&app, "reset all: removed 1 rule (scope=user)");
+    try expectTranscriptContains(&app, "reset all: removed 1 rule (scope=global)");
     try std.testing.expect(std.mem.find(u8, app.text(), "shadowed") == null);
 
     var after_reset = try config_runtime.loadMergedSettingsDetailed(
@@ -3263,7 +3354,7 @@ test "session_commands user save notice uses one post-commit load after legacy c
     try Commands(FakeApp).handleModel(&app, "user/new");
 
     try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
-    try expectTranscriptContains(&app, "* model: saved to user settings (scope=user)");
+    try expectTranscriptContains(&app, "* model: saved to global settings (scope=global)");
     try std.testing.expect(std.mem.find(u8, app.text(), "model=project") == null);
     try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
     try expectTranscriptContains(&app, "settings.json.preference-migration.model.");
@@ -3296,7 +3387,7 @@ test "session_commands durable user save survives post-commit resolver failure" 
     try Commands(FakeApp).handleModel(&app, "user/new");
 
     try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
-    try expectTranscriptContains(&app, "! model: saved to user settings (scope=user)");
+    try expectTranscriptContains(&app, "! model: saved to global settings (scope=global)");
     try expectTranscriptContains(&app, "next-startup source unknown");
     try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
     try expectTranscriptContains(&app, "settings.json.preference-migration.model.");
@@ -3330,7 +3421,7 @@ test "session_commands durable user save survives post-commit resolver diagnosti
     try Commands(FakeApp).handleModel(&app, "user/new");
 
     try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
-    try expectTranscriptContains(&app, "! model: saved to user settings (scope=user)");
+    try expectTranscriptContains(&app, "! model: saved to global settings (scope=global)");
     try expectTranscriptContains(&app, "next-startup source unknown (DurablePathUnsafe)");
 }
 
@@ -3347,7 +3438,7 @@ test "session_commands allowlist failures retain explicit scope and error" {
 
     try expectTranscriptContains(
         &app,
-        "✗ allowlist: failed to add rule to settings (scope=user, error=HomeNotSet)",
+        "✗ allowlist: failed to add rule to settings (scope=global, error=HomeNotSet)",
     );
     try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
 }
@@ -3375,7 +3466,7 @@ test "session_commands allowlist durable save survives post-commit resolver diag
     );
 
     try expectTranscriptContains(&app, "! allowlist: added command");
-    try expectTranscriptContains(&app, "(scope=user)");
+    try expectTranscriptContains(&app, "(scope=global)");
     try expectTranscriptContains(
         &app,
         "saved but effective source unknown and runtime reload failed (DurablePathUnsafe)",
@@ -3398,7 +3489,7 @@ test "session_commands runtime-first model keeps runtime state when both durable
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
     try expectTranscriptContains(
         &app,
-        "✗ model: active for this process but not saved to user settings",
+        "✗ model: active for this process but not saved to global settings",
     );
     try expectTranscriptContains(
         &app,
@@ -3423,7 +3514,7 @@ test "session_commands report indeterminate settings and session failures indepe
 
     try Commands(FakeApp).handleModel(&app, "new/model");
 
-    try expectTranscriptContains(&app, "user settings persistence uncertain");
+    try expectTranscriptContains(&app, "global settings persistence uncertain");
     try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
     try expectTranscriptContains(&app, "recovery=/tmp/settings.json.preference-migration.model.json");
     try expectTranscriptContains(&app, "✗ model: failed to persist current session");

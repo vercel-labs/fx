@@ -141,15 +141,15 @@ describe("host-managed authentication", () => {
       FX_AUTH_MODE: "host-managed",
       FX_AUTO_UPGRADE: "0",
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_SOUND: "0",
-      FX_E2E_GATEWAY_MODELS_URL: `${baseUrl}/gateway/models`,
-      FX_E2E_GATEWAY_CHAT_URL: `${baseUrl}/gateway/responses`,
-      FX_E2E_OPENAI_CODEX_MODELS_URL: `${baseUrl}/codex/models`,
-      FX_E2E_OPENAI_CODEX_RESPONSES_URL: `${baseUrl}/codex/responses`,
-      FX_E2E_XAI_GROK_MODELS_URL: `${baseUrl}/grok/models`,
-      FX_E2E_XAI_GROK_MODALITIES_URL: `${baseUrl}/grok/modalities`,
-      FX_E2E_XAI_GROK_RESPONSES_URL: `${baseUrl}/grok/responses`,
+      FX_TEST_GATEWAY_MODELS_URL: `${baseUrl}/gateway/models`,
+      FX_TEST_GATEWAY_CHAT_URL: `${baseUrl}/gateway/responses`,
+      FX_TEST_OPENAI_CODEX_MODELS_URL: `${baseUrl}/codex/models`,
+      FX_TEST_OPENAI_CODEX_RESPONSES_URL: `${baseUrl}/codex/responses`,
+      FX_TEST_XAI_GROK_MODELS_URL: `${baseUrl}/grok/models`,
+      FX_TEST_XAI_GROK_MODALITIES_URL: `${baseUrl}/grok/modalities`,
+      FX_TEST_XAI_GROK_RESPONSES_URL: `${baseUrl}/grok/responses`,
     };
   }
 
@@ -160,10 +160,11 @@ describe("host-managed authentication", () => {
     expect(status.stderr).toBe("");
     expect(JSON.parse(status.stdout).auth).toBe("host managed");
 
-    for (const command of [["login"], ["logout"], ["setup"], ["teams"]]) {
+    for (const command of [["login"], ["login", "--api-key"], ["logout"], ["setup"], ["teams"]]) {
       const result = await runFx(command, { cwd: workspace, env: childEnv });
       expect(result.code).toBe(0);
-      expect(result.stderr).toBe("");
+      // `fx setup` is deprecated and says so even when the host manages authentication.
+      expect(result.stderr).toBe(command[0] === "setup" ? "fx setup is deprecated and stops working in fx 0.0.17; use fx login vercel --api-key\n" : "");
       expect(result.stdout).toBe("Authentication is managed by the host.\n");
     }
     expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);

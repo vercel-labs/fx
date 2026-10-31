@@ -68,7 +68,7 @@ function gatewayEnv(
     VERCEL_OIDC_TOKEN: undefined,
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_MODEL: FAKE_GATEWAY_MODEL,
     FX_AUTO_UPGRADE: "0",
   };
@@ -102,7 +102,7 @@ async function continueSession(
       "ask",
       "--json",
       "--auto",
-      ...(latest ? ["--resume", "last"] : ["--resume-id", sessionId]),
+      ...(latest ? ["--resume", "last"] : ["--resume", sessionId]),
       "Continue after recovery.",
     ],
     {
@@ -209,7 +209,7 @@ test("conversation language survives an ordinary saved turn and resume", async (
     expect(seeded.code).toBe(0);
     const id = JSON.parse(seeded.stdout).session_id;
     expect((await savedSession(fixture.home, id)).conversation_language).toBe("ja");
-    const resumed = await runFx(["ask", "--json", "--resume-id", id, "👍"], {
+    const resumed = await runFx(["ask", "--json", "--resume", id, "👍"], {
       cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
     });
     expect(resumed.code).toBe(0);
@@ -335,7 +335,7 @@ function legacyGatewayEnv(
 ) {
   return {
     ...gatewayEnv(fixture, gateway), FX_MODEL: undefined, FX_EFFORT: undefined,
-    FX_FAST_MODE: undefined, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_FAST_MODE: undefined, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
     FX_TRACE_LOG: join(fixture.root, "legacy.trace.log"), FX_TRACE_SCOPES: "tool,session,agent",
   };
 }
@@ -419,7 +419,7 @@ describe("session recovery", () => {
         through_event_id: records.at(-1).event_id, through_event_log_bytes: Buffer.byteLength(events) }), { mode: 0o600 });
       const oldHashes = savedFileHashes(legacy.source);
       const healthyId = await createSavedSession(fixture, gateway);
-      const env = { ...legacyGatewayEnv(fixture, gateway), FX_SOUND: "0", FX_SKIP_ONBOARDING: "1" };
+      const env = { ...legacyGatewayEnv(fixture, gateway), FX_SOUND: "0", FX_TEST_SKIP_ONBOARDING: "1" };
       const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
       async function resume(args: string[], marker: string, label: string) {
         const stderrPath = join(fixture.root, `${label}.stderr`);
@@ -439,7 +439,7 @@ describe("session recovery", () => {
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await tui.kill(); tui = undefined;
       }
-      await resume(["--resume-last"], "HEALTHY_LATEST_USAGE", "latest");
+      await resume(["--resume", "last"], "HEALTHY_LATEST_USAGE", "latest");
       expect(savedFileHashes(legacy.source)).toEqual(oldHashes);
       expect(gateway.requests).toHaveLength(1);
       expect(existsSync(sessionDir(fixture.home, healthyId))).toBe(true);
@@ -574,7 +574,7 @@ describe("session recovery", () => {
           fakeGatewayFinalText("RECOVERED_CONTINUATION_SAVED"),
         );
         const tracePath = join(fixture.root, "continue.trace.log");
-        const continued = await runFx(["ask", "--json", "--full-access", "--resume-id", result.recovered_id, "Read the retained result. Do not repeat completed commands."], {
+        const continued = await runFx(["ask", "--json", "--full-access", "--resume", result.recovered_id, "Read the retained result. Do not repeat completed commands."], {
           cwd: fixture.workspace,
           env: { ...gatewayEnv(fixture, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "tool,session,agent" },
           timeoutMs: TIMEOUT,
@@ -695,7 +695,7 @@ describe("session recovery", () => {
         const result = JSON.parse(recovered.stdout);
         expect(result).toMatchObject({ kind: "session_recovery", source_id: id, status: "recovered_with_unverified_artifacts" });
         expect(savedFileHashes(source)).toEqual(before);
-        const continued = await runFx(["ask", "--json", "--resume-id", result.recovered_id, "What did the command print?"], {
+        const continued = await runFx(["ask", "--json", "--resume", result.recovered_id, "What did the command print?"], {
           cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
         });
         expect(continued.code).toBe(0);
@@ -839,7 +839,7 @@ describe("session recovery", () => {
       const fencedBefore = savedFileHashes(fenced);
       const stderrPath = join(fixture.root, "continue.stderr");
       tui = await TmuxSession.create({
-        cmd: `${JSON.stringify(FX_BIN)} --resume-last`,
+        cmd: `${JSON.stringify(FX_BIN)} --resume last`,
         cwd: fixture.workspace, env: gatewayEnv(fixture, gateway), stderrPath,
       });
       await tui.waitForComposer(TIMEOUT);
@@ -967,7 +967,7 @@ describe("session recovery", () => {
         ...JSON.parse(watermark), through_event_log_bytes: Buffer.byteLength(readFileSync(join(legacy.source, "events.jsonl"))) - 1,
       }));
       const before = savedFileHashes(legacy.source);
-      const failed = await runFx(["ask", "--json", "--auto", "--resume-id", legacy.id, "Do not run with invalid history."], {
+      const failed = await runFx(["ask", "--json", "--auto", "--resume", legacy.id, "Do not run with invalid history."], {
         cwd: fixture.workspace, env: legacyGatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
       });
       expect(failed.timedOut).toBe(false);
@@ -978,7 +978,7 @@ describe("session recovery", () => {
       expect(readdirSync(join(fixture.home, ".fx", "sessions"))).toEqual([legacy.id]);
       writeFileSync(legacy.watermarkPath, watermark);
 
-      for (const [index, args] of [["--resume-id", legacy.id], ["--resume", "last"]].entries()) {
+      for (const [index, args] of [["--resume", legacy.id], ["--resume", "last"]].entries()) {
         const result = await runFx(["ask", "--json", "--auto", ...args, "Continue the synthetic saved conversation."], {
           cwd: fixture.workspace, env: legacyGatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
         });
@@ -1034,7 +1034,7 @@ describe("session recovery", () => {
 
         expect(gateway.requests).toHaveLength(0);
         const prompt = "Continue after the superseding legacy event.";
-        const result = await runFx(["ask", "--json", "--auto", "--resume-id", legacy.id, prompt], {
+        const result = await runFx(["ask", "--json", "--auto", "--resume", legacy.id, prompt], {
           cwd: fixture.workspace, env: legacyGatewayEnv(fixture, gateway), timeoutMs: TIMEOUT,
         });
         expect(result.code).toBe(0);

@@ -171,7 +171,7 @@ function askEnv(
     AI_GATEWAY_API_KEY: "fake-shell-tool-key",
     VERCEL_OIDC_TOKEN: undefined,
     FX_DISABLE_KEYCHAIN: "1",
-    FX_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_ONBOARDING: "1",
     FX_AUTO_UPGRADE: "0",
     FX_PERMISSION_MODE: "yolo",
     FX_MODEL: FAKE_GATEWAY_MODEL,
@@ -1135,7 +1135,7 @@ test.skipIf(!tmuxAvailable())(
     const resumed = await launch(
       fixture,
       gateway,
-      `${FX_BIN} --resume-last`,
+      `${FX_BIN} --resume last`,
     );
     await resumed.sendText("Use the earlier managed TTY.");
     await resumed.waitForText("SHELL_TTY_RESUME_OK", TIMEOUT);
