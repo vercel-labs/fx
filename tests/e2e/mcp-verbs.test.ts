@@ -448,6 +448,25 @@ describe("/mcp in the shell", () => {
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toEqual({ type: "http", url: "https://w.example/mcp" });
   }, 90_000);
 
+  test.skipIf(!tmuxAvailable())("/mcp add joins a backslash-newline in its arguments the way the shell does", async () => {
+    // Every shell reads `"a\<newline>b"` as `ab`, so that is the argument
+    // the saved server gets.
+    const root = createRoot();
+    gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.pasteText('/mcp add probe -- /bin/echo "a\\\nb"');
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Added probe to ~/.fx/mcp.json.", 10_000);
+    expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.probe).toEqual({ command: "/bin/echo", args: ["ab"] });
+  }, 60_000);
+
   test.skipIf(!tmuxAvailable())("a config change restarts only the server it changed, never freezes the shell, and a server runs one copy at a time", async () => {
     // `s` keeps running after its input closes and ignores SIGTERM, so fx
     // takes about 3 s to stop it: 1.5 s for it to exit, 1.5 s after SIGTERM.
