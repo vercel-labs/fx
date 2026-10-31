@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runFx } from "../evals/eval-helpers";
+import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { contentText } from "./conditional-guidance-oracle";
 import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import {
@@ -3910,4 +3910,465 @@ describe("MCP stdio servers", () => {
     // Nothing needed the configured server, so it never started.
     expect(existsSync(root.wireLogPath)).toBe(false);
   }, 25_000);
+});
+
+// `fx mcp call` lets a command fx's shell tool runs call the session's MCP
+// tools, so a big result can go to a file and only what the command prints
+// reaches the model (`src/core/mcp_host/mcp_call_bridge.zig`).
+describe("fx mcp call", () => {
+  const bridgeRoot = (label: string, settings: Record<string, unknown> = {}, options: RootOptions = {}) => {
+    const root = createRoot(label, MODERN_FIXTURE, options);
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.fixture.environment.FX_MCP_RESULT_PAD_BYTES = String(1536 * 1024);
+    profile.mcp.fixture.environment.FX_MCP_RESULT_TEXT = "BRIDGE_TAIL";
+    writeFileSync(profilePath, JSON.stringify(profile));
+    writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify(settings));
+    return root;
+  };
+  const command = `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"hello"}' > out.txt; echo "exit=$?"; wc -c < out.txt | tr -d ' '; tail -c 18 out.txt`;
+  const toolCalls = (root: FixtureRoot) =>
+    existsSync(root.wireLogPath)
+      ? readWire(root.wireLogPath).filter((entry) => entry.message.method === "tools/call")
+      : [];
+
+  test("a command saves a big MCP result to a file, and only what it prints reaches the model", async () => {
+    const root = bridgeRoot("bridge-file");
+    let seen = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command }),
+      (body: string) => {
+        seen = toolResultText(body, "run_call");
+        return fakeGatewayFinalText("BRIDGE_DONE");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Save the list to a file."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 40_000,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("BRIDGE_DONE");
+    expect(seen).toContain("exit=0");
+    expect(seen).toContain("BRIDGE_TAIL:hello");
+    expect(seen.length).toBeLessThan(4096);
+    const saved = readFileSync(join(root.workspace, "out.txt"), "utf8");
+    expect(saved.length).toBeGreaterThan(1536 * 1024);
+    expect(saved.trimEnd().endsWith("BRIDGE_TAIL:hello")).toBe(true);
+    // Its stderr line tells the model what the file holds.
+    expect(seen).toContain(`fx mcp call: wrote ${Buffer.byteLength(saved)} bytes of text`);
+    expect(toolCalls(root)).toHaveLength(1);
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())(
+    "in the TUI, a command's call waits for the user's approval, then saves the result",
+    async () => {
+      // The TUI can show forms, so it declares elicitation to every server.
+      const root = bridgeRoot("bridge-tui-approval", {}, { expectedElicitation: "both" });
+      const stderrPath = join(root.root, "stderr.log");
+      let seen = "";
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("run_call", "shell", { action: "run", command }),
+        (body: string) => {
+          seen = toolResultText(body, "run_call");
+          return fakeGatewayFinalText("BRIDGE_TUI_DONE");
+        },
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "ask" },
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Save the list to a file.");
+      // The shell command asks first, as any command does in ask mode.
+      await tui.waitForText("Would you like to run the following command?", 20_000);
+      await tui.sendKeys("1");
+      // Then its `fx mcp call` asks while the command waits, and nothing
+      // reaches the server before the answer.
+      const approval = await tui.waitForText("Allow this MCP tool call?", 20_000);
+      expect(approval).toContain(TOOL_NAME);
+      expect(toolCalls(root)).toHaveLength(0);
+      await tui.sendKeys("1");
+
+      await tui.waitForText("BRIDGE_TUI_DONE", 20_000);
+      expect(seen).toContain("exit=0");
+      expect(seen).toContain("BRIDGE_TAIL:hello");
+      expect(seen.length).toBeLessThan(4096);
+      expect(readFileSync(join(root.workspace, "out.txt"), "utf8").length).toBeGreaterThan(1536 * 1024);
+      expect(toolCalls(root)).toHaveLength(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
+
+  test("a call the permission rules deny runs nothing, and the command learns why", async () => {
+    const root = bridgeRoot("bridge-denied", { permission: { bash: { "*": "allow" }, [TOOL_NAME]: "deny" } });
+    let seen = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command }),
+      (body: string) => {
+        seen = toolResultText(body, "run_call");
+        return fakeGatewayFinalText("BRIDGE_DENIED");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Save the list to a file."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 40_000,
+    });
+    expect(result.code).toBe(0);
+    expect(seen).toContain("exit=5");
+    expect(seen).toContain("did not run");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 60_000);
+
+  // Runs one shell command through the built binary and returns what the
+  // model saw of it.
+  const runBridgeCommand = async (root: FixtureRoot, shellCommand: string) => {
+    let seen = "";
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("run_call", "shell", { action: "run", command: shellCommand }),
+      (body: string) => {
+        seen = toolResultText(body, "run_call");
+        return fakeGatewayFinalText("BRIDGE_OUTCOME_DONE");
+      },
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const result = await runFx(["ask", "--json", "--full-access", "--no-save", "Run the command."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway),
+      timeoutMs: 80_000,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("BRIDGE_OUTCOME_DONE");
+    return seen;
+  };
+  const callTo = (outFile: string, text = "hello") =>
+    `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"${text}"}' > ${outFile} 2> err.txt; echo "exit=$?"; cat err.txt; echo "out=$(wc -c < ${outFile} | tr -d ' ')"`;
+
+  test("a tool that returns an error exits 6 with the tool's message and no data", async () => {
+    const root = bridgeRoot("bridge-tool-error", {}, { mode: "tool_failure" });
+    const seen = await runBridgeCommand(root, callTo("out.txt"));
+    expect(seen).toContain("exit=6");
+    expect(seen).toContain("returned an error");
+    expect(seen).toContain("Invalid input: labels require at least one item");
+    expect(seen).toContain("out=0");
+    expect(toolCalls(root)).toHaveLength(1);
+  }, 90_000);
+
+  test("a call whose server crashes exits 1, and the command learns why", async () => {
+    const root = bridgeRoot("bridge-crash", {}, { mode: "crash_always", restartLimit: 0 });
+    const seen = await runBridgeCommand(root, callTo("out.txt"));
+    expect(seen).toContain("exit=1");
+    expect(seen).toContain("fx mcp call: ");
+    expect(seen).toContain("out=0");
+  }, 90_000);
+
+  test("arguments that are not one JSON object exit 2, and nothing is sent", async () => {
+    const root = bridgeRoot("bridge-usage");
+    const seen = await runBridgeCommand(
+      root,
+      `"${FX_BIN}" mcp call ${TOOL_NAME} '[1]'; echo "array=$?"; "${FX_BIN}" mcp call ${TOOL_NAME} 'not json'; echo "text=$?"; "${FX_BIN}" mcp call; echo "none=$?"`,
+    );
+    expect(seen).toContain("array=2");
+    expect(seen).toContain("text=2");
+    expect(seen).toContain("none=2");
+    expect(seen).toContain("must be one JSON object");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 90_000);
+
+  test("a ninth call while eight are running exits 4, and it never reaches the server", async () => {
+    const root = bridgeRoot("bridge-busy", {}, { mode: "stall_operation", operationTimeoutMs: 15_000 });
+    const holders = Array.from({ length: 8 }, (_, index) =>
+      `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"hold${index}"}' > /dev/null 2>&1 &`).join(" ");
+    const seen = await runBridgeCommand(
+      root,
+      `${holders} sleep 3; ${callTo("out.txt", "ninth")}; kill $(jobs -p) 2>/dev/null; wait 2>/dev/null; true`,
+    );
+    expect(seen).toContain("exit=4");
+    expect(seen).toContain("out=0");
+    const texts = toolCalls(root).map((entry) => (entry.message.params?.arguments as { text?: string } | undefined)?.text);
+    expect(texts).not.toContain("ninth");
+    expect(texts.length).toBeLessThanOrEqual(8);
+  }, 120_000);
+
+  // A socket that answers like an fx bridge, so the client's own refusals
+  // can be driven without a session.
+  const withFakeBridge = async (reply: string | null, run: (env: Record<string, string>) => Promise<void>) => {
+    const dir = mkdtempSync(join(tmpdir(), "fxmc-"));
+    const socketPath = join(dir, "s");
+    const server = Bun.listen({
+      unix: socketPath,
+      socket: {
+        data(socket) {
+          if (reply !== null) socket.write(reply);
+          socket.end();
+        },
+      },
+    });
+    try {
+      await run({ FX_MCP_CALL_SOCKET: socketPath, FX_MCP_CALL_TOKEN: "ab".repeat(32) });
+    } finally {
+      server.stop(true);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  const runClient = async (env: Record<string, string | undefined>) => {
+    const child = Bun.spawn([FX_BIN, "mcp", "call", TOOL_NAME, '{"text":"hello"}'], {
+      env: { ...process.env, FX_MCP_CALL_SOCKET: undefined, FX_MCP_CALL_TOKEN: undefined, FX_SOUND: "0", ...env },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    return { stdout, stderr, code };
+  };
+
+  test("outside a shell call, or against another fx version, a call exits 3", async () => {
+    const outside = await runClient({});
+    expect(outside.code).toBe(3);
+    expect(outside.stderr).toContain("no running fx shell call to reach");
+    expect(outside.stdout).toBe("");
+
+    await withFakeBridge('{"v":999,"status":"ok","bytes":0}\n', async (env) => {
+      const other = await runClient(env);
+      expect(other.code).toBe(3);
+      expect(other.stderr).toContain("another fx version");
+      expect(other.stdout).toBe("");
+    });
+  }, 30_000);
+
+  test("a bridge that closes without replying exits 1 and writes no data", async () => {
+    await withFakeBridge(null, async (env) => {
+      const lost = await runClient(env);
+      expect(lost.code).toBe(1);
+      expect(lost.stderr).toContain("the connection to fx was lost");
+      expect(lost.stdout).toBe("");
+    });
+  }, 30_000);
+
+  // A subagent's command reaches the bridge through its own shell call, with
+  // the subagent's access, under the same permission rules as its parent.
+  const runSubagentCommand = async (root: FixtureRoot, mode: "--full-access" | "--auto") => {
+    let seen = "";
+    let childRanCommand = false;
+    const activeGateway = startDynamicFakeGateway(async (body) => {
+      if (body.includes('"toolCallId":"create_bridge_child"')) return fakeGatewayFinalText("BRIDGE_PARENT_DONE");
+      if (body.includes('"toolCallId":"child_call"')) {
+        seen = toolResultText(body, "child_call");
+        // The command ran in the subagent's turn, not the parent's.
+        childRanCommand = body.includes("BRIDGE_CHILD_TASK") && !body.includes("BRIDGE_PARENT_TASK");
+        return fakeGatewayFinalText("BRIDGE_CHILD_DONE");
+      }
+      if (body.includes("BRIDGE_CHILD_TASK")) {
+        return fakeGatewayToolCall("child_call", "shell", { action: "run", command });
+      }
+      if (body.includes("BRIDGE_PARENT_TASK")) {
+        return fakeGatewayToolCall("create_bridge_child", "subagent", {
+          request: { action: "run", task: "BRIDGE_CHILD_TASK" },
+        });
+      }
+      return fakeGatewayFinalText("unexpected bridge subagent request");
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    gateway = activeGateway;
+    const result = await runFx(["ask", "--json", mode, "BRIDGE_PARENT_TASK"], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, activeGateway),
+      timeoutMs: 60_000,
+    });
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("BRIDGE_PARENT_DONE");
+    expect(childRanCommand).toBe(true);
+    return seen;
+  };
+
+  test("a subagent's command saves a big result to a file through its own shell call", async () => {
+    const root = bridgeRoot("bridge-subagent");
+    const seen = await runSubagentCommand(root, "--full-access");
+    expect(seen).toContain("exit=0");
+    expect(seen).toContain("BRIDGE_TAIL:hello");
+    expect(seen).toContain("fx mcp call: wrote");
+    expect(seen.length).toBeLessThan(4096);
+    const saved = readFileSync(join(root.workspace, "out.txt"), "utf8");
+    expect(saved.length).toBeGreaterThan(1536 * 1024);
+    expect(toolCalls(root)).toHaveLength(1);
+  }, 90_000);
+
+  test("a subagent's call meets the same deny rule as its parent's", async () => {
+    const root = bridgeRoot("bridge-subagent-denied", { permission: { bash: { "*": "allow" }, [TOOL_NAME]: "deny" } });
+    const seen = await runSubagentCommand(root, "--auto");
+    expect(seen).toContain("exit=5");
+    expect(seen).toContain("did not run");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 90_000);
+
+  // What the command printed, from the shell tool's result.
+  const shellOutput = (result: string): string => JSON.parse(result).output_delta;
+
+  // A shell loop that follows each page's cursor, as a script paging through
+  // a long list would.
+  const pageLoop = [
+    `cursor=0; n=0; : > all.txt`,
+    `while [ -n "$cursor" ]; do`,
+    `  "${FX_BIN}" mcp call ${TOOL_NAME} "{\\"text\\":\\"$cursor\\"}" > page.json 2>/dev/null || { echo "exit=$?"; break; }`,
+    `  n=$((n+1)); grep -o '"item-[0-9]*"' page.json >> all.txt`,
+    `  cursor=$(grep -o '"nextCursor":"[0-9]*"' page.json | grep -o '[0-9][0-9]*')`,
+    `done`,
+    `echo "calls=$n items=$(wc -l < all.txt | tr -d ' ')"`,
+  ].join("\n");
+
+  test("a shell loop pages through a tool's results, one call per page", async () => {
+    const root = bridgeRoot("bridge-pages", {}, { mode: "paged" });
+    const seen = await runBridgeCommand(root, pageLoop);
+    expect(seen).toContain("calls=3 items=9");
+    expect(seen).not.toContain("exit=");
+    expect(readFileSync(join(root.workspace, "all.txt"), "utf8").trim().split("\n")).toEqual(
+      Array.from({ length: 9 }, (_, index) => `"item-${index}"`),
+    );
+    // Each page is its own call, with the cursor the last page gave.
+    expect(toolCalls(root).map((entry) => entry.message.params?.arguments?.text)).toEqual(["0", "1", "2"]);
+  }, 90_000);
+
+  test("a structured result that is only one result string saves as that text", async () => {
+    const root = bridgeRoot("bridge-wrapped", {}, { mode: "wrapped_text" });
+    const seen = await runBridgeCommand(root, `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"docs"}' > docs.md; echo "exit=$?"`);
+    expect(seen).toContain("exit=0");
+    const saved = readFileSync(join(root.workspace, "docs.md"), "utf8");
+    expect(saved).toBe("# Page: Overview\n\nwrapped docs\n");
+    expect(seen).toContain(`fx mcp call: wrote ${Buffer.byteLength(saved)} bytes of text`);
+  }, 90_000);
+
+  test("list, search, and help describe the agent's tools to a command, and call none", async () => {
+    const root = bridgeRoot("bridge-lookups");
+    const seen = shellOutput(await runBridgeCommand(root, [
+      `"${FX_BIN}" mcp call list fixture; echo "list=$?"`,
+      `"${FX_BIN}" mcp call search echo text; echo "search=$?"`,
+      `"${FX_BIN}" mcp call help ${TOOL_NAME}; echo "help=$?"`,
+      `"${FX_BIN}" mcp call help mcp_fixture_nope; echo "missing=$?"`,
+      `"${FX_BIN}" mcp call list nope; echo "server=$?"`,
+    ].join("\n")));
+    const line = `${TOOL_NAME}\tEcho text through the modern MCP fixture`;
+    expect(seen).toContain(`${line}\nlist=0`);
+    expect(seen).toContain(`${line}\nsearch=0`);
+    // The description is the one the model gets, the server's instructions
+    // included, then each argument.
+    expect(seen).toContain(`${TOOL_NAME}\nEcho text through the modern MCP fixture\n\nServer instructions: Use the modern echo tool.\n`);
+    expect(seen).toContain("\nArguments, as one JSON object:\n  text: string\nhelp=0");
+    expect(seen).toContain("No MCP tool named mcp_fixture_nope is available to this agent.");
+    expect(seen).toContain("missing=1");
+    expect(seen).toContain("No MCP server by that name is available to this agent.");
+    expect(seen).toContain("server=1");
+    expect(toolCalls(root)).toHaveLength(0);
+  }, 90_000);
+
+  test("list, search, and help hide a tool the permission rules deny", async () => {
+    const root = bridgeRoot("bridge-lookups-denied", { permission: { bash: { "*": "allow" }, [TOOL_NAME]: "deny" } });
+    const seen = shellOutput(await runBridgeCommand(root, [
+      `"${FX_BIN}" mcp call list fixture; echo "list=$?"`,
+      `"${FX_BIN}" mcp call help ${TOOL_NAME}; echo "help=$?"`,
+    ].join("\n")));
+    expect(seen).not.toContain(`${TOOL_NAME}\t`);
+    expect(seen).toContain("list=0");
+    expect(seen).toContain(`No MCP tool named ${TOOL_NAME} is available to this agent.`);
+    expect(seen).toContain("help=1");
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())(
+    "in the TUI, each call a command makes shows as its own MCP row beside the command",
+    async () => {
+      const root = bridgeRoot("bridge-tui-rows", {}, { mode: "paged", expectedElicitation: "both" });
+      const stderrPath = join(root.root, "stderr.log");
+      let seen = "";
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("run_call", "shell", { action: "run", command: pageLoop }),
+        (body: string) => {
+          seen = toolResultText(body, "run_call");
+          return fakeGatewayFinalText("BRIDGE_ROWS_DONE");
+        },
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "full-access" },
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Page through the list.");
+      await tui.waitForText("BRIDGE_ROWS_DONE", 30_000);
+      const scrollback = await tui.captureFullScrollback();
+      // The rows a direct call of the tool gets, in the command's group.
+      expect(scrollback).toContain("● 4 tool calls · 3 MCP calls · 1 command");
+      expect(scrollback.split(`Ran MCP ${TOOL_NAME}`)).toHaveLength(4);
+      expect(scrollback).toContain(`└ Ran MCP ${TOOL_NAME}`);
+      expect(scrollback).not.toContain("Running MCP");
+      expect(seen).toContain("calls=3 items=9");
+      // The model sees the command's output, not the rows.
+      expect(seen).not.toContain("Ran MCP");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "in the TUI, a call that runs when the user cancels shows as running, then as cancelled",
+    async () => {
+      const root = bridgeRoot("bridge-tui-cancel", {}, { mode: "stall_operation", operationTimeoutMs: 30_000, expectedElicitation: "both" });
+      const stderrPath = join(root.root, "stderr.log");
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("run_call", "shell", { action: "run", command }),
+        fakeGatewayFinalText("BRIDGE_AFTER_CANCEL"),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: { ...fixtureEnv(root, activeGateway), FX_PERMISSION_MODE: "full-access" },
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Save the list to a file.");
+      await tui.waitForText(`Running MCP ${TOOL_NAME}`, 20_000);
+      expect(toolCalls(root)).toHaveLength(1);
+      await tui.sendInterruptEscapePair(10_000);
+      await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
+      await tui.waitForStableComposer(10_000);
+      expect(await tui.captureFullScrollback()).not.toContain("Running MCP");
+
+      // The session goes on.
+      await tui.sendText("Go on.");
+      await tui.waitForText("BRIDGE_AFTER_CANCEL", 10_000);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    },
+    60_000,
+  );
 });

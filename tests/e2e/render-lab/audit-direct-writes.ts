@@ -66,6 +66,7 @@ const allowlist: AllowRule[] = [
   rule("src/core/cli/cli_ask.zig", "(?:writeRealStdout|writeRealStderr)", /stdio_acquisition_write/, "noninteractive_output", "workflow CLI output"),
   rule("src/core/cli/cli_ask.zig", "realStdoutIsTty", /stdio_acquisition/, "terminal_probe", "ask presentation TTY capability probe"),
   rule("src/core/cli/cli_ask.zig", "realStderrIsTty", /stdio_acquisition/, "terminal_probe", "notification fallback TTY capability probe"),
+  rule("src/core/mcp_host/mcp_call_client.zig", "stdoutIsTerminal", /stdio_acquisition/, "terminal_probe", "fx mcp call result summary TTY probe"),
   rule("src/core/cli/cli_replay.zig", "(?:writeStdout|writeStderr)", /stdio_acquisition_write/, "noninteractive_output", "replay process output"),
   rule("src/core/cli/cli_surface.zig", "(?:writeRealStdout|writeRealStderr|writeFdAll)", /(?:stdio_acquisition_write|fixed_fd_write|raw_fd_write|delegated_fd_write)/, "noninteractive_output", "top-level CLI output"),
   rule("src/core/cli/cli_surface.zig", "(?:setupTerminalAvailableDefault|enable)", /fixed_descriptor/, "terminal_probe", "masked setup prompt TTY and raw-mode setup"),

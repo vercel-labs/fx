@@ -4699,6 +4699,12 @@ test {
     _ = @import("mcp/mcp.zig");
     _ = @import("core/mcp_host/runtime.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
+    _ = @import("core/mcp_host/mcp_call.zig");
+    _ = @import("core/mcp_host/mcp_call_wire.zig");
+    _ = @import("core/mcp_host/mcp_call_bridge.zig");
+    _ = @import("core/mcp_host/mcp_call_client.zig");
+    _ = @import("core/mcp_host/verbs.zig");
+    _ = @import("core/mcp/tool_lookup.zig");
     _ = @import("core/recovery/recovery.zig");
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");

@@ -717,6 +717,13 @@ pub fn Bindings(comptime App: type) type {
             };
         }
 
+        /// Shows a row a running tool call adds for a call of its own
+        /// (`tool_runtime` `nested_tool_lifecycle`).
+        pub fn pushNestedToolLifecycle(ctx: *anyopaque, event: types.ToolLifecycleEvent) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app_worker_runtime.Runtime(App).pushToolLifecycle(app, event);
+        }
+
         fn renderSubagentStatusLine(ctx: *anyopaque, buf: []u8, status: types.SubagentStatus) []const u8 {
             const app: *App = @ptrCast(@alignCast(ctx));
             const show_context = if (comptime @hasField(App, "statusline_context")) app.statusline_context else false;

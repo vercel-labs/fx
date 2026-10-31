@@ -27,6 +27,7 @@ const host = @import("../hosts/host.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
 const tool_result_limits = @import("tool_result_limits.zig");
 const tool_mcp_runtime = @import("tool_mcp_runtime.zig");
+const mcp_call_capability = @import("mcp_call_capability.zig");
 const web_search_contract = @import("web_search_contract.zig");
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -317,6 +318,9 @@ pub const DispatchContext = struct {
     mcp_call_options: tool_mcp_runtime.CallOptions = .{},
     mcp_call_status_sink: ?*?tool_mcp_runtime.CallStatus = null,
     mcp_execution_error_sink: ?*?anyerror = null,
+    /// Lent to `fx mcp call` while this tool call runs; see
+    /// `mcp_call_capability.zig`. Only the shell tool uses it.
+    mcp_call_capability: ?mcp_call_capability.Capability = null,
     mcp_permission_rules: core_types.PermissionRuleSet = .{},
     selected_dynamic_tool_ctx: ?*anyopaque = null,
     on_selected_dynamic_tool: ?SelectedDynamicToolSinkFn = null,

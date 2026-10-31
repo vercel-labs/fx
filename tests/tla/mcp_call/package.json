@@ -1,0 +1,8 @@
+{
+  "name": "fx-tla-mcp-call",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "verify": "bun ../drivers/mcp_call/verify.ts"
+  }
+}

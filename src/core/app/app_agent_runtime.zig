@@ -309,6 +309,7 @@ pub fn Runtime(comptime App: type) type {
                 .on_mcp_progress = app_callbacks.Bindings(App).onMcpProgress,
                 .tool_progress_ctx = @ptrCast(app),
                 .on_tool_progress = app_callbacks.Bindings(App).onToolProgress,
+                .nested_tool_lifecycle = .{ .context = @ptrCast(app), .push_fn = app_callbacks.Bindings(App).pushNestedToolLifecycle },
                 .subagent_status_renderer = app_callbacks.Bindings(App).subagentStatusRenderer(app),
                 .lifecycle_view = app.lifecycle_view,
                 .lifecycle_scope = lifecycleContext(app).scope,
@@ -1335,7 +1336,7 @@ fn formatInvalidArgsToolAction(arena: Allocator, state: ToolActionState, denied_
 }
 
 fn formatToolActionValue(arena: Allocator, label: []const u8, value: []const u8) ![]const u8 {
-    return arena.print("● {s}\x1b[0m {s}{s}\x1b[0m", .{ label, shared_theme.current().tool_stdout_style, value });
+    return tool_presentation.formatToolActionValue(arena, label, value);
 }
 
 /// Command rows keep the muted tool-text base and add shell syntax colors for
@@ -1372,8 +1373,8 @@ fn presentationLabel(presentation: tool_dispatch.CallPresentation, state: ToolAc
 
 fn dynamicMcpActionLabel(state: ToolActionState) ?[]const u8 {
     return switch (state) {
-        .active => "Running MCP",
-        .completed => "Ran MCP",
+        .active => tool_presentation.mcp_running_label,
+        .completed => tool_presentation.mcp_ran_label,
         .denied => null,
     };
 }

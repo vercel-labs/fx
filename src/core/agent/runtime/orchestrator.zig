@@ -9993,6 +9993,7 @@ fn processQueuedPromptLoop(
                         .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                         .max_tool_result_bytes = config.max_tool_result_bytes,
                         .classification_complete = executable_classification_complete.items,
+                        .presentation_group_id = stream_ctx.provisional_statuses.presentation_group_id,
                     };
                     var completion_publisher = ParallelSubagentCompletionPublisher{
                         .deps = deps,
@@ -11354,6 +11355,7 @@ fn processQueuedPromptLoop(
                 else
                     false,
                 .lifecycle_id = execution_lifecycle_id,
+                .presentation_group_id = stream_ctx.provisional_statuses.presentation_group_id,
             }) catch |err| blk: {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
