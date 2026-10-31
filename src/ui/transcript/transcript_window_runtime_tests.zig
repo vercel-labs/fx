@@ -437,3 +437,33 @@ test "a transcript window drop that runs out of memory leaves the transcript as 
     // The drop allocates, so some of the runs above failed inside it.
     try std.testing.expect(fail_after > 0);
 }
+
+test "a resume that brings back the cycle before the newest compaction keeps it until it is painted" {
+    const alloc = std.testing.allocator;
+    var runtime = testRuntime(alloc);
+    defer runtime.deinit(alloc);
+    var metrics: types.Metrics = .{};
+    try runtime.enableTranscriptWindow(alloc, true);
+    try runTurn(alloc, &runtime, &metrics, "BEFORE_COMPACT", "ANSWER\n");
+    // As the resume path leaves it: the replayed entries, prepared and not
+    // painted yet.
+    runtime.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+        &runtime,
+        alloc,
+        try alloc.dupe(u8, runtime.transcript.items),
+    );
+    try runtime.transcriptWindowResumed(alloc, true);
+    // The compaction applied as a live one: the window lets the cycle go, and
+    // the screen keeps it.
+    try std.testing.expect(!runtime.transcriptWindowHoldsPreviousCycle());
+    try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
+    // Painted, then scrolled into terminal history: the next sync drops it.
+    if (runtime.pending_resume_source) |*source| source.deinit(alloc);
+    runtime.pending_resume_source = null;
+    try commitStableFrame(alloc, &runtime);
+    const anchor = &runtime.transcript_commit_state.stable;
+    anchor.history_visual_offset = anchor.total_visual_rows;
+    try runtime.syncTranscriptWindow(alloc);
+    try std.testing.expect(!holds(&runtime, "BEFORE_COMPACT"));
+    try expectWindowMatchesEntries(&runtime);
+}

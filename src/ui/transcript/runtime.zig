@@ -6964,12 +6964,17 @@ pub const TranscriptRuntime = struct {
         try self.enableTranscriptWindow(alloc, saved);
     }
 
-    /// The entries were rebuilt from the session log on resume.
-    pub fn transcriptWindowResumed(self: *TranscriptRuntime, alloc: Allocator) !void {
+    /// The entries were rebuilt from the session log on resume;
+    /// `holds_previous_cycle` when they are the cycle before the newest
+    /// compaction, which had no turn since (`Session.visitHistorySinceCompaction`).
+    /// Then the window applies that compaction as it applies a live one: the
+    /// entries stay on screen and leave memory as they scroll off.
+    pub fn transcriptWindowResumed(self: *TranscriptRuntime, alloc: Allocator, holds_previous_cycle: bool) !void {
         // Which cycle is "one back" changed with the session.
         self.discardTranscriptArchive();
         const window = if (self.transcript_window) |*value| value else return;
         try window.resumed(alloc, self.entries.items);
+        if (holds_previous_cycle) try self.transcriptWindowCompacted(alloc);
     }
 
     /// The session compacted its context, after the session log committed it.
@@ -7054,6 +7059,9 @@ pub const TranscriptRuntime = struct {
     /// rows released into terminal history.
     fn transcriptWindowDropHold(self: *TranscriptRuntime, alloc: Allocator) !TranscriptWindowDropHold {
         if (self.fullTranscriptActive()) return .all;
+        // A resumed transcript not painted yet: everything it holds is about
+        // to be on screen.
+        if (self.pending_resume_source != null) return .all;
         const history = switch (self.transcript_commit_state) {
             .invalid => return .none,
             .stable => |anchor| anchor.history_visual_offset,

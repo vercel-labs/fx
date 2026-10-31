@@ -2493,14 +2493,19 @@ pub const Session = struct {
     /// `visitHistory` from the newest compaction on: the turns the transcript
     /// window holds after a resume (`transcript_window_shell.zig`), which are
     /// the blocks that finished after that compaction. Ctrl+O reads the older
-    /// cycles from the log. Without a compaction it visits every turn.
-    pub fn visitHistorySinceCompaction(self: *Session, alloc: Allocator, visitor: anytype) !void {
+    /// cycles from the log. Without a compaction it visits every turn. When no
+    /// turn finished after the newest compaction, it visits the cycle before
+    /// it instead and returns true: the window holds that cycle until the next
+    /// turn ends, as it does live.
+    pub fn visitHistorySinceCompaction(self: *Session, alloc: Allocator, visitor: anytype) !bool {
         const Sink = struct {
             alloc: Allocator,
             visitor: @TypeOf(visitor),
+            turns: usize = 0,
 
             fn turn(sink: *@This(), value: types.HistoryTurn, _: ?u64) !void {
                 defer types.freeHistoryTurn(sink.alloc, value);
+                sink.turns += 1;
                 try sink.visitor.append(value);
             }
 
@@ -2509,15 +2514,20 @@ pub const Session = struct {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const state = try self.handle.state(scratch.allocator());
-        var from: sm.From = .start;
-        var skip_offset: ?u64 = null;
-        if (state.compaction_offset) |offset| {
-            const compaction: sm.Cursor = .{ .offset = offset, .seq = state.last_compaction_seq orelse return error.InvalidSessionFormat };
-            from = .{ .at = try self.source().cycleStart(scratch.allocator(), compaction) };
-            skip_offset = offset;
-        }
         var sink: Sink = .{ .alloc = alloc, .visitor = visitor };
-        try replay(self.source(), alloc, alloc, from, skip_offset, ReplaySink.init(&sink));
+        const offset = state.compaction_offset orelse {
+            try replay(self.source(), alloc, alloc, .start, null, ReplaySink.init(&sink));
+            return false;
+        };
+        const compaction: sm.Cursor = .{ .offset = offset, .seq = state.last_compaction_seq orelse return error.InvalidSessionFormat };
+        try replay(self.source(), alloc, alloc, .{ .at = try self.source().cycleStart(scratch.allocator(), compaction) }, offset, ReplaySink.init(&sink));
+        if (sink.turns > 0) return false;
+        // The newest cycle has no turn yet: the cycle before it, read across
+        // the newest compaction line, whose summary this sink ignores.
+        const previous = try self.previousCompactionCursor(alloc, compaction);
+        const from: sm.From = if (previous) |cursor| .{ .at = try self.source().cycleStart(scratch.allocator(), cursor) } else .start;
+        try replay(self.source(), alloc, alloc, from, if (previous) |cursor| cursor.offset else null, ReplaySink.init(&sink));
+        return sink.turns > 0;
     }
 
     /// The cursor of every compaction line in the log, oldest first: the
@@ -6251,7 +6261,7 @@ test "the history splits into compaction cycles that Ctrl+O reads one at a time"
     try visitor.expectPrompts(&.{"three"});
     try s.visitHistoryCycle(testing.allocator, cursors[1], &visitor);
     try visitor.expectPrompts(&.{"four"});
-    try s.visitHistorySinceCompaction(testing.allocator, &visitor);
+    try testing.expect(!try s.visitHistorySinceCompaction(testing.allocator, &visitor));
     try visitor.expectPrompts(&.{"four"});
 
     // Walking back from the newest compaction finds the same boundaries.
@@ -6260,6 +6270,50 @@ test "the history splits into compaction cycles that Ctrl+O reads one at a time"
     const older = (try s.previousCompactionCursor(testing.allocator, newest)).?;
     try testing.expectEqual(cursors[0], older);
     try testing.expectEqual(@as(?sm.Cursor, null), try s.previousCompactionCursor(testing.allocator, older));
+}
+
+test "a resume right after a compaction shows the cycle before it" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    const language = types.ConversationLanguage.default();
+    const Visitor = struct {
+        prompts: std.ArrayList([]u8) = .empty,
+
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            try self.prompts.append(testing.allocator, try testing.allocator.dupe(u8, turn.assistant.user.text));
+        }
+
+        fn expectPrompts(self: *@This(), want: []const []const u8) !void {
+            defer {
+                for (self.prompts.items) |prompt| testing.allocator.free(prompt);
+                self.prompts.deinit(testing.allocator);
+                self.* = .{};
+            }
+            try testing.expectEqual(want.len, self.prompts.items.len);
+            for (self.prompts.items, want) |got, expected| try testing.expectEqualStrings(expected, got);
+        }
+    };
+    var visitor: Visitor = .{};
+    try s.commitTurn(assistantTurn("one", "1"), language);
+    try s.commitTurn(assistantTurn("two", "2"), language);
+    var first = "turns one and two".*;
+    try s.commitCompaction(.{ .summary = &first, .removed_turn_count = 2, .compaction_count = 1 }, false, null);
+    // Nothing since the compaction: the cycle before it comes back.
+    try testing.expect(try s.visitHistorySinceCompaction(testing.allocator, &visitor));
+    try visitor.expectPrompts(&.{ "one", "two" });
+    try s.commitTurn(assistantTurn("three", "3"), language);
+    try testing.expect(!try s.visitHistorySinceCompaction(testing.allocator, &visitor));
+    try visitor.expectPrompts(&.{"three"});
+    // A second compaction with nothing after it brings back only the cycle
+    // between the two.
+    var second = "turn three".*;
+    try s.commitCompaction(.{ .summary = &second, .removed_turn_count = 1, .compaction_count = 2 }, false, null);
+    try testing.expect(try s.visitHistorySinceCompaction(testing.allocator, &visitor));
+    try visitor.expectPrompts(&.{"three"});
 }
 
 test "a compaction inside an open turn starts its display cycle at that turn's prompt" {
@@ -6324,7 +6378,7 @@ test "a compaction inside an open turn starts its display cycle at that turn's p
     };
     var visitor: Visitor = .{};
     // Resume holds the split turn whole, from its prompt.
-    try r.visitHistorySinceCompaction(testing.allocator, &visitor);
+    try testing.expect(!try r.visitHistorySinceCompaction(testing.allocator, &visitor));
     try visitor.expectPrompts(&.{ "split", "after" });
     // Ctrl+O: the cycle before leaves the split turn out, and the one the
     // compaction opens shows it whole.

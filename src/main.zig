@@ -1420,6 +1420,7 @@ const App = struct {
     pub fn installResumeProjection(
         self: *App,
         projection: *ResumeProjection,
+        holds_previous_cycle: bool,
     ) !void {
         const c_alloc = std.heap.c_allocator;
         try self.diff_entries.ensureUnusedCapacity(
@@ -1432,7 +1433,7 @@ const App = struct {
         projection.pending_diffs.clearRetainingCapacity();
         self.next_diff_id = projection.next_diff_id;
         projection.install(&self.shell);
-        try self.shell.transcriptWindowResumed(self.alloc);
+        try self.shell.transcriptWindowResumed(self.alloc, holds_previous_cycle);
     }
 
     pub fn historicalToolActivityKind(

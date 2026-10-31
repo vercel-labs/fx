@@ -2342,11 +2342,11 @@ pub fn Runtime(comptime App: type) type {
                     .labels = &historical_labels,
                 };
                 try writeResumeNotice(app, &sink, display, notice);
-                try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
+                const holds_previous = try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
                 const projection_finished_ns = io_mod.nanoTimestamp();
                 try projection.finalize();
                 const finalization_finished_ns = io_mod.nanoTimestamp();
-                try app.installResumeProjection(&projection);
+                try app.installResumeProjection(&projection, holds_previous);
                 const install_finished_ns = io_mod.nanoTimestamp();
                 debug_trace.logf(
                     "session",
@@ -2361,7 +2361,7 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 var sink = LiveHistorySink(App){ .app = app };
                 try writeResumeNotice(app, &sink, display, notice);
-                try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
+                _ = try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
             }
             if (comptime @hasDecl(App, "restoreSessionCredential")) {
                 try app.restoreSessionCredential(previous_provider);
@@ -4112,12 +4112,14 @@ pub fn Runtime(comptime App: type) type {
             app.shell.transcript_archive_available = newest != null;
         }
 
+        /// True when the replayed turns are the cycle before the newest
+        /// compaction, because no turn finished after it.
         fn replayResumedHistoryToSink(
             app: *App,
             sink: anytype,
             context_history: []const types.HistoryTurn,
             labels: *HistoricalSessionLabels,
-        ) !void {
+        ) !bool {
             if (comptime runtime_profile.allows(App, .durable_sessions)) {
                 // The main screen holds the newest compaction cycle; Ctrl+O
                 // reads the older ones from the log.
@@ -4136,7 +4138,8 @@ pub fn Runtime(comptime App: type) type {
                     return v2.visitHistorySinceCompaction(app.alloc, &visitor);
                 }
             }
-            return replayHistoryToSink(app, sink, context_history, labels);
+            try replayHistoryToSink(app, sink, context_history, labels);
+            return false;
         }
 
         fn writeResumeNotice(

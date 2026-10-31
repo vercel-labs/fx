@@ -57,6 +57,11 @@ current code.
 - Resume replays the log from the newest compaction line, or from the start
   of the turn it splits: an overflow compacts after the prompt, and that
   turn shows whole in the cycle the compaction opens, as Ctrl+O shows it.
+  When no turn finished after the newest compaction, resume replays the cycle
+  before it and then applies that compaction as a live one is applied: the
+  screen shows what it showed before, and those entries leave memory as they
+  scroll off. For the model this is Resumed from a log without the newest
+  compaction, then Compacted.
 - Ctrl+O does not run `ctrlo_*`, `read_log` or `log_read_*`: it pages by
   entries, 256 to a page. Its newest pages show the held cycle together with
   the one before it, read from the log when Ctrl+O opens (or from memory while
