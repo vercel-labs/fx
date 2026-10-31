@@ -144,10 +144,19 @@ fn deleteRequest(
             bounds,
             entities,
         ),
-        .line_start => kill_ring.DeleteRange{
-            .start = bounds.start,
-            .end = bounds.cursor,
-        },
+        .line_start => if (bounds.start == bounds.end)
+            kill_ring.DeleteRange{
+                .start = bounds.start -| 1,
+                .end = if (bounds.start == 0 and bounds.end < edit.input.items.len)
+                    bounds.end + 1
+                else
+                    bounds.cursor,
+            }
+        else
+            kill_ring.DeleteRange{
+                .start = bounds.start,
+                .end = bounds.cursor,
+            },
         .line_end => kill_ring.DeleteRange{
             .start = bounds.cursor,
             .end = if (bounds.cursor == bounds.end and bounds.end < edit.input.items.len)
@@ -268,6 +277,62 @@ test "delete requests keep selection precedence and logical line ownership pure"
             },
             deleteRequest(&fixture.edit, &fixture.entities, kind).?,
         );
+    }
+}
+
+test "line start deletion removes empty logical lines and records the newline" {
+    const alloc = std.testing.allocator;
+    const cases = .{
+        .{ "alpha\n\nbeta", "alpha\n".len, "alpha\nbeta", "alpha".len },
+        .{ "alpha\n", "alpha\n".len, "alpha", "alpha".len },
+        .{ "\nbeta", 0, "beta", 0 },
+        .{ "\n", 0, "", 0 },
+        .{ "\n", 1, "", 0 },
+        .{ "alpha\n\n\nbeta", "alpha\n\n".len, "alpha\n\nbeta", "alpha\n".len },
+    };
+    inline for (cases) |case| {
+        var fixture: Fixture = .{};
+        defer fixture.deinit(alloc);
+        try fixture.edit.setText(alloc, case[0]);
+        _ = fixture.edit.setCursor(case[1]);
+
+        try std.testing.expect(try fixture.state().delete(alloc, .line_start));
+        try std.testing.expectEqualStrings(case[2], fixture.edit.input.items);
+        try std.testing.expectEqual(@as(usize, case[3]), fixture.edit.cursor);
+        try std.testing.expectEqualStrings("\n", fixture.ring.text.items);
+        const entry = fixture.history.peekUndo().?;
+        try std.testing.expectEqualStrings("\n", entry.removed.items);
+        try std.testing.expectEqual(@as(usize, case[1]), entry.cursor_before);
+        try std.testing.expectEqual(@as(usize, case[3]), entry.cursor_after);
+
+        try std.testing.expectEqual(
+            kill_ring.YankResult{ .inserted = 0 },
+            try fixture.state().yank(alloc, 1, 4096),
+        );
+        try std.testing.expectEqualStrings(case[0], fixture.edit.input.items);
+    }
+}
+
+test "line start deletion leaves empty drafts and nonempty line starts unchanged" {
+    const alloc = std.testing.allocator;
+    const cases = .{
+        .{ "", 0 },
+        .{ "alpha", 0 },
+        .{ "alpha\nbeta", "alpha\n".len },
+        .{ "alpha\n \nbeta", "alpha\n".len },
+    };
+    inline for (cases) |case| {
+        var fixture: Fixture = .{};
+        defer fixture.deinit(alloc);
+        try fixture.edit.setText(alloc, case[0]);
+        _ = fixture.edit.setCursor(case[1]);
+        try fixture.ring.text.appendSlice(alloc, "previous kill");
+
+        try std.testing.expect(!try fixture.state().delete(alloc, .line_start));
+        try std.testing.expectEqualStrings(case[0], fixture.edit.input.items);
+        try std.testing.expectEqual(@as(usize, case[1]), fixture.edit.cursor);
+        try std.testing.expectEqualStrings("previous kill", fixture.ring.text.items);
+        try std.testing.expect(fixture.history.peekUndo() == null);
     }
 }
 

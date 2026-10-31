@@ -1,4 +1,4 @@
-import { afterEach, describe, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
   mkdtempSync,
   readFileSync,
@@ -7,7 +7,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import {
+  cleanupIsolatedTestHome,
+  createIsolatedTestHome,
+  FX_BIN,
+} from "../evals/eval-helpers";
 import {
   assertSingleFooter,
   findFooterBlocks,
@@ -56,6 +60,7 @@ const routes = [
 
 let session: TmuxSession | null = null;
 const workDirs: string[] = [];
+const testHomes: string[] = [];
 
 afterEach(async () => {
   if (session) {
@@ -64,6 +69,9 @@ afterEach(async () => {
   }
   for (const dir of workDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
+  }
+  for (const home of testHomes.splice(0)) {
+    cleanupIsolatedTestHome(home);
   }
 });
 
@@ -125,7 +133,87 @@ function assertFooterLogicalRows(
   }
 }
 
+async function waitForLogicalLines(
+  activeSession: TmuxSession,
+  expectedLines: readonly string[],
+): Promise<void> {
+  const start = Date.now();
+  let lines: string[] | null = null;
+  while (Date.now() - start < 5_000) {
+    const grid = await activeSession.capturePaneGrid();
+    const footers = findFooterBlocks(grid);
+    if (footers.length === 1) {
+      const footer = footers[0]!;
+      lines = grid
+        .slice(footer.input, footer.bottomDivider)
+        .map((row) => visibleText(row).replace(/^┃/, ""));
+      if (JSON.stringify(lines) === JSON.stringify(expectedLines)) return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  expect(lines).toEqual(expectedLines);
+}
+
 describe.skipIf(SKIP)("tui: logical-line deletion", () => {
+  test(
+    "Ctrl-U removes empty logical lines and supports undo and yank",
+    async () => {
+      const cases = [
+        { input: ["alpha", "", "beta"], left: 5, expected: ["alpha", "beta"] },
+        { input: ["alpha", ""], left: 0, expected: ["alpha"] },
+        { input: ["", "beta"], left: 5, expected: ["beta"] },
+        { input: ["alpha", "", "", "beta"], left: 5, expected: ["alpha", "", "beta"] },
+      ];
+      const lineStartRoutes = routes.filter((route) =>
+        route.label.includes("Ctrl+U") || route.label === "Cmd+Backspace"
+      );
+      for (const route of lineStartRoutes) {
+        const home = createIsolatedTestHome();
+        testHomes.push(home);
+        const stderrPath = join(home, "stderr.log");
+        session = await TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: home,
+          env: { HOME: home },
+          stderrPath,
+          width: 120,
+          height: 40,
+        });
+        await session.waitForComposer(10_000);
+
+        for (const [index, scenario] of cases.entries()) {
+          if (index > 0) {
+            await session.sendHexBytes(["03"]);
+            await waitForLogicalLines(session, [""]);
+          }
+          for (const [lineIndex, line] of scenario.input.entries()) {
+            if (lineIndex > 0) await session.sendHexBytes(["0a"]);
+            if (line.length > 0) await session.sendLiteralText(line);
+          }
+          await waitForLogicalLines(session, scenario.input);
+          if (scenario.left > 0) {
+            await session.sendKeys(Array(scenario.left).fill("Left").join(" "));
+          }
+
+          await session.sendHexBytes(route.hex);
+          await waitForLogicalLines(session, scenario.expected);
+          await session.sendHexBytes(["1f"]);
+          await waitForLogicalLines(session, scenario.input);
+          await session.sendHexBytes(route.hex);
+          await waitForLogicalLines(session, scenario.expected);
+          await session.sendHexBytes(["19"]);
+          await waitForLogicalLines(session, scenario.input);
+          expect(session.isAlive()).toBe(true);
+          expect(readFileSync(stderrPath, "utf8")).toBe("");
+        }
+
+        await session.kill();
+        session = null;
+      }
+    },
+    TIMEOUT,
+  );
+
   test(
     "all decoded and raw routes preserve surrounding logical lines",
     async () => {
@@ -134,10 +222,13 @@ describe.skipIf(SKIP)("tui: logical-line deletion", () => {
         workDirs.push(workDir);
         const stderrPath = join(workDir, "stderr.log");
         writeFileSync(stderrPath, "");
+        const home = createIsolatedTestHome();
+        testHomes.push(home);
 
         session = await TmuxSession.create({
           cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_SKIP_ONBOARDING=1 ${FX_BIN} 2>${stderrPath}`,
           cwd: workDir,
+          env: { HOME: home },
           width: 120,
           height: 40,
         });
