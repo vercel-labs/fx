@@ -633,6 +633,17 @@ function handle(message) {
       });
       return;
     }
+    if (mode === "wrapped_text") {
+      // A tool that returns text, answered as FastMCP servers such as
+      // DeepWiki do: the text, and the same text wrapped as `result`.
+      const text = `# Page: Overview\n\nwrapped ${message.params?.arguments?.text ?? ""}`;
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: { resultType: "complete", content: [{ type: "text", text }], structuredContent: { result: text } },
+      });
+      return;
+    }
     if (mode === "exit_after_result") {
       // Answer, then exit so the next call finds the connection already closed.
       const result = {

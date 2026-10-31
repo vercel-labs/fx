@@ -1144,6 +1144,11 @@ fn bridgeResultData(arena: Allocator, envelope: []const u8) ![]const u8 {
     if (result != .object) return envelope;
     var out: std.Io.Writer.Allocating = .init(arena);
     if (result.object.get("structuredContent")) |structured| {
+        if (wrappedResultText(structured)) |text| {
+            try out.writer.writeAll(text);
+            if (!std.mem.endsWith(u8, text, "\n")) try out.writer.writeByte('\n');
+            return out.written();
+        }
         if (structured != .null) {
             try std.json.Stringify.value(structured, .{}, &out.writer);
             try out.writer.writeByte('\n');
@@ -1163,6 +1168,15 @@ fn bridgeResultData(arena: Allocator, envelope: []const u8) ![]const u8 {
     try std.json.Stringify.value(result, .{}, &out.writer);
     try out.writer.writeByte('\n');
     return out.written();
+}
+
+/// The text of a structured result that holds nothing else,
+/// `{"result": "..."}`: how some servers, FastMCP's among them, wrap a tool
+/// that returns text. A command saving it wants the text, not the wrapper.
+fn wrappedResultText(structured: std.json.Value) ?[]const u8 {
+    if (structured != .object or structured.object.count() != 1) return null;
+    const value = structured.object.get("result") orelse return null;
+    return if (value == .string) value.string else null;
 }
 
 /// The most search pages one `list` reads: 2,000 tools.
@@ -1249,6 +1263,26 @@ test "bridge result data is the structured content, else the text" {
     ));
     const cut = "partial text\n... [mcp tool result truncated for s/t: original 9 bytes; cap is 4 bytes]\n";
     try std.testing.expectEqualStrings(cut, try bridgeResultData(arena, cut));
+}
+
+test "bridge result data unwraps a structured result that is only one result string" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // As DeepWiki answers: the text, and the same text wrapped as `result`.
+    try std.testing.expectEqualStrings("# Page: Overview\n\nDocs.\n", try bridgeResultData(arena,
+        \\{"server":"deepwiki","tool":"read","result":{"content":[{"type":"text","text":"# Page: Overview\n\nDocs."}],"structuredContent":{"result":"# Page: Overview\n\nDocs."},"isError":false}}
+    ));
+    // Anything more, or a result that is not text, stays JSON.
+    try std.testing.expectEqualStrings("{\"result\":5}\n", try bridgeResultData(arena,
+        \\{"server":"s","tool":"t","result":{"content":[{"type":"text","text":"5"}],"structuredContent":{"result":5}}}
+    ));
+    try std.testing.expectEqualStrings("{\"result\":\"a\",\"more\":1}\n", try bridgeResultData(arena,
+        \\{"server":"s","tool":"t","result":{"content":[],"structuredContent":{"result":"a","more":1}}}
+    ));
+    try std.testing.expectEqualStrings("{\"results\":\"a\"}\n", try bridgeResultData(arena,
+        \\{"server":"s","tool":"t","result":{"content":[],"structuredContent":{"results":"a"}}}
+    ));
 }
 
 const RunCommandBackendState = struct {

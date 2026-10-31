@@ -4248,6 +4248,15 @@ describe("fx mcp call", () => {
     expect(toolCalls(root).map((entry) => entry.message.params?.arguments?.text)).toEqual(["0", "1", "2"]);
   }, 90_000);
 
+  test("a structured result that is only one result string saves as that text", async () => {
+    const root = bridgeRoot("bridge-wrapped", {}, { mode: "wrapped_text" });
+    const seen = await runBridgeCommand(root, `"${FX_BIN}" mcp call ${TOOL_NAME} '{"text":"docs"}' > docs.md; echo "exit=$?"`);
+    expect(seen).toContain("exit=0");
+    const saved = readFileSync(join(root.workspace, "docs.md"), "utf8");
+    expect(saved).toBe("# Page: Overview\n\nwrapped docs\n");
+    expect(seen).toContain(`fx mcp call: wrote ${Buffer.byteLength(saved)} bytes of text`);
+  }, 90_000);
+
   test("list, search, and help describe the agent's tools to a command, and call none", async () => {
     const root = bridgeRoot("bridge-lookups");
     const seen = shellOutput(await runBridgeCommand(root, [
