@@ -240,13 +240,13 @@ export class Fixture {
       HOME: this.home,
       AI_GATEWAY_API_KEY: "acp-modes-fake-key",
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_AUTO_UPGRADE: "0",
       FX_SOUND: "0",
       FX_GATEWAY_BASE_URL: this.gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: this.gateway.chatUrl,
-      FX_E2E_GATEWAY_MODELS_URL: `${this.gateway.baseUrl}/coding-agent/v1/models`,
-      FX_E2E_GATEWAY_CHAT_URL: this.gateway.chatUrl,
+      FX_TEST_GATEWAY_MODELS_URL: `${this.gateway.baseUrl}/coding-agent/v1/models`,
+      FX_TEST_GATEWAY_CHAT_URL: this.gateway.chatUrl,
       ...(this.traceLog ? { FX_TRACE_LOG: this.traceLog, FX_TRACE_SCOPES: "acp,permission,host_config" } : {}),
     })) {
       if (value === undefined || STRIPPED_ENV.includes(key)) continue;
@@ -323,7 +323,8 @@ export class Fixture {
   }
 
   /// Saves a mode the way another fx process would (the CLI's /permissions
-  /// or another ACP process): fx persists full access as "yolo".
+  /// or another ACP process). Older fx saved full access as "yolo", which fx
+  /// still reads.
   saveFromOtherProcess(mode: string) {
     const path = join(this.home, ".fx", "settings.json");
     const settings = JSON.parse(readFileSync(path, "utf8"));

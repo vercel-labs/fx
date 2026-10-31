@@ -152,7 +152,7 @@ export async function binaryStage(dir: string): Promise<BinaryResult> {
       env: {
         ...testEnvironment({
           HOME: home, AI_GATEWAY_API_KEY: "fake-fuzzy-key", FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: MODEL_IDS[3]!,
         }),
         VERCEL_OIDC_TOKEN: undefined,

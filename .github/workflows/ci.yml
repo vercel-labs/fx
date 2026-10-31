@@ -74,8 +74,11 @@ jobs:
       - name: Walk the recovery module along its model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/recovery/driver.ts --self-check
 
+      - name: Check CLI shape
+        run: python3 -m scripts.check_cli_shape
+
       - name: Test CI and release scripts
-        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_detect_ci_need scripts.tests.test_fuzz_nightly -q
+        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_detect_ci_need scripts.tests.test_fuzz_nightly scripts.tests.test_check_cli_shape
 
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
@@ -96,7 +99,7 @@ jobs:
           TEST_TIMEOUT_SECONDS: ${{ matrix.test_timeout_seconds }}
           # Ubuntu has sh, dash, and bash, and the step above adds zsh, so the
           # shell parity tests fail here if any of them is missing.
-          FX_SHELL_PARITY_ALL_SHELLS: "1"
+          FX_TEST_SHELL_PARITY_ALL_SHELLS: "1"
         run: |
           started_at=$SECONDS
           trap 'printf "Unit tests elapsed: %ss\n" "$((SECONDS - started_at))"' EXIT
@@ -749,6 +752,8 @@ jobs:
           missing=()
           command -v tmux >/dev/null 2>&1 || missing+=(tmux)
           command -v zsh >/dev/null 2>&1 || missing+=(zsh)
+          # cli.test.ts runs the fish completion script only where fish is installed.
+          command -v fish >/dev/null 2>&1 || missing+=(fish)
           if [ "${#missing[@]}" -gt 0 ]; then
             retry() {
               local attempt
@@ -783,6 +788,7 @@ jobs:
           printf 'set-option -g history-limit 100000\n' > "$HOME/.tmux.conf"
           tmux -V
           zsh --version
+          fish --version
 
       - name: Install E2E dependencies
         run: bun install --frozen-lockfile

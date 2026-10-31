@@ -1229,7 +1229,7 @@ fn expectRealCapture(shell_path: []const u8, file_name: []const u8, contents: []
         },
     };
     defer generation.destroy();
-    try testing.expectEqualStrings("captured-from-startup", generation.environ.get("FX_SNAPSHOT_MARKER").?);
+    try testing.expectEqualStrings("captured-from-startup", generation.environ.get("FX_TEST_SNAPSHOT_MARKER").?);
     try testing.expect(std.mem.startsWith(u8, generation.environ.get("PATH").?, "/opt/fx-snapshot-marker/bin:"));
     try testing.expect(generation.environ.get("PWD") == null);
     try testing.expect(generation.defines("fxll"));
@@ -1244,7 +1244,7 @@ test "snapshot capture reads a real zsh login shell" {
         "/bin/zsh",
         ".zshrc",
         "print -r -- 'startup chatter'\n" ++
-            "export FX_SNAPSHOT_MARKER=captured-from-startup\n" ++
+            "export FX_TEST_SNAPSHOT_MARKER=captured-from-startup\n" ++
             "export PATH=\"/opt/fx-snapshot-marker/bin:$PATH\"\n" ++
             "alias fxll='print -r -- alias-ok'\n" ++
             "fx_snapshot_function() { print -r -- function-ok; }\n" ++
@@ -1257,7 +1257,7 @@ test "snapshot capture reads a real bash login shell" {
         "/bin/bash",
         ".bashrc",
         "echo 'startup chatter'\n" ++
-            "export FX_SNAPSHOT_MARKER=captured-from-startup\n" ++
+            "export FX_TEST_SNAPSHOT_MARKER=captured-from-startup\n" ++
             "export PATH=\"/opt/fx-snapshot-marker/bin:$PATH\"\n" ++
             "alias fxll='echo alias-ok'\n" ++
             "fx_snapshot_function() { echo function-ok; }\n",

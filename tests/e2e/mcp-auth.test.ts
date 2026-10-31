@@ -1517,7 +1517,7 @@ describe("MCP login", () => {
     profile.mcp.fixture.oauth = { client_id: FX_SLACK_CLIENT_ID, callback_port: port };
     writeFileSync(profilePath, JSON.stringify(profile));
     const standIn = new URL(auth.url).origin;
-    const env = { ...v2Env(root), FX_E2E_SLACK_ORIGIN: standIn };
+    const env = { ...v2Env(root), FX_TEST_SLACK_ORIGIN: standIn };
     const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
     expect(login.stderr).toBe("");
     expectExit0(login);
@@ -1587,7 +1587,7 @@ describe("MCP login", () => {
     });
     try {
       const root = createRoot(auth, true, "http", auth.url, true, FX_SLACK_CLIENT_ID);
-      const env = { ...v2Env(root), FX_E2E_SLACK_ORIGIN: `http://127.0.0.1:${bridge.port}` };
+      const env = { ...v2Env(root), FX_TEST_SLACK_ORIGIN: `http://127.0.0.1:${bridge.port}` };
       const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
       expect(bridgeRequests).toEqual([]);
       // The browser goes to the server's own page, with fx's own loopback redirect.

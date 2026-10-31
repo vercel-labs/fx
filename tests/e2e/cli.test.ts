@@ -55,8 +55,15 @@ const NO_GATEWAY_AUTH = {
   AI_GATEWAY_API_KEY: undefined,
   VERCEL_OIDC_TOKEN: undefined,
 };
+// `fx config` shows these when they're set, so its tests clear them.
+const NO_SETTING_ENV = Object.fromEntries(
+  [
+    "FX_PROVIDER", "FX_MODEL", "FX_ULTRAFAST", "FX_REVIEW_MODEL", "FX_PROVIDER_ORDER", "FX_PROVIDER_STRICT",
+    "FX_PERMISSION_MODE", "FX_MAX_AGENT_STEPS", "FX_AUTO_COMPACT_PERCENT", "FX_THEME", "FX_SOUND", "FX_AUTO_UPGRADE",
+  ].map((name) => [name, undefined]),
+);
 const MISSING_AUTH_MESSAGE =
-  "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
+  "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.";
 const MODERN_MCP_FIXTURE = join(
   import.meta.dirname,
   "fixtures",
@@ -356,7 +363,9 @@ describe("cli: help", () => {
       expect(stdout).toContain("Sign in to a model provider");
       expect(stdout).toContain("Sign out of a model provider");
       expect(stdout).toContain("Choose the active model provider");
-      expect(stdout).toContain("Configure a Vercel AI Gateway API key");
+      // `fx setup` is deprecated and hidden; `fx login --api-key` replaces it.
+      expect(stdout).not.toContain("Configure a Vercel AI Gateway API key");
+      expect(stdout).toContain("login [vercel|codex|grok] [--api-key]");
       expect(stdout).toContain("Choose a Vercel AI Gateway team");
       expect(stdout).toContain("Show Vercel AI Gateway credits");
       expect(stdout).not.toContain("Sign in to Vercel or a selected provider");
@@ -366,11 +375,12 @@ describe("cli: help", () => {
       expect(stdout).toContain("Set name=bytes|off; repeatable");
       expect(stdout).toContain("--add-dir <path>");
       expect(stdout).toContain("-c, --continue");
-      expect(stdout).toContain("-r");
-      expect(stdout).toContain("Open the saved-session picker");
+      expect(stdout).toContain("-r, --resume [last|<id>]");
+      expect(stdout).toContain("Pick a saved session, or resume");
       expect(stdout).not.toContain("-c, -r, --continue");
-      expect(stdout).toContain("--resume [last|<id>]");
-      expect(stdout).toContain("--resume-last");
+      expect(stdout).toContain('fx [flags] "<prompt>"');
+      expect(stdout).not.toContain("--resume-last");
+      expect(stdout).not.toContain("--resume-<id>");
       expect(stdout).toContain("session resume [last|id]");
       expect(stdout).toContain("-v, --version");
       expect(stdout).toContain("Print the fx version and exit");
@@ -400,12 +410,15 @@ describe("cli: help", () => {
 Run one noninteractive request
 
 Usage:
-  fx ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save] [--no-color] [--resume <last|id>|--resume-id <id>] [--] <prompt>
+  fx ask [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save] [--no-color] [--resume <last|<id>>] [--] <prompt>
 
 Options:
+  --permission-mode <mode>    Set the permission mode for this request: ask, auto, or full-access
+  --ask                       Ask before each action that needs permission
   --auto                      Automatically review unresolved permission requests
   --full-access               Disable fx permission checks
   --yolo                      Alias for --full-access
+  --provider <name>           Override the model provider for this request (gateway, codex, grok, or a configured name)
   --model <id>                Override the model for this request
   --effort <level>            Override the reasoning effort for this request
   --fast                      Enable Fast mode for this request when the model supports it
@@ -420,10 +433,11 @@ Options:
   --json                      Emit machine-readable JSON instead of text
   --quiet                     Suppress assistant output
   --prompt-permissions        Prompt for Y/N permission approval when stdin is a TTY
-  --no-save                   Do not save the session; incompatible with --resume and --resume-id
-  --no-color                  Render TTY output without colors or hyperlinks
-  --resume <last|id>          Continue the last session or a session by id
-  --resume-id <id>            Continue a session by exact id
+  --timeout <seconds>         Time limit for each shell command the agent runs
+  --config <key=value>        Override a setting for this request, with the keys fx config set takes; repeatable
+  --no-save                   Do not save the session; incompatible with --resume
+  --no-color                  Render TTY output without colors or hyperlinks; NO_COLOR or TERM=dumb also turns color off
+  --resume <last|<id>>        Continue the last session or a session by id
   --                          Treat every following argument as prompt text
 
 The prompt may be passed as arguments or piped on stdin when no prompt args are given.
@@ -474,7 +488,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(r.code).toBe(0);
         expect(r.stderr).toBe("");
         expect(r.stdout).toContain(
-          "Usage:\n  fx acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]",
+          "Usage:\n  fx acp [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--log-file <path>]",
         );
         expect(r.stdout).toContain("--model <id>");
         expect(r.stdout).toContain("--ultrafast");
@@ -493,6 +507,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
       expect(r.stderr).toBe("");
       expect(r.stdout).toContain("--golden <path>");
       expect(r.stdout).toContain("Write the final rendered grid to a file");
+      expect(r.stdout).toContain("Developer tool for reproducing terminal rendering bugs");
       expect(r.stdout).not.toContain("Compare output against a golden file");
     },
     TIMEOUT,
@@ -501,12 +516,23 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   test(
     "fx acp rejects unknown options and missing option values",
     async () => {
-      for (const args of [["--bogus"], ["--model"], ["--log-file"]]) {
+      const cases: [string[], string][] = [
+        [["--bogus"], "fx acp: unknown flag --bogus\n"],
+        [["--model"], "fx acp: --model needs a value\n"],
+        [["--log-file"], "fx acp: --log-file needs a value\n"],
+        [["--effort", "high effort"], "fx acp: invalid value for --effort: high effort\n"],
+        [["--permission-mode", "never"], "fx acp: invalid value for --permission-mode: never\n"],
+        // ACP sessions don't apply gateway provider routing.
+        [["--provider-order", "a"], "fx acp: unknown flag --provider-order\n"],
+        [["--add-dir", "/tmp"], "fx acp: unknown flag --add-dir; it goes before the command: fx --add-dir <path> acp\n"],
+      ];
+      for (const [args, problem] of cases) {
         const result = await runFx(["acp", ...args]);
-        expect(result.code).toBe(1);
+        expect(result.code).toBe(2);
         expect(result.stdout).toBe("");
         expect(result.stderr).toBe(
-          "usage: fx acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]\n",
+          problem +
+            "usage: fx acp [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--log-file <path>]\n",
         );
       }
     },
@@ -522,7 +548,7 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
         expect(r.stderr).toBe("");
         expect(r.stdout).toContain("Commands:");
         expect(r.stdout).toContain("ask");
-        expect(r.stdout).toContain("setup");
+        expect(r.stdout).toContain("login");
         expect(r.stdout).toContain("status");
         expect(r.stdout).toContain("doctor");
         expect(maxLineWidth(r.stdout)).toBeLessThanOrEqual(60);
@@ -549,8 +575,8 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
     "fx rejects the removed record flag as unknown input",
     async () => {
       const r = await runFx(["--record"]);
-      expect(r.code).not.toBe(0);
-      expect(r.stderr).toContain("fx: unknown subcommand: --record");
+      expect(r.code).toBe(2);
+      expect(r.stderr).toContain("fx: unknown flag --record");
       expect(r.stderr).not.toContain("visual terminal capture:");
     },
     TIMEOUT,
@@ -593,7 +619,7 @@ describe("cli: status", () => {
           FX_DISABLE_KEYCHAIN: "1",
           FX_AUTO_UPGRADE: "0",
           FX_MODEL: FAKE_GATEWAY_MODEL,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
         };
         const cwd = realpathSync(workspace);
         const before = snapshotTree(home);
@@ -681,6 +707,248 @@ describe("cli: status", () => {
         expect(snapshotTree(home)).toEqual(validBefore);
       } finally {
         gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "doctor names unknown settings keys while status stays quiet",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-unknown-settings-")));
+      try {
+        const home = join(root, "home");
+        const cwd = join(root, "workspace");
+        mkdirSync(join(home, ".fx"), { recursive: true });
+        mkdirSync(cwd);
+        writeFileSync(
+          join(home, ".fx", "settings.json"),
+          JSON.stringify({
+            $schema: "https://fx.sh/schemas/settings.json",
+            fast_mdoe: true,
+            statusLine: { contxt: true },
+            status_line: { context: true },
+            maxxing_mode: 1,
+            workspaces: { [cwd]: { efort: "low" } },
+          }) + "\n",
+          { mode: 0o600 },
+        );
+        writeFileSync(join(cwd, ".fx.json"), JSON.stringify({ $schema: "https://fx.sh/schemas/fx.json", max_agent_step: 5 }) + "\n");
+        const env = { ...NO_GATEWAY_AUTH, HOME: home, FX_DISABLE_KEYCHAIN: "1" };
+
+        const doctor = await runFx(["doctor", "--json"], { cwd, env });
+        expect(doctor.code).toBe(0);
+        const warnings = JSON.parse(doctor.stdout)
+          .checks.filter((check: { name: string; status: string }) => check.name === "config" && check.status === "warn")
+          .map((check: { detail: string }) => check.detail);
+        expect(warnings).toEqual([
+          "unknown setting fast_mdoe in ~/.fx/settings.json (did you mean fast_mode?)",
+          "unknown setting statusLine.contxt in ~/.fx/settings.json (did you mean statusLine.context?)",
+          `unknown setting efort in ~/.fx/settings.json for workspace ${cwd} (did you mean effort?)`,
+          "statusLine and status_line are both set in ~/.fx/settings.json; fx uses status_line where they differ, so remove statusLine",
+          "unknown setting max_agent_step in .fx.json (did you mean max_agent_steps?)",
+        ]);
+
+        const status = await runFx(["status"], { cwd, env });
+        expect(status.code).toBe(0);
+        expect(status.stderr).toBe("");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx config schema prints the settings.json and .fx.json schemas",
+    async () => {
+      const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-config-schema-")));
+      try {
+        const env = { ...NO_GATEWAY_AUTH, HOME: home };
+        const profile = await runFx(["config", "schema"], { env });
+        expect(profile.code).toBe(0);
+        expect(profile.stderr).toBe("");
+        const schema = JSON.parse(profile.stdout);
+        expect(schema.$id).toBe("https://fx.sh/schemas/settings.json");
+        expect(schema.additionalProperties).toBe(false);
+        expect(schema.properties.fast_mode).toEqual({ description: "Use faster inference when the model supports it", type: "boolean" });
+        expect(schema.properties.permission_mode.enum).toEqual(["ask", "auto", "full-access", "yolo"]);
+        expect(schema.properties.auto_compact_percent).toMatchObject({ type: "integer", minimum: 10, maximum: 80 });
+        expect(schema.properties.statusLine.deprecated).toBe(true);
+        expect(schema.properties.workspaces.additionalProperties).toEqual({ $ref: "#/$defs/workspace" });
+        expect(schema.properties.additional_directories).toBeUndefined();
+        expect(schema.$defs.workspace.properties.additional_directories.type).toBe("array");
+        expect(schema.$defs.workspace.properties.providers).toBeUndefined();
+
+        const project = await runFx(["config", "schema", "--project"], { env });
+        expect(project.code).toBe(0);
+        const projectSchema = JSON.parse(project.stdout);
+        expect(projectSchema.$id).toBe("https://fx.sh/schemas/fx.json");
+        expect(Object.keys(projectSchema.properties)).toEqual([
+          "$schema",
+          "context",
+          "max_agent_steps",
+          "max_tool_result_bytes",
+          "provider_order",
+          "provider_strict",
+        ]);
+
+        const misplaced = await runFx(["config", "list", "--project"], { env });
+        expect(misplaced.code).toBe(2);
+        expect(misplaced.stdout).toBe("");
+        expect(misplaced.stderr).toContain("usage: fx config [list|get <key>|set <key> <value>|unset <key>|schema [--project]]");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx config lists settings in precedence order and gets the value fx uses",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-config-")));
+      try {
+        const home = join(root, "home");
+        const cwd = join(root, "workspace");
+        mkdirSync(join(home, ".fx"), { recursive: true });
+        mkdirSync(cwd);
+        const settingsPath = join(home, ".fx", "settings.json");
+        writeFileSync(
+          settingsPath,
+          JSON.stringify({
+            fast_mode: true,
+            fast_mdoe: 1,
+            statusLine: { context: true },
+            models: { codex: "gpt-5.5" },
+            provider_order: ["a", "b"],
+            workspaces: { [cwd]: { fast_mode: false } },
+          }) + "\n",
+          { mode: 0o600 },
+        );
+        writeFileSync(join(cwd, ".fx.json"), JSON.stringify({ max_agent_steps: 7, model: "ignored/here" }) + "\n");
+        const env = { ...NO_GATEWAY_AUTH, ...NO_SETTING_ENV, HOME: home, FX_DISABLE_KEYCHAIN: "1" };
+        const before = readFileSync(settingsPath, "utf8");
+
+        const list = await runFx(["config", "list", "--show-origin"], { cwd, env });
+        expect(list.code).toBe(0);
+        expect(list.stdout).toBe(
+          [
+            "file:.fx.json\tmax_agent_steps=7",
+            "file:~/.fx/settings.json\tfast_mode=true",
+            "file:~/.fx/settings.json\tstatus_line.context=true",
+            "file:~/.fx/settings.json\tmodels.codex=gpt-5.5",
+            'file:~/.fx/settings.json\tprovider_order=["a","b"]',
+            `workspace:${cwd}\tfast_mode=false`,
+            "",
+          ].join("\n"),
+        );
+        expect(list.stderr).toBe("fx config: unknown setting fast_mdoe in ~/.fx/settings.json (did you mean fast_mode?)\n");
+
+        // get reads the settings the runtime resolves, so it gives the same
+        // warnings a run does: this .fx.json sets a profile-only key.
+        const projectWarning = "fx: config project: ignored_project_user_only_setting; key=model\n";
+        const get = await runFx(["config", "get", "fast_mode"], { cwd, env });
+        expect([get.code, get.stdout, get.stderr]).toEqual([0, "false\n", projectWarning]);
+        const global = await runFx(["config", "get", "fast_mode", "--global"], { cwd, env });
+        expect([global.code, global.stdout]).toEqual([0, "true\n"]);
+        const unset = await runFx(["config", "get", "theme"], { cwd, env });
+        expect([unset.code, unset.stdout, unset.stderr]).toEqual([1, "", projectWarning]);
+        // A key nothing sets gives the value fx uses, labeled default.
+        const fallback = await runFx(["config", "get", "--show-origin", "permission_mode"], { cwd, env });
+        expect([fallback.code, fallback.stdout]).toEqual([0, "default\tauto\n"]);
+
+        const typo = await runFx(["config", "get", "fast_mdoe"], { cwd, env });
+        expect(typo.code).toBe(2);
+        expect(typo.stderr).toStartWith("fx config: unknown setting fast_mdoe (did you mean fast_mode?)\nusage: fx config");
+
+        // Documented FX_* overrides come last, as fx applies them; an ignored value doesn't show.
+        const withEnv = { ...env, FX_MAX_AGENT_STEPS: "20", FX_SOUND: "off" };
+        const fromEnv = await runFx(["config", "list", "--show-origin"], { cwd, env: withEnv });
+        expect(fromEnv.stdout.trimEnd().split("\n").slice(-4)).toEqual([
+          "env:FX_MAX_AGENT_STEPS\tmax_agent_steps=20",
+          "env:FX_SOUND\tsound.turn_end=false",
+          "env:FX_SOUND\tsound.attention_required=false",
+          "env:FX_SOUND\tsound.max=false",
+        ]);
+        const envGet = await runFx(["config", "get", "max_agent_steps"], { cwd, env: withEnv });
+        expect([envGet.code, envGet.stdout]).toEqual([0, "20\n"]);
+        const ignored = await runFx(["config", "get", "max_agent_steps"], { cwd, env: { ...env, FX_MAX_AGENT_STEPS: "many" } });
+        expect([ignored.code, ignored.stdout]).toEqual([0, "7\n"]);
+        const scoped = await runFx(["config", "list", "--global", "--show-origin"], { cwd, env: withEnv });
+        expect(scoped.stdout).not.toContain("env:");
+
+        const json = await runFx(["config", "--workspace", "--json"], { cwd, env });
+        expect(json.code).toBe(0);
+        expect(JSON.parse(json.stdout)).toEqual({
+          kind: "config",
+          entries: [{ key: "fast_mode", value: false, origin: "workspace", file: "~/.fx/settings.json", workspace: cwd }],
+          unknown: [],
+        });
+
+        expect(readFileSync(settingsPath, "utf8")).toBe(before);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx config set and unset change plain preferences and refuse the rest",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-config-set-")));
+      try {
+        const home = join(root, "home");
+        const cwd = join(root, "workspace");
+        mkdirSync(join(home, ".fx"), { recursive: true });
+        mkdirSync(cwd);
+        const settingsPath = join(home, ".fx", "settings.json");
+        writeFileSync(settingsPath, JSON.stringify({ statusLine: { session: true } }) + "\n", { mode: 0o600 });
+        const env = { ...NO_GATEWAY_AUTH, ...NO_SETTING_ENV, HOME: home, FX_DISABLE_KEYCHAIN: "1" };
+        const settings = () => JSON.parse(readFileSync(settingsPath, "utf8"));
+
+        const set = await runFx(["config", "set", "fast_mode", "on"], { cwd, env });
+        expect([set.code, set.stdout, set.stderr]).toEqual([0, "fast_mode set to true in ~/.fx/settings.json.\n", ""]);
+        const again = await runFx(["config", "set", "fast_mode", "true"], { cwd, env });
+        expect([again.code, again.stdout]).toEqual([0, "fast_mode is already true.\n"]);
+        const steps = await runFx(["config", "set", "max_agent_steps", "40", "--json"], { cwd, env });
+        expect(steps.code).toBe(0);
+        expect(JSON.parse(steps.stdout)).toEqual({
+          kind: "config",
+          action: "set",
+          key: "max_agent_steps",
+          value: 40,
+          changed: true,
+          file: "~/.fx/settings.json",
+        });
+        const unset = await runFx(["config", "unset", "statusLine.session"], { cwd, env });
+        expect([unset.code, unset.stdout]).toEqual([0, "status_line.session removed from ~/.fx/settings.json.\n"]);
+        expect(settings()).toEqual({ fast_mode: true, max_agent_steps: 40 });
+        const get = await runFx(["config", "get", "max_agent_steps"], { cwd, env });
+        expect([get.code, get.stdout]).toEqual([0, "40\n"]);
+
+        const before = readFileSync(settingsPath, "utf8");
+        const refusals: Array<[string[], string]> = [
+          [
+            ["config", "set", "permission_mode", "full-access"],
+            "fx config: can't change permission_mode with fx config; use /permissions in a session, or --permission-mode for one run\n",
+          ],
+          [["config", "set", "fast_mode", "maybe"], "fx config: invalid value for fast_mode: maybe (use true or false)\n"],
+          [["config", "set", "models.codex", "gpt-5.5"], "fx config: can't change models.codex with fx config; use /model in a session\n"],
+        ];
+        for (const [args, stderr] of refusals) {
+          const result = await runFx(args, { cwd, env });
+          expect([result.code, result.stdout, result.stderr]).toEqual([2, "", stderr]);
+        }
+        const workspace = await runFx(["config", "set", "--workspace", "fast_mode", "off"], { cwd, env });
+        expect(workspace.code).toBe(2);
+        expect(workspace.stderr).toStartWith(
+          "fx config: preferences apply to every workspace, so set and unset don't take --workspace\nusage: fx config",
+        );
+        expect(readFileSync(settingsPath, "utf8")).toBe(before);
+      } finally {
         rmSync(root, { recursive: true, force: true });
       }
     },
@@ -791,6 +1059,57 @@ describe("cli: status", () => {
     );
   }
 
+  test("FX_HOME holds settings and sessions in place of ~/.fx", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-home-")));
+    const gateway = startFakeGateway([fakeGatewayFinalText("SAVED_UNDER_FX_HOME")]);
+    try {
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const fxHome = join(root, "profile");
+      mkdirSync(home);
+      mkdirSync(workspace);
+      const options = {
+        cwd: workspace,
+        env: {
+          HOME: home,
+          FX_HOME: fxHome,
+          AI_GATEWAY_API_KEY: "fx-home-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        },
+      };
+
+      const set = await runFx(["config", "set", "theme", "light"], options);
+      expect(set.code).toBe(0);
+      expect(set.stdout).toBe("theme set to light in $FX_HOME/settings.json.\n");
+      expect(JSON.parse(readFileSync(join(fxHome, "settings.json"), "utf8")).theme).toBe("light");
+
+      const status = await runFx(["status", "--json"], options);
+      expect(status.code).toBe(0);
+      expect(JSON.parse(status.stdout).fx_home).toBe(fxHome);
+
+      const asked = await runFx(["ask", "--json", "Say something."], options);
+      expect(asked.code).toBe(0);
+      const sessionId = JSON.parse(asked.stdout).session_id;
+      expect(existsSync(join(fxHome, "sessions"))).toBe(true);
+      const sessions = await runFx(["sessions", "--json"], options);
+      expect(sessions.stdout).toContain(sessionId);
+
+      expect(existsSync(join(home, ".fx"))).toBe(false);
+
+      const relative = await runFx(["status"], { ...options, env: { ...options.env, FX_HOME: "profile" } });
+      expect(relative.code).toBe(1);
+      expect(relative.stderr).toBe("fx: FX_HOME must be an absolute path\n");
+    } finally {
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
   test("fresh and resumed asks retain an unavailable exact login with an environment key", async () => {
     const root = mkdtempSync(join(tmpdir(), "fx-ask-exact-source-"));
     const gateway = startFakeGateway([
@@ -815,7 +1134,7 @@ describe("cli: status", () => {
           FX_DISABLE_KEYCHAIN: "1",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
         },
       };
       const seeded = await runFx(["ask", "--json", "Create a short greeting."], options);
@@ -833,7 +1152,7 @@ describe("cli: status", () => {
         for (const json of [false, true]) {
           const result = await runFx([
             "ask", ...(json ? ["--json"] : []),
-            ...(resumed ? ["--resume-id", sessionId] : ["--no-save"]),
+            ...(resumed ? ["--resume", sessionId] : ["--no-save"]),
             "Continue with a greeting.",
           ], options);
           expect(result.code).toBe(1);
@@ -930,7 +1249,7 @@ describe("cli: status", () => {
           ...NO_GATEWAY_AUTH,
           HOME: realpathSync(home),
           FX_DISABLE_KEYCHAIN: "1",
-          FX_E2E_OAUTH_ISSUER_URL: requestCatcher.issuerUrl,
+          FX_TEST_OAUTH_ISSUER_URL: requestCatcher.issuerUrl,
         };
         const cwd = realpathSync(workspace);
 
@@ -1084,6 +1403,58 @@ describe("cli: status", () => {
       expect(result.code).toBe(0);
       expect(result.stdout).toContain("--channel <stable|dev>");
       expect(result.stdout).toContain("Select and remember the release channel");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx mcp list reports bad arguments as JSON when --json is given",
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), "fx-mcp-list-json-"));
+      try {
+        for (const [args, error] of [
+          [["mcp", "list", "--bogus", "--json"], "unknown flag --bogus"],
+          [["mcp", "list", "--json", "--bogus"], "unknown flag --bogus"],
+          [["mcp", "list", "extra", "--json"], "fx mcp list takes no server name."],
+        ] as const) {
+          const result = await runFx([...args], { env: { HOME: home } });
+          expect(result.code).toBe(2);
+          expect(result.stderr).toBe("");
+          expect(JSON.parse(result.stdout)).toEqual({
+            kind: "mcp_list",
+            error,
+            code: "InvalidLocalSurfaceArgs",
+          });
+        }
+        const text = await runFx(["mcp", "list", "--bogus"], { env: { HOME: home } });
+        expect(text.code).toBe(2);
+        expect(text.stdout).toBe("");
+        expect(text.stderr).toStartWith("fx mcp list: unknown flag --bogus\nusage: fx mcp list");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx upgrade names a channel that does not exist and saves nothing",
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), "fx-upgrade-channel-"));
+      try {
+        for (const args of [["upgrade", "--channel=nightly"], ["upgrade", "--channel", "nightly"]]) {
+          const result = await runFx(args, { env: { HOME: home } });
+          expect(result.code).toBe(2);
+          expect(result.stdout).toBe("");
+          expect(result.stderr).toStartWith("fx upgrade: invalid value for --channel: nightly\nusage: fx upgrade");
+        }
+        const json = await runFx(["upgrade", "--json", "--channel=nightly"], { env: { HOME: home } });
+        expect(json.code).toBe(2);
+        expect(JSON.parse(json.stdout)).toEqual({ kind: "upgrade", error: "invalid arguments", code: "InvalidUpgradeArgs" });
+        expect(existsSync(join(home, ".fx", "settings.json"))).toBe(false);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
     },
     TIMEOUT,
   );
@@ -1264,7 +1635,7 @@ describe("cli: status", () => {
           ...NO_GATEWAY_AUTH,
           HOME: home,
           FX_DISABLE_KEYCHAIN: "1",
-          FX_SKIP_ONBOARDING: "1",
+          FX_TEST_SKIP_ONBOARDING: "1",
           FX_SOUND: "0",
         };
 
@@ -1436,7 +1807,7 @@ describe("cli: usage", () => {
         },
       });
       writeSeededFxAuth(fixture.home, "team_e2e", fixture.gateway.baseUrl);
-      const env = { ...fixture.env, FX_E2E_OAUTH_ISSUER_URL: fixture.gateway.baseUrl };
+      const env = { ...fixture.env, FX_TEST_OAUTH_ISSUER_URL: fixture.gateway.baseUrl };
       try {
         const json = await runFx(["usage", "--json"], { env });
         expect(json.code).toBe(0);
@@ -1460,6 +1831,24 @@ describe("cli: usage", () => {
         expect(text.code).toBe(0);
         expect(text.stdout).toContain("Budget        $12.00 of $50.00 this month");
         expect(text.stdout).not.toContain(SEEDED_GATEWAY_TOKEN);
+      } finally {
+        fixture.stop();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx usage keeps its cache in FX_HOME",
+    async () => {
+      const fixture = usageFixture("fx-e2e-usage-fx-home-");
+      const fxHome = join(realpathSync(fixture.root), "profile");
+      const env = { ...fixture.env, AI_GATEWAY_API_KEY: "e2e-usage-key", FX_HOME: fxHome };
+      try {
+        const json = await runFx(["usage", "--json"], { env });
+        expect(json.code).toBe(0);
+        expect(readdirSync(join(fxHome, "usage-cache")).length).toBeGreaterThan(0);
+        expect(existsSync(join(fixture.home, ".fx"))).toBe(false);
       } finally {
         fixture.stop();
       }
@@ -2126,7 +2515,40 @@ describe("cli: setup", () => {
       });
       expect(r.code).toBe(1);
       expect(r.stdout).toBe("");
-      expect(r.stderr).toContain("stored API keys are disabled");
+      expect(r.stderr).toBe(
+        "fx setup is deprecated and stops working in fx 0.0.17; use fx login vercel --api-key\n" +
+          "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n",
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx login --api-key replaces fx setup and is only for vercel",
+    async () => {
+      for (const args of [["login", "--api-key"], ["login", "vercel", "--api-key"]]) {
+        const disabled = await runFx(args, { env: { ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" } });
+        expect(disabled.code).toBe(1);
+        expect(disabled.stdout).toBe("");
+        expect(disabled.stderr).toBe("fx login: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n");
+      }
+
+      const noTerminal = await runFx(["login", "--api-key"], { env: { ...NO_GATEWAY_AUTH } });
+      expect(noTerminal.code).toBe(1);
+      expect(noTerminal.stderr).toBe("fx login: an interactive terminal is required to paste an API key\n");
+
+      const usage = "usage: fx login [vercel|codex|grok] [--api-key]\n";
+      const cases: [string[], string][] = [
+        [["login", "codex", "--api-key"], "fx login: --api-key works only with vercel\n"],
+        [["login", "--bogus"], "fx login: unknown flag --bogus\n" + usage],
+        [["login", "vercel", "codex"], usage],
+      ];
+      for (const [args, stderr] of cases) {
+        const r = await runFx(args, { env: { ...NO_GATEWAY_AUTH } });
+        expect(r.code).toBe(2);
+        expect(r.stdout).toBe("");
+        expect(r.stderr).toBe(stderr);
+      }
     },
     TIMEOUT,
   );
@@ -2160,6 +2582,7 @@ exit 99
         });
         expect(r.code).toBe(1);
         expect(r.stdout).toBe("");
+        expect(r.stderr).toContain("fx setup is deprecated and stops working in fx 0.0.17; use fx login vercel --api-key\n");
         expect(r.stderr).toContain("interactive terminal is required");
         expect(existsSync(invocationLog)).toBe(false);
       } finally {
@@ -2290,7 +2713,7 @@ describe("cli: Keychain authentication", () => {
               USER: account,
               FX_GATEWAY_BASE_URL: gateway.baseUrl,
               FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-              FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
               FX_MODEL: FAKE_GATEWAY_MODEL,
               FX_AUTO_UPGRADE: "0",
             },
@@ -2355,7 +2778,7 @@ describe("cli: read-only no-create matrix", () => {
             env: {
               ...NO_GATEWAY_AUTH,
               HOME: realpathSync(home),
-              FX_E2E_FAIL_ON_DURABLE_MUTATION: "1",
+              FX_TEST_FAIL_ON_DURABLE_MUTATION: "1",
             },
             timeoutMs: TIMEOUT,
           });
@@ -3101,17 +3524,26 @@ describe("cli: sessions", () => {
         const cases: Array<{
           args: string[];
           kind: string;
+          code: number;
           expectedError?: string;
         }> = [
-          { args: ["session", "last", "--json"], kind: "session" },
+          { args: ["session", "last", "--json"], kind: "session", code: 1 },
           {
             args: ["ask", "--json"],
             kind: "ask",
+            code: 2,
             expectedError: "MissingPrompt",
           },
           {
             args: ["ask", "--json", "--no-save", "--resume", "last", "hello"],
             kind: "ask",
+            code: 2,
+            expectedError: "InvalidAskArgs",
+          },
+          {
+            args: ["ask", "--json", "--bogus", "hello"],
+            kind: "ask",
+            code: 2,
             expectedError: "InvalidAskArgs",
           },
         ];
@@ -3122,12 +3554,14 @@ describe("cli: sessions", () => {
             env: { HOME: home, ...NO_GATEWAY_AUTH },
             timeoutMs: TIMEOUT,
           });
-          expect(result.code).toBe(1);
+          expect(result.code).toBe(item.code);
           expect(result.stdout.trim().length).toBeGreaterThan(0);
           const parsed = JSON.parse(result.stdout.trim());
           expect(parsed.kind ?? item.kind).toBe(item.kind);
           expect(typeof parsed.error).toBe("string");
           if (item.expectedError) expect(parsed.error).toBe(item.expectedError);
+          // The JSON field reports the status the process exits with.
+          if (item.kind === "ask") expect(parsed.exit_code).toBe(item.code);
         }
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -3139,13 +3573,17 @@ describe("cli: sessions", () => {
 
 describe("cli: removed task and background commands", () => {
   test(
-    "fx task, fx tasks, and fx background are unknown commands",
+    "fx task, fx tasks, and fx background are not commands",
     async () => {
-      for (const command of ["task", "tasks", "background"]) {
+      for (const command of ["task", "tasks"]) {
         const result = await runFx([command], { env: NO_GATEWAY_AUTH });
-        expect(result.code).toBe(1);
-        expect(`${result.stdout}\n${result.stderr}`).toContain("unknown subcommand");
+        expect(result.code).toBe(2);
+        expect(result.stderr).toContain(`fx: unknown command ${command} (did you mean ask?)`);
       }
+      // A word that isn't close to a command is a first prompt for a session.
+      const background = await runFx(["background"], { env: NO_GATEWAY_AUTH });
+      expect(background.code).toBe(1);
+      expect(background.stderr).toContain("fx requires an interactive terminal (TTY).");
     },
     TIMEOUT,
   );
@@ -3191,7 +3629,7 @@ function modelsGatewayEnv(home: string, modelsUrl: string) {
     HOME: home,
     FX_DISABLE_KEYCHAIN: "1",
     FX_AUTO_UPGRADE: "0",
-    FX_E2E_GATEWAY_MODELS_URL: modelsUrl,
+    FX_TEST_GATEWAY_MODELS_URL: modelsUrl,
   };
 }
 
@@ -3533,7 +3971,7 @@ describe("cli: models", () => {
             FX_DISABLE_KEYCHAIN: "1",
             AI_GATEWAY_API_KEY: "redirect-proof-key",
             VERCEL_OIDC_TOKEN: undefined,
-            FX_E2E_GATEWAY_MODELS_URL: `http://127.0.0.1:${redirectServer.port}/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `http://127.0.0.1:${redirectServer.port}/v1/models`,
           },
         });
 
@@ -3682,7 +4120,7 @@ describe("cli: models", () => {
               FX_DISABLE_KEYCHAIN: "1",
               FX_AUTO_UPGRADE: "0",
               FX_GATEWAY_BASE_URL: `http://127.0.0.1:${server.port}`,
-              FX_E2E_GATEWAY_MODELS_URL: undefined,
+              FX_TEST_GATEWAY_MODELS_URL: undefined,
               FX_TRACE_LOG: tracePath,
               FX_TRACE_SCOPES: "catalog",
             },
@@ -3788,7 +4226,7 @@ describe("cli: credits", () => {
             VERCEL_OIDC_TOKEN: undefined,
             HOME: realpathSync(home),
             FX_DISABLE_KEYCHAIN: "1",
-            FX_E2E_GATEWAY_CREDITS_URL: `http://127.0.0.1:${server.port}/v1/credits`,
+            FX_TEST_GATEWAY_CREDITS_URL: `http://127.0.0.1:${server.port}/v1/credits`,
             HOME: home,
           },
         });
@@ -3885,7 +4323,7 @@ describe("cli: ask input validation", () => {
             HOME: realpathSync(home),
             AI_GATEWAY_API_KEY: "invalid-utf8-proof-key",
             FX_DISABLE_KEYCHAIN: "1",
-            FX_E2E_GATEWAY_CHAT_URL: `http://127.0.0.1:${server.port}/ai/v1/chat/completions`,
+            FX_TEST_GATEWAY_CHAT_URL: `http://127.0.0.1:${server.port}/ai/v1/chat/completions`,
           },
           stdin: Uint8Array.from([0xff, 0xfe, 0x80, 0x68, 0x69]),
           timeoutMs: TIMEOUT,
@@ -3988,14 +4426,42 @@ describe("cli: session", () => {
 
 describe("cli: interactive startup", () => {
   test(
+    "fx explains a first argument it can't take as a command or a prompt",
+    async () => {
+      const cases: Array<[string[], string]> = [
+        [["fix", "the", "login", "bug"], 'fx: put the prompt in quotes: fx "fix the login bug"\n'],
+        [["stauts"], "fx: unknown command stauts (did you mean status?)\n"],
+        [["-p", "fix the bug"], 'fx: -p isn\'t an fx flag; to run one request and exit, use fx ask "fix the bug"\n'],
+        [["--print"], 'fx: --print isn\'t an fx flag; to run one request and exit, use fx ask "<prompt>"\n'],
+        [[""], "fx: the prompt is empty\n"],
+      ];
+      for (const [args, stderr] of cases) {
+        const r = await runFx(args, { env: NO_GATEWAY_AUTH });
+        expect(r.code, args.join(" ")).toBe(2);
+        expect(r.stdout).toBe("");
+        expect(r.stderr).toBe(stderr);
+      }
+      for (const args of [["--modle", "x"], ["fix it", "--modle=x"]]) {
+        const r = await runFx(args, { env: NO_GATEWAY_AUTH });
+        expect(r.code, args.join(" ")).toBe(2);
+        expect(r.stderr.split("\n")[0]).toBe("fx: unknown flag --modle (did you mean --model?)");
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "interactive startup without TTY exits one",
     async () => {
       const cases = [
         [],
-        ["resume", "last"],
+        ["--resume", "last"],
         ["--resume"],
+        ["-r", "last"],
         ["session", "resume", "last"],
-        ["session", "resume", "--id", "session.v3"],
+        ["session", "resume", "session.v3"],
+        ["fix the login bug"],
+        ["fix the login bug", "--model", "x"],
       ];
 
       for (const args of cases) {
@@ -4005,6 +4471,66 @@ describe("cli: interactive startup", () => {
           expect(r.code).toBe(1);
           expect(r.stdout).toBe("");
           expect(r.stderr).toBe("fx requires an interactive terminal (TTY).\n");
+          expect(readdirSync(home)).toEqual([]);
+        } finally {
+          rmSync(home, { recursive: true, force: true });
+        }
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "command flag errors name the flag and the last repeated flag wins",
+    async () => {
+      const failures: [string[], string][] = [
+        [["status", "--jsno"], "fx status: unknown flag --jsno (did you mean --json?)\nusage: fx status [--json]\n"],
+        [["sessions", "--limit"], "fx sessions: --limit needs a value\n"],
+        [["usage", "--perod", "7d"], "fx usage: unknown flag --perod (did you mean --period?)\n"],
+        [["workspace", "--json=1"], "fx workspace: --json doesn't take a value\n"],
+      ];
+      for (const [args, stderr] of failures) {
+        const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-flag-errors-")));
+        try {
+          const r = await runFx(args, { env: { HOME: home } });
+          expect(r.code).toBe(2);
+          expect(r.stdout).toBe("");
+          expect(r.stderr.startsWith(stderr)).toBe(true);
+        } finally {
+          rmSync(home, { recursive: true, force: true });
+        }
+      }
+
+      const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-flag-last-")));
+      try {
+        const r = await runFx(["sessions", "--limit=5", "--limit", "2", "--json", "--json"], { env: { HOME: home } });
+        expect(r.code).toBe(0);
+        expect(JSON.parse(r.stdout).kind).toBe("sessions");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "removed resume spellings exit two and name the replacement",
+    async () => {
+      const cases: [string[], string][] = [
+        [["--resume-last"], "fx: --resume-last was removed; use fx --resume last\n"],
+        [["--resume-session.v3"], "fx: --resume-<id> was removed; use fx --resume <id>\n"],
+        [["resume", "last"], "fx: fx resume was removed; use fx --resume [last|<id>] or fx session resume [last|<id>]\n"],
+        [["session", "resume", "--id", "session.v3"], "fx session resume: --id was removed; use fx session resume <id>\n"],
+        [["session", "resume", "--resume", "--last"], "fx session resume: --resume --last was removed; use fx session resume last\n"],
+      ];
+
+      for (const [args, stderr] of cases) {
+        const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-removed-resume-")));
+        try {
+          const r = await runFx(args, { env: { HOME: home } });
+          expect(r.code).toBe(2);
+          expect(r.stdout).toBe("");
+          expect(r.stderr).toBe(stderr);
           expect(readdirSync(home)).toEqual([]);
         } finally {
           rmSync(home, { recursive: true, force: true });
@@ -4250,7 +4776,7 @@ describe("cli: ask success", () => {
               VERCEL_OIDC_TOKEN: undefined,
               FX_GATEWAY_BASE_URL: gateway.baseUrl,
               FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-              FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+              FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
             },
             timeoutMs: 60_000,
           },
@@ -4325,7 +4851,7 @@ describe("cli: ask success", () => {
               FX_TRACE_LOG: tracePath,
               FX_GATEWAY_BASE_URL: undefined,
               FX_GATEWAY_CHAT_URL: undefined,
-              FX_E2E_GATEWAY_MODELS_URL: undefined,
+              FX_TEST_GATEWAY_MODELS_URL: undefined,
               VERCEL_OIDC_TOKEN: undefined,
             },
             timeoutMs: 120_000,
@@ -4424,8 +4950,8 @@ describe("cli: ask success", () => {
               FX_DISABLE_KEYCHAIN: "1",
               FX_GATEWAY_BASE_URL: gateway.baseUrl,
               FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-              FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-              FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+              FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
               FX_MODEL: FAKE_GATEWAY_MODEL,
               FX_AUTO_UPGRADE: "0",
             },
@@ -4492,7 +5018,7 @@ describe("cli: ask success", () => {
               VERCEL_OIDC_TOKEN: undefined,
               FX_GATEWAY_BASE_URL: gateway.baseUrl,
               FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-              FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
               FX_MODEL: FAKE_GATEWAY_MODEL,
               FX_AUTO_UPGRADE: "0",
             },
@@ -4533,7 +5059,7 @@ describe("cli: ask success", () => {
               VERCEL_OIDC_TOKEN: undefined,
               FX_GATEWAY_BASE_URL: gateway.baseUrl,
               FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-              FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
               FX_MODEL: FAKE_GATEWAY_MODEL,
               FX_AUTO_UPGRADE: "0",
             },
@@ -4572,7 +5098,7 @@ describe("cli: ask success", () => {
               VERCEL_OIDC_TOKEN: undefined,
               FX_GATEWAY_BASE_URL: gateway.baseUrl,
               FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-              FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
               FX_MODEL: FAKE_GATEWAY_MODEL,
               FX_AUTO_UPGRADE: "0",
             },
@@ -4652,13 +5178,13 @@ describe("cli: ask success", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_AUTO_UPGRADE: "0",
         };
 
         const first = await runFx(
-          ["ask", "--json", "--auto", "--resume-id", sessionId, "Convert and continue."],
+          ["ask", "--json", "--auto", "--resume", sessionId, "Convert and continue."],
           { cwd: workspaceRoot, env, timeoutMs: 60_000 },
         );
         expect(first.code, first.stderr + first.stdout).toBe(0);
@@ -4673,7 +5199,7 @@ describe("cli: ask success", () => {
         expect(existsSync(legacyDir)).toBe(false);
 
         const second = await runFx(
-          ["ask", "--json", "--auto", "--resume-id", sessionId, "Continue after restart."],
+          ["ask", "--json", "--auto", "--resume", sessionId, "Continue after restart."],
           { cwd: workspaceRoot, env, timeoutMs: 60_000 },
         );
         expect(second.code).toBe(0);
@@ -4739,7 +5265,7 @@ describe("cli: ask success", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_AUTO_UPGRADE: "0",
         };
@@ -4781,7 +5307,7 @@ describe("cli: ask success", () => {
             "ask",
             "--json",
             "--auto",
-            "--resume-id",
+            "--resume",
             sessionId,
             "Reply with the exact resumed turn.",
           ],
@@ -4834,7 +5360,7 @@ describe("cli: ask success", () => {
             "ask",
             "--json",
             "--auto",
-            "--resume-id",
+            "--resume",
             sessionId,
             "Reply with the continued target turn.",
           ],
@@ -4855,7 +5381,7 @@ describe("cli: ask success", () => {
             "ask",
             "--json",
             "--auto",
-            "--resume-id",
+            "--resume",
             createdNextId,
             "Continue the second saved session.",
           ],
@@ -4936,7 +5462,7 @@ describe("cli: error handling", () => {
           env,
           timeoutMs: TIMEOUT,
         });
-        expect(rejected.code).toBe(1);
+        expect(rejected.code).toBe(2);
         expect(rejected.stderr).toContain("usage: fx ask");
         expect(gateway.requests).toHaveLength(0);
 
@@ -4972,20 +5498,22 @@ describe("cli: error handling", () => {
   );
 
   test(
-    "fx ask with no prompt exits 1",
+    "fx ask with no prompt exits 2",
     async () => {
       const r = await runFx(["ask"]);
-      expect(r.code).toBe(1);
+      expect(r.code).toBe(2);
       expect(r.stderr).toContain("missing prompt");
     },
     TIMEOUT,
   );
 
   test(
-    "fx unknown-command exits 1",
+    "fx with a mistyped command exits 2",
     async () => {
-      const r = await runFx(["unknown-command"]);
-      expect(r.code).toBe(1);
+      // A word that isn't close to a command is a first prompt instead.
+      const r = await runFx(["statsu"]);
+      expect(r.code).toBe(2);
+      expect(r.stderr).toBe("fx: unknown command statsu (did you mean status?)\n");
     },
     TIMEOUT,
   );
@@ -5012,20 +5540,20 @@ describe("cli: error handling", () => {
 
         for (const args of [
           ["ask", "--no-save", "--resume", "last", "hello"],
-          ["ask", "--resume-id", "session.v3", "--no-save", "hello"],
+          ["ask", "--resume", "session.v3", "--no-save", "hello"],
         ]) {
           const rejected = await runFx(args, {
             cwd: realpathSync(workspace),
             env,
             timeoutMs: TIMEOUT,
           });
-          expect(rejected.code).toBe(1);
+          expect(rejected.code).toBe(2);
           expect(rejected.stdout).toBe("");
           expect(rejected.stderr).toContain(
-            "fx ask: --no-save cannot be used with --resume or --resume-id",
+            "fx ask: --no-save cannot be used with --resume",
           );
           expect(rejected.stderr).toContain(
-            "usage: fx ask [--auto|--full-access] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--no-save]",
+            "usage: fx ask [--permission-mode <mode>|--ask|--auto|--full-access] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] [--image PATH] [--system TEXT] [--json] [--quiet] [--prompt-permissions] [--timeout <seconds>] [--config <key=value>] [--no-save]",
           );
         }
         expect(gateway.requests).toHaveLength(0);
@@ -5055,21 +5583,26 @@ describe("cli: workspace access", () => {
       expect(help.stderr).toBe("");
 
       const missing = await runFx(["--add-dir"], { env: enabled });
-      expect(missing.code).toBe(1);
-      expect(missing.stderr).toContain("--add-dir requires a directory path");
-      expect(missing.stderr).not.toContain("MissingAddDirectoryValue");
+      expect(missing.code).toBe(2);
+      expect(missing.stderr).toContain("fx: --add-dir needs a value\n");
+      expect(missing.stderr).not.toContain("InvalidFlag");
 
+      // A repeated flag is not an error: the launch gets past parsing and
+      // stops only because this run has no terminal.
       const duplicate = await runFx(
         ["--no-additional-dirs", "--no-additional-dirs"],
         { env: enabled },
       );
       expect(duplicate.code).toBe(1);
-      expect(duplicate.stderr).toContain(
-        "--no-additional-dirs may only be specified once",
-      );
-      expect(duplicate.stderr).not.toContain(
-        "DuplicateAdditionalDirectorySuppression",
-      );
+      expect(duplicate.stderr).toBe("fx requires an interactive terminal (TTY).\n");
+
+      const badMode = await runFx(["--permission-mode", "never"], { env: enabled });
+      expect(badMode.code).toBe(2);
+      expect(badMode.stderr).toContain("fx: --permission-mode accepts ask, auto, or full-access\n");
+
+      const beforeCommand = await runFx(["--auto", "status"], { env: enabled });
+      expect(beforeCommand.code).toBe(2);
+      expect(beforeCommand.stderr).toBe("fx: agent-run flags such as --permission-mode apply to a session and to fx ask, fx pr, fx issue, and fx acp\n");
     },
     TIMEOUT,
   );
@@ -5486,6 +6019,129 @@ describe("cli: MCP profile", () => {
       { env: { HOME: tmpdir(), ...NO_GATEWAY_AUTH } },
     );
     expect(flagged.code).toBe(2);
-    expect(flagged.stderr).toStartWith("fx mcp add has no --transport flag.\nusage: fx mcp add");
+    expect(flagged.stderr).toStartWith("fx mcp add: unknown flag --transport\nusage: fx mcp add");
   });
+});
+
+function shellAvailable(shell: string): boolean {
+  return spawnSync("sh", ["-c", `command -v ${shell}`]).status === 0;
+}
+
+describe("cli: completion", () => {
+  // The words on the command line, the last one under the cursor, and what
+  // Tab offers there.
+  const cases: [string[], string][] = [
+    [["fx", "con"], "config"],
+    [["fx", "config", ""], "list get set unset schema"],
+    [["fx", "config", "schema", "--p"], "--project"],
+    [["fx", "config", "get", "status_line.c"], "status_line.context"],
+    [["fx", "config", "get", "theme", ""], ""],
+    [["fx", "ask", "--permission-mode", ""], "ask auto full-access"],
+    [["fx", "--model", "gpt-5", "ask", "--permission-m"], "--permission-mode"],
+    [["fx", "mcp", ""], "list show add remove login logout approve reject"],
+    [["fx", "mcp", "add", "--g"], "--global"],
+    [["fx", "usage", "--period", ""], "today 7d month"],
+    [["fx", "login", ""], "vercel codex grok"],
+    [["fx", "completion", ""], "bash zsh fish"],
+    [["fx", "-r", ""], "last"],
+  ];
+
+  async function writeScript(shell: string, dir: string): Promise<string> {
+    const result = await runFx(["completion", shell], { env: { HOME: dir } });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    const path = join(dir, `fx.${shell}`);
+    writeFileSync(path, result.stdout);
+    return path;
+  }
+
+  function quoted(words: string[]): string {
+    return words.map((word) => `'${word}'`).join(" ");
+  }
+
+  test("fx completion takes one shell name", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fx-completion-usage-"));
+    try {
+      const unknown = await runFx(["completion", "tcsh"], { env: { HOME: home } });
+      expect(unknown.code).toBe(2);
+      expect(unknown.stdout).toBe("");
+      expect(unknown.stderr).toBe("fx completion: unknown shell tcsh; choose bash, zsh, or fish\nusage: fx completion bash|zsh|fish\n");
+      const none = await runFx(["completion"], { env: { HOME: home } });
+      expect(none.code).toBe(2);
+      expect(none.stderr).toBe("usage: fx completion bash|zsh|fish\n");
+      const help = await runFx(["completion", "--help"], { env: { HOME: home } });
+      expect(help.code).toBe(0);
+      expect(help.stdout).toContain('Commands:\n  bash  Load it with: eval "$(fx completion bash)"\n');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
+  test("fx completion bash completes words, flags, values, and setting keys", async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-completion-bash-")));
+    try {
+      const script = await writeScript("bash", home);
+      const harness = join(home, "harness.bash");
+      writeFileSync(harness, [
+        // The way help says to load it. bash 3.2 loads nothing through
+        // source <(...), so eval is the line that works everywhere.
+        `eval "$(cat '${script}')"`,
+        'comp() { COMP_WORDS=("$@"); COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 )); COMPREPLY=(); _fx; echo "${COMPREPLY[*]}"; }',
+        ...cases.map(([words]) => `comp ${quoted(words)}`),
+        "",
+      ].join("\n"));
+      const run = spawnSync("bash", [harness], { cwd: home, encoding: "utf8" });
+      expect(run.stderr).toBe("");
+      expect(run.stdout.split("\n").slice(0, cases.length)).toEqual(cases.map(([, want]) => want));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
+  test.skipIf(!shellAvailable("zsh"))("fx completion zsh offers the same candidates", async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-completion-zsh-")));
+    try {
+      const script = await writeScript("zsh", home);
+      const harness = join(home, "harness.zsh");
+      // compsys filters by the typed prefix itself, so the stubs do too.
+      writeFileSync(harness, [
+        "compdef() { :; }",
+        `source '${script}'`,
+        '_fx_test_print() { local prefix=${words[CURRENT]}; local -a out; out=(${(M)@:#${prefix}*}); print -r -- "${out[*]}"; }',
+        '_describe() { local -a items; items=("${(@P)4}"); _fx_test_print "${(@)items%%:*}"; }',
+        'compadd() { if [[ $1 == -a ]]; then _fx_test_print "${(@P)2}"; else _fx_test_print "$@"; fi; }',
+        '_files() { print -r -- ""; }',
+        'comp() { words=("$@"); CURRENT=${#words}; _fx; }',
+        ...cases.map(([words]) => `comp ${quoted(words)}`),
+        "",
+      ].join("\n"));
+      const run = spawnSync("zsh", ["-f", harness], { cwd: home, encoding: "utf8" });
+      expect(run.stderr).toBe("");
+      expect(run.stdout.split("\n").slice(0, cases.length)).toEqual(cases.map(([, want]) => want));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
+
+  test.skipIf(!shellAvailable("fish"))("fx completion fish offers the same candidates", async () => {
+    const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-completion-fish-")));
+    try {
+      const script = await writeScript("fish", home);
+      for (const [words, want] of cases) {
+        const line = words.join(" ");
+        // As in the bash and zsh harnesses, file completion offers nothing,
+        // so only the words fx itself offers are compared.
+        const stubFiles = "function __fish_complete_path; end";
+        const run = spawnSync("fish", ["--no-config", "-c", `source '${script}'; ${stubFiles}; complete -C '${line}'`], {
+          cwd: home,
+          encoding: "utf8",
+        });
+        expect(run.stderr).toBe("");
+        const got = run.stdout.split("\n").filter(Boolean).map((row) => row.split("\t")[0]).sort();
+        expect(got).toEqual(want.split(" ").filter(Boolean).sort());
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, TIMEOUT);
 });
