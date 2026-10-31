@@ -703,7 +703,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                         .topic = "subagent",
                         .tone = .@"error",
                         .body = if (err == error.OneOffChild)
-                            std.mem.print(&body_buf, "This subagent ran a single task and can't take messages. Press {s} to go back to {s}.", .{ home.key, home.name }) catch
+                            std.mem.print(&body_buf, "This subagent ran a single task and can't take messages. Press {s} and pick {s} to go back.", .{ home.key, home.name }) catch
                                 "This subagent ran a single task and can't take messages."
                         else
                             "This subagent can't take a message right now, so your message wasn't sent.",
@@ -871,12 +871,13 @@ pub fn SubmitRuntime(comptime App: type) type {
         }
 
         /// The instance a notice on a subagent's screen sends the user back
-        /// to; `main` and Alt+← for an app without instances.
+        /// to, and the key that opens the agent list to pick it; `main` and
+        /// ↓ for an app without instances.
         fn homeHint(app: *App, name_buf: []u8) struct { name: []const u8, key: []const u8 } {
             if (comptime @hasDecl(App, "subagentHome")) {
                 if (app.subagentHome(name_buf)) |home| return .{ .name = home.name, .key = home.key };
             }
-            return .{ .name = "main", .key = "Alt+←" };
+            return .{ .name = "main", .key = "↓" };
         }
 
         /// `/resume`, `/new`, `/fork`, `/clear`, and `/reset` replace main's
@@ -893,7 +894,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             var name_buf: [32]u8 = undefined;
             var body_buf: [192]u8 = undefined;
             const home = homeHint(app, &name_buf);
-            const body = std.mem.print(&body_buf, "{s} works on {s}'s screen. Press {s} to go back to {s}.", .{ command.command, home.name, home.key, home.name }) catch
+            const body = std.mem.print(&body_buf, "{s} works on {s}'s screen. Press {s} and pick {s} to go back.", .{ command.command, home.name, home.key, home.name }) catch
                 "This command works on an fx instance's screen, not a subagent's.";
             try app.writeDomainNotice(.{ .topic = "subagent", .tone = .neutral, .body = body }, true);
             app.input_runtime.inputResetState().clearCurrent(app.alloc);

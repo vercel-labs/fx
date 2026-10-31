@@ -135,8 +135,8 @@ pub const State = struct {
     launched: usize = 0,
     /// How many instances startup opens: `--instances`, the test hook, or 1.
     startup_count: usize = 1,
-    /// Backs the footer's instance label.
-    label_buf: [32]u8 = undefined,
+    /// Backs the footer's agent indicator, which can hold a subagent's label.
+    label_buf: [192]u8 = undefined,
     /// Whether the first instance, kept in `App.main_agent`, still runs. It
     /// closes like any other and stays closed.
     first_open: bool = true,
@@ -153,6 +153,8 @@ pub const State = struct {
     /// Startup resumed the first instance's session, so its group comes
     /// back with the startup instances.
     restore_pending: bool = false,
+    /// The instance list `/agents` and Alt+↑ open.
+    agents_menu: app_agents_runtime.AgentsMenu = .{},
     /// Startup opened the session picker, so the group of the session
     /// picked comes back then; a later in-app `/resume` brings back only
     /// that session.
@@ -164,6 +166,7 @@ pub const State = struct {
         self.exit_handoff = null;
         self.clearWritten(alloc);
         self.written.deinit(alloc);
+        self.agents_menu.deinit(alloc);
     }
 
     fn clearWritten(self: *State, alloc: Allocator) void {
