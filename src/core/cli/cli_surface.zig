@@ -2264,7 +2264,7 @@ fn runTopLevelMcp(
 /// `fx mcp`: the verbs `/mcp` shares.
 fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
     const home = homeDir(deps) orelse {
-        try writeStderr(deps, "fx mcp: HOME isn't set\n");
+        try writeStderr(deps, "fx mcp: HOME is not set to an absolute path\n");
         return .handled_failure;
     };
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
@@ -2447,7 +2447,7 @@ fn writeUsageCommandFailure(
 
 fn usageFailureMessage(err: anyerror) []const u8 {
     return switch (err) {
-        error.HomeNotSet => "HOME is not set",
+        error.HomeNotSet => "HOME is not set to an absolute path",
         error.DurablePathUnsafe,
         error.PrivateStatePermissionsUnsupported,
         => "the ~/.fx folder is unsafe",
@@ -2932,7 +2932,7 @@ fn writeLookupFailure(
         error.HomeNotSet => {
             try writeStderr(deps, "fx ");
             try writeStderr(deps, kind);
-            try writeStderr(deps, ": HOME is not set\n");
+            try writeStderr(deps, ": HOME is not set to an absolute path\n");
         },
         else => return err,
     }
@@ -3013,7 +3013,7 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         error.PrivateStatePermissionsUnsupported,
         => "durable session storage is unsafe or does not support required private permissions",
         error.SessionStoreUnavailable => "durable session store is unavailable",
-        error.HomeNotSet => "HOME is not set",
+        error.HomeNotSet => "HOME is not set to an absolute path",
         else => null,
     };
 }

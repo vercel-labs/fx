@@ -5479,7 +5479,7 @@ describe("cli: MCP profile", () => {
       env: { HOME: undefined, ...NO_GATEWAY_AUTH },
     });
     expect(missingHome.code).toBe(1);
-    expect(missingHome.stderr).toBe("fx mcp: HOME isn't set\n");
+    expect(missingHome.stderr).toBe("fx mcp: HOME is not set to an absolute path\n");
 
     const flagged = await runFx(
       ["mcp", "add", "--transport", "sse", "fixture", "https://example.test"],

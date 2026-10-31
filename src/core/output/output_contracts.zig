@@ -415,7 +415,7 @@ pub fn workspaceErrorMessage(err: anyerror) ?[]const u8 {
         error.UnknownAdditionalDirectory => "directory is not configured as an additional workspace",
         error.PrimaryDirectory => "the primary workspace cannot be added or removed",
         error.TooManyDirectories => "additional directory limit reached",
-        error.HomeNotSet => "HOME is not set",
+        error.HomeNotSet => "HOME is not set to an absolute path",
         error.SettingsStoreUnavailable => "settings are unavailable",
         error.DurablePathUnsafe, error.PrivateStatePermissionsUnsupported => "settings path is unsafe",
         else => "workspace update failed",

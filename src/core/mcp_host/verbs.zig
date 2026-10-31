@@ -283,6 +283,10 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
             return 2;
         },
     };
+    // Every verb but help reads or writes under `~/.fx`. The shell passes an
+    // empty home when `io_mod.homeDir` has none, and a path built from it
+    // would land under the current folder.
+    if (command != .help and io_mod.absoluteHome(c.home) == null) return error.HomeNotSet;
     return switch (command) {
         .help => |verb| {
             try writeUsage(c.out, c.surface, verb);
@@ -317,7 +321,7 @@ fn describe(err: anyerror) []const u8 {
         error.BothKeys => "the file has both \"mcp\" and \"mcpServers\"; merge them into one",
         error.Unreadable => "the file isn't valid JSON, or repeats a key; fix it by hand first",
         error.NotAnObject => "the file's servers aren't a JSON object; fix it by hand first",
-        error.HomeNotSet => "HOME isn't set",
+        error.HomeNotSet => "HOME is not set to an absolute path",
         error.AccessDenied => "permission denied",
         error.Timeout, error.LockTimeout => "another fx is changing the MCP config; try again",
         error.McpConfigInvalidJson => "~/.fx/mcp.json isn't valid JSON",
@@ -980,6 +984,36 @@ test "status words follow commands.md, held states first" {
     try testing.expectEqualStrings("needs $TOKEN", try statusText(a, s));
     s.state = .waiting_for_approval;
     try testing.expectEqualStrings("waiting for approval", try statusText(a, s));
+}
+
+test "every verb but help needs an absolute home" {
+    const NoHosts = struct {
+        fn get(_: *anyopaque, _: ?runtime_mod.Notify) anyerror!?*Host {
+            return null;
+        }
+        fn release(_: *anyopaque, _: *Host) void {}
+        fn changed(_: *anyopaque) void {}
+    };
+    var unused: u8 = 0;
+    for ([_][]const u8{ "", "relative/home" }) |home| {
+        var out: Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var err: Writer.Allocating = .init(testing.allocator);
+        defer err.deinit();
+        const c: Context = .{
+            .gpa = testing.allocator,
+            .out = &out.writer,
+            .err = &err.writer,
+            .surface = .shell,
+            .home = home,
+            .workspace_root = "/Users/example/project",
+            .hosts = .{ .context = &unused, .get = NoHosts.get, .release = NoHosts.release, .changed = NoHosts.changed },
+        };
+        try testing.expectEqual(@as(u8, 1), run(c, &.{ "add", "probe", "http://127.0.0.1:9/mcp" }));
+        try testing.expectEqualStrings("/mcp: HOME is not set to an absolute path\n", err.written());
+        try testing.expectEqual(@as(u8, 0), run(c, &.{"help"}));
+        try testing.expect(out.written().len > 0);
+    }
 }
 
 test "list lines up its columns and keeps hostile names inert" {
