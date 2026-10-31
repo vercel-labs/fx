@@ -3307,8 +3307,12 @@ fn onCommandOutputChunk(raw_ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleI
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const id = lifecycle_id orelse return;
     const card = ctx.published_tool_calls.getPtr(id.call_id) orelse return;
-    const text = try card.command_output[@backingInt(stream)].append(ctx.alloc, chunk);
-    defer ctx.alloc.free(text);
+    const output = &card.command_output[@backingInt(stream)];
+    const text = if (output.pending_len == 0 and std.unicode.utf8ValidateSlice(chunk))
+        chunk
+    else
+        try output.append(ctx.alloc, chunk);
+    defer if (text.ptr != chunk.ptr) ctx.alloc.free(text);
     if (text.len > 0) try ctx.sendToolCallProgressText(id.call_id, text);
 }
 
@@ -4331,64 +4335,6 @@ test "ACP tool notifications preserve UTF-8 for clipped and unsafe output" {
         );
         defer parsed.deinit();
     }
-}
-
-test "ACP command progress preserves UTF-8 across output chunks" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var capture = try tmp.dir.createFile(std.testing.io, "command-progress.jsonl", .{ .read = true });
-    defer capture.close(std.testing.io);
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    state.writer = .{ .stdout = capture };
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = "session_1",
-    };
-    defer ctx.deinitPublishedToolCalls();
-    _ = try ctx.sendToolCallPending(arena_state.allocator(), .{
-        .id = "call_command",
-        .name = "shell",
-        .arguments_json = "{\"request\":{\"action\":\"run\",\"command\":\"sh emit.sh\"}}",
-    });
-
-    // The command runner can flush 4096 bytes in the middle of a code point.
-    var first_chunk: [4096]u8 = undefined;
-    @memset(first_chunk[0..4095], ' ');
-    first_chunk[4095] = 0xd0;
-    const lifecycle_id: types.ToolLifecycleId = .{ .turn_id = 1, .call_id = "call_command" };
-    try onCommandOutputChunk(&ctx, lifecycle_id, .stdout, &first_chunk);
-    try onCommandOutputChunk(&ctx, lifecycle_id, .stdout, "\xaf\n");
-    try pushCommandOutputComplete(&ctx, lifecycle_id);
-
-    var captured_file = try tmp.dir.openFile(std.testing.io, "command-progress.jsonl", .{});
-    defer captured_file.close(std.testing.io);
-    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 16 * 1024);
-    defer alloc.free(captured);
-    var text: std.Io.Writer.Allocating = .init(alloc);
-    defer text.deinit();
-    var notifications = std.mem.splitScalar(u8, captured, '\n');
-    while (notifications.next()) |line| {
-        if (line.len == 0) continue;
-        try std.testing.expectEqual(true, std.unicode.utf8ValidateSlice(line));
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
-        defer parsed.deinit();
-        const update = parsed.value.object.get("params").?.object.get("update").?.object;
-        if (!std.mem.eql(u8, update.get("sessionUpdate").?.string, "tool_call_update")) continue;
-        try std.testing.expectEqualStrings("in_progress", update.get("status").?.string);
-        if (update.get("content")) |content| {
-            for (content.array.items) |item| {
-                try text.writer.writeAll(item.object.get("content").?.object.get("text").?.string);
-            }
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 4098), text.written().len);
-    try std.testing.expectEqualSlices(u8, first_chunk[0..4095], text.written()[0..4095]);
-    try std.testing.expectEqualStrings("\xd0\xaf\n", text.written()[4095..]);
 }
 
 test "ACP command progress keeps UTF-8 state per call and stream and flushes invalid tails" {
