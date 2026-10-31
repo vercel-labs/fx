@@ -87,8 +87,8 @@ function fixture(s: Scenario): Fixture {
     HOME: home, TMPDIR: root,
     AI_GATEWAY_API_KEY: "fake-mfv-key", FX_PROVIDER: "gateway",
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
     FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
     // Kept with the scenario evidence so an unexpected outcome can be traced.
     FX_TRACE_LOG: join(root, "trace.log"), FX_TRACE_SCOPES: "agent,core,gateway,auth,session",

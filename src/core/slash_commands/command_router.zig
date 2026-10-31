@@ -36,7 +36,7 @@ pub const ParsedCommand = union(enum) {
     alias: []const u8,
     credits,
     paste,
-    fast,
+    fast: []const u8,
     ultrafast: []const u8,
     statusline: []const u8,
     notifications: []const u8,
@@ -58,6 +58,8 @@ pub const CommandHandlers = struct {
     login: *const fn (ctx: *anyopaque) anyerror!void,
     logout: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     provider: *const fn (ctx: *anyopaque) anyerror!void,
+    /// `/setup`, the deprecated alias of `/provider`: warn, then run `/provider`.
+    setup_alias: *const fn (ctx: *anyopaque) anyerror!void,
     show_status: *const fn (ctx: *anyopaque) anyerror!void,
     attach_image: *const fn (ctx: *anyopaque, path: []const u8) anyerror!void,
     manage_images: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
@@ -78,7 +80,7 @@ pub const CommandHandlers = struct {
     handle_alias: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_credits: *const fn (ctx: *anyopaque) anyerror!void,
     paste_clipboard: *const fn (ctx: *anyopaque) anyerror!void,
-    toggle_fast: *const fn (ctx: *anyopaque) anyerror!void,
+    handle_fast: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_ultrafast: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_statusline: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     rename_session: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
@@ -126,7 +128,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .alias => .{ .alias = payload },
         .credits => .credits,
         .paste => .paste,
-        .fast => .fast,
+        .fast => .{ .fast = payload },
         .ultrafast => .{ .ultrafast = payload },
         .statusline => .{ .statusline = payload },
         .notifications => .{ .notifications = payload },
@@ -149,6 +151,15 @@ pub fn parse(registry: SlashRegistry, cmd: []const u8) ParsedCommand {
     return .unknown;
 }
 
+/// The deprecated alias of `/provider`. It keeps working with a warning
+/// until it is removed.
+pub const deprecated_setup_alias = "/setup";
+
+fn typedSetupAlias(registry: SlashRegistry, cmd: []const u8) bool {
+    const matched = registry.matchExact(cmd) orelse return false;
+    return std.mem.eql(u8, matched.token, deprecated_setup_alias);
+}
+
 pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []const u8) !void {
     switch (parse(registry, cmd)) {
         .quit => try handlers.quit(handlers.ctx),
@@ -161,7 +172,10 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .help => try handlers.show_help(handlers.ctx),
         .login => try handlers.login(handlers.ctx),
         .logout => |rest| try handlers.logout(handlers.ctx, rest),
-        .provider => try handlers.provider(handlers.ctx),
+        .provider => if (typedSetupAlias(registry, cmd))
+            try handlers.setup_alias(handlers.ctx)
+        else
+            try handlers.provider(handlers.ctx),
         .status => try handlers.show_status(handlers.ctx),
         .image => |path| try handlers.attach_image(handlers.ctx, path),
         .images => |rest| try handlers.manage_images(handlers.ctx, rest),
@@ -182,7 +196,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .alias => |rest| try handlers.handle_alias(handlers.ctx, rest),
         .credits => try handlers.show_credits(handlers.ctx),
         .paste => try handlers.paste_clipboard(handlers.ctx),
-        .fast => try handlers.toggle_fast(handlers.ctx),
+        .fast => |rest| try handlers.handle_fast(handlers.ctx, rest),
         .ultrafast => |rest| try handlers.handle_ultrafast(handlers.ctx, rest),
         .statusline => |rest| try handlers.handle_statusline(handlers.ctx, rest),
         .notifications => |rest| try handlers.handle_notifications(handlers.ctx, rest),
@@ -300,8 +314,18 @@ test "parse recognizes exact no-payload commands" {
     try std.testing.expectEqual(ParsedCommand.credits, parse(testSlashRegistry(), "/credits"));
     try std.testing.expectEqual(ParsedCommand.credits, parse(testSlashRegistry(), "/balance"));
     try std.testing.expectEqual(ParsedCommand.paste, parse(testSlashRegistry(), "/paste"));
-    try std.testing.expectEqual(ParsedCommand.fast, parse(testSlashRegistry(), "/fast"));
     try std.testing.expectEqual(ParsedCommand.version, parse(testSlashRegistry(), "/version"));
+}
+
+test "parse extracts fast command payload" {
+    switch (parse(testSlashRegistry(), "/fast")) {
+        .fast => |rest| try std.testing.expectEqualStrings("", rest),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/fast off")) {
+        .fast => |rest| try std.testing.expectEqualStrings("off", rest),
+        else => return error.TestExpectedEqual,
+    }
 }
 
 test "parse extracts ultrafast command payload" {
@@ -498,6 +522,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .login = unexpectedNoPayload,
         .logout = unexpectedPayload,
         .provider = unexpectedNoPayload,
+        .setup_alias = unexpectedNoPayload,
         .show_status = unexpectedNoPayload,
         .attach_image = unexpectedPayload,
         .manage_images = unexpectedPayload,
@@ -518,7 +543,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .handle_alias = unexpectedPayload,
         .show_credits = unexpectedNoPayload,
         .paste_clipboard = unexpectedNoPayload,
-        .toggle_fast = unexpectedNoPayload,
+        .handle_fast = unexpectedPayload,
         .handle_ultrafast = unexpectedPayload,
         .handle_statusline = unexpectedPayload,
         .rename_session = unexpectedPayload,
@@ -539,6 +564,28 @@ test "route passes shell payload" {
 
     try std.testing.expectEqualStrings("shell", ctx.called);
     try std.testing.expectEqualStrings("reload", ctx.payload);
+}
+
+test "/setup warns through its own handler and /provider does not" {
+    const Record = struct {
+        fn provider(ctx: *anyopaque) anyerror!void {
+            testContext(ctx).called = "provider";
+        }
+        fn setupAlias(ctx: *anyopaque) anyerror!void {
+            testContext(ctx).called = "setup_alias";
+        }
+    };
+    for ([_]struct { cmd: []const u8, called: []const u8 }{
+        .{ .cmd = "/provider", .called = "provider" },
+        .{ .cmd = deprecated_setup_alias, .called = "setup_alias" },
+    }) |case| {
+        var ctx: TestContext = .{};
+        var handlers = testHandlers(&ctx);
+        handlers.provider = Record.provider;
+        handlers.setup_alias = Record.setupAlias;
+        try route(testSlashRegistry(), &handlers, case.cmd);
+        try std.testing.expectEqualStrings(case.called, ctx.called);
+    }
 }
 
 test "route calls expected no-payload handler" {

@@ -407,6 +407,40 @@ pub fn encodeTerminalSafeInline(
     return encodeTerminalSafe(alloc, flattened.items, max_encoded_bytes);
 }
 
+/// `raw` as a `{f}` format argument, written with the visible escapes
+/// `encodeTerminalSafe` uses, without allocating or shortening it. Messages
+/// use it to quote a word from the command line, the environment, or a file,
+/// so the terminal shows the word instead of acting on its escape sequences.
+pub fn terminalSafe(raw: []const u8) TerminalSafe {
+    return .{ .raw = raw };
+}
+
+const TerminalSafe = struct {
+    raw: []const u8,
+
+    pub fn format(self: TerminalSafe, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        var index: usize = 0;
+        while (index < self.raw.len) {
+            var token_buf: [12]u8 = undefined;
+            const token = terminalSafeToken(self.raw, index, &token_buf);
+            try writer.writeAll(token.bytes);
+            index += token.source_len;
+        }
+    }
+};
+
+test "terminalSafe writes what encodeTerminalSafe returns" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "plain --model", "dark\x1b]0;owned\x07\x1b[2J", "tab\there\r\n", "caf\xc3\xa9 \xff\xfe", "\x7f\xc2\x9b" }) |raw| {
+        var encoded = try encodeTerminalSafe(alloc, raw, std.math.maxInt(usize));
+        defer encoded.deinit(alloc);
+        const formatted = try alloc.print("{f}", .{terminalSafe(raw)});
+        defer alloc.free(formatted);
+        try std.testing.expectEqualStrings(encoded.bytes, formatted);
+        try std.testing.expect(isTerminalSafe(formatted));
+    }
+}
+
 /// Appends one line of file text ready to draw. Tabs stay, since they only
 /// move along the row, and a trailing carriage return from a CRLF line ending
 /// is dropped. Every other control byte, C1 control, and invalid UTF-8 byte

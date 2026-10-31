@@ -189,9 +189,9 @@ pub const Store = struct {
     };
 
     fn openDir(s: Store) !io_mod.VerifiedDir {
-        var home = io_mod.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), s.home, .{ .iterate = true }) };
+        var home = io_mod.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(s.home), .{ .iterate = true }) };
         defer home.close();
-        var root = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name);
+        var root = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.rootName());
         defer root.close();
         return io_mod.openOrCreateVerifiedPrivateDir(&root, profile_paths.mcp_credentials_dir_name);
     }

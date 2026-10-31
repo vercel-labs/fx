@@ -188,9 +188,9 @@ export async function runTurn(ctx: RunContext, spec: TurnSpec): Promise<Observed
   const env = {
     PATH: "/usr/bin:/bin:/usr/sbin:/sbin", HOME: home, TMPDIR: root, SHELL: "/bin/zsh", LANG: "en_US.UTF-8",
     AI_GATEWAY_API_KEY: "synthetic-shell-contract", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
-    FX_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: helpers.FAKE_GATEWAY_MODEL,
+    FX_TEST_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: helpers.FAKE_GATEWAY_MODEL,
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
     FX_TRACE_LOG: join(root, "trace.log"), FX_TRACE_SCOPES: "tool,terminal",
   };
   const child = Bun.spawn([ctx.binary, "ask", "--json", "--full-access", "fixture"], {
