@@ -278,6 +278,7 @@ fn classifyBrowserCallback(
 fn completeSignIn(
     _: ?*anyopaque,
     alloc: Allocator,
+    _: oauth_transport.Provider,
     _: []const u8,
     _: []const u8,
     token: *oauth.TokenSet,
@@ -796,11 +797,11 @@ test "ChatGPT sign-in refuses an account id unsafe for HTTP headers before savin
 
     var unsafe = try makeToken(alloc, "acct\\r\\ninjected");
     defer unsafe.deinit(alloc);
-    try std.testing.expectError(error.InvalidChatGptAccessToken, completeSignIn(null, alloc, "", "", &unsafe));
+    try std.testing.expectError(error.InvalidChatGptAccessToken, completeSignIn(null, alloc, oauth_transport.unavailable_provider, "", "", &unsafe));
 
     var safe = try makeToken(alloc, "acct_test");
     defer safe.deinit(alloc);
-    var completion = try completeSignIn(null, alloc, "", "", &safe);
+    var completion = try completeSignIn(null, alloc, oauth_transport.unavailable_provider, "", "", &safe);
     defer completion.deinit(alloc);
     try std.testing.expectEqualStrings("acct_test", completion.chatgpt.account_id);
 }

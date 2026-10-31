@@ -1504,7 +1504,10 @@ pub fn Runtime(comptime App: type) type {
             blocked,
         };
 
-        pub fn loadTeamsForProviderPicker(app: *App) !TeamColumn {
+        /// Decides the team column from local state, or starts listing the
+        /// teams on a worker and returns null; `collectProviderPickerTeams`
+        /// in the provider picker resumes the choice with the result.
+        pub fn beginTeamsForProviderPicker(app: *App) !?TeamColumn {
             const view = app.auth.pickerView();
             if (view.unavailable_sources.contains(.fx_login)) {
                 const body = try auth_runtime.preparationFailureText(app.alloc, .gateway, error.CredentialStorageUnavailable);
@@ -1520,9 +1523,15 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             if (!view.fx_login_session_available) return .needs_sign_in;
-            try app.flushBeforeBlockingExternalWork();
+            if (comptime @import("builtin").single_threaded or !@hasDecl(@TypeOf(app.auth), "beginTeamList")) {
+                return try finishTeamsForProviderPicker(app, login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport()));
+            }
+            _ = try app.auth.beginTeamList(app.alloc, .provider_picker);
+            return null;
+        }
 
-            var selection = login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport()) catch |err| {
+        pub fn finishTeamsForProviderPicker(app: *App, loaded: anyerror!login_flow.TeamSelection) !TeamColumn {
+            var selection = loaded catch |err| {
                 debug_trace.logf("auth", "provider picker team load failed err={s}", .{@errorName(err)});
                 // A session file that exists but can no longer be refreshed is
                 // not a listing failure: there is nothing to list until the
@@ -1562,9 +1571,32 @@ pub fn Runtime(comptime App: type) type {
 
         fn beginTeamPicker(app: *App) !void {
             if (!app.auth.pickerView().fx_login_session_available) return;
-            try app.flushBeforeBlockingExternalWork();
+            if (comptime @import("builtin").single_threaded or !@hasDecl(@TypeOf(app.auth), "beginTeamList")) {
+                return finishTeamPicker(app, login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport()));
+            }
+            // Listing teams can renew the session, and both talk to the
+            // network; `collectTeamListFacts` opens the picker.
+            _ = try app.auth.beginTeamList(app.alloc, .change_team);
+        }
 
-            var selection = login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport()) catch |err| {
+        /// Hands a finished team list to the screen that asked for it: the
+        /// team picker, if the auth picker is still open, or the `/provider`
+        /// picker.
+        pub fn collectTeamListFacts(app: *App) !void {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "takeTeamList")) return;
+            try provider_picker_runtime.Runtime(App).collectProviderPickerTeams(app);
+            const loaded = app.auth.takeTeamList(.change_team) orelse return;
+            if (!app.auth.picker_active) {
+                debug_trace.logf("auth", "team list dropped reason=picker_closed", .{});
+                var dropped = loaded;
+                if (dropped) |*selection| selection.deinit(app.alloc) else |_| {}
+                return;
+            }
+            try finishTeamPicker(app, loaded);
+        }
+
+        fn finishTeamPicker(app: *App, loaded: anyerror!login_flow.TeamSelection) !void {
+            var selection = loaded catch |err| {
                 debug_trace.logf("auth", "team picker load failed err={s}", .{@errorName(err)});
                 try app.writeDomainNotice(.{
                     .topic = "auth",

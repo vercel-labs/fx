@@ -2941,6 +2941,7 @@ const App = struct {
         if (comptime host_profile.native_auth) {
             try AuthAppRuntime.collectApiKeySaveFacts(self);
             try AuthAppRuntime.collectRemoteRevocationFacts(self);
+            try AuthAppRuntime.collectTeamListFacts(self);
         }
         try self.processNextCooperativePrompt();
 

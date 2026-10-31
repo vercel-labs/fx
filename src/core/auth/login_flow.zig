@@ -296,6 +296,7 @@ pub fn prepareBrowserLogin(
 pub const CompleteSignInFn = *const fn (
     ?*anyopaque,
     Allocator,
+    oauth_transport.Provider,
     []const u8,
     []const u8,
     *oauth.TokenSet,
@@ -641,6 +642,7 @@ pub const SignInRuntime = struct {
         var completion = self.deps.complete(
             self.deps.ctx,
             alloc,
+            self.cancellableTransport(),
             flow.metadata.issuer,
             flow.client_id,
             token,
@@ -746,11 +748,12 @@ fn prepareLogin(
 fn completeSignIn(
     _: ?*anyopaque,
     alloc: Allocator,
+    transport: oauth_transport.Provider,
     issuer_url: []const u8,
     client_id: []const u8,
     token: *oauth.TokenSet,
 ) !SignInCompletion {
-    var teams = fetchTeams(alloc, token.access_token, issuer_url) catch std.ArrayList(Team).empty;
+    var teams = fetchTeams(alloc, transport, token.access_token, issuer_url) catch std.ArrayList(Team).empty;
     errdefer freeTeams(alloc, &teams);
     const now_ms = io_mod.milliTimestamp();
     const session = try take_login_session(alloc, issuer_url, client_id, token, null, now_ms);
@@ -801,7 +804,7 @@ pub fn runLogin(
     );
     defer token.deinit(alloc);
 
-    var teams = fetchTeams(alloc, token.access_token, prepared.metadata.issuer) catch std.ArrayList(Team).empty;
+    var teams = fetchTeams(alloc, transport, token.access_token, prepared.metadata.issuer) catch std.ArrayList(Team).empty;
     defer freeTeams(alloc, &teams);
     const selected_team_index = try selectTeam(alloc, teams.items, null);
     const selected_team = if (selected_team_index) |index| &teams.items[index] else null;
@@ -900,7 +903,7 @@ pub fn loadTeamSelection(
     };
     errdefer session.deinit(alloc);
 
-    const teams = try fetchTeams(alloc, session.access_token, session.issuer);
+    const teams = try fetchTeams(alloc, transport, session.access_token, session.issuer);
     return .{
         .session = session,
         .teams = teams,
@@ -1267,11 +1270,15 @@ fn discardStdinLine() void {
     }
 }
 
-fn fetchTeams(alloc: Allocator, access_token: []const u8, issuer_url: []const u8) !std.ArrayList(Team) {
+/// Lists the account's teams through `transport`, which bounds the request
+/// with a deadline and the caller's cancel flag.
+fn fetchTeams(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    access_token: []const u8,
+    issuer_url: []const u8,
+) !std.ArrayList(Team) {
     if (comptime host_target.is_wasm) return fetchTeamsFromJsHost(alloc, access_token, issuer_url);
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-    defer client.deinit();
-
     const e2e_endpoint = if (oauth_session.isLoopbackE2EIssuer(issuer_url))
         try alloc.print("{s}/v2/teams", .{issuer_url})
     else
@@ -1282,23 +1289,14 @@ fn fetchTeams(alloc: Allocator, access_token: []const u8, issuer_url: []const u8
     const auth_header = try alloc.print("Bearer {s}", .{access_token});
     defer secret.zeroAndFree(alloc, auth_header);
 
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    const result = try client.fetch(.{
-        .location = .{ .url = endpoint },
-        .method = .GET,
-        .headers = .{
-            .authorization = .{ .override = auth_header },
-            .accept_encoding = .omit,
-        },
-        .response_writer = &out.writer,
-        .redirect_behavior = .unhandled,
+    var response = try transport.execute(alloc, .{
+        .method = .get,
+        .url = endpoint,
+        .authorization = auth_header,
     });
-    if (result.status != .ok) return error.TeamRequestFailed;
-    const body = try out.toOwnedSlice();
-    defer alloc.free(body);
-    return parseTeams(alloc, body);
+    defer response.deinit(alloc);
+    if (response.disposition != .accepted) return error.TeamRequestFailed;
+    return parseTeams(alloc, response.body);
 }
 
 fn fetchTeamsFromJsHost(
@@ -1981,6 +1979,7 @@ const SignInTestState = struct {
     fn complete(
         raw: ?*anyopaque,
         alloc: Allocator,
+        _: oauth_transport.Provider,
         issuer_url: []const u8,
         client_id: []const u8,
         token: *oauth.TokenSet,
@@ -2039,6 +2038,7 @@ const CooperativeSignInTestState = struct {
     fn complete(
         raw: ?*anyopaque,
         alloc: Allocator,
+        _: oauth_transport.Provider,
         issuer_url: []const u8,
         client_id: []const u8,
         token: *oauth.TokenSet,

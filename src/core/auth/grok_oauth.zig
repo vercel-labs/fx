@@ -305,6 +305,7 @@ fn classifyBrowserCallback(
 fn completeSignIn(
     raw: ?*anyopaque,
     alloc: Allocator,
+    _: oauth_transport.Provider,
     _: []const u8,
     _: []const u8,
     token: *oauth.TokenSet,

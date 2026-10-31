@@ -1324,6 +1324,67 @@ const InventoryRefreshTask = struct {
     }
 };
 
+/// What a team list was loaded for, so its result resumes the screen that
+/// asked for it.
+pub const TeamListPurpose = enum { change_team, provider_picker };
+
+pub const TeamListStart = enum { started, busy };
+
+/// Lists the fx login's Vercel teams off the input loop. Listing can renew
+/// the session first, and both steps talk to the network.
+const TeamListTask = struct {
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    purpose: TeamListPurpose,
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    cancel: std.atomic.Value(bool) = .init(false),
+    selection: anyerror!login_flow.TeamSelection = error.TeamListPending,
+
+    fn start(
+        alloc: Allocator,
+        transport: oauth_transport.Provider,
+        purpose: TeamListPurpose,
+    ) !*TeamListTask {
+        if (comptime builtin.single_threaded) return error.ThreadsUnsupported;
+        const task = try alloc.create(TeamListTask);
+        task.* = .{ .alloc = alloc, .transport = transport, .purpose = purpose };
+        task.thread = std.Thread.spawn(.{}, workerMain, .{task}) catch |err| {
+            alloc.destroy(task);
+            return err;
+        };
+        return task;
+    }
+
+    fn workerMain(self: *TeamListTask) void {
+        self.selection = login_flow.loadTeamSelection(self.alloc, .{
+            .context = self,
+            .execute_fn = executeCancellable,
+        });
+        self.done.store(true, .release);
+    }
+
+    fn executeCancellable(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        request: oauth_transport.Request,
+    ) !oauth_transport.Response {
+        const self: *TeamListTask = @ptrCast(@alignCast(raw.?));
+        var bounded = request;
+        bounded.cancel_flag = &self.cancel;
+        return self.transport.execute(alloc, bounded);
+    }
+
+    /// Cancels the requests, waits for the worker, and frees a list nobody
+    /// took.
+    fn deinit(self: *TeamListTask) void {
+        self.cancel.store(true, .seq_cst);
+        if (self.thread) |thread| thread.join();
+        if (self.selection) |*selection| selection.deinit(self.alloc) else |_| {}
+        self.alloc.destroy(self);
+    }
+};
+
 const ApiKeyExitReason = enum {
     cancel,
     saved,
@@ -1830,6 +1891,7 @@ pub const Runtime = struct {
     prompt_credential_refresh_task: ?*PromptCredentialRefreshTask = null,
     /// Revocations of signed-out sessions still talking to their issuer.
     remote_revocation_tasks: std.ArrayList(*RemoteRevocationTask) = .empty,
+    team_list_task: ?*TeamListTask = null,
     provider_preparation: ?*ProviderPreparation = null,
     startup_credential_task: ?*StartupCredentialTask = null,
     /// The launch source inventory waits for the first frame.
@@ -1876,7 +1938,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (@typeInfo(Self).@"struct".field_names.len != 34) {
+            if (@typeInfo(Self).@"struct".field_names.len != 35) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -1912,6 +1974,7 @@ pub const Runtime = struct {
         storage.inventory_refresh_task = null;
         storage.prompt_credential_refresh_task = null;
         storage.remote_revocation_tasks = .empty;
+        storage.team_list_task = null;
         storage.provider_preparation = null;
         storage.startup_credential_task = null;
         storage.startup_inventory_deferred = false;
@@ -1925,6 +1988,11 @@ pub const Runtime = struct {
         self.inventory_refresh_task = null;
         if (self.prompt_credential_refresh_task) |task| task.deinit();
         self.prompt_credential_refresh_task = null;
+        if (self.team_list_task) |task| {
+            if (!task.done.load(.acquire)) debug_trace.logf("auth", "team list dropped reason=shutdown", .{});
+            task.deinit();
+        }
+        self.team_list_task = null;
         // The user asked to end these sessions at their issuer, and every
         // request has a deadline, so shutdown waits instead of cancelling.
         for (self.remote_revocation_tasks.items) |task| {
@@ -2225,6 +2293,30 @@ pub const Runtime = struct {
         }
         self.applySourceInventory(task.inventory.?);
         return .{ .ready = task.action };
+    }
+
+    /// Starts listing the fx login's teams on a worker; `takeTeamList`
+    /// returns the result once to the screen that asked for it.
+    pub fn beginTeamList(self: *Self, alloc: Allocator, purpose: TeamListPurpose) !TeamListStart {
+        if (self.team_list_task != null) return .busy;
+        self.team_list_task = try TeamListTask.start(alloc, self.oauth_transport, purpose);
+        return .started;
+    }
+
+    pub fn teamListLoading(self: *const Self) bool {
+        return self.team_list_task != null;
+    }
+
+    /// Returns the finished list loaded for `purpose`, and null while it
+    /// loads or when none was asked for. The caller owns a returned list.
+    pub fn takeTeamList(self: *Self, purpose: TeamListPurpose) ?anyerror!login_flow.TeamSelection {
+        const task = self.team_list_task orelse return null;
+        if (task.purpose != purpose or !task.done.load(.acquire)) return null;
+        self.team_list_task = null;
+        const selection = task.selection;
+        task.selection = error.TeamListTaken;
+        task.deinit();
+        return selection;
     }
 
     pub fn sourceInventoryRefreshActive(self: *const Self) bool {
