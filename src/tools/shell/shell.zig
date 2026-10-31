@@ -7,6 +7,7 @@ const command_environment = @import("../../core/execution/command_environment.zi
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
+const mcp_call_bridge = @import("../../core/mcp_host/mcp_call_bridge.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
@@ -650,12 +651,24 @@ fn callRun(
     var execution_id_buffer: [64]u8 = undefined;
     const execution_id = runtime.generatedId(&execution_id_buffer) catch |err|
         return runtimeFailure(ctx, err);
+    // While this call runs, its command can reach the session's MCP tools
+    // with `fx mcp call`, as this agent (`mcp_call_bridge.zig`).
+    const bridge_registration: ?*mcp_call_bridge.Registration = if (comptime mcp_call_bridge.supported) registration: {
+        const capability = ctx.mcp_call_capability orelse break :registration null;
+        break :registration mcp_call_bridge.register(capability) catch |err| {
+            debug_trace.logf("mcp-call", "shell call not registered with the bridge err={s}", .{@errorName(err)});
+            break :registration null;
+        };
+    } else null;
+    defer if (comptime mcp_call_bridge.supported) if (bridge_registration) |registration| mcp_call_bridge.unregister(registration);
     var prepared = runtime.startCaptured(ctx.allocator, .{
         .execution_id = execution_id,
         .command = command,
         .cwd = cwd,
         .environment = environment,
         .authority = authority,
+        .extra_environment = if (bridge_registration) |registration| registration.environment() else &.{},
+        .yield_hold = if (bridge_registration) |registration| &registration.hold else null,
         .max_output_bytes = ctx.max_command_output_bytes,
         .timeout_ms = if (input.timeout_ms) |value|
             std.math.cast(usize, value) orelse return unavailable(ctx)

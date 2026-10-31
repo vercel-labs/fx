@@ -616,6 +616,23 @@ function handle(message) {
       return;
     }
     if (mode === "crash_always") process.exit(42);
+    if (mode === "paged") {
+      // Three pages of three items; `text` is the cursor, and the last page
+      // has none, as a paging API such as Linear's does.
+      const page = Number(message.params?.arguments?.text || "0");
+      const items = [0, 1, 2].map((offset) => `item-${page * 3 + offset}`);
+      const nextCursor = page < 2 ? String(page + 1) : null;
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: {
+          resultType: "complete",
+          content: [{ type: "text", text: JSON.stringify({ items, nextCursor }) }],
+          structuredContent: { items, nextCursor },
+        },
+      });
+      return;
+    }
     if (mode === "exit_after_result") {
       // Answer, then exit so the next call finds the connection already closed.
       const result = {

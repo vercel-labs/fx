@@ -35,6 +35,13 @@ pub const StartCapturedInput = struct {
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
     yield_time_ms: u32 = contract.default_yield_time_ms,
     cancel_flag: ?*std.atomic.Value(bool) = null,
+    /// Added to the command's environment. Copied before `startCaptured`
+    /// returns.
+    extra_environment: []const command_runner.EnvironmentVariable = &.{},
+    /// While this count is above zero, `startCaptured` waits past
+    /// `yield_time_ms`: the command is waiting on an `fx mcp call` whose
+    /// owner is this call, which must not end before the answer does.
+    yield_hold: ?*const std.atomic.Value(u32) = null,
 };
 
 pub const TtyCursor = struct {
@@ -184,6 +191,7 @@ const Entry = struct {
     output_chunk_lifecycle_id: ?types.ToolLifecycleId = null,
     output_chunk_ctx: ?*anyopaque = null,
     on_output_chunk: ?command_runner.CommandOutputCallback = null,
+    extra_environment: []const command_runner.EnvironmentVariable = &.{},
     output_handle: ?[]const u8 = null,
     output_framed_bytes: usize = 0,
     stdout_bytes: usize = 0,
@@ -220,6 +228,10 @@ const Entry = struct {
         const cwd = try owned.dupe(u8, input.cwd);
         const execution_id = try owned.dupe(u8, input.execution_id);
         const environment = try dupeEnvironment(owned, input.environment);
+        const extra_environment = try owned.alloc(command_runner.EnvironmentVariable, input.extra_environment.len);
+        for (input.extra_environment, extra_environment) |source, *target| {
+            target.* = .{ .name = try owned.dupe(u8, source.name), .value = try owned.dupe(u8, source.value) };
+        }
         const command_artifact_dir = if (input.command_artifact_dir) |path|
             try owned.dupe(u8, path)
         else
@@ -275,6 +287,7 @@ const Entry = struct {
             .output_chunk_lifecycle_id = output_chunk_lifecycle_id,
             .output_chunk_ctx = input.output_chunk_ctx,
             .on_output_chunk = input.on_output_chunk,
+            .extra_environment = extra_environment,
         };
         return entry;
     }
@@ -443,6 +456,7 @@ const Entry = struct {
             .timeout_ms = self.timeout_ms,
             .timeout_started_ms = started_ms,
             .command_artifact_dir = self.command_artifact_dir,
+            .extra_environment = self.extra_environment,
         }, self.arena.allocator(), captured.route) catch |err| {
             const zio = io_mod.getIo();
             self.mutex.lockUncancelable(zio);
@@ -596,7 +610,8 @@ pub const Runtime = struct {
                 }
             }
             const elapsed = io_mod.milliTimestamp() - started_ms;
-            if (elapsed >= input.yield_time_ms) break;
+            const held = if (input.yield_hold) |hold| hold.load(.acquire) > 0 else false;
+            if (elapsed >= input.yield_time_ms and !held) break;
             io_mod.sleep(10 * std.time.ns_per_ms);
         }
 
