@@ -567,6 +567,42 @@ describe("/mcp in the shell", () => {
     }
   }, 90_000);
 
+  test.skipIf(!tmuxAvailable())("a server added or removed by fx mcp outside the session reaches the next prompt and /mcp", async () => {
+    const root = createRoot({ mcpServers: { fixture: fixtureServer() } });
+    gateway = startFakeGateway([fakeGatewayFinalText("first done"), fakeGatewayFinalText("second done")], {
+      models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }],
+    });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    const servers = (body: string) => body.slice(body.lastIndexOf("<mcp_servers>"), body.lastIndexOf("</mcp_servers>"));
+
+    // Another fx process writes the profile, as an agent's shell tool would.
+    expect((await mcp(root, "add", "outside", "--", process.execPath, MODERN_FIXTURE)).code).toBe(0);
+    // The next prompt loads it first, so its own request tells the model.
+    await tui.sendText("first prompt");
+    await tui.waitForText("first done", 15_000);
+    expect(gateway.requests).toHaveLength(1);
+    expect(servers(gateway.requests[0]!.body)).toContain("fixture");
+    expect(servers(gateway.requests[0]!.body)).toContain("outside");
+    // The session runs it, so `/mcp list` reports it.
+    await tui.sendText("/mcp list");
+    await tui.waitForText(/outside +~\/\.fx\/mcp\.json +stdio/, 10_000);
+
+    // Removed the same way, it's gone by the next prompt.
+    expect((await mcp(root, "remove", "outside")).code).toBe(0);
+    await tui.sendText("second prompt");
+    await tui.waitForText("second done", 15_000);
+    expect(gateway.requests).toHaveLength(2);
+    expect(servers(gateway.requests[1]!.body)).toContain("fixture");
+    expect(servers(gateway.requests[1]!.body)).not.toContain("outside");
+  }, 90_000);
+
   test.skipIf(!tmuxAvailable())("the status line, not the transcript, names waiting project servers and config problems", async () => {
     const root = createRoot(
       { mcpServers: { docs: { command: "node", args: ["s.js", "${DOCS_TOKEN}"] } } },

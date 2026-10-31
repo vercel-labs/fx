@@ -11,6 +11,9 @@ const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_host = @import("../mcp_host/host.zig");
 const mcp_verbs = @import("../mcp_host/verbs.zig");
 const mcp_menu = @import("../mcp_host/menu.zig");
+const config_file = @import("../mcp_host/config_file.zig");
+const config_runtime = @import("../config/config_runtime.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const editor_state = @import("../input/editor_state.zig");
 const command_lex = @import("../shell_command/command_lex.zig");
 const mod_registry = @import("../mods/registry.zig");
@@ -35,6 +38,50 @@ fn typedLoginServer(arena: Allocator, args: []const []const u8) Allocator.Error!
     };
 }
 
+/// What decides the servers fx runs in `workspace_root`, hashed: the
+/// profile's `mcp.json`, the project's `.mcp.json`, and the project servers
+/// the user approved or rejected, read the way `loadNativeConfigs` in
+/// `src/builtins/mcp.zig` reads them. A file fx can't read hashes as its
+/// error, so a lasting problem changes the stamp once, not at every check.
+fn configStamp(alloc: Allocator, home: ?[]const u8, workspace_root: []const u8) u64 {
+    var h: std.hash.Wyhash = .init(0);
+    if (home) |dir| stampFile(alloc, &h, profile_paths.mcpConfigPath(alloc, dir));
+    stampFile(alloc, &h, std.Io.Dir.path.join(alloc, &.{ workspace_root, ".mcp.json" }));
+    if (home) |dir| {
+        if (config_runtime.loadProjectMcpChoicesFromHome(alloc, dir, workspace_root)) |loaded| {
+            var load = loaded;
+            defer load.deinit(alloc);
+            h.update(&.{ 1, @intFromBool(load.choices.enable_all) });
+            for ([_][]const []u8{ load.choices.approved, load.choices.rejected }) |names| {
+                h.update(std.mem.asBytes(&names.len));
+                for (names) |name| stampBytes(&h, name);
+            }
+        } else |err| stampError(&h, err);
+    }
+    return h.final();
+}
+
+/// The file at `path` into `h`: its bytes, or that it's absent or unreadable.
+fn stampFile(alloc: Allocator, h: *std.hash.Wyhash, path: anyerror![]u8) void {
+    const p = path catch |err| return stampError(h, err);
+    defer alloc.free(p);
+    const text = config_file.read(alloc, p) catch |err| return stampError(h, err);
+    const bytes = text orelse return h.update(&.{0});
+    defer alloc.free(bytes);
+    h.update(&.{1});
+    stampBytes(h, bytes);
+}
+
+fn stampBytes(h: *std.hash.Wyhash, bytes: []const u8) void {
+    h.update(std.mem.asBytes(&bytes.len));
+    h.update(bytes);
+}
+
+fn stampError(h: *std.hash.Wyhash, err: anyerror) void {
+    h.update(&.{2});
+    stampBytes(h, @errorName(err));
+}
+
 /// Owns the native profile MCP runtime. All transport work and retirement happen
 /// after releasing this state lock; the lock protects only pointer publication.
 pub const State = struct {
@@ -54,6 +101,9 @@ pub const State = struct {
     host_completion_arena: ?std.heap.ArenaAllocator = null,
     host_completion_at_ms: i64 = 0,
     host_reload_requested: std.atomic.Value(bool) = .init(false),
+    /// The config files as of the last load (`configStamp`), so a change made
+    /// outside this session is noticed the next time it uses MCP.
+    host_config_stamp: ?u64 = null,
     /// The `/mcp` menu; what it shows of the servers,
     /// rebuilt on the UI thread while it's open; and the open server's tools.
     host_menu: mcp_menu.State = .{},
@@ -104,6 +154,7 @@ pub const State = struct {
         self: *State,
         load: mcp_host.LoadFn,
         alloc: Allocator,
+        home: ?[]const u8,
         workspace_root: []const u8,
         registry: tool_dispatch.Registry,
         questions: elicitation.Capabilities,
@@ -115,14 +166,53 @@ pub const State = struct {
             sink.* = .{};
             self.host_sink = sink;
         }
+        // Read before the load, so a change between the two loads again at
+        // the next check instead of going unnoticed.
+        self.host_config_stamp = configStamp(alloc, home, workspace_root);
         self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = questions, .notify = self.host_sink.?.notify(), .slash_commands = true }));
     }
 
-    /// Loads the config again after `/mcp` changed it. The host takes it in
-    /// place, so only a server whose config changed restarts. A new host
-    /// comes only when there was none, or the last server went; calls still
-    /// using an old one finish on it.
-    pub fn reloadHost(self: *State, alloc: Allocator, workspace_root: []const u8, registry: tool_dispatch.Registry) !void {
+    pub const RefreshCheck = enum {
+        /// Only a change a `/mcp` command made.
+        requested,
+        /// Also the config files, for a change made outside this session:
+        /// `fx mcp add` in a shell, an edit, or another fx.
+        files,
+    };
+
+    /// On the UI thread: loads the config again when a `/mcp` command changed
+    /// it, or, with `.files`, when the config files changed since the last
+    /// load. True when it loaded. A load that fails keeps the current servers
+    /// and says so once per change, since the stamp it read is kept.
+    pub fn refreshHost(
+        self: *State,
+        alloc: Allocator,
+        home: ?[]const u8,
+        workspace_root: []const u8,
+        registry: tool_dispatch.Registry,
+        check: RefreshCheck,
+    ) bool {
+        if (self.host_load == null) return false;
+        const requested = self.takeHostReload();
+        if (!requested and check == .requested) return false;
+        // Read before the load, as in `loadHost`.
+        const stamp = configStamp(alloc, home, workspace_root);
+        if (!requested) if (self.host_config_stamp) |last| if (last == stamp) return false;
+        self.host_config_stamp = stamp;
+        debug_trace.logf("mcp", "MCP config loaded again reason={s}", .{if (requested) "mcp_command" else "config_files_changed"});
+        self.reloadHost(alloc, workspace_root, registry) catch |err| {
+            debug_trace.logf("mcp", "MCP reload failed err={s}", .{@errorName(err)});
+            const sink = self.host_sink orelse return true;
+            sink.push(std.heap.c_allocator.dupe(u8, "The MCP config changed, but fx couldn't load it again. Your current servers are still active.") catch return true, true);
+        };
+        return true;
+    }
+
+    /// Loads the config again after it changed. The host takes it in place,
+    /// so only a server whose config changed restarts. A new host comes only
+    /// when there was none, or the last server went; calls still using an old
+    /// one finish on it.
+    fn reloadHost(self: *State, alloc: Allocator, workspace_root: []const u8, registry: tool_dispatch.Registry) !void {
         const load = self.host_load orelse return;
         const sink = self.host_sink orelse return;
         const lease = self.leaseHost();
@@ -1212,4 +1302,120 @@ test "a typed sign-in reports in the transcript, any other on the status line" {
     // Needing a login is the status line's to say.
     notify.notice(notify.context, .{ .needs_login = "docs" });
     try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
+}
+
+fn writeTestFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) !void {
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| try tmp.dir.createDirPath(io_mod.getIo(), parent);
+    var file = try tmp.dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
+    defer file.close(io_mod.getIo());
+    try file.writeStreamingAll(io_mod.getIo(), content);
+}
+
+test "the config stamp follows the MCP config files and project choices, and nothing else" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+
+    const none = configStamp(alloc, home, root);
+    try std.testing.expectEqual(none, configStamp(alloc, home, root));
+    // An empty file isn't a missing one.
+    try writeTestFile(&tmp, "home/.fx/mcp.json", "");
+    const blank = configStamp(alloc, home, root);
+    try std.testing.expect(blank != none);
+    try writeTestFile(&tmp, "home/.fx/mcp.json",
+        \\{"mcp":{"linear":{"url":"https://mcp.linear.app/mcp"}}}
+    );
+    const profile = configStamp(alloc, home, root);
+    try std.testing.expect(profile != blank);
+    try writeTestFile(&tmp, "workspace/.mcp.json",
+        \\{"mcpServers":{"p":{"command":"p-server"}}}
+    );
+    const project = configStamp(alloc, home, root);
+    try std.testing.expect(project != profile);
+
+    // Settings other than the project's MCP choices, such as a model switch,
+    // leave it as it was.
+    const unrelated = try alloc.print("{{\"permission_mode\":\"auto\",\"workspaces\":{{\"{s}\":{{\"max_agent_steps\":10}}}}}}", .{root});
+    defer alloc.free(unrelated);
+    try writeTestFile(&tmp, "home/.fx/settings.json", unrelated);
+    try std.testing.expectEqual(project, configStamp(alloc, home, root));
+
+    const approved = try alloc.print("{{\"workspaces\":{{\"{s}\":{{\"" ++ @import("../mcp/project_config.zig").enabled_servers_key ++ "\":[\"p\"]}}}}}}", .{root});
+    defer alloc.free(approved);
+    try writeTestFile(&tmp, "home/.fx/settings.json", approved);
+    // The approval is read, so the change below is the approval's.
+    var load = try config_runtime.loadProjectMcpChoicesFromHome(alloc, home, root);
+    defer load.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), load.choices.approved.len);
+    try std.testing.expect(configStamp(alloc, home, root) != project);
+}
+
+const TestLoader = struct {
+    var loads: usize = 0;
+    var fail = false;
+
+    fn load(_: Allocator, _: []const u8, _: tool_dispatch.Registry, _: mcp_host.Extras) anyerror!?*mcp_host.Host {
+        loads += 1;
+        if (fail) return error.TestLoadFailed;
+        return null;
+    }
+};
+
+test "the host loads again when its config files change outside the session, once per change" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(root);
+    TestLoader.loads = 0;
+    TestLoader.fail = false;
+    const registry: tool_dispatch.Registry = .{ .tools = &.{} };
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    try state.loadHost(TestLoader.load, alloc, home, root, registry, .{});
+    try std.testing.expectEqual(@as(usize, 1), TestLoader.loads);
+    try std.testing.expect(!state.refreshHost(alloc, home, root, registry, .files));
+
+    // `fx mcp add` in a shell writes the profile; only a check that reads the
+    // files notices.
+    try writeTestFile(&tmp, "home/.fx/mcp.json",
+        \\{"mcp":{"linear":{"url":"https://mcp.linear.app/mcp"}}}
+    );
+    try std.testing.expect(!state.refreshHost(alloc, home, root, registry, .requested));
+    try std.testing.expect(state.refreshHost(alloc, home, root, registry, .files));
+    try std.testing.expectEqual(@as(usize, 2), TestLoader.loads);
+    try std.testing.expect(!state.refreshHost(alloc, home, root, registry, .files));
+
+    // A `/mcp` command's own change loads even when the files read the same.
+    state.host_reload_requested.store(true, .release);
+    try std.testing.expect(state.refreshHost(alloc, home, root, registry, .requested));
+    try std.testing.expectEqual(@as(usize, 3), TestLoader.loads);
+
+    // A load that fails warns once for the change, not at every check.
+    TestLoader.fail = true;
+    try writeTestFile(&tmp, "workspace/.mcp.json",
+        \\{"mcpServers":{"p":{"command":"p-server"}}}
+    );
+    try std.testing.expect(state.refreshHost(alloc, home, root, registry, .files));
+    try std.testing.expect(!state.refreshHost(alloc, home, root, registry, .files));
+    try std.testing.expectEqual(@as(usize, 4), TestLoader.loads);
+    const notices = state.takeHostNotices();
+    defer {
+        for (notices) |n| std.heap.c_allocator.free(n.text);
+        std.heap.c_allocator.free(notices);
+    }
+    try std.testing.expectEqual(@as(usize, 1), notices.len);
+    try std.testing.expect(notices[0].warning);
+    try std.testing.expectEqualStrings("The MCP config changed, but fx couldn't load it again. Your current servers are still active.", notices[0].text);
 }

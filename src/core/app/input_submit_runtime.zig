@@ -1105,8 +1105,14 @@ pub fn SubmitRuntime(comptime App: type) type {
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
         ) !PromptAdmission {
-            // Sending a prompt clears MCP notices the user has seen.
-            if (comptime @hasField(App, "mcp") and @hasDecl(@FieldType(App, "mcp"), "dismissHostStatus")) app.mcp.dismissHostStatus();
+            // Sending a prompt loads an MCP config changed outside this
+            // session, then clears the MCP notices the user has seen. What a
+            // load just brought, such as a server that needs a login, hasn't
+            // been seen yet, so it stays on the status line.
+            const mcp_loaded = if (comptime @hasDecl(App, "refreshMcpHostForPrompt")) app.refreshMcpHostForPrompt() else false;
+            if (comptime @hasField(App, "mcp") and @hasDecl(@FieldType(App, "mcp"), "dismissHostStatus")) {
+                if (!mcp_loaded) app.mcp.dismissHostStatus();
+            }
             switch (try installPendingSubmission(app, prompt, skill_tokens)) {
                 .installed => return .pending,
                 .unavailable => {},
