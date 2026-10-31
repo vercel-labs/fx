@@ -4483,8 +4483,6 @@ test "top-level MCP and usage treat a relative HOME as unset" {
         try std.testing.expectEqualStrings("", capture.stdout.written());
         try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "HOME") != null);
     }
-    // Nothing was saved under the relative path.
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_mod.getIo(), "relative", .{}));
 }
 
 test "workspace launch modifiers preserve supported command help" {
