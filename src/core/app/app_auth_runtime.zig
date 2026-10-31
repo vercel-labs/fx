@@ -1820,6 +1820,25 @@ pub fn Runtime(comptime App: type) type {
             return preparePromptCredential(app);
         }
 
+        /// Admits a prompt that queues behind active work without waiting on
+        /// the network. A credential past its refresh deadline still admits,
+        /// because the worker refreshes it before the turn's first request.
+        /// Only a failure that needs a new sign-in stops the prompt here.
+        pub fn admitQueuedPromptCredential(app: *App) !bool {
+            if (comptime host_target.is_wasm or !oauthAuthEnabled(App)) return admitPromptCredential(app);
+            if (!try ensurePromptCredential(app)) return false;
+            if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
+                if (app.auth.credentialFailure()) |failure| {
+                    if (failure.requiresSignIn()) {
+                        try beginCredentialRepair(app, failure);
+                        return false;
+                    }
+                }
+            }
+            if (app.auth.queuedPromptCredential() != null) return true;
+            return recoverPromptCredentialRefreshFailure(app, error.CredentialRefreshUnavailable);
+        }
+
         pub fn startPromptCredentialPrewarm(app: *App) void {
             if (comptime @hasDecl(@TypeOf(app.auth), "providerPreparationPending")) {
                 if (app.auth.providerPreparationPending()) return;
@@ -2385,6 +2404,8 @@ const TestAuth = struct {
     gateway_ready: bool = true,
     catalog_ready: bool = true,
     gateway_ready_after_refresh_count: ?usize = null,
+    /// A credential is selected but past its refresh deadline.
+    credential_due: bool = false,
     team_selection: TestTeamSelection = .{},
     sign_in_url: ?[]const u8 = null,
     picker_pop_count: usize = 0,
@@ -2552,6 +2573,11 @@ const TestAuth = struct {
 
     fn gatewayCredential(self: *const TestAuth) ?TestGatewayCredential {
         return if (self.gateway_ready) .{ .api_key = "refreshed-key" } else null;
+    }
+
+    fn queuedPromptCredential(self: *const TestAuth) ?TestGatewayCredential {
+        if (self.gateway_ready) return .{ .api_key = "refreshed-key" };
+        return if (self.credential_due) .{ .api_key = "due-key" } else null;
     }
 
     fn adoptPreparedCredential(
@@ -3426,6 +3452,43 @@ test "prompt credential refresh allows only OutOfMemory to escape" {
     try std.testing.expect(!app.shell.render_requests.footer_requested);
     try std.testing.expectEqual(@as(usize, 0), app.auth.source_inventory_refresh_count);
     try std.testing.expect(!app.auth.picker_opened);
+}
+
+test "queued prompt admission leaves a due credential for the worker to refresh" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = .fx_login;
+    app.auth.gateway_ready = false;
+    app.auth.credential_due = true;
+
+    try std.testing.expect(try Runtime(TestApp).admitQueuedPromptCredential(&app));
+    try std.testing.expectEqual(@as(usize, 0), app.auth.refresh_count);
+    try std.testing.expectEqual(@as(usize, 0), app.auth.prompt_refresh_start_count);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+}
+
+test "queued prompt admission starts repair for a failure that needs a new sign-in" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = .fx_login;
+    app.auth.credential_due = true;
+    app.auth.credential_failure = .{ .source = .fx_login, .reason = .invalid_credential };
+
+    try std.testing.expect(!try Runtime(TestApp).admitQueuedPromptCredential(&app));
+    try std.testing.expectEqual(@as(usize, 0), app.auth.refresh_count);
+    try std.testing.expectEqual(@as(usize, 1), app.auth.sign_in_start_count);
+}
+
+test "queued prompt admission rejects a missing credential without refreshing" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = .fx_login;
+    app.auth.gateway_ready = false;
+
+    try std.testing.expect(!try Runtime(TestApp).admitQueuedPromptCredential(&app));
+    try std.testing.expectEqual(@as(usize, 0), app.auth.refresh_count);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "fx login sign-in expired.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Your prompt is saved.") != null);
 }
 
 test "manual compaction missing credentials leave transcript feedback to its owner" {

@@ -916,6 +916,16 @@ pub fn SubmitRuntime(comptime App: type) type {
             return true;
         }
 
+        /// A prompt that queues behind active work must not wait on a
+        /// credential refresh: the input loop would freeze until the network
+        /// answers. The worker refreshes before the turn's first request.
+        fn preflightQueuedPrompt(app: *App) !bool {
+            if (comptime @hasDecl(App, "admitQueuedPromptCredential")) {
+                return App.admitQueuedPromptCredential(app);
+            }
+            return preflightPrompt(app);
+        }
+
         fn pendingAuthRoutesLocalCommand(app: *App) bool {
             const input = std.mem.trimStart(
                 u8,
@@ -1111,7 +1121,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                 .installed => return .pending,
                 .unavailable => {},
             }
-            if (!try preflightPrompt(app)) return .rejected;
+            if (!try preflightQueuedPrompt(app)) return .rejected;
             const accepted = if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings"))
                 try App.enqueuePromptWithSkillBindings(app, prompt, skill_tokens)
             else

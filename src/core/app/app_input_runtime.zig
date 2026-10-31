@@ -12107,7 +12107,10 @@ const FakeSubmitApp = struct {
     prompt_admitted: bool = true,
     queue_admitted: bool = true,
     queue_accept_count: usize = 0,
+    /// Every credential admission, blocking or queued.
     preflight_count: usize = 0,
+    /// Admissions through `ensurePromptCredential`, which may refresh inline.
+    blocking_preflight_count: usize = 0,
     notice_count: usize = 0,
     capture_count: usize = 0,
     capture_error_id: ?usize = null,
@@ -12195,6 +12198,12 @@ const FakeSubmitApp = struct {
     }
 
     pub fn ensurePromptCredential(self: *FakeSubmitApp) !bool {
+        self.preflight_count += 1;
+        self.blocking_preflight_count += 1;
+        return self.prompt_admitted;
+    }
+
+    pub fn admitQueuedPromptCredential(self: *FakeSubmitApp) !bool {
         self.preflight_count += 1;
         return self.prompt_admitted;
     }
@@ -12650,6 +12659,24 @@ test "app_input_runtime idle submit commits its frame before credential prefligh
         input_submit_runtime.PendingPhase.queued,
         app.submission.pending.?.phase,
     );
+}
+
+test "app_input_runtime submit during a running turn queues without a blocking credential refresh" {
+    const alloc = std.testing.allocator;
+    var app = FakeSubmitApp{ .alloc = alloc };
+    defer app.deinit();
+    app.stream.active = true;
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "while thinking");
+    app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
+
+    try Runtime(FakeSubmitApp).submit(&app, 100);
+
+    try std.testing.expect(app.submission.pending == null);
+    try std.testing.expectEqual(@as(usize, 1), app.preflight_count);
+    try std.testing.expectEqual(@as(usize, 0), app.blocking_preflight_count);
+    try std.testing.expectEqual(@as(usize, 1), app.queue_accept_count);
+    try std.testing.expectEqualStrings("while thinking", app.last_prompt.?);
+    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
 }
 
 test "app_input_runtime second Enter preserves the newer draft until pending acknowledgement" {

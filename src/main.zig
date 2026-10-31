@@ -1064,6 +1064,10 @@ const App = struct {
         return AuthAppRuntime.admitPromptCredential(self);
     }
 
+    pub fn admitQueuedPromptCredential(self: *App) !bool {
+        return AuthAppRuntime.admitQueuedPromptCredential(self);
+    }
+
     pub fn restoreSessionCredential(self: *App, previous_provider: model_provider.ProviderId) !void {
         try AuthAppRuntime.restoreSessionCredential(self, previous_provider);
     }
@@ -1519,7 +1523,7 @@ const App = struct {
         const model_copy = try std.heap.c_allocator.dupe(u8, self.provider_selection.selection().model);
         errdefer std.heap.c_allocator.free(model_copy);
 
-        const gateway_credential = self.auth.gatewayCredential() orelse return error.MissingApiKey;
+        const gateway_credential = self.auth.queuedPromptCredential() orelse return error.MissingApiKey;
         const api_key_copy = if (gateway_credential.api_key) |api_key|
             try std.heap.c_allocator.dupe(u8, api_key)
         else

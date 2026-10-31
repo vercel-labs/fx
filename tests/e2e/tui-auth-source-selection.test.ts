@@ -27,6 +27,7 @@ import {
   fakeGatewayFinalText,
   fakeGatewaySse,
   fakeGatewayToolCall,
+  heldFakeGatewayFinalText,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -2151,6 +2152,61 @@ tmuxTest(
     expect(gateway.requests[0]?.headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
     expect(gateway.requests[1]?.headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "a prompt sent during a running turn queues at once while its fx login refresh is due",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-queued-refresh-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    const firstTurn = heldFakeGatewayFinalText();
+    gateway = startFakeGateway([
+      () => firstTurn.response,
+      fakeGatewayFinalText("QUEUED_PROMPT_RESPONSE"),
+    ]);
+    // A refresh on the input loop would freeze the terminal this long.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      tokenDelayMs: 5_000,
+    });
+    // fx refreshes an fx login one minute before it expires, so this token
+    // serves the first turn and falls due while that turn still runs.
+    const refreshDueAt = Date.now() + 8_000;
+    writeSeededFxLogin(home, refreshDueAt + 60_000, oauth.issuerUrl, "team_123");
+
+    try {
+      session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+        AI_GATEWAY_API_KEY: undefined,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Start the long answer.");
+      while (gateway.requests.length < 1) {
+        if (Date.now() >= refreshDueAt) throw new Error("the first turn did not start before the refresh came due");
+        await Bun.sleep(25);
+      }
+      await session.waitForPane((pane) => pane.includes("Thinking"), TIMEOUT);
+      await Bun.sleep(Math.max(0, refreshDueAt - Date.now()) + 250);
+
+      const queued = "QUEUED_WHILE_REFRESH_DUE";
+      await session.sendText(queued);
+      const responsiveDraft = "TERMINAL_RESPONSIVE_WHILE_QUEUING";
+      await session.sendLiteral(responsiveDraft);
+      await session.waitForPane((pane) => pane.includes(responsiveDraft), 1_000);
+      // Nothing refreshed on the way in; the worker refreshes when the turn starts.
+      expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
+      await session.sendKeys("C-u");
+      await session.sendKeys("C-k");
+
+      firstTurn.release("FIRST_TURN_RESPONSE");
+      await session.waitForText("QUEUED_PROMPT_RESPONSE", TIMEOUT);
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1]!.body).toContain(queued);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      firstTurn.dispose();
+    }
   },
   60_000,
 );

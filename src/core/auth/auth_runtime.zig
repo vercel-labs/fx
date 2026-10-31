@@ -1864,17 +1864,34 @@ pub const Runtime = struct {
 
     /// Borrows the current credential until this runtime replaces or releases it.
     pub fn gatewayCredential(self: *const Self) ?GatewayCredential {
-        return self.gatewayCredentialAt(io_mod.milliTimestamp());
+        return self.gatewayCredentialAt(io_mod.milliTimestamp(), .current);
     }
 
-    fn gatewayCredentialAt(self: *const Self, now_ms: i64) ?GatewayCredential {
+    /// Borrows the credential a queued prompt hands to the worker, until this
+    /// runtime replaces or releases it. A refreshable credential past its
+    /// refresh deadline still qualifies, because the worker refreshes it before
+    /// the turn's first request. Queuing a prompt never waits on the network.
+    pub fn queuedPromptCredential(self: *const Self) ?GatewayCredential {
+        return self.gatewayCredentialAt(io_mod.milliTimestamp(), .worker_refreshes);
+    }
+
+    const CredentialFreshness = enum {
+        /// The token must be usable now.
+        current,
+        /// A refreshable token may be due; the worker refreshes it first.
+        worker_refreshes,
+    };
+
+    fn gatewayCredentialAt(self: *const Self, now_ms: i64, freshness: CredentialFreshness) ?GatewayCredential {
         if (self.auth_mode == .host_managed) return .{
             .api_key = null,
             .gateway_team = null,
             .source = .host_managed,
         };
         const credential = self.selected_credential orelse return null;
-        if (credential.needsRefreshAt(now_ms)) return null;
+        if (credential.needsRefreshAt(now_ms)) {
+            if (freshness == .current or !credentials.sourceRefreshable(credential.source)) return null;
+        }
         if (credential.source == .fx_login) {
             const team = credential.gatewayTeam() orelse return null;
             if (!types.validGatewayTeam(team)) return null;
@@ -3617,9 +3634,9 @@ test "auth runtime withholds an fx credential across its expiry boundary" {
     _ = runtime.adoptCredential(alloc, &credential);
 
     try std.testing.expect(!runtime.credentialNeedsRefreshAt(39_999));
-    try std.testing.expect(runtime.gatewayCredentialAt(39_999) != null);
+    try std.testing.expect(runtime.gatewayCredentialAt(39_999, .current) != null);
     try std.testing.expect(runtime.credentialNeedsRefreshAt(40_000));
-    try std.testing.expect(runtime.gatewayCredentialAt(40_000) == null);
+    try std.testing.expect(runtime.gatewayCredentialAt(40_000, .current) == null);
     try std.testing.expectEqual(credentials.Source.fx_login, runtime.credentialSource().?);
     try std.testing.expectEqualStrings("team_123", runtime.view().selected_team.?);
     try std.testing.expectEqual(credentials.Source.fx_login, runtime.statusSnapshotAt(40_000, .gateway, null).active_source.?);
@@ -3634,7 +3651,38 @@ test "auth runtime withholds an fx credential across its expiry boundary" {
     refreshed.refresh_after_ms = 140_000;
     try std.testing.expect(runtime.adoptCredential(alloc, &refreshed));
     try std.testing.expect(!runtime.credentialNeedsRefreshAt(40_000));
-    try std.testing.expectEqualStrings("stale-token", runtime.gatewayCredentialAt(40_000).?.api_key.?);
+    try std.testing.expectEqualStrings("stale-token", runtime.gatewayCredentialAt(40_000, .current).?.api_key.?);
+}
+
+test "auth runtime lets a queued prompt carry a refreshable credential past its deadline" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    var credential = try makeTestCredential(alloc, "due-token", .fx_login, "team_123", "vercel-labs");
+    defer credential.deinit(alloc);
+    credential.refresh_after_ms = 40_000;
+    _ = runtime.adoptCredential(alloc, &credential);
+
+    try std.testing.expect(runtime.gatewayCredentialAt(40_000, .current) == null);
+    const queued = runtime.gatewayCredentialAt(40_000, .worker_refreshes).?;
+    try std.testing.expectEqualStrings("due-token", queued.api_key.?);
+    try std.testing.expectEqualStrings("team_123", queued.gateway_team.?);
+    try std.testing.expectEqual(credentials.Source.fx_login, queued.source);
+}
+
+test "auth runtime withholds a due credential the worker cannot refresh from queued prompts" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    var credential = try makeTestCredential(alloc, "oidc-token", .vercel_oidc_token, null, null);
+    defer credential.deinit(alloc);
+    credential.refresh_after_ms = 40_000;
+    _ = runtime.adoptCredential(alloc, &credential);
+
+    try std.testing.expect(runtime.gatewayCredentialAt(39_999, .worker_refreshes) != null);
+    try std.testing.expect(runtime.gatewayCredentialAt(40_000, .worker_refreshes) == null);
 }
 
 test "auth runtime view preserves missing and loaded states" {
