@@ -13,6 +13,7 @@
 //   compactAfterCollapsedResize, footerTopRowForExtra
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const shared_theme = @import("../../core/shared/theme.zig");
@@ -1092,6 +1093,9 @@ fn unusedRowsForSelection(
 pub const PreparedTranscriptSurfacePaint = struct {
     bytes: []u8 = &.{},
     owns_bytes: bool = true,
+    /// Whether the `source_*` line slices are owned here: they are when the
+    /// paint took over the line index of a source it prepared itself.
+    owns_source_lines: bool = false,
     visible_lines: std.ArrayList(VisibleTranscriptLine) = .empty,
     line_visual_rows: std.ArrayList(u16) = .empty,
     line_provenance: std.ArrayList(transcript_blocks.LineProvenance) = .empty,
@@ -1136,6 +1140,12 @@ pub const PreparedTranscriptSurfacePaint = struct {
     pub fn deinit(self: *PreparedTranscriptSurfacePaint, alloc: Allocator) void {
         self.finality_candidates.deinit(alloc);
         if (self.owns_bytes and self.bytes.len > 0) alloc.free(self.bytes);
+        if (self.owns_source_lines) {
+            if (self.source_visible_lines.len > 0) alloc.free(self.source_visible_lines);
+            if (self.source_line_visual_rows.len > 0) alloc.free(self.source_line_visual_rows);
+            if (self.source_visual_row_offsets.len > 0) alloc.free(self.source_visual_row_offsets);
+            if (self.source_line_provenance.len > 0) alloc.free(self.source_line_provenance);
+        }
         self.visible_lines.deinit(alloc);
         self.line_visual_rows.deinit(alloc);
         self.line_provenance.deinit(alloc);
@@ -1314,6 +1324,17 @@ fn prepareTranscriptSurfacePaintWithOwnedSource(
     if (source.bytes.len > 0) {
         prepared.owns_bytes = true;
         source.bytes = &.{};
+    }
+    // The paint borrows the source's line index when it fits as is; the
+    // source is freed here, so the paint takes the index over.
+    if (prepared.source_visible_lines.len > 0 and
+        prepared.source_visible_lines.ptr == source.transcript_visible_lines.ptr)
+    {
+        prepared.owns_source_lines = true;
+        source.transcript_visible_lines = &.{};
+        source.transcript_line_visual_rows = &.{};
+        source.transcript_visual_row_offsets = &.{};
+        if (prepared.source_line_provenance.len > 0) source.line_provenance = &.{};
     }
     return prepared;
 }
@@ -2520,13 +2541,13 @@ const PreparedProjectionBoundary = struct {
     line_terminated: bool,
 };
 
-const PreparedControlBoundary = struct {
+pub const PreparedControlBoundary = struct {
     resume_bytes: []u8 = &.{},
     steady_bytes: []u8 = &.{},
     cursor_col: u16 = 1,
     pending_wrap: bool = false,
 
-    fn deinit(self: *PreparedControlBoundary, alloc: Allocator) void {
+    pub fn deinit(self: *PreparedControlBoundary, alloc: Allocator) void {
         if (self.resume_bytes.len > 0) alloc.free(self.resume_bytes);
         if (self.steady_bytes.len > 0) alloc.free(self.steady_bytes);
     }
@@ -2549,6 +2570,80 @@ fn prepareControlBoundary(
     }
 
     return captureControlBoundary(alloc, &state);
+}
+
+/// The emulator's presentation state after `bytes[0..raw_offset]`. When
+/// `known` lies at or before `raw_offset` it resumes there and feeds only the
+/// bytes after it; the caller guarantees `bytes[0..known.offset]` are the
+/// bytes `known` was computed from. Caller owns the result.
+pub fn controlBoundaryAt(
+    alloc: Allocator,
+    bytes: []const u8,
+    cols: u16,
+    raw_offset: usize,
+    known: ?KnownControlBoundary,
+) !PreparedControlBoundary {
+    const from = if (known) |value| if (value.offset <= raw_offset) value else null else null;
+    var boundary = if (from) |value|
+        try advanceControlBoundary(alloc, bytes, cols, value, raw_offset)
+    else
+        try prepareControlBoundary(alloc, bytes, cols, raw_offset);
+    errdefer boundary.deinit(alloc);
+    if (from != null and source_preparation.prefixOracleEnabled()) {
+        try checkControlBoundaryAgainstFull(alloc, bytes, cols, raw_offset, &boundary);
+    }
+    return boundary;
+}
+
+/// The control boundary at `raw_offset`, from one known at an earlier offset
+/// of the same bytes: restores it and feeds only `bytes[known.offset..raw_offset]`.
+fn advanceControlBoundary(
+    alloc: Allocator,
+    bytes: []const u8,
+    cols: u16,
+    known: KnownControlBoundary,
+    raw_offset: usize,
+) !PreparedControlBoundary {
+    if (known.offset > raw_offset or raw_offset > bytes.len) return error.InvalidTranscriptTransition;
+
+    var state = try vt_emulator.Grid.init(alloc, cols, 1);
+    defer state.deinit();
+    state.defer_sync_updates = false;
+    try state.restorePresentationBoundary(
+        known.boundary.resume_bytes,
+        known.boundary.cursor_col,
+        known.boundary.pending_wrap,
+    );
+    try state.feed(bytes[known.offset..raw_offset]);
+    if (!state.atControlSequenceBoundary()) {
+        return error.InvalidTranscriptTransition;
+    }
+
+    return captureControlBoundary(alloc, &state);
+}
+
+/// The oracle for an advanced boundary: feeds the whole prefix and compares.
+/// A mismatch fails a test; otherwise the full boundary wins.
+fn checkControlBoundaryAgainstFull(
+    alloc: Allocator,
+    bytes: []const u8,
+    cols: u16,
+    raw_offset: usize,
+    advanced: *PreparedControlBoundary,
+) !void {
+    var full = try prepareControlBoundary(alloc, bytes, cols, raw_offset);
+    defer full.deinit(alloc);
+    if (std.mem.eql(u8, full.resume_bytes, advanced.resume_bytes) and
+        std.mem.eql(u8, full.steady_bytes, advanced.steady_bytes) and
+        full.cursor_col == advanced.cursor_col and
+        full.pending_wrap == advanced.pending_wrap) return;
+    debug_trace.logf(
+        "render",
+        "control boundary oracle mismatch offset={d} full_resume={d} advanced_resume={d} full_col={d} advanced_col={d}",
+        .{ raw_offset, full.resume_bytes.len, advanced.resume_bytes.len, full.cursor_col, advanced.cursor_col },
+    );
+    if (builtin.is_test) @panic("control boundary oracle: the advanced boundary differs from the full one");
+    std.mem.swap(PreparedControlBoundary, &full, advanced);
 }
 
 fn captureControlBoundary(
@@ -2728,6 +2823,20 @@ fn replacePreparedProjectionResumeBytesForFlowOffset(
                     false,
                 );
                 defer advanced.deinit(alloc);
+                if (source_preparation.prefixOracleEnabled()) {
+                    var full = try prepareControlBoundary(alloc, prepared.bytes, cols, offset);
+                    defer full.deinit(alloc);
+                    if (!std.mem.eql(u8, full.resume_bytes, advanced.endpoint_resume_bytes) or
+                        full.cursor_col != advanced.endpoint_cursor_col or
+                        full.pending_wrap != advanced.endpoint_pending_wrap)
+                    {
+                        debug_trace.logf("render", "projection resume oracle mismatch offset={d} base={d}", .{ offset, base_offset });
+                        if (builtin.is_test) @panic("projection resume oracle: the advanced state differs from the full one");
+                        std.mem.swap([]u8, &full.resume_bytes, &advanced.endpoint_resume_bytes);
+                        advanced.endpoint_cursor_col = full.cursor_col;
+                        advanced.endpoint_pending_wrap = full.pending_wrap;
+                    }
+                }
                 if (prepared.projection_resume_bytes.len > 0) {
                     alloc.free(prepared.projection_resume_bytes);
                 }
@@ -2810,7 +2919,30 @@ pub fn prepareTranscriptDocumentAppend(
     raw_end: usize,
     close_endpoint: bool,
 ) !PreparedResumeDocumentAppend {
-    var start = try prepareControlBoundary(alloc, bytes, cols, raw_start);
+    return prepareTranscriptDocumentAppendFrom(alloc, bytes, cols, raw_start, raw_end, close_endpoint, null);
+}
+
+/// The presentation state after the first `offset` bytes of a flow, computed
+/// earlier for these same bytes at the same width.
+pub const KnownControlBoundary = struct {
+    offset: usize,
+    boundary: PresentationBoundary,
+};
+
+/// Like `prepareTranscriptDocumentAppend`, but when `known` lies at or before
+/// `raw_start` it resumes the emulator there and feeds only the bytes after
+/// it, instead of the whole flow before the append. The caller guarantees
+/// `bytes[0..known.offset]` are the bytes `known` was computed from.
+pub fn prepareTranscriptDocumentAppendFrom(
+    alloc: Allocator,
+    bytes: []const u8,
+    cols: u16,
+    raw_start: usize,
+    raw_end: usize,
+    close_endpoint: bool,
+    known: ?KnownControlBoundary,
+) !PreparedResumeDocumentAppend {
+    var start = try controlBoundaryAt(alloc, bytes, cols, raw_start, known);
     defer start.deinit(alloc);
     return prepareResumeDocumentAppend(
         alloc,
@@ -2826,6 +2958,49 @@ pub fn prepareTranscriptDocumentAppend(
         },
         true,
     );
+}
+
+test "an append resumed from a known boundary equals one from the whole flow" {
+    const alloc = std.testing.allocator;
+    // Colors that span lines, an open hyperlink, wide runes that wrap at a
+    // narrow width, and a line exactly as wide as the terminal (pending wrap).
+    const flow = "\x1b[1;38;5;81mbold blue\nstill blue\x1b[0m plain\n" ++
+        "\x1b]8;id=fx-7;https://example.com\x1b\\link text\n more link\x1b]8;;\x1b\\ after\n" ++
+        "\xe7\x95\x8c\xe7\x95\x8c\xe7\x95\x8c\xe7\x95\x8c caf\xc3\xa9 \xe7\x95\x8c\n" ++
+        "0123456789\x1b[7mreversed\x1b[27m\n0123456789\n" ++
+        "\x1b[3mitalic\nwrapped across rows and rows and rows\x1b[0m tail";
+    var compared: usize = 0;
+    for ([_]u16{ 10, 13, 80 }) |cols| {
+        var known_at: usize = 0;
+        while (known_at <= flow.len) : (known_at += 3) {
+            var known = prepareControlBoundary(alloc, flow, cols, known_at) catch |err| switch (err) {
+                error.InvalidTranscriptTransition => continue,
+                else => return err,
+            };
+            defer known.deinit(alloc);
+            var raw_start = known_at;
+            while (raw_start <= flow.len) : (raw_start += 5) {
+                const raw_end = @min(flow.len, raw_start + 17);
+                var full = prepareTranscriptDocumentAppend(alloc, flow, cols, raw_start, raw_end, true) catch |err| switch (err) {
+                    error.InvalidTranscriptTransition => continue,
+                    else => return err,
+                };
+                defer full.deinit(alloc);
+                var resumed = try prepareTranscriptDocumentAppendFrom(alloc, flow, cols, raw_start, raw_end, true, .{
+                    .offset = known_at,
+                    .boundary = .{ .resume_bytes = known.resume_bytes, .cursor_col = known.cursor_col, .pending_wrap = known.pending_wrap },
+                });
+                defer resumed.deinit(alloc);
+                try std.testing.expectEqualStrings(full.bytes, resumed.bytes);
+                try std.testing.expectEqualStrings(full.endpoint_resume_bytes, resumed.endpoint_resume_bytes);
+                try std.testing.expectEqual(full.start_pending_wrap, resumed.start_pending_wrap);
+                try std.testing.expectEqual(full.endpoint_pending_wrap, resumed.endpoint_pending_wrap);
+                try std.testing.expectEqual(full.endpoint_cursor_col, resumed.endpoint_cursor_col);
+                compared += 1;
+            }
+        }
+    }
+    try std.testing.expect(compared > 500);
 }
 
 test "document append preparation emits terminal-ready newlines" {

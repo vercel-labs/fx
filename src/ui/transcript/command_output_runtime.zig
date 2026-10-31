@@ -10,8 +10,8 @@
 //   flushRecordedCommandOutputSummaryAtomic,
 //   rebuildTranscriptCacheFromEntries,
 //   rebuildTranscriptCacheAfterStructuredRewrite,
-//   recomputeCursorFromTranscript, enforceStructuredRetention,
-//   enforceStructuredRetentionAndReport
+//   recomputeCursorFromTranscript, pruneOrphanedCommandState,
+//   pruneOrphanedCommandStateAndReport
 
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
@@ -1327,39 +1327,36 @@ fn CommandOutputRecordSink(comptime Shell: type) type {
 
 fn commandOutputRetentionCap(shell: anytype) usize {
     const Shell = @TypeOf(shell.*);
-    return if (comptime @hasField(Shell, "max_retained_transcript_bytes"))
-        shell.max_retained_transcript_bytes
+    return if (comptime @hasField(Shell, "command_output_block_cap"))
+        shell.command_output_block_cap
     else
         std.math.maxInt(usize);
 }
 
+/// What one command's output holds in memory. Each command is bounded on its
+/// own: the transcript window holds a whole compaction cycle, so the
+/// transcript's total is not the measure.
 fn retainedCommandOutputBytes(shell: anytype, block_index: usize) usize {
     if (commandOutputRetentionCap(shell) == std.math.maxInt(usize)) return 0;
-    const Shell = @TypeOf(shell.*);
-    return if (comptime @hasDecl(Shell, "retainedStructuredBytesForCommandOutput"))
-        shell.retainedStructuredBytesForCommandOutput()
-    else
-        commandOutputBlockRetainedBytes(shell.command_output_blocks.items[block_index]);
+    return commandOutputBlockRetainedBytes(shell.command_output_blocks.items[block_index]);
 }
 
-test "unbounded command output admission does not scan retained state" {
-    const CountingShell = struct {
-        max_retained_transcript_bytes: usize = std.math.maxInt(usize),
+test "command output admission measures only its own command" {
+    const Shell = struct {
+        command_output_block_cap: usize = 1000,
         command_output_blocks: std.ArrayList(CommandOutputBlock) = .empty,
-        retained_scan_count: usize = 0,
-
-        pub fn retainedStructuredBytesForCommandOutput(self: *@This()) usize {
-            self.retained_scan_count += 1;
-            return 123;
-        }
     };
-
-    var shell: CountingShell = .{};
+    var shell: Shell = .{};
     defer shell.command_output_blocks.deinit(std.testing.allocator);
+    try shell.command_output_blocks.append(std.testing.allocator, .{ .retained_text_bytes = 100 });
     try shell.command_output_blocks.append(std.testing.allocator, .{});
 
+    // An earlier command's output does not count against a new one.
+    try std.testing.expectEqual(@as(usize, 100), retainedCommandOutputBytes(&shell, 0));
+    try std.testing.expectEqual(@as(usize, 0), retainedCommandOutputBytes(&shell, 1));
+    // Unbounded, nothing is measured.
+    shell.command_output_block_cap = std.math.maxInt(usize);
     try std.testing.expectEqual(@as(usize, 0), retainedCommandOutputBytes(&shell, 0));
-    try std.testing.expectEqual(@as(usize, 0), shell.retained_scan_count);
 }
 
 fn commandStreamIndex(stream: command_output_content.Stream) usize {
@@ -1419,10 +1416,10 @@ fn consolidateCommandOutputBlock(
     }
     shell.recomputeCursorFromTranscript();
     requestTranscriptPaint(shell, null);
-    if (comptime @hasDecl(@TypeOf(shell.*), "enforceStructuredRetentionAndReport")) {
-        return shell.enforceStructuredRetentionAndReport(alloc, shell.command_output_blocks.items[index].entry_id);
+    if (comptime @hasDecl(@TypeOf(shell.*), "pruneOrphanedCommandStateAndReport")) {
+        return shell.pruneOrphanedCommandStateAndReport(alloc);
     }
-    try shell.enforceStructuredRetention(alloc, shell.command_output_blocks.items[index].entry_id);
+    try shell.pruneOrphanedCommandState(alloc);
     return false;
 }
 

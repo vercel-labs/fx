@@ -18,7 +18,6 @@ pub const ResumeProjection = struct {
     runtime: TranscriptRuntime,
     alloc: Allocator,
     created_at_ms: i64,
-    retention_cap: usize,
     publication_source: ?transcript_runtime.TranscriptPreparationSource = null,
     pending_diffs: std.ArrayList(diff.DiffEntry) = .empty,
     next_diff_id: u32,
@@ -31,14 +30,10 @@ pub const ResumeProjection = struct {
         created_at_ms: i64,
         next_diff_id: u32,
     ) !ResumeProjection {
-        var detached = try transcript_store.cloneDetachedPresentationState(source, alloc);
-        const retention_cap = detached.max_retained_transcript_bytes;
-        detached.max_retained_transcript_bytes = std.math.maxInt(usize);
         return .{
-            .runtime = detached,
+            .runtime = try transcript_store.cloneDetachedPresentationState(source, alloc),
             .alloc = alloc,
             .created_at_ms = created_at_ms,
-            .retention_cap = retention_cap,
             .next_diff_id = next_diff_id,
         };
     }
@@ -392,11 +387,7 @@ pub const ResumeProjection = struct {
             full_flow,
         );
 
-        self.runtime.max_retained_transcript_bytes = self.retention_cap;
-        const retention_changed = try self.runtime.enforceStructuredRetentionAndReport(
-            self.alloc,
-            null,
-        );
+        const retention_changed = try self.runtime.pruneOrphanedCommandStateAndReport(self.alloc);
         if (!retention_changed) {
             self.runtime.transcript.clearRetainingCapacity();
             self.runtime.replaceable_last_line = false;
@@ -454,6 +445,19 @@ pub const ResumeProjection = struct {
         self.runtime.deinit(self.alloc);
     }
 
+    /// Transfers a replayed older cycle into a standalone runtime for Ctrl+O,
+    /// which pages over its entries: no main-screen source is prepared, so a
+    /// large cycle costs its replay only. The caller owns the returned runtime
+    /// and must deinitialize it with the same allocator.
+    pub fn intoArchivedRuntime(self: *ResumeProjection) !TranscriptRuntime {
+        std.debug.assert(!self.finalized);
+        std.debug.assert(!self.consumed);
+        _ = try command_output_runtime.syncCommandOutputBlockEntries(&self.runtime, self.alloc);
+        self.finalized = true;
+        self.consumed = true;
+        return self.runtime;
+    }
+
     /// Transfers a finalized detached projection into a standalone transcript
     /// runtime. The caller owns the returned runtime and must deinitialize it
     /// with the same allocator.
@@ -487,7 +491,7 @@ pub const ResumeProjection = struct {
     }
 };
 
-test "resume projection finalizes complete flow before one retained-tail pass" {
+test "resume projection finalizes the complete flow and keeps every entry" {
     const alloc = std.testing.allocator;
     var source: TranscriptRuntime = .{};
     source.layout = .{
@@ -499,7 +503,6 @@ test "resume projection finalizes complete flow before one retained-tail pass" {
         .divider_bottom_row = 39,
         .hint_row = 40,
     };
-    source.max_retained_transcript_bytes = 96;
     defer source.deinit(alloc);
 
     var projection = try ResumeProjection.init(alloc, &source, 42, 1);
@@ -518,7 +521,39 @@ test "resume projection finalizes complete flow before one retained-tail pass" {
 
     try std.testing.expect(std.mem.find(u8, projection.publication_source.?.bytes, "historical marker 0") != null);
     try std.testing.expect(std.mem.find(u8, projection.publication_source.?.bytes, "historical marker 11") != null);
-    try std.testing.expect(projection.runtime.entries.items.len < 13);
+    // The resumed cycle is held whole: the notice and the twelve lines.
+    try std.testing.expectEqual(@as(usize, 13), projection.runtime.entries.items.len);
+}
+
+test "resume projection hands Ctrl+O an older cycle whole, without a screen source" {
+    const alloc = std.testing.allocator;
+    var source: TranscriptRuntime = .{};
+    source.layout = .{
+        .rows = 40,
+        .cols = 80,
+        .content_bottom = 36,
+        .divider_top_row = 37,
+        .input_row = 38,
+        .divider_bottom_row = 39,
+        .hint_row = 40,
+    };
+    defer source.deinit(alloc);
+
+    var projection = try ResumeProjection.initEmpty(alloc, &source, 42, 1);
+    defer projection.deinit();
+    for (0..12) |index| {
+        var text: [64]u8 = undefined;
+        const line = try std.mem.print(&text, "historical marker {d}\n", .{index});
+        _ = try projection.appendRawClassified(line, .unknown_raw);
+    }
+    var archived = try projection.intoArchivedRuntime();
+    defer archived.deinit(alloc);
+    // Every entry of the cycle, and nothing rendered for a screen that never
+    // shows it.
+    try std.testing.expectEqual(@as(usize, 12), archived.entries.items.len);
+    try std.testing.expect(projection.publication_source == null);
+    try std.testing.expectEqual(@as(usize, 0), archived.transcript.items.len);
+    try std.testing.expect(archived.pending_resume_source == null);
 }
 
 test "empty resume projection keeps layout without source conversation" {
@@ -561,12 +596,10 @@ test "resume projection installs complete publication and retained continuation 
         .divider_bottom_row = 39,
         .hint_row = 40,
     };
-    source.max_retained_transcript_bytes = 96;
     defer source.deinit(alloc);
 
     var target: TranscriptRuntime = .{};
     target.layout = source.layout;
-    target.max_retained_transcript_bytes = source.max_retained_transcript_bytes;
     defer target.deinit(alloc);
 
     var projection = try ResumeProjection.init(alloc, &source, 42, 1);
@@ -581,7 +614,7 @@ test "resume projection installs complete publication and retained continuation 
 
     try std.testing.expect(std.mem.find(u8, target.pendingResumeFlow(), "publication marker 0") != null);
     try std.testing.expect(std.mem.find(u8, target.pendingResumeFlow(), "publication marker 11") != null);
-    try std.testing.expect(target.entries.items.len < 12);
+    try std.testing.expectEqual(@as(usize, 12), target.entries.items.len);
     var prepared = try target.prepareTranscriptSource(alloc, null);
     defer prepared.deinit(alloc);
     try std.testing.expectEqualStrings(target.pendingResumeFlow(), prepared.bytes);

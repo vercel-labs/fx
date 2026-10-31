@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const transcript_window_shell = @import("transcript_window_shell.zig");
 const diagnostics = @import("../../core/workspace/diagnostics.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const display_width = @import("../../core/shared/display_width.zig");
@@ -24,6 +25,7 @@ const build_checkpoint = @import("../render_engine/build_checkpoint.zig");
 const transcript_io = @import("io.zig");
 const transcript_painter = @import("painter.zig");
 const source_preparation = @import("source_preparation.zig");
+const frozen_prefix = @import("frozen_prefix.zig");
 const full_transcript_worker = @import("full_transcript_worker.zig");
 const tool_group_projection = @import("tool_group_projection.zig");
 const transcript_store = @import("store.zig");
@@ -147,6 +149,45 @@ pub const MeasuredResizeProjection = union(enum) {
     },
 };
 
+/// Which entry of an older cycle Ctrl+O lands on when it pages into it.
+pub const ArchiveLanding = enum { first, last };
+
+/// The first entry id of an older cycle replayed for Ctrl+O, far above the
+/// live ids so a page that joins it to the held entries keeps them apart.
+pub fn archiveEntryIdBase(back: u32) u32 {
+    return 0x8000_0000 +| (back *| 0x0010_0000);
+}
+
+/// What the newest Ctrl+O pages range over: the cycle before the held one
+/// (from the session log) and then the held entries, as one view.
+const JoinedPageStore = struct {
+    archived: []const TranscriptEntry,
+    held: []const TranscriptEntry,
+
+    fn len(self: JoinedPageStore) usize {
+        return self.archived.len + self.held.len;
+    }
+
+    fn entryId(self: JoinedPageStore, index: usize) u32 {
+        return if (index < self.archived.len) self.archived[index].id() else self.held[index - self.archived.len].id();
+    }
+};
+
+/// An older compaction cycle replayed from the session log for Ctrl+O.
+pub const TranscriptArchive = struct {
+    /// Cycles before the held entries: 1 is the newest older one.
+    back: u32,
+    /// Whether the session log holds a cycle before this one.
+    has_older: bool,
+    runtime: *TranscriptRuntime,
+    alloc: Allocator,
+
+    pub fn deinit(self: *TranscriptArchive) void {
+        self.runtime.deinit(self.alloc);
+        self.alloc.destroy(self.runtime);
+    }
+};
+
 const CommittedTranscriptAnchor = struct {
     selection: ViewportSelection,
     visual_offset: u32,
@@ -170,14 +211,142 @@ const CommittedTranscriptAnchor = struct {
     /// The offset gap alone is insufficient because footer displacement can
     /// create the same shape without content debt.
     history_catchup_pending: bool = false,
+    /// The emulator's presentation states at prefixes of `flow`, so the
+    /// next append resumes from one instead of feeding the whole flow
+    /// through the emulator again. Set only from states computed for these
+    /// bytes; cleared whenever `flow` is replaced.
+    flow_boundaries: FlowBoundaries = .{},
 
     fn deinit(self: *CommittedTranscriptAnchor, alloc: Allocator) void {
         self.retention_identity.deinit(alloc);
         if (self.flow.len > 0) alloc.free(self.flow);
         if (self.row_provenance.len > 0) alloc.free(self.row_provenance);
+        self.flow_boundaries.deinit(alloc);
         self.* = undefined;
     }
 };
+
+/// The presentation state after the first `offset` bytes of a flow at `cols`
+/// columns, as `transcript_painter.KnownControlBoundary` takes it. Owns
+/// `resume_bytes`.
+const FlowBoundary = struct {
+    offset: usize,
+    cols: u16,
+    resume_bytes: []u8 = &.{},
+    cursor_col: u16,
+    pending_wrap: bool,
+
+    fn deinit(self: *FlowBoundary, alloc: Allocator) void {
+        if (self.resume_bytes.len > 0) alloc.free(self.resume_bytes);
+        self.* = undefined;
+    }
+
+    fn known(self: FlowBoundary) transcript_painter.KnownControlBoundary {
+        return .{ .offset = self.offset, .boundary = .{
+            .resume_bytes = self.resume_bytes,
+            .cursor_col = self.cursor_col,
+            .pending_wrap = self.pending_wrap,
+        } };
+    }
+
+    fn presentation(self: FlowBoundary) transcript_painter.PresentationBoundary {
+        return self.known().boundary;
+    }
+};
+
+/// The presentation states appends computed in a flow. An append starts at
+/// the previous end (`start`, `end`) or replays from the history boundary a
+/// screen back (`replay`); frames alternate between the two, and both points
+/// only move forward, so each frame resumes from the state its last kind
+/// left.
+const FlowBoundaries = struct {
+    replay: ?FlowBoundary = null,
+    start: ?FlowBoundary = null,
+    end: ?FlowBoundary = null,
+
+    fn deinit(self: *FlowBoundaries, alloc: Allocator) void {
+        if (self.replay) |*boundary| boundary.deinit(alloc);
+        if (self.start) |*boundary| boundary.deinit(alloc);
+        if (self.end) |*boundary| boundary.deinit(alloc);
+        self.* = .{};
+    }
+
+    fn isEmpty(self: FlowBoundaries) bool {
+        return self.replay == null and self.start == null and self.end == null;
+    }
+
+    fn slots(self: FlowBoundaries) [3]?FlowBoundary {
+        return .{ self.replay, self.start, self.end };
+    }
+
+    /// The kept state latest in the flow at or before `offset`, at `cols`.
+    fn latestAtOrBefore(self: FlowBoundaries, offset: usize, cols: u16) ?FlowBoundary {
+        var best: ?FlowBoundary = null;
+        for (self.slots()) |slot| {
+            const boundary = slot orelse continue;
+            if (boundary.cols != cols or boundary.offset > offset) continue;
+            if (best == null or boundary.offset > best.?.offset) best = boundary;
+        }
+        return best;
+    }
+
+    /// The kept state earliest in the flow.
+    fn earliest(self: FlowBoundaries) ?FlowBoundary {
+        var best: ?FlowBoundary = null;
+        for (self.slots()) |slot| {
+            const boundary = slot orelse continue;
+            if (best == null or boundary.offset < best.?.offset) best = boundary;
+        }
+        return best;
+    }
+
+    /// The furthest offset any kept state covers.
+    fn reach(self: FlowBoundaries) usize {
+        var furthest: usize = 0;
+        for (self.slots()) |slot| if (slot) |boundary| {
+            furthest = @max(furthest, boundary.offset);
+        };
+        return furthest;
+    }
+};
+
+/// The flow boundaries a new stable anchor over `flow` keeps, moved out of
+/// their owner: this frame's own, or the previous anchor's while `flow` still
+/// starts with the bytes they were computed from.
+fn takeCommittedFlowBoundaries(
+    transition: *TranscriptTransition,
+    previous: *TranscriptCommitState,
+    flow: []const u8,
+) FlowBoundaries {
+    var kept: FlowBoundaries = .{};
+    if (!transition.flow_boundaries.isEmpty() and transition.flow_boundaries.reach() <= flow.len) {
+        kept = transition.flow_boundaries;
+        transition.flow_boundaries = .{};
+    }
+    // The slots this frame did not fill keep the previous anchor's states.
+    switch (previous.*) {
+        .stable => |*anchor| {
+            const old = &anchor.flow_boundaries;
+            if (kept.replay == null) moveFlowBoundaryIfHeld(&old.replay, &kept.replay, flow, anchor.flow);
+            if (kept.start == null and kept.end == null) {
+                moveFlowBoundaryIfHeld(&old.start, &kept.start, flow, anchor.flow);
+                moveFlowBoundaryIfHeld(&old.end, &kept.end, flow, anchor.flow);
+            }
+        },
+        .invalid, .recovering => {},
+    }
+    return kept;
+}
+
+/// Moves a kept state from `from` to `to` while `flow` still starts with the
+/// bytes of `old_flow` it was computed from.
+fn moveFlowBoundaryIfHeld(from: *?FlowBoundary, to: *?FlowBoundary, flow: []const u8, old_flow: []const u8) void {
+    const boundary = from.* orelse return;
+    const end = boundary.offset;
+    if (end > flow.len or end > old_flow.len or !std.mem.eql(u8, flow[0..end], old_flow[0..end])) return;
+    to.* = boundary;
+    from.* = null;
+}
 
 fn committedProjectionVisualOffset(anchor: CommittedTranscriptAnchor) u32 {
     return if (anchor.normal_buffer_recovery_pending)
@@ -241,6 +410,45 @@ const TranscriptCommitState = union(enum) {
     }
 };
 
+test "kept presentation states are refused once the bytes before them change" {
+    const alloc = testing_allocator.no_resize;
+    var runtime = TranscriptRuntime{ .detached_commit_alloc = alloc };
+    defer runtime.deinit(alloc);
+    runtime.layout.cols = 40;
+    const flow = "one\ntwo\nthree\nfour\n";
+    runtime.transcript_commit_state = .{ .stable = .{
+        .flow = try alloc.dupe(u8, flow),
+        .visual_offset = 0,
+        .history_visual_offset = 0,
+        .total_visual_rows = 4,
+        .selection = .{ .start_line = 0, .top_row = 1, .bottom_row = 4, .partial_skip_rows = 0, .line_count = 4 },
+        .cursor_row = 5,
+        .cursor_col = 1,
+        .occupied_last_row = 4,
+        .occupied_last_row_blank = false,
+        .layout_id = 1,
+        .flow_boundaries = .{ .replay = .{ .offset = 8, .cols = 40, .cursor_col = 1, .pending_wrap = false } },
+    } };
+    const replay_base: TranscriptRuntime.TransitionAppendBase = .{
+        .flow_len = 14,
+        .history_replay = .{ .flow_start = 14, .flow_end = 19, .clear_rows = 0 },
+        .visual_offset = 2,
+        .visual_rows = 2,
+        .cursor_row = 1,
+        .cursor_col = 1,
+    };
+    const same = flow ++ "five\n";
+    const changed = "ONE\ntwo\nthree\nfour\nfive\n";
+    try std.testing.expectEqual(@as(?usize, 8), if (runtime.keptAppendBoundary(same, replay_base)) |kept| kept.offset else null);
+    try std.testing.expect(runtime.keptAppendBoundary(changed, replay_base) == null);
+    try std.testing.expectEqual(@as(?usize, 8), if (runtime.keptProjectionSeed(same)) |kept| kept.offset else null);
+    try std.testing.expect(runtime.keptProjectionSeed(changed) == null);
+    // Another width is another state.
+    runtime.layout.cols = 41;
+    try std.testing.expect(runtime.keptAppendBoundary(same, replay_base) == null);
+    try std.testing.expect(runtime.keptProjectionSeed(same) == null);
+}
+
 test "retention rebase carries stable and recovering source boundaries" {
     const alloc = testing_allocator.no_resize;
     var before = try source_preparation.prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "a\nb\nc\nd\ne\nf"), 80, null);
@@ -251,7 +459,7 @@ test "retention rebase carries stable and recovering source boundaries" {
     for (&provenance, 0..) |*line, index| line.* = .{ .entry = .{ .entry_id = @intCast(index + 1), .entry_class = .unknown_raw } };
     before.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &provenance);
     after.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, provenance[2..]);
-    var mapping = try source_preparation.RetentionRebase.init(alloc, &before, &after, &.{});
+    var mapping = try source_preparation.RetentionRebase.init(alloc, &before, &after);
     defer mapping.deinit(alloc);
     for ([_]bool{ false, true }) |recovering| {
         var runtime = TranscriptRuntime{ .detached_commit_alloc = alloc };
@@ -280,10 +488,12 @@ test "retention rebase carries stable and recovering source boundaries" {
             .occupied_last_row = 2,
             .occupied_last_row_blank = false,
             .layout_id = 1,
+            .flow_boundaries = .{ .end = .{ .offset = 2, .cols = 80, .resume_bytes = try alloc.dupe(u8, "\x1b[1m"), .cursor_col = 1, .pending_wrap = false } },
         } };
         var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
         try std.testing.expectError(error.OutOfMemory, runtime.rebaseRetainedTranscript(failing.allocator(), mapping, .{}));
         try std.testing.expectEqual(@as(u32, 3), runtime.transcriptCommitDiagnostic().history_visual_offset);
+        if (!recovering) try std.testing.expect(!runtime.transcript_commit_state.stable.flow_boundaries.isEmpty());
         try runtime.rebaseRetainedTranscript(alloc, mapping, .{});
         const diagnostic = runtime.transcriptCommitDiagnostic();
         try std.testing.expectEqual(@as(u32, 1), diagnostic.history_visual_offset);
@@ -294,6 +504,8 @@ test "retention rebase carries stable and recovering source boundaries" {
             .stable => |anchor| {
                 try std.testing.expectEqualStrings(after.bytes, anchor.flow);
                 try std.testing.expectEqual(@as(usize, 2), anchor.selection.start_line);
+                // The kept presentation state described the old flow.
+                try std.testing.expect(anchor.flow_boundaries.isEmpty());
             },
             .recovering => |receipt| {
                 try std.testing.expectEqualStrings(after.bytes, receipt.flow);
@@ -320,7 +532,7 @@ test "retention rebase recovery rejects the removed entry partial-row endpoint" 
     };
     before.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &lines);
     after.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, lines[1..]);
-    var mapping = try source_preparation.RetentionRebase.init(alloc, &before, &after, &.{});
+    var mapping = try source_preparation.RetentionRebase.init(alloc, &before, &after);
     defer mapping.deinit(alloc);
     var runtime = TranscriptRuntime{ .detached_commit_alloc = alloc, .transcript_commit_state = .{ .recovering = .{
         .flow = try alloc.dupe(u8, before.bytes),
@@ -474,6 +686,9 @@ pub const TranscriptTransition = struct {
     presentation_resume_bytes: []u8 = &.{},
     presentation_pending_wrap: bool = false,
     presentation_valid: bool = false,
+    /// The emulator states where this frame's append started and ended in
+    /// `target_flow`; a stable commit keeps them on the anchor.
+    flow_boundaries: FlowBoundaries = .{},
     target_cache: std.ArrayList(u8),
     target_cache_unchanged: bool = false,
     target_cache_origin_untrimmed: bool = false,
@@ -505,6 +720,7 @@ pub const TranscriptTransition = struct {
         if (self.target_flow_owned and self.target_flow.len > 0) alloc.free(self.target_flow);
         alloc.free(self.presentation_flow);
         if (self.presentation_resume_bytes.len > 0) alloc.free(self.presentation_resume_bytes);
+        self.flow_boundaries.deinit(alloc);
         if (self.document_append_bytes.len > 0) {
             alloc.free(self.document_append_bytes);
         }
@@ -1378,7 +1594,7 @@ test "full transcript page boundaries preserve monotonic navigation" {
     runtime.scrollFullTranscript(.up, .page);
     const older_anchor = switch (runtime.full_transcript_page_anchor) {
         .entry_index => |index| index,
-        .tail => return error.TestExpectedOlderPage,
+        .tail, .archive => return error.TestExpectedOlderPage,
     };
     try std.testing.expectEqual(@as(usize, 743), older_anchor);
     try std.testing.expect(runtime.full_transcript.bookmark_pending);
@@ -1407,7 +1623,7 @@ test "full transcript page boundaries preserve monotonic navigation" {
     runtime.scrollFullTranscript(.down, .page);
     const newer_anchor = switch (runtime.full_transcript_page_anchor) {
         .entry_index => |index| index,
-        .tail => return error.TestExpectedNewerPage,
+        .tail, .archive => return error.TestExpectedNewerPage,
     };
     try std.testing.expectEqual(@as(usize, 871), newer_anchor);
     try std.testing.expect(runtime.full_transcript.bookmark_pending);
@@ -3743,8 +3959,8 @@ test "prepared canonical command mutation stays bounded across twenty four thous
             true,
         );
         try std.testing.expect(
-            runtime.retainedStructuredBytesForCommandOutput() <=
-                runtime.max_retained_transcript_bytes,
+            command_output_runtime.commandOutputBlockRetainedBytes(runtime.command_output_blocks.items[0]) <=
+                runtime.command_output_block_cap,
         );
     }
     const block = runtime.command_output_blocks.items[0];
@@ -3768,7 +3984,7 @@ test "oversized open command record stops growing after overflow" {
             .divider_bottom_row = 23,
             .hint_row = 24,
         },
-        .max_retained_transcript_bytes = 8 * 1024,
+        .command_output_block_cap = 8 * 1024,
     };
     defer runtime.deinit(alloc);
     const styles: Styles = .{
@@ -3796,8 +4012,8 @@ test "oversized open command record stops growing after overflow" {
         if (source_entry_id == null) source_entry_id = block.lines.items[0].entry_id;
         try std.testing.expectEqual(source_entry_id, block.lines.items[0].entry_id);
         try std.testing.expect(
-            runtime.retainedStructuredBytesForCommandOutput() <=
-                runtime.max_retained_transcript_bytes,
+            command_output_runtime.commandOutputBlockRetainedBytes(runtime.command_output_blocks.items[0]) <=
+                runtime.command_output_block_cap,
         );
         if (block.retention_overflow) {
             if (retained_after_overflow) |retained| {
@@ -3855,7 +4071,7 @@ test "descriptor capped bare carriage return replaces one dropped record" {
         true,
     );
     const kept_entry_id = runtime.command_output_blocks.items[0].lines.items[0].entry_id.?;
-    runtime.max_retained_transcript_bytes = runtime.retainedStructuredBytesForCommandOutput();
+    runtime.command_output_block_cap = command_output_runtime.commandOutputBlockRetainedBytes(runtime.command_output_blocks.items[0]);
 
     _ = try command_output_runtime.writeCommandOutputChunkUncommitted(
         &runtime,
@@ -3924,7 +4140,7 @@ test "descriptor capped ansi-only prefix keeps later visible overflow record" {
         "kept\n",
         true,
     );
-    runtime.max_retained_transcript_bytes = runtime.retainedStructuredBytesForCommandOutput();
+    runtime.command_output_block_cap = command_output_runtime.commandOutputBlockRetainedBytes(runtime.command_output_blocks.items[0]);
 
     _ = try command_output_runtime.writeCommandOutputChunkUncommitted(
         &runtime,
@@ -3954,7 +4170,7 @@ test "descriptor capped ansi-only prefix keeps later visible overflow record" {
     );
     block = &runtime.command_output_blocks.items[0];
     try std.testing.expect(block.overflow_record_visible[0]);
-    runtime.max_retained_transcript_bytes = std.math.maxInt(usize);
+    runtime.command_output_block_cap = std.math.maxInt(usize);
 
     _ = try command_output_runtime.flushCommandOutputSummaryUncommitted(
         &runtime,
@@ -4005,7 +4221,7 @@ test "descriptor capped split osc terminator preserves record boundaries" {
         "kept\n",
         true,
     );
-    runtime.max_retained_transcript_bytes = runtime.retainedStructuredBytesForCommandOutput();
+    runtime.command_output_block_cap = command_output_runtime.commandOutputBlockRetainedBytes(runtime.command_output_blocks.items[0]);
 
     try runtime.writeCommandOutputChunk(
         alloc,
@@ -4264,7 +4480,7 @@ pub fn wrapAssistantText(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
     return transcript_blocks.wrapAssistantText(alloc, text, cols);
 }
 
-const default_max_retained_transcript_bytes: usize = 1024 * 1024;
+const default_command_output_block_cap: usize = 1024 * 1024;
 const full_transcript_snapshot_clone_max_bytes: usize = 8 * 1024 * 1024;
 const resume_publication_rows_per_frame: u32 = 64;
 
@@ -4564,6 +4780,16 @@ pub const TranscriptRuntime = struct {
     full_transcript_page_load: full_transcript_worker.Load = .{},
     full_transcript_window_load: full_transcript_worker.WindowLoad = .{},
     full_transcript_page_anchor: full_transcript_page.Anchor = .tail,
+    /// The older compaction cycle Ctrl+O shows, replayed from the session
+    /// log. One is held at a time.
+    transcript_archive: ?TranscriptArchive = null,
+    /// Whether the session log holds compaction cycles older than these
+    /// entries for Ctrl+O to page into. The app sets it.
+    transcript_archive_available: bool = false,
+    /// The cycle a Ctrl+O page needs (`Archive.back`), for the app to load.
+    transcript_archive_request: ?u32 = null,
+    /// Which entry of the requested cycle Ctrl+O lands on once it loads.
+    transcript_archive_boundary: ?ArchiveLanding = null,
     full_transcript_installed_page: ?InstalledFullTranscriptPage = null,
     full_transcript_installed_page_retired: bool = false,
     full_transcript_failed_request: ?full_transcript_page.Request = null,
@@ -4573,6 +4799,16 @@ pub const TranscriptRuntime = struct {
     full_transcript_prepared_page_visible: bool = false,
     full_transcript_content_revision: u64 = 0,
     compact_transcript_source_cache: CompactTranscriptSourceCache = .{},
+    /// The renderer's state after the entries of finished turns, reused by
+    /// the next preparation when those entries are unchanged
+    /// (`frozen_prefix.zig`).
+    frozen_prefix: frozen_prefix.FrozenPrefix = .{},
+    /// Set on the mutation shadows cloned from a runtime: they read and fill
+    /// the runtime's frozen prefix instead of their own.
+    frozen_prefix_source: ?*frozen_prefix.FrozenPrefix = null,
+    /// The transcript window, when it decides what the transcript holds
+    /// (`transcript_window_shell.zig`). Mutation shadows never carry it.
+    transcript_window: ?transcript_window_shell.Shell = null,
     /// When enabled, compact transcript tool groups render only their summary
     /// header while the full transcript retains every individual tool call.
     collapse_tool_calls: bool = false,
@@ -4580,8 +4816,6 @@ pub const TranscriptRuntime = struct {
     /// current width while retaining the raw byte buffer for append paths
     /// that still write pre-rendered transcript content.
     entries: std.ArrayList(TranscriptEntry) = .empty,
-    /// Borrowed only by a detached store transaction; never installed on the live runtime.
-    retention_prefix_trims: ?*std.ArrayList(transcript_store.RetentionPrefixTrim) = null,
     lifecycle_state: activity_runtime.ToolActivityState = .{},
     worker_status: worker_status.State = .none,
     /// Core-owned producer state and policy for native-history release.
@@ -4606,16 +4840,13 @@ pub const TranscriptRuntime = struct {
     /// canonical entry source at `last_rendered_cols`.
     transcript_cache_origin_untrimmed: bool = false,
     /// Visible byte-cache cap. This bounds `transcript.items`, which is
-    /// the rendered tail used by viewport paint. Structured entries and
-    /// folded command output are bounded separately by
-    /// `max_retained_transcript_bytes` below.
+    /// the rendered tail used by viewport paint. Which structured entries
+    /// are held is the transcript window's (`transcript_window`): the
+    /// current compaction cycle.
     max_transcript_bytes: usize = 256 * 1024,
-    /// Structured retention cap for raw/user/assistant entries plus
-    /// folded command output lines. This model is the source of truth
-    /// for reconstructive paint, resize, and diff restyling, so it gets
-    /// its own conservative budget instead of borrowing the smaller
-    /// visible byte-cache limit.
-    max_retained_transcript_bytes: usize = default_max_retained_transcript_bytes,
+    /// The bytes one command's output keeps in memory; the rest of it is
+    /// counted only, and its artifact holds it whole.
+    command_output_block_cap: usize = default_command_output_block_cap,
     painting: bool = false,
     /// Renderer-local cache state set by transcript mutations. The same
     /// mutation must request `.transcript`; this flag never authorizes a
@@ -4709,6 +4940,9 @@ pub const TranscriptRuntime = struct {
         self.full_transcript_page_load.deinit();
         self.discardInstalledFullTranscriptPage();
         self.compact_transcript_source_cache.deinit(alloc);
+        self.frozen_prefix.deinit();
+        if (self.transcript_window) |*window| window.deinit(alloc);
+        self.discardTranscriptArchive();
         self.lifecycle_state.deinit(alloc);
         for (self.tool_details.items) |*detail| detail.deinit(alloc);
         self.tool_details.deinit(alloc);
@@ -4812,16 +5046,12 @@ pub const TranscriptRuntime = struct {
         transcript_store.reconcileDetachedInstallSource(self, source);
     }
 
-    pub fn enforceStructuredRetention(self: *TranscriptRuntime, alloc: Allocator, protected_id: ?u32) !void {
-        return transcript_store.enforceStructuredRetention(self, alloc, protected_id);
+    pub fn pruneOrphanedCommandState(self: *TranscriptRuntime, alloc: Allocator) !void {
+        return transcript_store.pruneOrphanedCommandState(self, alloc);
     }
 
-    pub fn enforceStructuredRetentionAndReport(
-        self: *TranscriptRuntime,
-        alloc: Allocator,
-        protected_id: ?u32,
-    ) !bool {
-        return transcript_store.enforceStructuredRetentionAndReport(self, alloc, protected_id);
+    pub fn pruneOrphanedCommandStateAndReport(self: *TranscriptRuntime, alloc: Allocator) !bool {
+        return transcript_store.pruneOrphanedCommandStateAndReport(self, alloc);
     }
 
     pub fn lifecyclePinCount(self: *const TranscriptRuntime) usize {
@@ -4924,6 +5154,7 @@ pub const TranscriptRuntime = struct {
             return err;
         };
         self.lifecycle_state.commitCleanup(alloc, watermark);
+        try self.syncTranscriptWindow(alloc);
     }
 
     pub fn activityProjection(
@@ -5801,6 +6032,7 @@ pub const TranscriptRuntime = struct {
                 return err;
             };
             self.lifecycle_state.releasePausedTurn(alloc, finished.turn_id);
+            try self.syncTranscriptWindow(alloc);
         } else {
             self.lifecycle_state.commitTurnFinished(finished.turn_id, fallbacks);
         }
@@ -6586,12 +6818,6 @@ pub const TranscriptRuntime = struct {
         return command_output_runtime.resetCommandOutputDisplay(self, alloc, reason);
     }
 
-    pub fn retainedStructuredBytesForCommandOutput(
-        self: *const TranscriptRuntime,
-    ) usize {
-        return transcript_store.retainedStructuredBytes(self);
-    }
-
     /// Append a raw-bytes entry. Takes ownership of `bytes` — the slice
     /// must have been allocated by `alloc` and must not be freed by the
     /// caller; the entry is freed on `clearTranscript` or `deinit`.
@@ -6703,7 +6929,150 @@ pub const TranscriptRuntime = struct {
             if (summary.completed_at_ms > 0) summary.completed_at_ms else io_mod.milliTimestamp(),
         );
         self.markTranscriptContentDirtyFrom(entry_id);
+        try self.syncTranscriptWindow(alloc);
         return entry_id;
+    }
+
+    /// Hands retention to the transcript window: entries leave only when the
+    /// window drops them, so the byte cap no longer applies. `saved` is false
+    /// for a session without a session log.
+    pub fn enableTranscriptWindow(self: *TranscriptRuntime, alloc: Allocator, saved: bool) !void {
+        if (self.transcript_window) |*window| window.deinit(alloc);
+        self.transcript_window = transcript_window_shell.Shell.init(saved);
+        // Each window's trace starts here (tests/tla/drivers/transcript_window/binary-to-spec.ts).
+        debug_trace.logf("transcript_window", "window_enabled saved={}", .{saved});
+        try self.syncTranscriptWindow(alloc);
+    }
+
+    /// Reports new entries and finished live ones to the transcript window
+    /// and removes the entries it drops.
+    pub fn syncTranscriptWindow(self: *TranscriptRuntime, alloc: Allocator) !void {
+        const window = if (self.transcript_window) |*value| value else return;
+        var drops: std.ArrayList(u32) = .empty;
+        defer drops.deinit(alloc);
+        try window.sync(alloc, self.entries.items, &drops);
+        try self.applyTranscriptWindowDrops(alloc, window, drops.items);
+    }
+
+    /// Sets whether the session writes a session log, enabling the window
+    /// when it is not running yet.
+    pub fn setTranscriptWindowSaved(self: *TranscriptRuntime, alloc: Allocator, saved: bool) !void {
+        if (self.transcript_window) |*window| {
+            window.state.config.saved = saved;
+            return;
+        }
+        try self.enableTranscriptWindow(alloc, saved);
+    }
+
+    /// The entries were rebuilt from the session log on resume.
+    pub fn transcriptWindowResumed(self: *TranscriptRuntime, alloc: Allocator) !void {
+        // Which cycle is "one back" changed with the session.
+        self.discardTranscriptArchive();
+        const window = if (self.transcript_window) |*value| value else return;
+        try window.resumed(alloc, self.entries.items);
+    }
+
+    /// The session compacted its context, after the session log committed it.
+    pub fn transcriptWindowCompacted(self: *TranscriptRuntime, alloc: Allocator) !void {
+        // A new newest compaction: the cycle Ctrl+O read as "one back" is
+        // now two back.
+        self.discardTranscriptArchive();
+        const window = if (self.transcript_window) |*value| value else return;
+        var drops: std.ArrayList(u32) = .empty;
+        defer drops.deinit(alloc);
+        try window.compacted(alloc, self.entries.items, &drops);
+        try self.applyTranscriptWindowDrops(alloc, window, drops.items);
+    }
+
+    /// Removes the dropped entries that are off screen. The main screen
+    /// repaints its live area from the entries every frame, so an entry with a
+    /// row below the rows released into terminal history stays until it
+    /// scrolls off; the next sync tries it again.
+    fn applyTranscriptWindowDrops(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        window: *transcript_window_shell.Shell,
+        drops: []const u32,
+    ) !void {
+        // The previous cycle left memory: "one back" now means it, not the
+        // cycle before it.
+        if (drops.len > 0) self.discardTranscriptArchive();
+        try window.pending_drops.appendSlice(alloc, drops);
+        if (window.pending_drops.items.len == 0) return;
+        var hold = try self.transcriptWindowDropHold(alloc);
+        defer hold.deinit(alloc);
+        var ready: std.ArrayList(u32) = .empty;
+        defer ready.deinit(alloc);
+        var kept: usize = 0;
+        for (window.pending_drops.items) |id| {
+            if (hold.holds(id)) {
+                window.pending_drops.items[kept] = id;
+                kept += 1;
+            } else {
+                try ready.append(alloc, id);
+            }
+        }
+        window.pending_drops.shrinkRetainingCapacity(kept);
+        if (kept > 0) debug_trace.logf("transcript_window", "drop held entries={d} on screen", .{kept});
+        _ = try transcript_store.dropEntriesAtomic(self, alloc, ready.items);
+    }
+
+    /// The screen is about to be cleared and replayed from the entries: the
+    /// drops held for rows on screen can go, so the replay starts at the
+    /// held cycle.
+    pub fn transcriptWindowScreenCleared(self: *TranscriptRuntime, alloc: Allocator) !void {
+        const window = if (self.transcript_window) |*value| value else return;
+        if (window.pending_drops.items.len == 0) return;
+        var ready = window.pending_drops;
+        window.pending_drops = .empty;
+        defer ready.deinit(alloc);
+        debug_trace.logf("transcript_window", "screen cleared: releasing held drops entries={d}", .{ready.items.len});
+        _ = try transcript_store.dropEntriesAtomic(self, alloc, ready.items);
+    }
+
+    const TranscriptWindowDropHold = union(enum) {
+        /// Nothing is on screen: no frame is committed.
+        none,
+        /// The screen is in a state the drop must not disturb.
+        all,
+        entries: std.AutoHashMapUnmanaged(u32, void),
+
+        fn holds(self: *const TranscriptWindowDropHold, id: u32) bool {
+            return switch (self.*) {
+                .none => false,
+                .all => true,
+                .entries => |set| set.contains(id),
+            };
+        }
+
+        fn deinit(self: *TranscriptWindowDropHold, alloc: Allocator) void {
+            if (self.* == .entries) self.entries.deinit(alloc);
+        }
+    };
+
+    /// The entries with a row in the committed frame's live area, below the
+    /// rows released into terminal history.
+    fn transcriptWindowDropHold(self: *TranscriptRuntime, alloc: Allocator) !TranscriptWindowDropHold {
+        if (self.fullTranscriptActive()) return .all;
+        const history = switch (self.transcript_commit_state) {
+            .invalid => return .none,
+            .stable => |anchor| anchor.history_visual_offset,
+            .recovering => return .all,
+        };
+        var committed = (try self.prepareCommittedRetentionSource(alloc)) orelse return .all;
+        defer committed.deinit(alloc);
+        if (committed.bytes.len == 0) return .none;
+        try committed.ensureLineIndex(alloc);
+        if (committed.line_provenance.len + 1 != committed.transcript_visual_row_offsets.len) return .all;
+        var set: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        errdefer set.deinit(alloc);
+        var owner: ?u32 = null;
+        for (committed.line_provenance, 0..) |line, index| {
+            owner = source_preparation.publication_owner(owner, line);
+            if (committed.transcript_visual_row_offsets[index + 1] <= history) continue;
+            if (owner) |id| try set.put(alloc, id, {});
+        }
+        return .{ .entries = set };
     }
 
     /// Swap the bytes of the `raw_bytes` entry with `entry_id` to a dup of
@@ -7065,8 +7434,186 @@ pub const TranscriptRuntime = struct {
         self.resetFullTranscriptPageNavigation();
     }
 
+    /// Whether the newest Ctrl+O pages show the cycle before the held one
+    /// with it: the session log holds a compaction and the window no longer
+    /// holds that cycle in memory (when it does, the held entries already
+    /// span both).
+    pub fn ctrlOJoinsPreviousCycle(self: *const TranscriptRuntime) bool {
+        return self.transcript_archive_available and !self.transcriptWindowHoldsPreviousCycle();
+    }
+
+    /// The newest older cycle Ctrl+O shows on pages of its own.
+    fn firstPagedBack(self: *const TranscriptRuntime) u32 {
+        return if (self.ctrlOJoinsPreviousCycle()) 2 else 1;
+    }
+
+    /// The newest pages' entries, or null while the cycle they join is not
+    /// loaded.
+    fn joinedPageStore(self: *const TranscriptRuntime) ?JoinedPageStore {
+        if (!self.ctrlOJoinsPreviousCycle()) return .{ .archived = &.{}, .held = self.entries.items };
+        const previous = self.archiveFor(1) orelse return null;
+        return .{ .archived = previous.runtime.entries.items, .held = self.entries.items };
+    }
+
+    /// The page above the one at `anchor` over `range`: the previous page of
+    /// the same entries, else the newest older cycle in the session log,
+    /// else none.
+    pub fn olderPageAnchor(self: *const TranscriptRuntime, anchor: full_transcript_page.Anchor, range: full_transcript_page.SourceRange) ?full_transcript_page.Anchor {
+        if (full_transcript_page.previousAnchor(range)) |previous| return pageAnchorInStore(anchor, previous.entry_index);
+        return switch (anchor) {
+            .tail, .entry_index => if (!self.transcript_archive_available)
+                null
+            else if (!self.ctrlOJoinsPreviousCycle())
+                .{ .archive = .{ .back = 1, .entry_index = std.math.maxInt(usize) } }
+            else if (self.archiveFor(1)) |previous|
+                if (previous.has_older) .{ .archive = .{ .back = 2, .entry_index = std.math.maxInt(usize) } } else null
+            else
+                null,
+            .archive => |archive| if (self.archiveFor(archive.back)) |held|
+                if (held.has_older) .{ .archive = .{ .back = archive.back + 1, .entry_index = std.math.maxInt(usize) } } else null
+            else
+                null,
+        };
+    }
+
+    /// The page below the one at `anchor` over `range`: the next page of the
+    /// same entries, else the next newer cycle, else the held entries.
+    pub fn newerPageAnchor(self: *const TranscriptRuntime, anchor: full_transcript_page.Anchor, range: full_transcript_page.SourceRange) ?full_transcript_page.Anchor {
+        const total = self.pageStoreLen(anchor) orelse return null;
+        if (full_transcript_page.nextAnchor(range, total)) |next| return pageAnchorInStore(anchor, next.entry_index);
+        return switch (anchor) {
+            .tail, .entry_index => null,
+            .archive => |archive| if (archive.back > self.firstPagedBack())
+                .{ .archive = .{ .back = archive.back - 1, .entry_index = 0 } }
+            else
+                .{ .entry_index = 0 },
+        };
+    }
+
+    fn pageAnchorInStore(anchor: full_transcript_page.Anchor, index: usize) full_transcript_page.Anchor {
+        return switch (anchor) {
+            .tail, .entry_index => .{ .entry_index = index },
+            .archive => |archive| .{ .archive = .{ .back = archive.back, .entry_index = index } },
+        };
+    }
+
+    /// How many entries a page anchor ranges over, or null for a cycle not
+    /// loaded.
+    fn pageStoreLen(self: *const TranscriptRuntime, anchor: full_transcript_page.Anchor) ?usize {
+        return switch (anchor) {
+            .tail, .entry_index => if (self.joinedPageStore()) |store| store.len() else null,
+            .archive => |archive| if (self.archiveFor(archive.back)) |held| held.runtime.entries.items.len else null,
+        };
+    }
+
+    fn pageStoreEntryId(self: *const TranscriptRuntime, anchor: full_transcript_page.Anchor, index: usize) ?u32 {
+        return switch (anchor) {
+            .tail, .entry_index => if (self.joinedPageStore()) |store| store.entryId(index) else null,
+            .archive => |archive| if (self.archiveFor(archive.back)) |held| held.runtime.entries.items[index].id() else null,
+        };
+    }
+
+    /// The cycle a page anchor needs loaded, or null for none.
+    fn pageStoreArchiveBack(self: *const TranscriptRuntime, anchor: full_transcript_page.Anchor) ?u32 {
+        return switch (anchor) {
+            .archive => |archive| archive.back,
+            .tail, .entry_index => if (self.ctrlOJoinsPreviousCycle()) 1 else null,
+        };
+    }
+
+    fn archiveFor(self: *const TranscriptRuntime, back: u32) ?*const TranscriptArchive {
+        const held = if (self.transcript_archive) |*value| value else return null;
+        return if (held.back == back) held else null;
+    }
+
+    /// Moves Ctrl+O to the page at `anchor`, landing on its `land` entry; a
+    /// cycle not loaded yet is requested from the app and landed on once it
+    /// is installed.
+    pub fn moveToFullTranscriptPage(self: *TranscriptRuntime, anchor: full_transcript_page.Anchor, land: ArchiveLanding) void {
+        self.full_transcript_page_anchor = anchor;
+        const total = self.pageStoreLen(anchor) orelse {
+            const back = self.pageStoreArchiveBack(anchor) orelse return;
+            self.transcript_archive_request = back;
+            self.transcript_archive_boundary = land;
+            debug_trace.logf("full_transcript_cache", "archive_requested back={d} land={s}", .{ back, @tagName(land) });
+            return;
+        };
+        if (total == 0) return;
+        const index = switch (anchor) {
+            .tail => return,
+            .entry_index => |value| value,
+            .archive => |archive| archive.entry_index,
+        };
+        self.full_transcript = self.full_transcript.select_page_boundary(self.pageStoreEntryId(anchor, @min(index, total - 1)).?);
+    }
+
+    /// Installs a cycle the app replayed from the session log for Ctrl+O,
+    /// replacing the one held, and lands on it when a page was waiting for
+    /// it. Takes ownership of `archived`, allocated with `alloc`.
+    pub fn installTranscriptArchive(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        back: u32,
+        has_older: bool,
+        archived: TranscriptRuntime,
+    ) !void {
+        // Its ids are apart from the live ones (`archiveEntryIdBase`), so a
+        // page can join it to the held entries.
+        std.debug.assert(archived.entries.items.len == 0 or archived.entries.items[0].id() >= archiveEntryIdBase(0));
+        const owned = try alloc.create(TranscriptRuntime);
+        owned.* = archived;
+        self.discardTranscriptArchive();
+        self.transcript_archive = .{ .back = back, .has_older = has_older, .runtime = owned, .alloc = alloc };
+        debug_trace.logf("full_transcript_cache", "archive_installed back={d} entries={d} has_older={}", .{ back, owned.entries.items.len, has_older });
+        if (self.transcript_archive_request == back) self.transcript_archive_request = null;
+        const land = self.transcript_archive_boundary orelse return;
+        self.transcript_archive_boundary = null;
+        const anchor = self.full_transcript_page_anchor;
+        if (self.pageStoreArchiveBack(anchor) != back) return;
+        const total = self.pageStoreLen(anchor) orelse return;
+        if (total == 0) return;
+        const index: usize = switch (land) {
+            .first => 0,
+            .last => total - 1,
+        };
+        self.full_transcript_page_anchor = switch (anchor) {
+            .archive => .{ .archive = .{ .back = back, .entry_index = index } },
+            .tail, .entry_index => .{ .entry_index = index },
+        };
+        self.full_transcript = self.full_transcript.select_page_boundary(self.pageStoreEntryId(anchor, index).?);
+    }
+
+    /// The app could not load the requested cycle: Ctrl+O stays on the held
+    /// entries.
+    pub fn failTranscriptArchive(self: *TranscriptRuntime) void {
+        self.transcript_archive_request = null;
+        self.transcript_archive_boundary = null;
+        if (self.full_transcript_page_anchor == .archive) self.full_transcript_page_anchor = .{ .entry_index = 0 };
+    }
+
+    fn fullTranscriptOpenOrOpening(self: *const TranscriptRuntime) bool {
+        return self.full_transcript.depth == .full or
+            self.full_transcript_open_request != null or
+            self.full_transcript_restore_open_pending;
+    }
+
+    pub fn discardTranscriptArchive(self: *TranscriptRuntime) void {
+        if (self.transcript_archive) |*held| held.deinit();
+        self.transcript_archive = null;
+    }
+
+    /// Whether the transcript window still holds the cycle before the newest
+    /// compaction, which it does until the first turn end the log holds.
+    pub fn transcriptWindowHoldsPreviousCycle(self: *const TranscriptRuntime) bool {
+        const window = if (self.transcript_window) |*value| value else return false;
+        return window.state.prev_first != null;
+    }
+
     fn resetFullTranscriptPageNavigation(self: *TranscriptRuntime) void {
         self.full_transcript_page_anchor = .tail;
+        self.discardTranscriptArchive();
+        self.transcript_archive_request = null;
+        self.transcript_archive_boundary = null;
         self.full_transcript_prepared_page_visible = false;
         self.full_transcript_open_request = null;
         self.full_transcript_restore_open_pending = false;
@@ -7112,34 +7659,25 @@ pub const TranscriptRuntime = struct {
         else
             0;
         const local_max_offset = local_total_rows -| local_visible_rows;
-        const adjacent_anchor = switch (direction) {
+        const adjacent_anchor: ?full_transcript_page.Anchor = switch (direction) {
             .up => if (before == 0 and self.full_transcript.scroll_rows == 0)
                 if (self.full_transcript_installed_page) |*page|
-                    full_transcript_page.previousAnchor(page.source.range)
+                    self.olderPageAnchor(page.source.request.anchor, page.source.range)
                 else
                     null
             else
                 null,
             .down => if (before >= local_max_offset and
                 self.full_transcript_installed_page != null)
-                full_transcript_page.nextAnchor(
+                self.newerPageAnchor(
+                    self.full_transcript_installed_page.?.source.request.anchor,
                     self.full_transcript_installed_page.?.source.range,
-                    self.entries.items.len,
                 )
             else
                 null,
         };
         if (adjacent_anchor) |anchor| {
-            const boundary_index = switch (anchor) {
-                .entry_index => |index| index,
-                .tail => unreachable,
-            };
-            if (boundary_index < self.entries.items.len) {
-                self.full_transcript_page_anchor = anchor;
-                self.full_transcript = self.full_transcript.select_page_boundary(
-                    self.entries.items[boundary_index].id(),
-                );
-            }
+            self.moveToFullTranscriptPage(anchor, if (direction == .up) .last else .first);
         }
         debug_trace.logf(
             "full_transcript_cache",
@@ -7476,6 +8014,7 @@ pub const TranscriptRuntime = struct {
                 if (!anchor.flow_materialized) anchor.normal_buffer_recovery_pending = true;
                 alloc.free(anchor.flow);
                 anchor.flow = retained_flow;
+                anchor.flow_boundaries.deinit(alloc);
                 anchor.retention_identity.deinit(alloc);
                 anchor.retention_identity = identity;
                 anchor.visual_offset = mapping.visual(anchor.visual_offset);
@@ -8833,6 +9372,58 @@ pub const TranscriptRuntime = struct {
         cursor_col: u16,
     };
 
+    /// The kept presentation state the append at `base` can resume from: the
+    /// stable anchor's latest one at or before it, while `target_flow` still
+    /// holds the bytes it was computed from. A plain stable base already
+    /// checked that `target_flow` starts with the anchor's flow
+    /// (`resolveTransitionAppendBase`); any other base is compared here.
+    fn keptAppendBoundary(
+        self: *const TranscriptRuntime,
+        target_flow: []const u8,
+        base: TransitionAppendBase,
+    ) ?FlowBoundary {
+        const anchor = switch (self.transcript_commit_state) {
+            .stable => |value| value,
+            .invalid, .recovering => return null,
+        };
+        const kept = anchor.flow_boundaries.latestAtOrBefore(base.flow_len, self.layout.cols) orelse {
+            if (debug_trace.isScopeEnabled("render")) debug_trace.logf("render", "kept boundary none at or before base={d} start={?d} end={?d} anchor_flow={d}", .{
+                base.flow_len,
+                if (anchor.flow_boundaries.start) |value| value.offset else null,
+                if (anchor.flow_boundaries.end) |value| value.offset else null,
+                anchor.flow.len,
+            });
+            return null;
+        };
+        if (kept.offset > anchor.flow.len or kept.offset > target_flow.len) return null;
+        const plain_base = base.history_replay == null and base.flow_len == anchor.flow.len;
+        if (!plain_base and !std.mem.eql(u8, target_flow[0..kept.offset], anchor.flow[0..kept.offset])) {
+            if (debug_trace.isScopeEnabled("render")) debug_trace.logf("render", "kept boundary prefix changed base={d} kept={d} target_flow={d} anchor_flow={d} first_diff={?d}", .{
+                base.flow_len,
+                kept.offset,
+                target_flow.len,
+                anchor.flow.len,
+                std.mem.findDiff(u8, target_flow[0..kept.offset], anchor.flow[0..kept.offset]),
+            });
+            return null;
+        }
+        return kept;
+    }
+
+    /// The kept presentation state the projection resume can advance from:
+    /// the stable anchor's earliest, while `bytes` still holds the bytes it
+    /// was computed from.
+    fn keptProjectionSeed(self: *const TranscriptRuntime, bytes: []const u8) ?FlowBoundary {
+        const anchor = switch (self.transcript_commit_state) {
+            .stable => |value| value,
+            .invalid, .recovering => return null,
+        };
+        const kept = anchor.flow_boundaries.earliest() orelse return null;
+        if (kept.cols != self.layout.cols or kept.offset > anchor.flow.len or kept.offset > bytes.len) return null;
+        if (!std.mem.eql(u8, bytes[0..kept.offset], anchor.flow[0..kept.offset])) return null;
+        return kept;
+    }
+
     fn resolveTransitionAppendBase(
         self: *const TranscriptRuntime,
         prepared: *const transcript_painter.PreparedTranscriptSurfacePaint,
@@ -9129,7 +9720,17 @@ pub const TranscriptRuntime = struct {
                 );
             },
             .stable => {},
-        };
+        } else switch (self.transcript_commit_state) {
+            // The projection resumes at the top of the visible rows, at or
+            // after where the last append started: seed that kept state so
+            // it advances from there instead of feeding the flow from 0.
+            .stable => if (prepared.projection_resume_flow_offset == null) {
+                if (self.keptProjectionSeed(prepared.bytes)) |kept| {
+                    try transcript_painter.seedPreparedPresentationBoundary(alloc, prepared, kept.offset, kept.presentation());
+                }
+            },
+            .invalid, .recovering => {},
+        }
         return self.planTranscriptScrollForFrame(
             prepared,
             footer_reservation_changed,
@@ -9495,6 +10096,8 @@ pub const TranscriptRuntime = struct {
         var presentation_resume_bytes: []u8 = &.{};
         var presentation_pending_wrap = false;
         var presentation_valid = false;
+        var flow_boundaries: FlowBoundaries = .{};
+        errdefer flow_boundaries.deinit(alloc);
         errdefer if (document_append_bytes.len > 0) {
             alloc.free(document_append_bytes);
         };
@@ -9582,18 +10185,59 @@ pub const TranscriptRuntime = struct {
                 presentation_pending_wrap = prepared_append.endpoint_pending_wrap;
                 presentation_valid = true;
             } else {
-                var prepared_append = try transcript_painter.prepareTranscriptDocumentAppend(
+                const known = self.keptAppendBoundary(target_flow, base);
+                if (known == null and debug_trace.isScopeEnabled("render")) debug_trace.logf("render", "append boundary fed from start state={s} kept={} base={d} replay={}", .{
+                    @tagName(self.transcript_commit_state),
+                    switch (self.transcript_commit_state) {
+                        .stable => |anchor| !anchor.flow_boundaries.isEmpty(),
+                        .invalid, .recovering => false,
+                    },
+                    base.flow_len,
+                    base.history_replay != null,
+                });
+                var start = try transcript_painter.controlBoundaryAt(
+                    alloc,
+                    target_flow,
+                    self.layout.cols,
+                    base.flow_len,
+                    if (known) |value| value.known() else null,
+                );
+                defer start.deinit(alloc);
+                var prepared_append = try transcript_painter.prepareResumeDocumentAppend(
                     alloc,
                     target_flow,
                     self.layout.cols,
                     base.flow_len,
                     projected_flow_end.?,
                     target.projection_staged,
+                    .{
+                        .resume_bytes = start.resume_bytes,
+                        .cursor_col = start.cursor_col,
+                        .pending_wrap = start.pending_wrap,
+                    },
+                    true,
                 );
                 defer prepared_append.deinit(alloc);
                 append_pending_wrap = prepared_append.start_pending_wrap;
                 document_append_bytes = prepared_append.bytes;
                 prepared_append.bytes = &.{};
+                const start_kept: FlowBoundary = .{
+                    .offset = base.flow_len,
+                    .cols = self.layout.cols,
+                    .resume_bytes = start.resume_bytes,
+                    .cursor_col = start.cursor_col,
+                    .pending_wrap = start.pending_wrap,
+                };
+                if (base.history_replay != null) flow_boundaries.replay = start_kept else flow_boundaries.start = start_kept;
+                start.resume_bytes = &.{};
+                flow_boundaries.end = .{
+                    .offset = projected_flow_end.?,
+                    .cols = self.layout.cols,
+                    .resume_bytes = prepared_append.endpoint_resume_bytes,
+                    .cursor_col = prepared_append.endpoint_cursor_col,
+                    .pending_wrap = prepared_append.endpoint_pending_wrap,
+                };
+                prepared_append.endpoint_resume_bytes = &.{};
             }
             document_append = .{
                 .bytes = if (document_append_bytes.len > 0)
@@ -9703,6 +10347,7 @@ pub const TranscriptRuntime = struct {
             .presentation_resume_bytes = presentation_resume_bytes,
             .presentation_pending_wrap = presentation_pending_wrap,
             .presentation_valid = presentation_valid,
+            .flow_boundaries = flow_boundaries,
             .target_cache = target_cache,
             .target_cache_unchanged = borrows_source,
             .target_cache_origin_untrimmed = target_cache_origin_untrimmed,
@@ -9928,6 +10573,7 @@ pub const TranscriptRuntime = struct {
                 .normal_buffer_recovery_pending = transition.normal_buffer_recovery_pending and
                     (transition.retention_identity.publication_entries.len == 0 or transition.history_catchup_pending or transition.history_visual_offset < transition.visual_offset),
                 .history_catchup_pending = transition.history_catchup_pending,
+                .flow_boundaries = takeCommittedFlowBoundaries(transition, &previous_state, stable_flow),
             } };
             transition.row_provenance = &.{};
             transition.retention_identity = .{};
@@ -10174,7 +10820,8 @@ pub const TranscriptRuntime = struct {
         record: bool,
         class: RawEntryClass,
     ) !void {
-        return transcript_writer.writeTranscriptClassified(self, alloc, metrics, text, record, class);
+        try transcript_writer.writeTranscriptClassified(self, alloc, metrics, text, record, class);
+        if (class == .turn_cancellation) try self.syncTranscriptWindow(alloc);
     }
 
     pub fn writeTranscriptBytesFrom(
@@ -10480,6 +11127,14 @@ pub const TranscriptRuntime = struct {
         bottom_reserved_rows: u16,
     ) !transcript_painter.PreparedTranscriptSurfacePaint {
         return transcript_painter.prepareTranscriptSurfacePaint(self, alloc, metrics, bottom_reserved_rows);
+    }
+
+    /// The frozen prefix this runtime's preparations use: its own, or the one
+    /// of the runtime a mutation shadow was cloned from. It is a cache, so
+    /// filling it through a const runtime does not change what that runtime
+    /// shows.
+    pub fn borrowedFrozenPrefix(self: *const TranscriptRuntime) *frozen_prefix.FrozenPrefix {
+        return self.frozen_prefix_source orelse @constCast(&self.frozen_prefix);
     }
 
     pub fn prepareTranscriptSource(
@@ -11034,6 +11689,12 @@ pub const TranscriptRuntime = struct {
             capability,
             full_diff_resolver,
         ) catch |err| switch (err) {
+            error.TranscriptArchiveNotLoaded => {
+                // The log is read only for a Ctrl+O that is open or opening:
+                // while it is closed, memory holds the one cycle.
+                if (self.fullTranscriptOpenOrOpening()) self.transcript_archive_request = self.pageStoreArchiveBack(request.anchor);
+                return;
+            },
             error.FullTranscriptPageSnapshotTooLarge => {
                 self.full_transcript_failed_request = request;
                 self.full_transcript_failure_pending = true;
@@ -11053,17 +11714,101 @@ pub const TranscriptRuntime = struct {
         source_owned = false;
     }
 
-    fn snapshotFullTranscriptPage(
+    pub fn snapshotFullTranscriptPage(
         self: *const TranscriptRuntime,
         request: full_transcript_page.Request,
         capability: ?*session_child_store.SessionChildCapability,
         full_diff_resolver: ?full_transcript_screen.FullDiffResolver,
     ) !full_transcript_worker.Source {
         const alloc = std.heap.c_allocator;
-        const range = full_transcript_page.sourceRange(
-            request,
-            self.entries.items.len,
-        );
+        if (request.anchor == .archive) {
+            // An older cycle's page comes from the cycle's own entries.
+            const held = self.archiveFor(request.anchor.archive.back) orelse return error.TranscriptArchiveNotLoaded;
+            const range = full_transcript_page.sourceRange(request, held.runtime.entries.items.len);
+            var source = try self.snapshotArchivedRange(held, request, range);
+            source.range = range;
+            return source;
+        }
+        const store = self.joinedPageStore() orelse return error.TranscriptArchiveNotLoaded;
+        const range = full_transcript_page.sourceRange(request, store.len());
+        if (store.archived.len == 0) {
+            var source = try self.snapshotEntryRange(request, range, capability, full_diff_resolver);
+            errdefer source.deinit(alloc);
+            try self.prependFullDetailRecords(alloc, &source);
+            return source;
+        }
+        // A page across the join: the older cycle's part from its own
+        // runtime, the held part from this one. Their entry ids are apart
+        // (`archiveEntryIdBase`).
+        const archived_end = @min(range.end, store.archived.len);
+        var source = if (range.start < archived_end)
+            try self.snapshotArchivedRange(self.archiveFor(1).?, request, .{ .start = range.start, .end = archived_end })
+        else
+            try self.snapshotEntryRange(request, .{ .start = 0, .end = 0 }, null, null);
+        errdefer source.deinit(alloc);
+        if (range.end > store.archived.len) {
+            var held = try self.snapshotEntryRange(request, .{
+                .start = @max(range.start, store.archived.len) - store.archived.len,
+                .end = range.end - store.archived.len,
+            }, capability, full_diff_resolver);
+            defer held.deinit(alloc);
+            try moveSnapshotParts(alloc, &source, &held);
+        }
+        source.range = range;
+        try self.prependFullDetailRecords(alloc, &source);
+        return source;
+    }
+
+    /// A page of an older cycle, shown with this runtime's Ctrl+O state.
+    fn snapshotArchivedRange(
+        self: *const TranscriptRuntime,
+        archive: *const TranscriptArchive,
+        request: full_transcript_page.Request,
+        range: full_transcript_page.SourceRange,
+    ) !full_transcript_worker.Source {
+        archive.runtime.layout = self.layout;
+        archive.runtime.command_output_render = self.command_output_render;
+        var source = try archive.runtime.snapshotEntryRange(request, range, null, null);
+        source.presentation = self.presentationForRebuiltPage();
+        source.visible_rows = @intCast(@min(self.fullTranscriptPageRows(), std.math.maxInt(u16)));
+        return source;
+    }
+
+    /// Moves `from`'s entries, details, command blocks and diffs after
+    /// `into`'s, leaving `from` empty.
+    fn moveSnapshotParts(alloc: Allocator, into: *full_transcript_worker.Source, from: *full_transcript_worker.Source) !void {
+        try into.entries.appendSlice(alloc, from.entries.items);
+        from.entries.clearRetainingCapacity();
+        try into.details.appendSlice(alloc, from.details.items);
+        from.details.clearRetainingCapacity();
+        try into.command_blocks.appendSlice(alloc, from.command_blocks.items);
+        from.command_blocks.clearRetainingCapacity();
+        try into.full_diffs.appendSlice(alloc, from.full_diffs.items);
+        from.full_diffs.clearRetainingCapacity();
+        try into.full_diff_lifecycles.appendSlice(alloc, from.full_diff_lifecycles.items);
+        from.full_diff_lifecycles.clearRetainingCapacity();
+        into.presentation = from.presentation;
+        into.visible_rows = from.visible_rows;
+        if (from.capability) |capability| {
+            if (into.capability) |*old| old.deinit();
+            into.capability = capability;
+            from.capability = null;
+        }
+    }
+
+    /// One store's entries `range` as a page source: the entries, their tool
+    /// details, the command output and full diffs they show.
+    fn snapshotEntryRange(
+        self: *const TranscriptRuntime,
+        request: full_transcript_page.Request,
+        range: full_transcript_page.SourceRange,
+        capability: ?*session_child_store.SessionChildCapability,
+        full_diff_resolver: ?full_transcript_screen.FullDiffResolver,
+    ) !full_transcript_worker.Source {
+        const alloc = std.heap.c_allocator;
+        // Entries the transcript window dropped but still holds for the
+        // screen belong to an older cycle, which Ctrl+O reads from the log.
+        const pending_drops: []const u32 = if (self.transcript_window) |*window| window.pending_drops.items else &.{};
         if (self.fullTranscriptPageSnapshotBytes(
             range,
             full_diff_resolver,
@@ -11088,6 +11833,7 @@ pub const TranscriptRuntime = struct {
             @min(self.command_output_blocks.items.len, range.len()),
         );
         for (self.entries.items[range.start..range.end]) |entry| {
+            if (pending_drops.len > 0 and std.mem.findScalar(u32, pending_drops, entry.id()) != null) continue;
             source.entries.appendAssumeCapacity(
                 try transcript_store.cloneEntryForSnapshot(alloc, entry),
             );
@@ -11163,7 +11909,6 @@ pub const TranscriptRuntime = struct {
         if (capability) |current| {
             source.capability = try current.cloneReadOnly(alloc);
         }
-        try self.prependFullDetailRecords(alloc, &source);
         debug_trace.logf(
             "full_transcript_cache",
             "page_snapshot revision={d} cols={d} range={d}..{d} entries={d} details={d} blocks={d} diffs={d}",

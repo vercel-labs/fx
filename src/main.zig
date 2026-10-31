@@ -195,7 +195,11 @@ fn nativeLoopPollTimeoutMs(
     skills_refresh_active: bool,
     transcript_page_work_active: bool,
     file_listing_hold_pending: bool,
+    /// A time-bounded drain put events back: run the next iteration without
+    /// waiting for input.
+    next_iteration_due: bool,
 ) i32 {
+    if (next_iteration_due) return 0;
     return if (first_frame_pending or
         auth_refresh_active or
         skills_refresh_active or
@@ -1148,6 +1152,7 @@ const App = struct {
                 self.skills.refreshActive(),
                 self.fullTranscriptFocusedWorkActive(),
                 InputAppRuntime.fileListingHoldPending(self, app_permission_runtime.monotonicMillis()),
+                self.worker.takeDrainContinuationDue(),
             );
         }
         return if (self.pacer.hasPending()) default_timeout_ms else idle_wasm_poll_timeout_ms;
@@ -1427,6 +1432,7 @@ const App = struct {
         projection.pending_diffs.clearRetainingCapacity();
         self.next_diff_id = projection.next_diff_id;
         projection.install(&self.shell);
+        try self.shell.transcriptWindowResumed(self.alloc);
     }
 
     pub fn historicalToolActivityKind(
@@ -2965,6 +2971,14 @@ const App = struct {
                 RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
             }
         }
+        if (self.shell.transcript_archive_request) |back| {
+            // A Ctrl+O page needs an older compaction cycle from the log.
+            SessionAppRuntime.loadTranscriptArchive(self, back) catch |err| {
+                debug_trace.logf("full_transcript_cache", "archive_load_failed back={d} err={s}", .{ back, @errorName(err) });
+                self.shell.failTranscriptArchive();
+            };
+            RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
+        }
         try self.shell.prewarmFullTranscriptPage(
             self.fullTranscriptSidecarCapability(),
             self.fullTranscriptDiffResolver(),
@@ -3013,7 +3027,15 @@ const App = struct {
             InputAppRuntime.terminalPasteActive(self),
         );
         try self.routeTerminalInputIngress(terminal_input);
-        try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self));
+        if (comptime host_target.is_wasm) {
+            try WorkerAppRuntime.tick(self, app_callbacks.Bindings(App).workerEventHandlers(self));
+        } else {
+            try WorkerAppRuntime.tickWithinBudget(
+                self,
+                app_callbacks.Bindings(App).workerEventHandlers(self),
+                app_worker_runtime.interactive_drain_budget_ns,
+            );
+        }
         const now_ns = io_mod.nanoTimestamp();
         if (!self.approval_prompt.isActive() and !self.question_prompt.isActive() and !self.auth.apiKeyEntryActive()) {
             try self.pacer.tick(self.alloc, now_ns, self.pacerCallbacks());
@@ -3790,13 +3812,15 @@ test "process io connects through a reachable address while fx tasks hold every 
 }
 
 test "focused UI workers retain a bounded native poll timeout" {
-    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, true, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, true));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true, true, true));
+    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, true, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, true, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true, true, true, false));
+    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, false, false, false, false, false, true));
+    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, true, true, true, true, true, true));
 }
 
 test "footer runtime compatibility facade exports composeFooterFrame" {
@@ -4747,8 +4771,14 @@ test {
     _ = @import("core/app/app_worker_runtime.zig");
     _ = @import("ui/event_loop.zig");
     _ = @import("ui/resize_tests.zig");
+    _ = @import("ui/transcript/transcript_window_fuzz.zig");
+    _ = @import("ui/transcript/frozen_prefix_tests.zig");
+    _ = @import("ui/transcript/transcript_window_shell.zig");
+    _ = @import("ui/transcript/transcript_window_runtime_tests.zig");
+    _ = @import("ui/transcript/frozen_prefix.zig");
     _ = @import("ui/render_engine/assistant_wrap.zig");
     _ = @import("ui/render_engine/transcript_blocks.zig");
+    _ = @import("ui/render_engine/transcript_measure.zig");
     _ = @import("ui/render_engine/viewport_selection.zig");
     _ = @import("core/agent/assistant_presentation.zig");
     _ = @import("core/agent/presentation/inline_render.zig");
@@ -4919,6 +4949,7 @@ test {
     _ = @import("ui/render_engine/terminal_diff.zig");
     _ = @import("ui/transcript/runtime.zig");
     _ = @import("ui/transcript/runtime_tests.zig");
+    _ = @import("ui/transcript/painter.zig");
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("gateway/client.zig");
     _ = @import("gateway/host_stream_provider.zig");

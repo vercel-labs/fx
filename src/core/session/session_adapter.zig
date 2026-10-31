@@ -38,6 +38,8 @@ const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const sm = @import("session_manager");
+/// A line boundary in a session log, for hosts that walk it.
+pub const LogCursor = sm.Cursor;
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
@@ -2488,6 +2490,107 @@ pub const Session = struct {
         try replay(self.source(), alloc, alloc, .start, null, ReplaySink.init(&sink));
     }
 
+    /// `visitHistory` from the newest compaction on: the turns the transcript
+    /// window holds after a resume (`transcript_window_shell.zig`), which are
+    /// the blocks that finished after that compaction. Ctrl+O reads the older
+    /// cycles from the log. Without a compaction it visits every turn.
+    pub fn visitHistorySinceCompaction(self: *Session, alloc: Allocator, visitor: anytype) !void {
+        const Sink = struct {
+            alloc: Allocator,
+            visitor: @TypeOf(visitor),
+
+            fn turn(sink: *@This(), value: types.HistoryTurn, _: ?u64) !void {
+                defer types.freeHistoryTurn(sink.alloc, value);
+                try sink.visitor.append(value);
+            }
+
+            fn summary(_: *@This(), _: []const u8) !void {}
+        };
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const state = try self.handle.state(scratch.allocator());
+        var from: sm.From = .start;
+        var skip_offset: ?u64 = null;
+        if (state.compaction_offset) |offset| {
+            const compaction: sm.Cursor = .{ .offset = offset, .seq = state.last_compaction_seq orelse return error.InvalidSessionFormat };
+            from = .{ .at = try self.source().cycleStart(scratch.allocator(), compaction) };
+            skip_offset = offset;
+        }
+        var sink: Sink = .{ .alloc = alloc, .visitor = visitor };
+        try replay(self.source(), alloc, alloc, from, skip_offset, ReplaySink.init(&sink));
+    }
+
+    /// The cursor of every compaction line in the log, oldest first: the
+    /// boundaries of the cycles Ctrl+O reads one at a time.
+    pub fn compactionCursors(self: *Session, alloc: Allocator) ![]sm.Cursor {
+        var cursors: std.ArrayList(sm.Cursor) = .empty;
+        errdefer cursors.deinit(alloc);
+        const src = self.source();
+        var from: sm.From = .start;
+        while (true) {
+            var page = try src.read(alloc, from, replay_page_lines);
+            defer page.deinit();
+            for (page.entries) |entry| {
+                if (entry.kind == .compacted) try cursors.append(alloc, .{ .offset = entry.offset, .seq = entry.seq });
+            }
+            from = .{ .at = page.next orelse break };
+        }
+        return cursors.toOwnedSlice(alloc);
+    }
+
+    /// Where the cycle that ends at the compaction line `before` starts: the
+    /// compaction line before it, read backward a page at a time, or null when
+    /// the log starts first. With `before` null, the newest compaction line,
+    /// from the folded state. Ctrl+O walks older cycles this way, so it reads
+    /// only as much of the log as the cycles it shows.
+    pub fn previousCompactionCursor(self: *Session, alloc: Allocator, before: ?sm.Cursor) !?sm.Cursor {
+        const end = before orelse {
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const state = try self.handle.state(scratch.allocator());
+            const offset = state.compaction_offset orelse return null;
+            return .{ .offset = offset, .seq = state.last_compaction_seq orelse return error.InvalidSessionFormat };
+        };
+        const src = self.source();
+        var from: sm.From = .{ .at = end };
+        while (true) {
+            var page = try src.readTo(alloc, from, .backward, replay_page_lines);
+            defer page.deinit();
+            for (page.entries) |entry| {
+                if (entry.offset >= end.offset) continue;
+                if (entry.kind == .compacted) return .{ .offset = entry.offset, .seq = entry.seq };
+            }
+            from = .{ .at = page.next orelse return null };
+        }
+    }
+
+    /// `visitHistory` over one compaction cycle: the turns after the
+    /// compaction line at `start`, or from the log's start when null, up to
+    /// the next compaction line. A turn the next compaction splits is not
+    /// visited; the next cycle shows it whole (`cycleStart`).
+    pub fn visitHistoryCycle(self: *Session, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !void {
+        const Sink = struct {
+            alloc: Allocator,
+            visitor: @TypeOf(visitor),
+
+            fn turn(sink: *@This(), value: types.HistoryTurn, _: ?u64) !void {
+                defer types.freeHistoryTurn(sink.alloc, value);
+                try sink.visitor.append(value);
+            }
+
+            fn summary(_: *@This(), _: []const u8) !void {
+                return error.CycleEnd;
+            }
+        };
+        var sink: Sink = .{ .alloc = alloc, .visitor = visitor };
+        const from: sm.From = if (start) |cursor| .{ .at = try self.source().cycleStart(alloc, cursor) } else .start;
+        const skip_offset: ?u64 = if (start) |cursor| cursor.offset else null;
+        replay(self.source(), alloc, alloc, from, skip_offset, ReplaySink.init(&sink)) catch |err| switch (err) {
+            error.CycleEnd => {},
+            else => |other| return other,
+        };
+    }
+
     /// A prompt a fork can start before: the turn it opened and its text.
     pub const ForkPoint = struct {
         turn: u64,
@@ -2928,6 +3031,28 @@ const Source = struct {
     fn readTo(src: Source, sa: Allocator, from: sm.From, direction: sm.Direction, limit: usize) !sm.Page {
         if (src.handle) |handle| return handle.read(sa, from, direction, limit);
         return src.store.manager.read(sa, src.id, from, direction, limit);
+    }
+
+    /// Where the display cycle opened by the compaction line `compaction`
+    /// starts: the `turn_started` of a turn still open at that line, so a turn
+    /// the compaction splits (an overflow compacts after the prompt) shows
+    /// whole, or the compaction line itself.
+    fn cycleStart(src: Source, sa: Allocator, compaction: sm.Cursor) !sm.Cursor {
+        var from: sm.From = .{ .at = compaction };
+        while (true) {
+            var page = try src.readTo(sa, from, .backward, replay_page_lines);
+            defer page.deinit();
+            for (page.entries) |entry| {
+                if (entry.offset >= compaction.offset) continue;
+                const body = entry.body orelse continue;
+                switch (body) {
+                    .turn_started => return .{ .offset = entry.offset, .seq = entry.seq },
+                    .turn_committed, .turn_interrupted => return compaction,
+                    else => {},
+                }
+            }
+            from = .{ .at = page.next orelse return compaction };
+        }
     }
 
     /// The cursor of `turn`'s `turn_started`, reading back from `before`.
@@ -6077,6 +6202,137 @@ test "a finished turn keeps no trace of its running calls" {
     try testing.expectEqual(@as(usize, 1), restored.history.len);
     try testing.expectEqualStrings("answered", restored.history[0].assistant.assistant);
     try testing.expectEqual(@as(usize, 0), restored.history[0].assistant.execution.tool_steps.len);
+}
+
+test "the history splits into compaction cycles that Ctrl+O reads one at a time" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    const language = types.ConversationLanguage.default();
+    try s.commitTurn(assistantTurn("one", "1"), language);
+    try s.commitTurn(assistantTurn("two", "2"), language);
+    var first = "turns one and two".*;
+    try s.commitCompaction(.{ .summary = &first, .removed_turn_count = 2, .compaction_count = 1 }, false, null);
+    try s.commitTurn(assistantTurn("three", "3"), language);
+    // The model keeps turn three after this compaction; the display cycle
+    // still starts at the compaction line.
+    var second = "turn three".*;
+    try s.commitCompaction(.{ .summary = &second, .removed_turn_count = 1, .compaction_count = 2 }, false, .{ .turns = 1 });
+    try s.commitTurn(assistantTurn("four", "4"), language);
+
+    const Visitor = struct {
+        prompts: std.ArrayList([]u8) = .empty,
+
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            try self.prompts.append(testing.allocator, try testing.allocator.dupe(u8, turn.assistant.user.text));
+        }
+
+        fn expectPrompts(self: *@This(), want: []const []const u8) !void {
+            defer {
+                for (self.prompts.items) |prompt| testing.allocator.free(prompt);
+                self.prompts.deinit(testing.allocator);
+                self.* = .{};
+            }
+            try testing.expectEqual(want.len, self.prompts.items.len);
+            for (self.prompts.items, want) |got, expected| try testing.expectEqualStrings(expected, got);
+        }
+    };
+    const cursors = try s.compactionCursors(testing.allocator);
+    defer testing.allocator.free(cursors);
+    try testing.expectEqual(@as(usize, 2), cursors.len);
+    try testing.expect(cursors[0].offset < cursors[1].offset);
+    var visitor: Visitor = .{};
+    try s.visitHistoryCycle(testing.allocator, null, &visitor);
+    try visitor.expectPrompts(&.{ "one", "two" });
+    try s.visitHistoryCycle(testing.allocator, cursors[0], &visitor);
+    try visitor.expectPrompts(&.{"three"});
+    try s.visitHistoryCycle(testing.allocator, cursors[1], &visitor);
+    try visitor.expectPrompts(&.{"four"});
+    try s.visitHistorySinceCompaction(testing.allocator, &visitor);
+    try visitor.expectPrompts(&.{"four"});
+
+    // Walking back from the newest compaction finds the same boundaries.
+    const newest = (try s.previousCompactionCursor(testing.allocator, null)).?;
+    try testing.expectEqual(cursors[1], newest);
+    const older = (try s.previousCompactionCursor(testing.allocator, newest)).?;
+    try testing.expectEqual(cursors[0], older);
+    try testing.expectEqual(@as(?sm.Cursor, null), try s.previousCompactionCursor(testing.allocator, older));
+}
+
+test "a compaction inside an open turn starts its display cycle at that turn's prompt" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const turn_end = try encodePiece(a, .{ .turn_completed = .{} });
+    const Turn = struct {
+        fn user(alloc: Allocator, text: []const u8) !sm.Event {
+            return .{ .item = .{ .type = "user", .data = try encodePiece(alloc, .{ .user = .{ .text = text } }) } };
+        }
+        fn answer(alloc: Allocator, text: []const u8) !sm.Event {
+            return .{ .item = .{ .type = "assistant", .data = try encodePiece(alloc, .{ .assistant = .{ .text = text } }) } };
+        }
+    };
+    // As an overflow compaction writes it: the request that overflowed is
+    // compacted after its prompt, and the turn goes on after the summary.
+    const id = "1786460757753-split";
+    const imported = try t.store.manager.openImport(.{ .id = id, .workspace = "/w", .host = .ask, .created_ms = 1000 });
+    _ = try imported.appendAt(&.{
+        .turn_started,
+        try Turn.user(a, "first"),
+        try Turn.answer(a, "first answer"),
+        .{ .item = .{ .type = "turn_end", .data = turn_end } },
+        .turn_committed,
+        .turn_started,
+        try Turn.user(a, "split"),
+        .{ .compacted = try jsonValue(a, CompactedData{ .summary = "the first turn", .removed_turn_count = 1, .compaction_count = 1 }) },
+        try Turn.answer(a, "split answer"),
+        .{ .item = .{ .type = "turn_end", .data = turn_end } },
+        .turn_committed,
+        .turn_started,
+        try Turn.user(a, "after"),
+        try Turn.answer(a, "after answer"),
+        .{ .item = .{ .type = "turn_end", .data = turn_end } },
+        .turn_committed,
+    }, 2000);
+    try imported.publishImport();
+    imported.release();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    const Visitor = struct {
+        prompts: std.ArrayList([]u8) = .empty,
+
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            try self.prompts.append(testing.allocator, try testing.allocator.dupe(u8, turn.assistant.user.text));
+        }
+
+        fn expectPrompts(self: *@This(), want: []const []const u8) !void {
+            defer {
+                for (self.prompts.items) |prompt| testing.allocator.free(prompt);
+                self.prompts.deinit(testing.allocator);
+                self.* = .{};
+            }
+            try testing.expectEqual(want.len, self.prompts.items.len);
+            for (self.prompts.items, want) |got, expected| try testing.expectEqualStrings(expected, got);
+        }
+    };
+    var visitor: Visitor = .{};
+    // Resume holds the split turn whole, from its prompt.
+    try r.visitHistorySinceCompaction(testing.allocator, &visitor);
+    try visitor.expectPrompts(&.{ "split", "after" });
+    // Ctrl+O: the cycle before leaves the split turn out, and the one the
+    // compaction opens shows it whole.
+    const compaction = (try r.previousCompactionCursor(testing.allocator, null)).?;
+    try r.visitHistoryCycle(testing.allocator, null, &visitor);
+    try visitor.expectPrompts(&.{"first"});
+    try r.visitHistoryCycle(testing.allocator, compaction, &visitor);
+    try visitor.expectPrompts(&.{ "split", "after" });
 }
 
 test "the history visit shows every turn, even those a compaction summarized" {

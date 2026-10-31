@@ -2406,11 +2406,6 @@ while :; do :; done
         "the unrelated follow-up request",
         timeout,
       );
-      const retentionMarker = "[transcript_retention] pruned command output line";
-      const retentionBeforeAssistant = countOccurrences(
-        readFileSync(tracePath, "utf8"),
-        retentionMarker,
-      );
       releaseNextResponse();
       releaseNextResponse = null;
       await waitForScrollback(active, nextMarker, timeout);
@@ -2422,12 +2417,6 @@ while :; do :; done
       expect(after).toContain(nextMarker);
       expect(historicalLines(after)).toEqual(historicalLines(before));
       expect(historicalLines(afterAnsi)).toEqual(historicalLines(beforeAnsi));
-      await waitForCondition(
-        () => countOccurrences(readFileSync(tracePath, "utf8"), retentionMarker) >
-          retentionBeforeAssistant,
-        "the recorded assistant-stream retention pass",
-        timeout,
-      );
 
       const followRequest = JSON.parse(gateway.requests[1]!.body) as {
         prompt: Array<{ role: string; content: unknown }>;

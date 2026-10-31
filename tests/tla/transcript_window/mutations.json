@@ -1,0 +1,264 @@
+{
+  "spec": [
+    {
+      "id": "drop-mid-turn",
+      "bug": "The previous cycle drops while a turn is open, so a resize mid-turn loses the turn's start.",
+      "law": "DropBetweenTurns",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "    /\\ ~open\n    /\\ (~Saved \\/ st >= cf)",
+      "replace": "    /\\ (~Saved \\/ st >= cf)"
+    },
+    {
+      "id": "drop-unsaved",
+      "bug": "A block leaves memory before the log holds it.",
+      "law": "DropOnlySaved",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "    /\\ (~Saved \\/ st >= cf)",
+      "replace": "    /\\ TRUE"
+    },
+    {
+      "id": "never-drop",
+      "bug": "The previous cycle is never dropped, so memory grows with every compaction.",
+      "law": "HeldIsRecentCycles",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "CanDrop(po, cf, open, st) ==\n    /\\ po # None",
+      "replace": "CanDrop(po, cf, open, st) ==\n    /\\ FALSE /\\ po # None"
+    },
+    {
+      "id": "never-drop-liveness",
+      "bug": "The same bug, seen by the liveness property.",
+      "law": "PreviousCycleDropped",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "CanDrop(po, cf, open, st) ==\n    /\\ po # None",
+      "replace": "CanDrop(po, cf, open, st) ==\n    /\\ FALSE /\\ po # None"
+    },
+    {
+      "id": "reprint-all-at-once",
+      "bug": "A resize reprints every held block in one slice and freezes the loop.",
+      "law": "ReprintSliceBound",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "to |-> Min(paintedThrough + Slice, nextSeq)]>>\n               /\\ paintedThrough' = Min(paintedThrough + Slice, nextSeq)",
+      "replace": "to |-> nextSeq]>>\n               /\\ paintedThrough' = nextSeq"
+    },
+    {
+      "id": "reprint-skips-blocks",
+      "bug": "A block finished during a reprint is painted at once, and the reprint skips the blocks before it.",
+      "law": "ScreenHoldsHeld",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "    /\\ IF reprinting\n          THEN /\\ out' = <<>> /\\ UNCHANGED paintedThrough",
+      "replace": "    /\\ IF FALSE\n          THEN /\\ out' = <<>> /\\ UNCHANGED paintedThrough"
+    },
+    {
+      "id": "reprint-overlaps",
+      "bug": "Each reprint slice repeats the last block of the one before.",
+      "law": "PaintedOnce",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "          ELSE /\\ out' = <<[kind |-> \"reprint_slice\", from |-> paintedThrough,",
+      "replace": "          ELSE /\\ out' = <<[kind |-> \"reprint_slice\", from |-> IF paintedThrough > HeldFirst THEN paintedThrough - 1 ELSE paintedThrough,"
+    },
+    {
+      "id": "reprint-never-finishes",
+      "bug": "The reprint reaches the newest block and keeps going.",
+      "law": "ReprintFinishes",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "          THEN /\\ reprinting' = FALSE /\\ out' = <<[kind |-> \"repaint_live\"]>>",
+      "replace": "          THEN /\\ reprinting' = TRUE /\\ out' = <<[kind |-> \"repaint_live\"]>>"
+    },
+    {
+      "id": "change-reprints",
+      "bug": "A change to one live block starts a full reprint: the whole-transcript cost per update.",
+      "law": "UpdateIsLocal",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "    /\\ UNCHANGED <<core, alive, cycleStarts>>",
+      "replace": "    /\\ reprinting' = TRUE\n    /\\ UNCHANGED <<cycle, cycleFirst, prevFirst, nextSeq, savedThrough, live, turnOpen, paintedThrough, coOpen, coLo, coHi, coAtStart, pending, pendingDir, nextToken, alive, cycleStarts>>"
+    },
+    {
+      "id": "open-reads-log",
+      "bug": "Opening Ctrl+O reads the log instead of showing the newest blocks from memory.",
+      "law": "OpenReadsNothing",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "    /\\ out' = <<[kind |-> \"ctrlo_show\",\n                 lo |-> Max(HeldFirst, IF nextSeq > Window THEN nextSeq - Window ELSE 0),\n                 hi |-> nextSeq]>>",
+      "replace": "    /\\ out' = <<[kind |-> \"read_log\", token |-> nextToken, dir |-> \"older\", from |-> nextSeq, count |-> Step]>>"
+    },
+    {
+      "id": "window-grows",
+      "bug": "Reading older blocks keeps the newest ones, so Ctrl+O's window grows without bound.",
+      "law": "CtrlOWindowBound",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "hi2 == IF pendingDir = \"older\" THEN Min(coHi, coLo - n + Window) ELSE coHi + n",
+      "replace": "hi2 == IF pendingDir = \"older\" THEN coHi ELSE coHi + n"
+    },
+    {
+      "id": "stale-reply-applied",
+      "bug": "A reply to an earlier read moves the window as if it answered the pending one.",
+      "law": "StaleReadIgnored",
+      "constants": "MCTranscriptWindow",
+      "find": "    /\\ IF coOpen /\\ pending = token\n          THEN LET n ==",
+      "replace": "    /\\ IF coOpen /\\ pending # 0\n          THEN LET n =="
+    },
+    {
+      "id": "close-keeps-read",
+      "bug": "Closing Ctrl+O leaves its read in flight.",
+      "law": "OneReadInFlight",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "    /\\ coOpen' = FALSE /\\ pending' = 0 /\\ out' = <<>>",
+      "replace": "    /\\ coOpen' = FALSE /\\ UNCHANGED pending /\\ out' = <<>>"
+    },
+    {
+      "id": "unsaved-reads-log",
+      "bug": "A --no-save session asks a log it does not have for older blocks.",
+      "law": "NoReadWhenUnsaved",
+      "constants": "MCTranscriptWindowSweepUnsaved",
+      "find": "               ELSE /\\ coAtStart' = TRUE\n                    /\\ out' = <<>>",
+      "replace": "               ELSE /\\ coAtStart' = TRUE\n                    /\\ out' = <<[kind |-> \"read_log\", token |-> nextToken, dir |-> \"older\", from |-> coLo, count |-> Step]>>"
+    },
+    {
+      "id": "resume-keeps-unsaved",
+      "bug": "Resume holds blocks the log never received.",
+      "law": "RecoveredFromLog",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "       /\\ nextSeq' = savedThrough /\\ cycleFirst' = last",
+      "replace": "       /\\ nextSeq' = nextSeq /\\ cycleFirst' = last"
+    },
+    {
+      "id": "replies-misread",
+      "bug": "The reader takes every reply as empty and never moves past memory.",
+      "law": "CtrlOReachesStart",
+      "constants": "MCCtrlOReachesStart",
+      "find": "          THEN LET n == Min(Min(count, Step), Available(pendingDir))",
+      "replace": "          THEN LET n == 0"
+    },
+    {
+      "id": "drop-into-current-cycle",
+      "bug": "A drop frees blocks of the current cycle, which is still on screen and may be reprinted.",
+      "law": "LiveNeverDropped",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "DropEffect(from, to) == IF from < to THEN <<[kind |-> \"drop\", from |-> from, to |-> to]>> ELSE <<>>",
+      "replace": "DropEffect(from, to) == IF from < to THEN <<[kind |-> \"drop\", from |-> from, to |-> nextSeq]>> ELSE <<>>"
+    },
+    {
+      "id": "paint-wrong-block",
+      "bug": "A finished block is painted under the next block's number.",
+      "law": "PaintOnceInOrder",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "          ELSE /\\ out' = <<[kind |-> \"paint_final\", seq |-> nextSeq]>>",
+      "replace": "          ELSE /\\ out' = <<[kind |-> \"paint_final\", seq |-> nextSeq + 1]>>"
+    },
+    {
+      "id": "reprint-from-dropped",
+      "bug": "A resize reprints from the start of the session, below the held blocks.",
+      "law": "ReprintInOrder",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "    /\\ reprinting' = TRUE /\\ paintedThrough' = HeldFirst",
+      "replace": "    /\\ reprinting' = TRUE /\\ paintedThrough' = 0"
+    },
+    {
+      "id": "reply-unbounded",
+      "bug": "A reply brings as many blocks as it claims, not at most one read step.",
+      "law": "ReadBounded",
+      "constants": "MCTranscriptWindowSweep",
+      "find": "          THEN LET n == Min(Min(count, Step), Available(pendingDir))",
+      "replace": "          THEN LET n == Min(count, Available(pendingDir))"
+    }
+  ],
+  "core": [
+    {
+      "id": "core-drop-mid-turn",
+      "bug": "canDrop ignores an open turn.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "    if (turn_open) return false;\n",
+      "replace": "    if (turn_open and false) return false;\n"
+    },
+    {
+      "id": "core-drop-unsaved",
+      "bug": "canDrop ignores the save watermark.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "    return !state.config.saved or saved_through >= cycle_first;",
+      "replace": "    return !state.config.saved or saved_through >= cycle_first or true;"
+    },
+    {
+      "id": "core-reprint-all-at-once",
+      "bug": "One slice holds every block.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "            const to = @min(state.painted_through + state.config.slice, state.next_seq);",
+      "replace": "            const to = state.next_seq;"
+    },
+    {
+      "id": "core-paint-during-reprint",
+      "bug": "A block finished during a reprint is painted at once.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "            if (state.reprinting) return .{ .state = next };\n",
+      "replace": ""
+    },
+    {
+      "id": "core-stale-reply-applied",
+      "bug": "A reply is applied without checking its token.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "    if (!co.open or co.pending == 0 or co.pending != token) return reject(state, .stale_reply);",
+      "replace": "    if (!co.open or co.pending == 0 or (co.pending != token and false)) return reject(state, .stale_reply);"
+    },
+    {
+      "id": "core-open-below-memory",
+      "bug": "Ctrl+O opens on blocks memory no longer holds.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "            const lo = @max(state.heldFirst(), state.next_seq -| state.config.window);",
+      "replace": "            const lo = state.next_seq -| state.config.window;"
+    },
+    {
+      "id": "core-count-unclamped",
+      "bug": "A garbage reply count is trusted.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "    const n = @min(@min(count, state.config.read_step), available);",
+      "replace": "    const n = @min(count, available);"
+    },
+    {
+      "id": "core-resume-keeps-state",
+      "bug": "Resume keeps the dead process's Ctrl+O and live blocks.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "            var next = State.init(state.config);",
+      "replace": "            var next = state;"
+    },
+    {
+      "id": "core-unsaved-reads-log",
+      "bug": "An unsaved session reads the log when scrolling newer through dropped blocks.",
+      "sweep": "MCTranscriptWindowSweepUnsaved",
+      "find": "            if (!state.config.saved) return show(state, held_first, @min(held_first + 1, state.next_seq));\n",
+      "replace": ""
+    },
+    {
+      "id": "core-empty-reply-not-at-start",
+      "bug": "An empty older reply does not mark the start of the log.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "            out.state.ctrlo.at_start = lo == 0 or n == 0;",
+      "replace": "            out.state.ctrlo.at_start = lo == 0;"
+    },
+    {
+      "id": "core-compaction-counts-as-saved",
+      "bug": "A compaction marks every earlier block saved.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "            next.cycle_first = state.next_seq;\n            return dropIfDone(next);",
+      "replace": "            next.cycle_first = state.next_seq;\n            if (state.config.saved) next.saved_through = state.next_seq;\n            return dropIfDone(next);"
+    },
+    {
+      "id": "core-held-ignores-previous",
+      "bug": "The held range forgets the previous cycle before it is dropped.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "        return self.prev_first orelse self.cycle_first;",
+      "replace": "        _ = self.prev_first;\n        return self.cycle_first;"
+    },
+    {
+      "id": "core-change-reprints",
+      "bug": "A change to one live block starts a full reprint.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "            return .{ .state = state, .effect = .{ .repaint_block = id } };",
+      "replace": "            var next = state;\n            next.reprinting = true;\n            return .{ .state = next, .effect = .{ .repaint_block = id } };"
+    },
+    {
+      "id": "core-close-keeps-read",
+      "bug": "Closing Ctrl+O leaves its read pending.",
+      "sweep": "MCTranscriptWindowSweep",
+      "find": "            next.ctrlo.open = false;\n            next.ctrlo.pending = 0;",
+      "replace": "            next.ctrlo.open = false;"
+    }
+  ]
+}
