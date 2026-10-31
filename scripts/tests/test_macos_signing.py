@@ -24,6 +24,9 @@ PGSO_WORKFLOW_PATH = (
 PGSO_LINUX_WORKFLOW_PATH = (
     REPO_ROOT / ".github" / "workflows" / "pgso-linux-arm64.yml"
 )
+PGSO_LINUX_X86_64_WORKFLOW_PATH = (
+    REPO_ROOT / ".github" / "workflows" / "pgso-linux-x86_64.yml"
+)
 DEV_RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "dev-release.yml"
 PGSO_SETUP_ACTION_PATH = REPO_ROOT / ".github" / "actions" / "setup-pgso" / "action.yml"
 SIGNING_IDENTITY = "Developer ID Application: Vercel, Inc (JW6Y669B67)"
@@ -520,7 +523,7 @@ class MacosSigningWorkflowTests(unittest.TestCase):
     def test_validation_builds_existing_versions_without_publishing(self) -> None:
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
         check_job = release.split("  check-version:\n", 1)[1].split(
-            "\n  build-linux:", 1
+            "\n  build-linux-aarch64:", 1
         )[0]
         check_script = textwrap.dedent(check_job.split("        run: |\n", 1)[1])
         for validate, tag_exists, expected_needed, expected_publish in (
@@ -605,7 +608,9 @@ class MacosSigningWorkflowTests(unittest.TestCase):
     def test_stable_release_is_the_only_workflow_with_signing_secrets(self) -> None:
         release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
         pgso = PGSO_WORKFLOW_PATH.read_text(encoding="utf-8")
-        pgso_linux = PGSO_LINUX_WORKFLOW_PATH.read_text(encoding="utf-8")
+        pgso_linux = PGSO_LINUX_WORKFLOW_PATH.read_text(
+            encoding="utf-8"
+        ) + PGSO_LINUX_X86_64_WORKFLOW_PATH.read_text(encoding="utf-8")
         dev_release = DEV_RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
 
         self.assertIn("build-macos-x86_64:", release)
@@ -632,8 +637,7 @@ class MacosSigningWorkflowTests(unittest.TestCase):
         self.assertIn("needs: [check-version, build-macos-arm64]", sign_release)
         self.assertIn("environment: apple-signing", sign_release)
         self.assertIn(
-            "needs: [check-version, build-linux, package-linux-aarch64, "
-            "build-macos-x86_64, sign-macos-arm64]",
+            "needs: [check-version, package-linux, build-macos-x86_64, sign-macos-arm64]",
             release,
         )
         workflow_call = pgso.split("  workflow_dispatch:\n", 1)[0]
@@ -693,7 +697,12 @@ class MacosSigningWorkflowTests(unittest.TestCase):
                         f"{path.relative_to(REPO_ROOT)}:{line_number}: {line.strip()}"
                     )
 
-        for path in (PGSO_WORKFLOW_PATH, PGSO_LINUX_WORKFLOW_PATH, PGSO_SETUP_ACTION_PATH):
+        for path in (
+            PGSO_WORKFLOW_PATH,
+            PGSO_LINUX_WORKFLOW_PATH,
+            PGSO_LINUX_X86_64_WORKFLOW_PATH,
+            PGSO_SETUP_ACTION_PATH,
+        ):
             self.assertIn(path, checked)
         self.assertEqual([], mutable_references)
 
@@ -705,23 +714,46 @@ class LinuxReleaseWorkflowTests(unittest.TestCase):
             r"\n  (?=\S)", release.split(f"\n  {name}:\n", 1)[1], maxsplit=1
         )[0]
 
-    def test_release_ships_the_qualified_pgso_candidate_for_linux_arm64(self) -> None:
-        build_linux = self.release_job("build-linux")
-        self.assertIn("target: x86_64-linux", build_linux)
-        self.assertNotIn("aarch64-linux", build_linux)
+    def test_release_ships_the_qualified_pgso_candidate_for_each_linux_target(self) -> None:
+        release = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("\n  build-linux:\n", release)
+        self.assertNotIn("zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}", release)
 
-        caller = self.release_job("build-linux-aarch64")
-        self.assertIn("uses: ./.github/workflows/pgso-linux-arm64.yml", caller)
-        self.assertIn("evidence-retention-days: 90", caller)
-        self.assertNotIn("secrets:", caller)
+        for job, workflow_path in (
+            ("build-linux-aarch64", PGSO_LINUX_WORKFLOW_PATH),
+            ("build-linux-x86_64", PGSO_LINUX_X86_64_WORKFLOW_PATH),
+        ):
+            with self.subTest(job=job):
+                caller = self.release_job(job)
+                self.assertIn(f"uses: ./.github/workflows/{workflow_path.name}", caller)
+                self.assertIn("evidence-retention-days: 90", caller)
+                self.assertNotIn("secrets:", caller)
+                workflow = workflow_path.read_text(encoding="utf-8")
+                triggers = workflow.split("\njobs:\n", 1)[0]
+                self.assertIn("  workflow_call:\n", triggers)
+                self.assertIn("value: ${{ jobs.candidate.outputs.artifact-id }}", triggers)
+                self.assertIn("artifact-id: ${{ steps.upload.outputs.artifact-id }}", workflow)
+                self.assertIn(
+                    "retention-days: ${{ inputs.evidence-retention-days || 14 }}", workflow
+                )
 
-        package = self.release_job("package-linux-aarch64")
-        self.assertIn("needs: [check-version, build-linux-aarch64]", package)
-        self.assertIn("runs-on: ubuntu-24.04-arm", package)
-        self.assertIn(
-            "artifact-ids: ${{ needs.build-linux-aarch64.outputs.artifact-id }}",
-            package,
-        )
+        package = self.release_job("package-linux")
+        self.assertIn("needs: [check-version, build-linux-aarch64, build-linux-x86_64]", package)
+        self.assertIn("runs-on: ${{ matrix.runner }}", package)
+        for name, runner, arch, build in (
+            ("linux-aarch64", "ubuntu-24.04-arm", "aarch64", "build-linux-aarch64"),
+            ("linux-x86_64", "ubuntu-24.04", "x86_64", "build-linux-x86_64"),
+        ):
+            with self.subTest(name=name):
+                self.assertIn(
+                    f"          - name: {name}\n"
+                    f"            runner: {runner}\n"
+                    f"            arch: {arch}\n"
+                    f"            artifact-id: ${{{{ needs.{build}.outputs.artifact-id }}}}\n",
+                    package,
+                )
+        self.assertIn('test "$(uname -m)" = "$ARCH"', package)
+        self.assertIn("artifact-ids: ${{ matrix.artifact-id }}", package)
         self.assertNotIn("environment:", package)
         report = package.index("python3 -m scripts.pgso report")
         digest = package.index("- name: Confirm the candidate is the qualified binary")
@@ -730,19 +762,11 @@ class LinuxReleaseWorkflowTests(unittest.TestCase):
         self.assertLess(report, digest)
         self.assertLess(digest, smoke)
         self.assertLess(smoke, archive)
-        self.assertIn("          name: fx-linux-aarch64\n", package)
-
-        workflow = PGSO_LINUX_WORKFLOW_PATH.read_text(encoding="utf-8")
-        triggers = workflow.split("\njobs:\n", 1)[0]
-        self.assertIn("  workflow_call:\n", triggers)
-        self.assertIn("value: ${{ jobs.candidate.outputs.artifact-id }}", triggers)
-        self.assertIn("artifact-id: ${{ steps.upload.outputs.artifact-id }}", workflow)
-        self.assertIn(
-            "retention-days: ${{ inputs.evidence-retention-days || 14 }}", workflow
-        )
+        self.assertIn("ARCHIVE: fx-${{ matrix.name }}.tar.gz", package)
+        self.assertIn("          name: fx-${{ matrix.name }}\n", package)
 
     def test_release_rejects_a_candidate_that_is_not_the_qualified_binary(self) -> None:
-        package = self.release_job("package-linux-aarch64")
+        package = self.release_job("package-linux")
         step = package.split(
             "      - name: Confirm the candidate is the qualified binary\n", 1
         )[1].split("\n      - name:", 1)[0]
