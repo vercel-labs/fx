@@ -56,45 +56,6 @@ jobs:
             echo "Tag ${TAG} missing, release needed"
           fi
 
-  build-linux:
-    needs: check-version
-    if: needs.check-version.outputs.needed == 'true'
-    name: Build ${{ matrix.name }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x86_64
-            target: x86_64-linux
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: "0.17.0"
-
-      - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
-
-      - name: Package
-        run: |
-          python3 -c 'import pathlib; n = pathlib.Path("zig-out/bin/fx").stat().st_size; print(f"linux executable: {n:,} bytes ({n / 1048576:.6f} MiB)")' >> "$GITHUB_STEP_SUMMARY"
-          package_dir="$RUNNER_TEMP/fx-package-${{ matrix.name }}"
-          mkdir -p "$package_dir"
-          cp zig-out/bin/fx LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
-          tar -czf fx-${{ matrix.name }}.tar.gz -C "$package_dir" fx LICENSE THIRD_PARTY_NOTICES.md
-          sha256sum fx-${{ matrix.name }}.tar.gz > fx-${{ matrix.name }}.tar.gz.sha256
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: fx-${{ matrix.name }}
-          path: |
-            fx-${{ matrix.name }}.tar.gz
-            fx-${{ matrix.name }}.tar.gz.sha256
-
   build-linux-aarch64:
     needs: check-version
     if: needs.check-version.outputs.needed == 'true'
@@ -107,25 +68,50 @@ jobs:
       # manual PGSO comparisons.
       evidence-retention-days: 90
 
-  package-linux-aarch64:
-    needs: [check-version, build-linux-aarch64]
+  build-linux-x86_64:
+    needs: check-version
     if: needs.check-version.outputs.needed == 'true'
-    name: Package linux-aarch64
-    runs-on: ubuntu-24.04-arm
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/pgso-linux-x86_64.yml
+    with:
+      evidence-retention-days: 90
+
+  package-linux:
+    needs: [check-version, build-linux-aarch64, build-linux-x86_64]
+    if: needs.check-version.outputs.needed == 'true'
+    name: Package ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     permissions:
       actions: read
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            arch: aarch64
+            artifact-id: ${{ needs.build-linux-aarch64.outputs.artifact-id }}
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+            arch: x86_64
+            artifact-id: ${{ needs.build-linux-x86_64.outputs.artifact-id }}
+    env:
+      ARCH: ${{ matrix.arch }}
+      ARCHIVE: fx-${{ matrix.name }}.tar.gz
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Require native arm64 host
-        run: test "$(uname -m)" = aarch64
+      - name: Require native host
+        run: test "$(uname -m)" = "$ARCH"
 
       - name: Download eligible candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          artifact-ids: ${{ needs.build-linux-aarch64.outputs.artifact-id }}
+          artifact-ids: ${{ matrix.artifact-id }}
           merge-multiple: true
           path: ${{ runner.temp }}/fx-pgso
 
@@ -158,17 +144,17 @@ jobs:
           package_dir="$RUNNER_TEMP/fx-release-package"
           mkdir -p "$package_dir"
           cp "$RUNNER_TEMP/fx-pgso/candidate/fx" LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
-          tar -czf "$RUNNER_TEMP/fx-linux-aarch64.tar.gz" -C "$package_dir" fx LICENSE THIRD_PARTY_NOTICES.md
+          tar -czf "$RUNNER_TEMP/$ARCHIVE" -C "$package_dir" fx LICENSE THIRD_PARTY_NOTICES.md
           cd "$RUNNER_TEMP"
-          sha256sum fx-linux-aarch64.tar.gz > fx-linux-aarch64.tar.gz.sha256
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
 
       - name: Upload stable release artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: fx-linux-aarch64
+          name: fx-${{ matrix.name }}
           path: |
-            ${{ runner.temp }}/fx-linux-aarch64.tar.gz
-            ${{ runner.temp }}/fx-linux-aarch64.tar.gz.sha256
+            ${{ runner.temp }}/${{ env.ARCHIVE }}
+            ${{ runner.temp }}/${{ env.ARCHIVE }}.sha256
           if-no-files-found: error
 
   build-macos-x86_64:
@@ -321,7 +307,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [check-version, build-linux, package-linux-aarch64, build-macos-x86_64, sign-macos-arm64]
+    needs: [check-version, package-linux, build-macos-x86_64, sign-macos-arm64]
     if: needs.check-version.outputs.publish == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.validate_only)
     runs-on: ubuntu-latest
     environment: release
