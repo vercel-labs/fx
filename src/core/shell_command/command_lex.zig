@@ -186,6 +186,14 @@ pub fn tokenize_argv(alloc: std.mem.Allocator, command: []const u8) !Argv {
             }
         }
 
+        // A backslash before a newline, outside single quotes, continues the
+        // line: the shell removes both before it splits words, so they start
+        // no word and add nothing to one.
+        if (ch == '\\' and !in_single and i + 1 < command.len and command[i + 1] == '\n') {
+            i += 2;
+            continue;
+        }
+
         if (!token_active) {
             token_start = i;
             token_active = true;
@@ -207,9 +215,10 @@ pub fn tokenize_argv(alloc: std.mem.Allocator, command: []const u8) !Argv {
             if (i + 1 >= command.len) return error.MalformedEscape;
             const next = command[i + 1];
             // Inside double quotes, a backslash quotes only `$`, `` ` ``, `"`,
-            // `\`, and newline. Before any other character the shell keeps it.
+            // and `\`; before a newline it continues the line, handled above.
+            // Before any other character the shell keeps it.
             const keeps_backslash = in_double and switch (next) {
-                '$', '`', '"', '\\', '\n' => false,
+                '$', '`', '"', '\\' => false,
                 else => true,
             };
             if (keeps_backslash) try value.append(alloc, ch);
@@ -624,6 +633,18 @@ test "tokenize_argv keeps a double-quoted backslash unless it quotes a special c
     try std.testing.expectEqualStrings("a\\&b", argv.tokens[1].value);
     try std.testing.expectEqualStrings("$x ` \" \\", argv.tokens[2].value);
     try std.testing.expectEqualStrings("a&b", argv.tokens[3].value);
+}
+
+test "tokenize_argv reads a backslash before a newline as a line continuation" {
+    // The shell passes `ab`, `ab`, and `c`: the continuation between words
+    // joins nothing and starts no empty word.
+    var argv = try tokenize_argv(std.testing.allocator, "printf \"a\\\nb\" a\\\nb \\\n c");
+    defer argv.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), argv.tokens.len);
+    try std.testing.expectEqualStrings("ab", argv.tokens[1].value);
+    try std.testing.expectEqualStrings("ab", argv.tokens[2].value);
+    try std.testing.expectEqualStrings("c", argv.tokens[3].value);
 }
 
 test "tokenize_argv preserves raw byte offsets" {
