@@ -902,6 +902,7 @@ def measure_startup(
     samples: int,
     timeout_s: float,
     command_names: Sequence[str] | None = None,
+    retry_speed_failures: bool = True,
 ) -> tuple[MeasurementResult, ...]:
     home = output_dir / "home"
     logs = output_dir / "logs"
@@ -1011,7 +1012,11 @@ def measure_startup(
                 passed=comparison.passed,
             )
 
-        results.append(measure_with_one_retry(measure_command, logs))
+        results.append(
+            measure_with_one_retry(measure_command, logs)
+            if retry_speed_failures
+            else measure_command(logs)
+        )
     return tuple(results)
 
 

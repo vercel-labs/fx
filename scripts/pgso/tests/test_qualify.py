@@ -321,7 +321,7 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertEqual(100, sum(command[0] == str(hyperfine) for command in calls))
         self.assertIsNone(results[0].first_attempt)
 
-    def measure_one_startup_command(self, candidate_seconds):
+    def measure_one_startup_command(self, candidate_seconds, **options):
         self.progress = io.StringIO()
         control = self.root / "control" / "fx"
         candidate = self.root / "candidate" / "fx"
@@ -348,6 +348,7 @@ class PgsoQualificationTests(unittest.TestCase):
                 samples=50,
                 timeout_s=10,
                 command_names=("help",),
+                **options,
             )
         exports = [
             pathlib.Path(command[command.index("--export-json") + 1])
@@ -379,6 +380,18 @@ class PgsoQualificationTests(unittest.TestCase):
             "measuring again after a speed failure: startup-help (p50 +20.0%, p95 +20.0%)",
             self.progress.getvalue(),
         )
+
+    def test_startup_measurement_without_retries_measures_a_speed_failure_once(
+        self,
+    ) -> None:
+        result, exports = self.measure_one_startup_command(
+            lambda export_path: 1.2, retry_speed_failures=False
+        )
+
+        self.assertFalse(result.passed)
+        self.assertIsNone(result.first_attempt)
+        self.assertEqual(100, len(exports))
+        self.assertEqual("", self.progress.getvalue())
 
     def test_startup_regression_that_repeats_fails_after_one_retry(self) -> None:
         result, exports = self.measure_one_startup_command(lambda export_path: 1.2)
