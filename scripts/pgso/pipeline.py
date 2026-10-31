@@ -84,8 +84,9 @@ BENCHMARK_USE_FLAGS = (
     f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc",
 )
 
-FX_MACHINE_OUTLINER_FLAGS = (
+FX_CODEGEN_FLAGS = (
     "-machine-outliner-reruns=1",
+    "-homogeneous-prolog-epilog",
 )
 
 
@@ -476,14 +477,16 @@ def candidate_object_argv(
     toolchain: Toolchain,
     paths: PipelinePaths,
 ) -> tuple[str, ...]:
-    # A second AArch64 outliner pass can fold sequences exposed by the first.
-    # Keep benchmark artifacts on their established code-generation contract.
-    outliner_flags = FX_MACHINE_OUTLINER_FLAGS if paths.selector == "fx" else ()
+    # A second AArch64 outliner pass can fold sequences exposed by the first,
+    # and each size-optimized function saves and restores its callee-saved
+    # registers through a shared frame helper instead of inline. Keep
+    # benchmark artifacts on their established code-generation contract.
+    codegen_flags = FX_CODEGEN_FLAGS if paths.selector == "fx" else ()
     return (
         str(toolchain.llc),
         "-filetype=obj",
         "-O=2",
-        *outliner_flags,
+        *codegen_flags,
         *toolchain.platform.candidate_object_flags(paths),
         str(paths.profile_use_bitcode),
         "-o",
