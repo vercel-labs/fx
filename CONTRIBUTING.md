@@ -239,7 +239,7 @@ Other workflows and benchmark jobs also report on pull requests, such as the `Ex
 
 - The binary size workflow builds each release target for the pull request and its base commit on native runners, reports the size change, and smoke-tests every target's binary. Growth of 52,429 bytes (0.05 MiB) or more on a platform adds a warning. Investigate growth you can't explain.
 - The macOS arm64 PGSO workflow runs on a pull request only when the PGSO pipeline itself changes: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or `.github/workflows/pgso-macos-arm64.yml`. Stable releases always run it. [scripts/pgso/README.md](scripts/pgso/README.md) explains the pipeline and its acceptance gates.
-- The Linux arm64 PGSO workflow runs on the same pull request paths, with `.github/workflows/pgso-linux-arm64.yml` in place of the macOS workflow file. It qualifies a Linux candidate in one job, which takes several hours. The stable release always runs it and ships its candidate as the Linux arm64 binary.
+- The Linux arm64 PGSO workflow runs on the same pull request paths, with `.github/workflows/pgso-linux-arm64.yml` in place of the macOS workflow file. It qualifies a Linux candidate in one job, which takes several hours. The stable release always runs it and ships its candidate as the Linux arm64 binary. `.github/workflows/pgso-linux-x86_64.yml` qualifies a Linux x86_64 candidate the same way, and releases don't use it yet.
 
 Other runs start only on request:
 
@@ -248,7 +248,7 @@ Other runs start only on request:
 | macOS checks | `gh workflow run macos.yml --ref your-branch`, or add the `ci:macos` label |
 | libfx durable-session and MCP model checks | `gh workflow run ci.yml --ref your-branch` |
 | PGSO qualification | `gh workflow run pgso-macos-arm64.yml --ref your-branch` |
-| Linux PGSO qualification | `gh workflow run pgso-linux-arm64.yml --ref your-branch` |
+| Linux PGSO qualification | `gh workflow run pgso-linux-arm64.yml --ref your-branch` or `pgso-linux-x86_64.yml` |
 | Live ACP suite | `gh workflow run ci.yml --ref your-branch -f acp_live=true` |
 | Long-turn memory benchmark | `gh workflow run bench.yml --ref your-branch -f long_turn_memory=true` |
 | libfx runtime benchmark | `gh workflow run bench.yml --ref your-branch -f libfx_runtime=true` |

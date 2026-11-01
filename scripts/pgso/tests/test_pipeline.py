@@ -1415,14 +1415,15 @@ sys.stderr.write('optimizer warning')""",
                         expected_contract=self.good_link_contract(),
                     )
 
-    def test_candidate_size_rejects_more_than_7_000_mib(self) -> None:
+    def test_candidate_size_rejects_more_than_the_platform_ceiling(self) -> None:
         candidate = self.root / "candidate"
         candidate.write_bytes(b"")
         with candidate.open("r+b") as stream:
             stream.truncate(7_340_033)
 
         with self.assertRaisesRegex(PgsoError, "exceeds 7.000 MiB"):
-            validate_candidate_size(candidate)
+            validate_candidate_size(candidate, 7.000)
+        self.assertEqual(8.000, validate_candidate_size(candidate, 8.000).ceiling_mib)
 
     def test_candidate_must_not_create_an_adversarial_profile_file(self) -> None:
         before: set[pathlib.Path] = set()
