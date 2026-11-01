@@ -4680,6 +4680,122 @@ fn fitRequestImages(
     }
 }
 
+/// Rounds the images left out of `request` up to the end of a block
+/// (`request_image_budget.blockCut`), so a session past its image limit keeps
+/// the same images in its cached prompt until the cut reaches the next block.
+/// `sizes` holds every image the request had before any was left out. Returns
+/// the body to send: `body` itself when nothing more is left out, or when the
+/// rounded request would not fit.
+fn holdImagesToBlocks(
+    arena: Allocator,
+    provider: agent_stream_provider.Provider,
+    request: *agent_stream_provider.RequestData,
+    body: []const u8,
+    sizes: []const usize,
+    limits: request_image_budget.Limits,
+    tool_text_limit: usize,
+    trace_ctx: TraceContext,
+) ![]const u8 {
+    const kept = (try request_image_budget.imageSizes(arena, request.messages)).len;
+    const cut = sizes.len -| kept;
+    const rounded_cut = request_image_budget.blockCut(sizes, cut, limits);
+    if (rounded_cut <= cut) return body;
+    const projection = try request_image_budget.withhold(arena, request.messages, rounded_cut - cut, tool_text_limit);
+    var rounded = request.*;
+    rounded.messages = projection.messages;
+    const rebuilt = (try provider.buildRequest(arena, rounded)) orelse return body;
+    if (rebuilt.len > limits.max_request_bytes) {
+        debug_trace.eventf("images", "request_images_block_skipped", trace_ctx, "cut={d} block_cut={d} request_bytes={d} limit_bytes={d}", .{
+            cut,
+            rounded_cut,
+            rebuilt.len,
+            limits.max_request_bytes,
+        });
+        return body;
+    }
+    debug_trace.eventf("images", "request_images_withheld_to_block", trace_ctx, "cut={d} block_cut={d} request_bytes_before={d} request_bytes_after={d}", .{
+        cut,
+        rounded_cut,
+        body.len,
+        rebuilt.len,
+    });
+    request.* = rounded;
+    return rebuilt;
+}
+
+test "a session past its size limit leaves images out a block at a time" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A body as long as the request's text and images.
+    const Builder = struct {
+        fn build(_: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.RequestData) anyerror![]u8 {
+            var len: usize = 100;
+            for (request.messages) |message| {
+                const text: []const u8 = message.content orelse "";
+                len += text.len;
+                if (message.tool_result_memory) |memory| {
+                    for (memory.tool_images) |image| len += image.data.len;
+                }
+            }
+            const body = try alloc.alloc(u8, len);
+            @memset(body, 'x');
+            return body;
+        }
+        fn stream(_: ?*anyopaque, _: Allocator, _: agent_stream_provider.ModelRequest) anyerror!agent_stream_provider.Result {
+            return error.TestUnexpectedStream;
+        }
+    };
+    const provider = agent_stream_provider.Provider{ .stream_fn = Builder.stream, .build_request_fn = Builder.build };
+    const limits = request_image_budget.Limits{ .max_request_bytes = 100_000 };
+
+    var messages: [40]types.ChatMessage = undefined;
+    for (&messages, 0..) |*message, index| {
+        const data = try arena.alloc(u8, 4000);
+        @memset(data, 'A');
+        const images = try arena.alloc(types.ToolImage, 1);
+        images[0] = .{ .data = data, .mime_type = try arena.dupe(u8, "image/png") };
+        message.* = .{
+            .role = .tool,
+            .content = try arena.print("<path>shot-{d}.png</path>", .{index}),
+            .tool_result_memory = .{ .tool_images = images, .tool_image_handle = try arena.print("image-result-{d}", .{index}) },
+        };
+    }
+
+    var previous_cut: usize = 0;
+    var cut_changes: usize = 0;
+    var minimal_changes: usize = 0;
+    var previous_minimal: usize = 0;
+    for (1..messages.len + 1) |count| {
+        var request: agent_stream_provider.RequestData = .{
+            .model = "test/model",
+            .messages = messages[0..count],
+            .tool_choice = .auto,
+            .provider_options = .{},
+        };
+        const sizes = try request_image_budget.imageSizes(arena, request.messages);
+        const first = (try provider.buildRequest(arena, request)).?;
+        const fitted = try fitRequestImages(arena, provider, &request, first, limits, 4096, .{});
+        const minimal = sizes.len - (try request_image_budget.imageSizes(arena, request.messages)).len;
+        const body = try holdImagesToBlocks(arena, provider, &request, fitted, sizes, limits, 4096, .{});
+        const cut = sizes.len - (try request_image_budget.imageSizes(arena, request.messages)).len;
+
+        try std.testing.expect(body.len <= limits.max_request_bytes);
+        try std.testing.expect(cut >= minimal and cut >= previous_cut);
+        // The newest image is always sent.
+        try std.testing.expectEqual(@as(usize, 1), request.messages[count - 1].tool_result_memory.?.tool_images.len);
+        if (cut != previous_cut) cut_changes += 1;
+        if (minimal != previous_minimal) minimal_changes += 1;
+        previous_cut = cut;
+        previous_minimal = minimal;
+    }
+    // Leaving out one more image per request would change the cached prompt
+    // on every request past the limit. A block ends at a quarter of the
+    // limit, seven of these images, so the cut changes every seventh.
+    try std.testing.expect(minimal_changes >= 10);
+    try std.testing.expect(cut_changes * 4 <= minimal_changes);
+}
+
 test "size rejections retry with fewer images only while images remain" {
     const too_large = agent_stream_provider.Failure{ .kind = .request_too_large };
     const overflow_text = agent_stream_provider.Failure{
@@ -7410,7 +7526,9 @@ fn processQueuedPromptLoop(
             // The request re-sends every image the session keeps, and
             // building it whole would hold all of them, encoded, at once.
             // Images that pass every limit by their own size leave before the
-            // build; `fitRequestImages` fits the rest to this model's limit.
+            // build; `fitRequestImages` fits the rest to this model's limit,
+            // and `holdImagesToBlocks` rounds what it left out to a block.
+            const request_image_sizes = try request_image_budget.imageSizes(overlay_arena, request_data.messages);
             const past_limit = try request_image_budget.withholdImagesPastLimit(
                 overlay_arena,
                 request_data.messages,
@@ -7428,15 +7546,26 @@ fn processQueuedPromptLoop(
                 overlay_arena,
                 request_data,
             )) |built_request_body| {
-                const request_body = try fitRequestImages(
+                const image_limits: request_image_budget.Limits = .{ .max_request_bytes = request_image_budget.maxRequestBytes(
+                    agent.requestByteLimit(gateway_model),
+                    deps.agent_stream_provider.max_request_bytes,
+                ) };
+                const fitted_body = try fitRequestImages(
                     overlay_arena,
                     deps.agent_stream_provider,
                     &request_data,
                     built_request_body,
-                    .{ .max_request_bytes = request_image_budget.maxRequestBytes(
-                        agent.requestByteLimit(gateway_model),
-                        deps.agent_stream_provider.max_request_bytes,
-                    ) },
+                    image_limits,
+                    config.max_tool_result_bytes,
+                    step_ctx,
+                );
+                const request_body = try holdImagesToBlocks(
+                    overlay_arena,
+                    deps.agent_stream_provider,
+                    &request_data,
+                    fitted_body,
+                    request_image_sizes,
+                    image_limits,
                     config.max_tool_result_bytes,
                     step_ctx,
                 );

@@ -255,11 +255,9 @@ function expectOrdinaryToolResults(body: string, callIds: string[]) {
   for (const result of results) {
     const output = result.output as Record<string, unknown> | undefined;
     expect(output?.type).toBe("text");
-    expect(JSON.parse(output?.value as string)).toMatchObject({
-      state: "completed",
-      exit_code: 0,
-      error: null,
-    });
+    const snapshot = JSON.parse(output?.value as string);
+    expect(snapshot).toMatchObject({ state: "completed", exit_code: 0 });
+    expect(snapshot).not.toHaveProperty("error");
   }
   expect(JSON.stringify(results)).not.toContain("Repeated identical tool call blocked");
 }
@@ -2279,12 +2277,10 @@ describe("effect-aware command permissions", () => {
           "terminal_session_command",
         );
         const commandSnapshot = JSON.parse(commandResult);
-        expect(commandSnapshot).toMatchObject({
-          state: "completed",
-          backend: "captured",
-          persistence: "process",
-          exit_code: 0,
-        });
+        expect(commandSnapshot).toMatchObject({ state: "completed", exit_code: 0 });
+        // A finished command that was not kept as a session reports no
+        // backend: it ran captured, without the terminal.
+        expect(commandSnapshot).not.toHaveProperty("backend");
         expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDOUT_BEGIN");
         expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDOUT_END");
         expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDERR");

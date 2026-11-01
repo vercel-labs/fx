@@ -145,6 +145,7 @@ pub const mcp_scope_options = [_]command_specs.OptionDoc{
 pub const mcp_add_options = mcp_scope_options ++ [_]command_specs.OptionDoc{
     .{ .flag = "--env <KEY=VALUE>", .description = "Set an environment variable for a command server" },
     .{ .flag = "--header <KEY=VALUE>", .description = "Send a header to an HTTP server" },
+    .{ .flag = "--no-login", .description = "Don't sign in to an HTTP server that needs a login" },
 };
 /// `list --connect` moved to `show NAME`; it is read to say so.
 const mcp_connect_option: command_specs.OptionDoc = .{ .flag = "--connect", .description = "Moved to show NAME", .hidden = true };

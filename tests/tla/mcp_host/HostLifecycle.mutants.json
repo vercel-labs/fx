@@ -7,8 +7,8 @@
   },
   {
     "description": "A reload never starts the server it approved or added back (reloadHost without startHostServers)",
-    "old": "          /\\ st' = [st EXCEPT ![cur][s] = Started(Initial(nd, s))]",
-    "new": "          /\\ st' = [st EXCEPT ![cur][s] = Initial(nd, s)]",
+    "old": "IF s \\in Stale THEN Started(Initial(decision, s)) ELSE st[cur][s]",
+    "new": "IF s \\in Stale THEN Initial(decision, s) ELSE st[cur][s]",
     "invariant": "StartedAfterFirstFrame"
   },
   {
@@ -31,8 +31,8 @@
   },
   {
     "description": "A server added back stays down",
-    "old": "          /\\ st' = [st EXCEPT ![cur][s] = Started(Initial(nd, s))]",
-    "new": "          /\\ st' = [st EXCEPT ![cur][s] = IF d = \"ok\" THEN \"absent\" ELSE Started(Initial(nd, s))]",
+    "old": "IF s \\in Stale THEN Started(Initial(decision, s)) ELSE st[cur][s]",
+    "new": "IF s \\in Stale THEN IF decision[s] = \"ok\" THEN \"absent\" ELSE Started(Initial(decision, s)) ELSE st[cur][s]",
     "property": "ApprovedServersSettle"
   },
   {
@@ -49,8 +49,20 @@
   },
   {
     "description": "A reload stops every running server, as a new host did",
-    "old": "           gone == {<<cur, s>>} \\cap procs\n",
-    "new": "           gone == Of(cur)\n",
+    "old": "    /\\ LET gone == {p \\in procs : p[1] = cur /\\ p[2] \\in Stale}\n",
+    "new": "    /\\ LET gone == Of(cur)\n",
     "property": "KeptServersKeepRunning"
+  },
+  {
+    "description": "A change to the config files stops the server it touches at once, before the host loads it",
+    "old": "    /\\ UNCHANGED <<cur, alive, retired, leases, st, procs, stopping, termed, framed, quit, shown, heldAt, loaded>>",
+    "new": "    /\\ LET gone == {<<cur, s>>} \\cap procs IN procs' = procs \\ gone /\\ stopping' = stopping \\cup gone\n    /\\ UNCHANGED <<cur, alive, retired, leases, st, termed, framed, quit, shown, heldAt, loaded>>",
+    "property": "KeptServersKeepRunning"
+  },
+  {
+    "description": "No check ever loads a change to the config files (refreshHost never reloads)",
+    "old": "    /\\ ~quit /\\ Stale # {}\n",
+    "new": "    /\\ ~quit /\\ Stale # {} /\\ FALSE\n",
+    "property": "ApprovedServersSettle"
   }
 ]
