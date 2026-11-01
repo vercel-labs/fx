@@ -1,5 +1,6 @@
 const std = @import("std");
 const TranscriptRuntime = @import("benchmark_exports").TranscriptRuntime;
+const transcript_store = @import("benchmark_exports").transcript_store;
 
 const Kind = enum { baseline, candidate };
 const call_ids = [_][]const u8{ "first", "second" };
@@ -9,7 +10,7 @@ const growth_batches = 5;
 const ratio_scale = 1_000;
 const max_ratio = 2 * ratio_scale;
 const Harness = struct {
-    transcript: TranscriptRuntime = .{ .max_retained_transcript_bytes = 256 },
+    transcript: TranscriptRuntime = .{},
     kind: Kind,
     entry_ids: [call_ids.len]u32 = undefined,
 
@@ -177,7 +178,7 @@ const GrowthObservation = struct {
             .active = transcript.activeToolActivityCount(),
             .pins = transcript.lifecyclePinCount(),
             .details = transcript.tool_details.items.len,
-            .retained_bytes = transcript.retainedStructuredBytesForCommandOutput(),
+            .retained_bytes = transcript_store.retainedStructuredBytes(transcript),
         };
     }
 

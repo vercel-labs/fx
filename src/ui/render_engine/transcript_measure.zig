@@ -19,6 +19,17 @@ pub fn walkText(start_row: u32, start_col: u16, bytes: []const u8, cols: u16) Wa
     while (i < bytes.len) {
         const ch = bytes[i];
 
+        // A run of printable ASCII is one cell per byte: advance it a row at
+        // a time with the wrap rule below.
+        if (ch >= 0x20 and ch <= 0x7e) {
+            const end = asciiRunEnd(bytes, i);
+            if (end > i) {
+                advanceCells(&row, &col, end - i, cols);
+                i = end;
+                continue;
+            }
+        }
+
         if (ch == 0x1b) {
             i = display_width.ansiSequenceEnd(bytes, i);
             continue;
@@ -66,6 +77,32 @@ pub fn walkText(start_row: u32, start_col: u16, bytes: []const u8, cols: u16) Wa
         i += unit.byte_len;
     }
     return .{ .end_row = row, .end_col = col };
+}
+
+/// The end of the run of printable ASCII that starts at `start`. A rune after
+/// the run may join its last byte into one cluster, so that byte is left out
+/// and goes the slow way.
+fn asciiRunEnd(bytes: []const u8, start: usize) usize {
+    var end = start + 1;
+    while (end < bytes.len and bytes[end] >= 0x20 and bytes[end] <= 0x7e) end += 1;
+    if (end < bytes.len and bytes[end] >= 0x80) end -= 1;
+    return end;
+}
+
+/// Advances the cursor over `cells` one-cell glyphs, a row at a time, with
+/// `walkText`'s wrap rule.
+fn advanceCells(row: *u32, col: *u16, cells: usize, cols: u16) void {
+    var remaining = cells;
+    while (remaining > 0) {
+        if (display_width.shouldWrapAt(col.*, 1, cols)) {
+            col.* = 1;
+            row.* += 1;
+        }
+        const room: usize = @as(usize, cols) + 1 - col.*;
+        const take = @min(remaining, room);
+        col.* += @intCast(take);
+        remaining -= take;
+    }
 }
 
 // Transcript rows can carry SGR + OSC-8 + other escape sequences (image
@@ -283,4 +320,84 @@ test "walkText cols=0 is a noop on row/col" {
     const r = walkText(5, 3, "abc\ndef", 0);
     try std.testing.expectEqual(@as(u32, 5), r.end_row);
     try std.testing.expectEqual(@as(u16, 3), r.end_col);
+}
+
+/// The walk before ASCII runs were batched, kept as the oracle for `walkText`.
+fn walkTextByteWise(start_row: u32, start_col: u16, bytes: []const u8, cols: u16) WalkResult {
+    if (bytes.len == 0 or cols == 0) return .{ .end_row = start_row, .end_col = start_col };
+    var row: u32 = start_row;
+    var col: u16 = start_col;
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const ch = bytes[i];
+        if (ch == 0x1b) {
+            i = display_width.ansiSequenceEnd(bytes, i);
+            continue;
+        }
+        switch (ch) {
+            '\r' => {
+                col = 1;
+                i += 1;
+                continue;
+            },
+            '\n' => {
+                col = 1;
+                row += 1;
+                i += 1;
+                continue;
+            },
+            else => {},
+        }
+        if (ch == '\t') {
+            col = display_width.nextTabStopColumn(col, cols);
+            i += 1;
+            continue;
+        }
+        if (ch < 32) {
+            i += 1;
+            continue;
+        }
+        const unit = display_width.displayUnitAt(bytes, i);
+        if (unit.cell_width == 0) {
+            i += unit.byte_len;
+            continue;
+        }
+        const w: u16 = @intCast(unit.cell_width);
+        if (display_width.shouldWrapAt(col, w, cols)) {
+            col = 1;
+            row += 1;
+        }
+        col += w;
+        i += unit.byte_len;
+    }
+    return .{ .end_row = row, .end_col = col };
+}
+
+test "walkText batches ASCII runs exactly like the byte-wise walk" {
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x7c1d);
+    const random = prng.random();
+    // ASCII runs, controls, complete and unterminated escapes, and runes
+    // that join a preceding ASCII byte into one cluster.
+    const pieces = [_][]const u8{
+        "a",                                "abc ",                      "0123456789",     " ",                         "\t",
+        "\n",                               "\r",                        "\r\n",           "\x1b[1m",                   "\x1b[38;5;81m",
+        "\x1b[0m",                          "\x1b]8;;https://e.x\x1b\\", "\x1b]8;;\x07",   "\x1b[",                     "\x1b]0;title",
+        "\x1b",                             "\xc3\xa9",                  "e\xcc\x81",      "\xe7\x95\x8c",              "\xf0\x9f\x91\x8d",
+        "\xf0\x9f\x91\x8d\xf0\x9f\x8f\xbd", "\xe2\x9d\xa4\xef\xb8\x8f",  "a\xe2\x80\x8db", "\x7f",                      "\x01",
+        "\xff",                             "\x80",                      "~",
+        // An ASCII base that a following rune turns into a wide cluster.
+                     "1\xef\xb8\x8f\xe2\x83\xa3", "#\xef\xb8\x8f",
+        "*\xe2\x83\xa3",                    "9\xef\xb8\x8f",
+    };
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for (0..4000) |_| {
+        text.clearRetainingCapacity();
+        for (0..random.uintLessThan(usize, 40)) |_| try text.appendSlice(alloc, pieces[random.uintLessThan(usize, pieces.len)]);
+        const cols: u16 = 1 + random.uintLessThan(u16, 30);
+        const start_col: u16 = 1 + random.uintLessThan(u16, cols + 1);
+        const start_row = random.uintLessThan(u32, 5);
+        try std.testing.expectEqual(walkTextByteWise(start_row, start_col, text.items, cols), walkText(start_row, start_col, text.items, cols));
+    }
 }

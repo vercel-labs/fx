@@ -1238,6 +1238,12 @@ pub fn Runtime(comptime App: type) type {
                 &app.shell,
                 app.stream.active or app.pacer.hasPending(),
             );
+            // A terminal reset clears the screen and replays the transcript,
+            // so the entries the transcript window kept only because a row of
+            // theirs was on screen go before the replay.
+            if (comptime @hasDecl(@TypeOf(app.shell), "transcriptWindowScreenCleared")) {
+                if (app.shell.terminal_reset_pending) try app.shell.transcriptWindowScreenCleared(app.alloc);
+            }
             const presentation_shell: *transcript_runtime.TranscriptRuntime = &app.shell;
             const render_requests = activeRenderRequests(app);
             var upgrade_status_buf: [64]u8 = undefined;
@@ -4810,9 +4816,6 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
         _ = try app.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{ .id = id, .reconciles_provisional_call_id = null, .tool_name = "run_command", .activity_kind = .command } });
         break :blk app.shell.toolActivityRecord(id).?.entry_id;
     } else try store.appendPinnedToolStatusAtomic(&app.shell, alloc, "phase one\nphase two\nphase three\n");
-    const status_bytes = for (app.shell.entries.items) |entry| {
-        if (entry.id() == status_id) break entry.raw_bytes.bytes.len;
-    } else unreachable;
     var physical = try vt_emulator.Grid.init(alloc, 80, rows);
     defer physical.deinit();
     physical.defer_sync_updates = false;
@@ -4866,19 +4869,23 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
         try std.testing.expect(app.terminal.fullTranscriptScreenActive());
         try std.testing.expect(physical.saved_normal_screen != null);
     }
-    if (case != .status_shrink) app.shell.max_retained_transcript_bytes = store.retainedStructuredBytes(&app.shell);
     switch (case) {
         .command_retention => try app.shell.writeCommandOutputChunk(alloc, &app.metrics, .{}, .stdout, "NEW_COMMAND_OUTPUT\n", true),
         .status_retention => try std.testing.expect(try store.replacePinnedToolStatusAtomic(&app.shell, alloc, status_id, "phase replacement\nsecond phase\nthird phase\nfourth phase\nfifth phase\n")),
         .status_shrink => try std.testing.expect(try store.replacePinnedToolStatusAtomic(&app.shell, alloc, status_id, "ok\n")),
-        .removed_conversation => {
-            app.shell.max_retained_transcript_bytes = status_bytes + "NEW_NOTICE\n".len;
-            if (retry.viewer) {
-                try std.testing.expect(try store.replacePinnedToolStatusAtomic(&app.shell, alloc, status_id, "viewer status replacement\n"));
-            } else {
-                _ = try store.writeRecordedTranscriptClassifiedAtomic(&app.shell, alloc, &app.metrics, "NEW_NOTICE\n", .unknown_raw);
-            }
+        .removed_conversation => if (retry.viewer) {
+            try std.testing.expect(try store.replacePinnedToolStatusAtomic(&app.shell, alloc, status_id, "viewer status replacement\n"));
+        } else {
+            _ = try store.writeRecordedTranscriptClassifiedAtomic(&app.shell, alloc, &app.metrics, "NEW_NOTICE\n", .unknown_raw);
         },
+    }
+    // The transcript window drops the closed cycle after the rewrite: the
+    // prefix, and for a removed conversation the answer too. The pinned
+    // status always stays.
+    switch (case) {
+        .status_shrink => {},
+        .command_retention, .status_retention => try std.testing.expect(try store.dropEntriesAtomic(&app.shell, alloc, &.{prefix_id})),
+        .removed_conversation => try std.testing.expect(try store.dropEntriesAtomic(&app.shell, alloc, &.{ prefix_id, assistant_id })),
     }
     const prefix_survives = for (app.shell.entries.items) |entry| {
         if (entry.id() == prefix_id) break true;
@@ -4933,7 +4940,6 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
         try std.testing.expect(!try coordinatorGridContains(physical, "RW_OLD_00"));
         return;
     }
-    const publication_bound = app.shell.transcriptCommitDiagnostic().source_bytes + app.shell.max_retained_transcript_bytes;
     if (retry.update_status) {
         try std.testing.expect(try store.replacePinnedToolStatusAtomic(&app.shell, alloc, status_id, "phase new\nphase two\nphase end\n"));
         try std.testing.expectEqualStrings("phase new\nphase two\nphase end", store.toolStatusEntryLabel(&app.shell, status_id).?);
@@ -4947,7 +4953,6 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
             defer committed.deinit(alloc);
             try std.testing.expect(std.mem.find(u8, committed.bytes, "P2") == null);
             try std.testing.expectEqual(held_bytes, committed.bytes.len);
-            try std.testing.expect(store.retainedStructuredBytes(&app.shell) <= app.shell.max_retained_transcript_bytes);
         }
     }
     if (retry.accepted_bytes) |cut| {
@@ -4978,11 +4983,6 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
             try std.testing.expectEqual(@as(usize, 0), app.shell.lifecyclePinCount());
         }
         if (retry.mutate_before_retry) _ = try store.writeRecordedTranscriptClassifiedAtomic(&app.shell, alloc, &app.metrics, "P3\n", .unknown_raw);
-        if (cut == 0 and retry.mutate_before_retry) {
-            var committed = (try app.shell.prepareCommittedRetentionSource(alloc)).?;
-            defer committed.deinit(alloc);
-            try std.testing.expect(std.mem.find(u8, committed.bytes, "NEW_NOTICE") == null);
-        }
     }
     if (retry.resize_cols) |cols| {
         try physical.resize(cols, physical.rows);
@@ -5023,8 +5023,10 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
                     seen[prior] = true;
                 }
             }
-            try std.testing.expect(app.shell.transcriptCommitDiagnostic().source_bytes <= publication_bound);
-            try std.testing.expect(store.retainedStructuredBytes(&app.shell) <= app.shell.max_retained_transcript_bytes);
+            // Below a status that stays pinned, rows past the screen wait for
+            // the pin to end (the in-place region, as on main), so stop once
+            // the dropped rows are out and released. A finished turn drains on.
+            if (!retry.cancel and std.mem.findScalar(u32, app.shell.committedRetentionIdentity().?.publication_entries, assistant_id) == null) break;
         }
         try std.testing.expect(std.mem.findScalar(bool, seen, true) != null);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, exported.items, "RW_ARTIFACTS"));
@@ -5105,8 +5107,8 @@ test "rewrite publication survives generic projection invalidation" {
     try checkRewritePublicationRetry(.removed_conversation, .{ .invalidate = true, .drain = true });
 }
 
-test "rewrite publication remains bounded while status stays mutable" {
-    try checkRewritePublicationRetry(.removed_conversation, .{ .update_status = true, .drain = true, .drain_frames = 96 });
+test "rewrite publication replaces a still mutable status after the drop" {
+    try checkRewritePublicationRetry(.removed_conversation, .{ .update_status = true, .drain = true });
 }
 
 test "rewrite publication does not delay explicit clear or resume" {

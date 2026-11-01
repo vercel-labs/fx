@@ -3772,21 +3772,23 @@ test "structured command-output rewrite materializes committed transcript scroll
     for (0..60) |index| {
         try follow_up.writer.print("follow-up retained row {d}\n", .{index + 1});
     }
-    const retained_before = h.shell.retainedStructuredBytesForCommandOutput();
-    h.shell.max_retained_transcript_bytes = retained_before + follow_up.written().len / 2;
-    {
+    const code_block_id = blk: {
         var block = assistant_presentation.CodeBlockPayload{
             .language = try h.alloc.dupe(u8, "zig"),
             .code = try h.alloc.dupe(u8, "const retained_boundary = true;\n"),
         };
         errdefer block.deinit(h.alloc);
-        _ = try h.shell.appendAssistantCodeBlockOwned(h.alloc, block);
-    }
+        break :blk try h.shell.appendAssistantCodeBlockOwned(h.alloc, block);
+    };
     _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, follow_up.written());
-    try std.testing.expect(
-        h.shell.retainedStructuredBytesForCommandOutput() <=
-            h.shell.max_retained_transcript_bytes,
-    );
+    // The transcript window drops everything before the code block.
+    var dropped: std.ArrayList(u32) = .empty;
+    defer dropped.deinit(h.alloc);
+    for (h.shell.entries.items) |entry| {
+        if (entry.id() == code_block_id) break;
+        try dropped.append(h.alloc, entry.id());
+    }
+    try std.testing.expect(try @import("transcript/store.zig").dropEntriesAtomic(&h.shell, h.alloc, dropped.items));
     var retained_source = try h.shell.prepareTranscriptSource(h.alloc, null);
     defer retained_source.deinit(h.alloc);
     try std.testing.expect(std.mem.find(
@@ -3795,7 +3797,7 @@ test "structured command-output rewrite materializes committed transcript scroll
         "SYSTEM OUTPUT 02",
     ) == null);
 
-    // Retention removed the recorded entry, not its unexported publication.
+    // The drop removed the recorded entry, not its unexported publication.
     try std.testing.expect(h.shell.lookupAssistantSegments(first_assistant_id) == null);
     const rebased = h.shell.transcript_commit_state.stable;
     try std.testing.expect(std.mem.findScalar(u32, rebased.retention_identity.publication_entries, first_assistant_id) != null);
@@ -8640,7 +8642,7 @@ fn retentionRow(alloc: Allocator, id: usize) ![]u8 {
     return alloc.print("ROW_{d:0>4} immutable sentinel\n", .{id});
 }
 
-fn expectAssistantRetentionPreservesHistory(retention: bool) !void {
+fn expectDroppedPrefixPreservesHistory(retention: bool) !void {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 168, 75, 4);
     defer h.deinit();
@@ -8676,11 +8678,12 @@ fn expectAssistantRetentionPreservesHistory(retention: bool) !void {
     defer alloc.free(published);
     const append = try retentionRow(alloc, 240);
     defer alloc.free(append);
-    const projected = @import("transcript/store.zig").retainedStructuredBytes(&h.shell) + append.len;
-    h.shell.max_retained_transcript_bytes = if (retention) projected - 1 else projected + 1;
     try std.testing.expectEqual(@as(u32, 288), h.shell.transcriptCommitDiagnostic().history_visual_offset);
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, append);
     if (retention) {
+        // The transcript window drops the oldest entry, already in terminal
+        // history; its physical rows stay and the anchor rebases.
+        try std.testing.expect(try @import("transcript/store.zig").dropEntriesAtomic(&h.shell, alloc, &.{old_id.?}));
         const rebased = h.shell.transcriptCommitDiagnostic();
         try std.testing.expectEqual(@as(u32, 167), rebased.history_visual_offset);
         try std.testing.expectEqual(@as(u32, 167), rebased.visual_offset);
@@ -8689,7 +8692,6 @@ fn expectAssistantRetentionPreservesHistory(retention: bool) !void {
     try paintRetentionFrame(&h, &probe, &input, &approval);
     try expectRetentionRows(&probe, &h, 241);
     try expectGridContains(&h, "ROW_0240");
-    h.shell.max_retained_transcript_bytes = std.math.maxInt(usize);
     for (241..331) |id| {
         const text = try retentionRow(alloc, id);
         defer alloc.free(text);
@@ -8702,23 +8704,23 @@ fn expectAssistantRetentionPreservesHistory(retention: bool) !void {
     try std.testing.expectEqual(@as(u16, 73), h.vt.cursor_row);
 }
 
-test "assistant retention preserves physical rows control" {
-    try expectAssistantRetentionPreservesHistory(false);
+test "a dropped prefix preserves physical rows control" {
+    try expectDroppedPrefixPreservesHistory(false);
 }
 
-test "assistant retention preserves physical rows after prefix removal" {
-    try expectAssistantRetentionPreservesHistory(true);
+test "a dropped prefix preserves physical rows" {
+    try expectDroppedPrefixPreservesHistory(true);
 }
 
-test "assistant retention unpainted paragraph prefix control" {
-    try expectUnpaintedRetentionIdentity(false);
+test "a dropped prefix keeps an unpainted paragraph identity control" {
+    try expectDroppedPrefixUnpaintedIdentity(false);
 }
 
-test "assistant retention unpainted paragraph reflow keeps physical append identity" {
-    try expectUnpaintedRetentionIdentity(true);
+test "a dropped prefix keeps an unpainted paragraph reflow physical append identity" {
+    try expectDroppedPrefixUnpaintedIdentity(true);
 }
 
-fn expectUnpaintedRetentionIdentity(reflow: bool) !void {
+fn expectDroppedPrefixUnpaintedIdentity(reflow: bool) !void {
     const alloc = std.testing.allocator;
     const cols: u16 = if (reflow) 18 else 22;
     var h = try Harness.init(alloc, cols, 12, 4);
@@ -8726,7 +8728,7 @@ fn expectUnpaintedRetentionIdentity(reflow: bool) !void {
     var probe = try PhysicalHistoryProbe.init(cols, 12);
     defer probe.deinit();
     try h.shell.initViewport(&h.metrics, 1);
-    _ = try h.shell.appendRawTranscriptEntry(alloc, text_utils.repeat("old\n", 20));
+    const old_id = try h.shell.appendRawTranscriptEntry(alloc, text_utils.repeat("old\n", 20));
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, if (reflow) "alpha beta gamma delta" else "alpha beta gamma");
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
@@ -8734,15 +8736,14 @@ fn expectUnpaintedRetentionIdentity(reflow: bool) !void {
     const committed = try alloc.dupe(u8, h.shell.transcript_commit_state.stable.flow);
     defer alloc.free(committed);
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, if (reflow) " epsilon" else " delta epsilon");
-    const append = "\nzeta\n";
-    h.shell.max_retained_transcript_bytes = @import("transcript/store.zig").retainedStructuredBytes(&h.shell) + append.len - 1;
-    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, append);
-    // Retention must not label an unpainted reflow as the physical endpoint.
+    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, "\nzeta\n");
+    // The transcript window drops the oldest entry; the rebase must not label
+    // an unpainted reflow as the physical endpoint.
+    try std.testing.expect(try @import("transcript/store.zig").dropEntriesAtomic(&h.shell, alloc, &.{old_id}));
     const anchor = h.shell.transcript_commit_state.stable;
     try std.testing.expect(std.mem.endsWith(u8, committed, anchor.flow));
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
-    h.shell.max_retained_transcript_bytes = std.math.maxInt(usize);
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, "eta\ntheta\niota\nkappa\nlambda\nmu\n");
     for (0..3) |_| {
         try h.renderTranscriptFrame();
@@ -8767,7 +8768,7 @@ fn expectUnpaintedRetentionIdentity(reflow: bool) !void {
     }
 }
 
-test "assistant retention deleted soft wrapped entry preserves the next physical rows" {
+test "a dropped soft wrapped entry preserves the next physical rows" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 12, 12, 4);
     defer h.deinit();
@@ -8786,13 +8787,13 @@ test "assistant retention deleted soft wrapped entry preserves the next physical
     defer alloc.free(before_full);
     const published_old_rows = std.mem.count(u8, before_full, "abcdefghijkl");
     try std.testing.expect(published_old_rows > 0);
-    h.shell.max_retained_transcript_bytes = @import("transcript/store.zig").retainedStructuredBytes(&h.shell) + "tail\n".len - 1;
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, "tail\n");
+    // The transcript window drops the soft-wrapped entry; its published rows stay.
+    try std.testing.expect(try @import("transcript/store.zig").dropEntriesAtomic(&h.shell, alloc, &.{retired_id}));
     try std.testing.expectEqual(old_history, h.shell.transcriptCommitDiagnostic().history_visual_offset);
     try std.testing.expect(std.mem.findScalar(u32, h.shell.committedRetentionIdentity().?.publication_entries, retired_id) != null);
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
-    h.shell.max_retained_transcript_bytes = std.math.maxInt(usize);
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, text_utils.repeat("next\n", 12));
     for (0..3) |_| {
         try h.renderTranscriptFrame();
@@ -8809,7 +8810,7 @@ test "assistant retention deleted soft wrapped entry preserves the next physical
     try std.testing.expect(std.mem.findScalar(u32, h.shell.committedRetentionIdentity().?.publication_entries, retired_id) == null);
 }
 
-test "assistant retention partial compact group preserves surviving physical children" {
+test "a dropped compact group child preserves surviving physical children" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 60, 12, 4);
     defer h.deinit();
@@ -8838,13 +8839,13 @@ test "assistant retention partial compact group preserves surviving physical chi
     const history = h.shell.transcriptCommitDiagnostic().history_visual_offset;
     try std.testing.expect(history > 2 and history < 16);
     const first_id = h.shell.entries.items[0].id();
-    h.shell.max_retained_transcript_bytes = @import("transcript/store.zig").retainedStructuredBytes(&h.shell) + "after\n".len - 1;
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, "after\n");
+    // The transcript window drops the group's first child.
+    try std.testing.expect(try @import("transcript/store.zig").dropEntriesAtomic(&h.shell, alloc, &.{first_id}));
     try std.testing.expect(h.shell.entries.items[0].id() != first_id);
     try std.testing.expectEqual(history - 1, h.shell.transcriptCommitDiagnostic().history_visual_offset);
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
-    h.shell.max_retained_transcript_bytes = std.math.maxInt(usize);
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, text_utils.repeat("later\n", 16));
     for (0..3) |_| {
         try h.renderTranscriptFrame();
@@ -8865,7 +8866,7 @@ test "assistant retention partial compact group preserves surviving physical chi
     }
 }
 
-fn expectAssistantRetentionPreservesToolProjection(collapsed: bool) !void {
+fn expectDroppedPrefixPreservesToolProjection(collapsed: bool) !void {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 60, 12, 4);
     defer h.deinit();
@@ -8890,15 +8891,15 @@ fn expectAssistantRetentionPreservesToolProjection(collapsed: bool) !void {
     try std.testing.expect(h.shell.transcriptCommitDiagnostic().history_visual_offset > 21);
     const append = try retentionRow(alloc, 24);
     defer alloc.free(append);
-    h.shell.max_retained_transcript_bytes = @import("transcript/store.zig").retainedStructuredBytes(&h.shell) + append.len - 1;
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, append);
+    // The transcript window drops the prefix entry before the tool group.
+    try std.testing.expect(try @import("transcript/store.zig").dropEntriesAtomic(&h.shell, alloc, &.{prefix_id}));
     try std.testing.expect(h.shell.entries.items[0].id() != prefix_id);
     for (0..3) |_| {
         try h.renderTranscriptFrame();
         try capturePhysicalFrame(&h, &probe);
     }
     try expectRetentionRows(&probe, &h, 25);
-    h.shell.max_retained_transcript_bytes = std.math.maxInt(usize);
     for (25..40) |id| {
         const text = try retentionRow(alloc, id);
         defer alloc.free(text);
@@ -8918,90 +8919,12 @@ fn expectAssistantRetentionPreservesToolProjection(collapsed: bool) !void {
     }
 }
 
-test "assistant retention collapsed tool projection preserves physical rows" {
-    try expectAssistantRetentionPreservesToolProjection(true);
+test "a dropped prefix preserves collapsed tool projection rows" {
+    try expectDroppedPrefixPreservesToolProjection(true);
 }
 
-test "assistant retention expanded tool projection preserves physical rows" {
-    try expectAssistantRetentionPreservesToolProjection(false);
-}
-
-fn checkAssistantRetentionAllocationFailure(operation_alloc: Allocator) !void {
-    const alloc = std.testing.allocator;
-    var h = try Harness.init(alloc, 60, 12, 4);
-    defer h.deinit();
-    try h.shell.initViewport(&h.metrics, 1);
-    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, text_utils.repeat("before\n", 24));
-    try h.renderTranscriptFrame();
-    try h.flush();
-    var before = try h.shell.prepareTranscriptSource(alloc, null);
-    defer before.deinit(alloc);
-    const diagnostic = h.shell.transcriptCommitDiagnostic();
-    const next_entry_id = h.shell.next_entry_id;
-    h.shell.max_retained_transcript_bytes = 100;
-    _ = h.shell.streamAssistantChunk(operation_alloc, &h.metrics, "after\n") catch |err| {
-        try std.testing.expectEqual(error.OutOfMemory, err);
-        var unchanged = try h.shell.prepareTranscriptSource(alloc, null);
-        defer unchanged.deinit(alloc);
-        try std.testing.expectEqualStrings(before.bytes, unchanged.bytes);
-        try std.testing.expect(std.meta.eql(diagnostic, h.shell.transcriptCommitDiagnostic()));
-        try std.testing.expectEqual(next_entry_id, h.shell.next_entry_id);
-        return err;
-    };
-    try std.testing.expect(h.shell.lookupAssistantSegments(1).?.text.items.len <= 100);
-}
-
-test "assistant retention allocation failures leave source and boundaries unchanged" {
-    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkAssistantRetentionAllocationFailure, .{});
-}
-
-fn wrappedRetentionRow(alloc: Allocator, id: usize) ![]u8 {
-    return alloc.print("ROW_{d:0>4} 界 café repeated words repeated words repeated words repeated words repeated words\n", .{id});
-}
-
-test "assistant retention preserves physical rows inside a protected wrapped entry" {
-    const alloc = std.testing.allocator;
-    for ([_]usize{ 0, 1, 80 }) |trim_lines| {
-        var h = try Harness.init(alloc, 60, 24, 4);
-        defer h.deinit();
-        var probe = try PhysicalHistoryProbe.init(h.vt.cols, h.vt.rows);
-        defer probe.deinit();
-        var input: InputRuntime = .{};
-        defer input.deinit(alloc);
-        var approval: approval_prompt.ApprovalPrompt = .{};
-        defer approval.deinit(alloc);
-        try h.shell.initViewport(&h.metrics, 1);
-        h.frame_redraw = true;
-        try paintRetentionFrame(&h, &probe, &input, &approval);
-        var entry_id: u32 = 0;
-        var prefix_bytes: usize = 0;
-        for (0..120) |id| {
-            const text = try wrappedRetentionRow(alloc, id);
-            defer alloc.free(text);
-            if (id < trim_lines) prefix_bytes += text.len;
-            entry_id = try h.shell.streamAssistantChunk(alloc, &h.metrics, text);
-            try paintRetentionFrame(&h, &probe, &input, &approval);
-            if (id == 0) try expectGridContains(&h, "ROW_0000");
-        }
-        try expectRetentionRows(&probe, &h, 120);
-        const old_len = h.shell.lookupAssistantSegments(entry_id).?.text.items.len;
-        const append = try wrappedRetentionRow(alloc, 120);
-        defer alloc.free(append);
-        h.shell.max_retained_transcript_bytes = old_len + append.len - prefix_bytes + 1;
-        try std.testing.expectEqual(entry_id, try h.shell.streamAssistantChunk(alloc, &h.metrics, append));
-        try std.testing.expectEqual(old_len + append.len - prefix_bytes, h.shell.lookupAssistantSegments(entry_id).?.text.items.len);
-        try paintRetentionFrame(&h, &probe, &input, &approval);
-        try expectRetentionRows(&probe, &h, 121);
-        try expectGridContains(&h, "ROW_0120");
-        // Two retention mutations may arrive before the next frame commits.
-        for (121..123) |id| {
-            const later = try wrappedRetentionRow(alloc, id);
-            defer alloc.free(later);
-            _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, later);
-        }
-        try paintRetentionFrame(&h, &probe, &input, &approval);
-        try expectRetentionRows(&probe, &h, 123);
-    }
+test "a dropped prefix preserves expanded tool projection rows" {
+    try expectDroppedPrefixPreservesToolProjection(false);
 }
 
 test "command tool rows reclip to live width across lifecycle states" {
@@ -9231,4 +9154,79 @@ fn expectFuzzShadowMatchesScreen(h: *Harness) !void {
         std.debug.print("transcript_paint: screen {d}x{d} at {d},{d}; shadow {d}x{d} at {d},{d}\n", .{ h.vt.cols, h.vt.rows, h.vt.cursor_row, h.vt.cursor_col, shadow.cols, shadow.rows, shadow.cursor_row, shadow.cursor_col });
         return error.TestShadowTerminalDiverged;
     }
+}
+
+test "a stable frame keeps the presentation states where its append started and ended" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 40, 10, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    var kept: usize = 0;
+    for (0..30) |index| {
+        const text = try alloc.print("**bold {d}** and `code` with a tail that wraps past forty columns {d}\n", .{ index, index });
+        defer alloc.free(text);
+        _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, text);
+        try h.renderTranscriptFrame();
+        kept += try expectKeptBoundariesMatchFullFeed(&h);
+    }
+    try std.testing.expect(kept >= 20);
+}
+
+/// Checks every presentation state the stable anchor kept against a fresh
+/// emulator fed its flow up to that offset; returns how many it checked.
+fn expectKeptBoundariesMatchFullFeed(h: *Harness) !usize {
+    const anchor = switch (h.shell.transcript_commit_state) {
+        .stable => |value| value,
+        .invalid, .recovering => return 0,
+    };
+    var checked: usize = 0;
+    for ([_]@TypeOf(anchor.flow_boundaries.start){ anchor.flow_boundaries.replay, anchor.flow_boundaries.start, anchor.flow_boundaries.end }) |slot| {
+        const boundary = slot orelse continue;
+        try std.testing.expect(boundary.offset <= anchor.flow.len);
+        try std.testing.expectEqual(h.shell.layout.cols, boundary.cols);
+        var full = try transcript_painter.prepareTranscriptDocumentAppend(h.alloc, anchor.flow, boundary.cols, 0, boundary.offset, false);
+        defer full.deinit(h.alloc);
+        try std.testing.expectEqualStrings(full.endpoint_resume_bytes, boundary.resume_bytes);
+        try std.testing.expectEqual(full.endpoint_cursor_col, boundary.cursor_col);
+        try std.testing.expectEqual(full.endpoint_pending_wrap, boundary.pending_wrap);
+        checked += 1;
+    }
+    return checked;
+}
+
+test "the kept presentation state follows a window drop and a rewrite of earlier rows" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 40, 10, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    var first_ids: [6]u32 = undefined;
+    var kept: usize = 0;
+    // Plain rows append; the tool rows after the first six update in place
+    // as one group, and grouping them later rewrites rows before the boundary.
+    for (0..24) |index| {
+        const text = try alloc.print("\x1b[1mrow {d}\x1b[0m output line that wraps past the forty column edge\n", .{index});
+        defer alloc.free(text);
+        const class: transcript_runtime.RawEntryClass = if (index >= 6 and index < 9) .tool_status else .unknown_raw;
+        const id = try h.shell.appendRawTranscriptEntryClassified(alloc, text, class);
+        if (index < first_ids.len) first_ids[index] = id;
+        try h.renderTranscriptFrame();
+        kept += try expectKeptBoundariesMatchFullFeed(&h);
+    }
+    // The window drops the oldest entries: the anchor's flow is rebuilt.
+    try std.testing.expect(try @import("transcript/store.zig").dropEntriesAtomic(&h.shell, alloc, &first_ids));
+    for (0..6) |_| {
+        try h.renderTranscriptFrame();
+        kept += try expectKeptBoundariesMatchFullFeed(&h);
+    }
+    // Rows before the boundary change: grouping the tool rows rewrites them.
+    h.shell.collapse_tool_calls = !h.shell.collapse_tool_calls;
+    h.shell.markTranscriptDirty();
+    for (0..12) |index| {
+        try h.renderTranscriptFrame();
+        kept += try expectKeptBoundariesMatchFullFeed(&h);
+        const text = try alloc.print("after {d}\n", .{index});
+        defer alloc.free(text);
+        _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, text);
+    }
+    try std.testing.expect(kept >= 20);
 }

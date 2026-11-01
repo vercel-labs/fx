@@ -1,7 +1,7 @@
 // Host contract:
 // - fields: transcript, entries, next_entry_id, last_rendered_cols,
 //   transcript_cache_origin_untrimmed,
-//   max_transcript_bytes, max_retained_transcript_bytes,
+//   max_transcript_bytes,
 //   folded_command_blocks, command_output_blocks, command_output_display,
 //   tool_details,
 //   full_transcript, replaceable_last_line, replaceable_start,
@@ -251,33 +251,6 @@ pub fn replaceableEntryId(self: anytype) ?u32 {
     };
 }
 
-fn protectedPreviousUserTurnId(self: anytype, protected_id: u32) ?u32 {
-    for (self.entries.items, 0..) |entry, index| {
-        if (entry.id() != protected_id) continue;
-        if (entry != .assistant_turn or index == 0) return null;
-        const previous = self.entries.items[index - 1];
-        return if (previous == .user_turn) previous.user_turn.id else null;
-    }
-    return null;
-}
-
-fn isProtectedEntry(self: anytype, entry_id: u32, protected_id: ?u32) bool {
-    if (isLifecyclePinned(self, entry_id)) return true;
-    for (self.command_output_blocks.items) |block| {
-        if (command_output_runtime.isPrunedRangeAnchor(block, entry_id)) return true;
-    }
-    if (protected_id) |id| {
-        if (entry_id == id) return true;
-        if (protectedPreviousUserTurnId(self, id)) |user_id| {
-            if (entry_id == user_id) return true;
-        }
-    }
-    if (replaceableEntryId(self)) |id| {
-        if (entry_id == id) return true;
-    }
-    return false;
-}
-
 pub fn isLifecyclePinned(self: anytype, entry_id: u32) bool {
     for (self.entries.items) |entry| {
         if (entry != .raw_bytes or entry.raw_bytes.id != entry_id) continue;
@@ -329,36 +302,6 @@ fn compactEntriesToRetainedSet(
         write_index += 1;
     }
     self.entries.items.len = write_index;
-}
-
-fn buildProtectedEntryIdSet(
-    self: anytype,
-    alloc: Allocator,
-    protected_id: ?u32,
-) !EntryIdSet {
-    var protected_entry_ids: EntryIdSet = .empty;
-    errdefer protected_entry_ids.deinit(alloc);
-
-    for (self.entries.items) |entry| {
-        if (entry == .raw_bytes and entry.raw_bytes.lifecycle_pinned) {
-            try protected_entry_ids.put(alloc, entry.raw_bytes.id, {});
-        }
-    }
-    for (self.command_output_blocks.items) |block| {
-        for (block.pruned_ranges.items) |range| {
-            try protected_entry_ids.put(alloc, range.anchor_entry_id, {});
-        }
-    }
-    if (protected_id) |id| {
-        try protected_entry_ids.put(alloc, id, {});
-        if (protectedPreviousUserTurnId(self, id)) |user_id| {
-            try protected_entry_ids.put(alloc, user_id, {});
-        }
-    }
-    if (replaceableEntryId(self)) |id| {
-        try protected_entry_ids.put(alloc, id, {});
-    }
-    return protected_entry_ids;
 }
 
 fn pruneOrphanedFoldedCommandBlocks(
@@ -519,251 +462,6 @@ fn coalesceCommandOutputPrunedRanges(self: anytype, alloc: Allocator) bool {
     return changed;
 }
 
-fn trimFoldedCommandLinesToBudget(self: anytype, alloc: Allocator, cap: usize) bool {
-    var changed = false;
-    var total = retainedStructuredBytes(self);
-    if (total <= cap) return false;
-
-    var block_index: usize = 0;
-    while (block_index < self.folded_command_blocks.items.len and total > cap) : (block_index += 1) {
-        var block = &self.folded_command_blocks.items[block_index];
-        while (block.lines.items.len > 0 and total > cap) {
-            const line = block.lines.orderedRemove(0);
-            const line_len = line.text.len;
-            alloc.free(line.text);
-            total -|= line_len;
-            changed = true;
-            debug_trace.logf("transcript_retention", "pruned folded command line bytes={d} retained={d} cap={d}", .{ line_len, total, cap });
-        }
-    }
-
-    return changed;
-}
-
-fn trimCommandOutputLinesToBudget(
-    self: anytype,
-    alloc: Allocator,
-    cap: usize,
-    only_count_only_blocks: bool,
-) !bool {
-    var changed = false;
-    var total = retainedStructuredBytes(self);
-    if (total <= cap) return false;
-
-    var block_index: usize = 0;
-    while (block_index < self.command_output_blocks.items.len and total > cap) : (block_index += 1) {
-        var block = &self.command_output_blocks.items[block_index];
-        if (only_count_only_blocks and block.total_lines <= block.lines.items.len) continue;
-        while (block.lines.items.len > 0 and total > cap) {
-            const line_index = block.lines.items.len - 1;
-            const line_len = block.lines.items[line_index].text.len;
-            if (!try command_output_runtime.trimRetainedCommandOutputLine(
-                self,
-                alloc,
-                block_index,
-                line_index,
-            )) break;
-            block = &self.command_output_blocks.items[block_index];
-            total = retainedStructuredBytes(self);
-            changed = true;
-            debug_trace.logf("transcript_retention", "pruned command output line bytes={d} retained={d} cap={d}", .{ line_len, total, cap });
-        }
-    }
-
-    return changed;
-}
-
-const CommandOutputLineLocation = struct {
-    block_index: usize,
-    line_index: usize,
-    open: bool,
-};
-
-const CommandOutputBlockIndex = std.AutoHashMapUnmanaged(u32, usize);
-
-fn buildCommandOutputBlockIndex(self: anytype, alloc: Allocator) !CommandOutputBlockIndex {
-    var index: CommandOutputBlockIndex = .empty;
-    errdefer index.deinit(alloc);
-    for (self.command_output_blocks.items, 0..) |block, block_index| {
-        for (block.lines.items) |line| {
-            if (line.entry_id) |entry_id| {
-                try index.put(alloc, entry_id, block_index);
-            }
-        }
-    }
-    return index;
-}
-
-fn commandOutputLineLocation(
-    self: anytype,
-    block_index: *const CommandOutputBlockIndex,
-    entry_id: u32,
-) ?CommandOutputLineLocation {
-    const index = block_index.get(entry_id) orelse return null;
-    const block = self.command_output_blocks.items[index];
-    for (block.lines.items, 0..) |line, line_index| {
-        if (line.entry_id != entry_id) continue;
-        var open = false;
-        for (block.open_line_indices) |open_line_index| {
-            if (open_line_index == line_index) {
-                open = true;
-                break;
-            }
-        }
-        return .{
-            .block_index = index,
-            .line_index = line_index,
-            .open = open,
-        };
-    }
-    return null;
-}
-
-pub const RetentionPrefixTrim = struct {
-    entry_id: u32,
-    bytes: usize,
-};
-
-fn trimProtectedEntriesToBudget(self: anytype, alloc: Allocator, cap: usize, protected_id: ?u32, prefix_trims: ?*std.ArrayList(RetentionPrefixTrim)) !bool {
-    var changed = false;
-    var total = retainedStructuredBytes(self);
-    while (total > cap) {
-        const excess = total - cap;
-        var trimmed = false;
-
-        for (self.entries.items) |*entry| {
-            const entry_id = entry.id();
-            if (!isProtectedEntry(self, entry_id, protected_id)) continue;
-            if (isLifecyclePinned(self, entry_id)) continue;
-
-            const before = entryRetainedBytes(entry.*);
-            if (before == 0) continue;
-
-            const target = before -| excess;
-            if (prefix_trims) |trims| try trims.ensureUnusedCapacity(alloc, 1);
-            if (try trimEntryRetainedBytes(alloc, entry, target)) |removed_bytes| {
-                if (prefix_trims) |trims| trims.appendAssumeCapacity(.{ .entry_id = entry_id, .bytes = removed_bytes });
-                const after = entryRetainedBytes(entry.*);
-                total -|= before - after;
-                changed = true;
-                trimmed = true;
-                debug_trace.logf("transcript_retention", "trimmed protected entry id={d} before={d} after={d} retained={d} cap={d}", .{ entry_id, before, after, total, cap });
-                break;
-            }
-        }
-
-        if (!trimmed) break;
-    }
-    return changed;
-}
-
-fn trimEntryRetainedBytes(alloc: Allocator, entry: *TranscriptEntry, target: usize) !?usize {
-    switch (entry.*) {
-        .raw_bytes => |*e| {
-            if (e.bytes.len <= target) return null;
-            const start = retainedTextStart(e.bytes, target);
-            const retained = try alloc.dupe(u8, e.bytes[start..]);
-            alloc.free(e.bytes);
-            e.bytes = retained;
-            return start;
-        },
-        .assistant_turn => |*e| {
-            if (e.segments.text.items.len <= target) return null;
-            const start = retainedTextStart(e.segments.text.items, target);
-            if (start == 0) return null;
-            const remaining = e.segments.text.items.len - start;
-            @memmove(e.segments.text.items[0..remaining], e.segments.text.items[start..]);
-            e.segments.text.items.len = remaining;
-            return start;
-        },
-        .assistant_table, .assistant_code_block, .assistant_thematic_rule => return null,
-        .semantic_notice, .user_turn => return null,
-    }
-}
-
-fn retainedTextStart(bytes: []const u8, target: usize) usize {
-    var start = cappedTailStart(bytes, target);
-    while (start < bytes.len and bytes[start] & 0xc0 == 0x80) : (start += 1) {}
-    return start;
-}
-
-test "retention text cuts preserve UTF8 boundaries" {
-    const text = "é界abc";
-    for (0..text.len + 1) |target| {
-        const start = retainedTextStart(text, target);
-        try std.testing.expect(text.len - start <= target);
-        try std.testing.expect(std.unicode.utf8ValidateSlice(text[start..]));
-    }
-    try std.testing.expectEqual(@as(usize, 5), retainedTextStart(text, 5));
-    try std.testing.expectEqual(@as(usize, 4), retainedTextStart("abc\ndef", 5));
-}
-
-test "retention rebase maps a cut inside a wrapped assistant paragraph" {
-    const alloc = std.testing.allocator;
-    const Runtime = @import("runtime.zig").TranscriptRuntime;
-    var runtime = Runtime{ .layout = .{ .cols = 22, .rows = 12, .content_bottom = 8, .divider_top_row = 9, .input_row = 10, .divider_bottom_row = 11, .hint_row = 12 } };
-    defer runtime.deinit(alloc);
-    const entry_id = try runtime.appendAssistantTurnEntry(alloc);
-    const text = "alpha 界 café repeated words repeated words repeated words repeated words repeated words repeated words repeated words";
-    try runtime.lookupAssistantSegments(entry_id).?.text.appendSlice(alloc, text);
-    var before = try source_preparation.prepareRetentionSource(&runtime, alloc);
-    defer before.deinit(alloc);
-    var retained = try cloneRecordedMutationState(&runtime, alloc);
-    defer retained.deinit(alloc);
-    const removed = (try trimEntryRetainedBytes(alloc, &retained.entries.items[0], text.len - 8)).?;
-    var after = try source_preparation.prepareRetentionSource(&retained, alloc);
-    defer after.deinit(alloc);
-    const old_rows = try assistant_wrap.retentionSourceRows(alloc, text, 22);
-    defer alloc.free(old_rows);
-    const new_rows = try assistant_wrap.retentionSourceRows(alloc, retained.lookupAssistantSegments(entry_id).?.text.items, 22);
-    defer alloc.free(new_rows);
-    const entries = [_]source_preparation.RetentionEntryRows{.{ .entry_id = entry_id, .removed_bytes = removed, .before = old_rows, .retained = new_rows }};
-    var mapping = try source_preparation.RetentionRebase.init(alloc, &before, &after, &entries);
-    defer mapping.deinit(alloc);
-    try std.testing.expect(old_rows.len > 4);
-    const surviving_byte = old_rows[4] - removed;
-    var expected: u32 = 0;
-    for (new_rows, 0..) |source_byte, row| {
-        if (source_byte > surviving_byte) break;
-        expected = @intCast(row);
-    }
-    try std.testing.expectEqual(expected, mapping.visual(4));
-    try std.testing.expectEqual(@as(usize, expected), mapping.line(4));
-}
-
-test "retention rebase assistant byte endpoint follows source within rewrapped row" {
-    const alloc = std.testing.allocator;
-    const Runtime = @import("runtime.zig").TranscriptRuntime;
-    for ([_]struct { text: []const u8, marker: []const u8 }{
-        .{ .text = "abcdefghijkl", .marker = "g" },
-        .{ .text = "ab界cdefghijkl", .marker = "e" },
-        .{ .text = "ab\x1b[31mcdefghijkl\x1b[0m", .marker = "g" },
-    }) |case| {
-        var runtime = Runtime{ .layout = .{ .cols = 8, .rows = 12, .content_bottom = 8, .divider_top_row = 9, .input_row = 10, .divider_bottom_row = 11, .hint_row = 12 } };
-        defer runtime.deinit(alloc);
-        const entry_id = try runtime.appendAssistantTurnEntry(alloc);
-        try runtime.lookupAssistantSegments(entry_id).?.text.appendSlice(alloc, case.text);
-        var before = try source_preparation.prepareRetentionSource(&runtime, alloc);
-        defer before.deinit(alloc);
-        var retained = try cloneRecordedMutationState(&runtime, alloc);
-        defer retained.deinit(alloc);
-        const removed = (try trimEntryRetainedBytes(alloc, &retained.entries.items[0], case.text.len - 2)).?;
-        var after = try source_preparation.prepareRetentionSource(&retained, alloc);
-        defer after.deinit(alloc);
-        var old_map = try assistant_wrap.retentionSourceMap(alloc, case.text, 8);
-        defer old_map.deinit(alloc);
-        var new_map = try assistant_wrap.retentionSourceMap(alloc, retained.lookupAssistantSegments(entry_id).?.text.items, 8);
-        defer new_map.deinit(alloc);
-        const entries = [_]source_preparation.RetentionEntryRows{.{ .entry_id = entry_id, .removed_bytes = removed, .before = old_map.rows.items, .retained = new_map.rows.items, .assistant_before = old_map, .assistant_retained = new_map }};
-        var mapping = try source_preparation.RetentionRebase.init(alloc, &before, &after, &entries);
-        defer mapping.deinit(alloc);
-        const old_point = std.mem.find(u8, before.bytes, case.marker).?;
-        const new_point = std.mem.find(u8, after.bytes, case.marker).?;
-        try std.testing.expectEqual(new_point, mapping.byte(old_point));
-        try std.testing.expectEqual(new_point + 1, mapping.byte(old_point + 1));
-    }
-}
-
 test "retention rebase compact group cutoff follows surviving children" {
     const alloc = std.testing.allocator;
     const Runtime = @import("runtime.zig").TranscriptRuntime;
@@ -786,7 +484,7 @@ test "retention rebase compact group cutoff follows surviving children" {
         compactEntriesToRetainedSet(&retained, alloc, &ids);
         var after = try source_preparation.prepareRetentionSource(&retained, alloc);
         defer after.deinit(alloc);
-        var mapping = try source_preparation.RetentionRebase.init(alloc, &before, &after, &.{});
+        var mapping = try source_preparation.RetentionRebase.init(alloc, &before, &after);
         defer mapping.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 0), mapping.line(0));
         const old_cut = std.mem.find(u8, before.bytes, "└ third-child").?;
@@ -847,6 +545,43 @@ fn refreshReplaceableStateAfterEntriesRebuild(self: anytype) void {
     }
 }
 
+/// Every entry in plain mode, as `transcript_blocks.renderEntriesToBytes`
+/// renders them, resuming after the frozen prefix when it is still valid.
+/// The caller owns the returned bytes.
+pub fn renderPlainEntries(self: anytype, alloc: Allocator, cols: u16) ![]u8 {
+    const styles = self.command_output_render.styles;
+    const plan = source_preparation.planFrozenPrefix(self, .plain, &.{}, cols);
+    var captured: ?transcript_blocks.PreparationResume = null;
+    defer if (captured) |*value| value.deinit(alloc);
+    const bytes = try transcript_blocks.renderEntriesToBytesResumable(
+        alloc,
+        self.entries.items,
+        cols,
+        styles,
+        plan.resume_from,
+        plan.capture_at,
+        if (plan.capture_at != null) &captured else null,
+    );
+    errdefer alloc.free(bytes);
+    if (source_preparation.prefix_oracle and plan.resume_from != null) {
+        const full = try transcript_blocks.renderEntriesToBytes(alloc, self.entries.items, cols, styles);
+        defer alloc.free(full);
+        if (!std.mem.eql(u8, full, bytes)) {
+            debug_trace.logf(
+                "frozen_prefix",
+                "oracle mismatch plain entries={d} full_bytes={d} resumed_bytes={d}",
+                .{ self.entries.items.len, full.len, bytes.len },
+            );
+            return error.TranscriptOracleMismatch;
+        }
+    }
+    if (captured) |value| {
+        plan.store.?.store(.plain, plan.capture_key, value, alloc);
+        captured = null;
+    }
+    return bytes;
+}
+
 fn rebuildTranscriptCacheFromEntriesMode(
     self: anytype,
     alloc: Allocator,
@@ -854,11 +589,10 @@ fn rebuildTranscriptCacheFromEntriesMode(
     mode: TranscriptSourceRewriteMode,
 ) !void {
     const cols: u16 = if (self.layout.cols > 0) self.layout.cols else 80;
-    const fresh = try transcript_blocks.renderEntriesToBytes(
+    const fresh = try renderPlainEntries(
+        self,
         alloc,
-        self.entries.items,
         cols,
-        self.command_output_render.styles,
     );
     defer alloc.free(fresh);
     try rebuildTranscriptFromRendered(self, alloc, fresh, label);
@@ -883,8 +617,31 @@ pub fn rebuildTranscriptCacheAfterStructuredRewrite(
     );
 }
 
-pub fn enforceStructuredRetention(self: anytype, alloc: Allocator, protected_id: ?u32) !void {
-    _ = try enforceStructuredRetentionAndReport(self, alloc, protected_id);
+/// Removes command state no entry refers to any more (the folded and command
+/// output blocks of removed entries) and coalesces pruned command ranges; when
+/// anything changed, refreshes what depends on them. The transcript window
+/// decides which entries are held; this keeps the rest consistent.
+pub fn pruneOrphanedCommandState(self: anytype, alloc: Allocator) !void {
+    _ = try pruneOrphanedCommandStateAndReport(self, alloc);
+}
+
+pub fn pruneOrphanedCommandStateAndReport(self: anytype, alloc: Allocator) !bool {
+    var entry_ids: EntryIdSet = .empty;
+    defer entry_ids.deinit(alloc);
+    try rebuildEntryIdSet(self, alloc, &entry_ids);
+    var changed = pruneOrphanedFoldedCommandBlocks(self, alloc, &entry_ids);
+    if (pruneOrphanedCommandOutputBlocks(self, alloc, &entry_ids)) changed = true;
+    if (coalesceCommandOutputPrunedRanges(self, alloc)) changed = true;
+    if (!changed) return false;
+    _ = try command_output_runtime.syncCommandOutputBlockEntries(self, alloc);
+    if (comptime @hasDecl(@TypeOf(self.*), "pruneToolDetailsForRetainedEntries")) {
+        try rebuildEntryIdSet(self, alloc, &entry_ids);
+        self.pruneToolDetailsForRetainedEntries(alloc, &entry_ids);
+    }
+    try self.refreshFoldedCommandSummaryIndices(alloc);
+    try rebuildTranscriptCacheAfterStructuredRewrite(self, alloc, "structured retention");
+    requestTranscriptPaint(self);
+    return true;
 }
 
 fn committedFlowPrefix(self: anytype, bytes: []const u8) bool {
@@ -921,173 +678,60 @@ fn hasCommittedRetentionSource(self: anytype) bool {
     return false;
 }
 
-pub fn enforceStructuredRetentionAndReport(
-    self: anytype,
-    alloc: Allocator,
-    protected_id: ?u32,
-) !bool {
-    if (comptime @hasField(@TypeOf(self.*), "retention_prefix_trims")) {
-        if (hasCommittedRetentionSource(self) and retainedStructuredBytes(self) > self.max_retained_transcript_bytes) {
+/// Removes the entries the transcript window dropped (`transcript_window_shell.zig`),
+/// with the same cleanup the byte-cap retention runs after it prunes. Ids no
+/// longer present are skipped; a pinned entry is never removed.
+pub fn dropEntriesAtomic(self: anytype, alloc: Allocator, ids: []const u32) !bool {
+    if (ids.len == 0) return false;
+    if (comptime @hasField(@TypeOf(self.*), "transcript_commit_state")) {
+        if (hasCommittedRetentionSource(self)) {
             var shadow = try cloneRecordedMutationState(self, alloc);
             defer shadow.deinit(alloc);
-            var prefix_trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-            defer prefix_trims.deinit(alloc);
-            shadow.retention_prefix_trims = &prefix_trims;
-            const changed = try enforceStructuredRetentionWithTrims(&shadow, alloc, protected_id, &prefix_trims);
-            if (changed) try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "structured_retention", .preserve_same_epoch);
+            const changed = try dropEntries(&shadow, alloc, ids);
+            if (changed) try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "transcript_window_drop", .preserve_same_epoch);
             return changed;
         }
     }
-    const trims = if (comptime @hasField(@TypeOf(self.*), "retention_prefix_trims")) self.retention_prefix_trims else null;
-    return enforceStructuredRetentionWithTrims(self, alloc, protected_id, trims);
+    return dropEntries(self, alloc, ids);
 }
 
-fn enforceStructuredRetentionWithTrims(
-    self: anytype,
-    alloc: Allocator,
-    protected_id: ?u32,
-    prefix_trims: ?*std.ArrayList(RetentionPrefixTrim),
-) !bool {
-    const cap = self.max_retained_transcript_bytes;
+fn dropEntries(self: anytype, alloc: Allocator, ids: []const u32) !bool {
     var entry_ids: EntryIdSet = .empty;
     defer entry_ids.deinit(alloc);
     try rebuildEntryIdSet(self, alloc, &entry_ids);
-
-    var changed = pruneOrphanedFoldedCommandBlocks(self, alloc, &entry_ids);
-    if (pruneOrphanedCommandOutputBlocks(self, alloc, &entry_ids)) changed = true;
-    if (coalesceCommandOutputPrunedRanges(self, alloc)) {
-        changed = true;
-        try rebuildEntryIdSet(self, alloc, &entry_ids);
-    }
-    var total = retainedStructuredBytes(self);
-
-    if (total > cap) {
-        if (try trimCommandOutputLinesToBudget(self, alloc, cap, true)) {
-            changed = true;
-            total = retainedStructuredBytes(self);
+    var pinned: EntryIdSet = .empty;
+    defer pinned.deinit(alloc);
+    for (self.entries.items) |entry| switch (entry) {
+        .raw_bytes => |raw| if (raw.lifecycle_pinned) try pinned.put(alloc, raw.id, {}),
+        else => {},
+    };
+    var removed: usize = 0;
+    var removed_bytes: usize = 0;
+    for (ids) |id| {
+        if (pinned.contains(id)) {
+            debug_trace.logf("transcript_window", "drop kept pinned entry id={d}", .{id});
+            continue;
         }
+        if (!entry_ids.remove(id)) continue;
+        removed += 1;
     }
-
-    var protected_entry_ids = try buildProtectedEntryIdSet(self, alloc, protected_id);
-    defer protected_entry_ids.deinit(alloc);
-    try protected_entry_ids.ensureTotalCapacity(alloc, @intCast(self.entries.items.len));
-    var command_output_block_index = try buildCommandOutputBlockIndex(self, alloc);
-    defer command_output_block_index.deinit(alloc);
-    var prune_scan_index: usize = 0;
-
-    while (total > cap) {
-        var prune_index: ?usize = null;
-        for (self.entries.items[prune_scan_index..], prune_scan_index..) |entry, i| {
-            if (!entry_ids.contains(entry.id())) continue;
-            if (!protected_entry_ids.contains(entry.id())) {
-                if (commandOutputLineLocation(self, &command_output_block_index, entry.id())) |location| {
-                    if (location.open) continue;
-                }
-                prune_index = i;
-                break;
-            }
-        }
-
-        const index = prune_index orelse break;
-        prune_scan_index = index;
-        const entry_id = self.entries.items[index].id();
-        if (commandOutputLineLocation(self, &command_output_block_index, entry_id)) |location| {
-            const block_bytes_before = command_output_runtime.commandOutputBlockRetainedBytes(
-                self.command_output_blocks.items[location.block_index],
-            );
-            const entry_bytes_before = entryRetainedBytes(self.entries.items[index]);
-            const line_bytes = self.command_output_blocks.items[location.block_index]
-                .lines.items[location.line_index].text.len;
-            if (try command_output_runtime.trimRetainedCommandOutputLine(
-                self,
-                alloc,
-                location.block_index,
-                location.line_index,
-            )) {
-                changed = true;
-                debug_trace.logf(
-                    "transcript_retention",
-                    "pruned command output entry id={d} bytes={d} retained_before={d} cap={d}",
-                    .{ entry_id, line_bytes, total, cap },
-                );
-                try protected_entry_ids.put(alloc, entry_id, {});
-                _ = command_output_block_index.remove(entry_id);
-                const block_bytes_after = command_output_runtime.commandOutputBlockRetainedBytes(
-                    self.command_output_blocks.items[location.block_index],
-                );
-                const entry_bytes_after = if (rawEntryIndex(self, entry_id)) |entry_index|
-                    entryRetainedBytes(self.entries.items[entry_index])
-                else
-                    0;
-                const before = block_bytes_before +| entry_bytes_before;
-                const after = block_bytes_after +| entry_bytes_after;
-                if (before >= after) {
-                    total -|= before - after;
-                } else {
-                    total +|= after - before;
-                }
-                continue;
-            }
-        }
-
-        const entry_bytes = entryRetainedBytes(self.entries.items[index]);
-        _ = entry_ids.remove(entry_id);
-        changed = true;
-        debug_trace.logf("transcript_retention", "pruned entry id={d} bytes={d} retained_before={d} cap={d}", .{ entry_id, entry_bytes, total, cap });
-        total -|= entry_bytes;
+    if (removed == 0) return false;
+    for (self.entries.items) |entry| {
+        if (!entry_ids.contains(entry.id())) removed_bytes += entryRetainedBytes(entry);
     }
-
-    if (changed) {
-        compactEntriesToRetainedSet(self, alloc, &entry_ids);
-        if (coalesceCommandOutputPrunedRanges(self, alloc)) {
-            try rebuildEntryIdSet(self, alloc, &entry_ids);
-        }
-        _ = pruneOrphanedFoldedCommandBlocks(self, alloc, &entry_ids);
-        _ = pruneOrphanedCommandOutputBlocks(self, alloc, &entry_ids);
-        total = retainedStructuredBytes(self);
-    }
-
-    if (total > cap) {
-        if (trimFoldedCommandLinesToBudget(self, alloc, cap)) {
-            changed = true;
-            total = retainedStructuredBytes(self);
-        }
-    }
-
-    if (total > cap) {
-        if (try trimCommandOutputLinesToBudget(self, alloc, cap, false)) {
-            changed = true;
-            total = retainedStructuredBytes(self);
-        }
-    }
-
-    if (changed) {
-        _ = try command_output_runtime.syncCommandOutputBlockEntries(self, alloc);
-        total = retainedStructuredBytes(self);
-    }
-
-    if (total > cap) {
-        if (try trimProtectedEntriesToBudget(self, alloc, cap, protected_id, prefix_trims)) {
-            changed = true;
-        }
-    }
-
-    if (total > cap and lifecyclePinCount(self) > 0) {
-        debug_trace.logf(
-            "transcript_retention",
-            "pinned lifecycle bytes exceed retention cap retained={d} cap={d} pins={d}",
-            .{ retainedStructuredBytes(self), cap, lifecyclePinCount(self) },
-        );
-    }
-
-    if (!changed) return false;
+    compactEntriesToRetainedSet(self, alloc, &entry_ids);
+    if (coalesceCommandOutputPrunedRanges(self, alloc)) try rebuildEntryIdSet(self, alloc, &entry_ids);
+    _ = pruneOrphanedFoldedCommandBlocks(self, alloc, &entry_ids);
+    _ = pruneOrphanedCommandOutputBlocks(self, alloc, &entry_ids);
+    _ = try command_output_runtime.syncCommandOutputBlockEntries(self, alloc);
     if (comptime @hasDecl(@TypeOf(self.*), "pruneToolDetailsForRetainedEntries")) {
         try rebuildEntryIdSet(self, alloc, &entry_ids);
         self.pruneToolDetailsForRetainedEntries(alloc, &entry_ids);
     }
     try self.refreshFoldedCommandSummaryIndices(alloc);
-    try rebuildTranscriptCacheAfterStructuredRewrite(self, alloc, "structured retention");
+    try rebuildTranscriptCacheAfterStructuredRewrite(self, alloc, "transcript window drop");
     requestTranscriptPaint(self);
+    debug_trace.logf("transcript_window", "dropped entries={d} bytes={d} retained={d}", .{ removed, removed_bytes, retainedStructuredBytes(self) });
     return true;
 }
 
@@ -1112,6 +756,10 @@ pub fn clearTranscript(self: anytype, alloc: Allocator) void {
     }
     for (self.entries.items) |*entry| entry.deinit(alloc);
     self.entries.clearRetainingCapacity();
+    if (comptime @hasField(@TypeOf(self.*), "transcript_window")) {
+        if (self.transcript_window) |*window| window.reset(alloc);
+        if (comptime @hasDecl(@TypeOf(self.*), "discardTranscriptArchive")) self.discardTranscriptArchive();
+    }
     for (self.folded_command_blocks.items) |*block| block.deinit(alloc);
     self.folded_command_blocks.clearRetainingCapacity();
     for (self.command_output_blocks.items) |*block| block.deinit(alloc);
@@ -1255,11 +903,6 @@ pub fn appendPinnedToolStatusAtomic(
     try self.assertCanMutateTranscript();
 
     var shadow = try cloneMutationState(self, alloc);
-    var rewrite_trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-    defer rewrite_trims.deinit(alloc);
-    if (comptime @hasField(@TypeOf(shadow), "retention_prefix_trims")) {
-        shadow.retention_prefix_trims = self.retention_prefix_trims orelse &rewrite_trims;
-    }
     defer shadow.deinit(alloc);
 
     const owned = try alloc.dupe(u8, text);
@@ -1275,11 +918,7 @@ pub fn appendPinnedToolStatusAtomic(
     const entry_index = rawEntryIndex(&shadow, entry_id) orelse
         return error.MissingLifecycleTranscriptEntry;
     shadow.entries.items[entry_index].raw_bytes.lifecycle_pinned = true;
-    try enforceStructuredRetention(
-        &shadow,
-        alloc,
-        entry_id,
-    );
+    try pruneOrphanedCommandState(&shadow, alloc);
     try rebuildTranscriptCacheFromEntries(
         &shadow,
         alloc,
@@ -1351,11 +990,6 @@ fn appendSemanticNoticeAtomicPinned(
     try self.assertCanMutateTranscript();
 
     var shadow = try cloneMutationState(self, alloc);
-    var rewrite_trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-    defer rewrite_trims.deinit(alloc);
-    if (comptime @hasField(@TypeOf(shadow), "retention_prefix_trims")) {
-        shadow.retention_prefix_trims = self.retention_prefix_trims orelse &rewrite_trims;
-    }
     defer shadow.deinit(alloc);
 
     const entry_id = try appendSemanticNoticeEntry(
@@ -1364,11 +998,7 @@ fn appendSemanticNoticeAtomicPinned(
         notice,
         pending_replacement,
     );
-    try enforceStructuredRetention(
-        &shadow,
-        alloc,
-        entry_id,
-    );
+    try pruneOrphanedCommandState(&shadow, alloc);
     try rebuildTranscriptCacheFromEntries(
         &shadow,
         alloc,
@@ -1405,11 +1035,6 @@ pub fn replaceSemanticNoticeAtomic(
     try self.assertCanMutateTranscript();
 
     var shadow = try cloneMutationState(self, alloc);
-    var rewrite_trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-    defer rewrite_trims.deinit(alloc);
-    if (comptime @hasField(@TypeOf(shadow), "retention_prefix_trims")) {
-        shadow.retention_prefix_trims = self.retention_prefix_trims orelse &rewrite_trims;
-    }
     defer shadow.deinit(alloc);
     const entry_index = semanticNoticeIndex(&shadow, entry_id) orelse return false;
     // In-place replacement requires the producer-owned pin, mirroring the
@@ -1435,11 +1060,7 @@ pub fn replaceSemanticNoticeAtomic(
     handed_off = true;
     previous.deinit(alloc);
 
-    try enforceStructuredRetention(
-        &shadow,
-        alloc,
-        entry_id,
-    );
+    try pruneOrphanedCommandState(&shadow, alloc);
     try rebuildTranscriptCacheFromEntries(
         &shadow,
         alloc,
@@ -1468,11 +1089,6 @@ pub fn writeRecordedTranscriptClassifiedAtomic(
     try self.assertCanMutateTranscript();
 
     var shadow = try cloneRecordedMutationState(self, alloc);
-    var rewrite_trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-    defer rewrite_trims.deinit(alloc);
-    if (comptime @hasField(@TypeOf(shadow), "retention_prefix_trims")) {
-        shadow.retention_prefix_trims = self.retention_prefix_trims orelse &rewrite_trims;
-    }
     defer shadow.deinit(alloc);
     try shadow.writeTranscriptBytes(alloc, metrics, text, true);
 
@@ -1486,11 +1102,7 @@ pub fn writeRecordedTranscriptClassifiedAtomic(
         class,
     );
     handed_off = true;
-    try enforceStructuredRetention(
-        &shadow,
-        alloc,
-        entry_id,
-    );
+    try pruneOrphanedCommandState(&shadow, alloc);
 
     try commitAuthoritativeRecordedMutationState(
         self,
@@ -1538,20 +1150,7 @@ pub fn writeRecordedCommandOutputChunkAtomic(
     }
 
     var shadow = try cloneRecordedMutationState(self, alloc);
-    var rewrite_trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-    defer rewrite_trims.deinit(alloc);
-    if (comptime @hasField(@TypeOf(shadow), "retention_prefix_trims")) {
-        shadow.retention_prefix_trims = self.retention_prefix_trims orelse &rewrite_trims;
-    }
     defer shadow.deinit(alloc);
-    var retention_changed = false;
-    if (shadow.command_output_display.open_command_block == null) {
-        retention_changed = try reserveNewCommandOutputAdmission(
-            &shadow,
-            alloc,
-            command_output_runtime.commandOutputAdmissionBytes(text),
-        );
-    }
     const entry_id = try command_output_runtime.applyPreparedCommandOutputMutation(
         &shadow,
         alloc,
@@ -1566,11 +1165,7 @@ pub fn writeRecordedCommandOutputChunkAtomic(
     _ = try command_output_runtime.syncCommandOutputBlockEntries(&shadow, alloc);
     const dirty_entry_id = entry_id orelse
         command_output_runtime.openCommandOutputDirtyEntryId(&shadow);
-    retention_changed = (try enforceStructuredRetentionAndReport(
-        &shadow,
-        alloc,
-        entry_id,
-    )) or retention_changed;
+    const retention_changed = try pruneOrphanedCommandStateAndReport(&shadow, alloc);
     try rebuildCommandOutputTranscriptCache(
         &shadow,
         alloc,
@@ -1588,20 +1183,6 @@ pub fn writeRecordedCommandOutputChunkAtomic(
     return entry_id;
 }
 
-fn reserveNewCommandOutputAdmission(
-    self: anytype,
-    alloc: Allocator,
-    reservation: usize,
-) !bool {
-    const cap = self.max_retained_transcript_bytes;
-    const target = cap -| reservation;
-    if (retainedStructuredBytes(self) <= target) return false;
-
-    self.max_retained_transcript_bytes = target;
-    defer self.max_retained_transcript_bytes = cap;
-    return enforceStructuredRetentionAndReport(self, alloc, null);
-}
-
 pub fn flushRecordedCommandOutputSummaryAtomic(
     self: anytype,
     alloc: Allocator,
@@ -1612,11 +1193,6 @@ pub fn flushRecordedCommandOutputSummaryAtomic(
     try self.assertCanMutateTranscript();
 
     var shadow = try cloneRecordedMutationState(self, alloc);
-    var rewrite_trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-    defer rewrite_trims.deinit(alloc);
-    if (comptime @hasField(@TypeOf(shadow), "retention_prefix_trims")) {
-        shadow.retention_prefix_trims = self.retention_prefix_trims orelse &rewrite_trims;
-    }
     defer shadow.deinit(alloc);
     const dirty_entry_id = command_output_runtime.commandOutputDirtyEntryIdForLifecycle(
         &shadow,
@@ -1749,8 +1325,7 @@ fn replacePinnedToolStatusAtomicInternal(
         false;
     if (reservations.empty() and
         !published_rewrite and
-        !reposition and
-        !retentionPlanningRequired(self, entry_id, new_bytes.len))
+        !reposition)
     {
         return replacePinnedToolStatusFast(
             self,
@@ -1761,11 +1336,6 @@ fn replacePinnedToolStatusAtomicInternal(
     }
 
     var shadow = try cloneMutationState(self, alloc);
-    var rewrite_trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-    defer rewrite_trims.deinit(alloc);
-    if (comptime @hasField(@TypeOf(shadow), "retention_prefix_trims")) {
-        shadow.retention_prefix_trims = self.retention_prefix_trims orelse &rewrite_trims;
-    }
     defer shadow.deinit(alloc);
     try shadow.tool_details.ensureUnusedCapacity(alloc, reservations.tool_details);
     try shadow.entries.ensureUnusedCapacity(
@@ -1800,11 +1370,7 @@ fn replacePinnedToolStatusAtomicInternal(
         );
         handed_off = true;
     }
-    const retention_changed = try enforceStructuredRetentionAndReport(
-        &shadow,
-        alloc,
-        retention_anchor,
-    );
+    const retention_changed = try pruneOrphanedCommandStateAndReport(&shadow, alloc);
     try rebuildTranscriptCacheFromEntries(
         &shadow,
         alloc,
@@ -1870,11 +1436,6 @@ fn replacePinnedToolStatusesAtomicWithRewriteMode(
     try self.assertCanMutateTranscript();
 
     var shadow = try cloneMutationState(self, alloc);
-    var rewrite_trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-    defer rewrite_trims.deinit(alloc);
-    if (comptime @hasField(@TypeOf(shadow), "retention_prefix_trims")) {
-        shadow.retention_prefix_trims = self.retention_prefix_trims orelse &rewrite_trims;
-    }
     defer shadow.deinit(alloc);
     try shadow.tool_details.ensureUnusedCapacity(
         alloc,
@@ -1908,11 +1469,7 @@ fn replacePinnedToolStatusesAtomicWithRewriteMode(
         );
         handed_off = true;
     }
-    const retention_changed = try enforceStructuredRetentionAndReport(
-        &shadow,
-        alloc,
-        turn_cancellation_entry_id,
-    );
+    const retention_changed = try pruneOrphanedCommandStateAndReport(&shadow, alloc);
     try rebuildTranscriptCacheFromEntries(
         &shadow,
         alloc,
@@ -1955,11 +1512,6 @@ pub fn clearLifecyclePinsAtomic(
     try self.assertCanMutateTranscript();
 
     var shadow = try cloneMutationState(self, alloc);
-    var rewrite_trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-    defer rewrite_trims.deinit(alloc);
-    if (comptime @hasField(@TypeOf(shadow), "retention_prefix_trims")) {
-        shadow.retention_prefix_trims = self.retention_prefix_trims orelse &rewrite_trims;
-    }
     defer shadow.deinit(alloc);
     for (entry_ids) |entry_id| {
         const entry_index = rawEntryIndex(&shadow, entry_id) orelse
@@ -1979,11 +1531,7 @@ pub fn clearLifecyclePinsAtomic(
         );
     }
     const dirty_entry_id = shadow.entries.items[dirty_entry_index].id();
-    const retention_changed = try enforceStructuredRetentionAndReport(
-        &shadow,
-        alloc,
-        null,
-    );
+    const retention_changed = try pruneOrphanedCommandStateAndReport(&shadow, alloc);
     try rebuildTranscriptCacheFromEntries(
         &shadow,
         alloc,
@@ -2009,27 +1557,6 @@ noinline fn rawEntryIndex(self: anytype, entry_id: u32) ?usize {
     return null;
 }
 
-fn retentionPlanningRequired(
-    self: anytype,
-    entry_id: u32,
-    replacement_len: usize,
-) bool {
-    const index = rawEntryIndex(self, entry_id) orelse return false;
-    const current_len = self.entries.items[index].raw_bytes.bytes.len;
-    const projected = retainedStructuredBytes(self) -| current_len + replacement_len;
-    if (projected <= self.max_retained_transcript_bytes) return false;
-
-    if (self.folded_command_blocks.items.len > 0 or
-        self.command_output_blocks.items.len > 0)
-    {
-        return true;
-    }
-    for (self.entries.items) |entry| {
-        if (!isProtectedEntry(self, entry.id(), entry_id)) return true;
-    }
-    return false;
-}
-
 fn replacePinnedToolStatusFast(
     self: anytype,
     alloc: Allocator,
@@ -2050,11 +1577,10 @@ fn replacePinnedToolStatusFast(
         self.entries.items[entry_index].raw_bytes.bytes = old_bytes;
     };
 
-    const rendered = try transcript_blocks.renderEntriesToBytes(
+    const rendered = try renderPlainEntries(
+        self,
         alloc,
-        self.entries.items,
         cols,
-        self.command_output_render.styles,
     );
     defer alloc.free(rendered);
     const start = cappedTailStart(rendered, self.max_transcript_bytes);
@@ -2098,7 +1624,11 @@ fn cloneRecordedMutationState(self: anytype, alloc: Allocator) !@TypeOf(self.*) 
 /// build. The caller owns the returned runtime and must deinitialize it with
 /// the same allocator unless its state is consumed by an owner-level install.
 pub fn cloneDetachedPresentationState(self: anytype, alloc: Allocator) !@TypeOf(self.*) {
-    return cloneRecordedMutationState(self, alloc);
+    var detached = try cloneRecordedMutationState(self, alloc);
+    // A detached build can outlive this runtime or become a standalone one,
+    // so it keeps its own frozen prefix.
+    if (comptime @hasField(@TypeOf(self.*), "frozen_prefix_source")) detached.frozen_prefix_source = null;
+    return detached;
 }
 
 fn cloneMutationState(self: anytype, alloc: Allocator) !@TypeOf(self.*) {
@@ -2118,7 +1648,6 @@ fn cloneMutationState(self: anytype, alloc: Allocator) !@TypeOf(self.*) {
         .last_rendered_cols = self.last_rendered_cols,
         .transcript_cache_origin_untrimmed = self.transcript_cache_origin_untrimmed,
         .max_transcript_bytes = self.max_transcript_bytes,
-        .max_retained_transcript_bytes = self.max_retained_transcript_bytes,
         .command_output_display = self.command_output_display,
         .command_output_render = self.command_output_render,
         .collapse_tool_calls = self.collapse_tool_calls,
@@ -2129,8 +1658,9 @@ fn cloneMutationState(self: anytype, alloc: Allocator) !@TypeOf(self.*) {
         .transcript_band_dirty = self.transcript_band_dirty,
     };
     errdefer shadow.deinit(alloc);
-    if (comptime @hasField(Runtime, "retention_prefix_trims")) {
-        shadow.retention_prefix_trims = self.retention_prefix_trims;
+    if (comptime @hasField(Runtime, "command_output_block_cap")) shadow.command_output_block_cap = self.command_output_block_cap;
+    if (comptime @hasDecl(Runtime, "borrowedFrozenPrefix")) {
+        shadow.frozen_prefix_source = self.borrowedFrozenPrefix();
     }
 
     shadow.entries = try cloneEntries(alloc, self.entries.items);
@@ -2202,12 +1732,8 @@ fn commitAuthoritativeRecordedMutationStateKeepingSource(
     );
     var source_kept = false;
     defer if (!source_kept) authoritative_source.deinit(alloc);
-    const prefix_trims = if (comptime @hasField(@TypeOf(shadow.*), "retention_prefix_trims"))
-        if (shadow.retention_prefix_trims) |trims| trims.items else &.{}
-    else
-        &.{};
-    const unchanged_prefix = prefix_trims.len == 0 and entryIdsPreservePrefix(self.entries.items, shadow.entries.items) and committedFlowPrefix(self, authoritative_source.bytes);
-    const rebased = if (unchanged_prefix) false else try rebaseTranscriptRewrite(self, shadow, alloc, prefix_trims, null);
+    const unchanged_prefix = entryIdsPreservePrefix(self.entries.items, shadow.entries.items) and committedFlowPrefix(self, authoritative_source.bytes);
+    const rebased = if (unchanged_prefix) false else try rebaseTranscriptRewrite(self, shadow, alloc, null);
     if (rebased) debug_trace.logf("scroll", "transcript_source_publication_rebased reason={s}", .{reason});
     commitMutationStateWithReconciliationSource(
         self,
@@ -2218,7 +1744,7 @@ fn commitAuthoritativeRecordedMutationStateKeepingSource(
         dirty_entry_id,
     );
     if (kept) |out| {
-        if (!rebased and prefix_trims.len == 0) {
+        if (!rebased) {
             out.* = authoritative_source;
             source_kept = true;
         }
@@ -2693,17 +2219,6 @@ pub fn appendRawTranscriptEntryClassified(
     class: RawEntryClass,
 ) !u32 {
     std.debug.assert(text.len > 0);
-    if (hasCommittedRetentionSource(self) and retainedStructuredBytes(self) +| text.len > self.max_retained_transcript_bytes) {
-        var shadow = try cloneRecordedMutationState(self, alloc);
-        defer shadow.deinit(alloc);
-        var trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-        defer trims.deinit(alloc);
-        if (comptime @hasField(@TypeOf(shadow), "retention_prefix_trims")) shadow.retention_prefix_trims = &trims;
-        const id = try appendRawTranscriptEntryClassified(&shadow, alloc, text, class);
-        try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "raw_transcript_retention", .preserve_same_epoch);
-        return id;
-    }
-
     const dup = try alloc.dupe(u8, text);
     var entry_owns_dup = false;
     errdefer if (!entry_owns_dup) alloc.free(dup);
@@ -2732,7 +2247,7 @@ pub fn appendRawTranscriptEntryClassified(
     _ = self.advanceCursor(text);
     requestTranscriptPaintFrom(self, entry_id);
     rollback_entry = false;
-    try enforceStructuredRetention(self, alloc, entry_id);
+    try pruneOrphanedCommandState(self, alloc);
     return entry_id;
 }
 
@@ -2766,11 +2281,10 @@ pub fn updateRawBytesEntry(
         self.entries.items[idx].raw_bytes.bytes = old_bytes;
     };
 
-    const new_buffer = try transcript_blocks.renderEntriesToBytes(
+    const new_buffer = try renderPlainEntries(
+        self,
         alloc,
-        self.entries.items,
         self.layout.cols,
-        self.command_output_render.styles,
     );
     defer alloc.free(new_buffer);
 
@@ -2787,7 +2301,7 @@ pub fn updateRawBytesEntry(
     } else {
         self.replaceable_last_line = false;
     }
-    try enforceStructuredRetention(self, alloc, entry_id);
+    try pruneOrphanedCommandState(self, alloc);
     self.recomputeCursorFromTranscript();
     requestTranscriptPaint(self);
     reconcileTranscriptAnchorAfterSourceChange(
@@ -2827,11 +2341,6 @@ pub fn writeUserPromptCard(
     try self.assertCanMutateTranscript();
 
     var shadow = try cloneRecordedMutationState(self, alloc);
-    var rewrite_trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-    defer rewrite_trims.deinit(alloc);
-    if (comptime @hasField(@TypeOf(shadow), "retention_prefix_trims")) {
-        shadow.retention_prefix_trims = self.retention_prefix_trims orelse &rewrite_trims;
-    }
     defer shadow.deinit(alloc);
 
     if (!has_prior_turns and shadow.cursor_col != 1) {
@@ -2933,11 +2442,7 @@ fn appendUserTurnOwnedWithSkillTokensAndRetention(
         .skill_tokens = owned_skill_tokens,
     } });
     handed_off = true;
-    const retention_changed = try enforceStructuredRetentionAndReport(
-        self,
-        alloc,
-        entry_id,
-    );
+    const retention_changed = try pruneOrphanedCommandStateAndReport(self, alloc);
     return .{
         .entry_id = entry_id,
         .retention_changed = retention_changed,
@@ -2948,7 +2453,7 @@ pub fn appendAssistantTurnEntry(self: anytype, alloc: Allocator) !u32 {
     const entry_id = self.next_entry_id;
     self.next_entry_id +%= 1;
     try self.entries.append(alloc, .{ .assistant_turn = .{ .id = entry_id, .created_at_ms = io_mod.milliTimestamp(), .segments = .{} } });
-    try enforceStructuredRetention(self, alloc, entry_id);
+    try pruneOrphanedCommandState(self, alloc);
     return entry_id;
 }
 
@@ -2961,9 +2466,6 @@ pub fn appendAssistantTableOwned(
     if (hasCommittedRetentionSource(self)) {
         var shadow = try cloneRecordedMutationState(self, alloc);
         defer shadow.deinit(alloc);
-        var trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-        defer trims.deinit(alloc);
-        if (comptime @hasField(@TypeOf(shadow), "retention_prefix_trims")) shadow.retention_prefix_trims = &trims;
         const id = try appendAssistantTableOwned(&shadow, alloc, table);
         errdefer {
             _ = shadow.entries.pop();
@@ -2981,16 +2483,15 @@ pub fn appendAssistantTableOwned(
         _ = self.entries.pop();
     }
 
-    const rendered = try transcript_blocks.renderEntriesToBytes(
+    const rendered = try renderPlainEntries(
+        self,
         alloc,
-        self.entries.items,
         self.layout.cols,
-        self.command_output_render.styles,
     );
     defer alloc.free(rendered);
     try ensurePaintReservation(self, alloc);
     try rebuildTranscriptFromRendered(self, alloc, rendered, "append_assistant_table");
-    try enforceStructuredRetention(self, alloc, entry_id);
+    try pruneOrphanedCommandState(self, alloc);
     requestTranscriptPaint(self);
     self.next_entry_id +%= 1;
     return entry_id;
@@ -3005,9 +2506,6 @@ pub fn appendAssistantCodeBlockOwned(
     if (hasCommittedRetentionSource(self)) {
         var shadow = try cloneRecordedMutationState(self, alloc);
         defer shadow.deinit(alloc);
-        var trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-        defer trims.deinit(alloc);
-        if (comptime @hasField(@TypeOf(shadow), "retention_prefix_trims")) shadow.retention_prefix_trims = &trims;
         const id = try appendAssistantCodeBlockOwned(&shadow, alloc, block);
         errdefer {
             _ = shadow.entries.pop();
@@ -3025,16 +2523,15 @@ pub fn appendAssistantCodeBlockOwned(
         _ = self.entries.pop();
     }
 
-    const rendered = try transcript_blocks.renderEntriesToBytes(
+    const rendered = try renderPlainEntries(
+        self,
         alloc,
-        self.entries.items,
         self.layout.cols,
-        self.command_output_render.styles,
     );
     defer alloc.free(rendered);
     try ensurePaintReservation(self, alloc);
     try rebuildTranscriptFromRendered(self, alloc, rendered, "append_assistant_code_block");
-    try enforceStructuredRetention(self, alloc, entry_id);
+    try pruneOrphanedCommandState(self, alloc);
     requestTranscriptPaint(self);
     self.next_entry_id +%= 1;
     return entry_id;
@@ -3044,9 +2541,6 @@ pub fn appendAssistantThematicRule(self: anytype, alloc: Allocator) !u32 {
     if (hasCommittedRetentionSource(self)) {
         var shadow = try cloneRecordedMutationState(self, alloc);
         defer shadow.deinit(alloc);
-        var trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-        defer trims.deinit(alloc);
-        if (comptime @hasField(@TypeOf(shadow), "retention_prefix_trims")) shadow.retention_prefix_trims = &trims;
         const id = try appendAssistantThematicRule(&shadow, alloc);
         try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "assistant_rule_append", .preserve_same_epoch);
         return id;
@@ -3060,16 +2554,15 @@ pub fn appendAssistantThematicRule(self: anytype, alloc: Allocator) !u32 {
         _ = self.entries.pop();
     }
 
-    const rendered = try transcript_blocks.renderEntriesToBytes(
+    const rendered = try renderPlainEntries(
+        self,
         alloc,
-        self.entries.items,
         self.layout.cols,
-        self.command_output_render.styles,
     );
     defer alloc.free(rendered);
     try ensurePaintReservation(self, alloc);
     try rebuildTranscriptFromRendered(self, alloc, rendered, "append_assistant_thematic_rule");
-    try enforceStructuredRetention(self, alloc, entry_id);
+    try pruneOrphanedCommandState(self, alloc);
     requestTranscriptPaint(self);
     self.next_entry_id +%= 1;
     return entry_id;
@@ -3097,7 +2590,6 @@ pub fn tailAssistantSegments(self: anytype) ?*AssistantTurnSegments {
 const AssistantStreamAdmission = struct {
     entry_id: u32,
     opened_new_turn: bool,
-    retention_changed: bool = false,
 };
 
 fn commitAssistantStreamChunkFast(
@@ -3105,14 +2597,7 @@ fn commitAssistantStreamChunkFast(
     alloc: Allocator,
     metrics: *Metrics,
     text: []const u8,
-) !?AssistantStreamAdmission {
-    const retained = retainedStructuredBytes(self);
-    if (retained > self.max_retained_transcript_bytes or
-        text.len > self.max_retained_transcript_bytes - retained)
-    {
-        return null;
-    }
-
+) !AssistantStreamAdmission {
     const tail_segments = tailAssistantSegments(self);
     const entry_id = if (tail_segments != null)
         self.entries.items[self.entries.items.len - 1].id()
@@ -3150,57 +2635,6 @@ fn commitAssistantStreamChunkFast(
     return .{
         .entry_id = entry_id,
         .opened_new_turn = tail_segments == null,
-    };
-}
-
-fn streamAssistantChunkUncommitted(
-    self: anytype,
-    alloc: Allocator,
-    metrics: *Metrics,
-    text: []const u8,
-    prefix_trims: *std.ArrayList(RetentionPrefixTrim),
-) !AssistantStreamAdmission {
-    const entry_id = if (tailAssistantSegments(self) != null)
-        self.entries.items[self.entries.items.len - 1].id()
-    else
-        self.next_entry_id;
-    try self.writeTranscriptBytesFrom(alloc, metrics, text, true, entry_id);
-
-    if (tailAssistantSegments(self)) |segments| {
-        try segments.text.appendSlice(alloc, text);
-        const retention_changed = try enforceStructuredRetentionWithTrims(
-            self,
-            alloc,
-            entry_id,
-            prefix_trims,
-        );
-        return .{
-            .entry_id = entry_id,
-            .opened_new_turn = false,
-            .retention_changed = retention_changed,
-        };
-    }
-
-    var segments: AssistantTurnSegments = .{};
-    errdefer segments.deinit(alloc);
-    try segments.text.appendSlice(alloc, text);
-    try self.entries.append(alloc, .{ .assistant_turn = .{
-        .id = entry_id,
-        .created_at_ms = io_mod.milliTimestamp(),
-        .segments = segments,
-    } });
-    segments = .{};
-    self.next_entry_id +%= 1;
-    const retention_changed = try enforceStructuredRetentionWithTrims(
-        self,
-        alloc,
-        entry_id,
-        prefix_trims,
-    );
-    return .{
-        .entry_id = entry_id,
-        .opened_new_turn = true,
-        .retention_changed = retention_changed,
     };
 }
 
@@ -3248,49 +2682,6 @@ test "rewrite publication compatible append and same geometry status retain fast
         try std.testing.expectEqual(control_counter.allocated_bytes, published_counter.allocated_bytes);
         try std.testing.expectEqual(flow, runtime.transcript_commit_state.stable.flow.ptr);
     }
-}
-
-test "rewrite publication carries repeated partial entry trims through the shared commit" {
-    const alloc = std.testing.allocator;
-    const Runtime = @import("runtime.zig").TranscriptRuntime;
-    var runtime = Runtime{
-        .layout = .{ .cols = 40, .rows = 12, .content_bottom = 8, .divider_top_row = 9, .input_row = 10, .divider_bottom_row = 11, .hint_row = 12 },
-        .detached_commit_alloc = alloc,
-        .committed_frame_layout = .{ .terminal_cols = 40, .terminal_rows = 12 },
-    };
-    defer runtime.deinit(alloc);
-    const id = try runtime.appendRawTranscriptEntryClassified(alloc, "first\nsecond\nthird\nfourth\n", .unknown_raw);
-    var source = try source_preparation.prepareRetentionSource(&runtime, alloc);
-    defer source.deinit(alloc);
-    runtime.transcript_commit_state = .{ .stable = .{
-        .flow = try alloc.dupe(u8, source.bytes),
-        .retention_identity = try source_preparation.RetentionIdentity.capture(&runtime, alloc, &source),
-        .visual_offset = 2,
-        .history_visual_offset = 2,
-        .total_visual_rows = 4,
-        .selection = .{ .start_line = 2, .top_row = 1, .bottom_row = 8, .partial_skip_rows = 0, .line_count = 2 },
-        .cursor_row = 2,
-        .cursor_col = 1,
-        .occupied_last_row = 2,
-        .occupied_last_row_blank = false,
-        .layout_id = 0,
-    } };
-    var shadow = try cloneRecordedMutationState(&runtime, alloc);
-    defer shadow.deinit(alloc);
-    var trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-    defer trims.deinit(alloc);
-    shadow.retention_prefix_trims = &trims;
-    shadow.max_retained_transcript_bytes = "second\nthird\nfourth\n".len + 1;
-    try std.testing.expect(try enforceStructuredRetentionAndReport(&shadow, alloc, id));
-    shadow.max_retained_transcript_bytes = "third\nfourth\n".len + 1;
-    try std.testing.expect(try enforceStructuredRetentionAndReport(&shadow, alloc, id));
-    try std.testing.expectEqual(@as(usize, 2), trims.items.len);
-    try commitAuthoritativeRecordedMutationState(&runtime, &shadow, alloc, "test_partial_retention", .preserve_same_epoch);
-    const anchor = runtime.transcript_commit_state.stable;
-    try std.testing.expectEqual(@as(u32, 0), anchor.history_visual_offset);
-    try std.testing.expectEqual(@as(usize, 0), anchor.selection.start_line);
-    try std.testing.expectEqualStrings("third\nfourth", anchor.flow);
-    try std.testing.expect(runtime.retention_prefix_trims == null);
 }
 
 test "rewrite publication excludes unpainted raw continuation from committed source" {
@@ -3371,7 +2762,7 @@ fn checkRewritePublicationContinuation(command: bool, retire: bool) !void {
     var failures: usize = 0;
     while (failures < 1024) : (failures += 1) {
         var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = failures });
-        _ = rebaseTranscriptRewrite(&runtime, &next, failing.allocator(), &.{}, null) catch |err| {
+        _ = rebaseTranscriptRewrite(&runtime, &next, failing.allocator(), null) catch |err| {
             if (err != error.OutOfMemory and err != error.WriteFailed) return err;
             try std.testing.expect(failing.has_induced_failure);
             try std.testing.expectEqualDeep(diagnostic, runtime.transcriptCommitDiagnostic());
@@ -3402,59 +2793,6 @@ fn checkRewritePublicationContinuation(command: bool, retire: bool) !void {
     }
 }
 
-test "rewrite publication recovering partial trim is atomic across allocation failure" {
-    const alloc = testing_allocator.no_resize;
-    const Runtime = @import("runtime.zig").TranscriptRuntime;
-    var runtime = Runtime{
-        .layout = .{ .cols = 40, .rows = 12, .content_bottom = 8, .divider_top_row = 9, .input_row = 10, .divider_bottom_row = 11, .hint_row = 12 },
-        .detached_commit_alloc = alloc,
-        .committed_frame_layout = .{ .terminal_cols = 40, .terminal_rows = 12 },
-    };
-    defer runtime.deinit(alloc);
-    const text = "COMMITTED_RAW";
-    const id = try runtime.appendRawTranscriptEntryClassified(alloc, text, .unknown_raw);
-    var before = try source_preparation.prepareRetentionSource(&runtime, alloc);
-    defer before.deinit(alloc);
-    var identity = try source_preparation.RetentionIdentity.capture(&runtime, alloc, &before);
-    errdefer identity.deinit(alloc);
-    identity.publication_entries = try alloc.dupe(u32, &.{id});
-    identity.publication_release_floor = 1;
-    runtime.transcript_commit_state = .{ .recovering = .{
-        .flow = try alloc.dupe(u8, before.bytes),
-        .retention_identity = identity,
-        .attempt_cols = 40,
-        .attempt_total_visual_rows = 1,
-        .materialized_visual_rows = 1,
-        .materialized_flow_len = before.bytes.len,
-        .tracks_semantic_progress = true,
-        .presentation_valid = true,
-    } };
-    identity = .{};
-    const first_trim = try alloc.dupe(u8, text[3..]);
-    alloc.free(runtime.entries.items[0].raw_bytes.bytes);
-    runtime.entries.items[0].raw_bytes.bytes = first_trim;
-    var next = try cloneRecordedMutationState(&runtime, alloc);
-    defer next.deinit(alloc);
-    const second_trim = try alloc.dupe(u8, text[6..]);
-    alloc.free(next.entries.items[0].raw_bytes.bytes);
-    next.entries.items[0].raw_bytes.bytes = second_trim;
-    const receipt = runtime.transcript_commit_state.recovering;
-    var failures: usize = 0;
-    while (failures < 1024) : (failures += 1) {
-        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = failures });
-        _ = rebaseTranscriptRewrite(&runtime, &next, failing.allocator(), &.{.{ .entry_id = id, .bytes = 3 }}, null) catch |err| {
-            if (err != error.OutOfMemory and err != error.WriteFailed) return err;
-            try std.testing.expect(failing.has_induced_failure);
-            try std.testing.expectEqualDeep(receipt, runtime.transcript_commit_state.recovering);
-            continue;
-        };
-        break;
-    }
-    try std.testing.expect(failures > 0 and failures < 1024);
-    try std.testing.expectEqualStrings(text, runtime.transcript_commit_state.recovering.flow);
-    try std.testing.expectEqual(receipt.materialized_flow_len, runtime.transcript_commit_state.recovering.materialized_flow_len);
-}
-
 pub fn settleTranscriptPublication(self: anytype, alloc: Allocator, checkpoint: ?*build_checkpoint.BuildCheckpoint) !bool {
     try build_checkpoint.poll(checkpoint);
     const identity = self.committedRetentionIdentity() orelse return false;
@@ -3473,7 +2811,7 @@ pub fn settleTranscriptPublication(self: anytype, alloc: Allocator, checkpoint: 
         if (owner) |id| _ = released.remove(id);
     }
     if (released.count() == 0) return false;
-    _ = try rebaseTranscriptRewrite(self, self, alloc, &.{}, checkpoint);
+    _ = try rebaseTranscriptRewrite(self, self, alloc, checkpoint);
     requestTranscriptPaint(self);
     return true;
 }
@@ -3493,7 +2831,7 @@ fn finalizedPublicationEntry(self: anytype, next: anytype, entry: TranscriptEntr
     };
 }
 
-fn rebaseTranscriptRewrite(self: anytype, next: anytype, alloc: Allocator, prefix_trims: []const RetentionPrefixTrim, checkpoint: ?*build_checkpoint.BuildCheckpoint) !bool {
+fn rebaseTranscriptRewrite(self: anytype, next: anytype, alloc: Allocator, checkpoint: ?*build_checkpoint.BuildCheckpoint) !bool {
     try build_checkpoint.poll(checkpoint);
     if (comptime !@hasDecl(@TypeOf(self.*), "rebaseRetainedTranscript")) return false;
     const cols = self.retentionSourceCols() orelse return false;
@@ -3525,76 +2863,25 @@ fn rebaseTranscriptRewrite(self: anytype, next: anytype, alloc: Allocator, prefi
         if (committed_texts.getPtr(entry.id())) |text| text.index = index;
     }
     compactEntriesToRetainedSet(&retained, alloc, &previous_ids);
-    var entry_rows: std.ArrayList(source_preparation.RetentionEntryRows) = .empty;
-    defer {
-        for (entry_rows.items) |rows| {
-            if (rows.assistant_before) |value| {
-                var map = value;
-                map.deinit(alloc);
-            } else alloc.free(rows.before);
-            if (rows.assistant_retained) |value| {
-                var map = value;
-                map.deinit(alloc);
-            } else alloc.free(rows.retained);
-        }
-        entry_rows.deinit(alloc);
-    }
     for (retained.entries.items) |*entry| {
         try build_checkpoint.consume(checkpoint, entryRetainedBytes(entry.*));
-        var removed: usize = 0;
-        for (prefix_trims) |trim| if (trim.entry_id == entry.id()) {
-            removed += trim.bytes;
-        };
         // Lifecycle status replaces an existing presentation. Other raw entries
         // may have grown since the last frame and must retain its byte extent.
         if (entry.* == .raw_bytes and entry.raw_bytes.class != .tool_status) {
             const committed = committed_texts.get(entry.id()) orelse continue;
             const old_index = committed.index orelse continue;
             const old_bytes = self.entries.items[old_index].raw_bytes.bytes;
-            const committed_bytes = old_bytes[0..@min(committed.bytes, old_bytes.len)];
-            const bytes = try alloc.dupe(u8, committed_bytes[@min(removed, committed_bytes.len)..]);
+            const bytes = try alloc.dupe(u8, old_bytes[0..@min(committed.bytes, old_bytes.len)]);
             alloc.free(entry.raw_bytes.bytes);
             entry.raw_bytes.bytes = bytes;
-        }
-        if (entry.* == .raw_bytes and removed > 0) {
-            const old_index = (committed_texts.get(entry.id()) orelse continue).index orelse continue;
-            const old_bytes = self.entries.items[old_index].raw_bytes.bytes;
-            const before_rows = try render_engine.viewport_selection.buildHardLineStarts(alloc, old_bytes);
-            errdefer before_rows.deinit(alloc);
-            const retained_rows = try render_engine.viewport_selection.buildHardLineStarts(alloc, entry.raw_bytes.bytes);
-            errdefer retained_rows.deinit(alloc);
-            try entry_rows.append(alloc, .{
-                .entry_id = entry.id(),
-                .removed_bytes = removed,
-                .before = before_rows.starts,
-                .retained = retained_rows.starts,
-                .raw_before = old_bytes,
-                .raw_retained = entry.raw_bytes.bytes,
-            });
         }
         if (entry.* != .assistant_turn) continue;
         const committed = committed_texts.get(entry.id()) orelse continue;
         const old_index = committed.index orelse continue;
         const old = &self.entries.items[old_index].assistant_turn.segments;
-        const committed_len = @min(committed.bytes, old.text.items.len);
-        const committed_text = old.text.items[0..committed_len];
-        const bytes = committed_text[@min(removed, committed_text.len)..];
+        const bytes = old.text.items[0..@min(committed.bytes, old.text.items.len)];
         try entry.assistant_turn.segments.text.resize(alloc, bytes.len);
         @memcpy(entry.assistant_turn.segments.text.items, bytes);
-        if (removed > 0) {
-            var before_map = try assistant_wrap.retentionSourceMap(alloc, committed_text, cols);
-            errdefer before_map.deinit(alloc);
-            var retained_map = try assistant_wrap.retentionSourceMap(alloc, bytes, cols);
-            errdefer retained_map.deinit(alloc);
-            try entry_rows.append(alloc, .{
-                .entry_id = entry.id(),
-                .removed_bytes = removed,
-                .before = before_map.rows.items,
-                .retained = retained_map.rows.items,
-                .assistant_before = before_map,
-                .assistant_retained = retained_map,
-            });
-        }
     }
     var after = try source_preparation.prepareTranscriptSourceInterruptible(&retained, alloc, null, null, null, checkpoint);
     defer after.deinit(alloc);
@@ -3606,7 +2893,6 @@ fn rebaseTranscriptRewrite(self: anytype, next: anytype, alloc: Allocator, prefi
     defer retiring.deinit(alloc);
     for (committed_identity.publication_entries) |id| try retiring.put(alloc, id, {});
     const history = self.transcriptCommitDiagnostic().history_visual_offset;
-    const history_byte = before.byteAtVisualOffset(history);
     const publication_limit: ?usize = switch (self.transcript_commit_state) {
         .recovering => |receipt| receipt.materialized_flow_len,
         .stable, .invalid => null,
@@ -3619,19 +2905,7 @@ fn rebaseTranscriptRewrite(self: anytype, next: anytype, alloc: Allocator, prefi
             } else continue;
             if (start >= limit) continue;
         }
-        if (!next_ids.contains(entry.id())) {
-            try retiring.put(alloc, entry.id(), {});
-            continue;
-        }
-        for (entry_rows.items) |rows| {
-            if (rows.entry_id != entry.id()) continue;
-            const start = for (before.line_provenance, 0..) |line, index| {
-                if (line == .entry and line.entry.entry_id == entry.id()) break before.hard_line_starts[index];
-            } else continue;
-            const removed_end = start + if (rows.assistant_before) |map| map.renderedAt(rows.removed_bytes) else rows.removed_bytes;
-            if (removed_end > history_byte) try retiring.put(alloc, entry.id(), {});
-            break;
-        }
+        if (!next_ids.contains(entry.id())) try retiring.put(alloc, entry.id(), {});
     }
     var publication_entries: std.ArrayList(u32) = .empty;
     defer publication_entries.deinit(alloc);
@@ -3644,12 +2918,7 @@ fn rebaseTranscriptRewrite(self: anytype, next: anytype, alloc: Allocator, prefi
         }
     }
     try source_preparation.preservePublicationEntries(alloc, &before, &after, publication_entries.items, publication_limit, checkpoint);
-    var mapping_rows: std.ArrayList(source_preparation.RetentionEntryRows) = .empty;
-    defer mapping_rows.deinit(alloc);
-    for (entry_rows.items) |rows| {
-        if (std.mem.findScalar(u32, publication_entries.items, rows.entry_id) == null) try mapping_rows.append(alloc, rows);
-    }
-    var mapping = try source_preparation.RetentionRebase.init(alloc, &before, &after, mapping_rows.items);
+    var mapping = try source_preparation.RetentionRebase.init(alloc, &before, &after);
     defer mapping.deinit(alloc);
     var retained_identity = try source_preparation.RetentionIdentity.capture(&retained, alloc, &after);
     defer retained_identity.deinit(alloc);
@@ -3678,36 +2947,7 @@ pub fn streamAssistantChunk(
         .assistant_code_block => "assistant_code_block",
         .assistant_thematic_rule => "assistant_thematic_rule",
     };
-    const admission = if (try commitAssistantStreamChunkFast(self, alloc, metrics, text)) |fast|
-        fast
-    else blk: {
-        var shadow = try cloneRecordedMutationState(self, alloc);
-        defer shadow.deinit(alloc);
-        var prefix_trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-        defer prefix_trims.deinit(alloc);
-        const staged = try streamAssistantChunkUncommitted(
-            &shadow,
-            alloc,
-            metrics,
-            text,
-            &prefix_trims,
-        );
-        var authoritative_source = try source_preparation.prepareTranscriptSource(&shadow, alloc, null);
-        defer authoritative_source.deinit(alloc);
-        if (staged.retention_changed) {
-            _ = try rebaseTranscriptRewrite(self, &shadow, alloc, prefix_trims.items, null);
-        }
-        commitMutationStateWithReconciliationSource(
-            self,
-            &shadow,
-            "atomic_assistant_stream_append",
-            .preserve_same_epoch,
-            authoritative_source.bytes,
-            if (staged.retention_changed) null else staged.entry_id,
-        );
-        self.forgetShimmer();
-        break :blk staged;
-    };
+    const admission = try commitAssistantStreamChunkFast(self, alloc, metrics, text);
 
     if (admission.opened_new_turn) {
         debug_trace.logf(
@@ -3733,11 +2973,6 @@ pub fn retintEntriesForTheme(
     if (tokens.len == 0) return;
 
     var shadow = try cloneMutationState(self, alloc);
-    var rewrite_trims: std.ArrayList(RetentionPrefixTrim) = .empty;
-    defer rewrite_trims.deinit(alloc);
-    if (comptime @hasField(@TypeOf(shadow), "retention_prefix_trims")) {
-        shadow.retention_prefix_trims = self.retention_prefix_trims orelse &rewrite_trims;
-    }
     defer shadow.deinit(alloc);
 
     for (shadow.entries.items) |*entry| {
@@ -3759,11 +2994,7 @@ pub fn retintEntriesForTheme(
         }
     }
 
-    try enforceStructuredRetention(
-        &shadow,
-        alloc,
-        null,
-    );
+    try pruneOrphanedCommandState(&shadow, alloc);
     try rebuildTranscriptCacheFromEntries(&shadow, alloc, "theme retint");
     shadow.recomputeCursorFromTranscript();
     requestTranscriptPaint(&shadow);
@@ -3997,7 +3228,7 @@ pub fn appendReplaceableTranscriptLineSilent(self: anytype, alloc: Allocator, te
     errdefer if (!handed_off) alloc.free(dup);
     const entry_id = try appendRawBytesEntry(self, alloc, dup);
     handed_off = true;
-    try enforceStructuredRetention(self, alloc, entry_id);
+    try pruneOrphanedCommandState(self, alloc);
     return entry_id;
 }
 
@@ -4034,7 +3265,7 @@ pub fn replaceTrailingTranscriptLineSilent(self: anytype, alloc: Allocator, text
             const new_bytes = try alloc.dupe(u8, text);
             alloc.free(old);
             tail.raw_bytes.bytes = new_bytes;
-            try enforceStructuredRetention(self, alloc, tail.raw_bytes.id);
+            try pruneOrphanedCommandState(self, alloc);
         }
     }
     reconcileTranscriptAnchorAfterSourceChange(

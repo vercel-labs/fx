@@ -116,7 +116,7 @@ jobs:
   zig:
     name: Build & Test
     if: ${{ always() }}
-    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-package-guards, sdk-browser-wasm, tla-mcp]
+    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-package-guards, sdk-browser-wasm, tla-mcp, tla-transcript-window]
     runs-on: ubuntu-latest
     steps:
       - name: Require unit tests and every SDK job
@@ -124,7 +124,7 @@ jobs:
           RESULTS: ${{ toJSON(needs.*.result) }}
         run: |
           printf '%s\n' "$RESULTS"
-          jq -e 'length == 7 and all(.[]; . == "success")' <<<"$RESULTS"
+          jq -e 'length == 8 and all(.[]; . == "success")' <<<"$RESULTS"
 
   build:
     name: Build fx (ReleaseSafe)
@@ -167,10 +167,11 @@ jobs:
           cache-hit: ${{ steps.zig.outputs.cache-hit }}
 
   # The durable-session model check in SDK (Bun + N-API/WASM) takes about 40
-  # minutes and the TLA+ MCP models and drivers about 20. A pull request runs
-  # each only when it changes the code that check covers; see
-  # scripts/detect-ci-need.sh. Pushes to main and manual dispatches always run
-  # both, so the main run that Publish libfx waits for includes them.
+  # minutes, the TLA+ MCP models and drivers about 20, and the TLA+ transcript
+  # window model a few. A pull request runs each only when it changes the code
+  # that check covers; see scripts/detect-ci-need.sh. Pushes to main and manual
+  # dispatches always run all three, so the main run that Publish libfx waits
+  # for includes them.
   ci-need:
     name: Detect CI need
     runs-on: ubuntu-24.04
@@ -178,6 +179,7 @@ jobs:
     outputs:
       libfx: ${{ steps.detect.outputs.libfx }}
       mcp: ${{ steps.detect.outputs.mcp }}
+      transcript_window: ${{ steps.detect.outputs.transcript_window }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -695,6 +697,43 @@ jobs:
           tests/tla/mcp_host/check.sh
           bun tests/tla/drivers/mcp/driver.ts
           bun test ./tests/tla/drivers/mcp_host/
+
+  # The transcript window model and the window's core driven along it both
+  # ways. Its planted bugs and the run of a built fx along the model stay local
+  # (tests/tla/transcript_window/check.sh without --ci): the first measure the
+  # checks, not the code, and the second drives fx through tmux.
+  tla-transcript-window:
+    name: TLA+ transcript window model
+    needs: ci-need
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      AI_GATEWAY_API_KEY: ""
+      VERCEL_OIDC_TOKEN: ""
+    steps:
+      - uses: actions/checkout@v4
+        if: needs.ci-need.outputs.transcript_window == 'true'
+      # The core's tests and the drivers' harness build against
+      # src/ui/transcript/transcript_window.zig.
+      - name: Setup Zig
+        if: needs.ci-need.outputs.transcript_window == 'true'
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.17.0"
+          cache-key: ci-tla-transcript-window
+      - name: Setup Bun
+        if: needs.ci-need.outputs.transcript_window == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+      - name: Model-check the transcript window and drive its core along the model
+        if: needs.ci-need.outputs.transcript_window == 'true'
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/tla2tools.jar"
+          curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
+          TLA2TOOLS_JAR="$jar" tests/tla/transcript_window/check.sh --ci
 
   e2e_mode:
     name: E2E (deterministic, shard ${{ matrix.shard.label }})

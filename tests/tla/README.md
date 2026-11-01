@@ -1,6 +1,6 @@
 # TLA+ models
 
-TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK and MCP models on `main` and on pull requests that change the code they cover, as `scripts/detect-ci-need.sh` decides, and the recovery model, with the driver that walks the recovery module along it, on every pull request. Run the others when you change the behavior they describe.
+TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK, MCP, and transcript window models on `main` and on pull requests that change the code they cover, as `scripts/detect-ci-need.sh` decides, and the recovery model, with the driver that walks the recovery module along it, on every pull request. Run the others when you change the behavior they describe.
 
 | Folder | What it models | Checker |
 |---|---|---|
@@ -20,6 +20,7 @@ TLA+ specifications for fx, checked with TLC, together with the scripts and Bun 
 | `session_manager/` | The session log, turn lifecycle, writer lock, snapshots, fork, subagents, catalog, host wiring, the side-file move, v1 conversion, and prompt images saved as blobs (`PromptImages.tla`). `rollout/` holds the models of the changes that moved fx onto the session manager. `system-design.md` is the design record the specs check and defines the `D1` to `D95` decision numbers that code comments cite. | `session_manager/check.sh`, `session_manager/mutants.py`, `session_manager/rollout/run.py`, `bun test drivers/session_manager/` |
 | `shell_command/` | How an agent git command is admitted and run (`src/core/shell_command/safe_git.zig`), and one model turn through the shell tool, for the current design and a redesign. | `shell_command/check.sh`, `bun test drivers/shell_command/` |
 | `terminal/` | The in-memory shell snapshot owner (`src/core/terminal/shell_snapshot.zig`) and the lifecycle of hosted terminals. | `terminal/check.sh` |
+| `transcript_window/` | What the main screen holds of a long session and what Ctrl+O reads (`src/ui/transcript/transcript_window.zig`, a pure core the transcript runtime drives through `transcript_window_shell.zig` for every session). The current compaction cycle is held, plus the previous one until the first turn end at which the session log holds it; live blocks are never dropped; a resize reprints the held blocks in bounded slices; Ctrl+O opens from memory and reads older blocks from the log one window at a time, through crashes and lost, stale, duplicate, and garbage replies. `design/` holds the goal, vision, context, and design the checks trace to, and `mutations.json` the planted bugs. | `transcript_window/check.sh`, which runs `bun run verify`: TLC on every config, every edge of the sweep graphs replayed against the real core, code traces with real crashes checked by TLC, every planted bug in the spec and the core, `design/DESIGN.md` traceability, and the built binary through three compaction cycles, Ctrl+O, a resize, and a resume, its traced window steps replayed on the core and checked by TLC |
 | `usage/` | `/usage` refreshes and the shared usage cache (`src/usage/`): `LeanUsage.tla` and `UsageModel.tla`. | `usage/check.sh`, then the drivers in `drivers/usage/` |
 | `drivers/` | The Bun drivers. They run the real fx binary or SDK code, record what happens, and have TLC check each run against its model. `drive.mjs`, `drive-intake.mjs`, `drive-images.mjs`, `drive-agents.mjs`, `drive-tenants.mjs`, and `drive-steer.mjs` walk the SDK code along the `sdk/` state graphs. `recovery/driver.ts` walks `src/core/recovery/recovery.zig` along every edge of `recovery/Recovery.tla`'s state graph through a small Zig lab, `recovery/lab.zig`. `resume/driver.ts` walks the fx TUI along `recovery/Resume.tla`'s state graph in tmux; it runs on request. | See each folder's `check.sh` |
 | `lib/` | `tlc.sh`, which finds TLC and Java and runs a table of configs with their expected verdicts, `tlc.py`, which asks `tlc.sh` for TLC and Java on behalf of the Python checkers, and `run-tlc.sh`, which runs TLC once for the drivers. | |
@@ -56,6 +57,10 @@ npm ci --prefix sdk/durable
 ## MCP in CI
 
 CI's `TLA+ MCP models and drivers` job runs each engine model's smoke config (`mcp/run.py check`), `mcp_host/check.sh`, and both MCP drivers, on `main` and on pull requests that change MCP code, these models, their drivers, or the files the drivers load. The engine models' planted bugs (`mcp/check.sh`) run only by hand: they measure the checks, not the code.
+
+## Transcript window in CI
+
+CI's `TLA+ transcript window model` job runs `transcript_window/check.sh --ci` on `main` and on pull requests that change the window's code, its model, its drivers, or the driver code they share. `--ci` leaves out the planted bugs and the run of a built fx along the model, which run only by hand with `transcript_window/check.sh`.
 
 ## MCP models without a driver here
 

@@ -1202,6 +1202,24 @@ test "a resumed request older than a day, or dated ahead, asks first" {
     try std.testing.expect(resumeIsStale(now, std.math.maxInt(u64)));
 }
 
+/// The boundaries of the older compaction cycles, found walking back from
+/// the held one as Ctrl+O reads older, so each cycle is found once.
+pub const TranscriptArchiveBoundaries = struct {
+    /// The newest compaction, and whether the transcript window held the
+    /// cycle before it, when the walk started: a change starts it over.
+    key: ?struct { newest: session_adapter.LogCursor, holds_previous: bool } = null,
+    /// Where the held entries start: the end of cycle 1 back.
+    held_start: ?session_adapter.LogCursor = null,
+    /// `starts[k - 1]` is where cycle `k` back starts, and so where cycle
+    /// `k + 1` ends; null at the log's start.
+    starts: std.ArrayList(?session_adapter.LogCursor) = .empty,
+
+    pub fn deinit(self: *TranscriptArchiveBoundaries, alloc: Allocator) void {
+        self.starts.deinit(alloc);
+        self.* = .{};
+    }
+};
+
 pub const Persistence = struct {
     // Serializes event-log mutations with worker usage callbacks. Usage takes
     // its checkpoint mutex first, so callers must not checkpoint while held.
@@ -1227,6 +1245,9 @@ pub const Persistence = struct {
     title_generation: TitleGenerationLoad = .{},
     degraded_warning_emitted: bool = false,
     pending_cancelled_command: ?PendingCancelledCommand = null,
+    /// Where the older compaction cycles Ctrl+O read start in the session log
+    /// (`loadTranscriptArchive`).
+    transcript_archive_boundaries: TranscriptArchiveBoundaries = .{},
     image_snapshot_temp_dir: ?[]u8 = null,
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
@@ -1247,7 +1268,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 29) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 30) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1272,6 +1293,7 @@ pub const Persistence = struct {
         storage.title_generation = .{};
         storage.degraded_warning_emitted = false;
         storage.pending_cancelled_command = null;
+        storage.transcript_archive_boundaries = .{};
         storage.image_snapshot_temp_dir = null;
         storage.resume_handoff_intent = .none;
         storage.pending_live_session_policy = null;
@@ -1297,6 +1319,7 @@ pub const Persistence = struct {
         if (self.pending_request_resume != null) {
             debug_trace.logf("recovery", "event=resume_dropped reason=deinit", .{});
         }
+        self.transcript_archive_boundaries.deinit(alloc);
         if (self.pending_live_session_policy) |policy| {
             debug_trace.logf(
                 "session",
@@ -1506,8 +1529,21 @@ pub fn Runtime(comptime App: type) type {
             if (comptime runtime_profile.allows(App, .js_host_sessions)) {
                 try beginFreshJsHostSession(app);
             }
+            defer syncTranscriptWindowSaveMode(app);
+            defer syncTranscriptArchiveAvailable(app);
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
             if (app.session_persistence.v2_store) |v2_store| try beginFreshV2Session(app, v2_store);
+        }
+
+        /// The transcript window drops entries only once the session log holds
+        /// them, so it follows whether this session writes one.
+        fn syncTranscriptWindowSaveMode(app: *App) void {
+            if (comptime !@hasField(App, "shell")) return;
+            if (comptime !@hasDecl(@TypeOf(app.shell), "setTranscriptWindowSaved")) return;
+            const saved = if (comptime @hasField(@TypeOf(app.session_persistence), "v2")) app.session_persistence.v2 != null else false;
+            app.shell.setTranscriptWindowSaved(app.alloc, saved) catch |err| {
+                debug_trace.logf("transcript_window", "save mode not set saved={} err={s}", .{ saved, @errorName(err) });
+            };
         }
 
         /// A v2 session starts in memory; its folder appears with the first
@@ -2201,8 +2237,12 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.v2 = v2;
             v2_owned = false;
             errdefer closeWritableSession(app);
+            // Before the replay: the resume projection copies the window's
+            // retention, so the whole newest cycle comes back.
+            syncTranscriptWindowSaveMode(app);
             try hydrateResumedSession(app, resumed.state, &display, notice);
             enableSessionStores(app);
+            syncTranscriptArchiveAvailable(app);
             // A fork is a new session: it continues nothing on its own.
             if (notice != .fork) noteInterruptedRequest(app, v2);
         }
@@ -2302,11 +2342,11 @@ pub fn Runtime(comptime App: type) type {
                     .labels = &historical_labels,
                 };
                 try writeResumeNotice(app, &sink, display, notice);
-                try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
+                const holds_previous = try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
                 const projection_finished_ns = io_mod.nanoTimestamp();
                 try projection.finalize();
                 const finalization_finished_ns = io_mod.nanoTimestamp();
-                try app.installResumeProjection(&projection);
+                try app.installResumeProjection(&projection, holds_previous);
                 const install_finished_ns = io_mod.nanoTimestamp();
                 debug_trace.logf(
                     "session",
@@ -2321,7 +2361,7 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 var sink = LiveHistorySink(App){ .app = app };
                 try writeResumeNotice(app, &sink, display, notice);
-                try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
+                _ = try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
             }
             if (comptime @hasDecl(App, "restoreSessionCredential")) {
                 try app.restoreSessionCredential(previous_provider);
@@ -3986,15 +4026,103 @@ pub fn Runtime(comptime App: type) type {
             gop.value_ptr.* = .{ .label = label, .reflow = reflow };
         }
 
+        /// Replays an older compaction cycle from the session log into a
+        /// detached transcript for Ctrl+O: `back` cycles before the held
+        /// entries, 1 being the newest. Reads only that cycle, after finding
+        /// its start by walking back from the cycles already found.
+        pub fn loadTranscriptArchive(app: *App, back: u32) !void {
+            if (comptime !@hasField(App, "shell") or !@hasDecl(App, "beginResumeProjection")) return error.TranscriptArchiveUnavailable;
+            if (back == 0) return error.TranscriptArchiveUnavailable;
+            const v2 = app.session_persistence.v2 orelse return error.SessionPersistenceUnavailable;
+            const started_ns = io_mod.nanoTimestamp();
+            const newest = (try v2.previousCompactionCursor(app.alloc, null)) orelse return error.TranscriptArchiveUnavailable;
+            const holds_previous = app.shell.transcriptWindowHoldsPreviousCycle();
+            const cache = &app.session_persistence.transcript_archive_boundaries;
+            const stale = if (cache.key) |key| !std.meta.eql(key.newest, newest) or key.holds_previous != holds_previous else true;
+            if (stale) {
+                cache.starts.clearRetainingCapacity();
+                cache.key = .{ .newest = newest, .holds_previous = holds_previous };
+                cache.held_start = if (holds_previous) try v2.previousCompactionCursor(app.alloc, newest) else newest;
+            }
+            while (true) {
+                while (cache.starts.items.len < back) {
+                    const end = if (cache.starts.items.len == 0)
+                        cache.held_start orelse return error.TranscriptArchiveUnavailable
+                    else
+                        cache.starts.items[cache.starts.items.len - 1] orelse return error.TranscriptArchiveUnavailable;
+                    try cache.starts.append(app.alloc, try v2.previousCompactionCursor(app.alloc, end));
+                }
+                const start = cache.starts.items[back - 1];
+
+                var projection = try resume_projection.ResumeProjection.initEmpty(app.alloc, &app.shell, 0, 1);
+                defer projection.deinit();
+                // Apart from the live ids: Ctrl+O joins this cycle to the held entries.
+                projection.runtime.next_entry_id = transcript_runtime.archiveEntryIdBase(back);
+                var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+                defer labels.deinit(app.alloc);
+                var sink = DetachedHistorySink(@TypeOf(projection)){
+                    .app = app,
+                    .projection = &projection,
+                    .labels = &labels,
+                };
+                const Visitor = struct {
+                    app: *App,
+                    sink: *@TypeOf(sink),
+                    labels: *HistoricalSessionLabels,
+                    has_prior_turns: bool = false,
+
+                    pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+                        return replayHistoryToSinkIncremental(self.app, self.sink, &.{turn}, &self.has_prior_turns, self.labels);
+                    }
+                };
+                var visitor = Visitor{ .app = app, .sink = &sink, .labels = &labels };
+                try v2.visitHistoryCycle(app.alloc, start, &visitor);
+                if (projection.runtime.entries.items.len == 0) if (start) |empty_start| {
+                    // Two compactions with no turn between leave an empty
+                    // cycle; it is not a page of its own, so the cycle before
+                    // it takes its place. Each skip moves to an older
+                    // compaction line, so this ends.
+                    cache.starts.items[back - 1] = try v2.previousCompactionCursor(app.alloc, empty_start);
+                    cache.starts.shrinkRetainingCapacity(back);
+                    debug_trace.logf("full_transcript_cache", "archive_empty_cycle_skipped back={d}", .{back});
+                    continue;
+                };
+                const archived = try projection.intoArchivedRuntime();
+                const entries = archived.entries.items.len;
+                try app.shell.installTranscriptArchive(app.alloc, back, start != null, archived);
+                debug_trace.logf("full_transcript_cache", "archive_loaded back={d} entries={d} us={d}", .{
+                    back,
+                    entries,
+                    @divTrunc(io_mod.nanoTimestamp() - started_ns, std.time.ns_per_us),
+                });
+                return;
+            }
+        }
+
+        /// Whether Ctrl+O can page into older compaction cycles: the window
+        /// holds only the newest cycle, and the log holds the older ones.
+        fn syncTranscriptArchiveAvailable(app: *App) void {
+            if (comptime !@hasField(App, "shell")) return;
+            if (comptime !@hasField(@TypeOf(app.shell), "transcript_archive_available")) return;
+            const v2 = app.session_persistence.v2 orelse {
+                app.shell.transcript_archive_available = false;
+                return;
+            };
+            const newest = v2.previousCompactionCursor(app.alloc, null) catch null;
+            app.shell.transcript_archive_available = newest != null;
+        }
+
+        /// True when the replayed turns are the cycle before the newest
+        /// compaction, because no turn finished after it.
         fn replayResumedHistoryToSink(
             app: *App,
             sink: anytype,
             context_history: []const types.HistoryTurn,
             labels: *HistoricalSessionLabels,
-        ) !void {
+        ) !bool {
             if (comptime runtime_profile.allows(App, .durable_sessions)) {
-                // Every saved turn shows, not only those since the newest
-                // compaction.
+                // The main screen holds the newest compaction cycle; Ctrl+O
+                // reads the older ones from the log.
                 if (app.session_persistence.v2) |v2| {
                     const Visitor = struct {
                         app: *App,
@@ -4007,10 +4135,11 @@ pub fn Runtime(comptime App: type) type {
                         }
                     };
                     var visitor = Visitor{ .app = app, .sink = sink, .labels = labels };
-                    return v2.visitHistory(app.alloc, &visitor);
+                    return v2.visitHistorySinceCompaction(app.alloc, &visitor);
                 }
             }
-            return replayHistoryToSink(app, sink, context_history, labels);
+            try replayHistoryToSink(app, sink, context_history, labels);
+            return false;
         }
 
         fn writeResumeNotice(
@@ -5061,6 +5190,12 @@ pub fn Runtime(comptime App: type) type {
             }
             app.session.commitCompactedHistory(app.alloc, prepared);
             prepared_owned = false;
+            if (comptime @hasField(App, "shell")) {
+                if (comptime @hasDecl(@TypeOf(app.shell), "transcriptWindowCompacted")) {
+                    try app.shell.transcriptWindowCompacted(app.alloc);
+                    syncTranscriptArchiveAvailable(app);
+                }
+            }
         }
 
         pub fn commitPermissionState(

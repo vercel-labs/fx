@@ -26,6 +26,13 @@ const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const program_status = @import("../../ui/terminal/program_status.zig");
 
 const WorkerEvent = worker_runtime.WorkerEvent;
+const HeadSegmentScan = worker_runtime.HeadSegmentScan;
+
+/// How long one interactive drain applies worker events before it lets the
+/// loop read keys and paint. Late in a long session an event costs several
+/// milliseconds, and hundreds can be queued at once. Every slice costs a
+/// frame, so a shorter budget makes the whole turn slower.
+pub const interactive_drain_budget_ns: i128 = 32 * std.time.ns_per_ms;
 const InputRuntime = core_input_runtime.Runtime;
 
 const CancelledEventAdmission = enum {
@@ -298,29 +305,60 @@ fn batchContainsTerminalClosure(
 }
 
 fn batchSegmentIsInterrupted(events: []const WorkerEvent, cancelled_turn_id: ?u64) bool {
-    var turn_id: ?u64 = null;
-    scan: for (events, 0..) |event, index| {
-        if (index > 0) switch (event) {
-            .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt, .begin_resumed_prompt => break :scan,
-            else => {},
-        };
-        switch (event) {
-            .begin_presented_prompt, .begin_resumed_prompt => |id| turn_id = id,
-            .turn_phase_update => |phase| turn_id = phase.turn_id,
-            .tool_lifecycle => |lifecycle| {
-                turn_id = switch (lifecycle) {
-                    .turn_finished => |finished| return finished.outcome == .interrupted,
-                    .provisional => |value| value.id.turn_id,
-                    .authoritative_started => |value| value.id.turn_id,
-                    .progress => |value| value.id.turn_id,
-                    .terminal => |value| value.id.turn_id,
-                };
-            },
-            else => {},
-        }
+    return segmentInterrupted(scanSegment(.fresh, events), cancelled_turn_id);
+}
+
+/// Whether `event` begins a new prompt, and so a new segment.
+fn startsSegment(event: WorkerEvent) bool {
+    return switch (event) {
+        .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt, .begin_resumed_prompt => true,
+        else => false,
+    };
+}
+
+/// Whether a time-bounded drain has passed its deadline; never for an
+/// unbounded one.
+fn budgetSpent(deadline_ns: ?i128) bool {
+    const deadline = deadline_ns orelse return false;
+    return io_mod.nanoTimestamp() >= deadline;
+}
+
+/// Continues `state` over `events`, which carry on the segment `state`
+/// describes, stopping where the next prompt begins.
+fn scanSegment(state: HeadSegmentScan, events: []const WorkerEvent) HeadSegmentScan {
+    var scan = state;
+    for (events, 0..) |event, index| {
+        if (index > 0 and startsSegment(event)) break;
+        scan = scanSegmentEvent(scan, event);
+        if (scan == .settled) break;
     }
-    const cancelled = cancelled_turn_id orelse return false;
-    return turn_id == null or turn_id.? == cancelled;
+    return scan;
+}
+
+fn scanSegmentEvent(state: HeadSegmentScan, event: WorkerEvent) HeadSegmentScan {
+    if (state == .settled) return state;
+    return switch (event) {
+        .begin_presented_prompt, .begin_resumed_prompt => |id| .{ .turn = id },
+        .turn_phase_update => |phase| .{ .turn = phase.turn_id },
+        .tool_lifecycle => |lifecycle| switch (lifecycle) {
+            .turn_finished => |finished| .{ .settled = finished.outcome == .interrupted },
+            .provisional => |value| .{ .turn = value.id.turn_id },
+            .authoritative_started => |value| .{ .turn = value.id.turn_id },
+            .progress => |value| .{ .turn = value.id.turn_id },
+            .terminal => |value| .{ .turn = value.id.turn_id },
+        },
+        else => state,
+    };
+}
+
+fn segmentInterrupted(state: HeadSegmentScan, cancelled_turn_id: ?u64) bool {
+    return switch (state) {
+        .settled => |interrupted| interrupted,
+        .turn => |turn_id| {
+            const cancelled = cancelled_turn_id orelse return false;
+            return turn_id == null or turn_id.? == cancelled;
+        },
+    };
 }
 
 pub fn Runtime(comptime App: type) type {
@@ -807,8 +845,27 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             event_handlers: WorkerEventHandlers,
         ) !void {
+            try tickWithDrainBudget(app, event_handlers, null);
+        }
+
+        /// `tick` for the interactive loop: once `budget_ns` has passed, the
+        /// drain stops before its next event and puts the rest back, so the
+        /// loop reads keys and paints before applying them.
+        pub fn tickWithinBudget(
+            app: *App,
+            event_handlers: WorkerEventHandlers,
+            budget_ns: i128,
+        ) !void {
+            try tickWithDrainBudget(app, event_handlers, budget_ns);
+        }
+
+        fn tickWithDrainBudget(
+            app: *App,
+            event_handlers: WorkerEventHandlers,
+            budget_ns: ?i128,
+        ) !void {
             if (!try authorizeInteractiveAdmission(app)) return;
-            try drainEvents(app, event_handlers);
+            try drainEvents(app, event_handlers, budget_ns);
             syncState(app, event_handlers.tool_lifecycle);
 
             const now_ms = io_mod.milliTimestamp();
@@ -882,7 +939,7 @@ pub fn Runtime(comptime App: type) type {
             return activity_status.buildProgressLabel(buf, app.stream);
         }
 
-        fn drainEvents(app: *App, handlers: WorkerEventHandlers) !void {
+        fn drainEvents(app: *App, handlers: WorkerEventHandlers, budget_ns: ?i128) !void {
             errdefer if (comptime @hasDecl(@TypeOf(app.worker), "failPendingHistoryPublication")) {
                 app.worker.failPendingHistoryPublication(error.HistoryPublicationDeliveryFailed);
             };
@@ -909,16 +966,36 @@ pub fn Runtime(comptime App: type) type {
             var can_persist_finished = true;
             errdefer preserveFinishedAfterDrainFailure(app, &batch, can_persist_finished);
 
-            var interrupted_segment = batchSegmentIsInterrupted(batch.events.items, taken.cancelled_turn_id);
+            // A take's cancellation snapshot stays with the events taken under
+            // it, so a batch that carries one is never split.
+            const deadline_ns: ?i128 = if (budget_ns) |budget|
+                if (taken.cancelled_turn_id == null) io_mod.nanoTimestamp() + budget else null
+            else
+                null;
+            var segment_scan: HeadSegmentScan = taken.head_segment orelse .fresh;
+            var interrupted_segment = segmentInterrupted(
+                scanSegment(segment_scan, batch.events.items),
+                taken.cancelled_turn_id,
+            );
             var first_event = true;
 
             events: while (batch.claim()) |event| {
-                if (!first_event) switch (event) {
-                    .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt, .begin_resumed_prompt => {
+                if (!first_event) {
+                    const starts_segment = startsSegment(event);
+                    if (budgetSpent(deadline_ns)) {
+                        try retainClaimedEventAndSuffixForBudget(
+                            app,
+                            &batch,
+                            if (starts_segment) null else segment_scan,
+                        );
+                        break :events;
+                    }
+                    if (starts_segment) {
                         interrupted_segment = batchSegmentIsInterrupted(batch.claimedAndRemaining(), taken.cancelled_turn_id);
-                    },
-                    else => {},
-                };
+                        segment_scan = .fresh;
+                    }
+                }
+                segment_scan = scanSegmentEvent(segment_scan, event);
                 first_event = false;
                 var drain_owns_current = true;
                 defer if (drain_owns_current) {
@@ -1316,6 +1393,24 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
+        /// Puts the claimed event and the rest back for the next drain, with
+        /// the scan of the segment they continue (null when the claimed event
+        /// starts one).
+        fn retainClaimedEventAndSuffixForBudget(
+            app: *App,
+            batch: *DetachedWorkerEventBatch,
+            head_segment: ?HeadSegmentScan,
+        ) !void {
+            const retained = batch.claimedAndRemaining();
+            try app.worker.prependOwnedEventsForBudget(batch.alloc, retained, head_segment);
+            batch.markClaimedAndRemainingTransferred();
+            debug_trace.logf(
+                "worker",
+                "retained detached worker events reason=drain_time_budget count={d}",
+                .{retained.len},
+            );
+        }
+
         fn applyToolLifecycle(
             app: *App,
             presenter: activity_runtime.LifecyclePresenter,
@@ -1510,6 +1605,8 @@ const FakeWorker = struct {
 
     worker_cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     events: std.ArrayList(WorkerEvent) = .empty,
+    head_segment: ?HeadSegmentScan = null,
+    drain_continuation_due: bool = false,
     queued_count: usize = 0,
     processing: bool = false,
     cancel_continues_turn: bool = false,
@@ -1555,6 +1652,22 @@ const FakeWorker = struct {
         try self.events.insertSlice(alloc, 0, events);
     }
 
+    fn prependOwnedEventsForBudget(
+        self: *FakeWorker,
+        alloc: std.mem.Allocator,
+        events: []const WorkerEvent,
+        head_segment: ?HeadSegmentScan,
+    ) !void {
+        try self.events.insertSlice(alloc, 0, events);
+        self.head_segment = head_segment;
+        self.drain_continuation_due = true;
+    }
+
+    fn takeDrainContinuationDue(self: *FakeWorker) bool {
+        defer self.drain_continuation_due = false;
+        return self.drain_continuation_due;
+    }
+
     fn takeEvents(self: *FakeWorker) std.ArrayList(WorkerEvent) {
         const events = self.events;
         self.events = .empty;
@@ -1567,9 +1680,11 @@ const FakeWorker = struct {
 
     fn takeEventBatch(self: *FakeWorker) worker_runtime.WorkerEventBatch {
         const cancel_requested = self.worker_cancel_requested.load(.seq_cst);
+        defer self.head_segment = null;
         return .{
             .events = self.takeEvents(),
             .cancelled_turn_id = if (cancel_requested and self.active_turn_id != 0) self.active_turn_id else null,
+            .head_segment = self.head_segment,
         };
     }
 
@@ -5170,4 +5285,277 @@ test "unaccepted worker finish records save failure and stops the detached suffi
     try std.testing.expectEqual(@as(?anyerror, error.InputOutput), app.session_persistence.shutdown_failure);
     try std.testing.expectEqual(@as(usize, 0), app.persisted_finishes.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
+}
+
+test "a segment scan resumed at any split point decides like one full scan" {
+    const finished = struct {
+        fn event(turn_id: u64, outcome: types.TurnPresentationOutcome) WorkerEvent {
+            return .{ .tool_lifecycle = .{ .turn_finished = .{ .turn_id = turn_id, .outcome = outcome } } };
+        }
+        fn phase(turn_id: u64) WorkerEvent {
+            return .{ .turn_phase_update = .{ .turn_id = turn_id, .step_id = 1, .phase = .generating } };
+        }
+    };
+    var prompt_text = "p".*;
+    const alphabet = [_]WorkerEvent{
+        .clear_route_recovery_status,
+        .{ .begin_prompt = .{ .text = &prompt_text } },
+        .{ .begin_presented_prompt = 5 },
+        .{ .begin_resumed_prompt = 6 },
+        finished.phase(5),
+        finished.phase(6),
+        finished.event(5, .interrupted),
+        finished.event(6, .completed),
+    };
+    const max_len = 6;
+    var events: [max_len]WorkerEvent = undefined;
+    var checked: usize = 0;
+    for (1..max_len + 1) |len| {
+        var digits: [max_len]usize = @splat(0);
+        while (true) {
+            for (0..len) |i| events[i] = alphabet[digits[i]];
+            const sequence = events[0..len];
+            const whole = scanSegment(.fresh, sequence);
+            for (0..len + 1) |split| {
+                // A drain puts events back only inside a segment, never before
+                // the event that starts the next one.
+                const resumed = scanSegment(scanSegment(.fresh, sequence[0..split]), sequence[split..]);
+                const segment_end = for (sequence, 0..) |event, i| {
+                    if (i > 0 and (event == .begin_prompt or event == .begin_presented_prompt or event == .begin_resumed_prompt)) break i;
+                } else len;
+                if (split > 0 and split >= segment_end) continue;
+                for ([_]?u64{ null, 5, 6 }) |cancelled| {
+                    try std.testing.expectEqual(segmentInterrupted(whole, cancelled), segmentInterrupted(resumed, cancelled));
+                    checked += 1;
+                }
+            }
+            var carry: usize = 0;
+            while (carry < len) : (carry += 1) {
+                digits[carry] += 1;
+                if (digits[carry] < alphabet.len) break;
+                digits[carry] = 0;
+            }
+            if (carry == len) break;
+        }
+    }
+    try std.testing.expect(checked > 100_000);
+}
+
+const BudgetCapture = struct {
+    texts: std.ArrayList([]const u8) = .empty,
+    prompts: usize = 0,
+
+    fn deinit(self: *BudgetCapture) void {
+        for (self.texts.items) |shown| std.testing.allocator.free(shown);
+        self.texts.deinit(std.testing.allocator);
+    }
+
+    fn text(raw: *anyopaque, value: []const u8) !void {
+        const self: *BudgetCapture = @ptrCast(@alignCast(raw));
+        try self.texts.append(std.testing.allocator, try std.testing.allocator.dupe(u8, value));
+    }
+
+    fn prompt(raw: *anyopaque, _: types.UserTurn) !void {
+        const self: *BudgetCapture = @ptrCast(@alignCast(raw));
+        self.prompts += 1;
+    }
+
+    fn handlers(self: *BudgetCapture, app: *FakeApp) WorkerEventHandlers {
+        var value = NoopBridge.handlers(app);
+        value.ctx = @ptrCast(self);
+        value.append_text = text;
+        value.write_user_prompt = prompt;
+        return value;
+    }
+
+    fn joined(self: *const BudgetCapture) ![]u8 {
+        return std.mem.join(std.testing.allocator, ",", self.texts.items);
+    }
+};
+
+const BudgetEvent = union(enum) {
+    phase: u64,
+    text: []const u8,
+    prompt: []const u8,
+    finished: struct { turn_id: u64, outcome: types.TurnPresentationOutcome },
+};
+
+fn queueBudgetEvents(app: *FakeApp, events: []const BudgetEvent) !void {
+    for (events) |event| switch (event) {
+        .phase => |turn_id| try app.worker.pushEvent(std.heap.c_allocator, .{ .turn_phase_update = .{
+            .turn_id = turn_id,
+            .step_id = 1,
+            .phase = .generating,
+        } }),
+        .text => |value| try app.worker.pushEvent(std.heap.c_allocator, .{ .assistant_presentation = .{
+            .text = @constCast(value),
+        } }),
+        .prompt => |value| try app.worker.pushEvent(std.heap.c_allocator, .{ .begin_prompt = .{ .text = @constCast(value) } }),
+        .finished => |finished| try queueTurnFinished(app, finished.turn_id, finished.outcome),
+    };
+}
+
+/// Drains `events` once unbounded and once one event per tick (budget 0),
+/// returning both texts shown so a test can compare them.
+fn expectBudgetMatchesUnbounded(
+    events: []const BudgetEvent,
+    cancelled_active_turn: ?u64,
+    expected_texts: []const u8,
+) !void {
+    var results: [2][]u8 = undefined;
+    var filled: usize = 0;
+    defer for (results[0..filled]) |value| std.testing.allocator.free(value);
+    for ([_]bool{ false, true }) |bounded| {
+        var app = FakeApp.init(std.testing.allocator);
+        defer app.deinit();
+        if (cancelled_active_turn) |turn_id| {
+            app.worker.active_turn_id = turn_id;
+            app.worker.worker_cancel_requested.store(true, .seq_cst);
+        }
+        var capture = BudgetCapture{};
+        defer capture.deinit();
+        try queueBudgetEvents(&app, events);
+        if (bounded) {
+            var ticks: usize = 0;
+            while (app.worker.events.items.len > 0) : (ticks += 1) {
+                try std.testing.expect(ticks < events.len * 2 + 2);
+                try Runtime(FakeApp).tickWithinBudget(&app, capture.handlers(&app), 0);
+            }
+        } else {
+            try Runtime(FakeApp).tick(&app, capture.handlers(&app));
+        }
+        results[filled] = try capture.joined();
+        filled += 1;
+    }
+    try std.testing.expectEqualStrings(expected_texts, results[0]);
+    try std.testing.expectEqualStrings(results[0], results[1]);
+}
+
+test "a time-bounded drain applies one event per tick at budget 0 in order" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    var capture = BudgetCapture{};
+    defer capture.deinit();
+    try queueBudgetEvents(&app, &.{ .{ .text = "a" }, .{ .text = "b" }, .{ .text = "c" } });
+
+    try Runtime(FakeApp).tickWithinBudget(&app, capture.handlers(&app), 0);
+    try std.testing.expectEqual(@as(usize, 1), capture.texts.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.worker.events.items.len);
+    try std.testing.expect(app.worker.takeDrainContinuationDue());
+    try std.testing.expect(!app.worker.takeDrainContinuationDue());
+
+    try Runtime(FakeApp).tickWithinBudget(&app, capture.handlers(&app), 0);
+    try Runtime(FakeApp).tickWithinBudget(&app, capture.handlers(&app), 0);
+    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
+    try std.testing.expect(app.worker.takeDrainContinuationDue());
+    try Runtime(FakeApp).tickWithinBudget(&app, capture.handlers(&app), 0);
+    try std.testing.expect(!app.worker.takeDrainContinuationDue());
+    const shown = try capture.joined();
+    defer std.testing.allocator.free(shown);
+    try std.testing.expectEqualStrings("a,b,c", shown);
+}
+
+test "a time-bounded drain with a large budget applies the whole batch" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    var capture = BudgetCapture{};
+    defer capture.deinit();
+    try queueBudgetEvents(&app, &.{ .{ .text = "a" }, .{ .text = "b" }, .{ .text = "c" } });
+    try Runtime(FakeApp).tickWithinBudget(&app, capture.handlers(&app), std.time.ns_per_s * 60);
+    try std.testing.expectEqual(@as(usize, 3), capture.texts.items.len);
+    try std.testing.expect(!app.worker.takeDrainContinuationDue());
+}
+
+test "a time-bounded split keeps an earlier turn's tail when a later turn is cancelled" {
+    const two_turns = [_]BudgetEvent{
+        .{ .phase = 5 },
+        .{ .text = "a" },
+        .{ .text = "b" },
+        .{ .prompt = "next" },
+        .{ .phase = 6 },
+        .{ .text = "c" },
+    };
+    try expectBudgetMatchesUnbounded(&two_turns, null, "a,b,c");
+    // The cancel is in the first take, so that batch is never split.
+    try expectBudgetMatchesUnbounded(&two_turns, 6, "a,b");
+}
+
+test "a time-bounded split resumes the earlier turn's scan after a cancel between slices" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    var capture = BudgetCapture{};
+    defer capture.deinit();
+    try queueBudgetEvents(&app, &.{
+        .{ .phase = 5 },
+        .{ .text = "a" },
+        .{ .text = "b" },
+        .{ .prompt = "next" },
+        .{ .phase = 6 },
+        .{ .text = "c" },
+    });
+    try Runtime(FakeApp).tickWithinBudget(&app, capture.handlers(&app), 0);
+    // Turn 6 is cancelled after the first slice: turn 5's tail still shows,
+    // and turn 6's text is dropped as if it had arrived after the cancel.
+    app.worker.active_turn_id = 6;
+    app.worker.worker_cancel_requested.store(true, .seq_cst);
+    while (app.worker.events.items.len > 0) {
+        try Runtime(FakeApp).tickWithinBudget(&app, capture.handlers(&app), 0);
+    }
+    const shown = try capture.joined();
+    defer std.testing.allocator.free(shown);
+    try std.testing.expectEqualStrings("a,b", shown);
+}
+
+test "a time-bounded split keeps a settled interrupted finish for the rest of its segment" {
+    try expectBudgetMatchesUnbounded(&.{
+        .{ .phase = 5 },
+        .{ .finished = .{ .turn_id = 5, .outcome = .interrupted } },
+        .{ .text = "late" },
+        .{ .prompt = "next" },
+        .{ .text = "shown" },
+    }, null, "shown");
+}
+
+test "a time-bounded split right before a prompt starts that segment's scan fresh" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    var capture = BudgetCapture{};
+    defer capture.deinit();
+    try queueBudgetEvents(&app, &.{
+        .{ .phase = 5 },
+        .{ .text = "a" },
+        .{ .prompt = "next" },
+        .{ .text = "b" },
+    });
+    try Runtime(FakeApp).tickWithinBudget(&app, capture.handlers(&app), 0);
+    try Runtime(FakeApp).tickWithinBudget(&app, capture.handlers(&app), 0);
+    try std.testing.expect(app.worker.events.items[0] == .begin_prompt);
+    try std.testing.expectEqual(@as(?HeadSegmentScan, null), app.worker.head_segment);
+    // A cancel now applies to the new prompt's segment, which names no turn.
+    app.worker.active_turn_id = 6;
+    app.worker.worker_cancel_requested.store(true, .seq_cst);
+    while (app.worker.events.items.len > 0) {
+        try Runtime(FakeApp).tickWithinBudget(&app, capture.handlers(&app), 0);
+    }
+    const shown = try capture.joined();
+    defer std.testing.allocator.free(shown);
+    try std.testing.expectEqualStrings("a", shown);
+    try std.testing.expectEqual(@as(usize, 1), capture.prompts);
+}
+
+test "a time-bounded drain applies a cancelled take whole" {
+    // This take's cancel snapshot is the only one that drops turn 5, so its
+    // events must not be put back for a later take that no longer cancels.
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.active_turn_id = 5;
+    app.worker.worker_cancel_requested.store(true, .seq_cst);
+    app.worker.reset_cancel_after_take_events = true;
+    var capture = BudgetCapture{};
+    defer capture.deinit();
+    try queueBudgetEvents(&app, &.{ .{ .phase = 5 }, .{ .text = "a" }, .{ .text = "b" } });
+    try Runtime(FakeApp).tickWithinBudget(&app, capture.handlers(&app), 0);
+    try std.testing.expectEqual(@as(usize, 0), app.worker.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), capture.texts.items.len);
+    try std.testing.expect(!app.worker.takeDrainContinuationDue());
 }

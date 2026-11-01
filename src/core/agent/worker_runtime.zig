@@ -525,6 +525,18 @@ pub const WorkerEvent = union(enum) {
 pub const WorkerEventBatch = struct {
     events: std.ArrayList(WorkerEvent),
     cancelled_turn_id: ?u64,
+    /// Where a time-bounded drain stopped scanning the turn segment that the
+    /// first events continue; null when they start a fresh scan.
+    head_segment: ?HeadSegmentScan = null,
+};
+
+/// How far a scan of one turn segment has got: the turn its events named so
+/// far, or the interrupted answer a `turn_finished` already settled.
+pub const HeadSegmentScan = union(enum) {
+    turn: ?u64,
+    settled: bool,
+
+    pub const fresh: HeadSegmentScan = .{ .turn = null };
 };
 
 pub const WorkerRuntime = struct {
@@ -540,6 +552,12 @@ pub const WorkerRuntime = struct {
     active_context_compaction: bool = false,
     history_publication_response: HistoryPublicationResponse = .idle,
     worker_events: std.ArrayList(WorkerEvent) = .empty,
+    /// Scan state for the queue head after a time-bounded drain put events
+    /// back mid-segment; the next take hands it over. Guarded by `worker_mutex`.
+    head_segment: ?HeadSegmentScan = null,
+    /// Set by a time-bounded put-back so the main loop runs its next
+    /// iteration without waiting; read once. Guarded by `worker_mutex`.
+    drain_continuation_due: bool = false,
     worker_processing: bool = false,
     active_turn_id: u64 = 0,
     active_tool_calls: std.StringHashMapUnmanaged(void) = .empty,
@@ -835,6 +853,32 @@ pub const WorkerRuntime = struct {
         self.worker_cond.broadcast(io_mod.getIo());
     }
 
+    /// Puts back the events a time-bounded drain did not reach, ahead of newer
+    /// ones, with the scan state of the segment they continue (null when the
+    /// first of them starts a segment). Takes ownership on success.
+    pub fn prependOwnedEventsForBudget(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        events: []const WorkerEvent,
+        head_segment: ?HeadSegmentScan,
+    ) !void {
+        if (events.len == 0) return;
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        try self.worker_events.insertSlice(alloc, 0, events);
+        self.head_segment = head_segment;
+        self.drain_continuation_due = true;
+        self.worker_cond.broadcast(io_mod.getIo());
+    }
+
+    /// True once after each time-bounded put-back.
+    pub fn takeDrainContinuationDue(self: *WorkerRuntime) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        defer self.drain_continuation_due = false;
+        return self.drain_continuation_due;
+    }
+
     pub fn pushTurnFinished(self: *WorkerRuntime, alloc: std.mem.Allocator, event: types.TurnFinished) !void {
         std.debug.assert(event.turn_id != 0);
 
@@ -893,6 +937,7 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         const events = self.worker_events;
         self.worker_events = .empty;
+        defer self.head_segment = null;
         return .{
             .events = events,
             .cancelled_turn_id = if (self.worker_cancel_requested.load(.seq_cst) and
@@ -901,6 +946,7 @@ pub const WorkerRuntime = struct {
                 self.active_turn_id
             else
                 null,
+            .head_segment = self.head_segment,
         };
     }
 
@@ -7200,4 +7246,48 @@ test "session transition hold keeps an existing queued prompt until released" {
     defer freeQueuedPrompt(alloc, prompt);
     try std.testing.expectEqualStrings("queued", prompt.prompt);
     try std.testing.expect((try runtime.tryTakeNextPrompt(alloc)) == null);
+}
+
+test "a time-bounded put-back hands its segment scan to the next take only" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    try runtime.pushEvent(alloc, .{ .api_status_text = @constCast("newer") });
+    const retained = [_]WorkerEvent{
+        .{ .api_status_text = try alloc.dupe(u8, "first") },
+        .{ .api_status_text = try alloc.dupe(u8, "second") },
+    };
+    errdefer {
+        for (retained) |event| freeWorkerEvent(alloc, event);
+    }
+    try runtime.prependOwnedEventsForBudget(alloc, &retained, .{ .turn = 7 });
+    try std.testing.expect(runtime.takeDrainContinuationDue());
+    try std.testing.expect(!runtime.takeDrainContinuationDue());
+
+    var batch = runtime.takeEventBatch();
+    defer freeEventList(alloc, &batch.events);
+    try std.testing.expectEqual(@as(usize, 3), batch.events.items.len);
+    try std.testing.expectEqualStrings("first", batch.events.items[0].api_status_text);
+    try std.testing.expectEqualStrings("second", batch.events.items[1].api_status_text);
+    try std.testing.expectEqualStrings("newer", batch.events.items[2].api_status_text);
+    try std.testing.expectEqual(@as(?HeadSegmentScan, .{ .turn = 7 }), batch.head_segment);
+
+    var next = runtime.takeEventBatch();
+    defer freeEventList(alloc, &next.events);
+    try std.testing.expectEqual(@as(?HeadSegmentScan, null), next.head_segment);
+}
+
+test "a plain put-back carries no segment scan or continuation" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+
+    const retained = [_]WorkerEvent{.{ .api_status_text = try alloc.dupe(u8, "blocked") }};
+    errdefer freeWorkerEvent(alloc, retained[0]);
+    try runtime.prependOwnedEvents(alloc, &retained);
+    try std.testing.expect(!runtime.takeDrainContinuationDue());
+    var batch = runtime.takeEventBatch();
+    defer freeEventList(alloc, &batch.events);
+    try std.testing.expectEqual(@as(?HeadSegmentScan, null), batch.head_segment);
 }
