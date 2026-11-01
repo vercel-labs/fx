@@ -218,6 +218,7 @@ class Checker:
 
     def run(self) -> list[Problem]:
         self.check_env()
+        self.check_documented_overrides()
         self.check_flags()
         self.check_parsing()
         self.check_settings()
@@ -286,8 +287,12 @@ class Checker:
                 )
         for name in sorted(external - set(seen_external)):
             self.report(None, "env", f"external_env lists {name}, which src/ no longer reads; remove it")
-        # fx config list shows these as the documented FX_* setting overrides,
-        # and every variable fx.sh documents is stable.
+
+    def check_documented_overrides(self) -> None:
+        """fx config list shows the variables env_settings.collect reads as the
+        documented FX_* setting overrides, and every variable fx.sh documents is
+        stable. An unregistered name is check_env's to report."""
+        registered = self.registry.get("env", {})
         overrides: dict[str, Line] = {}
         for line in function_body(self.lines(ENV_SETTINGS), "collect"):
             for match in FX_LITERAL.finditer(line.text):
