@@ -15,6 +15,8 @@ const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const app_agent_runtime = @import("app_agent_runtime.zig");
 const ui_render = @import("../../ui/render.zig");
+const render_input = @import("../../ui/footer/render_input.zig");
+const agents_menu_presentation = @import("../../ui/footer/agents_menu_presentation.zig");
 const session_mod = @import("../session/session.zig");
 const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_process_runtime = @import("app_process_runtime.zig");
@@ -97,11 +99,71 @@ pub const ChildAgent = struct {
     /// see `turnGoing`.
     fn workGoing(self: *ChildAgent) bool {
         if (self.agent.child_run) |*run| if (run.inFlight()) return true;
-        return self.agent.worker.isProcessing() or
-            self.agent.worker.queuedPromptCount() > 0 or
-            self.agent.worker.hasPendingEvents();
+        return turnInFlight(&self.agent) or self.agent.worker.hasPendingEvents();
     }
 };
+
+/// The agent list ↓, Ctrl+X, and `/agents` open. Its rows are every open
+/// agent in switch order, built each time it is drawn so each shows what it
+/// is doing now. The highlighted row's agent is the one on screen: moving
+/// through the list previews each agent, Enter keeps the one shown, and Esc
+/// or Ctrl+X go back to `origin`.
+pub const AgentsMenu = struct {
+    open: bool = false,
+    /// The selected agent's place in the switch list, from 0.
+    selected: usize = 0,
+    window_start: usize = 0,
+    /// The agent on screen when the list opened, null for the first
+    /// instance. Compared by address only, so it is never read after its
+    /// agent closes. Meaningful while `open`.
+    origin: ?*ChildAgent = null,
+    /// Backs the rows the last projection showed. Owned.
+    rows: std.ArrayList(render_input.AgentsMenuRow) = .empty,
+
+    pub fn deinit(self: *AgentsMenu, alloc: Allocator) void {
+        self.rows.deinit(alloc);
+        self.* = .{};
+    }
+};
+
+/// What an instance is doing, as the instance list shows it, most urgent
+/// first.
+const InstanceState = enum {
+    needs_approval,
+    has_question,
+    /// A request only the user can continue, such as one out of credits.
+    needs_you,
+    working,
+    finished,
+    idle,
+
+    pub fn label(self: InstanceState) []const u8 {
+        return switch (self) {
+            .needs_approval => "needs approval",
+            .has_question => "has a question",
+            .needs_you => "needs you",
+            .working => "working",
+            .finished => "finished",
+            .idle => "idle",
+        };
+    }
+};
+
+/// `request_waits` is whether the agent's status row shows a request that
+/// waits for the user.
+fn instanceState(agent: *agents.Agent, request_waits: bool) InstanceState {
+    if (agent.approval_prompt.isActive()) return .needs_approval;
+    if (agent.question_prompt.isActive()) return .has_question;
+    if (request_waits) return .needs_you;
+    if (turnInFlight(agent)) return .working;
+    if (agent.finished_unseen) return .finished;
+    return .idle;
+}
+
+/// Whether one of `agent`'s turns is going or queued.
+fn turnInFlight(agent: *agents.Agent) bool {
+    return agent.worker.isProcessing() or agent.worker.queuedPromptCount() > 0;
+}
 
 /// Slot threads and the main loop both use the mailbox's list.
 const mailbox_alloc = std.heap.c_allocator;
@@ -558,13 +620,20 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// Whether Alt+←/→ has another agent to switch to. Brings in the
-        /// subagents main's session started before a restart first.
-        pub fn canSwitch(app: *App) bool {
+        /// Whether the agent list has an agent to switch to besides the one on
+        /// screen. Brings in the subagents main's session started before a
+        /// restart first.
+        pub fn hasAnotherAgent(app: *App) bool {
             syncChildList(app) catch |err| {
                 debug_trace.logf("host", "child list sync failed err={s}", .{@errorName(err)});
             };
-            return app.child_agents.items.len > 0;
+            return openAgentCount(app) > 1;
+        }
+
+        /// How many agents are open: the instances, the first one included,
+        /// and every subagent the app hosts.
+        fn openAgentCount(app: *App) usize {
+            return @as(usize, if (firstOpen(app)) 1 else 0) + app.child_agents.items.len;
         }
 
         /// Puts every subagent in the subagent host's registry in the switch
@@ -583,25 +652,7 @@ pub fn Runtime(comptime App: type) type {
             orderByListing(app.child_agents.items, listing);
         }
 
-        /// Puts the next or previous agent on screen. The list is main,
-        /// then the subagents in the order they started, wrapping at both ends.
-        pub fn switchAgent(app: *App, direction: input_action.SwitchDirection) !void {
-            var list: std.ArrayList(?*ChildAgent) = .empty;
-            defer list.deinit(app.alloc);
-            try switchList(app, &list);
-            const total = list.items.len;
-            if (total <= 1) return;
-            const current = for (list.items, 0..) |entry, position| {
-                if (entry == app.agent_on_screen) break position;
-            } else unreachable;
-            const target = switch (direction) {
-                .next => (current + 1) % total,
-                .previous => (current + total - 1) % total,
-            };
-            try show(app, list.items[target]);
-        }
-
-        /// The order Alt+←/→ walks: the instances in launch order,
+        /// The agent list's rows, in order: the instances in launch order,
         /// the first one as null, each followed by the subagents in its tree
         /// in the order they started. With one instance this is main, then
         /// every subagent in start order, as before instances existed.
@@ -651,37 +702,280 @@ pub fn Runtime(comptime App: type) type {
 
         /// Where a notice on a subagent's screen sends the user back to: the
         /// instance whose tree holds it, by the name the waiting note uses,
-        /// and the key that reaches it. Null off a subagent's screen.
+        /// and the key that opens the agent list to pick it. Null off a
+        /// subagent's screen.
         pub const Home = struct { name: []const u8, key: []const u8 };
 
         pub fn homeOfScreen(app: *App, name_buf: []u8) ?Home {
             const child = app.agent_on_screen orelse return null;
             if (child.agent.role != .subagent) return null;
-            const root = rootInstance(app, child);
-            const hosted: ?*ChildAgent = if (root == &app.main_agent) null else for (app.child_agents.items) |entry| {
-                if (&entry.agent == root) break entry;
-            } else null;
-            return .{ .name = noteName(app, hosted, name_buf), .key = keyToward(app, hosted) };
+            return .{ .name = noteName(app, screenInstance(app), name_buf), .key = switchKey(app) };
         }
 
-        /// The key that reaches agent `target`, null for the first instance,
-        /// from the one on screen in fewer presses while several instances
-        /// are open. With one, main is back and its subagents ahead, as
-        /// before instances existed.
-        pub fn keyToward(app: *App, target: ?*ChildAgent) []const u8 {
-            if (openInstanceCount(app) <= 1) return if (target == null) "Alt+←" else "Alt+→";
-            var order: std.ArrayList(?*ChildAgent) = .empty;
-            defer order.deinit(app.alloc);
-            switchList(app, &order) catch return "Alt+→";
-            const from = positionIn(order.items, app.agent_on_screen) orelse return "Alt+→";
-            const to = positionIn(order.items, target) orelse return "Alt+→";
-            const forward = (to + order.items.len - from) % order.items.len;
-            return if (forward <= order.items.len - forward) "Alt+→" else "Alt+←";
+        /// The instance on screen, or the one whose tree holds the subagent
+        /// on screen; null for the first instance.
+        fn screenInstance(app: *App) ?*ChildAgent {
+            const child = app.agent_on_screen orelse return null;
+            if (child.agent.role != .subagent) return child;
+            const root = rootInstance(app, child);
+            if (root == &app.main_agent) return null;
+            for (app.child_agents.items) |entry| if (&entry.agent == root) return entry;
+            return null;
+        }
+
+        /// The footer note for a hidden agent waiting on the user, such as
+        /// "reviewer needs approval", or the finished note, or empty. It
+        /// waits on an approval, a question, or a request only the user can
+        /// continue, such as one out of credits. The footer follows it with
+        /// the agent indicator, which names the key that opens the agent
+        /// list. fx never switches on its own. `buf` backs the returned text.
+        pub fn waitingNote(app: *App, buf: []u8) []const u8 {
+            // The first waiting agent the note names, null for the first
+            // instance, which `main_agent` holds.
+            var first: ?*ChildAgent = null;
+            var found = false;
+            var state: InstanceState = .needs_approval;
+            var count: usize = 0;
+            if (app.agent_on_screen != null and firstOpen(app)) {
+                // Main's own request, not a subagent's that main also shows.
+                const main_waiting = if (app.main_agent.approval_prompt.request) |request|
+                    request.origin == .active_session
+                else
+                    false;
+                const asks = app.main_agent.question_prompt.isActive();
+                if (main_waiting or asks or requestWaitsForUser(app, null)) {
+                    found = true;
+                    state = if (main_waiting) .needs_approval else if (asks) .has_question else .needs_you;
+                    count += 1;
+                }
+            }
+            for (app.child_agents.items) |child| {
+                if (child == app.agent_on_screen) continue;
+                const approval = child.agent.approval_prompt.isActive();
+                const asks = child.agent.question_prompt.isActive();
+                if (!approval and !asks and !requestWaitsForUser(app, child)) continue;
+                if (!found) {
+                    first = child;
+                    found = true;
+                    state = if (approval) .needs_approval else if (asks) .has_question else .needs_you;
+                }
+                count += 1;
+            }
+            if (!found) return finishedNote(app, buf);
+            var name_buf: [32]u8 = undefined;
+            const name = noteName(app, first, &name_buf);
+            return if (count > 1)
+                std.mem.print(buf, "{s} and {d} more need you", .{ name, count - 1 }) catch ""
+            else
+                std.mem.print(buf, "{s} {s}", .{ name, state.label() }) catch "";
+        }
+
+        /// The key that opens the agent list from the composer as it is now:
+        /// ↓ while it is idle, else Ctrl+X.
+        pub fn switchKey(app: *App) []const u8 {
+            return if (composerIdle(app)) "↓" else "ctrl+x";
+        }
+
+        /// Whether ↓ in the composer opens the agent list: nothing typed,
+        /// pasted, or attached, and no prompt recalled from history, where ↓
+        /// moves forward through history instead.
+        pub fn composerIdle(app: *App) bool {
+            if (comptime !@hasField(App, "input_runtime")) return true;
+            const input = &app.input_runtime;
+            if (input.edit_state.input.items.len > 0) return false;
+            if (input.entities.pasted_blocks.items.len > 0) return false;
+            if (agents.screenAgentOf(app).pending_images.items.len > 0) return false;
+            return input.composer_history.activeIndex() == null;
         }
 
         fn positionIn(order: []const ?*ChildAgent, agent: ?*ChildAgent) ?usize {
             for (order, 0..) |value, index| if (value == agent) return index;
             return null;
+        }
+
+        fn targetAgent(app: *App, target: ?*ChildAgent) *AppAgent {
+            return if (target) |child| &child.agent else &app.main_agent;
+        }
+
+        /// Notes, after each tick, every instance one of whose turns ended
+        /// while it wasn't on screen, until it is shown. Redraws the footer
+        /// when one starts or ends a turn, for its note and the list.
+        pub fn noteFinishedTurns(app: *App) void {
+            var changed = false;
+            if (firstOpen(app)) changed = noteFinished(&app.main_agent, app.agent_on_screen == null) or changed;
+            for (app.child_agents.items) |child| {
+                if (child.agent.role != .instance) continue;
+                changed = noteFinished(&child.agent, child == app.agent_on_screen) or changed;
+            }
+            if (changed) app.shell.render_requests.request(.footer);
+        }
+
+        /// Updates `agent`'s marks; whether either changed.
+        fn noteFinished(agent: *AppAgent, on_screen: bool) bool {
+            const going = turnInFlight(agent);
+            const finished = if (on_screen) false else agent.finished_unseen or (agent.was_working and !going);
+            const changed = going != agent.was_working or finished != agent.finished_unseen;
+            agent.was_working = going;
+            agent.finished_unseen = finished;
+            return changed;
+        }
+
+        /// The footer note for hidden instances whose turns ended since they
+        /// were last shown, such as "fx 7 finished", or empty. Only while
+        /// several instances are open.
+        pub fn finishedNote(app: *App, buf: []u8) []const u8 {
+            if (openInstanceCount(app) <= 1) return "";
+            var first: ?*ChildAgent = null;
+            var found = false;
+            var count: usize = 0;
+            if (firstOpen(app) and app.agent_on_screen != null and app.main_agent.finished_unseen) {
+                found = true;
+                count += 1;
+            }
+            for (app.child_agents.items) |child| {
+                if (child.agent.role != .instance or child == app.agent_on_screen or !child.agent.finished_unseen) continue;
+                if (!found) first = child;
+                found = true;
+                count += 1;
+            }
+            if (!found) return "";
+            var name_buf: [32]u8 = undefined;
+            const name = noteName(app, first, &name_buf);
+            return if (count > 1)
+                std.mem.print(buf, "{s} and {d} more finished", .{ name, count - 1 }) catch ""
+            else
+                std.mem.print(buf, "{s} finished", .{name}) catch "";
+        }
+
+        pub fn menuActive(app: *App) bool {
+            if (comptime !@hasField(App, "instances")) return false;
+            return app.instances.agents_menu.open;
+        }
+
+        /// Opens the agent list on the agent on screen, which Esc and Ctrl+X
+        /// go back to.
+        pub fn openMenu(app: *App) !void {
+            if (comptime !@hasField(App, "instances")) return;
+            syncChildList(app) catch |err| {
+                debug_trace.logf("host", "child list sync failed err={s}", .{@errorName(err)});
+            };
+            var order: std.ArrayList(?*ChildAgent) = .empty;
+            defer order.deinit(app.alloc);
+            try switchList(app, &order);
+            const menu = &app.instances.agents_menu;
+            menu.selected = positionIn(order.items, app.agent_on_screen) orelse 0;
+            menu.window_start = 0;
+            menu.origin = app.agent_on_screen;
+            menu.open = true;
+            debug_trace.eventf("host", "agents_menu_opened", .{}, "agents={d} position={d} agent={s}", .{
+                order.items.len,
+                menu.selected + 1,
+                nameOf(app.agent_on_screen),
+            });
+            app.shell.render_requests.request(.footer);
+        }
+
+        /// Closes the list, keeping on screen the agent it shows. Another
+        /// surface taking the footer closes it this way.
+        pub fn closeMenu(app: *App) bool {
+            if (!menuActive(app)) return false;
+            endMenu(app);
+            debug_trace.eventf("host", "agents_menu_closed", .{}, "agent={s}", .{nameOf(app.agent_on_screen)});
+            return true;
+        }
+
+        fn endMenu(app: *App) void {
+            const menu = &app.instances.agents_menu;
+            menu.open = false;
+            menu.origin = null;
+            app.shell.render_requests.request(.footer);
+        }
+
+        /// Esc and Ctrl+X: closes the list and puts back the agent it opened
+        /// on. If that agent closed meanwhile, the one shown stays.
+        pub fn backMenu(app: *App) !bool {
+            if (!menuActive(app)) return false;
+            const origin = app.instances.agents_menu.origin;
+            endMenu(app);
+            var order: std.ArrayList(?*ChildAgent) = .empty;
+            defer order.deinit(app.alloc);
+            try switchList(app, &order);
+            if (positionIn(order.items, origin) != null) {
+                try show(app, origin);
+            } else {
+                debug_trace.logf("host", "agents menu origin closed; keeping agent={s}", .{nameOf(app.agent_on_screen)});
+            }
+            debug_trace.eventf("host", "agents_menu_back", .{}, "agent={s}", .{nameOf(app.agent_on_screen)});
+            return true;
+        }
+
+        /// Moves the list's selection by `delta`, keeping it in view in
+        /// `row_budget` rows, and shows the agent it lands on: the list
+        /// previews by switching.
+        pub fn moveMenu(app: *App, delta: i32, row_budget: u16) !bool {
+            if (!menuActive(app)) return false;
+            var order: std.ArrayList(?*ChildAgent) = .empty;
+            defer order.deinit(app.alloc);
+            try switchList(app, &order);
+            if (order.items.len == 0) return true;
+            const menu = &app.instances.agents_menu;
+            const last: i64 = @intCast(order.items.len - 1);
+            const current: i64 = @intCast(@min(menu.selected, order.items.len - 1));
+            menu.selected = @intCast(std.math.clamp(current + delta, 0, last));
+            menu.window_start = agents_menu_presentation.windowStart(menuProjection(app), row_budget);
+            app.shell.render_requests.request(.footer);
+            const target = order.items[menu.selected];
+            if (target == app.agent_on_screen) return true;
+            try show(app, target);
+            debug_trace.eventf("host", "agents_menu_previewed", .{}, "position={d} agent={s}", .{ menu.selected + 1, nameOf(target) });
+            return true;
+        }
+
+        /// Enter: closes the list, keeping the agent it shows.
+        pub fn submitMenu(app: *App) !bool {
+            if (!menuActive(app)) return false;
+            var order: std.ArrayList(?*ChildAgent) = .empty;
+            defer order.deinit(app.alloc);
+            try switchList(app, &order);
+            const selected = app.instances.agents_menu.selected;
+            endMenu(app);
+            // The preview already shows the selected agent; a list that
+            // changed under it shows it now.
+            if (order.items.len > 0) {
+                const chosen = order.items[@min(selected, order.items.len - 1)];
+                if (chosen != app.agent_on_screen) try show(app, chosen);
+            }
+            debug_trace.eventf("host", "agents_menu_chosen", .{}, "agent={s}", .{nameOf(app.agent_on_screen)});
+            return true;
+        }
+
+        /// The agent list as the footer draws it now, or an inactive one.
+        pub fn menuProjection(app: *App) render_input.AgentsMenuProjection {
+            if (!menuActive(app)) return .{};
+            const menu = &app.instances.agents_menu;
+            var order: std.ArrayList(?*ChildAgent) = .empty;
+            defer order.deinit(app.alloc);
+            switchList(app, &order) catch return .{};
+            menu.rows.clearRetainingCapacity();
+            menu.rows.ensureTotalCapacity(app.alloc, order.items.len) catch return .{};
+            // Instances come in launch order, so each one's number is the
+            // count of instance rows so far.
+            var number: usize = 0;
+            for (order.items) |target| {
+                const agent = targetAgent(app, target);
+                const subagent: ?*ChildAgent = if (target) |child| (if (child.agent.role == .subagent) child else null) else null;
+                if (subagent == null) number += 1;
+                menu.rows.appendAssumeCapacity(.{
+                    .number = if (subagent == null) number else 0,
+                    .subagent_name = if (subagent) |child| child.displayName() else "",
+                    .title = agent.session_title.items,
+                    .profile = agent.profile.profile.name,
+                    .state = instanceState(agent, requestWaitsForUser(app, target)).label(),
+                    .on_screen = target == menu.origin,
+                });
+            }
+            if (menu.selected >= menu.rows.items.len) menu.selected = menu.rows.items.len -| 1;
+            return .{ .rows = menu.rows.items, .selected = menu.selected, .window_start = menu.window_start };
         }
 
         /// Whether the first instance, kept in `main_agent`, still runs.
@@ -720,23 +1014,30 @@ pub fn Runtime(comptime App: type) type {
             return 0;
         }
 
-        /// The footer's name for the agent on screen: a subagent's own label,
-        /// or an instance's place among the instances while there are
-        /// several, the first one included. Empty for a single
-        /// instance, as before instances existed. Valid until the next call.
-        pub fn footerLabelOnScreen(app: *App) []const u8 {
+        /// The footer's agent indicator, on its right: the agent on screen
+        /// and the key that opens the agent list, such as "fx 2/3 ↓", or
+        /// "fx 2/3 · ctrl+x" while the composer holds a draft. A subagent
+        /// shows its own label, and the first instance alone with subagents
+        /// shows "main". Empty with a single agent, as before instances
+        /// existed. Valid until the next call.
+        pub fn footerIndicator(app: *App) []const u8 {
+            if (openAgentCount(app) <= 1) return "";
+            var name_buf: [32]u8 = undefined;
+            const name = footerName(app, &name_buf);
+            const key = switchKey(app);
+            const separator = if (composerIdle(app)) " " else " · ";
+            return std.mem.print(&app.instances.label_buf, "{s}{s}{s}", .{ name, separator, key }) catch key;
+        }
+
+        /// The agent on screen as the indicator names it: a subagent's own
+        /// label, else the instance's place among the instances while
+        /// there are several, else "main". May use `buf`.
+        fn footerName(app: *App, buf: []u8) []const u8 {
             if (app.agent_on_screen) |child| if (child.agent.role == .subagent) return child.footerLabel();
-            var total: usize = if (firstOpen(app)) 1 else 0;
-            var position: usize = 1;
-            for (app.child_agents.items) |child| {
-                if (child.agent.role != .instance) continue;
-                total += 1;
-                if (app.agent_on_screen) |on_screen| if (on_screen == child) {
-                    position = total;
-                };
-            }
-            if (total == 1) return "";
-            return std.mem.print(&app.instances.label_buf, "fx {d}/{d}", .{ position, total }) catch "";
+            const total = openInstanceCount(app);
+            if (total <= 1) return "main";
+            const position = instanceNumber(app, app.agent_on_screen) orelse 1;
+            return std.mem.print(buf, "fx {d}/{d}", .{ position, total }) catch "fx";
         }
 
         /// The instance whose tree subagent `child` is in: the one that
@@ -868,6 +1169,17 @@ pub fn Runtime(comptime App: type) type {
 
         fn screenOf(app: *App, child: ?*ChildAgent) *ScreenSlot {
             return if (child) |value| &value.screen else &app.main_screen;
+        }
+
+        /// Whether agent `target`'s status row, null for the first instance,
+        /// shows a request that waits for the user: the screen's row for the
+        /// agent on it, the one kept with its transcript for a hidden one.
+        fn requestWaitsForUser(app: *App, target: ?*ChildAgent) bool {
+            if (target == app.agent_on_screen) {
+                if (comptime !@hasDecl(@TypeOf(app.shell), "worker_status_state")) return false;
+                return app.shell.worker_status_state().waitsForUser();
+            }
+            return screenOf(app, target).transcript.notebook.worker_status.waitsForUser();
         }
 
         fn nameOf(child: ?*ChildAgent) []const u8 {
@@ -1581,7 +1893,9 @@ test "the switch order holds for random hosts" {
 }
 
 test "the switch order holds for fuzzed hosts" {
-    try std.testing.fuzz({}, fuzzSwitchOrder, .{});
+    try std.testing.fuzz({}, fuzzSwitchOrder, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").switch_order.*),
+    });
 }
 
 fn fuzzSwitchOrder(_: void, smith: *std.testing.Smith) !void {

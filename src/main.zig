@@ -43,6 +43,7 @@ const app_session_runtime = @import("core/app/app_session_runtime.zig");
 const app_upgrade_runtime = @import("core/app/app_upgrade_runtime.zig");
 const app_worker_runtime = @import("core/app/app_worker_runtime.zig");
 const app_agents_runtime = @import("core/app/app_agents_runtime.zig");
+const render_input = @import("ui/footer/render_input.zig");
 const app_profile_runtime = @import("core/app/app_profile_runtime.zig");
 const app_instances_runtime = @import("core/app/app_instances_runtime.zig");
 const profiles = @import("core/profiles/profiles.zig");
@@ -3210,6 +3211,7 @@ const App = struct {
         // its own context.
         AgentsAppRuntime.takePosts(self);
         try AgentsAppRuntime.tickChildren(self, {}, tickAgentInContext);
+        AgentsAppRuntime.noteFinishedTurns(self);
         AgentsAppRuntime.settleChildRuns(self);
         AgentsAppRuntime.settleLentQuestion(self);
         AgentsAppRuntime.lendQuestion(self);
@@ -3254,6 +3256,22 @@ const App = struct {
         try InstancesAppRuntime.closeOnScreen(self);
     }
 
+    /// ↓, Ctrl+X, and `/agents`: opens the agent list in place of any other
+    /// footer menu or panel.
+    pub fn openAgentsMenu(self: *App) !void {
+        app_commands.Handlers(App).closeFooterMenus(self);
+        try AgentsAppRuntime.openMenu(self);
+    }
+
+    pub fn closeAgentsMenu(self: *App) void {
+        _ = AgentsAppRuntime.closeMenu(self);
+    }
+
+    /// The instance list as the footer draws it now.
+    pub fn agentsMenuProjection(self: *App) render_input.AgentsMenuProjection {
+        return AgentsAppRuntime.menuProjection(self);
+    }
+
     /// Applies profile `name` to instance `agent`.
     pub fn applyInstanceProfile(self: *App, agent: *agents.Agent, name: []const u8) !void {
         if (comptime host_profile.tools) {
@@ -3276,9 +3294,9 @@ const App = struct {
         return ProfileAppRuntime.profileMode(agent, "instance", parent);
     }
 
-    /// The footer's name for the agent on screen.
+    /// The footer's agent indicator, such as "fx 2/3 ↓".
     pub fn footerAgentLabel(self: *App) []const u8 {
-        return AgentsAppRuntime.footerLabelOnScreen(self);
+        return AgentsAppRuntime.footerIndicator(self);
     }
 
     /// True while a subagent, not an instance, is on screen.
@@ -3330,69 +3348,9 @@ const App = struct {
         return child.displayName();
     }
 
-    /// The footer note for a hidden agent waiting on the user, such as
-    /// "reviewer needs approval · Alt+→", or empty. It waits on an approval,
-    /// a question, or a request only the user can continue, such as one out
-    /// of credits. fx never switches on its own. `buf` backs the returned
-    /// text.
+    /// The footer note for a hidden agent waiting on the user.
     pub fn hiddenAgentWaitingNote(self: *App, buf: []u8) []const u8 {
-        const Wait = enum { approval, question, request };
-        // The first waiting agent the note names, null for the first
-        // instance, which `main_agent` holds.
-        var first: ?*app_agents_runtime.ChildAgent = null;
-        var first_wait: ?Wait = null;
-        var count: usize = 0;
-        if (self.agent_on_screen != null and AgentsAppRuntime.firstOpen(self)) {
-            // Main's own request, not a subagent's that main also shows.
-            const main_waiting = if (self.main_agent.approval_prompt.request) |request|
-                request.origin == .active_session
-            else
-                false;
-            const wait: ?Wait = if (main_waiting)
-                .approval
-            else if (self.main_agent.question_prompt.isActive())
-                .question
-            else if (requestWaitsForUser(&self.main_screen))
-                .request
-            else
-                null;
-            if (wait) |value| {
-                first_wait = value;
-                count += 1;
-            }
-        }
-        for (self.child_agents.items) |child| {
-            if (child == self.agent_on_screen) continue;
-            const wait: Wait = if (child.agent.approval_prompt.isActive())
-                .approval
-            else if (child.agent.question_prompt.isActive())
-                .question
-            else if (requestWaitsForUser(&child.screen))
-                .request
-            else
-                continue;
-            if (first_wait == null) {
-                first = child;
-                first_wait = wait;
-            }
-            count += 1;
-        }
-        const wait = first_wait orelse return "";
-        var name_buf: [32]u8 = undefined;
-        const name = AgentsAppRuntime.noteName(self, first, &name_buf);
-        const key = AgentsAppRuntime.keyToward(self, first);
-        if (count > 1) return std.mem.print(buf, "{s} and {d} more need you · {s}", .{ name, count - 1, key }) catch "";
-        return switch (wait) {
-            .approval => std.mem.print(buf, "{s} needs approval · {s}", .{ name, key }) catch "",
-            .question => std.mem.print(buf, "{s} has a question · {s}", .{ name, key }) catch "",
-            .request => std.mem.print(buf, "{s} needs you · {s}", .{ name, key }) catch "",
-        };
-    }
-
-    /// Whether a hidden agent's status row, kept with its transcript off
-    /// screen, shows a request that waits for the user.
-    fn requestWaitsForUser(screen: *const app_agents_runtime.ScreenSlot) bool {
-        return screen.transcript.notebook.worker_status.waitsForUser();
+        return AgentsAppRuntime.waitingNote(self, buf);
     }
 
     /// Handles the events and paced text of the agent in context.
@@ -5225,6 +5183,7 @@ test {
     _ = @import("core/config/config_runtime.zig");
     _ = @import("core/config/settings_store.zig");
     _ = @import("core/session/session_title_generation.zig");
+    _ = @import("ui/footer/agents_menu_presentation.zig");
     _ = @import("ui/footer/compact_command_menu_presentation.zig");
     _ = @import("ui/footer/settings_menu_presentation.zig");
     _ = @import("builtins/context.zig");
@@ -5464,13 +5423,15 @@ test "the tick visits only the child agents with work waiting" {
     try std.testing.expect(app.screenAgent() == &app.main_agent);
 }
 
-test "switching agents walks main then the subagents in start order, keeping each one's screen and draft" {
+test "the agent list previews each agent by switching, keeps every draft where it was typed, and Esc goes back" {
     const alloc = std.testing.allocator;
     var app = App{ .alloc = alloc };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
     defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
     const first = try addTestChildAgent(&app, "first");
     const second = try addTestChildAgent(&app, "second");
     first.name = try alloc.dupe(u8, "reviewer");
@@ -5478,34 +5439,69 @@ test "switching agents walks main then the subagents in start order, keeping eac
     try first.screen.transcript.notebook.transcript.appendSlice(alloc, "first text\n");
     try app.input_runtime.edit_state.setText(alloc, "main draft");
 
-    // Alt+Right from main: the first subagent, with its own screen and composer.
-    try App.AgentsAppRuntime.switchAgent(&app, .next);
+    // The list opens on main; ↓ previews the first subagent on its own
+    // screen with its own empty composer, and main's draft waits with main.
+    try runtime.openMenu(&app);
+    try std.testing.expect(runtime.menuActive(&app));
+    try std.testing.expect(try runtime.moveMenu(&app, 1, 10));
     try std.testing.expect(app.agent_on_screen == first);
     try std.testing.expect(app.screenAgent() == &first.agent);
     try std.testing.expectEqualStrings("first text\n", app.shell.notebook.transcript.items);
     try std.testing.expectEqualStrings("main text\n", app.main_screen.transcript.notebook.transcript.items);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
-    try app.input_runtime.edit_state.setText(alloc, "first draft");
+    try std.testing.expectEqualStrings("main draft", app.main_screen.draft.edit.input.items);
 
-    // On to the second, then back to main, wrapping at the end.
-    try App.AgentsAppRuntime.switchAgent(&app, .next);
+    // On to the last row, which stays put past the end.
+    _ = try runtime.moveMenu(&app, 1, 10);
     try std.testing.expect(app.agent_on_screen == second);
-    try std.testing.expectEqualStrings("first draft", first.screen.draft.edit.input.items);
-    try App.AgentsAppRuntime.switchAgent(&app, .next);
+    _ = try runtime.moveMenu(&app, 1, 10);
+    try std.testing.expect(app.agent_on_screen == second);
+
+    // Esc goes back to main, with its draft.
+    try std.testing.expect(try runtime.backMenu(&app));
+    try std.testing.expect(!runtime.menuActive(&app));
     try std.testing.expect(app.agent_on_screen == null);
-    try std.testing.expect(app.screenAgent() == &app.main_agent);
     try std.testing.expectEqualStrings("main text\n", app.shell.notebook.transcript.items);
     try std.testing.expectEqualStrings("main draft", app.input_runtime.edit_state.input.items);
 
-    // Alt+Left from main wraps to the last subagent.
-    try App.AgentsAppRuntime.switchAgent(&app, .previous);
-    try std.testing.expect(app.agent_on_screen == second);
-    try App.AgentsAppRuntime.switchAgent(&app, .previous);
+    // Enter keeps the agent shown; main's draft stays with main.
+    try runtime.openMenu(&app);
+    _ = try runtime.moveMenu(&app, 1, 10);
+    try std.testing.expect(try runtime.submitMenu(&app));
+    try std.testing.expect(!runtime.menuActive(&app));
     try std.testing.expect(app.agent_on_screen == first);
-    try std.testing.expectEqualStrings("first draft", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqualStrings("first text\n", app.shell.notebook.transcript.items);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("main draft", app.main_screen.draft.edit.input.items);
+
+    // A draft typed on the subagent stays with it when main comes back.
+    try app.input_runtime.edit_state.setText(alloc, "first draft");
+    try runtime.openMenu(&app);
+    _ = try runtime.moveMenu(&app, -1, 10);
+    try std.testing.expect(app.agent_on_screen == null);
+    try std.testing.expectEqualStrings("main draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("first draft", first.screen.draft.edit.input.items);
+    _ = try runtime.submitMenu(&app);
     try std.testing.expectEqualStrings("reviewer", first.displayName());
     try std.testing.expectEqualStrings("second", second.displayName());
+}
+
+test "the footer indicator names the agent on screen and the key that opens the list" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    // One agent: nothing to switch to, so no indicator.
+    try std.testing.expectEqualStrings("", app.footerAgentLabel());
+    const writer = try addTestChildAgent(&app, "writer-id");
+    writer.name = try alloc.dupe(u8, "writer");
+    // ↓ opens the list from an idle composer; with a draft, Ctrl+X does.
+    try std.testing.expectEqualStrings("main ↓", app.footerAgentLabel());
+    try app.input_runtime.edit_state.setText(alloc, "half typed");
+    try std.testing.expectEqualStrings("main · ctrl+x", app.footerAgentLabel());
+    try App.AgentsAppRuntime.show(&app, writer);
+    try std.testing.expectEqualStrings("writer · done ↓", app.footerAgentLabel());
 }
 
 test "while a subagent is on screen, the tick visits main and the other hidden agents" {
@@ -5563,10 +5559,10 @@ test "the footer notes a hidden agent waiting on an approval, never the one on s
     try std.testing.expectEqualStrings("", app.hiddenAgentWaitingNote(&buf));
 
     _ = try writer.agent.approval_prompt.syncRequest(alloc, .{ .label = "write" });
-    try std.testing.expectEqualStrings("writer needs approval · Alt+→", app.hiddenAgentWaitingNote(&buf));
+    try std.testing.expectEqualStrings("writer needs approval", app.hiddenAgentWaitingNote(&buf));
     // A subagent's request that main shows too is not main waiting.
     _ = try app.main_agent.approval_prompt.syncRequest(alloc, .{ .label = "write", .origin = .{ .subagent = "writer" } });
-    try std.testing.expectEqualStrings("writer needs approval · Alt+→", app.hiddenAgentWaitingNote(&buf));
+    try std.testing.expectEqualStrings("writer needs approval", app.hiddenAgentWaitingNote(&buf));
 
     // On its own screen the prompt shows instead of a note.
     try App.AgentsAppRuntime.show(&app, writer);
@@ -5575,7 +5571,7 @@ test "the footer notes a hidden agent waiting on an approval, never the one on s
     // From another subagent's screen, main's own request comes first.
     try App.AgentsAppRuntime.show(&app, reviewer);
     _ = try app.main_agent.approval_prompt.syncRequest(alloc, .{ .label = "shell" });
-    try std.testing.expectEqualStrings("main and 1 more need you · Alt+←", app.hiddenAgentWaitingNote(&buf));
+    try std.testing.expectEqualStrings("main and 1 more need you", app.hiddenAgentWaitingNote(&buf));
 }
 
 test "the footer notes a hidden agent whose request waits for the user" {
@@ -5595,7 +5591,7 @@ test "the footer notes a hidden agent whose request waits for the user" {
     // A hidden subagent out of credits waits on its own screen, where
     // the status row says why; the screen the user is on says who.
     writer.screen.transcript.notebook.worker_status.set_route_recovery(.{ .kind = .need_user, .need = .quota });
-    try std.testing.expectEqualStrings("writer needs you · Alt+→", app.hiddenAgentWaitingNote(&buf));
+    try std.testing.expectEqualStrings("writer needs you", app.hiddenAgentWaitingNote(&buf));
 
     // On its own screen the status row shows instead of a note.
     try App.AgentsAppRuntime.show(&app, writer);
@@ -5604,7 +5600,7 @@ test "the footer notes a hidden agent whose request waits for the user" {
     // It counts with the agents waiting on an answer.
     try App.AgentsAppRuntime.show(&app, null);
     _ = try reviewer.agent.approval_prompt.syncRequest(alloc, .{ .label = "write" });
-    try std.testing.expectEqualStrings("writer and 1 more need you · Alt+→", app.hiddenAgentWaitingNote(&buf));
+    try std.testing.expectEqualStrings("writer and 1 more need you", app.hiddenAgentWaitingNote(&buf));
 }
 
 test "a hidden subagent's approval is lent to main's screen, answered on its worker, and goes back" {
