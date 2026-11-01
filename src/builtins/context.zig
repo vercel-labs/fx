@@ -3746,6 +3746,7 @@ test "gateway_system_prompt: safety and permission boundaries" {
 
 test "gateway_system_prompt: focused tools and live verification" {
     try expectDefaultPromptContains("Choose the smallest suitable available capability.");
+    try expectDefaultPromptContains("When several tool calls do not depend on each other, make them together in one step");
     try expectDefaultPromptContains("verify the relevant behavior with direct checks");
     try expectDefaultPromptContains("Broaden when the touched surface is shared");
     try expectDefaultPromptContains("preserve the exact commands, pass or fail status, exit code when available, meaningful output");
