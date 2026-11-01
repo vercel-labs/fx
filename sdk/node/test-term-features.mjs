@@ -218,7 +218,7 @@ async function runUltrafastTerminal(scenario) {
     assert.equal(gets, 0, "Ultrafast must not add synchronous catalog I/O to startup");
     if (scenario === "unsupported") {
       runtime.write("unsupported ultra request\r");
-      await waitFor(() => grid().includes("UltrafastUnavailable"), "fail-closed catalog rejection");
+      await waitFor(() => grid().includes("ultrafast unavailable"), "fail-closed catalog rejection");
       assert.equal(gets, 1);
       assert.equal(posts.length, 0);
       runtime.abort();

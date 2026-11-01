@@ -398,7 +398,9 @@ fn buildFooterSurfaceProjection(
     // The provider flow's inline API-key field is rendered in the composer column,
     // not as the legacy auth panel.
     const inline_api_key = ctx.auth_picker.active and ctx.auth_picker.stage == .api_key and ctx.auth_picker.api_key_inline;
-    const show_auth_picker = !viewer_active and !modal_active and !ctx.stream.active and ctx.auth_picker.active and !inline_api_key;
+    const show_auth_picker = !viewer_active and !modal_active and
+        (!ctx.stream.active or ctx.auth_picker_during_turn) and
+        ctx.auth_picker.active and !inline_api_key;
     const show_settings_menu = !viewer_active and !show_auth_picker and !modal_active and ctx.settings_menu.active;
     const show_mcp_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !modal_active and ctx.mcp_host_menu.active();
     const show_help_menu = !viewer_active and !show_auth_picker and !show_settings_menu and !show_mcp_menu and !modal_active and ctx.help_menu.active;

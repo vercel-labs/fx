@@ -135,6 +135,7 @@ def main() -> None:
             repo_root=repo, control_binary=paths["control"], candidate_binary=paths["candidate"],
             hyperfine_binary=hyperfine, output_dir=args.output / f"startup-{cohort}",
             samples=samples, timeout_s=30, command_names=("status",) if cohort == 2 else None,
+            retry_speed_failures=False,
         )
         records = [measurement_record(result) for result in results]
         for record in records:

@@ -776,6 +776,10 @@ pub fn Runtime(comptime App: type) type {
                 else
                     "",
                 .auth_picker = app.auth.pickerView(),
+                .auth_picker_during_turn = if (comptime @hasDecl(@TypeOf(app.shell), "worker_status_state"))
+                    app.shell.worker_status_state().waitsForSignIn()
+                else
+                    false,
                 .skills_menu = if (comptime @hasField(App, "skills"))
                     render_input.skillsMenuProjection(&app.skills)
                 else
@@ -1658,6 +1662,7 @@ pub fn Runtime(comptime App: type) type {
                     .tool_slot => |slot| if (slot.thinking_label != null) .thinking else .tool_marker,
                     .turn_thinking => |thinking| switch (thinking.tone) {
                         .thinking => .thinking,
+                        .live => .live,
                         .neutral => .neutral,
                         .warning => .warning,
                         .success => .success,

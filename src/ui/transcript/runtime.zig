@@ -771,56 +771,6 @@ test "appendTurnSummaryEntry stores classified dim transcript row" {
     try std.testing.expectEqualStrings("\x1b[38;5;245m  2m 10s (↑10k ↓5k)\x1b[0m\n", rendered);
 }
 
-test "recovered route status is transient and final summary stays normal" {
-    const alloc = std.testing.allocator;
-    var runtime = TranscriptRuntime{
-        .layout = .{
-            .rows = 24,
-            .cols = 80,
-            .content_bottom = 20,
-            .divider_top_row = 21,
-            .input_row = 22,
-            .divider_bottom_row = 23,
-            .hint_row = 24,
-        },
-        .owned_top_row = 1,
-    };
-    defer runtime.deinit(alloc);
-
-    runtime.worker_status.set_route_recovery(.{
-        .kind = .auto_recovered,
-        .succeeded_attempt = 3,
-        .attempt_limit = 3,
-    }, 1_000);
-
-    switch (runtime.activityProjection()) {
-        .turn_thinking => |thinking| {
-            try std.testing.expectEqual(activity_runtime.ActivityProjection.Tone.success, thinking.tone);
-            try std.testing.expectEqualStrings("✓ recovered · attempt 3", thinking.label);
-        },
-        .none, .tool_slot => return error.TestUnexpectedResult,
-    }
-    try std.testing.expect(!runtime.worker_status.expire_transient(2_499));
-    try std.testing.expect(runtime.worker_status.expire_transient(2_500));
-    try std.testing.expect(runtime.activityProjection() == .none);
-
-    runtime.worker_status.set_route_recovery(.{
-        .kind = .auto_recovered,
-        .succeeded_attempt = 3,
-        .attempt_limit = 3,
-    }, 3_000);
-    _ = try runtime.appendTurnSummaryEntry(alloc, .{
-        .thinking_duration_ms = 15_000,
-        .turn_duration_ms = 130_000,
-        .token_progress = .{ .input_tokens = 10_000, .output_tokens = 5_000 },
-    });
-
-    try std.testing.expect(runtime.activityProjection() == .none);
-    try std.testing.expect(std.mem.find(u8, runtime.entries.items[0].raw_bytes.bytes, ui_render.dim_style) != null);
-    try std.testing.expect(std.mem.find(u8, runtime.entries.items[0].raw_bytes.bytes, "  2m 10s (↑10k ↓5k)") != null);
-    try std.testing.expect(std.mem.find(u8, runtime.entries.items[0].raw_bytes.bytes, "✓ recovered") == null);
-}
-
 test "appendTurnSummaryEntry leaves terminal route status visible" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
@@ -837,7 +787,7 @@ test "appendTurnSummaryEntry leaves terminal route status visible" {
     };
     defer runtime.deinit(alloc);
 
-    runtime.worker_status.set_route_recovery(.{ .kind = .content_filter }, 0);
+    runtime.worker_status.set_route_recovery(.{ .kind = .content_filter });
     _ = try runtime.appendTurnSummaryEntry(alloc, .{
         .thinking_duration_ms = 15_000,
         .turn_duration_ms = 130_000,
@@ -1309,6 +1259,28 @@ test "full transcript page navigation preserves tail intent while the page loads
 
     try std.testing.expect(runtime.full_transcript.follow_tail);
     try std.testing.expectEqual(@as(u32, 0), runtime.full_transcript.scroll_rows);
+}
+
+test "stopping background loads joins a full transcript load still running" {
+    var runtime = TranscriptRuntime{ .layout = testLayoutWithRows(12) };
+    runtime.layout.cols = 60;
+    defer runtime.deinit(std.testing.allocator);
+    try runtime.full_transcript_page_load.schedule(.{
+        .request = .{
+            .content_revision = 0,
+            .cols = 60,
+            .anchor = .tail,
+        },
+        .range = .{ .start = 0, .end = 0 },
+        .styles = .{},
+    });
+    try std.testing.expect(runtime.full_transcript_page_load.busy());
+
+    runtime.stopBackgroundLoads();
+    try std.testing.expect(!runtime.full_transcript_page_load.busy());
+    try std.testing.expect(!runtime.full_transcript_window_load.busy());
+    // The later teardown finds nothing left to join.
+    runtime.stopBackgroundLoads();
 }
 
 test "cancelled full transcript page completion is never installed" {
@@ -4551,6 +4523,9 @@ pub const TranscriptRuntime = struct {
     /// A settled terminal resize needs a canonical repaint from row one.
     /// It remains pending until the reset frame commits successfully.
     terminal_reset_pending: bool = false,
+    /// The first entry id the current answer attempt can add, set when the
+    /// attempt starts (`markAssistantAttemptStart`).
+    assistant_attempt_first_entry_id: ?u32 = null,
     /// A committed resize reset established terminal-bottom ownership that
     /// the next cancellation projection must preserve.
     resize_bottom_anchor_pending: bool = false,
@@ -4716,6 +4691,16 @@ pub const TranscriptRuntime = struct {
     ) void {
         std.debug.assert(self.shadow_vt == null);
         self.detached_commit_alloc = alloc;
+    }
+
+    /// Ends the full-detail loads and waits for their threads. They read
+    /// saved results through the session store, so they must stop before a
+    /// process exit closes it under them.
+    pub fn stopBackgroundLoads(self: *TranscriptRuntime) void {
+        self.full_transcript_window_load.cancelActive();
+        self.full_transcript_page_load.cancelActive();
+        self.full_transcript_window_load.deinit();
+        self.full_transcript_page_load.deinit();
     }
 
     pub fn deinit(self: *TranscriptRuntime, alloc: Allocator) void {
@@ -6718,7 +6703,6 @@ pub const TranscriptRuntime = struct {
             if (summary.completed_at_ms > 0) summary.completed_at_ms else io_mod.milliTimestamp(),
         );
         self.markTranscriptContentDirtyFrom(entry_id);
-        if (self.worker_status.clear_recovered_route()) self.render_requests.request(.footer);
         return entry_id;
     }
 
@@ -6825,6 +6809,55 @@ pub const TranscriptRuntime = struct {
     /// turn when mid-stream.
     pub fn tailAssistantSegments(self: *TranscriptRuntime) ?*AssistantTurnSegments {
         return transcript_store.tailAssistantSegments(self);
+    }
+
+    /// An answer attempt starts. Earlier text has shown, so entries from
+    /// `next_entry_id` on belong to this attempt.
+    pub fn markAssistantAttemptStart(self: *TranscriptRuntime) void {
+        self.assistant_attempt_first_entry_id = self.next_entry_id;
+    }
+
+    /// Removes what the current answer attempt added, so a restarted answer
+    /// streams in its place. That works only while none of it is final: the
+    /// attempt added at most the writable assistant entry at the tail, and
+    /// no row of it entered terminal history. A finished table or code block
+    /// is final at once, and a resize can push writable rows into history.
+    /// Returns false, changing nothing, when the attempt's output must stay.
+    pub fn discardAssistantAttempt(self: *TranscriptRuntime, alloc: Allocator) !bool {
+        const first = self.assistant_attempt_first_entry_id orelse return false;
+        const entries = self.entries.items;
+        var added: usize = 0;
+        while (added < entries.len and entries[entries.len - 1 - added].id() >= first) added += 1;
+        // Everything the attempt produced is still unshown text.
+        if (added == 0) return true;
+        if (added > 1 or entries[entries.len - 1] != .assistant_turn) return false;
+        const tail_id = entries[entries.len - 1].id();
+        if (try self.entryReachedHistory(alloc, tail_id)) return false;
+
+        try self.assertCanMutateTranscript();
+        var removed = self.entries.orderedRemove(self.entries.items.len - 1);
+        removed.deinit(alloc);
+        try self.rebuildTranscriptCacheAfterStructuredRewrite(alloc, "restarted answer");
+        self.recomputeCursorFromTranscript();
+        self.forgetShimmer();
+        self.markTranscriptStructureDirty();
+        debug_trace.logf("transcript", "restarted answer removed entry_id={d}", .{tail_id});
+        return true;
+    }
+
+    /// Whether any row of entry `id` has entered terminal history, where fx
+    /// can no longer change it.
+    fn entryReachedHistory(self: *const TranscriptRuntime, alloc: Allocator, id: u32) !bool {
+        var source = (try self.prepareCommittedRetentionSourceInterruptible(alloc, null)) orelse return false;
+        defer source.deinit(alloc);
+        const history = self.transcriptCommitDiagnostic().history_visual_offset;
+        var owner: ?u32 = null;
+        for (source.line_provenance, 0..) |line, index| {
+            owner = source_preparation.publication_owner(owner, line);
+            const owned = if (owner) |entry_id| entry_id == id else false;
+            if (owned and source.transcript_visual_row_offsets[index] < history) return true;
+        }
+        return false;
     }
 
     /// Appends paced text to the trailing assistant entry, creating one if needed,

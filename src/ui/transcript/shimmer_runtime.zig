@@ -25,6 +25,8 @@ pub const ActivityPaintInput = struct {
 
 pub const ActivityPaintStyle = enum {
     thinking,
+    /// `thinking`'s bullet and color with the bullet always shown.
+    live,
     tool_marker,
     neutral,
     warning,
@@ -196,12 +198,12 @@ fn paintPlannedActivityRow(
     else
         surface.plan.activity_band.bottom -| row +| 1;
     const static_status = switch (input.style) {
-        .neutral, .warning, .success, .danger => true,
+        .live, .neutral, .warning, .success, .danger => true,
         .thinking, .tool_marker => false,
     };
     const preserve_trailing_context = switch (input.style) {
         .warning, .danger => true,
-        .thinking, .tool_marker, .neutral, .success => false,
+        .thinking, .live, .tool_marker, .neutral, .success => false,
     };
     const preview = if (static_status)
         try wrappedStaticActivityLabel(
@@ -221,6 +223,7 @@ fn paintPlannedActivityRow(
             preview.bytes,
             input.thinking_blink orelse markerBlinkVisible(input.shimmer_pos),
         ),
+        .live => writeThinkingBlinkText(&buf, preview.bytes, true),
         .tool_marker => writeToolMarkerBlinkText(&buf, preview.bytes, input.shimmer_pos),
         .neutral => writeStaticStyledText(&buf, preview.bytes, ui_render.dim_style),
         .warning => writeStaticStyledText(&buf, preview.bytes, ui_render.warning_style),
@@ -793,6 +796,27 @@ test "activity surface painter honors the thinking blink override" {
 
     try std.testing.expectEqual(@as(u21, ' '), hidden.surface.cellAt(4, 1).?.codepoint);
     try std.testing.expectEqual(@as(u21, '•'), visible.surface.cellAt(4, 1).?.codepoint);
+}
+
+test "activity surface painter holds the live bullet still" {
+    const plan = testPlan(
+        .{ .transient_row = .{ .row = 4, .gap_above_rows = 0 } },
+        .{ .top = 4, .bottom = 4, .owner = .activity },
+    );
+    var painted = try testSurface(plan);
+    defer painted.surface.deinit();
+    defer painted.shadow.deinit();
+
+    // The frame phase and blink override that hide the thinking bullet leave
+    // the live one showing; animating it belongs to the status line.
+    _ = try paintActivityIntoSurface(&painted.surface, .{
+        .label = "• Gateway error · retrying · attempt 2 · 3s",
+        .style = .live,
+        .shimmer_pos = -render_request.animation_padding,
+        .thinking_blink = false,
+    });
+    try std.testing.expectEqual(@as(u21, '•'), painted.surface.cellAt(4, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 'G'), painted.surface.cellAt(4, 3).?.codepoint);
 }
 
 test "activity surface painter rejects activity over footer" {

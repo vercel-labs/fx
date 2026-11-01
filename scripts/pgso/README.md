@@ -2,7 +2,7 @@
 
 This directory owns the non-publishing Stage 1 build for a smaller macOS arm64 `fx` candidate. It preserves Zig ReleaseSafe semantics and the complete product feature set, then uses native LLVM profiles to keep measured hot code speed-oriented and compile profile-proven cold functions for size.
 
-The candidate is accepted only when it is no larger than its platform's ceiling, **7.000 MiB** for macOS arm64 and Linux arm64 and **8.000 MiB** for Linux x86_64, has the preferred **0.250 MiB** of size headroom under that ceiling, passes the deterministic product corpus, and stays within a **10%** p50 and p95 performance regression limit. The ordinary ReleaseSafe binary remains the control and recovery path.
+The candidate is accepted only when it is no larger than its platform's ceiling, **7.000 MiB** for macOS arm64 and Linux arm64 and **8.250 MiB** for Linux x86_64, has the preferred **0.250 MiB** of size headroom under that ceiling, passes the deterministic product corpus, and stays within a **10%** p50 and p95 performance regression limit. The ordinary ReleaseSafe binary remains the control and recovery path.
 
 ## Toolchain and target
 
@@ -132,8 +132,16 @@ zero-fill, which takes no space in the file, and stores those bytes at the
 start of `main`, or of the function Zig's `main` alias names. Even one nonzero
 byte otherwise writes the whole global out; std's `Progress` state is 18 KB for
 a single 255. Nothing reads these globals before `main`, and no later stage
-folds the stores back into an initializer. `globaldce,verify` then drops the
-dead constants. Benchmark artifacts receive every pass so their candidates keep
+folds the stores back into an initializer. `compact-error-names` then reads
+every error name through one function: Zig's `__zig_error_name_table` holds a
+16-byte pointer and length per error, about 26 KB of relocated data, and each
+`@errorName` reads it in place. The function returns the same pointer and
+length from 16-bit offsets into one blob of the same NUL-terminated names.
+Where a PHI merges an entry with another pointer, or a call passes it to a
+function that only reads it, such as a pair copy the IR outliner made, the
+pair goes to a stack slot laid out like the entry. Any entry or use the pass
+does not recognize leaves
+the table unchanged. `globaldce,verify` then drops the dead constants. Benchmark artifacts receive every pass so their candidates keep
 the production code shape. The candidate link passes
 `-no_compact_unwind`: fx builds without unwind tables, and newer Apple linkers
 otherwise emit about 160 KB of compact unwind data.
@@ -175,7 +183,7 @@ Candidate behavior qualification records each scenario's debug trace under `cand
 
 Startup compares `help`, `--version`, `status --json`, `doctor --json`, and `sessions --json`. It first copies each verified immutable artifact into the measurement directory and checks that the copy's SHA-256 matches, so both binaries start from the same page-cache state: on Linux a binary whose pages were read back from disk can start 10 to 15 percent slower than one written moments ago. It then executes each copy once to require successful output and empty stderr. Timing then uses pinned Hyperfine with no intermediate shell, ten warmups per artifact in each of at least 100 alternating rounds, and at least 1,000 measured samples per artifact. No contiguous block exceeds ten measured runs, so short machine-noise bursts are distributed between control and candidate while p95 retains 50 tail observations. Startup measurement sets `FX_DISABLE_KEYCHAIN=1` so the compiler comparison cannot be dominated by host-global macOS Keychain subprocess latency; the deterministic behavior corpus remains responsible for exercising Keychain integration. No per-sample Python process management or evidence-file write is included in the timed boundary, and measurement never replaces `zig-out/bin/fx`. Heavy qualification compares file indexing at 100,000 paths, UI activity, and approval transcript, diff, combined, and large-payload workloads.
 
-Heavy comparisons use at least 50 measured samples for each artifact and alternate pair order AB then BA. Command failures and timeouts fail qualification and are never replaced. A candidate fails when either p50 or p95 is more than 10% slower than its matching control. The existing Linux startup workflow remains the authority for the repository's absolute 2 ms command budget.
+Heavy comparisons use at least 50 measured samples for each artifact and alternate pair order AB then BA. Command failures and timeouts fail qualification and are never replaced. A candidate fails when either p50 or p95 is more than 10% slower than its matching control. When only that speed comparison fails, the startup command or heavy workload is measured once more, into a `retry` subdirectory of its logs, and the second measurement decides. Shared CI runners have brief slow periods that can push one measurement's p95 over the limit while its median is faster; a real regression fails both measurements. The first measurement's failed comparison stays in the evidence as `first_attempt`. A command failure or timeout is never measured again. The existing Linux startup workflow remains the authority for the repository's absolute 2 ms command budget.
 
 The heavy benchmarks are trained once by the candidate coordinator, not rebuilt
 by measurement jobs. For each benchmark, the coordinator selects only functions

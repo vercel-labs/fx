@@ -32,6 +32,13 @@ pub const Event = union(enum) {
     table: TablePayload,
     code_block: CodeBlockPayload,
     thematic_rule,
+    /// An answer attempt starts. It waits for earlier text to show, so the
+    /// host knows where the attempt's output begins.
+    attempt_start,
+    /// The attempt broke off and the answer starts over. The host replaces
+    /// what it showed of the attempt when it still can, and otherwise shows
+    /// this line after it.
+    attempt_restart: []u8,
 
     pub fn clone(self: Event, alloc: Allocator) Allocator.Error!Event {
         return switch (self) {
@@ -39,13 +46,15 @@ pub const Event = union(enum) {
             .table => |table| .{ .table = try table.clone(alloc) },
             .code_block => |block| .{ .code_block = try block.clone(alloc) },
             .thematic_rule => .thematic_rule,
+            .attempt_start => .attempt_start,
+            .attempt_restart => |text| .{ .attempt_restart = try alloc.dupe(u8, text) },
         };
     }
 
     pub fn requiresTextDrain(self: Event) bool {
         return switch (self) {
-            .text => false,
-            .table, .code_block, .thematic_rule => true,
+            .text, .attempt_restart => false,
+            .table, .code_block, .thematic_rule, .attempt_start => true,
         };
     }
 
@@ -61,7 +70,8 @@ pub const Event = union(enum) {
                 break :blk total;
             },
             .code_block => |block| block.language.len +| block.code.len,
-            .thematic_rule => 1,
+            .thematic_rule, .attempt_start => 1,
+            .attempt_restart => |text| text.len,
         };
     }
 
@@ -70,7 +80,8 @@ pub const Event = union(enum) {
             .text => |text| alloc.free(text),
             .table => |*table| table.deinit(alloc),
             .code_block => |*block| block.deinit(alloc),
-            .thematic_rule => {},
+            .thematic_rule, .attempt_start => {},
+            .attempt_restart => |text| alloc.free(text),
         }
         self.* = undefined;
     }

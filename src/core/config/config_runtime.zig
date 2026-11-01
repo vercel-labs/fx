@@ -8,6 +8,7 @@ const compactor = @import("../compactor/compactor.zig");
 const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const settings_store = @import("settings_store.zig");
+const settings_keys = @import("settings_keys.zig");
 const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
@@ -207,6 +208,7 @@ pub const ConfigDiagnosticCause = enum {
     settings_too_large,
     durable_path_unsafe,
     private_state_permissions_unsupported,
+    private_state_permissions_tightened,
     invalid_model_id,
     ignored_project_user_only_setting,
     legacy_workspace_preferences,
@@ -225,7 +227,16 @@ pub const ConfigDiagnostic = struct {
     recovery_path: ?[]u8 = null,
 
     pub fn reportAtStartup(self: ConfigDiagnostic) bool {
-        return self.cause != .legacy_workspace_preferences;
+        return self.cause != .legacy_workspace_preferences and self.note() == null;
+    }
+
+    /// A one-line note for the user instead of a configuration issue.
+    pub fn note(self: ConfigDiagnostic) ?[]const u8 {
+        return switch (self.cause) {
+            .private_state_permissions_tightened => profile_paths.displayText("Other users could write to ~/.fx, so fx took that access away. " ++
+                "If you didn't write ~/.fx/settings.json yourself, check it."),
+            else => null,
+        };
     }
 
     pub fn deinit(self: *ConfigDiagnostic, alloc: Allocator) void {
@@ -336,13 +347,22 @@ pub fn selectProviderModel(
     return .{ .provider = provider, .model = model };
 }
 
+/// What fx says about a provider name that isn't built in and isn't defined
+/// under "providers". `fx provider` and `fx ask --provider` both print it.
+pub fn unknownProviderMessage(alloc: Allocator, name: []const u8) ![]u8 {
+    return alloc.print(
+        "unknown provider {s}; expected gateway, codex, grok, or a name under \"providers\" in {s}",
+        .{ name, profile_paths.displayText("~/.fx/settings.json") },
+    );
+}
+
 /// User-facing guidance for a `ModelSelectionError`, or null for any other error.
 pub fn modelNotSelectedMessage(err: anyerror) ?[]const u8 {
     const for_this_run = "or set a model for this run with --model or FX_MODEL";
     return switch (err) {
         error.CodexModelNotSelected => "no Codex model is selected; run `fx provider codex` to choose one, " ++ for_this_run,
         error.GrokModelNotSelected => "no Grok model is selected; run `fx provider grok` to choose one, " ++ for_this_run,
-        error.ConfiguredModelNotSelected => "no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, " ++ for_this_run,
+        error.ConfiguredModelNotSelected => profile_paths.displayText("no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, " ++ for_this_run),
         else => null,
     };
 }
@@ -464,7 +484,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
     defer if (user_root) |*parsed| parsed.deinit();
 
     if (home_dir) |home| {
-        var store: ?settings_store.Store = settings_store.Store.initFromHome(alloc, home, .read_only) catch |err| blk: {
+        var store: ?settings_store.Store = settings_store.Store.initFromHomeTighteningReadOnly(alloc, home) catch |err| blk: {
             prompt_history_store_allowed = false;
             try diagnostics.append(alloc, .{
                 .layer = .user,
@@ -516,6 +536,9 @@ fn loadMergedSettingsDetailedWithOptionalHome(
                         user_root = null;
                     }
                 },
+            }
+            if (usable_store.tightened.any()) {
+                try diagnostics.append(alloc, .{ .layer = .user, .cause = .private_state_permissions_tightened });
             }
         }
     }
@@ -641,39 +664,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
             ),
         };
     }
-    if (io_mod.getenv("FX_PROVIDER_ORDER")) |order_override| {
-        switch (parseProviderOrderList(alloc, order_override)) {
-            .ok => |maybe_order| {
-                if (maybe_order) |order| {
-                    if (settings.provider_order) |old| {
-                        for (old) |slug| alloc.free(@constCast(slug));
-                        alloc.free(old);
-                    }
-                    settings.provider_order = order;
-                }
-            },
-            .invalid => debug_trace.logf("config", "ignoring invalid FX_PROVIDER_ORDER value", .{}),
-        }
-    }
-    if (io_mod.getenv("FX_PROVIDER_STRICT")) |strict_override| {
-        const trimmed = std.mem.trim(u8, strict_override, " \t\r\n");
-        if (parseEnvBool(trimmed)) |strict| {
-            settings.provider_strict = strict;
-        } else if (trimmed.len > 0) {
-            debug_trace.logf("config", "ignoring invalid FX_PROVIDER_STRICT value", .{});
-        }
-    }
-    if (io_mod.getenv("FX_REVIEW_MODEL")) |review_override| {
-        const trimmed = std.mem.trim(u8, review_override, " \t\r\n");
-        if (trimmed.len > 0) {
-            if (settings_store.validateModel(trimmed)) |_| {
-                if (settings.review_model) |old| alloc.free(old);
-                settings.review_model = try alloc.dupe(u8, trimmed);
-            } else |_| {
-                debug_trace.logf("config", "ignoring invalid FX_REVIEW_MODEL value", .{});
-            }
-        }
-    }
+    try applyEnvSettingOverrides(alloc, &settings);
     const ultrafast_mode_env_override = ultrafastModeEnvOverride() catch |err| blk: {
         try diagnostics.append(alloc, .{
             .layer = .user,
@@ -748,7 +739,9 @@ pub fn ultrafastModeEnvOverride() UltrafastModeEnvError!?bool {
     return parseEnvBool(trimmed) orelse error.InvalidUltrafastMode;
 }
 
-fn parseEnvBool(raw: []const u8) ?bool {
+/// The env-var booleans: `1`, `true`, `on`, or `yes`, and `0`, `false`, `off`,
+/// or `no`, in any case.
+pub fn parseEnvBool(raw: []const u8) ?bool {
     if (std.ascii.eqlIgnoreCase(raw, "1") or std.ascii.eqlIgnoreCase(raw, "true") or
         std.ascii.eqlIgnoreCase(raw, "on") or std.ascii.eqlIgnoreCase(raw, "yes")) return true;
     if (std.ascii.eqlIgnoreCase(raw, "0") or std.ascii.eqlIgnoreCase(raw, "false") or
@@ -819,52 +812,16 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
         if (workspace.get("prompt_history")) |value| {
             if (value == .object and value.object.contains("enabled")) return true;
         }
-        if (workspace.get("statusLine")) |value| {
-            if (value == .object and
-                (value.object.contains("context") or
-                    value.object.contains("session")))
-            {
-                return true;
+        for ([_]?std.json.Value{ workspace.get("statusLine"), workspace.get("status_line") }) |group| {
+            if (group) |value| {
+                if (value == .object and
+                    (value.object.contains("context") or
+                        value.object.contains("session")))
+                {
+                    return true;
+                }
             }
         }
-    }
-    return false;
-}
-
-fn isProfileOnlySettingKey(key: []const u8) bool {
-    inline for (&.{
-        "model",
-        "models",
-        "provider",
-        "providers",
-        "codex_model",
-        "grok_model",
-        "review_model",
-        "effort",
-        "fast_mode",
-        "ultrafast_mode",
-        "fast_mode_model_bound",
-        "slash_menu_categories",
-        "collapse_tool_calls",
-        "theme",
-        "session_titles",
-        "startup_scrollback",
-        "prompt_history",
-        "statusLine",
-        "notifications",
-        "context_limits",
-        "skill_match_fuzzy",
-        "first_call_tool_choice",
-        "auto_upgrade",
-        "update_channel",
-        "permission_mode",
-        "credential_source",
-        "yolo_acknowledged",
-        "permission",
-        "additional_directories",
-        "skill_symlink_authorities",
-    }) |profile_key| {
-        if (std.mem.eql(u8, key, profile_key)) return true;
     }
     return false;
 }
@@ -877,7 +834,7 @@ fn appendIgnoredProjectProfileSettingDiagnostics(
     if (root != .object) return;
     var iterator = root.object.iterator();
     while (iterator.next()) |entry| {
-        if (!isProfileOnlySettingKey(entry.key_ptr.*)) continue;
+        if (!settings_keys.ignoredInProject(entry.key_ptr.*)) continue;
         try diagnostics.append(alloc, .{
             .layer = .project,
             .cause = .ignored_project_user_only_setting,
@@ -1428,6 +1385,90 @@ fn readOptionalFile(alloc: Allocator, path: []const u8) !?[]u8 {
     return try io_mod.readFileToEnd(alloc, &file, max_settings_bytes + 1);
 }
 
+/// One `--config key=value` for a single run, with the value already checked
+/// and in settings-file form. The key is dotted, such as `statusLine.context`.
+pub const SettingOverride = struct {
+    key: []const u8,
+    value: std.json.Value,
+};
+
+/// Applies one run's `--config` values as the top settings layer, above every
+/// settings file. Flags and FX_* variables are resolved later, so they still
+/// win, as they do over the files. A later override for a key replaces an
+/// earlier one. Nothing is saved.
+/// The `FX_*` overrides the loader applies to merged settings:
+/// `FX_PROVIDER_ORDER`, `FX_PROVIDER_STRICT`, and `FX_REVIEW_MODEL`. They beat
+/// every settings layer, including `fx ask --config`, so
+/// `applySettingOverrides` runs them again after its merge.
+pub fn applyEnvSettingOverrides(alloc: Allocator, settings: *Settings) !void {
+    if (io_mod.getenv("FX_PROVIDER_ORDER")) |order_override| {
+        switch (parseProviderOrderList(alloc, order_override)) {
+            .ok => |maybe_order| {
+                if (maybe_order) |order| {
+                    if (settings.provider_order) |old| {
+                        for (old) |slug| alloc.free(@constCast(slug));
+                        alloc.free(old);
+                    }
+                    settings.provider_order = order;
+                }
+            },
+            .invalid => debug_trace.logf("config", "ignoring invalid FX_PROVIDER_ORDER value", .{}),
+        }
+    }
+    if (io_mod.getenv("FX_PROVIDER_STRICT")) |strict_override| {
+        const trimmed = std.mem.trim(u8, strict_override, " \t\r\n");
+        if (parseEnvBool(trimmed)) |strict| {
+            settings.provider_strict = strict;
+        } else if (trimmed.len > 0) {
+            debug_trace.logf("config", "ignoring invalid FX_PROVIDER_STRICT value", .{});
+        }
+    }
+    if (io_mod.getenv("FX_REVIEW_MODEL")) |review_override| {
+        const trimmed = std.mem.trim(u8, review_override, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (settings_store.validateModel(trimmed)) |_| {
+                if (settings.review_model) |old| alloc.free(old);
+                settings.review_model = try alloc.dupe(u8, trimmed);
+            } else |_| {
+                debug_trace.logf("config", "ignoring invalid FX_REVIEW_MODEL value", .{});
+            }
+        }
+    }
+}
+
+pub fn applySettingOverrides(alloc: Allocator, settings: *Settings, overrides: []const SettingOverride) !void {
+    if (overrides.len == 0) return;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    var root: std.json.ObjectMap = .empty;
+    for (overrides) |override| {
+        const dot = std.mem.findScalar(u8, override.key, '.') orelse {
+            try root.put(scratch, override.key, override.value);
+            continue;
+        };
+        const parent = try root.getOrPut(scratch, override.key[0..dot]);
+        if (!parent.found_existing or parent.value_ptr.* != .object) parent.value_ptr.* = .{ .object = .empty };
+        try parent.value_ptr.object.put(scratch, override.key[dot + 1 ..], override.value);
+    }
+
+    var incoming = try parseSettingsValueForLayer(alloc, .{ .object = root }, .profile, false, true);
+    defer incoming.deinit(alloc);
+    try mergeSettings(settings, &incoming, alloc);
+    // Like git's GIT_* variables over -c, an FX_* override still wins.
+    try applyEnvSettingOverrides(alloc, settings);
+}
+
+/// Reads and parses one settings file for inspection, such as `fx doctor`'s
+/// unknown-key check, with the same size limit as loading. Null when the file
+/// is absent. Caller deinits the result, which owns all of its strings.
+pub fn readSettingsFileJson(alloc: Allocator, path: []const u8) !?std.json.Parsed(std.json.Value) {
+    const bytes = try readOptionalFile(alloc, path) orelse return null;
+    defer alloc.free(bytes);
+    return try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .allocate = .alloc_always });
+}
+
 fn parseSettingsJson(alloc: Allocator, json_text: []const u8) !Settings {
     return parseSettingsJsonForLayer(alloc, json_text, .profile);
 }
@@ -1813,41 +1854,56 @@ fn parseProfileOnlyFields(
         }
     }
 
-    if (root.object.get("statusLine")) |statusline_value| {
-        const value = statusline_value;
-        if (value != .object) {
-            if (!tolerate_non_object_user_containers) return error.InvalidStatusLineType;
-        } else {
-            if (value.object.get("context")) |v| {
-                if (v != .bool) return error.InvalidStatusLineContextType;
-                settings.statusline_context = v.bool;
-            }
-            if (value.object.get("session")) |v| {
-                if (v != .bool) return error.InvalidStatusLineSessionType;
-                settings.statusline_session = v.bool;
-            }
-            if (parse_workspace_statusline) {
-                if (value.object.get("workspace")) |v| {
-                    if (v != .bool) return error.InvalidStatusLineWorkspaceType;
-                    settings.statusline_workspace = v.bool;
+    // `status_line` and `sound` were `statusLine` and `notifications`. The
+    // older name is read first, so the current one wins any value both set.
+    // The current names were unknown keys before, which startup ignores, so a
+    // value under one that isn't an object is still ignored.
+    for ([_]?std.json.Value{ root.object.get("statusLine"), root.object.get("status_line") }, 0..) |group, index| {
+        if (group) |value| {
+            if (value != .object) {
+                if (index == 1) {
+                    debug_trace.logf("config", "ignoring status_line: not an object", .{});
+                    continue;
+                }
+                if (!tolerate_non_object_user_containers) return error.InvalidStatusLineType;
+            } else {
+                if (value.object.get("context")) |v| {
+                    if (v != .bool) return error.InvalidStatusLineContextType;
+                    settings.statusline_context = v.bool;
+                }
+                if (value.object.get("session")) |v| {
+                    if (v != .bool) return error.InvalidStatusLineSessionType;
+                    settings.statusline_session = v.bool;
+                }
+                if (parse_workspace_statusline) {
+                    if (value.object.get("workspace")) |v| {
+                        if (v != .bool) return error.InvalidStatusLineWorkspaceType;
+                        settings.statusline_workspace = v.bool;
+                    }
                 }
             }
         }
     }
 
-    if (root.object.get("notifications")) |notifications_value| {
-        if (notifications_value != .object) return error.InvalidNotificationsType;
-        if (notifications_value.object.get("turn_end")) |value| {
-            if (value != .bool) return error.InvalidNotificationTurnEndType;
-            settings.notification_turn_end = value.bool;
-        }
-        if (notifications_value.object.get("attention_required")) |value| {
-            if (value != .bool) return error.InvalidNotificationAttentionRequiredType;
-            settings.notification_attention_required = value.bool;
-        }
-        if (notifications_value.object.get("max")) |value| {
-            if (value != .bool) return error.InvalidNotificationMaxType;
-            settings.notification_max = value.bool;
+    for ([_]?std.json.Value{ root.object.get("notifications"), root.object.get("sound") }, 0..) |group, index| {
+        if (group) |sound_value| {
+            if (sound_value != .object) {
+                if (index == 0) return error.InvalidNotificationsType;
+                debug_trace.logf("config", "ignoring sound: not an object", .{});
+                continue;
+            }
+            if (sound_value.object.get("turn_end")) |value| {
+                if (value != .bool) return error.InvalidNotificationTurnEndType;
+                settings.notification_turn_end = value.bool;
+            }
+            if (sound_value.object.get("attention_required")) |value| {
+                if (value != .bool) return error.InvalidNotificationAttentionRequiredType;
+                settings.notification_attention_required = value.bool;
+            }
+            if (sound_value.object.get("max")) |value| {
+                if (value != .bool) return error.InvalidNotificationMaxType;
+                settings.notification_max = value.bool;
+            }
         }
     }
 
@@ -2948,6 +3004,65 @@ test "review_model parses, merges, and yields to FX_REVIEW_MODEL" {
     try std.testing.expectEqualStrings("process/review", result.settings.review_model.?);
 }
 
+test "renamed groups read either spelling and the current one wins" {
+    const alloc = std.testing.allocator;
+    var both = try parseSettingsJson(alloc,
+        \\{"status_line":{"context":true},"statusLine":{"context":false,"session":true},
+        \\ "sound":{"max":true},"notifications":{"max":false,"turn_end":true}}
+    );
+    defer both.deinit(alloc);
+    try std.testing.expect(both.statusline_context.? and both.statusline_session.?);
+    try std.testing.expect(both.notification_max.? and both.notification_turn_end.?);
+
+    var older = try parseSettingsJson(alloc, "{\"statusLine\":{\"session\":true},\"notifications\":{\"attention_required\":false}}");
+    defer older.deinit(alloc);
+    try std.testing.expect(older.statusline_session.?);
+    try std.testing.expect(!older.notification_attention_required.?);
+
+    // The current names were unknown keys before the rename, so a stray value
+    // of another type under one is ignored, not a startup failure.
+    var stray = try parseSettingsJson(alloc, "{\"sound\":false,\"status_line\":7,\"notifications\":{\"max\":true}}");
+    defer stray.deinit(alloc);
+    try std.testing.expect(stray.notification_max.?);
+    try std.testing.expect(stray.statusline_context == null);
+    try std.testing.expectError(error.InvalidNotificationsType, parseSettingsJson(alloc, "{\"notifications\":\"on\"}"));
+}
+
+test "an FX_* override beats a setting override for one run" {
+    const alloc = std.testing.allocator;
+    var env = try TestHome.install(alloc, null);
+    defer env.deinit();
+    try env.map.put("FX_PROVIDER_STRICT", "0");
+
+    var settings = try parseSettingsJson(alloc, "{\"provider_strict\":false}");
+    defer settings.deinit(alloc);
+    try applySettingOverrides(alloc, &settings, &.{.{ .key = "provider_strict", .value = .{ .bool = true } }});
+    try std.testing.expect(!settings.provider_strict.?);
+}
+
+test "setting overrides sit above the files, nest dotted keys, and keep the last value" {
+    const alloc = std.testing.allocator;
+    var settings = try parseSettingsJson(alloc, "{\"fast_mode\":false,\"effort\":\"low\",\"theme\":\"dark\",\"statusLine\":{\"session\":true}}");
+    defer settings.deinit(alloc);
+
+    try applySettingOverrides(alloc, &settings, &.{
+        .{ .key = "fast_mode", .value = .{ .bool = true } },
+        .{ .key = "effort", .value = .{ .string = "medium" } },
+        .{ .key = "effort", .value = .{ .string = "high" } },
+        .{ .key = "statusLine.context", .value = .{ .bool = true } },
+        .{ .key = "statusLine.workspace", .value = .{ .bool = true } },
+        .{ .key = "theme", .value = .{ .string = "light" } },
+    });
+    try std.testing.expect(settings.fast_mode.?);
+    try std.testing.expectEqualStrings("high", settings.effort.?.label());
+    try std.testing.expect(settings.statusline_context.? and settings.statusline_workspace.?);
+    try std.testing.expect(settings.statusline_session.?);
+    try std.testing.expectEqualStrings("light", settings.theme.?);
+
+    try applySettingOverrides(alloc, &settings, &.{});
+    try std.testing.expect(settings.fast_mode.?);
+}
+
 test "obsolete web_fetch worker model setting is ignored" {
     var parsed = try parseSettingsJson(std.testing.allocator, "{\"web_fetch_worker_model\":false,\"model\":\"provider/model\"}");
     defer parsed.deinit(std.testing.allocator);
@@ -3729,6 +3844,27 @@ test "project profile-only settings are ignored and diagnosed by key" {
     }
 }
 
+test "project auto_compact_percent is ignored with a diagnostic" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{}\n");
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"auto_compact_percent\":20}\n");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(?u8, null), result.settings.auto_compact_percent);
+    try std.testing.expectEqual(@as(usize, 1), result.diagnostics.len);
+    try expectIgnoredProjectKey(result.diagnostics, "auto_compact_percent");
+}
+
 test "malformed project profile-only settings are ignored before value parsing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4310,7 +4446,7 @@ test "invalid user model emits typed diagnostic and project model is ignored" {
     try std.testing.expect(!result.prompt_history_store_allowed);
 }
 
-test "detailed settings report unsafe user permissions distinctly" {
+test "detailed settings remove loose write access, load, and note it once" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
@@ -4329,14 +4465,25 @@ test "detailed settings report unsafe user permissions distinctly" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.settings.permission_mode == null);
-    try std.testing.expectEqual(
-        ConfigDiagnosticCause.private_state_permissions_unsupported,
-        result.diagnostics[0].cause,
-    );
-    try std.testing.expect(!result.prompt_history_store_allowed);
+    {
+        var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result.settings.permission_mode == .auto);
+        try std.testing.expectEqual(@as(usize, 1), result.diagnostics.len);
+        const diagnostic = result.diagnostics[0];
+        try std.testing.expectEqual(ConfigDiagnosticCause.private_state_permissions_tightened, diagnostic.cause);
+        try std.testing.expect(!diagnostic.reportAtStartup());
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.note().?, "~/.fx/settings.json") != null);
+        try std.testing.expect(result.prompt_history_store_allowed);
+    }
+    const tightened = try root_dir.statFile(io_mod.getIo(), "settings.json", .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o644), tightened.permissions.toMode() & 0o777);
+
+    // Nothing is loose any more, so the next start says nothing.
+    var again = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer again.deinit(std.testing.allocator);
+    try std.testing.expect(again.settings.permission_mode == .auto);
+    try std.testing.expectEqual(@as(usize, 0), again.diagnostics.len);
 }
 
 test "detailed settings treat a missing home as read-only absence" {
@@ -4715,4 +4862,113 @@ test "FX_ULTRAFAST overrides the profile and diagnoses malformed values" {
         if (diagnostic.cause == .invalid_ultrafast_mode_override) diagnosed = true;
     }
     try std.testing.expect(diagnosed);
+}
+
+/// Whether `parseSettingsValueForLayer` accepts `json` as a whole file.
+fn settingsTextAcceptedForTest(layer: SettingsLayer, json: []const u8) !bool {
+    const alloc = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    var settings = parseSettingsValueForLayer(alloc, parsed.value, layer, false, false) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return false;
+    };
+    settings.deinit(alloc);
+    return true;
+}
+
+fn expectSettingForTest(layer: SettingsLayer, name: []const u8, value_json: []const u8, accepted: bool) !void {
+    const json = try std.testing.allocator.print("{{\"{s}\": {s}}}", .{ name, value_json });
+    defer std.testing.allocator.free(json);
+    errdefer std.debug.print("settings {s} in layer {t}\n", .{ json, layer });
+    try std.testing.expectEqual(accepted, try settingsTextAcceptedForTest(layer, json));
+}
+
+test "the settings list gives the types, values, and bounds the settings parser accepts" {
+    const alloc = std.testing.allocator;
+    for (settings_keys.keys) |key| {
+        // fx reads these elsewhere or not at all: one workspace's own keys,
+        // the workspace map, retired keys, and `$schema`, which editors read.
+        if (key.workspace_only or key.kind == .workspaces or key.where == .retired or key.where == .editor) continue;
+        const layer: SettingsLayer = if (key.where == .project_safe) .project else .profile;
+        const wrong = switch (key.kind) {
+            .string, .string_or_null => try alloc.dupe(u8, "5"),
+            .switches => try alloc.print("{{\"{s}\": \"wrong\"}}", .{key.children[0]}),
+            .refused => try alloc.dupe(u8, "true"),
+            else => try alloc.dupe(u8, "\"wrong\""),
+        };
+        defer alloc.free(wrong);
+        try expectSettingForTest(layer, key.name, wrong, false);
+        // And a value of the listed kind is accepted, so a key listed as the
+        // wrong kind fails one of the two.
+        if (key.kind != .refused) {
+            const right = switch (key.kind) {
+                .boolean => try alloc.dupe(u8, "true"),
+                .integer => try alloc.print("{d}", .{key.minimum orelse 0}),
+                .string => try alloc.print("\"{s}\"", .{if (key.values.len > 0) key.values[0] else "dark"}),
+                .string_or_null => try alloc.dupe(u8, "\"auto\""),
+                .strings => try alloc.dupe(u8, "[]"),
+                .switches => try alloc.print("{{\"{s}\": true}}", .{key.children[0]}),
+                else => try alloc.dupe(u8, "{}"),
+            };
+            defer alloc.free(right);
+            try expectSettingForTest(layer, key.name, right, true);
+        }
+        // A project file that sets a profile key is ignored, not refused.
+        if (key.where == .profile) try expectSettingForTest(.project, key.name, wrong, true);
+
+        for (key.values) |value| {
+            const json = try alloc.print("\"{s}\"", .{value});
+            defer alloc.free(json);
+            try expectSettingForTest(layer, key.name, json, true);
+        }
+        if (key.minimum) |minimum| {
+            const at = try alloc.print("{d}", .{minimum});
+            defer alloc.free(at);
+            const below = try alloc.print("{d}", .{minimum - 1});
+            defer alloc.free(below);
+            try expectSettingForTest(layer, key.name, at, true);
+            try expectSettingForTest(layer, key.name, below, false);
+        }
+        if (key.maximum) |maximum| {
+            const at = try alloc.print("{d}", .{maximum});
+            defer alloc.free(at);
+            const above = try alloc.print("{d}", .{maximum + 1});
+            defer alloc.free(above);
+            try expectSettingForTest(layer, key.name, at, true);
+            try expectSettingForTest(layer, key.name, above, false);
+        }
+        if (key.max_items) |max_items| {
+            var items: std.Io.Writer.Allocating = .init(alloc);
+            defer items.deinit();
+            try items.writer.writeAll("[\"slug-0\"");
+            for (1..max_items) |index| try items.writer.print(", \"slug-{d}\"", .{index});
+            const full = try alloc.print("{s}]", .{items.written()});
+            defer alloc.free(full);
+            const over = try alloc.print("{s}, \"slug-{d}\"]", .{ items.written(), max_items });
+            defer alloc.free(over);
+            try expectSettingForTest(layer, key.name, full, true);
+            try expectSettingForTest(layer, key.name, over, false);
+        }
+    }
+    try expectSettingForTest(.profile, "effort", "null", true);
+}
+
+test "the settings list names every value the settings enums accept" {
+    const listed = struct {
+        fn has(name: []const u8, value: []const u8) bool {
+            for (settings_keys.find(name).?.values) |listed_value| {
+                if (std.mem.eql(u8, listed_value, value)) return true;
+            }
+            return false;
+        }
+    };
+    for (std.meta.tags(types.PermissionMode)) |mode| try std.testing.expect(listed.has("permission_mode", mode.label()));
+    for (std.meta.tags(update_target.Channel)) |channel| try std.testing.expect(listed.has("update_channel", channel.label()));
+    for (std.meta.tags(types.ToolChoice)) |choice| {
+        if (types.ToolChoice.parse(@tagName(choice)) != null) try std.testing.expect(listed.has("first_call_tool_choice", @tagName(choice)));
+    }
+    for (std.meta.tags(types.CredentialSource)) |source| {
+        if (types.parseCredentialSource(@tagName(source)) != null) try std.testing.expect(listed.has("credential_source", @tagName(source)));
+    }
 }

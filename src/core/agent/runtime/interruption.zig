@@ -254,43 +254,6 @@ pub fn persistFailedPartialTurnOnce(
     );
 }
 
-/// Saves a failed turn that already did work, such as a stall-stopped turn,
-/// so the next request still carries its prompt, any partial reply, and every
-/// completed tool step. Returns true only when this call saved and finished
-/// the turn; otherwise the caller still owns finishing it. An error can come
-/// back after the turn is finished, when propagating the saved turn fails.
-pub fn persistFailedTurnWorkOnce(
-    hooks: *const AgentRuntimeDeps,
-    finalization: *TurnFinalizationGuard,
-    job: QueuedPrompt,
-    partial_assistant: []const u8,
-    persisted: *bool,
-    trace_ctx: TraceContext,
-    current_turn_messages: []const types.ChatMessage,
-    terminal_materializing: *bool,
-) !bool {
-    if (persisted.*) return false;
-
-    const full_execution = try runtime_execution_memory.buildInterruptedExecutionMemory(
-        std.heap.c_allocator,
-        current_turn_messages,
-        null,
-    );
-    defer types.freeExecutionMemory(std.heap.c_allocator, full_execution);
-    if (full_execution.isEmpty()) return false;
-    try persistFailedTurn(
-        hooks,
-        finalization,
-        job,
-        partial_assistant,
-        persisted,
-        trace_ctx,
-        full_execution,
-        terminal_materializing,
-    );
-    return true;
-}
-
 /// Borrows `full_execution`; the caller keeps ownership.
 fn persistFailedTurn(
     hooks: *const AgentRuntimeDeps,

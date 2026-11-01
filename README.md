@@ -46,10 +46,10 @@ fx runs on macOS and Linux, on x86_64 and arm64. The installer puts it in `~/.lo
 Sign in with one of these:
 
 ```bash
-fx login          # Vercel AI Gateway
-fx login codex    # ChatGPT subscription
-fx login grok     # Grok subscription
-fx setup          # AI Gateway API key
+fx login                    # Vercel AI Gateway
+fx login codex              # ChatGPT subscription
+fx login grok               # Grok subscription
+fx login vercel --api-key   # AI Gateway API key
 ```
 
 Then open a project and start fx:

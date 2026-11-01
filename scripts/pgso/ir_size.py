@@ -48,8 +48,9 @@ a constant expression when it matches regions, so two regions that differ
 only in an instruction's constant, one with 16 and one with 8898, can share a
 parameter that also replaces the nested 16: the second region then reads
 `@g + 8898`. With the expressions rebuilt as instructions, every constant is
-an operand the outliner compares. Run it on each partition right before
-`opt -passes=iroutliner`, with no pass between that could fold them back.
+an operand the outliner compares. Run it on the outliner's input right
+before `opt -passes=iroutliner`, with no pass between that could fold them
+back.
 PHI nodes, landing pads, call targets, and intrinsic calls keep their
 expressions: the outliner never moves an intrinsic call or a PHI's incoming
 constant into a region, and a call target must stay a direct callee.
@@ -62,8 +63,9 @@ reversed region's operands to the outlined function in their original order,
 so that region computes `a < b` instead of `a > b`. A PGSO build of the
 current source turned a skill file read's bounds check around this way and
 panicked on the first chunk. With no greater-than comparison left, the
-outliner matches only comparisons written the same way. Run it on each
-partition right before `opt -passes=iroutliner`, after expand-constant-exprs.
+outliner matches only comparisons written the same way. Run it on the
+outliner's input right before `opt -passes=iroutliner`, after
+expand-constant-exprs.
 
 check-outlined fails when an outlined function holds a constant expression
 that the outliner rebuilt from a parameter: an instruction LLVM named
@@ -264,6 +266,32 @@ class Llvm:
         self.ConstString = f("LLVMConstStringInContext2", P, P, C.c_char_p, C.c_size_t, C.c_int)
         self.ConstGEP2 = f("LLVMConstInBoundsGEP2", P, P, P, C.POINTER(P), C.c_uint)
         self.DeleteGlobal = f("LLVMDeleteGlobal", None, P)
+        self.IsALoadInst = f("LLVMIsALoadInst", P, P)
+        self.IsAGEPInst = f("LLVMIsAGetElementPtrInst", P, P)
+        self.CountIncoming = f("LLVMCountIncoming", C.c_uint, P)
+        self.IncomingValue = f("LLVMGetIncomingValue", P, P, C.c_uint)
+        self.IncomingBlock = f("LLVMGetIncomingBlock", P, P, C.c_uint)
+        self.BuildPhi = f("LLVMBuildPhi", P, P, P, C.c_char_p)
+        self.AddIncoming = f("LLVMAddIncoming", None, P, C.POINTER(P), C.POINTER(P), C.c_uint)
+        self.BuildCall2 = f("LLVMBuildCall2", P, P, P, P, C.POINTER(P), C.c_uint, C.c_char_p)
+        self.BuildExtractValue = f("LLVMBuildExtractValue", P, P, P, C.c_uint, C.c_char_p)
+        self.BuildInsertValue = f("LLVMBuildInsertValue", P, P, P, P, C.c_uint, C.c_char_p)
+        self.BuildLoad2 = f("LLVMBuildLoad2", P, P, P, P, C.c_char_p)
+        self.BuildSub = f("LLVMBuildSub", P, P, P, P, C.c_char_p)
+        self.BuildRet = f("LLVMBuildRet", P, P, P)
+        self.PositionAtEnd = f("LLVMPositionBuilderAtEnd", None, P, P)
+        self.AppendBlock = f("LLVMAppendBasicBlockInContext", P, P, P, C.c_char_p)
+        self.AddFunction = f("LLVMAddFunction", P, P, C.c_char_p, P)
+        self.FunctionType = f("LLVMFunctionType", P, P, C.POINTER(P), C.c_uint, C.c_int)
+        self.StructType = f("LLVMStructTypeInContext", P, P, C.POINTER(P), C.c_uint, C.c_int)
+        self.PointerType = f("LLVMPointerTypeInContext", P, P, C.c_uint)
+        self.Int16Ty = f("LLVMInt16TypeInContext", P, P)
+        self.Int32Ty = f("LLVMInt32TypeInContext", P, P)
+        self.GetParam = f("LLVMGetParam", P, P, C.c_uint)
+        self.CountParams = f("LLVMCountParams", C.c_uint, P)
+        self.GetPoison = f("LLVMGetPoison", P, P)
+        self.ConstArray2 = f("LLVMConstArray2", P, P, C.POINTER(P), C.c_ulonglong)
+        self.BuildAlloca = f("LLVMBuildAlloca", P, P, P, C.c_char_p)
         self.GetNamedFunction = f("LLVMGetNamedFunction", P, P, C.c_char_p)
         self.EntryBlock = f("LLVMGetEntryBasicBlock", P, P)
         self.ConstNull = f("LLVMConstNull", P, P)
@@ -754,6 +782,248 @@ def zero_fill_globals(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) ->
     return summary
 
 
+ERROR_NAME_TABLE = b"__zig_error_name_table"
+ZEXT = 31
+
+
+def _users(llvm: Llvm, value) -> list:
+    out = []
+    use = llvm.FirstUse(value)
+    while use:
+        out.append(llvm.GetUser(use))
+        use = llvm.NextUse(use)
+    return out
+
+
+def _error_names(llvm: Llvm, td, table) -> list[bytes]:
+    """Each entry's name: Zig fills the table with (pointer, length) pairs
+    into NUL-terminated strings, and leaves entry 0 undefined."""
+    ty = llvm.GlobalValueType(table)
+    initializer = llvm.GetInitializer(table)
+    if (
+        llvm.IsDeclaration(table)
+        or not llvm.IsGlobalConstant(table)
+        or llvm.GetLinkage(table) not in (INTERNAL_LINKAGE, PRIVATE_LINKAGE)
+        or not initializer
+        or llvm.TypeKind(ty) != ARRAY
+        or llvm.ABISize(td, llvm.ElementType(ty)) != 16
+    ):
+        raise _Skip("unexpected error name table")
+    names = []
+    for i in range(llvm.ArrayLen(ty)):
+        entry = llvm.AggElem(initializer, i)
+        if not entry:
+            raise _Skip("unreadable error name entry")
+        if llvm.IsUndef(entry):
+            names.append(b"")
+            continue
+        pointer, length = llvm.AggElem(entry, 0), llvm.AggElem(entry, 1)
+        string = llvm.IsAGlobalValue(pointer) if pointer else None
+        if not string or not length or not llvm.IsAConstantInt(length) or not llvm.IsGlobalConstant(string):
+            raise _Skip("error name entry is not a string and length")
+        data = llvm.GetInitializer(string)
+        if not data or not llvm.IsAConstantDataSequential(data):
+            raise _Skip("error name is not constant bytes")
+        size = C.c_size_t()
+        raw = C.string_at(llvm.GetAsString(data, C.byref(size)), size.value)
+        count = llvm.ConstZExt(length)
+        if count >= len(raw) or raw[count] != 0:
+            raise _Skip("error name is not NUL-terminated")
+        names.append(raw[:count])
+    return names
+
+
+def _passes_to_reader(llvm: Llvm, call, entry) -> bool:
+    """Whether `call` passes `entry` only as arguments of a function defined in
+    the module that only reads them, like the pair copies the IR outliner
+    makes. The callee is left unchanged."""
+    callee = llvm.IsAFunction(llvm.CalledValue(call))
+    if not callee or llvm.IsDeclaration(callee):
+        return False
+    # The called function is a call's last operand.
+    arguments = llvm.NumOperands(call) - 1
+    if arguments != llvm.CountParams(callee):
+        return False
+    passed = False
+    for i in range(arguments):
+        if llvm.GetOperand(call, i) == entry:
+            passed = True
+            try:
+                _entry_reads(llvm, llvm.GetParam(callee, i), allow_phi=False, allow_calls=False)
+            except _Skip:
+                return False
+    return passed
+
+
+def _entry_reads(llvm: Llvm, entry, allow_phi: bool, allow_calls: bool = True) -> tuple[list, list, list, list, list]:
+    """The loads of an entry's name pointer and length, the length-field
+    addresses, the PHIs that merge entries, and the calls that pass the entry
+    to a function that only reads it. Anything else stops the pass."""
+    name_loads, length_loads, length_fields, phis, calls = [], [], [], [], []
+    for user in _users(llvm, entry):
+        if llvm.IsALoadInst(user) and llvm.TypeKind(llvm.TypeOf(user)) == POINTER:
+            name_loads.append(user)
+        elif llvm.IsAGEPInst(user) and llvm.NumOperands(user) == 2 and llvm.GetOperand(user, 0) == entry:
+            source, offset = llvm.GEPSourceType(user), llvm.GetOperand(user, 1)
+            if (
+                llvm.TypeKind(source) != INTEGER
+                or llvm.IntWidth(source) != 8
+                or not llvm.IsAConstantInt(offset)
+                or llvm.ConstZExt(offset) != 8
+            ):
+                raise _Skip("error name entry read at an unexpected offset")
+            for load in _users(llvm, user):
+                ty = llvm.TypeOf(load)
+                if not llvm.IsALoadInst(load) or llvm.TypeKind(ty) != INTEGER or llvm.IntWidth(ty) != 64:
+                    raise _Skip("error name length used other than by a load")
+                length_loads.append(load)
+            length_fields.append(user)
+        elif allow_phi and llvm.IsAPHINode(user):
+            phis.append(user)
+        elif allow_calls and llvm.IsACallInst(user) and _passes_to_reader(llvm, user, entry):
+            if user not in calls:
+                calls.append(user)
+        else:
+            raise _Skip("error name entry used other than by reading it")
+    return name_loads, length_loads, length_fields, phis, calls
+
+
+def _error_name_function(llvm: Llvm, ctx, mod, names: list[bytes]):
+    """`pgso.error_name(index)` returns the same (pointer, length) pair as the
+    table entry. The names share one blob, each still NUL-terminated, and an
+    entry's length is the distance to the next name minus its NUL."""
+    i8, i64 = llvm.Int8Ty(ctx), llvm.Int64Ty(ctx)
+    blob = b"".join(name + b"\x00" for name in names)
+    offsets = [0]
+    for name in names:
+        offsets.append(offsets[-1] + len(name) + 1)
+    width = llvm.Int16Ty(ctx) if offsets[-1] < 1 << 16 else llvm.Int32Ty(ctx)
+    values = (P * len(offsets))(*[llvm.ConstInt(width, offset, 0) for offset in offsets])
+    offset_table = llvm.AddGlobal(mod, llvm.ArrayType2(width, len(offsets)), b"pgso.error_name_offsets")
+    llvm.SetInitializer(offset_table, llvm.ConstArray2(width, values, len(offsets)))
+    blob_global = llvm.AddGlobal(mod, llvm.ArrayType2(i8, len(blob)), b"pgso.error_names")
+    llvm.SetInitializer(blob_global, llvm.ConstString(ctx, blob, len(blob), 1))
+    for glob in (offset_table, blob_global):
+        llvm.SetGlobalConstant(glob, 1)
+        llvm.SetLinkage(glob, INTERNAL_LINKAGE)
+        llvm.SetUnnamedAddress(glob, GLOBAL_UNNAMED_ADDR)
+
+    pointer = llvm.PointerType(ctx, 0)
+    pair = llvm.StructType(ctx, (P * 2)(pointer, i64), 2, 0)
+    fn_type = llvm.FunctionType(pair, (P * 1)(i64), 1, 0)
+    fn = llvm.AddFunction(mod, b"pgso.error_name", fn_type)
+    llvm.SetLinkage(fn, INTERNAL_LINKAGE)
+    for attribute in ("noinline", "minsize", "optsize", "nounwind"):
+        llvm.AddAttr(fn, FUNCTION_INDEX, llvm.CreateEnumAttr(ctx, llvm.kind(attribute), 0))
+    builder = llvm.CreateBuilder(ctx)
+    llvm.PositionAtEnd(builder, llvm.AppendBlock(ctx, fn, b"entry"))
+    index = llvm.GetParam(fn, 0)
+    start_at = llvm.BuildGEP2(builder, width, offset_table, (P * 1)(index), 1, b"")
+    end_at = llvm.BuildGEP2(builder, width, start_at, (P * 1)(llvm.ConstInt(i64, 1, 0)), 1, b"")
+    start = llvm.BuildCast(builder, ZEXT, llvm.BuildLoad2(builder, width, start_at, b""), i64, b"")
+    end = llvm.BuildCast(builder, ZEXT, llvm.BuildLoad2(builder, width, end_at, b""), i64, b"")
+    name = llvm.BuildGEP2(builder, i8, blob_global, (P * 1)(start), 1, b"")
+    length = llvm.BuildSub(builder, llvm.BuildSub(builder, end, start, b""), llvm.ConstInt(i64, 1, 0), b"")
+    result = llvm.BuildInsertValue(builder, llvm.GetPoison(pair), name, 0, b"")
+    result = llvm.BuildInsertValue(builder, result, length, 1, b"")
+    llvm.BuildRet(builder, result)
+    return fn, fn_type
+
+
+def compact_error_names(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> dict:
+    """Reads error names through one function over a compact table.
+
+    Zig's `__zig_error_name_table` holds a 16-byte (pointer, length) entry
+    per error and is read in place at every `@errorName`, so its pointers
+    keep it in relocated data. Each read becomes a call to
+    `pgso.error_name`, which returns the same pair from 16-bit offsets into
+    one blob of the same NUL-terminated names. Where a PHI merges an entry's
+    address with another pointer, or a call passes it to a function that only
+    reads it, the pair goes to a stack slot laid out like the entry, and the
+    PHI or call carries the slot. Any table entry or use the pass does not
+    recognize leaves the module unchanged."""
+    ctx, mod = llvm.load(source)
+    td = llvm.CreateTD(llvm.GetDL(mod))
+    summary = {"pass": "compact-error-names", "rewritten_reads": 0, "spilled_reads": 0, "names": 0}
+    table = llvm.GetNamedGlobal(mod, ERROR_NAME_TABLE)
+    try:
+        if not table:
+            raise _Skip("no error name table")
+        names = _error_names(llvm, td, table)
+        plans, phis = [], {}
+        for user in _users(llvm, table):
+            if not llvm.IsAGEPInst(user) or llvm.NumOperands(user) != 2 or llvm.GetOperand(user, 0) != table:
+                raise _Skip("error name table used other than by indexing it")
+            index = llvm.GetOperand(user, 1)
+            index_type = llvm.TypeOf(index)
+            if llvm.ABISize(td, llvm.GEPSourceType(user)) != 16 or llvm.TypeKind(index_type) != INTEGER or llvm.IntWidth(index_type) != 64:
+                raise _Skip("unexpected error name index")
+            reads = _entry_reads(llvm, user, allow_phi=True)
+            plans.append((user, index, reads))
+            for phi in reads[3]:
+                phis[phi] = None
+        for phi in phis:
+            # The merged pointer must itself be read only as an entry.
+            _entry_reads(llvm, phi, allow_phi=False)
+    except _Skip as reason:
+        llvm.save(mod, output)
+        summary["skipped"] = str(reason)
+        return summary
+
+    fn, fn_type = _error_name_function(llvm, ctx, mod, names)
+    builder = llvm.CreateBuilder(ctx)
+    i8, i64 = llvm.Int8Ty(ctx), llvm.Int64Ty(ctx)
+    pair = llvm.StructType(ctx, (P * 2)(llvm.PointerType(ctx, 0), i64), 2, 0)
+
+    def new_slot(inst):
+        entry_block = llvm.EntryBlock(llvm.BlockParent(llvm.InstParent(inst)))
+        llvm.PositionBefore(builder, llvm.FirstInstruction(entry_block))
+        slot = llvm.BuildAlloca(builder, pair, b"")
+        llvm.SetAlignment(slot, 8)
+        return slot
+
+    def store_pair(slot, name, length):
+        llvm.SetAlignment(llvm.BuildStore(builder, name, slot), 8)
+        length_at = llvm.BuildGEP2(builder, i8, slot, (P * 1)(llvm.ConstInt(i64, 8, 0)), 1, b"")
+        llvm.SetAlignment(llvm.BuildStore(builder, length, length_at), 8)
+
+    slots = {phi: new_slot(phi) for phi in phis}
+    for gep, index, (name_loads, length_loads, length_fields, gep_phis, gep_calls) in plans:
+        call_slot = new_slot(gep) if gep_calls else None
+        llvm.PositionBefore(builder, gep)
+        call = llvm.BuildCall2(builder, fn_type, fn, (P * 1)(index), 1, b"")
+        name = llvm.BuildExtractValue(builder, call, 0, b"")
+        length = llvm.BuildExtractValue(builder, call, 1, b"")
+        for load in name_loads:
+            llvm.ReplaceAllUses(load, name)
+            llvm.Erase(load)
+        for load in length_loads:
+            llvm.ReplaceAllUses(load, length)
+            llvm.Erase(load)
+        for field in length_fields:
+            llvm.Erase(field)
+        for phi in gep_phis:
+            slot = slots[phi]
+            store_pair(slot, name, length)
+            for k in range(llvm.CountIncoming(phi)):
+                if llvm.IncomingValue(phi, k) == gep:
+                    llvm.SetOperand(phi, k, slot)
+            summary["spilled_reads"] += 1
+        if call_slot is not None:
+            store_pair(call_slot, name, length)
+            for passing in gep_calls:
+                for k in range(llvm.NumOperands(passing) - 1):
+                    if llvm.GetOperand(passing, k) == gep:
+                        llvm.SetOperand(passing, k, call_slot)
+            summary["spilled_reads"] += 1
+        if name_loads or length_loads:
+            summary["rewritten_reads"] += 1
+        llvm.Erase(gep)
+    summary["names"] = len(names)
+    llvm.save(mod, output)
+    return summary
+
+
 def _instructions(llvm: Llvm, fn):
     block = llvm.FirstBlock(fn)
     while block:
@@ -967,6 +1237,7 @@ def main(argv: list[str] | None = None) -> int:
             "sparse-constants",
             "overlay-constants",
             "zero-fill-globals",
+            "compact-error-names",
             "expand-constant-exprs",
             "swap-compares",
             "check-outlined",
@@ -994,6 +1265,7 @@ def main(argv: list[str] | None = None) -> int:
                 "sparse-constants": sparse_constants,
                 "overlay-constants": overlay_constants,
                 "zero-fill-globals": zero_fill_globals,
+                "compact-error-names": compact_error_names,
                 "expand-constant-exprs": expand_constant_exprs,
                 "swap-compares": swap_compares,
                 "minsize-functions": minsize_functions,

@@ -311,15 +311,15 @@ async function startFx(
       AI_GATEWAY_API_KEY: ENV_TOKEN,
       VERCEL_OIDC_TOKEN: undefined,
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_GATEWAY_BASE_URL: fakeGateway.baseUrl,
       FX_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
-      FX_E2E_GATEWAY_MODELS_URL: `${fakeGateway.baseUrl}/coding-agent/v1/models`,
+      FX_TEST_GATEWAY_MODELS_URL: `${fakeGateway.baseUrl}/coding-agent/v1/models`,
       FX_MODEL: FAKE_GATEWAY_MODEL,
       FX_AUTO_UPGRADE: "0",
       FX_NO_OPEN_BROWSER: "1",
       FX_OAUTH_CLIENT_ID: "test-client",
-      FX_E2E_OAUTH_ISSUER_URL: oauthIssuerUrl,
+      FX_TEST_OAUTH_ISSUER_URL: oauthIssuerUrl,
       FX_TRACE_LOG: tracePath,
       FX_TRACE_SCOPES: tracePath ? "auth,prompt" : undefined,
       ...envOverrides,
@@ -608,10 +608,10 @@ function startFakeChatGptOAuth(
     accessToken,
     requests,
     env: {
-      FX_E2E_CHATGPT_ISSUER_URL: baseUrl,
-      FX_E2E_CHATGPT_TOKEN_URL: `${baseUrl}/chatgpt/token`,
-      FX_E2E_OPENAI_CODEX_MODELS_URL: `${baseUrl}/chatgpt/models`,
-      FX_E2E_OPENAI_CODEX_RESPONSES_URL: `${baseUrl}/chatgpt/responses`,
+      FX_TEST_CHATGPT_ISSUER_URL: baseUrl,
+      FX_TEST_CHATGPT_TOKEN_URL: `${baseUrl}/chatgpt/token`,
+      FX_TEST_OPENAI_CODEX_MODELS_URL: `${baseUrl}/chatgpt/models`,
+      FX_TEST_OPENAI_CODEX_RESPONSES_URL: `${baseUrl}/chatgpt/responses`,
     },
     baseUrl,
     setModels(next: typeof models) {
@@ -758,13 +758,13 @@ function startFakeGrokOAuth(options: {
     tokenCalls: () => tokenCalls,
     baseUrl,
     env: {
-      FX_E2E_GROK_ISSUER_URL: baseUrl,
-      FX_E2E_GROK_TOKEN_URL: `${baseUrl}/oauth2/token`,
-      FX_E2E_GROK_USERINFO_URL: `${baseUrl}/oauth2/userinfo`,
-      FX_E2E_GROK_REVOKE_URL: `${baseUrl}/oauth2/revoke`,
-      FX_E2E_XAI_GROK_MODELS_URL: `${baseUrl}/v1/models`,
-      FX_E2E_XAI_GROK_MODALITIES_URL: `${baseUrl}/v1/language-models`,
-      FX_E2E_XAI_GROK_RESPONSES_URL: `${baseUrl}/v1/responses`,
+      FX_TEST_GROK_ISSUER_URL: baseUrl,
+      FX_TEST_GROK_TOKEN_URL: `${baseUrl}/oauth2/token`,
+      FX_TEST_GROK_USERINFO_URL: `${baseUrl}/oauth2/userinfo`,
+      FX_TEST_GROK_REVOKE_URL: `${baseUrl}/oauth2/revoke`,
+      FX_TEST_XAI_GROK_MODELS_URL: `${baseUrl}/v1/models`,
+      FX_TEST_XAI_GROK_MODALITIES_URL: `${baseUrl}/v1/language-models`,
+      FX_TEST_XAI_GROK_RESPONSES_URL: `${baseUrl}/v1/responses`,
     },
     setModels(next: typeof models) {
       models = next;
@@ -1632,7 +1632,7 @@ test("Vercel CLI keeps an issuer authorization denial distinct from persistence 
     FX_AUTO_UPGRADE: "0",
     FX_NO_OPEN_BROWSER: "1",
     FX_OAUTH_CLIENT_ID: "test-client",
-    FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+    FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
   }, timeoutMs: TIMEOUT });
   expect(result.code).toBe(1);
   expect(result.stderr).toContain("authorization denied");
@@ -1659,8 +1659,8 @@ test("Vercel CLI reports a post-authorization save failure without claiming auth
     FX_AUTO_UPGRADE: "0",
     FX_NO_OPEN_BROWSER: "1",
     FX_OAUTH_CLIENT_ID: "test-client",
-    FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
-    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
   }, timeoutMs: TIMEOUT });
   const deadline = Date.now() + 10_000;
   while (!oauth.requests.some((request) => request.path === "/oauth/token") && Date.now() < deadline) await Bun.sleep(5);
@@ -1862,7 +1862,7 @@ tmuxTest(
       FX_AUTO_UPGRADE: "0",
       FX_NO_OPEN_BROWSER: "1",
       FX_MODEL: undefined,
-      FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+      FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
       ...chatgptOauth.env,
       ...grok.env,
     };
@@ -1979,7 +1979,7 @@ tmuxTest(
       FX_AUTO_UPGRADE: "0",
       FX_NO_OPEN_BROWSER: "1",
       FX_OAUTH_CLIENT_ID: "test-client",
-      FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+      FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
       ...chatgptOauth.env,
       ...grok.env,
     };
@@ -2105,6 +2105,158 @@ tmuxTest(
     } finally {
       grok.stop();
     }
+  },
+  60_000,
+);
+
+tmuxTest(
+  "an expired login during a request opens sign-in and finishes the request",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-recovery-sign-in-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([
+      () => new Response(JSON.stringify({ error: { message: "token expired" } }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      }),
+      fakeGatewayFinalText("SIGNED_IN_RECOVERY_RESPONSE"),
+    ]);
+    // The refresh token is rejected, so only a new sign-in can help.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      rejectRefreshGrant: true,
+      teams: [{ id: "team_123", slug: "vercel-labs", name: "Vercel Labs" }],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Answer after I sign in again.");
+    // fx opens the sign-in on its own; the fake approves the device code at
+    // once, so the team choice comes next.
+    const waiting = await session.waitForPane(
+      (pane) => pane.includes("Choose a team to finish setup"),
+      TIMEOUT,
+    );
+    expect(waiting).toContain("Sign-in expired · opening /login");
+    expect(gateway.requests).toHaveLength(1);
+    // The team list shows while the request waits.
+    await session.waitForText("› Vercel Labs", TIMEOUT);
+    await session.sendKeys("Enter");
+    await session.waitForText("SIGNED_IN_RECOVERY_RESPONSE", TIMEOUT);
+
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[0]?.headers.get("authorization")).toBe(`Bearer ${LOGIN_TOKEN}`);
+    expect(gateway.requests[1]?.headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+// The same recovery on the two subscriptions: their sign-in is a browser
+// flow, which the test completes the way the browser would.
+for (const provider of ["codex", "grok"] as const) {
+  const label = provider === "codex" ? "Codex" : "Grok";
+  tmuxTest(
+    `an expired ${label} sign-in during a request opens its sign-in and finishes the request`,
+    async () => {
+      home = mkdtempSync(join(tmpdir(), `fx-tui-recovery-${provider}-sign-in-`));
+      stderrPath = join(home, "stderr.log");
+      writeFileSync(stderrPath, "");
+      gateway = startFakeGateway([]);
+      // The first request is refused and so is the refresh, so only a new
+      // sign-in can help.
+      chatgptOauth = startFakeChatGptOAuth({ unauthorizedResponses: provider === "codex" ? 1 : 0, rejectRefresh: true });
+      const grok = startFakeGrokOAuth({ unauthorizedResponses: provider === "grok" ? 1 : 0, rejectRefresh: true });
+      try {
+        // A token the fake did not issue, for the same account.
+        const stale = provider === "codex"
+          ? chatgptAccessToken().replace("signature", "stale-signature")
+          : "grok-stale-access-token";
+        if (provider === "codex") writeSeededChatGptLogin(home, stale);
+        else writeSeededGrokLogin(home, stale);
+        writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({
+          provider, models: { codex: "gpt-5.6-sol", grok: "grok-4.6" },
+        }), { mode: 0o600 });
+
+        session = await startFx(home, stderrPath, gateway, undefined, undefined, {
+          ...chatgptOauth.env, ...grok.env, FX_MODEL: undefined,
+        });
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText(`Answer after I sign in to ${label} again.`);
+        // fx opens the subscription's own sign-in while the request waits.
+        const waiting = await session.waitForPane(
+          (pane) => pane.includes(`Authorize with ${label}`),
+          TIMEOUT,
+        );
+        expect(waiting).toContain("Sign-in expired · opening /login");
+        await completeDisplayedSubscriptionLogin(
+          session,
+          `Authorize with ${label}`,
+          provider === "codex" ? `${chatgptOauth.baseUrl}/oauth/authorize?` : `${grok.baseUrl}/oauth2/authorize?`,
+        );
+        await session.waitForText(provider === "codex" ? "CHATGPT_DIRECT_RESPONSE" : "GROK_DIRECT_RESPONSE", TIMEOUT);
+
+        const sent = provider === "codex"
+          ? chatgptOauth.requests.filter((request) => request.path === "/chatgpt/responses")
+          : grok.requests.filter((request) => request.path === "/v1/responses");
+        expect(sent).toHaveLength(2);
+        expect(sent[0]!.authorization).toBe(`Bearer ${stale}`);
+        expect(sent[1]!.authorization).toBe(`Bearer ${provider === "codex" ? chatgptOauth.accessToken : grok.initialAccessToken}`);
+        expect(sent[1]!.body).toContain(`Answer after I sign in to ${label} again.`);
+        // Nothing went to the Gateway.
+        expect(gateway.requests).toHaveLength(0);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        grok.stop();
+      }
+    },
+    60_000,
+  );
+}
+
+tmuxTest(
+  "one Esc during the sign-in fx opened closes it and ends the request",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-recovery-sign-in-esc-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([
+      () => new Response(JSON.stringify({ error: { message: "token expired" } }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      }),
+      fakeGatewayFinalText("MUST_NOT_RUN"),
+    ]);
+    // The device code stays unapproved, so the sign-in screen stays up.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      rejectRefreshGrant: true,
+      tokenDelayMs: 20_000,
+      teams: [{ id: "team_123", slug: "vercel-labs", name: "Vercel Labs" }],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Stop while I would sign in.");
+    await session.waitForPane(
+      (pane) => pane.includes("Sign in with Vercel") && pane.includes("TEST-CODE") &&
+        pane.includes("Sign-in expired · opening /login"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Escape");
+    await session.waitForPane(
+      (pane) => !pane.includes("Sign in with Vercel") && !pane.includes("Sign-in expired"),
+      TIMEOUT,
+    );
+    await session.waitForComposer(TIMEOUT);
+
+    expect(gateway.requests).toHaveLength(1);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
 );
@@ -2247,8 +2399,8 @@ for (const [provider, previousProvider] of [
             FX_AUTO_UPGRADE: "0",
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-            FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
             ...chatgptOauth.env,
             ...grok.env,
           };
@@ -2894,7 +3046,7 @@ tmuxTest(
 
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
       AI_GATEWAY_API_KEY: undefined,
-      FX_SKIP_ONBOARDING: "0",
+      FX_TEST_SKIP_ONBOARDING: "0",
     });
     await session.waitForText("Welcome to fx", TIMEOUT);
     await session.sendKeys("Enter");
@@ -3073,10 +3225,10 @@ async function startFxWithoutAuth(
       VERCEL_OIDC_TOKEN: undefined,
       FX_OAUTH_CLIENT_ID: undefined,
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_GATEWAY_BASE_URL: fakeGateway.baseUrl,
       FX_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
-      FX_E2E_GATEWAY_MODELS_URL: `${fakeGateway.baseUrl}/coding-agent/v1/models`,
+      FX_TEST_GATEWAY_MODELS_URL: `${fakeGateway.baseUrl}/coding-agent/v1/models`,
       FX_MODEL: FAKE_GATEWAY_MODEL,
       FX_AUTO_UPGRADE: "0",
     },
@@ -3572,7 +3724,7 @@ tmuxTest(
       tracePath,
       {
         AI_GATEWAY_API_KEY: undefined,
-        FX_E2E_GATEWAY_MODELS_URL: undefined,
+        FX_TEST_GATEWAY_MODELS_URL: undefined,
         FX_TRACE_SCOPES: "auth,prompt,catalog",
       },
     );
@@ -3718,11 +3870,11 @@ test(
         AI_GATEWAY_API_KEY: ENV_TOKEN,
         VERCEL_OIDC_TOKEN: undefined,
         FX_DISABLE_KEYCHAIN: "1",
-        FX_SKIP_ONBOARDING: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
         FX_AUTO_UPGRADE: "0",
         FX_NO_OPEN_BROWSER: "1",
         FX_OAUTH_CLIENT_ID: "test-client",
-        FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+        FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
         FX_GATEWAY_BASE_URL: gateway.baseUrl,
         FX_MODEL: FAKE_GATEWAY_MODEL,
       },
@@ -3797,10 +3949,10 @@ test(
         AI_GATEWAY_API_KEY: ENV_TOKEN,
         VERCEL_OIDC_TOKEN: undefined,
         FX_DISABLE_KEYCHAIN: "1",
-        FX_SKIP_ONBOARDING: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
         FX_AUTO_UPGRADE: "0",
         FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+        FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
         FX_MODEL: FAKE_GATEWAY_MODEL,
       },
       timeoutMs: TIMEOUT,
@@ -3848,10 +4000,10 @@ test(
         AI_GATEWAY_API_KEY: ENV_TOKEN,
         VERCEL_OIDC_TOKEN: undefined,
         FX_DISABLE_KEYCHAIN: "1",
-        FX_SKIP_ONBOARDING: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
         FX_AUTO_UPGRADE: "0",
         FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+        FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
         FX_MODEL: FAKE_GATEWAY_MODEL,
       },
       timeoutMs: TIMEOUT,
@@ -3887,9 +4039,9 @@ test("fx logout clears a remembered fx login source", async () => {
       AI_GATEWAY_API_KEY: ENV_TOKEN,
       VERCEL_OIDC_TOKEN: undefined,
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_AUTO_UPGRADE: "0",
-      FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+      FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
     },
     timeoutMs: TIMEOUT,
   });
@@ -3923,7 +4075,7 @@ test("fx models does not retry anonymously for an explicit credential", async ()
       AI_GATEWAY_API_KEY: ENV_TOKEN,
       VERCEL_OIDC_TOKEN: undefined,
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_AUTO_UPGRADE: "0",
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_MODEL: FAKE_GATEWAY_MODEL,
@@ -3952,7 +4104,7 @@ test("status never substitutes an environment key for a missing explicit login",
       AI_GATEWAY_API_KEY: ENV_TOKEN,
       VERCEL_OIDC_TOKEN: undefined,
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_AUTO_UPGRADE: "0",
     },
     timeoutMs: TIMEOUT,
@@ -3975,11 +4127,11 @@ test(
       AI_GATEWAY_API_KEY: ENV_TOKEN,
       VERCEL_OIDC_TOKEN: undefined,
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_AUTO_UPGRADE: "0",
       FX_NO_OPEN_BROWSER: "1",
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
-      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
       ...chatgptOauth.env,
     };
 
@@ -4072,7 +4224,7 @@ function withoutSavedModelEnv(
     AI_GATEWAY_API_KEY: undefined,
     VERCEL_OIDC_TOKEN: undefined,
     FX_DISABLE_KEYCHAIN: "1",
-    FX_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_ONBOARDING: "1",
     FX_AUTO_UPGRADE: "0",
     FX_NO_OPEN_BROWSER: "1",
     FX_PROVIDER: provider,
@@ -4287,11 +4439,11 @@ test(
         AI_GATEWAY_API_KEY: ENV_TOKEN,
         VERCEL_OIDC_TOKEN: undefined,
         FX_DISABLE_KEYCHAIN: "1",
-        FX_SKIP_ONBOARDING: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
         FX_AUTO_UPGRADE: "0",
         FX_NO_OPEN_BROWSER: "1",
         FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
         ...grok.env,
       };
 
@@ -4381,11 +4533,11 @@ test(
         AI_GATEWAY_API_KEY: ENV_TOKEN,
         VERCEL_OIDC_TOKEN: undefined,
         FX_DISABLE_KEYCHAIN: "1",
-        FX_SKIP_ONBOARDING: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
         FX_AUTO_UPGRADE: "0",
         FX_NO_OPEN_BROWSER: "1",
         FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
         ...grok.env,
       }, "grok-code");
 
@@ -4418,7 +4570,7 @@ test("Grok logout removes local credentials when remote revocation fails", async
         HOME: home,
         FX_DISABLE_KEYCHAIN: "1",
         FX_AUTO_UPGRADE: "0",
-        FX_E2E_GROK_REVOKE_URL: grok.env.FX_E2E_GROK_REVOKE_URL,
+        FX_TEST_GROK_REVOKE_URL: grok.env.FX_TEST_GROK_REVOKE_URL,
       },
       timeoutMs: TIMEOUT,
     });
@@ -4454,7 +4606,7 @@ test("Grok logout removes malformed and unsafe local credentials", async () => {
           HOME: home,
           FX_DISABLE_KEYCHAIN: "1",
           FX_AUTO_UPGRADE: "0",
-          FX_E2E_GROK_REVOKE_URL: grok.env.FX_E2E_GROK_REVOKE_URL,
+          FX_TEST_GROK_REVOKE_URL: grok.env.FX_TEST_GROK_REVOKE_URL,
         },
         timeoutMs: TIMEOUT,
       });
@@ -4488,7 +4640,7 @@ test("Grok 401 replay refuses a different account before the second provider sen
       FX_DISABLE_KEYCHAIN: "1",
       FX_AUTO_UPGRADE: "0",
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
-      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
       ...grok.env,
     };
     const ask = await runFx(["ask", "--json", "--auto", "--no-save", "Answer."], {
@@ -4536,7 +4688,7 @@ test("Grok CLI sends verified images directly without advertising the vision fal
         FX_DISABLE_KEYCHAIN: "1",
         FX_AUTO_UPGRADE: "0",
         FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
         ...grok.env,
       },
       timeoutMs: TIMEOUT,
@@ -4803,12 +4955,12 @@ tmuxTest(
       );
       session = await startFx(home, stderrPath, gateway, undefined, undefined, {
         FX_MODEL: undefined,
-        FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
-        FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
-        FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
+        FX_TEST_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
+        FX_TEST_XAI_GROK_MODELS_URL: grok.modelsUrl,
+        FX_TEST_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
       });
       await session.waitForComposer(TIMEOUT);
-      const failureVisible = session.waitForText("request failed: XaiGrokSseEventTooLarge", TIMEOUT);
+      const failureVisible = session.waitForText("request failed: reply too large to read", TIMEOUT);
       await session.sendText("Recover from a bounded Grok response.");
       await failureVisible;
       await session.sendText("Accept another prompt after recovery.");
@@ -4817,7 +4969,8 @@ tmuxTest(
       await session.waitForText("GROK_AFTER_LIMIT_OK", TIMEOUT);
 
       const scrollback = await session.captureFullScrollback();
-      expect(scrollback).toContain("XaiGrokSseEventTooLarge");
+      expect(scrollback).toContain("request failed: reply too large to read");
+      expect(scrollback).not.toContain("XaiGrokSseEventTooLarge");
       expect(grok.bodies).toHaveLength(3);
       expect(gateway.requests).toHaveLength(0);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -4876,12 +5029,12 @@ for (const scenario of ["replace", "conflict", "invalid-index"] as const) {
           HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
           FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
           FX_GATEWAY_BASE_URL: testGateway.baseUrl,
-          FX_E2E_GATEWAY_MODELS_URL: testGateway.baseUrl + "/coding-agent/v1/models",
-          FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
-          FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
-          FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
-          FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
-          FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+          FX_TEST_GATEWAY_MODELS_URL: testGateway.baseUrl + "/coding-agent/v1/models",
+          FX_TEST_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
+          FX_TEST_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+          FX_TEST_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
+          FX_TEST_XAI_GROK_MODELS_URL: direct.modelsUrl,
+          FX_TEST_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
         };
         const result = await runFx(["ask", "--json", "--auto", "Create the requested files containing saved."], { cwd: profile, env, timeoutMs: TIMEOUT });
         expect(result.code, provider + ": " + result.stdout + "\n" + result.stderr).toBe(conflict ? 1 : 0);
@@ -4908,7 +5061,7 @@ for (const scenario of ["replace", "conflict", "invalid-index"] as const) {
         expect(steps[0].tool_calls[0].id).toBe(conflict ? "prior" : "pending");
         expect(steps[0].tool_calls[0].arguments_json).toBe(conflict ? prior.arguments : final.arguments);
         if (conflict) {
-          const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", resultJson.session_id, "Report the completed work without writing more files."], { cwd: profile, env, timeoutMs: TIMEOUT });
+          const resumed = await runFx(["ask", "--json", "--auto", "--resume", resultJson.session_id, "Report the completed work without writing more files."], { cwd: profile, env, timeoutMs: TIMEOUT });
           expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
           expect(resumed.stderr).toBe("");
           expect(JSON.parse(resumed.stdout).output).toBe("FINAL_RECORD_OK");
@@ -4958,17 +5111,17 @@ test("native assistant messages keep their boundaries and phases through tools a
       const env = {
         HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
         FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
-        FX_GATEWAY_BASE_URL: testGateway.baseUrl, FX_E2E_GATEWAY_MODELS_URL: testGateway.baseUrl + "/coding-agent/v1/models",
-        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
-        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
-        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+        FX_GATEWAY_BASE_URL: testGateway.baseUrl, FX_TEST_GATEWAY_MODELS_URL: testGateway.baseUrl + "/coding-agent/v1/models",
+        FX_TEST_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_TEST_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_TEST_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_TEST_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_TEST_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
       };
       const first = await runFx(["ask", "--json", "--auto", "Read notes.txt and report the value."], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(first.code, first.stdout + first.stderr).toBe(0);
       const result = JSON.parse(first.stdout);
       expect(result.output).toBe("Checking the file.\n\nReading its contents.\n\nRead complete.\n\nThe value is 42.");
       expect(direct.bodies).toHaveLength(2);
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "What was the value?"], { cwd: profile, env, timeoutMs: TIMEOUT });
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", result.session_id, "What was the value?"], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
       expect(JSON.parse(resumed.stdout).output).toBe("Still 42.");
       expect(direct.bodies).toHaveLength(3);
@@ -5026,10 +5179,10 @@ test("native reasoning snapshots survive tools and saved resume exactly once", a
         HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
         FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
         FX_GATEWAY_BASE_URL: testGateway.baseUrl,
-        FX_E2E_GATEWAY_MODELS_URL: testGateway.baseUrl + "/coding-agent/v1/models",
-        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
-        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
-        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+        FX_TEST_GATEWAY_MODELS_URL: testGateway.baseUrl + "/coding-agent/v1/models",
+        FX_TEST_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_TEST_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_TEST_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_TEST_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_TEST_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
       };
       const first = await runFx(["ask", "--json", "--auto", "Read notes.txt and summarize it."], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(first.code, provider + "/" + shape + ": " + first.stdout + first.stderr).toBe(conflict ? 1 : 0);
@@ -5046,7 +5199,7 @@ test("native reasoning snapshots survive tools and saved resume exactly once", a
       expect(direct.bodies).toHaveLength(2);
       const saved = savedText(profile, result.session_id);
       expect(saved).toContain(signature);
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Continue without tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", result.session_id, "Continue without tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
       expect(resumed.stderr).toBe("");
       expect(direct.bodies).toHaveLength(3);
@@ -5100,10 +5253,10 @@ test("native final snapshots preserve completed items and reject conflicting kin
       const env = {
         HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
         FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "agent,gateway,tool",
-        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_E2E_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
-        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
-        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
-        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_TEST_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
+        FX_TEST_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_TEST_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_TEST_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_TEST_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_TEST_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
       };
       const first = await runFx(["ask", "--json", "--auto", "Read notes.txt and report the result."], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(first.code, provider + "/" + shape + ": " + first.stdout + first.stderr).toBe(conflict ? 1 : 0);
@@ -5127,7 +5280,7 @@ test("native final snapshots preserve completed items and reject conflicting kin
       expect(history).toHaveLength(1);
       expect(history[0].kind).toBe(conflict ? "interrupted" : "assistant");
       expect(history[0].execution?.tool_steps ?? []).toHaveLength(conflict ? 0 : 1);
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Continue without tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", result.session_id, "Continue without tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
       expect(resumed.stderr).toBe("");
       expect(JSON.parse(resumed.stdout).output).toBe(conflict ? "SNAPSHOT_OK" : "RESUMED_OK");
@@ -5185,10 +5338,10 @@ test("native discarded prose keeps tool continuation and saved resume valid", as
       const env = {
         HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
         FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "agent,gateway,tool",
-        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_E2E_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
-        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
-        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
-        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_TEST_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
+        FX_TEST_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_TEST_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_TEST_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_TEST_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_TEST_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
       };
       const first = await runFx(["ask", "--json", "--auto", "Please read the notes.txt file and explain the result."], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(first.code, provider + "/" + mismatch + "/" + multiple + ": " + first.stdout + first.stderr).toBe(0);
@@ -5202,7 +5355,7 @@ test("native discarded prose keeps tool continuation and saved resume valid", as
       const detail = await runFx(["session", "--json", "--id", result.session_id], { cwd: profile, env });
       expect(detail.code).toBe(0);
       expect(JSON.parse(detail.stdout).history).toHaveLength(1);
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Please confirm the saved result without tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", result.session_id, "Please confirm the saved result without tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
       expect(resumed.stderr).toBe("");
       expect(JSON.parse(resumed.stdout).tool_calls).toEqual([]);
@@ -5262,11 +5415,11 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
       const env = {
         HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: native ? undefined : model,
         FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
-        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_E2E_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
-        FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct?.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct?.modelsUrl,
-        FX_E2E_XAI_GROK_RESPONSES_URL: direct?.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct?.modelsUrl,
-        FX_E2E_XAI_GROK_MODALITIES_URL: direct && "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_TEST_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_OPENAI_CODEX_RESPONSES_URL: direct?.responsesUrl, FX_TEST_OPENAI_CODEX_MODELS_URL: direct?.modelsUrl,
+        FX_TEST_XAI_GROK_RESPONSES_URL: direct?.responsesUrl, FX_TEST_XAI_GROK_MODELS_URL: direct?.modelsUrl,
+        FX_TEST_XAI_GROK_MODALITIES_URL: direct && "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
       };
       const result = await runFx(["ask", "--json", "--auto", "Report the supplied answer without using tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(result.signal).toBeNull();
@@ -5287,7 +5440,7 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
           expect(history[0].execution?.tool_steps ?? []).toEqual([]);
           expect(history[0].tool_call).toBeNull();
           expect(history[0].completed_tool_names).toEqual([]);
-          const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", output.session_id, "Continue from the saved partial answer without using tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
+          const resumed = await runFx(["ask", "--json", "--auto", "--resume", output.session_id, "Continue from the saved partial answer without using tools."], { cwd: profile, env, timeoutMs: TIMEOUT });
           expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
           expect(JSON.parse(resumed.stdout).output).toBe("RECOVERED_OK");
           expect(direct!.bodies).toHaveLength(2);
@@ -5297,7 +5450,9 @@ test("native terminal outcomes preserve recovery and incomplete warnings", async
         }
       } else {
         expect(output.output).toBe(limited ? "LIMITED_ANSWER" : "RECOVERED_OK");
-        expect(result.stderr).toContain(limited ? "response hit provider length limit" : "OUTCOME_RETRY");
+        if (limited) expect(result.stderr).toContain("response hit provider length limit");
+        // A retry shows the recovery module's wording, never the provider's detail.
+        else expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
         const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
         expect(detail.code).toBe(0);
         const history = JSON.parse(detail.stdout).history;
@@ -5356,11 +5511,11 @@ test("provider SSE framing preserves saved and resumed answers", async () => {
       const env = {
         HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: native ? undefined : model,
         FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
-        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_E2E_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
-        FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct?.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct?.modelsUrl,
-        FX_E2E_XAI_GROK_RESPONSES_URL: direct?.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct?.modelsUrl,
-        FX_E2E_XAI_GROK_MODALITIES_URL: direct && "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_TEST_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_OPENAI_CODEX_RESPONSES_URL: direct?.responsesUrl, FX_TEST_OPENAI_CODEX_MODELS_URL: direct?.modelsUrl,
+        FX_TEST_XAI_GROK_RESPONSES_URL: direct?.responsesUrl, FX_TEST_XAI_GROK_MODELS_URL: direct?.modelsUrl,
+        FX_TEST_XAI_GROK_MODALITIES_URL: direct && "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
       };
       const first = await runFx(["ask", "--json", "--auto", "Report the supplied answer."], { cwd: profile, env, timeoutMs: TIMEOUT });
       const output = JSON.parse(first.stdout);
@@ -5377,7 +5532,7 @@ test("provider SSE framing preserves saved and resumed answers", async () => {
         const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
         expect(detail.code).toBe(0);
         expect(JSON.parse(detail.stdout).history[0].assistant).toBe(prefix + answer);
-        const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", output.session_id, "Recall the prior answer."], { cwd: profile, env, timeoutMs: TIMEOUT });
+        const resumed = await runFx(["ask", "--json", "--auto", "--resume", output.session_id, "Recall the prior answer."], { cwd: profile, env, timeoutMs: TIMEOUT });
         expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
         expect(resumed.stderr).toBe("");
         expect(direct ? direct.bodies.length : gateway.requests.length).toBe(2);
@@ -5433,10 +5588,10 @@ test("direct providers reconcile final text before saving or releasing tools", a
       const env = {
         HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
         FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
-        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_E2E_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
-        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
-        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
-        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_TEST_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
+        FX_TEST_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl, FX_TEST_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_TEST_XAI_GROK_RESPONSES_URL: direct.responsesUrl, FX_TEST_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_TEST_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
       };
       const first = await runFx(["ask", "--json", "--auto", "Report both response items."], { cwd: profile, env, timeoutMs: TIMEOUT });
       const output = JSON.parse(first.stdout);
@@ -5455,7 +5610,7 @@ test("direct providers reconcile final text before saving or releasing tools", a
         const detail = await runFx(["session", "--json", "--id", output.session_id], { cwd: profile, env });
         expect(detail.code).toBe(0);
         expect(JSON.parse(detail.stdout).history[0].assistant).toBe(display);
-        const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", output.session_id, "Recall the prior answer."], { cwd: profile, env, timeoutMs: TIMEOUT });
+        const resumed = await runFx(["ask", "--json", "--auto", "--resume", output.session_id, "Recall the prior answer."], { cwd: profile, env, timeoutMs: TIMEOUT });
         expect(resumed.code, resumed.stdout + resumed.stderr).toBe(0);
         expect(resumed.stderr).toBe("");
         expect(direct.bodies).toHaveLength(2);
@@ -5504,12 +5659,12 @@ test("direct providers keep images with their users through tools and resume", a
         HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
         FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
         FX_GATEWAY_BASE_URL: testGateway.baseUrl,
-        FX_E2E_GATEWAY_MODELS_URL: testGateway.baseUrl + "/coding-agent/v1/models",
-        FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
-        FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
-        FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
-        FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
-        FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+        FX_TEST_GATEWAY_MODELS_URL: testGateway.baseUrl + "/coding-agent/v1/models",
+        FX_TEST_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
+        FX_TEST_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+        FX_TEST_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
+        FX_TEST_XAI_GROK_MODELS_URL: direct.modelsUrl,
+        FX_TEST_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
         FX_TRACE_LOG: join(profile, "trace.log"), FX_TRACE_SCOPES: "context_compaction",
       };
       const firstPrompt = "Read fixture.txt, then describe the attached image.";
@@ -5535,13 +5690,13 @@ test("direct providers keep images with their users through tools and resume", a
       expect(imageOwners(direct.bodies[1])).toEqual([firstOwner]);
       expect(readFileSync(join(profile, "trace.log"), "utf8")).toContain("has_images=true image_baseline=true");
       unlinkSync(firstPath);
-      const second = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "--image", secondPath, secondPrompt], { cwd: profile, env, timeoutMs: TIMEOUT });
+      const second = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "--image", secondPath, secondPrompt], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(second.code, second.stdout + second.stderr).toBe(0);
       expect(second.signal).toBeNull();
       expect(second.stderr).toBe("");
       expect(direct.bodies).toHaveLength(3);
       expect(imageOwners(direct.bodies[2])).toEqual([firstOwner, secondOwner]);
-      const third = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Look again at both earlier images."], { cwd: profile, env, timeoutMs: TIMEOUT });
+      const third = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Look again at both earlier images."], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(third.code, third.stdout + third.stderr).toBe(0);
       expect(third.signal).toBeNull();
       expect(third.stderr).toBe("");
@@ -5589,10 +5744,10 @@ test("provider context accounting is independent of image encoding size", async 
             HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined,
             FX_MODEL: provider === "gateway" ? model : undefined, FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
             FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_E2E_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
-            FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct?.responsesUrl, FX_E2E_OPENAI_CODEX_MODELS_URL: direct?.modelsUrl,
-            FX_E2E_XAI_GROK_RESPONSES_URL: direct?.responsesUrl, FX_E2E_XAI_GROK_MODELS_URL: direct?.modelsUrl,
-            FX_E2E_XAI_GROK_MODALITIES_URL: direct && "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+            FX_TEST_GATEWAY_MODELS_URL: gateway.baseUrl + "/coding-agent/v1/models",
+            FX_TEST_OPENAI_CODEX_RESPONSES_URL: direct?.responsesUrl, FX_TEST_OPENAI_CODEX_MODELS_URL: direct?.modelsUrl,
+            FX_TEST_XAI_GROK_RESPONSES_URL: direct?.responsesUrl, FX_TEST_XAI_GROK_MODELS_URL: direct?.modelsUrl,
+            FX_TEST_XAI_GROK_MODALITIES_URL: direct && "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
             FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "context_compaction",
           },
         });
@@ -5638,12 +5793,12 @@ test("direct provider tool identities obey the session boundary before execution
           HOME: profile, AI_GATEWAY_API_KEY: "fixture", VERCEL_OIDC_TOKEN: undefined, FX_MODEL: undefined,
           FX_DISABLE_KEYCHAIN: "1", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
           FX_GATEWAY_BASE_URL: testGateway.baseUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${testGateway.baseUrl}/coding-agent/v1/models`,
-          FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
-          FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
-          FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
-          FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
-          FX_E2E_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
+          FX_TEST_GATEWAY_MODELS_URL: `${testGateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
+          FX_TEST_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+          FX_TEST_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
+          FX_TEST_XAI_GROK_MODELS_URL: direct.modelsUrl,
+          FX_TEST_XAI_GROK_MODALITIES_URL: "modalitiesUrl" in direct ? direct.modalitiesUrl : undefined,
         };
         const result = await runFx(["ask", "--json", "--auto", "Create result.txt containing saved."], { cwd: profile, env, timeoutMs: TIMEOUT });
         const accepted = bytes === 256;
@@ -5694,9 +5849,9 @@ test(
             FX_DISABLE_KEYCHAIN: "1",
             FX_AUTO_UPGRADE: "0",
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
-            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_TEST_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
           },
           timeoutMs: TIMEOUT,
         },
@@ -5733,8 +5888,8 @@ tmuxTest(
       );
       session = await startFx(home, stderrPath, gateway, undefined, undefined, {
         FX_MODEL: undefined,
-        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
-        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+        FX_TEST_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_TEST_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
       });
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Read enough lines to complete the capacity loop.");
@@ -5777,10 +5932,10 @@ test(
             FX_DISABLE_KEYCHAIN: "1",
             FX_AUTO_UPGRADE: "0",
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-            FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
-            FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
-            FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
+            FX_TEST_XAI_GROK_MODELS_URL: grok.modelsUrl,
+            FX_TEST_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
           },
           timeoutMs: TIMEOUT,
         },
@@ -5812,11 +5967,11 @@ test(
       AI_GATEWAY_API_KEY: ENV_TOKEN,
       VERCEL_OIDC_TOKEN: undefined,
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_AUTO_UPGRADE: "0",
       FX_NO_OPEN_BROWSER: "1",
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
-      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
       ...chatgptOauth.env,
     };
 
@@ -5844,11 +5999,11 @@ test(
         AI_GATEWAY_API_KEY: ENV_TOKEN,
         VERCEL_OIDC_TOKEN: undefined,
         FX_DISABLE_KEYCHAIN: "1",
-        FX_SKIP_ONBOARDING: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
         FX_AUTO_UPGRADE: "0",
         FX_NO_OPEN_BROWSER: "1",
         FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
         ...grok.env,
       };
 
@@ -5893,9 +6048,9 @@ test(
             FX_DISABLE_KEYCHAIN: "1",
             FX_AUTO_UPGRADE: "0",
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
-            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_TEST_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
           },
           timeoutMs: TIMEOUT,
         },
@@ -5949,10 +6104,10 @@ test(
             FX_DISABLE_KEYCHAIN: "1",
             FX_AUTO_UPGRADE: "0",
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-            FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
-            FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
-            FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
+            FX_TEST_XAI_GROK_MODELS_URL: grok.modelsUrl,
+            FX_TEST_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
           },
           timeoutMs: TIMEOUT,
         },
@@ -6004,9 +6159,9 @@ test(
             FX_DISABLE_KEYCHAIN: "1",
             FX_AUTO_UPGRADE: "0",
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-            FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
-            FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+            FX_TEST_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
           },
           timeoutMs: TIMEOUT,
         },
@@ -6061,12 +6216,12 @@ test(
               FX_GATEWAY_BASE_URL: testGateway.baseUrl,
               FX_TRACE_LOG: join(testHome, "compaction.log"),
               FX_TRACE_SCOPES: "agent,core,gateway,stream,context_compaction,session",
-              FX_E2E_GATEWAY_MODELS_URL: `${testGateway.baseUrl}/coding-agent/v1/models`,
-              FX_E2E_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
-              FX_E2E_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
-              FX_E2E_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
-              FX_E2E_XAI_GROK_MODELS_URL: direct.modelsUrl,
-              FX_E2E_XAI_GROK_MODALITIES_URL: direct.modalitiesUrl,
+              FX_TEST_GATEWAY_MODELS_URL: `${testGateway.baseUrl}/coding-agent/v1/models`,
+              FX_TEST_OPENAI_CODEX_RESPONSES_URL: direct.responsesUrl,
+              FX_TEST_OPENAI_CODEX_MODELS_URL: direct.modelsUrl,
+              FX_TEST_XAI_GROK_RESPONSES_URL: direct.responsesUrl,
+              FX_TEST_XAI_GROK_MODELS_URL: direct.modelsUrl,
+              FX_TEST_XAI_GROK_MODALITIES_URL: direct.modalitiesUrl,
             },
             timeoutMs: 60_000,
           };
@@ -6074,7 +6229,7 @@ test(
         expect(catalog.code, `${catalog.stdout}\n${catalog.stderr}\n${JSON.stringify(direct.urls)}`).toBe(0);
         const seeded = await runFx(["ask", "--json", "--yolo", "Keep these provider facts."], options);
         expect(seeded.code).toBe(0);
-        const result = await runFx(["ask", "--json", "--yolo", "--resume-id", JSON.parse(seeded.stdout).session_id, "Continue from those facts."], options);
+        const result = await runFx(["ask", "--json", "--yolo", "--resume", JSON.parse(seeded.stdout).session_id, "Continue from those facts."], options);
 
         expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}\nrequests=${direct.bodies.length}\n${readFileSync(join(testHome, "compaction.log"), "utf8").split("\n").filter((line) => line.includes("context_compaction")).join("\n")}`).toBe(0);
         expect(JSON.parse(result.stdout).output).toContain(`${provider.toUpperCase()}_COMPACTION_CONTINUED`);
@@ -6133,10 +6288,10 @@ test(
             FX_DISABLE_KEYCHAIN: "1",
             FX_AUTO_UPGRADE: "0",
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-            FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
-            FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
-            FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
+            FX_TEST_XAI_GROK_MODELS_URL: grok.modelsUrl,
+            FX_TEST_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
           },
           timeoutMs: TIMEOUT,
         },
@@ -6189,11 +6344,11 @@ test(
         AI_GATEWAY_API_KEY: undefined,
         VERCEL_OIDC_TOKEN: undefined,
         FX_DISABLE_KEYCHAIN: "1",
-        FX_SKIP_ONBOARDING: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
         FX_AUTO_UPGRADE: "0",
         FX_NO_OPEN_BROWSER: "1",
         FX_OAUTH_CLIENT_ID: "test-client",
-        FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+        FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
       },
       timeoutMs: TIMEOUT,
     });
@@ -6240,11 +6395,11 @@ test(
         AI_GATEWAY_API_KEY: undefined,
         VERCEL_OIDC_TOKEN: undefined,
         FX_DISABLE_KEYCHAIN: "1",
-        FX_SKIP_ONBOARDING: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
         FX_AUTO_UPGRADE: "0",
         FX_NO_OPEN_BROWSER: "1",
         FX_OAUTH_CLIENT_ID: "test-client",
-        FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+        FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
       },
       timeoutMs: TIMEOUT,
     });
@@ -6487,7 +6642,7 @@ tmuxTest(
 
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
       AI_GATEWAY_API_KEY: undefined,
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
     });
     await session.waitForComposer(TIMEOUT);
     await session.sendText("/logout");
@@ -7050,7 +7205,7 @@ tmuxTest(
       tracePath,
       {
         AI_GATEWAY_API_KEY: undefined,
-        FX_E2E_GATEWAY_MODELS_URL: undefined,
+        FX_TEST_GATEWAY_MODELS_URL: undefined,
         FX_TRACE_SCOPES: "auth,prompt,catalog",
       },
     );
@@ -7186,7 +7341,7 @@ tmuxTest(
       tracePath,
       {
         AI_GATEWAY_API_KEY: undefined,
-        FX_E2E_GATEWAY_MODELS_URL: undefined,
+        FX_TEST_GATEWAY_MODELS_URL: undefined,
         FX_TRACE_SCOPES: "auth,prompt,catalog",
       },
     );
@@ -7366,8 +7521,8 @@ tmuxTest(
       undefined,
       {
         AI_GATEWAY_API_KEY: undefined,
-        FX_E2E_GATEWAY_MODELS_URL: undefined,
-        FX_E2E_GATEWAY_CREDITS_URL: creditsGateway.url,
+        FX_TEST_GATEWAY_MODELS_URL: undefined,
+        FX_TEST_GATEWAY_CREDITS_URL: creditsGateway.url,
       },
     );
     await session.waitForComposer(TIMEOUT);
@@ -7423,7 +7578,7 @@ tmuxTest(
       undefined,
       {
         AI_GATEWAY_API_KEY: undefined,
-        FX_E2E_GATEWAY_CREDITS_URL: creditsGateway.url,
+        FX_TEST_GATEWAY_CREDITS_URL: creditsGateway.url,
       },
     );
     await session.waitForComposer(TIMEOUT);
@@ -7629,9 +7784,9 @@ for (const provider of ["codex", "grok"] as const) {
         FX_AUTO_UPGRADE: "0",
         FX_SOUND: "0",
         ...(chatgpt?.env ?? grok!.env),
-        FX_E2E_CODEX_CLIENT_VERSION: undefined,
-        FX_E2E_GROK_CLIENT_VERSION: undefined,
-        [provider === "codex" ? "FX_E2E_CODEX_VERSION_URL" : "FX_E2E_GROK_VERSION_URL"]:
+        FX_TEST_CODEX_CLIENT_VERSION: undefined,
+        FX_TEST_GROK_CLIENT_VERSION: undefined,
+        [provider === "codex" ? "FX_TEST_CODEX_VERSION_URL" : "FX_TEST_GROK_VERSION_URL"]:
           `http://127.0.0.1:${releases.port}/version`,
       };
 
@@ -7709,9 +7864,9 @@ tmuxTest("Codex discovers upstream versions and refreshes models in an open sess
       FX_DISABLE_KEYCHAIN: "1",
       FX_AUTO_UPGRADE: "0",
       FX_SOUND: "0",
-      FX_E2E_OPENAI_CODEX_MODELS_URL: `http://127.0.0.1:${catalog.port}/models`,
-      FX_E2E_CODEX_VERSION_URL: `http://127.0.0.1:${catalog.port}/version`,
-      FX_E2E_CODEX_CLIENT_VERSION: undefined,
+      FX_TEST_OPENAI_CODEX_MODELS_URL: `http://127.0.0.1:${catalog.port}/models`,
+      FX_TEST_CODEX_VERSION_URL: `http://127.0.0.1:${catalog.port}/version`,
+      FX_TEST_CODEX_CLIENT_VERSION: undefined,
     };
     const listed = await runFx(["models", "--json"], { env, timeoutMs: TIMEOUT });
     expect(listed.code, listed.stderr).toBe(0);
@@ -7772,8 +7927,8 @@ test("Grok refreshes upstream versions for catalogs and responses and survives l
       FX_AUTO_UPGRADE: "0",
       FX_SOUND: "0",
       ...grok.env,
-      FX_E2E_GROK_VERSION_URL: `http://127.0.0.1:${releases.port}/stable`,
-      FX_E2E_GROK_CLIENT_VERSION: undefined,
+      FX_TEST_GROK_VERSION_URL: `http://127.0.0.1:${releases.port}/stable`,
+      FX_TEST_GROK_CLIENT_VERSION: undefined,
     };
     const cachePath = join(home, ".fx", "provider-versions", "grok.json");
     const expireCache = () => {

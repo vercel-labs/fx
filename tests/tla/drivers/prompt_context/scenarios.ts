@@ -184,11 +184,11 @@ export async function collectObservations(ctx: RunContext): Promise<Capture> {
     const env = testEnvironment({
       HOME: fixtureHome,
       AI_GATEWAY_API_KEY: "fake-prompt-cache-key",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_MODEL: ctx.model,
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
     });
     const argv = [binary, "ask", "--full-access", "--json", "--", plan.prompt];
     log("fx_spawn", { session: plan.session, worktree: plan.worktree, cwd: paths[plan.worktree], argv });
@@ -321,11 +321,11 @@ export async function collectMidSession(ctx: RunContext, events?: readonly MidSe
       const env = testEnvironment({
         HOME: fixtureHome,
         AI_GATEWAY_API_KEY: "fake-prompt-cache-key",
-        FX_SKIP_ONBOARDING: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
         FX_MODEL: ctx.model,
         FX_GATEWAY_BASE_URL: gateway.baseUrl,
         FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
       });
       const resume = index === 0 ? [] : ["--resume", "last"];
       const access = turn.defaultAccess ? [] : ["--full-access"];

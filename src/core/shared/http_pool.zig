@@ -22,8 +22,9 @@ pub const HttpPool = struct {
     setup_lock: std.Io.RwLock = .init,
     /// Pooled connections idle longer than this are closed instead of reused.
     /// std's pool has no liveness tracking; a gracefully-idle-closed
-    /// connection fails only when the next request reads from it, which lands
-    /// in the delivery-ambiguity retry path. Bounding idle age keeps that
+    /// connection fails only when the next request writes to it or reads its
+    /// head. `openRequest` reports reuse so the gateway client can resend that
+    /// request once on a fresh connection. Bounding idle age keeps that
     /// rare. One conservative timestamp is enough: the pool only gains free
     /// connections at noteActivity-stamped completions, so when
     /// now - last_activity > ttl every free connection is provably stale.
@@ -158,19 +159,50 @@ pub const HttpPool = struct {
     }
 
     /// Opens a request on the shared client with a current certificate
-    /// clock. The setup lock is held shared through connection setup; the
-    /// exclusive holder only stores a timestamp, so the wait is bounded.
+    /// clock, and reports whether it reuses an idle pooled connection, which
+    /// the server may have closed while it sat idle. When none is idle, std
+    /// may still reuse one that another request released in between; that
+    /// counts as fresh, so its failures are reported. The setup lock is held
+    /// shared through connection setup; the exclusive holder only stores a
+    /// timestamp, so the wait is bounded.
     pub fn openRequest(
         self: *HttpPool,
         method: std.http.Method,
         uri: std.Uri,
         options: std.http.Client.RequestOptions,
-    ) std.http.Client.RequestError!std.http.Client.Request {
+    ) std.http.Client.RequestError!PooledRequest {
         self.refreshTlsClock();
         const io = self.client.io;
         self.setup_lock.lockSharedUncancelable(io);
         defer self.setup_lock.unlockShared(io);
-        return self.client.request(method, uri, options);
+        var pooled_options = options;
+        const idle = if (options.connection == null) self.takeIdleConnection(uri) else null;
+        if (idle) |connection| pooled_options.connection = connection;
+        const request = self.client.request(method, uri, pooled_options) catch |err| {
+            if (idle) |connection| self.client.connection_pool.release(connection, io);
+            return err;
+        };
+        return .{ .request = request, .reused = idle != null };
+    }
+
+    /// Takes an idle pooled connection to the URI's origin. Returns null when
+    /// none is free or a proxy carries the request, in which case std connects
+    /// as usual.
+    fn takeIdleConnection(self: *HttpPool, uri: std.Uri) ?*std.http.Client.Connection {
+        var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+        const criteria = originCriteria(uri, &host_buf) orelse return null;
+        const proxy = switch (criteria.protocol) {
+            .plain => self.client.http_proxy,
+            .tls => self.client.https_proxy,
+        };
+        if (proxy != null) return null;
+        const io = self.client.io;
+        return self.client.connection_pool.findConnection(io, criteria) catch |err| switch (err) {
+            error.Canceled => {
+                io.recancel();
+                return null;
+            },
+        };
     }
 
     /// std sets `client.now` once, when the CA bundle first loads, so a
@@ -195,18 +227,22 @@ pub const HttpPool = struct {
         const now = io_mod.milliTimestamp();
         const idle_ms = now - last;
         if (idle_ms <= self.ttl_ms) return;
+        const drained = self.closeIdleConnections(url);
+        // Refresh the stamp so a run of misses does not re-drain every call.
+        self.last_activity_ms.store(now, .release);
+        if (drained > 0) {
+            debug_trace.logf("gateway", "pool_drain_stale count={d} idle_ms={d} ttl_ms={d}", .{ drained, idle_ms, self.ttl_ms });
+        }
+    }
+
+    /// Closes every idle pooled connection to the URL's origin and returns
+    /// how many it closed.
+    pub fn closeIdleConnections(self: *HttpPool, url: []const u8) usize {
         const io = io_mod.getIo();
-        const uri = std.Uri.parse(url) catch return;
-        const protocol = std.http.Client.Protocol.fromUri(uri) orelse return;
+        const uri = std.Uri.parse(url) catch return 0;
         var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-        const host = std.Io.net.HostName.fromUri(uri, &host_buf) catch return;
-        const port: u16 = uri.port orelse defaultPort(protocol);
-        const criteria: std.http.Client.ConnectionPool.Criteria = .{
-            .host = host,
-            .port = port,
-            .protocol = protocol,
-        };
-        var drained: usize = 0;
+        const criteria = originCriteria(uri, &host_buf) orelse return 0;
+        var closed: usize = 0;
         while (true) {
             // A cancelled drain stops early and leaves the cancellation pending.
             const conn = (self.client.connection_pool.findConnection(io, criteria) catch |err| switch (err) {
@@ -221,13 +257,22 @@ pub const HttpPool = struct {
             self.client.connection_pool.used.remove(&conn.pool_node);
             self.client.connection_pool.mutex.unlock(io);
             conn.destroy(io);
-            drained += 1;
+            closed += 1;
         }
-        // Refresh the stamp so a run of misses does not re-drain every call.
-        self.last_activity_ms.store(now, .release);
-        if (drained > 0) {
-            debug_trace.logf("gateway", "pool_drain_stale count={d} idle_ms={d} ttl_ms={d}", .{ drained, idle_ms, self.ttl_ms });
-        }
+        return closed;
+    }
+
+    fn originCriteria(
+        uri: std.Uri,
+        host_buf: *[std.Io.net.HostName.max_len]u8,
+    ) ?std.http.Client.ConnectionPool.Criteria {
+        const protocol = std.http.Client.Protocol.fromUri(uri) orelse return null;
+        const host = std.Io.net.HostName.fromUri(uri, host_buf) catch return null;
+        return .{
+            .host = host,
+            .port = uri.port orelse defaultPort(protocol),
+            .protocol = protocol,
+        };
     }
 
     fn defaultPort(protocol: std.http.Client.Protocol) u16 {
@@ -236,6 +281,12 @@ pub const HttpPool = struct {
             .tls => 443,
         };
     }
+};
+
+/// A request opened on the pool, and whether it reuses an idle connection.
+const PooledRequest = struct {
+    request: std.http.Client.Request,
+    reused: bool,
 };
 
 test "warm and drain tolerate malformed urls without touching the pool" {
@@ -305,9 +356,37 @@ test "openRequest advances a stale clock before connection setup" {
     const before = std.Io.Clock.real.now(zio);
 
     // The listen backlog completes the connect without any server accept.
-    var req = try pool.openRequest(.POST, try std.Uri.parse(url), .{});
-    defer req.deinit();
+    var opened = try pool.openRequest(.POST, try std.Uri.parse(url), .{});
+    defer opened.request.deinit();
     try std.testing.expect(pool.client.now.?.nanoseconds >= before.nanoseconds);
+    try std.testing.expect(!opened.reused);
+}
+
+test "openRequest reports a reused idle connection and returns it to the pool" {
+    const zio = io_mod.getIo();
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
+    defer std.testing.allocator.free(url);
+    const uri = try std.Uri.parse(url);
+
+    var pool = HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+
+    // The listen backlog completes the connect without any server accept.
+    pool.warm(url);
+    try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
+
+    var opened = try pool.openRequest(.POST, uri, .{});
+    try std.testing.expect(opened.reused);
+    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
+    opened.request.deinit();
+    try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
+
+    try std.testing.expectEqual(@as(usize, 1), pool.closeIdleConnections(url));
+    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
+    try std.testing.expectEqual(@as(usize, 0), pool.closeIdleConnections("not a url"));
 }
 
 test "drain evicts a real parked connection past the TTL" {
