@@ -207,6 +207,7 @@ fn hashUsize(hasher: *std.crypto.hash.sha2.Sha256, value: usize) void {
 }
 
 pub const InitialContextInput = struct {
+    bounded_reconstruction: bool = false,
     workspace_root: []const u8,
     access_scope: ?workspace_access.AccessScope = null,
     targets: []const ApplicableTarget = &.{},

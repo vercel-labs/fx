@@ -2,6 +2,15 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const builtin_gateway = @import("gateway.zig");
+const terminal_contracts = @import("../core/terminal/contracts.zig");
+const managed_execution_contract = @import("../core/execution/managed_execution_contract.zig");
+const subagent_domain = @import("../core/subagent/domain.zig");
+const lexical_relevance = @import("../core/shared/lexical_relevance.zig");
+
+const path_description = "Relative to the workspace, or absolute.";
+const shell_base_description =
+    "Run a shell command. Each call starts a new shell with the user's startup files, so cd and export do not carry over. If the command is still running after yield_time_ms, you get a session_id: call again with action=interact to wait for more output, or action=stop to end it. Never rerun it. Owned sessions end when the process exits; & and nohup jobs end with their command. In zsh, quote globs meant for another program.";
+const shell_process_description = shell_base_description;
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_projection = @import("../core/tooling/tool_projection.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");

@@ -301,12 +301,16 @@ fn continue_steering_after_stop(
 }
 
 fn reset_recovery_after_immediate_steering(
+    latest_diagnostic: *?types.ModelFailureDiagnostic,
     strategy: *?resend_strategy.Strategy,
     cause: *types.ModelRecoveryCause,
+    pacing: *resend_strategy.RetryPacingState,
     tool_evidence: *resend_strategy.ToolEvidence,
 ) void {
+    latest_diagnostic.* = null;
     strategy.* = null;
     cause.* = .network_interrupted;
+    pacing.* = .idle;
     tool_evidence.* = .none;
 }
 
@@ -5212,6 +5216,13 @@ fn refreshGatewayCredentialForJob(
     return true;
 }
 
+noinline fn pushRouteRecoveryStatus(
+    deps: *const AgentRuntimeDeps,
+    status: types.RouteRecoveryStatus,
+) !void {
+    try deps.push_route_recovery_status(deps.ctx, status);
+}
+
 const ProviderAdmission = struct {
     stream: *runtime_assistant_stream.StreamChunkContext,
 
@@ -5223,10 +5234,6 @@ const ProviderAdmission = struct {
         runtime_assistant_stream.pushTokenProgressUpdate(self.stream, .changed) catch |progress_err| {
             debug_trace.logf("agent", "token progress publication failed source=provider_admission err={s}", .{@errorName(progress_err)});
         };
-        if (self.pending_status.*) |status| {
-            try pushRouteRecoveryStatus(self.deps, status);
-            self.pending_status.* = null;
-        }
     }
 };
 
@@ -7191,6 +7198,8 @@ fn processQueuedPromptLoop(
     var response_language_correction_attempted = false;
     // How the next resend is phrased, from the tool evidence of the attempt
     // that failed. `src/core/recovery/` decides when to resend.
+    var latest_recovery_diagnostic: ?types.ModelFailureDiagnostic = null;
+    var retry_pacing: resend_strategy.RetryPacingState = .idle;
     var recovery_strategy: ?resend_strategy.Strategy = if (job.recovery_checkpoint) |checkpoint|
         restoredRecoveryStrategy(checkpoint)
     else
@@ -7307,11 +7316,6 @@ fn processQueuedPromptLoop(
         // Results that settle mid-turn ride at the tail of this step's
         // request, after everything the cache already holds (D132).
         var parent_turn_context: std.ArrayList(ChatMessage) = .empty;
-        var parent_turn_delivery = try appendPreparedParentTurnContext(
-            deps,
-            overlay_arena,
-            &parent_turn_context,
-        );
         var parent_turn_delivery = try appendPreparedParentTurnContext(
             deps,
             overlay_arena,
@@ -8172,7 +8176,7 @@ fn processQueuedPromptLoop(
                 if (cancel_requested or !delay_completed) {
                     runtime_telemetry.traceCancelObserved(step_ctx, false);
                     try request_recovery.cancel();
-                    try stream_ctx.provisional_statuses.finishTrackedCancelled(
+                    try stream_ctx.provisional_statuses.finishTrackedStopped(
                         deps,
                         stream_ctx.alloc,
                         arena,
@@ -8200,8 +8204,10 @@ fn processQueuedPromptLoop(
                         interruption_source,
                     )) {
                         reset_recovery_after_immediate_steering(
+                            &latest_recovery_diagnostic,
                             &recovery_strategy,
                             &recovery_cause,
+                            &retry_pacing,
                             &preserved_tool_evidence,
                         );
                         if (interruption_source.len > 0) {
@@ -8640,7 +8646,7 @@ fn processQueuedPromptLoop(
             if (config.cancel_flag.load(.seq_cst)) {
                 runtime_telemetry.traceCancelObserved(step_ctx, false);
                 try request_recovery.cancel();
-                try finishPendingCancelledCalls(
+                try finishPendingStoppedCalls(
                     deps,
                     &stream_ctx.provisional_statuses,
                     stream_ctx.alloc,
@@ -8673,8 +8679,10 @@ fn processQueuedPromptLoop(
                     interruption_source,
                 )) {
                     reset_recovery_after_immediate_steering(
+                        &latest_recovery_diagnostic,
                         &recovery_strategy,
                         &recovery_cause,
+                        &retry_pacing,
                         &preserved_tool_evidence,
                     );
                     if (interruption_source.len > 0) {
@@ -8859,8 +8867,10 @@ fn processQueuedPromptLoop(
                         partial_assistant,
                     )) {
                         reset_recovery_after_immediate_steering(
+                            &latest_recovery_diagnostic,
                             &recovery_strategy,
                             &recovery_cause,
+                            &retry_pacing,
                             &preserved_tool_evidence,
                         );
                         if (partial_assistant.len > 0) {

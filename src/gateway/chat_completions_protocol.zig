@@ -66,6 +66,7 @@ pub const Error = error{
     JsonTooDeep,
     Cancelled,
     ReadFailed,
+    OutputTruncated,
 };
 
 const max_selected_tools = 256;

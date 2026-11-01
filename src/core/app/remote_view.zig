@@ -384,6 +384,7 @@ pub fn Runtime(comptime App: type) type {
                         .edit => app.stream.edit_count += 1,
                         .open => app.stream.open_count += 1,
                         .command => app.stream.command_count += 1,
+                        .mcp => app.stream.mcp_count += 1,
                         .subagent => app.stream.subagent_count += 1,
                         .ask => {},
                     }
@@ -436,6 +437,20 @@ pub fn Runtime(comptime App: type) type {
                         try app.appendAssistantCodeBlock(owned);
                     },
                     .thematic_rule => try app.appendAssistantThematicRule(),
+                    .attempt_start => {
+                        // Earlier text has shown, so the transcript
+                        // ends where this attempt's output begins.
+                        if (comptime @hasDecl(@TypeOf(app.shell), "markAssistantAttemptStart")) {
+                            app.shell.markAssistantAttemptStart();
+                        }
+                    },
+                    .attempt_restart => |fallback| {
+                        if (comptime @hasDecl(App, "replaceRestartedAttempt")) {
+                            _ = try app.replaceRestartedAttempt();
+                        } else {
+                            _ = try app.shell.streamAssistantChunk(app.alloc, &app.metrics, fallback);
+                        }
+                    },
                 }
             } else if (field(event, "diff_block")) |value| {
                 var parsed = try std.json.parseFromValue(diff.DiffEntryPayload, app.alloc, value, .{});
@@ -451,7 +466,7 @@ pub fn Runtime(comptime App: type) type {
             } else if (field(event, "route_recovery_status")) |value| {
                 var parsed = try std.json.parseFromValue(types.RouteRecoveryStatus, app.alloc, value, .{});
                 defer parsed.deinit();
-                app.shell.worker_status_state().set_route_recovery(parsed.value, io_mod.milliTimestamp());
+                app.shell.worker_status_state().set_route_recovery(parsed.value);
             } else if (field(event, "clear_route_recovery_status") != null) {
                 _ = app.shell.worker_status_state().clear_route_recovery();
             }

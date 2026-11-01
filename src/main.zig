@@ -3146,7 +3146,6 @@ const App = struct {
             self,
             app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
             io_mod.milliTimestamp(),
-            std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake),
         );
     }
 

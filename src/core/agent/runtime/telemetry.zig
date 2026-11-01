@@ -86,6 +86,9 @@ pub const TurnSummaryAccumulator = struct {
     /// Whether a request reported its prompt tokens yet. Until one does, the
     /// input figure is the submitted prompt's estimate (D211).
     input_reported: bool = false,
+    /// The previous step's whole prompt, so a provider that reports no cache
+    /// figure still counts only what the prompt grew by.
+    last_prompt_tokens: u64 = 0,
 
     pub fn init(turn_started_at_ms: i64, submitted_prompt: []const u8) TurnSummaryAccumulator {
         var estimator = token_estimate.StreamingEstimator{};
@@ -138,7 +141,7 @@ pub const TurnSummaryAccumulator = struct {
         const before = self.tokenProgress();
         const active = self.active_token_request orelse return .invalid;
 
-        if (usage.input_tokens) |prompt| self.settleInputTokens(prompt, usage.cache_read_tokens orelse 0, !delivery_ambiguous);
+        if (usage.input_tokens) |prompt| self.settleInputTokens(prompt, usage.cache_read_tokens, !delivery_ambiguous);
         const output_tokens = usage.output_tokens orelse active.outputEstimate();
         self.settleOutputTokens(
             output_tokens,
@@ -169,17 +172,27 @@ pub const TurnSummaryAccumulator = struct {
     /// Counts a request's prompt tokens as proto does: what the provider
     /// read without its cache, so a step that reuses a cached prefix adds
     /// only what was new (D211). `prompt` is the whole prompt; cache reads
-    /// come off it.
-    fn settleInputTokens(self: *TurnSummaryAccumulator, prompt: u64, cache_read: u64, exact: bool) void {
-        const uncached = prompt -| cache_read;
+    /// come off it. A provider that reports no cache figure still resends the
+    /// earlier prompt every step, so a later step counts only what the prompt
+    /// grew by, as an estimate; the first step counts the whole prompt.
+    fn settleInputTokens(self: *TurnSummaryAccumulator, prompt: u64, cache_read: ?u64, exact: bool) void {
+        const previous = self.last_prompt_tokens;
+        self.last_prompt_tokens = prompt;
+        const counted_exact = exact and (cache_read != null or !self.input_reported);
+        const uncached = if (cache_read) |read|
+            prompt -| read
+        else if (self.input_reported)
+            prompt -| previous
+        else
+            prompt;
         if (!self.input_reported) {
             self.input_reported = true;
             self.settled_token_progress.input_tokens = uncached;
-            self.settled_token_progress.input_exact = exact;
+            self.settled_token_progress.input_exact = counted_exact;
             return;
         }
         self.settled_token_progress.input_tokens +|= uncached;
-        self.settled_token_progress.input_exact = self.settled_token_progress.input_exact and exact;
+        self.settled_token_progress.input_exact = self.settled_token_progress.input_exact and counted_exact;
     }
 
     fn settleOutputTokens(self: *TurnSummaryAccumulator, output_tokens: u64, output_exact: bool) void {
@@ -485,6 +498,30 @@ test "turn token progress discards a definitely unsent request" {
     );
     try std.testing.expectEqual(types.TurnTokenProgress{
         .input_tokens = 2,
+        .input_exact = false,
+    }, accumulator.tokenProgress());
+}
+
+test "turn token progress counts only prompt growth when the provider reports no cache" {
+    var accumulator = TurnSummaryAccumulator.init(0, "submitted prompt");
+
+    accumulator.prepareTokenRequest();
+    _ = accumulator.reconcileTokenRequest(.{ .input_tokens = 30_000, .output_tokens = 5 }, false);
+    // Each later step resends the whole earlier prompt plus what the last
+    // step added; none of the resent prefix is new input.
+    accumulator.prepareTokenRequest();
+    _ = accumulator.reconcileTokenRequest(.{ .input_tokens = 30_800, .output_tokens = 5 }, false);
+    accumulator.prepareTokenRequest();
+    _ = accumulator.reconcileTokenRequest(.{ .input_tokens = 31_500, .output_tokens = 5 }, false);
+    // A shorter prompt after compaction adds nothing.
+    accumulator.prepareTokenRequest();
+    _ = accumulator.reconcileTokenRequest(.{ .input_tokens = 12_000, .output_tokens = 5 }, false);
+    accumulator.prepareTokenRequest();
+    _ = accumulator.reconcileTokenRequest(.{ .input_tokens = 12_300, .output_tokens = 5 }, false);
+
+    try std.testing.expectEqual(types.TurnTokenProgress{
+        .input_tokens = 30_000 + 800 + 700 + 0 + 300,
+        .output_tokens = 25,
         .input_exact = false,
     }, accumulator.tokenProgress());
 }

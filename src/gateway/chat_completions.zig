@@ -431,12 +431,27 @@ fn reviewErrorOutcome(err: anyerror) classifier.TransportOutcome {
     };
 }
 
+pub fn failure_kind(status: std.http.Status) streams.FailureKind {
+    return switch (status) {
+        .bad_request => .invalid_request,
+        .unauthorized => .unauthorized,
+        .forbidden => .forbidden,
+        .payload_too_large => .request_too_large,
+        .too_many_requests => .rate_limited,
+        .internal_server_error => .server_error,
+        .bad_gateway => .bad_gateway,
+        .service_unavailable => .unavailable,
+        .gateway_timeout => .gateway_timeout,
+        else => .provider_error,
+    };
+}
+
 /// An upstream that is busy, down or overloaded may answer the next
 /// attempt; one that rejects the request will not (D292).
 fn reviewFailureOutcome(kind: streams.FailureKind) classifier.TransportOutcome {
     return switch (kind) {
         .rate_limited, .server_error, .bad_gateway, .unavailable, .gateway_timeout, .provider_error => .transient_failure,
-        .invalid_request, .unauthorized, .forbidden, .request_too_large => .permanent_failure,
+        .invalid_request, .unauthorized, .forbidden, .request_too_large, .quota_exhausted => .permanent_failure,
     };
 }
 

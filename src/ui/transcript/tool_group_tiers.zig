@@ -168,7 +168,7 @@ pub fn tierOf(arena: Allocator, item: Item) Tier {
     if (std.mem.eql(u8, name, "checklist")) return if (isOneOf(op, &.{"view"})) .routine else .outcome;
     const kind = record.activity_kind orelse return .outcome;
     return switch (kind) {
-        .write, .edit, .command, .subagent => .outcome,
+        .write, .edit, .command, .subagent, .mcp => .outcome,
         .read, .open, .ask => if (isOneOf(name, &.{ "checkpoint", "rewind" })) .outcome else .routine,
     };
 }

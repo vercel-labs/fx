@@ -818,9 +818,7 @@ pub fn Runtime(comptime App: type) type {
             syncState(app, event_handlers.tool_lifecycle);
 
             const now_ms = io_mod.milliTimestamp();
-            if (app.shell.worker_status_state().expire_transient(now_ms)) {
-                app.shell.render_requests.request(.footer);
-            }
+            _ = now_ms;
         }
 
         /// Schedules the next shimmer frame for a live activity row. The host
@@ -2380,7 +2378,7 @@ fn tickNoop(app: *FakeApp) !void {
 /// One host loop pass: the tick, then the shimmer clock the host advances.
 fn tickAndAnimateNoop(app: *FakeApp) !void {
     try tickNoop(app);
-    _ = Runtime(FakeApp).advanceVisibleAnimation(app, NoopBridge.lifecyclePresenter(app), io_mod.milliTimestamp(), std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake));
+    _ = Runtime(FakeApp).advanceVisibleAnimation(app, NoopBridge.lifecyclePresenter(app), io_mod.milliTimestamp());
 }
 
 fn test_awake_timestamp(milliseconds: i64) std.Io.Clock.Timestamp {

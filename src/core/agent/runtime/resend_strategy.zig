@@ -8,6 +8,7 @@
 //! depending on whether it ran. Pure: no I/O, no clock, no allocation.
 
 const std = @import("std");
+const types = @import("../../shared/types.zig");
 
 pub const Delivery = enum {
     definitely_unsent,
@@ -80,3 +81,13 @@ test "only strategies that change the request add a prompt" {
         try std.testing.expect(prompt(strategy).?.len > 0);
     }
 }
+
+/// Ephemeral backoff state a steer-restart clears. Request recovery owns the
+/// waits; this records the implicit-retry chain that reset clears.
+pub const RetryPacingState = union(enum) {
+    idle,
+    implicit: struct {
+        cause: types.ModelRecoveryCause,
+        attempt: usize,
+    },
+};

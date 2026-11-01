@@ -65,8 +65,8 @@ pub const EventSink = struct {
         fromContext(context).emit(.{ .reasoning_delta = chunk });
     }
 
-    pub fn onToolInputChunk(context: *anyopaque, chunk: []const u8) void {
-        fromContext(context).emit(.{ .tool_input_delta = chunk });
+    pub fn onToolInputChunk(context: *anyopaque, delta: ToolInputDelta) void {
+        fromContext(context).emit(.{ .tool_input_delta = delta });
     }
 
     pub fn onToolStart(
@@ -848,9 +848,9 @@ test "event sink callback adapters emit the matching events" {
     on_reasoning(&sink, "thought");
     try std.testing.expectEqualStrings("thought", capture.last.?.reasoning_delta);
 
-    const on_tool_input: StreamCallback = EventSink.onToolInputChunk;
-    on_tool_input(&sink, "{\"a\"");
-    try std.testing.expectEqualStrings("{\"a\"", capture.last.?.tool_input_delta);
+    const on_tool_input: ToolInputCallback = EventSink.onToolInputChunk;
+    on_tool_input(&sink, .{ .id = "call_1", .index = 0, .chunk = "{\"a\"" });
+    try std.testing.expectEqualStrings("{\"a\"", capture.last.?.tool_input_delta.chunk);
 
     const on_tool_start: ToolStartCallback = EventSink.onToolStart;
     on_tool_start(&sink, "call_1", "read_file", "Read", "{}");
