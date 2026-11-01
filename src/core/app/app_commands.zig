@@ -308,7 +308,6 @@ pub fn Handlers(comptime App: type) type {
                 .create_trace = commandCreateTrace,
                 .compact_history = commandCompactHistory,
                 .handle_settings = commandHandleSettings,
-                .handle_alias = commandHandleAlias,
                 .show_credits = commandShowCredits,
                 .paste_clipboard = commandPasteClipboard,
                 .handle_fast = commandHandleFast,
@@ -1262,15 +1261,6 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             try session_commands.Commands(App).handleSettings(app, rest);
-        }
-
-        fn commandHandleAlias(ctx: *anyopaque, _: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try app.writeDomainNotice(.{
-                .topic = "aliases",
-                .tone = .neutral,
-                .body = "Aliases are not yet configurable.",
-            }, true);
         }
 
         fn commandShowCredits(ctx: *anyopaque) !void {
