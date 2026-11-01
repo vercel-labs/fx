@@ -7087,3 +7087,158 @@ test.skipIf(!tmuxAvailable())("command rows reclip to the live width while runni
     rmSync(root, { recursive: true, force: true });
   }
 }, 60_000);
+
+// Claude cache warming (src/core/agent/runtime/cache_warmer.zig): while the
+// session waits, fx resends its last request with a one-token reply before
+// Anthropic's cache entry expires. FX_TEST_CACHE_WARMING_TTL_MS shortens the
+// five-minute lifetime to two seconds, so a ping goes out every 1.8 seconds
+// and the last one at most 12 seconds after the request.
+const WARM_MODEL = "anthropic/claude-opus-5.5";
+const WARM_TTL_MS = 2_000;
+const WARM_CAP_MS = 6 * WARM_TTL_MS;
+const PING_CACHE_READ = 4_242;
+
+type WarmRequest = { body: string; headers: Headers; at: number };
+
+// Answers the agent's requests and its pings, and stamps each arrival; the
+// stamps pair by index with the gateway's own record of bodies and headers.
+function startWarmingGateway(arrivals: number[]) {
+  return startDynamicFakeGateway((body) => {
+    arrivals.push(Date.now());
+    const ping = JSON.parse(body).maxOutputTokens === 1;
+    return fakeGatewaySse([
+      ...(ping ? [] : [{ type: "text-delta", id: "answer_1", delta: "WARM_REPLY_DONE" }]),
+      {
+        type: "finish",
+        finishReason: ping ? { unified: "length", raw: "max_tokens" } : { unified: "stop", raw: "stop" },
+        usage: {
+          inputTokens: { total: 9_000, noCache: 0, cacheRead: ping ? PING_CACHE_READ : 1_000, cacheWrite: ping ? 0 : 8_000 },
+          outputTokens: { total: 1 },
+        },
+      },
+    ]);
+  }, {
+    models: [{
+      id: WARM_MODEL,
+      type: "language",
+      tags: ["explicit-caching", "reasoning", "tool-use"],
+      context_window: 1_000_000,
+      max_tokens: 64_000,
+      reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
+    }],
+    classifierDecision: "clear",
+  });
+}
+
+async function startWarmingSession(name: string, settings: object = {}) {
+  root = realpathSync(mkdtempSync(join(tmpdir(), `fx-cache-warming-${name}-`)));
+  const home = join(root, "home"), workspace = join(root, "workspace");
+  const trace = join(root, "trace.log"), stderr = join(root, "stderr.log");
+  mkdirSync(join(home, ".fx"), { recursive: true }); mkdirSync(workspace);
+  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify(settings));
+  const arrivals: number[] = [];
+  const host = startWarmingGateway(arrivals);
+  gateway = host;
+  const requests = (): WarmRequest[] => host.requests.map((request, i) => ({ ...request, at: arrivals[i]! }));
+  session = await TmuxSession.create({
+    cwd: workspace, width: 120, height: 40, stderrPath: stderr, isolated: true, remainOnExit: true,
+    env: {
+      HOME: home, AI_GATEWAY_API_KEY: "fake-cache-warming", FX_DISABLE_KEYCHAIN: "1",
+      FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: WARM_MODEL, FX_PERMISSION_MODE: "full-access",
+      FX_GATEWAY_BASE_URL: host.baseUrl, FX_GATEWAY_CHAT_URL: host.chatUrl, FX_E2E_GATEWAY_CHAT_URL: host.chatUrl,
+      FX_TEST_CACHE_WARMING_TTL_MS: String(WARM_TTL_MS),
+      FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "cache_warming,agent,session",
+    },
+  });
+  await session.waitForComposer();
+  return { host, home, trace, stderr, requests };
+}
+
+const isPing = (request: WarmRequest) => JSON.parse(request.body).maxOutputTokens === 1;
+
+// The saved session's cache-read total: the largest `set usage` value in
+// its log, since each one holds the running totals.
+function savedCacheReadTotal(home: string): number {
+  let total = 0;
+  const visit = (dir: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.name === "log.jsonl") {
+        for (const line of readFileSync(path, "utf8").split("\n")) {
+          if (!line.includes('"key":"usage"')) continue;
+          total = Math.max(total, JSON.parse(line).value?.cache_read_tokens ?? 0);
+        }
+      }
+    }
+  };
+  visit(join(home, ".fx", "sessions"));
+  return total;
+}
+
+test.skipIf(!tmuxAvailable())("an idle Claude session pings its exact last request until the cap, and the next prompt saves their usage", async () => {
+  const { home, trace, stderr, requests } = await startWarmingSession("idle");
+  await session!.sendText("warm this up");
+  await session!.waitForText("WARM_REPLY_DONE", TIMEOUT);
+  const agent = requests().filter((request) => !isPing(request));
+  expect(agent).toHaveLength(1);
+  expect(JSON.parse(agent[0]!.body).maxOutputTokens).toBe(64_000);
+  const armedAt = agent[0]!.at;
+
+  // Wait past the cap; no ping may follow it.
+  await Bun.sleep(WARM_CAP_MS + 2 * WARM_TTL_MS);
+  const pings = requests().filter(isPing);
+  expect(pings.length).toBeGreaterThanOrEqual(1);
+  expect(pings.length).toBeLessThanOrEqual(6);
+  const expected = JSON.parse(agent[0]!.body);
+  expected.maxOutputTokens = 1;
+  for (const ping of pings) {
+    // Every byte but the reply limit matches the request.
+    expect(ping.body).toBe(agent[0]!.body.replace(/"maxOutputTokens":\d+/, '"maxOutputTokens":1'));
+    expect(JSON.parse(ping.body)).toEqual(expected);
+    expect(ping.headers.get("x-session-affinity")).toBe(agent[0]!.headers.get("x-session-affinity"));
+    expect(ping.headers.get("ai-language-model-id")).toBe(WARM_MODEL);
+    expect(ping.at - armedAt).toBeLessThanOrEqual(WARM_CAP_MS + 1_000);
+  }
+  for (let i = 1; i < pings.length; i += 1) {
+    expect(pings[i]!.at - pings[i - 1]!.at).toBeGreaterThanOrEqual(WARM_TTL_MS * 0.9 - 100);
+  }
+  const traced = readFileSync(trace, "utf8");
+  expect(traced).toContain("event=armed model=anthropic/claude-opus-5.5");
+  expect(traced).toMatch(/event=stopped reason=(cap|late)/);
+
+  // The next prompt disarms the warmer and saves the pings' usage with the
+  // session's.
+  await session!.sendText("again");
+  await waitForCondition(() => requests().filter((request) => !isPing(request)).length === 2, "second request");
+  await session!.waitForText("WARM_REPLY_DONE", TIMEOUT);
+  await waitForCondition(() => savedCacheReadTotal(home) >= 2 * 1_000 + pings.length * PING_CACHE_READ, "ping usage saved");
+  expect(savedCacheReadTotal(home)).toBe(2 * 1_000 + pings.length * PING_CACHE_READ);
+
+  await session!.sendText("/quit");
+  await waitForCondition(() => session!.paneStatus().dead, "fx exit");
+  expect(session!.paneStatus().status).toBe(0);
+  session = null;
+  expect(readFileSync(stderr, "utf8")).toBe("");
+}, 90_000);
+
+test.skipIf(!tmuxAvailable())("/new stops the pings of the previous conversation", async () => {
+  const { trace, requests } = await startWarmingSession("new");
+  await session!.sendText("warm this up");
+  await session!.waitForText("WARM_REPLY_DONE", TIMEOUT);
+  await waitForCondition(() => requests().some(isPing), "first ping", WARM_TTL_MS * 3);
+  await session!.sendText("/new");
+  await waitForCondition(() => readFileSync(trace, "utf8").includes("event=disarmed why=history_cleared"), "disarm on /new");
+  const before = requests().filter(isPing).length;
+  await Bun.sleep(WARM_TTL_MS * 2);
+  expect(requests().filter(isPing).length).toBe(before);
+}, 60_000);
+
+test.skipIf(!tmuxAvailable())("cache_warming: false sends no pings", async () => {
+  const { trace, requests } = await startWarmingSession("off", { cache_warming: false });
+  await session!.sendText("warm this up");
+  await session!.waitForText("WARM_REPLY_DONE", TIMEOUT);
+  await Bun.sleep(WARM_TTL_MS * 2);
+  expect(requests().filter(isPing)).toHaveLength(0);
+  expect(readFileSync(trace, "utf8")).not.toContain("event=armed");
+}, 60_000);

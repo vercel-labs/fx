@@ -1007,6 +1007,7 @@ pub fn Runtime(comptime App: type) type {
 
             var deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
             if (comptime @hasDecl(App, "providerSet")) deps.agent_stream_provider = app.providerSet().select(job.provider).agent_stream_or_unavailable();
+            deps.cache_warmer = cacheWarmerFor(app);
             deps.compaction_failure = failure_provenance;
             const semantic_presentation = app_callbacks.Bindings(App).semanticPresentationSink(app);
             const config = buildQueuedPromptConfig(
@@ -1021,6 +1022,14 @@ pub fn Runtime(comptime App: type) type {
             );
             const process_result = agent_runtime.processAgentPrompt(&app.session.agent, &deps, semantic_presentation, lifecycleContext(app), config, job);
             try process_result;
+        }
+
+        /// The session's cache warmer, when the profile keeps it on. Unit
+        /// tests share the real provider bundles and never ping.
+        fn cacheWarmerFor(app: *App) ?*@import("../agent/runtime/cache_warmer.zig").Warmer {
+            if (comptime @import("builtin").is_test or !@hasField(App, "cache_warming")) return null;
+            if (!app.cache_warming) return null;
+            return app.session.cacheWarmer();
         }
 
         pub fn processContextCompaction(

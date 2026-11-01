@@ -27,6 +27,7 @@ const tool_dispatch = @import("../../../tooling/tool_dispatch.zig");
 const model_tool_schema = @import("../../../tooling/model_tool_schema.zig");
 const prompt_context = @import("../prompt_context.zig");
 const runtime_orchestrator = @import("../orchestrator.zig");
+const cache_warmer = @import("../cache_warmer.zig");
 
 const test_support = @import("support.zig");
 const text_utils = @import("../../../shared/text_utils.zig");
@@ -211,6 +212,97 @@ test "processQueuedPrompt projects lifecycle session identity to the provider" {
         "session-provider-123",
         gateway.request_session_ids.items[0].?,
     );
+}
+
+/// Runs one fake Claude turn with a cache warmer attached. The caller
+/// destroys the warmer.
+fn runWarmedTurn(
+    gateway: *FakeGateway,
+    hooks: *FakeAgentRuntimeDeps,
+    config: runtime_config.Config,
+    job: worker_runtime.QueuedPrompt,
+) !*cache_warmer.Warmer {
+    const warmer = try cache_warmer.Warmer.create();
+    errdefer warmer.destroy();
+    hooks.cache_warmer = warmer;
+    var lifecycle = test_support.testLifecycleContext(
+        lifecycle_hooks.RuntimeView.empty(),
+        hooks.alloc,
+        config.workspace_root,
+    );
+    lifecycle.scope.session_id = "session-warm";
+    try test_support.runFakePromptWithLifecycle(gateway, hooks, config, job, lifecycle);
+    return warmer;
+}
+
+test "a completed Claude request arms cache warming with exactly its body" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "ok" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+    const warmer = try runWarmedTurn(&gateway, &hooks, fixture.config(), fixture.job());
+    defer warmer.destroy();
+
+    try std.testing.expect(warmer.state.armed);
+    const armed = warmer.armed.?;
+    // The ping differs from the request only in its one-token reply limit.
+    const expected = (try cache_warmer.pingBody(alloc, gateway.request_bodies.items[0])).?;
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, armed.ping_body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, armed.ping_body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("maxOutputTokens").?.integer);
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.6", armed.model);
+    try std.testing.expectEqualStrings("session-warm", armed.session_id.?);
+    try std.testing.expectEqualStrings("key", armed.api_key);
+}
+
+test "the next request disarms cache warming and saves the usage of its pings" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{.{ .content = "ok" }};
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.record_usages = true;
+    var fixture = PromptFixture{};
+    const warmer = try cache_warmer.Warmer.create();
+    defer warmer.destroy();
+    // Pings since the last request read 777 cached tokens.
+    warmer.usage = .{ .cache_read_tokens = 777, .output_tokens = 2 };
+    hooks.cache_warmer = warmer;
+    try test_support.runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+
+    try std.testing.expect(hooks.recorded_usages.items.len >= 1);
+    try std.testing.expectEqual(@as(?u64, 777), hooks.recorded_usages.items[0].cache_read_tokens);
+    try std.testing.expectEqual(@as(?types.Usage, null), warmer.takeUsage());
+}
+
+test "requests from other models and from subagents are not kept warm" {
+    const alloc = std.testing.allocator;
+    inline for (.{ "openai/gpt-6.1", "subagent" }) |case| {
+        const completions = [_]FakeCompletion{.{ .content = "ok" }};
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var config = fixture.config();
+        var job = fixture.job();
+        if (comptime std.mem.eql(u8, case, "subagent")) {
+            config.origin = .subagent;
+        } else {
+            job.model = @constCast(case);
+        }
+        const warmer = try runWarmedTurn(&gateway, &hooks, config, job);
+        defer warmer.destroy();
+        try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+        try std.testing.expect(!warmer.state.armed);
+        try std.testing.expect(warmer.task == null);
+    }
 }
 
 test "terminal assistant completion continues with steering admitted during the response" {

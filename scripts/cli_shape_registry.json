@@ -133,6 +133,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_CACHE_WARMING_TTL_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_CHATGPT_ISSUER_URL": {
       "job": "test",
       "stability": "internal"

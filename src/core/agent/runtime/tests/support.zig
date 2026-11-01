@@ -4,6 +4,7 @@ const agent_stream_provider = @import("../../stream_provider.zig");
 const command_admission = @import("../../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../../permissions/auto_classifier.zig");
 const types = @import("../../../shared/types.zig");
+const cache_warmer = @import("../cache_warmer.zig");
 const permissions = @import("../../../permissions/permissions.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
 const builtin_context = @import("../../../../builtins/context.zig");
@@ -455,6 +456,10 @@ pub const FakeAgentRuntimeDeps = struct {
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
     root_permission_mode: ?PermissionMode = null,
+    cache_warmer: ?*cache_warmer.Warmer = null,
+    /// Records each usage the agent loop saves, as a saved session would.
+    record_usages: bool = false,
+    recorded_usages: std.ArrayList(types.Usage) = .empty,
     validation_mcp_runtime_generation: ?u64 = null,
     validation_mcp_tool_name: ?[]const u8 = null,
     execute_mutex: std.Io.Mutex = .init,
@@ -678,6 +683,7 @@ pub const FakeAgentRuntimeDeps = struct {
     }
 
     pub fn deinit(self: *FakeAgentRuntimeDeps) void {
+        self.recorded_usages.deinit(self.alloc);
         freeStringList(self.alloc, &self.log);
         freeStringList(self.alloc, &self.texts);
         freeStringList(self.alloc, &self.assistant_sources);
@@ -811,6 +817,8 @@ pub const FakeAgentRuntimeDeps = struct {
             .record_tool_call_rejected = recordRejected,
             .record_tool_call_failed = recordFailed,
             .report_inner_tool_usage = reportCapturedInnerToolUsage,
+            .cache_warmer = self.cache_warmer,
+            .record_usage = if (self.record_usages) recordUsage else null,
         };
     }
 
@@ -1643,6 +1651,11 @@ pub const FakeAgentRuntimeDeps = struct {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         self.inner_usage_names.append(self.alloc, self.alloc.dupe(u8, tool_name) catch return) catch return;
         self.inner_usages.append(self.alloc, usage) catch return;
+    }
+
+    fn recordUsage(ctx: *anyopaque, usage: types.Usage) anyerror!void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(ctx));
+        try self.recorded_usages.append(self.alloc, usage);
     }
 
     fn recordRejected(raw: *anyopaque, _: Allocator, call: ToolCall, _: []const u8, _: ?[]const u8) !void {
