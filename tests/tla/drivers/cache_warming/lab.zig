@@ -102,10 +102,8 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len != 3) {
-        std.debug.print("usage: cache_warming_lab <ops.jsonl> <results.jsonl>\n", .{});
-        std.process.exit(2);
-    }
+    // driver.ts always passes the operations file and the results file.
+    if (args.len != 3) return error.ExpectedOpsAndResultsPaths;
     const input = try std.Io.Dir.cwd().readFileAlloc(io, args[1], arena, .limited(1 << 30));
     var file = try std.Io.Dir.cwd().createFile(io, args[2], .{});
     defer file.close(io);
