@@ -301,7 +301,7 @@ test "requests from other models and from subagents are not kept warm" {
         defer warmer.destroy();
         try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
         try std.testing.expect(!warmer.state.armed);
-        try std.testing.expectEqual(@as(?std.Thread, null), warmer.thread);
+        try std.testing.expect(warmer.task == null);
     }
 }
 

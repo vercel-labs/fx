@@ -1,7 +1,7 @@
 //! Keeps one conversation's Claude prompt cache entry alive: holds a copy of
 //! the last real request, wakes when the planner in `cache_warming.zig` says
 //! to, and sends each ping, the same request with a one-token reply, from its
-//! own thread. The conversation's `SessionRuntime` owns it; the agent loop
+//! own `std.Io` task. The conversation's `SessionRuntime` owns it; the agent loop
 //! arms it after each completed request and disarms it before each send.
 //!
 //! Pings are best effort. A ping that fails or writes the entry instead of
@@ -89,8 +89,8 @@ const Snapshot = struct {
     }
 };
 
-/// Pings run on the warmer's own thread, so a build without threads, such
-/// as libfx's WebAssembly core, keeps nothing warm.
+/// Pings run on the warmer's own concurrent task, so a build without threads,
+/// such as libfx's WebAssembly core, keeps nothing warm.
 const threads = !builtin.single_threaded;
 
 /// The longest a ping may take before it counts as failed. A ping reads a
@@ -100,7 +100,7 @@ const max_ping_ms: i64 = 15_000;
 pub const Warmer = struct {
     mutex: std.Io.Mutex = .init,
     changed: std.Io.Condition = .init,
-    thread: ?std.Thread = null,
+    task: ?std.Io.Future(void) = null,
     closing: bool = false,
     timing: cache_warming.Timing,
     state: cache_warming.State = .{},
@@ -114,14 +114,14 @@ pub const Warmer = struct {
     usage: ?types.Usage = null,
     cancel: std.atomic.Value(bool) = .init(false),
 
-    /// Uses c_allocator: the warmer and its thread outlive any caller scope.
+    /// Uses c_allocator: the warmer and its task outlive any caller scope.
     pub fn create() !*Warmer {
         const warmer = try std.heap.c_allocator.create(Warmer);
         warmer.* = .{ .timing = timingFromEnvironment() };
         return warmer;
     }
 
-    /// Cancels the ping on the wire, joins the thread, and frees everything.
+    /// Cancels the ping on the wire, awaits the task, and frees everything.
     pub fn destroy(self: *Warmer) void {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
@@ -129,9 +129,7 @@ pub const Warmer = struct {
         self.cancel.store(true, .release);
         self.changed.signal(io);
         self.mutex.unlock(io);
-        if (comptime threads) {
-            if (self.thread) |thread| thread.join();
-        }
+        if (self.task) |*task| task.await(io);
         const alloc = std.heap.c_allocator;
         if (self.armed) |snapshot| snapshot.destroy(alloc);
         if (self.usage) |usage| {
@@ -165,9 +163,9 @@ pub const Warmer = struct {
         debug_trace.logf("cache_warming", "event=armed model={s} generation={d} body_bytes={d} started_ms={d} age_ms={d}", .{
             input.model, self.state.generation, input.body.len, input.started_ms, now_ms - input.started_ms,
         });
-        if (self.thread == null and self.state.armed) {
-            self.thread = std.Thread.spawn(.{}, threadMain, .{self}) catch |err| spawn: {
-                debug_trace.logf("cache_warming", "event=thread_unavailable err={s}", .{@errorName(err)});
+        if (self.task == null and self.state.armed) {
+            self.task = std.Io.concurrent(io, taskMain, .{self}) catch |err| spawn: {
+                debug_trace.logf("cache_warming", "event=task_unavailable err={s}", .{@errorName(err)});
                 self.apply(.{ .disarmed = .{ .now_ms = now_ms } });
                 break :spawn null;
             };
@@ -215,7 +213,7 @@ pub const Warmer = struct {
         if (old) |replaced| if (replaced != self.sending) replaced.destroy(std.heap.c_allocator);
     }
 
-    fn threadMain(self: *Warmer) void {
+    fn taskMain(self: *Warmer) void {
         const io = io_mod.getIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -682,5 +680,5 @@ test "a request whose body is not a JSON object is not armed" {
         .started_ms = io_mod.milliTimestamp(),
     });
     try testing.expect(!warmer.state.armed);
-    try testing.expectEqual(@as(?std.Thread, null), warmer.thread);
+    try testing.expect(warmer.task == null);
 }
