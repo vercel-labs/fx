@@ -19,7 +19,7 @@ export type Made = { id: string; read(home: string, v2: boolean): Promise<string
 // fixture's full access runs every tool call unreviewed.
 async function continued(f: Fixture, id: string, home: string, v2: boolean, prompt: string) {
   const mark = f.gateway.requests.length;
-  const run = await f.fx(v2, ["ask", "--json", "--resume-id", id, prompt], home);
+  const run = await f.fx(v2, ["ask", "--json", v2 ? "--resume" : "--resume-id", id, prompt], home);
   return run.code === 0 ? f.gateway.requests.slice(mark).map((r: any) => r.body as string) : null;
 }
 

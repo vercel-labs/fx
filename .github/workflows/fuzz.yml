@@ -78,7 +78,7 @@ jobs:
           TARGET: ${{ matrix.target }}
           # Ubuntu has sh, dash, and bash, and the step above adds zsh, so
           # shell_parity fails here if any of them is missing.
-          FX_SHELL_PARITY_ALL_SHELLS: "1"
+          FX_TEST_SHELL_PARITY_ALL_SHELLS: "1"
           BUDGET_SECONDS: ${{ github.event_name == 'pull_request' && '120' || '1200' }}
         run: >-
           python3 -m scripts.fuzz_nightly run

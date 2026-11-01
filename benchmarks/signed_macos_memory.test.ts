@@ -50,9 +50,9 @@ test("signed macOS variants preserve the image flow and native resource accounti
           cwd: workspace, stdin: "ignore", stdout: "pipe", stderr: "pipe",
           env: { PATH: process.env.PATH ?? "", TMPDIR: dir, LANG: "en_US.UTF-8", TZ: "UTC",
             HOME: profile, AI_GATEWAY_API_KEY: "fake-fixture-key", FX_AUTO_UPGRADE: "0", FX_SOUND: "0",
-            FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_PERMISSION_MODE: "auto", FX_MODEL: model,
+            FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", FX_PERMISSION_MODE: "auto", FX_MODEL: model,
             FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl },
+            FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl },
         });
         childPid = child.pid;
         const timer = setTimeout(() => child.kill("SIGKILL"), 20_000);

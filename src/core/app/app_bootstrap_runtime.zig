@@ -168,6 +168,8 @@ pub fn Runtime(comptime App: type) type {
             /// Borrowed from the launch arguments; StartupState dupes on apply.
             provider_order: ?[]const []const u8 = null,
             provider_strict: ?bool = null,
+            /// `--permission-mode` for this launch; the saved mode is untouched.
+            permission_mode: ?types.PermissionMode = null,
         };
 
         pub fn bootstrap(
@@ -532,7 +534,7 @@ pub fn Runtime(comptime App: type) type {
                 launch_overrides.fast,
                 launch_overrides.provider,
             );
-            app.permission_engine.mode = startup.permission_mode;
+            app.permission_engine.mode = launch_overrides.permission_mode orelse startup.permission_mode;
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
             app.agent_step_limit = startup.agent_step_limit;
             app.worker.agent_turn_settings.max_tool_result_bytes = startup.max_tool_result_bytes;

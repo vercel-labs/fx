@@ -1462,7 +1462,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             firstJson.session_id,
             "Continue with the saved native image context.",
           ],
@@ -1567,7 +1567,7 @@ describe("Vision route fake Gateway", () => {
               "--json",
               "--auto",
               "--no-color",
-              "--resume-id",
+              "--resume",
               sessionId,
               `Reread ${entry.name} image.`,
             ],
@@ -1864,7 +1864,7 @@ describe("Vision route fake Gateway", () => {
 
         // The next turn, in a new process, cannot reach the catalog.
         const resumed = await runFx(
-          ["ask", "--json", "--auto", "--no-color", "--resume-id", firstJson.session_id, "Testing"],
+          ["ask", "--json", "--auto", "--no-color", "--resume", firstJson.session_id, "Testing"],
           { cwd: root.workspace, env: fakeGatewayEnv(root, down, KIMI_MODEL), timeoutMs: TIMEOUT },
         );
         const resumedJson = parseFxJson(resumed);
@@ -1996,7 +1996,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             firstJson.session_id,
             "--image",
             secondImagePath,
@@ -2019,7 +2019,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             firstJson.session_id,
             "Reread only the second historical image.",
           ],
@@ -2117,7 +2117,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             sessionId,
             "--image",
             newImagePath,
@@ -2163,7 +2163,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             sessionId,
             "Reread only the second repaired legacy image.",
           ],
@@ -2474,7 +2474,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             sessionId,
             "Inspect both saved images.",
           ],
@@ -2543,7 +2543,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             sessionId,
             "Inspect all saved images.",
           ],
@@ -3304,7 +3304,7 @@ for (const sourceChange of ["removed", "changed"] as const) {
       expectSavedBlob(root.home, id, original);
       if (sourceChange === "removed") rmSync(input);
       else writeMarkedImage(input, "REPLACEMENT_MUST_NOT_BE_USED");
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", id, "Describe the saved image again."], options);
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", id, "Describe the saved image again."], options);
       expect(parseFxJson(resumed).output).toContain("RECOVERY_IMAGE_COMPLETE");
       expect(gateway.chatRequests).toHaveLength(4);
       const parts = nativeFileParts(gateway.chatRequests[2]!.body);

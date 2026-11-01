@@ -2,6 +2,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
+const profile_paths = @import("core/shared/profile_paths.zig");
+const terminal_env = @import("core/shared/terminal_env.zig");
+const env_settings = @import("core/config/env_settings.zig");
 
 pub const version = "0.0.16";
 
@@ -534,7 +537,7 @@ const App = struct {
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
     /// Replaced in `init` with the real home directory.
-    usage_dashboard: usage.Dashboard = usage.Dashboard.init(std.heap.c_allocator, usage_host.host("")),
+    usage_dashboard: usage.Dashboard = usage.Dashboard.init(std.heap.c_allocator, usage_host.unset),
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
     workspace_host: WorkspaceHostRuntime = .{},
@@ -661,6 +664,9 @@ const App = struct {
             launch.requested_resume = null;
         }
         errdefer if (app.requested_resume) |*target| target.deinit(alloc);
+        app.submission.launch_prompt = launch.initial_prompt;
+        launch.initial_prompt = null;
+        errdefer if (app.submission.launch_prompt) |prompt| alloc.free(prompt);
         try BootstrapAppRuntime.bootstrap(
             &app,
             footer_rows,
@@ -680,6 +686,7 @@ const App = struct {
                 .ultrafast = launch.modifiers.ultrafast_override,
                 .provider_order = launch.modifiers.provider_order_override,
                 .provider_strict = launch.modifiers.provider_strict_override,
+                .permission_mode = launch.modifiers.permission_override,
             },
         );
         errdefer app.deinit();
@@ -722,10 +729,7 @@ const App = struct {
                 SessionAppRuntime.queueInterruptedTurnHint(&app);
             }
         }
-        const env_disabled = if (io_mod.getenv("FX_AUTO_UPGRADE")) |val|
-            std.mem.eql(u8, val, "0") or std.ascii.eqlIgnoreCase(val, "false")
-        else
-            false;
+        const env_disabled = if (io_mod.getenv("FX_AUTO_UPGRADE")) |val| env_settings.autoUpgradeOff(val) else false;
         if (env_disabled or !auto_upgrade.shouldEnableForCurrentExecutable()) {
             app.auto_upgrade_enabled = false;
         }
@@ -897,6 +901,7 @@ const App = struct {
         // Cancel a /usage fetch in flight before shutdown continues.
         self.usage_dashboard.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
+        InputSubmitRuntime.discardLaunchPrompt(self, "shutdown");
         const resume_handoff = SessionAppRuntime.finalizePersistenceWithResumeHandoff(self);
         const shutdown_failure = self.session_persistence.shutdown_failure;
         // These delete image snapshots and log discarded drafts.
@@ -967,6 +972,7 @@ const App = struct {
         self.model_cache.deinit();
         self.usage_dashboard.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
+        InputSubmitRuntime.discardLaunchPrompt(self, "shutdown");
         SessionAppRuntime.finalizePersistence(self);
         shutdown_trace.mark("persistence_finalized");
         self.worker.deinit(std.heap.c_allocator);
@@ -2903,6 +2909,7 @@ const App = struct {
         }
         if (comptime host_profile.durable_sessions) SessionAppRuntime.collectInterruptedTurnHint(self);
         InputSubmitRuntime.collectPendingSubmissionFacts(self);
+        try InputSubmitRuntime.collectLaunchPromptFacts(self, max_prompt_history);
         InputAppRuntime.collectFilePickerFacts(self);
 
         try self.collectThemeFacts();
@@ -3268,6 +3275,8 @@ pub fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char)
 fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !void {
     const raw_args = rawArgs(c_argc, c_argv);
     const raw_env: RawEnviron = @ptrCast(c_envp);
+    // Before any mode runs, since terminal helpers write under fx's folder too.
+    try useFxHomeFromEnv(raw_env);
 
     if (comptime terminal_native_session.isSupported()) {
         if (terminal_native_session.isControlModeRaw(raw_args)) {
@@ -3313,6 +3322,79 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         exitFast(0);
     }
     try runNonBenchmark(raw_args, raw_env, cli_args);
+}
+
+/// `FX_HOME` replaces `~/.fx` for the whole process. A bad value stops
+/// fx before it reads or writes anything there.
+fn useFxHomeFromEnv(raw_env: RawEnviron) !void {
+    const value = rawEnvValue(raw_env, "FX_HOME") orelse return;
+    profile_paths.useFxHome(value, rawEnvValue(raw_env, "HOME")) catch |err| {
+        try writeStderrFast(switch (err) {
+            error.FxHomeNotAbsolute => "fx: FX_HOME must be an absolute path\n",
+            error.FxHomeIsRoot => "fx: FX_HOME can't be the root folder\n",
+            error.FxHomeIsHome => "fx: FX_HOME can't be your home folder; fx keeps its folder private\n",
+        });
+        exitFast(1);
+    };
+    if (namesNonFolderRaw(value)) {
+        try writeStderrFast("fx: FX_HOME must name a folder, but it or a folder above it is a file\n");
+        exitFast(1);
+    }
+    // fx creates its own folder on first use, but opens the folder that holds
+    // it directly, so that one has to exist.
+    if (profile_paths.fxHomeParent()) |parent| createFolderPathRaw(parent);
+}
+
+/// Whether `path` is a file, or a path through one, rather than a folder or
+/// nothing yet. Asking for `path/` makes the system resolve it as a folder.
+/// This runs before fx's I/O is set up, so it calls libc.
+fn namesNonFolderRaw(path: []const u8) bool {
+    var buffer: [std.Io.Dir.max_path_bytes + 2]u8 = undefined;
+    const trimmed = std.mem.trimEnd(u8, path, "/");
+    if (trimmed.len == 0 or trimmed.len + 2 > buffer.len) return false;
+    @memcpy(buffer[0..trimmed.len], trimmed);
+    buffer[trimmed.len] = '/';
+    buffer[trimmed.len + 1] = 0;
+    const rc = std.c.access(@ptrCast(&buffer), std.c.F_OK);
+    return rc != 0 and std.posix.errno(rc) == .NOTDIR;
+}
+
+test "FX_HOME is refused only when it is a file or a path through one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "file", .data = "" });
+    try tmp.dir.createDirPath(io_mod.getIo(), "folder");
+    const root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, ".");
+    defer std.testing.allocator.free(root);
+
+    const cases = [_]struct { sub: []const u8, refused: bool }{
+        .{ .sub = "file", .refused = true },
+        .{ .sub = "file/", .refused = true },
+        .{ .sub = "file/fx", .refused = true },
+        .{ .sub = "folder", .refused = false },
+        .{ .sub = "folder/fx", .refused = false },
+        .{ .sub = "missing", .refused = false },
+    };
+    for (cases) |case| {
+        const path = try std.Io.Dir.path.join(std.testing.allocator, &.{ root, case.sub });
+        defer std.testing.allocator.free(path);
+        try std.testing.expectEqual(case.refused, namesNonFolderRaw(path));
+    }
+}
+
+/// Creates `path` and every folder above it that is missing. This runs before
+/// fx's I/O is set up, so it calls libc; a folder that already exists, or
+/// one fx can't create, is left for the first use to report.
+fn createFolderPathRaw(path: []const u8) void {
+    var buffer: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
+    if (path.len == 0 or path.len >= buffer.len) return;
+    var end: usize = 1;
+    while (end <= path.len) : (end += 1) {
+        if (end != path.len and path[end] != '/') continue;
+        @memcpy(buffer[0..end], path[0..end]);
+        buffer[end] = 0;
+        _ = std.c.mkdir(@ptrCast(&buffer), 0o755);
+    }
 }
 
 fn writeTopLevelHelpFast(raw_env: RawEnviron) !void {
@@ -3449,8 +3531,8 @@ fn topLevelHelpColumns(raw_env: RawEnviron) usize {
 }
 
 fn topLevelHelpStyle(raw_env: RawEnviron) command_specs.HelpStyle {
-    const no_color = rawEnvHas(raw_env, "NO_COLOR");
-    const dumb_terminal = if (rawEnvValue(raw_env, "TERM")) |term| std.mem.eql(u8, term, "dumb") else false;
+    const no_color = terminal_env.noColorValue(rawEnvValue(raw_env, "NO_COLOR"));
+    const dumb_terminal = terminal_env.dumbTerminalValue(rawEnvValue(raw_env, "TERM"));
     return topLevelHelpStyleForValues(stdoutIsTerminal(), no_color, dumb_terminal);
 }
 

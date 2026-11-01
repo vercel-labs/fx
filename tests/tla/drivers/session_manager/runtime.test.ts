@@ -21,7 +21,7 @@ function fixture(label: string) {
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
     AI_GATEWAY_API_KEY: "synthetic-tlc-runtime-fixture", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
     FX_MODEL: FAKE_GATEWAY_MODEL, FX_PERMISSION_MODE: "full-access",
     FX_AUTO_UPGRADE: "0", FX_SOUND: "0", NO_COLOR: "1", FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "wiring",
   });
@@ -92,7 +92,7 @@ test("TLC accepts actual committed/resumed logs and rejects corrupted or incompl
       const first = await run.ask(gateway, ["TLC_FIRST_PROMPT"]);
       expect(first.json.output).toBe("TLC_FIRST_ANSWER"); expect(first.outcome.stderr).toBe("");
       const id = first.json.session_id;
-      const second = await run.ask(gateway, ["--resume-id", id, "TLC_SECOND_PROMPT"]);
+      const second = await run.ask(gateway, ["--resume", id, "TLC_SECOND_PROMPT"]);
       expect(second.json.session_id).toBe(id); expect(second.json.output).toBe("TLC_SECOND_ANSWER");
       expect(gateway.requests.at(-1).body).toContain("TLC_FIRST_ANSWER");
       expect(run.lines(id).filter(line => line.kind === "turn_committed")).toHaveLength(2);
@@ -154,7 +154,7 @@ test("TLC accepts real owned-process crash followed by interrupted recovery and 
       writeFileSync(join(run.root, "fault-boundary.json"), JSON.stringify({ pid: pending.child.pid, id, lines: before, gatewayRequests: gateway.requests.length }, null, 2));
       assert(pending.child.kill("SIGKILL"), "owned process was not killed");
       const killed = await pending.finished; expect(killed.signal).toBe("SIGKILL"); expect(killed.exitCode).toBe(null);
-      const resumed = await run.ask(gateway, ["--resume-id", id, "TLC_RECOVERY_PROMPT"]);
+      const resumed = await run.ask(gateway, ["--resume", id, "TLC_RECOVERY_PROMPT"]);
       expect(resumed.json.output).toBe("TLC_RECOVERED_ANSWER"); expect(resumed.json.session_id).toBe(id);
       expect(gateway.requests.at(-1).body).toContain("TLC_CRASH_PROMPT");
       expect(run.lines(id).some(line => line.kind === "turn_interrupted" && line.reason === "crash")).toBe(true);
