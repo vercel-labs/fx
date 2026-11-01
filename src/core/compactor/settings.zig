@@ -14,7 +14,7 @@ pub fn isValidPercent(value: u64) bool {
 }
 
 /// Parses a process override. Invalid or out-of-range values are ignored.
-fn parsePercent(raw: ?[]const u8) ?u8 {
+pub fn parsePercent(raw: ?[]const u8) ?u8 {
     const trimmed = std.mem.trim(u8, raw orelse return null, " \t\r\n");
     if (trimmed.len == 0) return null;
     const value = std.fmt.parseUnsigned(u8, trimmed, 10) catch return null;

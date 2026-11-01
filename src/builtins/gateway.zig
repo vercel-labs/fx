@@ -49,7 +49,7 @@ pub const retry_count: usize = 3;
 pub const chat_url_env = "FX_GATEWAY_CHAT_URL";
 pub const default_model_catalog_base_url = "https://ai-gateway.vercel.sh";
 const base_url_env = "FX_GATEWAY_BASE_URL";
-const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
+const e2e_gateway_models_url_env = "FX_TEST_GATEWAY_MODELS_URL";
 const oauth_request_timeout_ms: i64 = 15_000;
 const oauth_response_max_bytes: usize = 64 * 1024;
 

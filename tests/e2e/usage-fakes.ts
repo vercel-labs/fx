@@ -92,9 +92,9 @@ export function usageFake(options: UsageFakeOptions = {}) {
 export function usageEnv(baseUrl: string, clockFile: string) {
   return {
     FX_GATEWAY_BASE_URL: baseUrl,
-    FX_E2E_CHATGPT_ORIGIN: baseUrl,
-    FX_E2E_GROK_ORIGIN: baseUrl,
-    FX_E2E_USAGE_CLOCK_FILE: clockFile,
+    FX_TEST_CHATGPT_ORIGIN: baseUrl,
+    FX_TEST_GROK_ORIGIN: baseUrl,
+    FX_TEST_USAGE_CLOCK_FILE: clockFile,
     FX_DISABLE_KEYCHAIN: "1",
   };
 }
