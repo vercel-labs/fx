@@ -1,5 +1,6 @@
 const std = @import("std");
 const domain = @import("domain.zig");
+const profiles = @import("../profiles/profiles.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_adapter = @import("../session/session_adapter.zig");
@@ -130,9 +131,13 @@ pub const Child = struct {
     last_request_fingerprint: ?[32]u8 = null,
     last_outcome: ?Outcome = null,
     last_failure: ?types.ModelFailureDiagnostic = null,
+    /// The agent profile the child started in, or null for fx's `agent`.
+    /// Fixed when the child is created. Owned.
+    profile: ?[]u8 = null,
 
     pub fn deinit(self: *Child, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.profile) |name| alloc.free(name);
         switch (self.kind) {
             .one_off => {},
             .persistent => |*persistent| persistent.deinit(alloc),
@@ -155,10 +160,13 @@ pub const Child = struct {
         };
         var active = if (self.active) |value| try value.clone(alloc) else null;
         errdefer if (active) |*value| value.deinit(alloc);
+        const profile = if (self.profile) |name| try alloc.dupe(u8, name) else null;
+        errdefer if (profile) |name| alloc.free(name);
         return .{
             .id = id,
             .kind = kind,
             .phase = self.phase,
+            .profile = profile,
             .work_generation = self.work_generation,
             .active = active,
             .last_work_id = if (self.last_work_id) |value| try alloc.dupe(u8, value) else null,
@@ -225,6 +233,14 @@ pub const Registry = struct {
             if (std.mem.eql(u8, child.id, child_id)) return child;
         }
         return null;
+    }
+
+    /// Records the profile a new child started in. A child keeps it for life.
+    pub fn setProfile(self: *Registry, alloc: Allocator, child_id: []const u8, name: []const u8) !void {
+        if (!profiles.validName(name)) return error.InvalidState;
+        const child = self.findById(child_id) orelse return error.InvalidState;
+        if (child.profile != null) return error.InvalidState;
+        child.profile = try alloc.dupe(u8, name);
     }
 
     pub fn findPersistent(self: *Registry, agent: []const u8) ?*Child {
@@ -600,6 +616,8 @@ const SpawnData = struct {
     /// A named child's name; null for a one-off.
     agent: ?[]const u8 = null,
     fingerprint: []const u8,
+    /// The agent profile the child started in; null for fx's `agent`.
+    profile: ?[]const u8 = null,
 };
 
 /// fx's data on a `child_finished` line.
@@ -658,9 +676,16 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
         if (!domain.validAgentName(agent)) return error.InvalidState;
         kind = .{ .persistent = .{ .agent = try alloc.dupe(u8, agent), .instructions = &.{} } };
     }
+    errdefer switch (kind) {
+        .one_off => {},
+        .persistent => |*persistent| persistent.deinit(alloc),
+    };
+    if (spawn.profile) |name| if (!profiles.validName(name)) return error.InvalidState;
+    const profile = if (spawn.profile) |name| try alloc.dupe(u8, name) else null;
     return .{
         .id = id,
         .kind = kind,
+        .profile = profile,
         .phase = switch (last_outcome) {
             .interrupted, .lost => .interrupted,
             .completed, .failed, .cancelled => switch (kind) {
@@ -705,7 +730,7 @@ fn planLines(arena: Allocator, old: Registry, next: Registry) ![]session_adapter
                 try lines.append(arena, .{ .spawned = .{
                     .child = after.id,
                     .work_id = work_id,
-                    .data = try stringifyAlloc(arena, SpawnData{ .agent = after.agentName(), .fingerprint = &fingerprint }),
+                    .data = try stringifyAlloc(arena, SpawnData{ .agent = after.agentName(), .fingerprint = &fingerprint, .profile = after.profile }),
                 } });
             }
         }
@@ -1479,4 +1504,58 @@ test "v2 children live in the parent's log and come back after a reopen (D22)" {
     try std.testing.expectEqualStrings("work-1", child.last_work_id.?);
     try std.testing.expectEqual(Outcome.completed, child.last_outcome.?);
     try std.testing.expectEqual(@as([32]u8, @splat(0x11)), child.last_request_fingerprint.?);
+}
+
+test "a v2 child keeps the profile it started in after a reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var store = try session_adapter.Store.open(alloc, home);
+    defer store.deinit(alloc);
+    var model = "test-model".*;
+    const seed: session_adapter.Seed = .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = types.ConversationLanguage.default(),
+        .permission_state = .{},
+    };
+    const parent = try session_adapter.Session.create(alloc, &store, "/w", .ask, seed);
+    var parent_open = true;
+    defer if (parent_open) parent.close();
+    try parent.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("delegate") }, .assistant = @constCast("ok") } }, types.ConversationLanguage.default());
+    const parent_id = try alloc.dupe(u8, parent.id());
+    defer alloc.free(parent_id);
+    const child_id = "1786460757753-kid";
+    {
+        var children = V2Children.init(alloc, parent, "/w");
+        defer children.deinit();
+        const state_store = Store{ .children = &children, .parent_id = parent_id };
+        var lock = state_store.acquireLock();
+        defer lock.release();
+        var registry = try state_store.load(alloc);
+        defer registry.deinit(alloc);
+        var work = try testWork(alloc, "work-1", 0x11);
+        defer work.deinit(alloc);
+        try registry.appendPersistent(alloc, child_id, "reviewer", "", work);
+        try std.testing.expectError(error.InvalidState, registry.setProfile(alloc, child_id, "Bad Name"));
+        try registry.setProfile(alloc, child_id, "reviewer");
+        try std.testing.expectError(error.InvalidState, registry.setProfile(alloc, child_id, "other"));
+        var copy = try registry.children[0].clone(alloc);
+        defer copy.deinit(alloc);
+        try std.testing.expectEqualStrings("reviewer", copy.profile.?);
+        try state_store.save(alloc, registry);
+    }
+    parent.close();
+    parent_open = false;
+
+    const reopened = try session_adapter.Session.resumeSession(alloc, &store, .{ .id = parent_id }, "/w", .ask);
+    defer reopened.close();
+    var children = V2Children.init(alloc, reopened, "/w");
+    defer children.deinit();
+    const state_store = Store{ .children = &children, .parent_id = parent_id };
+    var registry = try state_store.load(alloc);
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), registry.children.len);
+    try std.testing.expectEqualStrings("reviewer", registry.children[0].profile.?);
 }

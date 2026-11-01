@@ -41,9 +41,22 @@ const LiveViewProvider = struct {
     }
 };
 
+/// The MCP servers an agent may use, by name: an instance's profile.
+pub const ServerFilter = struct {
+    context: *const anyopaque,
+    allows_fn: *const fn (*const anyopaque, []const u8) bool,
+
+    pub fn allows(self: ServerFilter, server: []const u8) bool {
+        return self.allows_fn(self.context, server);
+    }
+};
+
 pub const Access = union(enum) {
     unrestricted,
     disabled,
+    /// Every tool of a server the filter allows. The host, which knows each
+    /// tool's server, decides.
+    servers: ServerFilter,
     scoped: struct {
         captured: *const access_policy.View,
         admission_authority_generation: u64,
@@ -53,7 +66,7 @@ pub const Access = union(enum) {
 
     pub fn allowsTool(self: Access, runtime_generation: u64, name: []const u8) bool {
         return switch (self) {
-            .unrestricted => true,
+            .unrestricted, .servers => true,
             .disabled => false,
             .scoped => |scope| scope.captured.runtime_generation == runtime_generation and
                 scope.captured.tool(name) != null,

@@ -1,4 +1,5 @@
 const std = @import("std");
+const agents = @import("../../core/agents/agents.zig");
 const agent_runtime = @import("../../core/agent/agent_runtime.zig");
 const hooks = @import("../../core/hooks/hooks.zig");
 const notification_contract = @import("../../core/notifications/notification_contract.zig");
@@ -202,8 +203,11 @@ fn Runtime(comptime App: type) type {
             deliver(player, .turn_end, .@"error", ready.turn_end_error);
         }
 
+        /// `session_id` is the session of the agent whose turn needs
+        /// attention, which need not be the one on screen.
         pub fn dispatchAttentionRequired(
             app: *App,
+            session_id: ?[]const u8,
             turn_id: u64,
             kind: hooks.AttentionKind,
         ) void {
@@ -212,7 +216,7 @@ fn Runtime(comptime App: type) type {
                 .scope = .{
                     .kind = .interactive,
                     .workspace_root = app.workspace_root,
-                    .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
+                    .session_id = session_id,
                 },
                 .outcome_allocator = app.alloc,
             }, .{
@@ -251,8 +255,12 @@ fn Runtime(comptime App: type) type {
             enqueue(app, .{ .kind = .attention_required });
         }
 
+        /// Queues a cue on the first slot's worker queue. Only interactive
+        /// scopes, which are main's turns, are enabled, and the turn-end hook
+        /// runs on the worker of the turn that ended. The main loop
+        /// still drains that queue after the first instance closes.
         fn enqueue(app: *App, notification: Notification) void {
-            app.worker.pushEvent(std.heap.c_allocator, .{ .notification = notification }) catch |err| {
+            app.main_agent.worker.pushEvent(std.heap.c_allocator, .{ .notification = notification }) catch |err| {
                 debug_trace.logf(
                     "notifications",
                     "interactive notification enqueue failed kind={s} err={s}",
@@ -354,11 +362,12 @@ fn ProviderAdapter(comptime App: type) type {
 
         fn dispatchAttentionRequired(
             raw: *anyopaque,
+            session_id: ?[]const u8,
             turn_id: u64,
             kind: hooks.AttentionKind,
         ) void {
             const app: *App = @ptrCast(@alignCast(raw));
-            Concrete.dispatchAttentionRequired(app, turn_id, kind);
+            Concrete.dispatchAttentionRequired(app, session_id, turn_id, kind);
         }
     };
 }

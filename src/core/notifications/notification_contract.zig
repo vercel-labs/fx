@@ -40,5 +40,6 @@ pub const Provider = struct {
     flush: *const fn (*anyopaque) void,
     play_cue: *const fn (*anyopaque, Cue) void,
     play_max_cue: *const fn (*anyopaque, Cue) void,
-    dispatch_attention_required: *const fn (*anyopaque, u64, hooks.AttentionKind) void,
+    /// The session id names the agent whose turn needs attention.
+    dispatch_attention_required: *const fn (*anyopaque, ?[]const u8, u64, hooks.AttentionKind) void,
 };
