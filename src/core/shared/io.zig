@@ -453,6 +453,33 @@ pub fn resetEnvironForTest() void {
     global_libc_environ = false;
 }
 
+/// Borrows the installed environment so a test can restore every representation
+/// before destroying a replacement map or block. The saved storage must outlive
+/// the test's temporary environment.
+pub fn saveEnvironForTest() SavedTestEnviron {
+    if (comptime !builtin.is_test) @compileError("saveEnvironForTest is test-only");
+    return .{
+        .map = global_environ,
+        .block = global_environ_block,
+        .raw = global_raw_environ,
+        .libc = global_libc_environ,
+    };
+}
+
+const SavedTestEnviron = struct {
+    map: ?*const std.process.Environ.Map,
+    block: ?std.process.Environ.Block,
+    raw: ?RawEnviron,
+    libc: bool,
+
+    pub fn restore(self: SavedTestEnviron) void {
+        global_environ = self.map;
+        global_environ_block = self.block;
+        global_raw_environ = self.raw;
+        global_libc_environ = self.libc;
+    }
+};
+
 pub fn getenv(key: []const u8) ?[]const u8 {
     if (global_environ) |m| return m.get(key);
     if (global_environ_block) |block| return getenvFromBlock(block, key);
@@ -1266,6 +1293,40 @@ test "cloneEnvironMap falls back to the test runner environment" {
     var cloned = try cloneEnvironMap(std.testing.allocator);
     defer cloned.deinit();
     try std.testing.expectEqualStrings(expected.get("PATH").?, cloned.get("PATH").?);
+}
+
+test "saved test environment restores absent map block raw and libc state" {
+    const previous = saveEnvironForTest();
+    defer previous.restore();
+    var original = std.process.Environ.Map.init(std.testing.allocator);
+    defer original.deinit();
+    try original.put("FX_SAVED_ENV_TEST", "original");
+    const block = try original.createPosixBlock(std.testing.allocator, .{});
+    defer block.deinit(std.testing.allocator);
+    const raw = [_:null]?[*:0]const u8{"FX_SAVED_ENV_TEST=original"};
+    var replacement = std.process.Environ.Map.init(std.testing.allocator);
+    defer replacement.deinit();
+    try replacement.put("FX_SAVED_ENV_TEST", "replacement");
+
+    for ([_]enum { absent, map, block, raw, libc }{ .absent, .map, .block, .raw, .libc }) |kind| {
+        switch (kind) {
+            .absent => resetEnvironForTest(),
+            .map => setEnvironMap(&original),
+            .block => setEnvironBlock(block),
+            .raw => setRawEnviron(&raw),
+            .libc => setLibcEnviron(),
+        }
+        const saved = saveEnvironForTest();
+        setEnvironMap(&replacement);
+        try std.testing.expectEqualStrings("replacement", getenv("FX_SAVED_ENV_TEST").?);
+        saved.restore();
+        try std.testing.expectEqualDeep(saved, saveEnvironForTest());
+        if (kind == .absent) {
+            try std.testing.expect(getenv("FX_SAVED_ENV_TEST") == null);
+        } else if (kind != .libc) {
+            try std.testing.expectEqualStrings("original", getenv("FX_SAVED_ENV_TEST").?);
+        }
+    }
 }
 
 test "resetEnvironForTest gives child processes the test runner environment again" {
