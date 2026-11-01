@@ -208,7 +208,7 @@ pub const State = struct {
         self.reloadHost(alloc, workspace_root, registry) catch |err| {
             debug_trace.logf("mcp", "MCP reload failed err={s}", .{@errorName(err)});
             const sink = self.host_sink orelse return true;
-            sink.push(std.heap.c_allocator.dupe(u8, "The MCP config changed, but fx couldn't load it again. Your current servers are still active.") catch return true, true);
+            sink.push(std.heap.c_allocator.print("The MCP config changed, but fx couldn't load it: {s}. Your current servers are still active.", .{mcp_verbs.describe(err)}) catch return true, true);
         };
         return true;
     }
@@ -1445,7 +1445,7 @@ const TestLoader = struct {
 
     fn load(_: Allocator, _: []const u8, _: tool_dispatch.Registry, _: mcp_host.Extras) anyerror!?*mcp_host.Host {
         loads += 1;
-        if (fail) return error.TestLoadFailed;
+        if (fail) return error.McpConfigInvalidJson;
         return null;
     }
 };
@@ -1500,5 +1500,5 @@ test "the host loads again when its config files change outside the session, onc
     }
     try std.testing.expectEqual(@as(usize, 1), notices.len);
     try std.testing.expect(notices[0].warning);
-    try std.testing.expectEqualStrings("The MCP config changed, but fx couldn't load it again. Your current servers are still active.", notices[0].text);
+    try std.testing.expectEqualStrings("The MCP config changed, but fx couldn't load it: ~/.fx/mcp.json isn't valid JSON. Your current servers are still active.", notices[0].text);
 }

@@ -428,7 +428,7 @@ fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
 }
 
 /// fx's words for an error, never its name.
-fn describe(err: anyerror) []const u8 {
+pub fn describe(err: anyerror) []const u8 {
     return switch (err) {
         error.OutOfMemory => "out of memory",
         error.Exists => "that name is already in the file; remove it first",

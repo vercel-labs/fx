@@ -3,7 +3,7 @@ import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, rea
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
-import { fakeGatewayFinalText, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import { fakeGatewayFinalText, heldFakeGatewayFinalText, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 // `fx mcp`. Sign-in is covered in mcp-auth.test.ts.
 
@@ -612,6 +612,53 @@ describe("/mcp in the shell", () => {
     expect(gateway.requests).toHaveLength(2);
     expect(servers(gateway.requests[1]!.body)).toContain("fixture");
     expect(servers(gateway.requests[1]!.body)).not.toContain("outside");
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("a prompt sent while a turn runs keeps the current servers, and the next prompt after the turn loads the change", async () => {
+    // Only SIGTERM ends it: it never reads stdin, and never answers.
+    const root = createRoot({
+      mcpServers: { slow: { command: "/bin/sh", args: ["-c", "echo $$ > slow.pid; trap 'exit 0' TERM; while :; do sleep 0.05; done"] } },
+    });
+    const held = heldFakeGatewayFinalText();
+    gateway = startFakeGateway([held.response, fakeGatewayFinalText("second done"), fakeGatewayFinalText("third done")], {
+      models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }],
+    });
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+    });
+    await tui.waitForComposer(15_000);
+    const pidPath = join(root.workspace, "slow.pid");
+    for (let i = 0; i < 200 && !existsSync(pidPath); i++) await Bun.sleep(25);
+    const pid = Number(readFileSync(pidPath, "utf8").trim());
+    try {
+      expect(isRunning(pid)).toBe(true);
+      await tui.sendText("first prompt");
+      for (let i = 0; i < 600 && gateway.requests.length === 0; i++) await Bun.sleep(25);
+      expect(gateway.requests).toHaveLength(1);
+      // While the turn runs, another fx removes the server and a prompt is sent.
+      expect((await mcp(root, "remove", "slow")).code).toBe(0);
+      await tui.sendText("second prompt");
+      await tui.waitForText("second prompt", 10_000);
+      // A removed server stops within about 1.5 s; this one keeps running.
+      for (let i = 0; i < 50; i++) {
+        expect(isRunning(pid)).toBe(true);
+        await Bun.sleep(50);
+      }
+      held.release("first done");
+      await tui.waitForText("second done", 15_000);
+      // The next prompt, sent with no turn running, loads the change.
+      await tui.sendText("third prompt");
+      await tui.waitForText("third done", 15_000);
+      for (let i = 0; i < 200 && isRunning(pid); i++) await Bun.sleep(25);
+      expect(isRunning(pid)).toBe(false);
+    } finally {
+      held.dispose();
+      if (isRunning(pid)) process.kill(pid, "SIGKILL");
+    }
   }, 90_000);
 
   test.skipIf(!tmuxAvailable())("a project .mcp.json that is a FIFO or a link to /dev/tty can't stop the shell starting or checking the config", async () => {
