@@ -1392,6 +1392,10 @@ pub const Choice = union(enum) {
     }
 };
 
+/// What a picker row or column says while the team list loads in the
+/// background.
+pub const team_list_loading_label = "loading teams...";
+
 pub const PickerView = struct {
     active: bool,
     available_sources: SourceSet,
@@ -1513,7 +1517,7 @@ pub const PickerView = struct {
                 .setup, .switch_credential, .switch_provider => "",
                 .automatic => "use the first available source",
                 .change_team => if (self.team_list_loading)
-                    "loading teams..."
+                    team_list_loading_label
                 else if (self.fx_login_session_available)
                     "choose a team"
                 else

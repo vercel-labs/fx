@@ -355,10 +355,7 @@ pub fn Runtime(comptime App: type) type {
                 try writeRemoteRevocationWarning(app, .grok_subscription);
             }
             try reconcileSubscriptionLogout(app, .grok);
-            if (revocation) |pending| {
-                revocation = null;
-                try startRemoteRevocation(app, pending);
-            }
+            try startRemoteRevocation(app, &revocation);
         }
 
         /// Signs out of fx login locally, then revokes the session at the
@@ -377,16 +374,16 @@ pub fn Runtime(comptime App: type) type {
             var revocation: ?auth_runtime.RemoteRevocation = if (local.session) |session| .{ .fx_login = session } else null;
             defer if (revocation) |pending| releaseRemoteRevocation(pending);
             try applyLogoutResult(app, local.result);
-            if (revocation) |pending| {
-                revocation = null;
-                try startRemoteRevocation(app, pending);
-            }
+            try startRemoteRevocation(app, &revocation);
         }
 
         /// The local sign-out is already done. Revoking the session at its
         /// issuer can take seconds, so it runs off the input loop, and a
         /// failure is reported when `collectRemoteRevocationFacts` sees it.
-        fn startRemoteRevocation(app: *App, revocation: auth_runtime.RemoteRevocation) !void {
+        /// Takes `pending`, leaving null so the caller's release skips it.
+        fn startRemoteRevocation(app: *App, pending: *?auth_runtime.RemoteRevocation) !void {
+            const revocation = pending.* orelse return;
+            pending.* = null;
             const source = revocation.source();
             if (!app.auth.beginRemoteRevocation(revocation)) {
                 try writeRemoteRevocationWarning(app, source);

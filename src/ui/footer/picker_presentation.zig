@@ -109,14 +109,7 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
             .action => |action| switch (action) {
                 .connections => if (view.available_sources.count() > 0) "connected" else "not connected",
                 .switch_provider => view.choiceLabel(.{ .provider = view.active_provider }),
-                .change_team => if (view.team_list_loading)
-                    "loading teams..."
-                else if (!view.fx_login_session_available)
-                    "sign in to manage"
-                else if (view.current_team != null)
-                    "selected"
-                else
-                    "choose a team",
+                .change_team => changeTeamSetupValue(view),
                 .switch_credential => if (view.active_source != null)
                     view.activeSourceLabel()
                 else
@@ -143,6 +136,12 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
         .provider, .change_team, .switch_credential => view.choiceDescription(choice),
         .sign_in, .api_key => "",
     };
+}
+
+fn changeTeamSetupValue(view: auth_runtime.PickerView) []const u8 {
+    if (view.team_list_loading) return auth_runtime.team_list_loading_label;
+    if (!view.fx_login_session_available) return "sign in to manage";
+    return if (view.current_team != null) "selected" else "choose a team";
 }
 
 fn detailValueColumn(width: u16) usize {
@@ -927,7 +926,7 @@ pub fn composePickerStatusRowWithProvider(
         .provider_stage => switch (provider_stage) {
             .provider => "no matching providers",
             .method => "no matching sign-in methods",
-            .team => if (loading) "loading teams..." else if (failed) "unable to load teams" else "no matching teams",
+            .team => if (loading) auth_runtime.team_list_loading_label else if (failed) "unable to load teams" else "no matching teams",
             .key_source => "no matching key sources",
             .api_key => "",
         },

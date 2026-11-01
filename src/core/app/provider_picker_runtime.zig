@@ -71,7 +71,7 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime @hasDecl(@TypeOf(app.auth), "teamListLoading")) {
                 if (app.auth.teamListLoading()) {
-                    column.labels[0] = "loading teams...";
+                    column.labels[0] = auth_runtime.team_list_loading_label;
                     column.annotations[0] = "";
                     column.count = 1;
                     return column.count;
