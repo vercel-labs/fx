@@ -42,6 +42,10 @@ pub const Theme = struct {
     statusline_style: []const u8,
     tag_style: []const u8,
     subtitle_style: []const u8,
+    /// A tool group's title and row text: proto's silver accent.
+    tool_title_style: []const u8,
+    /// A displayed reasoning trace: dim and italic, proto's thinking text.
+    thinking_style: []const u8,
     system_notice_label_style: []const u8,
     system_notice_text_style: []const u8,
     dim_style: []const u8,
@@ -81,6 +85,8 @@ pub const fx_dark: Theme = .{
     .statusline_style = "\x1b[38;5;245m",
     .tag_style = "\x1b[1;38;5;255m",
     .subtitle_style = "\x1b[1;38;5;255m",
+    .tool_title_style = "\x1b[38;5;250m",
+    .thinking_style = "\x1b[3;38;5;245m",
     .system_notice_label_style = "\x1b[1;38;5;252m",
     .system_notice_text_style = "\x1b[38;5;250m",
     .dim_style = "\x1b[38;5;245m",
@@ -124,6 +130,8 @@ pub const fx_light: Theme = .{
     .statusline_style = "\x1b[38;5;241m",
     .tag_style = "\x1b[1;38;5;235m",
     .subtitle_style = "\x1b[1;38;5;235m",
+    .tool_title_style = "\x1b[38;5;238m",
+    .thinking_style = "\x1b[3;38;5;245m",
     .system_notice_label_style = "\x1b[1;38;5;238m",
     .system_notice_text_style = "\x1b[38;5;241m",
     .dim_style = "\x1b[38;5;247m",

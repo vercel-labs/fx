@@ -589,7 +589,7 @@ test "lifecycle transition reports focus changes from immutable snapshots" {
 }
 
 /// Visual rows of live reasoning the activity band shows at most.
-pub const reasoning_preview_row_limit: usize = 3;
+pub const reasoning_preview_row_limit: usize = 5;
 /// Preview rows align under the status label's marker.
 pub const reasoning_preview_indent_width: usize = 2;
 
@@ -659,7 +659,7 @@ pub fn reasoningPreviewRows(
     return out[0..stored];
 }
 
-test "reasoning preview rows keep only the newest three visual rows" {
+test "reasoning preview rows keep only the newest five visual rows" {
     const text = "alpha beta gamma delta epsilon zeta eta theta";
     var rows: [reasoning_preview_row_limit][]const u8 = undefined;
     const shown = reasoningPreviewRows(text, 10, &rows);

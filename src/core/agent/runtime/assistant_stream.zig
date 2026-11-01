@@ -165,9 +165,9 @@ pub const StreamChunkContext = struct {
     }
 
     /// Publishes this step's reasoning once, as a full-only transcript record
-    /// at the step's position. Inline output stays compact; ctrl+o carries the
-    /// whole stream. Providers that expose no visible reasoning publish
-    /// nothing.
+    /// at the step's position. The compact transcript shows its first prose
+    /// lines; ctrl+o carries the whole stream. Providers that expose no
+    /// visible reasoning publish nothing.
     pub fn publishReasoningRecord(self: *StreamChunkContext) void {
         // Text or a tool call closes the trace whose tail the display shows.
         flushReasoningPreview(self, io_mod.milliTimestamp());

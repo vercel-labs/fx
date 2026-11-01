@@ -3,6 +3,7 @@
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const thinking_text = @import("../../core/shared/thinking_text.zig");
 const render_request = @import("../render_request.zig");
 const ui_render = @import("../render.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
@@ -295,8 +296,10 @@ fn paintActivityDetailRows(
     max_rows: u16,
 ) !void {
     if (detail.len == 0 or max_rows == 0) return;
+    var folded_buf: [thinking_text.preview_capacity]u8 = undefined;
+    const prose = thinking_text.proseOnlyInto(&folded_buf, detail);
     var rows: [activity_runtime.reasoning_preview_row_limit][]const u8 = undefined;
-    const shown = activity_runtime.reasoningPreviewRows(detail, surface.cols, &rows);
+    const shown = activity_runtime.reasoningPreviewRows(prose, surface.cols, &rows);
     const indent: [activity_runtime.reasoning_preview_indent_width]u8 = @splat(' ');
     var buf: [4096]u8 = undefined;
     for (shown, 0..) |line, index| {
@@ -410,9 +413,16 @@ fn writeToolMarkerBlinkText(out: []u8, label: []const u8, shimmer_pos: i16) []co
     }
     const marker_unit = display_width.displayUnitAt(label, marker_start);
     if (marker_unit.byte_len == 0) return label;
-    const marker_end = @min(marker_start + marker_unit.byte_len, label.len);
+    var marker_end = @min(marker_start + marker_unit.byte_len, label.len);
+    if (std.mem.startsWith(u8, label[marker_start..], "└─") or std.mem.startsWith(u8, label[marker_start..], "├─")) {
+        const dash = display_width.displayUnitAt(label, marker_start + marker_unit.byte_len);
+        marker_end = @min(marker_start + marker_unit.byte_len + dash.byte_len, label.len);
+    }
     const marker = label[marker_start..marker_end];
-    if (!std.mem.eql(u8, marker, "●") and !std.mem.eql(u8, marker, "└")) return label;
+    if (!std.mem.eql(u8, marker, "●") and
+        !std.mem.eql(u8, marker, "└") and
+        !std.mem.eql(u8, marker, "└─") and
+        !std.mem.eql(u8, marker, "├─")) return label;
 
     var marker_buf: [64]u8 = undefined;
     var marker_writer: std.Io.Writer = .fixed(&marker_buf);
@@ -423,7 +433,8 @@ fn writeToolMarkerBlinkText(out: []u8, label: []const u8, shimmer_pos: i16) []co
             ui_render.reset_style,
         }) catch return label;
     } else {
-        marker_writer.writeAll(" ") catch return label;
+        var spaces: [4]u8 = @splat(' ');
+        marker_writer.writeAll(spaces[0..@min(display_width.visibleWidth(marker), spaces.len)]) catch return label;
     }
     const animated_marker = marker_writer.buffered();
     const prefix = label[0..marker_start];
@@ -445,14 +456,18 @@ fn writeToolMarkerBlinkText(out: []u8, label: []const u8, shimmer_pos: i16) []co
     return out[0..end];
 }
 
-test "tool marker shimmer accepts the minimal final connector" {
+test "tool marker shimmer accepts the final and middle tree connectors" {
     var out: [256]u8 = undefined;
-    const result = writeToolMarkerBlinkText(&out, "└ Running zig build", 0);
+    const result = writeToolMarkerBlinkText(&out, "└─ Running zig build", 0);
     try std.testing.expect(std.mem.find(u8, result, "Running zig build") != null);
-    try std.testing.expect(!std.mem.eql(u8, result, "└ Running zig build"));
+    try std.testing.expect(!std.mem.eql(u8, result, "└─ Running zig build"));
 
-    const unchanged = writeToolMarkerBlinkText(&out, "├ Read runtime.zig", 0);
-    try std.testing.expectEqualStrings("├ Read runtime.zig", unchanged);
+    const middle = writeToolMarkerBlinkText(&out, "├─ Running zig build", 0);
+    try std.testing.expect(std.mem.find(u8, middle, "Running zig build") != null);
+    try std.testing.expect(!std.mem.eql(u8, middle, "├─ Running zig build"));
+
+    const unchanged = writeToolMarkerBlinkText(&out, "Plain activity", 0);
+    try std.testing.expectEqualStrings("Plain activity", unchanged);
 }
 
 fn traceSurfaceShimmerPaint(surface: *const frame_surface.FrameSurface, row: u16, label: []const u8) void {

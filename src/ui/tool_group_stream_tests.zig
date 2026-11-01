@@ -98,7 +98,7 @@ fn plain(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
 }
 
 fn isBody(text: []const u8) bool {
-    return std.mem.startsWith(u8, text, "│") or std.mem.startsWith(u8, text, "    ");
+    return std.mem.startsWith(u8, text, "│") or std.mem.startsWith(u8, text, "   ");
 }
 
 /// A body row sits under its own call, and the tree closes once: after
@@ -109,7 +109,7 @@ fn expectWellFormed(rows: []const Line) !void {
     for (rows[1..]) |row| {
         if (isBody(row.text)) {
             try std.testing.expectEqual(owner, row.entry_id);
-            try std.testing.expect(std.mem.startsWith(u8, row.text, if (closed) "    " else "│"));
+            try std.testing.expect(std.mem.startsWith(u8, row.text, if (closed) "   " else "│"));
             continue;
         }
         try std.testing.expect(!closed);
@@ -122,7 +122,7 @@ fn expectWellFormed(rows: []const Line) !void {
 /// A row without its tree rail: the last row's `└` becomes `├` when a call
 /// joins below it, and nothing else may change.
 fn withoutRail(text: []const u8) []const u8 {
-    for ([_][]const u8{ "├ ", "└ ", "│   ", "    " }) |rail| {
+    for ([_][]const u8{ "├─ ", "└─ ", "│  ", "   " }) |rail| {
         if (std.mem.startsWith(u8, text, rail)) return text[rail.len..];
     }
     return text;
@@ -195,26 +195,26 @@ test "reads read as what they did while other commands and Python keep their out
     for (rows) |row| try texts.append(arena, row.text);
     try std.testing.expectEqualStrings(
         \\● Ran 3 commands, listed 1 directory, read 1 file and 1 other call
-        \\├ Listed ~/code/proto
-        \\├ Ran git log --oneline -3 && du -sh packages
-        \\│   abc1 one
-        \\│   abc2 two
-        \\│   abc3 three
-        \\│    41M packages
-        \\├ Read assistant-message.ts:1-120
-        \\├ Ran python3
-        \\│   cd ~/code/proto && python3 - <<'PY'
-        \\│   Module · 3 nodes
-        \\│   ├─ import os
-        \\│   └─ for name os.listdir('.') ·L2
-        \\│      └─ print(name)
-        \\│   PY
-        \\│   Output
-        \\│   README.md
-        \\│   packages
-        \\├ Searched "table" in markdown.ts
-        \\└ Ran make check
-        \\    ok
+        \\├─ Listed ~/code/proto
+        \\├─ Ran git log --oneline -3 && du -sh packages
+        \\│  abc1 one
+        \\│  abc2 two
+        \\│  abc3 three
+        \\│   41M packages
+        \\├─ Read assistant-message.ts:1-120
+        \\├─ Ran python3
+        \\│  └─ python3 - <<'PY'
+        \\│  Module · 3 nodes
+        \\│  ├─ import os
+        \\│  └─ for name os.listdir('.') ·L2
+        \\│     └─ print(name)
+        \\│  PY
+        \\│  Output
+        \\│  README.md
+        \\│  packages
+        \\├─ Searched "table" in markdown.ts
+        \\└─ Ran make check
+        \\   ok
     , try std.mem.join(arena, "\n", texts.items));
 }
 
@@ -249,9 +249,9 @@ test "long commands drop their cd and quiet redirects and end at a word" {
     while (split.next()) |line| try texts.append(arena, try plain(arena, line));
     try std.testing.expectEqualStrings(
         \\● Ran 2 commands
-        \\├ Ran npm run build -- --filter packages/tui; npm test -- …
-        \\│   done
-        \\└ Ran make lint
-        \\    done
+        \\├─ Ran npm run build -- --filter packages/tui; npm test -- …
+        \\│  done
+        \\└─ Ran make lint
+        \\   done
     , try std.mem.join(arena, "\n", texts.items));
 }

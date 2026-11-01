@@ -21,6 +21,7 @@ const display_width = @import("../../core/shared/display_width.zig");
 const checklist = @import("../../core/checklist/checklist.zig");
 const checklist_panel = @import("checklist_panel.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
+const thinking_text = @import("../../core/shared/thinking_text.zig");
 const types = @import("../../core/shared/types.zig");
 const workspace_access = @import("../../core/workspace/workspace_access.zig");
 const file_index = @import("../../core/workspace/file_index.zig");
@@ -707,10 +708,11 @@ pub fn activityProjectionRows(projection: ActivityProjection, cols: u16) u16 {
     return switch (projection) {
         .turn_thinking => |thinking| if (thinking.tone == .thinking and thinking.detail_styled)
             1 +| styledRowCount(thinking.detail)
-        else if (thinking.tone == .thinking)
-            1 +| activity_runtime.reasoningPreviewRowCount(thinking.detail, cols)
-        else
-            wrappedStatusRowCount(thinking.label, cols, max_static_status_activity_rows),
+        else if (thinking.tone == .thinking) blk: {
+            var folded_buf: [thinking_text.preview_capacity]u8 = undefined;
+            const prose = thinking_text.proseOnlyInto(&folded_buf, thinking.detail);
+            break :blk 1 +| activity_runtime.reasoningPreviewRowCount(prose, cols);
+        } else wrappedStatusRowCount(thinking.label, cols, max_static_status_activity_rows),
         .none, .tool_slot => 1,
     };
 }
@@ -1370,7 +1372,7 @@ test "thinking activity reserves rows for the reasoning preview" {
         .detail = "one two three four five six seven eight",
     } };
     try std.testing.expectEqual(@as(u16, 2), activityProjectionRows(preview, 80));
-    try std.testing.expectEqual(@as(u16, 4), activityProjectionRows(preview, 12));
+    try std.testing.expectEqual(@as(u16, 6), activityProjectionRows(preview, 12));
     try std.testing.expectEqualStrings(
         "one two three four five six seven eight",
         activityProjectionDetail(preview).?,

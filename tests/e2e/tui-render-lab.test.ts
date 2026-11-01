@@ -367,7 +367,7 @@ test("render-lab analyzer rejects activity marker corruption", () => {
   outDir = mkdtempSync(join(tmpdir(), "fx-render-lab-analyzer-test-"));
   const submitted = "exercise one active command placement";
   const group = "● 1 tool call · 1 command";
-  const activity = "└ Running sleep 1; i=1";
+  const activity = "└─ Running sleep 1; i=1";
   const cases = [
     {
       name: "missing",

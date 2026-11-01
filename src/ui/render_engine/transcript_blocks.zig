@@ -5,6 +5,7 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const shared_theme = @import("../../core/shared/theme.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
+const thinking_text = @import("../../core/shared/thinking_text.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const assistant_wrap = @import("assistant_wrap.zig");
@@ -231,87 +232,98 @@ fn blockKindForEntry(entry: TranscriptEntry) TranscriptBlockKind {
     };
 }
 
+/// A step's reasoning trace. Its record stays full-only in the store; the
+/// compact transcript shows its first few prose lines.
+pub fn isThinkingNotice(notice: anytype) bool {
+    return !notice.inline_hidden and
+        std.mem.eql(u8, notice.topic, "thinking") and
+        notice.visibility == .full_only;
+}
+
 pub fn isEntryVisibleInCompactPresentation(entry: TranscriptEntry) bool {
     return switch (entry) {
-        .semantic_notice => |notice| !notice.inline_hidden and (notice.visibility == .compact_and_full or reasoningTitle(notice) != null),
+        .semantic_notice => |notice| !notice.inline_hidden and
+            (notice.visibility == .compact_and_full or isThinkingNotice(notice)),
         inline else => |payload| !payload.inline_hidden,
     };
 }
 
-/// The widest reasoning heading, in display columns, before it ends in "…".
-const max_reasoning_title_cols = 72;
-
-/// A step's reasoning shows inline as one heading when it has a title; the
-/// full trace stays in the full transcript. Null for every other notice.
-pub fn reasoningTitle(notice: anytype) ?[]const u8 {
-    if (notice.visibility != .full_only or !std.mem.eql(u8, notice.topic, "thinking")) return null;
-    return stepTitle(notice.body);
+test "compact reasoning shows a heading and five prose lines with code folded" {
+    const alloc = std.testing.allocator;
+    const entry = TranscriptEntry{ .semantic_notice = .{
+        .id = 1,
+        .topic = "thinking",
+        .tone = .information,
+        .body = "Line one.\nLine two.\nLine three.\n```\ncode one\ncode two\n```\nLine four.\nLine five.\nLine six.",
+        .visibility = .full_only,
+    } };
+    const block = try renderEntryToBlock(alloc, entry, 40, .{});
+    defer block.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, block.bytes, "Thinking") != null);
+    try std.testing.expect(std.mem.find(u8, block.bytes, "Line one.") != null);
+    try std.testing.expect(std.mem.find(u8, block.bytes, "Line five.") != null);
+    try std.testing.expect(std.mem.find(u8, block.bytes, "Line six.") == null);
+    try std.testing.expect(std.mem.find(u8, block.bytes, "code one") == null);
+    try std.testing.expect(std.mem.find(u8, block.bytes, "(2 lines of code)") != null);
+    try std.testing.expect(std.mem.find(u8, block.bytes, "…") != null);
 }
 
-/// The widest plain first line that still reads as a title.
-const max_plain_title_bytes = 60;
-const max_plain_title_words = 8;
+/// Rows of a reasoning trace the compact transcript shows. The full trace
+/// stays in ctrl+o.
+const reasoning_inline_rows = 5;
+const reasoning_inline_indent = 2;
+const reasoning_inline_max_bytes = 64 * 1024;
 
-/// A reasoning trace's title, as proto shows one (D208): a summary's `#` or
-/// bold title line, or a first line short enough to read as a title, on
-/// its own, starting with a capital and ending without sentence or list
-/// punctuation. A trace that opens with prose ("The user wants three
-/// things:") has none, and no heading shows.
-pub fn stepTitle(body: []const u8) ?[]const u8 {
-    var lines = std.mem.splitScalar(u8, body, '\n');
+/// A step's reasoning as proto shows one: a muted heading, then the first
+/// few prose lines in dim italic. Fenced code is folded away before the
+/// lines are counted, so the cap covers what a person can read.
+fn renderReasoningTrace(alloc: Allocator, body: []const u8, cols: u16) ![]u8 {
+    const folded = try thinking_text.proseOnly(alloc, body);
+    defer alloc.free(folded);
+    const room = @max(@as(usize, cols) -| reasoning_inline_indent, 1);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "  ");
+    try out.appendSlice(alloc, ui_render.dim_style);
+    try out.appendSlice(alloc, "Thinking");
+    try out.appendSlice(alloc, ui_render.reset_style);
+
+    var shown: usize = 0;
+    var truncated = false;
+    var lines = std.mem.splitScalar(u8, folded, '\n');
     while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
-        if (line.len == 0) continue;
-        if (line[0] == '#') return titleText(std.mem.trim(u8, std.mem.trimStart(u8, line, "#"), " *_"));
-        if (line.len > 4 and std.mem.startsWith(u8, line, "**") and std.mem.endsWith(u8, line, "**")) {
-            const inner = std.mem.trim(u8, line[2 .. line.len - 2], " ");
-            if (std.mem.find(u8, inner, "**") != null) return null;
-            return titleText(inner);
+        const trimmed = std.mem.trim(u8, raw, " \t\r");
+        if (trimmed.len == 0) continue;
+        // One source line at a time: `encodeTerminalSafe` escapes the line
+        // break itself, and the wrap below is per display row.
+        const safe = try text_utils.encodeTerminalSafeInline(alloc, trimmed, reasoning_inline_max_bytes);
+        defer alloc.free(safe.bytes);
+        var line: []const u8 = safe.bytes;
+        while (line.len > 0) {
+            if (shown == reasoning_inline_rows) {
+                truncated = true;
+                break;
+            }
+            var chunk = display_width.wrapCutIgnoringAnsi(line, room);
+            if (chunk.len == 0) chunk = line[0..display_width.displayUnitAt(line, 0).byte_len];
+            try out.append(alloc, '\n');
+            try out.appendSlice(alloc, "  ");
+            try out.appendSlice(alloc, ui_render.thinking_style);
+            try out.appendSlice(alloc, chunk);
+            try out.appendSlice(alloc, ui_render.reset_style);
+            shown += 1;
+            line = std.mem.trimStart(u8, line[chunk.len..], " \t");
         }
-        // A plain line is a title only on its own, not the start of a paragraph.
-        if (lines.peek()) |next| if (std.mem.trim(u8, next, " \t\r").len != 0) return null;
-        const plain = titleText(line) orelse return null;
-        if (plain.len > max_plain_title_bytes or !std.ascii.isUpper(plain[0])) return null;
-        if (std.mem.find(u8, plain, ". ") != null) return null;
-        if (std.mem.countScalar(u8, plain, ' ') + 1 > max_plain_title_words) return null;
-        return plain;
+        if (truncated) break;
     }
-    return null;
-}
-
-/// `text` when it can stand as a title: not empty and not ending in the
-/// punctuation that ends a sentence or opens a list.
-fn titleText(text: []const u8) ?[]const u8 {
-    if (text.len == 0) return null;
-    if (std.mem.endsWith(u8, text, "\u{2026}")) return null;
-    return switch (text[text.len - 1]) {
-        ':', '.', ',', ';', '!', '?' => null,
-        else => text,
-    };
-}
-
-test "a step heading shows only for a real title" {
-    try std.testing.expectEqualStrings("Planning the count", stepTitle("**Planning the count**\n\nI will run one shell command.").?);
-    try std.testing.expectEqualStrings("Reading the notes", stepTitle("## Reading the notes\nThen more.").?);
-    try std.testing.expectEqualStrings("Counting Python files", stepTitle("Counting Python files\n\nThe tree has three folders.").?);
-    // Prose openings, list lead-ins and long or wrapped lines show nothing.
-    try std.testing.expect(stepTitle("The user wants three things:\n\n1. count\n2. write") == null);
-    try std.testing.expect(stepTitle("**The user wants three things:**\n\n1. count") == null);
-    try std.testing.expect(stepTitle("I'll count the .py files under the workspace with a single shell invocation.") == null);
-    try std.testing.expect(stepTitle("Let me check\nthe folder layout first") == null);
-    try std.testing.expect(stepTitle("lowercase start of a thought") == null);
-    try std.testing.expect(stepTitle("Okay so now I need to think about how to count the files here") == null);
-    try std.testing.expect(stepTitle("Done. Next the plan") == null);
-    try std.testing.expect(stepTitle("\n  \n") == null);
-}
-
-fn renderReasoningHeading(alloc: Allocator, title: []const u8, cols: u16) ![]u8 {
-    const safe = try text_utils.encodeTerminalSafeInline(alloc, title, 512);
-    defer alloc.free(safe.bytes);
-    const room = @min(@as(usize, cols) -| 2, max_reasoning_title_cols);
-    const fits = display_width.visibleWidth(safe.bytes) <= room;
-    const shown = if (fits) safe.bytes else display_width.prefixByWidth(safe.bytes, room -| 1);
-    return alloc.print("  \x1b[1m{s}{s}\x1b[0m", .{ shown, if (fits) "" else "…" });
+    if (truncated) {
+        try out.appendSlice(alloc, " ");
+        try out.appendSlice(alloc, ui_render.dim_style);
+        try out.appendSlice(alloc, "…");
+        try out.appendSlice(alloc, ui_render.reset_style);
+    }
+    return out.toOwnedSlice(alloc);
 }
 
 pub fn entryClassForEntry(entry: TranscriptEntry) TranscriptEntryClass {
@@ -2102,9 +2114,12 @@ fn renderEntryToBlockForPresentationInterruptible(
             .stored_tail_newlines = 0,
         };
     }
-    if (presentation == .compact and entry == .semantic_notice) {
-        if (reasoningTitle(entry.semantic_notice)) |title| {
-            return normalizeOwnedRenderedBlock(alloc, kind, try renderReasoningHeading(alloc, title, cols));
+    if (presentation == .compact) {
+        switch (entry) {
+            .semantic_notice => |notice| if (isThinkingNotice(notice)) {
+                return normalizeOwnedRenderedBlock(alloc, kind, try renderReasoningTrace(alloc, notice.body, cols));
+            },
+            else => {},
         }
     }
     return switch (entry) {

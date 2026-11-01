@@ -56,10 +56,6 @@ pub fn appendCommandBody(arena: Allocator, rows: *std.ArrayList(Row), item: Item
     const reason = if (failed) try human_text.failureReason(arena, commandOutput(record)) else null;
     if (std.mem.eql(u8, record.tool_name, "browser")) return appendBrowserBody(arena, rows, item.entry_id, command, commandOutput(record));
     const script = python_outline.script(command);
-    if (failed and reason != null and command.len > 0) {
-        const shown = if (script) |found| try arena.print("{s} {s}", .{ found.interpreter, found.form }) else firstLineOf(command);
-        try appendBody(arena, rows, item.entry_id, try arena.print("$ {s}", .{shown}));
-    }
     if (script) |found| try appendScriptBody(arena, rows, item.entry_id, found);
     const output = commandOutput(record);
     var lines: std.ArrayList([]const u8) = .empty;
@@ -81,7 +77,7 @@ pub fn appendCommandBody(arena: Allocator, rows: *std.ArrayList(Row), item: Item
     for (lines.items[start..]) |line| {
         const plain = try std.mem.replaceOwned(u8, arena, try stripEscapes(arena, line), "\t", "    ");
         const safe = try text_utils.encodeTerminalSafe(arena, plain, 400);
-        try appendBody(arena, rows, item.entry_id, safe.bytes);
+        try appendOutputBody(arena, rows, item.entry_id, safe.bytes);
     }
 }
 
@@ -106,7 +102,7 @@ fn appendBrowserBody(arena: Allocator, rows: *std.ArrayList(Row), entry_id: u32,
     try appendBody(arena, rows, entry_id, "Output");
     const start = tail.items.len -| tail_lines;
     if (start > 0) try appendBody(arena, rows, entry_id, try arena.print("… {d} earlier line{s}", .{ start, if (start == 1) "" else "s" }));
-    for (tail.items[start..]) |line| try appendBody(arena, rows, entry_id, try safeLine(arena, line));
+    for (tail.items[start..]) |line| try appendOutputBody(arena, rows, entry_id, try safeLine(arena, line));
 }
 
 /// A Python cell as proto shows it: the shell around it when the command
@@ -114,12 +110,6 @@ fn appendBrowserBody(arena: Allocator, rows: *std.ArrayList(Row), entry_id: u32,
 /// lines when the outline cannot read it.
 fn appendScriptBody(arena: Allocator, rows: *std.ArrayList(Row), entry_id: u32, found: python_outline.Script) !void {
     const mixed = found.mixed();
-    if (mixed) {
-        var before: std.ArrayList([]const u8) = .empty;
-        var split = std.mem.splitScalar(u8, found.before, '\n');
-        while (split.next()) |line| if (std.mem.trim(u8, line, " \t\r").len > 0) try before.append(arena, line);
-        for (before.items[before.items.len -| shell_chunk_lines..]) |line| try appendBody(arena, rows, entry_id, try safeLine(arena, line));
-    }
     if (try python_outline.parse(arena, found.code)) |outline| {
         for (try python_outline.rows(arena, outline, outline_rows)) |row| try appendBody(arena, rows, entry_id, try safeLine(arena, row));
     } else {
@@ -152,6 +142,16 @@ pub fn safeLine(arena: Allocator, line: []const u8) ![]const u8 {
 
 pub fn appendBody(arena: Allocator, rows: *std.ArrayList(Row), entry_id: u32, text: []const u8) !void {
     try rows.append(arena, .{ .entry_id = entry_id, .kind = .body, .style = .dim, .text = text });
+}
+
+/// A call's command or arguments, shown under its row with a dim tree hook.
+pub fn appendArgBody(arena: Allocator, rows: *std.ArrayList(Row), entry_id: u32, text: []const u8) !void {
+    try rows.append(arena, .{ .entry_id = entry_id, .kind = .arg, .style = .dim, .text = text });
+}
+
+/// A command's printed output, in the tool-output color.
+pub fn appendOutputBody(arena: Allocator, rows: *std.ArrayList(Row), entry_id: u32, text: []const u8) !void {
+    try rows.append(arena, .{ .entry_id = entry_id, .kind = .body, .style = .output, .text = text });
 }
 
 /// What a terminal shows of a line: the text after its last carriage return.

@@ -1083,7 +1083,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("direct auto complete", TIMEOUT);
 
       const scrollback = await activeSession.captureFullScrollback();
-      const completedIndex = scrollback.indexOf("└ Ran pwd");
+      const completedIndex = scrollback.indexOf("└─ Ran pwd");
       const streamTextIndex = scrollback.indexOf(streamText);
       expect(completedIndex).toBeGreaterThanOrEqual(0);
       expect(streamTextIndex).toBeGreaterThanOrEqual(0);
@@ -1297,21 +1297,21 @@ describe("effect-aware command permissions", () => {
       await activeSession.waitForText("COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
 
       const narrow = await activeSession.captureFullScrollback();
-      const narrowRow = narrow.split("\n").find((line) => line.includes("└ Ran printf ok"));
+      const narrowRow = narrow.split("\n").find((line) => line.includes("└─ Ran printf ok"));
       expect(narrowRow).toBeDefined();
       expect(narrowRow).toEndWith("…");
       expect(narrowRow).not.toContain("omega >/dev/null");
 
       await activeSession.resizeWindow(240, 32);
       const wide = await activeSession.captureFullScrollback();
-      const wideRow = wide.split("\n").find((line) => line.includes("└ Ran printf ok"));
-      expect(wideRow).toBe(`└ Ran ${command}`);
+      const wideRow = wide.split("\n").find((line) => line.includes("└─ Ran printf ok"));
+      expect(wideRow).toBe(`└─ Ran ${command}`);
 
       await activeSession.sendText("Run the next prepared command.");
       await activeSession.waitForText("WORKSPACE_COMMAND_SUMMARY_WIDTH_COMPLETE", TIMEOUT);
       const workspaceWide = await activeSession.captureFullScrollback();
       const workspaceRow = workspaceWide.split("\n").find((line) =>
-        line.includes("└ Ran printf '%s' absolute-path-prefix-"),
+        line.includes("└─ Ran printf '%s' absolute-path-prefix-"),
       );
       expect(workspaceRow).toContain(" ./file >/dev/null");
       expect(workspaceRow).not.toContain(root.workspace);
@@ -2378,7 +2378,7 @@ describe("effect-aware command permissions", () => {
       expect(pane).not.toContain("Auto agent denied");
       expect(pane).toContain("1 denied");
       expect(pane).toContain(`Safety caution ${command}`);
-      expect(pane).not.toContain("└ terminal");
+      expect(pane).not.toContain("└─ terminal");
       expect(gateway.requests).toHaveLength(2);
       const permissionResultRequest = gateway.requests[1]!.body;
       expect(permissionResultRequest).toContain("tool_review_held");
@@ -2413,7 +2413,7 @@ describe("effect-aware command permissions", () => {
         TIMEOUT,
       );
       expect(resumedPane).toContain("1 denied");
-      expect(resumedPane).not.toContain("└ terminal");
+      expect(resumedPane).not.toContain("└─ terminal");
       expect(resumedPane).not.toContain("tool_permission_denied");
       expect(gateway.requests).toHaveLength(2);
       expect(readFileSync(stderrPath, "utf8")).toBe("");

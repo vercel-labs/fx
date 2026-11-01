@@ -775,7 +775,7 @@ test "retention rebase compact group cutoff follows surviving children" {
         }
         var before = try source_preparation.prepareRetentionSource(&runtime, alloc);
         defer before.deinit(alloc);
-        try std.testing.expect(std.mem.find(u8, before.bytes, "├ second-child") != null);
+        try std.testing.expect(std.mem.find(u8, before.bytes, "├─ second-child") != null);
         var retained = try cloneRecordedMutationState(&runtime, alloc);
         defer retained.deinit(alloc);
         var ids: EntryIdSet = .empty;
@@ -789,8 +789,8 @@ test "retention rebase compact group cutoff follows surviving children" {
         var mapping = try source_preparation.RetentionRebase.init(alloc, &before, &after, &.{});
         defer mapping.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 0), mapping.line(0));
-        const old_cut = std.mem.find(u8, before.bytes, "└ third-child").?;
-        const new_cut = std.mem.find(u8, after.bytes, "└ third-child").?;
+        const old_cut = std.mem.find(u8, before.bytes, "└─ third-child").?;
+        const new_cut = std.mem.find(u8, after.bytes, "└─ third-child").?;
         try std.testing.expectEqual(new_cut, mapping.byte(old_cut));
         const old_line = std.mem.count(u8, before.bytes[0..old_cut], "\n");
         const new_line = std.mem.count(u8, after.bytes[0..new_cut], "\n");

@@ -4048,7 +4048,9 @@ test "a live tool group holds no rows, so streamed assistant hard lines enter hi
     defer held_source.deinit(alloc);
     const held = h.shell.stableTranscriptProjectionForFlow(held_source.bytes) orelse
         return error.TestExpectedStableTranscript;
-    try std.testing.expectEqual(held.history_visual_offset, held.visual_offset);
+    // The live group's rows are all in the transcript; the viewport sits in a
+    // document taller than its eight rows.
+    try std.testing.expect(held.visual_offset >= held.history_visual_offset);
 
     _ = try h.shell.streamAssistantChunk(
         alloc,
@@ -6733,7 +6735,8 @@ test "compact command completion keeps restored history footer stable" {
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
 
-    const running_row = try findRowContaining(&h, "run_command");
+    // The running call names its command on the argument row under it.
+    const running_row = try findRowContaining(&h, "└─ sleep 5");
     const running_thinking_row = try findRowContaining(&h, "Thinking");
     const running_footer_row = try findFirstDividerRowAfter(&h, running_thinking_row);
     try std.testing.expect(h.shell.transcriptCommitDiagnostic().visual_offset > 0);
@@ -6752,11 +6755,12 @@ test "compact command completion keeps restored history footer stable" {
     const completed_row = try findRowContaining(&h, "Ran sleep 5");
     const completed_thinking_row = try findRowContaining(&h, "Thinking");
     const completed_footer_row = try findFirstDividerRowAfter(&h, completed_thinking_row);
-    // A lone completed call collapses to one row: its group header goes away,
-    // so the rows below it move up by that row.
-    try std.testing.expectEqual(running_row - 1, completed_row);
-    try std.testing.expectEqual(running_thinking_row - 1, completed_thinking_row);
-    try std.testing.expectEqual(running_footer_row - 1, completed_footer_row);
+    // A lone completed call collapses to one row that names its command: its
+    // group header and its argument row go away, so the rows below move up
+    // by those two rows.
+    try std.testing.expectEqual(running_row - 2, completed_row);
+    try std.testing.expectEqual(running_thinking_row - 2, completed_thinking_row);
+    try std.testing.expectEqual(running_footer_row - 2, completed_footer_row);
     try expectExactlyOneBlankRowBetween(&h, completed_row, completed_thinking_row);
     try expectExactlyOneBlankRowBetween(&h, completed_thinking_row, completed_footer_row);
 }

@@ -2678,7 +2678,7 @@ test.skipIf(!tmuxAvailable())(
     const finalMarker = "ORDER_REPRO_DONE";
     const prompt =
       "Use the shell tool to run exactly pwd and no other commands. Then reply with the completion marker.";
-    const statusLine = "└ Ran pwd";
+    const statusLine = "└─ Ran pwd";
     const outputLine = workspace;
     const reviewOutputPrefix = workspace.slice(0, 56);
     const visibleLinearText = (text: string): string =>
@@ -3323,7 +3323,7 @@ test.skipIf(!tmuxAvailable())(
       await waitForCondition(() => gateway.requests.length >= 2, "post-command gateway request");
       const readingAfter = await active.capturePaneGrid();
       const normalizeLiveMetadata = (grid: string[]) => grid.map((row) => {
-        if (/^└ (?:Running|Ran) /.test(row)) return "<command status>";
+        if (/^└─ (?:Running|Ran) /.test(row)) return "<command status>";
         if (/^│  \d+ output lines$/.test(row)) return "<output count>";
         if (/^│  \d+ more lines · → to expand$/.test(row)) return "<fold count>";
         if (/^(?:auto · )?gpt-5$/.test(row)) return "<status line>";
@@ -5069,10 +5069,10 @@ test.skipIf(!tmuxAvailable())(
       expect(scrollback).not.toContain("1 deferred");
       expect(scrollback).toContain(`Reading project instructions before continuing: ${command}`);
       expect(scrollback).not.toContain("Not executed");
-      expect(scrollback).not.toContain("├ terminal");
-      expect(scrollback).not.toContain("└ terminal");
-      expect(scrollback).not.toContain("├ read_file");
-      expect(scrollback).not.toContain("└ read_file");
+      expect(scrollback).not.toContain("├─ terminal");
+      expect(scrollback).not.toContain("└─ terminal");
+      expect(scrollback).not.toContain("├─ read_file");
+      expect(scrollback).not.toContain("└─ read_file");
       expect(scrollback).not.toContain("● Failed nested/input.txt");
       expect(scrollback).not.toContain(`● Failed ${command}`);
       expect(scrollback).toContain("Read nested/input.txt");

@@ -1539,9 +1539,11 @@ fn buildCompactTranscriptProjectionInterruptible(
         collapseToolCalls(self),
         .{
             .marker_style = user_message_card.promptMarkerStyle(),
+            .title_style = ui_render.tool_title_style,
             .text_style = ui_render.statusline_style,
             .reset_style = "\x1b[0m",
             .attention_style = ui_render.red_style,
+            .output_style = ui_render.tool_stdout_style,
         },
         self.command_output_render.styles,
         checkpoint,

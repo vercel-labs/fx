@@ -2896,7 +2896,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         // The prompt shows once in the history; the resume line above it
         // names the session by the same text.
         expect(scrollback.split(`┃ ${prompt}`).length - 1).toBe(1);
-        expect(scrollback.split("└ Read before.txt").length - 1).toBe(1);
+        expect(scrollback.split("└─ Read before.txt").length - 1).toBe(1);
         expect(scrollback.split(finalText).length - 1).toBe(outcome === "finish" ? 1 : 0);
         expect(queuedGateway.requests).toHaveLength(3);
         expect(session.isAlive()).toBe(true);
@@ -2937,8 +2937,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       expect(queuedGateway.requests).toHaveLength(13);
       // Both reads render inside one uninterrupted tool group now that the
       // turn no longer pauses between them.
-      expect(scrollback).toContain("├ Read before.txt");
-      expect(scrollback).toContain("└ Read after.txt");
+      expect(scrollback).toContain("├─ Read before.txt");
+      expect(scrollback).toContain("└─ Read after.txt");
       expect(scrollback).toContain(finalText);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
@@ -5471,12 +5471,12 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         );
       }
       expect(
-        countOccurrences(normalizedPane, `├ Read ${CANONICAL_READ_PATH}`),
+        countOccurrences(normalizedPane, `├─ Read ${CANONICAL_READ_PATH}`),
       ).toBe(1);
       expect(
         countOccurrences(
           normalizedPane,
-          `└ Read ${CANONICAL_SECOND_PATH}`,
+          `└─ Read ${CANONICAL_SECOND_PATH}`,
         ),
       ).toBe(1);
       expect(countOccurrences(normalizedPane, CANONICAL_FINAL_TEXT)).toBe(1);
@@ -5604,8 +5604,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(line_index).toBeGreaterThan(previous_index);
         previous_index = line_index;
       }
-      expect(scrollback).toContain("├ Read one.txt");
-      expect(scrollback).toContain("└ Read two.txt");
+      expect(scrollback).toContain("├─ Read one.txt");
+      expect(scrollback).toContain("└─ Read two.txt");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
@@ -6312,8 +6312,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.sendText("Run the supported call after the unknown call.");
       await session.waitForText(finalText, TIMEOUT);
       const header = "● Ran 2 commands · 1 failed";
-      const failedRow = `├ Failed ${unsupportedToolName}`;
-      const completedRow = `└ Ran ${supportedCommand}`;
+      const failedRow = `├─ Failed ${unsupportedToolName}`;
+      const completedRow = `└─ Ran ${supportedCommand}`;
       const compact = await session.captureFullScrollback();
       expect(compact).toContain(`${header}\n${failedRow}\n${completedRow}`);
       expect(countOccurrences(compact, `Failed ${unsupportedToolName}`)).toBe(1);
@@ -6327,11 +6327,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       await session.sendKeys("C-o");
       const full = await session.waitForText(
-        `├ Failed ${unsupportedToolName}`,
+        `├─ Failed ${unsupportedToolName}`,
         TIMEOUT,
       );
-      expect(full).toContain(`├ Failed ${unsupportedToolName}`);
-      expect(full).toContain(`└ Ran ${supportedCommand}`);
+      expect(full).toContain(`├─ Failed ${unsupportedToolName}`);
+      expect(full).toContain(`└─ Ran ${supportedCommand}`);
       expect(countOccurrences(full, `Failed ${unsupportedToolName}`)).toBe(1);
       expect(countOccurrences(full, `Ran ${supportedCommand}`)).toBe(1);
       await session.sendKeys("C-o");
@@ -6904,28 +6904,28 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       const fullAtTail = await session.waitForText(finalText, TIMEOUT);
       let fullAtNested = fullAtTail;
       for (let page = 0; page < 10 && !fullAtNested.includes(
-        "├ Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
+        "├─ Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
       ); page += 1) {
         await session.sendKeys("PPage");
         fullAtNested = await session.capturePane();
       }
       expect(fullAtNested).toContain(
-        "├ Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
+        "├─ Ran cd ./vercel/packages/cli/test/fixtures/unit/commands/git/connect/unlink",
       );
-      expect(fullAtTail).toContain(`└ Ran ${thirdCommand}`);
+      expect(fullAtTail).toContain(`└─ Ran ${thirdCommand}`);
       expect(withoutWorkspaceStatusline(fullAtTail)).not.toContain(workspace);
 
       let fullAtFirst = await session.capturePane();
       for (
         let page = 0;
-        page < 20 && !fullAtFirst.includes(`├ Ran ${firstDisplayCommand}`);
+        page < 20 && !fullAtFirst.includes(`├─ Ran ${firstDisplayCommand}`);
         page += 1
       ) {
         await session.sendKeys("PPage");
         await Bun.sleep(50);
         fullAtFirst = await session.capturePane();
       }
-      expect(fullAtFirst).toContain(`├ Ran ${firstDisplayCommand}`);
+      expect(fullAtFirst).toContain(`├─ Ran ${firstDisplayCommand}`);
       expect(fullAtFirst).not.toContain(`Ran ${firstCommand}`);
       expect(withoutWorkspaceStatusline(fullAtFirst)).not.toContain(workspace);
 

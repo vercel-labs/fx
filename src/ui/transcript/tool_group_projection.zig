@@ -134,10 +134,14 @@ const OwnedOverride = struct {
 
 pub const SummaryStyle = struct {
     marker_style: []const u8 = "",
+    /// The group's title, in proto's silver accent.
+    title_style: []const u8 = "",
     text_style: []const u8 = "",
     reset_style: []const u8 = "",
     /// Rows and counts that need attention: failures and denials.
     attention_style: []const u8 = "",
+    /// Printed command output, in the tool-output gray.
+    output_style: []const u8 = "",
 };
 
 const BuildStats = struct {
@@ -313,7 +317,7 @@ const SegmentKey = struct {
 
 fn isReasoningHeading(entry: TranscriptEntry) bool {
     return switch (entry) {
-        .semantic_notice => |notice| !notice.inline_hidden and transcript_blocks.reasoningTitle(notice) != null,
+        .semantic_notice => |notice| transcript_blocks.isThinkingNotice(notice),
         else => false,
     };
 }
@@ -371,6 +375,60 @@ test "a multi-row reasoning trace above a tool group has provenance for every ro
     try std.testing.expectEqual(rows, block.lines.len);
     try std.testing.expect(block.lines[rows - 2] == .block_separator);
     try std.testing.expectEqual(@as(u32, 4), block.lines[rows - 1].entry.entry_id);
+}
+
+test "thoughts between reads and searches leave one block" {
+    const alloc = std.testing.allocator;
+    const group: types.ToolPresentationGroupId = .{ .turn_id = 1, .anchor_step_id = 1 };
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "read", .class = .tool_status } },
+        .{ .semantic_notice = .{ .id = 2, .topic = "thinking", .tone = .information, .body = "First thought.", .visibility = .full_only } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "read", .class = .tool_status } },
+        .{ .semantic_notice = .{ .id = 4, .topic = "thinking", .tone = .information, .body = "Second thought.", .visibility = .full_only } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "read", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .presentation_group_id = group },
+        .{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .presentation_group_id = group },
+        .{ .entry_id = 5, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .presentation_group_id = group },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    // One block holds all three reads; the later rows are hidden in it.
+    const block = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, block, "Read 3 files") != null);
+    try std.testing.expect(projection.entry_actions.items[2] == .hide);
+    try std.testing.expect(projection.entry_actions.items[4] == .hide);
+}
+
+test "a thought beside a command still opens a new block" {
+    const alloc = std.testing.allocator;
+    const group: types.ToolPresentationGroupId = .{ .turn_id = 1, .anchor_step_id = 1 };
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "read", .class = .tool_status } },
+        .{ .semantic_notice = .{ .id = 2, .topic = "thinking", .tone = .information, .body = "First thought.", .visibility = .full_only } },
+        .{ .raw_bytes = .{ .id = 3, .bytes = "command", .class = .tool_status } },
+        .{ .semantic_notice = .{ .id = 4, .topic = "thinking", .tone = .information, .body = "Second thought.", .visibility = .full_only } },
+        .{ .raw_bytes = .{ .id = 5, .bytes = "read", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .presentation_group_id = group },
+        .{ .entry_id = 3, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed, .presentation_group_id = group },
+        .{ .entry_id = 5, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .presentation_group_id = group },
+    };
+
+    var projection = try build(alloc, &entries, &details, 120);
+    defer projection.deinit(alloc);
+
+    // The command starts its own block, drawn with the thought above it.
+    const first = projection.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, first, "First thought.") != null);
+    try std.testing.expect(std.mem.find(u8, first, "run_command") == null);
+    const second = projection.entry_actions.items[2].override.bytes;
+    try std.testing.expect(std.mem.find(u8, second, "run_command") != null);
+    try std.testing.expect(std.mem.find(u8, second, "Second thought.") != null);
 }
 
 fn isAttachedEntry(entry: TranscriptEntry) bool {
@@ -760,13 +818,13 @@ fn formatGroupBlock(
         const rows = try tiers.single(scratch, row_items.items[0]);
         const failed = rows[0].style == .attention;
         try lines.append(alloc, .{ .entry = .{ .entry_id = rows[0].entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
-        try writeStyled(&out.writer, if (failed) style.attention_style else style.marker_style, "●");
+        try writeStyled(&out.writer, if (failed) style.attention_style else markerStyle(style), if (rows[0].running) "◐" else "●");
         try out.writer.writeByte(' ');
         try writeTierRow(scratch, &out.writer, "", rows[0], cols -| 2, style);
         for (rows[1..]) |row| {
             try lines.append(alloc, .{ .entry = .{ .entry_id = row.entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
             try out.writer.writeByte('\n');
-            try writeTierRow(scratch, &out.writer, "    ", row, cols, style);
+            try writeTierRow(scratch, &out.writer, if (row.kind == .arg) "   └─ " else "   ", row, cols, style);
         }
         const bytes = try out.toOwnedSlice();
         errdefer alloc.free(bytes);
@@ -777,19 +835,20 @@ fn formatGroupBlock(
     // in the status color.
     const summary_words = try tiers.header(scratch, all_items.items);
     try lines.append(alloc, .{ .entry = .{ .entry_id = first_id, .entry_class = .tool_status, .projection_part = .group_header } });
-    const header_plain = try scratch.print("● {s}{s}", .{ summary_words.words, summary_words.attention });
+    const marker = if (live) "◐" else "●";
+    const header_plain = try scratch.print("{s} {s}{s}", .{ marker, summary_words.words, summary_words.attention });
     const header_clipped = try clipSummary(scratch, header_plain, cols);
-    if (!std.mem.startsWith(u8, header_clipped, "●")) {
+    if (!std.mem.startsWith(u8, header_clipped, marker)) {
         // Too narrow for the marker: the clip is all there is.
         try out.writer.writeAll(header_clipped);
         const bytes = try out.toOwnedSlice();
         errdefer alloc.free(bytes);
         return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
     }
-    try writeStyled(&out.writer, style.marker_style, "●");
-    const header_body = header_clipped["●".len..];
+    try writeStyled(&out.writer, markerStyle(style), marker);
+    const header_body = header_clipped[marker.len..];
     const words_end = @min(header_body.len, 1 + summary_words.words.len);
-    try out.writer.writeAll(header_body[0..words_end]);
+    try writeStyled(&out.writer, style.title_style, header_body[0..words_end]);
     if (words_end < header_body.len) try writeStyled(&out.writer, style.attention_style, header_body[words_end..]);
     if (collapse_tool_calls) {
         const bytes = try out.toOwnedSlice();
@@ -800,14 +859,15 @@ fn formatGroupBlock(
     const rows = try tiers.plan(scratch, row_items.items);
     var last_top: usize = 0;
     for (rows, 0..) |row, index| {
-        if (row.kind != .body) last_top = index;
+        if (row.kind == .item or row.kind == .fold) last_top = index;
     }
     for (rows, 0..) |row, index| {
         try lines.append(alloc, .{ .entry = .{ .entry_id = row.entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
         try out.writer.writeByte('\n');
         const prefix = switch (row.kind) {
-            .item, .fold => if (index == last_top) "└ " else "├ ",
-            .body => if (index > last_top) "    " else "│   ",
+            .item, .fold => if (index == last_top) "└─ " else "├─ ",
+            .arg => if (index > last_top) "   └─ " else "│  └─ ",
+            .body => if (index > last_top) "   " else "│  ",
         };
         try writeTierRow(scratch, &out.writer, prefix, row, cols, style);
     }
@@ -831,6 +891,12 @@ fn formatGroupBlock(
     const bytes = try out.toOwnedSlice();
     errdefer alloc.free(bytes);
     return .{ .bytes = bytes, .lines = try lines.toOwnedSlice(alloc) };
+}
+
+/// The group marker takes the silver title color when one is configured,
+/// else the prompt marker's color.
+fn markerStyle(style: SummaryStyle) []const u8 {
+    return if (style.title_style.len > 0) style.title_style else style.marker_style;
 }
 
 /// `text` in `sgr`, closed with a full reset; plain when `sgr` is empty.
@@ -866,7 +932,9 @@ fn writeTierRow(
     cols: u16,
     style: SummaryStyle,
 ) !void {
-    const room = cols -| @as(u16, @intCast(display_width.visibleWidth(prefix)));
+    // A narrow terminal may not fit the tree connector; the clip wins.
+    const shown_prefix = try clipSummary(scratch, prefix, cols);
+    const room = cols -| @as(u16, @intCast(display_width.visibleWidth(shown_prefix)));
     var row = planned;
     // A command cut to the width ends at a word, not inside one (D294).
     if (row.kind != .body and display_width.visibleWidth(row.text) > room) {
@@ -875,10 +943,11 @@ fn writeTierRow(
     }
     switch (row.style) {
         // A styled row carries its tree prefix in the same span.
-        .attention => try writeStyled(writer, style.attention_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ prefix, row.text }), cols)),
-        .dim => try writeStyled(writer, style.text_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ prefix, row.text }), cols)),
+        .attention => try writeStyled(writer, style.attention_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text }), cols)),
+        .dim => try writeStyled(writer, style.text_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text }), cols)),
+        .output => try writeStyled(writer, style.output_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text }), cols)),
         .normal => {
-            try writer.writeAll(prefix);
+            try writer.writeAll(shown_prefix);
             // Style the whole row, then clip it: the clip closes any style
             // it cuts through.
             const highlighted = if (row.kind == .item)
@@ -1033,7 +1102,7 @@ fn formatExpandedChild(
     // Expanded rows carry no ambient text style, so tokens highlight over the
     // terminal default foreground.
     const display_phrase = try highlightCommandPhrase(scratch, phrase, detail, "") orelse phrase;
-    const child = try scratch.print("{s} {s}", .{ connector, display_phrase });
+    const child = try scratch.print("{s}─ {s}", .{ connector, display_phrase });
     const accented = if (entryShowsDiffStats(detail))
         try accentTrailingDiffStats(scratch, child, "")
     else
@@ -1044,7 +1113,7 @@ fn formatExpandedChild(
     try out.writer.writeAll(accented);
     var rows = continuationRows(continuation);
     while (rows.next()) |text| {
-        try out.writer.print("\n{s}{s}", .{ if (std.mem.eql(u8, connector, "└")) "  " else "│ ", text });
+        try out.writer.print("\n{s}{s}", .{ if (std.mem.eql(u8, connector, "└")) "   " else "│  ", text });
     }
     return out.toOwnedSlice();
 }
@@ -1065,14 +1134,14 @@ test "expanded subagent row preserves status continuation" {
     defer alloc.free(row);
 
     try std.testing.expectEqualStrings(
-        "└ reviewer working · inspect auth\n  gpt-5.5 · high · 12k/256k 4%",
+        "└─ reviewer working · inspect auth\n   gpt-5.5 · high · 12k/256k 4%",
         row,
     );
 
     const middle_row = try formatExpandedChild(alloc, entry, &detail, "├");
     defer alloc.free(middle_row);
     try std.testing.expectEqualStrings(
-        "├ reviewer working · inspect auth\n│ gpt-5.5 · high · 12k/256k 4%",
+        "├─ reviewer working · inspect auth\n│  gpt-5.5 · high · 12k/256k 4%",
         middle_row,
     );
 }
@@ -1327,8 +1396,8 @@ fn materializeExpandedOverride(
 /// non-final child ("├") and its continuation ("│") keep the rail on wrapped
 /// rows; the header and the final child ("└") indent past their marker.
 fn expandedContinuationPrefix(row: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, row, "├") or std.mem.startsWith(u8, row, "│")) return "│ ";
-    return "  ";
+    if (std.mem.startsWith(u8, row, "├") or std.mem.startsWith(u8, row, "│")) return "│  ";
+    return "   ";
 }
 
 pub fn buildStyledFocused(
@@ -1442,12 +1511,18 @@ fn buildWithStyleAndStats(
         usize,
     ) = .empty;
     defer presentation_group_by_id.deinit(alloc);
-    var segment_by_group: std.AutoHashMapUnmanaged(types.ToolPresentationGroupId, u32) = .empty;
+    const SegmentState = struct {
+        segment: u32 = 0,
+        /// Whether the group's previous row only explores.
+        last_explored: bool = false,
+    };
+    var segment_by_group: std.AutoHashMapUnmanaged(types.ToolPresentationGroupId, SegmentState) = .empty;
     defer segment_by_group.deinit(alloc);
 
     // A step's reasoning heading arrives just after the step's first tool
     // row. In the compact view it opens that step's block, so the block
-    // starts a new segment of its presentation group.
+    // starts a new segment of its presentation group, unless that row and
+    // the one before it only explore.
     const heading_for_status = try alloc.alloc(?usize, if (mode == .compact) entries.len else 0);
     defer alloc.free(heading_for_status);
     @memset(heading_for_status, null);
@@ -1467,10 +1542,16 @@ fn buildWithStyleAndStats(
         if (statusNamesAsk(entry, detail) or (mode == .compact and isRewind(detail))) continue;
         const group_id = presentationGroupId(detail) orelse continue;
         const segment = try segment_by_group.getOrPut(alloc, group_id);
-        if (!segment.found_existing) segment.value_ptr.* = 0;
-        if (mode == .compact and heading_for_status[entry_index] != null) segment.value_ptr.* += 1;
+        if (!segment.found_existing) segment.value_ptr.* = .{};
+        const exploring = if (detail) |record| tiers.isExploration(record) else false;
+        // A thought opens a new block, except between two rows that only
+        // explore: an agent thinks between reads and searches, and each
+        // thought would otherwise leave a block of one or two rows.
+        if (mode == .compact and heading_for_status[entry_index] != null and
+            !(exploring and segment.value_ptr.last_explored)) segment.value_ptr.segment += 1;
+        segment.value_ptr.last_explored = exploring;
 
-        const result = try presentation_group_by_id.getOrPut(alloc, .{ .group = group_id, .segment = segment.value_ptr.* });
+        const result = try presentation_group_by_id.getOrPut(alloc, .{ .group = group_id, .segment = segment.value_ptr.segment });
         if (!result.found_existing) {
             result.value_ptr.* = presentation_groups.items.len;
             try presentation_groups.append(alloc, .{ .anchor_index = entry_index });
@@ -1728,9 +1809,9 @@ test "minimal tool group summary uses semantic category order and outcomes" {
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expectEqualStrings(
         "● Read 1 file, edited 1 file, ran 1 command · 1 failed\n" ++
-            "├ Read runtime.zig\n" ++
-            "├ Edited main.zig\n" ++
-            "└ Ran \x1b[38;5;252mzig\x1b[39m build",
+            "├─ Read runtime.zig\n" ++
+            "├─ Edited main.zig\n" ++
+            "└─ Ran \x1b[38;5;252mzig\x1b[39m build",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
@@ -1757,15 +1838,15 @@ test "grouped subagent status keeps the vertical continuation for middle rows" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● Started 4 workers · 4 running\n" ++
-            "├ Subagent working · inspect auth\n" ++
-            "│   glm-5.3-flash · max\n" ++
-            "├ Subagent working · inspect auth\n" ++
-            "│   glm-5.3-flash · max\n" ++
-            "├ Subagent working · inspect auth\n" ++
-            "│   glm-5.3-flash · max\n" ++
-            "└ Subagent working · inspect auth\n" ++
-            "    glm-5.3-flash · max",
+        "◐ Started 4 workers · 4 running\n" ++
+            "├─ Subagent working · inspect auth\n" ++
+            "│  glm-5.3-flash · max\n" ++
+            "├─ Subagent working · inspect auth\n" ++
+            "│  glm-5.3-flash · max\n" ++
+            "├─ Subagent working · inspect auth\n" ++
+            "│  glm-5.3-flash · max\n" ++
+            "└─ Subagent working · inspect auth\n" ++
+            "   glm-5.3-flash · max",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -1804,10 +1885,10 @@ test "small minimal tool groups surface canonical action targets" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● Read 2 files, edited 1 file · 1 running\n" ++
-            "├ Read runtime.zig\n" ++
-            "├ Searched snapshot\n" ++
-            "└ Editing store.zig",
+        "◐ Read 2 files, edited 1 file · 1 running\n" ++
+            "├─ Read runtime.zig\n" ++
+            "├─ Searched snapshot\n" ++
+            "└─ Editing store.zig",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -1873,9 +1954,9 @@ test "collapsed tool group keeps diff count accents" {
 
     try std.testing.expectEqualStrings(
         "● Read 1 file, wrote 1 file, edited 1 file\n" ++
-            "├ Read runtime.zig\n" ++
-            "├ Wrote note.txt [G]+143\x1b[0m\n" ++
-            "└ Edited main.zig [G]+12\x1b[0m / [R]-3\x1b[0m",
+            "├─ Read runtime.zig\n" ++
+            "├─ Wrote note.txt [G]+143\x1b[0m\n" ++
+            "└─ Edited main.zig [G]+12\x1b[0m / [R]-3\x1b[0m",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -1906,9 +1987,9 @@ test "grouped command lines shell-highlight verbs and numeric flags" {
 
     try std.testing.expectEqualStrings(
         "● Ran 1 command, wrote 1 file and 1 other call\n" ++
-            "├ Ran \x1b[38;5;252mcat\x1b[39m log.txt \x1b[38;5;252m|\x1b[39m \x1b[38;5;252mhead\x1b[39m \x1b[38;5;250m-80\x1b[39m\n" ++
-            "├ Wrote note.txt [G]+2\x1b[0m\n" ++
-            "└ Wrote detached.txt +7",
+            "├─ Ran \x1b[38;5;252mcat\x1b[39m log.txt \x1b[38;5;252m|\x1b[39m \x1b[38;5;252mhead\x1b[39m \x1b[38;5;250m-80\x1b[39m\n" ++
+            "├─ Wrote note.txt [G]+2\x1b[0m\n" ++
+            "└─ Wrote detached.txt +7",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -1937,18 +2018,18 @@ test "expanded tool group keeps diff count accents" {
     defer projection.deinit(alloc);
     const expanded = projection.entry_actions.items[0].override.bytes;
 
-    try std.testing.expect(std.mem.find(u8, expanded, "\n└ Wrote note.txt [G]+143\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, expanded, "\n└─ Wrote note.txt [G]+143\x1b[0m") != null);
 }
 
 test "clipSummary clips styled text by visible width and closes open SGR" {
     const alloc = std.testing.allocator;
 
-    const before_style = try clipSummary(alloc, "├ Wrote a/very/long/path/that/overflows.zig \x1b[32m+143\x1b[0m", 20);
+    const before_style = try clipSummary(alloc, "├─ Wrote a/very/long/path/that/overflows.zig \x1b[32m+143\x1b[0m", 20);
     defer alloc.free(before_style);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(before_style) <= 20);
     try std.testing.expect(std.mem.find(u8, before_style, "\x1b") == null);
 
-    const inside_style = try clipSummary(alloc, "├ Wrote x \x1b[32m+143\x1b[0m", 13);
+    const inside_style = try clipSummary(alloc, "├─ Wrote x \x1b[32m+143\x1b[0m", 13);
     defer alloc.free(inside_style);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(inside_style) <= 13);
     try std.testing.expect(std.mem.endsWith(u8, inside_style, "\x1b[0m"));
@@ -1970,8 +2051,8 @@ test "minimal tool groups keep instruction refresh neutral and denials visible" 
 
     try std.testing.expectEqualStrings(
         "● Ran 1 command, read 1 file · 1 denied\n" ++
-            "├ Denied by auto agent zig build\n" ++
-            "└ Reading project instructions before continuing: runtime.zig",
+            "├─ Denied by auto agent zig build\n" ++
+            "└─ Reading project instructions before continuing: runtime.zig",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -2008,8 +2089,8 @@ test "focused tool remains counted but is omitted from stable child rows" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● Read 1 file, ran 1 command · 1 running\n" ++
-            "└ Read runtime.zig",
+        "◐ Read 1 file, ran 1 command · 1 running\n" ++
+            "└─ Read runtime.zig",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
@@ -2032,10 +2113,10 @@ test "minimal command details expose running completed and failed process states
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● Ran 3 commands · 1 failed · 1 running\n" ++
-            "├ Running \x1b[38;5;252mrg\x1b[39m snapshot\n" ++
-            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "└ Exited 7 · zig build test",
+        "◐ Ran 3 commands · 1 failed · 1 running\n" ++
+            "├─ Running \x1b[38;5;252mrg\x1b[39m snapshot\n" ++
+            "├─ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "└─ Exited 7 · zig build test",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -2237,10 +2318,10 @@ test "completed session and tty command rows reproject stored commands at the cu
     // routine and unstyled.
     const narrow_tty = narrow_lines.next().?;
     const narrow_observe = narrow_lines.next().?;
-    try std.testing.expect(std.mem.startsWith(u8, narrow_tty, "├ Ran \x1b[38;5;252mbun\x1b[39m run pipeline-stage-"));
+    try std.testing.expect(std.mem.startsWith(u8, narrow_tty, "├─ Ran \x1b[38;5;252mbun\x1b[39m run pipeline-stage-"));
     try std.testing.expect(std.mem.endsWith(u8, narrow_tty, "…"));
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(narrow_tty) <= 80);
-    try std.testing.expect(std.mem.startsWith(u8, narrow_observe, "└ Observed npm run dev-server-"));
+    try std.testing.expect(std.mem.startsWith(u8, narrow_observe, "└─ Observed npm run dev-server-"));
     try std.testing.expect(std.mem.endsWith(u8, narrow_observe, "…"));
     // Reprojection replaces the frozen ASCII marker before reclipping.
     try std.testing.expect(std.mem.find(u8, narrow_rows, "...") == null);
@@ -2249,8 +2330,8 @@ test "completed session and tty command rows reproject stored commands at the cu
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
         "● Ran 1 command and 1 other call\n" ++
-            "├ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10) ++ "\n" ++
-            "└ Observed npm run " ++ text_utils.repeat("dev-server-", 12),
+            "├─ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10) ++ "\n" ++
+            "└─ Observed npm run " ++ text_utils.repeat("dev-server-", 12),
         wide.entry_actions.items[0].override.bytes,
     );
 }
@@ -2290,6 +2371,7 @@ fn paintedTreeTextForTest(
         for ([_][]const u8{ "├", "└", "│" }) |glyph| {
             if (std.mem.startsWith(u8, text, glyph)) {
                 text = text[glyph.len..];
+                if (std.mem.startsWith(u8, text, "─")) text = text["─".len..];
                 break;
             }
         }
@@ -2375,14 +2457,15 @@ test "expanded rows wrap under their tree rail and keep command styling" {
         try std.testing.expect(rail.style.fg.eql(.default));
         const before_wrap = lastContentCellForTest(&grid, row - 1);
         try std.testing.expect(!before_wrap.style.fg.eql(.default));
-        try std.testing.expect(grid.cellAt(row, 3).?.style.fg.eql(before_wrap.style.fg));
+        try std.testing.expect(grid.cellAt(row, 4).?.style.fg.eql(before_wrap.style.fg));
     }
     // The final child indents past its marker.
     row = last_child_row + 1;
     while (row <= grid.rows) : (row += 1) {
         try std.testing.expectEqual(@as(u21, ' '), grid.cellAt(row, 1).?.codepoint);
         try std.testing.expectEqual(@as(u21, ' '), grid.cellAt(row, 2).?.codepoint);
-        try std.testing.expect(grid.cellAt(row, 3).?.codepoint != ' ');
+        try std.testing.expectEqual(@as(u21, ' '), grid.cellAt(row, 3).?.codepoint);
+        try std.testing.expect(grid.cellAt(row, 4).?.codepoint != ' ');
     }
 
     // Nothing is hidden: each child's rows hold its whole command.
@@ -2454,7 +2537,7 @@ test "expanded group children reproject stored commands at the current width" {
     defer wide.deinit(alloc);
     // The full transcript keeps the group header even for a single tool.
     try std.testing.expectEqualStrings(
-        "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10),
+        "● 1 tool call · 1 command\n└─ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10),
         wide.entry_actions.items[0].override.bytes,
     );
 
@@ -2555,7 +2638,7 @@ test "command reprojection keeps the row's own label across lifecycle states" {
         const expected_prefix = if (case.outcome != null)
             try alloc.print("● {s} ", .{case.label})
         else
-            try alloc.print("\n└ {s} ", .{case.label});
+            try alloc.print("\n└─ {s} ", .{case.label});
         defer alloc.free(expected_prefix);
         try std.testing.expect(std.mem.find(u8, row, expected_prefix) != null);
     }
@@ -2637,18 +2720,27 @@ test "tool-heavy groups keep every call in order, live or settled" {
     // Live: every call in the order it ran, the running one last, so
     // settling it moves nothing above it (D291, D295).
     try std.testing.expectEqualStrings(
-        "● Read 10 files, ran 8 commands, edited 2 files · 1 failed · 1 running\n" ++
-            "├ Read 10 files · file.zig\n" ++
-            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "├ Exited 1 · rg snapshot\n" ++
-            "├ Edited store.zig\n" ++
-            "└ Editing runtime.zig",
+        "◐ Read 10 files, ran 8 commands, edited 2 files · 1 failed · 1 running\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├─ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├─ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├─ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├─ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├─ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├─ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├─ Exited 1 · rg snapshot\n" ++
+            "├─ Edited store.zig\n" ++
+            "└─ Editing runtime.zig",
         summary,
     );
 
@@ -2661,17 +2753,26 @@ test "tool-heavy groups keep every call in order, live or settled" {
     // Settled: the same rows; only the running one says it finished.
     try std.testing.expectEqualStrings(
         "● Read 10 files, ran 8 commands, edited 2 files · 1 failed\n" ++
-            "├ Read 10 files · file.zig\n" ++
-            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "├ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
-            "├ Exited 1 · rg snapshot\n" ++
-            "├ Edited store.zig\n" ++
-            "└ Edited runtime.zig",
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Read file.zig\n" ++
+            "├─ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├─ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├─ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├─ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├─ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├─ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├─ Ran \x1b[38;5;252mzig\x1b[39m build\n" ++
+            "├─ Exited 1 · rg snapshot\n" ++
+            "├─ Edited store.zig\n" ++
+            "└─ Edited runtime.zig",
         completed_summary,
     );
     var lines = std.mem.splitScalar(u8, completed_summary, '\n');
@@ -2694,7 +2795,7 @@ test "minimal tool group keeps cancellation in the header and child row" {
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expectEqualStrings(
         "● Ran 1 command · 1 cancelled\n" ++
-            "└ Cancelled sleep 30\n" ++
+            "└─ Cancelled sleep 30\n" ++
             "\n" ++
             "■ Cancelled sleep 30 · What should change?",
         projection.entry_actions.items[0].override.bytes,
@@ -2771,10 +2872,10 @@ test "cancelled actions remain inside the message-delimited block" {
     defer projection.deinit(alloc);
 
     try std.testing.expect(projection.entry_actions.items[0] == .override);
-    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├ Cancelled first") != null);
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├─ Cancelled first") != null);
     // Rows come in the order the calls ran (D295).
-    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├ Cancelled second") != null);
-    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "└ read") != null);
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "├─ Cancelled second") != null);
+    try std.testing.expect(std.mem.find(u8, projection.entry_actions.items[0].override.bytes, "└─ read") != null);
     try std.testing.expect(projection.entry_actions.items[1] == .hide);
     try std.testing.expect(projection.entry_actions.items[2] == .hide);
     try std.testing.expect(projection.entry_actions.items[3] == .hide);
@@ -2859,9 +2960,9 @@ test "one presentation group keeps sibling tools in creation order across assist
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● Ran 2 commands · 2 running\n" ++
-            "├ Running \x1b[38;5;252mfirst\x1b[39m\n" ++
-            "└ Running \x1b[38;5;252msecond\x1b[39m",
+        "◐ Ran 2 commands · 2 running\n" ++
+            "├─ Running \x1b[38;5;252mfirst\x1b[39m\n" ++
+            "└─ Running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expect(projection.entry_actions.items[1] == .keep);
@@ -2940,8 +3041,8 @@ test "legacy lifecycle records without group identity respect transcript boundar
     );
     try std.testing.expect(projection.entry_actions.items[1] == .keep);
     try std.testing.expectEqualStrings(
-        "● Ran 1 command · 1 running\n" ++
-            "└ Running \x1b[38;5;252msecond\x1b[39m",
+        "◐ Ran 1 command · 1 running\n" ++
+            "└─ Running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[2].override.bytes,
     );
 }
@@ -2978,9 +3079,9 @@ fn checkPresentationGroupingAllocationFailures(alloc: std.mem.Allocator) !void {
     };
     defer projection.deinit(alloc);
     try std.testing.expectEqualStrings(
-        "● Ran 2 commands · 1 running\n" ++
-            "├ Running \x1b[38;5;252mfirst\x1b[39m\n" ++
-            "└ Running \x1b[38;5;252msecond\x1b[39m",
+        "◐ Ran 2 commands · 1 running\n" ++
+            "├─ Running \x1b[38;5;252mfirst\x1b[39m\n" ++
+            "└─ Running \x1b[38;5;252msecond\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -3018,8 +3119,8 @@ test "entries hidden by compact presentation do not split tool groups" {
     try std.testing.expect(projection.entry_actions.items[0] == .override);
     try std.testing.expectEqualStrings(
         "● Read 1 file, edited 1 file\n" ++
-            "├ read_file\n" ++
-            "└ edit_file",
+            "├─ read_file\n" ++
+            "└─ edit_file",
         projection.entry_actions.items[0].override.bytes,
     );
     try std.testing.expect(projection.entry_actions.items[1] == .keep);
@@ -3108,7 +3209,7 @@ test "visible assistant messages split groups while silent entries do not" {
 
     try std.testing.expectEqualStrings(
         "● Read 5 files\n" ++
-            "└ Read 5 files · read_file",
+            "└─ Read 5 files · read_file",
         projection.entry_actions.items[0].override.bytes,
     );
     for (projection.entry_actions.items[1..5]) |action| {
@@ -3119,8 +3220,8 @@ test "visible assistant messages split groups while silent entries do not" {
     try std.testing.expect(projection.entry_actions.items[7] == .keep);
     try std.testing.expectEqualStrings(
         "● Read 3 files, ran 1 command\n" ++
-            "├ Read 3 files · read_file\n" ++
-            "└ run_command",
+            "├─ Read 3 files · read_file\n" ++
+            "└─ run_command",
         projection.entry_actions.items[8].override.bytes,
     );
     for (projection.entry_actions.items[9..12]) |action| {
@@ -3259,8 +3360,12 @@ test "mixed group keeps the count header before every action" {
 
     try std.testing.expectEqualStrings(
         "● Read 5 files, ran 1 command\n" ++
-            "├ Read 5 files · one.zig, two.zig, +3\n" ++
-            "└ Ran \x1b[38;5;252mgit\x1b[39m \x1b[38;5;250m-C\x1b[39m /workspace status \x1b[38;5;250m--short\x1b[39m",
+            "├─ Read one.zig\n" ++
+            "├─ Read two.zig\n" ++
+            "├─ Read three.zig\n" ++
+            "├─ Read four.zig\n" ++
+            "├─ Read five.zig\n" ++
+            "└─ Ran \x1b[38;5;252mgit\x1b[39m \x1b[38;5;250m-C\x1b[39m /workspace status \x1b[38;5;250m--short\x1b[39m",
         projection.entry_actions.items[0].override.bytes,
     );
 }
@@ -3309,9 +3414,9 @@ test "expanded tool title stays primary while the group summary stays secondary"
     const expanded = projection.entry_actions.items[0].override.bytes;
 
     try std.testing.expect(std.mem.find(u8, expanded, "<secondary>1 tool call · 1 read<reset>") != null);
-    try std.testing.expect(std.mem.find(u8, expanded, "\n└ Read README.md") != null);
+    try std.testing.expect(std.mem.find(u8, expanded, "\n└─ Read README.md") != null);
     try std.testing.expect(std.mem.find(u8, expanded, "\n│\n") == null);
-    try std.testing.expect(std.mem.find(u8, expanded, "<secondary>└ Read README.md") == null);
+    try std.testing.expect(std.mem.find(u8, expanded, "<secondary>└─ Read README.md") == null);
 }
 
 test "expanded tool relationships materialize at multiple widths" {
@@ -3359,7 +3464,7 @@ test "expanded tool relationships materialize at multiple widths" {
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 2);
     }
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;81m●\x1b[0m \x1b[1;3m1 tool call · 1 read\x1b[0m\n└ Read README.md",
+        "\x1b[38;5;81m●\x1b[0m \x1b[1;3m1 tool call · 1 read\x1b[0m\n└─ Read README.md",
         wide.entry_actions.items[0].override.bytes,
     );
 }
@@ -3507,7 +3612,7 @@ test "prose-prefixed command rows highlight only the trailing stored command" {
     const rows = projection.entry_actions.items[0].override.bytes;
 
     // The prose prefix stays plain in full; the trailing command highlights.
-    try std.testing.expect(std.mem.find(u8, rows, "\n└ Reading project instructions before continuing: \x1b[38;5;252mcat\x1b[39m") != null);
+    try std.testing.expect(std.mem.find(u8, rows, "\n└─ Reading project instructions before continuing: \x1b[38;5;252mcat\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, rows, "\x1b[38;5;252m&&\x1b[39m") != null);
     try std.testing.expect(std.mem.find(u8, rows, "\x1b[38;5;252mprintf\x1b[39m") != null);
 }

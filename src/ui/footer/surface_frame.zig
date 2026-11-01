@@ -1763,7 +1763,7 @@ test "surface footer measurement preserves the reasoning preview detail" {
                 try std.testing.expectEqual(case.shown, thinking.detail.len > 0);
                 if (case.shown) try std.testing.expectEqualStrings(preview, thinking.detail);
                 try std.testing.expectEqual(
-                    @as(u16, if (case.shown) 4 else 1),
+                    @as(u16, if (case.shown) 5 else 1),
                     render_input.activityProjectionRows(
                         measurement.activity_projection,
                         shell.layout.cols,

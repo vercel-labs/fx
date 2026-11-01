@@ -13546,12 +13546,21 @@ test "current compact projection groups tool rows without mutating entries" {
     defer compact.deinit(alloc);
     // Plain words in the header with the failure in the status color; the
     // routine read dim, the failed edit in the status color.
-    const header = try std.mem.concat(alloc, u8, &.{ "\x1b[38;5;255m●\x1b[0m Read 1 file, edited 1 file", ui_render.red_style, " · 1 failed\x1b[0m\n" });
+    const header = try std.mem.concat(alloc, u8, &.{
+        ui_render.tool_title_style,
+        "●\x1b[0m",
+        ui_render.tool_title_style,
+        " Read 1 file, edited 1 file\x1b[0m",
+        ui_render.red_style,
+        " · 1 failed\x1b[0m\n",
+    });
     defer alloc.free(header);
-    const failed_row = try std.mem.concat(alloc, u8, &.{ ui_render.red_style, "└ Edit failed\x1b[0m" });
+    const failed_row = try std.mem.concat(alloc, u8, &.{ ui_render.red_style, "└─ Edit failed\x1b[0m" });
     defer alloc.free(failed_row);
+    const read_row = try std.mem.concat(alloc, u8, &.{ ui_render.statusline_style, "├─ Read file\x1b[0m" });
+    defer alloc.free(read_row);
     try std.testing.expect(std.mem.find(u8, compact.bytes, header) != null);
-    try std.testing.expect(std.mem.find(u8, compact.bytes, "\x1b[38;5;245m├ Read file\x1b[0m\n") != null);
+    try std.testing.expect(std.mem.find(u8, compact.bytes, read_row) != null);
     try std.testing.expect(std.mem.find(u8, compact.bytes, failed_row) != null);
     try std.testing.expectEqual(entry_count, runtime.entries.items.len);
 }
@@ -16691,8 +16700,8 @@ test "finality candidates anchor a fully grouped turn at its newest rendered gro
     try std.testing.expect(source.finality.mutation_pin_start == null);
 
     const group_a_header = try alloc.print(
-        "{s}●\x1b[0m Read 3 files",
-        .{user_message_card.promptMarkerStyle()},
+        "{s}●{s}{s} Read 3 files{s}",
+        .{ ui_render.tool_title_style, ui_render.reset_style, ui_render.tool_title_style, ui_render.reset_style },
     );
     defer alloc.free(group_a_header);
     const group_a_start = std.mem.find(u8, source.bytes, group_a_header) orelse

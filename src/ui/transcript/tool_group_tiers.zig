@@ -50,8 +50,8 @@ pub const Item = struct {
     continuation: ?[]const u8 = null,
 };
 
-pub const Style = enum { normal, dim, attention };
-pub const Kind = enum { item, fold, body };
+pub const Style = enum { normal, dim, attention, output };
+pub const Kind = enum { item, fold, arg, body };
 
 pub const Row = struct {
     entry_id: u32,
@@ -60,6 +60,8 @@ pub const Row = struct {
     text: []const u8,
     /// The record an item row's command may be highlighted from.
     detail: ?*const ToolDetailRecord = null,
+    /// The call has not settled; its row gets the running glyph.
+    running: bool = false,
 };
 
 pub fn isLive(detail: ?*const ToolDetailRecord) bool {
@@ -83,6 +85,16 @@ fn searchFoundNothing(record: *const ToolDetailRecord) bool {
     const actions = explored(fixed.allocator(), record) orelse return false;
     for (actions) |action| if (action.kind != .search) return false;
     return std.mem.trim(u8, record.result orelse "", " \t\r\n").len == 0;
+}
+
+/// Whether a call only explores: a file read, a search, or a shell run that
+/// only reads, lists and searches. An agent thinks between these, so its
+/// thoughts do not split a block of them (D290).
+pub fn isExploration(record: *const ToolDetailRecord) bool {
+    if (record.activity_kind == .read) return true;
+    var buffer: [32 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    return explored(fixed.allocator(), record) != null;
 }
 
 /// What a shell run reads, lists and searches when that is all it does,
@@ -344,19 +356,59 @@ fn isFileRead(item: Item) bool {
 }
 
 fn appendRun(arena: Allocator, rows: *std.ArrayList(Row), run: []const Item, kind: []const u8) !void {
-    const only_file_reads = for (run) |item| {
-        if (!isFileRead(item) or isLive(item.detail)) break false;
-    } else true;
+    if (std.mem.eql(u8, kind, explore_run)) return appendExploreRun(arena, rows, run);
     const text = if (run.len == 1)
         try itemText(arena, run[0])
-    else if (std.mem.eql(u8, kind, explore_run) and !only_file_reads)
-        try exploredText(arena, run)
     else blk: {
         var folds: std.ArrayList(Fold) = .empty;
         for (run) |item| try addToFold(arena, &folds, item);
         break :blk try folds.items[0].text(arena);
     };
-    try rows.append(arena, .{ .entry_id = run[0].entry_id, .kind = if (run.len == 1) .item else .fold, .style = .dim, .text = text, .detail = if (run.len == 1) run[0].detail else null });
+    const item = run[0];
+    try rows.append(arena, .{
+        .entry_id = item.entry_id,
+        .kind = if (run.len == 1) .item else .fold,
+        .style = .dim,
+        .text = text,
+        .detail = if (run.len == 1) item.detail else null,
+        .running = run.len == 1 and isLive(item.detail),
+    });
+    if (run.len == 1) if (try argumentLine(arena, item, text)) |line| {
+        try bodies.appendArgBody(arena, rows, item.entry_id, line);
+    };
+}
+
+/// Reads, lists and searches read as one tree row each, in the order they
+/// ran: "Read notes.md", "Searched \"x\" in app.py". A shell command that did
+/// several of them becomes several rows instead of one combined "Explored".
+fn appendExploreRun(arena: Allocator, rows: *std.ArrayList(Row), run: []const Item) !void {
+    for (run) |item| {
+        const running = isLive(item.detail);
+        var emitted = false;
+        if (exploredItem(arena, item)) |actions| {
+            for (actions) |action| {
+                try rows.append(arena, .{
+                    .entry_id = item.entry_id,
+                    .kind = .item,
+                    .style = .dim,
+                    .text = try arena.print("{s} {s}", .{
+                        if (running) action.kind.present() else action.kind.past(),
+                        action.target,
+                    }),
+                    .running = running,
+                });
+                emitted = true;
+            }
+        }
+        if (!emitted) try rows.append(arena, .{
+            .entry_id = item.entry_id,
+            .kind = .item,
+            .style = .dim,
+            .text = try itemText(arena, item),
+            .detail = item.detail,
+            .running = running,
+        });
+    }
 }
 
 /// A group of one: its row in its own voice, never dim, with what it
@@ -424,13 +476,21 @@ fn exploredText(arena: Allocator, run: []const Item) ![]const u8 {
 }
 
 fn appendItem(arena: Allocator, rows: *std.ArrayList(Row), item: Item, style: Style, tail: bool) !void {
+    const text = try itemText(arena, item);
     try rows.append(arena, .{
         .entry_id = item.entry_id,
         .kind = .item,
         .style = style,
-        .text = try itemText(arena, item),
+        .text = text,
         .detail = item.detail,
+        .running = isLive(item.detail),
     });
+    // What the row itself does not say, said once, under it. A row that
+    // already says what the call read, listed or searched carries enough.
+    const summarized = isFileRead(item) or exploredItem(arena, item) != null;
+    if (!summarized) if (try argumentLine(arena, item, text)) |line| {
+        try bodies.appendArgBody(arena, rows, item.entry_id, line);
+    };
     // A card keeps one row under it: the one that carries its outcome.
     if (item.continuation) |continuation| {
         if (firstRow(continuation)) |row| try bodies.appendBody(arena, rows, item.entry_id, row);
@@ -507,6 +567,40 @@ fn itemText(arena: Allocator, item: Item) ![]const u8 {
     if (first.len < std.mem.trimEnd(u8, command, " \t\r\n").len) return arena.print("{s} {s} …", .{ verb, cleaned });
     if (cleaned.ptr == first.ptr or std.mem.eql(u8, cleaned, first)) return item.phrase;
     return arena.print("{s} {s}", .{ verb, cleaned });
+}
+
+/// Argument names a row may repeat so a person can see what the call acted
+/// on. The row already carries any value it names, so only missing ones are
+/// listed.
+const argument_keys = [_][]const u8{ "path", "file_path", "pattern", "query", "url" };
+
+/// The call's command or arguments, for a row that does not already say
+/// them: proto's dim "└─" line. Null when the row carries everything.
+fn argumentLine(arena: Allocator, item: Item, text: []const u8) !?[]const u8 {
+    // A row that already ends in an ellipsis is a truncated frozen phrase;
+    // its stored record may carry unrelated content, so nothing is added.
+    if (std.mem.endsWith(u8, text, "…") or std.mem.endsWith(u8, text, "...")) return null;
+    const record = item.detail orelse return null;
+    if (!std.mem.eql(u8, record.tool_name, "browser")) if (bodies.commandText(arena, record)) |command| {
+        // The row's voice already drops a leading `cd` and quiet redirects
+        // (D294); the argument line uses the same cleaned command so it
+        // never adds back what that decision hid.
+        const cleaned = try command_summary.clean(arena, command);
+        if (std.mem.find(u8, text, cleaned) != null) return null;
+        return try bodies.safeLine(arena, cleaned);
+    };
+    const json = record.arguments_json orelse return null;
+    const args = tool_args.parseToolArgsObject(arena, json) catch return null;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    for (argument_keys) |key| {
+        const raw = tool_args.optionalStringArg(args, key) orelse continue;
+        const value = std.mem.trim(u8, raw, " \t\r\n");
+        if (value.len == 0 or std.mem.find(u8, text, value) != null) continue;
+        if (out.written().len > 0) try out.writer.writeAll(", ");
+        try out.writer.print("{s}: {s}", .{ key, value });
+    }
+    if (out.written().len == 0) return null;
+    return try bodies.safeLine(arena, out.written());
 }
 
 /// A call that did not run, in plain words (D293): "Held · reviewer
@@ -700,10 +794,12 @@ test "adjacent routine rows fold, outcomes stay, failures say why" {
     for (rows) |row| try texts.append(arena, try arena.print("{s}:{s}", .{ @tagName(row.style), row.text }));
     const joined = try std.mem.join(arena, "\n", texts.items);
     try std.testing.expectEqualStrings(
-        \\dim:Read 3 files · notes.md, app.py, +1
+        \\dim:Read notes.md
+        \\dim:Read app.py
+        \\dim:Read lib/a.py
         \\normal:Wrote out.txt +1
         \\attention:Exited 1 · cat: nope.txt: No such file or directory
-        \\dim:$ cat nope.txt
+        \\dim:cat nope.txt
         \\dim:Inspected sleep 9 ×2
     , joined);
 }
@@ -774,7 +870,7 @@ test "a Python run outlines its code and keeps the end of its output" {
     const rows = try plan(arena, &items);
     const expected = [_][]const u8{
         "Exited 1 · AttributeError: module 'os' has no attribute 'nope'",
-        "$ python3 heredoc",
+        "python3 - <<'PY'",
         "Module · 2 nodes",
         "├─ import os",
         "└─ os.nope()",
@@ -815,7 +911,7 @@ test "a Python cell inside other shell keeps its shell chunks, and unparsed code
 
     record.command_display = @constCast("python3 - <<'PY'\nprint((1,\nPY");
     const broken = try plan(arena, &items);
-    try std.testing.expectEqualStrings("print((1,", broken[1].text);
+    try std.testing.expectEqualStrings("print((1,", broken[2].text);
 }
 
 test "browser rows read by what they opened and did, with the script and its output tail" {
@@ -890,9 +986,12 @@ test "adjacent reading commands share one Explored row and only other commands k
     var texts: std.ArrayList([]const u8) = .empty;
     for (rows) |row| try texts.append(arena, try arena.print("{s}:{s}", .{ @tagName(row.style), row.text }));
     try std.testing.expectEqualStrings(
-        \\dim:Explored · Listed ~/code/proto · Read markdown.ts:1-120 · Searched "table" in markdown.ts · Read package.json
+        \\dim:Listed ~/code/proto
+        \\dim:Read markdown.ts:1-120
+        \\dim:Searched "table" in markdown.ts
+        \\dim:Read package.json
         \\normal:Ran git log --oneline -3
-        \\dim:abc first
+        \\output:abc first
         \\dim:Searched "nothing-here" in src
     , try std.mem.join(arena, "\n", texts.items));
 
