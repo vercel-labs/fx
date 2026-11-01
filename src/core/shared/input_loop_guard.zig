@@ -1,6 +1,6 @@
 //! Marks the thread that runs the TUI input loop. A network request made on
 //! that thread freezes typing and drawing until the server answers, so the
-//! request entry points report one. With `FX_E2E_INPUT_LOOP_NETWORK_GUARD=1`,
+//! request entry points report one. With `FX_TEST_INPUT_LOOP_NETWORK_GUARD=1`,
 //! which the terminal tests set, the report is a panic, so any test that
 //! reaches such a request fails.
 
@@ -8,7 +8,7 @@ const std = @import("std");
 const debug_trace = @import("debug_trace.zig");
 const io_mod = @import("io.zig");
 
-const strict_env = "FX_E2E_INPUT_LOOP_NETWORK_GUARD";
+const strict_env = "FX_TEST_INPUT_LOOP_NETWORK_GUARD";
 
 threadlocal var on_input_loop: bool = false;
 

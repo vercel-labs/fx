@@ -7758,7 +7758,7 @@ tmuxTest(
 
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
       AI_GATEWAY_API_KEY: undefined,
-      FX_E2E_GATEWAY_CREDITS_URL: creditsGateway.url,
+      FX_TEST_GATEWAY_CREDITS_URL: creditsGateway.url,
     });
     await session.waitForComposer(TIMEOUT);
     await Bun.sleep(Math.max(0, refreshDueAt - Date.now()) + 250);
@@ -7886,7 +7886,7 @@ tmuxTest(
 
     session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
       AI_GATEWAY_API_KEY: undefined,
-      FX_E2E_GATEWAY_CREDITS_URL: creditsGateway.url,
+      FX_TEST_GATEWAY_CREDITS_URL: creditsGateway.url,
     });
     await session.waitForComposer(TIMEOUT);
     await Bun.sleep(Math.max(0, refreshDueAt - Date.now()) + 250);

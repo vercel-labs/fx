@@ -644,7 +644,7 @@ export class TmuxSession {
       ["FX_TEST_SKIP_ONBOARDING", "1"],
       ["FX_SOUND", "0"],
       // fx panics if it makes a network request on the input loop.
-      ["FX_E2E_INPUT_LOOP_NETWORK_GUARD", "1"],
+      ["FX_TEST_INPUT_LOOP_NETWORK_GUARD", "1"],
     ].flatMap(([key, value]) =>
       Object.prototype.hasOwnProperty.call(env, key) ? [] : [shellQuote(`${key}=${value}`)]
     );

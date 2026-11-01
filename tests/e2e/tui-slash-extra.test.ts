@@ -186,7 +186,7 @@ describe.skipIf(!tmuxAvailable())("tui: credits slash command", () => {
             HOME: home,
             AI_GATEWAY_API_KEY: "credits-fake-key",
             VERCEL_OIDC_TOKEN: undefined,
-            FX_E2E_GATEWAY_CREDITS_URL: gateway.url,
+            FX_TEST_GATEWAY_CREDITS_URL: gateway.url,
           },
           stderrPath,
           width: 120,

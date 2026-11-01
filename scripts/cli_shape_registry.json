@@ -209,6 +209,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_INPUT_LOOP_NETWORK_GUARD": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_OAUTH_ISSUER_URL": {
       "job": "test",
       "stability": "internal"
