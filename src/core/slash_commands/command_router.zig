@@ -278,6 +278,7 @@ test "parse rejects removed slash commands" {
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/history"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/rules"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/background"));
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/alias build zig build"));
 }
 
 test "parse extracts image commands" {
