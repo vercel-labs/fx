@@ -283,7 +283,7 @@ describe("fx mcp", () => {
     );
     const both = await mcp(root, "remove", "twin");
     expect(both.code).toBe(2);
-    expect(both.stderr).toBe("twin is in both ~/.fx/mcp.json and .mcp.json. Add --profile or --project.\n");
+    expect(both.stderr).toBe("twin is in both ~/.fx/mcp.json and .mcp.json. Add --global or --project.\n");
 
     const project = await mcp(root, "remove", "--project", "twin");
     expect(project.code).toBe(0);
@@ -297,6 +297,17 @@ describe("fx mcp", () => {
     const gone = await mcp(root, "remove", "solo");
     expect(gone.code).toBe(1);
     expect(gone.stderr).toBe("No MCP server named solo in ~/.fx/mcp.json or .mcp.json.\n");
+
+    // `--global` names ~/.fx/mcp.json; the older `--profile` still works.
+    const global = await mcp(root, "remove", "--global", "twin");
+    expect(global.code).toBe(0);
+    expect(JSON.parse(readFileSync(root.profilePath, "utf8"))).toEqual({ mcpServers: {}, other: 1 });
+    const profile = await mcp(root, "remove", "--profile", "twin");
+    expect(profile.code).toBe(1);
+    // The older --profile still names the profile file, with a warning.
+    expect(profile.stderr).toBe(
+      "fx mcp remove: --profile is deprecated and stops working in fx 0.0.17; use --global\nNo MCP server named twin in ~/.fx/mcp.json.\n",
+    );
   });
 
   test("approve and reject say exactly what they trust", async () => {
@@ -360,14 +371,14 @@ describe("fx mcp", () => {
     expect(overview.stdout).toStartWith("usage: fx mcp COMMAND\n\n  list [--json]               configured servers; never connects\n");
     const verbHelp = await mcp(root, "remove", "-h");
     expect(verbHelp.code).toBe(0);
-    expect(verbHelp.stdout).toBe("usage: fx mcp remove [--project | --profile] NAME\n");
+    expect(verbHelp.stdout).toBe("usage: fx mcp remove [--global | --project] NAME\n");
 
     const unknownVerb = await mcp(root, "nope");
     expect(unknownVerb.code).toBe(2);
     expect(unknownVerb.stderr).toStartWith("'nope' isn't a fx mcp command.\nusage: fx mcp COMMAND\n");
     const badFlag = await mcp(root, "logout", "--json", "x");
     expect(badFlag.code).toBe(2);
-    expect(badFlag.stderr).toBe("fx mcp logout has no --json flag.\nusage: fx mcp logout NAME\n");
+    expect(badFlag.stderr).toBe("fx mcp logout: unknown flag --json\nusage: fx mcp logout NAME\n");
 
     for (const [args, message] of [
       [["auth", "x"], "fx mcp auth is now fx mcp login NAME.\n"],
@@ -442,7 +453,7 @@ describe("/mcp in the shell", () => {
     await tui.sendText("/mcp nope");
     await tui.waitForText("'nope' isn't a /mcp command.", 10_000);
     await tui.sendText("/mcp list --json");
-    await tui.waitForText("/mcp list has no --json flag.", 10_000);
+    await tui.waitForText("/mcp list: unknown flag --json", 10_000);
     await tui.sendText("/mcp auth web");
     await tui.waitForText("/mcp auth is now /mcp login NAME.", 10_000);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toEqual({ type: "http", url: "https://w.example/mcp" });

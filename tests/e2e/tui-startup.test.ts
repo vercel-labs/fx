@@ -92,7 +92,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
             VERCEL_OIDC_TOKEN: undefined,
             FX_AUTO_UPGRADE: "0",
             FX_DISABLE_KEYCHAIN: "1",
-            FX_SKIP_ONBOARDING: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
           },
           stderrPath,
           width: 100,
@@ -200,7 +200,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
             VERCEL_OIDC_TOKEN: undefined,
             FX_AUTO_UPGRADE: "0",
             FX_DISABLE_KEYCHAIN: "1",
-            FX_SKIP_ONBOARDING: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
           },
           stderrPath,
           width: 100,
@@ -388,7 +388,7 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
             VERCEL_OIDC_TOKEN: undefined,
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
             FX_MODEL: FAKE_GATEWAY_MODEL,
           },
           stderrPath,
@@ -409,6 +409,128 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         expect(gateway.requests).toHaveLength(2);
         expect(gateway.requests[1].body).toContain("second fixture prompt");
         expect(gateway.requests[1].body).not.toContain("first fixture prompt");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a quoted prompt after fx is sent as the first message",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-launch-prompt-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(stderrPath, "");
+      const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("LAUNCH_PROMPT_REPLY"));
+
+      try {
+        session = await TmuxSession.create({
+          cmd: `${FX_BIN} "fix the launch prompt fixture"`,
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            AI_GATEWAY_API_KEY: "launch-prompt-fixture-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+          },
+          stderrPath,
+          width: 100,
+          height: 24,
+        });
+        await session.waitForText("LAUNCH_PROMPT_REPLY", 10_000);
+        await session.waitForPane((pane) => hasEmptyComposer(pane), 10_000);
+        expect(gateway.requests).toHaveLength(1);
+        expect(gateway.requests[0].body).toContain("fix the launch prompt fixture");
+        const history = await session.captureFullScrollback();
+        expect(history.indexOf("fix the launch prompt fixture")).toBeGreaterThanOrEqual(0);
+        expect(history.indexOf("fix the launch prompt fixture")).toBeLessThan(
+          history.indexOf("LAUNCH_PROMPT_REPLY"),
+        );
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx -c with a quoted prompt sends it in the remembered session",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-continue-prompt-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      const gateway = startDynamicFakeGateway((body) =>
+        fakeGatewayFinalText(
+          body.includes("second launch fixture prompt") ? "SECOND_LAUNCH_REPLY" : "FIRST_LAUNCH_REPLY",
+        ),
+      );
+      const env = {
+        HOME: home,
+        FX_AUTO_UPGRADE: "0",
+        AI_GATEWAY_API_KEY: "continue-prompt-fixture-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+      };
+
+      try {
+        writeFileSync(stderrPath, "");
+        session = await TmuxSession.create({
+          cmd: `${FX_BIN} "first launch fixture prompt"`,
+          cwd: root,
+          env,
+          stderrPath,
+          width: 100,
+          height: 24,
+        });
+        await session.waitForText("FIRST_LAUNCH_REPLY", 10_000);
+        await session.waitForPane((pane) => hasEmptyComposer(pane), 10_000);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd()).toBe(true);
+        await session.kill();
+        session = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+        session = await TmuxSession.create({
+          cmd: `${FX_BIN} -c "second launch fixture prompt"`,
+          cwd: root,
+          env,
+          stderrPath,
+          width: 100,
+          height: 24,
+        });
+        await session.waitForText("SECOND_LAUNCH_REPLY", 10_000);
+        await session.waitForPane((pane) => hasEmptyComposer(pane), 10_000);
+        expect(gateway.requests).toHaveLength(2);
+        // The second request carries the resumed history before the new prompt.
+        const second = gateway.requests[1].body;
+        expect(second).toContain("first launch fixture prompt");
+        expect(second).toContain("second launch fixture prompt");
+        expect(second.indexOf("first launch fixture prompt")).toBeLessThan(
+          second.indexOf("second launch fixture prompt"),
+        );
         expect(readFileSync(stderrPath, "utf8")).toBe("");
       } finally {
         if (session) {
@@ -450,13 +572,13 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         });
         await session.waitForComposer(10_000);
         // Three local notices, one after another.
-        for (const view of ["effective", "local", "user"]) {
+        for (const view of ["effective", "workspace", "global"]) {
           await session.sendText(`/allowlist view ${view}`);
           await session.waitForPane((pane) => pane.includes(`* allowlist: ${view} persistent allow rules`), 5_000);
         }
         const before = await session.captureFullScrollback();
         const expectedNotice = before.slice(before.lastIndexOf("* allowlist: effective")).split("\n┃")[0]?.trimEnd();
-        expect(expectedNotice).toContain("* allowlist: user persistent allow rules: (none)");
+        expect(expectedNotice).toContain("* allowlist: global persistent allow rules: (none)");
         session.sendLiteralImmediate("/new");
         await session.resizeWindow(78, 18, 0);
         await Bun.sleep(40);
@@ -471,8 +593,8 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         let lastIndex = -1;
         for (const field of [
           "* allowlist: effective persistent allow rules: (none)",
-          "* allowlist: local persistent allow rules: (none)",
-          "* allowlist: user persistent allow rules: (none)",
+          "* allowlist: workspace persistent allow rules: (none)",
+          "* allowlist: global persistent allow rules: (none)",
         ]) {
           const index = oldNotice.indexOf(field);
           expect(index).toBeGreaterThan(lastIndex);
@@ -716,6 +838,60 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
   );
 });
 
+describe.skipIf(SKIP_TMUX)("tui: standard terminal variables", () => {
+  const colorSgr = /\x1b\[(?:[0-9;]*;)?(?:3[0-9]|4[0-9]|9[0-7]|10[0-7])(?:;[0-9;]*)?m/;
+
+  test(
+    "NO_COLOR keeps the session and removes its colors",
+    async () => {
+      // The same screen with and without NO_COLOR, so the check can't pass vacuously.
+      const screens: string[] = [];
+      for (const noColor of [undefined, "1"]) {
+        const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-no-color-")));
+        session = await TmuxSession.create({
+          env: {
+            AI_GATEWAY_API_KEY: undefined,
+            VERCEL_OIDC_TOKEN: undefined,
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_DISABLE_KEYCHAIN: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
+            NO_COLOR: noColor,
+          },
+        });
+        await session.waitForComposer(TIMEOUT);
+        await session.sendText("/help");
+        await session.waitForPane((pane) => pane.includes("/model"), TIMEOUT);
+        screens.push(await session.captureFullScrollbackEscapes());
+        await session.kill();
+        session = null;
+      }
+      expect(screens[0]).toMatch(colorSgr);
+      expect(screens[1]).not.toMatch(colorSgr);
+      expect(screens[1]).toContain("/model");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "TERM=dumb refuses the interactive session and points to fx ask",
+    async () => {
+      // The session needs cursor movement, which a dumb terminal lacks.
+      const home = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-dumb-term-")));
+      session = await TmuxSession.create({
+        env: { HOME: home, FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", TERM: "dumb" },
+        remainOnExit: true,
+      });
+      await session.waitForPane(() => session!.paneStatus().dead === true, TIMEOUT);
+      expect(session.paneStatus().status).toBe(1);
+      expect(await session.captureFullScrollback()).toContain(
+        "fx: TERM=dumb can't show the interactive session; use fx ask, or run fx in a terminal that supports cursor movement",
+      );
+    },
+    TIMEOUT,
+  );
+});
+
 describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
   test(
     "/setup opens the inline provider picker columns",
@@ -728,7 +904,7 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
           HOME: home,
           FX_AUTO_UPGRADE: "0",
           FX_DISABLE_KEYCHAIN: "1",
-          FX_SKIP_ONBOARDING: "0",
+          FX_TEST_SKIP_ONBOARDING: "0",
         },
       });
 
@@ -744,6 +920,9 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
       );
       expect(picker).not.toContain("Connections");
       expect(picker).not.toContain("Credential source");
+      // `/setup` is the deprecated alias of `/provider`. The full notice wraps,
+      // so check the part that names the release.
+      expect(await session.captureFullScrollback()).toContain("/setup is deprecated and stops working in fx 0.0.17; use /login");
 
       await session.sendKeys("Enter");
       await session.waitForPane(
@@ -775,7 +954,7 @@ describe.skipIf(SKIP_TMUX)("tui: credential onboarding", () => {
         FX_AUTO_UPGRADE: "0",
         FX_DISABLE_KEYCHAIN: "1",
         FX_NO_OPEN_BROWSER: "1",
-        FX_SKIP_ONBOARDING: "0",
+        FX_TEST_SKIP_ONBOARDING: "0",
       };
 
       session = await TmuxSession.create({ env });
@@ -833,7 +1012,7 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
         VERCEL_OIDC_TOKEN: undefined,
         FX_AUTO_UPGRADE: "0",
         FX_DISABLE_KEYCHAIN: "1",
-        FX_SKIP_ONBOARDING: "1",
+        FX_TEST_SKIP_ONBOARDING: "1",
         FX_THEME: options.fxTheme,
         COLORFGBG: options.colorFgBg,
         COLORTERM: undefined,
@@ -873,7 +1052,7 @@ describe.skipIf(SKIP_TMUX)("tui: custom themes", () => {
             VERCEL_OIDC_TOKEN: undefined,
             FX_AUTO_UPGRADE: "0",
             FX_DISABLE_KEYCHAIN: "1",
-            FX_SKIP_ONBOARDING: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
             FX_THEME: "e2e-accent",
             COLORFGBG: "15;0",
             COLORTERM: undefined,

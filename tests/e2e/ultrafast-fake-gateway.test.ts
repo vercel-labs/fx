@@ -104,13 +104,13 @@ function fakeGatewayEnv(
     AI_GATEWAY_API_KEY: "ultrafast-fake-key",
     VERCEL_OIDC_TOKEN: undefined,
     FX_DISABLE_KEYCHAIN: "1",
-    FX_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_ONBOARDING: "1",
     FX_AUTO_UPGRADE: "0",
     FX_SOUND: "0",
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_PROVIDER: "gateway",
     FX_MODEL: ULTRA_MODEL,
     FX_FAST: undefined,
@@ -343,6 +343,20 @@ describe("ultrafast fake Gateway", () => {
           args: ["--no-ultrafast"],
           ultrafast: false,
         },
+        {
+          name: "the last CLI flag wins when it turns Ultrafast off",
+          settings: {},
+          extraEnv: {},
+          args: ["--ultrafast", "--no-ultrafast"],
+          ultrafast: false,
+        },
+        {
+          name: "the last CLI flag wins when it turns Ultrafast on",
+          settings: {},
+          extraEnv: {},
+          args: ["--no-ultrafast", "--ultrafast"],
+          ultrafast: true,
+        },
         { name: "workspace on", settings: { ultrafast_mode: false }, workspace: true, extraEnv: {}, args: [], ultrafast: true },
         { name: "workspace off", settings: { ultrafast_mode: true }, workspace: false, extraEnv: {}, args: [], ultrafast: false },
         { name: "environment overrides workspace", settings: { ultrafast_mode: false }, workspace: true, extraEnv: { FX_ULTRAFAST: "0" }, args: [], ultrafast: false },
@@ -382,32 +396,6 @@ describe("ultrafast fake Gateway", () => {
           gateway.stop();
           rmSync(root.root, { recursive: true, force: true });
         }
-      }
-    },
-    TIMEOUT,
-  );
-
-  test(
-    "ask rejects conflicting Ultrafast flags before any POST",
-    async () => {
-      const root = createIsolatedRoot();
-      const gateway = startFakeGateway([], { models: [ultrafastCatalogModel()] });
-      try {
-        const result = await runFx(
-          ["ask", "--auto", "--no-save", "--ultrafast", "--no-ultrafast", "Conflicting flags must not spend."],
-          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway), timeoutMs: TIMEOUT },
-        );
-        expect(result.code, result.stderr).toBe(1);
-        expect(result.stdout).toBe("");
-        expect(result.stderr).toMatch(/ultrafast/i);
-        expect(result.stderr).not.toMatch(/panic|segmentation fault|aborted/i);
-        expect(gateway.requests).toEqual([]);
-        expect(gateway.classifierRequests).toEqual([]);
-        expect(gateway.evaluationRequests).toEqual([]);
-        expect(gateway.titleRequests).toEqual([]);
-      } finally {
-        gateway.stop();
-        rmSync(root.root, { recursive: true, force: true });
       }
     },
     TIMEOUT,

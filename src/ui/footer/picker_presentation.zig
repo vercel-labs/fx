@@ -410,7 +410,7 @@ fn composeOnboardingPickerRow(
         2 => "   fx can access AI models with an account, subscription, or API key.",
         3 => "   Choose a sign-in option below, or add your own API key.",
         4 => "",
-        5 => "   You can change this anytime with /setup.",
+        5 => "   You can change this anytime with /provider.",
         6 => "",
         7 => "   Get started",
         12 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
@@ -2193,7 +2193,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
 
     try std.testing.expect(std.mem.find(u8, screen.items, "Welcome to fx") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "fx can access AI models with an account, subscription, or API key") != null);
-    try std.testing.expect(std.mem.find(u8, screen.items, "You can change this anytime with /setup.") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "You can change this anytime with /provider.") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "⚠︎ Note: fx is experimental and defaults to auto mode. \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Learn more: https://") == null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") != null);

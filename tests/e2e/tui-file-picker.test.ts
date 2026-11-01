@@ -2298,7 +2298,7 @@ describe("@ file picker", () => {
         writeFileSync(current.stderrPath, "");
         const activeGateway = gateway!;
         session = await TmuxSession.create({
-          cmd: `${FX_BIN} --resume-last`,
+          cmd: `${FX_BIN} --resume last`,
           cwd: current.workspace,
           env: mockFxEnvironment(current, activeGateway, {
             FX_RECORD: join(current.root, `resume-${cycle}.fxtape`),

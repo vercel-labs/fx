@@ -551,7 +551,7 @@ scenario("two processes opening one v1 family at once convert it once", async f 
   // The first converter waits 300 ms at its root's publish holding the
   // family's locks, so the second meets them taken.
   const fault = f.faultPaths("pause", [f.stagingPath(id)], 300);
-  const args = ["ask", "--json", "--auto", "--resume-id", id, "CONV_NEXT"];
+  const args = ["ask", "--json", "--auto", "--resume", id, "CONV_NEXT"];
   const [first, second] = [f.start(true, args), f.start(true, args)];
   const runs = await Promise.all([first.finished, second.finished]);
   fault.stop();

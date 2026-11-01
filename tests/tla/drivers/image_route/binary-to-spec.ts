@@ -152,7 +152,7 @@ async function runSession(bin: string, dir: string, name: string, turns: Turn[],
       gateway.requests = [];
       let imageData = "";
       const args = ["ask", "--json", "--auto", "--no-color"];
-      if (sessionId) args.push("--resume-id", sessionId);
+      if (sessionId) args.push("--resume", sessionId);
       if (turn.attach) {
         // A distinct image per turn, so a request body shows which ones it carries.
         const path = join(workspace, `turn-${index + 1}.png`);

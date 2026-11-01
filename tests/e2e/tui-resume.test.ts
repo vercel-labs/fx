@@ -285,7 +285,7 @@ test.skipIf(!tmuxAvailable())("suspended sessions retain exclusive writer owners
     await tui.waitForText("DRAFT_SURVIVES_SUSPENSION", TIMEOUT);
     await tui.sendKeys("C-z");
     await tui.waitForPane(pane => /stopped|suspended/i.test(pane), TIMEOUT);
-    const other = await runFx(["ask", "--json", "--resume-id", id, "Must not run while the owner is suspended."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+    const other = await runFx(["ask", "--json", "--resume", id, "Must not run while the owner is suspended."], { cwd: workspace, env, timeoutMs: TIMEOUT });
     expect(other.code).toBe(1);
     expect(JSON.parse(other.stdout).error).toBe("SessionBusy");
     expect(gateway.requests).toHaveLength(1);
@@ -301,7 +301,7 @@ test.skipIf(!tmuxAvailable())("suspended sessions retain exclusive writer owners
     await tui.sendText("/quit");
     await tui.waitForPane(() => existsSync(exitPath), TIMEOUT);
     expect(readFileSync(exitPath, "utf8")).toBe("0");
-    const cold = await runFx(["ask", "--json", "--resume-id", id, "Read the saved conversation."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+    const cold = await runFx(["ask", "--json", "--resume", id, "Read the saved conversation."], { cwd: workspace, env, timeoutMs: TIMEOUT });
     expect(cold.code).toBe(0);
     expect(gateway.requests.at(-1)?.body).toContain("FIRST_ACCEPTED_TURN");
     expect(gateway.requests.at(-1)?.body).toContain("AFTER_FOREGROUND_TURN");
@@ -1023,7 +1023,7 @@ test.skipIf(!tmuxAvailable())(
       const resumeGateway = startFakeGateway([]);
       try {
         active = await TmuxSession.create({
-          cmd: `${FX_BIN} --resume-last`,
+          cmd: `${FX_BIN} --resume last`,
           cwd: realpathSync(workspace),
           // A fixed zone, so entry headers show this zone's local time on every machine.
           env: { ...gatewayEnv(home, resumeGateway), TZ: "IST-5:30" },
@@ -1096,7 +1096,7 @@ test.skipIf(!tmuxAvailable())(
       const sessionId = sessionIdFromHome(home);
       const cases = [
         {
-          command: `${FX_BIN} session resume --id ${sessionId}`,
+          command: `${FX_BIN} session resume ${sessionId}`,
           stderrPath: exactStderrPath,
         },
         {
@@ -1322,7 +1322,7 @@ printf '${trailingMarker}   '
 
       resumedGateway = startFakeGateway([]);
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, resumedGateway),
         stderrPath: resumedStderrPath,
@@ -1449,7 +1449,7 @@ test.skipIf(!tmuxAvailable())(
 
       resumedGateway = startFakeGateway([]);
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, resumedGateway),
         stderrPath: resumedStderrPath,
@@ -1549,7 +1549,7 @@ test.skipIf(!tmuxAvailable())(
 
       resumedGateway = startFakeGateway([]);
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, resumedGateway),
         stderrPath: resumedStderrPath,
@@ -1623,7 +1623,7 @@ test.skipIf(!tmuxAvailable())(
 
       resumedGateway = startFakeGateway([]);
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: workspace,
         env: gatewayEnv(home, resumedGateway),
         stderrPath: join(root, "stderr-resumed.log"),
@@ -1711,7 +1711,7 @@ test.skipIf(!tmuxAvailable())(
         fakeGatewayFinalText("STALE_NOTE_PHASE3_DONE"),
       ]);
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: workspace,
         env: gatewayEnv(home, resumedGateway),
         stderrPath: join(root, "stderr-resumed.log"),
@@ -4759,7 +4759,7 @@ test.skipIf(!tmuxAvailable())(
 
       writeFileSync(contenderStderrPath, "");
       contender = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: workspaceRoot,
         env: {
           ...gatewayEnv(home, ownerGateway),
@@ -4808,7 +4808,7 @@ test.skipIf(!tmuxAvailable())(
 
       writeFileSync(retryStderrPath, "");
       retry = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: workspaceRoot,
         env: gatewayEnv(home, retryGateway),
         stderrPath: retryStderrPath,
@@ -4888,7 +4888,8 @@ test.skipIf(!tmuxAvailable())(
       contender = await TmuxSession.create({
         cmd: FX_BIN,
         cwd: workspaceRoot,
-        env: gatewayEnv(home, contenderGateway),
+        // The selected picker row is found by its color, so this session keeps it.
+        env: { ...gatewayEnv(home, contenderGateway), NO_COLOR: undefined },
         stderrPath: contenderStderrPath,
         width: 100,
         height: 30,
@@ -5111,7 +5112,7 @@ test.skipIf(!tmuxAvailable())(
       active = null;
 
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} resume last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: workspaceRoot,
         env: gatewayEnv(home, resumeGateway),
         stderrPath: resumeStderrPath,
@@ -5428,8 +5429,9 @@ test.skipIf(!tmuxAvailable())(
 
     try {
       writeFileSync(stderrPath, "");
+      // A bare --resume opens the same picker as -r.
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} -r`,
+        cmd: `${FX_BIN} --resume`,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, gateway),
         stderrPath,
@@ -5537,10 +5539,10 @@ test.skipIf(!tmuxAvailable())(
       const invocations = [
         ["-c"],
         ["--continue"],
-        ["--resume"],
-        ["--resume-last"],
-        [`--resume-${sessionId}`],
-        ["resume", "--resume", "--last"],
+        ["-r", "last"],
+        ["--resume", "last"],
+        ["--resume", sessionId],
+        ["session", "resume", "last"],
       ];
       for (const [index, args] of invocations.entries()) {
         const restoredMarker =
@@ -5558,8 +5560,8 @@ test.skipIf(!tmuxAvailable())(
             FX_RECORD: tapePath,
           },
           stderrPath,
-          width: args[0] === `--resume-${sessionId}` ? 42 : 100,
-          height: args[0] === `--resume-${sessionId}` ? 16 : 32,
+          width: args[1] === sessionId ? 42 : 100,
+          height: args[1] === sessionId ? 16 : 32,
         });
         await active.waitForComposer(TIMEOUT);
         const scrollback = await waitForScrollback(active, restoredMarker);
@@ -5642,7 +5644,8 @@ test.skipIf(!tmuxAvailable())(
       active = await TmuxSession.create({
         cmd: FX_BIN,
         cwd: realpathSync(markdownWorkspace),
-        env: { ...gatewayEnv(markdownHome, markdownGateway), FX_RECORD: markdownTapePath },
+        // The restored code block is checked for its syntax colors.
+        env: { ...gatewayEnv(markdownHome, markdownGateway), FX_RECORD: markdownTapePath, NO_COLOR: undefined },
         stderrPath: markdownStderrPath,
         width: 72,
         height: 32,
@@ -5684,9 +5687,13 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(resumedMarkdownGateway);
       writeFileSync(markdownStderrPath, "");
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: realpathSync(markdownWorkspace),
-        env: { ...gatewayEnv(markdownHome, resumedMarkdownGateway), FX_RECORD: resumedMarkdownTapePath },
+        env: {
+          ...gatewayEnv(markdownHome, resumedMarkdownGateway),
+          FX_RECORD: resumedMarkdownTapePath,
+          NO_COLOR: undefined,
+        },
         stderrPath: markdownStderrPath,
         width: 42,
         height: 32,
@@ -5765,9 +5772,9 @@ test.skipIf(!tmuxAvailable())(
 
       const toolSessionId = sessionIdFromHome(toolHome);
       const toolInvocations = [
-        ["--resume"],
-        ["--resume-last"],
-        [`--resume-${toolSessionId}`],
+        ["-r", toolSessionId],
+        ["--resume", "last"],
+        ["--resume", toolSessionId],
       ];
       for (const [index, args] of toolInvocations.entries()) {
         const followUp = `tool resume follow-up ${index}`;
@@ -5832,7 +5839,7 @@ test("manual upgrade output links stable notes and dev changes", async () => {
 
   try {
     const stable = Bun.spawn([installedFx, "upgrade", "--channel", "stable"], {
-      env: { ...process.env, HOME: home, FX_E2E_UPGRADE_BASE_URL: release.baseUrl },
+      env: { ...process.env, HOME: home, FX_TEST_UPGRADE_BASE_URL: release.baseUrl },
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -5845,16 +5852,19 @@ test("manual upgrade output links stable notes and dev changes", async () => {
     copyFileSync(FX_BIN, installedFx);
     chmodSync(installedFx, 0o755);
     const dev = Bun.spawn([installedFx, "upgrade", "--channel", "dev"], {
-      env: { ...process.env, HOME: home, FX_E2E_UPGRADE_BASE_URL: release.baseUrl },
+      env: { ...process.env, HOME: home, FX_TEST_UPGRADE_BASE_URL: release.baseUrl },
       stdout: "pipe",
       stderr: "pipe",
     });
     const devExitCode = await dev.exited;
     expect(devExitCode).toBe(0);
     const buildRevision = JSON.parse(currentRevision).build_revision;
-    expect(await new Response(dev.stdout).text()).toContain(
+    const devStdout = await new Response(dev.stdout).text();
+    expect(devStdout).toContain(
       `changes: https://github.com/vercel-labs/fx/compare/${buildRevision}...${revision}`,
     );
+    expect(devStdout.startsWith("Release channel set to dev in ~/.fx/settings.json.\n")).toBe(true);
+    expect(JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8")).update_channel).toBe("dev");
   } finally {
     release.stop();
     rmSync(root, { recursive: true, force: true });
@@ -5873,7 +5883,7 @@ test("update runs the manual upgrade", async () => {
 
   try {
     const update = Bun.spawn([installedFx, "update", "--channel", "stable"], {
-      env: { ...process.env, HOME: home, FX_E2E_UPGRADE_BASE_URL: release.baseUrl },
+      env: { ...process.env, HOME: home, FX_TEST_UPGRADE_BASE_URL: release.baseUrl },
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -5928,7 +5938,7 @@ test.skipIf(!tmuxAvailable())(
         env: {
           ...gatewayEnv(home, gateway),
           FX_AUTO_UPGRADE: "1",
-          FX_E2E_UPGRADE_BASE_URL: release.baseUrl,
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "core,session",
         },
@@ -6100,7 +6110,7 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(flagGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: workspaceRoot,
         env: gatewayEnv(home, flagGateway),
         stderrPath,
@@ -6231,7 +6241,7 @@ test.skipIf(!tmuxAvailable())(
       ]);
       gateways.push(resumedGateway);
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: workspaceRoot,
         env: gatewayEnv(home, resumedGateway),
         stderrPath,
@@ -6358,7 +6368,7 @@ test.skipIf(!tmuxAvailable())(
       expect(eventsJsonl).not.toContain("sk-abcdefghijklmnop");
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-${sessionId}`,
+        cmd: `${FX_BIN} --resume ${sessionId}`,
         cwd: realpathSync(workspace),
         env: { ...gatewayEnv(home, resumedGateway), FX_RECORD: resumedTapePath },
         stderrPath,
@@ -6483,7 +6493,7 @@ test.skipIf(!tmuxAvailable())(
       const resumedGateway = startFakeGateway([]);
       try {
         active = await TmuxSession.create({
-          cmd: `${FX_BIN} --resume-${sessionId}`,
+          cmd: `${FX_BIN} --resume ${sessionId}`,
           cwd: realpathSync(workspace),
           env: { ...gatewayEnv(home, resumedGateway), FX_RECORD: join(root, "resumed.fxtape") },
           stderrPath,
@@ -6657,7 +6667,7 @@ printf '${stdoutTail2}\\n'
       gateways.push(flagGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: workspaceRoot,
         env: gatewayEnv(home, flagGateway),
         stderrPath,
@@ -7251,7 +7261,7 @@ test.skipIf(!tmuxAvailable())(
       gateways.push(resumedGateway);
       writeFileSync(stderrPath, "");
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} resume ${sessionId}`,
+        cmd: `${FX_BIN} --resume ${sessionId}`,
         cwd: workspaceRoot,
         env: {
           ...gatewayEnv(home, resumedGateway),
@@ -7348,7 +7358,7 @@ test.skipIf(!tmuxAvailable())(
       const resumedGateway = startFakeGateway([]);
       gateways.push(resumedGateway);
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} resume last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: workspaceRoot,
         env: gatewayEnv(home, resumedGateway),
         stderrPath,
@@ -7502,7 +7512,7 @@ while :; do sleep 1; done
       expect(readFileSync(initialStderrPath, "utf8")).toBe("");
 
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} resume last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, resumedGateway),
         stderrPath: resumedStderrPath,
@@ -7623,7 +7633,7 @@ test.skipIf(!tmuxAvailable())(
       expect(readFileSync(initialStderrPath, "utf8")).toBe("");
 
       active = await TmuxSession.create({
-        cmd: `${FX_BIN} resume last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: realpathSync(workspace),
         env: gatewayEnv(home, resumedGateway),
         stderrPath: resumedStderrPath,
@@ -7716,7 +7726,7 @@ test.skipIf(!tmuxAvailable())(
         writeFileSync(path, content, { mode: 0o600 });
         remnants.push([path, content]);
       }
-      for (const [flag, reply] of [["--resume-last", "LATEST_CONTINUATION_SAVED"], ["-r", "PICKER_CONTINUATION_SAVED"]] as const) {
+      for (const [flag, reply] of [["--resume last", "LATEST_CONTINUATION_SAVED"], ["-r", "PICKER_CONTINUATION_SAVED"]] as const) {
         const stderrPath = join(root, `${flag}.stderr`);
         active = await TmuxSession.create({ cmd: `${shellQuote(FX_BIN)} ${flag}`, cwd: workspace, env, stderrPath, remainOnExit: true });
         if (flag === "-r") {
@@ -7947,7 +7957,7 @@ for (const inspectDetails of [false, true]) {
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         const sessionId = sessionIdFromHome(home);
         await active.kill();
-        active = await TmuxSession.create({ cmd: `${FX_BIN} --resume-last`, cwd: workspace, env, stderrPath, isolated: true, remainOnExit: true, width: 88, height: 24 });
+        active = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: workspace, env, stderrPath, isolated: true, remainOnExit: true, width: 88, height: 24 });
         await active.waitForComposer(TIMEOUT);
         await assertHistory();
         if (inspectDetails) {
@@ -8052,7 +8062,7 @@ test.skipIf(!tmuxAvailable())("remembered continuation restores the selected con
     active = await open([], "empty-window");
     await active.waitForStableComposer(TIMEOUT);
     await close(active); active = null;
-    const latest = await runFx(["ask", "--json", "--resume-id", bId, "Update B without tools."], { cwd: workspace, env, timeoutMs: TIMEOUT });
+    const latest = await runFx(["ask", "--json", "--resume", bId, "Update B without tools."], { cwd: workspace, env, timeoutMs: TIMEOUT });
     expect(latest.code).toBe(0);
     const last = await runFx(["session", "last", "--json"], { cwd: workspace, env });
     expect(last.code).toBe(0); expect(JSON.parse(last.stdout).id).toBe(bId);

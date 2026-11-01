@@ -97,7 +97,7 @@ async function launch(options: {
       FX_MODEL: options.model ?? MODEL,
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-      FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
       FX_SOUND: "0",
       FX_AUTO_UPGRADE: "0",
       FX_DISABLE_KEYCHAIN: "1",
