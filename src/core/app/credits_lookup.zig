@@ -1,10 +1,11 @@
-//! Runs the `/credits` lookup off the input loop. One lookup runs at a time.
-//! The event loop takes its result when it finishes, and shutdown cancels it
-//! and waits for its bounded requests to stop.
+//! Runs the `/credits` lookup off the input loop as a `std.Io` task. One
+//! lookup runs at a time. The event loop takes its result when it finishes,
+//! and shutdown cancels it and awaits its bounded requests.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
+const io_mod = @import("../shared/io.zig");
 const secret = @import("../auth/secret.zig");
 const credentials = @import("../auth/credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
@@ -14,7 +15,8 @@ const output_contracts = @import("../output/output_contracts.zig");
 
 pub const Start = enum { started, busy };
 
-const renewal_failed_message = "Could not renew the sign-in to check credits. Try again, or run /login.";
+const renewal_failed_message = "Could not renew the sign-in to check credits. Try again.";
+const renewal_sign_in_message = "Your sign-in has expired. Run /login, then check credits again.";
 
 /// Renews a refreshable credential that is past its refresh deadline before
 /// the lookup asks for credits.
@@ -40,7 +42,7 @@ pub const Result = struct {
 pub const Lookup = struct {
     task: ?*Task = null,
 
-    /// Copies `input` and `renewal`, then fetches on a worker thread. Returns
+    /// Copies `input` and `renewal`, then fetches in a `std.Io` task. Returns
     /// `.busy` while an earlier lookup runs. `provider.context` and the
     /// renewal transport's context must outlive the lookup.
     pub fn start(
@@ -49,7 +51,6 @@ pub const Lookup = struct {
         input: gateway_provider.CreditsLookupInput,
         renewal: ?Renewal,
     ) !Start {
-        if (comptime builtin.single_threaded) return error.ThreadsUnsupported;
         if (self.task != null) return .busy;
         self.task = try Task.start(provider, input, renewal);
         return .started;
@@ -87,7 +88,7 @@ const Task = struct {
     cancel: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     result: Result = .{ .snapshot = .{} },
-    thread: std.Thread = undefined,
+    future: std.Io.Future(void) = undefined,
 
     fn start(
         provider: gateway_provider.CreditsProvider,
@@ -111,7 +112,7 @@ const Task = struct {
             .renewal = renewal,
             .renewal_account_id = account_id,
         };
-        task.thread = try std.Thread.spawn(.{}, run, .{task});
+        task.future = try io_mod.getIo().concurrent(run, .{task});
         return task;
     }
 
@@ -120,15 +121,20 @@ const Task = struct {
         var credential: ?[]const u8 = self.credential;
         var tenant: ?[]const u8 = self.tenant;
         if (self.renewal) |renewal| {
+            var transport: oauth_transport.Cancellable = .{ .inner = renewal.transport, .cancel_flag = &self.cancel };
             const renewed = auth_runtime.refreshCredentialForAccount(
-                self.cancellableTransport(),
+                transport.provider(),
                 alloc,
                 renewal.source,
                 .if_needed,
                 self.renewal_account_id,
             ) catch |err| {
                 debug_trace.logf("credits", "lookup could not renew source={t} err={s}", .{ renewal.source, @errorName(err) });
-                self.result.snapshot = .{ .err_message = alloc.dupe(u8, renewal_failed_message) catch null };
+                const message = if (auth_runtime.classifyCredentialFailure(renewal.source, err).requiresSignIn())
+                    renewal_sign_in_message
+                else
+                    renewal_failed_message;
+                self.result.snapshot = .{ .err_message = alloc.dupe(u8, message) catch null };
                 self.done.store(true, .release);
                 return;
             };
@@ -147,24 +153,9 @@ const Task = struct {
         self.done.store(true, .release);
     }
 
-    fn cancellableTransport(self: *Task) oauth_transport.Provider {
-        return .{ .context = self, .execute_fn = executeCancellable };
-    }
-
-    fn executeCancellable(
-        raw: ?*anyopaque,
-        alloc: std.mem.Allocator,
-        request: oauth_transport.Request,
-    ) !oauth_transport.Response {
-        const self: *Task = @ptrCast(@alignCast(raw.?));
-        var bounded = request;
-        bounded.cancel_flag = &self.cancel;
-        return self.renewal.?.transport.execute(alloc, bounded);
-    }
-
-    /// Waits for the thread, frees the task, and returns its result.
+    /// Awaits the task, frees it, and returns its result.
     fn finish(self: *Task) Result {
-        self.thread.join();
+        self.future.await(io_mod.getIo());
         const result = self.result;
         const alloc = std.heap.c_allocator;
         if (self.credential) |value| secret.zeroAndFree(alloc, value);

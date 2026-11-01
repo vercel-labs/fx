@@ -63,12 +63,51 @@ pub const Provider = struct {
     }
 };
 
+/// Sends every request through `inner` with `cancel_flag` set, so the owner
+/// of a background request can stop it. Must outlive the requests it sends.
+pub const Cancellable = struct {
+    inner: Provider,
+    cancel_flag: *std.atomic.Value(bool),
+
+    pub fn provider(self: *Cancellable) Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn execute(raw: ?*anyopaque, alloc: Allocator, request: Request) !Response {
+        const self: *Cancellable = @ptrCast(@alignCast(raw.?));
+        var bounded = request;
+        bounded.cancel_flag = self.cancel_flag;
+        return self.inner.execute(alloc, bounded);
+    }
+};
+
 fn unavailable(
     _: ?*anyopaque,
     _: Allocator,
     _: Request,
 ) !Response {
     return error.OAuthTransportUnavailable;
+}
+
+test "cancellable transport adds its cancel flag to every request" {
+    const Recorder = struct {
+        seen: ?*std.atomic.Value(bool) = null,
+
+        fn execute(raw: ?*anyopaque, _: Allocator, request: Request) !Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.seen = request.cancel_flag;
+            return .{ .disposition = .accepted, .body = &.{} };
+        }
+    };
+    var recorder: Recorder = .{};
+    var cancel = std.atomic.Value(bool).init(false);
+    var cancellable: Cancellable = .{
+        .inner = .{ .context = &recorder, .execute_fn = Recorder.execute },
+        .cancel_flag = &cancel,
+    };
+    var response = try cancellable.provider().execute(std.testing.allocator, .{ .method = .get, .url = "https://issuer.test" });
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(&cancel, recorder.seen.?);
 }
 
 pub const unavailable_provider = Provider{

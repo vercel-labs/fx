@@ -6610,6 +6610,34 @@ async function waitForRevocations(
 }
 
 tmuxTest(
+  "quitting right after /logout does not wait on a stalled issuer",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-logout-quit-stalled-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    // Longer than the OAuth request deadline, so only cancellation ends it.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { revokeDelayMs: 20_000 });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/logout");
+    await session.waitForText("Signed out of fx.", 1_000);
+
+    const quitAt = Date.now();
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(10_000)).toBe(true);
+    session = null;
+    // Shutdown gives the revocation 2 seconds, then cancels it.
+    expect(Date.now() - quitAt).toBeLessThan(5_000);
+    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
   "logout signs out at once while the issuer revokes the session slowly",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-logout-slow-revoke-"));

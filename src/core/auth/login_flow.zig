@@ -350,29 +350,7 @@ pub const SignInRuntime = struct {
                 .oauth_transport = transport,
             });
         }
-        self.mutex.lockUncancelable(io_mod.getIo());
-        if (self.thread != null or self.state == .polling or self.completion != null) {
-            self.mutex.unlock(io_mod.getIo());
-            return false;
-        }
-        self.state = .polling;
-        self.failure = null;
-        self.flow = null;
-        self.poll_state = null;
-        self.browser_pending = false;
-        self.deps = .{ .oauth_transport = transport };
-        self.deps.poll.cancel_flag = &self.cancel_requested;
-        self.cancel_requested.store(false, .seq_cst);
-        self.mutex.unlock(io_mod.getIo());
-
-        self.thread = std.Thread.spawn(.{}, prepareThenPollMain, .{ self, alloc }) catch |err| {
-            self.mutex.lockUncancelable(io_mod.getIo());
-            self.state = .idle;
-            self.mutex.unlock(io_mod.getIo());
-            self.clearFlow(alloc);
-            return err;
-        };
-        return true;
+        return self.startPreparedWithMode(alloc, null, .{ .oauth_transport = transport }, false);
     }
 
     /// Returns true once after the worker publishes a device code.
@@ -402,33 +380,34 @@ pub const SignInRuntime = struct {
         return self.startPreparedWithMode(alloc, prepared, deps, true);
     }
 
+    /// Without `prepared`, the worker requests the device code before it
+    /// polls; cooperative hosts have no worker and must pass one.
     fn startPreparedWithMode(
         self: *Self,
         alloc: Allocator,
-        prepared: PreparedLogin,
+        prepared: ?PreparedLogin,
         deps: SignInRuntimeDeps,
         comptime cooperative: bool,
     ) !bool {
-        const poll_state = if (cooperative)
-            LoginPollState.init(deps.poll, prepared.device) catch |err| {
-                var rejected = prepared;
-                rejected.deinit(alloc);
+        const poll_state = if (cooperative) poll: {
+            const device = if (prepared) |value| value.device else return error.LoginFlowMissing;
+            break :poll LoginPollState.init(deps.poll, device) catch |err| {
+                releasePrepared(alloc, prepared);
                 if (deps.deinit_ctx) |deinit_ctx| deinit_ctx(deps.ctx, alloc);
                 return err;
-            }
-        else
-            null;
+            };
+        } else null;
         self.mutex.lockUncancelable(io_mod.getIo());
         if (self.thread != null or self.state == .polling or self.completion != null) {
             self.mutex.unlock(io_mod.getIo());
-            var rejected = prepared;
-            rejected.deinit(alloc);
+            releasePrepared(alloc, prepared);
             if (deps.deinit_ctx) |deinit_ctx| deinit_ctx(deps.ctx, alloc);
             return false;
         }
         self.state = .polling;
         self.failure = null;
         self.flow = prepared;
+        self.browser_pending = false;
         self.poll_state = poll_state;
         self.deps = deps;
         self.deps.poll.cancel_flag = &self.cancel_requested;
@@ -540,11 +519,13 @@ pub const SignInRuntime = struct {
         };
     }
 
-    fn prepareThenPollMain(self: *Self, alloc: Allocator) void {
-        const prepared = prepareLogin(alloc, self.cancellableTransport()) catch |err| {
+    /// Requests the device code for a flow started without one, through a
+    /// transport `cancel` can stop. Returns whether the flow can poll.
+    fn prepareFlow(self: *Self, alloc: Allocator) bool {
+        var transport: oauth_transport.Cancellable = .{ .inner = self.deps.oauth_transport, .cancel_flag = &self.cancel_requested };
+        const prepared = prepareLogin(alloc, transport.provider()) catch |err| {
             self.publishFailure(err);
-            self.finishAttempt(alloc);
-            return;
+            return false;
         };
         self.mutex.lockUncancelable(io_mod.getIo());
         if (self.state != .polling or self.cancel_requested.load(.seq_cst)) {
@@ -552,33 +533,17 @@ pub const SignInRuntime = struct {
             debug_trace.logf("auth", "sign-in dropped prepared device code reason=cancelled", .{});
             var discarded = prepared;
             discarded.deinit(alloc);
-            self.finishAttempt(alloc);
-            return;
+            return false;
         }
         self.flow = prepared;
         self.browser_pending = true;
         self.mutex.unlock(io_mod.getIo());
-        self.workerMain(alloc);
-    }
-
-    /// Lets `cancel` stop the discovery and device-code requests.
-    fn cancellableTransport(self: *Self) oauth_transport.Provider {
-        return .{ .context = self, .execute_fn = executeCancellable };
-    }
-
-    fn executeCancellable(
-        raw: ?*anyopaque,
-        alloc: Allocator,
-        request: oauth_transport.Request,
-    ) !oauth_transport.Response {
-        const self: *Self = @ptrCast(@alignCast(raw.?));
-        var bounded = request;
-        bounded.cancel_flag = &self.cancel_requested;
-        return self.deps.oauth_transport.execute(alloc, bounded);
+        return true;
     }
 
     fn workerMain(self: *Self, alloc: Allocator) void {
         defer self.finishAttempt(alloc);
+        if (self.flow == null and !self.prepareFlow(alloc)) return;
         const flow = if (self.flow) |*prepared| prepared else return;
         var prompt = BrowserOpenPrompt{ .url = flow.device.verification_uri };
         var token = pollForTokenWithDeps(
@@ -642,10 +607,11 @@ pub const SignInRuntime = struct {
             debug_trace.logf("auth", "sign-in discarded token after cancel", .{});
             return;
         }
+        var transport: oauth_transport.Cancellable = .{ .inner = self.deps.oauth_transport, .cancel_flag = &self.cancel_requested };
         var completion = self.deps.complete(
             self.deps.ctx,
             alloc,
-            self.cancellableTransport(),
+            transport.provider(),
             flow.metadata.issuer,
             flow.client_id,
             token,
@@ -720,6 +686,11 @@ pub const SignInRuntime = struct {
         if (finish) |notify| notify(ctx, alloc, saved);
     }
 };
+
+fn releasePrepared(alloc: Allocator, prepared: ?PreparedLogin) void {
+    var owned = prepared orelse return;
+    owned.deinit(alloc);
+}
 
 fn prepareLogin(
     alloc: Allocator,

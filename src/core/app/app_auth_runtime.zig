@@ -1526,7 +1526,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @import("builtin").single_threaded or !@hasDecl(@TypeOf(app.auth), "beginTeamList")) {
                 return try finishTeamsForProviderPicker(app, login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport()));
             }
-            _ = try app.auth.beginTeamList(app.alloc, .provider_picker);
+            try app.auth.beginTeamList(app.alloc, .provider_picker);
             return null;
         }
 
@@ -1576,7 +1576,8 @@ pub fn Runtime(comptime App: type) type {
             }
             // Listing teams can renew the session, and both talk to the
             // network; `collectTeamListFacts` opens the picker.
-            _ = try app.auth.beginTeamList(app.alloc, .change_team);
+            try app.auth.beginTeamList(app.alloc, .change_team);
+            app.shell.render_requests.request(.footer);
         }
 
         /// Hands a finished team list to the screen that asked for it: the

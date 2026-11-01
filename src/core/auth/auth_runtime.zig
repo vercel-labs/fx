@@ -795,8 +795,9 @@ const PromptCredentialRefreshTask = struct {
     }
 
     fn workerMain(self: *PromptCredentialRefreshTask) void {
+        var transport: oauth_transport.Cancellable = .{ .inner = self.transport, .cancel_flag = &self.cancel_requested };
         self.credential = refreshCredentialForAccount(
-            self.cancellableTransport(),
+            transport.provider(),
             std.heap.c_allocator,
             self.source,
             .if_needed,
@@ -808,24 +809,6 @@ const PromptCredentialRefreshTask = struct {
         };
         if (self.credential == null) self.failure = error.CredentialRefreshUnavailable;
         self.done.store(true, .release);
-    }
-
-    fn cancellableTransport(self: *PromptCredentialRefreshTask) oauth_transport.Provider {
-        return .{
-            .context = self,
-            .execute_fn = executeCancellable,
-        };
-    }
-
-    fn executeCancellable(
-        raw: ?*anyopaque,
-        alloc: Allocator,
-        request: oauth_transport.Request,
-    ) !oauth_transport.Response {
-        const self: *PromptCredentialRefreshTask = @ptrCast(@alignCast(raw.?));
-        var bounded = request;
-        bounded.cancel_flag = &self.cancel_requested;
-        return self.transport.execute(alloc, bounded);
     }
 
     fn poll(self: *const PromptCredentialRefreshTask) bool {
@@ -888,33 +871,38 @@ pub const RemoteRevocation = union(enum) {
     }
 };
 
-pub const RemoteRevocationOutcome = struct {
+const RemoteRevocationOutcome = struct {
     source: credentials.Source,
     failed: bool,
 };
 
+/// How long shutdown waits for revocations in flight before cancelling them.
+const remote_revocation_shutdown_grace_ms: i64 = 2_000;
+
 const RemoteRevocationTask = struct {
     transport: oauth_transport.Provider,
     target: RemoteRevocation,
-    thread: std.Thread = undefined,
+    future: std.Io.Future(void) = undefined,
     done: std.atomic.Value(bool) = .init(false),
+    cancel: std.atomic.Value(bool) = .init(false),
     failed: bool = false,
 
-    /// Takes ownership of `target` only when the thread starts.
+    /// Takes ownership of `target` only when the task starts.
     fn start(transport: oauth_transport.Provider, target: RemoteRevocation) !*RemoteRevocationTask {
         const alloc = std.heap.c_allocator;
         const task = try alloc.create(RemoteRevocationTask);
         errdefer alloc.destroy(task);
         task.* = .{ .transport = transport, .target = target };
-        task.thread = try std.Thread.spawn(.{}, workerMain, .{task});
+        task.future = try io_mod.getIo().concurrent(workerMain, .{task});
         return task;
     }
 
     fn workerMain(self: *RemoteRevocationTask) void {
         const alloc = std.heap.c_allocator;
+        var transport: oauth_transport.Cancellable = .{ .inner = self.transport, .cancel_flag = &self.cancel };
         const revoked: anyerror!void = switch (self.target) {
-            .fx_login => |session| login_flow.revokeLoggedOutSession(alloc, self.transport, session),
-            .grok => |token| grok_oauth.revokeToken(alloc, self.transport, token),
+            .fx_login => |session| login_flow.revokeLoggedOutSession(alloc, transport.provider(), session),
+            .grok => |token| grok_oauth.revokeToken(alloc, transport.provider(), token),
         };
         revoked catch |err| {
             debug_trace.logf("auth", "remote revocation failed source={t} err={s}", .{ self.target.source(), @errorName(err) });
@@ -923,9 +911,9 @@ const RemoteRevocationTask = struct {
         self.done.store(true, .release);
     }
 
-    /// Waits for the thread, releases the task, and returns its outcome.
+    /// Awaits the task, releases it, and returns its outcome.
     fn finish(self: *RemoteRevocationTask) RemoteRevocationOutcome {
-        self.thread.join();
+        self.future.await(io_mod.getIo());
         const outcome: RemoteRevocationOutcome = .{ .source = self.target.source(), .failed = self.failed };
         self.target.deinit();
         std.heap.c_allocator.destroy(self);
@@ -1084,9 +1072,10 @@ pub const ProviderPreparation = struct {
             self.credential = candidate;
             self.input.candidate = null;
         } else if (!self.host_managed) {
+            var transport: oauth_transport.Cancellable = .{ .inner = self.transport, .cancel_flag = &self.cancel_requested };
             self.credential = prepareCredential(
                 self.alloc,
-                .{ .context = self, .execute_fn = executeCancellable },
+                transport.provider(),
                 self.secret_store,
                 self.input.target(),
                 self.input.preferred_source,
@@ -1115,13 +1104,6 @@ pub const ProviderPreparation = struct {
             self.failure = err;
             return;
         };
-    }
-
-    fn executeCancellable(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
-        const self: *ProviderPreparation = @ptrCast(@alignCast(raw.?));
-        var bounded = request;
-        bounded.cancel_flag = &self.cancel_requested;
-        return self.transport.execute(alloc, bounded);
     }
 
     pub fn requestCancel(self: *ProviderPreparation) void {
@@ -1326,9 +1308,7 @@ const InventoryRefreshTask = struct {
 
 /// What a team list was loaded for, so its result resumes the screen that
 /// asked for it.
-pub const TeamListPurpose = enum { change_team, provider_picker };
-
-pub const TeamListStart = enum { started, busy };
+const TeamListPurpose = enum { change_team, provider_picker };
 
 /// Lists the fx login's Vercel teams off the input loop. Listing can renew
 /// the session first, and both steps talk to the network.
@@ -1336,7 +1316,7 @@ const TeamListTask = struct {
     alloc: Allocator,
     transport: oauth_transport.Provider,
     purpose: TeamListPurpose,
-    thread: ?std.Thread = null,
+    future: std.Io.Future(void) = undefined,
     done: std.atomic.Value(bool) = .init(false),
     cancel: std.atomic.Value(bool) = .init(false),
     selection: anyerror!login_flow.TeamSelection = error.TeamListPending,
@@ -1346,10 +1326,9 @@ const TeamListTask = struct {
         transport: oauth_transport.Provider,
         purpose: TeamListPurpose,
     ) !*TeamListTask {
-        if (comptime builtin.single_threaded) return error.ThreadsUnsupported;
         const task = try alloc.create(TeamListTask);
         task.* = .{ .alloc = alloc, .transport = transport, .purpose = purpose };
-        task.thread = std.Thread.spawn(.{}, workerMain, .{task}) catch |err| {
+        task.future = io_mod.getIo().concurrent(workerMain, .{task}) catch |err| {
             alloc.destroy(task);
             return err;
         };
@@ -1357,29 +1336,15 @@ const TeamListTask = struct {
     }
 
     fn workerMain(self: *TeamListTask) void {
-        self.selection = login_flow.loadTeamSelection(self.alloc, .{
-            .context = self,
-            .execute_fn = executeCancellable,
-        });
+        var transport: oauth_transport.Cancellable = .{ .inner = self.transport, .cancel_flag = &self.cancel };
+        self.selection = login_flow.loadTeamSelection(self.alloc, transport.provider());
         self.done.store(true, .release);
     }
 
-    fn executeCancellable(
-        raw: ?*anyopaque,
-        alloc: Allocator,
-        request: oauth_transport.Request,
-    ) !oauth_transport.Response {
-        const self: *TeamListTask = @ptrCast(@alignCast(raw.?));
-        var bounded = request;
-        bounded.cancel_flag = &self.cancel;
-        return self.transport.execute(alloc, bounded);
-    }
-
-    /// Cancels the requests, waits for the worker, and frees a list nobody
-    /// took.
+    /// Cancels the requests, awaits the task, and frees a list nobody took.
     fn deinit(self: *TeamListTask) void {
         self.cancel.store(true, .seq_cst);
-        if (self.thread) |thread| thread.join();
+        self.future.await(io_mod.getIo());
         if (self.selection) |*selection| selection.deinit(self.alloc) else |_| {}
         self.alloc.destroy(self);
     }
@@ -1993,11 +1958,17 @@ pub const Runtime = struct {
             task.deinit();
         }
         self.team_list_task = null;
-        // The user asked to end these sessions at their issuer, and every
-        // request has a deadline, so shutdown waits instead of cancelling.
+        // The user asked to end these sessions at their issuer, so shutdown
+        // gives revocations in flight a short grace period. A stalled issuer
+        // must not hold exit, so whatever is left after it is cancelled.
+        const grace_deadline_ms = io_mod.milliTimestamp() + remote_revocation_shutdown_grace_ms;
         for (self.remote_revocation_tasks.items) |task| {
+            while (!task.done.load(.acquire) and io_mod.milliTimestamp() < grace_deadline_ms) {
+                io_mod.sleep(10 * std.time.ns_per_ms);
+            }
             if (!task.done.load(.acquire)) {
-                debug_trace.logf("auth", "shutdown waits for remote revocation source={t}", .{task.target.source()});
+                debug_trace.logf("auth", "remote revocation dropped reason=shutdown source={t}", .{task.target.source()});
+                task.cancel.store(true, .seq_cst);
             }
             _ = task.finish();
         }
@@ -2295,12 +2266,12 @@ pub const Runtime = struct {
         return .{ .ready = task.action };
     }
 
-    /// Starts listing the fx login's teams on a worker; `takeTeamList`
-    /// returns the result once to the screen that asked for it.
-    pub fn beginTeamList(self: *Self, alloc: Allocator, purpose: TeamListPurpose) !TeamListStart {
-        if (self.team_list_task != null) return .busy;
+    /// Starts listing the fx login's teams in a `std.Io` task, unless one is
+    /// loading; `takeTeamList` returns the result once to the screen that
+    /// asked for it.
+    pub fn beginTeamList(self: *Self, alloc: Allocator, purpose: TeamListPurpose) !void {
+        if (self.team_list_task != null) return;
         self.team_list_task = try TeamListTask.start(alloc, self.oauth_transport, purpose);
-        return .started;
     }
 
     pub fn teamListLoading(self: *const Self) bool {
