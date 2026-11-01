@@ -113,6 +113,7 @@
     {"name": "verify-mcp-verbs", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-verbs.test.ts"], "test_file": "mcp-verbs.test.ts"},
     {"name": "verify-tui-auth-source-selection", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-auth-source-selection.test.ts"], "test_file": "tui-auth-source-selection.test.ts"},
     {"name": "verify-tui-compaction-activity", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-compaction-activity.test.ts"], "test_file": "tui-compaction-activity.test.ts"},
+    {"name": "verify-tui-transcript-window", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-transcript-window.test.ts"], "test_file": "tui-transcript-window.test.ts"},
     {"name": "verify-compaction-policy", "argv": ["bun", "test", "--max-concurrency", "1", "./compaction-policy.test.ts"], "test_file": "compaction-policy.test.ts", "requires_tmux": false},
     {"name": "verify-tui-composer-edit-contracts", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-composer-edit-contracts.test.ts"], "test_file": "tui-composer-edit-contracts.test.ts"},
     {"name": "verify-tui-permissions-panel", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-permissions-panel.test.ts"], "test_file": "tui-permissions-panel.test.ts"},

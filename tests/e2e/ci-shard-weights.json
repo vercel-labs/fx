@@ -62,6 +62,7 @@
   { "file": "tui-startup.test.ts", "weight": 7 },
   { "file": "tui-status-session.test.ts", "weight": 45 },
   { "file": "tui-terminal-tool.test.ts", "weight": 177 },
+  { "file": "tui-transcript-window.test.ts", "weight": 30 },
   { "file": "ultrafast-fake-gateway.test.ts", "weight": 8 },
   { "file": "vision-route-fake-gateway.test.ts", "weight": 20 },
   { "file": "web-fetch-fake-network.test.ts", "weight": 3 },
