@@ -616,16 +616,18 @@ function toolResultOutput(body: string, callId: string): string {
   return contentText(result.output);
 }
 
+// A shell result leaves out every field that is null or false.
 type ShellResult = {
+  session_id?: string;
   state: string;
-  backend: string;
-  persistence: string;
+  backend?: string;
+  persistence?: string;
   output_delta: string;
-  full_output_handle: string | null;
-  exit_code: number | null;
-  signal: string | null;
-  termination_indeterminate: boolean;
-  error: string | null;
+  full_output_handle?: string;
+  exit_code?: number;
+  signal?: string;
+  termination_indeterminate?: true;
+  error?: string;
 };
 
 function shellResult(body: string, callId: string): ShellResult {
@@ -4560,11 +4562,12 @@ describe("gateway stream lifecycle", () => {
       expect(json.output).toContain("acknowledged without retry");
       expect(gateway.requestCount()).toBe(2);
       expect(readFileSync(effectPath, "utf8")).toBe("effect\n");
-      expect(JSON.parse(observedFailure)).toMatchObject({
+      const observedSnapshot = JSON.parse(observedFailure);
+      expect(observedSnapshot).toMatchObject({
         state: "completed",
-        exit_code: null,
         termination_indeterminate: true,
       });
+      expect(observedSnapshot).not.toHaveProperty("exit_code");
       expect(observedFailure).not.toContain("Unexpected");
       expect(json.tool_calls).toHaveLength(1);
       expect(json.tool_calls[0]).toMatchObject({
@@ -5359,7 +5362,8 @@ describe("gateway stream lifecycle", () => {
         case 1: {
           try {
             const ready = shellResult(body, readyCallId);
-            expect(ready).toMatchObject({ state: "completed", exit_code: 0, error: null });
+            expect(ready).toMatchObject({ state: "completed", exit_code: 0 });
+            expect(ready).not.toHaveProperty("error");
             expect(ready.output_delta.startsWith(readyMarker)).toBe(true);
             const pythonPath = ready.output_delta.slice(readyMarker.length).trim();
             expect(pythonPath.startsWith("/")).toBe(true);
@@ -5569,9 +5573,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(started).toMatchObject({
         state: "completed",
         exit_code: 0,
-        error: null,
         output_delta: expect.stringContaining("DAEMON-STARTED"),
       });
+      expect(started).not.toHaveProperty("error");
       expect(Number.isSafeInteger(daemonPid) && daemonPid! > 0).toBe(true);
       expect(Number.isSafeInteger(jobPid) && jobPid! > 0).toBe(true);
       expect(daemonAliveAfterStart).toBe(true);
@@ -5682,9 +5686,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(started).toMatchObject({
         state: "completed",
         exit_code: 0,
-        error: null,
         output_delta: "SERVICE-READY",
       });
+      expect(started).not.toHaveProperty("error");
       // Connect only after fx has exited, as a later check of the machine would.
       await Bun.sleep(500);
       const response = await fetch(`http://127.0.0.1:${port}/`);
