@@ -2642,7 +2642,8 @@ fn checkControlBoundaryAgainstFull(
         "control boundary oracle mismatch offset={d} full_resume={d} advanced_resume={d} full_col={d} advanced_col={d}",
         .{ raw_offset, full.resume_bytes.len, advanced.resume_bytes.len, full.cursor_col, advanced.cursor_col },
     );
-    if (builtin.is_test) @panic("control boundary oracle: the advanced boundary differs from the full one");
+    // A test fails on the mismatch; elsewhere the full boundary replaces it.
+    if (builtin.is_test) return error.TranscriptOracleMismatch;
     std.mem.swap(PreparedControlBoundary, &full, advanced);
 }
 
@@ -2831,7 +2832,7 @@ fn replacePreparedProjectionResumeBytesForFlowOffset(
                         full.pending_wrap != advanced.endpoint_pending_wrap)
                     {
                         debug_trace.logf("render", "projection resume oracle mismatch offset={d} base={d}", .{ offset, base_offset });
-                        if (builtin.is_test) @panic("projection resume oracle: the advanced state differs from the full one");
+                        if (builtin.is_test) return error.TranscriptOracleMismatch;
                         std.mem.swap([]u8, &full.resume_bytes, &advanced.endpoint_resume_bytes);
                         advanced.endpoint_cursor_col = full.cursor_col;
                         advanced.endpoint_pending_wrap = full.pending_wrap;

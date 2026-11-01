@@ -571,7 +571,11 @@ pub fn renderPlainEntries(self: anytype, alloc: Allocator, cols: u16) ![]u8 {
                 "oracle mismatch plain entries={d} full_bytes={d} resumed_bytes={d}",
                 .{ self.entries.items.len, full.len, bytes.len },
             );
-            if (@import("builtin").is_test) @panic("frozen prefix oracle: the resumed plain render differs from the full one");
+            // A test fails on the mismatch; elsewhere the full render is used.
+            if (@import("builtin").is_test) {
+                alloc.free(full);
+                return error.TranscriptOracleMismatch;
+            }
             alloc.free(bytes);
             return full;
         }

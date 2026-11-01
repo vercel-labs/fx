@@ -1203,6 +1203,7 @@ fn prepareTranscriptSourceInternal(
             checkpoint,
         );
         if (plan.resume_from != null and prefixOracleEnabled()) {
+            errdefer rendered.deinit(alloc);
             try checkPreparedAgainstFull(self, alloc, &rendered, render_options, checkpoint);
         }
         bytes = rendered.bytes;
@@ -1468,7 +1469,9 @@ pub fn planFrozenPrefix(
 /// Whether every preparation that resumed from the frozen prefix is also
 /// rendered in full and compared. On in tests that set it and in debugging
 /// sessions; a mismatch fails the test, and otherwise the full render wins.
+/// Every test build checks each resumed render against a full one.
 pub fn prefixOracleEnabled() bool {
+    if (builtin.is_test) return true;
     return io_mod.getenv("FX_TRANSCRIPT_PREFIX_ORACLE") != null;
 }
 
@@ -1508,7 +1511,8 @@ fn checkPreparedAgainstFull(
         "oracle mismatch prepared entries={d} full_bytes={d} resumed_bytes={d}",
         .{ self.entries.items.len, full.bytes.len, rendered.bytes.len },
     );
-    if (builtin.is_test) @panic("frozen prefix oracle: the resumed preparation differs from the full one");
+    // A test fails on the mismatch; elsewhere the full preparation replaces it.
+    if (builtin.is_test) return error.TranscriptOracleMismatch;
     std.mem.swap(transcript_blocks.TranscriptPreparationBytes, &full, rendered);
     @memcpy(options.finality_entry_floor_bytes, floors);
 }
@@ -1531,7 +1535,7 @@ fn checkLineIndexAgainstFull(alloc: Allocator, bytes: []const u8, cols: u16, ind
         "oracle mismatch line index bytes={d} full_lines={d} cached_lines={d}",
         .{ bytes.len, full.starts.len, index.starts.len },
     );
-    if (builtin.is_test) @panic("frozen prefix oracle: the cached line index differs from the full one");
+    if (builtin.is_test) return error.TranscriptOracleMismatch;
     std.mem.swap(LineIndex, &full, index);
 }
 
