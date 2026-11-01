@@ -119,7 +119,6 @@ pub const ProviderAttemptOwner = enum {
 
 pub const NetworkFailureCause = enum {
     transport_interrupted,
-    system_resumed,
     /// The network path is provably down (refused, unreachable, DNS). Nothing
     /// was sent; probing it costs nothing and never consumes a provider
     /// attempt.
@@ -470,6 +469,9 @@ pub const FailureKind = enum {
     forbidden,
     request_too_large,
     rate_limited,
+    /// A 429 whose body names a used-up quota or spend cap: waiting does not
+    /// restore it, so fx does not resend.
+    quota_exhausted,
     server_error,
     bad_gateway,
     unavailable,

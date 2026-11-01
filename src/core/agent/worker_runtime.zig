@@ -132,6 +132,9 @@ pub const QueuedPrompt = struct {
     /// Present only when an explicit host action resumes a durable paused
     /// model turn. The same ownership rules as the other queued fields apply.
     recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null,
+    /// The request a previous fx process left unfinished, which this turn's
+    /// first model request resumes.
+    recovery_resume: ?types.RecoveryResume = null,
     /// True when this output surface already contains the checkpoint's
     /// assistant source. Recovery still restores the source for overlap and
     /// persistence, but publishes only novel continuation text.
@@ -485,6 +488,9 @@ pub const WorkerEvent = union(enum) {
     begin_prompt: types.UserTurn,
     begin_prompt_with_skill_bindings: BeginPromptWithSkillBindings,
     begin_presented_prompt: u64,
+    /// A turn that resumes a request a previous fx process left unfinished.
+    /// Its prompt is fx's note to the model, so no user card is written.
+    begin_resumed_prompt: u64,
     append_user_feedback: []u8,
     assistant_presentation: assistant_presentation.Event,
     notification: notification_contract.Notification,
@@ -546,16 +552,13 @@ pub const WorkerRuntime = struct {
     worker_stop_requested: bool = false,
     finalization_failure: ?FinalizationFailure = null,
     worker_cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set when the user answers a request that waits for them; the request's
+    /// recovery reads and clears it (`RequestRecovery.continue_flag`).
+    recovery_continue_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// The active turn whose text steering admission owns the cancel flag.
     /// Guarded by `worker_mutex`; explicit cancellation clears this ownership.
     steering_cancel_turn_id: ?u64 = null,
     direct_steering_closed: bool = false,
-    worker_recovery_pause_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    worker_connectivity_wait_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// Set under `worker_mutex` once the active turn publishes its terminal
-    /// recovery pause. The turn may still be finalizing, but cannot perform
-    /// more model work, so one continuation may queue before processing clears.
-    recovery_continuation_ready: bool = false,
     /// When true, queued work will not start.
     turn_start_held: bool = false,
     /// Independent of a pending submission's turn-start hold; protects queued
@@ -732,15 +735,6 @@ pub const WorkerRuntime = struct {
         self.markExplicitCancellation();
     }
 
-    /// Interrupt the current gateway wait while preserving its recovery
-    /// checkpoint. The ordinary cancel flag wakes the existing socket watcher;
-    /// agent policy distinguishes the typed pause flag at the boundary.
-    pub fn requestRecoveryPause(self: *WorkerRuntime) void {
-        debug_trace.eventf("recovery", "pause_requested", .{}, "source=interactive_try_later", .{});
-        self.worker_recovery_pause_requested.store(true, .seq_cst);
-        self.markExplicitCancellation();
-    }
-
     fn markExplicitCancellation(self: *WorkerRuntime) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
@@ -794,15 +788,17 @@ pub const WorkerRuntime = struct {
         return self.worker_cancel_requested.load(.seq_cst);
     }
 
+    /// The user answered a request that waits for them, for example with
+    /// Enter. A request that is not waiting ignores it.
+    pub fn requestRecoveryContinue(self: *WorkerRuntime) void {
+        self.recovery_continue_requested.store(true, .seq_cst);
+    }
+
     pub fn cancellationStopsTurn(self: *WorkerRuntime) bool {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         return self.worker_cancel_requested.load(.seq_cst) and
             self.steering_cancel_turn_id != self.active_turn_id;
-    }
-
-    pub fn isConnectivityWaitActive(self: *const WorkerRuntime) bool {
-        return self.worker_connectivity_wait_active.load(.seq_cst);
     }
 
     pub fn pushEvent(self: *WorkerRuntime, alloc: std.mem.Allocator, event: WorkerEvent) !void {
@@ -822,7 +818,6 @@ pub const WorkerRuntime = struct {
         self.worker_events.appendAssumeCapacity(event);
         self.applyActiveToolTransitionLocked(tool_transition);
         self.applyToolBoundaryPhaseLocked(event);
-        self.applyRecoveryStateEvent(event);
         self.worker_cond.broadcast(io_mod.getIo());
     }
 
@@ -854,34 +849,7 @@ pub const WorkerRuntime = struct {
             });
             return error.TurnFinalizationDeliveryFailed;
         };
-        self.applyRecoveryStateEvent(.{ .tool_lifecycle = .{
-            .turn_finished = event,
-        } });
         self.worker_cond.broadcast(io_mod.getIo());
-    }
-
-    fn applyRecoveryStateEvent(self: *WorkerRuntime, event: WorkerEvent) void {
-        switch (event) {
-            .route_recovery_status => |status| {
-                self.worker_connectivity_wait_active.store(
-                    status.action == .waiting_for_connectivity,
-                    .seq_cst,
-                );
-                self.recovery_continuation_ready = status.action == .paused;
-            },
-            .clear_route_recovery_status,
-            .finish_prompt,
-            .error_text,
-            => {
-                self.worker_connectivity_wait_active.store(false, .seq_cst);
-                self.recovery_continuation_ready = false;
-            },
-            .tool_lifecycle => |lifecycle| switch (lifecycle) {
-                .turn_finished => self.worker_connectivity_wait_active.store(false, .seq_cst),
-                .provisional, .authoritative_started, .progress, .terminal => return,
-            },
-            else => return,
-        }
     }
 
     pub fn latchFinalizationFailure(self: *WorkerRuntime, failure: FinalizationFailure) void {
@@ -1059,7 +1027,6 @@ pub const WorkerRuntime = struct {
             !recoveryContinuationAdmission(
                 self.worker_processing,
                 self.queuedWorkCountLocked(),
-                self.recovery_continuation_ready,
             ))
         {
             return error.RecoveryBusy;
@@ -1443,9 +1410,6 @@ pub const WorkerRuntime = struct {
         if (self.queued_context_compaction) |task| {
             self.queued_context_compaction = null;
             self.worker_cancel_requested.store(false, .seq_cst);
-            self.worker_recovery_pause_requested.store(false, .seq_cst);
-            self.worker_connectivity_wait_active.store(false, .seq_cst);
-            self.recovery_continuation_ready = false;
             self.worker_processing = true;
             self.active_turn_id = task.turn_id;
             self.tool_phase_step_id = null;
@@ -1481,7 +1445,11 @@ pub const WorkerRuntime = struct {
         errdefer if (!transfer_history) {
             types.freeHistoryTurnSlice(alloc, job_history);
         };
-        if (queued.recovery_checkpoint == null and queued.user_prompt_already_presented) {
+        if (queued.recovery_resume != null) {
+            try self.worker_events.append(alloc, .{
+                .begin_resumed_prompt = queued.turn_id,
+            });
+        } else if (queued.recovery_checkpoint == null and queued.user_prompt_already_presented) {
             try self.worker_events.append(alloc, .{
                 .begin_presented_prompt = queued.turn_id,
             });
@@ -1510,9 +1478,6 @@ pub const WorkerRuntime = struct {
         job.history = job_history;
         self.steering_cancel_turn_id = null;
         self.worker_cancel_requested.store(false, .seq_cst);
-        self.worker_recovery_pause_requested.store(false, .seq_cst);
-        self.worker_connectivity_wait_active.store(false, .seq_cst);
-        self.recovery_continuation_ready = false;
         self.worker_processing = true;
         self.active_turn_id = job.turn_id;
         self.tool_phase_step_id = null;
@@ -1557,7 +1522,6 @@ pub const WorkerRuntime = struct {
         self.clearActiveToolCallsLocked();
         self.tool_phase_step_id = null;
         self.active_context_compaction = false;
-        self.worker_connectivity_wait_active.store(false, .seq_cst);
         self.worker_cond.broadcast(io_mod.getIo());
         self.worker_mutex.unlock(io_mod.getIo());
     }
@@ -1571,8 +1535,6 @@ pub const WorkerRuntime = struct {
         if (self.worker_processing or self.worker_stop_requested) return false;
         self.direct_steering_closed = false;
         self.worker_cancel_requested.store(false, .seq_cst);
-        self.worker_recovery_pause_requested.store(false, .seq_cst);
-        self.worker_connectivity_wait_active.store(false, .seq_cst);
         self.worker_processing = true;
         self.active_turn_id = turn_id;
         self.tool_phase_step_id = null;
@@ -2570,93 +2532,18 @@ pub const WorkerRuntime = struct {
     }
 };
 
+/// A resumed turn starts only on an idle worker with nothing queued.
 fn recoveryContinuationAdmission(
     processing: bool,
     queued_count: usize,
-    terminal_pause_ready: bool,
 ) bool {
-    return queued_count == 0 and (!processing or terminal_pause_ready);
+    return queued_count == 0 and !processing;
 }
 
-test "recovery continuation admission requires an empty idle or terminally paused worker" {
-    try std.testing.expect(recoveryContinuationAdmission(false, 0, false));
-    try std.testing.expect(!recoveryContinuationAdmission(true, 0, false));
-    try std.testing.expect(recoveryContinuationAdmission(true, 0, true));
-    try std.testing.expect(!recoveryContinuationAdmission(false, 1, true));
-}
-
-test "terminal recovery pause admits continuation before worker cleanup" {
-    const alloc = std.testing.allocator;
-    var runtime: WorkerRuntime = .{};
-    defer runtime.deinit(alloc);
-
-    const Fixture = struct {
-        fn make(allocator: std.mem.Allocator) !QueuedPrompt {
-            var prompt = try makePrompt(allocator, "continue preserved turn", "model");
-            errdefer freeQueuedPrompt(allocator, prompt);
-            prompt.recovery_checkpoint = try (session_codec.RecoveryCheckpoint{
-                .turn_id = 41,
-                .user = .{ .text = @constCast("unfinished prompt") },
-                .assistant_source = @constCast("partial response"),
-                .cause = .network_interrupted,
-                .action = .paused,
-                .authority = .{ .provider = .gateway, .model = @constCast("model") },
-                .requested_fast_mode = false,
-                .fast_mode = false,
-                .max_provider_attempts = 10,
-                .consumed_provider_attempts = 10,
-            }).dupe(allocator);
-            return prompt;
-        }
-    };
-
-    runtime.worker_processing = true;
-    try runtime.pushEvent(alloc, .{ .route_recovery_status = .{
-        .kind = .terminal_provider_error,
-        .failed_attempt = 10,
-        .attempt_limit = 10,
-        .cause = .network_interrupted,
-        .action = .paused,
-        .required_action = .continue_later,
-    } });
-    try runtime.pushTurnFinished(alloc, .{
-        .turn_id = 41,
-        .outcome = .paused,
-    });
-
-    const continuation = try Fixture.make(alloc);
-    runtime.enqueuePrompt(alloc, continuation) catch |err| {
-        freeQueuedPrompt(alloc, continuation);
-        return err;
-    };
-    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
-}
-
-test "connectivity wait state follows worker events before UI presentation" {
-    var runtime: WorkerRuntime = .{};
-    defer runtime.deinit(std.testing.allocator);
-
-    try runtime.pushEvent(std.testing.allocator, .{ .route_recovery_status = .{
-        .kind = .auto_retry,
-        .cause = .system_resumed,
-        .action = .waiting_for_connectivity,
-    } });
-    try std.testing.expect(runtime.isConnectivityWaitActive());
-
-    try runtime.pushEvent(std.testing.allocator, .{ .route_recovery_status = .{
-        .kind = .auto_retry,
-        .cause = .network_interrupted,
-        .action = .retrying_request,
-    } });
-    try std.testing.expect(!runtime.isConnectivityWaitActive());
-
-    try runtime.pushEvent(std.testing.allocator, .{ .route_recovery_status = .{
-        .kind = .auto_retry,
-        .cause = .system_resumed,
-        .action = .waiting_for_connectivity,
-    } });
-    try runtime.pushEvent(std.testing.allocator, .clear_route_recovery_status);
-    try std.testing.expect(!runtime.isConnectivityWaitActive());
+test "recovery continuation admission requires an empty idle worker" {
+    try std.testing.expect(recoveryContinuationAdmission(false, 0));
+    try std.testing.expect(!recoveryContinuationAdmission(true, 0));
+    try std.testing.expect(!recoveryContinuationAdmission(false, 1));
 }
 
 fn dupeOwnedQuestionEntry(alloc: std.mem.Allocator, entry: types.QuestionBatchEntry) !OwnedQuestionEntry {
@@ -3978,6 +3865,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
             } };
         },
         .begin_presented_prompt => |turn_id| .{ .begin_presented_prompt = turn_id },
+        .begin_resumed_prompt => |turn_id| .{ .begin_resumed_prompt = turn_id },
         .append_user_feedback => |text| .{ .append_user_feedback = try alloc.dupe(u8, text) },
         .assistant_presentation => |presentation| .{
             .assistant_presentation = try presentation.clone(alloc),
@@ -4072,7 +3960,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
             freeSkillBindings(alloc, begin.skill_bindings);
             freeSkillDisplaySpans(alloc, begin.skill_display_spans);
         },
-        .begin_presented_prompt => {},
+        .begin_presented_prompt, .begin_resumed_prompt => {},
         .append_user_feedback => |text| alloc.free(text),
         .assistant_presentation => |presentation| {
             var owned = presentation;
@@ -5235,7 +5123,6 @@ test "takeEventBatch snapshots cancellation with detached events" {
 
     runtime.active_turn_id = 7;
     runtime.worker_cancel_requested.store(true, .seq_cst);
-    runtime.worker_recovery_pause_requested.store(true, .seq_cst);
     try runtime.pushEvent(alloc, .{ .assistant_presentation = .{
         .text = @constCast("late"),
     } });
@@ -5948,7 +5835,6 @@ test "waitAndTakeNextPrompt assigns turn id and resets cancellation for next pro
 
     try std.testing.expect(job.turn_id != 0);
     try std.testing.expect(!runtime.isCancelRequested());
-    try std.testing.expect(!runtime.worker_recovery_pause_requested.load(.seq_cst));
 
     var events = runtime.takeEvents();
     defer freeEventList(alloc, &events);
@@ -5974,13 +5860,6 @@ test "already-presented queued prompt emits identity without duplicating user pa
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
     try std.testing.expect(events.items[0] == .begin_presented_prompt);
     try std.testing.expectEqual(@as(u64, 9001), events.items[0].begin_presented_prompt);
-}
-
-test "requestRecoveryPause wakes the active operation without losing pause intent" {
-    var worker = WorkerRuntime{};
-    worker.requestRecoveryPause();
-    try std.testing.expect(worker.worker_recovery_pause_requested.load(.seq_cst));
-    try std.testing.expect(worker.worker_cancel_requested.load(.seq_cst));
 }
 
 test "enqueuePrompt stamps agent settings from worker runtime" {
@@ -6280,7 +6159,7 @@ test "clear queued prompts preserves events and discard frees event payloads" {
         .tone = .information,
         .body = "notice",
     } }));
-    freeWorkerEvent(alloc, .{ .route_recovery_status = .{ .kind = .auto_retry, .failed_attempt = 1, .attempt_limit = 3 } });
+    freeWorkerEvent(alloc, .{ .route_recovery_status = .{ .kind = .waiting, .attempt = 1 } });
     freeWorkerEvent(alloc, .clear_route_recovery_status);
     freeWorkerEvent(alloc, .{ .command_output = .{ .stream = .stdout, .text = try alloc.dupe(u8, "out") } });
     freeWorkerEvent(alloc, .{ .command_output_complete = null });

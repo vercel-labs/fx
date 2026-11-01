@@ -2145,7 +2145,7 @@ test "processQueuedPrompt length-limited calls bypass malformed local tool ident
     try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "Partial answer") != null);
-    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "did not execute") != null);
+    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "did not run them") != null);
 }
 
 test "local tool emits authoritative progress and terminal lifecycle by default" {
@@ -4143,7 +4143,7 @@ test "processQueuedPrompt length-limited calls bypass malformed provider result 
     try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "Partial provider answer") != null);
-    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "did not execute") != null);
+    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "did not run them") != null);
 }
 
 test "processQueuedPrompt rejects duplicate authoritative tool ids before effects" {
@@ -6609,13 +6609,13 @@ test "processQueuedPrompt interruption persists staged feedback from a completed
     );
 }
 
-test "processQueuedPrompt pauses retryable failures and preserves execution on terminal failure" {
+test "processQueuedPrompt preserves execution when Esc ends a retry or a failure ends the turn" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
         toolCall("call_completed", "read_file", "{\"path\":\"README.md\"}"),
     };
     const Expected = enum {
-        paused,
+        interrupted,
         transport_error,
     };
     const Case = struct {
@@ -6628,15 +6628,15 @@ test "processQueuedPrompt pauses retryable failures and preserves execution on t
                 .status = .bad_gateway,
                 .err_body = "gateway unavailable",
             },
-            .expected = .paused,
+            .expected = .interrupted,
         },
         .{
             .completion = .{ .finish_reason = .provider_error },
-            .expected = .paused,
+            .expected = .interrupted,
         },
         .{
             .completion = .{ .omit_finish = true },
-            .expected = .paused,
+            .expected = .interrupted,
         },
         .{
             .completion = .{ .stream_error = error.TestTransportFailure },
@@ -6653,20 +6653,14 @@ test "processQueuedPrompt pauses retryable failures and preserves execution on t
         var gateway = FakeGateway.init(alloc, &completions);
         defer gateway.deinit();
         var deps = FakeAgentRuntimeDeps.init(alloc);
-        if (case.completion.finish_reason == .provider_error) deps.enable_route_recovery = false;
         defer deps.deinit();
         var fixture = PromptFixture{};
 
-        var config = fixture.config();
-        config.max_provider_attempts = 2;
-        // Retryable failures recover autonomously now; park the turn with a
-        // lifecycle pause (the user's try-later) when the retry is scheduled.
-        var pause_flag = std.atomic.Value(bool).init(false);
-        deps.pause_on_auto_retry_status = true;
-        deps.recovery_pause_flag = &pause_flag;
-        config.recovery_pause_flag = &pause_flag;
+        const config = fixture.config();
+        // Esc while the request waits to retry ends the turn.
+        deps.cancel_on_auto_retry_status = config.cancel_flag;
         switch (case.expected) {
-            .paused => try runFakePrompt(
+            .interrupted => try runFakePrompt(
                 &gateway,
                 &deps,
                 config,
@@ -6679,10 +6673,17 @@ test "processQueuedPrompt pauses retryable failures and preserves execution on t
         }
 
         try std.testing.expectEqual(@as(usize, 1), deps.executed_names.items.len);
-        if (case.expected == .paused) {
-            try std.testing.expectEqual(@as(usize, 0), deps.history_turns.items.len);
-            try std.testing.expectEqual(@as(usize, 0), deps.finish_event_count);
-            try std.testing.expectEqual(types.TurnPresentationOutcome.paused, deps.finalized_outcome.?);
+        if (case.expected == .interrupted) {
+            // The interrupted turn keeps the tool step that already ran.
+            try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items.len);
+            const interrupted = deps.history_turns.items[0].interrupted;
+            try std.testing.expectEqual(@as(usize, 1), interrupted.execution.tool_steps.len);
+            try std.testing.expectEqualStrings(
+                "call_completed",
+                interrupted.execution.tool_steps[0].tool_calls[0].id,
+            );
+            try std.testing.expectEqual(@as(usize, 1), deps.finish_event_count);
+            try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, deps.finalized_outcome.?);
             continue;
         }
         try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items.len);

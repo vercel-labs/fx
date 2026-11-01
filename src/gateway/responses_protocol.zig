@@ -6,6 +6,7 @@ const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const types = @import("../core/shared/types.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
+const json_depth = @import("json_depth.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
@@ -869,6 +870,8 @@ pub const Reducer = struct {
     generation_id: ?[]u8 = null,
     provider_failure_detail: ?[]u8 = null,
     provider_failure_cause: ?types.ProviderFailureCause = null,
+    /// An error event or a failed response said why the request failed.
+    failure_explained: bool = false,
     terminal_seen: bool = false,
     text_parts: std.AutoHashMapUnmanaged(TextKey, TextPart) = .empty,
     last_text_key: ?TextKey = null,
@@ -914,6 +917,9 @@ pub const Reducer = struct {
                 limits.aggregate_bytes,
             );
         }
+        // fx serializes parts of an event, such as a reasoning item or a tool
+        // input, and std.json.Stringify aborts past 256 levels.
+        if (json_depth.exceeds(json_text)) return error.InvalidEvent;
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidEvent,
@@ -1054,6 +1060,11 @@ pub const Reducer = struct {
                 response_value.object,
                 self.tools.items.len > 0,
             );
+            // An incomplete response with no known reason, or a cancelled
+            // one, failed without saying why, and fx resends it.
+            if (self.finish_reason == .provider_error and !self.failure_explained) {
+                self.provider_failure_cause = .unexplained_error_finish;
+            }
             self.usage = parseUsage(response_value.object);
             if (stringField(response_value.object, "id")) |id| {
                 if (self.generation_id) |prior| alloc.free(prior);
@@ -1155,7 +1166,9 @@ pub const Reducer = struct {
         return &self.message_items.items[low];
     }
 
+    /// The AI Gateway's SSE classifier differs on purpose: `client.zig` `ErrorEventClass`.
     fn accept_failure(self: *Reducer, alloc: std.mem.Allocator, fields: std.json.ObjectMap) !void {
+        self.failure_explained = true;
         const code = stringField(fields, "code") orelse "provider_error";
         const message = stringField(fields, "message") orelse "Provider response failed";
         const bounded_code = types.ModelFailureDiagnostic.init(code);
@@ -1858,6 +1871,15 @@ test "Responses terminal failures retain provider diagnostics as outcomes" {
     }
 }
 
+test "Responses events nested past the depth limit are invalid" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    // fx serializes a whole completed reasoning item, so one field 300 levels
+    // deep aborted fx.
+    const deep = text_utils.repeat("{\"a\":", 300) ++ "0" ++ text_utils.repeat("}", 300);
+    try std.testing.expectError(error.InvalidEvent, stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_deep\",\"summary\":[],\"encrypted_content\":\"opaque\",\"extra\":" ++ deep ++ "}}"));
+}
+
 test "Responses terminal incomplete event does not require nested status" {
     var stream = ToolRecordTest.init(std.testing.allocator);
     defer stream.deinit();
@@ -1865,6 +1887,30 @@ test "Responses terminal incomplete event does not require nested status" {
     const completion = try stream.finish();
     defer stream.freeCompletion(completion);
     try std.testing.expectEqual(types.ProviderFinishReason.length, completion.finish_reason.?);
+}
+
+test "Responses incomplete and cancelled endings without a reason are unexplained" {
+    for ([_][]const u8{
+        "{\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\"}}",
+        "{\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"something_new\"}}}",
+        "{\"type\":\"response.done\",\"response\":{\"status\":\"cancelled\"}}",
+    }) |event| {
+        var stream = ToolRecordTest.init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.apply(event);
+        const completion = try stream.finish();
+        defer stream.freeCompletion(completion);
+        errdefer std.debug.print("event: {s}\n", .{event});
+        try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
+        try std.testing.expectEqual(types.ProviderFailureCause.unexplained_error_finish, completion.provider_failure_cause.?);
+    }
+    // A failed response explains itself, so it keeps its classified cause.
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.apply("{\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\",\"message\":\"retry\"}}}");
+    const completion = try stream.finish();
+    defer stream.freeCompletion(completion);
+    try std.testing.expectEqual(@as(?types.ProviderFailureCause, null), completion.provider_failure_cause);
 }
 
 test "Responses terminal failure classification is conservative and diagnostics are bounded" {

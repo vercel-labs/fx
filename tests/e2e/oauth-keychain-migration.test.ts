@@ -185,9 +185,9 @@ function keychainEnv(home: string, account: string, issuer: string) {
     AI_GATEWAY_API_KEY: undefined,
     VERCEL_OIDC_TOKEN: undefined,
     FX_DISABLE_KEYCHAIN: undefined,
-    FX_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_ONBOARDING: "1",
     FX_AUTO_UPGRADE: "0",
-    FX_E2E_OAUTH_ISSUER_URL: issuer,
+    FX_TEST_OAUTH_ISSUER_URL: issuer,
     FX_TRACE_LOG: join(home, "oauth-keychain-trace.log"),
     FX_TRACE_SCOPES: "auth,keychain",
   };

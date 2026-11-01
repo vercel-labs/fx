@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
+const env_settings = @import("../config/env_settings.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
@@ -10,6 +11,7 @@ const oauth_transport = @import("../auth/oauth_transport.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const request_recovery = @import("../agent/runtime/request_recovery.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const shared_theme = @import("../shared/theme.zig");
@@ -81,13 +83,71 @@ fn tmuxAbnormalExitHandler(sig: std.posix.SIG) callconv(.c) void {
     abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, sig);
 }
 
+/// SIGHUP and SIGTERM close fx: a closed window, a logout, or a reboot. The
+/// handler only wakes `closerMain`, which saves the model request in flight
+/// outside signal context, marked as a clean close, so the next launch
+/// resumes it without counting a crash (`RequestRecovery.closeActive`,
+/// `tests/tla/recovery/Resume.tla` NoFalseCrashQuestion). It then restores
+/// the terminal and re-raises as the handler did before. Without that
+/// thread, the handler restores and re-raises itself.
+var close_pipe: [2]std.posix.fd_t = .{ -1, -1 };
+var close_signal: std.atomic.Value(i32) = .init(0);
+var closer_tmux = false;
+var closer_started = false;
+
+/// Must remain async-signal-safe: one atomic exchange and one `write(2)`.
+fn closeSignalHandler(sig: std.posix.SIG) callconv(.c) void {
+    if (close_signal.cmpxchgStrong(0, @intCast(@backingInt(sig)), .seq_cst, .seq_cst) != null) return;
+    const byte = [1]u8{1};
+    _ = std.c.write(close_pipe[1], &byte, 1);
+}
+
+fn closerMain() void {
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const read = std.c.read(close_pipe[0], &byte, 1);
+        if (read == 1) break;
+        if (read < 0 and std.posix.errno(read) == .INTR) continue;
+        return;
+    }
+    const sig: std.posix.SIG = @fromBackingInt(@intCast(close_signal.load(.seq_cst)));
+    const saved = request_recovery.RequestRecovery.closeActive();
+    debug_trace.logf("app", "event=closing signal={d} record_saved={}", .{ close_signal.load(.seq_cst), saved });
+    if (closer_tmux) {
+        abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, sig);
+    } else {
+        abnormalExitHandlerWithRestore(abnormal_exit_restore, sig);
+    }
+}
+
+/// Starts the closer once per process. False when it cannot run.
+fn startCloser(tmux: bool) bool {
+    if (closer_started) return true;
+    // Close-on-exec, so the commands and servers fx starts do not inherit it.
+    close_pipe = std.Io.Threaded.pipe2(.{ .CLOEXEC = true }) catch return false;
+    closer_tmux = tmux;
+    const thread = std.Thread.spawn(.{}, closerMain, .{}) catch |err| {
+        debug_trace.logf("app", "closer unavailable err={s}", .{@errorName(err)});
+        _ = std.c.close(close_pipe[0]);
+        _ = std.c.close(close_pipe[1]);
+        close_pipe = .{ -1, -1 };
+        return false;
+    };
+    thread.detach();
+    closer_started = true;
+    return true;
+}
+
 /// Install handlers for SIGTERM and SIGHUP so an externally-terminated
-/// fx restores terminal state before dying. SIGINT is not included
-/// because raw mode disables terminal-generated SIGINT.
+/// fx saves the request in flight and restores terminal state before dying.
+/// SIGINT is not included because raw mode disables terminal-generated
+/// SIGINT.
 pub fn installAbnormalExitHandlers(tmux: ?[]const u8) void {
     if (!shell_runtime.supports_resize_signal) return;
 
-    const handler: std.posix.Sigaction.handler_fn = if (tmux == null)
+    const handler: std.posix.Sigaction.handler_fn = if (startCloser(tmux != null))
+        closeSignalHandler
+    else if (tmux == null)
         abnormalExitHandler
     else
         tmuxAbnormalExitHandler;
@@ -414,9 +474,11 @@ pub fn loadStartupStateWithAuthMode(
     default_agent_step_limit: usize,
     auth_mode: credentials.AuthMode,
 ) !StartupState {
-    return loadStartupStateForRun(alloc, transport, secret_store, default_model, default_agent_step_limit, auth_mode, null);
+    return loadStartupStateForRun(alloc, transport, secret_store, default_model, default_agent_step_limit, auth_mode, null, null);
 }
 
+/// `provider_override` is the run's `--provider`; it wins over FX_PROVIDER and
+/// settings and binds configured provider names like the launch flag does.
 /// `model_override` is the run's `--model`. It stands in for a provider without
 /// a saved model; callers still apply it over the selected or resumed model.
 pub fn loadStartupStateForRun(
@@ -426,10 +488,27 @@ pub fn loadStartupStateForRun(
     default_model: []const u8,
     default_agent_step_limit: usize,
     auth_mode: credentials.AuthMode,
+    provider_override: ?model_provider.ProviderId,
     model_override: ?[]const u8,
 ) !StartupState {
+    return loadStartupStateForRunWithOverrides(alloc, transport, secret_store, default_model, default_agent_step_limit, auth_mode, provider_override, model_override, &.{});
+}
+
+/// `loadStartupStateForRun` with one run's `--config` values applied as the top
+/// settings layer (`fx ask --config key=value`).
+pub fn loadStartupStateForRunWithOverrides(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    secret_store: host.SecretStore,
+    default_model: []const u8,
+    default_agent_step_limit: usize,
+    auth_mode: credentials.AuthMode,
+    provider_override: ?model_provider.ProviderId,
+    model_override: ?[]const u8,
+    settings_overrides: []const config_runtime.SettingOverride,
+) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateFromOwnedWorkspace(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed, null, model_override);
+    return loadStartupStateWithKeychainRead(alloc, transport, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .refresh_if_needed, provider_override, model_override, .blocking, settings_overrides);
 }
 
 pub fn loadStartupStateWithoutCredentials(alloc: Allocator, default_model: []const u8, default_agent_step_limit: usize) !StartupState {
@@ -511,7 +590,7 @@ pub fn loadInteractiveStartupState(
     model_override: ?[]const u8,
 ) !StartupState {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-    return loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored, provider_override, model_override, .deferred);
+    return loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, secret_store, workspace_root, default_model, default_agent_step_limit, auth_mode, null, .stored, provider_override, model_override, .deferred, &.{});
 }
 
 pub fn loadStartupStatus(
@@ -648,7 +727,7 @@ fn loadStartupStateFromOwnedWorkspace(
     provider_override: ?model_provider.ProviderId,
     model_override: ?[]const u8,
 ) !StartupState {
-    return loadStartupStateWithKeychainRead(alloc, transport, secret_store, owned_workspace_root, default_model, default_agent_step_limit, auth_mode, profile_home, credential_mode, provider_override, model_override, .blocking);
+    return loadStartupStateWithKeychainRead(alloc, transport, secret_store, owned_workspace_root, default_model, default_agent_step_limit, auth_mode, profile_home, credential_mode, provider_override, model_override, .blocking, &.{});
 }
 
 fn loadStartupStateWithKeychainRead(
@@ -664,6 +743,7 @@ fn loadStartupStateWithKeychainRead(
     provider_override: ?model_provider.ProviderId,
     model_override: ?[]const u8,
     keychain_read: KeychainRead,
+    settings_overrides: []const config_runtime.SettingOverride,
 ) !StartupState {
     var state = StartupState{
         .agent_step_limit = default_agent_step_limit,
@@ -678,6 +758,7 @@ fn loadStartupStateWithKeychainRead(
     else
         try config_runtime.loadMergedSettingsDetailed(alloc, state.workspace_root);
     defer detailed.deinit(alloc);
+    try config_runtime.applySettingOverrides(alloc, &detailed.settings, settings_overrides);
     const settings = &detailed.settings;
     // A malformed process override must never silently fall through to a
     // potentially paid profile preference, regardless of credential mode.
@@ -733,7 +814,6 @@ fn loadStartupStateWithKeychainRead(
     if (hasProcessModelOverride()) state.model_source = .process_override;
     state.config_diagnostics = detailed.diagnostics;
     detailed.diagnostics = &.{};
-    state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.prompt_history_store_allowed = detailed.prompt_history_store_allowed;
     state.credential_source_preference = settings.credential_source;
     if (auth_mode == .local and !state.model_requests_blocked) {
@@ -765,10 +845,22 @@ fn loadStartupStateWithKeychainRead(
             state.fx_login_status = resolution.fx_login_status;
         }
     }
+    try resolveSettings(alloc, &state, &detailed);
+
+    return state;
+}
+
+/// Turns merged settings into the values a run uses, defaults and `FX_*`
+/// overrides included. The session and `fx config get` both read settings
+/// through it, so the two can't disagree. Call it with `state.agent_step_limit`
+/// holding the default and `state.model_source` already set.
+pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const config_runtime.DetailedSettings) !void {
+    const settings = &detailed.settings;
+    state.prompt_history_enabled = settings.prompt_history_enabled orelse true;
     state.permission_mode = loadPermissionMode(settings.permission_mode);
     state.yolo_acknowledged = settings.yolo_acknowledged orelse false;
     state.permission_rules = try types.dupePermissionRuleSet(alloc, settings.permission_rules);
-    state.agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps);
+    state.agent_step_limit = loadAgentStepLimit(state.agent_step_limit, settings.max_agent_steps);
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.auto_compact_percent = compactor.resolvePercent(settings.auto_compact_percent, io_mod.getenv("FX_AUTO_COMPACT_PERCENT"));
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
@@ -820,8 +912,12 @@ fn loadStartupStateWithKeychainRead(
     state.notification_turn_end = sound_on_override orelse settings.notification_turn_end orelse notification_sound.default_enabled;
     state.notification_attention_required = sound_on_override orelse settings.notification_attention_required orelse notification_sound.default_enabled;
     state.notification_max = max_override orelse settings.notification_max orelse false;
+}
 
-    return state;
+/// `FX_THEME`, which beats the `theme` setting. An empty value counts as unset.
+pub fn themeEnvOverride() ?[]const u8 {
+    const value = io_mod.getenv("FX_THEME") orelse return null;
+    return if (value.len > 0) value else null;
 }
 
 const StartupFastMode = struct {
@@ -906,9 +1002,7 @@ pub fn bootstrapInteractiveApp(cfg: BootstrapConfig) !StartupState {
     // builtin variant and skip the OSC 11 probe; any other value names a theme
     // file under ~/.fx/themes.
     var configured_theme: ?[]const u8 = state.theme;
-    if (io_mod.getenv("FX_THEME")) |value| {
-        if (value.len > 0) configured_theme = value;
-    }
+    if (themeEnvOverride()) |value| configured_theme = value;
     if (if (configured_theme) |value| shared_theme.classifyValue(value) else null) |choice| {
         switch (choice) {
             .pin_light, .pin_dark => {
@@ -1109,10 +1203,10 @@ fn writeLastShutdownReportInner(alloc: Allocator, trace: *const ShutdownStageTra
     try out.writer.writeAll("]}");
 
     var home_dir = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }),
+        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }),
     };
     defer home_dir.close();
-    var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name);
+    var fx_dir = try io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.rootName());
     defer fx_dir.close();
     var diagnostics = try io_mod.openOrCreateVerifiedPrivateDir(&fx_dir, profile_paths.diagnostics_dir_name);
     defer diagnostics.close();
@@ -1763,23 +1857,14 @@ fn loadStartupStatusModel(alloc: Allocator, default_model: []const u8, configure
 }
 
 fn credentialOnboardingDisabled() bool {
-    const value = io_mod.getenv("FX_SKIP_ONBOARDING") orelse return false;
+    const value = io_mod.getenv("FX_TEST_SKIP_ONBOARDING") orelse return false;
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     if (trimmed.len == 0) return false;
     return !std.mem.eql(u8, trimmed, "0") and !std.ascii.eqlIgnoreCase(trimmed, "false");
 }
 
-const SoundEnvLevel = enum { off, on, max };
-
-fn soundEnvOverride() ?SoundEnvLevel {
-    const value = io_mod.getenv("FX_SOUND") orelse return null;
-    const trimmed = std.mem.trim(u8, value, " \t\r\n");
-    if (trimmed.len == 0) return null;
-    if (std.ascii.eqlIgnoreCase(trimmed, "max")) return .max;
-    const off = std.mem.eql(u8, trimmed, "0") or
-        std.ascii.eqlIgnoreCase(trimmed, "false") or
-        std.ascii.eqlIgnoreCase(trimmed, "off");
-    return if (off) .off else .on;
+fn soundEnvOverride() ?env_settings.SoundPreset {
+    return env_settings.soundPreset(io_mod.getenv("FX_SOUND") orelse return null);
 }
 
 const EnvEntry = struct {
@@ -2830,7 +2915,7 @@ test "loadStartupState diagnoses the retired fuzzy skill setting" {
 
 test "credential onboarding can be skipped independently from Keychain" {
     var env = try TestEnv.install(std.testing.allocator, &.{
-        .{ .key = "FX_SKIP_ONBOARDING", .value = "1" },
+        .{ .key = "FX_TEST_SKIP_ONBOARDING", .value = "1" },
         .{ .key = "FX_DISABLE_KEYCHAIN", .value = "1" },
     });
     defer env.deinit();
@@ -2878,7 +2963,7 @@ test "interactive launch leaves a Keychain credential unresolved for the caller"
     var keychain_store = host.unavailable_secret_store;
     keychain_store.is_disabled_fn = keychainEnabledForTest;
     for ([_]KeychainRead{ .blocking, .deferred }) |keychain_read| {
-        var state = try loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, keychain_store, try alloc.dupe(u8, workspace_root), "default/model", 25, .local, null, .stored, null, null, keychain_read);
+        var state = try loadStartupStateWithKeychainRead(alloc, oauth_transport.unavailable_provider, keychain_store, try alloc.dupe(u8, workspace_root), "default/model", 25, .local, null, .stored, null, null, keychain_read, &.{});
         defer state.deinit(alloc);
         try std.testing.expect(state.credential == null);
         if (keychain_read == .deferred and builtin.target.os.tag == .macos) {

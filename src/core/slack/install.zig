@@ -2,11 +2,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 const oauth = @import("../auth/oauth.zig");
 const io = @import("../shared/io.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 const browser = @import("../auth/browser_callback.zig");
 const transport_mod = @import("../auth/oauth_transport.zig");
 const host = @import("../hosts/host.zig");
 const output = @import("../output/output_contracts.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const cli_flags = @import("../cli/cli_flags.zig");
+const command_specs = @import("../slash_commands/command_specs.zig");
 const Allocator = std.mem.Allocator;
 const callback_url = "https://fx.sh/api/slack/oauth/callback";
 const bot_scope = "app_mentions:read";
@@ -15,10 +18,17 @@ const authorization_lifetime: std.Io.Clock.Duration = .{ .raw = .fromSeconds(300
 pub const Action = enum { install, status, refresh };
 pub const Options = struct { action: Action, format: output.OutputFormat = .text };
 pub fn parse(args: []const [:0]const u8) !Options {
-    if (args.len < 1 or args.len > 2) return error.InvalidSlackArguments;
-    const action = std.meta.stringToEnum(Action, args[0]) orelse return error.InvalidSlackArguments;
-    if (args.len == 2 and !std.mem.eql(u8, args[1], "--json")) return error.InvalidSlackArguments;
-    return .{ .action = action, .format = if (args.len == 2) .json else .text };
+    var action: ?Action = null;
+    var format: output.OutputFormat = .text;
+    var parser: cli_flags.Parser = .init(&command_specs.slack_options, args);
+    while (parser.next() catch return error.InvalidSlackArguments) |item| switch (item) {
+        .positional => |word| {
+            if (action != null) return error.InvalidSlackArguments;
+            action = std.meta.stringToEnum(Action, word) orelse return error.InvalidSlackArguments;
+        },
+        .option => format = .json,
+    };
+    return .{ .action = action orelse return error.InvalidSlackArguments, .format = format };
 }
 
 const Config = struct { client_id: []const u8, app_id: []const u8, team_id: []const u8, redirect_uri: []const u8, scope: []const u8 };
@@ -41,12 +51,12 @@ const Installation = struct {
 // The caller supplies an arena; the returned snapshot borrows its allocations.
 pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, opener: host.UrlOpener) !output.SlackSnapshot {
     if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return error.SlackInstallationUnsupported;
-    const origin = io.getenv("FX_E2E_SLACK_ORIGIN") orelse "https://fx.sh";
+    const origin = io.getenv("FX_TEST_SLACK_ORIGIN") orelse "https://fx.sh";
     if (!std.mem.eql(u8, origin, "https://fx.sh") and !test_origin(origin)) return error.InvalidSlackTestOrigin;
     const home = io.homeDir() orelse return error.HomeNotSet;
-    var home_dir = io.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io.getIo(), home, .{ .iterate = true }) };
+    var home_dir = io.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io.getIo(), profile_paths.rootParent(home), .{ .iterate = true }) };
     defer home_dir.close();
-    var root = try io.openOrCreateVerifiedPrivateDir(&home_dir, ".fx");
+    var root = try io.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.rootName());
     defer root.close();
     var dir = try io.openOrCreateVerifiedPrivateDir(&root, "slack");
     defer dir.close();

@@ -228,6 +228,13 @@ pub const AssistantPacer = struct {
         return true;
     }
 
+    /// Drops text not yet shown, as when the answer it belongs to restarts.
+    /// A deferred finish stays.
+    pub fn discardPendingText(self: *AssistantPacer) void {
+        self.pending.clearRetainingCapacity();
+        self.sgr = .{};
+    }
+
     pub fn clear(self: *AssistantPacer, alloc: Allocator) void {
         self.pending.clearRetainingCapacity();
         if (self.deferred_turn) |finished| {

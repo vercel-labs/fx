@@ -1209,10 +1209,6 @@ pub fn Runtime(comptime App: type) type {
                 .skill_catalog = catalog,
                 .skill_bindings = bindings,
                 .gateway_retry_count = gateway_retry_count,
-                .recovery_pause_flag = if (comptime @hasField(@TypeOf(app.worker), "worker_recovery_pause_requested"))
-                    &app.worker.worker_recovery_pause_requested
-                else
-                    null,
                 .gateway_chat_url = gateway_chat_url,
                 .advertised_tool_names = tool_projection.advertised_names,
                 .advertised_functions = tool_projection.advertised_functions,
@@ -1227,6 +1223,7 @@ pub fn Runtime(comptime App: type) type {
                 .max_tool_result_bytes = job.agent_settings.max_tool_result_bytes,
                 .auto_compact_percent = job.agent_settings.auto_compact_percent,
                 .cancel_flag = &app.worker.worker_cancel_requested,
+                .recovery_continue_flag = &app.worker.recovery_continue_requested,
                 .review_enabled = false,
                 .fast_mode = job.agent_settings.fast_mode,
                 .ultrafast_mode = job.agent_settings.ultrafast_mode,
@@ -2877,7 +2874,7 @@ test "app direct ask delivers semantic presentation through the runtime sink" {
                 semantic_events[semantic_event_count] = .thematic_rule;
                 semantic_event_count += 1;
             },
-            .text => {},
+            .text, .attempt_start, .attempt_restart => {},
         },
         else => {},
     };

@@ -8,6 +8,16 @@ const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
 const cli_replay = @import("cli_replay.zig");
+const cli_flags = @import("cli_flags.zig");
+const completion = @import("completion.zig");
+const agent_run_flags = @import("agent_run_flags.zig");
+const flag_placement = @import("flag_placement.zig");
+const cli_config = @import("cli_config.zig");
+const settings_messages = @import("settings_messages.zig");
+const settings_entries = @import("../config/settings_entries.zig");
+const settings_keys = @import("../config/settings_keys.zig");
+const settings_schema = @import("../config/settings_schema.zig");
+const builtin_commands = @import("../../builtins/commands.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
@@ -86,14 +96,22 @@ pub const Command = union(enum) {
     upgrade: []const [:0]const u8,
     replay: []const [:0]const u8,
     workspace: []const [:0]const u8,
+    config: []const [:0]const u8,
+    completion: []const [:0]const u8,
     unknown: []const u8,
 };
 
 const ResumeInvocation = struct {
     args: []const [:0]const u8,
     top_level_alias: bool = false,
+    /// Set for `fx resume`, which only the upgrade relaunch may still use: an
+    /// older fx that installs this version restarts it with
+    /// `fx resume <id> --upgrade-relaunch`.
+    legacy_command: bool = false,
 };
 
+/// Prefix of the removed `--resume-<id>` alias, matched only to explain the
+/// replacement.
 const resume_id_alias_prefix = "--resume-";
 pub const upgrade_relaunch_arg = "--upgrade-relaunch";
 
@@ -106,9 +124,10 @@ pub const UpgradeRelaunch = struct {
     }
 };
 
-// The one resume alias that asks which session to open. Every other spelling
-// names its target, so it resumes without a prompt.
-const resume_picker_alias = "-r";
+// `-r` is the short form of `--resume`. Given no value, either one opens the
+// session picker; given `last` or an ID, it resumes that session.
+const resume_short_flag = "-r";
+const resume_inline_prefix = "--resume=";
 
 pub const ResumeTarget = union(enum) {
     remembered,
@@ -136,6 +155,8 @@ pub const LaunchModifiers = struct {
     ultrafast_override: ?bool = null,
     provider_order_override: ?[][]const u8 = null,
     provider_strict_override: ?bool = null,
+    /// `--permission-mode` and its shortcuts; never saved.
+    permission_override: ?types.PermissionMode = null,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
@@ -153,7 +174,8 @@ pub const LaunchModifiers = struct {
     pub fn hasModelOverrides(self: LaunchModifiers) bool {
         return self.provider_override != null or self.model_override != null or
             self.effort_override != null or self.fast_override != null or
-            self.ultrafast_override != null or self.provider_order_override != null or self.provider_strict_override != null;
+            self.ultrafast_override != null or self.provider_order_override != null or
+            self.provider_strict_override != null or self.permission_override != null;
     }
 
     pub fn hasOnlyUltrafastOverride(self: LaunchModifiers) bool {
@@ -187,12 +209,16 @@ pub const InteractiveLaunch = struct {
     /// Why the session the launch resumes could not be converted from v1
     /// (D61), for the message the launch exits with. Owned.
     resume_refusal: ?[]u8 = null,
+    /// `fx "<prompt>"`: sent once the session's first frame is on screen.
+    /// Owned by the allocator that parsed the launch.
+    initial_prompt: ?[]u8 = null,
 
     pub fn deinit(self: *InteractiveLaunch, alloc: Allocator) void {
         if (self.resume_refusal) |reason| alloc.free(reason);
         if (self.requested_resume) |*target| target.deinit(alloc);
         if (self.upgrade_relaunch) |*relaunch| relaunch.deinit(alloc);
         self.modifiers.deinit(alloc);
+        if (self.initial_prompt) |prompt| alloc.free(prompt);
         self.* = undefined;
     }
 };
@@ -203,6 +229,9 @@ pub const RunResult = union(enum) {
     handled_failure,
     handled_exit: u8,
 };
+
+/// Result for a command line fx can't accept; see `output_contracts.usage_exit_code`.
+const usage_failure: RunResult = .{ .handled_exit = output_contracts.usage_exit_code };
 
 const version_usage = "usage: fx --version\n";
 
@@ -250,6 +279,36 @@ fn parseLoginProvider(rest: []const [:0]const u8) !?model_provider.ProviderId {
     if (rest.len == 0) return null;
     if (rest.len != 1) return error.InvalidLoginProviderArgs;
     return provider_catalog.parse(rest[0]) orelse error.InvalidLoginProviderArgs;
+}
+
+const LoginArgs = struct {
+    provider: ?model_provider.ProviderId = null,
+    /// Paste an AI Gateway API key instead of signing in through the browser.
+    api_key: bool = false,
+};
+
+const LoginFlag = enum { api_key };
+const login_flag_ids = cli_flags.idTable(LoginFlag, &builtin_commands.login_options);
+
+/// `fx login [vercel|codex|grok] [--api-key]`, in either order.
+fn parseLoginArgs(rest: []const [:0]const u8) error{ InvalidLoginProviderArgs, ApiKeyNeedsVercel }!LoginArgs {
+    var parsed: LoginArgs = .{};
+    var provider_arg: ?[]const u8 = null;
+    var parser: cli_flags.Parser = .init(&builtin_commands.login_options, rest);
+    while (parser.next() catch return error.InvalidLoginProviderArgs) |item| switch (item) {
+        .positional => |arg| {
+            if (provider_arg != null) return error.InvalidLoginProviderArgs;
+            provider_arg = arg;
+        },
+        .option => |match| switch (login_flag_ids[match.index].?) {
+            .api_key => parsed.api_key = true,
+        },
+    };
+    if (provider_arg) |name| {
+        parsed.provider = provider_catalog.parse(name) orelse return error.InvalidLoginProviderArgs;
+    }
+    if (parsed.api_key and (parsed.provider orelse .gateway) != .gateway) return error.ApiKeyNeedsVercel;
+    return parsed;
 }
 
 fn selectCatalogModel(
@@ -320,20 +379,53 @@ const SessionRecoveryOptions = struct {
 };
 
 const AcpOptions = struct {
-    model: ?[]const u8 = null,
-    ultrafast_override: ?bool = null,
+    agent: agent_run_flags.Overrides = .{},
     log_file: ?[]const u8 = null,
+
+    fn deinit(self: *AcpOptions, alloc: Allocator) void {
+        self.agent.deinit(alloc);
+    }
 };
 
 const WorkflowOptions = struct {
-    auto_permission: bool,
-    create: bool,
-    context: []u8,
+    agent: agent_run_flags.Overrides = .{},
+    create: bool = false,
+    context: []u8 = &.{},
 
-    fn deinit(self: WorkflowOptions, alloc: Allocator) void {
+    fn deinit(self: *WorkflowOptions, alloc: Allocator) void {
+        self.agent.deinit(alloc);
         alloc.free(self.context);
     }
 };
+
+/// An agent-run flag given a value it can't take, such as `--effort lots`.
+const BadAgentValue = struct { flag: []const u8, value: []const u8 };
+
+/// Applies one agent-run flag `match` from `docs`, noting a value the flag
+/// can't take in `bad`.
+fn applyAgentFlag(
+    alloc: Allocator,
+    agent: *agent_run_flags.Overrides,
+    flag: agent_run_flags.Flag,
+    docs: []const command_specs.OptionDoc,
+    match: cli_flags.Match,
+    bad: *?BadAgentValue,
+) !void {
+    const value = match.value orelse "";
+    agent.apply(alloc, flag, value) catch |err| switch (err) {
+        error.InvalidAgentRunValue => {
+            bad.* = .{ .flag = cli_flags.flagName(docs[match.index]), .value = value };
+            return err;
+        },
+        else => |other| return other,
+    };
+}
+
+fn writeBadAgentValue(alloc: Allocator, deps: RunDeps, command: []const u8, bad: BadAgentValue) !void {
+    const message = try alloc.print("fx {s}: invalid value for {s}: {f}\n", .{ command, bad.flag, text_utils.terminalSafe(bad.value) });
+    defer alloc.free(message);
+    try writeStderr(deps, message);
+}
 
 const WriteFn = *const fn (?*anyopaque, []const u8) anyerror!void;
 const LoadStartupStateFn = *const fn (Allocator, oauth_transport.Provider, host.SecretStore, []const u8, usize) anyerror!app_lifecycle.StartupState;
@@ -368,6 +460,9 @@ const RunDeps = struct {
 const GlobalLaunchArgs = struct {
     remaining: []const [:0]const u8,
     modifiers: LaunchModifiers = .{},
+    /// The one positional argument of `fx [flags] "<prompt>" [flags]`, borrowed
+    /// from the arguments. Only set by `parseLaunchFlags(.around_prompt)`.
+    prompt: ?[]const u8 = null,
 
     fn deinit(self: *GlobalLaunchArgs, alloc: Allocator) void {
         self.modifiers.deinit(alloc);
@@ -381,13 +476,48 @@ const GlobalLaunchArgs = struct {
     }
 };
 
-/// Parses the launch flags `fx` and `fx ask` share. How `--model`, `--fast`,
-/// `--ultrafast`, and `--effort` reach the first turn is modeled in
-/// `tests/tla/cli/LaunchSelection.tla`.
-fn parseGlobalLaunchArgs(
-    alloc: Allocator,
-    args: []const [:0]const u8,
-) !GlobalLaunchArgs {
+const LaunchFlag = enum {
+    context_limit,
+    add_dir,
+    no_additional_dirs,
+    provider,
+    provider_order,
+    provider_strict,
+    no_provider_strict,
+    model,
+    effort,
+    fast,
+    no_fast,
+    ultrafast,
+    no_ultrafast,
+    permission_mode,
+    ask,
+    auto,
+    full_access,
+    yolo,
+};
+
+const launch_flag_ids = cli_flags.idTable(LaunchFlag, &builtin_commands.launch_options);
+
+/// Reads the global flags before a command or an interactive launch. When a
+/// flag repeats or conflicts, the last one wins. A malformed flag returns
+/// `error.InvalidFlag`; `launchFlagFailure` describes it.
+/// How `--model`, `--fast`, `--ultrafast`, and `--effort` reach the first turn
+/// is modeled in `tests/tla/cli/LaunchSelection.tla`.
+fn parseGlobalLaunchArgs(alloc: Allocator, args: []const [:0]const u8) !GlobalLaunchArgs {
+    return parseLaunchFlags(alloc, args, .before_command);
+}
+
+const LaunchFlagMode = enum {
+    /// `fx [flags] <command> ...`: stop at the first argument that isn't a
+    /// launch flag, since it and everything after belong to the command.
+    before_command,
+    /// `fx [flags] "<prompt>" [flags]`: launch flags anywhere, and exactly one
+    /// positional argument, the first prompt.
+    around_prompt,
+};
+
+fn parseLaunchFlags(alloc: Allocator, args: []const [:0]const u8, comptime mode: LaunchFlagMode) !GlobalLaunchArgs {
     var overrides: std.ArrayList(config_runtime.context_limits.Override) = .empty;
     errdefer overrides.deinit(alloc);
     var directories: std.ArrayList([]u8) = .empty;
@@ -395,114 +525,72 @@ fn parseGlobalLaunchArgs(
         for (directories.items) |path| alloc.free(path);
         directories.deinit(alloc);
     }
-    var suppress_saved = false;
-    var provider_override: ?model_provider.ProviderId = null;
-    var model_override: ?[]u8 = null;
-    errdefer if (model_override) |model| alloc.free(model);
-    var effort_override: ?types.ReasoningEffort = null;
-    var fast_override: ?bool = null;
-    var ultrafast_override: ?bool = null;
-    var provider_order_override: ?[][]const u8 = null;
-    errdefer if (provider_order_override) |order| freeProviderOrderOverride(alloc, order);
-    var provider_strict_override: ?bool = null;
+    var modifiers: LaunchModifiers = .{};
+    errdefer {
+        if (modifiers.model_override) |model| alloc.free(model);
+        if (modifiers.provider_order_override) |order| freeProviderOrderOverride(alloc, order);
+    }
 
-    var index: usize = 0;
-    while (index < args.len) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--context-limit")) {
-            index += 1;
-            if (index >= args.len) return error.MissingContextLimitValue;
-            try overrides.append(alloc, try config_runtime.context_limits.parseOverride(args[index]));
-        } else if (std.mem.startsWith(u8, arg, "--context-limit=")) {
-            try overrides.append(alloc, try config_runtime.context_limits.parseOverride(arg["--context-limit=".len..]));
-        } else if (std.mem.eql(u8, arg, "--add-dir")) {
-            index += 1;
-            if (index >= args.len or args[index].len == 0) return error.MissingAddDirectoryValue;
-            try directories.append(alloc, try alloc.dupe(u8, args[index]));
-        } else if (std.mem.startsWith(u8, arg, "--add-dir=")) {
-            const value = arg["--add-dir=".len..];
-            if (value.len == 0) return error.MissingAddDirectoryValue;
-            try directories.append(alloc, try alloc.dupe(u8, value));
-        } else if (std.mem.eql(u8, arg, "--no-additional-dirs")) {
-            if (suppress_saved) return error.DuplicateAdditionalDirectorySuppression;
-            suppress_saved = true;
-        } else if (std.mem.eql(u8, arg, "--provider")) {
-            index += 1;
-            if (index >= args.len) return error.MissingProviderValue;
-            provider_override = model_provider.parse(args[index]) orelse
-                return error.InvalidProviderValue;
-        } else if (std.mem.startsWith(u8, arg, "--provider=")) {
-            provider_override = model_provider.parse(arg["--provider=".len..]) orelse
-                return error.InvalidProviderValue;
-        } else if (std.mem.eql(u8, arg, "--model")) {
-            index += 1;
-            if (index >= args.len) return error.MissingModelValue;
-            const model = std.mem.trim(u8, args[index], " \t\r\n");
-            if (model.len == 0) return error.MissingModelValue;
-            const owned_model = try alloc.dupe(u8, model);
-            if (model_override) |old| alloc.free(old);
-            model_override = owned_model;
-        } else if (std.mem.startsWith(u8, arg, "--model=")) {
-            const model = std.mem.trim(u8, arg["--model=".len..], " \t\r\n");
-            if (model.len == 0) return error.MissingModelValue;
-            const owned_model = try alloc.dupe(u8, model);
-            if (model_override) |old| alloc.free(old);
-            model_override = owned_model;
-        } else if (std.mem.eql(u8, arg, "--effort")) {
-            index += 1;
-            if (index >= args.len) return error.MissingEffortValue;
-            effort_override = types.ReasoningEffort.parse(args[index]) orelse
-                return error.InvalidEffortValue;
-        } else if (std.mem.startsWith(u8, arg, "--effort=")) {
-            effort_override = types.ReasoningEffort.parse(arg["--effort=".len..]) orelse
-                return error.InvalidEffortValue;
-        } else if (std.mem.eql(u8, arg, "--fast") or std.mem.eql(u8, arg, "--no-fast")) {
-            const enabled = std.mem.eql(u8, arg, "--fast");
-            if (fast_override != null and fast_override.? != enabled)
-                return error.ConflictingFastFlags;
-            fast_override = enabled;
-            if (enabled) ultrafast_override = false;
-        } else if (std.mem.eql(u8, arg, "--ultrafast") or std.mem.eql(u8, arg, "--no-ultrafast")) {
-            const enabled = std.mem.eql(u8, arg, "--ultrafast");
-            if (ultrafast_override != null and ultrafast_override.? != enabled)
-                return error.ConflictingUltrafastFlags;
-            ultrafast_override = enabled;
-            if (enabled) fast_override = false;
-        } else if (std.mem.eql(u8, arg, "--provider-order")) {
-            index += 1;
-            if (index >= args.len) return error.MissingProviderOrderValue;
-            provider_order_override = try parseProviderOrderFlag(alloc, args[index], provider_order_override);
-        } else if (std.mem.startsWith(u8, arg, "--provider-order=")) {
-            provider_order_override = try parseProviderOrderFlag(alloc, arg["--provider-order=".len..], provider_order_override);
-        } else if (std.mem.eql(u8, arg, "--provider-strict") or std.mem.eql(u8, arg, "--no-provider-strict")) {
-            const strict = std.mem.eql(u8, arg, "--provider-strict");
-            if (provider_strict_override != null and provider_strict_override.? != strict)
-                return error.ConflictingProviderStrictFlags;
-            provider_strict_override = strict;
-        } else {
-            break;
+    var prompt: ?[]const u8 = null;
+    var parser: cli_flags.Parser = switch (mode) {
+        .before_command => .initPrefix(&builtin_commands.launch_options, args),
+        .around_prompt => .init(&builtin_commands.launch_options, args),
+    };
+    while (try parser.next()) |item| {
+        // Prefix mode stops at positionals, so only the prompt mode sees one.
+        const match = switch (item) {
+            .option => |option| option,
+            .positional => |positional| {
+                if (prompt != null) return error.UnquotedPrompt;
+                prompt = positional;
+                continue;
+            },
+        };
+        const value = match.value orelse "";
+        switch (launch_flag_ids[match.index].?) {
+            .context_limit => try overrides.append(alloc, try config_runtime.context_limits.parseOverride(value)),
+            .add_dir => {
+                if (value.len == 0) return error.MissingAddDirectoryValue;
+                try directories.append(alloc, try alloc.dupe(u8, value));
+            },
+            .no_additional_dirs => modifiers.saved_directories_suppressed = true,
+            .provider => modifiers.provider_override = model_provider.parse(value) orelse
+                return error.InvalidProviderValue,
+            .model => {
+                const model = std.mem.trim(u8, value, " \t\r\n");
+                if (model.len == 0) return error.MissingModelValue;
+                const owned_model = try alloc.dupe(u8, model);
+                if (modifiers.model_override) |old| alloc.free(old);
+                modifiers.model_override = owned_model;
+            },
+            .effort => modifiers.effort_override = types.ReasoningEffort.parse(value) orelse
+                return error.InvalidEffortValue,
+            .fast => {
+                modifiers.fast_override = true;
+                modifiers.ultrafast_override = false;
+            },
+            .no_fast => modifiers.fast_override = false,
+            .ultrafast => {
+                modifiers.ultrafast_override = true;
+                modifiers.fast_override = false;
+            },
+            .no_ultrafast => modifiers.ultrafast_override = false,
+            .provider_order => modifiers.provider_order_override = try parseProviderOrderFlag(alloc, value, modifiers.provider_order_override),
+            .provider_strict => modifiers.provider_strict_override = true,
+            .no_provider_strict => modifiers.provider_strict_override = false,
+            .permission_mode => modifiers.permission_override = types.PermissionMode.parse(value) orelse
+                return error.InvalidPermissionModeValue,
+            .ask => modifiers.permission_override = .ask,
+            .auto => modifiers.permission_override = .auto,
+            .full_access, .yolo => modifiers.permission_override = .yolo,
         }
-        index += 1;
     }
 
     const override_slice = try overrides.toOwnedSlice(alloc);
     errdefer if (override_slice.len > 0) alloc.free(override_slice);
-    const directory_slice = try directories.toOwnedSlice(alloc);
-    return .{
-        .remaining = args[index..],
-        .modifiers = .{
-            .context_limit_overrides = override_slice,
-            .additional_directories = directory_slice,
-            .saved_directories_suppressed = suppress_saved,
-            .provider_override = provider_override,
-            .model_override = model_override,
-            .effort_override = effort_override,
-            .fast_override = fast_override,
-            .ultrafast_override = ultrafast_override,
-            .provider_order_override = provider_order_override,
-            .provider_strict_override = provider_strict_override,
-        },
-    };
+    modifiers.context_limit_overrides = override_slice;
+    modifiers.additional_directories = try directories.toOwnedSlice(alloc);
+    return .{ .remaining = args[parser.index..], .modifiers = modifiers, .prompt = prompt };
 }
 
 /// Returns the command that follows the supported global launch modifiers.
@@ -513,38 +601,99 @@ pub fn commandAfterGlobalLaunchArgs(args: []const [:0]const u8) ?[]const u8 {
     return if (remaining.len > 0) remaining[0] else null;
 }
 
-pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u8 {
-    var index: usize = 0;
-    while (index < args.len) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--context-limit") or
-            std.mem.eql(u8, arg, "--add-dir") or
-            std.mem.eql(u8, arg, "--provider") or
-            std.mem.eql(u8, arg, "--provider-order") or
-            std.mem.eql(u8, arg, "--model") or
-            std.mem.eql(u8, arg, "--effort"))
-        {
-            index += 1;
-            if (index >= args.len) return &.{};
-        } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
-            !std.mem.startsWith(u8, arg, "--add-dir=") and
-            !std.mem.startsWith(u8, arg, "--provider=") and
-            !std.mem.startsWith(u8, arg, "--provider-order=") and
-            !std.mem.startsWith(u8, arg, "--model=") and
-            !std.mem.startsWith(u8, arg, "--effort=") and
-            !std.mem.eql(u8, arg, "--no-additional-dirs") and
-            !std.mem.eql(u8, arg, "--fast") and
-            !std.mem.eql(u8, arg, "--no-fast") and
-            !std.mem.eql(u8, arg, "--ultrafast") and
-            !std.mem.eql(u8, arg, "--no-ultrafast") and
-            !std.mem.eql(u8, arg, "--provider-strict") and
-            !std.mem.eql(u8, arg, "--no-provider-strict"))
-        {
-            return args[index..];
-        }
-        index += 1;
+/// Why the global flags in `args` failed to parse, or null when they parse.
+/// A flag after a first prompt, as in `fx "fix it" --jsno`, is past the
+/// launch prefix, so the whole line is checked as well.
+fn launchFlagFailure(args: []const [:0]const u8) ?cli_flags.Failure {
+    var parser: cli_flags.Parser = .initPrefix(&builtin_commands.launch_options, args);
+    while (parser.next() catch return parser.failure) |_| {}
+    // Flags may also follow a resume word and its target, as in `fx -c --model x`.
+    const rest = args[parser.index..];
+    if (rest.len > 0 and isResumeWord(rest[0])) {
+        return cli_flags.firstFailure(&builtin_commands.launch_options, rest[resumeHeadLen(rest, true)..]);
     }
-    return &.{};
+    return cli_flags.firstFailure(&builtin_commands.launch_options, args);
+}
+
+/// Every flag plain `fx` reads, so an unknown one can get a suggestion.
+const launch_suggestion_options = builtin_commands.launch_options ++ [_]command_specs.OptionDoc{
+    .{ .flag = "--help", .description = "" },
+    .{ .flag = "--version", .description = "" },
+    .{ .flag = "--continue", .description = "" },
+    .{ .flag = "--resume", .description = "" },
+};
+
+/// The unknown flag that follows the launch flags in `args`, with the
+/// nearest flag `fx` knows. Slices borrow from `args`.
+fn unknownLaunchFlagFailure(args: []const [:0]const u8) ?cli_flags.Failure {
+    const remaining = argsAfterGlobalLaunchArgs(args);
+    if (remaining.len == 0) return null;
+    return cli_flags.firstFailure(&launch_suggestion_options, remaining[0..1]) orelse
+        .{ .unknown = .{ .flag = remaining[0], .suggestion = null } };
+}
+
+/// Writes the line for a first argument that plain `fx` can't take as a
+/// command, a flag, or a prompt.
+fn writeLaunchWordProblem(
+    writer: *std.Io.Writer,
+    command_catalog: CommandCatalog,
+    args: []const [:0]const u8,
+    err: anyerror,
+) std.Io.Writer.Error!void {
+    const remaining = argsAfterGlobalLaunchArgs(args);
+    const word: []const u8 = if (remaining.len > 0) remaining[0] else "";
+    switch (err) {
+        error.PrintFlagUseAsk => {
+            const flag = if (std.mem.findScalar(u8, word, '=')) |at| word[0..at] else word;
+            try writer.print("fx: {s} isn't an fx flag; to run one request and exit, use fx ask ", .{flag});
+            if (printFlagPrompt(remaining)) |prompt| {
+                try writer.print("\"{f}\"\n", .{text_utils.terminalSafe(prompt)});
+            } else {
+                try writer.writeAll("\"<prompt>\"\n");
+            }
+        },
+        error.UnknownCommandTypo => {
+            try writer.print("fx: unknown command {f}", .{text_utils.terminalSafe(word)});
+            if (launchWordSuggestion(command_catalog, word)) |suggestion| {
+                try writer.print(" (did you mean {s}?)", .{suggestion});
+            }
+            try writer.writeAll("\n");
+        },
+        error.EmptyLaunchPrompt => try writer.writeAll("fx: the prompt is empty\n"),
+        error.UnquotedPrompt => {
+            // The shell split the prompt into words; show them quoted.
+            try writer.writeAll("fx: put the prompt in quotes: fx \"");
+            var parser: cli_flags.Parser = .init(&builtin_commands.launch_options, args);
+            var first = true;
+            while (parser.next() catch null) |item| switch (item) {
+                .option => {},
+                .positional => |positional| {
+                    if (!first) try writer.writeByte(' ');
+                    try writer.writeAll(positional);
+                    first = false;
+                },
+            };
+            try writer.writeAll("\"\n");
+        },
+        else => {},
+    }
+}
+
+/// The prompt given with `-p` or `--print`, for the `fx ask` hint.
+fn printFlagPrompt(remaining: []const [:0]const u8) ?[]const u8 {
+    if (remaining.len == 0) return null;
+    if (std.mem.startsWith(u8, remaining[0], "--print=")) {
+        const value = remaining[0]["--print=".len..];
+        return if (value.len > 0) value else null;
+    }
+    if (remaining.len < 2 or remaining[1].len == 0 or remaining[1][0] == '-') return null;
+    return remaining[1];
+}
+
+pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u8 {
+    var parser: cli_flags.Parser = .initPrefix(&builtin_commands.launch_options, args);
+    while (parser.next() catch return &.{}) |_| {}
+    return args[parser.index..];
 }
 
 pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Command {
@@ -557,6 +706,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         '-', 'h' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .help)) return .help;
             if (command_specs.matchesTopLevel(command_catalog, command, .@"resume") or
+                std.mem.startsWith(u8, command, resume_inline_prefix) or
                 std.mem.startsWith(u8, command, resume_id_alias_prefix))
             {
                 return .{ .resume_session = .{
@@ -572,6 +722,8 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
         'b' => if (command_specs.matchesTopLevel(command_catalog, command, .credits)) return .{ .credits = args[1..] },
         'c' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .credits)) return .{ .credits = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .config)) return .{ .config = args[1..] };
+            if (command_specs.matchesTopLevel(command_catalog, command, .completion)) return .{ .completion = args[1..] };
         },
         'd' => {
             if (command_specs.matchesTopLevel(command_catalog, command, .doctor)) return .{ .doctor = args[1..] };
@@ -593,7 +745,7 @@ pub fn parse(command_catalog: CommandCatalog, args: []const [:0]const u8) Comman
             if (command_specs.matchesTopLevel(command_catalog, command, .provider)) return .{ .provider = args[1..] };
         },
         'r' => {
-            if (command_specs.matchesTopLevel(command_catalog, command, .@"resume")) return .{ .resume_session = .{ .args = args[1..] } };
+            if (command_specs.matchesTopLevel(command_catalog, command, .@"resume")) return .{ .resume_session = .{ .args = args[1..], .legacy_command = true } };
             if (command_specs.matchesTopLevel(command_catalog, command, .replay)) return .{ .replay = args[1..] };
         },
         's' => {
@@ -672,6 +824,7 @@ pub fn parseInteractiveLaunch(
                 resume_args.len >= 2 and
                 std.mem.eql(u8, resume_args[1], upgrade_relaunch_arg);
             if (has_upgrade_relaunch and resume_args.len > 3) return error.InvalidResumeArgs;
+            if (invocation.legacy_command and !has_upgrade_relaunch) return error.RemovedResumeCommand;
             var upgrade_relaunch: ?UpgradeRelaunch = null;
             errdefer if (upgrade_relaunch) |*relaunch| relaunch.deinit(alloc);
             if (has_upgrade_relaunch) {
@@ -681,27 +834,176 @@ pub fn parseInteractiveLaunch(
                 } else null;
                 upgrade_relaunch = .{ .previous_revision = previous_revision };
             }
-            const target_args = if (has_upgrade_relaunch) resume_args[0..1] else resume_args;
-            const target = try parseResumeArgs(
+            const resume_line = if (has_upgrade_relaunch) resume_args[0..1] else resume_args;
+            const head_len = if (has_upgrade_relaunch) resume_line.len else resumeHeadLen(resume_line, invocation.top_level_alias);
+            var prompt: ?[]const u8 = null;
+            if (resume_line.len > head_len) {
+                // Launch flags may follow the resume word and its target, as in
+                // `fx -c --model x` or `fx session resume last --fast`. They're
+                // read together with the flags before the resume word, so the
+                // last one still wins.
+                const before = args[0 .. args.len - effective_args.len];
+                const after = resume_line[head_len..];
+                const line = try alloc.alloc([:0]const u8, before.len + after.len);
+                defer alloc.free(line);
+                @memcpy(line[0..before.len], before);
+                @memcpy(line[before.len..], after);
+                var launch = parseLaunchFlags(alloc, line, .around_prompt) catch |err| {
+                    // A second word after the target is a malformed resume,
+                    // not an unquoted prompt.
+                    if (err == error.UnquotedPrompt) return error.InvalidResumeArgs;
+                    // A removed resume spelling, such as `--id`, keeps its own
+                    // hint instead of reading as an unknown launch flag.
+                    if (err == error.InvalidFlag) {
+                        if (parseResumeArgs(alloc, resume_line, invocation.top_level_alias)) |parsed_target| {
+                            var unused = parsed_target;
+                            unused.deinit(alloc);
+                        } else |resume_err| if (removedResumeHint(resume_err) != null) return resume_err;
+                    }
+                    return err;
+                };
+                // `fx -c` and `fx -r` take a first prompt; `fx session resume`
+                // doesn't.
+                if (launch.prompt != null and !invocation.top_level_alias) {
+                    launch.deinit(alloc);
+                    return error.InvalidResumeArgs;
+                }
+                prompt = launch.prompt;
+                launch.remaining = &.{};
+                global_args.deinit(alloc);
+                global_args = launch;
+            }
+            if (prompt) |text| {
+                if (std.mem.trim(u8, text, " \t\r\n").len == 0) return error.EmptyLaunchPrompt;
+            }
+            var target = try parseResumeArgs(
                 alloc,
-                command_catalog,
-                target_args,
+                resume_line[0..head_len],
                 invocation.top_level_alias,
             );
+            errdefer target.deinit(alloc);
+            const initial_prompt: ?[]u8 = if (prompt) |text| try alloc.dupe(u8, text) else null;
             const relaunch = upgrade_relaunch;
             upgrade_relaunch = null;
             return .{ .interactive = .{
                 .requested_resume = target,
                 .upgrade_relaunch = relaunch,
                 .modifiers = global_args.takeModifiers(),
+                .initial_prompt = initial_prompt,
             } };
         },
-        else => return .{ .noninteractive = .{
-            .global_args = global_args,
-            .effective_args = effective_args,
-            .command = command,
-        } },
+        .unknown => |word| switch (classifyLaunchWord(command_catalog, word)) {
+            .command_line => {},
+            .print_flag => return error.PrintFlagUseAsk,
+            .unknown_flag => return error.UnknownLaunchFlag,
+            .command_typo => return error.UnknownCommandTypo,
+            .prompt => {
+                // Read the whole line again so launch flags may also follow
+                // the prompt, as in `fx "fix the bug" --model x`.
+                var with_prompt = try parseLaunchFlags(alloc, args, .around_prompt);
+                errdefer with_prompt.deinit(alloc);
+                var initial_prompt: ?[]u8 = null;
+                if (with_prompt.prompt) |prompt| {
+                    if (std.mem.trim(u8, prompt, " \t\r\n").len == 0) return error.EmptyLaunchPrompt;
+                    initial_prompt = try alloc.dupe(u8, prompt);
+                }
+                global_args.deinit(alloc);
+                return .{ .interactive = .{
+                    .modifiers = with_prompt.takeModifiers(),
+                    .initial_prompt = initial_prompt,
+                } };
+            },
+        },
+        else => {},
     }
+    return .{ .noninteractive = .{
+        .global_args = global_args,
+        .effective_args = effective_args,
+        .command = command,
+    } };
+}
+
+/// How many leading words of a resume line name what to resume: the resume
+/// word, when `has_resume_word` (`-c`, `-r`, `--resume`), and its target.
+/// `-c`, `--continue`, and `--resume=<id>` carry their target. `-r` and
+/// `--resume` take the next word as theirs unless it's a long flag, because
+/// a session ID can start with a single dash; `fx session resume` does the
+/// same with its first word. Every word after these is a launch flag or, for
+/// the resume flags, the first prompt.
+fn resumeHeadLen(line: []const [:0]const u8, has_resume_word: bool) usize {
+    var len: usize = 0;
+    if (has_resume_word) {
+        if (line.len == 0) return 0;
+        const word = line[0];
+        len = 1;
+        if (!std.mem.eql(u8, word, "--resume") and !std.mem.eql(u8, word, resume_short_flag)) return len;
+    }
+    if (line.len > len and !std.mem.startsWith(u8, line[len], "--")) len += 1;
+    return len;
+}
+
+fn isResumeWord(word: []const u8) bool {
+    return std.mem.eql(u8, word, "-c") or std.mem.eql(u8, word, "--continue") or
+        std.mem.eql(u8, word, "--resume") or std.mem.eql(u8, word, resume_short_flag) or
+        std.mem.startsWith(u8, word, resume_inline_prefix);
+}
+
+const LaunchWord = enum {
+    /// Handled by command dispatch, such as `--version`.
+    command_line,
+    /// `-p` or `--print`, the one-shot flag of other agents.
+    print_flag,
+    unknown_flag,
+    /// A near miss for a command name, such as `stauts`, or a flag name
+    /// typed without its dashes, such as `version`.
+    command_typo,
+    prompt,
+};
+
+/// Decides what plain `fx` does with a first argument that isn't a command.
+fn classifyLaunchWord(command_catalog: CommandCatalog, word: []const u8) LaunchWord {
+    // `fx -- "-x"` lets a prompt start with a dash.
+    if (std.mem.eql(u8, word, "--")) return .prompt;
+    if (word.len > 0 and word[0] == '-') {
+        if (isVersionFlag(word)) return .command_line;
+        if (isPrintFlag(word)) return .print_flag;
+        return .unknown_flag;
+    }
+    if (launchWordSuggestion(command_catalog, word) != null) return .command_typo;
+    return .prompt;
+}
+
+fn isPrintFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--print") or
+        std.mem.startsWith(u8, arg, "--print=");
+}
+
+/// The command or flag a mistyped first word most likely meant, such as
+/// `status` for `stauts` or `--version` for `version`. Words of four letters
+/// or fewer allow one edit and longer words two, so a short prompt such as
+/// `add` isn't taken for a typo of `acp`.
+fn launchWordSuggestion(command_catalog: CommandCatalog, word: []const u8) ?[]const u8 {
+    // Flag names people type without their dashes.
+    const bare_flags = [_]struct { word: []const u8, flag: []const u8 }{
+        .{ .word = "version", .flag = "--version" },
+        .{ .word = "continue", .flag = "--continue" },
+    };
+    for (bare_flags) |entry| {
+        if (std.mem.eql(u8, word, entry.word)) return entry.flag;
+    }
+    // Four letters or fewer get one edit, so a prompt word such as `add` isn't
+    // taken for a mistyped command.
+    var nearest: cli_flags.Nearest = .{ .word = word, .max_edits = if (word.len <= 4) 1 else 2 };
+    for (command_catalog.specs) |spec| {
+        // `fx resume` is removed; its typos shouldn't point back to it.
+        if (spec.kind == .@"resume") continue;
+        const names = [_][]const []const u8{ &.{spec.token}, spec.aliases };
+        for (names) |group| for (group) |name| {
+            if (name.len == 0 or name[0] == '-') continue;
+            nearest.offer(name);
+        };
+    }
+    return nearest.best;
 }
 
 /// Detects `fx <subcommand> --help` / `-h` and returns the subcommand kind so the
@@ -711,6 +1013,8 @@ fn topLevelHelpRequest(command_catalog: CommandCatalog, args: []const [:0]const 
     if (args.len < 2) return null;
     const kind = command_specs.topLevelKindFromToken(command_catalog, args[0]) orelse return null;
     if (kind == .help) return null;
+    // `fx resume` was removed, so its help request gets the removal hint.
+    if (kind == .@"resume" and std.mem.eql(u8, args[0], "resume")) return null;
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) return kind;
     }
@@ -855,7 +1159,17 @@ fn activateProviderSelectionFallible(
     defer settings.deinit(alloc);
 
     if (target == .configured) {
-        const bound = try target.bind(settings.providers orelse .{});
+        const bound = target.bind(settings.providers orelse .{}) catch |err| switch (err) {
+            error.UnknownConfiguredProvider => {
+                const detail = try config_runtime.unknownProviderMessage(alloc, target.label());
+                defer alloc.free(detail);
+                try writeProviderActivationError(alloc, deps, caller, detail);
+                // A name fx doesn't know is a bad argument, so the caller
+                // exits as a usage error.
+                return error.UnknownConfiguredProvider;
+            },
+            error.ConfiguredProviderChanged => return err,
+        };
         const selected_model = settings.models.get(bound) orelse return error.ConfiguredModelNotSelected;
         var attempt = config_runtime.attemptUserPreferences(alloc, .{
             .provider = bound,
@@ -1025,18 +1339,35 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
     const parsed_launch = parseInteractiveLaunch(alloc, args, cfg.command_catalog) catch |err| {
         if (err == error.InvalidResumeArgs) {
             try writeTopLevelUsage(cfg.command_catalog, deps, .@"resume");
-            return .handled_failure;
+            return usage_failure;
+        }
+        if (removedResumeHint(err)) |hint| {
+            try writeStderr(deps, hint);
+            return usage_failure;
         }
         var writer: std.Io.Writer.Allocating = .init(alloc);
         defer writer.deinit();
-        if (globalLaunchErrorMessage(err)) |message| {
+        switch (err) {
+            error.PrintFlagUseAsk, error.UnknownCommandTypo, error.EmptyLaunchPrompt, error.UnquotedPrompt => {
+                try writeLaunchWordProblem(&writer.writer, cfg.command_catalog, args, err);
+                try writeStderr(deps, writer.written());
+                return usage_failure;
+            },
+            else => {},
+        }
+        if (err == error.InvalidFlag or err == error.UnknownLaunchFlag) {
+            try writer.writer.writeAll("fx: ");
+            const failure = if (err == error.InvalidFlag) launchFlagFailure(args) else unknownLaunchFlagFailure(args);
+            if (failure) |found| try found.write(&writer.writer);
+            try writer.writer.writeAll("\n");
+        } else if (globalLaunchErrorMessage(err)) |message| {
             try writer.writer.print("fx: {s}\n", .{message});
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--provider <name>] [--model <id>] [--effort <level>] [--fast|--no-fast] [--ultrafast|--no-ultrafast] [--provider-order <a,b,...>] [--provider-strict|--no-provider-strict] <command>\n");
+        try writer.writer.writeAll(builtin_commands.launch_usage);
         try writeStderr(deps, writer.written());
-        return .handled_failure;
+        return usage_failure;
     };
     switch (parsed_launch) {
         .interactive => |launch| {
@@ -1065,7 +1396,7 @@ fn runNonInteractiveWithDeps(
         !commandSupportsWorkspaceModifiers(parsed_command))
     {
         try writeWorkspaceModifierUsage(deps);
-        return .handled_failure;
+        return usage_failure;
     }
 
     const acp_ultrafast_override = switch (parsed_command) {
@@ -1073,14 +1404,14 @@ fn runNonInteractiveWithDeps(
         else => false,
     };
     if (global_args.modifiers.hasModelOverrides() and !acp_ultrafast_override) {
-        try writeModelModifierUsage(deps);
-        return .handled_failure;
+        try writeModelModifierUsage(alloc, deps, parsed_command, global_args.modifiers);
+        return usage_failure;
     }
 
     if (isVersionFlag(effective_args[0])) {
         if (effective_args.len != 1) {
             try writeStderr(deps, version_usage);
-            return .handled_failure;
+            return usage_failure;
         }
         try writeStdout(deps, cfg.version);
         try writeStdout(deps, "\n");
@@ -1104,13 +1435,23 @@ fn runNonInteractiveWithDeps(
         .ask => |rest| {
             try writeMcpProfileWarningIfPresent(alloc, cfg, deps);
             const exit_code = try cli_ask.run(alloc, rest, workflowConfigWithLaunchModifiers(cfg, global_args.modifiers), cfg.context_registry, cfg.tool_set);
-            return if (exit_code == 0) .handled_success else .handled_failure;
+            return if (exit_code == 0) .handled_success else .{ .handled_exit = exit_code };
         },
         .acp => |rest| {
-            const acp_opts = parseAcpArgs(rest) catch {
-                try writeStderr(deps, "usage: fx acp [--model <id>] [--ultrafast|--no-ultrafast] [--log-file <path>]\n");
-                return .handled_failure;
+            var bad: ?BadAgentValue = null;
+            var acp_opts = parseAcpArgs(alloc, rest, &bad) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    if (bad) |value| {
+                        try writeBadAgentValue(alloc, deps, "acp", value);
+                    } else {
+                        try writeFlagFailure(alloc, deps, .acp, rest);
+                    }
+                    try writeStderr(deps, "usage: fx " ++ builtin_commands.acp_usage ++ "\n");
+                    return usage_failure;
+                },
             };
+            defer acp_opts.deinit(alloc);
             try cfg.acp_runner.run(alloc, .{
                 .auth_mode = cfg.auth_mode,
                 .default_model = cfg.default_model,
@@ -1136,8 +1477,12 @@ fn runNonInteractiveWithDeps(
                 .context_limit_overrides = global_args.modifiers.context_limit_overrides,
                 .additional_directories = global_args.modifiers.additional_directories,
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
-                .model_override = acp_opts.model,
-                .ultrafast_override = acp_opts.ultrafast_override orelse global_args.modifiers.ultrafast_override,
+                .model_override = acp_opts.agent.model,
+                .effort_override = if (acp_opts.agent.effort) |*effort| effort.label() else null,
+                .fast_override = acp_opts.agent.fast,
+                .ultrafast_override = acp_opts.agent.ultrafast orelse global_args.modifiers.ultrafast_override,
+                .provider_override = acp_opts.agent.provider,
+                .permission_override = acp_opts.agent.permission,
                 .log_file = acp_opts.log_file,
             });
             return .handled_success;
@@ -1145,16 +1490,25 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
-            const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
-                return .handled_failure;
+            const login_args = parseLoginArgs(rest) catch |err| {
+                switch (err) {
+                    error.ApiKeyNeedsVercel => try writeStderr(deps, "fx login: --api-key works only with vercel\n"),
+                    error.InvalidLoginProviderArgs => {
+                        try writeFlagFailure(alloc, deps, .login, rest);
+                        try writeStderr(deps, "usage: fx login [vercel|codex|grok] [--api-key]\n");
+                    },
+                }
+                return usage_failure;
             };
             if (cfg.auth_mode == .host_managed) {
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
+            if (login_args.api_key) {
+                return if (try runPasteSetup(alloc, cfg.secret_store, deps, "fx login")) .handled_success else .handled_failure;
+            }
             // Preserve the original `fx login` behavior for scripts and users.
-            const login_provider = maybe_login_provider orelse .gateway;
+            const login_provider = login_args.provider orelse .gateway;
             runProviderLogin(alloc, cfg, login_provider) catch |err| {
                 try writeProviderLoginFailure(alloc, deps, login_provider, .provider_login, err);
                 return .handled_failure;
@@ -1178,7 +1532,7 @@ fn runNonInteractiveWithDeps(
         .logout => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
                 try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
-                return .handled_failure;
+                return usage_failure;
             };
             if (cfg.auth_mode == .host_managed) {
                 try writeHostManagedAuthResult(deps);
@@ -1271,7 +1625,7 @@ fn runNonInteractiveWithDeps(
         .teams => |rest| {
             if (rest.len != 0) {
                 try writeStderr(deps, "usage: fx teams\n");
-                return .handled_failure;
+                return usage_failure;
             }
             if (cfg.auth_mode == .host_managed) {
                 try writeHostManagedAuthResult(deps);
@@ -1311,32 +1665,37 @@ fn runNonInteractiveWithDeps(
         .provider => |rest| {
             if (rest.len != 1) {
                 try writeStderr(deps, "usage: fx provider <name>\n");
-                return .handled_failure;
+                return usage_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
                 try writeStderr(deps, "fx provider: expected gateway, codex, grok, or a configured name\n");
-                return .handled_failure;
+                return usage_failure;
             };
-            return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command, null))
-                .handled_success
-            else
-                .handled_failure;
+            const activated = activateProviderSelection(alloc, cfg, deps, target, .provider_command, null) catch |err| switch (err) {
+                error.UnknownConfiguredProvider => return usage_failure,
+                else => return err,
+            };
+            return if (activated) .handled_success else .handled_failure;
         },
         .setup => |rest| {
+            if (try command_specs.deprecationWarning(alloc, cfg.command_catalog, .setup)) |warning| {
+                defer alloc.free(warning);
+                try writeStderr(deps, warning);
+            }
             if (rest.len != 0) {
                 try writeTopLevelUsage(cfg.command_catalog, deps, .setup);
-                return .handled_failure;
+                return usage_failure;
             }
             if (cfg.auth_mode == .host_managed) {
                 try writeHostManagedAuthResult(deps);
                 return .handled_success;
             }
-            return if (try runPasteSetup(alloc, cfg.secret_store, deps)) .handled_success else .handled_failure;
+            return if (try runPasteSetup(alloc, cfg.secret_store, deps, "fx setup")) .handled_success else .handled_failure;
         },
         .status => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .status, "status", err, rest);
-                return .handled_failure;
+                return usage_failure;
             };
             var startup = if (cfg.auth_mode == .host_managed)
                 try deps.load_startup_status_with_auth_mode(
@@ -1369,6 +1728,9 @@ fn runNonInteractiveWithDeps(
             snapshot.mcp = localMcpView(&mcp_inspection);
             snapshot.provider_endpoint = startup.provider_endpoint;
             snapshot.modes = statusModes(cfg.mode_registry, snapshot.permission_mode);
+            const fx_home = try profile_paths.activeRoot(alloc, io_mod.getenv("HOME"));
+            defer if (fx_home) |path| alloc.free(path);
+            snapshot.fx_home = fx_home;
             if (opts.format == .json) {
                 try writeStatusJsonLine(alloc, deps, snapshot);
                 return .handled_success;
@@ -1382,7 +1744,7 @@ fn runNonInteractiveWithDeps(
         .permissions => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .permissions, "permissions", err, rest);
-                return .handled_failure;
+                return usage_failure;
             };
             var startup = try deps.load_startup_state_without_credentials(alloc, cfg.default_model, cfg.default_agent_step_limit);
             defer startup.deinit(alloc);
@@ -1410,7 +1772,7 @@ fn runNonInteractiveWithDeps(
             }
             const opts = slack_install.parse(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .slack, "slack", err, rest);
-                return .handled_failure;
+                return usage_failure;
             };
             var arena: std.heap.ArenaAllocator = .init(alloc);
             defer arena.deinit();
@@ -1429,7 +1791,7 @@ fn runNonInteractiveWithDeps(
         .models => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .models, "models", err, rest);
-                return .handled_failure;
+                return usage_failure;
             };
 
             var startup = if (cfg.auth_mode == .host_managed)
@@ -1520,7 +1882,7 @@ fn runNonInteractiveWithDeps(
         .doctor => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .doctor, "doctor", err, rest);
-                return .handled_failure;
+                return usage_failure;
             };
 
             const workspace_root = try io_mod.realpathAlloc(alloc, ".");
@@ -1566,7 +1928,7 @@ fn runNonInteractiveWithDeps(
                         err,
                         rest[1..],
                     );
-                    return .handled_failure;
+                    return usage_failure;
                 };
                 defer recovery.deinit(alloc);
                 return runSessionRecovery(alloc, deps, recovery);
@@ -1574,13 +1936,13 @@ fn runNonInteractiveWithDeps(
 
             var opts = parseSessionDetailArgs(alloc, rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .session, "session", err, rest);
-                return .handled_failure;
+                return usage_failure;
             };
             defer opts.deinit(alloc);
 
             const target = opts.target orelse {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .session, "session", error.InvalidSessionDetailArgs, rest);
-                return .handled_failure;
+                return usage_failure;
             };
             return runSessionDetail(alloc, deps, target, opts.format);
         },
@@ -1588,20 +1950,20 @@ fn runNonInteractiveWithDeps(
             if (rest.len > 0 and std.mem.eql(u8, rest[0], "convert")) {
                 const format = parseSessionConvertArgs(rest[1..]) catch |err| {
                     try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
-                    return .handled_failure;
+                    return usage_failure;
                 };
                 return runSessionConvert(alloc, deps, format);
             }
             const opts = parseSessionListArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
-                return .handled_failure;
+                return usage_failure;
             };
             return runSessionList(alloc, deps, opts);
         },
         .workspace => |rest| {
             const opts = parseWorkspaceArgs(rest) catch |err| {
                 try writeWorkspaceCommandError(alloc, cfg.command_catalog, deps, rest, err);
-                return .handled_failure;
+                return usage_failure;
             };
             var startup = deps.load_startup_state_without_credentials(
                 alloc,
@@ -1656,7 +2018,7 @@ fn runNonInteractiveWithDeps(
         .credits => |rest| {
             const opts = parseLocalSurfaceArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .credits, "credits", err, rest);
-                return .handled_failure;
+                return usage_failure;
             };
             var startup = if (cfg.auth_mode == .host_managed)
                 try deps.load_startup_state_with_auth_mode(
@@ -1707,10 +2069,11 @@ fn runNonInteractiveWithDeps(
         .usage => |rest| {
             const opts = parseUsageArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .usage, "usage", err, rest);
-                return .handled_failure;
+                return usage_failure;
             };
-            // A relative $HOME counts as unset, as everywhere else in fx.
-            const home = deps.getenv(deps.env_ctx, "HOME") orelse "";
+            // A relative $HOME counts as unset, as everywhere else in fx, and
+            // with HOME unset FX_HOME's parent serves.
+            const home = deps.getenv(deps.env_ctx, "HOME") orelse profile_paths.fxHomeParent() orelse "";
             if (!std.Io.Dir.path.isAbsolute(home)) {
                 try writeUsageCommandFailure(alloc, deps, error.HomeNotSet, opts.format);
                 return .handled_failure;
@@ -1759,9 +2122,15 @@ fn runNonInteractiveWithDeps(
         },
         .upgrade => |rest| {
             const upgrade_runtime = @import("../upgrade/upgrade_runtime.zig");
-            const opts = parseUpgradeArgs(rest) catch |err| {
+            var rejected_channel: ?[]const u8 = null;
+            const opts = parseUpgradeArgs(rest, &rejected_channel) catch |err| {
+                if (rejected_channel) |value| if (!argsContainJson(rest)) {
+                    const line = try alloc.print("fx upgrade: invalid value for --channel: {f}\n", .{text_utils.terminalSafe(value)});
+                    defer alloc.free(line);
+                    try writeStderr(deps, line);
+                };
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .upgrade, "upgrade", err, rest);
-                return .handled_failure;
+                return usage_failure;
             };
 
             var startup = deps.load_startup_state_without_credentials(
@@ -1790,6 +2159,11 @@ fn runNonInteractiveWithDeps(
                     return .handled_failure;
                 };
                 defer outcome.deinit(alloc);
+                if (opts.format == .text) {
+                    const line = try channelSavedLine(alloc, selected, outcome);
+                    defer alloc.free(line);
+                    try writeStdout(deps, line);
+                }
             }
 
             var result = upgrade_runtime.run(alloc, .{
@@ -1813,9 +2187,53 @@ fn runNonInteractiveWithDeps(
             if (opts.format == .json) try writeStdout(deps, "\n");
             return if (result.snapshot.status == .failed) .handled_failure else .handled_success;
         },
+        .completion => |rest| {
+            const shell = if (rest.len == 1) completion.parseShell(rest[0]) else null;
+            if (shell == null) {
+                if (rest.len == 1) {
+                    try writeStderrLine(alloc, deps, "fx completion: unknown shell {s}; choose bash, zsh, or fish\n", rest[0]);
+                }
+                try writeTopLevelUsage(cfg.command_catalog, deps, .completion);
+                return usage_failure;
+            }
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try completion.writeScript(alloc, &out.writer, shell.?, cfg.command_catalog, &builtin_commands.launch_options);
+            try writeStdout(deps, out.written());
+            return .handled_success;
+        },
+        .config => |rest| {
+            var unknown_key: ?settings_keys.UnknownPart = null;
+            var problem: ?[]const u8 = null;
+            const opts = cli_config.parseArgs(rest, &unknown_key, &problem) catch |err| {
+                if (problem) |text| {
+                    if (argsContainJson(rest)) {
+                        try writeJsonCommandFailure(alloc, deps, "config", err, text);
+                        return usage_failure;
+                    }
+                    try writeStderrLine(alloc, deps, "fx config: {s}\n", text);
+                }
+                if (!argsContainJson(rest)) {
+                    if (unknown_key) |part| {
+                        const message = try settings_messages.formatUnknownPath(alloc, part);
+                        defer alloc.free(message);
+                        try writeStderrLine(alloc, deps, "fx config: {s}\n", message);
+                    } else if (err == error.WorkspaceConfigWrite) {
+                        try writeStderr(deps, "fx config: " ++ workspace_write_message ++ "\n");
+                    }
+                }
+                try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .config, "config", err, rest);
+                return usage_failure;
+            };
+            return switch (opts.action) {
+                .list, .get => runConfig(alloc, cfg, deps, opts),
+                .set, .unset => runConfigWrite(alloc, deps, opts),
+                .schema => runConfigSchema(alloc, deps, opts),
+            };
+        },
         .replay => |rest| {
             const exit_code = try cli_replay.run(alloc, rest);
-            return if (exit_code == 0) .handled_success else .handled_failure;
+            return if (exit_code == 0) .handled_success else .{ .handled_exit = exit_code };
         },
         .unknown => |command| {
             try writeStderr(deps, "fx: unknown subcommand: ");
@@ -1857,7 +2275,23 @@ fn runGithubWorkflow(
     deps: RunDeps,
     workflow: github_workflows.Workflow,
 ) !RunResult {
-    const opts = try parseWorkflowArgs(alloc, args);
+    var bad: ?BadAgentValue = null;
+    var opts = parseWorkflowArgs(alloc, args, &bad) catch |err| switch (err) {
+        error.InvalidWorkflowArgs, error.InvalidAgentRunValue => {
+            const kind: TopLevelKind = switch (workflow) {
+                .pull_request => .pr,
+                .issue => .issue,
+            };
+            if (bad) |value| {
+                try writeBadAgentValue(alloc, deps, @tagName(kind), value);
+            } else {
+                try writeFlagFailure(alloc, deps, kind, args);
+            }
+            try writeTopLevelUsage(cfg.command_catalog, deps, kind);
+            return usage_failure;
+        },
+        else => return err,
+    };
     defer opts.deinit(alloc);
 
     const prompt = switch (workflow) {
@@ -1874,11 +2308,11 @@ fn runGithubWorkflow(
 
     const workflow_cfg = workflowConfigWithLaunchModifiers(cfg, launch_modifiers);
     if (!opts.create) {
-        const exit_code = try cli_ask.runPrompt(alloc, prompt, opts.auto_permission, workflow_cfg, cfg.context_registry, cfg.tool_set);
+        const exit_code = try cli_ask.runPrompt(alloc, prompt, opts.agent, workflow_cfg, cfg.context_registry, cfg.tool_set);
         return if (exit_code == 0) .handled_success else .handled_failure;
     }
 
-    const run_result = try cli_ask.runPromptCapture(alloc, prompt, opts.auto_permission, workflow_cfg, cfg.context_registry, cfg.tool_set);
+    const run_result = try cli_ask.runPromptCapture(alloc, prompt, opts.agent, workflow_cfg, cfg.context_registry, cfg.tool_set);
     defer run_result.deinit(alloc);
     if (run_result.exit_code != 0) return .handled_failure;
 
@@ -1924,23 +2358,28 @@ fn writeStderr(deps: RunDeps, text: []const u8) !void {
     try deps.write_stderr(deps.stderr_ctx, text);
 }
 
+/// Reads and stores an AI Gateway API key. `command` names the command in
+/// failure messages: `fx login` for `fx login --api-key`, `fx setup` for the
+/// deprecated spelling.
 fn runPasteSetup(
     alloc: Allocator,
     secret_store: host.SecretStore,
     deps: RunDeps,
+    command: []const u8,
 ) !bool {
     if (secret_store.isDisabled()) {
-        try writeStderr(deps, "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n");
+        try writePasteFailure(alloc, deps, command, "stored API keys are disabled by FX_DISABLE_KEYCHAIN");
         return false;
     }
     if (!deps.setup_terminal_available(deps.setup_ctx)) {
-        try writeStderr(deps, "fx setup: an interactive terminal is required to paste an API key\n");
+        try writePasteFailure(alloc, deps, command, "an interactive terminal is required to paste an API key");
         return false;
     }
 
     try writeStderr(deps, "Paste AI Gateway API key (input hidden): ");
     const stored_interactively = secret_store.storeInteractive() catch {
-        try writeStderr(deps, "\nfx setup: API key was not saved\n");
+        try writeStderr(deps, "\n");
+        try writePasteFailure(alloc, deps, command, "API key was not saved");
         return false;
     };
     if (!stored_interactively) {
@@ -1950,13 +2389,14 @@ fn runPasteSetup(
             deps.write_stderr,
             deps.stderr_ctx,
         ) catch {
-            try writeStderr(deps, "\nfx setup: API key was not saved\n");
+            try writeStderr(deps, "\n");
+            try writePasteFailure(alloc, deps, command, "API key was not saved");
             return false;
         };
         defer secret.zeroAndFree(alloc, key);
         try writeStderr(deps, "\n");
         secret_store.store(alloc, key) catch {
-            try writeStderr(deps, "fx setup: API key was not saved\n");
+            try writePasteFailure(alloc, deps, command, "API key was not saved");
             return false;
         };
     }
@@ -1968,6 +2408,12 @@ fn runPasteSetup(
     defer alloc.free(message);
     try writeStdout(deps, message);
     return true;
+}
+
+fn writePasteFailure(alloc: Allocator, deps: RunDeps, command: []const u8, problem: []const u8) !void {
+    const message = try alloc.print("{s}: {s}\n", .{ command, problem });
+    defer alloc.free(message);
+    try writeStderr(deps, message);
 }
 
 fn setupTerminalAvailableDefault(_: ?*anyopaque) bool {
@@ -2073,14 +2519,19 @@ fn writeConfigDiagnostics(
     diagnostics: []const config_runtime.ConfigDiagnostic,
 ) !void {
     for (diagnostics) |diagnostic| {
-        if (!diagnostic.reportAtStartup()) continue;
+        const note = diagnostic.note();
+        if (note == null and !diagnostic.reportAtStartup()) continue;
         var notice_writer: std.Io.Writer.Allocating = .init(alloc);
         defer notice_writer.deinit();
-        try notice_writer.writer.print(
-            "fx: config {s}: {s}",
-            .{ @tagName(diagnostic.layer), @tagName(diagnostic.cause) },
-        );
-        try config_runtime.writeDiagnosticMetadata(&notice_writer.writer, diagnostic);
+        if (note) |text| {
+            try notice_writer.writer.print("fx: note: {s}", .{text});
+        } else {
+            try notice_writer.writer.print(
+                "fx: config {s}: {s}",
+                .{ @tagName(diagnostic.layer), @tagName(diagnostic.cause) },
+            );
+            try config_runtime.writeDiagnosticMetadata(&notice_writer.writer, diagnostic);
+        }
         try notice_writer.writer.writeByte('\n');
         const notice = try notice_writer.toOwnedSlice();
         defer alloc.free(notice);
@@ -2254,7 +2705,8 @@ fn runTopLevelMcp(
 
 /// `fx mcp`: the verbs `/mcp` shares.
 fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
-    const home = deps.getenv(deps.env_ctx, "HOME") orelse {
+    // With HOME unset, FX_HOME alone names fx's files, so its parent serves.
+    const home = deps.getenv(deps.env_ctx, "HOME") orelse profile_paths.fxHomeParent() orelse {
         try writeStderr(deps, "fx mcp: HOME isn't set\n");
         return .handled_failure;
     };
@@ -2384,8 +2836,8 @@ fn writeMcpProfileWarning(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.print(
-        "fx: ~/.fx/mcp.json warning: {s}",
-        .{@tagName(warning.cause)},
+        "fx: {s}/mcp.json warning: {s}",
+        .{ profile_paths.displayRoot(), @tagName(warning.cause) },
     );
     if (warning.key()) |key| {
         var encoded = try text_utils.encodeTerminalSafe(alloc, key, 128);
@@ -2409,10 +2861,69 @@ fn writeUsageOrJsonError(
     args: anytype,
 ) !void {
     if (argsContainJson(args)) {
+        if (try flagProblem(alloc, usage_kind, args)) |problem| {
+            defer alloc.free(problem);
+            return writeJsonCommandFailure(alloc, deps, output_kind, err, problem);
+        }
         try writeCommandFailure(alloc, deps, output_kind, err, .json);
     } else {
+        try writeFlagFailure(alloc, deps, usage_kind, args);
         try writeTopLevelUsage(command_catalog, deps, usage_kind);
     }
+}
+
+/// The options a command's parser reads through `cli_flags`, so a usage
+/// error can say which flag was wrong. Commands with their own parser are
+/// absent.
+fn parsedOptions(kind: TopLevelKind) ?[]const command_specs.OptionDoc {
+    return switch (kind) {
+        .status, .doctor, .models, .permissions, .credits => &builtin_commands.json_only_options,
+        .slack => &command_specs.slack_options,
+        .sessions => &builtin_commands.sessions_options,
+        .login => &builtin_commands.login_options,
+        .usage => &builtin_commands.usage_options,
+        .upgrade => &builtin_commands.upgrade_options,
+        .workspace => &builtin_commands.workspace_options,
+        .config => &builtin_commands.config_parse_options,
+        .session => &builtin_commands.session_options,
+        .acp => &builtin_commands.acp_options,
+        .pr, .issue => &builtin_commands.pr_options,
+        else => null,
+    };
+}
+
+/// Writes `fx <command>: <problem>` when `flagProblem` finds one.
+fn writeFlagFailure(alloc: Allocator, deps: RunDeps, kind: TopLevelKind, args: anytype) !void {
+    const problem = try flagProblem(alloc, kind, args) orelse return;
+    defer alloc.free(problem);
+    try writeStderrLine(alloc, deps, "fx {s}: ", @tagName(kind));
+    try writeStderr(deps, problem);
+    try writeStderr(deps, "\n");
+}
+
+/// What is wrong with the flags in `args`: a malformed flag, or a value
+/// outside the range its placeholder names, such as `--limit <1-100>`.
+/// Null when the flags are fine. The caller frees the result.
+fn flagProblem(alloc: Allocator, kind: TopLevelKind, args: anytype) !?[]u8 {
+    const docs = parsedOptions(kind) orelse return null;
+    // `fx session` and `fx config` read operands that may start with a dash,
+    // such as an ID or `-5`; report what their parsers hit.
+    const parser: cli_flags.Parser = switch (kind) {
+        .session, .config => .initDashOperands(docs, args),
+        else => .init(docs, args),
+    };
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    defer writer.deinit();
+    if (cli_flags.failureOf(parser)) |failure| {
+        try failure.write(&writer.writer);
+        switch (kind) {
+            .acp, .pr, .issue => try flag_placement.writeLaunchFlagHint(&writer.writer, @tagName(kind), failure),
+            else => {},
+        }
+    } else if (!try cli_flags.writeRangeFailure(&writer.writer, parser)) {
+        return null;
+    }
+    return try writer.toOwnedSlice();
 }
 
 fn writeUsageCommandFailure(
@@ -2460,6 +2971,7 @@ fn writeWorkspaceCommandError(
             try writeStderr(deps, "\n");
             return;
         }
+        try writeFlagFailure(alloc, deps, .workspace, args);
         try writeTopLevelUsage(command_catalog, deps, .workspace);
         return;
     }
@@ -2735,10 +3247,27 @@ fn runSessionList(alloc: Allocator, deps: RunDeps, opts: SessionListOptions) !Ru
     return writeSessionList(alloc, deps, page, opts);
 }
 
+const SessionConvertFlag = enum { json };
+const session_convert_flag_ids = cli_flags.idTable(SessionConvertFlag, &builtin_commands.sessions_convert_options);
+
 fn parseSessionConvertArgs(args: []const [:0]const u8) !output_contracts.OutputFormat {
-    if (args.len == 0) return .text;
-    if (args.len == 1 and std.mem.eql(u8, args[0], "--json")) return .json;
-    return error.InvalidLocalSurfaceArgs;
+    var format: output_contracts.OutputFormat = .text;
+    var parser: cli_flags.Parser = .init(&builtin_commands.sessions_convert_options, args);
+    while (parser.next() catch return error.InvalidLocalSurfaceArgs) |item| switch (item) {
+        .positional => return error.InvalidLocalSurfaceArgs,
+        .option => |match| switch (session_convert_flag_ids[match.index].?) {
+            .json => format = .json,
+        },
+    };
+    return format;
+}
+
+test "sessions convert reads its flags through the shared parser" {
+    try std.testing.expectEqual(output_contracts.OutputFormat.text, try parseSessionConvertArgs(&.{}));
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, try parseSessionConvertArgs(&.{"--json"}));
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, try parseSessionConvertArgs(&.{ "--json", "--json" }));
+    try std.testing.expectError(error.InvalidLocalSurfaceArgs, parseSessionConvertArgs(&.{"--jsno"}));
+    try std.testing.expectError(error.InvalidLocalSurfaceArgs, parseSessionConvertArgs(&.{"extra"}));
 }
 
 /// `fx sessions convert`: converts every v1 session v2 does not hold yet,
@@ -2983,7 +3512,12 @@ fn commandFailureMessage(err: anyerror) ?[]const u8 {
         error.InvalidSessionMigrationArgs,
         error.InvalidSessionRecoveryArgs,
         error.InvalidResumeArgs,
+        error.InvalidUpgradeArgs,
+        error.InvalidConfigArgs,
+        error.InvalidSlackArguments,
         => "invalid arguments",
+        error.UnknownConfigSetting => "unknown setting",
+        error.WorkspaceConfigWrite => workspace_write_message,
         else => null,
     };
 }
@@ -3179,191 +3713,371 @@ fn writeWorkspaceModifierUsage(deps: RunDeps) !void {
     );
 }
 
-fn writeModelModifierUsage(deps: RunDeps) !void {
-    try writeStderr(
-        deps,
-        "fx: --provider, --model, --effort, --fast, --ultrafast, --provider-order, and --provider-strict apply to interactive sessions; for one-shot runs pass model flags after `fx ask`\n",
-    );
+/// For an agent-run flag before a command, says where it goes, as in
+/// `fx: put agent-run flags after the command, as in fx ask --model <id>`.
+fn writeModelModifierUsage(alloc: Allocator, deps: RunDeps, command: Command, modifiers: LaunchModifiers) !void {
+    const example = firstAgentRunFlag(modifiers);
+    const routing = modifiers.provider_order_override != null or modifiers.provider_strict_override != null;
+    const target: ?[]const u8 = switch (command) {
+        .ask => "ask",
+        .pr => "pr",
+        .issue => "issue",
+        // ACP sessions don't apply gateway provider routing.
+        .acp => if (routing) null else "acp",
+        else => null,
+    };
+    const message = if (target) |name|
+        try alloc.print("fx: put agent-run flags after the command, as in fx {s} {s}\n", .{ name, example })
+    else
+        try alloc.print("fx: agent-run flags such as {s} apply to a session and to fx ask, fx pr, fx issue, and fx acp\n", .{example[0 .. std.mem.findScalar(u8, example, ' ') orelse example.len]});
+    defer alloc.free(message);
+    try writeStderr(deps, message);
+}
+
+/// The documented spelling of the first agent-run flag set before a command.
+fn firstAgentRunFlag(modifiers: LaunchModifiers) []const u8 {
+    if (modifiers.permission_override != null) return "--permission-mode <mode>";
+    if (modifiers.provider_override != null) return "--provider <name>";
+    if (modifiers.model_override != null) return "--model <id>";
+    if (modifiers.effort_override != null) return "--effort <level>";
+    if (modifiers.fast_override) |fast| return if (fast) "--fast" else "--no-fast";
+    if (modifiers.ultrafast_override) |ultrafast| return if (ultrafast) "--ultrafast" else "--no-ultrafast";
+    if (modifiers.provider_order_override != null) return "--provider-order <a,b,...>";
+    return if (modifiers.provider_strict_override == true) "--provider-strict" else "--no-provider-strict";
 }
 
 fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
-        error.DuplicateAdditionalDirectorySuppression => "--no-additional-dirs may only be specified once",
         error.MissingModelValue => "--model requires a model id",
-        error.MissingEffortValue => "--effort requires a value",
         error.InvalidEffortValue => "--effort value is not a valid reasoning effort",
-        error.ConflictingFastFlags => "--fast and --no-fast cannot be used together",
-        error.ConflictingUltrafastFlags => "--ultrafast and --no-ultrafast cannot be used together",
-        error.MissingProviderValue => "--provider requires a provider name",
         error.InvalidProviderValue => "--provider accepts gateway, codex, grok, or a configured provider name",
-        error.MissingProviderOrderValue => "--provider-order requires a comma-separated provider list",
         error.InvalidProviderOrderValue => "--provider-order accepts comma-separated provider slugs (letters, digits, '-')",
-        error.ConflictingProviderStrictFlags => "--provider-strict and --no-provider-strict cannot be used together",
+        error.InvalidPermissionModeValue => "--permission-mode accepts ask, auto, or full-access",
         else => null,
     };
 }
 
-fn parseAcpArgs(args: []const [:0]const u8) !AcpOptions {
+const AcpFlag = enum { permission_mode, ask, auto, full_access, yolo, provider, model, effort, fast, no_fast, ultrafast, no_ultrafast, log_file };
+const acp_flag_ids = cli_flags.idTable(AcpFlag, &builtin_commands.acp_options);
+
+fn parseAcpArgs(alloc: Allocator, args: []const [:0]const u8, bad: *?BadAgentValue) !AcpOptions {
     var opts = AcpOptions{};
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--model")) {
-            if (opts.model != null or i + 1 >= args.len) return error.InvalidAcpArgs;
-            i += 1;
-            opts.model = args[i];
-        } else if (std.mem.eql(u8, args[i], "--ultrafast") or std.mem.eql(u8, args[i], "--no-ultrafast")) {
-            const enabled = std.mem.eql(u8, args[i], "--ultrafast");
-            if (opts.ultrafast_override != null and opts.ultrafast_override.? != enabled) return error.InvalidAcpArgs;
-            opts.ultrafast_override = enabled;
-        } else if (std.mem.eql(u8, args[i], "--log-file")) {
-            if (opts.log_file != null or i + 1 >= args.len) return error.InvalidAcpArgs;
-            i += 1;
-            opts.log_file = args[i];
-        } else {
-            return error.InvalidAcpArgs;
-        }
-    }
+    errdefer opts.deinit(alloc);
+    var parser: cli_flags.Parser = .init(&builtin_commands.acp_options, args);
+    while (parser.next() catch return error.InvalidAcpArgs) |item| switch (item) {
+        .positional => return error.InvalidAcpArgs,
+        .option => |match| {
+            const id = acp_flag_ids[match.index].?;
+            if (agent_run_flags.fromId(id)) |flag| {
+                try applyAgentFlag(alloc, &opts.agent, flag, &builtin_commands.acp_options, match, bad);
+                continue;
+            }
+            switch (id) {
+                .log_file => opts.log_file = match.value.?,
+                else => unreachable,
+            }
+        },
+    };
     return opts;
 }
 
-test "ACP arguments accept an explicit ultrafast override" {
-    const enabled = try parseAcpArgs(&.{
-        @constCast("--model"),
-        @constCast("provider/astra"),
-        @constCast("--ultrafast"),
-    });
-    try std.testing.expectEqualStrings("provider/astra", enabled.model.?);
-    try std.testing.expectEqual(@as(?bool, true), enabled.ultrafast_override);
+test "ACP arguments take the agent-run flags and a log file" {
+    const alloc = std.testing.allocator;
+    var bad: ?BadAgentValue = null;
+    var enabled = try parseAcpArgs(alloc, &.{ "--model", "provider/astra", "--ultrafast" }, &bad);
+    defer enabled.deinit(alloc);
+    try std.testing.expectEqualStrings("provider/astra", enabled.agent.model.?);
+    try std.testing.expectEqual(@as(?bool, true), enabled.agent.ultrafast);
 
-    const disabled = try parseAcpArgs(&.{@constCast("--no-ultrafast")});
-    try std.testing.expectEqual(@as(?bool, false), disabled.ultrafast_override);
-    try std.testing.expectError(
-        error.InvalidAcpArgs,
-        parseAcpArgs(&.{ @constCast("--ultrafast"), @constCast("--no-ultrafast") }),
-    );
+    var last = try parseAcpArgs(alloc, &.{ "--ultrafast", "--no-ultrafast", "--model=a", "--model", "b", "--effort", "high", "--fast", "--ask", "--provider", "codex", "--log-file", "/tmp/acp.log" }, &bad);
+    defer last.deinit(alloc);
+    try std.testing.expectEqual(@as(?bool, false), last.agent.ultrafast);
+    try std.testing.expectEqualStrings("b", last.agent.model.?);
+    try std.testing.expectEqualStrings("high", last.agent.effort.?.label());
+    try std.testing.expect(last.agent.fast.?);
+    try std.testing.expectEqual(types.PermissionMode.ask, last.agent.permission.?);
+    try std.testing.expectEqualStrings("codex", last.agent.provider.?.label());
+    try std.testing.expectEqualStrings("/tmp/acp.log", last.log_file.?);
+
+    try std.testing.expectError(error.InvalidAgentRunValue, parseAcpArgs(alloc, &.{ "--effort", "high effort" }, &bad));
+    try std.testing.expectEqualStrings("--effort", bad.?.flag);
+    try std.testing.expectEqualStrings("high effort", bad.?.value);
+    // ACP sessions don't apply gateway provider routing, so the flag isn't offered.
+    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(alloc, &.{ "--provider-order", "a" }, &bad));
+}
+
+test "pr and issue take the agent-run flags before their context" {
+    const alloc = std.testing.allocator;
+    var bad: ?BadAgentValue = null;
+    var opts = try parseWorkflowArgs(alloc, &.{ "--auto", "--model", "m", "--effort=low", "--provider-order", "a,b", "--create", "fix", "the", "--model", "x" }, &bad);
+    defer opts.deinit(alloc);
+    try std.testing.expectEqual(types.PermissionMode.auto, opts.agent.permission.?);
+    try std.testing.expectEqualStrings("m", opts.agent.model.?);
+    try std.testing.expectEqual(@as(usize, 2), opts.agent.provider_order.?.len);
+    try std.testing.expect(opts.create);
+    // Flags after the context are part of it.
+    try std.testing.expectEqualStrings("fix the --model x", opts.context);
+
+    try std.testing.expectError(error.InvalidAgentRunValue, parseWorkflowArgs(alloc, &.{ "--permission-mode", "sometimes" }, &bad));
+    try std.testing.expectEqualStrings("--permission-mode", bad.?.flag);
+}
+
+/// Prints the settings `fx config list` or `fx config get` asks for. `get` of a
+/// key that isn't set prints nothing and fails, as `git config get` does.
+fn runConfigSchema(alloc: Allocator, deps: RunDeps, opts: cli_config.Options) !RunResult {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try settings_schema.write(&out.writer, if (opts.project) .project else .profile);
+    try writeStdout(deps, out.written());
+    return .handled_success;
+}
+
+fn runConfig(alloc: Allocator, cfg: Config, deps: RunDeps, opts: cli_config.Options) !RunResult {
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    var paths = try config_runtime.discoverPaths(alloc, workspace_root);
+    defer paths.deinit(alloc);
+
+    var failed_file: ?[]const u8 = null;
+    var loaded = cli_config.load(alloc, paths, workspace_root, opts.scope, &failed_file) catch |err| {
+        const file = failed_file orelse return err;
+        const message = try alloc.print("{s} {s}", .{ file, cli_config.loadFailureReason(err) });
+        defer alloc.free(message);
+        if (opts.format == .json) {
+            try writeJsonCommandFailure(alloc, deps, "config", err, message);
+        } else {
+            try writeStderrLine(alloc, deps, "fx config: {s}\n", message);
+        }
+        return .handled_failure;
+    };
+    defer loaded.deinit(alloc);
+
+    // list shows what each file sets, as git config --list does. get without a
+    // scope reports the value a run uses, defaults included, so it reads the
+    // settings the runtime resolves.
+    var resolved_arena: std.heap.ArenaAllocator = .init(alloc);
+    defer resolved_arena.deinit();
+    const shown: []const settings_entries.Entry = if (opts.scope == .all and opts.key != null)
+        resolvedConfigEntries(alloc, resolved_arena.allocator(), cfg, deps, opts.format, workspace_root, loaded.entries.items) catch |err| blk: {
+            debug_trace.logf("config", "resolving settings failed err={s}; showing file values", .{@errorName(err)});
+            break :blk loaded.entries.items;
+        }
+    else
+        loaded.entries.items;
+
+    const matches: ?[]settings_entries.Entry = if (opts.key) |key|
+        try settings_entries.lookup(alloc, shown, key)
+    else
+        null;
+    defer if (matches) |found| alloc.free(found);
+    const entries = matches orelse shown;
+    const snapshot: output_contracts.ConfigSnapshot = .{
+        .entries = entries,
+        .unknown = if (opts.key == null) loaded.unknown else &.{},
+        .workspace_root = workspace_root,
+        .show_origin = opts.show_origin,
+        .value_only = opts.key != null and entries.len == 1 and std.mem.eql(u8, entries[0].key, opts.key.?),
+    };
+    if (opts.format == .text) {
+        for (snapshot.unknown) |unknown| {
+            const message = try settings_messages.formatUnknownSetting(alloc, unknown.key, unknown.file);
+            defer alloc.free(message);
+            try writeStderrLine(alloc, deps, "fx config: {s}\n", message);
+        }
+    }
+
+    // Like git config --get, a key with no value prints nothing and exits 1;
+    // JSON names the key, so a script can tell why.
+    if (opts.format == .json and opts.key != null and entries.len == 0) {
+        const message = try alloc.print("{s} isn't set", .{opts.key.?});
+        defer alloc.free(message);
+        try writeJsonCommandFailureCode(alloc, deps, "config", "ConfigKeyNotSet", message);
+        return .handled_failure;
+    }
+    const text = try snapshot.render(alloc, opts.format);
+    defer alloc.free(text);
+    try writeFormattedOutput(deps, text, opts.format);
+    return if (opts.key != null and entries.len == 0) .handled_failure else .handled_success;
+}
+
+/// The entries `fx config get` looks a key up in without a scope: each value
+/// as a run resolves it, through the same `resolveSettings` the session uses.
+fn resolvedConfigEntries(
+    alloc: Allocator,
+    arena: Allocator,
+    cfg: Config,
+    deps: RunDeps,
+    format: output_contracts.OutputFormat,
+    workspace_root: []const u8,
+    set: []const settings_entries.Entry,
+) ![]settings_entries.Entry {
+    var detailed = try config_runtime.loadMergedSettingsDetailed(alloc, workspace_root);
+    defer detailed.deinit(alloc);
+    // The same warnings fx status prints, such as a profile fx rejects, which
+    // explain a value shown as the default.
+    if (format == .text) try writeConfigDiagnostics(alloc, deps, detailed.diagnostics);
+    var state = app_lifecycle.StartupState{ .agent_step_limit = cfg.default_agent_step_limit };
+    defer state.deinit(alloc);
+    state.model_source = detailed.model_source orelse .compiled_default;
+    try app_lifecycle.resolveSettings(alloc, &state, &detailed);
+    const selection = try config_runtime.selectProviderModel(cfg.default_model, &detailed.settings, null, config_runtime.modelEnvOverride());
+    const entries = try cli_config.effectiveEntries(arena, &state, selection.provider, set);
+    // Values borrow from `state`, which is freed on return.
+    for (entries) |*entry| entry.value = try dupeJsonValue(arena, entry.value);
+    return entries;
+}
+
+fn dupeJsonValue(arena: Allocator, value: std.json.Value) !std.json.Value {
+    return switch (value) {
+        .string => |text| .{ .string = try arena.dupe(u8, text) },
+        .number_string => |text| .{ .number_string = try arena.dupe(u8, text) },
+        .array => |array| blk: {
+            var copy: std.json.Array = .init(arena);
+            for (array.items) |item| try copy.append(try dupeJsonValue(arena, item));
+            break :blk .{ .array = copy };
+        },
+        else => value,
+    };
+}
+
+const workspace_write_message = "preferences apply to every workspace, so set and unset don't take --workspace";
+
+/// Saves what `fx config set` or `fx config unset` asks for to the profile's
+/// top level and prints one line naming the key, the value, and the file.
+fn runConfigWrite(alloc: Allocator, deps: RunDeps, opts: cli_config.Options) !RunResult {
+    var problem: cli_config.WriteProblem = .none;
+    const planned = cli_config.change(opts, &problem) catch |err| {
+        const message = try cli_config.formatWriteProblem(alloc, opts.key.?, opts.value, problem, "fx config");
+        defer alloc.free(message);
+        if (opts.format == .json) {
+            try writeJsonCommandFailure(alloc, deps, "config", err, message);
+        } else {
+            try writeStderrLine(alloc, deps, "fx config: {s}\n", message);
+        }
+        return usage_failure;
+    };
+
+    var outcome = config_runtime.setUserPreferences(alloc, planned.patch) catch |err| {
+        const message = try alloc.print("failed to save {s}/settings.json: {s}", .{ profile_paths.displayRoot(), cli_config.saveFailureReason(err) });
+        defer alloc.free(message);
+        if (opts.format == .json) {
+            try writeJsonCommandFailure(alloc, deps, "config", err, message);
+        } else {
+            try writeStderrLine(alloc, deps, "fx config: {s}\n", message);
+        }
+        return .handled_failure;
+    };
+    defer outcome.deinit(alloc);
+
+    const snapshot: output_contracts.ConfigChangeSnapshot = .{
+        .unset = opts.action == .unset,
+        .key = opts.key.?,
+        .value = planned.value,
+        .changed = outcome == .committed,
+    };
+    const text = try snapshot.render(alloc, opts.format);
+    defer alloc.free(text);
+    try writeFormattedOutput(deps, text, opts.format);
+    return .handled_success;
+}
+
+fn writeStderrLine(alloc: Allocator, deps: RunDeps, comptime format: []const u8, value: []const u8) !void {
+    const line = try alloc.print(format, .{value});
+    defer alloc.free(line);
+    try writeStderr(deps, line);
 }
 
 fn parseLocalSurfaceArgs(args: []const [:0]const u8) !LocalSurfaceOptions {
     var options = LocalSurfaceOptions{};
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--json")) {
-            options.format = .json;
-            continue;
-        }
-        return error.InvalidLocalSurfaceArgs;
-    }
+    var parser: cli_flags.Parser = .init(&builtin_commands.json_only_options, args);
+    while (parser.next() catch return error.InvalidLocalSurfaceArgs) |item| switch (item) {
+        .positional => return error.InvalidLocalSurfaceArgs,
+        .option => options.format = .json,
+    };
     return options;
 }
 
-fn parseUpgradeArgs(args: []const [:0]const u8) !UpgradeOptions {
+const UpgradeFlag = enum { channel, json };
+const upgrade_flag_ids = cli_flags.idTable(UpgradeFlag, &builtin_commands.upgrade_options);
+
+/// On a `--channel` value that names no channel, sets `rejected_channel` to it,
+/// borrowed from `args`.
+fn parseUpgradeArgs(args: []const [:0]const u8, rejected_channel: *?[]const u8) !UpgradeOptions {
     var options = UpgradeOptions{};
-    var format_seen = false;
-    var channel_seen = false;
-    var index: usize = 0;
-    while (index < args.len) : (index += 1) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--json")) {
-            if (format_seen) return error.InvalidUpgradeArgs;
-            format_seen = true;
-            options.format = .json;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--channel")) {
-            if (channel_seen or index + 1 >= args.len) return error.InvalidUpgradeArgs;
-            channel_seen = true;
-            index += 1;
-            options.channel = update_target.Channel.parse(args[index]) orelse
+    var parser: cli_flags.Parser = .init(&builtin_commands.upgrade_options, args);
+    while (parser.next() catch return error.InvalidUpgradeArgs) |item| switch (item) {
+        .positional => return error.InvalidUpgradeArgs,
+        .option => |match| switch (upgrade_flag_ids[match.index].?) {
+            .channel => options.channel = update_target.Channel.parse(match.value.?) orelse {
+                rejected_channel.* = match.value.?;
                 return error.InvalidUpgradeArgs;
-            continue;
-        }
-        if (std.mem.startsWith(u8, arg, "--channel=")) {
-            if (channel_seen) return error.InvalidUpgradeArgs;
-            channel_seen = true;
-            options.channel = update_target.Channel.parse(arg["--channel=".len..]) orelse
-                return error.InvalidUpgradeArgs;
-            continue;
-        }
-        return error.InvalidUpgradeArgs;
-    }
+            },
+            .json => options.format = .json,
+        },
+    };
     return options;
 }
+
+/// The line `fx upgrade --channel` prints after saving, so the user knows the
+/// channel persists and where. Caller owns the result.
+fn channelSavedLine(
+    alloc: Allocator,
+    channel: update_target.Channel,
+    outcome: config_runtime.CommitOutcome,
+) ![]u8 {
+    return switch (outcome) {
+        .unchanged => alloc.print("Release channel is already {s}.\n", .{channel.label()}),
+        .committed => alloc.print("Release channel set to {s} in {s}/settings.json.\n", .{ channel.label(), profile_paths.displayRoot() }),
+    };
+}
+
+const SessionListFlag = enum { all, limit, cursor, json };
+const session_list_flag_ids = cli_flags.idTable(SessionListFlag, &builtin_commands.sessions_options);
 
 fn parseSessionListArgs(args: []const [:0]const u8) !SessionListOptions {
     var options = SessionListOptions{};
-    var format_seen = false;
-    var limit_seen = false;
-    var cursor_seen = false;
-    var scope_seen = false;
-    var index: usize = 0;
-    while (index < args.len) : (index += 1) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--json")) {
-            if (format_seen) return error.InvalidLocalSurfaceArgs;
-            format_seen = true;
-            options.format = .json;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--all")) {
-            if (scope_seen) return error.InvalidLocalSurfaceArgs;
-            scope_seen = true;
-            options.scope = .all_workspaces;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--limit")) {
-            if (limit_seen or index + 1 >= args.len) return error.InvalidLocalSurfaceArgs;
-            limit_seen = true;
-            index += 1;
-            options.limit = std.fmt.parseUnsigned(usize, args[index], 10) catch
-                return error.InvalidLocalSurfaceArgs;
-            if (options.limit == 0 or
-                options.limit > session_store.session_list_max_limit)
-            {
-                return error.InvalidLocalSurfaceArgs;
-            }
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--cursor")) {
-            if (cursor_seen or index + 1 >= args.len) return error.InvalidLocalSurfaceArgs;
-            cursor_seen = true;
-            index += 1;
-            options.continuation = try parseSessionListCursor(args[index]);
-            continue;
-        }
-        return error.InvalidLocalSurfaceArgs;
-    }
+    var parser: cli_flags.Parser = .init(&builtin_commands.sessions_options, args);
+    while (parser.next() catch return error.InvalidLocalSurfaceArgs) |item| switch (item) {
+        .positional => return error.InvalidLocalSurfaceArgs,
+        .option => |match| switch (session_list_flag_ids[match.index].?) {
+            .all => options.scope = .all_workspaces,
+            .limit => {
+                options.limit = std.fmt.parseUnsigned(usize, match.value.?, 10) catch
+                    return error.InvalidLocalSurfaceArgs;
+                if (options.limit == 0 or options.limit > session_store.session_list_max_limit)
+                    return error.InvalidLocalSurfaceArgs;
+            },
+            .cursor => options.continuation = try parseSessionListCursor(match.value.?),
+            .json => options.format = .json,
+        },
+    };
     return options;
 }
 
+const UsageFlag = enum { period, json };
+const usage_flag_ids = cli_flags.idTable(UsageFlag, &builtin_commands.usage_options);
+
 fn parseUsageArgs(args: []const [:0]const u8) !UsageOptions {
     var options = UsageOptions{};
-    var period_seen = false;
-    var json_seen = false;
-    var index: usize = 0;
-    while (index < args.len) : (index += 1) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--json")) {
-            if (json_seen) return error.InvalidUsageArgs;
-            json_seen = true;
-            options.format = .json;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--period")) {
-            if (period_seen or index + 1 >= args.len) return error.InvalidUsageArgs;
-            period_seen = true;
-            index += 1;
-            options.period = if (std.mem.eql(u8, args[index], "today"))
-                .today
-            else if (std.mem.eql(u8, args[index], "7d"))
-                .days_7
-            else if (std.mem.eql(u8, args[index], "month"))
-                .month
-            else
-                return error.InvalidUsageArgs;
-            continue;
-        }
-        return error.InvalidUsageArgs;
-    }
+    var parser: cli_flags.Parser = .init(&builtin_commands.usage_options, args);
+    while (parser.next() catch return error.InvalidUsageArgs) |item| switch (item) {
+        .positional => return error.InvalidUsageArgs,
+        .option => |match| switch (usage_flag_ids[match.index].?) {
+            .period => {
+                const period = match.value.?;
+                options.period = if (std.mem.eql(u8, period, "today"))
+                    .today
+                else if (std.mem.eql(u8, period, "7d"))
+                    .days_7
+                else if (std.mem.eql(u8, period, "month"))
+                    .month
+                else
+                    return error.InvalidUsageArgs;
+            },
+            .json => options.format = .json,
+        },
+    };
     return options;
 }
 
@@ -3403,16 +4117,16 @@ fn parseWorkspaceArgs(args: []const [:0]const u8) !WorkspaceOptions {
     var positional: [2][]const u8 = undefined;
     var positional_len: usize = 0;
     var options = WorkspaceOptions{};
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--json")) {
-            if (options.format == .json) return error.InvalidWorkspaceArgs;
-            options.format = .json;
-            continue;
-        }
-        if (positional_len >= positional.len) return error.InvalidWorkspaceArgs;
-        positional[positional_len] = arg;
-        positional_len += 1;
-    }
+    var parser: cli_flags.Parser = .init(&builtin_commands.workspace_options, args);
+    while (parser.next() catch return error.InvalidWorkspaceArgs) |item| switch (item) {
+        // `--json` is the only flag.
+        .option => options.format = .json,
+        .positional => |arg| {
+            if (positional_len >= positional.len) return error.InvalidWorkspaceArgs;
+            positional[positional_len] = arg;
+            positional_len += 1;
+        },
+    };
 
     if (positional_len == 0) return options;
     if (std.mem.eql(u8, positional[0], "list")) {
@@ -3437,33 +4151,55 @@ fn parseWorkspaceArgs(args: []const [:0]const u8) !WorkspaceOptions {
     return error.InvalidWorkspaceArgs;
 }
 
+const SessionFlag = enum { id, json };
+const session_flag_ids = cli_flags.idTable(SessionFlag, &builtin_commands.session_options);
+
+/// The flags and the one target shared by `fx session` and
+/// `fx session recover`. A repeated `--id` keeps its last value; two
+/// targets, or a positional target with `--id`, are an error.
+const SessionTargetArgs = struct {
+    format: output_contracts.OutputFormat = .text,
+    /// Trimmed and non-empty; null when no target was given.
+    target: ?[]const u8 = null,
+    /// The target came from `--id`, so `last` is a literal ID.
+    exact_id: bool = false,
+};
+
+fn parseSessionTargetArgs(args: []const [:0]const u8) error{InvalidSessionArgs}!SessionTargetArgs {
+    var parsed: SessionTargetArgs = .{};
+    var positional: ?[]const u8 = null;
+    var id_flag: ?[]const u8 = null;
+    var parser: cli_flags.Parser = .initDashOperands(&builtin_commands.session_options, args);
+    while (parser.next() catch return error.InvalidSessionArgs) |item| switch (item) {
+        .positional => |arg| {
+            if (positional != null) return error.InvalidSessionArgs;
+            positional = arg;
+        },
+        .option => |match| switch (session_flag_ids[match.index].?) {
+            .id => id_flag = match.value.?,
+            .json => parsed.format = .json,
+        },
+    };
+    if (positional != null and id_flag != null) return error.InvalidSessionArgs;
+    const raw = id_flag orelse positional orelse return parsed;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidSessionArgs;
+    parsed.target = trimmed;
+    parsed.exact_id = id_flag != null;
+    return parsed;
+}
+
 fn parseSessionDetailArgs(
     alloc: Allocator,
     args: []const [:0]const u8,
 ) !SessionDetailOptions {
-    var options = SessionDetailOptions{};
-    errdefer options.deinit(alloc);
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--json")) {
-            options.format = .json;
-            continue;
-        }
-        if (options.target != null) return error.InvalidSessionDetailArgs;
-        const exact_id = std.mem.eql(u8, arg, "--id");
-        if (exact_id) {
-            i += 1;
-            if (i >= args.len) return error.InvalidSessionDetailArgs;
-        }
-        const trimmed = std.mem.trim(u8, args[i], " \t\r\n");
-        if (trimmed.len == 0) return error.InvalidSessionDetailArgs;
-        if (!exact_id and std.mem.eql(u8, trimmed, "last")) {
-            options.target = .last;
-            continue;
-        }
-        options.target = .{ .id = try alloc.dupe(u8, trimmed) };
-    }
+    const parsed = parseSessionTargetArgs(args) catch return error.InvalidSessionDetailArgs;
+    var options = SessionDetailOptions{ .format = parsed.format };
+    const target = parsed.target orelse return options;
+    options.target = if (!parsed.exact_id and std.mem.eql(u8, target, "last"))
+        .last
+    else
+        .{ .id = try alloc.dupe(u8, target) };
     return options;
 }
 
@@ -3471,96 +4207,107 @@ fn parseSessionRecoveryArgs(
     alloc: Allocator,
     args: []const [:0]const u8,
 ) !SessionRecoveryOptions {
-    var format: output_contracts.OutputFormat = .text;
-    var session_id: ?[]u8 = null;
-    errdefer if (session_id) |id| alloc.free(id);
-
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--json")) {
-            format = .json;
-            continue;
-        }
-        if (session_id != null) return error.InvalidSessionRecoveryArgs;
-        const exact_id = std.mem.eql(u8, arg, "--id");
-        if (exact_id) {
-            i += 1;
-            if (i >= args.len) return error.InvalidSessionRecoveryArgs;
-        }
-        const trimmed = std.mem.trim(u8, args[i], " \t\r\n");
-        if (trimmed.len == 0) return error.InvalidSessionRecoveryArgs;
-        session_id = try alloc.dupe(u8, trimmed);
-    }
+    const parsed = parseSessionTargetArgs(args) catch return error.InvalidSessionRecoveryArgs;
+    const target = parsed.target orelse return error.InvalidSessionRecoveryArgs;
     return .{
-        .format = format,
-        .session_id = session_id orelse return error.InvalidSessionRecoveryArgs,
+        .format = parsed.format,
+        .session_id = try alloc.dupe(u8, target),
     };
 }
 
 fn parseResumeArgs(
     alloc: Allocator,
-    command_catalog: CommandCatalog,
     args: []const [:0]const u8,
     top_level_alias: bool,
 ) !ResumeTarget {
     if (args.len == 0) return .last;
 
     if (top_level_alias) {
-        if (std.mem.eql(u8, args[0], "--resume")) {
-            if (args.len == 1) return .last;
-            if (args.len != 2) return error.InvalidResumeArgs;
-            const id = std.mem.trim(u8, args[1], " \t\r\n");
-            if (id.len == 0) return error.InvalidResumeArgs;
-            if (std.mem.eql(u8, id, "last")) return .last;
-            return .{ .id = try alloc.dupe(u8, id) };
+        const flag = args[0];
+        if (std.mem.startsWith(u8, flag, resume_inline_prefix)) {
+            if (args.len != 1) return error.InvalidResumeArgs;
+            return resumeFlagTarget(alloc, flag[resume_inline_prefix.len..]);
         }
+        if (std.mem.eql(u8, flag, "--resume") or std.mem.eql(u8, flag, resume_short_flag)) {
+            return switch (args.len) {
+                1 => .pick,
+                2 => resumeFlagTarget(alloc, args[1]),
+                else => error.InvalidResumeArgs,
+            };
+        }
+        if (std.mem.eql(u8, flag, "--resume-last")) return error.RemovedResumeLast;
+        if (std.mem.startsWith(u8, flag, resume_id_alias_prefix)) return error.RemovedResumeIdAlias;
         if (args.len != 1) return error.InvalidResumeArgs;
-        if (std.mem.eql(u8, args[0], resume_picker_alias)) return .pick;
-        if (std.mem.eql(u8, args[0], "-c") or std.mem.eql(u8, args[0], "--continue")) return .remembered;
-        if (command_specs.matchesTopLevel(command_catalog, args[0], .@"resume")) return .last;
-        if (!std.mem.startsWith(u8, args[0], resume_id_alias_prefix)) return error.InvalidResumeArgs;
-        const id = args[0][resume_id_alias_prefix.len..];
-        if (id.len == 0) return error.InvalidResumeArgs;
-        return .{ .id = try alloc.dupe(u8, id) };
-    }
-
-    if (std.mem.eql(u8, args[0], "--resume")) {
-        if (args.len == 2 and std.mem.eql(u8, args[1], "--last")) return .last;
+        if (std.mem.eql(u8, flag, "-c") or std.mem.eql(u8, flag, "--continue")) return .remembered;
         return error.InvalidResumeArgs;
     }
 
-    const exact_id = std.mem.eql(u8, args[0], "--id");
-    const operand_index: usize = if (exact_id) 1 else 0;
-    if (args.len != operand_index + 1) return error.InvalidResumeArgs;
+    if (std.mem.eql(u8, args[0], "--resume")) return error.RemovedResumeLastFlag;
+    if (std.mem.eql(u8, args[0], "--id")) return error.RemovedResumeIdFlag;
+    if (args.len != 1) return error.InvalidResumeArgs;
 
-    const trimmed = std.mem.trim(u8, args[operand_index], " \t\r\n");
+    const trimmed = std.mem.trim(u8, args[0], " \t\r\n");
     if (trimmed.len == 0) return error.InvalidResumeArgs;
-    if (!exact_id and std.mem.eql(u8, trimmed, "last")) return .last;
+    if (std.mem.eql(u8, trimmed, "last")) return .last;
     return .{ .id = try alloc.dupe(u8, trimmed) };
 }
 
-fn parseWorkflowArgs(alloc: Allocator, args: []const [:0]const u8) !WorkflowOptions {
-    var auto_permission = false;
-    var create = false;
-    var start_index: usize = 0;
-    while (start_index < args.len) : (start_index += 1) {
-        if (std.mem.eql(u8, args[start_index], "--auto")) {
-            auto_permission = true;
-            continue;
-        }
-        if (std.mem.eql(u8, args[start_index], "--create")) {
-            create = true;
-            continue;
-        }
-        break;
-    }
+/// The session a `--resume` or `-r` value names: `last`, or an exact ID.
+fn resumeFlagTarget(alloc: Allocator, value: []const u8) !ResumeTarget {
+    const id = std.mem.trim(u8, value, " \t\r\n");
+    if (id.len == 0) return error.InvalidResumeArgs;
+    if (std.mem.eql(u8, id, "last")) return .last;
+    return .{ .id = try alloc.dupe(u8, id) };
+}
 
-    return .{
-        .auto_permission = auto_permission,
-        .create = create,
-        .context = try joinArgs(alloc, args[start_index..]),
+/// The hint for a removed resume spelling, or null for any other error.
+fn removedResumeHint(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.RemovedResumeLast => "fx: --resume-last was removed; use fx --resume last\n",
+        error.RemovedResumeIdAlias => "fx: --resume-<id> was removed; use fx --resume <id>\n",
+        error.RemovedResumeCommand => "fx: fx resume was removed; use fx --resume [last|<id>] or fx session resume [last|<id>]\n",
+        error.RemovedResumeIdFlag => "fx session resume: --id was removed; use fx session resume <id>\n",
+        error.RemovedResumeLastFlag => "fx session resume: --resume --last was removed; use fx session resume last\n",
+        else => null,
     };
+}
+
+const WorkflowFlag = enum { permission_mode, ask, auto, full_access, yolo, provider, model, effort, fast, no_fast, ultrafast, no_ultrafast, provider_order, provider_strict, no_provider_strict, create };
+// `fx issue` documents the same flags as `fx pr`.
+const workflow_flag_ids = cli_flags.idTable(WorkflowFlag, &builtin_commands.pr_options);
+
+/// Reads `--auto` and `--create`, then joins the rest into the context.
+fn parseWorkflowArgs(alloc: Allocator, args: []const [:0]const u8, bad: *?BadAgentValue) !WorkflowOptions {
+    var opts: WorkflowOptions = .{};
+    errdefer opts.agent.deinit(alloc);
+    var parser: cli_flags.Parser = .initPrefix(&builtin_commands.pr_options, args);
+    // Prefix mode stops at positionals, so every item is an option.
+    while (parser.next() catch return error.InvalidWorkflowArgs) |item| {
+        const id = workflow_flag_ids[item.option.index].?;
+        if (agent_run_flags.fromId(id)) |flag| {
+            try applyAgentFlag(alloc, &opts.agent, flag, &builtin_commands.pr_options, item.option, bad);
+            continue;
+        }
+        switch (id) {
+            .create => opts.create = true,
+            else => unreachable,
+        }
+    }
+    // Context starts at the first argument that isn't a flag. A dash word
+    // there is a flag this command doesn't take, such as a typo, not
+    // context: context that starts with a dash follows `--`. Words after the
+    // context starts are all context.
+    var context_start = parser.index;
+    if (context_start < args.len) {
+        const arg = args[context_start];
+        if (std.mem.eql(u8, arg, "--")) {
+            context_start += 1;
+        } else if (arg.len >= 2 and arg[0] == '-') {
+            return error.InvalidWorkflowArgs;
+        }
+    }
+    opts.context = try joinArgs(alloc, args[context_start..]);
+    return opts;
 }
 
 fn joinArgs(alloc: Allocator, args: []const [:0]const u8) ![]u8 {
@@ -3580,8 +4327,43 @@ fn isVersionFlag(arg: []const u8) bool {
 }
 
 fn testCommandCatalog() CommandCatalog {
-    const builtin_commands = @import("../../builtins/commands.zig");
     return builtin_commands.top_level_registry;
+}
+
+test "launch flags may follow the resume word and its target" {
+    const alloc = std.testing.allocator;
+    const command_catalog = testCommandCatalog();
+    const Case = struct { args: []const [:0]const u8, target: std.meta.Tag(ResumeTarget), model: ?[]const u8 = null, fast: ?bool = null, prompt: ?[]const u8 = null };
+    const cases = [_]Case{
+        .{ .args = &.{ "-c", "--model", "x" }, .target = .remembered, .model = "x" },
+        .{ .args = &.{ "--continue", "--fast" }, .target = .remembered, .fast = true },
+        .{ .args = &.{ "--resume", "last", "--model", "x" }, .target = .last, .model = "x" },
+        .{ .args = &.{ "-r", "--model", "x" }, .target = .pick, .model = "x" },
+        .{ .args = &.{ "-c", "hello world", "--model", "x" }, .target = .remembered, .model = "x", .prompt = "hello world" },
+        .{ .args = &.{ "--model", "y", "-c", "--model", "x" }, .target = .remembered, .model = "x" },
+        .{ .args = &.{ "session", "resume", "last", "--fast" }, .target = .last, .fast = true },
+    };
+    for (cases) |case| {
+        var parsed = try parseInteractiveLaunch(alloc, case.args, command_catalog);
+        switch (parsed) {
+            .interactive => |*launch| {
+                defer launch.deinit(alloc);
+                try std.testing.expectEqual(case.target, std.meta.activeTag(launch.requested_resume.?));
+                if (case.model) |model| try std.testing.expectEqualStrings(model, launch.modifiers.model_override.?);
+                if (case.fast) |fast| try std.testing.expectEqual(fast, launch.modifiers.fast_override.?);
+                if (case.prompt) |prompt| try std.testing.expectEqualStrings(prompt, launch.initial_prompt.?) else try std.testing.expect(launch.initial_prompt == null);
+            },
+            .noninteractive => |*value| {
+                value.deinit(alloc);
+                return error.TestExpectedInteractiveLaunch;
+            },
+        }
+    }
+
+    const bad: []const [:0]const u8 = &.{ "-c", "--bogus" };
+    try std.testing.expectError(error.InvalidFlag, parseInteractiveLaunch(alloc, bad, command_catalog));
+    try std.testing.expectEqualStrings("--bogus", launchFlagFailure(bad).?.unknown.flag);
+    try std.testing.expectError(error.InvalidResumeArgs, parseInteractiveLaunch(alloc, &.{ "session", "resume", "last", "hello" }, command_catalog));
 }
 
 test "parse recognizes every top-level command and preserves unknown commands" {
@@ -3707,12 +4489,16 @@ test "usage arguments accept today, 7d or 30d and one JSON flag" {
         &.{@constCast("--period")},
         &.{ @constCast("--period"), @constCast("session") },
         &.{ @constCast("--period"), @constCast("24h") },
-        &.{ @constCast("--period"), @constCast("today"), @constCast("--period"), @constCast("7d") },
-        &.{ @constCast("--json"), @constCast("--json") },
+        &.{@constCast("--period=")},
+        &.{@constCast("--json=1")},
         &.{@constCast("30d")},
     }) |invalid| {
         try std.testing.expectError(error.InvalidUsageArgs, parseUsageArgs(invalid));
     }
+
+    const last = try parseUsageArgs(&.{ "--period", "today", "--period=7d", "--json", "--json" });
+    try std.testing.expectEqual(usage.Period.days_7, last.period);
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, last.format);
 }
 
 test "global launch modifiers preserve repeatable context limits before the command" {
@@ -3736,7 +4522,7 @@ test "global launch modifiers preserve repeatable context limits before the comm
 
 test "global context limits reject missing values and stop at the command" {
     try std.testing.expectError(
-        error.MissingContextLimitValue,
+        error.InvalidFlag,
         parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--context-limit")}),
     );
     var parsed = try parseGlobalLaunchArgs(std.testing.allocator, &.{
@@ -3832,7 +4618,7 @@ test "global launch modifiers accept configured provider names" {
 
 test "global model overrides fail closed when malformed" {
     try std.testing.expectError(
-        error.MissingProviderValue,
+        error.InvalidFlag,
         parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--provider")}),
     );
     try std.testing.expectError(
@@ -3840,7 +4626,7 @@ test "global model overrides fail closed when malformed" {
         parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--provider"), @constCast("bogus name") }),
     );
     try std.testing.expectError(
-        error.MissingModelValue,
+        error.InvalidFlag,
         parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--model")}),
     );
     try std.testing.expectError(
@@ -3848,7 +4634,7 @@ test "global model overrides fail closed when malformed" {
         parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--model=")}),
     );
     try std.testing.expectError(
-        error.MissingEffortValue,
+        error.InvalidFlag,
         parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--effort")}),
     );
     try std.testing.expectError(
@@ -3856,15 +4642,7 @@ test "global model overrides fail closed when malformed" {
         parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--effort=not an effort")}),
     );
     try std.testing.expectError(
-        error.ConflictingFastFlags,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--fast"), @constCast("--no-fast") }),
-    );
-    try std.testing.expectError(
-        error.ConflictingFastFlags,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--no-fast"), @constCast("--fast") }),
-    );
-    try std.testing.expectError(
-        error.MissingProviderOrderValue,
+        error.InvalidFlag,
         parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--provider-order")}),
     );
     try std.testing.expectError(
@@ -3876,9 +4654,50 @@ test "global model overrides fail closed when malformed" {
         parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--provider-order=azure,azure")}),
     );
     try std.testing.expectError(
-        error.ConflictingProviderStrictFlags,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--provider-strict"), @constCast("--no-provider-strict") }),
+        error.InvalidPermissionModeValue,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--permission-mode=never")}),
     );
+    try std.testing.expectError(
+        error.InvalidFlag,
+        parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--fast=1")}),
+    );
+    try std.testing.expectEqualStrings("--model", launchFlagFailure(&.{@constCast("--model")}).?.missing_value);
+    try std.testing.expectEqualStrings("--fast", launchFlagFailure(&.{@constCast("--fast=1")}).?.unexpected_value);
+    try std.testing.expect(launchFlagFailure(&.{ @constCast("--fast"), @constCast("ask") }) == null);
+}
+
+test "global launch flags let the last one win" {
+    const cases = [_]struct {
+        args: []const [:0]const u8,
+        fast: ?bool = null,
+        ultrafast: ?bool = null,
+        strict: ?bool = null,
+        permission: ?types.PermissionMode = null,
+    }{
+        .{ .args = &.{ "--fast", "--no-fast" }, .fast = false, .ultrafast = false },
+        .{ .args = &.{ "--no-fast", "--fast" }, .fast = true, .ultrafast = false },
+        .{ .args = &.{ "--ultrafast", "--fast" }, .fast = true, .ultrafast = false },
+        .{ .args = &.{ "--fast", "--ultrafast" }, .fast = false, .ultrafast = true },
+        .{ .args = &.{ "--provider-strict", "--no-provider-strict" }, .strict = false },
+        .{ .args = &.{ "--ask", "--full-access" }, .permission = .yolo },
+        .{ .args = &.{ "--yolo", "--permission-mode", "auto" }, .permission = .auto },
+        .{ .args = &.{ "--permission-mode=full-access", "--ask" }, .permission = .ask },
+    };
+    for (cases) |case| {
+        var parsed = try parseGlobalLaunchArgs(std.testing.allocator, case.args);
+        defer parsed.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.fast, parsed.modifiers.fast_override);
+        try std.testing.expectEqual(case.ultrafast, parsed.modifiers.ultrafast_override);
+        try std.testing.expectEqual(case.strict, parsed.modifiers.provider_strict_override);
+        try std.testing.expectEqual(case.permission, parsed.modifiers.permission_override);
+        try std.testing.expectEqual(@as(usize, 0), parsed.remaining.len);
+    }
+
+    var repeated = try parseGlobalLaunchArgs(std.testing.allocator, &.{ "--model=a", "--model", "b", "--no-additional-dirs", "--no-additional-dirs", "-c" });
+    defer repeated.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("b", repeated.modifiers.model_override.?);
+    try std.testing.expect(repeated.modifiers.saved_directories_suppressed);
+    try std.testing.expectEqualStrings("-c", repeated.remaining[0]);
 }
 
 test "argsAfterGlobalLaunchArgs skips provider routing flags" {
@@ -3902,36 +4721,27 @@ test "argsAfterGlobalLaunchArgs skips provider routing flags" {
 
 test "additional directory flags fail closed when malformed" {
     try std.testing.expectError(
-        error.MissingAddDirectoryValue,
+        error.InvalidFlag,
         parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--add-dir")}),
     );
     try std.testing.expectError(
         error.MissingAddDirectoryValue,
         parseGlobalLaunchArgs(std.testing.allocator, &.{@constCast("--add-dir=")}),
     );
-    try std.testing.expectError(
-        error.DuplicateAdditionalDirectorySuppression,
-        parseGlobalLaunchArgs(std.testing.allocator, &.{ @constCast("--no-additional-dirs"), @constCast("--no-additional-dirs") }),
-    );
 }
 
 test "parse acp args extracts known flags and rejects invalid arguments" {
-    const opts = try parseAcpArgs(&.{
-        @constCast("--model"),
-        @constCast("openai/gpt-4o"),
-        @constCast("--log-file"),
-        @constCast("/tmp/fx.log"),
-    });
-    try std.testing.expectEqualStrings("openai/gpt-4o", opts.model.?);
+    const alloc = std.testing.allocator;
+    var bad: ?BadAgentValue = null;
+    var opts = try parseAcpArgs(alloc, &.{ "--model", "openai/gpt-4o", "--log-file", "/tmp/fx.log" }, &bad);
+    defer opts.deinit(alloc);
+    try std.testing.expectEqualStrings("openai/gpt-4o", opts.agent.model.?);
     try std.testing.expectEqualStrings("/tmp/fx.log", opts.log_file.?);
 
-    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--unknown")}));
-    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--model")}));
-    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(&.{@constCast("--log-file")}));
-    try std.testing.expectError(
-        error.InvalidAcpArgs,
-        parseAcpArgs(&.{ @constCast("--model"), @constCast("first"), @constCast("--model"), @constCast("second") }),
-    );
+    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(alloc, &.{"--unknown"}, &bad));
+    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(alloc, &.{"--model"}, &bad));
+    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(alloc, &.{"--log-file"}, &bad));
+    try std.testing.expectError(error.InvalidAcpArgs, parseAcpArgs(alloc, &.{ "--model", "first", "stray" }, &bad));
 }
 
 test "ACP command routes parsed options and launch config through the injected runner" {
@@ -4043,7 +4853,8 @@ test "parse local surface args accepts only json" {
 }
 
 test "parse upgrade args accepts a remembered release channel" {
-    const defaults = try parseUpgradeArgs(&.{});
+    var rejected: ?[]const u8 = null;
+    const defaults = try parseUpgradeArgs(&.{}, &rejected);
     try std.testing.expectEqual(output_contracts.OutputFormat.text, defaults.format);
     try std.testing.expect(defaults.channel == null);
 
@@ -4051,21 +4862,71 @@ test "parse upgrade args accepts a remembered release channel" {
         @constCast("--channel"),
         @constCast("dev"),
         @constCast("--json"),
-    });
+    }, &rejected);
     try std.testing.expectEqual(output_contracts.OutputFormat.json, selected.format);
     try std.testing.expectEqual(update_target.Channel.dev, selected.channel.?);
 
-    const stable = try parseUpgradeArgs(&.{@constCast("--channel=stable")});
+    const stable = try parseUpgradeArgs(&.{@constCast("--channel=stable")}, &rejected);
     try std.testing.expectEqual(update_target.Channel.stable, stable.channel.?);
+    try std.testing.expect(rejected == null);
 
     try std.testing.expectError(
         error.InvalidUpgradeArgs,
-        parseUpgradeArgs(&.{ @constCast("--channel"), @constCast("nightly") }),
+        parseUpgradeArgs(&.{ @constCast("--channel"), @constCast("nightly") }, &rejected),
     );
-    try std.testing.expectError(
-        error.InvalidUpgradeArgs,
-        parseUpgradeArgs(&.{ @constCast("--channel=dev"), @constCast("--channel=stable") }),
+    try std.testing.expectEqualStrings("nightly", rejected.?);
+
+    rejected = null;
+    const last = try parseUpgradeArgs(&.{ "--channel=dev", "--channel", "stable" }, &rejected);
+    try std.testing.expectEqual(update_target.Channel.stable, last.channel.?);
+}
+
+test "upgrade channel saved line says whether the file changed" {
+    const alloc = std.testing.allocator;
+    const set = try channelSavedLine(alloc, .dev, .{ .committed = .{ .scope = .user } });
+    defer alloc.free(set);
+    try std.testing.expectEqualStrings("Release channel set to dev in ~/.fx/settings.json.\n", set);
+
+    const same = try channelSavedLine(alloc, .stable, .unchanged);
+    defer alloc.free(same);
+    try std.testing.expectEqualStrings("Release channel is already stable.\n", same);
+}
+
+test "runIfRequested names an upgrade channel that does not exist" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("upgrade"), @constCast("--channel=nightly") },
+        testConfig(),
+        capture.deps(),
     );
+    try std.testing.expectEqual(usage_failure, result);
+    try std.testing.expectEqualStrings("", capture.stdout.written());
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        capture.stderr.written(),
+        "fx upgrade: invalid value for --channel: nightly\nusage: fx upgrade",
+    ));
+}
+
+test "runIfRequested reports bad upgrade arguments as json with --json" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("upgrade"), @constCast("--json"), @constCast("--channel=nightly") },
+        testConfig(),
+        capture.deps(),
+    );
+    try std.testing.expectEqual(usage_failure, result);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"upgrade\",\"error\":\"invalid arguments\",\"code\":\"InvalidUpgradeArgs\"}\n",
+        capture.stdout.written(),
+    );
+    try std.testing.expectEqualStrings("", capture.stderr.written());
 }
 
 test "parse session list args supports bounded canonical pagination" {
@@ -4088,10 +4949,9 @@ test "parse session list args supports bounded canonical pagination" {
     try std.testing.expectEqual(@as(i64, 20), paged.continuation.?.updated_at_ms);
     try std.testing.expectEqualStrings("session-a", paged.continuation.?.id);
 
-    try std.testing.expectError(
-        error.InvalidLocalSurfaceArgs,
-        parseSessionListArgs(&.{ @constCast("--all"), @constCast("--all") }),
-    );
+    const repeated = try parseSessionListArgs(&.{ "--all", "--all", "--limit=5", "--limit", "3" });
+    try std.testing.expectEqual(session_store.SessionListScope.all_workspaces, repeated.scope);
+    try std.testing.expectEqual(@as(usize, 3), repeated.limit);
     try std.testing.expectError(
         error.InvalidLocalSurfaceArgs,
         parseSessionListArgs(&.{ @constCast("--limit"), @constCast("0") }),
@@ -4099,10 +4959,6 @@ test "parse session list args supports bounded canonical pagination" {
     try std.testing.expectError(
         error.InvalidLocalSurfaceArgs,
         parseSessionListArgs(&.{ @constCast("--limit"), @constCast("101") }),
-    );
-    try std.testing.expectError(
-        error.InvalidLocalSurfaceArgs,
-        parseSessionListArgs(&.{ @constCast("--limit"), @constCast("2"), @constCast("--limit"), @constCast("3") }),
     );
     try std.testing.expectError(
         error.InvalidLocalSurfaceArgs,
@@ -4137,6 +4993,35 @@ test "parse session detail args owns string ids and frees through deinit" {
 
     try std.testing.expectError(error.InvalidSessionDetailArgs, parseSessionDetailArgs(std.testing.allocator, &.{ @constCast("a"), @constCast("b") }));
     try std.testing.expectError(error.InvalidSessionDetailArgs, parseSessionDetailArgs(std.testing.allocator, &.{@constCast("")}));
+}
+
+test "session target flags keep the last --id and reject two targets" {
+    var repeated = try parseSessionDetailArgs(std.testing.allocator, &.{ "--id=a", "--id", "last", "--json" });
+    defer repeated.deinit(std.testing.allocator);
+    switch (repeated.target.?) {
+        .id => |value| try std.testing.expectEqualStrings("last", value),
+        else => return error.TestExpectedEqual,
+    }
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, repeated.format);
+
+    try std.testing.expectError(error.InvalidSessionDetailArgs, parseSessionDetailArgs(std.testing.allocator, &.{ "last", "--id", "a" }));
+}
+
+test "session targets accept a generated id that starts with a dash" {
+    const alloc = std.testing.allocator;
+    const id = "-_u88j00skyI";
+
+    var detail = try parseSessionDetailArgs(alloc, &.{ "--json", id });
+    defer detail.deinit(alloc);
+    try std.testing.expectEqualStrings(id, detail.target.?.id);
+
+    var recovery = try parseSessionRecoveryArgs(alloc, &.{ id, "--json" });
+    defer recovery.deinit(alloc);
+    try std.testing.expectEqualStrings(id, recovery.session_id);
+    try std.testing.expectEqual(output_contracts.OutputFormat.json, recovery.format);
+
+    try std.testing.expectError(error.InvalidSessionRecoveryArgs, parseSessionRecoveryArgs(alloc, &.{ id, "--jsno" }));
+    try std.testing.expectError(error.InvalidSessionDetailArgs, parseSessionDetailArgs(alloc, &.{ id, "-other" }));
 }
 
 test "parse session detail args accepts explicit id flag" {
@@ -4212,41 +5097,38 @@ test "parse session recovery args accepts exact ids and rejects ambiguity" {
 }
 
 test "parse resume args defaults to last owns ids and rejects invalid input" {
-    const command_catalog = testCommandCatalog();
-    const implicit = try parseResumeArgs(std.testing.allocator, command_catalog, &.{}, false);
+    const implicit = try parseResumeArgs(std.testing.allocator, &.{}, false);
     try std.testing.expectEqual(ResumeTarget.last, implicit);
 
-    const explicit = try parseResumeArgs(std.testing.allocator, command_catalog, &.{@constCast("last")}, false);
+    const explicit = try parseResumeArgs(std.testing.allocator, &.{@constCast("last")}, false);
     try std.testing.expectEqual(ResumeTarget.last, explicit);
 
-    var target = try parseResumeArgs(std.testing.allocator, command_catalog, &.{@constCast(" session-123 ")}, false);
+    var target = try parseResumeArgs(std.testing.allocator, &.{@constCast(" session-123 ")}, false);
     defer target.deinit(std.testing.allocator);
     switch (target) {
         .id => |value| try std.testing.expectEqualStrings("session-123", value),
         else => return error.TestExpectedEqual,
     }
 
-    try std.testing.expectError(error.InvalidResumeArgs, parseResumeArgs(std.testing.allocator, command_catalog, &.{ @constCast("a"), @constCast("b") }, false));
-    try std.testing.expectError(error.InvalidResumeArgs, parseResumeArgs(std.testing.allocator, command_catalog, &.{@constCast("   ")}, false));
+    try std.testing.expectError(error.InvalidResumeArgs, parseResumeArgs(std.testing.allocator, &.{ @constCast("a"), @constCast("b") }, false));
+    try std.testing.expectError(error.InvalidResumeArgs, parseResumeArgs(std.testing.allocator, &.{@constCast("   ")}, false));
 }
 
-test "parse resume args accepts explicit id flag" {
-    const command_catalog = testCommandCatalog();
-    var target = try parseResumeArgs(std.testing.allocator, command_catalog, &.{
-        @constCast("--id"),
-        @constCast("release.2026.06"),
-    }, false);
-    defer target.deinit(std.testing.allocator);
-
-    switch (target) {
-        .remembered, .pick, .last => return error.TestExpectedExactResumeId,
-        .id => |id| try std.testing.expectEqualStrings("release.2026.06", id),
+test "removed resume spellings fail with a hint" {
+    const cases = [_]struct { args: []const [:0]const u8, top_level_alias: bool, err: anyerror }{
+        .{ .args = &.{ "--id", "release.2026.06" }, .top_level_alias = false, .err = error.RemovedResumeIdFlag },
+        .{ .args = &.{ "--resume", "--last" }, .top_level_alias = false, .err = error.RemovedResumeLastFlag },
+        .{ .args = &.{"--resume-last"}, .top_level_alias = true, .err = error.RemovedResumeLast },
+        .{ .args = &.{"--resume-session.123"}, .top_level_alias = true, .err = error.RemovedResumeIdAlias },
+    };
+    for (cases) |case| {
+        try std.testing.expectError(case.err, parseResumeArgs(std.testing.allocator, case.args, case.top_level_alias));
+        try std.testing.expect(removedResumeHint(case.err) != null);
     }
 }
 
 test "parse resume args accepts an operand on the top-level resume flag" {
-    const command_catalog = testCommandCatalog();
-    var target = try parseResumeArgs(std.testing.allocator, command_catalog, &.{
+    var target = try parseResumeArgs(std.testing.allocator, &.{
         @constCast("--resume"),
         @constCast("session-123"),
     }, true);
@@ -4257,25 +5139,11 @@ test "parse resume args accepts an operand on the top-level resume flag" {
         .id => |id| try std.testing.expectEqualStrings("session-123", id),
     }
 
-    const latest = try parseResumeArgs(std.testing.allocator, command_catalog, &.{
+    const latest = try parseResumeArgs(std.testing.allocator, &.{
         @constCast("--resume"),
         @constCast("last"),
     }, true);
     try std.testing.expectEqual(ResumeTarget.last, latest);
-}
-
-test "parse resume args treats last after id flag as exact id" {
-    const command_catalog = testCommandCatalog();
-    var target = try parseResumeArgs(std.testing.allocator, command_catalog, &.{
-        @constCast("--id"),
-        @constCast("last"),
-    }, false);
-    defer target.deinit(std.testing.allocator);
-
-    switch (target) {
-        .remembered, .pick, .last => return error.TestExpectedExactResumeId,
-        .id => |id| try std.testing.expectEqualStrings("last", id),
-    }
 }
 
 test "parseInteractiveLaunch accepts legacy and revision-bearing upgrade relaunches" {
@@ -4334,11 +5202,13 @@ test "parseInteractiveLaunch shares native resume grammar" {
         args: []const [:0]const u8,
         expected_id: ?[]const u8,
     }{
-        .{ .args = &.{@constCast("--resume")}, .expected_id = null },
         .{ .args = &.{ @constCast("--resume"), @constCast("last") }, .expected_id = null },
         .{ .args = &.{ @constCast("--resume"), @constCast("session-123") }, .expected_id = "session-123" },
+        .{ .args = &.{@constCast("--resume=session-123")}, .expected_id = "session-123" },
+        .{ .args = &.{ @constCast("-r"), @constCast("last") }, .expected_id = null },
+        .{ .args = &.{ @constCast("-r"), @constCast("session-123") }, .expected_id = "session-123" },
         .{ .args = &.{ @constCast("session"), @constCast("resume"), @constCast("last") }, .expected_id = null },
-        .{ .args = &.{ @constCast("session"), @constCast("resume"), @constCast("--id"), @constCast("session.v3") }, .expected_id = "session.v3" },
+        .{ .args = &.{ @constCast("session"), @constCast("resume"), @constCast("session.v3") }, .expected_id = "session.v3" },
     };
     for (cases) |case| {
         const parsed = try parseInteractiveLaunch(alloc, case.args, command_catalog);
@@ -4364,12 +5234,12 @@ test "parseInteractiveLaunch shares native resume grammar" {
         error.InvalidResumeArgs,
         parseInteractiveLaunch(
             alloc,
-            &.{ @constCast("--resume"), @constCast("one"), @constCast("two") },
+            &.{ @constCast("--resume"), @constCast("one"), @constCast("a prompt"), @constCast("three") },
             command_catalog,
         ),
     );
     try std.testing.expectError(
-        error.MissingAddDirectoryValue,
+        error.InvalidFlag,
         parseInteractiveLaunch(alloc, &.{@constCast("--add-dir")}, command_catalog),
     );
 }
@@ -4397,30 +5267,34 @@ test "workflow drafts come only from the completed final response" {
 }
 
 test "parse workflow args consumes leading flags and joins remaining context exactly" {
-    var opts = try parseWorkflowArgs(std.testing.allocator, &.{
-        @constCast("--auto"),
-        @constCast("--create"),
-        @constCast("ready"),
-        @constCast("for"),
-        @constCast("review"),
-    });
+    var bad: ?BadAgentValue = null;
+    var opts = try parseWorkflowArgs(std.testing.allocator, &.{ "--auto", "--create", "ready", "for", "review" }, &bad);
     defer opts.deinit(std.testing.allocator);
-    try std.testing.expect(opts.auto_permission);
+    try std.testing.expectEqual(types.PermissionMode.auto, opts.agent.permission.?);
     try std.testing.expect(opts.create);
     try std.testing.expectEqualStrings("ready for review", opts.context);
 
-    var later_flag = try parseWorkflowArgs(std.testing.allocator, &.{
-        @constCast("context"),
-        @constCast("--auto"),
-    });
+    var later_flag = try parseWorkflowArgs(std.testing.allocator, &.{ "context", "--auto" }, &bad);
     defer later_flag.deinit(std.testing.allocator);
-    try std.testing.expect(!later_flag.auto_permission);
+    try std.testing.expect(later_flag.agent.permission == null);
     try std.testing.expect(!later_flag.create);
     try std.testing.expectEqualStrings("context --auto", later_flag.context);
 
-    var empty = try parseWorkflowArgs(std.testing.allocator, &.{});
+    var empty = try parseWorkflowArgs(std.testing.allocator, &.{}, &bad);
     defer empty.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("", empty.context);
+}
+
+test "pr and issue reject a flag they don't take instead of sending it as context" {
+    var bad: ?BadAgentValue = null;
+    try std.testing.expectError(error.InvalidWorkflowArgs, parseWorkflowArgs(std.testing.allocator, &.{ "--modle", "x" }, &bad));
+    try std.testing.expectError(error.InvalidWorkflowArgs, parseWorkflowArgs(std.testing.allocator, &.{ "--auto", "--add-dir", "/tmp" }, &bad));
+    try std.testing.expectError(error.InvalidWorkflowArgs, parseWorkflowArgs(std.testing.allocator, &.{ "--config", "fast_mode=true" }, &bad));
+
+    var dashed = try parseWorkflowArgs(std.testing.allocator, &.{ "--create", "--", "--verbose", "is", "gone" }, &bad);
+    defer dashed.deinit(std.testing.allocator);
+    try std.testing.expect(dashed.create);
+    try std.testing.expectEqualStrings("--verbose is gone", dashed.context);
 }
 
 test "runIfRequested help writes top-level help" {
@@ -4493,7 +5367,7 @@ test "workspace launch modifiers still reject unsupported local command help" {
         testConfig(),
         deps,
     );
-    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqual(usage_failure, result);
     try std.testing.expectEqualStrings("", capture.stdout.written());
     try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "only supported for interactive, resume, ask, ACP, PR, and issue launches") != null);
 }
@@ -4505,11 +5379,15 @@ test "global workspace launch option errors use user-facing copy" {
     }{
         .{
             .args = &.{@constCast("--add-dir")},
+            .expected = "fx: --add-dir needs a value\n",
+        },
+        .{
+            .args = &.{@constCast("--add-dir=")},
             .expected = "fx: --add-dir requires a directory path\n",
         },
         .{
-            .args = &.{ @constCast("--no-additional-dirs"), @constCast("--no-additional-dirs") },
-            .expected = "fx: --no-additional-dirs may only be specified once\n",
+            .args = &.{@constCast("--fast=on")},
+            .expected = "fx: --fast doesn't take a value\n",
         },
     };
 
@@ -4519,7 +5397,7 @@ test "global workspace launch option errors use user-facing copy" {
         const deps = capture.deps();
 
         const result = try runIfRequestedWithDeps(std.testing.allocator, case.args, testConfig(), deps);
-        try std.testing.expectEqual(RunResult.handled_failure, result);
+        try std.testing.expectEqual(usage_failure, result);
         try std.testing.expectEqualStrings("", capture.stdout.written());
         try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), case.expected));
         try std.testing.expect(std.mem.endsWith(u8, capture.stderr.written(), "<command>\n"));
@@ -4554,7 +5432,7 @@ test "runIfRequested version flags reject extra args" {
         defer capture.deinit();
 
         const result = try runIfRequestedWithDeps(std.testing.allocator, args, testConfig(), capture.deps());
-        try std.testing.expectEqual(RunResult.handled_failure, result);
+        try std.testing.expectEqual(usage_failure, result);
         try std.testing.expectEqualStrings("", capture.stdout.written());
         try std.testing.expectEqualStrings("usage: fx --version\n", capture.stderr.written());
     }
@@ -4620,9 +5498,51 @@ test "setup preserves the disabled secret-store failure" {
     try std.testing.expectEqual(@as(usize, 0), capture.setup_store_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.setup_read_calls);
     try std.testing.expectEqualStrings(
-        "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n",
+        "fx setup is deprecated and stops working in fx 0.0.17; use fx login vercel --api-key\n" ++
+            "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n",
         capture.stderr.written(),
     );
+}
+
+test "login --api-key stores a pasted key like setup, without the deprecation warning" {
+    for ([_][]const [:0]const u8{
+        &.{"--api-key"},
+        &.{ "vercel", "--api-key" },
+        &.{ "--api-key", "vercel" },
+    }) |rest| {
+        var capture = CaptureOutput.init(std.testing.allocator);
+        defer capture.deinit();
+        var cfg = testConfig();
+        cfg.secret_store = capture.secretStore();
+        var argv: [3][:0]const u8 = undefined;
+        argv[0] = "login";
+        @memcpy(argv[1 .. rest.len + 1], rest);
+
+        const result = try runIfRequestedWithDeps(std.testing.allocator, argv[0 .. rest.len + 1], cfg, capture.deps());
+        try std.testing.expectEqual(RunResult.handled_success, result);
+        try std.testing.expectEqual(@as(usize, 1), capture.setup_store_calls);
+        try std.testing.expect(capture.setup_value_matched);
+        try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "deprecated") == null);
+        try std.testing.expect(std.mem.find(u8, capture.stdout.written(), cfg.secret_store.backend_label) != null);
+    }
+
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+    capture.setup_store_disabled = true;
+    var cfg = testConfig();
+    cfg.secret_store = capture.secretStore();
+    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ "login", "--api-key" }, cfg, capture.deps());
+    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqualStrings("fx login: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n", capture.stderr.written());
+}
+
+test "login arguments take one provider and --api-key only for vercel" {
+    try std.testing.expectEqual(LoginArgs{}, try parseLoginArgs(&.{}));
+    try std.testing.expectEqual(LoginArgs{ .provider = .codex }, try parseLoginArgs(&.{"codex"}));
+    try std.testing.expectEqual(LoginArgs{ .provider = .gateway, .api_key = true }, try parseLoginArgs(&.{ "--api-key", "vercel" }));
+    try std.testing.expectError(error.ApiKeyNeedsVercel, parseLoginArgs(&.{ "codex", "--api-key" }));
+    try std.testing.expectError(error.InvalidLoginProviderArgs, parseLoginArgs(&.{ "vercel", "codex" }));
+    try std.testing.expectError(error.InvalidLoginProviderArgs, parseLoginArgs(&.{"--bogus"}));
 }
 
 test "workspace indeterminate errors report the reconciled durable state" {
@@ -4695,17 +5615,14 @@ test "runIfRequested rejects removed record flag as unknown input" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
 
-    try std.testing.expectError(
-        error.UnknownCliCommand,
-        runIfRequestedWithDeps(
-            std.testing.allocator,
-            &.{@constCast("--record")},
-            testConfig(),
-            capture.deps(),
-        ),
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{@constCast("--record")},
+        testConfig(),
+        capture.deps(),
     );
-
-    try std.testing.expect(std.mem.find(u8, capture.stderr.written(), "fx: unknown subcommand: --record") != null);
+    try std.testing.expectEqual(usage_failure, result);
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown flag --record\nusage: fx "));
 }
 
 test "global ultrafast launch modifier is ACP-only" {
@@ -4717,15 +5634,6 @@ test "global ultrafast launch modifier is ACP-only" {
     try std.testing.expectEqual(@as(?bool, true), acp.modifiers.ultrafast_override);
     try std.testing.expect(acp.modifiers.hasOnlyUltrafastOverride());
     try std.testing.expectEqualStrings("acp", acp.remaining[0]);
-
-    try std.testing.expectError(error.ConflictingFastFlags, parseGlobalLaunchArgs(
-        std.testing.allocator,
-        &.{ @constCast("--ultrafast"), @constCast("--fast"), @constCast("acp") },
-    ));
-    try std.testing.expectError(error.ConflictingUltrafastFlags, parseGlobalLaunchArgs(
-        std.testing.allocator,
-        &.{ @constCast("--fast"), @constCast("--ultrafast"), @constCast("acp") },
-    ));
 }
 
 test "runNoConfigIfRequested handles help without config" {
@@ -4807,7 +5715,7 @@ test "CLI surface uses the supplied command catalog for parsing usage and help" 
         cfg,
         usage_capture.deps(),
     );
-    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqual(usage_failure, result);
     try std.testing.expectEqualStrings("usage: fx start\n", usage_capture.stderr.written());
 }
 
@@ -4833,9 +5741,23 @@ test "runIfRequested invalid local flags write usage" {
     defer capture.deinit();
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--wat") }, testConfig(), capture.deps());
-    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqual(usage_failure, result);
     try std.testing.expectEqualStrings("", capture.stdout.written());
-    try std.testing.expectEqualStrings("usage: fx status [--json]\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("fx status: unknown flag --wat\nusage: fx status [--json]\n", capture.stderr.written());
+}
+
+test "runIfRequested names the bad flag after a session id that starts with a dash" {
+    var capture = CaptureOutput.init(std.testing.allocator);
+    defer capture.deinit();
+
+    const result = try runIfRequestedWithDeps(
+        std.testing.allocator,
+        &.{ @constCast("session"), @constCast("recover"), @constCast("-_u88j00skyI"), @constCast("--jsno") },
+        testConfig(),
+        capture.deps(),
+    );
+    try std.testing.expectEqual(usage_failure, result);
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx session: unknown flag --jsno (did you mean --json?)\n"));
 }
 
 test "runIfRequested invalid json local flags write json error" {
@@ -4843,7 +5765,7 @@ test "runIfRequested invalid json local flags write json error" {
     defer capture.deinit();
 
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json"), @constCast("--wat") }, testConfig(), capture.deps());
-    try std.testing.expectEqual(RunResult.handled_failure, result);
+    try std.testing.expectEqual(usage_failure, result);
     try std.testing.expectEqualStrings("", capture.stderr.written());
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), "\"kind\":\"status\"") != null);
     try std.testing.expect(std.mem.find(u8, capture.stdout.written(), "\"code\":\"InvalidLocalSurfaceArgs\"") != null);
@@ -4853,7 +5775,7 @@ test "runIfRequested resume no args returns last target" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
 
-    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("resume")}, testConfig(), capture.deps());
+    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("session"), @constCast("resume") }, testConfig(), capture.deps());
     switch (result) {
         .interactive => |launch| try std.testing.expectEqual(ResumeTarget.last, launch.requested_resume.?),
         else => return error.TestExpectedEqual,
@@ -4861,38 +5783,42 @@ test "runIfRequested resume no args returns last target" {
     try std.testing.expectEqualStrings("", capture.stderr.written());
 }
 
-test "runIfRequested -r asks which session to resume" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
-
-    const result = try runIfRequestedWithDeps(
-        std.testing.allocator,
+test "runIfRequested -r and a bare --resume ask which session to resume" {
+    const spellings = [_][]const [:0]const u8{
         &.{@constCast("-r")},
-        testConfig(),
-        capture.deps(),
-    );
-    switch (result) {
-        .interactive => |launch| try std.testing.expectEqual(ResumeTarget.pick, launch.requested_resume.?),
-        else => return error.TestExpectedEqual,
+        &.{@constCast("--resume")},
+    };
+    for (spellings) |args| {
+        var capture = CaptureOutput.init(std.testing.allocator);
+        defer capture.deinit();
+
+        const result = try runIfRequestedWithDeps(
+            std.testing.allocator,
+            args,
+            testConfig(),
+            capture.deps(),
+        );
+        switch (result) {
+            .interactive => |launch| try std.testing.expectEqual(ResumeTarget.pick, launch.requested_resume.?),
+            else => return error.TestExpectedEqual,
+        }
+        try std.testing.expectEqualStrings("", capture.stdout.written());
+        try std.testing.expectEqualStrings("", capture.stderr.written());
     }
-    try std.testing.expectEqualStrings("", capture.stdout.written());
-    try std.testing.expectEqualStrings("", capture.stderr.written());
 
     var extra_capture = CaptureOutput.init(std.testing.allocator);
     defer extra_capture.deinit();
     const extra = try runIfRequestedWithDeps(
         std.testing.allocator,
-        &.{ @constCast("-r"), @constCast("session.123") },
+        &.{ @constCast("-r"), @constCast("session.123"), @constCast("a prompt"), @constCast("extra") },
         testConfig(),
         extra_capture.deps(),
     );
-    try std.testing.expectEqual(RunResult.handled_failure, extra);
+    try std.testing.expectEqual(usage_failure, extra);
 }
 
 test "runIfRequested top-level resume aliases return the existing target" {
     const aliases = [_][]const [:0]const u8{
-        &.{@constCast("--resume")},
-        &.{@constCast("--resume-last")},
         &.{@constCast("--continue")},
         &.{@constCast("-c")},
     };
@@ -4908,8 +5834,7 @@ test "runIfRequested top-level resume aliases return the existing target" {
         );
         switch (result) {
             .interactive => |launch| {
-                const expected: ResumeTarget = if (std.mem.eql(u8, args[0], "-c") or std.mem.eql(u8, args[0], "--continue")) .remembered else .last;
-                try std.testing.expectEqual(expected, launch.requested_resume.?);
+                try std.testing.expectEqual(ResumeTarget.remembered, launch.requested_resume.?);
             },
             else => return error.TestExpectedEqual,
         }
@@ -4937,47 +5862,31 @@ test "runIfRequested top-level resume aliases return the existing target" {
         },
         else => return error.TestExpectedEqual,
     }
+}
 
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
+test "runIfRequested removed resume spellings exit with the replacement" {
+    const cases = [_]struct { args: []const [:0]const u8, stderr: []const u8 }{
+        .{ .args = &.{"--resume-session.123"}, .stderr = "fx: --resume-<id> was removed; use fx --resume <id>\n" },
+        .{ .args = &.{"--resume-"}, .stderr = "fx: --resume-<id> was removed; use fx --resume <id>\n" },
+        .{ .args = &.{ "--resume-last", "unexpected" }, .stderr = "fx: --resume-last was removed; use fx --resume last\n" },
+        .{ .args = &.{ "resume", "--resume", "--last" }, .stderr = "fx: fx resume was removed; use fx --resume [last|<id>] or fx session resume [last|<id>]\n" },
+        .{ .args = &.{ "resume", "--resume" }, .stderr = "fx: fx resume was removed; use fx --resume [last|<id>] or fx session resume [last|<id>]\n" },
+    };
+    for (cases) |case| {
+        var capture = CaptureOutput.init(std.testing.allocator);
+        defer capture.deinit();
 
-    const exact = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{@constCast("--resume-session.123")},
-        testConfig(),
-        capture.deps(),
-    );
-    switch (exact) {
-        .interactive => |launch_value| {
-            var launch = launch_value;
-            defer launch.deinit(std.testing.allocator);
-            switch (launch.requested_resume.?) {
-                .id => |id| try std.testing.expectEqualStrings("session.123", id),
-                .remembered, .pick, .last => return error.TestExpectedExactResumeId,
-            }
-        },
-        else => return error.TestExpectedEqual,
-    }
-
-    const nested = try runIfRequestedWithDeps(
-        std.testing.allocator,
-        &.{ @constCast("resume"), @constCast("--resume"), @constCast("--last") },
-        testConfig(),
-        capture.deps(),
-    );
-    switch (nested) {
-        .interactive => |launch| try std.testing.expectEqual(ResumeTarget.last, launch.requested_resume.?),
-        else => return error.TestExpectedEqual,
+        const result = try runIfRequestedWithDeps(std.testing.allocator, case.args, testConfig(), capture.deps());
+        try std.testing.expectEqual(usage_failure, result);
+        try std.testing.expectEqualStrings(case.stderr, capture.stderr.written());
     }
 }
 
 test "runIfRequested rejects malformed resume aliases with canonical usage" {
     const cases = [_][]const [:0]const u8{
-        &.{@constCast("--resume-")},
-        &.{ @constCast("--resume-last"), @constCast("unexpected") },
-        &.{ @constCast("--continue"), @constCast("unexpected") },
+        &.{ @constCast("--continue"), @constCast("unexpected"), @constCast("extra") },
         &.{ @constCast("--resume"), @constCast("   ") },
-        &.{ @constCast("resume"), @constCast("--resume") },
+        &.{ @constCast("session"), @constCast("resume"), @constCast("a"), @constCast("b") },
     };
     for (cases) |args| {
         var capture = CaptureOutput.init(std.testing.allocator);
@@ -4989,9 +5898,9 @@ test "runIfRequested rejects malformed resume aliases with canonical usage" {
             testConfig(),
             capture.deps(),
         );
-        try std.testing.expectEqual(RunResult.handled_failure, result);
+        try std.testing.expectEqual(usage_failure, result);
         try std.testing.expectEqualStrings(
-            "usage: fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
+            "usage: fx session resume [last|<id>] | -r, --resume [last|<id>] | --continue | -c\n",
             capture.stderr.written(),
         );
     }
@@ -5001,7 +5910,7 @@ test "runIfRequested resume id returns owned id" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
 
-    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("resume"), @constCast("abc123") }, testConfig(), capture.deps());
+    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("--resume"), @constCast("abc123") }, testConfig(), capture.deps());
     switch (result) {
         .interactive => |launch_value| {
             var launch = launch_value;
@@ -5019,34 +5928,159 @@ test "runIfRequested invalid resume writes usage" {
     var capture = CaptureOutput.init(std.testing.allocator);
     defer capture.deinit();
 
-    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("resume"), @constCast("a"), @constCast("b") }, testConfig(), capture.deps());
-    try std.testing.expectEqual(RunResult.handled_failure, result);
+    const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("--resume"), @constCast("a"), @constCast("b"), @constCast("c") }, testConfig(), capture.deps());
+    try std.testing.expectEqual(usage_failure, result);
     try std.testing.expectEqualStrings(
-        "usage: fx session resume [last|<id>] | session resume --id <id> | --resume [last|<id>] | resume [last|<id>] | resume --id <id> | --resume-last | --continue | -c | -r | --resume-<id>\n",
+        "usage: fx session resume [last|<id>] | -r, --resume [last|<id>] | --continue | -c\n",
         capture.stderr.written(),
     );
 }
 
-test "runIfRequested unknown command writes header and help" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
+test "runIfRequested takes one argument that isn't a command as the first prompt" {
+    const cases = [_]struct {
+        args: []const [:0]const u8,
+        prompt: []const u8,
+        model: ?[]const u8 = null,
+    }{
+        .{ .args = &.{@constCast("wat")}, .prompt = "wat" },
+        .{ .args = &.{@constCast("fix the login bug")}, .prompt = "fix the login bug" },
+        // Short words stay prompts rather than typos of short commands.
+        .{ .args = &.{@constCast("add")}, .prompt = "add" },
+        .{ .args = &.{ @constCast("--model"), @constCast("a"), @constCast("fix it") }, .prompt = "fix it", .model = "a" },
+        .{ .args = &.{ @constCast("fix it"), @constCast("--model=b") }, .prompt = "fix it", .model = "b" },
+        .{ .args = &.{ @constCast("--model=a"), @constCast("fix it"), @constCast("--model"), @constCast("b") }, .prompt = "fix it", .model = "b" },
+        .{ .args = &.{ @constCast("--"), @constCast("-p is a flag?") }, .prompt = "-p is a flag?" },
+    };
+    for (cases) |case| {
+        var capture = CaptureOutput.init(std.testing.allocator);
+        defer capture.deinit();
 
-    try std.testing.expectError(
-        error.UnknownCliCommand,
-        runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("wat")}, testConfig(), capture.deps()),
-    );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: wat\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
+        const result = try runIfRequestedWithDeps(std.testing.allocator, case.args, testConfig(), capture.deps());
+        var launch = switch (result) {
+            .interactive => |value| value,
+            else => return error.TestExpectedInteractiveLaunch,
+        };
+        defer launch.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(case.prompt, launch.initial_prompt.?);
+        try std.testing.expect(launch.requested_resume == null);
+        if (case.model) |model| {
+            try std.testing.expectEqualStrings(model, launch.modifiers.model_override.?);
+        } else {
+            try std.testing.expect(launch.modifiers.model_override == null);
+        }
+        try std.testing.expectEqualStrings("", capture.stderr.written());
+    }
 }
 
-test "runIfRequested bare version subcommand remains unknown" {
-    var capture = CaptureOutput.init(std.testing.allocator);
-    defer capture.deinit();
+test "runIfRequested takes a first prompt after a resume target" {
+    const cases = [_]struct {
+        args: []const [:0]const u8,
+        target: std.meta.Tag(ResumeTarget),
+        id: ?[]const u8 = null,
+    }{
+        .{ .args = &.{ @constCast("-c"), @constCast("fix it") }, .target = .remembered },
+        .{ .args = &.{ @constCast("--continue"), @constCast("fix it") }, .target = .remembered },
+        .{ .args = &.{ @constCast("-r"), @constCast("last"), @constCast("fix it") }, .target = .last },
+        .{ .args = &.{ @constCast("-r"), @constCast("session.123"), @constCast("fix it") }, .target = .id, .id = "session.123" },
+        .{ .args = &.{ @constCast("--resume"), @constCast("session.123"), @constCast("fix it") }, .target = .id, .id = "session.123" },
+        .{ .args = &.{ @constCast("--resume=last"), @constCast("fix it") }, .target = .last },
+        .{ .args = &.{ @constCast("--model"), @constCast("a"), @constCast("-c"), @constCast("fix it") }, .target = .remembered },
+    };
+    for (cases) |case| {
+        var capture = CaptureOutput.init(std.testing.allocator);
+        defer capture.deinit();
 
-    try std.testing.expectError(
-        error.UnknownCliCommand,
-        runIfRequestedWithDeps(std.testing.allocator, &.{@constCast("version")}, testConfig(), capture.deps()),
-    );
-    try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), "fx: unknown subcommand: version\n\n𝒇x v0.0.0\nFast, native coding agent for the terminal.\n"));
+        const result = try runIfRequestedWithDeps(std.testing.allocator, case.args, testConfig(), capture.deps());
+        var launch = switch (result) {
+            .interactive => |value| value,
+            else => return error.TestExpectedInteractiveLaunch,
+        };
+        defer launch.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("fix it", launch.initial_prompt.?);
+        const target = launch.requested_resume.?;
+        try std.testing.expectEqual(case.target, std.meta.activeTag(target));
+        if (case.id) |id| try std.testing.expectEqualStrings(id, target.id);
+        try std.testing.expectEqualStrings("", capture.stderr.written());
+    }
+
+    // A second word after the prompt is a usage error. Launch flags may
+    // follow the target or the prompt; another test covers them.
+    const rejected = [_][]const [:0]const u8{
+        &.{ @constCast("-r"), @constCast("a"), @constCast("b"), @constCast("c") },
+        &.{ @constCast("-c"), @constCast("fix it"), @constCast("again") },
+    };
+    for (rejected) |args| {
+        var capture = CaptureOutput.init(std.testing.allocator);
+        defer capture.deinit();
+        const result = try runIfRequestedWithDeps(std.testing.allocator, args, testConfig(), capture.deps());
+        try std.testing.expectEqual(usage_failure, result);
+    }
+
+    var empty_capture = CaptureOutput.init(std.testing.allocator);
+    defer empty_capture.deinit();
+    const empty = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("-c"), @constCast(" ") }, testConfig(), empty_capture.deps());
+    try std.testing.expectEqual(usage_failure, empty);
+    try std.testing.expectEqualStrings("fx: the prompt is empty\n", empty_capture.stderr.written());
+}
+
+test "runIfRequested explains a first argument that is neither a command nor a prompt" {
+    const cases = [_]struct {
+        args: []const [:0]const u8,
+        stderr: []const u8,
+    }{
+        .{
+            .args = &.{ @constCast("fix"), @constCast("the"), @constCast("login"), @constCast("bug") },
+            .stderr = "fx: put the prompt in quotes: fx \"fix the login bug\"\n",
+        },
+        .{
+            .args = &.{ @constCast("--fast"), @constCast("fix"), @constCast("it") },
+            .stderr = "fx: put the prompt in quotes: fx \"fix it\"\n",
+        },
+        .{ .args = &.{@constCast("stauts")}, .stderr = "fx: unknown command stauts (did you mean status?)\n" },
+        .{ .args = &.{ @constCast("sesions"), @constCast("--json") }, .stderr = "fx: unknown command sesions (did you mean sessions?)\n" },
+        .{ .args = &.{@constCast("version")}, .stderr = "fx: unknown command version (did you mean --version?)\n" },
+        .{
+            .args = &.{ @constCast("-p"), @constCast("fix the bug") },
+            .stderr = "fx: -p isn't an fx flag; to run one request and exit, use fx ask \"fix the bug\"\n",
+        },
+        .{
+            .args = &.{@constCast("--print")},
+            .stderr = "fx: --print isn't an fx flag; to run one request and exit, use fx ask \"<prompt>\"\n",
+        },
+        .{
+            .args = &.{@constCast("--print=fix it")},
+            .stderr = "fx: --print isn't an fx flag; to run one request and exit, use fx ask \"fix it\"\n",
+        },
+        .{ .args = &.{@constCast(" ")}, .stderr = "fx: the prompt is empty\n" },
+    };
+    for (cases) |case| {
+        var capture = CaptureOutput.init(std.testing.allocator);
+        defer capture.deinit();
+
+        const result = try runIfRequestedWithDeps(std.testing.allocator, case.args, testConfig(), capture.deps());
+        try std.testing.expectEqual(usage_failure, result);
+        try std.testing.expectEqualStrings(case.stderr, capture.stderr.written());
+        try std.testing.expectEqualStrings("", capture.stdout.written());
+    }
+}
+
+test "runIfRequested suggests the nearest flag for an unknown one, before or after a prompt" {
+    const cases = [_]struct {
+        args: []const [:0]const u8,
+        first_line: []const u8,
+    }{
+        .{ .args = &.{ @constCast("--modle"), @constCast("x") }, .first_line = "fx: unknown flag --modle (did you mean --model?)\n" },
+        .{ .args = &.{@constCast("--verison")}, .first_line = "fx: unknown flag --verison (did you mean --version?)\n" },
+        .{ .args = &.{ @constCast("fix it"), @constCast("--modle=x") }, .first_line = "fx: unknown flag --modle (did you mean --model?)\n" },
+    };
+    for (cases) |case| {
+        var capture = CaptureOutput.init(std.testing.allocator);
+        defer capture.deinit();
+
+        const result = try runIfRequestedWithDeps(std.testing.allocator, case.args, testConfig(), capture.deps());
+        try std.testing.expectEqual(usage_failure, result);
+        try std.testing.expect(std.mem.startsWith(u8, capture.stderr.written(), case.first_line));
+    }
 }
 
 test "runIfRequested model fetch failure is handled" {
@@ -5259,7 +6293,7 @@ test "runIfRequested local json success appends exactly one newline" {
     const result = try runIfRequestedWithDeps(std.testing.allocator, &.{ @constCast("status"), @constCast("--json") }, testConfig(), deps);
     try std.testing.expectEqual(RunResult.handled_success, result);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"effort\":\"auto\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":false,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"effort\":\"auto\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"auto\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":false,\"mcp\":{\"connection_check\":\"not_checked\",\"servers\":[],\"configuration_issues\":[],\"inspection_error\":null}}\n",
         capture.stdout.written(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, capture.stdout.written(), "\n\n"));
@@ -5348,7 +6382,7 @@ test "writeRenderedJsonLine falls back to heap and appends exactly one newline" 
     );
 
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"effort\":\"auto\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":true}\n",
+        "{\"kind\":\"status\",\"model\":\"test-model\",\"model_origin\":\"default\",\"effort\":\"auto\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":42,\"ultrafast_requested\":true}\n",
         capture.stdout.written(),
     );
 }

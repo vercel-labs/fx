@@ -168,6 +168,8 @@ pub fn Runtime(comptime App: type) type {
             /// Borrowed from the launch arguments; StartupState dupes on apply.
             provider_order: ?[]const []const u8 = null,
             provider_strict: ?bool = null,
+            /// `--permission-mode` for this launch; the saved mode is untouched.
+            permission_mode: ?types.PermissionMode = null,
         };
 
         pub fn bootstrap(
@@ -288,7 +290,9 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// Reports skill discovery issues inline and to the model's context.
+        /// Records skill discovery issues in the full transcript only. Most
+        /// roots belong to other agent tools, so the inline transcript stays
+        /// quiet. Claiming the body keeps later skill calls from repeating it.
         pub fn writeSkillDiagnosticsNotice(app: *App) !void {
             if (app.skills.diagnostics.len == 0) return;
             var notice_writer: std.Io.Writer.Allocating = .init(app.alloc);
@@ -299,13 +303,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "session") and @hasDecl(@TypeOf(app.session), "claimContextNotice")) {
                 _ = try app.session.claimContextNotice(app.alloc, skills_body);
             }
-
-            const skills_summary = try app.alloc.print("{d} discovery issue{s}; some skills may be missing", .{
-                app.skills.diagnostics.len,
-                if (app.skills.diagnostics.len == 1) "" else "s",
-            });
-            defer app.alloc.free(skills_summary);
-            try writeCollapsedStartupNotice(app, "skills", skills_summary, skills_body);
+            try app.writeDomainNotice(.{ .topic = "skills", .tone = .neutral, .body = skills_body, .visibility = .full_only }, true);
         }
 
         /// Hands a Keychain-backed launch credential to an auth worker so the
@@ -536,7 +534,7 @@ pub fn Runtime(comptime App: type) type {
                 launch_overrides.fast,
                 launch_overrides.provider,
             );
-            app.permission_engine.mode = startup.permission_mode;
+            app.permission_engine.mode = launch_overrides.permission_mode orelse startup.permission_mode;
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
             app.agent_step_limit = startup.agent_step_limit;
             app.worker.agent_turn_settings.max_tool_result_bytes = startup.max_tool_result_bytes;
@@ -662,6 +660,10 @@ pub fn Runtime(comptime App: type) type {
                     });
                     defer app.alloc.free(summary);
                     try writeCollapsedStartupNotice(app, "config", summary, detail_writer.written());
+                }
+                for (startup.config_diagnostics) |diagnostic| {
+                    const text = diagnostic.note() orelse continue;
+                    try app.writeDomainNotice(.{ .topic = "note", .tone = .information, .body = text }, true);
                 }
             }
             if (comptime @hasField(App, "prompt_history")) {
@@ -1332,10 +1334,10 @@ test "app_bootstrap_runtime renders startup notices without a resume cache" {
         &.{
             "load_skills",
             "welcome",
-            "welcome",
         },
         capture.eventSlice(),
     );
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "* skills: skill discovery warning:") != null);
 }
 
 test "app_bootstrap_runtime deinitializes app after bootstrap dependency failure" {
@@ -1359,7 +1361,7 @@ test "app_bootstrap_runtime propagates skill discovery allocation failure" {
     try std.testing.expectEqual(@as(usize, 1), app.deinit_calls);
 }
 
-test "app_bootstrap_runtime reports a bounded skill discovery warning" {
+test "app_bootstrap_runtime keeps skill discovery warnings in the full transcript only" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(alloc);
     capture.emit_skill_diagnostic = true;
@@ -1370,11 +1372,15 @@ test "app_bootstrap_runtime reports a bounded skill discovery warning" {
 
     try std.testing.expectEqual(@as(usize, 1), app.skills.diagnostics.len);
     try std.testing.expect(capture.early_notice_palette_initialized);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "* skills: 1 discovery issue; some skills may be missing (ctrl+o to view)\n") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "* skills: skill discovery warning:") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "hostile&#x0a;path/body-sentinel") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "metadata is invalid (missing_name)") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, " [full-only]\n") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "discovery issue") == null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "ctrl+o to view") == null);
+    const start = std.mem.find(u8, app.transcript.items, "* skills: skill discovery warning:") orelse return error.TestExpectedEqual;
+    const end = std.mem.findScalarPos(u8, app.transcript.items, start, '\n') orelse return error.TestExpectedEqual;
+    const notice = app.transcript.items[start..end];
+    try std.testing.expect(std.mem.find(u8, notice, "hostile&#x0a;path/body-sentinel") != null);
+    try std.testing.expect(std.mem.find(u8, notice, "metadata is invalid (missing_name)") != null);
+    try std.testing.expect(std.mem.endsWith(u8, notice, " [full-only]"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, app.transcript.items, "* skills:"));
 }
 
 test "app_bootstrap_runtime collapses config diagnostics into one neutral summary" {

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createConfiguredProviderFixture, completion as configuredCompletion, toolCompletion as configuredToolCompletion } from "./fixtures/chat-completions";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -128,6 +129,59 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
     session = null;
     secondSession = null;
   });
+
+  serialTest("a profile folder other users can write is tightened, loaded, and noted once", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-loose-profile-"));
+    const gateway = startFakeGateway([]);
+    try {
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const profile = join(home, ".fx");
+      const settingsPath = join(profile, "settings.json");
+      mkdirSync(profile, { recursive: true });
+      mkdirSync(workspace);
+      // What `mkdir ~/.fx` and an editor leave behind under umask 0002.
+      chmodSync(profile, 0o775);
+      writeFileSync(settingsPath, JSON.stringify({ permission_mode: "auto" }) + "\n");
+      chmodSync(settingsPath, 0o664);
+      const env = {
+        ...NO_AUTH,
+        HOME: home,
+        AI_GATEWAY_API_KEY: "test-key",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+      };
+      const launch = async (label: string) => {
+        const stderrPath = join(root, `${label}-stderr.log`);
+        session = await TmuxSession.create({ cwd: workspace, env, stderrPath });
+        await session.waitForComposer(TIMEOUT);
+        await Bun.sleep(300);
+        const pane = await session.captureFullScrollback();
+        await session.kill();
+        session = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        return pane;
+      };
+
+      const first = await launch("first");
+      expect(first).toContain("note: Other users could write to ~/.fx");
+      // The settings loaded, so nothing reports a configuration issue.
+      expect(first).not.toContain("configuration issue");
+      // No one else can write to either any more.
+      expect(statSync(profile).mode & 0o022).toBe(0);
+      expect(statSync(settingsPath).mode & 0o022).toBe(0);
+
+      const second = await launch("second");
+      expect(second).not.toContain("Other users could write");
+      expect(second).not.toContain("configuration issue");
+    } finally {
+      await session?.kill();
+      session = null;
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 3);
 
   serialTest("configured provider interactive unsafe profile permits inspection but blocks model sends", async () => {
     const fixture = createConfiguredProviderFixture();
@@ -343,7 +397,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         const catalogEnv = {
           ...NO_AUTH,
           HOME: home,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
         };
 
         session = await TmuxSession.create({
@@ -363,6 +417,11 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         await session.waitForText("* Switched to anthropic/claude-opus-4.7", TIMEOUT);
         await session.sendText("/fast");
         await session.waitForText("* fast: on", TIMEOUT);
+        await session.sendText("/fast off");
+        await session.waitForText("* fast: off", TIMEOUT);
+        await session.sendText("/fast on");
+        await session.sendText("/fast sometimes");
+        await session.waitForText("usage: /fast [on|off]", TIMEOUT);
         await session.sendText("/statusline context");
         await session.waitForText("* statusline: context:", TIMEOUT);
         await session.sendText("/statusline session");
@@ -384,7 +443,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(stored.fast_mode_model_bound).toBe(true);
         expect(stored.startup_scrollback).toBe(false);
         expect(stored.prompt_history).toMatchObject({ enabled: false });
-        expect(stored.statusLine).toMatchObject({
+        expect(stored.status_line).toMatchObject({
           context: true,
           session: true,
           workspace: true,
@@ -518,9 +577,9 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         });
         await session.waitForText("Run /help", TIMEOUT);
         await session.sendText('/allowlist add command "local-a *"');
-        await session.waitForText("(scope=local)", TIMEOUT);
-        await session.sendText('/allowlist user add command "user *"');
-        await session.waitForText("(scope=user)", TIMEOUT);
+        await session.waitForText("(scope=workspace)", TIMEOUT);
+        await session.sendText('/allowlist global add command "user *"');
+        await session.waitForText("(scope=global)", TIMEOUT);
         await session.sendText("/quit");
         await session.waitForSessionEnd(TIMEOUT);
         session = null;
@@ -540,14 +599,14 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           stderrPath: stderrBPath,
         });
         await session.waitForText("Run /help", TIMEOUT);
-        await session.sendText("/allowlist view local");
+        await session.sendText("/allowlist view workspace");
         await session.waitForText(
-          "* allowlist: local persistent allow rules: (none)",
+          "* allowlist: workspace persistent allow rules: (none)",
           TIMEOUT,
         );
-        await session.sendText("/allowlist view user");
+        await session.sendText("/allowlist view global");
         await session.waitForText("user *", TIMEOUT);
-        await session.sendText('/allowlist user remove command "padded *"');
+        await session.sendText('/allowlist global remove command "padded *"');
         await session.waitForText("* allowlist: removed command", TIMEOUT);
         await session.sendText("/clear");
         await session.waitForPane(
@@ -559,10 +618,10 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         expect(inherited).toContain("* allowlist: effective persistent allow rules:");
 
         await session.sendText('/allowlist add command "local-b *"');
-        await session.waitForText("(scope=local)", TIMEOUT);
-        await session.sendText("/allowlist view user");
+        await session.waitForText("(scope=workspace)", TIMEOUT);
+        await session.sendText("/allowlist view global");
         const shadowed = await session.waitForText(
-          "user rules are shadowed by local settings",
+          "global rules are shadowed by workspace settings",
           TIMEOUT,
         );
         expect(shadowed).toContain("user *");
@@ -575,6 +634,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         const localEffective = await session.waitForText("local-b *", TIMEOUT);
         expect(localEffective).not.toContain("user *");
 
+        // The older `user` scope word still works.
         await session.sendText('/allowlist user remove command "user *"');
         await session.waitForText("* allowlist: removed command", TIMEOUT);
         await session.sendText("/quit");
@@ -710,7 +770,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env: {
             ...NO_AUTH,
             HOME: home,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           stderrPath,
         });
@@ -833,7 +893,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
               ...NO_AUTH,
               HOME: home,
               FX_AUTO_UPGRADE: "0",
-              FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+              FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
             },
             stderrPath,
           });
@@ -894,7 +954,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
             ...NO_AUTH,
             AI_GATEWAY_API_KEY: "fake-standard-key",
             HOME: home,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           stderrPath,
         });
@@ -951,7 +1011,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env: {
             ...NO_AUTH,
             HOME: home,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           stderrPath,
         });
@@ -1062,7 +1122,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           HOME: home,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
         };
 
         session = await TmuxSession.create({
@@ -1196,7 +1256,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           HOME: home,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
         };
 
         const staleResult = await runFx(
@@ -1308,7 +1368,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env: {
             ...NO_AUTH,
             HOME: home,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           stderrPath,
         });
@@ -1372,7 +1432,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
           env: {
             ...NO_AUTH,
             HOME: home,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           stderrPath,
         });
@@ -1389,7 +1449,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
             !pane.includes("model-helper"),
           TIMEOUT,
         );
-        expect(await session.capturePane()).not.toContain("saved to user settings");
+        expect(await session.capturePane()).not.toContain("saved to global settings");
 
         const stored = JSON.parse(readFileSync(join(home, ".fx", "settings.json"), "utf8"));
         expect(stored.models.gateway).toBe("xai/grok-build-1");
@@ -1456,7 +1516,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
             HOME: home,
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           stderrPath,
         });
@@ -1630,7 +1690,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         rmSync(settingsPath);
         symlinkSync(externalSettings, settingsPath);
         await session.sendText("/statusline workspace");
-        await session.waitForText("active for this process but not saved to user settings", TIMEOUT);
+        await session.waitForText("active for this process but not saved to global settings", TIMEOUT);
         await session.waitForPane(
           (pane) => pane.includes("workspace-write-failure-visible"),
           TIMEOUT,
@@ -1804,7 +1864,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
         );
         expect(stored.future_global).toEqual({ nested: "keep-global" });
         expect(stored.startup_scrollback).toBe(false);
-        expect(stored.statusLine).toMatchObject({ context: true });
+        expect(stored.status_line).toMatchObject({ context: true });
         expect(stored.workspaces[workspaceRoot]).toMatchObject({
           future_workspace: {
             nested: { keep: true },
@@ -2635,7 +2695,7 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
               FX_AUTO_UPGRADE: "0",
               FX_GATEWAY_BASE_URL: gateway.baseUrl,
               FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-              FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
               FX_MODEL: FAKE_GATEWAY_MODEL,
             },
             stderrPath,

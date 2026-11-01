@@ -135,9 +135,9 @@ for (const action of ["run", "message"] as const) {
         env: {
           PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root.home,
           AI_GATEWAY_API_KEY: "synthetic-steering", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
-          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_SKIP_ONBOARDING: "1", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access", FX_MAX_AGENT_STEPS: "5",
+          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TEST_SKIP_ONBOARDING: "1", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access", FX_MAX_AGENT_STEPS: "5",
           FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_TRACE_LOG: join(root.root, "trace.log"), FX_TRACE_SCOPES: "subagent,worker,agent,tool",
         },
       });
@@ -486,7 +486,7 @@ function fixtureEnv(
     VERCEL_OIDC_TOKEN: undefined,
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_MODEL: MODEL,
     FX_TRACE_LOG: tracePath,
     FX_TRACE_SCOPES: "agent,core,gateway,stream",
@@ -501,16 +501,12 @@ function parseAskJson(stdout: string): {
   session_id: string;
   tool_calls: Array<{ name: string; status: string }>;
   usage: { input_tokens: number | null; output_tokens: number | null; cache_read_tokens?: number; cache_write_tokens?: number };
+  // The recovery module's shape (decision 38). `recovered` has no message.
   recovery?: {
     state: string;
-    kind: string;
-    cause?: string;
-    action?: string;
-    required_action?: string;
     attempt: number;
-    attempt_limit: number;
-    durable: boolean;
-    message: string;
+    need?: string;
+    message?: string;
   };
 } {
   return JSON.parse(stdout.trim());
@@ -906,7 +902,7 @@ describe("gateway stream lifecycle", () => {
       ]));
       expect(gateway.requestCount()).toBe(3);
       expect(result.stderr).not.toContain("panic");
-      const resume = () => runFx(["ask", "--auto", "--json", "--resume-id", output.session_id, "Continue with the saved context."], {
+      const resume = () => runFx(["ask", "--auto", "--json", "--resume", output.session_id, "Continue with the saved context."], {
         cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 30_000,
       });
       const restored = await resume();
@@ -1300,7 +1296,7 @@ describe("gateway stream lifecycle", () => {
           env: {
             ...fixtureEnv(root, gateway, tracePath),
             FX_MODEL: undefined,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           timeoutMs: 30_000,
         },
@@ -1357,7 +1353,7 @@ describe("gateway stream lifecycle", () => {
           env: {
             ...fixtureEnv(root, gateway, tracePath),
             FX_MODEL: undefined,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           timeoutMs: 30_000,
         },
@@ -1374,6 +1370,103 @@ describe("gateway stream lifecycle", () => {
       );
       const request = JSON.parse(gateway.requests[0]!.body);
       expect(request).toMatchObject({
+        reasoning: "high",
+        providerOptions: { gateway: { speed: "fast" } },
+      });
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("ask --config overrides the settings files and yields to dedicated flags", async () => {
+    const root = createFixtureRoot("ask-config-overrides");
+    const tracePath = join(root.root, "trace.log");
+    const settingsPath = join(root.home, ".fx", "settings.json");
+    writeFileSync(settingsPath, JSON.stringify({ effort: "low", fast_mode: false }) + "\n");
+    const settingsBefore = readFileSync(settingsPath, "utf8");
+    const gateway = startDynamicFakeGateway(
+      () => fakeGatewayFinalText("CONFIG_OVERRIDES_COMPLETE"),
+      {
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["tool-use", "reasoning"],
+          fast_options: [{ type: "toggle" }],
+          reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+        }],
+      },
+    );
+    const env = {
+      ...fixtureEnv(root, gateway, tracePath),
+      FX_MODEL: undefined,
+      FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    };
+    const ask = (flags: string[]) =>
+      runFx(["ask", "--json", "--auto", "--no-save", "--model", MODEL, ...flags, "Use the settings overrides."], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 30_000,
+      });
+
+    try {
+      const overridden = await ask(["--config", "effort=low", "--config", "effort=high", "--config", "fast_mode=on"]);
+      expect(overridden.code).toBe(0);
+      expect(parseAskJson(overridden.stdout).output).toContain("CONFIG_OVERRIDES_COMPLETE");
+      expect(overridden.stderr).toBe("");
+      expect(JSON.parse(gateway.requests[0]!.body)).toMatchObject({
+        reasoning: "high",
+        providerOptions: { gateway: { speed: "fast" } },
+      });
+
+      const flagWins = await ask(["--config", "fast_mode=on", "--no-fast"]);
+      expect(flagWins.code).toBe(0);
+      const second = JSON.parse(gateway.requests[1]!.body);
+      expect(second).toMatchObject({ reasoning: "low" });
+      expect(second).not.toHaveProperty("providerOptions.gateway.speed");
+
+      expect(readFileSync(settingsPath, "utf8")).toBe(settingsBefore);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("issue applies the agent-run flags to the gateway request", async () => {
+    const root = createFixtureRoot("issue-agent-run-flags");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startDynamicFakeGateway(
+      () => fakeGatewayFinalText("ISSUE_FLAGS_COMPLETE"),
+      {
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["tool-use", "reasoning"],
+          fast_options: [{ type: "toggle" }],
+          reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+        }],
+      },
+    );
+
+    try {
+      const result = await runFx(
+        ["issue", "--auto", "--model", MODEL, "--effort", "high", "--fast", "Login fails after an upgrade"],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MODEL: undefined,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("ISSUE_FLAGS_COMPLETE");
+      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(MODEL);
+      expect(JSON.parse(gateway.requests[0]!.body)).toMatchObject({
         reasoning: "high",
         providerOptions: { gateway: { speed: "fast" } },
       });
@@ -1406,7 +1499,7 @@ describe("gateway stream lifecycle", () => {
           env: {
             ...fixtureEnv(root, gateway, tracePath),
             FX_MODEL: undefined,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           timeoutMs: 30_000,
         },
@@ -1457,7 +1550,7 @@ describe("gateway stream lifecycle", () => {
       const env = {
         ...fixtureEnv(root, gateway, tracePath),
         FX_MODEL: undefined,
-        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
       };
       const first = await runFx(
         ["ask", "--json", "--auto", "Start the saved session."],
@@ -1470,7 +1563,7 @@ describe("gateway stream lifecycle", () => {
       const overridden = await runFx(
         [
           "ask", "--json", "--auto",
-          "--resume-id", sessionId,
+          "--resume", sessionId,
           "--model", MODEL,
           "--effort", "high",
           "--no-fast",
@@ -1488,7 +1581,7 @@ describe("gateway stream lifecycle", () => {
       expect(overriddenRequest).not.toHaveProperty("providerOptions.gateway.speed");
 
       const restored = await runFx(
-        ["ask", "--json", "--auto", "--resume-id", sessionId, "Continue without flags."],
+        ["ask", "--json", "--auto", "--resume", sessionId, "Continue without flags."],
         { cwd: root.workspace, env, timeoutMs: 30_000 },
       );
       expect(restored.code).toBe(0);
@@ -1530,7 +1623,7 @@ describe("gateway stream lifecycle", () => {
           env: {
             ...fixtureEnv(root, gateway, tracePath),
             FX_MODEL: undefined,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           timeoutMs: 30_000,
         },
@@ -2803,7 +2896,7 @@ describe("gateway stream lifecycle", () => {
       rmSync(skillDirectory, { recursive: true, force: true });
       const resumeStderr = join(root.root, "resume-stderr.log");
       tui = await TmuxSession.create({
-        cmd: `${binary} --resume-last`,
+        cmd: `${binary} --resume last`,
         cwd: root.workspace,
         env: fixtureEnv(root, gateway, join(root.root, "resume-trace.log")),
         stderrPath: resumeStderr,
@@ -3350,7 +3443,7 @@ describe("gateway stream lifecycle", () => {
       expect(first.stderr).not.toContain("Reading");
       expect(gateway.requests).toHaveLength(2);
 
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", firstJson.session_id, "Continue."], {
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", firstJson.session_id, "Continue."], {
         cwd: root.workspace,
         env: { ...fixtureEnv(root, gateway, join(root.root, "resume.log")), FX_MODEL: DEFAULT_MODEL },
         timeoutMs: 20_000,
@@ -3854,7 +3947,7 @@ describe("gateway stream lifecycle", () => {
           "ask",
           "--json",
           "--auto",
-          "--resume-id",
+          "--resume",
           firstJson.session_id,
           "Persist the second ordinary turn.",
         ],
@@ -3927,7 +4020,7 @@ describe("gateway stream lifecycle", () => {
           { ...completed, seq: 4 },
         ];
         writeFileSync(path, frames.map((frame) => JSON.stringify(frame)).join("\n") + "\n");
-        const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", seed.session_id, "Continue without tools."], {
+        const resumed = await runFx(["ask", "--json", "--auto", "--resume", seed.session_id, "Continue without tools."], {
           cwd: root.workspace,
           env: fixtureEnv(root, gateway, join(root.root, "resume.log")),
           timeoutMs: 15_000,
@@ -3950,7 +4043,7 @@ describe("gateway stream lifecycle", () => {
         if (tmuxAvailable()) {
           const stderrPath = join(root.root, "tui-stderr.log");
           const tui = await TmuxSession.create({
-            cmd: `${FX_BIN} --resume-last`,
+            cmd: `${FX_BIN} --resume last`,
             cwd: root.workspace,
             env: fixtureEnv(root, gateway, join(root.root, "tui-trace.log")),
             stderrPath,
@@ -4007,7 +4100,7 @@ describe("gateway stream lifecycle", () => {
       expect(result.output).toBe(`${commentary}\n\n${answer}`);
       expect(result.final_output).toBe(`${commentary}\n\n${answer}`);
 
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Say it again."], {
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", result.session_id, "Say it again."], {
         cwd: root.workspace,
         env: fixtureEnv(root, gateway, join(root.root, "resume.log")),
         timeoutMs: 15_000,
@@ -4082,7 +4175,7 @@ describe("gateway stream lifecycle", () => {
           "ask",
           "--json",
           "--auto",
-          "--resume-id",
+          "--resume",
           firstJson.session_id,
           "Confirm what the saved session contains.",
         ],
@@ -4158,7 +4251,7 @@ describe("gateway stream lifecycle", () => {
             const kept = savedText(root.home, result.session_id);
             expect(kept).toContain("removed_call");
             if (metadata) expect(kept).toContain("removed-signature");
-            const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Confirm the saved result without running tools."], {
+            const resumed = await runFx(["ask", "--json", "--auto", "--resume", result.session_id, "Confirm the saved result without running tools."], {
               cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
             });
             expect(resumed.code).toBe(0);
@@ -4215,13 +4308,13 @@ describe("gateway stream lifecycle", () => {
       const sessionId = parseAskJson(first.stdout).session_id;
       const logPath = join(sessionDir(root.home, sessionId), "log.jsonl");
       const originalLog = readFileSync(logPath, "utf8");
-      const second = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Exercise the second fixture."], {
+      const second = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Exercise the second fixture."], {
         cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
       });
       expect(second.code).toBe(0);
       expect(parseAskJson(second.stdout).final_output).toBe("Second turn stored.");
       expect(gateway.requestCount()).toBe(4);
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Confirm the stored results without running tools."], {
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Confirm the stored results without running tools."], {
         cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
       });
       expect(resumed.code).toBe(0);
@@ -4299,7 +4392,7 @@ describe("gateway stream lifecycle", () => {
           "ask",
           "--json",
           "--auto",
-          "--resume-id",
+          "--resume",
           firstJson.session_id,
           "Continue after the saved malformed recovery.",
         ],
@@ -4445,7 +4538,7 @@ describe("gateway stream lifecycle", () => {
           cwd: root.workspace,
           env: {
             ...fixtureEnv(root, gateway, tracePath),
-            FX_COMMAND_TEST_INDETERMINATE_AFTER_EXIT: "1",
+            FX_TEST_COMMAND_INDETERMINATE_AFTER_EXIT: "1",
           },
           timeoutMs: 15_000,
         },
@@ -4525,7 +4618,7 @@ describe("gateway stream lifecycle", () => {
           cwd: root.workspace,
           env: {
             ...fixtureEnv(root, gateway, tracePath),
-            FX_COMMAND_TEST_OUTPUT_INCOMPLETE_AFTER_EXIT: "1",
+            FX_TEST_COMMAND_OUTPUT_INCOMPLETE_AFTER_EXIT: "1",
           },
           timeoutMs: 15_000,
         },
@@ -5686,7 +5779,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             "ask",
             "--json",
             "--yolo",
-            "--resume-id",
+            "--resume",
             firstJson.session_id,
             "Read the saved replay again.",
           ],
@@ -5833,7 +5926,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         reasoning_tokens: 2,
       });
 
-      const resumed = await runFx(["ask", "--yolo", "--json", "--resume-id", id!, "--", "Finish up."], {
+      const resumed = await runFx(["ask", "--yolo", "--json", "--resume", id!, "--", "Finish up."], {
         cwd: root.workspace,
         env: fixtureEnv(root, gateway, join(root.root, "resume-trace.log")),
         timeoutMs: 15_000,
@@ -6198,7 +6291,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "ask",
           "--json",
           "--yolo",
-          "--resume-id",
+          "--resume",
           sessionId,
           "Inspect the cancelled command output.",
         ],
@@ -6251,7 +6344,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
                 "ask",
                 "--json",
                 "--auto",
-                "--resume-id",
+                "--resume",
                 sessionId,
                 `canonical turn ${turn}`,
               ];
@@ -6303,7 +6396,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             "ask",
             "--json",
             "--auto",
-            "--resume-id",
+            "--resume",
             sessionId,
             "canonical projection probe",
           ],
@@ -6454,7 +6547,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const compacted = await runFx(["session", "--id", id, "--json"], { cwd: root.workspace, env });
       expect(compacted.code).toBe(0);
       expect(JSON.parse(compacted.stdout).history.at(-1)?.summary).toContain("\"earlier\":\"The prior reads completed.");
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", id, "Continue with the saved result."], { cwd: root.workspace, env, timeoutMs: 30_000 });
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", id, "Continue with the saved result."], { cwd: root.workspace, env, timeoutMs: 30_000 });
       expect(resumed.code, resumed.stderr || resumed.stdout).toBe(0);
       expect(JSON.parse(resumed.stdout).final_output).toBe("COLD_REPLAY_DONE");
       expect(ordinary).toBe(9);
@@ -6584,7 +6677,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(savedText(root.home, sessionId)).toContain(pages[0]!.hash);
           // The compacted command is saved as T1 with the handle of its whole output.
           expect(readFileSync(compactionRecordPath(root.home, sessionId, "compacted-T1.txt")!, "utf8")).toContain(sourceHandle);
-          const resumed = await runFx(["ask", "--json", "--resume-id", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
+          const resumed = await runFx(["ask", "--json", "--resume", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
           expect(resumed.code).toBe(0);
           // Compaction folded the command into T1, so the read has no call
           // left to name.
@@ -6738,7 +6831,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             "ask",
             "--json",
             "--auto",
-            "--resume-id",
+            "--resume",
             sessionId,
             "compaction restart probe",
           ],
@@ -7283,16 +7376,18 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const trace = readFileSync(tracePath, "utf8");
 
       expect(result.code).toBe(0);
-      expect(result.stderr).toContain("Provider unavailable · provider_error: turn route failure one · retrying request");
-      expect(result.stderr).toContain("Provider unavailable · provider_error: turn route failure two · retrying request in 1s");
-      expect(result.stderr).toContain("recovered · succeeded on attempt 3");
+      // The notices carry the module's wording, never the provider's detail.
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 2s · attempt 2 · \d+s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 3 · \d+s$/m);
+      expect(result.stderr).not.toContain("turn route failure");
       expect(result.stdout).toContain("Recovered in ask turn.");
       expect(gateway.requestCount()).toBe(3);
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain(`selected_model=${MODEL}`);
       expect(trace).toContain(`route=${MODEL}`);
-      expect(trace).toContain("semantic_attempt=1/10");
-      expect(trace).toContain("semantic_attempt=2/10");
+      expect(trace).toContain(" attempt=1 http_status=200");
+      expect(trace).toContain(" attempt=2 http_status=200");
       expect(trace).toContain("retry=true");
       expect(trace).toContain("detail=provider_error: turn route failure one");
       expect(trace).toContain("detail=provider_error: turn route failure two");
@@ -7320,7 +7415,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           socketFailure ??= error;
         });
         connections += 1;
-        if (connections === 1) {
+        // The first connection is usually the one fx warms at launch. A
+        // pooled connection reset before use is resent silently on a fresh
+        // connection, so the second reset is the one that lands on a fresh
+        // connection, which fx reports and the turn retries.
+        if (connections <= 2) {
           socket.resetAndDestroy();
           return;
         }
@@ -7371,7 +7470,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               HOME: root.home,
               AI_GATEWAY_API_KEY: "fake-gateway-lifecycle-key",
               VERCEL_OIDC_TOKEN: undefined,
-              FX_E2E_GATEWAY_CHAT_URL:
+              FX_TEST_GATEWAY_CHAT_URL:
                 `http://127.0.0.1:${address.port}/v1/ai/chat/completions`,
               FX_MODEL: MODEL,
               FX_TRACE_LOG: tracePath,
@@ -7395,21 +7494,151 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(result.code).toBe(0);
         expect(result.signal).toBeNull();
         expect(result.stderr).toMatch(
-          /^\[notice\] ⚠ Network interrupted · [^\n]+ · retrying request$/m,
+          /^\[notice\] Connection lost · next try in 1s · attempt 1 · 0s$/m,
         );
-        expect(result.stderr).toContain("recovered · succeeded on attempt 2");
+        expect(result.stderr).toMatch(
+          /^\[notice\] Connection lost · retrying · attempt 2 · \d+s$/m,
+        );
         expect(json.exit_code).toBe(0);
         expect(json.output).toBe(expectedOutput);
-        expect(json.recovery?.state).toBe("recovered");
-        expect(json.recovery?.attempt).toBe(2);
-        expect(connections).toBe(2);
+        expect(json.recovery).toEqual({ state: "recovered", attempt: 2 });
+        expect(connections).toBe(3);
         expect(requests).toBe(1);
         expect(socketFailure).toBeUndefined();
-        expect(opens).toHaveLength(2);
-        expect(opens.every((line) => line.includes("attempt=1"))).toBe(true);
-        expect(trace).toContain("provider_attempts=1/10");
+        expect(opens).toHaveLength(3);
+        expect(occurrenceCount(trace, "event=stale_connection_retry")).toBe(1);
+        // The silent resend is the gateway's second try within the first
+        // send; the recovery retry is a new send that starts at attempt 1.
+        expect(opens.map((line) => /attempt=(\d+)/.exec(line)?.[1])).toEqual(["1", "2", "1"]);
+        expect(trace).toContain(" attempt=1 saw_content=");
         expect(trace).toContain("recovery=retry_request");
         expect(trace).toContain("event=stream_complete");
+      } finally {
+        for (const socket of sockets) socket.destroy();
+        if (server.listening) {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }
+  }, 60_000);
+
+  test("default fx ask resends without a warning when the gateway closed a pooled connection", async () => {
+    const expectedOutput = "Answered after a closed pooled connection.";
+    const toolCallBody = await fakeGatewayToolCall("read_notes", "read_file", {
+      path: "notes.txt",
+    }).text();
+    const finalBody = await fakeGatewayFinalText(expectedOutput).text();
+
+    for (let iteration = 1; iteration <= 4; iteration += 1) {
+      const root = createFixtureRoot(`closed-pooled-connection-${iteration}`);
+      const tracePath = join(root.root, "trace.log");
+      writeFileSync(join(root.workspace, "notes.txt"), "pooled connection fixture\n");
+      const sockets = new Set<Socket>();
+      // The launch warm-up connection usually carries the first request, but
+      // it can also sit unused, so count only connections that carried one.
+      const requestSockets = new Set<Socket>();
+      let connections = 0;
+      let requests = 0;
+      let socketFailure: Error | undefined;
+      const server = createServer((socket) => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+        socket.on("error", (error) => {
+          socketFailure ??= error;
+        });
+        connections += 1;
+
+        let request = Buffer.alloc(0);
+        let requestHandled = false;
+        socket.on("data", (chunk) => {
+          requestSockets.add(socket);
+          if (requestHandled) return;
+          if (request.length + chunk.length > 1024 * 1024) {
+            socketFailure ??= new Error("pooled connection fixture request exceeded 1 MiB");
+            socket.destroy();
+            return;
+          }
+          request = Buffer.concat([request, chunk]);
+          const headerEnd = request.indexOf("\r\n\r\n");
+          if (headerEnd < 0) return;
+          const headers = request.subarray(0, headerEnd).toString("utf8");
+          const lengthMatch = /\r\ncontent-length:\s*(\d+)/i.exec(`\r\n${headers}`);
+          const contentLength = lengthMatch ? Number.parseInt(lengthMatch[1]!, 10) : 0;
+          if (request.length < headerEnd + 4 + contentLength) return;
+
+          requestHandled = true;
+          requests += 1;
+          if (requests === 1) {
+            // Keep-alive response, then the connection closes the way a
+            // gateway drops an idle one. fx pools it and finds it dead when
+            // it sends the tool result.
+            socket.end(
+              "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: text/event-stream\r\n" +
+                `Content-Length: ${Buffer.byteLength(toolCallBody)}\r\n\r\n` +
+                toolCallBody,
+            );
+            return;
+          }
+          socket.end(
+            "HTTP/1.1 200 OK\r\n" +
+              "Content-Type: text/event-stream\r\n" +
+              `Content-Length: ${Buffer.byteLength(finalBody)}\r\n` +
+              "Connection: close\r\n\r\n" +
+              finalBody,
+          );
+        });
+      });
+
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(0, "127.0.0.1", resolve);
+        });
+        const address = server.address();
+        if (address === null || typeof address === "string") {
+          throw new Error("missing pooled connection fixture address");
+        }
+        const result = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "Read notes.txt, then answer."],
+          {
+            cwd: root.workspace,
+            env: {
+              FX_SOUND: "0",
+              HOME: root.home,
+              AI_GATEWAY_API_KEY: "fake-gateway-lifecycle-key",
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_TEST_GATEWAY_CHAT_URL:
+                `http://127.0.0.1:${address.port}/v1/ai/chat/completions`,
+              FX_MODEL: MODEL,
+              FX_TRACE_LOG: tracePath,
+              FX_TRACE_SCOPES: "agent,core,gateway,stream",
+            },
+            timeoutMs: 15_000,
+          },
+        );
+        const trace = readFileSync(tracePath, "utf8");
+        if (result.code !== 0 || result.signal !== null) {
+          throw new Error(
+            `closed pooled connection iteration ${iteration} failed: code=${result.code} signal=${result.signal}\n` +
+              `stdout:\n${result.stdout}\nstderr:\n${result.stderr}\ntrace:\n${trace}`,
+          );
+        }
+        const json = parseAskJson(result.stdout);
+
+        expect(json.exit_code).toBe(0);
+        expect(json.output).toBe(expectedOutput);
+        expect(json.tool_calls.map((call) => call.name)).toEqual(["read_file"]);
+        expect(json.recovery).toBeUndefined();
+        expect(result.stderr).not.toContain("Network interrupted");
+        expect(result.stderr).not.toContain("retrying request");
+        expect(connections).toBeGreaterThanOrEqual(2);
+        expect(requestSockets.size).toBe(2);
+        expect(requests).toBe(2);
+        expect(socketFailure).toBeUndefined();
+        expect(trace).toContain("event=stale_connection_retry");
+        expect(trace).not.toContain("recovery=retry_request");
       } finally {
         for (const socket of sockets) socket.destroy();
         if (server.listening) {
@@ -7502,7 +7731,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             HOME: root.home,
             AI_GATEWAY_API_KEY: "fake-gateway-lifecycle-key",
             VERCEL_OIDC_TOKEN: undefined,
-            FX_E2E_GATEWAY_CHAT_URL:
+            FX_TEST_GATEWAY_CHAT_URL:
               `http://127.0.0.1:${address.port}/v1/ai/chat/completions`,
             FX_MODEL: MODEL,
             FX_TRACE_LOG: tracePath,
@@ -7516,19 +7745,18 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.code).toBe(0);
       expect(result.signal).toBeNull();
       expect(result.stdout).toContain(expectedOutput);
-      expect(result.stderr).toContain(
-        "Provider unavailable · HTTP 503 · provider temporarily unavailable · retrying request",
-      );
-      expect(result.stderr).toMatch(
-        /Network interrupted · [^\r\n]+ · retrying request/,
-      );
-      expect(result.stderr).not.toContain("retrying request in 16s");
-      expect(result.stderr).toContain("recovered · succeeded on attempt 7");
+      // Each 503 waits exactly its Retry-After, which does not advance the
+      // backoff, so the reset that follows starts again at one second.
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 5 · \d+s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 6 · \d+s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · retrying · attempt 7 · \d+s$/m);
+      expect(result.stderr).not.toMatch(/next try in (?:[2-9]|\d\d)s/);
       expect(connections).toBe(7);
       expect(requests).toBe(6);
       expect(socketFailure).toBeUndefined();
       expect(trace).toContain("event=receive_head_error");
-      expect(trace).toContain("provider_attempts=6/10");
+      expect(trace).toContain(" attempt=6 saw_content=");
       expect(trace).toContain("recovery=retry_request");
     } finally {
       for (const socket of sockets) socket.destroy();
@@ -7561,8 +7789,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const trace = readFileSync(tracePath, "utf8");
       expect(result.code).toBe(0);
       expect(result.stdout).toContain("Recovered without executing the unstarted tool.");
-      expect(result.stderr).toContain("regenerating unstarted tool");
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
       expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[1]!.body).toContain("fx did not execute that call");
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("saw_tool_start=true");
       expect(trace).toContain("retry=true");
@@ -8060,7 +8289,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const originalLog = readFileSync(logPath, "utf8");
 
       phase = 1;
-      const resumed = await runFx(["ask", "--json", "--resume-id", id, "Continue without delegation."], {
+      const resumed = await runFx(["ask", "--json", "--resume", id, "Continue without delegation."], {
         cwd: root.workspace, env, timeoutMs: 15_000,
       });
       expect(resumed.code).toBe(0);
@@ -8075,7 +8304,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(readFileSync(tracePath, "utf8")).toContain(`child_id=${child} reason=session_load_failed error=NotFound`);
 
       phase = 2;
-      const reopened = await runFx(["ask", "--json", "--resume-id", id, "Continue again without delegation."], {
+      const reopened = await runFx(["ask", "--json", "--resume", id, "Continue again without delegation."], {
         cwd: root.workspace, env, timeoutMs: 15_000,
       });
       expect(reopened.code).toBe(0);
@@ -8548,7 +8777,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const first = await runFx(["ask", "--json", "--auto", `Run the ${outcome} delegation.`], { cwd: root.workspace, env, timeoutMs: 10_000 });
         expect(first.code).toBe(0);
         const sessionId = parseAskJson(first.stdout).session_id;
-        const repeat = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Observe that same delegation again."], { cwd: root.workspace, env, timeoutMs: 10_000 });
+        const repeat = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Observe that same delegation again."], { cwd: root.workspace, env, timeoutMs: 10_000 });
         expect(repeat.code).toBe(0);
         expect(seen[outcome]).toHaveLength(2);
         expect(seen[outcome][1]).toEqual(seen[outcome][0]);
@@ -8802,7 +9031,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "ask",
           "--json",
           "--auto",
-          "--resume-id",
+          "--resume",
           firstJson.session_id,
           "RESUME_PERSISTENT_SECOND",
         ],
@@ -8834,7 +9063,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         [
           "ask",
           "--auto",
-          "--resume-id",
+          "--resume",
           internalChildId,
           "DIRECT_CHILD_RESUME_MUST_FAIL",
         ],
@@ -8969,7 +9198,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "ask",
           "--json",
           "--auto",
-          "--resume-id",
+          "--resume",
           parentId!,
           resumePrompt,
         ],
@@ -9200,6 +9429,26 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     },
   ]);
 
+  // The whole limit went to reasoning, and the tool call after it was cut off.
+  const CUT_CALL_SENTINEL = "cut-call-ran.txt";
+  const cutToolCallReply = () => fakeGatewaySse([
+    { type: "reasoning-start", id: "spent_reasoning" },
+    { type: "reasoning-delta", id: "spent_reasoning", delta: "thinking until the limit runs out" },
+    { type: "reasoning-end", id: "spent_reasoning" },
+    { type: "tool-input-start", id: "cut_call", toolName: "shell" },
+    {
+      type: "tool-call",
+      toolCallId: "cut_call",
+      toolName: "shell",
+      input: { request: { action: "run", command: `printf ran > ${CUT_CALL_SENTINEL}` } },
+    },
+    {
+      type: "finish",
+      finishReason: { unified: "length", raw: "length" },
+      usage: { inputTokens: { total: 3 }, outputTokens: { total: 8_000 } },
+    },
+  ]);
+
   async function askWithReplies(
     label: string,
     replies: Array<() => Response>,
@@ -9220,8 +9469,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       return {
         result,
         json: parseAskJson(result.stdout),
-        bodies: gateway.requests.map((request) => JSON.parse(request.body) as { maxOutputTokens?: number }),
+        bodies: gateway.requests.map((request) =>
+          JSON.parse(request.body) as { maxOutputTokens?: number; reasoning?: string }
+        ),
         trace: readFileSync(tracePath, "utf8"),
+        cutCallRan: existsSync(join(root.workspace, CUT_CALL_SENTINEL)),
       };
     } finally {
       gateway.stop();
@@ -9246,7 +9498,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     expect(bodies[0]!.maxOutputTokens).toBeUndefined();
     expect(bodies[1]!.maxOutputTokens).toBe(32_768);
     expect(`${result.stdout}\n${result.stderr}`).toContain("Retrying with a higher limit.");
-    expect(trace).toContain("event=empty_length_limited_retry");
+    expect(trace).toContain("event=length_limited_resend");
   }, 40_000);
 
   test("an empty reply's retry limit stays inside the model's known context window", async () => {
@@ -9274,7 +9526,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
   }, 40_000);
 
-  test("an empty reply cut short at the catalog's own limit is not asked again", async () => {
+  test("an empty reply cut short at the catalog's own limit is not asked again when that would repeat the request", async () => {
+    // No lower effort and no higher limit: a resend would be the same request.
     const { result, json, bodies, trace } = await askWithReplies("empty-length-catalog-limit", [
       emptyLengthLimitedReply,
       () => fakeGatewayFinalText("a retry must not be sent"),
@@ -9285,7 +9538,77 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     expect(bodies[0]!.maxOutputTokens).toBe(8_000);
     expect(json.final_output).toBe("The reply ran out of output tokens before any text.");
     expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
-    expect(trace).not.toContain("event=empty_length_limited_retry");
+    expect(trace).not.toContain("event=length_limited_resend");
+  }, 40_000);
+
+  test("an empty reply cut short at the catalog's own limit is asked again once at low effort", async () => {
+    const { result, json, bodies, trace } = await askWithReplies("empty-length-low-effort", [
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("answered at low effort"),
+    ], {
+      context_window: 200_000,
+      max_tokens: 8_000,
+      reasoning_options: [{ type: "effort", values: ["none", "low", "high"] }],
+    });
+
+    expect(result.code).toBe(0);
+    expect(json.final_output).toContain("answered at low effort");
+    expect(bodies).toHaveLength(2);
+    // The catalog's limit stays; only the effort changes.
+    expect(bodies[0]!.maxOutputTokens).toBe(8_000);
+    expect(bodies[1]!.maxOutputTokens).toBe(8_000);
+    expect(bodies[0]!.reasoning).toBeUndefined();
+    expect(bodies[1]!.reasoning).toBe("low");
+    expect(`${result.stdout}\n${result.stderr}`).toContain("Retrying with low effort.");
+    expect(trace).toContain("event=length_limited_resend");
+  }, 40_000);
+
+  test("a reply that spent its limit before a cut-off tool call is resent at low effort without running the call", async () => {
+    const { result, json, bodies, trace, cutCallRan } = await askWithReplies("cut-tool-call-resend", [
+      cutToolCallReply,
+      () => fakeGatewayToolCall("listed", "glob_files", { pattern: "*" }),
+      () => fakeGatewayFinalText("finished after the resend"),
+    ], {
+      context_window: 1_050_000,
+      max_tokens: 8_000,
+      reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh", "max"] }],
+    });
+
+    expect(result.code).toBe(0);
+    expect(json.final_output).toContain("finished after the resend");
+    expect(cutCallRan).toBe(false);
+    expect(json.tool_calls).toHaveLength(1);
+    expect(bodies).toHaveLength(3);
+    expect(bodies[0]!.reasoning).toBeUndefined();
+    expect(bodies[1]!.reasoning).toBe("low");
+    // The lower effort is for the resend only; the next step goes back.
+    expect(bodies[2]!.reasoning).toBeUndefined();
+    // The cut-off call never reaches the model's history.
+    expect(JSON.stringify(bodies[1])).not.toContain(CUT_CALL_SENTINEL);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("Retrying with low effort.");
+    expect(result.stderr).not.toContain("did not run them");
+    expect(trace).toContain("event=length_limited_resend");
+    expect(trace).toContain("dropped_tool_calls=1");
+  }, 40_000);
+
+  test("a resent reply cut off again ends the turn without running either call", async () => {
+    const { result, bodies, trace, cutCallRan } = await askWithReplies("cut-tool-call-twice", [
+      cutToolCallReply,
+      cutToolCallReply,
+      () => fakeGatewayFinalText("a third request must not be sent"),
+    ], {
+      context_window: 1_050_000,
+      max_tokens: 8_000,
+      reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+    });
+
+    expect(result.code).toBe(1);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]!.reasoning).toBe("low");
+    expect(cutCallRan).toBe(false);
+    expect(result.stderr).toContain("so I did not run them");
+    expect(result.stderr).not.toContain("preserved above");
+    expect(trace).toContain("event=provider_completion_blocked");
   }, 40_000);
 
   test("commands with the same output get their own handles, and each reads back after resume", async () => {
@@ -9385,10 +9708,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.tool_calls).toEqual([]);
       expect(existsSync(sentinelPath)).toBe(false);
       expect(gateway.requestCount()).toBe(2);
-      expect(result.stderr).toContain(
-        "Provider unavailable · provider_error · checking uncertain tool state",
-      );
-      expect(result.stderr).toContain("recovered · succeeded on attempt 2");
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 2 });
       expect(trace).toContain("termination cause=valid_finish finish_reason=error");
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("retry=true");
@@ -9523,23 +9844,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.signal).toBeNull();
       expect(result.timedOut).toBe(false);
       expect(json.output).not.toContain("⚠ API error");
-      expect(json.recovery?.state).toBe("recovered");
-      expect(json.recovery?.attempt).toBe(3);
-      expect(json.recovery?.message).not.toContain("provider_error");
-      expect(json.recovery?.message).not.toContain("first route failure");
-      expect(result.stderr).toContain(
-        "Provider unavailable · provider_error: first route failure · retrying request",
-      );
-      expect(result.stderr).toContain(
-        "Provider unavailable · provider_error: second route failure · retrying request in 1s",
-      );
-      expect(result.stderr).toContain("recovered · succeeded on attempt 3");
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 3 · \d+s$/m);
+      expect(result.stderr).not.toContain("route failure");
       expect(gateway.requestCount()).toBe(3);
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain(`selected_model=${MODEL}`);
       expect(trace).toContain(`route=${MODEL}`);
-      expect(trace).toContain("semantic_attempt=1/10");
-      expect(trace).toContain("semantic_attempt=2/10");
+      expect(trace).toContain(" attempt=1 http_status=200");
+      expect(trace).toContain(" attempt=2 http_status=200");
       expect(trace).toContain("retry=true");
       expect(trace).toContain("detail=provider_error: first route failure");
       expect(trace).toContain("detail=provider_error: second route failure");
@@ -9549,7 +9863,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
-  test("gateway stream timeout probes the connection without spending the attempt budget", async () => {
+  test("gateway stream timeout waits and resends as a dropped connection", async () => {
     const root = createFixtureRoot("gateway-stream-timeout");
     const tracePath = join(root.root, "trace.log");
     let timeouts = 2;
@@ -9574,15 +9888,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.exit_code).toBe(0);
       expect(json.output).toBe("Recovered after the gateway stream timeout.");
       expect(gateway.requestCount()).toBe(3);
-      expect(json.recovery?.state).toBe("recovered");
-      expect(json.recovery?.attempt).toBe(1);
-      expect(json.recovery?.attempt_limit).toBe(10);
-      expect(result.stderr).toContain("Gateway stream timed out · checking the connection");
-      expect(result.stderr).toContain("checking the connection · 1s");
-      expect(result.stderr).not.toContain("retrying request");
-      expect(result.stderr).not.toContain("automatic retry paused");
+      // Each timeout is one counted send; nothing probes the connection.
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 2s · attempt 2 · \d+s$/m);
       expect(trace).toContain("event=route_failure");
-      expect(trace).toContain("retry=false");
+      expect(trace).toContain("retry=true");
       expect(trace).toContain("detail=gateway_stream_timeout: stream exceeded maximum duration");
     } finally {
       gateway.stop();
@@ -9590,7 +9901,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 20_000);
 
-  test("finish-only gateway stream timeout probes the connection without spending the attempt budget", async () => {
+  test("finish-only gateway stream timeout waits and resends as a dropped connection", async () => {
     const root = createFixtureRoot("finish-only-gateway-stream-timeout");
     const tracePath = join(root.root, "trace.log");
     let timeouts = 2;
@@ -9615,14 +9926,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.exit_code).toBe(0);
       expect(json.output).toBe("Recovered after the finish-only timeout.");
       expect(gateway.requestCount()).toBe(3);
-      expect(json.recovery?.state).toBe("recovered");
-      expect(json.recovery?.attempt).toBe(1);
-      expect(result.stderr).toContain("Gateway stream timed out · checking the connection");
-      expect(result.stderr).not.toContain("retrying request");
-      expect(result.stderr).not.toContain("automatic retry paused");
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1 · 0s$/m);
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("http_status=200");
-      expect(trace).toContain("retry=false");
+      expect(trace).toContain("retry=true");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -9655,56 +9963,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.exit_code).toBe(0);
       expect(json.output).toBe("Recovered beyond the old budget.");
       expect(gateway.requestCount()).toBe(13);
-      expect(json.recovery?.state).toBe("recovered");
-      expect(json.recovery?.attempt).toBe(13);
-      expect(json.recovery?.attempt_limit).toBe(10);
-      expect(result.stderr).toContain(
-        "Provider unavailable · HTTP 503 · provider temporarily unavailable · retrying request",
-      );
-      expect(result.stderr).toContain("recovered · succeeded on attempt 13");
-      expect(result.stderr).not.toContain("recovery paused");
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 13 });
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 13 · \d+s$/m);
+      // No attempt count is ever shown as a fraction of a limit.
+      expect(result.stderr).not.toMatch(/attempt \d+\//);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
-
-  test("identical interrupted responses stop as a no-progress stall after three attempts", async () => {
-    const root = createFixtureRoot("identical-stall-stop");
-    const tracePath = join(root.root, "trace.log");
-    const gateway = startGateway(() => sse("data: [DONE]\n\n"));
-    try {
-      const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
-        {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 15_000,
-        },
-      );
-      const json = parseAskJson(result.stdout);
-      const trace = readFileSync(tracePath, "utf8");
-
-      expect(result.code).toBe(1);
-      expect(json.exit_code).toBe(1);
-      expect(gateway.requestCount()).toBe(3);
-      expect(json.recovery?.state).toBe("failed");
-      expect(json.recovery?.cause).toBe("response_interrupted");
-      expect(json.recovery?.attempt).toBe(3);
-      expect(json.recovery?.attempt_limit).toBe(10);
-      expect(json.recovery?.required_action).toBe("surface_stall");
-      expect(json.recovery?.message).toContain("kept failing at the same point · stopped");
-      expect(result.stderr).toContain(
-        "⚠ Response ended early · stream interrupted · kept failing at the same point · stopped",
-      );
-      expect(result.stderr).not.toContain("recovery paused");
-      expect(trace).toContain("termination cause=done_without_finish");
-    } finally {
-      gateway.stop();
-      rmSync(root.root, { recursive: true, force: true });
-    }
-  }, 20_000);
-
 
   test("CLI recovery prints one complete response after checkpointed partial output", async () => {
     const root = createFixtureRoot("partial-autonomous-recovery");
@@ -9740,10 +10008,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.code).toBe(0);
       expect(recovered.output).toBe(finalText);
       expect(recovered.final_output).toBe(finalText);
-      expect(recovered.recovery?.state).toBe("recovered");
-      expect(recovered.recovery?.message).not.toContain(
-        "provider temporarily unavailable",
-      );
+      expect(recovered.recovery).toEqual({ state: "recovered", attempt: 11 });
       expect(gateway.requestCount()).toBe(11);
       expect(gateway.requests[10]!.body).not.toContain(partialText);
       expectOnlyLeadingSystemMessages(gateway.requests[10]!.body);
@@ -9798,7 +10063,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(step.tool_results.map((result: { tool_call_id: string }) => result.tool_call_id)).toEqual(ids);
 
       responses.push(fakeGatewayFinalText("Resumed without more tools."));
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", json.session_id, "What did you read?"], {
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", json.session_id, "What did you read?"], {
         cwd: root.workspace,
         env: { ...fixtureEnv(root, gateway, tracePath), FX_MODEL: DEFAULT_MODEL },
         timeoutMs: 15_000,
@@ -9866,7 +10131,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(readFileSync(tracePath, "utf8")).toContain(`field=${field} failure=${kind.startsWith("long-") ? "too_long" : "empty"}`);
 
         responses.push(fakeGatewayFinalText("The prior write is retained."));
-        const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", json.session_id, "What was completed?"], {
+        const resumed = await runFx(["ask", "--json", "--auto", "--resume", json.session_id, "What was completed?"], {
           cwd: root.workspace, env, timeoutMs: 15_000,
         });
         expect(resumed.code).toBe(0);
@@ -9945,7 +10210,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       responses.push(fakeGatewayFinalText("Resume complete."));
       const resumed = await runFx(
-        ["ask", "--json", "--auto", "--resume-id", json.session_id, "What did you just read?"],
+        ["ask", "--json", "--auto", "--resume", json.session_id, "What did you just read?"],
         { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
       );
       expect(resumed.code).toBe(0);
@@ -10189,10 +10454,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.exit_code).toBe(1);
       expect(json.error).toBeUndefined();
       expect(json.output).toContain("visible partial output");
-      expect(json.output).not.toContain("did not execute the returned tool calls");
+      expect(json.output).not.toContain("did not run them");
       expect(json.tool_calls).toEqual([]);
       expect(result.stderr).toContain("response hit provider length limit");
-      expect(result.stderr).toContain("did not execute the returned tool calls");
+      expect(result.stderr).toContain("so I did not run them");
       expect(existsSync(sentinelPath)).toBe(false);
       expect(gateway.requestCount()).toBe(1);
       expect(trace).toContain("event=provider_completion_blocked");
@@ -10252,16 +10517,54 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("empty provider finish reason fails closed before tool execution", async () => {
+  test("a gateway stream the upstream ended early is resent", async () => {
+    // The gateway names the cut without an HTTP status, as teammates saw it.
+    const root = createFixtureRoot("gateway-stream-terminated");
+    const tracePath = join(root.root, "trace.log");
+    let requestIndex = 0;
+    const gateway = startGateway(() =>
+      requestIndex++ === 0
+        ? sse(
+          'data: {"type":"error","error":{"code":"gateway_stream_terminated","message":"Upstream stream ended before terminal chunk"}}\n\n' +
+            "data: [DONE]\n\n",
+        )
+        : fakeGatewayFinalText("Answered after the upstream cut."),
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toBe("Answered after the upstream cut.");
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 2 });
+      expect(gateway.requestCount()).toBe(2);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("an unreadable provider finish is resent without running its tool", async () => {
     const root = createFixtureRoot("empty-finish-reason");
     const tracePath = join(root.root, "trace.log");
     const sentinelPath = join(root.workspace, "command-must-not-run.txt");
+    let requestIndex = 0;
     const gateway = startGateway(() =>
-      sse(
-        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"shell","input":{"request":{"action":"run","command":"printf executed > command-must-not-run.txt","timeout_ms":30000}}}\n\n' +
-          'data: {"type":"finish","finishReason":{"unified":"","raw":"provider_error"}}\n\n' +
-          "data: [DONE]\n\n",
-      ),
+      requestIndex++ === 0
+        ? sse(
+          'data: {"type":"tool-call","toolCallId":"command_1","toolName":"shell","input":{"request":{"action":"run","command":"printf executed > command-must-not-run.txt","timeout_ms":30000}}}\n\n' +
+            'data: {"type":"finish","finishReason":{"unified":"","raw":"provider_error"}}\n\n' +
+            "data: [DONE]\n\n",
+        )
+        : fakeGatewayFinalText("Answered after the unreadable finish."),
     );
     try {
       const result = await runFx(
@@ -10275,20 +10578,202 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const json = parseAskJson(result.stdout);
       const trace = readFileSync(tracePath, "utf8");
 
-      expect(result.code).toBe(1);
-      expect(json.exit_code).toBe(1);
-      expect(json.error).toBe("InvalidProviderFinishReason");
+      // The stream ends as one without a finish: fx never runs its tool and
+      // sends the same request again.
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.output).toBe("Answered after the unreadable finish.");
       expect(json.tool_calls).toEqual([]);
       expect(existsSync(sentinelPath)).toBe(false);
-      expect(gateway.requestCount()).toBe(1);
+      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[1]!.body).toContain("Run the fixture command.");
       expect(trace).toContain("termination cause=invalid_finish");
-      expect(trace).toContain("err=InvalidProviderFinishReason");
+      expect(trace).not.toContain("InvalidProviderFinishReason");
       expect(trace).not.toContain("event=before_tool_execution");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
   });
+
+  test("an invalid request error event ends fx ask after one request", async () => {
+    const root = createFixtureRoot("invalid-request-event");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() =>
+      sse(
+        `data: ${JSON.stringify({
+          type: "error",
+          error: { code: "invalid_request_error", message: "INVALID_FIXTURE_REQUEST" },
+        })}\n\n` +
+          'data: {"type":"finish","finishReason":{"unified":"error"}}\n\n' +
+          "data: [DONE]\n\n",
+      )
+    );
+    try {
+      const started = Date.now();
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+
+      // A resend would repeat the same request, so the turn ends at once.
+      expect(result.code).toBe(1);
+      expect(parseAskJson(result.stdout).exit_code).toBe(1);
+      expect(gateway.requestCount()).toBe(1);
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(result.stderr).toContain("invalid_request_error: INVALID_FIXTURE_REQUEST");
+      expect(result.stderr).not.toContain("next try in");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("a non-retryable error code without a finish ends fx ask after one request", async () => {
+    const root = createFixtureRoot("invalid-request-no-finish");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() =>
+      sse(
+        `data: ${JSON.stringify({
+          type: "error",
+          error: { code: "invalid_request_error", message: "INVALID_WITHOUT_FINISH" },
+        })}\n\n` + "data: [DONE]\n\n",
+      )
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+
+      // The code wins over the missing finish: the turn ends on its notice.
+      expect(result.code).toBe(1);
+      expect(parseAskJson(result.stdout).exit_code).toBe(1);
+      expect(gateway.requestCount()).toBe(1);
+      expect(result.stderr).toContain("invalid_request_error: INVALID_WITHOUT_FINISH");
+      expect(result.stderr).not.toContain("next try in");
+      expect(result.stderr).not.toContain("kept failing");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("a stream that keeps ending without a finish is retried past three requests", async () => {
+    // The old no-progress stop ended this request on its third send. Only Esc
+    // stops one now.
+    const root = createFixtureRoot("never-finishes");
+    const tracePath = join(root.root, "trace.log");
+    let requestIndex = 0;
+    const gateway = startGateway(() =>
+      requestIndex++ < 3 ? sse("data: [DONE]\n\n") : fakeGatewayFinalText("Finished on the fourth send."),
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_TRACE_SCOPES: "agent,core,gateway,stream,recovery",
+          },
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.output).toBe("Finished on the fourth send.");
+      expect(gateway.requestCount()).toBe(4);
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 4 });
+      expect(result.stderr).not.toContain("kept failing");
+      expect(trace).toContain("termination cause=done_without_finish");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("an HTTP error after a retry reports the request failed", async () => {
+    const root = createFixtureRoot("retry-then-bad-request");
+    const tracePath = join(root.root, "trace.log");
+    let requestIndex = 0;
+    const gateway = startGateway(() =>
+      requestIndex++ === 0
+        ? unavailableResponse("1")
+        : new Response(JSON.stringify({ error: { message: "bad request body" } }), {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(1);
+      expect(gateway.requestCount()).toBe(2);
+      // Not the `retrying` the request showed before the error.
+      expect(json.recovery).toEqual({ state: "failed", attempt: 2 });
+      expect(result.stderr).toContain("bad request body");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("fx ask JSON reports only the last request's recovery", async () => {
+    const root = createFixtureRoot("stale-recovery");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "notes.txt"), "fixture notes\n");
+    let requestIndex = 0;
+    const gateway = startGateway(() => {
+      const index = requestIndex++;
+      // The first step recovers from a 503 and calls a tool; the second
+      // step's request fails with HTTP 400 on its first try.
+      if (index === 0) return unavailableResponse("1");
+      if (index === 1) return fakeGatewayToolCall("read_notes", "read_file", { path: "notes.txt" });
+      return new Response(JSON.stringify({ error: { message: "bad request body" } }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Read notes.txt, then answer."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(gateway.requestCount()).toBe(3);
+      expect(json.recovery).toBeUndefined();
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   test("missing provider finish recovers across framing and content variants", async () => {
     const cases = [
@@ -10351,38 +10836,35 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         if (fixture.streamedText) {
           expect(retryPrompt.some(message => message.role === "assistant")).toBe(false);
           expect(retryPrompt.some(message => contentText(message.content) === fixture.streamedText)).toBe(false);
-          expect(retryPrompt.at(-1)?.role).toBe("user");
-          expect(contentText(retryPrompt.at(-1)?.content)).toContain(
-            "Restart that response from the beginning",
-          );
           if (fixture.name === "partial") {
-            expect(result.stderr).toContain("Response interrupted. Restarting.");
+            expect(result.stderr).toContain("↻ Restarted the answer");
           }
-        } else {
-          expect(retryBody).not.toContain("Restart that response");
         }
+        // The resend is the same request, with no word to the model that the
+        // answer was interrupted.
+        expect(retryPrompt.at(-1)?.role).toBe("user");
+        expect(contentText(retryPrompt.at(-1)?.content)).toContain("Return the fixture response.");
+        expect(retryBody).not.toContain("previous response was interrupted");
         expect(trace).toContain("event=prompt_finish");
         expect(trace).toContain("outcome_kind=assistant");
-        expect(result.stderr).toContain("Response ended early");
-        expect(result.stderr).toContain(
-          fixture.streamedText ? "restarting response" : "retrying request",
-        );
+        // A stream that ends without its finish is a dropped connection.
+        expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1 · 0s$/m);
+        expect(result.stderr).toMatch(/^\[notice\] Connection lost · retrying · attempt 2 · \d+s$/m);
         expect(result.stderr).not.toContain("/10");
-        expect(result.stderr).toContain("recovered · succeeded on attempt 2");
 
         const json = parseAskJson(result.stdout);
         expect(json.exit_code).toBe(0);
         expect(json.error).toBeUndefined();
         expect(json.output).toBe(recoveredText);
         expect(json.tool_calls).toEqual([]);
-        expect(json.recovery?.state).toBe("recovered");
-        expect(json.recovery?.attempt).toBe(2);
+        expect(json.recovery).toEqual({ state: "recovered", attempt: 2 });
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     }
-  });
+    // Each case waits one backoff step, up to a second, before its resend.
+  }, 60_000);
 
   test("a restarted reply refused as too long compacts and finishes the turn", async () => {
     const root = createFixtureRoot("restarted-reply-overflow");
@@ -10427,14 +10909,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const seedRequests = gateway.requests.length;
       phase = "attempt";
 
-      const result = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Continue."], {
+      const result = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Continue."], {
         cwd: root.workspace,
         env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,core,gateway,stream,context_compaction" },
         timeoutMs: 15_000,
       });
       const json = parseAskJson(result.stdout);
 
-      expect(result.stderr).toContain("Response interrupted. Restarting.");
+      expect(result.stderr).toContain("↻ Restarted the answer");
       expect(result.stderr).not.toContain("HTTP 400");
       expect(result.code).toBe(0);
       expect(json.exit_code).toBe(0);
@@ -10444,21 +10926,25 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       // The cut-off reply, its refused restart, the compaction's summary
       // requests, and the restart sent again over the compacted conversation.
       const requests = gateway.requests.slice(seedRequests).map((request) => request.body);
-      const restart = "Restart that response from the beginning";
+      // The restart is the same request again, with no word to the model that
+      // it was interrupted.
+      const note = "previous response was interrupted";
       const isSummary = (raw: string) => {
         const body = JSON.parse(raw);
         return body.toolChoice?.type === "none" && body.tools?.length === 0;
       };
       expect(requests.length).toBeGreaterThanOrEqual(4);
-      expect(promptText(requests[0]!)).not.toContain(restart);
-      expect(promptText(requests[1]!)).toContain(restart);
+      expect(promptText(requests[0]!)).not.toContain(note);
+      expect(promptText(requests[1]!)).not.toContain(note);
+      expect(promptText(requests[1]!)).toContain("Continue.");
       expect(requests[1]).not.toContain("compacted_conversation");
       const summaries = requests.slice(2, -1);
       expect(summaries.every(isSummary)).toBe(true);
       expect(summaries[0]).toContain("seed-notes.txt");
       const retry = requests.at(-1)!;
       expect(isSummary(retry)).toBe(false);
-      expect(promptText(retry)).toContain(restart);
+      expect(promptText(retry)).not.toContain(note);
+      expect(promptText(retry)).toContain("Continue.");
       expect(retry).toContain("compacted_conversation");
       expect(retry).toContain("RESTARTED_OVERFLOW_SUMMARY");
       expect(retry).not.toContain("RESTARTED_OVERFLOW_SEED_NOTES");
@@ -10642,9 +11128,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const json = parseAskJson(result.stdout);
       const trace = readFileSync(tracePath, "utf8");
 
+      // The turn stops for review with fx's own terminal wording.
       expect(result.code).toBe(1);
-      expect(json.recovery?.state).toBe("paused");
-      expect(json.recovery?.required_action).toBe("inspect_uncertain_tool");
+      expect(json.recovery?.state).toBe("failed");
+      expect(json.recovery?.message).toContain("Tool state needs review");
+      expect(json.recovery?.need).toBeUndefined();
       expect(gateway.requestCount()).toBe(2);
       expect(gateway.requests[1]!.body).toContain(
         '"toolChoice":{"type":"none"}',

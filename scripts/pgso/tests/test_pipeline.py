@@ -31,7 +31,6 @@ from scripts.pgso.pipeline import (
     GENERATION_FLAGS,
     IR_OUTLINER_FLAGS,
     OUTLINE_CLEANUP_FLAGS,
-    OUTLINE_PARTITIONS,
     PROFILE_PREPARATION_PASSES,
     USE_FLAGS,
     ArtifactSpec,
@@ -44,7 +43,6 @@ from scripts.pgso.pipeline import (
     exempt_cold_startup_functions,
     instrumentation_argv,
     instrumented_run_argv,
-    link_outlined_ir_argv,
     link_candidate,
     keep_startup_profile,
     merge_profile_batch,
@@ -56,7 +54,6 @@ from scripts.pgso.pipeline import (
     validate_archive_unchanged,
     validate_bitcode_hash,
     validate_candidate_size,
-    split_ir_argv,
     verify_release_safe_ir,
     zig_build_argv,
     zig_build_env,
@@ -257,8 +254,6 @@ class PgsoPipelineTests(unittest.TestCase):
             "llvm_profdata": tool_root / "llvm-profdata",
             "llvm_ar": tool_root / "llvm-ar",
             "llvm_nm": tool_root / "llvm-nm",
-            "llvm_link": tool_root / "llvm-link",
-            "llvm_split": tool_root / "llvm-split",
             "clang": tool_root / "clang",
             "libllvm": self.root / "libLLVM.dylib",
             "ir_size": tool_root / "ir_size.py",
@@ -404,7 +399,7 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
 
         self.assertEqual(paths.profile_use_bitcode, result)
         lines = actions.read_text().splitlines()
-        self.assertEqual(9, len(lines))
+        self.assertEqual(10, len(lines))
         self.assertIn(f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc ", lines[0])
         self.assertTrue(lines[0].endswith(f"-o {paths.profile_use_base_bitcode}"))
         base = paths.profile_use_base_bitcode
@@ -418,9 +413,11 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
         sparse = paths.profile_use_bitcode.with_name(paths.profile_use_bitcode.name + ".sparse")
         overlaid = paths.profile_use_bitcode.with_name(paths.profile_use_bitcode.name + ".overlaid")
         zero_filled = paths.profile_use_bitcode.with_name(paths.profile_use_bitcode.name + ".zero-filled")
+        compacted = paths.profile_use_bitcode.with_name(paths.profile_use_bitcode.name + ".compacted")
         self.assertIn(f"overlay-constants {sparse} {overlaid}", lines[6])
         self.assertIn(f"zero-fill-globals {overlaid} {zero_filled}", lines[7])
-        self.assertIn(f"-passes=globaldce,verify {zero_filled} -o {paths.profile_use_bitcode}", lines[8])
+        self.assertIn(f"compact-error-names {zero_filled} {compacted}", lines[8])
+        self.assertIn(f"-passes=globaldce,verify {compacted} -o {paths.profile_use_bitcode}", lines[9])
 
     def test_profile_use_stops_when_the_outliner_folds_a_nested_constant(self) -> None:
         actions = self.root / "folded-actions"
@@ -481,7 +478,6 @@ print('{{}}')""",
             ("-internalize-public-api-list=main,_mh_execute_header",),
             macos.public_api_flags(self.toolchain, self.paths),
         )
-        self.assertEqual(2, OUTLINE_PARTITIONS)
         self.assertEqual(
             (
                 "--disable-vp",
@@ -544,54 +540,28 @@ print('{{}}')""",
                 mapped_profile,
             )[len(USE_FLAGS) + 1],
         )
+        source = self.paths.profile_use_base_bitcode
         self.assertEqual(
             (
-                str(self.toolchain.llvm_split),
-                "-j",
-                "2",
+                str(self.toolchain.opt),
+                *IR_OUTLINER_FLAGS,
+                str(source),
                 "-o",
-                str(self.paths.outline_split_prefix),
-                str(self.paths.profile_use_base_bitcode),
+                str(self.paths.outlined_bitcode),
             ),
-            split_ir_argv(self.toolchain, self.paths),
-        )
-        for index, (split, outlined) in enumerate(
-            zip(self.paths.outline_split_bitcodes, self.paths.outlined_bitcodes)
-        ):
-            with self.subTest(index=index):
-                self.assertEqual(
-                    (
-                        str(self.toolchain.opt),
-                        *IR_OUTLINER_FLAGS,
-                        str(split),
-                        "-o",
-                        str(outlined),
-                    ),
-                    outline_ir_argv(self.toolchain, split, outlined),
-                )
-        self.assertEqual(
-            (
-                str(self.toolchain.llvm_link),
-                *map(str, self.paths.outlined_bitcodes),
-                "-o",
-                str(self.paths.linked_outlined_bitcode),
-            ),
-            link_outlined_ir_argv(self.toolchain, self.paths),
+            outline_ir_argv(self.toolchain, source, self.paths.outlined_bitcode),
         )
         self.assertEqual(
             (
                 str(self.toolchain.opt),
                 "-passes=internalize,constmerge,globaldce,mergefunc,verify",
                 "-internalize-public-api-list=main,_mh_execute_header",
-                str(self.paths.linked_outlined_bitcode),
+                str(self.paths.outlined_bitcode),
                 "-o",
                 str(self.paths.profile_use_bitcode),
             ),
             cleanup_outlined_ir_argv(self.toolchain, self.paths),
         )
-        split_command = split_ir_argv(self.toolchain, self.paths)
-        self.assertNotIn("--round-robin", split_command)
-        self.assertNotIn("--preserve-locals", split_command)
         self.assertEqual(
             (str(self.paths.instrumented_binary), "help"),
             instrumented_run_argv(self.paths, ("help",)),
@@ -1144,22 +1114,6 @@ with pathlib.Path({str(actions)!r}).open('a') as stream:
     stream.write('opt ' + ' '.join(sys.argv[1:]) + '\\n')
 pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
         )
-        split = self.write_executable(
-            "llvm-split",
-            f"""import pathlib,sys
-with pathlib.Path({str(actions)!r}).open('a') as stream:
-    stream.write('split ' + ' '.join(sys.argv[1:]) + '\\n')
-prefix = sys.argv[sys.argv.index('-o') + 1]
-pathlib.Path(prefix + '0').write_bytes(b'part zero')
-pathlib.Path(prefix + '1').write_bytes(b'part one')""",
-        )
-        link = self.write_executable(
-            "llvm-link",
-            f"""import pathlib,sys
-with pathlib.Path({str(actions)!r}).open('a') as stream:
-    stream.write('link ' + ' '.join(sys.argv[1:]) + '\\n')
-pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'linked')""",
-        )
         nm = self.write_executable(
             "public-nm",
             f"""import pathlib
@@ -1171,13 +1125,11 @@ print('_main T ---------------- 0')""",
         return dataclasses.replace(
             self.toolchain,
             opt=opt,
-            llvm_split=split,
-            llvm_link=link,
             llvm_nm=nm,
             ir_size=self.write_ir_size(actions),
         )
 
-    def test_listed_functions_are_marked_nooutline_before_the_split(self) -> None:
+    def test_listed_functions_are_marked_nooutline_before_outlining(self) -> None:
         actions = self.root / "profile-actions"
         toolchain = self.profile_use_toolchain(actions)
         self.paths.bitcode.write_bytes(b"same bitcode")
@@ -1193,7 +1145,7 @@ print('_main T ---------------- 0')""",
         )
 
         lines = actions.read_text().splitlines()
-        self.assertEqual(19, len(lines))
+        self.assertEqual(14, len(lines))
         self.assertTrue(lines[0].startswith("opt "))
         marked = self.paths.profile_use_base_bitcode.with_name(
             self.paths.profile_use_base_bitcode.name + ".no-outline.bc"
@@ -1203,11 +1155,11 @@ print('_main T ---------------- 0')""",
                 f"--functions {functions} no-outline {self.paths.profile_use_base_bitcode} {marked}"
             )
         )
-        self.assertTrue(lines[3].startswith("split -j 2 -o "))
+        self.assertIn(f"expand-constant-exprs {self.paths.profile_use_base_bitcode} ", lines[3])
         self.assertFalse(marked.exists())
         self.assertTrue(self.paths.profile_use_base_bitcode.read_bytes().startswith(b"BC\xc0\xde"))
 
-    def test_fx_profile_use_outlines_two_name_hashed_partitions_in_sequence(self) -> None:
+    def test_fx_profile_use_outlines_the_whole_program_once(self) -> None:
         actions = self.root / "profile-actions"
         toolchain = self.profile_use_toolchain(actions)
         self.paths.bitcode.write_bytes(b"same bitcode")
@@ -1222,32 +1174,31 @@ print('_main T ---------------- 0')""",
         self.assertEqual(self.paths.profile_use_bitcode, result)
         self.assertEqual(b"bitcode", result.read_bytes())
         lines = actions.read_text().splitlines()
-        self.assertEqual(18, len(lines))
+        self.assertEqual(13, len(lines))
         self.assertIn("-passes=function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,instcombine<no-verify-fixpoint>,simplifycfg),default<O2>,mergefunc", lines[0])
         self.assertNotIn("iroutliner", lines[0])
         self.assertEqual("nm", lines[1])
-        self.assertTrue(lines[2].startswith("split -j 2 -o "))
-        for index, first in ((0, 3), (1, 7)):
-            split = self.paths.outline_split_bitcodes[index]
-            outlined = self.paths.outlined_bitcodes[index]
-            expanded = split.with_name(split.name + ".expanded.bc")
-            swapped = split.with_name(split.name + ".swapped.bc")
-            self.assertIn(f"expand-constant-exprs {split} {expanded}", lines[first])
-            self.assertIn(f"swap-compares {expanded} {swapped}", lines[first + 1])
-            self.assertIn(f"-passes=iroutliner {swapped} -o {outlined}", lines[first + 2])
-            self.assertTrue(lines[first + 3].endswith(f"check-outlined {outlined}"))
-            self.assertTrue((self.paths.logs / f"swap-compares-profile-use-{index}.json").is_file())
-            self.assertTrue((self.paths.logs / f"check-outlined-profile-use-{index}.json").is_file())
-        self.assertTrue(lines[11].startswith("link "))
-        self.assertIn("-passes=internalize,constmerge,globaldce,mergefunc,verify", lines[12])
-        self.assertTrue(lines[13].startswith("ir_size --libllvm "))
-        self.assertIn(f"sparse-constants {self.paths.profile_use_bitcode} ", lines[13])
-        self.assertIn("overlay-constants ", lines[14])
-        self.assertIn("zero-fill-globals ", lines[15])
-        self.assertIn("-passes=globaldce,verify", lines[16])
-        self.assertTrue(lines[16].endswith(f"-o {self.paths.profile_use_bitcode}"))
-        self.assertEqual("nm", lines[17])
-        for suffix in (".sparse", ".overlaid", ".zero-filled"):
+        source = self.paths.profile_use_base_bitcode
+        outlined = self.paths.outlined_bitcode
+        expanded = source.with_name(source.name + ".expanded.bc")
+        swapped = source.with_name(source.name + ".swapped.bc")
+        self.assertIn(f"expand-constant-exprs {source} {expanded}", lines[2])
+        self.assertIn(f"swap-compares {expanded} {swapped}", lines[3])
+        self.assertIn(f"-passes=iroutliner {swapped} -o {outlined}", lines[4])
+        self.assertTrue(lines[5].endswith(f"check-outlined {outlined}"))
+        self.assertTrue((self.paths.logs / "swap-compares-profile-use.json").is_file())
+        self.assertTrue((self.paths.logs / "check-outlined-profile-use.json").is_file())
+        self.assertIn("-passes=internalize,constmerge,globaldce,mergefunc,verify", lines[6])
+        self.assertIn(f"{outlined} -o {self.paths.profile_use_bitcode}", lines[6])
+        self.assertTrue(lines[7].startswith("ir_size --libllvm "))
+        self.assertIn(f"sparse-constants {self.paths.profile_use_bitcode} ", lines[7])
+        self.assertIn("overlay-constants ", lines[8])
+        self.assertIn("zero-fill-globals ", lines[9])
+        self.assertIn("compact-error-names ", lines[10])
+        self.assertIn("-passes=globaldce,verify", lines[11])
+        self.assertTrue(lines[11].endswith(f"-o {self.paths.profile_use_bitcode}"))
+        self.assertEqual("nm", lines[12])
+        for suffix in (".sparse", ".overlaid", ".zero-filled", ".compacted"):
             self.assertFalse(
                 self.paths.profile_use_bitcode.with_name(
                     self.paths.profile_use_bitcode.name + suffix

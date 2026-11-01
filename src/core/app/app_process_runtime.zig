@@ -3,6 +3,7 @@ const app_worker_runtime = @import("app_worker_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const types = @import("../shared/types.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
 const compactor = @import("../compactor/compactor.zig");
@@ -121,18 +122,21 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
+        /// The notice for an error, in plain words. The raw error name goes
+        /// only to the trace.
         fn formatErrorBody(alloc: std.mem.Allocator, context: []const u8, err: anyerror) ![]u8 {
+            debug_trace.logf("worker", "error notice context={s} err={s}", .{ context, @errorName(err) });
             switch (err) {
                 error.ConnectionSetupTimedOut => return alloc.dupe(u8, "Connection setup timed out after 30 seconds."),
-                error.TlsInitializationFailed => return alloc.dupe(u8, "Connection setup failed: TLS could not be initialized."),
+                error.TlsInitializationFailed => return alloc.dupe(u8, "Couldn't make a secure connection."),
                 error.ModelImageCapabilityUnavailable => return alloc.dupe(u8, image_attachments.model_image_capability_unavailable_notice),
                 else => {},
             }
             if (detailedErrorSummary(err)) |detail| {
-                return alloc.print("{s}: {s} ({s})", .{ context, detail, @errorName(err) });
+                return alloc.print("{s}: {s}", .{ context, detail });
             }
-
-            return alloc.print("{s}: {s}", .{ context, @errorName(err) });
+            var words: [128]u8 = undefined;
+            return alloc.print("{s}: {s}", .{ context, types.plainErrorText(@errorName(err), &words) });
         }
 
         fn workerThreadMain(app: *App) void {
@@ -239,7 +243,7 @@ test "formatErrorBody describes an interrupted provider response without present
     defer alloc.free(body);
 
     try std.testing.expect(std.mem.find(u8, body, "provider response ended before completion") != null);
-    try std.testing.expect(std.mem.find(u8, body, "StreamInterrupted") != null);
+    try std.testing.expect(std.mem.find(u8, body, "StreamInterrupted") == null);
     try std.testing.expect(std.mem.find(u8, body, "\x1b[") == null);
     try std.testing.expect(!std.mem.endsWith(u8, body, "\n"));
 }
@@ -271,7 +275,7 @@ test "formatErrorBody describes terminal connection setup failures plainly" {
 
     const tls = try Rt.formatErrorBody(alloc, "request failed", error.TlsInitializationFailed);
     defer alloc.free(tls);
-    try std.testing.expectEqualStrings("Connection setup failed: TLS could not be initialized.", tls);
+    try std.testing.expectEqualStrings("Couldn't make a secure connection.", tls);
 
     for ([_][]const u8{ timeout, tls }) |body| {
         try std.testing.expect(std.mem.find(u8, body, "\x1b[") == null);
@@ -282,7 +286,12 @@ test "formatErrorBody describes terminal connection setup failures plainly" {
 
     const unrelated_timeout = try Rt.formatErrorBody(alloc, "request failed", error.ConnectionTimedOut);
     defer alloc.free(unrelated_timeout);
-    try std.testing.expectEqualStrings("request failed: ConnectionTimedOut", unrelated_timeout);
+    try std.testing.expectEqualStrings("request failed: connection timed out", unrelated_timeout);
+
+    // An error with no phrase of its own still reads as words.
+    const other = try Rt.formatErrorBody(alloc, "request failed", error.InvalidProviderCompletion);
+    defer alloc.free(other);
+    try std.testing.expectEqualStrings("request failed: invalid provider completion", other);
 }
 
 test "formatToolExecutionError includes detail for MissingField" {
@@ -403,7 +412,8 @@ test "worker thread reports queued prompt failures as worker events" {
                 try std.testing.expectEqual(types.NoticeTone.@"error", notice.tone);
                 try std.testing.expect(std.mem.find(u8, notice.body, "request failed") != null);
                 try std.testing.expect(std.mem.find(u8, notice.body, "invalid JSON syntax") != null);
-                try std.testing.expect(std.mem.find(u8, notice.body, "SyntaxError") != null);
+                // The raw error name goes only to the trace.
+                try std.testing.expect(std.mem.find(u8, notice.body, "SyntaxError") == null);
             },
             else => {},
         }
@@ -452,7 +462,10 @@ test "worker continues after project context selector failures" {
             .error_text => |notice| {
                 error_count += 1;
                 try std.testing.expect(std.mem.find(u8, notice.body, "request failed") != null);
-                try std.testing.expect(std.mem.find(u8, notice.body, @errorName(expected_error)) != null);
+                var words: [128]u8 = undefined;
+                const plain = types.plainErrorText(@errorName(expected_error), &words);
+                try std.testing.expect(std.mem.find(u8, notice.body, plain) != null);
+                try std.testing.expect(std.mem.find(u8, notice.body, @errorName(expected_error)) == null);
             },
             else => {},
         };

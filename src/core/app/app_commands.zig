@@ -1,4 +1,5 @@
 const std = @import("std");
+const profile_paths = @import("../shared/profile_paths.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
@@ -289,6 +290,7 @@ pub fn Handlers(comptime App: type) type {
                 .login = commandLogin,
                 .logout = commandLogout,
                 .provider = commandProvider,
+                .setup_alias = commandSetupAlias,
                 .show_status = commandShowStatus,
                 .attach_image = commandAttachImage,
                 .manage_images = commandManageImages,
@@ -309,7 +311,7 @@ pub fn Handlers(comptime App: type) type {
                 .handle_alias = commandHandleAlias,
                 .show_credits = commandShowCredits,
                 .paste_clipboard = commandPasteClipboard,
-                .toggle_fast = commandToggleFast,
+                .handle_fast = commandHandleFast,
                 .handle_ultrafast = commandHandleUltrafast,
                 .handle_statusline = commandHandleStatusline,
                 .rename_session = commandRenameSession,
@@ -476,6 +478,17 @@ pub fn Handlers(comptime App: type) type {
             if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
             app.input_runtime.help_menu.open();
             app.shell.render_requests.request(.footer);
+        }
+
+        /// `/setup` is the deprecated alias of `/provider`.
+        fn commandSetupAlias(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app.writeDomainNotice(.{
+                .topic = "",
+                .tone = .warning,
+                .body = "/setup " ++ command_specs.deprecated_until ++ "; use /login to sign in or add an API key, or /provider to choose a provider",
+            }, true);
+            try commandProvider(ctx);
         }
 
         fn commandLogin(ctx: *anyopaque) !void {
@@ -1095,6 +1108,7 @@ pub fn Handlers(comptime App: type) type {
                 .topic = "skills",
                 .tone = .warning,
                 .body = body,
+                .visibility = .full_only,
             }, true);
         }
 
@@ -1291,9 +1305,9 @@ pub fn Handlers(comptime App: type) type {
             try image_commands.Commands(App).attachClipboard(app);
         }
 
-        fn commandToggleFast(ctx: *anyopaque) !void {
+        fn commandHandleFast(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try session_commands.Commands(App).toggleFast(app);
+            try session_commands.Commands(App).handleFast(app, rest);
         }
 
         fn commandHandleUltrafast(ctx: *anyopaque, rest: []const u8) !void {
@@ -4433,7 +4447,7 @@ test "skills list opens menu without transcript inventory" {
     try std.testing.expect(std.mem.find(u8, rendered, "Visible skills (") == null);
 }
 
-test "skills list reports a bounded discovery warning with an escaped candidate path" {
+test "skills list keeps a bounded discovery warning in the full transcript only" {
     const alloc = std.testing.allocator;
     const skill_diagnostics = [_]skill_runtime.SkillDiagnostic{.{
         .path = "/tmp/hostile\npath/body-sentinel",
@@ -4455,12 +4469,13 @@ test "skills list reports a bounded discovery warning with an escaped candidate 
     const notice = app.shell.entries.items[0].semantic_notice;
     try std.testing.expectEqualStrings("skills", notice.topic);
     try std.testing.expectEqual(types.NoticeTone.warning, notice.tone);
+    try std.testing.expectEqual(types.NoticeVisibility.full_only, notice.visibility);
     try std.testing.expect(std.mem.find(u8, notice.body, "skill discovery warning:") != null);
     try std.testing.expect(std.mem.find(u8, notice.body, "hostile&#x0a;path/body-sentinel") != null);
     try std.testing.expect(std.mem.find(u8, notice.body, "metadata is invalid (missing_name)") != null);
     const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
     defer alloc.free(rendered);
-    try std.testing.expect(std.mem.find(u8, rendered, "! skills: skill discovery warning:") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "skill discovery warning:") == null);
 }
 
 test "skills show focuses matching menu row without transcript body" {

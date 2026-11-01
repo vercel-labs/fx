@@ -28,6 +28,9 @@ pub const SourceSet = std.EnumSet(credentials.Source);
 pub const CredentialRefreshMode = enum {
     if_needed,
     force,
+    /// Reads the stored credential again even when the request path verified
+    /// it recently, as after the user signs in. Refreshes only an expired one.
+    reload,
 };
 
 const credential_source_order = [_]credentials.Source{
@@ -259,15 +262,15 @@ fn loadCredentialForRefresh(
 ) !?credentials.Credential {
     return switch (source) {
         .fx_login => switch (mode) {
-            .if_needed => credentials.loadFxLoginCredential(alloc, transport),
+            .if_needed, .reload => credentials.loadFxLoginCredential(alloc, transport),
             .force => credentials.refreshFxLoginCredential(alloc, transport),
         },
         .chatgpt_subscription => switch (mode) {
-            .if_needed => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
+            .if_needed, .reload => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
             .force => credentials.refreshChatGptCredential(alloc, transport),
         },
         .grok_subscription => switch (mode) {
-            .if_needed => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
+            .if_needed, .reload => credentials.loadSource(alloc, transport, host.unavailable_secret_store, source),
             .force => credentials.refreshGrokCredential(alloc, transport),
         },
         else => null,

@@ -49,7 +49,7 @@ pub const retry_count: usize = 3;
 pub const chat_url_env = "FX_GATEWAY_CHAT_URL";
 pub const default_model_catalog_base_url = "https://ai-gateway.vercel.sh";
 const base_url_env = "FX_GATEWAY_BASE_URL";
-const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
+const e2e_gateway_models_url_env = "FX_TEST_GATEWAY_MODELS_URL";
 const oauth_request_timeout_ms: i64 = 15_000;
 const oauth_response_max_bytes: usize = 64 * 1024;
 
@@ -750,9 +750,10 @@ fn streamAgentCompletion(
 }
 
 /// Gateway reports the last provider it tried, so a provider's size rejection
-/// can arrive as a 400 from a later fallback. Classify it as too large.
+/// can arrive as a 400 from a later fallback. Classify it as too large. A 429
+/// whose body names a used-up quota is not a rate limit a wait outlives.
 fn gatewayFailureKind(alloc: Allocator, status: std.http.Status, err_body: ?[]const u8) agent_stream_provider_contract.FailureKind {
-    const kind = agent_stream_provider_contract.FailureKind.fromHttpStatus(status);
+    const kind = gateway_client.httpFailureKind(alloc, agent_stream_provider_contract.FailureKind.fromHttpStatus(status), err_body);
     if (kind != .invalid_request) return kind;
     const body = err_body orelse return kind;
     return if (vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body)) .request_too_large else kind;
@@ -766,6 +767,16 @@ test "Gateway 400 with a provider 413 attempt is a size failure" {
     try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.invalid_request, gatewayFailureKind(alloc, .bad_request, null));
     try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.request_too_large, gatewayFailureKind(alloc, .payload_too_large, null));
     try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.rate_limited, gatewayFailureKind(alloc, .too_many_requests, fallback_body));
+}
+
+test "Gateway 429 naming a used-up quota is not a rate limit" {
+    const alloc = std.testing.allocator;
+    const quota_body = "{\"error\":{\"message\":\"You exceeded your current quota\",\"type\":\"insufficient_quota\",\"code\":\"insufficient_quota\"}}";
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.quota_exhausted, gatewayFailureKind(alloc, .too_many_requests, quota_body));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.rate_limited, gatewayFailureKind(alloc, .too_many_requests, "{\"error\":{\"code\":\"rate_limit_exceeded\"}}"));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.rate_limited, gatewayFailureKind(alloc, .too_many_requests, null));
+    // Only a 429 changes kind.
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.forbidden, gatewayFailureKind(alloc, .forbidden, quota_body));
 }
 
 fn fetchCredits(

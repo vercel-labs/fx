@@ -1,5 +1,5 @@
-//! Drop-in replacements for `std.json.parseFromSlice` and
-//! `parseFromSliceLeaky`.
+//! Drop-in replacements for `std.json.parseFromSlice`, `parseFromSliceLeaky`,
+//! and `innerParse` with a `*std.json.Scanner` source.
 //!
 //! `std.json` generates a whole parser for every type it parses into, so each
 //! struct, slice, and optional carries its own copy of the parsing logic.
@@ -80,7 +80,7 @@ fn parseFromScannerLeaky(
 
 /// Same contract as `std.json.innerParse` with a `*std.json.Scanner` source:
 /// `options` must have no null fields, as in a `jsonParse` method.
-fn innerParse(
+pub fn innerParse(
     comptime T: type,
     allocator: Allocator,
     source: *Scanner,

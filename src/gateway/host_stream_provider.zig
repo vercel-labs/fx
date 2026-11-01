@@ -167,8 +167,9 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     if (opened.status != .ok) {
         const body = try readErrorBody(alloc, transport, opened.handle, request);
         // Gateway reports the last provider it tried, so a provider's size
-        // rejection can arrive as a 400 from a later fallback.
-        const kind = stream_provider.FailureKind.fromHttpStatus(opened.status);
+        // rejection can arrive as a 400 from a later fallback. A 429 whose
+        // body names a used-up quota is not a rate limit a wait outlives.
+        const kind = gateway_client.httpFailureKind(alloc, stream_provider.FailureKind.fromHttpStatus(opened.status), body);
         const size_rejected = kind == .invalid_request and vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body);
         return .{ .failed = .{
             .kind = if (size_rejected) .request_too_large else kind,
