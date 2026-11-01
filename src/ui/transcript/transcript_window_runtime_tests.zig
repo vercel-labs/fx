@@ -276,7 +276,15 @@ test "transcript window: Ctrl+O shows the cycle before the compaction with the n
     runtime.failTranscriptArchive();
     try std.testing.expectEqual(@as(?u32, null), runtime.transcript_archive_request);
     try std.testing.expectEqual(@as(usize, 0), runtime.full_transcript_page_anchor.entry_index);
+    try std.testing.expect(runtime.transcript_archive_failed);
+    // The next cycle that loads takes the notice away, and so does closing.
+    runtime.moveToFullTranscriptPage(back_down, .first);
+    try runtime.installTranscriptArchive(alloc, 1, true, try archivedCycle(alloc, 1, &.{ "older one\n", "older two\n", "older three\n" }));
+    try std.testing.expect(!runtime.transcript_archive_failed);
+    runtime.moveToFullTranscriptPage(further, .last);
+    runtime.failTranscriptArchive();
     runtime.closeFullTranscriptState();
+    try std.testing.expect(!runtime.transcript_archive_failed);
     try std.testing.expect(runtime.transcript_archive == null);
     try std.testing.expect(runtime.full_transcript_page_anchor == .tail);
 }

@@ -4847,6 +4847,7 @@ test {
     _ = @import("core/app/input_interrupt_runtime.zig");
     _ = @import("ui/footer/render_input.zig");
     _ = @import("ui/footer/surface_frame.zig");
+    _ = @import("ui/footer/paint_plan.zig");
     _ = @import("ui/render_request.zig");
     _ = @import("core/app/app_runtime_setup.zig");
     _ = @import("core/app/app_session_runtime.zig");

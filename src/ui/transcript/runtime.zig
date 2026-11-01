@@ -4788,6 +4788,9 @@ pub const TranscriptRuntime = struct {
     transcript_archive_available: bool = false,
     /// The cycle a Ctrl+O page needs (`Archive.back`), for the app to load.
     transcript_archive_request: ?u32 = null,
+    /// The last older cycle Ctrl+O asked the log for could not be read. The
+    /// footer says so until a cycle loads or the view resets.
+    transcript_archive_failed: bool = false,
     /// Which entry of the requested cycle Ctrl+O lands on once it loads.
     transcript_archive_boundary: ?ArchiveLanding = null,
     full_transcript_installed_page: ?InstalledFullTranscriptPage = null,
@@ -7573,6 +7576,7 @@ pub const TranscriptRuntime = struct {
         self.discardTranscriptArchive();
         self.transcript_archive = .{ .back = back, .has_older = has_older, .runtime = owned, .alloc = alloc };
         debug_trace.logf("full_transcript_cache", "archive_installed back={d} entries={d} has_older={}", .{ back, owned.entries.items.len, has_older });
+        self.transcript_archive_failed = false;
         if (self.transcript_archive_request == back) self.transcript_archive_request = null;
         const land = self.transcript_archive_boundary orelse return;
         self.transcript_archive_boundary = null;
@@ -7592,8 +7596,9 @@ pub const TranscriptRuntime = struct {
     }
 
     /// The app could not load the requested cycle: Ctrl+O stays on the held
-    /// entries.
+    /// entries, and its footer says the older history could not load.
     pub fn failTranscriptArchive(self: *TranscriptRuntime) void {
+        self.transcript_archive_failed = true;
         self.transcript_archive_request = null;
         self.transcript_archive_boundary = null;
         if (self.full_transcript_page_anchor == .archive) self.full_transcript_page_anchor = .{ .entry_index = 0 };
@@ -7622,6 +7627,7 @@ pub const TranscriptRuntime = struct {
         self.discardTranscriptArchive();
         self.transcript_archive_request = null;
         self.transcript_archive_boundary = null;
+        self.transcript_archive_failed = false;
         self.full_transcript_prepared_page_visible = false;
         self.full_transcript_open_request = null;
         self.full_transcript_restore_open_pending = false;
