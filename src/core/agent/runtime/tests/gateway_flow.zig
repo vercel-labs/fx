@@ -4853,8 +4853,9 @@ test "processQueuedPrompt final summary counts submitted input once across Gatew
     var prompt_estimator = token_estimate.StreamingEstimator{};
     prompt_estimator.consume(job.prompt);
     try std.testing.expectEqual(types.TurnTokenProgress{
-        .input_tokens = 300_000,
+        .input_tokens = prompt_estimator.estimate(),
         .output_tokens = 50_000,
+        .input_exact = false,
     }, summary.token_progress);
     try std.testing.expect(summary.turn_duration_ms >= summary.thinking_duration_ms);
 }
@@ -4953,6 +4954,8 @@ test "processQueuedPrompt places the turn context after history and before the c
     const history_idx = std.mem.find(u8, body, "past background prompt") orelse return error.TestExpectedEqual;
     const current_idx = std.mem.find(u8, body, "is it still running") orelse return error.TestExpectedEqual;
     const runtime_idx = std.mem.find(u8, body, "runtime tail context unique") orelse return error.TestExpectedEqual;
+    // The turn's captured context rides after the history and before the
+    // turn's prompt (D130, D94).
     try std.testing.expect(system_idx < static_idx);
     try std.testing.expect(static_idx < history_idx);
     try std.testing.expect(history_idx < runtime_idx);

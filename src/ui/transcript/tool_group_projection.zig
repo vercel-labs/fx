@@ -165,12 +165,11 @@ const category_labels = [_][]const u8{
     "open",
     "command",
     "subagent",
-    "browser",
     "MCP call",
 };
-const command_category_index = 5;
-const subagent_category_index = 6;
-const mcp_category_index = 8;
+const command_category_index = 4;
+const subagent_category_index = 5;
+const mcp_category_index = 6;
 
 const Summary = struct {
     total: usize = 0,

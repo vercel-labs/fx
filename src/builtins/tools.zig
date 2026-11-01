@@ -1103,7 +1103,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "c7f6ed30a46ab85da1ced6559a90cf93eea7208a6e0a546225c56b458eb20dc8",
+        "812eb4b07fbedd5a1de2bf77fa7f06dc48b0fd283aaf1a779b625c176eab519e",
         &actual_hex,
     );
 }
@@ -1250,13 +1250,11 @@ test "shell schema fields match the runtime action contract" {
             try std.testing.expect(schemaProperty(schema, name) != null);
         }
     }
-    // Each field's description opens with "For <action>" naming an action
-    // that accepts the field.
+    // Each field's description opens with the action that accepts it:
+    // "run ...", "interact ...", or "stop ...".
     for (shell_properties[1..]) |property| {
-        try std.testing.expect(std.mem.startsWith(u8, property.description, "For "));
-        const named = property.description["For ".len..];
         const owner = for (actions) |action| {
-            if (std.mem.startsWith(u8, named, @tagName(action))) break action;
+            if (std.mem.startsWith(u8, property.description, @tagName(action))) break action;
         } else return error.TestExpectedEqual;
         try std.testing.expect(nameInSet(shell_impl.actionFieldContract(owner).allowed, property.name));
     }
@@ -1308,12 +1306,12 @@ test "built-in read_file owns product metadata schema and callbacks" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("read_file", read_file.name);
-    try std.testing.expect(std.mem.find(u8, read_file.description, "numbered lines") != null);
-    try std.testing.expect(std.mem.find(u8, read_file.description, "image file") != null);
+    try std.testing.expect(std.mem.find(u8, read_file.description, "line-numbered output") != null);
+    try std.testing.expect(std.mem.find(u8, read_file.description, "image, web page") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"start_line\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"line_count\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\",\"description\":\"Relative to the workspace, or absolute.\"}") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"description\":\"Path relative to the workspace root") != null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.read_file, read_file.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, read_file.activity_kind);
     try std.testing.expect(!read_file.requires_approval);
@@ -1360,7 +1358,7 @@ test "built-in edit_file owns product metadata schema and callbacks" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("edit_file", edit_file.name);
-    try std.testing.expect(std.mem.find(u8, edit_file.description, "appear exactly once") != null);
+    try std.testing.expect(std.mem.find(u8, edit_file.description, "one exact old_string occurrence") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\",\"old_string\",\"new_string\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "replace_all") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\",\"description\":\"Relative to the workspace, or absolute.\"}") != null);
@@ -1385,11 +1383,11 @@ test "built-in web_fetch owns product metadata and schema" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("web_fetch", web_fetch.name);
-    try std.testing.expect(std.mem.find(u8, web_fetch.description, "public http(s) URL") != null);
+    try std.testing.expect(std.mem.find(u8, web_fetch.description, "public HTTP(S) URL") != null);
     try std.testing.expect(std.mem.find(u8, web_fetch.description, "untrusted") != null);
-    try std.testing.expect(std.mem.find(u8, web_fetch.description, "the user named") != null);
-    try std.testing.expect(std.mem.find(u8, web_fetch.description, "Not for local repository facts") != null);
-    try std.testing.expect(std.mem.find(u8, web_fetch.description, "GitHub metadata that gh can answer") != null);
+    try std.testing.expect(std.mem.find(u8, web_fetch.description, "the user provided or named") != null);
+    try std.testing.expect(std.mem.find(u8, web_fetch.description, "local repository facts") != null);
+    try std.testing.expect(std.mem.find(u8, web_fetch.description, "GitHub metadata that the GitHub CLI can answer") != null);
     try std.testing.expect(std.mem.find(u8, web_fetch.description, "web_search") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"additionalProperties\":false") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"url\":{\"type\":\"string\"") != null);
@@ -1462,7 +1460,7 @@ test "built-in skill owns product metadata schema and callbacks" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("skill", skill.name);
-    try std.testing.expect(std.mem.find(u8, skill.description, "relative to the skill, not the workspace") != null);
+    try std.testing.expect(std.mem.find(u8, skill.description, "from the selected skill directory, not the workspace") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"location\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"resource\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"offset\":{\"type\":\"integer\"") == null);
@@ -1537,8 +1535,8 @@ test "built-in install_skill owns product metadata and schema" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("install_skill", install_skill.name);
-    try std.testing.expect(std.mem.find(u8, install_skill.description, "when the user asks") != null);
-    try std.testing.expect(std.mem.find(u8, install_skill.description, "fx checks it") != null);
+    try std.testing.expect(std.mem.find(u8, install_skill.description, "the user asks to install a skill") != null);
+    try std.testing.expect(std.mem.find(u8, install_skill.description, "skill storage managed by fx") != null);
     try std.testing.expect(std.mem.find(u8, install_skill.description, "load an already-installed skill") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"source\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"skill\":{\"type\":\"string\"") != null);
@@ -1585,7 +1583,6 @@ test "built-in mcp_select_tool owns product metadata schema and callbacks" {
     try std.testing.expect(std.mem.find(u8, schema_json, "\"name\":\"mcp_select_tool\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"name\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"name\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "callable on your next step") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "mcp_search_tools") == null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.mcp_select_tool, mcp_select_tool.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, mcp_select_tool.activity_kind);
@@ -1689,7 +1686,7 @@ test "built-in vision owns product metadata schema and callbacks" {
 
     try std.testing.expectEqualStrings("vision", vision.name);
     try std.testing.expect(std.mem.find(u8, vision.description, "exactly one source") != null);
-    try std.testing.expect(std.mem.find(u8, vision.description, "image files the user named") != null);
+    try std.testing.expect(std.mem.find(u8, vision.description, "authorized images attached by the user") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"image_ids\":{\"type\":\"array\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"paths\":{\"type\":\"array\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"minItems\":1") != null);
@@ -1763,8 +1760,8 @@ test "built-in read_tool_result owns product metadata schema and callbacks" {
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("read_tool_result", read_tool_result.name);
-    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "pass query") != null);
-    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "pass search instead of a handle") != null);
+    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "with query to find") != null);
+    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "search finds them by text without a handle") != null);
     try std.testing.expect(std.mem.find(u8, read_tool_result.description, "request.") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"mode\"") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"oneOf\"") == null);
@@ -1779,7 +1776,7 @@ test "built-in read_tool_result owns product metadata schema and callbacks" {
         try std.testing.expect(properties.get(name) != null);
     }
     try std.testing.expectEqual(@as(i64, 3), properties.get("search").?.object.get("maxItems").?.integer);
-    try std.testing.expect(std.mem.find(u8, properties.get("search").?.object.get("description").?.string, "Without a handle") != null);
+    try std.testing.expect(std.mem.find(u8, properties.get("search").?.object.get("description").?.string, "without handle") != null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.read_tool_result, read_tool_result.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, read_tool_result.activity_kind);
     try std.testing.expect(!read_tool_result.requires_approval);

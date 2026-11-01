@@ -7309,8 +7309,8 @@ fn processQueuedPromptLoop(
             return;
         }
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
-        try ephemeral_overlay.appendSlice(overlay_arena, runtime_context.messages());
-        // The turn's context was captured once when it began (D130, D131).
+        // The turn's context was captured once when it began (D130, D131);
+        // it rides as the turn's own context messages, never as system text.
         try session_runtime.appendTurnContextChatMessages(overlay_arena, &ephemeral_overlay, job.turn_context, job.skill_context);
         try runtime_stream_rules.beforeStep(&stream_rules, arena, history_messages.items, &within_turn_suffix);
         // Results that settle mid-turn ride at the tail of this step's

@@ -3006,13 +3006,18 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
 - **D234 Decision:** a checklist row in the transcript says what changed,
   "Planned 5 tasks in 2 phases", "Completed Write parser", "Blocked Tag
   release · waiting on review", and under it the list after `init` and
-  `view` (phase with its count, then tasks with ✓ done, → in progress,
-  ○ pending, × dropped, ! blocked), or the progress after other changes,
-  "3 of 5 done · Write files complete, next: Verify". A long list keeps
-  its open tasks. Viewing is routine and folds; changes stay. **Why:**
-  proto's framed checklist in proto-fx's row style. **Alternative:**
-  proto's live panel above the composer, which needs the checklist in the
-  terminal's own state and is not ported.
+  `view` drawn as proto draws its checklist: phases numbered "I. Build
+  1/2" and each task a tree row "├─ □ Write parser" with a checkbox
+  (■ done, □ otherwise), done and dropped tasks struck through, colors
+  by status (done green, in progress accent, pending dim, blocked
+  warning with "(blocked: reason)", dropped red), or the progress after
+  other changes, "3 of 5 done · Write files complete, next: Verify". A
+  long list keeps its open tasks with the last closed one above them,
+  then "… N more". Viewing is routine and folds; changes stay. **Why:**
+  proto's framed checklist, checkboxes and tree included, in proto-fx's
+  row style. **Alternative:** proto's live panel above the composer,
+  which needs the checklist in the terminal's own state and is not
+  ported.
 
 - **D235 Decision:** every document a browser tab loads during a browser
   call answers to the same domain policy as `open` (D198): `tab.goto`

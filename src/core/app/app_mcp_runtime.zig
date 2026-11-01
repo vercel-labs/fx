@@ -12,7 +12,6 @@ const mcp_host = @import("../mcp_host/host.zig");
 const mcp_verbs = @import("../mcp_host/verbs.zig");
 const mcp_menu = @import("../mcp_host/menu.zig");
 const text_utils = @import("../shared/text_utils.zig");
-const mcp_notice_text = @import("../mcp_host/notice_text.zig");
 const editor_state = @import("../input/editor_state.zig");
 const command_lex = @import("../shell_command/command_lex.zig");
 const mod_registry = @import("../mods/registry.zig");
@@ -346,16 +345,21 @@ pub const State = struct {
                     if (!sink.isTyped(n.server)) return;
                     sink.pushLocked(signInText(a, aa, n.server, n.url) catch return, false);
                 },
-                .signed_in => |server| sink.endSignIn(server),
-                .sign_in_failed => |n| sink.endSignIn(n.server),
-                .needs_login, .not_saved => {},
-            }
-            // The status line says a login is needed for as long as it's true.
-            const shown = (mcp_notice_text.format(std.heap.c_allocator, notice) catch return) orelse return;
-            switch (notice) {
-                .signed_in => |server| sink.report(server, shown.text, shown.warning),
-                .sign_in_failed => |n| sink.report(n.server, shown.text, shown.warning),
-                else => sink.pushLocked(shown.text, shown.warning),
+                .signed_in => |server| {
+                    sink.endSignIn(server);
+                    sink.report(server, a.print("Signed in to {s}.", .{safeText(aa, server, 160)}) catch return, false);
+                },
+                .sign_in_failed => |n| {
+                    sink.endSignIn(n.server);
+                    sink.report(n.server, a.print("Couldn't sign in to {s}: {s}.", .{ safeText(aa, n.server, 160), safeText(aa, n.reason, 240) }) catch return, true);
+                },
+                // The status line says so for as long as it's true.
+                .needs_login => {},
+                .not_saved => |n| {
+                    const server = safeText(aa, n.server, 160);
+                    const text = a.print("Couldn't save {s}'s new login: {s}. It keeps working here, but after a restart {s} needs a login again.", .{ server, safeText(aa, n.reason, 240), server }) catch return;
+                    sink.pushLocked(text, true);
+                },
             }
         }
 

@@ -3469,9 +3469,9 @@ test "tightening read-only open removes group and other write access and records
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
-    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", "{\"permission_mode\":\"auto\"}\n");
-    var root_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{ .iterate = true });
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
+    try writeStoreFixture(tmp.dir, "home/.proto-fx/settings.json", "{\"permission_mode\":\"auto\"}\n");
+    var root_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.proto-fx", .{ .iterate = true });
     defer root_dir.close(io_mod.getIo());
     root_dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o775)) catch return error.SkipZigTest;
     var file = try root_dir.openFile(io_mod.getIo(), "settings.json", .{ .mode = .read_write });
@@ -3495,7 +3495,7 @@ test "tightening read-only open removes group and other write access and records
         try std.testing.expect(primary == .valid);
         try std.testing.expect(store.tightened.home and store.tightened.settings);
     }
-    const home_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx", .{});
+    const home_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.proto-fx", .{});
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o755), home_stat.permissions.toMode() & 0o777);
     const file_stat = try root_dir.statFile(io_mod.getIo(), "settings.json", .{});
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o644), file_stat.permissions.toMode() & 0o777);

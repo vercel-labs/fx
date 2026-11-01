@@ -7524,7 +7524,7 @@ test "a turn's context notes come back on resume at their boundaries, before tha
     // Each note is its own `context_note` item, written before the steering
     // at its boundary.
     const io = io_mod.getIo();
-    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".proto-fx", "sessions", "v2", id, "log.jsonl" });
     defer testing.allocator.free(log_path);
     const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
     defer testing.allocator.free(bytes);
@@ -7582,7 +7582,7 @@ test "a turn's runtime context comes back on resume, saved once right after its 
     s.close();
 
     const io = io_mod.getIo();
-    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", id, "log.jsonl" });
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".proto-fx", "sessions", "v2", id, "log.jsonl" });
     defer testing.allocator.free(log_path);
     const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
     defer testing.allocator.free(bytes);

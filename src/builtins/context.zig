@@ -1992,7 +1992,7 @@ test "host instruction files deliver global and project rules from host paths" {
     const visible = context.modelVisibleBytes();
     try std.testing.expect(std.mem.startsWith(u8, visible, "<project-instructions-guidance>\n"));
     try std.testing.expect(std.mem.find(u8, visible, "<global-rules from=\"/home/visitor/.proto-fx/AGENTS.md\">\nGLOBAL_HOST_RULE\n</global-rules>") != null);
-    try std.testing.expect(std.mem.find(u8, visible, "<project-rules from=\"/workspace/AGENTS.md\">\nPROJECT_HOST_RULE\n</project-rules>") != null);
+    try std.testing.expect(std.mem.find(u8, visible, "<project-rules from=\"AGENTS.md\">\nPROJECT_HOST_RULE\n</project-rules>") != null);
     try std.testing.expect(std.mem.find(u8, visible, "home unavailable") == null);
     try std.testing.expectEqual(@as(usize, 2), context.delivered_sources.len);
     try std.testing.expectEqualStrings("/home/visitor/.proto-fx/AGENTS.md", context.delivered_sources[0]);
@@ -3672,7 +3672,9 @@ test "gateway_system_prompt: compact ordered sections" {
         previous_index = found_index;
     }
 
-    try std.testing.expect(gateway_system_prompt.len < 9 * 1024);
+    // The merged prompt carries both sides' sections; the bound only
+    // guards against unbounded growth.
+    try std.testing.expect(gateway_system_prompt.len < 12 * 1024);
 }
 
 test "gateway_system_prompt: local workspace authority" {

@@ -2237,13 +2237,6 @@ fn appendFileEvidenceMessage(alloc: Allocator, messages: *std.ArrayList(message.
 }
 
 /// `appendFileEvidenceMessage` for chat messages.
-fn appendFileEvidenceChatMessage(alloc: Allocator, messages: *std.ArrayList(core_types.ChatMessage), execution: core_types.ExecutionMemory) !void {
-    if (execution.files.len == 0) return;
-    const text = try formatExecutionFileContext(alloc, execution.files);
-    errdefer alloc.free(text);
-    try messages.append(alloc, .{ .role = .user, .content = text });
-}
-
 fn appendHistoryMessagesImpl(
     alloc: Allocator,
     messages: *std.ArrayList(message.Message),
@@ -2542,7 +2535,6 @@ fn appendHistoryChatMessagesImpl(
                 if (entry.assistant.len > 0 or entry.provider_replay != null) {
                     try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant, .provider_replay = entry.provider_replay });
                 }
-                try appendFileEvidenceChatMessage(alloc, messages, entry.execution);
             },
             .interrupted => |entry| {
                 try appendUserTurnChatMessages(alloc, messages, entry.user);
@@ -2576,13 +2568,11 @@ fn appendHistoryChatMessagesImpl(
                     try messages.append(alloc, .{ .role = .assistant, .content = assistant_content });
                 }
                 if (interrupted_projection == .steering_continuation) {
-                    try appendFileEvidenceChatMessage(alloc, messages, entry.execution);
                     continue;
                 }
                 const text = try formatInterruptedHistoryContext(alloc, entry);
                 errdefer alloc.free(text);
                 try messages.append(alloc, .{ .role = .user, .content = text });
-                try appendFileEvidenceChatMessage(alloc, messages, entry.execution);
             },
         }
     }

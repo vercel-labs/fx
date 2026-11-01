@@ -2114,7 +2114,7 @@ pub fn runFakePromptWithLifecycle(
     var agent: runtime_agent.Agent = .{};
     defer agent.deinit(hooks.alloc);
     try agent.restoreHistory(hooks.alloc, job.history);
-    try runtime_orchestrator.processAgentPrompt(
+    runtime_orchestrator.processAgentPrompt(
         &agent,
         &deps,
         null,

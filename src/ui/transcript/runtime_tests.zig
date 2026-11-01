@@ -15092,7 +15092,7 @@ test "transcript lifecycle terminal markers preserve ANSI summaries and normaliz
     var styled_cancelled_expected: [256]u8 = undefined;
     try expectRawEntryBytes(&runtime, styled_cancelled_entry_id, try std.mem.print(
         &styled_cancelled_expected,
-        "{s}■{s}{s} Cancelled\x1b[0m \x1b[38;5;245msleep 30\x1b[0m{s}" ++
+        "{s}▪{s}{s} Cancelled\x1b[0m \x1b[38;5;245msleep 30\x1b[0m{s}" ++
             " · What should change?\n",
         .{
             ui_render.warning_style,
@@ -15125,7 +15125,7 @@ test "transcript lifecycle terminal markers preserve ANSI summaries and normaliz
     var cancelled_expected: [128]u8 = undefined;
     try expectRawEntryBytes(&runtime, cancelled_entry_id, try std.mem.print(
         &cancelled_expected,
-        "{s}■{s} {s}Tool cancelled{s} · What should change?\n",
+        "{s}▪{s} {s}Tool cancelled{s} · What should change?\n",
         .{
             ui_render.warning_style,
             ui_render.reset_style,
