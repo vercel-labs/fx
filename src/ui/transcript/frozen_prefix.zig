@@ -11,9 +11,8 @@
 //!
 //! The slots live in the transcript runtime. The mutation shadows cloned from
 //! it borrow its store, so a commit's preparation reuses the prefix too.
-//! Test builds, and any run with `FX_TRANSCRIPT_PREFIX_ORACLE=1`, run the oracle
-//! in `source_preparation.zig`, which checks every resumed render against a full
-//! one.
+//! In test builds, the oracle in `source_preparation.zig` checks every resumed
+//! render against a full one.
 
 const std = @import("std");
 const transcript_blocks = @import("../render_engine/transcript_blocks.zig");

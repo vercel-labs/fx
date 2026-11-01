@@ -78,9 +78,8 @@ current code.
   (the history replay base, and where the last append started and ended), and
   a frame resumes from the latest kept state at or before its base. A kept
   state is used only while the bytes before it are unchanged (a memcmp unless
-  the base is the plain stable one), and a rebase clears all three; an
-  oracle (`FX_TRANSCRIPT_PREFIX_ORACLE=1`) compares every resumed boundary
-  with a full feed.
+  the base is the plain stable one), and a rebase clears all three. In test
+  builds an oracle compares every resumed boundary with a full feed.
 - The cursor walk over the plain transcript advances runs of printable ASCII
   a row at a time, with the same results as the byte-at-a-time walk.
 - The interactive loop applies worker events in 32 ms slices

@@ -2589,7 +2589,7 @@ pub fn controlBoundaryAt(
     else
         try prepareControlBoundary(alloc, bytes, cols, raw_offset);
     errdefer boundary.deinit(alloc);
-    if (from != null and source_preparation.prefixOracleEnabled()) {
+    if (source_preparation.prefix_oracle and from != null) {
         try checkControlBoundaryAgainstFull(alloc, bytes, cols, raw_offset, &boundary);
     }
     return boundary;
@@ -2629,7 +2629,7 @@ fn checkControlBoundaryAgainstFull(
     bytes: []const u8,
     cols: u16,
     raw_offset: usize,
-    advanced: *PreparedControlBoundary,
+    advanced: *const PreparedControlBoundary,
 ) !void {
     var full = try prepareControlBoundary(alloc, bytes, cols, raw_offset);
     defer full.deinit(alloc);
@@ -2642,9 +2642,7 @@ fn checkControlBoundaryAgainstFull(
         "control boundary oracle mismatch offset={d} full_resume={d} advanced_resume={d} full_col={d} advanced_col={d}",
         .{ raw_offset, full.resume_bytes.len, advanced.resume_bytes.len, full.cursor_col, advanced.cursor_col },
     );
-    // A test fails on the mismatch; elsewhere the full boundary replaces it.
-    if (builtin.is_test) return error.TranscriptOracleMismatch;
-    std.mem.swap(PreparedControlBoundary, &full, advanced);
+    return error.TranscriptOracleMismatch;
 }
 
 fn captureControlBoundary(
@@ -2824,7 +2822,7 @@ fn replacePreparedProjectionResumeBytesForFlowOffset(
                     false,
                 );
                 defer advanced.deinit(alloc);
-                if (source_preparation.prefixOracleEnabled()) {
+                if (source_preparation.prefix_oracle) {
                     var full = try prepareControlBoundary(alloc, prepared.bytes, cols, offset);
                     defer full.deinit(alloc);
                     if (!std.mem.eql(u8, full.resume_bytes, advanced.endpoint_resume_bytes) or
@@ -2832,10 +2830,7 @@ fn replacePreparedProjectionResumeBytesForFlowOffset(
                         full.pending_wrap != advanced.endpoint_pending_wrap)
                     {
                         debug_trace.logf("render", "projection resume oracle mismatch offset={d} base={d}", .{ offset, base_offset });
-                        if (builtin.is_test) return error.TranscriptOracleMismatch;
-                        std.mem.swap([]u8, &full.resume_bytes, &advanced.endpoint_resume_bytes);
-                        advanced.endpoint_cursor_col = full.cursor_col;
-                        advanced.endpoint_pending_wrap = full.pending_wrap;
+                        return error.TranscriptOracleMismatch;
                     }
                 }
                 if (prepared.projection_resume_bytes.len > 0) {

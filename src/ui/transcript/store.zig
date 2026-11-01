@@ -563,23 +563,17 @@ pub fn renderPlainEntries(self: anytype, alloc: Allocator, cols: u16) ![]u8 {
         if (plan.capture_at != null) &captured else null,
     );
     errdefer alloc.free(bytes);
-    if (plan.resume_from != null and source_preparation.prefixOracleEnabled()) {
+    if (source_preparation.prefix_oracle and plan.resume_from != null) {
         const full = try transcript_blocks.renderEntriesToBytes(alloc, self.entries.items, cols, styles);
+        defer alloc.free(full);
         if (!std.mem.eql(u8, full, bytes)) {
             debug_trace.logf(
                 "frozen_prefix",
                 "oracle mismatch plain entries={d} full_bytes={d} resumed_bytes={d}",
                 .{ self.entries.items.len, full.len, bytes.len },
             );
-            // A test fails on the mismatch; elsewhere the full render is used.
-            if (@import("builtin").is_test) {
-                alloc.free(full);
-                return error.TranscriptOracleMismatch;
-            }
-            alloc.free(bytes);
-            return full;
+            return error.TranscriptOracleMismatch;
         }
-        alloc.free(full);
     }
     if (captured) |value| {
         plan.store.?.store(.plain, plan.capture_key, value, alloc);
