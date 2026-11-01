@@ -341,10 +341,8 @@ pub fn Handlers(comptime App: type) type {
 
         pub fn collectMcpHostFacts(app: *App) !void {
             if (comptime !@hasDecl(App, "takeMcpHostNotices")) return;
-            app.applyMcpHostReload() catch |err| {
-                debug_trace.logf("mcp", "MCP reload failed err={s}", .{@errorName(err)});
-                try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = "The MCP config changed, but fx couldn't load it again. Your current servers are still active." }, true);
-            };
+            // A reload that fails leaves its warning among the notices.
+            app.applyMcpHostReload();
             const notices = app.takeMcpHostNotices();
             defer {
                 for (notices) |n| std.heap.c_allocator.free(n.text);
