@@ -49,6 +49,14 @@ pub const ChildRun = struct {
     /// How the run's turn ended, when that is known before the turn is
     /// saved. The run ends once nothing of the turn is left to save.
     ended_as: ?types.TurnPresentationOutcome = null,
+    /// Its turn was interrupted only to hand off to the user's image or
+    /// `$skill`, so the work ends done rather than cancelled.
+    handed_off: bool = false,
+    /// The work a turn the parent didn't start opened in the parent's log,
+    /// until that turn ends: the user's, or one the child's own child's
+    /// report woke. Never `work_id`, which only the parent's works fill.
+    /// Owned.
+    turn_work_id: []u8 = &.{},
 
     /// True while the run's turn is in flight on the child agent.
     pub fn inFlight(self: *const ChildRun) bool {
@@ -76,6 +84,7 @@ pub const ChildRun = struct {
         self.finish(.cancelled);
         alloc.free(self.child_id);
         alloc.free(self.work_id);
+        alloc.free(self.turn_work_id);
         self.admission.deinit(alloc);
         alloc.free(self.system_prompt);
         if (self.credential) |*credential| credential.deinit(alloc);

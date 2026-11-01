@@ -532,16 +532,6 @@ pub const FakeAgentRuntimeDeps = struct {
     swap_link_on_execute: ?[]const u8 = null,
     swap_link_target_on_execute: ?[]const u8 = null,
     static_context_text: ?[]const u8 = null,
-    parent_turn_context_text: ?[]const u8 = null,
-    parent_turn_context_texts: []const []const u8 = &.{},
-    parent_turn_context_index: usize = 0,
-    parent_turn_context_after_execute: ?[]const u8 = null,
-    parent_turn_context_sequence: ?u64 = null,
-    parent_turn_prepare_count: usize = 0,
-    parent_turn_ack_count: usize = 0,
-    parent_turn_last_ack_sequence: u64 = 0,
-    parent_turn_last_ack_prepare_count: usize = 0,
-    parent_turn_ack_contract_valid: bool = true,
     runtime_context_text: ?[]const u8 = null,
     runtime_context_texts: []const []const u8 = &.{},
     runtime_context_index: usize = 0,
@@ -663,6 +653,8 @@ pub const FakeAgentRuntimeDeps = struct {
     cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
     route_recovery_status_error_attempt: ?usize = null,
     steering_messages: []const []const u8 = &.{},
+    /// Who wrote the fake's steering messages.
+    steering_author: worker_runtime.MessageAuthor = .user,
     steering_take_at: usize = 1,
     steering_take_count: usize = 0,
     immediate_steering_messages: []const []const u8 = &.{},
@@ -761,8 +753,6 @@ pub const FakeAgentRuntimeDeps = struct {
                 null,
             .finalize_turn = finalizeTurn,
             .release_agent_terminal_lease = releaseAgentTerminalLease,
-            .prepare_parent_turn_context = prepareParentTurnContext,
-            .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
             .append_runtime_context = appendRuntimeContext,
             .append_static_context = appendStaticContext,
             .validate_tool_call = validateToolCall,
@@ -933,8 +923,8 @@ pub const FakeAgentRuntimeDeps = struct {
             },
         };
         if (source.len == 0) return if (kind == .cancelled) .interrupt else .none;
-        const messages = try arena.alloc([]u8, source.len);
-        for (source, messages) |text, *copy| copy.* = try arena.dupe(u8, text);
+        const messages = try arena.alloc(worker_runtime.SteeringMessage, source.len);
+        for (source, messages) |text, *copy| copy.* = .{ .text = try arena.dupe(u8, text), .author = self.steering_author };
         return .{ .continue_turn = messages };
     }
 
@@ -950,12 +940,9 @@ pub const FakeAgentRuntimeDeps = struct {
         const result = try self.steering_worker.?.takeSteeringBoundary(self.alloc, turn_id, kind);
         return switch (result) {
             .continue_turn => |owned| blk: {
-                defer {
-                    for (owned) |text| self.alloc.free(text);
-                    self.alloc.free(owned);
-                }
-                const messages = try arena.alloc([]u8, owned.len);
-                for (owned, messages) |text, *copy| copy.* = try arena.dupe(u8, text);
+                defer worker_runtime.freeSteeringMessages(self.alloc, owned);
+                const messages = try arena.alloc(worker_runtime.SteeringMessage, owned.len);
+                for (owned, messages) |message, *copy| copy.* = .{ .text = try arena.dupe(u8, message.text), .author = message.author };
                 break :blk .{ .continue_turn = messages };
             },
             .none => .none,
@@ -1024,51 +1011,6 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn record(self: *FakeAgentRuntimeDeps, comptime fmt: []const u8, args: anytype) !void {
         try self.log.append(self.alloc, try self.alloc.print(fmt, args));
-    }
-
-    fn prepareParentTurnContext(raw: *anyopaque, arena: Allocator) !?runtime_deps.PreparedParentTurnContext {
-        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        self.parent_turn_prepare_count += 1;
-        const text = if (self.parent_turn_context_texts.len > 0) blk: {
-            const index = @min(self.parent_turn_context_index, self.parent_turn_context_texts.len - 1);
-            self.parent_turn_context_index += 1;
-            break :blk self.parent_turn_context_texts[index];
-        } else self.parent_turn_context_text orelse return null;
-        const acknowledgements = try arena.alloc(runtime_deps.ParentTurnDeliveryAck, 1);
-        acknowledgements[0] = .{
-            .child_id = try arena.dupe(u8, "child"),
-            .target_session_id = try arena.dupe(u8, "parent"),
-            .through_sequence = self.parent_turn_context_sequence orelse
-                @as(u64, @intCast(self.parent_turn_prepare_count)),
-            .delivery_id = try arena.dupe(u8, "delivery"),
-            .start_offset = 0,
-            .total_bytes = 0,
-        };
-        return .{
-            .content = try arena.dupe(u8, text),
-            .acknowledgements = acknowledgements,
-        };
-    }
-
-    fn acknowledgeParentTurnContext(
-        raw: *anyopaque,
-        _: Allocator,
-        acknowledgements: []const runtime_deps.ParentTurnDeliveryAck,
-    ) void {
-        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        self.parent_turn_ack_count += acknowledgements.len;
-        self.parent_turn_ack_contract_valid = self.parent_turn_ack_contract_valid and
-            self.parent_turn_prepare_count == self.parent_turn_last_ack_prepare_count + 1;
-        self.parent_turn_last_ack_prepare_count = self.parent_turn_prepare_count;
-        for (acknowledgements) |ack| {
-            self.parent_turn_ack_contract_valid = self.parent_turn_ack_contract_valid and
-                std.mem.eql(u8, ack.child_id, "child") and
-                std.mem.eql(u8, ack.target_session_id, "parent") and
-                std.mem.eql(u8, ack.delivery_id, "delivery");
-        }
-        if (acknowledgements.len != 0) {
-            self.parent_turn_last_ack_sequence = acknowledgements[acknowledgements.len - 1].through_sequence;
-        }
     }
 
     fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -1558,11 +1500,6 @@ pub const FakeAgentRuntimeDeps = struct {
                     self.swap_link_on_execute = null;
                     self.swap_link_target_on_execute = null;
                 }
-            }
-            if (self.parent_turn_context_after_execute) |text| {
-                self.parent_turn_context_text = text;
-                self.parent_turn_context_texts = &.{};
-                self.parent_turn_context_after_execute = null;
             }
         }
 

@@ -269,10 +269,13 @@ pub fn run(
         config.tool_context.tool_registry,
         .{ .profile = profile },
     );
+    // This engine never gives a child subagents of its own, so main
+    // started every child it runs.
     const child_system_prompt = childSystemPrompt(
         arena,
         profile,
         config.system_prompt,
+        .{ .name = turn.child_name orelse turn.child_id orelse "subagent", .parent = profiles.main_name },
         message.system_prompt_overlay,
     ) catch return error.OutOfMemory;
     debug_trace.eventf(
@@ -376,20 +379,32 @@ pub fn childProfile(resolver: ?*authority_mod.Resolver, child_id: ?[]const u8) ?
     return cache.find(child_id orelse return null);
 }
 
+/// Who a subagent is, for its system prompt: its own name, and the name of
+/// the agent that started it, `main` unless that is another subagent.
+pub const Role = struct { name: []const u8, parent: []const u8 };
+
 /// A child's system prompt: `base`, or its profile's prompt in its place or
-/// added to it, then the run's `<subagent_instructions>` overlay. Returns
-/// `base` itself when neither changes it.
+/// added to it, then what it is and who started it, whatever its profile,
+/// then the run's `<subagent_instructions>` overlay.
 pub fn childSystemPrompt(
     alloc: Allocator,
     profile: ?*const profiles.Profile,
     base: []const u8,
+    role: Role,
     overlay: []const u8,
 ) Allocator.Error![]const u8 {
     const base_prompt = if (profile) |value| try profiles.systemPrompt(alloc, value, base) else base;
-    if (overlay.len == 0) return base_prompt;
+    const with_role = try alloc.print(
+        "{s}\n\n<subagent_role>\nYou are the subagent \"{s}\", started by \"{s}\". When work it gives you " ++
+            "ends, your output reaches it on its own as your report. To message it sooner, for example when the " ++
+            "user asks you to tell {s} something, call the subagent tool with action \"message\" and agent " ++
+            "\"parent\", if you have that tool.\n</subagent_role>",
+        .{ base_prompt, role.name, role.parent, role.parent },
+    );
+    if (overlay.len == 0) return with_role;
     return alloc.print(
         "{s}\n\n<subagent_instructions>\n{s}\n</subagent_instructions>",
-        .{ base_prompt, overlay },
+        .{ with_role, overlay },
     );
 }
 
@@ -1086,14 +1101,30 @@ fn pushLiveOutputChunk(
     } });
 }
 
-test "a child's system prompt wraps the run's overlay and keeps the base alone without one" {
+test "a child's system prompt names it and who started it, then wraps the run's overlay" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const base = "base prompt";
-    const alone = try childSystemPrompt(arena.allocator(), null, base, "");
-    try std.testing.expectEqual(base.ptr, alone.ptr);
+    const role: Role = .{ .name = "reviewer", .parent = "main" };
+    const expected_role = "<subagent_role>\nYou are the subagent \"reviewer\", started by \"main\". When work it " ++
+        "gives you ends, your output reaches it on its own as your report. To message it sooner, for example when " ++
+        "the user asks you to tell main something, call the subagent tool with action \"message\" and agent " ++
+        "\"parent\", if you have that tool.\n</subagent_role>";
     try std.testing.expectEqualStrings(
-        "base prompt\n\n<subagent_instructions>\nbe brief\n</subagent_instructions>",
-        try childSystemPrompt(arena.allocator(), null, base, "be brief"),
+        "base prompt\n\n" ++ expected_role,
+        try childSystemPrompt(arena.allocator(), null, "base prompt", role, ""),
     );
+    try std.testing.expectEqualStrings(
+        "base prompt\n\n" ++ expected_role ++ "\n\n<subagent_instructions>\nbe brief\n</subagent_instructions>",
+        try childSystemPrompt(arena.allocator(), null, "base prompt", role, "be brief"),
+    );
+}
+
+test "a profile that replaces the system prompt still leaves a child its role" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const profile: profiles.Profile = .{ .name = "review", .description = "", .source = .home, .prompt = "Review only.", .prompt_mode = .replace };
+    const prompt = try childSystemPrompt(arena.allocator(), &profile, "base prompt", .{ .name = "helper", .parent = "lead" }, "");
+    try std.testing.expect(std.mem.startsWith(u8, prompt, "Review only.\n\n<subagent_role>\n"));
+    try std.testing.expect(std.mem.find(u8, prompt, "You are the subagent \"helper\", started by \"lead\".") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "base prompt") == null);
 }

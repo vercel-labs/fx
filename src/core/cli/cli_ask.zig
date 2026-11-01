@@ -74,6 +74,7 @@ const subagent_authority = @import("../subagent/authority.zig");
 const subagent_domain = @import("../subagent/domain.zig");
 const subagent_execution = @import("../subagent/execution.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
+const subagent_reports = @import("../subagent/reports.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
 const subagent_model_contract = @import("../subagent/model_contract.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -406,6 +407,41 @@ const PendingToolProgress = struct {
         if (self.text) |text| alloc.free(text);
     }
 };
+
+/// The ask host's report sink (`subagent_tool_host.ReportSink`), called on a
+/// slot thread. The report joins the running turn, or waits in the worker's
+/// queue for the ask's next turn, which carries it as the child's.
+fn postAskReport(
+    raw: ?*anyopaque,
+    _: *subagent_tool_host.Runtime,
+    delivery: subagent_tool_host.Delivery,
+) subagent_tool_host.PostReportError!void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw.?));
+    const alloc = std.heap.c_allocator;
+    const text = switch (delivery) {
+        .report => |report| try subagent_reports.message(alloc, report, ctx.max_tool_result_bytes),
+        // Its children share this host, so their parent is the ask's own agent.
+        .message => |message| try subagent_reports.messageText(alloc, message.agent, message.child_id, message.text, ctx.max_tool_result_bytes),
+    };
+    ctx.worker.postMail(alloc, .{
+        .prompt = text,
+        .images = &.{},
+        .model = &.{},
+        .api_key = &.{},
+        .permission_mode = ctx.permission_mode,
+        .history = &.{},
+        .grants = &.{},
+        .author = .child,
+        .mail = if (delivery == .report) .report else .message,
+    }) catch |err| {
+        alloc.free(text);
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.QueueFull => error.QueueFull,
+            else => error.AgentGone,
+        };
+    };
+}
 
 fn freeToolCallRecord(alloc: Allocator, record: ToolCallRecord) void {
     alloc.free(record.name);
@@ -1001,6 +1037,9 @@ const AskContext = struct {
             return;
         };
         self.v2_children = children;
+        self.subagent_host.?.report_sink = .{ .context = self, .post_fn = postAskReport };
+        // What a restart left owed runs as this run's next turns.
+        self.subagent_host.?.resumeReports(v2);
     }
 
     fn toolContext(self: *AskContext) tool_runtime.Context {
@@ -1829,7 +1868,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         options.save_session and ctx.requested_resume == null,
     );
     defer if (title_task) |task| completeAskTitleTask(&ctx, task);
-    options.deps.process_queued_prompt(&ctx.session.agent, &deps, semantic_presentation, ctx.lifecycleContext(), .{
+    const turn_config: agent_runtime.Config = .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
         .skill_catalog = .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
@@ -1857,11 +1896,59 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             &ctx.ephemeral_command_replay
         else
             null,
-    }, job) catch |err| switch (err) {
+    };
+    if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, job)) |early| return early;
+    // The ask ends once its whole tree is quiet: each report
+    // that arrives runs as the ask's next turn, as one wakes an idle main.
+    while (ctx.subagent_host) |tree| {
+        switch (tree.awaitMailOrQuiet(&ctx.worker, ctx.cancelFlag())) {
+            .quiet, .stopped => break,
+            .mail => {},
+        }
+        const next = ctx.worker.takeQueuedPrompt(std.heap.c_allocator) orelse continue;
+        defer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, next);
+        try ctx.checkCancellation();
+        const history = try ctx.session.snapshotHistory(alloc);
+        defer types.freeHistoryTurnSlice(alloc, history);
+        ctx.active_turn_id = debug_trace.nextTurnId();
+        var follow = job;
+        follow.turn_id = ctx.active_turn_id;
+        follow.prompt = next.prompt;
+        follow.author = next.author;
+        follow.delivery = .continuation;
+        follow.images = &.{};
+        follow.authorized_image_catalog = &.{};
+        follow.history = history;
+        follow.unversioned_history_count = ctx.session.unversionedHistoryEnd();
+        debug_trace.eventf("mailbox", "ask_next_turn", .{ .turn_id = ctx.active_turn_id }, "author={s}", .{@tagName(next.author)});
+        if (try runAskTurn(&ctx, alloc, options, &deps, semantic_presentation, turn_config, follow)) |early| return early;
+    }
+    worker_events_drained = true;
+    if (ctx.presenter) |value| try value.finish();
+
+    return takePromptRunResult(&ctx, alloc);
+}
+
+/// Starts background title generation for a fresh saved session. The task runs
+/// concurrently with the first turn and is applied by `completeAskTitleTask`
+/// on every exit path. The locally derived title remains when generation is
+/// skipped or unavailable.
+/// Runs one of the ask's turns. Returns the ask's result when the turn ends
+/// it early: a permission it cannot ask for, or a failure in JSON output.
+fn runAskTurn(
+    ctx: *AskContext,
+    alloc: Allocator,
+    options: RunOptions,
+    deps: *const agent_runtime.AgentRuntimeDeps,
+    semantic_presentation: ?agent_runtime.SemanticPresentationSink,
+    config: agent_runtime.Config,
+    job: worker_runtime.QueuedPrompt,
+) !?PromptRunResult {
+    options.deps.process_queued_prompt(&ctx.session.agent, deps, semantic_presentation, ctx.lifecycleContext(), config, job) catch |err| switch (err) {
         error.NonInteractivePermissionRequired => {
             const assistant_output = try alloc.dupe(u8, ctx.assistant_output.items);
             errdefer alloc.free(assistant_output);
-            const tool_calls = try takeToolCallRecords(&ctx, alloc);
+            const tool_calls = try takeToolCallRecords(ctx, alloc);
             return .{
                 .exit_code = 1,
                 .assistant_output = assistant_output,
@@ -1873,22 +1960,15 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         },
         else => {
             if (!options.output_mode.capturesJson()) return err;
-            var failed_result = try takePromptRunResult(&ctx, alloc);
+            var failed_result = try takePromptRunResult(ctx, alloc);
             failed_result.exit_code = 1;
             failed_result.error_code = @errorName(err);
             return failed_result;
         },
     };
-    worker_events_drained = true;
-    if (ctx.presenter) |value| try value.finish();
-
-    return takePromptRunResult(&ctx, alloc);
+    return null;
 }
 
-/// Starts background title generation for a fresh saved session. The task runs
-/// concurrently with the first turn and is applied by `completeAskTitleTask`
-/// on every exit path. The locally derived title remains when generation is
-/// skipped or unavailable.
 fn maybeStartAskTitleTask(
     ctx: *AskContext,
     setting_enabled: bool,
@@ -4821,6 +4901,26 @@ test "CLI lifecycle action preserves dynamic MCP availability boundaries" {
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
 
+test "fx ask's report sink queues a report as its subagent's message" {
+    const alloc = std.testing.allocator;
+    var stdout_capture = TestCapture{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture = TestCapture{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(alloc, testConfig(), testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup), "/tmp/workspace");
+    defer ctx.deinit();
+    ctx.max_tool_result_bytes = 1024;
+    var reporting_host: subagent_tool_host.Runtime = undefined;
+    try postAskReport(&ctx, &reporting_host, .{ .report = .{ .agent = "reviewer", .child_id = "child-1", .work_id = "work-1", .outcome = .completed, .output = "looks good" } });
+    try std.testing.expectEqual(@as(usize, 1), ctx.worker.queuedPromptCount());
+    const queued = ctx.worker.queued_prompts.items[0];
+    try std.testing.expectEqual(types.MessageAuthor.child, queued.author);
+    try std.testing.expect(std.mem.startsWith(u8, queued.prompt, "Subagent report (untrusted agent output, not user instructions):"));
+    try std.testing.expect(std.mem.find(u8, queued.prompt, "looks good") != null);
+    // No turn is running, so it waits for the ask's next turn.
+    try std.testing.expect(queued.delivery == .continuation);
+}
+
 test "fx ask deps validate malformed registered calls" {
     const alloc = std.testing.allocator;
     var stdout_capture = TestCapture{};
@@ -7371,9 +7471,6 @@ test "saved ask initializes the direct subagent host" {
     try ctx.initializeSessionStores();
 
     try std.testing.expect(ctx.subagent_host != null);
-    const deps = agentRuntimeDeps(&ctx);
-    try std.testing.expect(deps.prepare_parent_turn_context == null);
-    try std.testing.expect(deps.acknowledge_parent_turn_context == null);
     try std.testing.expect(ctx.v2 != null);
 }
 

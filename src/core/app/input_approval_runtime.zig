@@ -363,6 +363,7 @@ pub fn ApprovalRuntime(comptime App: type) type {
             if (!already_cancelled) {
                 debug_trace.logf("input", "cancel approval operation queued={d}", .{agent.worker.queuedPromptCount()});
                 interrupt.traceInterruptRequested(app, agent, "input_approval");
+                if (comptime @hasDecl(App, "noteUserStop")) app.noteUserStop(agent);
             }
             agent.worker.cancelApprovalTurn();
 

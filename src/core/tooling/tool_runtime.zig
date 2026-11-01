@@ -2121,7 +2121,7 @@ test "subagent progress publishes a complete two-line lifecycle row" {
     defer if (capture.text) |text| std.testing.allocator.free(text);
     var bridge = SubagentProgressBridge{
         .alloc = std.testing.allocator,
-        .call = .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}" },
+        .call = .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"inspect auth\"}" },
         .renderer = .{ .ctx = &capture, .render_fn = Capture.render },
         .progress_ctx = &capture,
         .progress_fn = Capture.publish,
@@ -2134,13 +2134,12 @@ test "subagent progress publishes a complete two-line lifecycle row" {
         .context_window = 100_000,
     });
 
-    try std.testing.expectEqualStrings("● Subagent working · inspect auth\n  openai/gpt-5.5 · high · Subagent · 12k", capture.text.?);
+    try std.testing.expectEqualStrings("● reviewer working · inspect auth\n  openai/gpt-5.5 · high · reviewer · 12k", capture.text.?);
 }
 
 test "subagent session title is derived only from the current request identity" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { arguments_json: []const u8, expected: []const u8 }{
-        .{ .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}", .expected = "Subagent" },
         .{ .arguments_json = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"inspect auth\"}", .expected = "reviewer" },
     };
     for (cases) |case| {
@@ -2152,11 +2151,13 @@ test "subagent session title is derived only from the current request identity" 
         defer alloc.free(title);
         try std.testing.expectEqualStrings(case.expected, title);
     }
-    try std.testing.expect((try requestDerivedSubagentSessionTitle(alloc, .{
-        .id = "child",
-        .name = "subagent",
-        .arguments_json = "{}",
-    })) == null);
+    for ([_][]const u8{ "{}", "{\"action\":\"run\",\"task\":\"inspect auth\"}" }) |arguments_json| {
+        try std.testing.expect((try requestDerivedSubagentSessionTitle(alloc, .{
+            .id = "child",
+            .name = "subagent",
+            .arguments_json = arguments_json,
+        })) == null);
+    }
 }
 
 fn subagentProviderFailure(
@@ -2204,7 +2205,7 @@ fn executeSubagentProvider(
         .timestamp_ms = io_mod.milliTimestamp(),
         .identity_epoch = identity_epoch,
         .cancel_flag = runtimeCancelFlag(ctx),
-        .steering_worker = if (ctx.interactive) ctx.worker else null,
+        .caller_worker = ctx.worker,
         .progress = if (progress_bridge) |*bridge| bridge.sink() else null,
         .model_capability_resolver = ctx.model_capability_resolver,
         .model_override_resolver = ctx.model_override_resolver,

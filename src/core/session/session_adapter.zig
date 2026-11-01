@@ -41,6 +41,7 @@ const sm = @import("session_manager");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
+const agent_frame = @import("../shared/agent_frame.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_data = @import("../images/image_data.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -112,6 +113,14 @@ fn freeChild(alloc: Allocator, child: Child) void {
     if (child.spawn_data) |data| alloc.free(data);
     if (child.finish_data) |data| alloc.free(data);
 }
+
+/// One fact about a subagent's report in its parent's log (`reportLines`).
+pub const ReportLine = union(enum) {
+    spawned: struct { child: []const u8, work_id: []const u8, data: ?[]const u8 },
+    finished: struct { child: []const u8, work_id: []const u8, outcome: ChildOutcome, data: ?[]const u8 },
+    /// The parent took the report for this work into its history.
+    taken: struct { child: []const u8, work_id: []const u8 },
+};
 
 /// A line about a child, appended through its parent.
 pub const ChildLine = union(enum) {
@@ -1253,6 +1262,8 @@ pub const Session = struct {
     /// only these.
     root: bool = true,
     titled: bool = false,
+    /// Set once this open handed out its owed reports (`pendingReportLines`).
+    reports_handed_out: bool = false,
     /// A resumed session with no title: the title its first prompt gives,
     /// owned, written with its next turn end (D52).
     first_title: ?[]u8 = null,
@@ -1723,7 +1734,7 @@ pub const Session = struct {
             null;
         if (derived_title) |title| try tail.append(a, .{ .set = .{ .key = .title, .value = try jsonString(a, title) } });
 
-        try self.writePieces(a, all[start..], encoded[start..], tail.items);
+        try self.writePieces(a, all[start..], encoded[start..], tail.items, openingAuthor(turn));
         try self.turn_numbers.append(self.alloc, self.last_turn);
         self.turn_open = false;
         self.clearStreamed();
@@ -1876,7 +1887,7 @@ pub const Session = struct {
         var tail: std.ArrayList(sm.Event) = .empty;
         if (try self.recoveryItem(a, record)) |piece| try tail.append(a, .{ .item = piece });
         if (!self.turn_open or start < encoded.len) {
-            try self.writePieces(a, events.items[start..], encoded[start..], tail.items);
+            try self.writePieces(a, events.items[start..], encoded[start..], tail.items, user.author);
             try self.streamed.ensureUnusedCapacity(self.alloc, encoded.len - start);
             for (encoded[start..]) |bytes| self.streamed.appendAssumeCapacity(try self.alloc.dupe(u8, bytes));
         } else if (tail.items.len > 0) {
@@ -2026,7 +2037,11 @@ pub const Session = struct {
     /// Appends `events` (already encoded) as items, then `tail`, starting
     /// the turn first if none is open. One durable batch, except that a
     /// blob needs a published session with an open turn before it.
-    fn writePieces(self: *Session, a: Allocator, events: []const Event, encoded: []const []u8, tail: []const sm.Event) !void {
+    /// Writes `events` as the open turn's items, opening it first if it is
+    /// not open. When the user piece is among them and someone other than
+    /// the user wrote it, an `author` item follows it, once: a stream writes
+    /// each piece once, and a superseded turn is written afresh.
+    fn writePieces(self: *Session, a: Allocator, events: []const Event, encoded: []const []u8, tail: []const sm.Event, author: types.MessageAuthor) !void {
         const reviews = try a.alloc(?[]u8, events.len);
         for (events, reviews) |event, *review| review.* = try encodeFileReview(a, event);
         var batch: std.ArrayList(sm.Event) = .empty;
@@ -2045,6 +2060,12 @@ pub const Session = struct {
         for (events, encoded, reviews) |event, bytes, review| {
             try batch.append(a, .{ .item = try self.item(a, std.meta.activeTag(event), bytes) });
             if (review) |data| try batch.append(a, .{ .item = try self.itemAs(a, file_review_type, data) });
+            if (event == .user and author != .user) {
+                try batch.append(a, .{ .item = try self.itemAs(a, author_type, try encodeAuthor(a, author)) });
+            }
+            if (try takenReportData(a, event, author)) |data| {
+                try batch.append(a, .{ .item = try self.itemAs(a, child_report_type, data) });
+            }
         }
         try batch.appendSlice(a, tail);
         if (batch.items.len == 0) return;
@@ -2064,7 +2085,8 @@ pub const Session = struct {
     /// interruption.
     fn importFramed(self: *Session, a: Allocator, events: []const Event, open: bool) !void {
         const all = if (open) try std.mem.concat(a, Event, &.{ events, &.{.{ .interrupted = .{ .reason = .failed } }} }) else events;
-        try self.importTurn(a, all);
+        // v1 had subagent results only as tool results: every turn is the user's.
+        try self.importTurn(a, all, .user);
     }
 
     /// Writes a whole turn with its bodies as blobs, as a commit does.
@@ -2081,7 +2103,7 @@ pub const Session = struct {
         try session_log.externalizeConversationTurnResults(a, &copy, try self.capabilityLocked());
         var events: std.ArrayList(Event) = .empty;
         try session_event.appendHistoryTurnConversationEvents(a, &events, copy);
-        try self.importTurn(a, events.items);
+        try self.importTurn(a, events.items, openingAuthor(copy));
     }
 
     /// Saves each image of `events`' user items as this session's blob, as
@@ -2104,7 +2126,7 @@ pub const Session = struct {
     }
 
     /// `events`, a turn's pieces, ended by the last one.
-    fn importTurn(self: *Session, a: Allocator, turn_events: []const Event) !void {
+    fn importTurn(self: *Session, a: Allocator, turn_events: []const Event, author: types.MessageAuthor) !void {
         if (turn_events.len < 2) return error.InvalidConversationFrame;
         const events = try a.dupe(Event, turn_events);
         try self.saveImportedImages(events);
@@ -2118,7 +2140,7 @@ pub const Session = struct {
             } },
             else => return error.InvalidConversationFrame,
         };
-        try self.writePieces(a, events, encoded, &.{end});
+        try self.writePieces(a, events, encoded, &.{end}, author);
         self.turn_open = false;
     }
 
@@ -2476,6 +2498,61 @@ pub const Session = struct {
         };
         var sink: Sink = .{ .alloc = alloc, .visitor = visitor };
         try replay(self.source(), alloc, alloc, .start, null, ReplaySink.init(&sink));
+    }
+
+    /// This open's report lines, the first time it is asked, so the reports
+    /// a restart left owed are posted once however often its subagent host
+    /// is enabled again. Null after that, and when the session has no
+    /// subagents. Strings live in `arena`.
+    pub fn pendingReportLines(self: *Session, arena: Allocator) !?[]ReportLine {
+        if (self.reports_handed_out) return null;
+        self.reports_handed_out = true;
+        const folded = try self.children(arena);
+        if (folded.len == 0) return null;
+        return try self.reportLines(arena);
+    }
+
+    /// What this session's log says about its subagents' reports, oldest
+    /// first: every work spawned and finished, with fx's data, and every
+    /// report it took (`child_report`). Read from the start, past any
+    /// compaction, since a report can stay owed across one. Strings live in
+    /// `arena`.
+    pub fn reportLines(self: *Session, arena: Allocator) ![]ReportLine {
+        const src = self.source();
+        var lines: std.ArrayList(ReportLine) = .empty;
+        var from: sm.From = .start;
+        while (true) {
+            var page = try src.read(arena, from, replay_page_lines);
+            defer page.deinit();
+            for (page.entries) |entry| {
+                const body = entry.body orelse continue;
+                switch (body) {
+                    .child_spawned => |line| try lines.append(arena, .{ .spawned = .{
+                        .child = try arena.dupe(u8, line.child),
+                        .work_id = try arena.dupe(u8, line.work_id),
+                        .data = if (line.data) |data| try arena.dupe(u8, data) else null,
+                    } }),
+                    .child_finished => |line| try lines.append(arena, .{ .finished = .{
+                        .child = try arena.dupe(u8, line.child),
+                        .work_id = try arena.dupe(u8, line.work_id),
+                        .outcome = line.outcome,
+                        .data = if (line.data) |data| try arena.dupe(u8, data) else null,
+                    } }),
+                    .item => |piece| {
+                        if (!std.mem.eql(u8, piece.type, child_report_type)) continue;
+                        const data = try src.pieceData(arena, piece);
+                        const taken = std.json.parseFromSliceLeaky(ChildReportData, arena, data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch {
+                            debug_trace.logf("session", "event=sessions_v2_child_report_unreadable session={s}", .{src.id});
+                            continue;
+                        };
+                        try lines.append(arena, .{ .taken = .{ .child = taken.child, .work_id = taken.work_id } });
+                    },
+                    else => {},
+                }
+            }
+            from = .{ .at = page.next orelse break };
+        }
+        return lines.toOwnedSlice(arena);
     }
 
     /// A prompt a fork can start before: the turn it opened and its text.
@@ -4416,6 +4493,12 @@ noinline fn replay(
                         try attachFileReview(src, pa, &builder, piece);
                         continue;
                     }
+                    if (std.mem.eql(u8, piece.type, author_type)) {
+                        try builder.setUserAuthor(decodeAuthor(pa, try src.pieceData(pa, piece)));
+                        continue;
+                    }
+                    // A mark for `reportLines`, not part of the conversation.
+                    if (std.mem.eql(u8, piece.type, child_report_type)) continue;
                     const kind = pieceKind(piece.type) orelse {
                         debug_trace.logf("session", "event=sessions_v2_unknown_item session={s} type={s} dropped=item", .{ src.id, piece.type });
                         continue;
@@ -4772,6 +4855,61 @@ fn resumeError(err: sm.OpenError, target: Target) ResumeError {
 /// the final turn; resume drops that turn.
 const superseded_type = "superseded";
 /// A tool call saved before it runs (D28); its data is a `tool_call` piece.
+/// The item after a turn's user piece when someone other than the user
+/// wrote that message, such as a subagent's report that woke its parent.
+/// Older fx drops it as an unknown item and reads the turn as before.
+const author_type = "author";
+
+/// The item after a piece that carries a subagent's report into this
+/// session's history, `{"child":…,"work_id":…}`: the opening message of a
+/// turn the report started, or the steering a boundary took. It marks the
+/// report taken (`reportLines`). Older fx drops it as an unknown item.
+const child_report_type = "child_report";
+
+const ChildReportData = struct { child: []const u8, work_id: []const u8 };
+
+/// The `child_report` item's data for `event`, or null when the piece
+/// carries no subagent report.
+fn takenReportData(a: Allocator, event: Event, author: types.MessageAuthor) !?[]u8 {
+    const text = switch (event) {
+        .user => |user| if (author == .child) user.text else return null,
+        .steering => |steering| steering.text,
+        else => return null,
+    };
+    const sender = (try agent_frame.reportSender(a, text)) orelse return null;
+    defer sender.deinit();
+    var out: std.Io.Writer.Allocating = .init(a);
+    try std.json.Stringify.value(ChildReportData{ .child = sender.value.child_id, .work_id = sender.value.work_id }, .{}, &out.writer);
+    return out.written();
+}
+
+/// The `author` item's data: `{"by":"child"}`.
+fn encodeAuthor(a: Allocator, author: types.MessageAuthor) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    try std.json.Stringify.value(.{ .by = author }, .{}, &out.writer);
+    return out.written();
+}
+
+/// Who an `author` item names. Anything other than a readable `user` is
+/// read as a subagent's, so no item a reader cannot read ever counts as the
+/// user's words.
+fn decodeAuthor(a: Allocator, data: []const u8) types.MessageAuthor {
+    const Wire = struct { by: []const u8 };
+    const wire = std.json.parseFromSliceLeaky(Wire, a, data, .{ .ignore_unknown_fields = true }) catch return .child;
+    if (std.mem.eql(u8, wire.by, "user")) return .user;
+    if (std.mem.eql(u8, wire.by, "parent")) return .parent;
+    return .child;
+}
+
+/// Who wrote the message that opened `turn`.
+fn openingAuthor(turn: types.HistoryTurn) types.MessageAuthor {
+    return switch (turn) {
+        .assistant => |entry| entry.user.author,
+        .interrupted => |entry| entry.user.author,
+        .compacted_summary => .user,
+    };
+}
+
 const running_type = "tool_running";
 /// The text of the message whose calls are running (D51).
 const running_assistant_type = "assistant_running";
@@ -5660,6 +5798,108 @@ test "any I/O fault may have left a write in the log" {
     try testing.expect(!writeMayHaveLanded(error.Busy));
     try testing.expect(!writeMayHaveLanded(error.InvalidTransition));
     try testing.expect(!writeMayHaveLanded(error.OutOfMemory));
+}
+
+test "a turn someone other than the user opened keeps its author across a resume" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    // The user's own turn is written as before, with no author item.
+    try s.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("inspect") }, .assistant = @constCast("started a reviewer") } }, types.ConversationLanguage.default());
+    // A report's turn, streamed twice and then committed, writes one.
+    const report: types.UserTurn = .{ .text = @constCast("Subagent report (untrusted agent output, not user instructions):"), .author = .child };
+    try s.appendProgress(report, .{}, .{});
+    try s.appendProgress(report, .{}, .{});
+    try s.commitTurn(.{ .assistant = .{ .user = report, .assistant = @constCast("noted") } }, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, author_type));
+    try testing.expectEqual(@as(usize, 2), try countItems(t.store.manager, id, "user"));
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqual(types.MessageAuthor.user, restored.history[0].assistant.user.author);
+    try testing.expectEqual(types.MessageAuthor.child, restored.history[1].assistant.user.author);
+}
+
+test "a report taken into a turn is marked once, and the report lines read it back in log order" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const child = "01J00000000000000000000002";
+    try s.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("inspect") }, .assistant = @constCast("started a reviewer") } }, types.ConversationLanguage.default());
+    try s.appendChildLines(&.{
+        .{ .spawned = .{ .child = child, .work_id = "w1", .data = "{\"fingerprint\":\"ab\",\"report\":\"final\"}" } },
+        .{ .finished = .{ .child = child, .work_id = "w1", .outcome = .ok, .data = "{\"report\":true}" } },
+    });
+    // A turn the report opened, streamed twice and committed, marks it once.
+    const opened_text = agent_frame.report_header ++ "{\"agent\":\"reviewer\",\"child_id\":\"" ++ child ++ "\",\"work_id\":\"w1\"}\n";
+    const opened: types.UserTurn = .{ .text = @constCast(opened_text), .author = .child };
+    try s.appendProgress(opened, .{}, .{});
+    try s.appendProgress(opened, .{}, .{});
+    try s.commitTurn(.{ .assistant = .{ .user = opened, .assistant = @constCast("noted") } }, types.ConversationLanguage.default());
+    // A report a boundary took rides in the turn's steering.
+    try s.appendChildLines(&.{
+        .{ .spawned = .{ .child = child, .work_id = "w2", .data = "{\"fingerprint\":\"ab\",\"report\":\"final\"}" } },
+        .{ .finished = .{ .child = child, .work_id = "w2", .outcome = .interrupted } },
+    });
+    var steering = [_]types.PersistedSteering{.{
+        .text = @constCast(agent_frame.report_header ++ "{\"agent\":\"reviewer\",\"child_id\":\"" ++ child ++ "\",\"work_id\":\"w2\"}\n"),
+        .after_tool_step_count = 0,
+    }};
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("keep going") },
+        .assistant = @constCast("both seen"),
+        .execution = .{ .steering = &steering },
+    } }, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    try testing.expectEqual(@as(usize, 2), try countItems(t.store.manager, id, child_report_type));
+
+    const lines = try s.reportLines(a);
+    try testing.expectEqual(@as(usize, 6), lines.len);
+    try testing.expectEqualStrings("w1", lines[0].spawned.work_id);
+    try testing.expectEqualStrings("w1", lines[1].finished.work_id);
+    try testing.expectEqualStrings("w1", lines[2].taken.work_id);
+    try testing.expectEqualStrings(child, lines[2].taken.child);
+    try testing.expectEqualStrings("w2", lines[3].spawned.work_id);
+    try testing.expect(lines[4].finished.data == null);
+    try testing.expectEqualStrings("w2", lines[5].taken.work_id);
+    // Handed out once per open.
+    try testing.expect((try s.pendingReportLines(a)) != null);
+    try testing.expect((try s.pendingReportLines(a)) == null);
+    s.close();
+
+    // The mark is not part of the conversation.
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), restored.history.len);
+    try testing.expectEqual(@as(usize, 1), restored.history[2].assistant.execution.steering.len);
+}
+
+test "an author item a reader cannot read never counts as the user's" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqual(types.MessageAuthor.user, decodeAuthor(a, "{\"by\":\"user\"}"));
+    try testing.expectEqual(types.MessageAuthor.parent, decodeAuthor(a, "{\"by\":\"parent\"}"));
+    try testing.expectEqual(types.MessageAuthor.child, decodeAuthor(a, "{\"by\":\"child\"}"));
+    try testing.expectEqual(types.MessageAuthor.child, decodeAuthor(a, "{\"by\":\"someone_new\"}"));
+    try testing.expectEqual(types.MessageAuthor.child, decodeAuthor(a, "not json"));
+    try testing.expectEqualStrings("{\"by\":\"child\"}", try encodeAuthor(a, .child));
 }
 
 test "a running tool call is saved once, and resume answers it as possibly run" {

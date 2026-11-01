@@ -1152,9 +1152,6 @@ pub fn Runtime(comptime App: type) type {
             defer agent.worker.endActivePromptSnapshots(&snapshot_ownership);
             agent.worker.active_context_snapshot = &job.context_snapshot;
             defer agent.worker.active_context_snapshot = null;
-            defer if (comptime !@import("builtin").single_threaded) {
-                if (agent.session_persistence.subagent_host) |child_host| child_host.cancelYielded();
-            };
             agent.worker.setActiveAgentTurnSettings(job.agent_settings);
             defer agent.worker.clearActiveAgentTurnSettings();
             var preflight_context_notices: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
@@ -1350,7 +1347,7 @@ pub fn Runtime(comptime App: type) type {
         ) subagent_execution.ServiceError!void {
             const app: *App = @ptrCast(@alignCast(raw.?));
             var post = app_agents_runtime.Post{ .turn = turn };
-            app_agents_runtime.postAndWait(&app.child_mailbox, &post, cancel) catch |err| return switch (err) {
+            app_agents_runtime.postAndWait(&app.child_handoffs, &post, cancel) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.Cancelled => error.Cancelled,
                 error.Failed => error.ProviderFailed,
@@ -1380,7 +1377,7 @@ pub fn Runtime(comptime App: type) type {
                 unsent.turn = null;
                 unsent.deinit(app.alloc);
             };
-            app_agents_runtime.postAndWait(&app.child_mailbox, &post, cancel) catch |err| return switch (err) {
+            app_agents_runtime.postAndWait(&app.child_handoffs, &post, cancel) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.Cancelled => error.Cancelled,
                 error.Failed => error.ProviderFailed,
@@ -1444,6 +1441,7 @@ pub fn Runtime(comptime App: type) type {
                 prompt_arena.allocator(),
                 subagent_agent_adapter.childProfile(resolver, child_id),
                 app.promptPolicy(root).system_prompt,
+                try childRole(app, prompt_arena.allocator(), child_id, resolver, turn),
                 overlay,
             ));
             errdefer alloc.free(system_prompt);
@@ -1457,6 +1455,33 @@ pub fn Runtime(comptime App: type) type {
         /// The instance at the top of child `child_id`'s tree, or the first
         /// instance while the child is not yet bound to the host that
         /// started it. Takes the authority lock, which guards the list.
+        /// A subagent's name and its parent's, for its system prompt. The
+        /// parent is the agent whose own subagent host has `resolver`: `main`
+        /// for main or an instance, otherwise that subagent. Names belong to
+        /// `arena`.
+        fn childRole(
+            app: *App,
+            arena: Allocator,
+            child_id: []const u8,
+            resolver: *subagent_authority.Resolver,
+            turn: ?*subagent_execution.TurnContext,
+        ) Allocator.Error!subagent_agent_adapter.Role {
+            var role: subagent_agent_adapter.Role = .{
+                .name = if (turn) |value| value.child_name orelse child_id else child_id,
+                .parent = profiles.main_name,
+            };
+            if (comptime !@hasField(App, "child_agents")) return role;
+            app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
+            defer app.permission_state.authority_mutex.unlock(io_mod.getIo());
+            for (app.child_agents.items) |child| {
+                if (std.mem.eql(u8, child.id, child_id) and child.name.len > 0) role.name = try arena.dupe(u8, child.name);
+                if (child.agent.role != .subagent) continue;
+                const own_host = child.agent.session_persistence.subagent_host orelse continue;
+                if (own_host.authorityResolver() == resolver) role.parent = try arena.dupe(u8, child.displayName());
+            }
+            return role;
+        }
+
         fn rootInstanceOfChild(app: *App, child_id: []const u8) *AppAgent {
             if (comptime !@hasField(App, "child_agents")) return &app.main_agent;
             app.permission_state.authority_mutex.lockUncancelable(io_mod.getIo());
@@ -2830,7 +2855,7 @@ test "subagent labels show named request and reply" {
     try std.testing.expectEqualStrings("● reviewer working\x1b[0m \x1b[38;5;245m· Check replay\x1b[0m", active);
 
     const completed = try app.describeToolActionCompleted(app.agent(), arena, subagent_call);
-    try std.testing.expectEqualStrings("● reviewer replied\x1b[0m \x1b[38;5;245m· Check replay\x1b[0m", completed);
+    try std.testing.expectEqualStrings("● sent to reviewer\x1b[0m \x1b[38;5;245m· Check replay\x1b[0m", completed);
 }
 
 test "app agent runtime refreshes enabled project context through registry" {

@@ -68,18 +68,19 @@ pub fn subagentAction(
         else => return null,
     } else outer;
     const action = tool_args.optionalStringArg(args, "action") orelse return null;
-    const named = std.mem.eql(u8, action, "message");
-    if (!named and !std.mem.eql(u8, action, "run")) return null;
-    if (state == .feedback and !named) return null;
-    const raw_name = if (named) tool_args.optionalStringArg(args, "agent") orelse return null else "Subagent";
-    const raw_preview = tool_args.optionalStringArg(args, if (named) "message" else "task") orelse return null;
+    // Only a message names a subagent and carries text to preview.
+    if (!std.mem.eql(u8, action, "message")) return null;
+    const raw_name = tool_args.optionalStringArg(args, "agent") orelse return null;
+    const raw_preview = tool_args.optionalStringArg(args, "message") orelse return null;
     const name = try text_utils.encodeTerminalSafe(scratch, raw_name, 64);
     const preview = try subagentPreview(scratch, raw_preview);
     const label = switch (state) {
         .identity => try alloc.dupe(u8, name.bytes),
         .active => try alloc.print("{s} working", .{name.bytes}),
         .pending => try alloc.print("{s} still running", .{name.bytes}),
-        .completed => try alloc.print("{s} {s}", .{ name.bytes, if (named) "replied" else "finished" }),
+        // The message returns before the subagent works on it; its reply
+        // arrives later, as a report.
+        .completed => try alloc.print("sent to {s}", .{name.bytes}),
         .feedback => |delivery| try alloc.print("{s} feedback {s}", .{ name.bytes, switch (delivery) {
             .queued => "queued",
             .applied => "applied",
@@ -169,22 +170,21 @@ pub fn subagentFailureLabel(alloc: Allocator, call: ToolCall, output: []const u8
 
 test "subagent pending result does not claim completion" {
     const alloc = std.testing.allocator;
-    const call = ToolCall{ .id = "call", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"work\"}" };
+    const call = ToolCall{ .id = "call", .name = "subagent", .arguments_json = "{\"action\":\"message\",\"agent\":\"worker\",\"message\":\"work\"}" };
     const line = (try subagentStatusLine(alloc, call, "{\"ok\":true,\"pending\":true}")).?;
     defer alloc.free(line);
-    try std.testing.expectEqualStrings("Subagent still running · work", line);
+    try std.testing.expectEqualStrings("worker still running · work", line);
     try std.testing.expect((try subagentStatusLine(alloc, call, "{\"ok\":true,\"result\":\"done\"}")) == null);
 }
 
 test "subagent rows project request identity state and bounded safe previews" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { args: []const u8, state: SubagentActionState, label: []const u8, detail: []const u8 }{
-        .{ .args = "{\"request\":{\"action\":\"run\",\"task\":\" Check\\n cancellation\\tcleanup \"}}", .state = .active, .label = "Subagent working", .detail = "· Check cancellation cleanup" },
-        .{ .args = "{\"action\":\"run\",\"task\":\"Check cleanup\"}", .state = .completed, .label = "Subagent finished", .detail = "· Check cleanup" },
-        .{ .args = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check replay\",\"instructions\":\"Never display this\"}}", .state = .completed, .label = "reviewer replied", .detail = "· Check replay" },
+        .{ .args = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\" Check\\n cancellation\\tcleanup \"}}", .state = .active, .label = "reviewer working", .detail = "· Check cancellation cleanup" },
+        .{ .args = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check replay\",\"instructions\":\"Never display this\"}}", .state = .completed, .label = "sent to reviewer", .detail = "· Check replay" },
         .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Failed" }, .label = "reviewer failed", .detail = "· Check again" },
         .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Cancelled" }, .label = "reviewer interrupted", .detail = "· Check again" },
-        .{ .args = "{\"action\":\"run\",\"task\":\"Check again\"}", .state = .{ .stopped = "Denied" }, .label = "Denied Subagent", .detail = "· Check again" },
+        .{ .args = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"Check again\"}", .state = .{ .stopped = "Denied" }, .label = "Denied reviewer", .detail = "· Check again" },
     };
     for (cases) |case| {
         const action = (try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = case.args }, case.state)).?;
@@ -192,7 +192,7 @@ test "subagent rows project request identity state and bounded safe previews" {
         try std.testing.expectEqualStrings(case.label, action.label);
         try std.testing.expectEqualStrings(case.detail, action.detail);
     }
-    for ([_][]const u8{ "{", "[]", "{\"request\":null}", "{\"action\":\"inspect\"}", "{\"action\":\"message\",\"message\":\"hello\"}" }) |args| {
+    for ([_][]const u8{ "{", "[]", "{\"request\":null}", "{\"action\":\"inspect\"}", "{\"action\":\"message\",\"message\":\"hello\"}", "{\"action\":\"run\",\"task\":\"gone\"}", "{\"action\":\"wait\"}" }) |args| {
         try std.testing.expectEqual(@as(?SubagentAction, null), try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = args }, .active));
     }
     const unsafe = (try subagentAction(alloc, .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"message\",\"agent\":\"a\\u001b[2J\",\"message\":\"Check 日本語\\u001b[31m\"}" }, .active)).?;
