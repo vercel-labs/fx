@@ -7090,7 +7090,7 @@ test.skipIf(!tmuxAvailable())("command rows reclip to the live width while runni
 
 // Claude cache warming (src/core/agent/runtime/cache_warmer.zig): while the
 // session waits, fx resends its last request with a one-token reply before
-// Anthropic's cache entry expires. FX_CACHE_WARMING_TEST_TTL_MS shortens the
+// Anthropic's cache entry expires. FX_TEST_CACHE_WARMING_TTL_MS shortens the
 // five-minute lifetime to two seconds, so a ping goes out every 1.8 seconds
 // and the last one at most 12 seconds after the request.
 const WARM_MODEL = "anthropic/claude-opus-5.5";
@@ -7146,7 +7146,7 @@ async function startWarmingSession(name: string, settings: object = {}) {
       HOME: home, AI_GATEWAY_API_KEY: "fake-cache-warming", FX_DISABLE_KEYCHAIN: "1",
       FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: WARM_MODEL, FX_PERMISSION_MODE: "full-access",
       FX_GATEWAY_BASE_URL: host.baseUrl, FX_GATEWAY_CHAT_URL: host.chatUrl, FX_E2E_GATEWAY_CHAT_URL: host.chatUrl,
-      FX_CACHE_WARMING_TEST_TTL_MS: String(WARM_TTL_MS),
+      FX_TEST_CACHE_WARMING_TTL_MS: String(WARM_TTL_MS),
       FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "cache_warming,agent,session",
     },
   });

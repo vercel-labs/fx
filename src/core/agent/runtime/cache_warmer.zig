@@ -396,9 +396,9 @@ fn findReplyLimit(alloc: Allocator, scanner: *std.json.Scanner) !?ReplyLimit {
 }
 
 /// Claude's timing, or a shorter one the end-to-end tests set with
-/// `FX_CACHE_WARMING_TEST_TTL_MS`: the cap stays six lifetimes.
+/// `FX_TEST_CACHE_WARMING_TTL_MS`: the cap stays six lifetimes.
 fn timingFromEnvironment() cache_warming.Timing {
-    const value = io_mod.getenv("FX_CACHE_WARMING_TEST_TTL_MS") orelse return .claude;
+    const value = io_mod.getenv("FX_TEST_CACHE_WARMING_TTL_MS") orelse return .claude;
     const ttl_ms = std.fmt.parseInt(i64, value, 10) catch return .claude;
     if (ttl_ms < 500 or ttl_ms > cache_warming.Timing.claude.ttl_ms) return .claude;
     return .{ .ttl_ms = ttl_ms, .cap_ms = ttl_ms * @divTrunc(cache_warming.Timing.claude.cap_ms, cache_warming.Timing.claude.ttl_ms) };

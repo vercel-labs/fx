@@ -10809,7 +10809,7 @@ test.skipIf(!tmuxAvailable())(
 
 // Claude cache warming (src/core/agent/runtime/cache_warmer.zig) in an ACP
 // session: the session's runtime owns the warmer, so a new session closes
-// the old one's. FX_CACHE_WARMING_TEST_TTL_MS sets a two-second lifetime.
+// the old one's. FX_TEST_CACHE_WARMING_TTL_MS sets a two-second lifetime.
 test("ACP keeps an idle Claude session's cache warm until the next session replaces it", async () => {
   const root = createIsolatedRoot("fx-acp-cache-warming-");
   const isPing = (body: string) => JSON.parse(body).maxOutputTokens === 1;
@@ -10834,7 +10834,7 @@ test("ACP keeps an idle Claude session's cache warm until the next session repla
   try {
     client = await AcpClient.create({
       cwd: root.workspace,
-      env: { ...fakeGatewayEnv(root, gateway), FX_MODEL: "anthropic/claude-opus-5.5", FX_CACHE_WARMING_TEST_TTL_MS: "2000" },
+      env: { ...fakeGatewayEnv(root, gateway), FX_MODEL: "anthropic/claude-opus-5.5", FX_TEST_CACHE_WARMING_TTL_MS: "2000" },
     });
     await client.request("initialize", { protocolVersion: 1 }, 1);
     const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
