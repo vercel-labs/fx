@@ -2464,20 +2464,30 @@ pub const Session = struct {
     /// takes no lock: a visitor may call back into this session, as the app
     /// does to read a command replay's side file while it draws a turn.
     pub fn visitHistory(self: *Session, alloc: Allocator, visitor: anytype) !void {
-        const Sink = struct {
+        var sink: VisitorSink(@TypeOf(visitor), false) = .{ .alloc = alloc, .visitor = visitor };
+        try replay(self.source(), alloc, alloc, .start, null, ReplaySink.init(&sink));
+    }
+
+    /// The replay sink behind the `visitHistory` readers: hands each turn to
+    /// the visitor, frees it, and counts it. The transcript shows turns only,
+    /// as v1's does, so a compaction summary is skipped, or ends the replay
+    /// with `error.CycleEnd` when `stop_at_summary` is set.
+    fn VisitorSink(comptime Visitor: type, comptime stop_at_summary: bool) type {
+        return struct {
             alloc: Allocator,
-            visitor: @TypeOf(visitor),
+            visitor: Visitor,
+            turns: usize = 0,
 
             fn turn(sink: *@This(), value: types.HistoryTurn, _: ?u64) !void {
                 defer types.freeHistoryTurn(sink.alloc, value);
+                sink.turns += 1;
                 try sink.visitor.append(value);
             }
 
-            /// The transcript shows turns only, as v1's does.
-            fn summary(_: *@This(), _: []const u8) !void {}
+            fn summary(_: *@This(), _: []const u8) !void {
+                if (stop_at_summary) return error.CycleEnd;
+            }
         };
-        var sink: Sink = .{ .alloc = alloc, .visitor = visitor };
-        try replay(self.source(), alloc, alloc, .start, null, ReplaySink.init(&sink));
     }
 
     /// `visitHistory` from the newest compaction on: the turns the transcript
@@ -2488,23 +2498,10 @@ pub const Session = struct {
     /// it instead and returns true: the window holds that cycle until the next
     /// turn ends, as it does live.
     pub fn visitHistorySinceCompaction(self: *Session, alloc: Allocator, visitor: anytype) !bool {
-        const Sink = struct {
-            alloc: Allocator,
-            visitor: @TypeOf(visitor),
-            turns: usize = 0,
-
-            fn turn(sink: *@This(), value: types.HistoryTurn, _: ?u64) !void {
-                defer types.freeHistoryTurn(sink.alloc, value);
-                sink.turns += 1;
-                try sink.visitor.append(value);
-            }
-
-            fn summary(_: *@This(), _: []const u8) !void {}
-        };
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const state = try self.handle.state(scratch.allocator());
-        var sink: Sink = .{ .alloc = alloc, .visitor = visitor };
+        var sink: VisitorSink(@TypeOf(visitor), false) = .{ .alloc = alloc, .visitor = visitor };
         const offset = state.compaction_offset orelse {
             try replay(self.source(), alloc, alloc, .start, null, ReplaySink.init(&sink));
             return false;
@@ -2518,24 +2515,6 @@ pub const Session = struct {
         const from: sm.From = if (previous) |cursor| .{ .at = try self.source().cycleStart(scratch.allocator(), cursor) } else .start;
         try replay(self.source(), alloc, alloc, from, if (previous) |cursor| cursor.offset else null, ReplaySink.init(&sink));
         return sink.turns > 0;
-    }
-
-    /// The cursor of every compaction line in the log, oldest first: the
-    /// boundaries of the cycles Ctrl+O reads one at a time.
-    pub fn compactionCursors(self: *Session, alloc: Allocator) ![]sm.Cursor {
-        var cursors: std.ArrayList(sm.Cursor) = .empty;
-        errdefer cursors.deinit(alloc);
-        const src = self.source();
-        var from: sm.From = .start;
-        while (true) {
-            var page = try src.read(alloc, from, replay_page_lines);
-            defer page.deinit();
-            for (page.entries) |entry| {
-                if (entry.kind == .compacted) try cursors.append(alloc, .{ .offset = entry.offset, .seq = entry.seq });
-            }
-            from = .{ .at = page.next orelse break };
-        }
-        return cursors.toOwnedSlice(alloc);
     }
 
     /// Where the cycle that ends at the compaction line `before` starts: the
@@ -2569,20 +2548,7 @@ pub const Session = struct {
     /// the next compaction line. A turn the next compaction splits is not
     /// visited; the next cycle shows it whole (`cycleStart`).
     pub fn visitHistoryCycle(self: *Session, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !void {
-        const Sink = struct {
-            alloc: Allocator,
-            visitor: @TypeOf(visitor),
-
-            fn turn(sink: *@This(), value: types.HistoryTurn, _: ?u64) !void {
-                defer types.freeHistoryTurn(sink.alloc, value);
-                try sink.visitor.append(value);
-            }
-
-            fn summary(_: *@This(), _: []const u8) !void {
-                return error.CycleEnd;
-            }
-        };
-        var sink: Sink = .{ .alloc = alloc, .visitor = visitor };
+        var sink: VisitorSink(@TypeOf(visitor), true) = .{ .alloc = alloc, .visitor = visitor };
         const from: sm.From = if (start) |cursor| .{ .at = try self.source().cycleStart(alloc, cursor) } else .start;
         const skip_offset: ?u64 = if (start) |cursor| cursor.offset else null;
         replay(self.source(), alloc, alloc, from, skip_offset, ReplaySink.init(&sink)) catch |err| switch (err) {
@@ -6240,26 +6206,20 @@ test "the history splits into compaction cycles that Ctrl+O reads one at a time"
             for (self.prompts.items, want) |got, expected| try testing.expectEqualStrings(expected, got);
         }
     };
-    const cursors = try s.compactionCursors(testing.allocator);
-    defer testing.allocator.free(cursors);
-    try testing.expectEqual(@as(usize, 2), cursors.len);
-    try testing.expect(cursors[0].offset < cursors[1].offset);
+    // Walking back from the newest compaction finds both boundaries.
+    const newest = (try s.previousCompactionCursor(testing.allocator, null)).?;
+    const older = (try s.previousCompactionCursor(testing.allocator, newest)).?;
+    try testing.expect(older.offset < newest.offset);
+    try testing.expectEqual(@as(?sm.Cursor, null), try s.previousCompactionCursor(testing.allocator, older));
     var visitor: Visitor = .{};
     try s.visitHistoryCycle(testing.allocator, null, &visitor);
     try visitor.expectPrompts(&.{ "one", "two" });
-    try s.visitHistoryCycle(testing.allocator, cursors[0], &visitor);
+    try s.visitHistoryCycle(testing.allocator, older, &visitor);
     try visitor.expectPrompts(&.{"three"});
-    try s.visitHistoryCycle(testing.allocator, cursors[1], &visitor);
+    try s.visitHistoryCycle(testing.allocator, newest, &visitor);
     try visitor.expectPrompts(&.{"four"});
     try testing.expect(!try s.visitHistorySinceCompaction(testing.allocator, &visitor));
     try visitor.expectPrompts(&.{"four"});
-
-    // Walking back from the newest compaction finds the same boundaries.
-    const newest = (try s.previousCompactionCursor(testing.allocator, null)).?;
-    try testing.expectEqual(cursors[1], newest);
-    const older = (try s.previousCompactionCursor(testing.allocator, newest)).?;
-    try testing.expectEqual(cursors[0], older);
-    try testing.expectEqual(@as(?sm.Cursor, null), try s.previousCompactionCursor(testing.allocator, older));
 }
 
 test "a resume right after a compaction shows the cycle before it" {
