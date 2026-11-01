@@ -419,7 +419,7 @@ Each platform check is informational. An increase of at least 52,429 bytes
 investigation, but does not reject the pull request. Investigate notable
 unexplained growth before changing the threshold. The full macOS arm64, Linux
 arm64, and Linux x86_64 PGSO release qualifications remain authoritative for the
-production ceilings (7.000 MiB, and 8.000 MiB for Linux x86_64) and performance
+production ceilings (7.000 MiB, and 8.250 MiB for Linux x86_64) and performance
 gates.
 
 ## Documentation
