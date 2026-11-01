@@ -192,10 +192,44 @@ fn promptExecutionFailure(err: anyerror) anyerror!TerminalOutcome {
 /// Where an announced tool-call card stands. A card is open until ACP sends
 /// its final update; a provider-executed search waits for its terminal
 /// lifecycle event instead of a tool result.
-const ToolCallCard = enum {
-    open,
-    awaiting_provider_terminal,
-    finished,
+const ToolCallCard = struct {
+    status: enum { open, awaiting_provider_terminal, finished },
+    command_output: [2]CommandOutputText = .{ .{}, .{} },
+};
+
+/// Raw command chunks may end partway through a UTF-8 sequence. Keep only
+/// that suffix until the next chunk; escape bytes that are actually invalid.
+/// The caller owns the text returned by append and finish.
+const CommandOutputText = struct {
+    pending: [4]u8 = undefined,
+    pending_len: usize = 0,
+
+    fn append(self: *CommandOutputText, alloc: Allocator, chunk: []const u8) ![]u8 {
+        const joined: ?[]u8 = if (self.pending_len > 0)
+            try std.mem.concat(alloc, u8, &.{ self.pending[0..self.pending_len], chunk })
+        else
+            null;
+        defer if (joined) |bytes| alloc.free(bytes);
+        const raw: []const u8 = if (joined) |bytes| bytes else chunk;
+        var end = raw.len;
+        var start = raw.len;
+        while (start > 0 and raw[start - 1] & 0xc0 == 0x80) start -= 1;
+        if (start > 0) {
+            start -= 1;
+            const sequence_len = std.unicode.utf8ByteSequenceLength(raw[start]) catch 1;
+            if (raw.len - start < sequence_len) end = start;
+        }
+        const text = try text_utils.dupeValidUtf8(alloc, raw[0..end]);
+        self.pending_len = raw.len - end;
+        @memcpy(self.pending[0..self.pending_len], raw[end..]);
+        return text;
+    }
+
+    fn finish(self: *CommandOutputText, alloc: Allocator) ![]u8 {
+        const text = try text_utils.dupeValidUtf8(alloc, self.pending[0..self.pending_len]);
+        self.pending_len = 0;
+        return text;
+    }
 };
 
 /// Pure final admission for every ACP model request. A persisted or
@@ -382,7 +416,7 @@ const AcpContext = struct {
         try self.sendUpdate(out.writer.buffered());
         self.published_tool_calls.putAssumeCapacity(
             owned_id,
-            if (tool_presentation.isProviderSearchAlias(call.name)) .awaiting_provider_terminal else .open,
+            .{ .status = if (tool_presentation.isProviderSearchAlias(call.name)) .awaiting_provider_terminal else .open },
         );
         return owned_id;
     }
@@ -394,7 +428,7 @@ const AcpContext = struct {
         result: ?[]const u8,
     ) !void {
         const card = self.published_tool_calls.get(tool_call_id) orelse return;
-        if (card != .awaiting_provider_terminal) return;
+        if (card.status != .awaiting_provider_terminal) return;
         const status = providerTerminalStatus(outcome.kind) orelse return;
 
         const detail = if (self.state.cfg.minimal_kernel) result else null;
@@ -407,11 +441,11 @@ const AcpContext = struct {
 
     fn finalUpdateSent(self: *const AcpContext, tool_call_id: []const u8) bool {
         const card = self.published_tool_calls.get(tool_call_id) orelse return false;
-        return card == .finished;
+        return card.status == .finished;
     }
 
     fn markCardFinished(self: *AcpContext, tool_call_id: []const u8) void {
-        if (self.published_tool_calls.getPtr(tool_call_id)) |card| card.* = .finished;
+        if (self.published_tool_calls.getPtr(tool_call_id)) |card| card.status = .finished;
     }
 
     /// Sends a final failed update for every announced card that never got
@@ -421,7 +455,7 @@ const AcpContext = struct {
     fn finishOpenToolCalls(self: *AcpContext, text: []const u8) void {
         var cards = self.published_tool_calls.iterator();
         while (cards.next()) |entry| {
-            if (entry.value_ptr.* == .finished) continue;
+            if (entry.value_ptr.status == .finished) continue;
             self.sendToolCallError(entry.key_ptr.*, text) catch |err| {
                 debug_trace.logf("acp", "tool call card left open call_id={s} err={s}", .{ entry.key_ptr.*, @errorName(err) });
             };
@@ -454,6 +488,7 @@ const AcpContext = struct {
     }
 
     fn sendToolCallCompletedWithCommandResult(self: *AcpContext, tool_call_id: []const u8, result_text: ?[]const u8, command_result_json: ?[]const u8) !void {
+        try self.finishCommandOutput(tool_call_id);
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .completed, result_text, command_result_json);
@@ -466,11 +501,22 @@ const AcpContext = struct {
     }
 
     fn sendToolCallErrorWithCommandResult(self: *AcpContext, tool_call_id: []const u8, err_text: []const u8, command_result_json: ?[]const u8) !void {
+        try self.finishCommandOutput(tool_call_id);
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .failed, err_text, command_result_json);
         try self.sendUpdate(out.writer.buffered());
         self.markCardFinished(tool_call_id);
+    }
+
+    fn finishCommandOutput(self: *AcpContext, tool_call_id: []const u8) !void {
+        const card = self.published_tool_calls.getPtr(tool_call_id) orelse return;
+        for (&card.command_output) |*output| {
+            if (output.pending_len == 0) continue;
+            const text = try output.finish(self.alloc);
+            defer self.alloc.free(text);
+            try self.sendToolCallProgressText(tool_call_id, text);
+        }
     }
 
     fn toolContext(self: *AcpContext) tool_runtime.Context {
@@ -3231,7 +3277,11 @@ fn pushDiffBlock(raw_ctx: *anyopaque, payload: agent_runtime.DiffEntryPayload) !
     try pushText(raw_ctx, .{ .operational = payload.preview });
 }
 
-fn pushCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
+fn pushCommandOutputComplete(raw_ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const id = lifecycle_id orelse return;
+    try ctx.finishCommandOutput(id.call_id);
+}
 
 fn pushHttpError(raw_ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
@@ -3253,10 +3303,17 @@ fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const 
     return tool_result_errors.formatToolExecutionErrorJson(arena, tool_name, err);
 }
 
-fn onCommandOutputChunk(raw_ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId, _: command_output_content.Stream, chunk: []const u8) !void {
+fn onCommandOutputChunk(raw_ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId, stream: command_output_content.Stream, chunk: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const id = lifecycle_id orelse return;
-    try ctx.sendToolCallProgressText(id.call_id, chunk);
+    const card = ctx.published_tool_calls.getPtr(id.call_id) orelse return;
+    const output = &card.command_output[@backingInt(stream)];
+    const text = if (output.pending_len == 0 and std.unicode.utf8ValidateSlice(chunk))
+        chunk
+    else
+        try output.append(ctx.alloc, chunk);
+    defer if (text.ptr != chunk.ptr) ctx.alloc.free(text);
+    if (text.len > 0) try ctx.sendToolCallProgressText(id.call_id, text);
 }
 
 fn onMcpProgress(raw_ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text: []const u8) void {
@@ -4278,6 +4335,72 @@ test "ACP tool notifications preserve UTF-8 for clipped and unsafe output" {
         );
         defer parsed.deinit();
     }
+}
+
+test "ACP command progress keeps UTF-8 state per call and stream and flushes invalid tails" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var capture = try tmp.dir.createFile(std.testing.io, "command-progress.jsonl", .{ .read = true });
+    defer capture.close(std.testing.io);
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = .{ .stdout = capture };
+    var ctx = AcpContext{ .alloc = alloc, .state = &state, .session_id = "session_1" };
+    defer ctx.deinitPublishedToolCalls();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const call_ids = [_][]const u8{ "call_first", "call_second" };
+    for (call_ids) |call_id| {
+        _ = try ctx.sendToolCallPending(arena_state.allocator(), .{
+            .id = call_id,
+            .name = "shell",
+            .arguments_json = "{\"request\":{\"action\":\"run\",\"command\":\"printf output\"}}",
+        });
+    }
+    const first: types.ToolLifecycleId = .{ .turn_id = 1, .call_id = call_ids[0] };
+    const second: types.ToolLifecycleId = .{ .turn_id = 1, .call_id = call_ids[1] };
+    try onCommandOutputChunk(&ctx, first, .stdout, "\xd0");
+    try onCommandOutputChunk(&ctx, second, .stdout, "\xe2\x82");
+    try onCommandOutputChunk(&ctx, first, .stderr, "\xf0\x90");
+    try onCommandOutputChunk(&ctx, first, .stdout, "\xaf");
+    try onCommandOutputChunk(&ctx, second, .stdout, "\xac");
+    try onCommandOutputChunk(&ctx, first, .stderr, "\x90\x80");
+    try onCommandOutputChunk(&ctx, first, .stdout, "\xff\xd0");
+    try ctx.sendToolCallError(first.call_id, "failed");
+    try onCommandOutputChunk(&ctx, second, .stdout, "\xf0\x90");
+    try ctx.sendToolCallCompletedWithCommandResult(second.call_id, "completed", null);
+
+    var captured_file = try tmp.dir.openFile(std.testing.io, "command-progress.jsonl", .{});
+    defer captured_file.close(std.testing.io);
+    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 16 * 1024);
+    defer alloc.free(captured);
+    var texts = [_]std.Io.Writer.Allocating{ .init(alloc), .init(alloc) };
+    defer for (&texts) |*text| text.deinit();
+    var finished = [_]bool{ false, false };
+    var notifications = std.mem.splitScalar(u8, captured, '\n');
+    while (notifications.next()) |line| {
+        if (line.len == 0) continue;
+        try std.testing.expect(std.unicode.utf8ValidateSlice(line));
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
+        defer parsed.deinit();
+        const update = parsed.value.object.get("params").?.object.get("update").?.object;
+        if (!std.mem.eql(u8, update.get("sessionUpdate").?.string, "tool_call_update")) continue;
+        const index: usize = if (std.mem.eql(u8, update.get("toolCallId").?.string, first.call_id)) 0 else 1;
+        try std.testing.expect(!finished[index]);
+        if (!std.mem.eql(u8, update.get("status").?.string, "in_progress")) {
+            finished[index] = true;
+            continue;
+        }
+        if (update.get("content")) |content| {
+            for (content.array.items) |item| {
+                try texts[index].writer.writeAll(item.object.get("content").?.object.get("text").?.string);
+            }
+        }
+    }
+    try std.testing.expectEqualStrings("\xd0\xaf\xf0\x90\x90\x80\\xff\\xd0", texts[0].written());
+    try std.testing.expectEqualStrings("\xe2\x82\xac\\xf0\\x90", texts[1].written());
+    try std.testing.expect(finished[0] and finished[1]);
 }
 
 test "ACP message IDs rotate when the logical message kind resumes" {
