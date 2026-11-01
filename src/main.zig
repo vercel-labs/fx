@@ -20,6 +20,7 @@ const secret = @import("core/auth/secret.zig");
 const model_cache_runtime = @import("core/app/model_cache_runtime.zig");
 const usage = @import("usage/usage.zig");
 const usage_host = @import("core/app/usage_host.zig");
+const credits_lookup = @import("core/app/credits_lookup.zig");
 const app_auth_runtime = @import("core/app/app_auth_runtime.zig");
 const app_host_config_runtime = @import("core/app/app_host_config_runtime.zig");
 const app_entry_runtime = @import("core/app/app_entry_runtime.zig");
@@ -534,6 +535,8 @@ const App = struct {
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
     /// Replaced in `init` with the real home directory.
     usage_dashboard: usage.Dashboard = usage.Dashboard.init(std.heap.c_allocator, usage_host.unset),
+    /// The `/credits` lookup in flight, if any.
+    credits_lookup: credits_lookup.Lookup = .{},
     workspace_root: []u8 = &.{},
     workspace_identity: statusline_identity.Runtime = .{},
     workspace_host: WorkspaceHostRuntime = .{},
@@ -894,8 +897,9 @@ const App = struct {
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
             SessionAppRuntime.recordShutdownFailure(self, err);
         };
-        // Cancel a /usage fetch in flight before shutdown continues.
+        // Cancel a /usage or /credits fetch in flight before shutdown continues.
         self.usage_dashboard.deinit();
+        self.credits_lookup.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
         InputSubmitRuntime.discardLaunchPrompt(self, "shutdown");
         const resume_handoff = SessionAppRuntime.finalizePersistenceWithResumeHandoff(self);
@@ -967,6 +971,7 @@ const App = struct {
         self.managed_executions.deinit();
         self.model_cache.deinit();
         self.usage_dashboard.deinit();
+        self.credits_lookup.deinit();
         InputSubmitRuntime.clearPendingSubmission(self, "shutdown");
         InputSubmitRuntime.discardLaunchPrompt(self, "shutdown");
         SessionAppRuntime.finalizePersistence(self);
@@ -1068,6 +1073,14 @@ const App = struct {
 
     pub fn ensurePromptCredential(self: *App) !bool {
         return AuthAppRuntime.admitPromptCredential(self);
+    }
+
+    pub fn admitQueuedPromptCredential(self: *App) !bool {
+        return AuthAppRuntime.admitQueuedPromptCredential(self);
+    }
+
+    pub fn adoptRenewedCredential(self: *App, renewed: *const credentials.Credential) !void {
+        try AuthAppRuntime.adoptRenewedCredential(self, renewed);
     }
 
     pub fn restoreSessionCredential(self: *App, previous_provider: model_provider.ProviderId) !void {
@@ -1525,7 +1538,7 @@ const App = struct {
         const model_copy = try std.heap.c_allocator.dupe(u8, self.provider_selection.selection().model);
         errdefer std.heap.c_allocator.free(model_copy);
 
-        const gateway_credential = self.auth.gatewayCredential() orelse return error.MissingApiKey;
+        const gateway_credential = self.auth.queuedPromptCredential() orelse return error.MissingApiKey;
         const api_key_copy = if (gateway_credential.api_key) |api_key|
             try std.heap.c_allocator.dupe(u8, api_key)
         else
@@ -2944,6 +2957,7 @@ const App = struct {
         }
         try app_commands.Handlers(App).collectMcpHostFacts(self);
         try app_commands.Handlers(App).collectShellSnapshotFacts(self);
+        try app_commands.Handlers(App).collectCreditsFacts(self);
         if (comptime host_profile.native_auth or host_profile.js_host_auth) {
             try AuthAppRuntime.collectProviderPreparationFacts(self);
             try AuthAppRuntime.collectSourceInventoryFacts(self);
@@ -2951,6 +2965,8 @@ const App = struct {
         }
         if (comptime host_profile.native_auth) {
             try AuthAppRuntime.collectApiKeySaveFacts(self);
+            try AuthAppRuntime.collectRemoteRevocationFacts(self);
+            try AuthAppRuntime.collectTeamListFacts(self);
         }
         try self.processNextCooperativePrompt();
 
@@ -4831,6 +4847,7 @@ test {
     _ = @import("core/app/app_bootstrap_runtime.zig");
     _ = @import("core/app/app_callbacks.zig");
     _ = @import("core/app/app_commands.zig");
+    _ = credits_lookup;
     _ = @import("core/app/app_entry_runtime.zig");
     _ = @import("core/app/app_input_runtime.zig");
     _ = input_submit_runtime;
@@ -4908,6 +4925,7 @@ test {
     _ = @import("core/hooks/runtime.zig");
     _ = @import("core/images/image_attachments.zig");
     _ = @import("core/images/image_commands.zig");
+    _ = @import("core/shared/input_loop_guard.zig");
     _ = @import("core/shared/io.zig");
     _ = @import("core/shared/message.zig");
     _ = @import("core/shared/token_estimate.zig");

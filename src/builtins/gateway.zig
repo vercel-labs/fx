@@ -34,7 +34,7 @@ const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const sort_utils = @import("../core/shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
-const FetchGatewayGetResultFn = *const fn (Allocator, ?[]const u8, []const u8) anyerror!gateway_client.GetResult;
+const FetchGatewayGetResultFn = *const fn (Allocator, ?[]const u8, []const u8, *std.atomic.Value(bool)) anyerror!gateway_client.GetResult;
 
 const Request = web_search_contract.ProviderRequest;
 const Response = web_search_contract.ProviderResponse;
@@ -790,11 +790,13 @@ fn fetchCredits(
     if (input.credential_source == .grok_subscription) {
         return creditsErrorSnapshot(alloc, "AI Gateway credits are unavailable for a Grok subscription.");
     }
+    var local_cancel = std.atomic.Value(bool).init(false);
     return fetchCreditsWithFetch(
         alloc,
         input.credential,
         input.tenant,
-        gateway_client.fetchGatewayGetResult,
+        input.cancel_flag orelse &local_cancel,
+        gateway_client.fetchGatewayGetResultCancellable,
     );
 }
 
@@ -807,6 +809,7 @@ fn fetchCreditsWithFetch(
     alloc: Allocator,
     api_key: ?[]const u8,
     gateway_team: ?[]const u8,
+    cancel_flag: *std.atomic.Value(bool),
     fetch_fn: FetchGatewayGetResultFn,
 ) output_contracts.CreditsSnapshot {
     var team_path: ?[]u8 = null;
@@ -821,7 +824,7 @@ fn fetchCreditsWithFetch(
         }
     }
 
-    var result = fetch_fn(alloc, api_key, team_path orelse credits_path) catch {
+    var result = fetch_fn(alloc, api_key, team_path orelse credits_path, cancel_flag) catch {
         return creditsErrorSnapshot(alloc, "failed to fetch credits from gateway");
     };
     defer result.deinit(alloc);
@@ -913,7 +916,8 @@ const OAuthHttpOperation = struct {
         };
         defer client.deinit();
 
-        const response_buffer = try self.alloc.alloc(u8, oauth_response_max_bytes + 1);
+        const max_bytes = self.request.max_response_bytes orelse oauth_response_max_bytes;
+        const response_buffer = try self.alloc.alloc(u8, max_bytes + 1);
         defer secret.zeroAndFree(self.alloc, response_buffer);
         var response_writer = std.Io.Writer.fixed(response_buffer);
 
@@ -944,7 +948,7 @@ const OAuthHttpOperation = struct {
             else => return err,
         };
         const body = response_writer.buffered();
-        if (body.len > oauth_response_max_bytes) return error.OAuthResponseTooLarge;
+        if (body.len > max_bytes) return error.OAuthResponseTooLarge;
 
         return .{
             .disposition = if (result.status == .ok) .accepted else .rejected,
@@ -2029,10 +2033,13 @@ test "built-in gateway defaults preserve active provider policy" {
     try std.testing.expectEqualStrings("FX_GATEWAY_CHAT_URL", chat_url_env);
 }
 
+var test_credits_never_cancelled = std.atomic.Value(bool).init(false);
+
 fn stubFetchCreditsError(
     _: Allocator,
     _: ?[]const u8,
     _: []const u8,
+    _: *std.atomic.Value(bool),
 ) anyerror!gateway_client.GetResult {
     return error.StubFetchFailed;
 }
@@ -2041,6 +2048,7 @@ fn stubFetchInvalidCreditsJson(
     alloc: Allocator,
     _: ?[]const u8,
     _: []const u8,
+    _: *std.atomic.Value(bool),
 ) anyerror!gateway_client.GetResult {
     return .{
         .status = .ok,
@@ -2052,6 +2060,7 @@ fn stubFetchCreditsObject(
     alloc: Allocator,
     _: ?[]const u8,
     _: []const u8,
+    _: *std.atomic.Value(bool),
 ) anyerror!gateway_client.GetResult {
     return .{
         .status = .ok,
@@ -2066,6 +2075,7 @@ fn stubCaptureCreditsPath(
     alloc: Allocator,
     _: ?[]const u8,
     path: []const u8,
+    _: *std.atomic.Value(bool),
 ) anyerror!gateway_client.GetResult {
     captured_credits_path_len = @min(path.len, captured_credits_path.len);
     @memcpy(
@@ -2082,6 +2092,7 @@ fn stubFetchForbiddenCredits(
     alloc: Allocator,
     _: ?[]const u8,
     _: []const u8,
+    _: *std.atomic.Value(bool),
 ) anyerror!gateway_client.GetResult {
     return .{
         .status = .forbidden,
@@ -2116,6 +2127,7 @@ test "built-in credits provider names the team query only when valid" {
             std.testing.allocator,
             null,
             case.team,
+            &test_credits_never_cancelled,
             stubCaptureCreditsPath,
         );
         defer snapshot.deinit(std.testing.allocator);
@@ -2131,6 +2143,7 @@ test "built-in credits provider maps fetch failure" {
         std.testing.allocator,
         null,
         null,
+        &test_credits_never_cancelled,
         stubFetchCreditsError,
     );
     defer snapshot.deinit(std.testing.allocator);
@@ -2149,6 +2162,7 @@ test "built-in credits provider maps Gateway HTTP denial" {
         std.testing.allocator,
         null,
         null,
+        &test_credits_never_cancelled,
         stubFetchForbiddenCredits,
     );
     defer snapshot.deinit(std.testing.allocator);
@@ -2167,6 +2181,7 @@ test "built-in credits provider rejects malformed JSON" {
         std.testing.allocator,
         null,
         null,
+        &test_credits_never_cancelled,
         stubFetchInvalidCreditsJson,
     );
     defer snapshot.deinit(std.testing.allocator);
@@ -2197,6 +2212,7 @@ test "built-in credits provider returns owned string fields" {
         std.testing.allocator,
         null,
         null,
+        &test_credits_never_cancelled,
         stubFetchCreditsObject,
     );
     defer snapshot.deinit(std.testing.allocator);

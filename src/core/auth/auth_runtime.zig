@@ -8,6 +8,7 @@ const grok_oauth = @import("grok_oauth.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const login_flow = @import("login_flow.zig");
+const oauth_session = @import("oauth_session.zig");
 const oauth = @import("oauth.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
@@ -794,8 +795,9 @@ const PromptCredentialRefreshTask = struct {
     }
 
     fn workerMain(self: *PromptCredentialRefreshTask) void {
+        var transport: oauth_transport.Cancellable = .{ .inner = self.transport, .cancel_flag = &self.cancel_requested };
         self.credential = refreshCredentialForAccount(
-            self.cancellableTransport(),
+            transport.provider(),
             std.heap.c_allocator,
             self.source,
             .if_needed,
@@ -807,24 +809,6 @@ const PromptCredentialRefreshTask = struct {
         };
         if (self.credential == null) self.failure = error.CredentialRefreshUnavailable;
         self.done.store(true, .release);
-    }
-
-    fn cancellableTransport(self: *PromptCredentialRefreshTask) oauth_transport.Provider {
-        return .{
-            .context = self,
-            .execute_fn = executeCancellable,
-        };
-    }
-
-    fn executeCancellable(
-        raw: ?*anyopaque,
-        alloc: Allocator,
-        request: oauth_transport.Request,
-    ) !oauth_transport.Response {
-        const self: *PromptCredentialRefreshTask = @ptrCast(@alignCast(raw.?));
-        var bounded = request;
-        bounded.cancel_flag = &self.cancel_requested;
-        return self.transport.execute(alloc, bounded);
     }
 
     fn poll(self: *const PromptCredentialRefreshTask) bool {
@@ -860,6 +844,81 @@ const PromptCredentialRefreshTask = struct {
         if (self.expected_account_id) |account_id| alloc.free(account_id);
         self.expected_account_id = null;
         alloc.destroy(self);
+    }
+};
+
+/// The tokens of a session the user signed out of, to revoke at its issuer.
+pub const RemoteRevocation = union(enum) {
+    /// Owned; allocated with `std.heap.c_allocator`.
+    fx_login: oauth_session.Session,
+    /// The Grok refresh token. Owned; allocated with `std.heap.c_allocator`.
+    grok: []u8,
+
+    pub fn source(self: RemoteRevocation) credentials.Source {
+        return switch (self) {
+            .fx_login => .fx_login,
+            .grok => .grok_subscription,
+        };
+    }
+
+    pub fn deinit(self: *RemoteRevocation) void {
+        const alloc = std.heap.c_allocator;
+        switch (self.*) {
+            .fx_login => |*session| session.deinit(alloc),
+            .grok => |token| secret.zeroAndFree(alloc, token),
+        }
+        self.* = undefined;
+    }
+};
+
+const RemoteRevocationOutcome = struct {
+    source: credentials.Source,
+    failed: bool,
+};
+
+/// How long shutdown waits for revocations in flight before cancelling them.
+const remote_revocation_shutdown_grace_ms: i64 = 2_000;
+
+const RemoteRevocationTask = struct {
+    transport: oauth_transport.Provider,
+    target: RemoteRevocation,
+    future: std.Io.Future(void) = undefined,
+    /// Set when the revocation returns, so shutdown can wait on it.
+    done: std.Io.Event = .unset,
+    cancel: std.atomic.Value(bool) = .init(false),
+    failed: bool = false,
+
+    /// Takes ownership of `target` only when the task starts.
+    fn start(transport: oauth_transport.Provider, target: RemoteRevocation) !*RemoteRevocationTask {
+        const alloc = std.heap.c_allocator;
+        const task = try alloc.create(RemoteRevocationTask);
+        errdefer alloc.destroy(task);
+        task.* = .{ .transport = transport, .target = target };
+        task.future = try io_mod.getIo().concurrent(workerMain, .{task});
+        return task;
+    }
+
+    fn workerMain(self: *RemoteRevocationTask) void {
+        const alloc = std.heap.c_allocator;
+        var transport: oauth_transport.Cancellable = .{ .inner = self.transport, .cancel_flag = &self.cancel };
+        const revoked: anyerror!void = switch (self.target) {
+            .fx_login => |session| login_flow.revokeLoggedOutSession(alloc, transport.provider(), session),
+            .grok => |token| grok_oauth.revokeToken(alloc, transport.provider(), token),
+        };
+        revoked catch |err| {
+            debug_trace.logf("auth", "remote revocation failed source={t} err={s}", .{ self.target.source(), @errorName(err) });
+            self.failed = true;
+        };
+        self.done.set(io_mod.getIo());
+    }
+
+    /// Awaits the task, releases it, and returns its outcome.
+    fn finish(self: *RemoteRevocationTask) RemoteRevocationOutcome {
+        self.future.await(io_mod.getIo());
+        const outcome: RemoteRevocationOutcome = .{ .source = self.target.source(), .failed = self.failed };
+        self.target.deinit();
+        std.heap.c_allocator.destroy(self);
+        return outcome;
     }
 };
 
@@ -1014,9 +1073,10 @@ pub const ProviderPreparation = struct {
             self.credential = candidate;
             self.input.candidate = null;
         } else if (!self.host_managed) {
+            var transport: oauth_transport.Cancellable = .{ .inner = self.transport, .cancel_flag = &self.cancel_requested };
             self.credential = prepareCredential(
                 self.alloc,
-                .{ .context = self, .execute_fn = executeCancellable },
+                transport.provider(),
                 self.secret_store,
                 self.input.target(),
                 self.input.preferred_source,
@@ -1045,13 +1105,6 @@ pub const ProviderPreparation = struct {
             self.failure = err;
             return;
         };
-    }
-
-    fn executeCancellable(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
-        const self: *ProviderPreparation = @ptrCast(@alignCast(raw.?));
-        var bounded = request;
-        bounded.cancel_flag = &self.cancel_requested;
-        return self.transport.execute(alloc, bounded);
     }
 
     pub fn requestCancel(self: *ProviderPreparation) void {
@@ -1254,6 +1307,50 @@ const InventoryRefreshTask = struct {
     }
 };
 
+/// What a team list was loaded for, so its result resumes the screen that
+/// asked for it.
+const TeamListPurpose = enum { change_team, provider_picker };
+
+/// Lists the fx login's Vercel teams off the input loop. Listing can renew
+/// the session first, and both steps talk to the network.
+const TeamListTask = struct {
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    purpose: TeamListPurpose,
+    future: std.Io.Future(void) = undefined,
+    done: std.atomic.Value(bool) = .init(false),
+    cancel: std.atomic.Value(bool) = .init(false),
+    selection: anyerror!login_flow.TeamSelection = error.TeamListPending,
+
+    fn start(
+        alloc: Allocator,
+        transport: oauth_transport.Provider,
+        purpose: TeamListPurpose,
+    ) !*TeamListTask {
+        const task = try alloc.create(TeamListTask);
+        task.* = .{ .alloc = alloc, .transport = transport, .purpose = purpose };
+        task.future = io_mod.getIo().concurrent(workerMain, .{task}) catch |err| {
+            alloc.destroy(task);
+            return err;
+        };
+        return task;
+    }
+
+    fn workerMain(self: *TeamListTask) void {
+        var transport: oauth_transport.Cancellable = .{ .inner = self.transport, .cancel_flag = &self.cancel };
+        self.selection = login_flow.loadTeamSelection(self.alloc, transport.provider());
+        self.done.store(true, .release);
+    }
+
+    /// Cancels the requests, awaits the task, and frees a list nobody took.
+    fn deinit(self: *TeamListTask) void {
+        self.cancel.store(true, .seq_cst);
+        self.future.await(io_mod.getIo());
+        if (self.selection) |*selection| selection.deinit(self.alloc) else |_| {}
+        self.alloc.destroy(self);
+    }
+};
+
 const ApiKeyExitReason = enum {
     cancel,
     saved,
@@ -1296,6 +1393,10 @@ pub const Choice = union(enum) {
     }
 };
 
+/// What a picker row or column says while the team list loads in the
+/// background.
+pub const team_list_loading_label = "loading teams...";
+
 pub const PickerView = struct {
     active: bool,
     available_sources: SourceSet,
@@ -1306,6 +1407,8 @@ pub const PickerView = struct {
     include_skip: bool,
     stage: PickerStage = .root,
     fx_login_session_available: bool = false,
+    /// A team list is loading in the background for a picker.
+    team_list_loading: bool = false,
     teams: []const login_flow.Team = &.{},
     current_team: ?[]const u8 = null,
     team_query: []const u8 = &.{},
@@ -1414,7 +1517,12 @@ pub const PickerView = struct {
                 .grok_login => if (self.available_sources.contains(.grok_subscription)) "connected" else "",
                 .setup, .switch_credential, .switch_provider => "",
                 .automatic => "use the first available source",
-                .change_team => if (self.fx_login_session_available) "choose a team" else "sign in first",
+                .change_team => if (self.team_list_loading)
+                    team_list_loading_label
+                else if (self.fx_login_session_available)
+                    "choose a team"
+                else
+                    "sign in first",
             },
             .team => |index| if (self.teamIsCurrent(index)) "current" else "",
         };
@@ -1758,6 +1866,9 @@ pub const Runtime = struct {
     api_key_save: ApiKeySaveRuntime = .{},
     inventory_refresh_task: ?*InventoryRefreshTask = null,
     prompt_credential_refresh_task: ?*PromptCredentialRefreshTask = null,
+    /// Revocations of signed-out sessions still talking to their issuer.
+    remote_revocation_tasks: std.ArrayList(*RemoteRevocationTask) = .empty,
+    team_list_task: ?*TeamListTask = null,
     provider_preparation: ?*ProviderPreparation = null,
     startup_credential_task: ?*StartupCredentialTask = null,
     /// The launch source inventory waits for the first frame.
@@ -1804,7 +1915,7 @@ pub const Runtime = struct {
         auth_mode: credentials.AuthMode,
     ) void {
         comptime {
-            if (@typeInfo(Self).@"struct".field_names.len != 33) {
+            if (@typeInfo(Self).@"struct".field_names.len != 35) {
                 @compileError("update Runtime.initInto for the changed field set");
             }
         }
@@ -1839,6 +1950,8 @@ pub const Runtime = struct {
         storage.api_key_save = .{};
         storage.inventory_refresh_task = null;
         storage.prompt_credential_refresh_task = null;
+        storage.remote_revocation_tasks = .empty;
+        storage.team_list_task = null;
         storage.provider_preparation = null;
         storage.startup_credential_task = null;
         storage.startup_inventory_deferred = false;
@@ -1852,6 +1965,34 @@ pub const Runtime = struct {
         self.inventory_refresh_task = null;
         if (self.prompt_credential_refresh_task) |task| task.deinit();
         self.prompt_credential_refresh_task = null;
+        if (self.team_list_task) |task| {
+            if (!task.done.load(.acquire)) debug_trace.logf("auth", "team list dropped reason=shutdown", .{});
+            task.deinit();
+        }
+        self.team_list_task = null;
+        // The user asked to end these sessions at their issuer, so shutdown
+        // gives revocations in flight a short grace period. A stalled issuer
+        // must not hold exit, so whatever is left after it is cancelled.
+        const io = io_mod.getIo();
+        const grace_deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+            .raw = .fromMilliseconds(remote_revocation_shutdown_grace_ms),
+            .clock = .awake,
+        });
+        for (self.remote_revocation_tasks.items) |task| {
+            // A spurious wakeup also reports a timeout, so the clock decides.
+            while (!task.done.isSet() and std.Io.Clock.Timestamp.now(io, .awake).compare(.lt, grace_deadline)) {
+                task.done.waitTimeout(io, .{ .deadline = grace_deadline }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => break,
+                };
+            }
+            if (!task.done.isSet()) {
+                debug_trace.logf("auth", "remote revocation dropped reason=shutdown source={t}", .{task.target.source()});
+                task.cancel.store(true, .seq_cst);
+            }
+            _ = task.finish();
+        }
+        self.remote_revocation_tasks.deinit(std.heap.c_allocator);
         self.api_key_save.deinit(alloc);
         self.sign_in_flow.deinit(alloc);
         self.clearSignInCodeInput(alloc, .runtime_deinit);
@@ -1864,17 +2005,34 @@ pub const Runtime = struct {
 
     /// Borrows the current credential until this runtime replaces or releases it.
     pub fn gatewayCredential(self: *const Self) ?GatewayCredential {
-        return self.gatewayCredentialAt(io_mod.milliTimestamp());
+        return self.gatewayCredentialAt(io_mod.milliTimestamp(), .current);
     }
 
-    fn gatewayCredentialAt(self: *const Self, now_ms: i64) ?GatewayCredential {
+    /// Borrows the credential a queued prompt hands to the worker, until this
+    /// runtime replaces or releases it. A refreshable credential past its
+    /// refresh deadline still qualifies, because the worker refreshes it before
+    /// the turn's first request. Queuing a prompt never waits on the network.
+    pub fn queuedPromptCredential(self: *const Self) ?GatewayCredential {
+        return self.gatewayCredentialAt(io_mod.milliTimestamp(), .worker_refreshes);
+    }
+
+    const CredentialFreshness = enum {
+        /// The token must be usable now.
+        current,
+        /// A refreshable token may be due; the worker refreshes it first.
+        worker_refreshes,
+    };
+
+    fn gatewayCredentialAt(self: *const Self, now_ms: i64, freshness: CredentialFreshness) ?GatewayCredential {
         if (self.auth_mode == .host_managed) return .{
             .api_key = null,
             .gateway_team = null,
             .source = .host_managed,
         };
         const credential = self.selected_credential orelse return null;
-        if (credential.needsRefreshAt(now_ms)) return null;
+        if (credential.needsRefreshAt(now_ms)) {
+            if (freshness == .current or !credentials.sourceRefreshable(credential.source)) return null;
+        }
         if (credential.source == .fx_login) {
             const team = credential.gatewayTeam() orelse return null;
             if (!types.validGatewayTeam(team)) return null;
@@ -2128,6 +2286,30 @@ pub const Runtime = struct {
         return .{ .ready = task.action };
     }
 
+    /// Starts listing the fx login's teams in a `std.Io` task, unless one is
+    /// loading; `takeTeamList` returns the result once to the screen that
+    /// asked for it.
+    pub fn beginTeamList(self: *Self, alloc: Allocator, purpose: TeamListPurpose) !void {
+        if (self.team_list_task != null) return;
+        self.team_list_task = try TeamListTask.start(alloc, self.oauth_transport, purpose);
+    }
+
+    pub fn teamListLoading(self: *const Self) bool {
+        return self.team_list_task != null;
+    }
+
+    /// Returns the finished list loaded for `purpose`, and null while it
+    /// loads or when none was asked for. The caller owns a returned list.
+    pub fn takeTeamList(self: *Self, purpose: TeamListPurpose) ?anyerror!login_flow.TeamSelection {
+        const task = self.team_list_task orelse return null;
+        if (task.purpose != purpose or !task.done.load(.acquire)) return null;
+        self.team_list_task = null;
+        const selection = task.selection;
+        task.selection = error.TeamListTaken;
+        task.deinit();
+        return selection;
+    }
+
     pub fn sourceInventoryRefreshActive(self: *const Self) bool {
         return self.inventory_refresh_task != null;
     }
@@ -2218,6 +2400,7 @@ pub const Runtime = struct {
             .include_skip = self.picker_include_skip,
             .stage = self.picker_stage,
             .fx_login_session_available = self.fx_login_session_available,
+            .team_list_loading = self.team_list_task != null,
             .teams = if (self.team_selection) |*selection| selection.teams.items else &.{},
             .current_team = if (self.team_selection) |*selection|
                 selection.currentTeam()
@@ -2466,6 +2649,11 @@ pub const Runtime = struct {
     pub fn signInBrowserUrlAlloc(self: *Self, alloc: Allocator) !?[]u8 {
         if (!self.signInEntryActive()) return null;
         return self.sign_in_flow.browserUrlAlloc(alloc);
+    }
+
+    /// True once when the sign-in worker has the device code ready.
+    pub fn takeSignInBrowserPending(self: *Self) bool {
+        return self.sign_in_flow.takeBrowserPending() and self.signInEntryActive();
     }
 
     pub fn pollSignInTransition(self: *Self, alloc: Allocator) login_flow.SignInTransition {
@@ -2877,7 +3065,10 @@ pub const Runtime = struct {
             self.oauth_transport,
             credential.source,
             credential.accountId(),
-        ) catch return .failed;
+        ) catch |err| {
+            debug_trace.logf("auth", "prompt credential refresh task unavailable err={s}", .{@errorName(err)});
+            return .failed;
+        };
         return .started;
     }
 
@@ -2892,6 +3083,38 @@ pub const Runtime = struct {
         const task = self.prompt_credential_refresh_task orelse return;
         self.prompt_credential_refresh_task = null;
         task.deinit();
+    }
+
+    /// Revokes a signed-out session's tokens on a worker and takes ownership
+    /// of `target`. Returns false, after releasing `target`, when the worker
+    /// cannot start; the revocation then did not happen.
+    pub fn beginRemoteRevocation(self: *Self, target: RemoteRevocation) bool {
+        var owned = target;
+        if (comptime builtin.single_threaded) {
+            owned.deinit();
+            return false;
+        }
+        self.remote_revocation_tasks.ensureUnusedCapacity(std.heap.c_allocator, 1) catch {
+            owned.deinit();
+            return false;
+        };
+        const task = RemoteRevocationTask.start(self.oauth_transport, owned) catch |err| {
+            debug_trace.logf("auth", "remote revocation task unavailable source={t} err={s}", .{ owned.source(), @errorName(err) });
+            owned.deinit();
+            return false;
+        };
+        self.remote_revocation_tasks.appendAssumeCapacity(task);
+        return true;
+    }
+
+    /// Returns one finished revocation's outcome, or null when none finished.
+    pub fn takeRemoteRevocation(self: *Self) ?RemoteRevocationOutcome {
+        for (self.remote_revocation_tasks.items, 0..) |task, index| {
+            if (!task.done.isSet()) continue;
+            _ = self.remote_revocation_tasks.swapRemove(index);
+            return task.finish();
+        }
+        return null;
     }
 
     /// Starts resolving the launch credential on a worker. Returns false when
@@ -3617,9 +3840,9 @@ test "auth runtime withholds an fx credential across its expiry boundary" {
     _ = runtime.adoptCredential(alloc, &credential);
 
     try std.testing.expect(!runtime.credentialNeedsRefreshAt(39_999));
-    try std.testing.expect(runtime.gatewayCredentialAt(39_999) != null);
+    try std.testing.expect(runtime.gatewayCredentialAt(39_999, .current) != null);
     try std.testing.expect(runtime.credentialNeedsRefreshAt(40_000));
-    try std.testing.expect(runtime.gatewayCredentialAt(40_000) == null);
+    try std.testing.expect(runtime.gatewayCredentialAt(40_000, .current) == null);
     try std.testing.expectEqual(credentials.Source.fx_login, runtime.credentialSource().?);
     try std.testing.expectEqualStrings("team_123", runtime.view().selected_team.?);
     try std.testing.expectEqual(credentials.Source.fx_login, runtime.statusSnapshotAt(40_000, .gateway, null).active_source.?);
@@ -3634,7 +3857,38 @@ test "auth runtime withholds an fx credential across its expiry boundary" {
     refreshed.refresh_after_ms = 140_000;
     try std.testing.expect(runtime.adoptCredential(alloc, &refreshed));
     try std.testing.expect(!runtime.credentialNeedsRefreshAt(40_000));
-    try std.testing.expectEqualStrings("stale-token", runtime.gatewayCredentialAt(40_000).?.api_key.?);
+    try std.testing.expectEqualStrings("stale-token", runtime.gatewayCredentialAt(40_000, .current).?.api_key.?);
+}
+
+test "auth runtime lets a queued prompt carry a refreshable credential past its deadline" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    var credential = try makeTestCredential(alloc, "due-token", .fx_login, "team_123", "vercel-labs");
+    defer credential.deinit(alloc);
+    credential.refresh_after_ms = 40_000;
+    _ = runtime.adoptCredential(alloc, &credential);
+
+    try std.testing.expect(runtime.gatewayCredentialAt(40_000, .current) == null);
+    const queued = runtime.gatewayCredentialAt(40_000, .worker_refreshes).?;
+    try std.testing.expectEqualStrings("due-token", queued.api_key.?);
+    try std.testing.expectEqualStrings("team_123", queued.gateway_team.?);
+    try std.testing.expectEqual(credentials.Source.fx_login, queued.source);
+}
+
+test "auth runtime withholds a due credential the worker cannot refresh from queued prompts" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+
+    var credential = try makeTestCredential(alloc, "oidc-token", .vercel_oidc_token, null, null);
+    defer credential.deinit(alloc);
+    credential.refresh_after_ms = 40_000;
+    _ = runtime.adoptCredential(alloc, &credential);
+
+    try std.testing.expect(runtime.gatewayCredentialAt(39_999, .worker_refreshes) != null);
+    try std.testing.expect(runtime.gatewayCredentialAt(40_000, .worker_refreshes) == null);
 }
 
 test "auth runtime view preserves missing and loaded states" {
@@ -5203,4 +5457,52 @@ test "request-path credential verification stamp gates only within the window" {
 
     request_path_verified_ms.store(stampNowMs() -% request_path_verified_window_ms -% 1, .seq_cst);
     try std.testing.expect(!requestPathCredentialVerifiedRecently(.fx_login));
+}
+
+const RevocationTestTransport = struct {
+    accept: bool,
+    calls: std.atomic.Value(usize) = .init(0),
+
+    fn provider(self: *RevocationTestTransport) oauth_transport.Provider {
+        return .{ .context = self, .execute_fn = execute };
+    }
+
+    fn execute(raw: ?*anyopaque, alloc: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+        const self: *RevocationTestTransport = @ptrCast(@alignCast(raw.?));
+        _ = self.calls.fetchAdd(1, .seq_cst);
+        if (!self.accept) return error.OAuthRequestFailed;
+        return .{ .disposition = .accepted, .body = try alloc.dupe(u8, "{}") };
+    }
+};
+
+test "auth runtime revokes a signed-out Grok session on a worker" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    for ([_]bool{ true, false }) |accept| {
+        var transport: RevocationTestTransport = .{ .accept = accept };
+        var runtime: Runtime = .{ .oauth_transport = transport.provider() };
+        defer runtime.deinit(std.testing.allocator);
+
+        const token = try std.heap.c_allocator.dupe(u8, "grok-refresh-token");
+        try std.testing.expect(runtime.beginRemoteRevocation(.{ .grok = token }));
+        const outcome = while (true) {
+            if (runtime.takeRemoteRevocation()) |finished| break finished;
+            std.Thread.yield() catch {};
+        };
+        try std.testing.expectEqual(credentials.Source.grok_subscription, outcome.source);
+        try std.testing.expectEqual(!accept, outcome.failed);
+        try std.testing.expectEqual(@as(usize, 1), transport.calls.load(.seq_cst));
+        try std.testing.expect(runtime.takeRemoteRevocation() == null);
+    }
+}
+
+test "auth runtime shutdown waits for a remote revocation in flight" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var transport: RevocationTestTransport = .{ .accept = true };
+    var runtime: Runtime = .{ .oauth_transport = transport.provider() };
+
+    const token = try std.heap.c_allocator.dupe(u8, "grok-refresh-token");
+    try std.testing.expect(runtime.beginRemoteRevocation(.{ .grok = token }));
+    runtime.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), transport.calls.load(.seq_cst));
 }
