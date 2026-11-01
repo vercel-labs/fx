@@ -4,6 +4,7 @@ const command_replay_store = @import("../../core/session/command_replay_store.zi
 const session_child_store = @import("../../core/session/session_child_store.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const tool_args = @import("../../core/tooling/tool_args.zig");
 const compactor = @import("../../core/compactor/compactor.zig");
 const read_result_presentation = @import("../../core/tooling/read_tool_result_presentation.zig");
 
@@ -37,13 +38,9 @@ pub const Input = struct {
 };
 
 pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result arguments must be valid JSON") };
-    };
+    var decoder: tool_args.ArgsDecoder = .{ .alloc = ctx.allocator, .tool = "read_tool_result" };
+    var parsed = decoder.parse(args_json) catch |err| return .{ .failure = try decoder.takeFailure(err) };
     defer parsed.deinit();
-    if (parsed.value != .object) {
-        return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result arguments must be an object") };
-    }
     const args = if (parsed.value.object.get("request")) |request| blk: {
         if (request != .object) {
             return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"request\" must be an object") };
@@ -58,16 +55,11 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
         };
         return decodeSearch(ctx.allocator, value);
     }
-    const handle_value = args.get("handle") orelse {
-        return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result requires string field \"handle\"") };
-    };
-    if (handle_value != .string) {
-        return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result field \"handle\" must be a string") };
-    }
+    const handle = decoder.requiredString(args, "handle") catch |err| return .{ .failure = try decoder.takeFailure(err) };
 
     const input = try ctx.allocator.create(Input);
     errdefer ctx.allocator.destroy(input);
-    input.* = .{ .handle = try ctx.allocator.dupe(u8, handle_value.string) };
+    input.* = .{ .handle = try ctx.allocator.dupe(u8, handle) };
     errdefer input.deinit(ctx.allocator);
 
     if (args.get("start_byte")) |value| {

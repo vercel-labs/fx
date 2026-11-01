@@ -7,6 +7,7 @@ const image_data = @import("../../core/images/image_data.zig");
 const png_downscale = @import("../../core/images/png_downscale.zig");
 const core_types = @import("../../core/shared/types.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 
 const Allocator = std.mem.Allocator;
@@ -36,26 +37,15 @@ pub const Input = struct {
 
 /// Decodes read_file JSON into an owned Input released by ToolInput.deinit.
 pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return .{ .failure = try ctx.allocator.dupe(u8, "read_file arguments must be valid JSON") };
-    };
+    var args: tool_args.ArgsDecoder = .{ .alloc = ctx.allocator, .tool = "read_file" };
+    var parsed = args.parse(args_json) catch |err| return .{ .failure = try args.takeFailure(err) };
     defer parsed.deinit();
-
-    if (parsed.value != .object) {
-        return .{ .failure = try ctx.allocator.dupe(u8, "read_file arguments must be an object") };
-    }
-
-    const path_value = parsed.value.object.get("path") orelse {
-        return .{ .failure = try ctx.allocator.dupe(u8, "read_file requires string field \"path\"") };
-    };
-    if (path_value != .string) {
-        return .{ .failure = try ctx.allocator.dupe(u8, "read_file field \"path\" must be a string") };
-    }
+    const path = args.requiredString(parsed.value.object, "path") catch |err| return .{ .failure = try args.takeFailure(err) };
 
     const input = try ctx.allocator.create(Input);
     errdefer ctx.allocator.destroy(input);
     input.* = .{
-        .path = try ctx.allocator.dupe(u8, path_value.string),
+        .path = try ctx.allocator.dupe(u8, path),
     };
     errdefer input.deinit(ctx.allocator);
 
