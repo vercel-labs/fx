@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 pub const ToolChoiceMode = configured_provider.ToolChoiceMode;
 pub const Options = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
+    cache_control: ?configured_provider.CacheControl = null,
     /// Borrowed only during serialization; includes the configured authority binding.
     provider: ?*const model_provider.ProviderId = null,
 };
@@ -497,6 +498,10 @@ fn flush_tool_image_follow_up(
 fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provider.RequestData, options: Options, functions: []const Function, projection: *const tool_call_ids.Projection) !void {
     try writer.writeAll("{\"model\":");
     try std.json.Stringify.value(request.model, .{}, writer);
+    if (options.cache_control) |cache| {
+        try writer.writeAll(",\"cache_control\":");
+        try std.json.Stringify.value(cache, .{ .emit_null_optional_fields = false }, writer);
+    }
     try writer.writeAll(",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
     var count: usize = 0;
     // Images from tool results buffer across each contiguous tool-message run
@@ -1820,6 +1825,31 @@ test "chat completions history correlation preserves canonical IDs and JSON stri
     try std.testing.expectEqualStrings(call.arguments_json, wire_call.get("function").?.object.get("arguments").?.string);
     try std.testing.expectEqualStrings("functions/read:0", call.id);
     try std.testing.expectEqualStrings(call.id, request.messages[1].tool_call_id.?);
+}
+
+test "chat completions sends a configured cache control breakpoint and omits the field when unset" {
+    const alloc = std.testing.allocator;
+    const control = configured_provider.CacheControl{};
+    const body = try build_request(alloc, test_request(), .{ .cache_control = control });
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const sent = parsed.value.object.get("cache_control").?.object;
+    try std.testing.expectEqualStrings("ephemeral", sent.get("type").?.string);
+    try std.testing.expect(sent.get("ttl") == null);
+
+    const hour = configured_provider.CacheControl{ .ttl = .@"1h" };
+    const hourly = try build_request(alloc, test_request(), .{ .cache_control = hour });
+    defer alloc.free(hourly);
+    var hourly_parsed = try std.json.parseFromSlice(std.json.Value, alloc, hourly, .{});
+    defer hourly_parsed.deinit();
+    try std.testing.expectEqualStrings("1h", hourly_parsed.value.object.get("cache_control").?.object.get("ttl").?.string);
+
+    const absent = try build_request(alloc, test_request(), .{});
+    defer alloc.free(absent);
+    var absent_parsed = try std.json.parseFromSlice(std.json.Value, alloc, absent, .{});
+    defer absent_parsed.deinit();
+    try std.testing.expect(absent_parsed.value.object.get("cache_control") == null);
 }
 
 test "chat completions tool choice controls and deliberate basic option mapping" {
