@@ -10806,3 +10806,56 @@ test.skipIf(!tmuxAvailable())(
   },
   TIMEOUT * 2,
 );
+
+// Claude cache warming (src/core/agent/runtime/cache_warmer.zig) in an ACP
+// session: the session's runtime owns the warmer, so a new session closes
+// the old one's. FX_CACHE_WARMING_TEST_TTL_MS sets a two-second lifetime.
+test("ACP keeps an idle Claude session's cache warm until the next session replaces it", async () => {
+  const root = createIsolatedRoot("fx-acp-cache-warming-");
+  const isPing = (body: string) => JSON.parse(body).maxOutputTokens === 1;
+  const gateway = startDynamicFakeGateway((body) => fakeGatewaySse([
+    ...(isPing(body) ? [] : [{ type: "text-delta", id: "answer_1", delta: "WARM_REPLY_DONE" }]),
+    {
+      type: "finish",
+      finishReason: { unified: "stop", raw: "stop" },
+      usage: { inputTokens: { total: 9_000, noCache: 0, cacheRead: isPing(body) ? 4_242 : 1_000, cacheWrite: 0 }, outputTokens: { total: 1 } },
+    },
+  ]), {
+    models: [{
+      id: "anthropic/claude-opus-5.5",
+      type: "language",
+      tags: ["explicit-caching", "reasoning", "tool-use"],
+      context_window: 1_000_000,
+      max_tokens: 64_000,
+      reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
+    }],
+  });
+  let client: AcpClient | undefined;
+  try {
+    client = await AcpClient.create({
+      cwd: root.workspace,
+      env: { ...fakeGatewayEnv(root, gateway), FX_MODEL: "anthropic/claude-opus-5.5", FX_CACHE_WARMING_TEST_TTL_MS: "2000" },
+    });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    sendPrompt(client, 3, "warm this up");
+    await readUntilResponses(client, [3]);
+    const pings = () => gateway.requests.filter((request) => isPing(request.body));
+    await waitForCondition("first ping", () => pings().length >= 1, 8_000);
+    const agent = gateway.requests.find((request) => !isPing(request.body))!;
+    expect(pings()[0]!.body).toBe(agent.body.replace(/"maxOutputTokens":\d+/, '"maxOutputTokens":1'));
+    expect(pings()[0]!.headers.get("x-session-affinity")).toBe(agent.headers.get("x-session-affinity"));
+
+    const replaced = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 4) as any;
+    if (replaced.error) throw new Error(JSON.stringify(replaced));
+    const before = pings().length;
+    await Bun.sleep(4_000);
+    expect(pings().length).toBe(before);
+    expect(client.stderr).toBe("");
+  } finally {
+    await client?.close();
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 45000);

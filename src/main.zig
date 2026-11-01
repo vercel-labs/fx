@@ -596,6 +596,9 @@ const App = struct {
     /// Resolved `session_titles` preference: generate a model-written session
     /// title from the first prompt of a fresh session.
     session_title_generation: bool = true,
+    /// Resolved `cache_warming` preference: ping a waiting Claude
+    /// conversation's prompt cache so it stays alive.
+    cache_warming: bool = true,
     /// Resolved display title for the active session. App owns these bytes;
     /// empty means no title has been derived or restored yet.
     session_title: std.ArrayList(u8) = .empty,
@@ -960,6 +963,9 @@ const App = struct {
         self.releaseTerminal();
         if (self.worker_thread) |thread| thread.join();
         shutdown_trace.mark("worker_thread_joined");
+        // No agent turn can arm the warmer now, and its pings must stop
+        // before the providers they use are released below.
+        self.session.closeCacheWarmer();
         WorkerAppRuntime.settleFinishedPromptsForShutdown(self) catch |err| {
             SessionAppRuntime.recordShutdownFailure(self, err);
         };
