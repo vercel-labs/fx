@@ -19,6 +19,10 @@
 //      Ctrl+O, and a resume, its traced window steps replayed on the core and
 //      checked by TLC (binary-to-spec.ts). FX_BIN picks the binary.
 //
+// With --ci, CI's TLA+ transcript window job leaves out steps 9, 10, and 12:
+// the planted bugs measure the checks rather than the code, and the binary
+// run needs a built fx and tmux.
+//
 // Settings: FX_TRANSCRIPT_WINDOW_SEED (default 20261030),
 // FX_TRANSCRIPT_WINDOW_TRACES (random traces per session kind, default 200),
 // FX_TLA_OUT (where the report goes).
@@ -34,8 +38,9 @@ import { checkTraceability } from "./traceability.ts";
 
 const seed = Number(process.env.FX_TRANSCRIPT_WINDOW_SEED ?? "20261030");
 const randomTraces = Number(process.env.FX_TRANSCRIPT_WINDOW_TRACES ?? "200");
+const ci = process.argv.includes("--ci");
 const out = outDir("transcript-window");
-const report: Record<string, unknown> = { started: new Date().toISOString(), seed, randomTraces, out };
+const report: Record<string, unknown> = { started: new Date().toISOString(), seed, randomTraces, ci, out };
 const failures: string[] = [];
 const started = performance.now();
 const elapsed = (from: number) => `${((performance.now() - from) / 1000).toFixed(1)} s`;
@@ -115,28 +120,32 @@ try {
   report.codeToSpec = traces;
   console.log(`  code to spec: ${elapsed(at)}`);
 
-  at = performance.now();
-  const spec = await specMutations(join(out, "mutations", "spec"));
-  const missedSpec = spec.filter((result) => !result.caught);
-  stage("spec mutations", missedSpec.length === 0, `${spec.length - missedSpec.length} of ${spec.length} caught${missedSpec.length ? `; missed ${missedSpec.map((result) => `${result.id} (${result.detail})`).join(", ")}` : ""}`);
-  const coreResults = await coreMutations(join(out, "mutations", "core"), graphs);
-  const missedCore = coreResults.filter((result) => !result.caught);
-  stage("core mutations", missedCore.length === 0, `${coreResults.length - missedCore.length} of ${coreResults.length} caught${missedCore.length ? `; missed ${missedCore.map((result) => `${result.id} (${result.detail})`).join(", ")}` : ""}`);
-  report.mutations = { spec, core: coreResults };
-  console.log(`  mutations: ${elapsed(at)}`);
+  if (!ci) {
+    at = performance.now();
+    const spec = await specMutations(join(out, "mutations", "spec"));
+    const missedSpec = spec.filter((result) => !result.caught);
+    stage("spec mutations", missedSpec.length === 0, `${spec.length - missedSpec.length} of ${spec.length} caught${missedSpec.length ? `; missed ${missedSpec.map((result) => `${result.id} (${result.detail})`).join(", ")}` : ""}`);
+    const coreResults = await coreMutations(join(out, "mutations", "core"), graphs);
+    const missedCore = coreResults.filter((result) => !result.caught);
+    stage("core mutations", missedCore.length === 0, `${coreResults.length - missedCore.length} of ${coreResults.length} caught${missedCore.length ? `; missed ${missedCore.map((result) => `${result.id} (${result.detail})`).join(", ")}` : ""}`);
+    report.mutations = { spec, core: coreResults };
+    console.log(`  mutations: ${elapsed(at)}`);
+  }
 
   const traceability = checkTraceability();
   report.traceability = traceability;
   stage("traceability", traceability.problems.length === 0,
     traceability.problems.length ? traceability.problems.join("; ") : `${traceability.laws} laws, ${traceability.entries} enforcement entries`);
 
-  at = performance.now();
-  const fx = process.env.FX_BIN ?? join(REPO_ROOT, "zig-out", "bin", "fx");
-  const binary = await binaryToSpec({ bin: fx, dir: join(out, "binary-to-spec") });
-  report.binaryToSpec = { ...binary, tlc: binary.tlc ? { verdict: binary.tlc.verdict, property: binary.tlc.property, distinct: binary.tlc.distinct } : null };
-  stage("binary to spec", binary.problem === null,
-    `${binary.windows} windows, ${binary.steps} steps, ${binary.rejected} rejected, ${binary.archiveLoads} archive loads; TLC ${binary.tlc?.verdict ?? "not run"}${binary.problem ? `; ${binary.problem}` : ""}`);
-  console.log(`  binary to spec: ${elapsed(at)}`);
+  if (!ci) {
+    at = performance.now();
+    const fx = process.env.FX_BIN ?? join(REPO_ROOT, "zig-out", "bin", "fx");
+    const binary = await binaryToSpec({ bin: fx, dir: join(out, "binary-to-spec") });
+    report.binaryToSpec = { ...binary, tlc: binary.tlc ? { verdict: binary.tlc.verdict, property: binary.tlc.property, distinct: binary.tlc.distinct } : null };
+    stage("binary to spec", binary.problem === null,
+      `${binary.windows} windows, ${binary.steps} steps, ${binary.rejected} rejected, ${binary.archiveLoads} archive loads; TLC ${binary.tlc?.verdict ?? "not run"}${binary.problem ? `; ${binary.problem}` : ""}`);
+    console.log(`  binary to spec: ${elapsed(at)}`);
+  }
 } catch (error) {
   stage("verify", false, error instanceof Error ? error.stack ?? error.message : String(error));
 }
@@ -144,5 +153,5 @@ try {
 report.failures = failures;
 report.seconds = Math.round((performance.now() - started) / 1000);
 writeJson(join(out, "report.json"), report);
-console.log(`${failures.length === 0 ? "PASS" : "FAIL"} transcript window verify in ${elapsed(started)}; report ${join(out, "report.json")}`);
+console.log(`${failures.length === 0 ? "PASS" : "FAIL"} transcript window verify${ci ? " (--ci: planted bugs and the binary run left out)" : ""} in ${elapsed(started)}; report ${join(out, "report.json")}`);
 process.exitCode = failures.length === 0 ? 0 : 1;

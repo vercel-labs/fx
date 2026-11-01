@@ -1,6 +1,6 @@
 # TLA+ models
 
-TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK and MCP models on `main` and on pull requests that change the code they cover, as `scripts/detect-ci-need.sh` decides, and the recovery model, with the driver that walks the recovery module along it, on every pull request. Run the others when you change the behavior they describe.
+TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK, MCP, and transcript window models on `main` and on pull requests that change the code they cover, as `scripts/detect-ci-need.sh` decides, and the recovery model, with the driver that walks the recovery module along it, on every pull request. Run the others when you change the behavior they describe.
 
 | Folder | What it models | Checker |
 |---|---|---|
@@ -56,6 +56,10 @@ npm ci --prefix sdk/durable
 ## MCP in CI
 
 CI's `TLA+ MCP models and drivers` job runs each engine model's smoke config (`mcp/run.py check`), `mcp_host/check.sh`, and both MCP drivers, on `main` and on pull requests that change MCP code, these models, their drivers, or the files the drivers load. The engine models' planted bugs (`mcp/check.sh`) run only by hand: they measure the checks, not the code.
+
+## Transcript window in CI
+
+CI's `TLA+ transcript window model` job runs `transcript_window/check.sh --ci` on `main` and on pull requests that change the window's code, its model, its drivers, or the driver code they share. `--ci` leaves out the planted bugs and the run of a built fx along the model, which run only by hand with `transcript_window/check.sh`.
 
 ## MCP models without a driver here
 
