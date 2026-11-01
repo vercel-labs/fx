@@ -614,6 +614,33 @@ describe("/mcp in the shell", () => {
     expect(servers(gateway.requests[1]!.body)).not.toContain("outside");
   }, 90_000);
 
+  test.skipIf(!tmuxAvailable())("a project .mcp.json that is a FIFO or a link to /dev/tty can't stop the shell starting or checking the config", async () => {
+    for (const kind of ["fifo", "tty"] as const) {
+      const root = createRoot();
+      if (kind === "fifo") expect(Bun.spawnSync(["mkfifo", root.projectPath]).exitCode).toBe(0);
+      else symlinkSync("/dev/tty", root.projectPath);
+      gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 120,
+        height: 30,
+        env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+      });
+      await tui.waitForComposer(15_000);
+      // `/mcp list` checks the config files again before it answers.
+      await tui.sendText("/mcp list");
+      await tui.waitForText("No MCP servers configured", 10_000);
+      expect(await tui.captureFullScrollback()).toContain(".mcp.json server 'unknown' was skipped: fx can't read it.");
+      await tui.kill();
+      tui = null;
+      gateway.stop();
+      gateway = null;
+      rmSync(cleanup!, { recursive: true, force: true });
+      cleanup = null;
+    }
+  }, 60_000);
+
   test.skipIf(!tmuxAvailable())("the status line, not the transcript, names waiting project servers and config problems", async () => {
     const root = createRoot(
       { mcpServers: { docs: { command: "node", args: ["s.js", "${DOCS_TOKEN}"] } } },

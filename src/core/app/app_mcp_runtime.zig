@@ -8,6 +8,7 @@ const mcp_access = @import("../mcp/access_policy.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const mcp_model_catalog = @import("../mcp/model_catalog.zig");
+const workspace_config = @import("../mcp/workspace_config.zig");
 const mcp_host = @import("../mcp_host/host.zig");
 const mcp_verbs = @import("../mcp_host/verbs.zig");
 const mcp_menu = @import("../mcp_host/menu.zig");
@@ -45,8 +46,8 @@ fn typedLoginServer(arena: Allocator, args: []const []const u8) Allocator.Error!
 /// error, so a lasting problem changes the stamp once, not at every check.
 fn configStamp(alloc: Allocator, home: ?[]const u8, workspace_root: []const u8) u64 {
     var h: std.hash.Wyhash = .init(0);
-    if (home) |dir| stampFile(alloc, &h, profile_paths.mcpConfigPath(alloc, dir));
-    stampFile(alloc, &h, std.Io.Dir.path.join(alloc, &.{ workspace_root, ".mcp.json" }));
+    if (home) |dir| stampFile(alloc, &h, readProfileConfig(alloc, dir));
+    stampFile(alloc, &h, workspace_config.readFile(alloc, workspace_root));
     if (home) |dir| {
         if (config_runtime.loadProjectMcpChoicesFromHome(alloc, dir, workspace_root)) |loaded| {
             var load = loaded;
@@ -61,11 +62,15 @@ fn configStamp(alloc: Allocator, home: ?[]const u8, workspace_root: []const u8) 
     return h.final();
 }
 
-/// The file at `path` into `h`: its bytes, or that it's absent or unreadable.
-fn stampFile(alloc: Allocator, h: *std.hash.Wyhash, path: anyerror![]u8) void {
-    const p = path catch |err| return stampError(h, err);
-    defer alloc.free(p);
-    const text = config_file.read(alloc, p) catch |err| return stampError(h, err);
+fn readProfileConfig(alloc: Allocator, home: []const u8) anyerror!?[]u8 {
+    const path = try profile_paths.mcpConfigPath(alloc, home);
+    defer alloc.free(path);
+    return config_file.read(alloc, path);
+}
+
+/// A config file read into `h`: its bytes, or that it's absent or unreadable.
+fn stampFile(alloc: Allocator, h: *std.hash.Wyhash, read: anyerror!?[]u8) void {
+    const text = read catch |err| return stampError(h, err);
     const bytes = text orelse return h.update(&.{0});
     defer alloc.free(bytes);
     h.update(&.{1});
