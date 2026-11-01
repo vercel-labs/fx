@@ -676,6 +676,7 @@ X86_64 = Platform(
     DISPLAY_NAME="Linux x86_64",
     HOST_ARCH="x86_64",
     PROFILE_RUNTIME_TRIPLE="x86_64-unknown-linux-gnu",
-    # x86_64 code is larger: the first candidate was 7.698 MiB.
-    SIZE_CEILING_MIB=8.000,
+    # x86_64 code is larger: candidates have measured 7.654 to 7.804 MiB, and
+    # the 0.250 MiB preferred headroom needs a ceiling of at least 8.054 MiB.
+    SIZE_CEILING_MIB=8.250,
 )

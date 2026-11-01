@@ -80,7 +80,7 @@ class LinuxPlatformTests(unittest.TestCase):
     def test_only_x86_64_has_a_larger_size_ceiling(self) -> None:
         self.assertEqual(7.000, macos.SIZE_CEILING_MIB)
         self.assertEqual(7.000, linux.ARM64.SIZE_CEILING_MIB)
-        self.assertEqual(8.000, linux.X86_64.SIZE_CEILING_MIB)
+        self.assertEqual(8.250, linux.X86_64.SIZE_CEILING_MIB)
 
     def test_every_platform_provides_what_the_pipeline_reads(self) -> None:
         names = (
