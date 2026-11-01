@@ -392,11 +392,15 @@ function handle(message) {
       jsonrpc: "2.0",
       id: message.id,
       result: {
-        protocolVersion: "2024-11-05",
+        protocolVersion: message.params.protocolVersion,
         capabilities: { tools: {} },
         serverInfo: { name: "fixture", version: "1.0.0" },
       },
     });
+    return;
+  }
+  if (message.id !== undefined && message.method !== "tools/list" && message.method !== "tools/call") {
+    send({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Method not found" } });
     return;
   }
   if (message.method === "tools/list") {
@@ -469,13 +473,20 @@ function expectReviewRequestContract(body: string) {
     prompt?: Array<{ role?: string; content?: unknown }>;
   };
   expect(payload.maxOutputTokens).toBe(2048);
-  expect(payload.providerOptions).toBeUndefined();
+  // A review on GPT-5.6 or later asks OpenAI for explicit caching, since no
+  // later request could read the cache write a review would pay for.
+  expect(payload.providerOptions).toEqual({ openai: { promptCacheOptions: { mode: "explicit" } } });
   expect(body).toContain('"toolChoice":{"type":"required"}');
   expect(body).toContain('"name":"permission_decision"');
 
-  const finalMessage = payload.prompt?.at(-1);
-  expect(finalMessage?.role).toBe("system");
-  const instruction = requestText(JSON.stringify(finalMessage?.content));
+  // The review instruction leads the prompt as its only system message, and
+  // the tool result that closes the pending call ends it.
+  const prompt = payload.prompt ?? [];
+  const instructionMessage = prompt[0];
+  expect(instructionMessage?.role).toBe("system");
+  expect(prompt.filter((message) => message.role === "system")).toHaveLength(1);
+  expect(prompt.at(-1)?.role).toBe("tool");
+  const instruction = requestText(JSON.stringify(instructionMessage?.content));
   expect(instruction).toContain("<permission_review>");
   expect(instruction).toContain(
     "Call permission_decision exactly once",
@@ -760,7 +771,9 @@ const scenarios: Scenario[] = [
         actions: [create, childAction],
         effectPath,
         expectedExecutionStarts: 2,
-        expectedOuterRequests: 4,
+        // The saved session's title, the parent's call, the child's two
+        // requests, and the parent after the child's result.
+        expectedOuterRequests: 5,
         saveSession: true,
         outerResponder(body) {
           if (body.includes(`\"toolCallId\":\"${childCallId}\"`)) {
