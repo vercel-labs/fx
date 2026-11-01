@@ -916,7 +916,8 @@ const OAuthHttpOperation = struct {
         };
         defer client.deinit();
 
-        const response_buffer = try self.alloc.alloc(u8, oauth_response_max_bytes + 1);
+        const max_bytes = self.request.max_response_bytes orelse oauth_response_max_bytes;
+        const response_buffer = try self.alloc.alloc(u8, max_bytes + 1);
         defer secret.zeroAndFree(self.alloc, response_buffer);
         var response_writer = std.Io.Writer.fixed(response_buffer);
 
@@ -947,7 +948,7 @@ const OAuthHttpOperation = struct {
             else => return err,
         };
         const body = response_writer.buffered();
-        if (body.len > oauth_response_max_bytes) return error.OAuthResponseTooLarge;
+        if (body.len > max_bytes) return error.OAuthResponseTooLarge;
 
         return .{
             .disposition = if (result.status == .ok) .accepted else .rejected,

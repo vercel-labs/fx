@@ -20,6 +20,9 @@ else
 
 const Allocator = std.mem.Allocator;
 const teams_endpoint = "https://api.vercel.com/v2/teams";
+/// A team list returns full team objects, so it can far exceed the OAuth
+/// transport's default response limit.
+const teams_response_max_bytes: usize = 4 * 1024 * 1024;
 const poll_wait_slice_ms: u64 = 100;
 pub const poll_request_timeout_ms: i64 = 15_000;
 const max_poll_interval_ms = std.math.maxInt(u64) / std.time.ns_per_ms;
@@ -1293,6 +1296,7 @@ fn fetchTeams(
         .method = .get,
         .url = endpoint,
         .authorization = auth_header,
+        .max_response_bytes = teams_response_max_bytes,
     });
     defer response.deinit(alloc);
     if (response.disposition != .accepted) return error.TeamRequestFailed;

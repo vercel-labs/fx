@@ -17,6 +17,9 @@ pub const Request = struct {
     authorization: ?[]const u8 = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
     deadline: ?std.Io.Clock.Timestamp = null,
+    /// Overrides the transport's response size limit for a request whose
+    /// body is expected to be larger than an OAuth response.
+    max_response_bytes: ?usize = null,
 };
 
 pub const Disposition = enum {

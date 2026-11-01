@@ -7709,6 +7709,50 @@ tmuxTest(
 );
 
 tmuxTest(
+  "a team list larger than an OAuth response still opens the team picker",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-provider-large-team-list-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    // About 95 KiB of teams, past the 64 KiB OAuth response limit.
+    const padding = Array.from({ length: 300 }, (_, n) => ({
+      id: `team_pad_${n}`,
+      slug: `padding-team-${n}`,
+      name: `Padding team ${n} ` + "x".repeat(240),
+    }));
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teams: [
+        { id: "team_123", slug: "example-internal-team", name: "Example Internal Team" },
+        ...padding,
+      ],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane(
+      (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForPane(
+      (pane) => pane.includes("oauth") && pane.includes("api-key"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForPane(
+      // The /provider team column lists teams by slug.
+      (pane) => pane.includes("example-internal-team"),
+      TIMEOUT,
+    );
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
   "expired login refresh failure keeps one anonymous catalog request and blocks credits",
   async () => {
     home = mkdtempSync(join(tmpdir(), "fx-tui-auth-expired-startup-"));
