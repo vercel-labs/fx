@@ -1,4 +1,5 @@
 const std = @import("std");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const model_capabilities = @import("model_capabilities.zig");
 const types = @import("../shared/types.zig");
 
@@ -284,29 +285,18 @@ const permission_options = [_][]const u8{ "ask", "auto", "full access" };
 const sound_level_options = [_][]const u8{ "off", "on", "max" };
 
 pub fn filteredCount(snapshot: Snapshot, category: Category, query: []const u8) usize {
-    var count: usize = 0;
-    for (specs) |spec| {
-        if (matches(snapshot, spec, category, query)) count += 1;
-    }
-    return count;
+    return settingsFilter(snapshot, category, query).count();
 }
 
 pub fn itemAt(snapshot: Snapshot, category: Category, query: []const u8, display_index: usize) ?Item {
-    var match_index: usize = 0;
-    for (specs) |spec| {
-        if (!matches(snapshot, spec, category, query)) continue;
-        if (match_index == display_index) {
-            return .{
-                .id = spec.id,
-                .category = spec.category,
-                .label = spec.label,
-                .description = spec.description,
-                .value = snapshot.value(spec.id),
-            };
-        }
-        match_index += 1;
-    }
-    return null;
+    const spec = specs[settingsFilter(snapshot, category, query).at(display_index) orelse return null];
+    return .{
+        .id = spec.id,
+        .category = spec.category,
+        .label = spec.label,
+        .description = spec.description,
+        .value = snapshot.value(spec.id),
+    };
 }
 
 pub fn optionCount(snapshot: *const Snapshot, id: SettingId) usize {
@@ -380,11 +370,6 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
     };
 }
 
-fn matches(snapshot: Snapshot, spec: Spec, category: Category, query: []const u8) bool {
-    if (!snapshot.session_controls and hostOwnedSetting(spec.id)) return false;
-    return (category == .all or spec.category == category) and matchesQuery(snapshot, spec, query);
-}
-
 /// Settings only the engine can apply to the live conversation.
 fn hostOwnedSetting(id: SettingId) bool {
     return switch (id) {
@@ -393,19 +378,29 @@ fn hostOwnedSetting(id: SettingId) bool {
     };
 }
 
-fn matchesQuery(snapshot: Snapshot, spec: Spec, query: []const u8) bool {
-    var tokens = std.mem.tokenizeAny(u8, query, " \t\r\n");
-    while (tokens.next()) |token| {
-        if (!tokenMatches(snapshot, spec, token)) return false;
-    }
-    return true;
-}
+/// The settings in the shown category, in catalog order, kept by
+/// `fuzzy_match.Filter`. A setting matches by its label or id, or by the
+/// words of its description and current value.
+const SettingMatches = struct {
+    snapshot: Snapshot,
+    category: Category,
+    query: []const u8,
 
-fn tokenMatches(snapshot: Snapshot, spec: Spec, token: []const u8) bool {
-    return std.ascii.findIgnoreCase(spec.label, token) != null or
-        std.ascii.findIgnoreCase(spec.description, token) != null or
-        std.ascii.findIgnoreCase(snapshot.value(spec.id), token) != null or
-        std.ascii.findIgnoreCase(@tagName(spec.id), token) != null;
+    pub fn matchAt(self: SettingMatches, position: usize) ?fuzzy_match.Match {
+        const spec = specs[position];
+        if (!self.snapshot.session_controls and hostOwnedSetting(spec.id)) return null;
+        if (self.category != .all and spec.category != self.category) return null;
+        return fuzzy_match.match(self.query, &.{
+            .{ .text = spec.label },
+            .{ .text = @tagName(spec.id) },
+            .{ .text = spec.description, .kind = .text },
+            .{ .text = self.snapshot.value(spec.id), .kind = .text },
+        });
+    }
+};
+
+fn settingsFilter(snapshot: Snapshot, category: Category, query: []const u8) fuzzy_match.Filter(SettingMatches) {
+    return .init(.{ .snapshot = snapshot, .category = category, .query = query }, specs.len);
 }
 
 fn onOff(value: bool) []const u8 {

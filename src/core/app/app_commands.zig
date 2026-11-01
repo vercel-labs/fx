@@ -1065,6 +1065,7 @@ pub fn Handlers(comptime App: type) type {
                 .topic = "skills",
                 .tone = .warning,
                 .body = body,
+                .visibility = .full_only,
             }, true);
         }
 
@@ -4455,7 +4456,7 @@ test "skills list opens menu without transcript inventory" {
     try std.testing.expect(std.mem.find(u8, rendered, "Visible skills (") == null);
 }
 
-test "skills list reports a bounded discovery warning with an escaped candidate path" {
+test "skills list keeps a bounded discovery warning in the full transcript only" {
     const alloc = std.testing.allocator;
     const skill_diagnostics = [_]skill_runtime.SkillDiagnostic{.{
         .path = "/tmp/hostile\npath/body-sentinel",
@@ -4477,12 +4478,13 @@ test "skills list reports a bounded discovery warning with an escaped candidate 
     const notice = app.shell.entries.items[0].semantic_notice;
     try std.testing.expectEqualStrings("skills", notice.topic);
     try std.testing.expectEqual(types.NoticeTone.warning, notice.tone);
+    try std.testing.expectEqual(types.NoticeVisibility.full_only, notice.visibility);
     try std.testing.expect(std.mem.find(u8, notice.body, "skill discovery warning:") != null);
     try std.testing.expect(std.mem.find(u8, notice.body, "hostile&#x0a;path/body-sentinel") != null);
     try std.testing.expect(std.mem.find(u8, notice.body, "metadata is invalid (missing_name)") != null);
     const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
     defer alloc.free(rendered);
-    try std.testing.expect(std.mem.find(u8, rendered, "! skills: skill discovery warning:") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "skill discovery warning:") == null);
 }
 
 test "skills show focuses matching menu row without transcript body" {

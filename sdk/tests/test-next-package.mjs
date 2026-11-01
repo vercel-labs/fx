@@ -1,27 +1,37 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { createWriteStream } from "node:fs";
-import { access, cp, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, mkdtemp, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { localNativePackage, nativeDirArgument, nativeTarballs } from "./native-package.mjs";
 import { serializeError } from "./package-report.mjs";
 
 const tarball = resolve(process.argv[2]);
 const next15 = process.argv.includes("--next15");
 const webpack = next15 || process.argv.includes("--webpack");
 const bundlerArgs = webpack && !next15 ? ["--webpack"] : [];
+// A directory of platform package tarballs, such as the four a release
+// publishes. The app installs each one pnpm would install on this machine.
+const nativeDir = nativeDirArgument();
+assert.ok(nativeDir, "usage: test-next-package.mjs <libfx.tgz> --native-dir <dir> [--webpack|--next15]");
+let nativeAddonHash;
+let coreWasmHash;
 const artifactRoot = process.env.LIBFX_TEST_ARTIFACT_ROOT || tmpdir();
 await mkdir(artifactRoot, { recursive: true });
 const root = await mkdtemp(resolve(artifactRoot, "libfx-next-"));
 const app = resolve(root, "app");
 const fixture = fileURLToPath(new URL("./next/", import.meta.url));
-const noNpmRegistry = fileURLToPath(new URL("./no-npm-registry.mjs", import.meta.url));
+const preload = fileURLToPath(new URL("./next-preload.mjs", import.meta.url));
+// Only wasm-runtime.js says this, so a server file that holds it holds the
+// WebAssembly host.
+const fallbackMarker = "fx WebAssembly requires JSPI";
 const token = randomUUID();
 const env = { ...process.env, NODE_OPTIONS: "", NODE_PATH: "", NEXT_TELEMETRY_DISABLED: "1", AI_GATEWAY_API_KEY: "",
   FX_SESSIONS_DIR: resolve(root, "sessions"),
@@ -48,16 +58,17 @@ async function start(cwd, args, name) {
   const port = reservation.address().port;
   await new Promise((resolveClose) => reservation.close(resolveClose));
   const log = createWriteStream(resolve(root, `${name}.log`));
+  const loadLog = resolve(root, `${name}.loads`);
   // Next 16 dev forwards flags through NODE_OPTIONS, which rejects the JSPI flag.
   const jspiArgs = name === "start" || (name === "dev" && next15) ? ["--experimental-wasm-jspi"] : [];
   const child = spawn(process.execPath, [...jspiArgs, "--no-experimental-require-module", ...args, ...(name === "standalone" ? [] : ["--hostname", "127.0.0.1", "--port", String(port)])], {
-    cwd, env: { ...env, HOSTNAME: "127.0.0.1", PORT: String(port), NODE_OPTIONS: `--import ${noNpmRegistry}` },
+    cwd, env: { ...env, HOSTNAME: "127.0.0.1", PORT: String(port), LIBFX_LOAD_LOG: loadLog, NODE_OPTIONS: `--import ${preload}` },
     detached: true, stdio: ["ignore", "pipe", "pipe"],
   });
   child.stdout.pipe(log, { end: false });
   child.stderr.pipe(log, { end: false });
   const closed = once(child, "close");
-  const server = { child, closed, log, url: `http://127.0.0.1:${port}` };
+  const server = { child, closed, log, loadLog, url: `http://127.0.0.1:${port}` };
   servers.add(server);
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
@@ -72,6 +83,18 @@ async function start(cwd, args, name) {
   throw new Error(`${name} did not become ready; see ${root}/${name}.log`);
 }
 
+// The files a server loaded after line `from` of its load log that hold the
+// WebAssembly host, and the log's length now.
+async function hostLoads(server, from) {
+  const lines = (await readFile(server.loadLog, "utf8").catch(() => "")).split("\n").filter(Boolean);
+  const files = [];
+  for (const url of new Set(lines.slice(from).filter((line) => line.startsWith("file:")))) {
+    const path = fileURLToPath(url);
+    if ((await readFile(path, "utf8").catch(() => "")).includes(fallbackMarker)) files.push(path);
+  }
+  return { files, end: lines.length };
+}
+
 async function stop(server) {
   try { process.kill(-server.child.pid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") throw error; }
   const timer = setTimeout(() => { try { process.kill(-server.child.pid, "SIGKILL"); } catch {} }, 5000);
@@ -79,6 +102,10 @@ async function stop(server) {
 }
 
 async function exercise(server, stage) {
+  // Next loads every page's server bundle as it starts, and the browser agent
+  // page's carries libfx/browser and its WebAssembly host. Only what the turns
+  // below load counts.
+  const booted = stage === "dev" ? null : await hostLoads(server, 0);
   const unauthorized = await fetch(`${server.url}/api/fx`);
   assert.equal(unauthorized.status, 401);
   for (const backend of ["native", "auto"]) {
@@ -97,6 +124,12 @@ async function exercise(server, stage) {
       console.log(`${stage}/${backend}/${scenario} passed`);
     }
   }
+  // Native turns load none of the WebAssembly fallback.
+  const native = booted && await hostLoads(server, booted.end);
+  if (native) {
+    assert.deepEqual(native.files, [], `${stage}: native turns loaded the WebAssembly fallback`);
+    console.log(`${stage}/native turns loaded no WebAssembly fallback`);
+  }
   // Next's standalone tracer excludes .wasm assets; native selection above must not rely on that fallback.
   if (stage === "start" || (stage === "dev" && next15)) {
     const response = await fetch(`${server.url}/api/fx?backend=wasm&scenario=startup`, {
@@ -109,6 +142,13 @@ async function exercise(server, stage) {
     assert.ok(result.checkpointBytes > 48);
     results.push({ stage, backend: "wasm", status: response.status, ...result });
     console.log(`${stage}/wasm/default asset startup passed`);
+    // The first WebAssembly turn loads the fallback then, so the bundler kept
+    // it out of the code the route starts with.
+    if (native) {
+      const fallback = await hostLoads(server, native.end);
+      assert.ok(fallback.files.length, `${stage}: the WebAssembly turn loaded no fallback chunk of its own`);
+      console.log(`${stage}/wasm turn loaded the fallback chunk`);
+    }
   }
   const concurrent = await Promise.all(Array.from({ length: 8 }, async () => {
     const response = await fetch(`${server.url}/api/fx?backend=native`, {
@@ -141,6 +181,17 @@ async function exercise(server, stage) {
   assert.equal(replayed.filter((line) => line.type === "turn_start").length, 2);
   results.push({ stage, scenario: "durable", sessionId, events: replayed.length });
   console.log(`${stage}/durable session passed`);
+
+  // The page whose client component creates a browser agent renders on the
+  // server. It runs last: a server that loads a page's bundle on its first
+  // request would otherwise load the page's WebAssembly host during the
+  // fallback checks above.
+  const page = await fetch(`${server.url}/agent`, { signal: AbortSignal.timeout(60_000) });
+  const html = await page.text();
+  assert.equal(page.status, 200, html.slice(0, 500));
+  assert.match(html, /id="libfx-agent">function</, "the server must render the browser agent page");
+  results.push({ stage, scenario: "browser-agent-page", status: page.status });
+  console.log(`${stage}/browser agent page passed`);
 }
 
 // NDJSON lines from `response` until `done(line)`; a session stream stays
@@ -167,7 +218,25 @@ async function ndjsonUntil(response, done) {
   throw new Error(`the stream ended after ${lines.length} lines without its last event`);
 }
 
+const sha256 = async (path) => createHash("sha256").update(await readFile(path)).digest("hex");
+
+// The agent page's client build emits the package's fx-core.wasm, and no
+// fx-term.wasm, which only a terminal loads.
+async function assertBrowserAssets(buildDir) {
+  const wasm = (await readdir(resolve(buildDir, "static"), { recursive: true })).filter((path) => path.endsWith(".wasm"));
+  assert.equal(wasm.length, 1, `the client build must emit exactly one .wasm: ${wasm.join(", ")}`);
+  assert.match(basename(wasm[0]), /^fx-core\./, `the client build emitted ${wasm[0]} instead of fx-core.wasm`);
+  assert.equal(await sha256(resolve(buildDir, "static", wasm[0])), coreWasmHash, `${wasm[0]} is not the package's fx-core.wasm`);
+}
+
 async function assertBundledNativeAssets(buildDir) {
+  // The route traces one addon: the platform package's, whichever bundler
+  // copied it.
+  const routeDir = resolve(buildDir, "server/app/api/fx");
+  const trace = JSON.parse(await readFile(resolve(routeDir, "route.js.nft.json"), "utf8"));
+  const addons = trace.files.filter((path) => path.endsWith(".node") && !/[\\/](@next|@img|sharp)[\\/]/.test(path));
+  assert.equal(addons.length, 1, `the fx route must trace exactly one libfx addon: ${addons.join(", ")}`);
+  assert.equal(await sha256(resolve(routeDir, addons[0])), nativeAddonHash, `${addons[0]} is not ${localNativePackage}'s addon`);
   if (!webpack) return;
   // A deployment carries the durability modules libfx loads on first use.
   const durableDir = resolve(buildDir, "server/app/api/durable");
@@ -177,13 +246,6 @@ async function assertBundledNativeAssets(buildDir) {
     assert.ok(file, `the durable route must trace the emitted durable/${name}.mjs`);
     await access(resolve(durableDir, file));
   }
-  const routeDir = resolve(buildDir, "server/app/api/fx");
-  const trace = JSON.parse(await readFile(resolve(routeDir, "route.js.nft.json"), "utf8"));
-  for (const platform of ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"]) {
-    const file = trace.files.find((path) => path.includes(`/static/media/libfx.${platform}.`) && path.endsWith(".node"));
-    assert.ok(file, `webpack must trace the emitted ${platform} addon, not externalize libfx`);
-    await access(resolve(routeDir, file));
-  }
 }
 
 try {
@@ -191,15 +253,31 @@ try {
   await cp(tarball, resolve(app, "libfx.tgz"));
   const manifest = JSON.parse(await readFile(resolve(app, "package.json"), "utf8"));
   manifest.dependencies.libfx = "file:./libfx.tgz";
+  // libfx's optional dependencies point at the local platform tarballs;
+  // pnpm skips each one whose os, cpu, and libc do not match. pnpm 11 reads
+  // overrides only from pnpm-workspace.yaml.
+  const tarballs = nativeTarballs(nativeDir);
+  assert.ok(tarballs[localNativePackage], `${nativeDir} has no ${localNativePackage} tarball`);
+  const overrides = [];
+  for (const [name, path] of Object.entries(tarballs)) {
+    await cp(path, resolve(app, basename(path)));
+    overrides.push(`  ${JSON.stringify(name)}: ${JSON.stringify(`file:./${basename(path)}`)}`);
+  }
+  await writeFile(resolve(app, "pnpm-workspace.yaml"), `overrides:\n${overrides.join("\n")}\n`);
   if (next15) manifest.dependencies.next = "15.5.25";
   await writeFile(resolve(app, "package.json"), JSON.stringify(manifest, null, 2));
   await run(process.env.PNPM_BIN || "pnpm", ["install", "--no-frozen-lockfile", "--ignore-scripts"], app, "install");
   const require = createRequire(resolve(app, "package.json"));
+  // The installed platform package, resolved from libfx as node.js does.
+  const nativePackageDir = dirname(createRequire(require.resolve("libfx")).resolve(`${localNativePackage}/package.json`));
+  nativeAddonHash = await sha256(resolve(nativePackageDir, "libfx.node"));
+  coreWasmHash = await sha256(resolve(dirname(require.resolve("libfx")), "fx-core.wasm"));
   if (!next15) {
     await run(process.execPath, [
       fileURLToPath(new URL("./test-node-tracing.mjs", import.meta.url)),
       dirname(require.resolve("libfx")),
       require.resolve("next/dist/compiled/@vercel/nft"),
+      nativePackageDir,
     ], app, "node-tracing");
   }
   const next = resolve(app, "node_modules/next/dist/bin/next");
@@ -208,6 +286,7 @@ try {
   await stop(dev);
   await run(process.execPath, ["--no-experimental-require-module", next, "build", ...bundlerArgs], app, "build");
   await assertBundledNativeAssets(resolve(app, ".next"));
+  await assertBrowserAssets(resolve(app, ".next"));
   const production = await start(app, [next, "start"], "start");
   await exercise(production, "start");
   await stop(production);
@@ -218,6 +297,7 @@ try {
   })};\n`);
   await run(process.execPath, ["--no-experimental-require-module", next, "build", ...bundlerArgs], app, "standalone-build");
   await assertBundledNativeAssets(resolve(app, distDir));
+  await assertBrowserAssets(resolve(app, distDir));
   const isolated = resolve(root, "isolated");
   await cp(resolve(app, distDir, "standalone"), isolated, { recursive: true, verbatimSymlinks: true });
   await mkdir(resolve(isolated, distDir), { recursive: true });

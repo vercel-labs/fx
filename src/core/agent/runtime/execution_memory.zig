@@ -9,9 +9,11 @@ const session_child_store = @import("../../session/session_child_store.zig");
 const command_output_content = @import("../../tooling/command_output_content.zig");
 const io_mod = @import("../../shared/io.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
+const diff_mod = @import("../../output/diff.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const tool_result_limits = @import("../../tooling/tool_result_limits.zig");
 const text_utils = @import("../../shared/text_utils.zig");
+const history_range = @import("../../shared/history_range.zig");
 
 const runtime_config = @import("config.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
@@ -134,6 +136,196 @@ test "restored steering survives execution memory round trips" {
     try std.testing.expectEqualStrings("parent-agent feedback, not new user authority:\n\nreview", retained.steering[0].text);
 }
 
+/// `execution` as a saved turn encodes it.
+fn encodedTurn(alloc: Allocator, execution: types.ExecutionMemory) ![]u8 {
+    const session_codec = @import("../../session/session_codec.zig");
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try session_codec.writeHistoryTurn(&out.writer, .{ .assistant = .{
+        .user = .{ .text = @constCast("read them") },
+        .assistant = @constCast(""),
+        .execution = execution,
+    } });
+    return out.toOwnedSlice();
+}
+
+test "a rebuilt turn keeps each tool result's stamp, so it encodes the same bytes" {
+    const alloc = std.testing.allocator;
+    var calls = [_]ToolCall{ toolCall("call-1", "read_file", "{}"), toolCall("call-2", "read_file", "{}") };
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "read them" },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "one", .tool_call_id = "call-1", .tool_name = "read_file", .tool_result_status = .success, .tool_result_created_at_ms = 1_700_000_000_001 },
+        .{ .role = .tool, .content = "two", .tool_call_id = "call-2", .tool_name = "read_file", .tool_result_status = .failure, .tool_result_memory = .{ .output_bytes = 3, .stored_output_bytes = 3 }, .tool_result_created_at_ms = 1_700_000_000_002 },
+    };
+    const first = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, first);
+    io_mod.sleep(2 * std.time.ns_per_ms);
+    const second = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, second);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_001), first.tool_steps[0].tool_results[0].created_at_ms);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_002), first.tool_steps[0].tool_results[1].created_at_ms);
+    const first_bytes = try encodedTurn(alloc, first);
+    defer alloc.free(first_bytes);
+    const second_bytes = try encodedTurn(alloc, second);
+    defer alloc.free(second_bytes);
+    try std.testing.expectEqualStrings(first_bytes, second_bytes);
+}
+
+test "a tool result without a usable stamp is stamped when rebuilt, as before" {
+    const alloc = std.testing.allocator;
+    var calls = [_]ToolCall{ toolCall("none", "read_file", "{}"), toolCall("zero", "read_file", "{}"), toolCall("negative", "read_file", "{}") };
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "a", .tool_call_id = "none", .tool_name = "read_file", .tool_result_status = .success },
+        .{ .role = .tool, .content = "b", .tool_call_id = "zero", .tool_name = "read_file", .tool_result_status = .success, .tool_result_created_at_ms = 0 },
+        .{ .role = .tool, .content = "c", .tool_call_id = "negative", .tool_name = "read_file", .tool_result_status = .success, .tool_result_created_at_ms = -5 },
+    };
+    const before = io_mod.milliTimestamp();
+    const rebuilt = try buildExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, rebuilt);
+    for (rebuilt.tool_steps[0].tool_results) |result| try std.testing.expect(result.created_at_ms >= before);
+}
+
+test "a turn resumed from its checkpoint keeps each result's stamp" {
+    const alloc = std.testing.allocator;
+    const session = @import("../../session/session.zig");
+    var calls = [_]ToolCall{ toolCall("kept", "read_file", "{}"), toolCall("unstamped", "read_file", "{}") };
+    var results = [_]types.PersistedToolResult{
+        .{ .tool_call_id = @constCast("kept"), .tool_name = @constCast("read_file"), .status = .success, .output = @constCast("ok"), .output_bytes = 2, .stored_output_bytes = 2, .created_at_ms = 1_700_000_000_123 },
+        .{ .tool_call_id = @constCast("unstamped"), .tool_name = @constCast("read_file"), .status = .success, .output = @constCast("ok"), .output_bytes = 2, .stored_output_bytes = 2 },
+    };
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    defer messages.deinit(alloc);
+    try session.appendExecutionMemoryChatMessages(alloc, &messages, .{ .tool_steps = &steps });
+    const tool_messages = messages.items[messages.items.len - 2 ..];
+    try std.testing.expectEqual(@as(?i64, 1_700_000_000_123), tool_messages[0].tool_result_created_at_ms);
+    // A result saved without a time gets one when the turn is rebuilt.
+    try std.testing.expectEqual(@as(?i64, null), tool_messages[1].tool_result_created_at_ms);
+    const rebuilt = try buildExecutionMemory(alloc, messages.items);
+    defer types.freeExecutionMemory(alloc, rebuilt);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_123), rebuilt.tool_steps[0].tool_results[0].created_at_ms);
+    try std.testing.expect(rebuilt.tool_steps[0].tool_results[1].created_at_ms > 0);
+}
+
+test "rebuilt tool results keep the times their messages carry" {
+    try std.testing.fuzz({}, fuzzStableStamps, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            // Two steps of three and two calls, each result with a time.
+            "\x02\x02\x05\x00\x00\x00\x00\x00\x00\x10\x01\x01\x05\x05\x00\x00\x00\x00\x00\x00\x20\x02\x02\x09\x01\x01\x04\x00\x00\x00\x00\x00\x00\x30\x03\x03\x05",
+            // One call each with no stamp, a zero, and a negative one.
+            "\x01\x02\x00\x01\x01\x02\x01\x02\x02\x02\x00\x00\x00\x00\x00\x00\x07\x00\x03\x03",
+            "contents",
+            "{\"created_at_ms\":1,\"nested\":{\"created_at_ms\":2}}",
+            "quotes \" and \\ and \x01 and \xff\xfe and caf\xc3\xa9 \xe4\xb8\xad",
+        }) ++ @import("fuzz_corpus").stable_tool_result_stamps.*),
+    });
+}
+
+/// The fuzz input read as a plan, a byte at a time, and as zeros once it
+/// ends, so every seed of `fuzz_seed.slices` describes a whole turn.
+const FuzzPlan = struct {
+    bytes: []const u8,
+    at: usize = 0,
+
+    fn byte(self: *FuzzPlan) u8 {
+        if (self.at >= self.bytes.len) return 0;
+        defer self.at += 1;
+        return self.bytes[self.at];
+    }
+
+    fn below(self: *FuzzPlan, n: u8) u8 {
+        return self.byte() % n;
+    }
+
+    /// A positive time from the next eight bytes.
+    fn time(self: *FuzzPlan) i64 {
+        var value: u64 = 0;
+        for (0..8) |_| value = (value << 8) | self.byte();
+        return @intCast(@max(1, value >> 1));
+    }
+
+    /// A piece of the input itself, as a result's text.
+    fn text(self: *FuzzPlan) []const u8 {
+        const start = self.byte() % (self.bytes.len + 1);
+        const end = start + self.byte() % (self.bytes.len - start + 1);
+        return self.bytes[start..end];
+    }
+};
+
+/// Builds a turn of fuzzed tool steps whose results carry fuzzed stamps,
+/// some missing or not a time, and requires each of two rebuilds, and the
+/// rebuild of the turn resumed from its own execution as a checkpoint
+/// resumes it, to give every result the stamp its message carries. A turn
+/// whose every result carries one encodes the same bytes each time.
+fn fuzzStableStamps(_: void, smith: *std.testing.Smith) !void {
+    const session = @import("../../session/session.zig");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var input: [512]u8 = undefined;
+    var plan: FuzzPlan = .{ .bytes = input[0..smith.slice(&input)] };
+
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    try messages.append(a, .{ .role = .user, .content = "read them" });
+    var expected: std.ArrayList(?i64) = .empty;
+    var all_stamped = true;
+    for (0..plan.below(6)) |step| {
+        const calls = try a.alloc(ToolCall, 1 + plan.below(3));
+        for (calls, 0..) |*call, index| call.* = toolCall(try a.print("call-{d}-{d}", .{ step, index }), "read_file", "{}");
+        try messages.append(a, .{ .role = .assistant, .tool_calls = calls });
+        for (calls) |call| {
+            const stamp: ?i64 = switch (plan.below(6)) {
+                0 => null,
+                1 => 0,
+                2 => -plan.time(),
+                else => plan.time(),
+            };
+            const usable: ?i64 = if (stamp) |value| (if (value > 0) value else null) else null;
+            all_stamped = all_stamped and usable != null;
+            try expected.append(a, usable);
+            const flags = plan.byte();
+            const content = plan.text();
+            try messages.append(a, .{
+                .role = .tool,
+                .content = content,
+                .tool_call_id = call.id,
+                .tool_name = call.name,
+                .tool_result_status = if (flags & 1 == 0) .success else .failure,
+                .tool_result_memory = if (flags & 2 == 0) null else .{ .output_bytes = content.len, .stored_output_bytes = content.len },
+                .tool_result_created_at_ms = stamp,
+            });
+        }
+    }
+
+    const first = try buildExecutionMemory(a, messages.items);
+    const second = try buildExecutionMemory(a, messages.items);
+    var index: usize = 0;
+    for (first.tool_steps, second.tool_steps) |one, two| {
+        for (one.tool_results, two.tool_results) |x, y| {
+            if (expected.items[index]) |stamp| {
+                try std.testing.expectEqual(stamp, x.created_at_ms);
+                try std.testing.expectEqual(stamp, y.created_at_ms);
+            }
+            index += 1;
+        }
+    }
+    try std.testing.expectEqual(expected.items.len, index);
+    if (all_stamped) try std.testing.expectEqualStrings(try encodedTurn(a, first), try encodedTurn(a, second));
+
+    var resumed: std.ArrayList(ChatMessage) = .empty;
+    try resumed.append(a, .{ .role = .user, .content = "read them" });
+    try session.appendExecutionMemoryChatMessages(a, &resumed, first);
+    const third = try buildExecutionMemory(a, resumed.items);
+    try std.testing.expectEqual(first.tool_steps.len, third.tool_steps.len);
+    for (first.tool_steps, third.tool_steps) |one, three| {
+        try std.testing.expectEqual(one.tool_results.len, three.tool_results.len);
+        for (one.tool_results, three.tool_results) |x, z| try std.testing.expectEqual(x.created_at_ms, z.created_at_ms);
+    }
+}
+
 test "empty restored steering keeps its checkpoint boundary" {
     const alloc = std.testing.allocator;
     const session = @import("../../session/session.zig");
@@ -167,13 +359,16 @@ pub const CompactedExecutionBoundary = struct {
     tool_steps: usize = 0,
     steering: usize = 0,
 
-    /// Borrows execution payloads; only the rebased steering slice uses arena.
+    /// Borrows execution payloads; only the rebased steering and context note
+    /// slices use arena.
     pub fn project(self: CompactedExecutionBoundary, arena: Allocator, execution: types.ExecutionMemory) !types.ExecutionMemory {
         std.debug.assert(self.tool_steps <= execution.tool_steps.len);
         std.debug.assert(self.steering <= execution.steering.len);
         var projected = execution;
         projected.tool_steps = execution.tool_steps[self.tool_steps..];
         projected.steering = execution.steering[self.steering..];
+        const covered_notes = history_range.coveredContextNotes(execution, self.tool_steps, self.steering);
+        projected.context_notes = try history_range.rebasedContextNotes(arena, execution.context_notes[covered_notes..], self.tool_steps);
         if (self.tool_steps > 0 and projected.steering.len > 0) {
             projected.steering = try arena.dupe(types.PersistedSteering, projected.steering);
             for (projected.steering) |*item| {
@@ -200,6 +395,11 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
         }
         steering.deinit(alloc);
     }
+    var context_notes: std.ArrayList(types.PersistedContextNote) = .empty;
+    errdefer {
+        for (context_notes.items) |item| types.freePersistedContextNote(alloc, item);
+        context_notes.deinit(alloc);
+    }
     var tool_step_count: usize = 0;
     var assistant_prefix: ?[]const u8 = null;
     for (within_turn_suffix, 0..) |message, index| {
@@ -208,6 +408,19 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
             assistant_prefix = null;
         } else if (message.role == .assistant) {
             assistant_prefix = message.content;
+        }
+        if (isContextNote(message)) {
+            // fx places a note only at a step boundary, so the steps before
+            // it are complete (D93). A note may save a shorter text than it
+            // sends (D95).
+            const copy = try alloc.dupe(u8, message.context_note_saved_text orelse message.content orelse "");
+            errdefer alloc.free(copy);
+            const sources = try types.dupeNoteSources(alloc, message.context_note_sources);
+            context_notes.append(alloc, .{ .text = copy, .after_tool_step_count = tool_step_count, .sources = sources }) catch |err| {
+                types.freeNoteSources(alloc, sources);
+                return err;
+            };
+            continue;
         }
         if (message.role != .user) continue;
         const content = message.content orelse continue;
@@ -239,7 +452,12 @@ pub fn buildExecutionMemory(alloc: Allocator, within_turn_suffix: []const ChatMe
     }
     std.debug.assert(tool_step_count == execution.tool_steps.len);
     execution.steering = try steering.toOwnedSlice(alloc);
+    execution.context_notes = try context_notes.toOwnedSlice(alloc);
     return execution;
+}
+
+fn isContextNote(message: ChatMessage) bool {
+    return message.role == .system and message.context_note;
 }
 
 fn startsPersistedToolStep(messages: []const ChatMessage, assistant_index: usize) bool {
@@ -247,7 +465,8 @@ fn startsPersistedToolStep(messages: []const ChatMessage, assistant_index: usize
     if (assistant.role != .assistant) return false;
     if (assistant.tool_calls.len == 0) return assistant.provider_replay != null or assistant.standalone_response;
     var result_index = assistant_index + 1;
-    while (result_index < messages.len and messages[result_index].role == .tool) : (result_index += 1) {
+    // A note never ends a step's results (D93).
+    while (result_index < messages.len and (messages[result_index].role == .tool or isContextNote(messages[result_index]))) : (result_index += 1) {
         const result_call_id = messages[result_index].tool_call_id orelse continue;
         for (assistant.tool_calls) |call| {
             if (std.mem.eql(u8, call.id, result_call_id)) return true;
@@ -279,7 +498,12 @@ pub fn retainedMessageOffset(messages: []const ChatMessage, cut: CompactedExecut
         if (message.role == .tool) prefix_start = index + 1;
     }
     if (steps != cut.tool_steps or steering != cut.steering) return error.InvalidContextHistoryStart;
-    return messages.len;
+    // The notes that end the messages sit at the cut's own boundary with no
+    // steering after them, so the cut keeps them, as
+    // `history_range.coveredContextNotes` counts for the saved turn (D93).
+    var kept_notes_start = messages.len;
+    while (kept_notes_start > 0 and isContextNote(messages[kept_notes_start - 1])) kept_notes_start -= 1;
+    return kept_notes_start;
 }
 
 test "retained context keeps non-tool continuation messages at a zero cut" {
@@ -438,8 +662,9 @@ pub fn buildInterruptedExecutionMemory(
         {}
         const result_messages = current_turn_messages[i + 1 .. result_end];
         var user_tail_end = result_end;
+        // A note at the step's boundary does not end the feedback after it.
         while (user_tail_end < current_turn_messages.len and
-            current_turn_messages[user_tail_end].role == .user) : (user_tail_end += 1)
+            (current_turn_messages[user_tail_end].role == .user or isContextNote(current_turn_messages[user_tail_end]))) : (user_tail_end += 1)
         {}
         const user_tail = current_turn_messages[result_end..user_tail_end];
 
@@ -485,6 +710,10 @@ pub fn buildInterruptedExecutionMemory(
                 }
             }
             for (user_tail) |entry| {
+                if (isContextNote(entry)) {
+                    filtered.appendAssumeCapacity(entry);
+                    continue;
+                }
                 if (!entry.permission_feedback and !isSteering(entry)) continue;
                 if (entry.tool_call_id) |source_tool_call_id| {
                     if (execution_memory_helpers.findToolCallById(calls, source_tool_call_id) == null) {
@@ -493,6 +722,10 @@ pub fn buildInterruptedExecutionMemory(
                 }
                 filtered.appendAssumeCapacity(entry);
             }
+        } else for (user_tail) |entry| {
+            // The step leaves without a result; a note after it stays, at
+            // the boundary before that step.
+            if (isContextNote(entry)) filtered.appendAssumeCapacity(entry);
         }
         i = user_tail_end;
     }
@@ -1133,6 +1366,49 @@ fn retainCommandReplay(
     memory.command_output_replay = candidate.retain(arena);
 }
 
+/// Text budget for the full-diff rows a committed file presentation keeps for
+/// a resumed session. Every history copy, recovery checkpoint, and saved turn
+/// carries these rows, and they grow with the change, not the file. The
+/// budget only bounds diffs as large as a whole rewritten file: 4 MiB keeps
+/// every row of any write the former 4 MiB file limit allowed.
+const max_captured_review_bytes: usize = 4 * 1024 * 1024;
+
+/// The full-diff rows a resumed session shows for `handoff`, or null when
+/// the handoff has no full view or the review cannot be indexed. Caller owns
+/// the rows.
+fn captureReviewLines(
+    alloc: Allocator,
+    handoff: file_mutation.CommittedFileHandoff,
+) Allocator.Error!?[]types.CommittedFilePresentationLine {
+    const full_view = handoff.full_view orelse return null;
+    const captured = diff_mod.captureReviewLines(
+        alloc,
+        handoff.tracker.previous_content,
+        full_view.after_content,
+        max_captured_review_bytes,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ArithmeticOverflow => {
+            debug_trace.logf(
+                "session",
+                "committed file review rows unavailable call_id={s} err={s}; resumed view keeps the preview",
+                .{ full_view.lifecycle_id.call_id, @errorName(err) },
+            );
+            return null;
+        },
+    };
+    if (captured.omitted_rows > 0) {
+        debug_trace.logf(
+            "session",
+            "committed file review rows truncated call_id={s} kept_rows={d} omitted_rows={d} budget_bytes={d}",
+            .{ full_view.lifecycle_id.call_id, captured.rows.len - 1, captured.omitted_rows, max_captured_review_bytes },
+        );
+    }
+    return captured.rows;
+}
+
+/// Projects a committed file change for history and resume. The full diff is
+/// kept as its rendered rows, never as the file snapshots behind them.
 pub fn captureCommittedFilePresentation(
     alloc: Allocator,
     handoff: file_mutation.CommittedFileHandoff,
@@ -1147,33 +1423,20 @@ pub fn captureCommittedFilePresentation(
     }
     for (handoff.preview.lines, 0..) |line, index| {
         lines[index] = .{
-            .kind = switch (line.op) {
-                .context => .context,
-                .addition => .addition,
-                .deletion => .deletion,
-                .elision => .elision,
-                .notice => .notice,
-            },
+            .kind = diff_mod.presentationLineKind(line.op),
             .old_line = line.old_line,
             .new_line = line.new_line,
-            .text = try alloc.dupe(u8, line.text),
+            // Saved text must be valid UTF-8; see `text_utils.dupeValidUtf8`.
+            .text = try text_utils.dupeValidUtf8(alloc, line.text),
         };
         copied_lines += 1;
     }
-    const full_view = handoff.full_view;
-    const previous_content = if (full_view != null) if (handoff.tracker.previous_content) |content|
-        try alloc.dupe(u8, content)
-    else
-        null else null;
-    errdefer if (previous_content) |content| alloc.free(content);
-    const after_content = if (full_view) |full|
-        try alloc.dupe(u8, full.after_content)
-    else
-        null;
-    errdefer if (after_content) |content| alloc.free(content);
-    const lifecycle_id: ?types.ToolLifecycleId = if (full_view) |full| .{
-        .turn_id = full.lifecycle_id.turn_id,
-        .call_id = try alloc.dupe(u8, full.lifecycle_id.call_id),
+    const review_lines = try captureReviewLines(alloc, handoff);
+    errdefer if (review_lines) |rows| types.freeCommittedFilePresentationLines(alloc, rows);
+    // The lifecycle id names the full diff, so it exists only with the rows.
+    const lifecycle_id: ?types.ToolLifecycleId = if (review_lines != null) .{
+        .turn_id = handoff.full_view.?.lifecycle_id.turn_id,
+        .call_id = try alloc.dupe(u8, handoff.full_view.?.lifecycle_id.call_id),
     } else null;
     errdefer if (lifecycle_id) |id| alloc.free(@constCast(id.call_id));
     return .{
@@ -1186,10 +1449,123 @@ pub fn captureCommittedFilePresentation(
         .additions = handoff.preview.additions,
         .deletions = handoff.preview.deletions,
         .truncated = handoff.preview.truncated,
-        .previous_content = previous_content,
-        .after_content = after_content,
         .lifecycle_id = lifecycle_id,
+        .review_lines = review_lines,
     };
+}
+
+fn testCommittedEditHandoff(
+    previous_content: []const u8,
+    after_content: []const u8,
+) file_mutation.CommittedFileHandoff {
+    return .{
+        .preview = .{
+            .path = "pnpm-lock.yaml",
+            .lines = &.{
+                .{ .op = .deletion, .old_line = 1, .text = "before" },
+                .{ .op = .addition, .new_line = 1, .text = "after" },
+            },
+            .additions = 1,
+            .deletions = 1,
+            .truncated = false,
+        },
+        .tracker = .{
+            .kind = .edit,
+            .raw_path = "pnpm-lock.yaml",
+            .previous_content = previous_content,
+            .committed_at_ms = 1,
+        },
+        .full_view = .{
+            .after_content = after_content,
+            .lifecycle_id = .{ .turn_id = 7, .call_id = "edit_1" },
+        },
+    };
+}
+
+fn testLockfile(alloc: Allocator, line_count: usize, changed: ?usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (0..line_count) |index| {
+        if (changed == index) {
+            try out.print(alloc, "  resolution: {{integrity: sha512-{d}}}\n", .{index});
+        } else {
+            try out.print(alloc, "  resolution: {{tarball: https://example.com/{d}.tgz}}\n", .{index});
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+test "committed file presentation keeps the full diff as rows, never file snapshots" {
+    const alloc = std.testing.allocator;
+    const previous = try testLockfile(alloc, 50_000, null);
+    defer alloc.free(previous);
+    const after = try testLockfile(alloc, 50_000, 25_000);
+    defer alloc.free(after);
+
+    const presentation = try captureCommittedFilePresentation(
+        alloc,
+        testCommittedEditHandoff(previous, after),
+    );
+    defer types.freeCommittedFilePresentation(alloc, presentation);
+
+    try std.testing.expect(presentation.previous_content == null);
+    try std.testing.expect(presentation.after_content == null);
+    try std.testing.expect(presentation.content_handle == null);
+    try std.testing.expect(types.committedFilePresentationContentSourceValid(presentation));
+    try std.testing.expectEqual(@as(u64, 7), presentation.lifecycle_id.?.turn_id);
+    try std.testing.expectEqualStrings("edit_1", presentation.lifecycle_id.?.call_id);
+
+    // One changed line keeps an elision, five context lines on each side, the
+    // replacement pair, and a closing elision, whatever the file's size.
+    const rows = presentation.review_lines.?;
+    try std.testing.expectEqual(@as(usize, 14), rows.len);
+    var row_bytes: usize = 0;
+    for (rows) |row| row_bytes += row.text.len;
+    try std.testing.expect(row_bytes < 1024);
+    try std.testing.expectEqualStrings("24995 unchanged lines ⋯", rows[0].text);
+    try std.testing.expectEqual(types.CommittedFilePresentationLineKind.deletion, rows[6].kind);
+    try std.testing.expectEqual(@as(?u32, 25_001), rows[6].old_line);
+    try std.testing.expectEqualStrings("  resolution: {integrity: sha512-25000}", rows[7].text);
+    try std.testing.expectEqualStrings("24994 unchanged lines ⋯", rows[13].text);
+}
+
+test "committed file presentation without a full view keeps only its preview" {
+    const alloc = std.testing.allocator;
+    var handoff = testCommittedEditHandoff("before\n", "after\n");
+    handoff.full_view = null;
+
+    const presentation = try captureCommittedFilePresentation(alloc, handoff);
+    defer types.freeCommittedFilePresentation(alloc, presentation);
+
+    try std.testing.expect(presentation.review_lines == null);
+    try std.testing.expect(presentation.lifecycle_id == null);
+    try std.testing.expectEqual(types.CommittedFilePresentationKind.edited, presentation.kind);
+    try std.testing.expectEqual(@as(usize, 2), presentation.lines.len);
+    try std.testing.expectEqualStrings("before", presentation.lines[0].text);
+    try std.testing.expect(types.committedFilePresentationContentSourceValid(presentation));
+}
+
+test "committed file presentation saves a file's invalid UTF-8 as visible escapes" {
+    const alloc = std.testing.allocator;
+    var handoff = testCommittedEditHandoff("keep\n\xff\xfe\tx\nold\n", "keep\n\xff\xfe\tx\nnew\n");
+    const preview_lines = [_]diff_mod.PreviewLine{
+        .{ .op = .context, .old_line = 2, .new_line = 2, .text = "\xff\xfe\tx" },
+        .{ .op = .addition, .new_line = 3, .text = "new" },
+    };
+    handoff.preview.lines = &preview_lines;
+
+    const presentation = try captureCommittedFilePresentation(alloc, handoff);
+    defer types.freeCommittedFilePresentation(alloc, presentation);
+
+    // The session store accepts only valid UTF-8; the tab stays for the
+    // renderer, which also handles control bytes.
+    try std.testing.expectEqualStrings("\\xff\\xfe\tx", presentation.lines[0].text);
+    var escaped_row = false;
+    for (presentation.review_lines.?) |row| {
+        try std.testing.expect(std.unicode.utf8ValidateSlice(row.text));
+        if (std.mem.eql(u8, row.text, "\\xff\\xfe\tx")) escaped_row = true;
+    }
+    try std.testing.expect(escaped_row);
 }
 
 fn toolCall(id: []const u8, name: []const u8, args: []const u8) ToolCall {
@@ -2069,6 +2445,178 @@ test "execution memory records each steering tool boundary" {
     try std.testing.expectEqual(@as(usize, 2), remaining.files.len);
     try std.testing.expect(remaining.files.ptr == execution.files.ptr);
     try std.testing.expectEqual(@as(usize, 2), execution.steering[1].after_tool_step_count);
+}
+
+fn contextNote(text: []const u8) ChatMessage {
+    return .{ .role = .system, .content = text, .context_note = true };
+}
+
+test "execution memory records each context note boundary, before that boundary's steering (D93)" {
+    const alloc = std.testing.allocator;
+    const session = @import("../../session/session.zig");
+    const gateway = @import("../../../builtins/gateway.zig");
+    const agent_stream_provider = @import("../stream_provider.zig");
+    const steering = try steeringMessage(alloc, "after first");
+    defer alloc.free(steering);
+    var first_calls = [_]ToolCall{toolCall("call_first", "shell", "{\"command\":\"ls\"}")};
+    var second_calls = [_]ToolCall{toolCall("call_second", "shell", "{\"command\":\"pwd\"}")};
+    const live = [_]ChatMessage{
+        contextNote("rules at start"),
+        .{ .role = .assistant, .tool_calls = &first_calls },
+        .{ .role = .tool, .content = "first result", .tool_call_id = "call_first", .tool_name = "shell", .tool_result_status = .success },
+        contextNote("rules after first"),
+        .{ .role = .user, .content = steering },
+        .{ .role = .assistant, .tool_calls = &second_calls },
+        .{ .role = .tool, .content = "second result", .tool_call_id = "call_second", .tool_name = "shell", .tool_result_status = .success },
+        contextNote("rules after second"),
+    };
+
+    const execution = try buildExecutionMemory(alloc, &live);
+    defer types.freeExecutionMemory(alloc, execution);
+    try std.testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 1), execution.steering.len);
+    try std.testing.expectEqual(@as(usize, 1), execution.steering[0].after_tool_step_count);
+    const want = [_]struct { []const u8, usize }{ .{ "rules at start", 0 }, .{ "rules after first", 1 }, .{ "rules after second", 2 } };
+    try std.testing.expectEqual(want.len, execution.context_notes.len);
+    for (want, execution.context_notes) |expected, note| {
+        try std.testing.expectEqualStrings(expected[0], note.text);
+        try std.testing.expectEqual(expected[1], note.after_tool_step_count);
+    }
+
+    // The resumed turn sends exactly the request the live turn sent.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const prompt = [_]ChatMessage{.{ .role = .user, .content = "run both" }};
+    var rebuilt: std.ArrayList(ChatMessage) = .empty;
+    try rebuilt.appendSlice(arena, &prompt);
+    try session.appendExecutionMemoryChatMessages(arena, &rebuilt, execution);
+    const resumed = try rewrapRestoredSteering(arena, rebuilt.items);
+    const sent = try std.mem.concat(arena, ChatMessage, &.{ &prompt, &live });
+    try std.testing.expectEqual(sent.len, resumed.len);
+    for (sent, resumed) |a, b| try std.testing.expectEqual(a.context_note, b.context_note);
+    for ([_][]const u8{ "anthropic/claude-sonnet-5.5", "openai/gpt-6.1-sol" }) |model| {
+        const request = struct {
+            fn body(a: Allocator, name: []const u8, messages: []const ChatMessage) ![]u8 {
+                return gateway.buildAgentRequest(a, .{
+                    .model = name,
+                    .instructions = &.{.{ .role = .system, .content = "stable", .cache_breakpoint = true }},
+                    .messages = messages,
+                    .tool_choice = .auto,
+                    .provider_options = .{ .prompt_caching = true },
+                });
+            }
+        };
+        // Every request carries its notes on their tool results first (D93).
+        const carried_sent = try agent_stream_provider.carryContextNotes(arena, sent);
+        const carried_resumed = try agent_stream_provider.carryContextNotes(arena, resumed);
+        try std.testing.expectEqualStrings(try request.body(arena, model, carried_sent), try request.body(arena, model, carried_resumed));
+    }
+
+    // A cut at the first boundary keeps that boundary's notes unless it
+    // covers the steering that follows them there.
+    const kept = try (CompactedExecutionBoundary{ .tool_steps = 1 }).project(arena, execution);
+    try std.testing.expectEqual(@as(usize, 2), kept.context_notes.len);
+    try std.testing.expectEqualStrings("rules after first", kept.context_notes[0].text);
+    try std.testing.expectEqual(@as(usize, 0), kept.context_notes[0].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 1), kept.context_notes[1].after_tool_step_count);
+    const past_steering = try (CompactedExecutionBoundary{ .tool_steps = 1, .steering = 1 }).project(arena, execution);
+    try std.testing.expectEqual(@as(usize, 1), past_steering.context_notes.len);
+    try std.testing.expectEqualStrings("rules after second", past_steering.context_notes[0].text);
+    // The live messages the same cuts keep start where the saved turn does.
+    try std.testing.expectEqual(@as(usize, 3), try retainedMessageOffset(&live, .{ .tool_steps = 1 }));
+    try std.testing.expectEqual(@as(usize, 5), try retainedMessageOffset(&live, .{ .tool_steps = 1, .steering = 1 }));
+    // Compacting the whole turn so far keeps the notes that end it.
+    try std.testing.expectEqual(@as(usize, 7), try retainedMessageOffset(&live, .{ .tool_steps = 2, .steering = 1 }));
+    try std.testing.expectEqual(@as(usize, 1), (try (CompactedExecutionBoundary{ .tool_steps = 2, .steering = 1 }).project(arena, execution)).context_notes.len);
+}
+
+test "restored context notes survive execution memory round trips (D93)" {
+    const alloc = std.testing.allocator;
+    const session = @import("../../session/session.zig");
+    var calls = [_]ToolCall{toolCall("restored", "read_file", "{\"path\":\"fixture\"}")};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("restored"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = @constCast("ok"),
+        .output_bytes = 2,
+        .stored_output_bytes = 2,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    var steering = [_]types.PersistedSteering{
+        .{ .text = @constCast("root update"), .after_tool_step_count = 0 },
+        .{ .text = @constCast("later update"), .after_tool_step_count = 1 },
+    };
+    var notes = [_]types.PersistedContextNote{
+        .{ .text = @constCast("start note"), .after_tool_step_count = 0 },
+        .{ .text = @constCast("end note"), .after_tool_step_count = 1 },
+    };
+    var messages: std.ArrayList(ChatMessage) = .empty;
+    defer messages.deinit(alloc);
+    try session.appendExecutionMemoryChatMessages(alloc, &messages, .{
+        .tool_steps = &steps,
+        .steering = &steering,
+        .context_notes = &notes,
+    });
+    // Each note comes back as a flagged system message, before the steering
+    // at its boundary.
+    try std.testing.expectEqual(@as(usize, 6), messages.items.len);
+    try std.testing.expect(messages.items[0].role == .system and messages.items[0].context_note);
+    try std.testing.expect(messages.items[1].restored_steering);
+    try std.testing.expect(messages.items[4].role == .system and messages.items[4].context_note);
+    try std.testing.expect(messages.items[5].restored_steering);
+
+    const rebuilt = try buildExecutionMemory(alloc, messages.items);
+    defer types.freeExecutionMemory(alloc, rebuilt);
+    try std.testing.expectEqual(@as(usize, 1), rebuilt.tool_steps.len);
+    try std.testing.expectEqual(@as(usize, 2), rebuilt.steering.len);
+    try std.testing.expectEqual(notes.len, rebuilt.context_notes.len);
+    for (notes, rebuilt.context_notes) |want, got| {
+        try std.testing.expectEqualStrings(want.text, got.text);
+        try std.testing.expectEqual(want.after_tool_step_count, got.after_tool_step_count);
+    }
+
+    const offset = try retainedMessageOffset(messages.items, .{ .tool_steps = 1, .steering = 1 });
+    const retained = try buildExecutionMemory(alloc, messages.items[offset..]);
+    defer types.freeExecutionMemory(alloc, retained);
+    try std.testing.expectEqual(@as(usize, 1), retained.context_notes.len);
+    try std.testing.expectEqualStrings("end note", retained.context_notes[0].text);
+    try std.testing.expectEqual(@as(usize, 0), retained.context_notes[0].after_tool_step_count);
+}
+
+test "a context note between steps keeps every tool result and its feedback (D93)" {
+    const alloc = std.testing.allocator;
+    var first_calls = [_]ToolCall{
+        toolCall("call_a", "read_file", "{\"path\":\"a\"}"),
+        toolCall("call_b", "read_file", "{\"path\":\"b\"}"),
+    };
+    var second_calls = [_]ToolCall{toolCall("call_c", "read_file", "{\"path\":\"c\"}")};
+    const messages = [_]ChatMessage{
+        .{ .role = .assistant, .tool_calls = &first_calls },
+        .{ .role = .tool, .content = "a", .tool_call_id = "call_a", .tool_name = "read_file", .tool_result_status = .success },
+        .{ .role = .tool, .content = "b", .tool_call_id = "call_b", .tool_name = "read_file", .tool_result_status = .success },
+        contextNote("between steps"),
+        .{ .role = .user, .content = "allowed once", .tool_call_id = "call_b", .permission_feedback = true },
+        .{ .role = .assistant, .tool_calls = &second_calls },
+        .{ .role = .tool, .content = "c", .tool_call_id = "call_c", .tool_name = "read_file", .tool_result_status = .success },
+    };
+    for ([_]bool{ false, true }) |interrupted| {
+        const execution = if (interrupted)
+            try buildInterruptedExecutionMemory(alloc, &messages, null)
+        else
+            try buildExecutionMemory(alloc, &messages);
+        defer types.freeExecutionMemory(alloc, execution);
+        try std.testing.expectEqual(@as(usize, 2), execution.tool_steps.len);
+        try std.testing.expectEqual(@as(usize, 2), execution.tool_steps[0].tool_results.len);
+        try std.testing.expectEqualStrings("call_b", execution.tool_steps[0].tool_results[1].tool_call_id);
+        try std.testing.expectEqual(@as(usize, 1), execution.tool_steps[0].tool_results[1].permission_feedback.len);
+        try std.testing.expectEqual(@as(usize, 1), execution.tool_steps[1].tool_results.len);
+        try std.testing.expectEqual(@as(usize, 1), execution.context_notes.len);
+        try std.testing.expectEqualStrings("between steps", execution.context_notes[0].text);
+        try std.testing.expectEqual(@as(usize, 1), execution.context_notes[0].after_tool_step_count);
+        try std.testing.expectEqual(@as(usize, 0), execution.steering.len);
+    }
 }
 
 test "transcript does not mark native web_search as provider resource placeholder" {

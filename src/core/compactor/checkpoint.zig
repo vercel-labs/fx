@@ -18,6 +18,7 @@ const std = @import("std");
 const trace = @import("trace.zig");
 const records = @import("records.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -233,7 +234,7 @@ pub fn parseLegacyState(arena: Allocator, ref: LegacyStateRef, bytes: []const u8
         return null;
     }
     const State = struct { summary: []const u8, users: []const []const u8 };
-    const state = std.json.parseFromSliceLeaky(State, arena, bytes, .{
+    const state = json_decode.parseFromSliceLeaky(State, arena, bytes, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     }) catch |err| switch (err) {
@@ -252,7 +253,7 @@ pub fn parseLegacyState(arena: Allocator, ref: LegacyStateRef, bytes: []const u8
 /// damaged payload, which is traced. `arena` owns everything returned.
 pub fn parse(arena: Allocator, summary: []const u8) Allocator.Error!?Payload {
     if (!isPayload(summary)) return null;
-    const payload = std.json.parseFromSliceLeaky(Payload, arena, summary[marker.len..], .{
+    const payload = json_decode.parseFromSliceLeaky(Payload, arena, summary[marker.len..], .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     }) catch |err| switch (err) {

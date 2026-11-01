@@ -14,6 +14,7 @@ from scripts.pgso.__main__ import (
     parse_args,
     run_command,
 )
+from scripts.pgso import macos
 from scripts.pgso.model import PgsoError
 from scripts.pgso.pipeline import PipelinePaths
 from scripts.pgso.runner import CommandResult
@@ -160,6 +161,7 @@ class PgsoCliTests(unittest.TestCase):
             target: str = "aarch64-macos"
             zig_version: str = "0.17.0"
             llvm_version: str = "22.1.8"
+            platform: object = macos
 
         @dataclasses.dataclass(frozen=True)
         class CorpusInfo:
@@ -198,7 +200,9 @@ class PgsoCliTests(unittest.TestCase):
             output.write_bytes(b"profile")
             return 0
 
-        def write_profile_use_ir(_toolchain, paths, _sha):
+        def write_profile_use_ir(_toolchain, paths, _sha, *, no_outline_functions):
+            # macOS has no startup exemption, so nothing is kept out of outlining.
+            self.assertIsNone(no_outline_functions)
             paths.profile_use_ir.write_text("ir\n", encoding="utf-8")
 
         def link_candidate(_toolchain, paths):
@@ -224,7 +228,6 @@ class PgsoCliTests(unittest.TestCase):
             load_corpus=mock.Mock(return_value=corpus),
             _git_output=mock.Mock(side_effect=["a" * 40, ""]),
             build_control=mock.Mock(return_value=control),
-            read_macos_minos=mock.Mock(return_value="15.0"),
             sha256_file=mock.Mock(return_value="s" * 64),
             emit_bitcode=mock.Mock(return_value="b" * 64),
             build_instrumented=mock.Mock(return_value=()),
@@ -241,7 +244,11 @@ class PgsoCliTests(unittest.TestCase):
             run_behavior_corpus=mock.Mock(return_value=CorpusResult()),
             measure_startup=mock.Mock(return_value=()),
             measure_heavy_workloads=mock.Mock(side_effect=capture_heavy),
-        ) as mocks:
+        ) as mocks, mock.patch.object(
+            macos,
+            "read_control_identity",
+            return_value={"minimum_macos": "15.0"},
+        ):
             mocks["Toolchain"].discover.return_value = toolchain
             manifest_path = run_command(arguments)
 

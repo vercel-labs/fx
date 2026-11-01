@@ -3339,7 +3339,7 @@ test.skipIf(!tmuxAvailable())("TUI keeps a failed turn's image through a cold re
     await session.sendText(`/image ${input}`);
     await session.waitForText("attached image:", TIMEOUT);
     await session.sendText("Describe this image.");
-    await session.waitForText("RequiredVisionToolCallMissing", TIMEOUT);
+    await session.waitForText("required vision tool call missing", TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
     const [id] = rootSessionIds(root.home) as [string];
     // The failed turn keeps the captured image as its session's blob (D89).

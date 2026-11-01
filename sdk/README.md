@@ -25,7 +25,7 @@ for await (const event of turn) {
 await agent.close();
 ```
 
-Set `AI_GATEWAY_API_KEY` and run it with Node.js 20 or newer. Model calls go through [AI Gateway](https://vercel.com/docs/ai-gateway), so any model it lists works, and on Vercel libfx uses the deployment's OIDC token instead of a key. libfx can also run on a user's own ChatGPT or Grok plan, or on another server through the OpenAI Chat Completions API. See [Providers](#providers).
+Set `AI_GATEWAY_API_KEY` and run it with Node.js 20.19, 22.12, or newer. Model calls go through [AI Gateway](https://vercel.com/docs/ai-gateway), so any model it lists works, and on Vercel libfx uses the deployment's OIDC token instead of a key. libfx can also run on a user's own ChatGPT or Grok plan, or on another server through the OpenAI Chat Completions API. See [Providers](#providers).
 
 Importing libfx and calling `createFxAgent()` touch no network, files or processes. The engine loads when a session runs its first turn.
 
@@ -513,14 +513,20 @@ A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`.
 
 | Runtime | Backend |
 | --- | --- |
-| Node.js 20+ on macOS or Linux, x64 or arm64 | Native addon. Linux needs glibc 2.34 or newer. |
+| Node.js 20.19, 22.12, or newer on macOS or Linux, x64 or arm64 | Native addon. Linux needs glibc 2.34 or newer. |
 | Node.js elsewhere | WebAssembly with JSPI. Some Node versions need `--experimental-wasm-jspi`. |
 | Browsers | WebAssembly with JSPI, from `libfx/browser` |
 | Bun | The same as Node.js. For WebAssembly, use Bun 1.4.2 or newer. |
 
 The default `backend: "auto"` tries the native addon first. Pass `"native"` or `"wasm"` to require one, and call `getBackendInfo()` to see what would load without creating anything.
 
+Each platform's addon is its own package, such as `@libfx/libfx-linux-x64-gnu`, and npm installs only the one for your machine as an optional dependency of libfx. When it is missing, for example because optional dependencies were omitted or the lockfile came from another platform, `getBackendInfo()` names the package and `"auto"` uses WebAssembly instead. Node.js loads the WebAssembly backend only for that fallback.
+
 Next.js works in Node.js route handlers, with webpack or Turbopack, and doesn't need `serverExternalPackages`. CommonJS apps can `require("libfx")`. With TypeScript's `moduleResolution: "bundler"`, add `"node"` to `customConditions` to get the Node.js types.
+
+In a browser build, `createFxAgent` and `createFxEngine` load `fx-core.wasm`, and `createFxTerminal` loads `fx-term.wasm`. Importing `libfx/browser` does no work, so a client component that a server renders can import it. Next.js copies only the files an app's client code uses into the build. Vite 8 copies both unless you set `build.rolldownOptions.experimental.lazyBarrel` to `true`, though a browser still downloads only the file the app uses. esbuild copies neither, so serve the file yourself and pass its URL as `wasm`.
+
+If a CDN serves the `.wasm` files, for example through Next.js's `assetPrefix`, it must send `Content-Type: application/wasm` so the browser can compile while it downloads. Otherwise libfx downloads the whole file before compiling it. When the files come from a different origin than the page, the response also needs CORS headers, such as `Access-Control-Allow-Origin`, or the browser blocks the request.
 
 ## The fx terminal in a browser
 

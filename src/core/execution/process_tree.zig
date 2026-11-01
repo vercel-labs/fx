@@ -295,6 +295,13 @@ pub const Tracker = struct {
         return self.signalProcessesChecked(signal, null).delivered;
     }
 
+    /// Stops every tracked process, parents first, for a caller that kills
+    /// some of them another way, such as by process group, before this
+    /// tracker kills the rest.
+    pub fn stopAll(self: *Tracker) void {
+        self.stopProcessesWith(null, SystemSignalEffects);
+    }
+
     pub fn signalOutsideProcessGroup(
         self: *Tracker,
         signal: std.posix.SIG,

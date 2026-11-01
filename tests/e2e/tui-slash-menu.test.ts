@@ -724,10 +724,6 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         stderrPath: fixture.stderrPath,
       });
 
-      await session.waitForText(
-        "skills: 1 discovery issue; some skills may be missing (ctrl+o to view)",
-        10_000,
-      );
       await session.waitForComposer(10_000);
       await session.sendKeys("C-o");
       await session.waitForPane(
@@ -743,6 +739,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-o");
       await session.waitForComposer(5_000);
+      // The warning exists (Ctrl+O showed it) but never reaches the inline transcript.
+      const inline = await session.captureFullScrollback();
+      expect(inline).not.toContain("skills:");
+      expect(inline).not.toContain("skill discovery warning:");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       session = null;
@@ -780,6 +780,75 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (pane) => composerContains(pane, "zig-best-practices"),
         5_000,
       );
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendKeys("C-u");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "fuzzy queries find commands, skills, and MCP servers",
+    async () => {
+      const fixture = createSkillRankingFixture();
+      writeFileSync(
+        join(fixture.home, ".fx", "mcp.json"),
+        JSON.stringify({
+          mcpServers: {
+            context7: { type: "http", url: "http://127.0.0.1:9/mcp" },
+            linear: { type: "http", url: "http://127.0.0.1:9/linear" },
+          },
+        }),
+      );
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: undefined,
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+        stderrPath: fixture.stderrPath,
+      });
+      await session.waitForComposer(10_000);
+
+      // Each query holds its item's letters in order from the start of a
+      // word, and no item holds it as typed.
+      await session.sendLiteralText("/mdl");
+      await session.waitForPane(
+        (pane) => /Commands 1\b/.test(pane) && /^\s*\/model\s{2,}/m.test(pane),
+        5_000,
+      );
+      await session.sendKeys("C-u");
+
+      await session.sendLiteralText("$zbp");
+      const skills = await waitForSkillsMenu(session, 1);
+      expect(skills.some((line) => line.includes("zig-best-practices"))).toBe(true);
+      expect(skills.some((line) => line.includes("workflow-helper"))).toBe(false);
+      await session.sendKeys("Enter");
+      await session.waitForPane(
+        (pane) => composerContains(pane, "zig-best-practices"),
+        5_000,
+      );
+      await session.sendKeys("C-u");
+
+      const serverRow = (name: string) => new RegExp(`^\\s*(?:›\\s*)?${name}\\s{2,}.*profile\\s*$`, "m");
+      await session.sendText("/mcp");
+      await session.waitForPane(
+        (pane) => serverRow("context7").test(pane) && serverRow("linear").test(pane),
+        10_000,
+      );
+      await session.sendLiteralText("ctx7");
+      const filtered = await session.waitForText(/MCP servers\s+1 of 2/, 5_000);
+      expect(filtered).toMatch(serverRow("context7"));
+      expect(filtered).not.toMatch(serverRow("linear"));
+      await session.sendKeys("Escape");
+      await session.waitForPane((pane) => !pane.includes("MCP servers"), 5_000);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
 
       await session.sendKeys("C-u");
@@ -2392,7 +2461,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("xAI");
       expect(pane).not.toContain("Z.AI");
       expect(pane).toContain(currentModel);
-      expect(pane).toContain("1M context · 32K output · Fast");
+      expect(pane).toContain("1M context · 32K output · Fast mode");
       expect(pane).toContain("Note: Gateway catalog is authenticated with an API key");
       const headerRow = grid.findIndex((line) => line.includes("Models 4"));
       const firstModelRow = grid.findIndex((line) => line.includes("openai/gpt-5.4"));
@@ -3271,13 +3340,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         height: 36,
       });
 
-      const diagnosticSummary =
-        "skills: 1 discovery issue; some skills may be missing (ctrl+o to view)";
-      await session.waitForText(diagnosticSummary, 10_000);
       await session.waitForComposer(10_000);
-      expect(await session.captureFullScrollback()).not.toContain(
-        "skill discovery warning:",
-      );
       await session.sendKeys("C-o");
       await session.waitForText("skill discovery warning:", 5_000);
       const tracePathPattern = tracePath
@@ -3289,6 +3352,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       await session.sendKeys("C-o");
       await session.waitForComposer(5_000);
+      const inline = await session.captureFullScrollback();
+      expect(inline).not.toContain("skills:");
+      expect(inline).not.toContain("skill discovery warning:");
       const startupDiagnosticCount = fileMarkerCount(
         tracePath,
         fixture.malformedMarker,
@@ -3339,12 +3405,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       expect(loadScrollback).not.toContain("1 tool call");
 
-      expect(
-        countOccurrences(
-          await session.captureFullScrollback(),
-          diagnosticSummary,
-        ),
-      ).toBe(1);
+      const finalScrollback = await session.captureFullScrollback();
+      expect(finalScrollback).not.toContain("discovery issue");
+      expect(finalScrollback).not.toContain("skill discovery warning:");
       expect(session.isAlive()).toBe(true);
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);

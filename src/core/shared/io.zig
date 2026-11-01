@@ -27,8 +27,15 @@ fn process_io_for(comptime os_tag: std.Target.Os.Tag, zio: std.Io) std.Io {
     return if (os_tag == .macos) darwin_process_spawn.wrap(zio) else zio;
 }
 
-pub fn getIo() std.Io {
+// Thousands of call sites reach `getIo`, so it stays out of line: an inlined
+// copy at each one costs more code than the call. The fallback is reached only
+// before main installs the process Io and in tests.
+pub noinline fn getIo() std.Io {
     if (real_io) |zio| return zio;
+    return fallbackIo();
+}
+
+noinline fn fallbackIo() std.Io {
     if (comptime builtin.is_test) return process_io_for(builtin.target.os.tag, std.testing.io);
     return process_io_for(builtin.target.os.tag, fallback_threaded.io());
 }
@@ -583,7 +590,8 @@ pub fn readFileToEndZ(alloc: std.mem.Allocator, file: *std.Io.File, max_bytes: u
     return result[0..data.len :0];
 }
 
-pub fn milliTimestamp() i64 {
+// Called from hundreds of sites; one out-of-line copy keeps each call small.
+pub noinline fn milliTimestamp() i64 {
     const ts = std.Io.Timestamp.now(getIo(), .real);
     return @intCast(@divFloor(ts.nanoseconds, 1_000_000));
 }
@@ -594,7 +602,7 @@ pub fn monotonicMilliTimestamp() i64 {
     return @intCast(@divFloor(ts.nanoseconds, 1_000_000));
 }
 
-pub fn nanoTimestamp() i128 {
+pub noinline fn nanoTimestamp() i128 {
     const ts = std.Io.Timestamp.now(getIo(), .real);
     return @intCast(ts.nanoseconds);
 }

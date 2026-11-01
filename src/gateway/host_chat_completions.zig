@@ -7,6 +7,7 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const definitions = @import("../core/config/configured_provider.zig");
 const chat_completions = @import("chat_completions.zig");
+const gateway_client = @import("client.zig");
 const host_stream = @import("host_stream_provider.zig");
 
 const Allocator = std.mem.Allocator;
@@ -81,11 +82,14 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
 
     const opened = try host_stream.openPost(alloc, transport, request, endpoint, &headers, payload);
     defer transport.close(opened.handle);
-    if (opened.status != .ok) return .{ .failed = .{
-        .kind = chat_completions.failure_kind(opened.status),
-        .detail = try host_stream.readErrorBody(alloc, transport, opened.handle, request),
-        .ownership = .owned,
-    } };
+    if (opened.status != .ok) {
+        const body = try host_stream.readErrorBody(alloc, transport, opened.handle, request);
+        return .{ .failed = .{
+            .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(opened.status), body),
+            .detail = body,
+            .ownership = .owned,
+        } };
+    }
 
     var reader: host_stream.HostStreamReader = undefined;
     reader.init(transport, opened.handle, request.cancel_flag, request.deadline, request.cooperative_pulse);

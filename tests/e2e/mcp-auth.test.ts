@@ -15,6 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { startIdleDropProxy } from "./fixtures/idle-drop-proxy";
 import { startLegacyStreamableHttpFixture } from "./fixtures/mcp-legacy-remote";
 import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
 import { stdoutFrames } from "./render-lab/tape";
@@ -47,6 +48,7 @@ let legacyStreamable:
 let auth: AuthFixture | null = null;
 let gateway: ReturnType<typeof startFakeGateway> | null = null;
 let tui: TmuxSession | null = null;
+let tokenProxy: Awaited<ReturnType<typeof startIdleDropProxy>> | null = null;
 
 beforeAll(() => {
   process.env.FX_DISABLE_KEYCHAIN = "1";
@@ -101,16 +103,19 @@ afterEach(async () => {
   const activeAuth = auth;
   const activeUpstream = upstream;
   const activeLegacyStreamable = legacyStreamable;
+  const activeTokenProxy = tokenProxy;
   const activeCleanupRoot = cleanupRoot;
   tui = null;
   gateway = null;
   auth = null;
   upstream = null;
   legacyStreamable = null;
+  tokenProxy = null;
   cleanupRoot = null;
 
   if (activeTui) await activeTui.kill();
   activeGateway?.stop();
+  activeTokenProxy?.stop();
   activeAuth?.stop();
   activeUpstream?.stop();
   activeLegacyStreamable?.stop();
@@ -1161,14 +1166,15 @@ describe("MCP login", () => {
     expect(pane).not.toContain(ACCESS_INITIAL);
   }, 60_000);
 
-  test.skipIf(!tmuxAvailable())("/mcp login NAME --no-browser prints the address and the outcome in the transcript", async () => {
+  test.skipIf(!tmuxAvailable())("/mcp login NAME --no-browser links the address and prints the outcome in the transcript", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
     const root = createRoot(auth, true, "http", auth.url, false);
+    const tapePath = join(root.root, "no-browser.fxtape");
     gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
       isolated: true, cwd: root.workspace, width: 140, height: 36,
-      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      env: { ...v2Env(root), FX_RECORD: tapePath, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
     });
     await tui.waitForComposer(15_000);
     // The flag after the name, which the parser takes like the flag before it.
@@ -1180,16 +1186,14 @@ describe("MCP login", () => {
       return composer < 0 ? lines : lines.slice(0, composer);
     };
     await tui.waitForText("Sign in to fixture in your browser.", 10_000);
-    // fx wraps the address to the pane; join its lines back up.
-    const lines = await transcript();
-    const start = lines.findIndex((line) => line.includes("If it didn't open, go to:"));
-    expect(start).toBeGreaterThanOrEqual(0);
-    let address = "";
-    for (const line of lines.slice(start + 1)) {
-      const part = line.trim();
-      if (!/^[A-Za-z0-9%._~:/?#\[\]@!$&'()*+,;=-]+$/.test(part)) break;
-      address += part;
-    }
+    // A few words stand for the address, which only their link carries.
+    const shown = (await transcript()).join("\n");
+    expect(shown).toContain("Didn't open? Open the sign-in page.");
+    expect(shown).not.toContain("/authorize?");
+    const written = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString("utf8");
+    const link = /\x1b\]8;id=fx-mcp-sign-in;([^\x1b]+)\x1b\\/.exec(written);
+    expect(link).not.toBeNull();
+    const address = link![1];
     expect(new URL(address).searchParams.get("state")).toBeTruthy();
     expect(existsSync(root.openLog)).toBe(false);
     // The user approves in some other browser, which then loads fx's loopback address.
@@ -1274,7 +1278,7 @@ describe("MCP login", () => {
     expect(await tui.captureFullScrollback()).not.toContain(ACCESS_INITIAL);
   }, 60_000);
 
-  test.skipIf(!tmuxAvailable())("while a sign-in waits, the server's screen says so and shows its whole address", async () => {
+  test.skipIf(!tmuxAvailable())("while a sign-in waits, the server's screen says so and links its address", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
     const root = createRoot(auth);
@@ -1288,11 +1292,12 @@ describe("MCP login", () => {
     await tui.waitForText("MCP servers  1", 10_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("› Log in        /mcp login fixture", 15_000);
-    // No browser opens, so the sign-in waits, and the screen says what for.
+    // No browser opens, so the sign-in waits, and the screen says what for in
+    // one line, like the transcript: its label links the address.
     await tui.sendKeys("Enter");
-    await tui.waitForText("Waiting for the browser. Didn't open? Go to:", 10_000);
+    await tui.waitForText("Waiting for the browser. Didn't open? Open the sign-in page.", 10_000);
     const pane = await tui.capturePane();
-    expect(pane).toContain("/authorize?");
+    expect(pane).not.toContain("/authorize?");
     expect(pane).not.toContain("Its tools show here once you log in.");
     expect(auth.tokenExchanges).toBe(0);
   }, 60_000);
@@ -1321,22 +1326,17 @@ describe("MCP login", () => {
     expect(await tui.capturePane()).not.toContain("Waiting for the browser");
     // Pressed again while the sign-in server is slow, then once its address shows.
     await tui.sendKeys("Enter");
-    await tui.waitForText("Waiting for the browser. Didn't open? Go to:", 15_000);
+    await tui.waitForText("Waiting for the browser. Didn't open? Open the sign-in page.", 15_000);
     await tui.sendKeys("Enter");
     await Bun.sleep(500);
 
-    // The address, wrapped over the rows under the heading.
-    const lines = (await tui.capturePane()).split("\n");
-    const heading = lines.findIndex((l) => l.includes("Didn't open? Go to:"));
-    let address = "";
-    for (const l of lines.slice(heading + 1)) {
-      if (!l.startsWith("    ") || l.trim() === "") break;
-      address += l.trim();
-    }
-    expect(address).toContain("/authorize?");
-    // Every row of it links the whole address.
+    // The label is one link to the whole address, which the screen doesn't spell out.
+    expect(await tui.capturePane()).not.toContain("/authorize?");
     const written = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString("utf8");
-    expect(written).toContain(`\x1b]8;id=fx-mcp-sign-in;${address}\x1b\\`);
+    const link = /\x1b\]8;id=fx-mcp-sign-in;([^\x1b]+)\x1b\\Open the sign-in page/.exec(written);
+    expect(link).not.toBeNull();
+    const address = link![1];
+    expect(address).toContain("/authorize?");
 
     // The browser's return reaches the sign-in those Enters kept.
     const redirect = await fetch(address, { redirect: "manual" });
@@ -1532,7 +1532,8 @@ describe("MCP login", () => {
     // the stand-in does; Slack doesn't list it.
     expect(opened.searchParams.get("scope")!.split(" ").filter((x) => x !== "offline_access").sort()).toEqual([
       "channels:history", "channels:read", "channels:write", "chat:write", "emoji:read", "files:write",
-      "groups:history", "im:history", "mpim:history", "search:read.public", "search:read.users", "users:read",
+      "groups:history", "groups:read", "im:history", "im:read", "mpim:history", "mpim:read",
+      "search:read.im", "search:read.mpim", "search:read.private", "search:read.public", "search:read.users", "users:read",
     ]);
     expect(auth.requests.some((r) => r.path.startsWith("/api/slack/"))).toBe(false);
     expect(auth.tokenExchanges).toBe(1);
@@ -1948,6 +1949,47 @@ describe("MCP login", () => {
     expect(readFileSync(storePath, "utf8")).toContain(`${REFRESH_ROTATED}-3`);
     expect(auth.replays).toBe(0);
   }, 90_000);
+
+  // A load balancer resets the token endpoint's keep-alive connection once it
+  // sits idle. fx keeps it for the next renewal, which must find it gone and
+  // go out on a new connection instead of failing every renewal until fx
+  // restarts.
+  test("a renewal after the token endpoint reset its idle connection still goes through", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { singleUseRefresh: { graceMs: 0 } });
+    tokenProxy = await startIdleDropProxy(auth.url, "reset");
+    const root = createRoot(auth);
+    seedV2Credential(root, auth, { token_endpoint: `${tokenProxy.origin}/token` });
+    const activeAuth = auth;
+    // Each call finds its access token withdrawn, so fx renews the login
+    // first. The second comes after the proxy reset the first one's
+    // connection.
+    const renewed = (withdrawn: string, id: string, waitMs: number) => async () => {
+      await Bun.sleep(waitMs);
+      activeAuth.validTokens.delete(withdrawn);
+      return fakeGatewayToolCall(id, TOOL_NAME, { text: id });
+    };
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
+      renewed(ACCESS_INITIAL, "first", 0),
+      renewed(`${ACCESS_REFRESHED}-1`, "second", 600),
+      fakeGatewayFinalText("Renewed twice."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the protected fixture twice."], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 30_000,
+    });
+    expectExit0(result);
+    const last = gateway.requests.at(-1)?.body ?? "";
+    expect(toolResultText(last, "first")).toContain("first");
+    expect(toolResultText(last, "second")).toContain("second");
+    expect(auth.refreshes).toBe(2);
+    expect(auth.replays).toBe(0);
+    // Each renewal had its own connection: the reset one wasn't used again.
+    expect(tokenProxy.dropped).toBeGreaterThanOrEqual(1);
+    expect(tokenProxy.connections).toBe(2);
+  }, 40_000);
 
   // A login that can't be saved works only where it was made, so fx says so.
   test("a login that can't be saved says so, and fx mcp login fails", async () => {

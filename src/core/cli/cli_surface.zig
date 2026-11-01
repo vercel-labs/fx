@@ -1885,14 +1885,19 @@ fn writeConfigDiagnostics(
     diagnostics: []const config_runtime.ConfigDiagnostic,
 ) !void {
     for (diagnostics) |diagnostic| {
-        if (!diagnostic.reportAtStartup()) continue;
+        const note = diagnostic.note();
+        if (note == null and !diagnostic.reportAtStartup()) continue;
         var notice_writer: std.Io.Writer.Allocating = .init(alloc);
         defer notice_writer.deinit();
-        try notice_writer.writer.print(
-            "proto-fx: config {s}: {s}",
-            .{ @tagName(diagnostic.layer), @tagName(diagnostic.cause) },
-        );
-        try config_runtime.writeDiagnosticMetadata(&notice_writer.writer, diagnostic);
+        if (note) |text| {
+            try notice_writer.writer.print("proto-fx: note: {s}", .{text});
+        } else {
+            try notice_writer.writer.print(
+                "proto-fx: config {s}: {s}",
+                .{ @tagName(diagnostic.layer), @tagName(diagnostic.cause) },
+            );
+            try config_runtime.writeDiagnosticMetadata(&notice_writer.writer, diagnostic);
+        }
         try notice_writer.writer.writeByte('\n');
         const notice = try notice_writer.toOwnedSlice();
         defer alloc.free(notice);
@@ -3593,6 +3598,10 @@ test "parse recognizes every top-level command and preserves unknown commands" {
     }
     switch (parse(command_catalog, &.{@constCast("upgrade")})) {
         .update => |rest| try std.testing.expectEqual(@as(usize, 0), rest.len),
+        else => return error.TestExpectedEqual,
+    }
+    switch (parse(command_catalog, &.{ @constCast("update"), @constCast("--channel"), @constCast("dev") })) {
+        .upgrade => |rest| try std.testing.expectEqual(@as(usize, 2), rest.len),
         else => return error.TestExpectedEqual,
     }
     switch (parse(command_catalog, &.{ @constCast("replay"), @constCast("tape") })) {

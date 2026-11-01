@@ -14947,7 +14947,7 @@ test "transcript lifecycle terminal and finalization transitions stay batch safe
     }{
         .{ .call_id = "completed", .kind = .completed, .summary = "completed", .marker_style = ui_render.system_notice_text_style, .marker = "●" },
         .{ .call_id = "denied", .kind = .denied, .summary = "denied", .marker_style = ui_render.red_style, .marker = "⊘" },
-        .{ .call_id = "cancelled", .kind = .cancelled, .summary = "cancelled", .marker_style = ui_render.warning_style, .marker = "■" },
+        .{ .call_id = "cancelled", .kind = .cancelled, .summary = "cancelled", .marker_style = ui_render.warning_style, .marker = "▪" },
         .{ .call_id = "failed", .kind = .failed, .summary = "failed", .marker_style = ui_render.red_style, .marker = "●" },
     };
     for (cases) |case| {

@@ -8,6 +8,7 @@ const artifact_digest = @import("artifact_digest.zig");
 const session_child_store = @import("session_child_store.zig");
 const session_codec = @import("session_codec.zig");
 const compactor = @import("../compactor/compactor.zig");
+const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -415,7 +416,7 @@ pub fn loadDiffContentManaged(
         previous_content: ?[]const u8 = null,
         after_content: ?[]const u8 = null,
     };
-    var parsed = std.json.parseFromSlice(Wire, alloc, bytes, .{
+    var parsed = json_decode.parseFromSlice(Wire, alloc, bytes, .{
         .allocate = .alloc_always,
         .max_value_len = diff_content_max_bytes,
     }) catch |err| switch (err) {

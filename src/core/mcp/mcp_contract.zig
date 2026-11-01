@@ -3,7 +3,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const default_startup_timeout_ms: u32 = 30_000;
-pub const default_operation_timeout_ms: u32 = 60_000;
+/// How long a request may go without an answer or progress. Tools such as
+/// browser automation run for minutes without reporting progress.
+pub const default_operation_timeout_ms: u32 = 5 * 60_000;
 pub const default_elicitation_timeout_ms: u32 = 30 * 60_000;
 pub const default_restart_limit: u8 = 1;
 

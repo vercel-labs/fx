@@ -1160,6 +1160,29 @@ pub fn pathInside(root: []const u8, candidate: []const u8) bool {
     return candidate.len > root.len and candidate[root.len] == std.Io.Dir.path.sep;
 }
 
+/// The model-visible form of `path`: relative to `workspace_root` when it lies
+/// inside it, so worktrees of one repository render the same prompt text, and
+/// unchanged otherwise. Borrows `path`; returns "." for the root itself.
+pub fn workspaceRelative(workspace_root: []const u8, path: []const u8) []const u8 {
+    if (workspace_root.len <= 1 or !std.Io.Dir.path.isAbsolute(workspace_root)) return path;
+    if (!pathInside(workspace_root, path)) return path;
+    const start = if (workspace_root[workspace_root.len - 1] == std.Io.Dir.path.sep) workspace_root.len else workspace_root.len + 1;
+    return if (start >= path.len) "." else path[start..];
+}
+
+test "workspaceRelative shortens only paths inside the workspace" {
+    try std.testing.expectEqualStrings("AGENTS.md", workspaceRelative("/w/repo", "/w/repo/AGENTS.md"));
+    try std.testing.expectEqualStrings(".fx/skills", workspaceRelative("/w/repo/", "/w/repo/.fx/skills"));
+    try std.testing.expectEqualStrings(".", workspaceRelative("/w/repo", "/w/repo"));
+    try std.testing.expectEqualStrings(".", workspaceRelative("/w/repo/", "/w/repo/"));
+    try std.testing.expectEqualStrings("/w/repo-evil/AGENTS.md", workspaceRelative("/w/repo", "/w/repo-evil/AGENTS.md"));
+    try std.testing.expectEqualStrings("/w/AGENTS.md", workspaceRelative("/w/repo", "/w/AGENTS.md"));
+    try std.testing.expectEqualStrings("/home/u/.fx/skills", workspaceRelative("/w/repo", "/home/u/.fx/skills"));
+    try std.testing.expectEqualStrings("/etc/x", workspaceRelative("/", "/etc/x"));
+    try std.testing.expectEqualStrings("/w/repo/a", workspaceRelative("", "/w/repo/a"));
+    try std.testing.expectEqualStrings("/w/repo/a", workspaceRelative("w/repo", "/w/repo/a"));
+}
+
 test "pathInside preserves exact child empty-root and prefix semantics" {
     try std.testing.expect(pathInside("/workspace", "/workspace"));
     try std.testing.expect(pathInside("/workspace", "/workspace/file.txt"));

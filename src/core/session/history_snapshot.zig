@@ -29,6 +29,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const session_event = @import("session_event.zig");
+const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -141,6 +142,8 @@ fn decodeAny(comptime T: type, alloc: Allocator, cur: *ByteCursor) DecodeError!T
                     // Every v1 prompt was the person's own and carried no
                     // saved turn context.
                     @field(value, field_name) = @field(@as(session_event.ConversationUser, .{ .text = "" }), field_name);
+                } else if (comptime absentFromCaches(T, field_name)) {
+                    @field(value, field_name) = null;
                 } else {
                     @field(value, field_name) = try decodeAny(field_type, alloc, cur);
                 }
@@ -179,6 +182,14 @@ fn notInCache(comptime T: type, comptime field_name: []const u8) bool {
     return T == session_event.ConversationUser and (std.mem.eql(u8, field_name, "origin") or
         std.mem.eql(u8, field_name, "turn_context") or
         std.mem.eql(u8, field_name, "skill_context"));
+}
+
+/// Fields added to the encoded types after the last release that wrote
+/// caches. No cache holds their bytes, so they decode as null and consume
+/// nothing; each must be optional. Reading released caches depends on this
+/// list staying exact.
+fn absentFromCaches(comptime T: type, comptime field_name: []const u8) bool {
+    return T == types.CommittedFilePresentation and std.mem.eql(u8, field_name, "review_lines");
 }
 
 /// Frees a decoded value tree. Only needed when decoding without an arena.

@@ -337,8 +337,24 @@ pub const State = struct {
             switch (notice) {
                 .authorize => |n| {
                     sink.waitForSignIn(n.server, n.url);
-                    // The menu shows the address; a typed login prints it.
+                    // The menu shows the address; a typed login links it.
                     if (!sink.isTyped(n.server)) return;
+                    sink.pushLocked(signInText(a, aa, n.server, n.url) catch return, false);
+                },
+                .signed_in => |server| {
+                    sink.endSignIn(server);
+                    sink.report(server, a.print("Signed in to {s}.", .{safeText(aa, server, 160)}) catch return, false);
+                },
+                .sign_in_failed => |n| {
+                    sink.endSignIn(n.server);
+                    sink.report(n.server, a.print("Couldn't sign in to {s}: {s}.", .{ safeText(aa, n.server, 160), safeText(aa, n.reason, 240) }) catch return, true);
+                },
+                // The status line says so for as long as it's true.
+                .needs_login => {},
+                .not_saved => |n| {
+                    const server = safeText(aa, n.server, 160);
+                    const text = a.print("Couldn't save {s}'s new login: {s}. It keeps working here, but after a restart {s} needs a login again.", .{ server, safeText(aa, n.reason, 240), server }) catch return;
+                    sink.pushLocked(text, true);
                 },
                 .signed_in => |server| sink.endSignIn(server),
                 .sign_in_failed => |n| sink.endSignIn(n.server),
@@ -415,6 +431,20 @@ pub const State = struct {
                 debug_trace.logf("mcp", "MCP notice dropped: out of memory", .{});
                 std.heap.c_allocator.free(text);
             };
+        }
+
+        fn safeText(arena: Allocator, raw: []const u8, max: usize) []const u8 {
+            return (text_utils.encodeTerminalSafeInline(arena, raw, max) catch return "?").bytes;
+        }
+
+        /// What a typed login says once its address comes, owned by `alloc`:
+        /// a link to it, or, when it can't be a link target, the address
+        /// itself made safe, to copy.
+        fn signInText(alloc: Allocator, arena: Allocator, server: []const u8, url: []const u8) ![]u8 {
+            const name = safeText(arena, server, 160);
+            if (text_utils.isLinkTarget(url))
+                return alloc.print("Sign in to {s} in your browser. Didn't open? \x1b]8;id=fx-mcp-sign-in;{s}\x1b\\" ++ mcp_menu.sign_in_link_label ++ "\x1b]8;;\x1b\\.", .{ name, url });
+            return alloc.print("Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ name, safeText(arena, url, 16 * 1024) });
         }
     };
 
@@ -1014,6 +1044,85 @@ test "a typed /mcp login names its server wherever --no-browser goes" {
     }
 }
 
+test "model catalog baseline surfaces availability changes once" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    const before = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("linear"), .availability = .authentication_required },
+    };
+    const first = try state.updateModelCatalogBaseline(alloc, alloc, &before);
+    try std.testing.expectEqual(@as(?[]u8, null), first);
+
+    const after = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("linear"), .availability = .ready, .tool_count = 74 },
+    };
+    const changed = try state.updateModelCatalogBaseline(alloc, alloc, &after);
+    defer if (changed) |notice| alloc.free(notice);
+    try std.testing.expect(changed != null);
+    try std.testing.expect(std.mem.find(u8, changed.?, "linear: authentication_required -> ready (74 tools)") != null);
+
+    const settled = try state.updateModelCatalogBaseline(alloc, alloc, &after);
+    try std.testing.expectEqual(@as(?[]u8, null), settled);
+}
+
+test "model catalog baseline waits out discovery before recording state" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    const discovering = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("linear"), .availability = .discovering },
+    };
+    const during_discovery = try state.updateModelCatalogBaseline(alloc, alloc, &discovering);
+    try std.testing.expectEqual(@as(?[]u8, null), during_discovery);
+    try std.testing.expect(state.model_catalog_baseline == null);
+
+    const ready = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("linear"), .availability = .ready, .tool_count = 74 },
+    };
+    const settled = try state.updateModelCatalogBaseline(alloc, alloc, &ready);
+    try std.testing.expectEqual(@as(?[]u8, null), settled);
+    try std.testing.expect(state.model_catalog_baseline != null);
+
+    const failed = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("linear"), .availability = .failed },
+    };
+    const outage = try state.updateModelCatalogBaseline(alloc, alloc, &failed);
+    defer if (outage) |notice| alloc.free(notice);
+    try std.testing.expect(outage != null);
+    try std.testing.expect(std.mem.find(u8, outage.?, "linear: ready -> failed") != null);
+}
+
+test "model catalog baseline reports removals" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+
+    const before = [_]mcp_model_catalog.ServerSummary{
+        .{ .name = @constCast("slack"), .availability = .ready, .tool_count = 3 },
+    };
+    _ = try state.updateModelCatalogBaseline(alloc, alloc, &before);
+
+    const removed = try state.updateModelCatalogBaseline(alloc, alloc, &.{});
+    defer if (removed) |notice| alloc.free(notice);
+    try std.testing.expect(removed != null);
+    try std.testing.expect(std.mem.find(u8, removed.?, "slack: removed") != null);
+}
+
+test "a typed sign-in prints an address that can't be a link, to copy" {
+    var sink: State.HostSink = .{};
+    defer sink.deinit();
+    const notify = sink.notify();
+    sink.markTyped("docs");
+    notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/a b\x1b[2J" } });
+    try std.testing.expectEqual(@as(usize, 1), sink.notices.items.len);
+    const text = sink.notices.items[0].text;
+    try std.testing.expect(std.mem.startsWith(u8, text, "Sign in to docs in your browser. If it didn't open, go to:\n  https://a.example/a b"));
+    try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
+}
+
 test "a typed sign-in reports in the transcript, any other on the status line" {
     var sink: State.HostSink = .{};
     defer sink.deinit();
@@ -1022,6 +1131,11 @@ test "a typed sign-in reports in the transcript, any other on the status line" {
     notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/authorize" } });
     notify.notice(notify.context, .{ .signed_in = "docs" });
     try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
+    // The address is a link under a few words, not printed out.
+    try std.testing.expectEqualStrings(
+        "Sign in to docs in your browser. Didn't open? \x1b]8;id=fx-mcp-sign-in;https://a.example/authorize\x1b\\Open the sign-in page\x1b]8;;\x1b\\.",
+        sink.notices.items[0].text,
+    );
     try std.testing.expectEqualStrings("Signed in to docs.", sink.notices.items[1].text);
     try std.testing.expect(sink.news == null);
     // Once reported, the next sign-in to it isn't typed.

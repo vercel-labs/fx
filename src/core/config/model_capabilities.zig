@@ -3,12 +3,27 @@ const types = @import("../shared/types.zig");
 const model_provider = @import("model_provider.zig");
 const image_route = @import("../images/image_route.zig");
 
+/// The provider syntax for the cache markers on messages flagged with
+/// `ChatMessage.cache_breakpoint`.
+pub const CacheMarkers = enum { none, anthropic, openai };
+
 pub const ResolvedProviderOptions = struct {
     reasoning: ?types.ReasoningEffort = null,
     fast: bool = false,
     ultrafast: bool = false,
     parallel_tool_calls: ?bool = null,
     prompt_caching: bool = false,
+    /// Marker syntax for flagged messages; written only with
+    /// `prompt_caching`. `none` writes no markers.
+    cache_markers: CacheMarkers = .none,
+    /// Asks OpenAI GPT-5.6 and later to write no prompt-cache entries
+    /// (explicit cache mode with no breakpoints), for a request whose prefix
+    /// no later request shares. Such a model otherwise writes the whole
+    /// prompt at the cache-write price on every call.
+    skip_cache_writes: bool = false,
+    /// The model takes one system message, at the start of the conversation,
+    /// so the Gateway request joins the leading system messages into one.
+    single_system_message: bool = false,
     /// Borrowed gateway provider slugs in preference order. Empty leaves
     /// provider selection to the gateway. The backing memory must outlive
     /// request-body serialization.
@@ -129,6 +144,70 @@ pub fn resolveForApp(comptime App: type, app: *App, model: []const u8) Capabilit
 // omitting the limit lets some providers stop replies at a few thousand tokens.
 const full_window_output_tokens: u32 = 32_768;
 const full_window_output_divisor: u32 = 8;
+
+/// The output limit for the one retry of a reply the provider cut short before
+/// any text, when the first request set no limit and the provider's default ran
+/// out. A known context window bounds it as it bounds a full-window limit; null
+/// when that leaves no room.
+pub fn emptyLengthRetryOutputTokens(capabilities: Capabilities) ?u32 {
+    const window = capabilities.context_window orelse return full_window_output_tokens;
+    const bounded = @min(full_window_output_tokens, window / full_window_output_divisor);
+    return if (bounded == 0) null else bounded;
+}
+
+test "empty length retry limit stays inside a known context window" {
+    try std.testing.expectEqual(@as(?u32, 32_768), emptyLengthRetryOutputTokens(.{}));
+    try std.testing.expectEqual(@as(?u32, 32_768), emptyLengthRetryOutputTokens(.{ .context_window = 1_000_000 }));
+    try std.testing.expectEqual(@as(?u32, 8_192), emptyLengthRetryOutputTokens(.{ .context_window = 65_536 }));
+    try std.testing.expectEqual(@as(?u32, null), emptyLengthRetryOutputTokens(.{ .context_window = 7 }));
+}
+
+/// The effort for the one resend of a reply that spent its whole output limit
+/// with nothing usable: `low` when the model offers it below the effort the
+/// request used, so the resend reasons less; null resends at the same effort.
+/// An effort the model does not list was never sent, so that request used the
+/// model's default.
+pub fn lengthResendEffort(capabilities: Capabilities, current: types.ReasoningEffort) ?types.ReasoningEffort {
+    const low = types.ReasoningEffort.literal("low");
+    const low_index = reasoningEffortIndex(capabilities, low);
+    if (low_index == 0) return null;
+    const current_index = reasoningEffortIndex(capabilities, current);
+    return if (current_index == 0 or low_index < current_index) low else null;
+}
+
+test "length resend lowers effort to low only when that reasons less" {
+    const efforts = [_]types.ReasoningEffort{
+        types.ReasoningEffort.literal("none"),
+        types.ReasoningEffort.literal("minimal"),
+        types.ReasoningEffort.literal("low"),
+        types.ReasoningEffort.literal("high"),
+    };
+    const caps = Capabilities{ .reasoning_efforts = .fromSlice(&efforts) };
+    const low = types.ReasoningEffort.literal("low");
+    const cases = [_]struct { current: types.ReasoningEffort, expected: ?types.ReasoningEffort }{
+        .{ .current = .auto, .expected = low },
+        .{ .current = types.ReasoningEffort.literal("high"), .expected = low },
+        .{ .current = types.ReasoningEffort.literal("unlisted"), .expected = low },
+        .{ .current = low, .expected = null },
+        .{ .current = types.ReasoningEffort.literal("minimal"), .expected = null },
+        .{ .current = types.ReasoningEffort.literal("none"), .expected = null },
+    };
+    for (cases) |case| {
+        const got = lengthResendEffort(caps, case.current);
+        if (case.expected) |expected| {
+            try std.testing.expect(got != null and got.?.eql(expected));
+        } else {
+            try std.testing.expectEqual(@as(?types.ReasoningEffort, null), got);
+        }
+    }
+
+    const without_low = [_]types.ReasoningEffort{
+        types.ReasoningEffort.literal("medium"),
+        types.ReasoningEffort.literal("high"),
+    };
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), lengthResendEffort(.{ .reasoning_efforts = .fromSlice(&without_low) }, .auto));
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), lengthResendEffort(.{}, .auto));
+}
 
 /// Output tokens to request and reserve for one model call, or null to leave the limit unset.
 pub fn requestOutputTokens(capabilities: Capabilities) ?u32 {

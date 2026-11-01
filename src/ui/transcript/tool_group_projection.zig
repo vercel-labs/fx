@@ -152,10 +152,13 @@ const category_labels = [_][]const u8{
     "edit",
     "open",
     "command",
-    "worker",
+    "subagent",
+    "browser",
+    "MCP call",
 };
-const command_category_index = 4;
-const worker_category_index = 5;
+const command_category_index = 5;
+const subagent_category_index = 6;
+const mcp_category_index = 8;
 
 const Summary = struct {
     total: usize = 0,
@@ -208,8 +211,9 @@ fn categoryIndex(kind: types.ToolActivityKind) ?usize {
         .edit => 2,
         .open => 3,
         .command => command_category_index,
-        .subagent => 5,
+        .subagent => subagent_category_index,
         .ask => null,
+        .mcp => mcp_category_index,
     };
 }
 
@@ -336,13 +340,37 @@ fn prependHeading(alloc: std.mem.Allocator, group: GroupBlock, heading: Transcri
     const rendered = try transcript_blocks.renderEntryToBlock(alloc, heading, cols, .{});
     defer rendered.deinit(alloc);
     const text = std.mem.trimEnd(u8, rendered.bytes, "\n");
-    const lines = try alloc.alloc(transcript_blocks.LineProvenance, group.lines.len + 2);
+    // A reasoning trace can render as a heading and several prose rows, so
+    // every row it prints needs its own provenance entry.
+    const heading_rows = std.mem.countScalar(u8, text, '\n') + 1;
+    const lines = try alloc.alloc(transcript_blocks.LineProvenance, heading_rows + 1 + group.lines.len);
     errdefer alloc.free(lines);
-    lines[0] = .{ .entry = .{ .entry_id = heading.id(), .entry_class = transcript_blocks.entryClassForEntry(heading) } };
-    lines[1] = .block_separator;
-    @memcpy(lines[2..], group.lines);
+    @memset(lines[0..heading_rows], .{ .entry = .{ .entry_id = heading.id(), .entry_class = transcript_blocks.entryClassForEntry(heading) } });
+    lines[heading_rows] = .block_separator;
+    @memcpy(lines[heading_rows + 1 ..], group.lines);
     const bytes = try alloc.print("{s}\n\n{s}", .{ text, group.bytes });
     return .{ .bytes = bytes, .lines = lines };
+}
+
+test "a multi-row reasoning trace above a tool group has provenance for every row" {
+    const alloc = std.testing.allocator;
+    const heading = TranscriptEntry{ .semantic_notice = .{
+        .id = 3,
+        .topic = "thinking",
+        .tone = .information,
+        .body = "First thought.\nSecond thought.\nThird thought.\nFourth thought.\nFifth thought.\nSixth thought.",
+        .visibility = .full_only,
+    } };
+    const group_lines = try alloc.alloc(transcript_blocks.LineProvenance, 1);
+    group_lines[0] = .{ .entry = .{ .entry_id = 4, .entry_class = .tool_status, .projection_part = .group_child } };
+    const group: GroupBlock = .{ .bytes = try alloc.dupe(u8, "● Ran sleep 45"), .lines = group_lines };
+    const block = try prependHeading(alloc, group, heading, 80);
+    defer alloc.free(block.bytes);
+    defer alloc.free(block.lines);
+    const rows = std.mem.countScalar(u8, block.bytes, '\n') + 1;
+    try std.testing.expectEqual(rows, block.lines.len);
+    try std.testing.expect(block.lines[rows - 2] == .block_separator);
+    try std.testing.expectEqual(@as(u32, 4), block.lines[rows - 1].entry.entry_id);
 }
 
 fn isAttachedEntry(entry: TranscriptEntry) bool {
@@ -422,7 +450,8 @@ fn normalizeCanonicalStatus(
 ) !?[]const u8 {
     var index: usize = 0;
     while (skipSgrSequence(text, &index)) {}
-    const markers = [_][]const u8{ "●", "■", "⊘", "↻" };
+    // `■` is the cancelled marker older sessions recorded before `▪`.
+    const markers = [_][]const u8{ "●", "▪", "■", "⊘", "↻" };
     const marker = for (markers) |candidate| {
         if (std.mem.startsWith(u8, text[index..], candidate)) break candidate;
     } else return null;
@@ -657,12 +686,12 @@ fn formatGroupSummary(alloc: std.mem.Allocator, summary: Summary) ![]u8 {
         const index = next_index orelse break;
         emitted[index] = true;
         const count = summary.categories[index];
-        const label = if (index == command_category_index and count != 1)
-            "commands"
-        else if (index == worker_category_index and count != 1)
-            "workers"
-        else
-            category_labels[index];
+        const label = if (count == 1) category_labels[index] else switch (index) {
+            command_category_index => "commands",
+            subagent_category_index => "subagents",
+            mcp_category_index => "MCP calls",
+            else => category_labels[index],
+        };
         try appendSegment(&out.writer, count, label);
     }
     for (summary.anomalies()) |anomaly| {
@@ -1741,6 +1770,23 @@ test "grouped subagent status keeps the vertical continuation for middle rows" {
     );
 }
 
+test "group summary uses singular and plural subagent labels" {
+    const alloc = std.testing.allocator;
+    var summary: Summary = .{ .total = 2 };
+    summary.categories[command_category_index] = 1;
+    summary.categories[subagent_category_index] = 1;
+    const single = try formatGroupSummary(alloc, summary);
+    defer alloc.free(single);
+    try std.testing.expectEqualStrings("● 2 tool calls · 1 command · 1 subagent", single);
+
+    summary = .{ .total = 5 };
+    summary.categories[command_category_index] = 2;
+    summary.categories[subagent_category_index] = 3;
+    const plural = try formatGroupSummary(alloc, summary);
+    defer alloc.free(plural);
+    try std.testing.expectEqualStrings("● 5 tool calls · 3 subagents · 2 commands", plural);
+}
+
 test "small minimal tool groups surface canonical action targets" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
@@ -2660,7 +2706,7 @@ test "minimal tool group clips cancellation to one child row" {
     const entries = [_]TranscriptEntry{
         .{ .raw_bytes = .{
             .id = 1,
-            .bytes = "■ Cancelled sleep waiting command words extend past line two",
+            .bytes = "▪ Cancelled sleep waiting command words extend past line two",
             .class = .tool_status,
         } },
     };
@@ -2710,8 +2756,8 @@ test "minimal tool group keeps later cancelled rows and hides other details" {
 test "cancelled actions remain inside the message-delimited block" {
     const alloc = std.testing.allocator;
     const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "■ Cancelled first", .class = .tool_status } },
-        .{ .raw_bytes = .{ .id = 2, .bytes = "■ Cancelled second", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 1, .bytes = "▪ Cancelled first", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "▪ Cancelled second", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 3, .bytes = "output", .class = .command_output } },
         .{ .raw_bytes = .{ .id = 4, .bytes = "read", .class = .tool_status } },
     };

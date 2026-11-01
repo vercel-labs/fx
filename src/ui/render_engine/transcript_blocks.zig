@@ -1838,6 +1838,32 @@ const NoticeLine = struct {
 
 const notice_osc8_prefix = "\x1b]8;";
 const notice_osc8_close = "\x1b]8;;\x1b\\";
+const notice_link_underline = "\x1b[4m";
+const notice_link_underline_off = "\x1b[24m";
+
+/// Copies a notice's text, underlining what an OSC 8 link in it covers, as
+/// fx underlines every link. `linked`: a link from the row before goes on.
+fn appendNoticeText(out: *std.ArrayList(u8), alloc: Allocator, text: []const u8, linked: bool) !void {
+    var link: ?[]const u8 = if (linked) "" else null;
+    if (linked) try out.appendSlice(alloc, notice_link_underline);
+    var copied: usize = 0;
+    while (std.mem.findPos(u8, text, copied, notice_osc8_prefix)) |start| {
+        const end = display_width.ansiSequenceEnd(text, start);
+        if (end <= start or end > text.len) break;
+        const was = link != null;
+        updateNoticeHyperlinkState(text[start..end], &link);
+        if (was and link == null) {
+            try out.appendSlice(alloc, text[copied..start]);
+            try out.appendSlice(alloc, notice_link_underline_off);
+            try out.appendSlice(alloc, text[start..end]);
+        } else {
+            try out.appendSlice(alloc, text[copied..end]);
+            if (!was and link != null) try out.appendSlice(alloc, notice_link_underline);
+        }
+        copied = end;
+    }
+    try out.appendSlice(alloc, text[copied..]);
+}
 
 fn updateNoticeHyperlinkState(fragment: []const u8, active: *?[]const u8) void {
     var offset: usize = 0;
@@ -1964,12 +1990,15 @@ fn appendNoticeRow(
     }
     if (end > label_end) {
         try out.appendSlice(alloc, styles.system_notice_text_style);
-        try out.appendSlice(alloc, logical[@max(start, label_end)..end]);
+        try appendNoticeText(out, alloc, logical[@max(start, label_end)..end], active_hyperlink.* != null);
         try out.appendSlice(alloc, styles.reset_style);
     }
     if (start == end) try out.appendSlice(alloc, styles.reset_style);
     updateNoticeHyperlinkState(logical[start..end], active_hyperlink);
-    if (active_hyperlink.* != null) try out.appendSlice(alloc, notice_osc8_close);
+    if (active_hyperlink.* != null) {
+        try out.appendSlice(alloc, notice_link_underline_off);
+        try out.appendSlice(alloc, notice_osc8_close);
+    }
 }
 
 /// Returns an owned semantic notice block without surrounding blank rows.
@@ -3355,7 +3384,7 @@ test "semantic notice topics never render the tool-activity bullet or forced cap
     }
 }
 
-test "semantic notice keeps an OSC 8 target hidden and clickable" {
+test "semantic notice keeps an OSC 8 target hidden, clickable, and underlined" {
     const alloc = std.testing.allocator;
     const url = "https://fx.sh/feedback";
     const body = try alloc.print(
@@ -3383,6 +3412,7 @@ test "semantic notice keeps an OSC 8 target hidden and clickable" {
     try std.testing.expect(link_cell.style.hyperlink_id != 0);
     try std.testing.expectEqualStrings(url, grid.hyperlinkUrl(link_cell.style.hyperlink_id).?);
     try std.testing.expectEqual(@as(u32, 0), grid.cellAt(1, 31).?.style.hyperlink_id);
+    try expectUnderlinedExactlyWhereLinked(&grid);
 
     var narrow_grid = try vt_emulator.Grid.init(alloc, 9, 16);
     defer narrow_grid.deinit();
@@ -3407,6 +3437,18 @@ test "semantic notice keeps an OSC 8 target hidden and clickable" {
     }
     try std.testing.expectEqualStrings("Openfeedback form", linked_text.items);
     try std.testing.expectEqual(@as(u32, 0), narrow_grid.current_style.hyperlink_id);
+    // Each row a link wraps onto is underlined too, and nothing after it.
+    try expectUnderlinedExactlyWhereLinked(&narrow_grid);
+    try std.testing.expect(!narrow_grid.current_style.flags.underline);
+}
+
+fn expectUnderlinedExactlyWhereLinked(grid: *vt_emulator.Grid) !void {
+    for (1..grid.rows + 1) |row_index| {
+        for (1..grid.cols + 1) |col_index| {
+            const cell = grid.cellAt(@intCast(row_index), @intCast(col_index)).?;
+            try std.testing.expectEqual(cell.style.hyperlink_id != 0, cell.style.flags.underline);
+        }
+    }
 }
 
 test "background semantic notices render one topic for launch and failure" {
@@ -3971,7 +4013,7 @@ test "tool status preview reasserts ANSI before standalone continuations" {
     };
     const fixtures = [_]Fixture{
         .{ .source = "\x1b[38;5;243m●\x1b[0m\x1b[1m Running\x1b[0m \x1b[38;5;245msleep waiting command words extend past line two\x1b[0m", .marker_color = 243 },
-        .{ .source = "\x1b[38;5;252m■\x1b[0m\x1b[1m\x1b[38;5;255m Cancelled\x1b[0m \x1b[38;5;245msleep waiting command words extend past line two\x1b[0m", .marker_color = 252 },
+        .{ .source = "\x1b[38;5;252m▪\x1b[0m\x1b[1m\x1b[38;5;255m Cancelled\x1b[0m \x1b[38;5;245msleep waiting command words extend past line two\x1b[0m", .marker_color = 252 },
         .{ .source = "\x1b[38;5;252m●\x1b[0m\x1b[1m Ran\x1b[0m \x1b[38;5;245msleep waiting command words extend past line two\x1b[0m", .marker_color = 252 },
     };
 
@@ -4705,7 +4747,7 @@ test "renderEntriesToBytes reflows parser-rendered lists at paint-time cols" {
     const third = std.mem.find(u8, narrow, "third-").?;
     try std.testing.expect(first < second and second < third);
     try std.testing.expect(std.mem.find(u8, narrow, "\n    ") != null);
-    try std.testing.expect(std.mem.find(u8, narrow, "\n     ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\n       ") != null);
     try std.testing.expect(std.mem.find(u8, narrow, "\n      ") != null);
 
     var lines = std.mem.splitScalar(u8, narrow, '\n');
@@ -4727,7 +4769,7 @@ test "renderEntriesToBytes preserves parser-rendered list paragraph indentation"
     try appendAssistantTestEntry(&entries, alloc, 1, source.items);
     const narrow = try renderEntriesToBytes(alloc, entries.items, 18, .{});
     defer alloc.free(narrow);
-    try std.testing.expect(std.mem.find(u8, narrow, "     alpha beta\n     gamma delta") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "       alpha beta\n       gamma delta") != null);
     try std.testing.expect(std.mem.find(u8, narrow, "    alpha beta\n    gamma delta") != null);
 }
 
@@ -4768,7 +4810,7 @@ test "renderEntriesToBytes reflows parser-rendered task lists at paint-time cols
     const nested = std.mem.find(u8, narrow, "nested-").?;
     try std.testing.expect(first < completed and completed < nested);
     try std.testing.expect(std.mem.find(u8, narrow, "\n    ") != null);
-    try std.testing.expect(std.mem.find(u8, narrow, "\n       ") != null);
+    try std.testing.expect(std.mem.find(u8, narrow, "\n         ") != null);
     try std.testing.expect(std.mem.find(u8, narrow, "\n      ") != null);
 
     var lines = std.mem.splitScalar(u8, narrow, '\n');

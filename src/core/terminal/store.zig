@@ -7,6 +7,7 @@ const session_child_store = @import("../session/session_child_store.zig");
 const session_layout = @import("../session/session_layout.zig");
 const process_identity = @import("../execution/process_identity.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const json_decode = @import("../shared/json_decode.zig");
 const process_provider_mod = @import(
     "../execution/process_provider.zig",
 );
@@ -1858,7 +1859,7 @@ fn clone_record(alloc: Allocator, wire: RecordWire) Allocator.Error!Record {
 }
 
 fn parse_record(alloc: Allocator, bytes: []const u8) !Record {
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_decode.parseFromSlice(
         RecordWire,
         alloc,
         bytes,
@@ -1985,7 +1986,7 @@ fn load_event(
         else => return err,
     };
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_decode.parseFromSlice(
         EventWire,
         alloc,
         bytes,
@@ -5508,7 +5509,7 @@ fn load_owner_catalog_authority(
     defer file.deinit();
     const bytes = try file.readToEnd(alloc, max_record_bytes);
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_decode.parseFromSlice(
         OwnerCatalogAuthorityWire,
         alloc,
         bytes,
@@ -5619,7 +5620,7 @@ fn load_authority(
     defer file.deinit();
     const bytes = try file.readToEnd(alloc, max_record_bytes);
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_decode.parseFromSlice(
         AuthorityWire,
         alloc,
         bytes,
@@ -5710,7 +5711,7 @@ fn load_close_transaction(
     defer file.deinit();
     const bytes = try file.readToEnd(alloc, max_event_bytes);
     defer alloc.free(bytes);
-    var parsed = std.json.parseFromSlice(
+    var parsed = json_decode.parseFromSlice(
         CloseTransaction,
         alloc,
         bytes,
@@ -6116,83 +6117,6 @@ const TestStoreFixture = struct {
             .persistence = persistence,
             .now_ms = 1,
         });
-    }
-};
-
-const OneShotFailingAllocator = struct {
-    failing: std.testing.FailingAllocator,
-
-    fn init(alloc: Allocator) OneShotFailingAllocator {
-        return .{ .failing = .init(alloc, .{}) };
-    }
-
-    fn allocator(self: *OneShotFailingAllocator) Allocator {
-        return .{ .ptr = self, .vtable = &.{
-            .alloc = allocate,
-            .resize = resize,
-            .remap = remap,
-            .free = free,
-        } };
-    }
-
-    fn allocate(
-        raw: *anyopaque,
-        len: usize,
-        alignment: std.mem.Alignment,
-        return_address: usize,
-    ) ?[*]u8 {
-        const self: *OneShotFailingAllocator = @ptrCast(@alignCast(raw));
-        const result = self.failing.allocator().rawAlloc(
-            len,
-            alignment,
-            return_address,
-        );
-        if (result == null and self.failing.has_induced_failure) {
-            self.failing.fail_index = std.math.maxInt(usize);
-        }
-        return result;
-    }
-
-    fn resize(
-        raw: *anyopaque,
-        memory: []u8,
-        alignment: std.mem.Alignment,
-        new_len: usize,
-        return_address: usize,
-    ) bool {
-        const self: *OneShotFailingAllocator = @ptrCast(@alignCast(raw));
-        return self.failing.allocator().rawResize(
-            memory,
-            alignment,
-            new_len,
-            return_address,
-        );
-    }
-
-    fn remap(
-        raw: *anyopaque,
-        memory: []u8,
-        alignment: std.mem.Alignment,
-        new_len: usize,
-        return_address: usize,
-    ) ?[*]u8 {
-        const self: *OneShotFailingAllocator = @ptrCast(@alignCast(raw));
-        return self.failing.allocator().rawRemap(
-            memory,
-            alignment,
-            new_len,
-            return_address,
-        );
-    }
-
-    fn free(
-        raw: *anyopaque,
-        memory: []u8,
-        alignment: std.mem.Alignment,
-        return_address: usize,
-    ) void {
-        const self: *OneShotFailingAllocator = @ptrCast(@alignCast(raw));
-        self.failing.allocator().rawFree(memory, alignment, return_address);
     }
 };
 

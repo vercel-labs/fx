@@ -67,8 +67,6 @@ jobs:
         include:
           - name: linux-x86_64
             target: x86_64-linux
-          - name: linux-aarch64
-            target: aarch64-linux
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -96,6 +94,82 @@ jobs:
           path: |
             fx-${{ matrix.name }}.tar.gz
             fx-${{ matrix.name }}.tar.gz.sha256
+
+  build-linux-aarch64:
+    needs: check-version
+    if: needs.check-version.outputs.needed == 'true'
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/pgso-linux-arm64.yml
+    with:
+      # Keep release evidence long enough to serve as the main control for
+      # manual PGSO comparisons.
+      evidence-retention-days: 90
+
+  package-linux-aarch64:
+    needs: [check-version, build-linux-aarch64]
+    if: needs.check-version.outputs.needed == 'true'
+    name: Package linux-aarch64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Require native arm64 host
+        run: test "$(uname -m)" = aarch64
+
+      - name: Download eligible candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.build-linux-aarch64.outputs.artifact-id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/fx-pgso
+
+      - name: Restore executable mode
+        run: chmod +x "$RUNNER_TEMP/fx-pgso/candidate/fx"
+
+      - name: Confirm release eligibility
+        run: python3 -m scripts.pgso report --output-dir "$RUNNER_TEMP/fx-pgso" >/dev/null
+
+      - name: Confirm the candidate is the qualified binary
+        run: |
+          python3 - "$RUNNER_TEMP/fx-pgso" <<'EOF'
+          import hashlib, json, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+          expected = manifest["evidence"]["artifacts"]["candidate"]["sha256"]
+          actual = hashlib.sha256((root / "candidate/fx").read_bytes()).hexdigest()
+          if actual != expected:
+              sys.exit(f"candidate SHA-256 {actual} is not the qualified {expected}")
+          EOF
+
+      - name: Smoke-test the candidate
+        run: |
+          "$RUNNER_TEMP/fx-pgso/candidate/fx" --version
+          "$RUNNER_TEMP/fx-pgso/candidate/fx" help >/dev/null
+
+      - name: Package stable release candidate
+        run: |
+          python3 -c 'import pathlib, sys; n = pathlib.Path(sys.argv[1]).stat().st_size; print(f"linux PGSO executable: {n:,} bytes ({n / 1048576:.6f} MiB)")' "$RUNNER_TEMP/fx-pgso/candidate/fx" >> "$GITHUB_STEP_SUMMARY"
+          package_dir="$RUNNER_TEMP/fx-release-package"
+          mkdir -p "$package_dir"
+          cp "$RUNNER_TEMP/fx-pgso/candidate/fx" LICENSE THIRD_PARTY_NOTICES.md "$package_dir/"
+          tar -czf "$RUNNER_TEMP/fx-linux-aarch64.tar.gz" -C "$package_dir" fx LICENSE THIRD_PARTY_NOTICES.md
+          cd "$RUNNER_TEMP"
+          sha256sum fx-linux-aarch64.tar.gz > fx-linux-aarch64.tar.gz.sha256
+
+      - name: Upload stable release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fx-linux-aarch64
+          path: |
+            ${{ runner.temp }}/fx-linux-aarch64.tar.gz
+            ${{ runner.temp }}/fx-linux-aarch64.tar.gz.sha256
+          if-no-files-found: error
 
   build-macos-x86_64:
     needs: check-version
@@ -247,7 +321,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [check-version, build-linux, build-macos-x86_64, sign-macos-arm64]
+    needs: [check-version, build-linux, package-linux-aarch64, build-macos-x86_64, sign-macos-arm64]
     if: needs.check-version.outputs.publish == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.validate_only)
     runs-on: ubuntu-latest
     environment: release

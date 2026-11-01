@@ -214,6 +214,7 @@ pub const ConfigDiagnosticCause = enum {
     settings_too_large,
     durable_path_unsafe,
     private_state_permissions_unsupported,
+    private_state_permissions_tightened,
     invalid_model_id,
     ignored_project_user_only_setting,
     legacy_workspace_preferences,
@@ -232,7 +233,16 @@ pub const ConfigDiagnostic = struct {
     recovery_path: ?[]u8 = null,
 
     pub fn reportAtStartup(self: ConfigDiagnostic) bool {
-        return self.cause != .legacy_workspace_preferences;
+        return self.cause != .legacy_workspace_preferences and self.note() == null;
+    }
+
+    /// A one-line note for the user instead of a configuration issue.
+    pub fn note(self: ConfigDiagnostic) ?[]const u8 {
+        return switch (self.cause) {
+            .private_state_permissions_tightened => "Other users could write to ~/.fx, so fx took that access away. " ++
+                "If you didn't write ~/.fx/settings.json yourself, check it.",
+            else => null,
+        };
     }
 
     pub fn deinit(self: *ConfigDiagnostic, alloc: Allocator) void {
@@ -527,7 +537,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
     defer if (user_root) |*parsed| parsed.deinit();
 
     if (home_dir) |home| {
-        var store: ?settings_store.Store = settings_store.Store.initFromHome(alloc, home, .read_only) catch |err| blk: {
+        var store: ?settings_store.Store = settings_store.Store.initFromHomeTighteningReadOnly(alloc, home) catch |err| blk: {
             prompt_history_store_allowed = false;
             try diagnostics.append(alloc, .{
                 .layer = .user,
@@ -579,6 +589,9 @@ fn loadMergedSettingsDetailedWithOptionalHome(
                         user_root = null;
                     }
                 },
+            }
+            if (usable_store.tightened.any()) {
+                try diagnostics.append(alloc, .{ .layer = .user, .cause = .private_state_permissions_tightened });
             }
         }
     }
@@ -4404,7 +4417,7 @@ test "invalid user model emits typed diagnostic and project model is ignored" {
     try std.testing.expect(!result.prompt_history_store_allowed);
 }
 
-test "detailed settings report unsafe user permissions distinctly" {
+test "detailed settings remove loose write access, load, and note it once" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
@@ -4423,14 +4436,25 @@ test "detailed settings report unsafe user permissions distinctly" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.settings.permission_mode == null);
-    try std.testing.expectEqual(
-        ConfigDiagnosticCause.private_state_permissions_unsupported,
-        result.diagnostics[0].cause,
-    );
-    try std.testing.expect(!result.prompt_history_store_allowed);
+    {
+        var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result.settings.permission_mode == .auto);
+        try std.testing.expectEqual(@as(usize, 1), result.diagnostics.len);
+        const diagnostic = result.diagnostics[0];
+        try std.testing.expectEqual(ConfigDiagnosticCause.private_state_permissions_tightened, diagnostic.cause);
+        try std.testing.expect(!diagnostic.reportAtStartup());
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.note().?, "~/.fx/settings.json") != null);
+        try std.testing.expect(result.prompt_history_store_allowed);
+    }
+    const tightened = try root_dir.statFile(io_mod.getIo(), "settings.json", .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o644), tightened.permissions.toMode() & 0o777);
+
+    // Nothing is loose any more, so the next start says nothing.
+    var again = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer again.deinit(std.testing.allocator);
+    try std.testing.expect(again.settings.permission_mode == .auto);
+    try std.testing.expectEqual(@as(usize, 0), again.diagnostics.len);
 }
 
 test "detailed settings treat a missing home as read-only absence" {

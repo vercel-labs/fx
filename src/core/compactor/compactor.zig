@@ -34,6 +34,7 @@ const trace = @import("trace.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
+const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -296,6 +297,9 @@ fn appendItems(arena: Allocator, items: *std.ArrayList(summarize.Item), message:
     if (isTurnContext(message)) return;
     const content = message.content orelse "";
     switch (message.role) {
+        // A saved turn's context notes come back as system messages, which
+        // are fx's context, not the conversation, and never reach the
+        // summarizer's messages (D93).
         .system => {},
         .user => if (message.context_origin == .user_turn) {
             try items.append(arena, .{ .user = content });
@@ -330,7 +334,7 @@ const question_tool = "ask_user_question";
 /// not list answers, as when the question was not answered.
 fn questionAnswers(arena: Allocator, output: []const u8) Allocator.Error![]const []const u8 {
     const Answered = struct { answer: []const u8 };
-    const answered = std.json.parseFromSliceLeaky([]const Answered, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+    const answered = json_decode.parseFromSliceLeaky([]const Answered, arena, output, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return &.{},
     };

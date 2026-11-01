@@ -95,6 +95,19 @@ export function parseSingleChildPid(output: string, parentPid: number): number {
   return pid;
 }
 
+/// A process's whole command line. `-ww` keeps ps from cutting it to a
+/// terminal's width when its output is not a terminal.
+function processCommandLine(pid: number): string {
+  try {
+    return execFileSync("ps", ["-ww", "-o", "args=", "-p", String(pid)], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    return "";
+  }
+}
+
 export function buildObservedCommand(
   command: string,
   stderrPath: string | undefined,
@@ -1143,16 +1156,26 @@ export class TmuxSession {
     return value;
   }
 
+  /// The process of the command the session runs. The watcher shell that
+  /// records the exit status is not always the pane's own process: on Linux,
+  /// tmux's bash stays between the pane and the watcher. Every wrapper's command
+  /// line names this session's exit status file and the command's does not, so
+  /// the command is the first child down the chain that does not name it.
   processPid(): number {
-    const panePid = this.panePid();
-    let children = "";
-    try {
-      children = execFileSync("pgrep", ["-P", String(panePid)], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-    } catch {}
-    return parseSingleChildPid(children, panePid);
+    let parent = this.panePid();
+    for (let depth = 0; depth < 4; depth += 1) {
+      let children = "";
+      try {
+        children = execFileSync("pgrep", ["-P", String(parent)], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch {}
+      const child = parseSingleChildPid(children, parent);
+      if (!processCommandLine(child).includes(this.exitStatusPath)) return child;
+      parent = child;
+    }
+    throw new Error(`no command process under tmux pane ${this.panePid()}`);
   }
 
   historyLimit(): number {

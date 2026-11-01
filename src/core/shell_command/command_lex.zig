@@ -205,7 +205,15 @@ pub fn tokenize_argv(alloc: std.mem.Allocator, command: []const u8) !Argv {
         }
         if (ch == '\\' and !in_single) {
             if (i + 1 >= command.len) return error.MalformedEscape;
-            try value.append(alloc, command[i + 1]);
+            const next = command[i + 1];
+            // Inside double quotes, a backslash quotes only `$`, `` ` ``, `"`,
+            // `\`, and newline. Before any other character the shell keeps it.
+            const keeps_backslash = in_double and switch (next) {
+                '$', '`', '"', '\\', '\n' => false,
+                else => true,
+            };
+            if (keeps_backslash) try value.append(alloc, ch);
+            try value.append(alloc, next);
             i += 2;
             continue;
         }
@@ -606,6 +614,16 @@ test "tokenize_argv decodes single and double quoted tokens" {
     try std.testing.expectEqualStrings("hello world", argv.tokens[1].value);
     try std.testing.expectEqualStrings("file name.txt", argv.tokens[2].value);
     try std.testing.expect(argv.tokens[1].quoted);
+}
+
+test "tokenize_argv keeps a double-quoted backslash unless it quotes a special character" {
+    var argv = try tokenize_argv(std.testing.allocator, "printf \"a\\&b\" \"\\$x \\` \\\" \\\\\" a\\&b");
+    defer argv.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 4), argv.tokens.len);
+    try std.testing.expectEqualStrings("a\\&b", argv.tokens[1].value);
+    try std.testing.expectEqualStrings("$x ` \" \\", argv.tokens[2].value);
+    try std.testing.expectEqualStrings("a&b", argv.tokens[3].value);
 }
 
 test "tokenize_argv preserves raw byte offsets" {

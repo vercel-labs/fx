@@ -8,9 +8,6 @@ const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const tool_admission = @import("../tooling/tool_admission.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
-const pathing = @import("../workspace/pathing.zig");
-const debug_trace = @import("../shared/debug_trace.zig");
-const tool_args = @import("../tooling/tool_args.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;

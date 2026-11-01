@@ -244,6 +244,13 @@ pub const Dashboard = struct {
     /// atomic on wasm32; readers only compare it, so wrapping is harmless.
     generation: std.atomic.Value(usize) = .init(0),
     worker: ?std.Thread = null,
+    /// Runs each fetch inside `tick` and `waitForFetch` instead of on a worker
+    /// thread: always in single-threaded builds (wasm), and in tests of that
+    /// path.
+    inline_fetches: bool = builtin.single_threaded,
+    /// A fetch `inline_fetches` started, waiting for `tick` or `waitForFetch`
+    /// to run it outside the lock.
+    queued_job: ?Job = null,
     cancel: std.atomic.Value(bool) = .init(false),
 
     /// Comptime-callable, so an owner can hold a default dashboard.
@@ -261,6 +268,8 @@ pub const Dashboard = struct {
         self.joinWorker();
         self.mutex.lockUncancelable(self.io());
         defer self.mutex.unlock(self.io());
+        if (self.queued_job) |*job| job.deinit(self.gpa);
+        self.queued_job = null;
         if (self.session) |*s| s.deinit(self.gpa);
         self.session = null;
         if (self.entry) |*e| e.deinit();
@@ -305,10 +314,16 @@ pub const Dashboard = struct {
 
     /// Call from the event loop; starts the 15-minute refresh when due, and a
     /// new sign-in's first fetch once the previous sign-in's has finished.
+    /// With `inline_fetches`, it also runs the fetch `open`, `refresh` or this
+    /// call started, so call it only where the host's fetch may pulse the
+    /// event loop.
     pub fn tick(self: *Dashboard) void {
-        self.mutex.lockUncancelable(self.io());
-        defer self.mutex.unlock(self.io());
-        if (self.maybeStartLocked(if (self.fetch_owed) .open else .timer)) self.bump();
+        {
+            self.mutex.lockUncancelable(self.io());
+            defer self.mutex.unlock(self.io());
+            if (self.maybeStartLocked(if (self.fetch_owed) .open else .timer)) self.bump();
+        }
+        self.runQueuedFetch();
     }
 
     /// The host's clock, which snapshots are taken by.
@@ -366,7 +381,22 @@ pub const Dashboard = struct {
 
     /// Waits for the fetch in flight, if any. For `fx usage` and tests.
     pub fn waitForFetch(self: *Dashboard) void {
+        self.runQueuedFetch();
         self.joinWorker();
+    }
+
+    /// Runs a fetch `inline_fetches` queued, without the lock: while a request
+    /// waits, the host's fetch may pulse the event loop, which calls back into
+    /// the dashboard to redraw.
+    fn runQueuedFetch(self: *Dashboard) void {
+        const job = blk: {
+            self.mutex.lockUncancelable(self.io());
+            defer self.mutex.unlock(self.io());
+            const queued = self.queued_job orelse return;
+            self.queued_job = null;
+            break :blk queued;
+        };
+        runJob(self, job);
     }
 
     fn bump(self: *Dashboard) void {
@@ -517,9 +547,6 @@ pub const Dashboard = struct {
     }
 
     fn maybeStartLocked(self: *Dashboard, trigger: policy.Trigger) bool {
-        // Fetches run on a worker thread; single-threaded builds (wasm) show
-        // only what is cached.
-        if (comptime builtin.single_threaded) return false;
         const s = self.session orelse return false;
         const now = self.host.now_fn(self.host.ctx);
         if (!policy.due(trigger, self.is_open, self.fetch_state, now)) return false;
@@ -527,17 +554,25 @@ pub const Dashboard = struct {
         self.reloadEntryLocked();
         const finished_day: ?i64 = if (self.entry) |e| (if (e.entry.finished) |f| f.day else null) else null;
         const job = Job.init(self.gpa, s, policy.plan(s.scope, finished_day, now), now) catch return false;
-        // The previous worker has finished (in_flight is false); reap it.
-        if (self.worker) |t| {
-            t.join();
-            self.worker = null;
+        if (builtin.single_threaded or self.inline_fetches) {
+            // `open` and `refresh` only queue it, because a key read during
+            // a model turn can call them; `tick` or `waitForFetch` runs it
+            // once the lock is free.
+            self.cancel.store(false, .release);
+            self.queued_job = job;
+        } else {
+            // The previous worker has finished (in_flight is false); reap it.
+            if (self.worker) |t| {
+                t.join();
+                self.worker = null;
+            }
+            self.cancel.store(false, .release);
+            self.worker = std.Thread.spawn(.{}, runJob, .{ self, job }) catch {
+                var j = job;
+                j.deinit(self.gpa);
+                return false;
+            };
         }
-        self.cancel.store(false, .release);
-        self.worker = std.Thread.spawn(.{}, runJob, .{ self, job }) catch {
-            var j = job;
-            j.deinit(self.gpa);
-            return false;
-        };
         self.fetch_state.in_flight = true;
         self.fetch_state.last_start_ms = now;
         self.fetch_owed = false;
@@ -888,6 +923,10 @@ const FakeGateway = struct {
     count: usize = 0,
     /// While set, every request waits, so a test can keep a fetch in flight.
     held: std.atomic.Value(bool) = .init(false),
+    /// When set, every request first redraws and ticks this dashboard, as the
+    /// WebAssembly terminal's pulse does while a request waits.
+    reenter: ?*Dashboard = null,
+    reentries: usize = 0,
 
     const today_body = "{\"results\":[{\"model\":\"anthropic/claude-opus-5.5\",\"request_count\":10,\"input_tokens\":5,\"total_cost\":2.5}]}";
     const window_body = "{\"results\":[{\"model\":\"anthropic/claude-opus-5.5\",\"request_count\":90,\"total_cost\":40},{\"model\":\"openai/gpt-5.6-luna\",\"request_count\":7,\"total_cost\":0.5}]}";
@@ -922,6 +961,12 @@ const FakeGateway = struct {
 
     fn fetch(ctx: ?*anyopaque, alloc: Allocator, request: Request, _: *std.atomic.Value(bool)) FetchError!Response {
         const self: *FakeGateway = @ptrCast(@alignCast(ctx.?));
+        if (self.reenter) |dashboard| {
+            var redraw = try dashboard.snapshot(alloc);
+            redraw.deinit();
+            dashboard.tick();
+            self.reentries += 1;
+        }
         while (self.held.load(.acquire)) std.atomic.spinLoopHint();
         self.mutex.lockUncancelable(testing.io);
         defer self.mutex.unlock(testing.io);
@@ -1003,6 +1048,59 @@ test "opening shows the cache at once and fills it from AI Gateway in the backgr
     other.waitForFetch();
     // It already has today's finished days: only today and the budget.
     try testing.expectEqual(@as(usize, 2), other_gateway.count);
+}
+
+test "without a worker thread, tick runs the fetch open started, outside the lock" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    var gateway: FakeGateway = .{};
+    var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
+    dashboard.inline_fetches = true;
+    defer dashboard.deinit();
+    gateway.reenter = &dashboard;
+
+    dashboard.open(api_key);
+    // Opening only queues the fetch.
+    try testing.expectEqual(@as(usize, 0), gateway.count);
+    {
+        var queued = try dashboard.snapshot(testing.allocator);
+        defer queued.deinit();
+        try testing.expect(queued.status == .fetching);
+    }
+
+    dashboard.tick();
+    // Today and the finished week and month, each redrawing and ticking the
+    // dashboard while it waited, without starting another fetch.
+    try testing.expectEqual(@as(usize, 3), gateway.count);
+    try testing.expectEqual(@as(usize, 3), gateway.reentries);
+    var snap = try dashboard.snapshot(testing.allocator);
+    defer snap.deinit();
+    try testing.expect(snap.status == .ready);
+    try testing.expectApproxEqAbs(@as(f64, 2.5), snap.of(.today).totals.total_cost, 1e-9);
+
+    // `r` queues the next fetch, and `fx usage` runs one by waiting for it.
+    try testing.expect(dashboard.refresh());
+    try testing.expectEqual(@as(usize, 3), gateway.count);
+    dashboard.waitForFetch();
+    try testing.expectEqual(@as(usize, 4), gateway.count);
+}
+
+test "a fetch queued without a worker thread is freed if it never runs" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    var gateway: FakeGateway = .{};
+    var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
+    dashboard.inline_fetches = true;
+
+    dashboard.open(member);
+    dashboard.deinit();
+    try testing.expectEqual(@as(usize, 0), gateway.count);
+    // A second deinit finds nothing left to free.
+    dashboard.deinit();
 }
 
 test "a dashboard reads what another fx process stored since" {

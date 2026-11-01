@@ -1,0 +1,37 @@
+{
+  "libfx": {
+    "packed": 4042000,
+    "unpacked": 11647000
+  },
+  "fx-core.wasm": {
+    "bytes": 2465000
+  },
+  "fx-term.wasm": {
+    "bytes": 4254000
+  },
+  "engine.js": {
+    "gzip": 34600
+  },
+  "wasm-runtime.js": {
+    "gzip": 11000
+  },
+  "fx-sdk.js": {
+    "gzip": 490
+  },
+  "@libfx/libfx-darwin-arm64": {
+    "packed": 3992000,
+    "unpacked": 8520000
+  },
+  "@libfx/libfx-darwin-x64": {
+    "packed": 4359000,
+    "unpacked": 9821000
+  },
+  "@libfx/libfx-linux-arm64-gnu": {
+    "packed": 4065000,
+    "unpacked": 8456000
+  },
+  "@libfx/libfx-linux-x64-gnu": {
+    "packed": 4302000,
+    "unpacked": 9942000
+  }
+}

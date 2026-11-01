@@ -21,6 +21,16 @@ pub const StructuredResponseFormat = struct {
 
 const pending_tool_review_result_text = "Tool call has not executed; it is pending permission review.";
 
+/// Marks a system message as the end of a cacheable prefix. AI Gateway passes
+/// it to the provider alongside its own `caching: "auto"` markers; Anthropic
+/// accepts at most four markers per request, and fx adds at most two.
+const anthropic_cache_breakpoint = ",\"providerOptions\":{\"anthropic\":{\"cacheControl\":{\"type\":\"ephemeral\"}}}";
+
+/// The same mark for OpenAI GPT-5.6 and later: an explicit breakpoint beside
+/// the implicit one. A request makes at most four cache writes, the implicit
+/// breakpoint takes one, and fx adds at most two.
+const openai_cache_breakpoint = ",\"providerOptions\":{\"openai\":{\"promptCacheBreakpoint\":{\"mode\":\"explicit\"}}}";
+
 pub fn roleName(role: ChatRole) []const u8 {
     return switch (role) {
         .system => "system",
@@ -35,7 +45,7 @@ fn writeChatMessageJson(
     writer: *std.Io.Writer,
     message: ChatMessage,
 ) !void {
-    writeChatMessageJsonInner(scratch_alloc, writer, message, null, null, &.{}) catch |err| return err;
+    writeChatMessageJsonInner(scratch_alloc, writer, message, null, null, &.{}, .none) catch |err| return err;
 }
 
 pub fn buildGatewayRequestBody(
@@ -308,6 +318,28 @@ fn reasoningWireValue(label: []const u8) []const u8 {
     return label;
 }
 
+/// Writes the leading system messages as one, in order and joined by a blank
+/// line, for a model that takes a single system message. Returns how many
+/// messages it wrote, 0 when the prompt starts with another role. Such a model
+/// takes no cache markers, so none is lost.
+fn writeJoinedLeadingSystem(alloc: std.mem.Allocator, writer: *std.Io.Writer, messages: []const ChatMessage) !usize {
+    var end: usize = 0;
+    while (end < messages.len and messages[end].role == .system and !messages[end].context_note) end += 1;
+    if (end == 0) return 0;
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(alloc);
+    for (messages[0..end]) |message| {
+        const content = message.content orelse continue;
+        if (content.len > 0) try parts.append(alloc, content);
+    }
+    const joined = try std.mem.join(alloc, "\n\n", parts.items);
+    defer alloc.free(joined);
+    try writer.writeAll("{\"role\":\"system\",\"content\":");
+    try std.json.Stringify.value(joined, .{}, writer);
+    try writer.writeByte('}');
+    return end;
+}
+
 fn buildGatewayRequestBodyValidated(
     alloc: std.mem.Allocator,
     tools_json: []const u8,
@@ -323,7 +355,8 @@ fn buildGatewayRequestBodyValidated(
     var saw_conversation = false;
     for (messages) |message| {
         if (message.role == .system) {
-            if (saw_conversation) return error.InvalidGatewayHistory;
+            // Only a context note follows the conversation's start (D93).
+            if (saw_conversation and !message.context_note) return error.InvalidGatewayHistory;
         } else {
             saw_conversation = true;
         }
@@ -336,6 +369,7 @@ fn buildGatewayRequestBodyValidated(
 
     try out.writer.writeAll("{\"prompt\":[");
     var i: usize = 0;
+    if (options.single_system_message) i = try writeJoinedLeadingSystem(alloc, &out.writer, messages);
     while (i < messages.len) {
         const message = messages[i];
         if (budget) |active| try active.check();
@@ -359,6 +393,10 @@ fn buildGatewayRequestBodyValidated(
             budget,
             verified_images,
             &ids,
+            // A marker belongs only to a request that asks the Gateway to
+            // cache; helpers on provider defaults send none. A context note
+            // never carries one.
+            if (options.prompt_caching and !message.context_note) options.cache_markers else .none,
         );
         if (budget) |active| try active.check();
         i += 1;
@@ -461,7 +499,8 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
         if (!allows_openai) return error.UltrafastProviderRestricted;
     }
     const gateway_options = options.fast or options.ultrafast or options.prompt_caching or routing;
-    if (!gateway_options and options.parallel_tool_calls == null) return;
+    const openai_options = options.ultrafast or options.skip_cache_writes;
+    if (!gateway_options and !openai_options and options.parallel_tool_calls == null) return;
 
     try writer.writeAll(",\"providerOptions\":{");
     if (gateway_options) {
@@ -490,16 +529,40 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
         }
         try writer.writeByte('}');
     }
-    if (options.ultrafast) {
-        try writer.writeAll(",\"openai\":{\"serviceTier\":\"ultrafast\"}");
+    if (openai_options) {
+        if (gateway_options) try writer.writeByte(',');
+        try writer.writeAll("\"openai\":{");
+        if (options.ultrafast) try writer.writeAll("\"serviceTier\":\"ultrafast\"");
+        if (options.skip_cache_writes) {
+            if (options.ultrafast) try writer.writeByte(',');
+            try writer.writeAll("\"promptCacheOptions\":{\"mode\":\"explicit\"}");
+        }
+        try writer.writeByte('}');
     }
     if (options.parallel_tool_calls) |parallel_tool_calls| {
-        if (gateway_options) try writer.writeByte(',');
+        if (gateway_options or openai_options) try writer.writeByte(',');
         try writer.writeAll("\"xai\":{\"parallelToolCalls\":");
         try writer.writeAll(if (parallel_tool_calls) "true" else "false");
         try writer.writeByte('}');
     }
     try writer.writeByte('}');
+}
+
+test "skipping cache writes asks OpenAI for explicit caching with no breakpoints" {
+    var alone: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer alone.deinit();
+    try writeProviderOptions(&alone.writer, .{ .skip_cache_writes = true });
+    try std.testing.expectEqualStrings(",\"providerOptions\":{\"openai\":{\"promptCacheOptions\":{\"mode\":\"explicit\"}}}", alone.written());
+
+    var combined: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer combined.deinit();
+    try writeProviderOptions(&combined.writer, .{ .ultrafast = true, .skip_cache_writes = true, .parallel_tool_calls = false });
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, combined.written()[",\"providerOptions\":".len..], .{});
+    defer parsed.deinit();
+    const openai = parsed.value.object.get("openai").?.object;
+    try std.testing.expectEqualStrings("ultrafast", openai.get("serviceTier").?.string);
+    try std.testing.expectEqualStrings("explicit", openai.get("promptCacheOptions").?.object.get("mode").?.string);
+    try std.testing.expect(parsed.value.object.get("xai") != null);
 }
 
 test "Ultrafast serializes only the OpenAI tier and strict OpenAI routing" {
@@ -758,6 +821,7 @@ fn writeChatMessageJsonInner(
     budget: ?BuildBudget,
     verified_images: ?[]const image_attachments.VerifiedSnapshot,
     ids: *const tool_call_ids.Projection,
+    cache_markers: model_capabilities.CacheMarkers,
 ) !void {
     try writer.writeAll("{\"role\":");
     try std.json.Stringify.value(roleName(message.role), .{}, writer);
@@ -776,6 +840,11 @@ fn writeChatMessageJsonInner(
             } else {
                 try writer.writeAll("\"\"");
             }
+            if (message.cache_breakpoint) try writer.writeAll(switch (cache_markers) {
+                .none => "",
+                .anthropic => anthropic_cache_breakpoint,
+                .openai => openai_cache_breakpoint,
+            });
         },
         .user => {
             try writer.writeAll(",\"content\":[");
@@ -1872,6 +1941,86 @@ test "formatGatewayRequestShapeSummary reports content kinds without request con
 
     try std.testing.expect(std.mem.find(u8, mutated_summary, "prompt.0 role=system content=array") != null);
     try std.testing.expect(std.mem.find(u8, mutated_summary, "SECRET_MUTATED_SYSTEM") == null);
+}
+
+test "a model that takes one system message gets the leading instructions joined, in order" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "read_file", .arguments_json = "{}" }};
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = "stable base" },
+        .{ .role = .system, .content = "" },
+        .{ .role = .system, .content = "turn context" },
+        .{ .role = .user, .content = "hello" },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "ok", .tool_call_id = "call_1", .tool_name = "read_file" },
+    };
+    for ([_]bool{ true, false }) |single| {
+        const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{ .single_system_message = single }, .auto);
+        defer alloc.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer parsed.deinit();
+        const prompt = parsed.value.object.get("prompt").?.array.items;
+        var systems: usize = 0;
+        for (prompt) |entry| systems += @intFromBool(std.mem.eql(u8, entry.object.get("role").?.string, "system"));
+        try std.testing.expectEqual(@as(usize, if (single) 1 else 3), systems);
+        if (single) {
+            // The stable text comes first, so the cached prefix still holds.
+            try std.testing.expectEqualStrings("stable base\n\nturn context", prompt[0].object.get("content").?.string);
+            try std.testing.expectEqualStrings("user", prompt[1].object.get("role").?.string);
+            try std.testing.expectEqual(@as(usize, 4), prompt.len);
+        }
+    }
+}
+
+test "Gateway request marks flagged system messages in the requested syntax only when it asks for caching" {
+    const alloc = std.testing.allocator;
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = "stable base", .cache_breakpoint = true },
+        .{ .role = .system, .content = "workspace rules" },
+        .{ .role = .system, .content = "stable end", .cache_breakpoint = true },
+        .{ .role = .system, .content = "turn context" },
+        // Only system instructions carry markers; a flag elsewhere is ignored.
+        .{ .role = .user, .content = "hello", .cache_breakpoint = true },
+    };
+
+    for ([_]model_capabilities.CacheMarkers{ .anthropic, .openai }) |markers| {
+        const cached = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, .{ .prompt_caching = true, .cache_markers = markers }, .auto);
+        defer alloc.free(cached);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, cached, .{});
+        defer parsed.deinit();
+        const prompt = parsed.value.object.get("prompt").?.array.items;
+        try std.testing.expectEqual(@as(usize, messages.len), prompt.len);
+        for (prompt, [_]bool{ true, false, true, false, false }) |entry, marked| {
+            const options = entry.object.get("providerOptions");
+            try std.testing.expectEqual(marked, options != null);
+            if (options) |value| {
+                try std.testing.expectEqual(@as(usize, 1), value.object.count());
+                // A marker in the wrong syntax fails here, not on a null unwrap.
+                const marker, const field, const expected = switch (markers) {
+                    .anthropic => .{ "anthropic", "cacheControl", "ephemeral" },
+                    .openai => .{ "openai", "promptCacheBreakpoint", "explicit" },
+                    .none => unreachable,
+                };
+                const provider = value.object.get(marker) orelse return error.TestExpectedCacheMarkerSyntax;
+                const setting = provider.object.get(field) orelse return error.TestExpectedCacheMarkerSyntax;
+                const kind = setting.object.get(if (markers == .anthropic) "type" else "mode") orelse return error.TestExpectedCacheMarkerSyntax;
+                try std.testing.expectEqualStrings(expected, kind.string);
+            }
+        }
+        try std.testing.expectEqualStrings("auto", parsed.value.object.get("providerOptions").?.object.get("gateway").?.object.get("caching").?.string);
+    }
+
+    // No syntax, or no caching request, writes no marker in any syntax.
+    for ([_]model_capabilities.ResolvedProviderOptions{
+        .{ .prompt_caching = true },
+        .{ .cache_markers = .anthropic },
+        .{ .cache_markers = .openai },
+    }) |options| {
+        const body = try buildGatewayRequestBodyWithOptions(alloc, "[]", &messages, options, .auto);
+        defer alloc.free(body);
+        try std.testing.expect(std.mem.find(u8, body, "cacheControl") == null);
+        try std.testing.expect(std.mem.find(u8, body, "promptCacheBreakpoint") == null);
+    }
 }
 
 test "buildGatewayRequestBodyWithOptions leaves one-shot caching to the provider" {

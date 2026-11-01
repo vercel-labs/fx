@@ -1493,7 +1493,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await ctx.session.waitForText("Permission needed", TIMEOUT);
 
       await ctx.session.sendKeys("Escape");
-      const cancelled = await ctx.session.waitForText("■ Cancelled", TIMEOUT);
+      const cancelled = await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
       expect(cancelled).not.toContain(APPROVAL_PROMPT);
 
       await ctx.session.resizeWindow(72, 20);
@@ -2626,13 +2626,13 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const ctx = await openQuestionPrompt("raw question cancellation completed");
 
       await ctx.session.sendKeys("Escape");
-      const cancelled = await ctx.session.waitForText("■ Cancelled", TIMEOUT);
-      expect(countOccurrences(cancelled, "■ Cancelled")).toBe(1);
+      const cancelled = await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
+      expect(countOccurrences(cancelled, "▪ Cancelled")).toBe(1);
       expect(cancelled).not.toContain(QUESTION_PROMPT);
       expect(cancelled).not.toContain("raw question cancellation completed");
       const cancelledGrid = await ctx.session.capturePaneGrid();
       const footer = findFooterBlocks(cancelledGrid).at(-1);
-      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("■ Cancelled"));
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
       expect(footer).toBeDefined();
       expect(cancelledRow).toBeGreaterThanOrEqual(0);
       expect(cancelledRow).toBeLessThan(footer!.topDivider);
@@ -2686,13 +2686,13 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         (grid) => {
           const footer = findFooterBlocks(grid).at(-1);
           return (
-            grid.some((row) => row.includes("■ Cancelled")) &&
+            grid.some((row) => row.includes("▪ Cancelled")) &&
             footer?.bottomDivider === grid.length - 2
           );
         },
       );
       const cancelledFooter = findFooterBlocks(cancelledGrid).at(-1);
-      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("■ Cancelled"));
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
       expect(cancelledFooter).toBeDefined();
       expect(cancelledRow).toBeGreaterThanOrEqual(0);
       expect(cancelledRow).toBeLessThan(cancelledFooter!.topDivider);
@@ -2716,7 +2716,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       );
       const editedFooter = findFooterBlocks(editedGrid).at(-1);
       expect(editedFooter).toEqual(cancelledFooter);
-      expect(countOccurrences(editedGrid.join("\n"), "■ Cancelled")).toBe(1);
+      expect(countOccurrences(editedGrid.join("\n"), "▪ Cancelled")).toBe(1);
       expect(editedGrid.join("\n")).not.toContain(QUESTION_PROMPT);
       expect(ctx.gateway.requests).toHaveLength(2);
       await assertProcessAliveAndClean(ctx);
@@ -2731,8 +2731,8 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const ctx = await openQuestionPrompt("kitty question cancellation completed");
 
       await ctx.session.sendHexBytes(CSI_U_ESCAPE);
-      const cancelled = await ctx.session.waitForText("■ Cancelled", TIMEOUT);
-      expect(countOccurrences(cancelled, "■ Cancelled")).toBe(1);
+      const cancelled = await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
+      expect(countOccurrences(cancelled, "▪ Cancelled")).toBe(1);
       expect(cancelled).not.toContain(QUESTION_PROMPT);
       expect(cancelled).not.toContain("kitty question cancellation completed");
 

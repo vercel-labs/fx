@@ -31,8 +31,7 @@ const wasmInternals = new Set(["checkPromptInput", "coreAnswered", "engineIntern
 
 // Each specifier as a consumer resolves it, the declaration file it must
 // reach, and the module whose runtime exports that file must match. node.cjs
-// is built from node.js (sdk/scripts/build-node-cjs.mjs), so the `require`
-// entry is checked against node.js.
+// exports node.js itself, so the `require` entry is checked against node.js.
 const entries = [
   { specifier: "libfx", resolution: "node16", mode: "import", types: "types/node.d.ts", runtime: "node.js" },
   { specifier: "libfx", resolution: "node16", mode: "require", types: "types/node.d.cts", runtime: "node.js" },

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createConfiguredProviderFixture, completion as configuredCompletion, toolCompletion as configuredToolCompletion } from "./fixtures/chat-completions";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -128,6 +129,59 @@ describe.skipIf(!tmuxAvailable())("config persistence", () => {
     session = null;
     secondSession = null;
   });
+
+  serialTest("a profile folder other users can write is tightened, loaded, and noted once", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-loose-profile-"));
+    const gateway = startFakeGateway([]);
+    try {
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const profile = join(home, ".fx");
+      const settingsPath = join(profile, "settings.json");
+      mkdirSync(profile, { recursive: true });
+      mkdirSync(workspace);
+      // What `mkdir ~/.fx` and an editor leave behind under umask 0002.
+      chmodSync(profile, 0o775);
+      writeFileSync(settingsPath, JSON.stringify({ permission_mode: "auto" }) + "\n");
+      chmodSync(settingsPath, 0o664);
+      const env = {
+        ...NO_AUTH,
+        HOME: home,
+        AI_GATEWAY_API_KEY: "test-key",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+      };
+      const launch = async (label: string) => {
+        const stderrPath = join(root, `${label}-stderr.log`);
+        session = await TmuxSession.create({ cwd: workspace, env, stderrPath });
+        await session.waitForComposer(TIMEOUT);
+        await Bun.sleep(300);
+        const pane = await session.captureFullScrollback();
+        await session.kill();
+        session = null;
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        return pane;
+      };
+
+      const first = await launch("first");
+      expect(first).toContain("note: Other users could write to ~/.fx");
+      // The settings loaded, so nothing reports a configuration issue.
+      expect(first).not.toContain("configuration issue");
+      // No one else can write to either any more.
+      expect(statSync(profile).mode & 0o022).toBe(0);
+      expect(statSync(settingsPath).mode & 0o022).toBe(0);
+
+      const second = await launch("second");
+      expect(second).not.toContain("Other users could write");
+      expect(second).not.toContain("configuration issue");
+    } finally {
+      await session?.kill();
+      session = null;
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 3);
 
   serialTest("configured provider interactive unsafe profile permits inspection but blocks model sends", async () => {
     const fixture = createConfiguredProviderFixture();

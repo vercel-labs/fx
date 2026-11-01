@@ -1065,6 +1065,34 @@ test.skipIf(!tmuxAvailable())(
   TIMEOUT,
 );
 
+test("shell TTY timeout stops a nested interactive shell before its next command", async () => {
+  const fixture = createFixture("fx-shell-tty-timeout-tree-");
+  const pidFile = join(fixture.root, "nested-shell.pid");
+  const marker = join(fixture.root, "after-timeout");
+  const gateway = startFakeGateway([
+    // An interactive bash moves itself and its job out of the terminal's
+    // process group, so killing only that group leaves it to run `touch`.
+    ttyRun(
+      "shell_tty_tree_timeout_run",
+      `bash --norc --noprofile -i -c 'printf %s $$ > ${pidFile}; sleep 3; touch ${marker}'`,
+      { yield_time_ms: 30_000, timeout_ms: 1_000 },
+    ),
+    fakeGatewayFinalText("TREE_TIMEOUT_DONE"),
+  ]);
+  gateways.push(gateway);
+
+  const result = await runFx(["ask", "--json", "Run the nested shell."], {
+    cwd: fixture.workspace,
+    env: askEnv(fixture, gateway),
+    timeoutMs: TIMEOUT,
+  });
+  expect(result.code).toBe(0);
+  const runResult = toolResultEnvelope(gateway.requests[1]!.body, "shell_tty_tree_timeout_run");
+  expect(runResult).toContain('\\"error\\":\\"TimeoutExpired\\"');
+  await waitUntilGone([Number(readFileSync(pidFile, "utf8"))], 1_000);
+  expect(existsSync(marker)).toBe(false);
+}, TIMEOUT);
+
 test.skipIf(!tmuxAvailable())(
   "quit ends a managed TTY and resume reports it as ended",
   async () => {

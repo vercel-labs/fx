@@ -26,6 +26,8 @@ import {
 } from "./tmux-helpers";
 
 const SKIP = !tmuxAvailable();
+// The persistence fault comes from a library the loader preloads into fx.
+const PRELOADS_LIBRARIES = loadsPreloadedLibraries(FX_BIN);
 const TIMEOUT = 30_000;
 const TRACE_SCOPES = "agent,worker,gateway,history,interrupt,prompt";
 const PARTIAL_CHUNKS = [
@@ -50,6 +52,22 @@ let session: TmuxSession | null = null;
 let gateway: GatewayHandle | null = null;
 let root: string | null = null;
 
+// A static Linux binary has no ELF interpreter, so nothing acts on
+// LD_PRELOAD. macOS binaries always load through dyld.
+function loadsPreloadedLibraries(binary: string): boolean {
+  if (process.platform !== "linux" || !existsSync(binary)) return true;
+  const elf = readFileSync(binary);
+  const PT_INTERP = 3;
+  if (elf.readUInt32BE(0) !== 0x7f454c46 || elf[4] !== 2 || elf[5] !== 1) return true;
+  const offset = Number(elf.readBigUInt64LE(0x20));
+  const size = elf.readUInt16LE(0x36);
+  const count = elf.readUInt16LE(0x38);
+  for (let i = 0; i < count; i++) {
+    if (elf.readUInt32LE(offset + i * size) === PT_INTERP) return true;
+  }
+  return false;
+}
+
 afterEach(async () => {
   if (session) {
     await session.kill();
@@ -64,7 +82,7 @@ afterEach(async () => {
 });
 
 describe.skipIf(SKIP)("tui: interrupt recovery", () => {
-  for (const inject of [false, true]) test(`quit reports final history persistence failure with fault=${inject}`, async () => {
+  for (const inject of [false, true]) test.skipIf(inject && !PRELOADS_LIBRARIES)(`quit reports final history persistence failure with fault=${inject}`, async () => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "fx-shutdown-save-")));
     const home = join(root, "home"), workspace = join(root, "workspace");
     mkdirSync(home); mkdirSync(workspace);
@@ -113,7 +131,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         expect(readFileSync(receipt, "utf8")).toContain(`target=${eventPath}`);
         expect(readFileSync(tracePath, "utf8")).toContain("shutdown finished prompt persistence failed");
         expect(session.paneStatus().status).toBe(1);
-        expect(output + stderr).toMatch(/save.*fail|fail.*sav|could not.*sav|unable to.*sav/i);
+        expect(output + stderr).toMatch(/save.*fail|fail.*sav|could not.*sav|couldn.t.*sav|unable to.*sav/i);
       } else { expect(session.paneStatus().status).toBe(0); expect(stderr).toBe(""); }
       expect(readFileSync(eventPath).subarray(0, saved.length).equals(saved)).toBe(true);
       const resumed = await runFx(["ask", "--json", "--resume-id", id, "Continue without repeating work."], {
@@ -532,7 +550,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await session.waitForText("What should change?", TIMEOUT);
       const cancelledGrid = await session.capturePaneGrid();
       const footer = findFooterBlocks(cancelledGrid).at(-1);
-      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("■ Cancelled"));
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
       expect(footer).toBeDefined();
       expect(cancelledRow).toBeGreaterThanOrEqual(0);
       expect(cancelledRow).toBeLessThan(footer!.topDivider);
@@ -725,7 +743,7 @@ while :; do sleep 1; done
         TIMEOUT,
       );
       expect(Date.now() - cancelStartedAt).toBeLessThan(500);
-      expect(immediateCancellation).toContain("■ Cancelled");
+      expect(immediateCancellation).toContain("▪ Cancelled");
       expect(immediateCancellation).not.toContain("system: cancelled");
       expect(immediateCancellation).not.toContain("Cancelling");
       await waitForTrace(

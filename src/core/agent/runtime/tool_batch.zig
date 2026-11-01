@@ -2,6 +2,7 @@ const std = @import("std");
 const observation = @import("observation.zig");
 const types = @import("../../shared/types.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const io_mod = @import("../../shared/io.zig");
 const diff = @import("../../output/diff.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -97,6 +98,7 @@ pub fn appendToolResultContent(
         .tool_result_status = accounting.status orelse
             if (accounting.increment_error) .failure else .success,
         .tool_result_memory = memory,
+        .tool_result_created_at_ms = io_mod.milliTimestamp(),
     });
     if (accounting.record_completion) {
         try runtime_interruption.recordCompletedToolName(arena, completed_tool_names, tool_call.name);
@@ -382,6 +384,7 @@ pub fn processCommittedFileResult(
             model_output,
         ),
         .tool_result_memory = prepared_memory,
+        .tool_result_created_at_ms = io_mod.milliTimestamp(),
     });
     if (batch.observer) |observer| observer.emit(.{ .tool_result = .{
         .call = tool_call,

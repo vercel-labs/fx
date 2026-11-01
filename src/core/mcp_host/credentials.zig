@@ -27,6 +27,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const secret = @import("../auth/secret.zig");
+const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -352,7 +353,7 @@ const Doc = struct {
         };
         var arena: std.heap.ArenaAllocator = .init(alloc);
         defer arena.deinit();
-        const saved = try std.json.parseFromSliceLeaky(Saved, arena.allocator(), bytes, .{ .ignore_unknown_fields = true });
+        const saved = try json_decode.parseFromSliceLeaky(Saved, arena.allocator(), bytes, .{ .ignore_unknown_fields = true });
         if (saved.version != 1 and saved.version != 2) return error.UnsupportedVersion;
         var doc: Doc = .{};
         errdefer doc.deinit(alloc);

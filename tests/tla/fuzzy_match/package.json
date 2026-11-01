@@ -1,0 +1,8 @@
+{
+  "name": "fx-tla-fuzzy-match",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "verify": "bun ../drivers/fuzzy_match/verify.ts"
+  }
+}

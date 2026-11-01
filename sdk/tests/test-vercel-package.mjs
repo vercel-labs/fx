@@ -3,10 +3,11 @@ import { strict as assert } from "node:assert";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { cp, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { nativeDirArgument, nativeTarballs } from "./native-package.mjs";
 import { serializeError } from "./package-report.mjs";
 
 const input = process.argv[2];
@@ -57,6 +58,27 @@ try {
   if (input.endsWith(".tgz")) {
     await cp(resolve(input), resolve(app, "libfx.tgz"));
     manifest.dependencies.libfx = "file:./libfx.tgz";
+    // A local libfx has no published platform packages, so its optional
+    // dependencies point at local tarballs. The deployment installs the
+    // Linux one. pnpm 10 reads package.json overrides; pnpm 11 reads them
+    // only from pnpm-workspace.yaml.
+    const nativeDir = nativeDirArgument();
+    assert.ok(nativeDir, "a local tarball needs --native-dir <dir of platform package tarballs>");
+    const overrides = {};
+    for (const [name, path] of Object.entries(nativeTarballs(nativeDir))) {
+      await cp(path, resolve(app, basename(path)));
+      overrides[name] = `file:./${basename(path)}`;
+    }
+    assert.ok(overrides["@libfx/libfx-linux-x64-gnu"], `${nativeDir} has no @libfx/libfx-linux-x64-gnu tarball`);
+    manifest.pnpm = { overrides };
+    await writeFile(resolve(app, "pnpm-workspace.yaml"), `overrides:\n${Object.entries(overrides)
+      .map(([name, spec]) => `  ${JSON.stringify(name)}: ${JSON.stringify(spec)}`).join("\n")}\n`);
+    // pnpm 11 cannot install from a lockfile that names another platform's
+    // local tarball: it links the skipped package's bins and fails with
+    // ENOTDIR. The deployment gets no lockfile and resolves fresh, as
+    // test-next-package.mjs installs.
+    await rm(resolve(app, "pnpm-lock.yaml"), { force: true });
+    await writeFile(resolve(app, "vercel.json"), JSON.stringify({ installCommand: `npx --yes ${manifest.packageManager} install` }));
   } else {
     assert.match(input, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/, "pin an immutable version, not a tag");
     manifest.dependencies.libfx = input;
@@ -64,7 +86,9 @@ try {
   if (next15) manifest.dependencies.next = "15.5.25";
   if (webpack && !next15) manifest.scripts.build = "next build --webpack";
   await writeFile(resolve(app, "package.json"), JSON.stringify(manifest, null, 2));
-  await run(process.env.PNPM_BIN || "pnpm", ["install", "--lockfile-only", "--no-frozen-lockfile", "--ignore-scripts"], "prepare");
+  if (!input.endsWith(".tgz")) {
+    await run(process.env.PNPM_BIN || "pnpm", ["install", "--lockfile-only", "--no-frozen-lockfile", "--ignore-scripts"], "prepare");
+  }
   await mkdir(resolve(app, ".vercel"));
   await writeFile(resolve(app, ".vercel/project.json"), JSON.stringify({ projectId, orgId }));
   const output = await vercel([

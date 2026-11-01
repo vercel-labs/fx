@@ -27,8 +27,12 @@ jobs:
     timeout-minutes: 120
     env:
       # Report every race, keep running, and leave the exit status to the
-      # tests themselves.
-      TSAN_OPTIONS: halt_on_error=0:abort_on_error=0:exitcode=0
+      # tests themselves. The unit tests run each command through the
+      # installed fx, which is sanitized too, and by default a sanitized
+      # process that still has other threads waits a second before it exits.
+      # That wait would hold every command open past what the command tests
+      # time, so it is off.
+      TSAN_OPTIONS: halt_on_error=0:abort_on_error=0:exitcode=0:atexit_sleep_ms=0
     steps:
       - uses: actions/checkout@v4
 

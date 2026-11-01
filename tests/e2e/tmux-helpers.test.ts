@@ -50,6 +50,45 @@ test("launched process PID parsing requires one direct child", () => {
   );
 });
 
+tmuxTest("the launched process PID skips a shell that runs the pane command as a child", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "fx-pane-shell-"));
+  // tmux starts the pane through its default shell. This one runs the
+  // command as a child instead of replacing itself, as bash does on Linux.
+  const shell = join(dir, "child-shell");
+  writeFileSync(shell, '#!/bin/sh\n/bin/sh -c "$2"\nexit $?\n', { mode: 0o755 });
+  const savedShell = process.env.SHELL;
+  process.env.SHELL = shell;
+  let session: TmuxSession | undefined;
+  try {
+    session = await TmuxSession.create({ cmd: "sleep 30", startupWaitMs: 200, isolated: true });
+  } finally {
+    if (savedShell === undefined) delete process.env.SHELL;
+    else process.env.SHELL = savedShell;
+  }
+  try {
+    // The watcher starts the command just after the pane starts.
+    let pid = 0;
+    const deadline = Date.now() + 5_000;
+    while (pid === 0) {
+      try {
+        pid = session.processPid();
+      } catch (err) {
+        if (Date.now() > deadline) throw err;
+        await Bun.sleep(25);
+      }
+    }
+    const name = execFileSync("ps", ["-o", "comm=", "-p", String(pid)], { encoding: "utf8" }).trim();
+    expect(name.split("/").at(-1)).toBe("sleep");
+    // The pane's direct child is the watcher shell, not the command.
+    const panePid = session.panePid();
+    const paneChild = parseSingleChildPid(execFileSync("pgrep", ["-P", String(panePid)], { encoding: "utf8" }), panePid);
+    expect(paneChild).not.toBe(pid);
+  } finally {
+    await session.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("held gateway response disposes before it is requested", async () => {
   const held = heldFakeGatewayFinalText();
 

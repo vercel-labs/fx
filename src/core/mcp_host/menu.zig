@@ -6,6 +6,7 @@
 //! TLA+ model: `tests/tla/mcp_host/HostLifecycle.tla`.
 
 const std = @import("std");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const runtime = @import("runtime.zig");
 
@@ -82,10 +83,16 @@ pub fn choices(row: Row, out: *[max_choices]Choice) []const Choice {
     return out[0..n];
 }
 
-/// Case-insensitive, like fx's other pickers; an empty filter keeps everything.
-pub fn matches(name: []const u8, filter: []const u8) bool {
-    return filter.len == 0 or std.ascii.findIgnoreCase(name, filter) != null;
-}
+/// Servers match by name, as fx's other menus match, and the list keeps its
+/// own order (`fuzzy_match.Filter`); an empty filter keeps everything.
+const ServerMatches = struct {
+    rows: []const Row,
+    filter: []const u8,
+
+    pub fn matchAt(self: ServerMatches, position: usize) ?fuzzy_match.Match {
+        return fuzzy_match.match(self.filter, &.{.{ .text = self.rows[position].status.name }});
+    }
+};
 
 /// What the menu knows of the open server's tools.
 pub const Tools = union(enum) {
@@ -98,10 +105,20 @@ pub const Tools = union(enum) {
 
 pub const Tool = struct { name: []const u8, description: []const u8 };
 
-/// A tool matches by its name or by what it says it does, so a terse name is
-/// still found.
-pub fn toolMatches(t: Tool, filter: []const u8) bool {
-    return matches(t.name, filter) or matches(t.description, filter);
+/// A tool matches by its name or by the words of what it says it does, so a
+/// terse name is still found.
+const ToolMatches = struct {
+    tools: []const Tool,
+    filter: []const u8,
+
+    pub fn matchAt(self: ToolMatches, position: usize) ?fuzzy_match.Match {
+        const t = self.tools[position];
+        return fuzzy_match.match(self.filter, &.{ .{ .text = t.name }, .{ .text = t.description, .kind = .text } });
+    }
+};
+
+fn toolFilter(tools: []const Tool, filter: []const u8) fuzzy_match.Filter(ToolMatches) {
+    return .init(.{ .tools = tools, .filter = filter }, tools.len);
 }
 
 /// How many tools `filter` keeps.
@@ -110,20 +127,12 @@ pub fn toolCount(tools: Tools, filter: []const u8) usize {
         .ready => |t| t,
         else => return 0,
     };
-    var n: usize = 0;
-    for (all) |t| n += @intFromBool(toolMatches(t, filter));
-    return n;
+    return toolFilter(all, filter).count();
 }
 
 /// The `n`th tool `filter` keeps.
 pub fn nthTool(tools: []const Tool, filter: []const u8, n: usize) ?Tool {
-    var seen: usize = 0;
-    for (tools) |t| {
-        if (!toolMatches(t, filter)) continue;
-        if (seen == n) return t;
-        seen += 1;
-    }
-    return null;
+    return tools[toolFilter(tools, filter).at(n) orelse return null];
 }
 
 /// A server's screen below its title: its facts and a blank, its choices,
@@ -276,15 +285,16 @@ pub fn viewOf(s: *const State, rows: []const Row, filter: []const u8, tools: Too
     var n: usize = 0;
     var open_row: ?Row = null;
     var attention_start: usize = 0;
+    const servers: fuzzy_match.Filter(ServerMatches) = .init(.{ .rows = rows, .filter = filter }, rows.len);
     // The servers that work first, then the ones that need attention, each
     // group by name.
     for ([_]bool{ false, true }) |attention_pass| {
         if (attention_pass) attention_start = n;
         const group_start = n;
-        for (rows) |r| {
+        for (rows, 0..) |r, position| {
             if (needsAttention(r.status) != attention_pass) continue;
             if (s.screen != .list and std.mem.eql(u8, r.status.name, s.selectedName())) open_row = r;
-            if (n == buf.len or !matches(r.status.name, filter)) continue;
+            if (n == buf.len or !servers.keeps(position)) continue;
             buf[n] = r;
             n += 1;
         }
@@ -434,6 +444,10 @@ fn keepVisible(s: *State, l: Layout) void {
 
 /// How long news of a sign-in stays on the status line.
 pub const news_ms: i64 = 5000;
+
+/// The link a waiting sign-in offers when the browser didn't open, in the
+/// transcript and on the server's screen alike.
+pub const sign_in_link_label = "Open the sign-in page";
 
 /// The longest the status line waits for servers to finish starting.
 pub const startup_quiet_ms: i64 = 10_000;
@@ -665,14 +679,29 @@ test "a server's choices start with its next step and end with Remove" {
     try testing.expect(!Choice.login.asks() and !Choice.logout.asks());
 }
 
-test "the filter is a case-insensitive part of the name" {
-    try testing.expect(matches("Linear", "lin"));
-    try testing.expect(matches("context7", ""));
-    try testing.expect(!matches("context7", "li"));
+test "the filter matches server names and tools as every menu does" {
+    const tools = [_]Tool{
+        .{ .name = "create_issue", .description = "Open a ticket" },
+        .{ .name = "close_issue", .description = "Close a ticket that is open" },
+    };
+    try testing.expectEqual(@as(usize, 1), toolCount(.{ .ready = &tools }, "createissue"));
+    try testing.expectEqual(@as(usize, 2), toolCount(.{ .ready = &tools }, "ticket open"));
+    try testing.expectEqual(@as(usize, 0), toolCount(.{ .ready = &tools }, "tkt"));
+    // `open a` is in the first description as typed, and in the second only
+    // word by word, so only the first is kept.
+    try testing.expectEqual(@as(usize, 1), toolCount(.{ .ready = &tools }, "open a"));
+    try testing.expectEqualStrings("create_issue", nthTool(&tools, "open a", 0).?.name);
+    try testing.expect(nthTool(&tools, "open a", 1) == null);
+
     const rows = [_]Row{ testRow("context7", .ready, .{}), testRow("linear", .ready, .{}) };
     var buf: [2]Row = undefined;
     var s: State = .{ .active = true };
     try testing.expectEqual(@as(usize, 1), viewOf(&s, &rows, "LIN", .loading, &buf).rows.len);
+    try testing.expectEqual(@as(usize, 2), viewOf(&s, &rows, "", .loading, &buf).rows.len);
+    // `li` is not in `context7`, only at the start of `linear`.
+    try testing.expectEqual(@as(usize, 1), viewOf(&s, &rows, "li", .loading, &buf).rows.len);
+    try testing.expectEqualStrings("linear", viewOf(&s, &rows, "li", .loading, &buf).rows[0].status.name);
+    try testing.expectEqualStrings("context7", viewOf(&s, &rows, "ctx7", .loading, &buf).rows[0].status.name);
     // The open server is found among all servers, whatever the filter.
     s.select("context7");
     s.screen = .server;

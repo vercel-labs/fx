@@ -55,8 +55,27 @@ jobs:
       - name: Check indexer boundary
         run: ./scripts/check-indexer-boundary.sh
 
+      - name: Check recovery boundary
+        run: ./scripts/check-recovery-boundary.sh
+
+      - name: Model-check request recovery
+        run: |
+          set -euo pipefail
+          jar="$RUNNER_TEMP/tla2tools.jar"
+          curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
+          TLA2TOOLS_JAR="$jar" tests/tla/recovery/check.sh
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Walk the recovery module along its model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/recovery/driver.ts --self-check
+
       - name: Test CI and release scripts
-        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_fuzz_nightly -q
+        run: python3 -m unittest scripts.tests.test_macos_signing scripts.tests.test_signed_macos scripts.tests.test_detect_macos_need scripts.tests.test_detect_ci_need scripts.tests.test_fuzz_nightly -q
 
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
@@ -94,7 +113,7 @@ jobs:
   zig:
     name: Build & Test
     if: ${{ always() }}
-    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-browser-wasm, tla-mcp]
+    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-package-guards, sdk-browser-wasm, tla-mcp]
     runs-on: ubuntu-latest
     steps:
       - name: Require unit tests and every SDK job
@@ -102,7 +121,7 @@ jobs:
           RESULTS: ${{ toJSON(needs.*.result) }}
         run: |
           printf '%s\n' "$RESULTS"
-          jq -e 'length == 6 and all(.[]; . == "success")' <<<"$RESULTS"
+          jq -e 'length == 7 and all(.[]; . == "success")' <<<"$RESULTS"
 
   build:
     name: Build fx (ReleaseSafe)
@@ -144,6 +163,30 @@ jobs:
           cache-key: ${{ steps.zig.outputs.cache-key }}
           cache-hit: ${{ steps.zig.outputs.cache-hit }}
 
+  # The durable-session model check in SDK (Bun + N-API/WASM) takes about 40
+  # minutes and the TLA+ MCP models and drivers about 20. A pull request runs
+  # each only when it changes the code that check covers; see
+  # scripts/detect-ci-need.sh. Pushes to main and manual dispatches always run
+  # both, so the main run that Publish libfx waits for includes them.
+  ci-need:
+    name: Detect CI need
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      libfx: ${{ steps.detect.outputs.libfx }}
+      mcp: ${{ steps.detect.outputs.mcp }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Decide which model checks this change needs
+        id: detect
+        env:
+          CI_NEED_REQUESTED: ${{ github.event_name == 'push' && 'push to main' || (github.event_name == 'workflow_dispatch' && 'manual dispatch' || '') }}
+        # A pull request's merge commit has the base branch as its first parent.
+        run: scripts/detect-ci-need.sh HEAD^1 HEAD
+
   sdk-wasm:
     name: SDK build (WASM)
     runs-on: ubuntu-latest
@@ -162,6 +205,17 @@ jobs:
         run: |
           zig build fx-core-wasm -Dwasm-surface=core -Doptimize=ReleaseSmall
           zig build fx-term-wasm -Dwasm-surface=term -Doptimize=ReleaseSmall
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      # The SDK jobs test the modules the package ships, after wasm-opt.
+      - name: Shrink WASM surfaces with wasm-opt
+        run: |
+          npm ci --prefix sdk/tools
+          node sdk/scripts/optimize-wasm.mjs zig-out/bin/fx-core.wasm zig-out/bin/fx-term.wasm
 
       - name: Share WASM surfaces with SDK jobs
         uses: actions/upload-artifact@v4
@@ -331,7 +385,7 @@ jobs:
 
   sdk-bun:
     name: SDK (Bun + N-API/WASM)
-    needs: [sdk-wasm, sdk-napi]
+    needs: [ci-need, sdk-wasm, sdk-napi]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -389,6 +443,7 @@ jobs:
           bun sdk/tests/test-durable-core.mjs local
 
       - name: Model-check durable sessions and drive the code along the model
+        if: needs.ci-need.outputs.libfx == 'true'
         run: |
           set -euo pipefail
           jar="$RUNNER_TEMP/tla2tools.jar"
@@ -460,18 +515,20 @@ jobs:
           node --experimental-wasm-jspi sdk/tests/test-node-bundled-assets.mjs
           node sdk/tests/test-node-package.mjs
           node sdk/tests/test-term-demo-package.mjs
-          node sdk/scripts/package-libfx.mjs sdk/dist/libfx native-addons/libfx.linux-x64.node native-addons/libfx.linux-arm64.node native-addons/libfx.darwin-x64.node native-addons/libfx.darwin-arm64.node
+          node sdk/scripts/package-libfx.mjs sdk/dist native-addons/libfx.linux-x64.node native-addons/libfx.linux-arm64.node native-addons/libfx.darwin-x64.node native-addons/libfx.darwin-arm64.node
           node --experimental-wasm-jspi sdk/tests/test-node-async-assets.mjs sdk/dist/libfx
           npm pack ./sdk/dist/libfx --ignore-scripts --json > /tmp/libfx-pack.json
           mv "$(node -p 'require("/tmp/libfx-pack.json")[0].filename')" /tmp/libfx-package.tgz
-          node sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native esm
-          node --no-experimental-require-module sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native cjs
+          mkdir -p /tmp/libfx-native
+          for package in sdk/dist/libfx-*/; do npm pack "./$package" --ignore-scripts --pack-destination /tmp/libfx-native; done
+          node sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native esm --native-dir /tmp/libfx-native
+          node sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native cjs --native-dir /tmp/libfx-native
           node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz wasm esm
-          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz wasm cjs
+          node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz wasm cjs
 
       - name: Test package recovery and lifecycle boundaries
         run: |
-          node sdk/tests/test-package-resilience.mjs --package /tmp/libfx-package.tgz \
+          node sdk/tests/test-package-resilience.mjs --package /tmp/libfx-package.tgz --native-dir /tmp/libfx-native \
             --cheap-cycles 100 --tool-workflows 20 --duration-ms 5000 --concurrency 4 \
             --json-out "${{ runner.temp }}/libfx-package-evidence/resilience.json"
 
@@ -482,9 +539,9 @@ jobs:
         env:
           LIBFX_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/libfx-package-evidence
         run: |
-          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz
-          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --webpack
-          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --next15
+          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --native-dir /tmp/libfx-native
+          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --native-dir /tmp/libfx-native --webpack
+          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --native-dir /tmp/libfx-native --next15
 
       - name: Retain package qualification evidence
         if: always()
@@ -498,6 +555,68 @@ jobs:
             ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/*.log
             ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/results.json
           if-no-files-found: ignore
+
+  sdk-package-guards:
+    name: SDK package guards
+    needs: [sdk-wasm, sdk-napi]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Download WASM surfaces
+        uses: actions/download-artifact@v4
+        with:
+          name: sdk-wasm
+          path: zig-out/bin
+
+      - name: Download native addons
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sdk-napi-*
+          path: native-addons
+          merge-multiple: true
+
+      - name: Install the durable Worlds and the package test tools
+        run: |
+          npm ci --prefix sdk/durable
+          npm ci --prefix sdk/tests/tools
+
+      - name: Package libfx and its platform packages
+        run: |
+          node sdk/scripts/package-libfx.mjs sdk/dist native-addons/libfx.linux-x64.node native-addons/libfx.linux-arm64.node native-addons/libfx.darwin-x64.node native-addons/libfx.darwin-arm64.node
+          npm pack ./sdk/dist/libfx --ignore-scripts --json > /tmp/libfx-pack.json
+          mv "$(node -p 'require("/tmp/libfx-pack.json")[0].filename')" /tmp/libfx-package.tgz
+          mkdir -p /tmp/libfx-native
+          for package in sdk/dist/libfx-*/; do npm pack "./$package" --ignore-scripts --pack-destination /tmp/libfx-native; done
+
+      # With the platform package, Node.js loads no WebAssembly host code;
+      # with only the macOS package, libfx names the Linux one it needs.
+      - name: Check what Node.js loads from libfx
+        run: node sdk/tests/test-node-load-graph.mjs /tmp/libfx-package.tgz --native-dir /tmp/libfx-native
+
+      - name: Check browser bundles
+        run: node sdk/tests/test-browser-bundles.mjs /tmp/libfx-package.tgz
+
+      - name: Check package sizes
+        run: node sdk/tests/test-package-size.mjs /tmp/libfx-package.tgz --native-dir /tmp/libfx-native
+
+      # The subpaths other than libfx and libfx/node have always been ES
+      # modules only, which require() loads on the Node.js versions libfx
+      # supports.
+      - name: Lint the package and its types
+        run: |
+          sdk/tests/tools/node_modules/.bin/publint /tmp/libfx-package.tgz
+          sdk/tests/tools/node_modules/.bin/attw /tmp/libfx-package.tgz --profile node16 --ignore-rules cjs-resolves-to-esm
 
   sdk-browser-wasm:
     name: SDK (Browser + WASM)
@@ -531,7 +650,7 @@ jobs:
   # they measure the checks, not the code.
   tla-mcp:
     name: TLA+ MCP models and drivers
-    needs: build
+    needs: [build, ci-need]
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
@@ -562,6 +681,7 @@ jobs:
           printf 'set-option -g history-limit 100000\n' > "$HOME/.tmux.conf"
           tmux -V
       - name: Model-check the MCP engine and host, and drive the code along the models
+        if: needs.ci-need.outputs.mcp == 'true'
         run: |
           set -euo pipefail
           jar="$RUNNER_TEMP/tla2tools.jar"
@@ -768,6 +888,8 @@ jobs:
             scripts/check-compactor-boundary.sh
             scripts/check-indexer-boundary.sh
             scripts/check-public-surface.sh
+            scripts/check-recovery-boundary.sh
+            scripts/detect-ci-need.sh
             scripts/detect-macos-need.sh
             scripts/smoke-binary.sh
             tests/e2e/ci-run-files.sh

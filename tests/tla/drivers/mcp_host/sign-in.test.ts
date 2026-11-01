@@ -6,10 +6,12 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { artifacts, binary } from "../lib/context";
+import { artifacts, binary, targetModule } from "../lib/context";
 import { BUN, cliLogin, fixture, probe, redemptions, save, startFake, stdioServer, waitFor, writeProfile } from "./driver";
 import { Shell } from "./shell";
 import { checkTrace, type TraceRecord } from "./trace";
+
+const { stdoutFrames } = await targetModule("render-lab/tape.ts");
 
 async function signInScenario(name: string, tamper: boolean) {
   const f = fixture(artifacts, name);
@@ -155,21 +157,27 @@ test("contract: a login asked for again while one waits is that login: the same 
   writeProfile(f, { web: { type: "http", url: fake.url } });
   const shell = new Shell(f);
   const records: TraceRecord[] = [];
-  // The n-th sign-in address the transcript printed, from 0.
-  const address = async (n: number) => {
+  const tapePath = join(f.base, "shell.fxtape");
+  // Once the transcript has linked a sign-in page n + 1 times, the addresses
+  // those links open, each once: a repaint writes a link again.
+  const addresses = async (n: number) => {
     const deadline = Date.now() + 20_000;
     for (;;) {
-      const found = [...(await shell.tui.captureFullScrollback()).matchAll(/go to:\n\s+(http\S+)/g)].map((m) => m[1]!);
-      if (found.length > n) return found[n]!;
-      if (Date.now() > deadline) throw new Error(`timed out waiting for sign-in address ${n + 1}`);
+      const shown = (await shell.tui.captureFullScrollback()).match(/Didn't open\? Open the sign-in page\./g)?.length ?? 0;
+      if (shown > n) {
+        const written = Buffer.concat(stdoutFrames(tapePath).map((frame: { payload: Uint8Array }) => frame.payload)).toString("utf8");
+        return [...new Set([...written.matchAll(/\x1b\]8;id=fx-mcp-sign-in;([^\x1b]+)\x1b\\/g)].map((m) => m[1]!))];
+      }
+      if (Date.now() > deadline) throw new Error(`timed out waiting for sign-in link ${n + 1}`);
       await Bun.sleep(100);
     }
   };
   try {
-    await shell.start({}, 400);
+    await shell.start({ FX_RECORD: tapePath }, 400);
     records.push({ event: "login", at: Date.now() });
     await shell.tui.sendText("/mcp login web");
-    const first = await address(0);
+    const [first] = await addresses(0);
+    expect(first).toBeTruthy();
     records.push({ event: "authorize", data: { login: 1 }, at: Date.now(), note: first });
     const signing = await shell.status({ k: "signing" }, 10_000);
     expect(signing?.k).toBe("signing");
@@ -180,8 +188,8 @@ test("contract: a login asked for again while one waits is that login: the same 
 
     records.push({ event: "login", at: Date.now() });
     await shell.tui.sendText("/mcp login web");
-    const again = await address(1);
-    expect(again).toBe(first);
+    // The second login links the first one's address, and no other.
+    expect(await addresses(1)).toEqual([first]);
     const still = await probe(port);
     records.push({ event: "probe", data: { login: 1, result: still.result }, at: Date.now() });
 

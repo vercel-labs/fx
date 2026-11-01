@@ -1,6 +1,6 @@
 # Durable libfx models
 
-One model per safety boundary of durable libfx sessions (`sdk/fx-sdk.js`). Each
+One model per safety boundary of durable libfx sessions (`sdk/engine.js`). Each
 checks the protocol, not the code. `check.sh` runs every spec, and `mutants.py`
 plants realistic bugs and requires TLC to catch each one.
 

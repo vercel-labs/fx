@@ -6,6 +6,7 @@ import math
 import os
 import pathlib
 import shlex
+import shutil
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -20,7 +21,6 @@ from scripts.pgso.pipeline import (
     emit_bitcode,
     link_candidate,
     merge_profile_batch,
-    read_macos_minos,
 )
 from scripts.pgso.profile_supplement import (
     MappedProfile,
@@ -528,7 +528,7 @@ def _external_control_link_argv(
         "-target",
         toolchain.target,
         "-O2",
-        "-Wl,-dead_strip",
+        *toolchain.platform.ZIG_CC_LINK_FLAGS,
         "-s",
         str(object_path),
         "-o",
@@ -583,14 +583,16 @@ def build_external_o2_control(
         log_path=paths.logs / "external-control-link.json",
         require_empty_stderr=True,
     )
-    run_checked(
-        (str(toolchain.strip), "-S", "-x", str(binary)),
-        cwd=paths.root,
-        env=os.environ.copy(),
-        timeout_s=120,
-        log_path=paths.logs / "external-control-strip.json",
-        require_empty_stderr=True,
-    )
+    strip_argv = toolchain.platform.external_control_strip_argv(toolchain, binary)
+    if strip_argv:
+        run_checked(
+            strip_argv,
+            cwd=paths.root,
+            env=os.environ.copy(),
+            timeout_s=120,
+            log_path=paths.logs / "external-control-strip.json",
+            require_empty_stderr=True,
+        )
     if not binary.is_file() or binary.stat().st_size == 0:
         raise PgsoError(f"external O2 control is missing or empty: {binary}")
     return binary
@@ -603,10 +605,10 @@ def build_benchmark_pair(
     plan: BenchmarkPlan,
 ) -> BenchmarkPair:
     paths = PipelinePaths.create(output_root, selector=plan.selector)
-    spec = ArtifactSpec(repo_root=repo_root, selector=plan.selector)
+    spec = ArtifactSpec(repo_root=repo_root, target=toolchain.target, selector=plan.selector)
     bitcode_sha256 = emit_bitcode(toolchain, spec, paths)
     external_control = build_external_o2_control(toolchain, paths)
-    minimum_macos = read_macos_minos(
+    control = toolchain.platform.read_control_identity(
         toolchain,
         external_control,
         paths.logs / "control-load-commands.json",
@@ -617,7 +619,7 @@ def build_benchmark_pair(
         build_instrumented(
             toolchain,
             paths,
-            minimum_macos,
+            control,
             training_argv=first_training,
             training_name="training-1",
         )
@@ -877,6 +879,8 @@ def measure_startup(
     logs = output_dir / "logs"
     home.mkdir(parents=True, exist_ok=True)
     logs.mkdir(parents=True, exist_ok=True)
+    control_binary = _fresh_copy(control_binary, output_dir / "binaries" / "control")
+    candidate_binary = _fresh_copy(candidate_binary, output_dir / "binaries" / "candidate")
     results: list[MeasurementResult] = []
     startup_samples = max(samples, STARTUP_MINIMUM_SAMPLES)
     startup_rounds = max(
@@ -977,6 +981,24 @@ def measure_startup(
             )
         )
     return tuple(results)
+
+
+def _fresh_copy(binary: pathlib.Path, directory: pathlib.Path) -> pathlib.Path:
+    """A byte-identical copy of `binary` written into `directory` now.
+
+    On Linux a binary whose pages the kernel read back from disk can start 10
+    to 15 percent slower than one written moments ago, with the same page
+    faults. The artifacts were written hours apart and the candidate was run
+    in between, so measuring them in place compares their page-cache state.
+    Copying both just before measuring gives them the same state.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    copy = directory / binary.name
+    shutil.copyfile(binary, copy)
+    shutil.copymode(binary, copy)
+    if sha256_file(copy) != sha256_file(binary):
+        raise PgsoError(f"startup copy of {binary} does not match it")
+    return copy
 
 
 def _measure_microbenchmark(

@@ -284,7 +284,7 @@ test "a server's startup and operation timeouts become its engine limits" {
     };
     const r = try resolve(arena_state.allocator(), &configs, &inherited, "/Users/example/repo");
     try testing.expectEqual(@as(u32, 30_000), r.engine[0].timeouts.?.start_ms);
-    try testing.expectEqual(@as(u32, 60_000), r.engine[0].timeouts.?.idle_ms);
+    try testing.expectEqual(@as(u32, 300_000), r.engine[0].timeouts.?.idle_ms);
     try testing.expectEqual(@as(u32, 600_000), r.engine[0].timeouts.?.hard_ms);
     try testing.expectEqual(@as(u32, 5_000), r.engine[1].timeouts.?.start_ms);
     try testing.expectEqual(@as(u32, 900_000), r.engine[1].timeouts.?.idle_ms);

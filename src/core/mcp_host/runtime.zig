@@ -23,6 +23,7 @@ const credentials = @import("credentials.zig");
 const loopback = @import("login.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
+const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 const engine = mcp.engine;
@@ -1387,7 +1388,7 @@ pub const Runtime = struct {
         var form: mcp.elicitation.Form = .{};
         const request = mcp.elicitation.parse(params, &form) catch return;
         const raw = request.elicitation_id orelse return;
-        const parsed = std.json.parseFromSlice([]const u8, r.gpa, raw, .{}) catch |err| switch (err) {
+        const parsed = json_decode.parseFromSlice([]const u8, r.gpa, raw, .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return,
         };
@@ -2318,7 +2319,7 @@ fn inputValues(a: Allocator, json: []const u8, keys: []const []const u8) ?[]cons
     if (answers != .object) return null;
     const values = a.alloc([]const u8, keys.len) catch return null;
     for (keys, values) |token, *value| {
-        const key = std.json.parseFromSliceLeaky([]const u8, a, token, .{}) catch return null;
+        const key = json_decode.parseFromSliceLeaky([]const u8, a, token, .{}) catch return null;
         const answer = answers.object.get(key) orelse return null;
         value.* = std.json.Stringify.valueAlloc(a, answer, .{}) catch return null;
     }

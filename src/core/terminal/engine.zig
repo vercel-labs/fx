@@ -5425,16 +5425,16 @@ fn fuzzGridFeed(_: void, smith: *std.testing.Smith) !void {
     try testing.expectEqualSlices(u8, state, repeated);
 
     // A terminal in its default modes shows each frame after its repaint.
-    var previous = try Grid.init(alloc, cols, rows);
+    var live = try Grid.init(alloc, cols, rows);
+    defer live.deinit();
+    try live.feed(bytes.items[0..split]);
+    var previous = try live.clone(alloc);
     defer previous.deinit();
-    try previous.feed(bytes.items[0..split]);
-    var next = try previous.clone(alloc);
-    defer next.deinit();
-    try next.feed(bytes.items[split..]);
+    try live.feed(bytes.items[split..]);
     var screen = try Grid.init(alloc, cols, rows);
     defer screen.deinit();
     try expectFuzzRepaint(&screen, previous);
-    try expectFuzzRepaint(&screen, next);
+    try expectFuzzRepaint(&screen, live);
 }
 
 test "terminal grid state survives fragmented feeds, checkpoints, and repaints" {

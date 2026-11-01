@@ -627,7 +627,13 @@ pub fn dispatchRunCommandCompatibility(
 }
 
 pub fn toolActivityKind(registry: Registry, tool_name: []const u8) core_types.ToolActivityKind {
-    return if (registry.lookup(tool_name)) |tool| tool.activity_kind else .command;
+    return if (registry.lookup(tool_name)) |tool| tool.activity_kind else unregisteredActivityKind(tool_name);
+}
+
+/// A name the registry does not hold is an MCP server's tool when it has the
+/// `mcp_` prefix every MCP tool name gets, and is otherwise treated as a command.
+fn unregisteredActivityKind(tool_name: []const u8) core_types.ToolActivityKind {
+    return if (std.mem.startsWith(u8, tool_name, "mcp_")) .mcp else .command;
 }
 
 pub fn staticPresentation(tool: Tool) CallPresentation {
@@ -668,7 +674,7 @@ pub fn toolActivityKindForCall(
     call: core_types.ToolCall,
 ) core_types.ToolActivityKind {
     const presentation = toolCallPresentation(alloc, registry, call) orelse
-        return .command;
+        return unregisteredActivityKind(call.name);
     return presentation.activity_kind;
 }
 

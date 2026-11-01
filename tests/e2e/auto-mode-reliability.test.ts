@@ -687,6 +687,14 @@ describe("lean auto mode reliability", () => {
       const review = reviewerText(gateway.classifierRequests[0]!.body);
       expect(review).toContain("review_context_kind: contextual");
       expect(review).toContain("Inspect the local site only");
+      // No later request shares a review's prefix, so the default GPT-5.6
+      // reviewer is asked to write nothing to its prompt cache.
+      expect(
+        gateway.classifierRequests[0]!.headers.get("ai-language-model-id"),
+      ).toBe("openai/gpt-5.6-luna");
+      expect(
+        JSON.parse(gateway.classifierRequests[0]!.body).providerOptions,
+      ).toEqual({ openai: { promptCacheOptions: { mode: "explicit" } } });
       expect(existsSync(marker)).toBe(true);
       expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
     },
@@ -1150,6 +1158,9 @@ describe("lean auto mode reliability", () => {
           cleanCommandCall("npm test \\&\\& npm run build --global", "escaped_separator"),
           // Every shell drops `#note` as a comment.
           cleanCommandCall("npm test #note", "comment_word"),
+          // Inside double quotes the shell keeps a backslash before `s`, so
+          // npm gets `te\st`, not `test`.
+          cleanCommandCall("npm \"te\\st\"", "double_quoted_backslash"),
           (body) => {
             expect(body).toContain("review_caution");
             return fakeGatewayFinalText("shell syntax stayed reviewed");
@@ -1159,6 +1170,7 @@ describe("lean auto mode reliability", () => {
           fakeGatewayPermissionDecision("caution", "quoted_separator_review"),
           fakeGatewayPermissionDecision("caution", "escaped_separator_review"),
           fakeGatewayPermissionDecision("caution", "comment_word_review"),
+          fakeGatewayPermissionDecision("caution", "double_quoted_backslash_review"),
         ],
       );
       const result = await runFx(
@@ -1174,7 +1186,7 @@ describe("lean auto mode reliability", () => {
       );
 
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(gateway.classifierRequests).toHaveLength(4);
       expect(existsSync(marker)).toBe(false);
     },
     TIMEOUT,
@@ -1218,6 +1230,44 @@ describe("lean auto mode reliability", () => {
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
       expect(gateway.classifierRequests).toHaveLength(2);
       expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a trailing 2>&1 stays review free only when the shell reads 2 as a file descriptor",
+    async () => {
+      const root = createIsolatedRoot();
+      runGit(root.workspace, ["init", "-q"]);
+      const gateway = startGateway(
+        [
+          cleanCommandCall("git status 2>&1", "bare_descriptor"),
+          (body) => {
+            expect(toolResultText(body, "bare_descriptor")).toContain("\"exit_code\":0");
+            // The shell passes `2` to git as an argument for both of these.
+            return cleanCommandCall("git status \\2>&1", "escaped_descriptor");
+          },
+          (body) => {
+            expect(toolResultText(body, "escaped_descriptor", "execution-denied")).toContain("review_caution");
+            return cleanCommandCall("git status 2 >&1", "spaced_descriptor");
+          },
+          (body) => {
+            expect(toolResultText(body, "spaced_descriptor", "execution-denied")).toContain("review_caution");
+            return fakeGatewayFinalText("descriptor forms checked");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "escaped_descriptor_review"),
+          fakeGatewayPermissionDecision("caution", "spaced_descriptor_review"),
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Check the repository status."],
+        { cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(2);
     },
     TIMEOUT,
   );

@@ -195,6 +195,9 @@ pub fn buildAgentRequest(
     defer alloc.free(prompt);
     @memcpy(prompt[0..request.instructions.len], request.instructions);
     @memcpy(prompt[request.instructions.len..], projected orelse request.messages);
+    var provider_options = request.provider_options;
+    provider_options.cache_markers = vercel_model_policy.cacheMarkers(request.model);
+    provider_options.single_system_message = vercel_model_policy.singleSystemMessage(request.model);
 
     if (request.verified_images) |images| {
         const response_format = request.response_format orelse
@@ -204,7 +207,7 @@ pub fn buildAgentRequest(
             tools_json,
             prompt,
             images,
-            request.provider_options,
+            provider_options,
             request.tool_choice,
             .{
                 .name = response_format.name,
@@ -223,7 +226,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 prompt,
-                request.provider_options,
+                provider_options,
                 request.tool_choice,
                 request.max_output_tokens,
                 active,
@@ -233,7 +236,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 prompt,
-                request.provider_options,
+                provider_options,
                 request.tool_choice,
                 request.max_output_tokens,
             );
@@ -246,7 +249,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 prompt,
-                request.provider_options,
+                provider_options,
                 request.max_output_tokens,
                 active,
             )
@@ -255,7 +258,7 @@ pub fn buildAgentRequest(
                 alloc,
                 tools_json,
                 prompt,
-                request.provider_options,
+                provider_options,
                 request.max_output_tokens,
             );
         return finalizeAgentRequestBody(alloc, request.model, try body);
@@ -419,6 +422,105 @@ test "agent request builder keeps default reasoning silent and emits output limi
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.get("providerOptions") == null);
+}
+
+test "agent request builder sends stable cache markers in each family's syntax" {
+    const alloc = std.testing.allocator;
+    const instructions = [_]shared_types.ChatMessage{
+        .{ .role = .system, .content = "stable base", .cache_breakpoint = true },
+        .{ .role = .system, .content = "turn context" },
+    };
+    const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
+    for ([_]struct { model: []const u8, anthropic: usize, openai: usize }{
+        .{ .model = "anthropic/claude-sonnet-5.5", .anthropic = 1, .openai = 0 },
+        .{ .model = "openai/gpt-6.1-sol", .anthropic = 0, .openai = 1 },
+        .{ .model = "openai/gpt-5.6-luna", .anthropic = 0, .openai = 1 },
+        .{ .model = "openai/gpt-5", .anthropic = 0, .openai = 0 },
+        .{ .model = "google/gemini-3-flash", .anthropic = 0, .openai = 0 },
+    }) |case| {
+        var options = resolveGatewayProviderOptions(case.model, .auto, false);
+        options.prompt_caching = true;
+        const body = try buildAgentRequest(alloc, .{
+            .model = case.model,
+            .instructions = &instructions,
+            .messages = &messages,
+            .tool_choice = .auto,
+            .provider_options = options,
+        });
+        defer alloc.free(body);
+        try std.testing.expectEqual(case.anthropic, std.mem.count(u8, body, "\"cacheControl\""));
+        try std.testing.expectEqual(case.openai, std.mem.count(u8, body, "\"promptCacheBreakpoint\""));
+        // The caller's instructions are not modified.
+        try std.testing.expect(instructions[0].cache_breakpoint);
+    }
+}
+
+test "agent requests carry delivered rules in the tool result for every family, without cache markers (D93)" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const instructions = [_]shared_types.ChatMessage{.{ .role = .system, .content = "stable base", .cache_breakpoint = true }};
+    const calls = [_]shared_types.ToolCall{.{ .id = "call_1", .name = "read_file", .arguments_json = "{\"path\":\"sub/notes.md\"}" }};
+    const messages = [_]shared_types.ChatMessage{
+        .{ .role = .user, .content = "question" },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "notes", .tool_call_id = "call_1", .tool_name = "read_file" },
+        .{ .role = .system, .content = "<scoped-rules from=\"sub/AGENTS.md\" scope=\"sub\">tabs</scoped-rules>", .context_note = true },
+    };
+    const sent = try agent_stream_provider_contract.carryContextNotes(arena, &messages);
+    const carried = "\"value\":\"notes\\n\\n<scoped-rules from=\\\"sub/AGENTS.md\\\" scope=\\\"sub\\\">tabs</scoped-rules>\"";
+    for ([_][]const u8{
+        "anthropic/claude-sonnet-5.5",
+        "openai/gpt-6.1-sol",
+        "openai/gpt-5",
+        "spacexai/grok-4.7",
+        "moonshotai/kimi-k3",
+        "alibaba/qwen3.8-max",
+        "meta/llama-4-maverick",
+    }) |model| {
+        var options = resolveGatewayProviderOptions(model, .auto, false);
+        options.prompt_caching = true;
+        const body = try buildAgentRequest(arena, .{
+            .model = model,
+            .instructions = &instructions,
+            .messages = sent,
+            .tool_choice = .auto,
+            .provider_options = options,
+        });
+        // The rules end the tool result's text, and the instructions are the
+        // request's only system message.
+        try std.testing.expect(std.mem.find(u8, body, carried) != null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "\"role\":\"system\""));
+        // Only the stable instructions carry a marker, for the families fx marks.
+        const markers: usize = @intFromBool(vercel_model_policy.cacheMarkers(model) != .none);
+        try std.testing.expectEqual(markers, std.mem.count(u8, body, "\"cacheControl\"") + std.mem.count(u8, body, "\"promptCacheBreakpoint\""));
+    }
+}
+
+test "agent requests to Qwen send the instructions as one system message" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const instructions = [_]shared_types.ChatMessage{
+        .{ .role = .system, .content = "stable base" },
+        .{ .role = .system, .content = "turn context" },
+    };
+    const messages = [_]shared_types.ChatMessage{.{ .role = .user, .content = "question" }};
+    for ([_]struct { model: []const u8, systems: usize }{
+        .{ .model = "alibaba/qwen3.8-max", .systems = 1 },
+        .{ .model = "zai/glm-5.3", .systems = 2 },
+    }) |case| {
+        const body = try buildAgentRequest(arena, .{
+            .model = case.model,
+            .instructions = &instructions,
+            .messages = &messages,
+            .tool_choice = .auto,
+            .provider_options = resolveGatewayProviderOptions(case.model, .auto, false),
+        });
+        try std.testing.expectEqual(case.systems, std.mem.count(u8, body, "{\"role\":\"system\""));
+    }
 }
 
 test "agent request builder scopes the product user agent to GLM 5.2" {
@@ -594,8 +696,8 @@ fn streamAgentCompletion(
         .content_capture_limit = request.content_capture_limit,
         .delivery = request.delivery,
         .admission = request.admission,
-        .on_reasoning_chunk = EventBridge.reasoning,
-        .on_tool_input_chunk = EventBridge.toolInput,
+        .on_reasoning_chunk = agent_stream_provider_contract.EventSink.onReasoningChunk,
+        .on_tool_input_chunk = agent_stream_provider_contract.EventSink.onToolInputChunk,
         .provider_attempt_owner = switch (request.provider_attempt_owner) {
             .transport => .transport,
             .agent => .agent,
@@ -607,8 +709,8 @@ fn streamAgentCompletion(
             alloc,
             stream_request,
             &events,
-            EventBridge.content,
-            EventBridge.toolStart,
+            agent_stream_provider_contract.EventSink.onContentChunk,
+            agent_stream_provider_contract.EventSink.onToolStart,
             deadline,
             request.cancel_flag,
         )
@@ -617,8 +719,8 @@ fn streamAgentCompletion(
             alloc,
             stream_request,
             &events,
-            EventBridge.content,
-            EventBridge.toolStart,
+            agent_stream_provider_contract.EventSink.onContentChunk,
+            agent_stream_provider_contract.EventSink.onToolStart,
             request.cancel_flag,
         )) catch |err| {
         request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
@@ -647,32 +749,11 @@ fn streamAgentCompletion(
     } };
 }
 
-const EventBridge = struct {
-    fn sink(raw: *anyopaque) *agent_stream_provider_contract.EventSink {
-        return @ptrCast(@alignCast(raw));
-    }
-
-    fn content(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .content_delta = chunk });
-    }
-
-    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .reasoning_delta = chunk });
-    }
-
-    fn toolInput(raw: *anyopaque, delta: agent_stream_provider_contract.ToolInputDelta) void {
-        sink(raw).emit(.{ .tool_input_delta = delta });
-    }
-
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
-    }
-};
-
 /// Gateway reports the last provider it tried, so a provider's size rejection
-/// can arrive as a 400 from a later fallback. Classify it as too large.
+/// can arrive as a 400 from a later fallback. Classify it as too large. A 429
+/// whose body names a used-up quota is not a rate limit a wait outlives.
 fn gatewayFailureKind(alloc: Allocator, status: std.http.Status, err_body: ?[]const u8) agent_stream_provider_contract.FailureKind {
-    const kind = failureKind(status);
+    const kind = gateway_client.httpFailureKind(alloc, agent_stream_provider_contract.FailureKind.fromHttpStatus(status), err_body);
     if (kind != .invalid_request) return kind;
     const body = err_body orelse return kind;
     return if (vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body)) .request_too_large else kind;
@@ -688,19 +769,14 @@ test "Gateway 400 with a provider 413 attempt is a size failure" {
     try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.rate_limited, gatewayFailureKind(alloc, .too_many_requests, fallback_body));
 }
 
-fn failureKind(status: std.http.Status) agent_stream_provider_contract.FailureKind {
-    return switch (status) {
-        .bad_request => .invalid_request,
-        .unauthorized => .unauthorized,
-        .forbidden => .forbidden,
-        .payload_too_large => .request_too_large,
-        .too_many_requests => .rate_limited,
-        .internal_server_error => .server_error,
-        .bad_gateway => .bad_gateway,
-        .service_unavailable => .unavailable,
-        .gateway_timeout => .gateway_timeout,
-        else => .provider_error,
-    };
+test "Gateway 429 naming a used-up quota is not a rate limit" {
+    const alloc = std.testing.allocator;
+    const quota_body = "{\"error\":{\"message\":\"You exceeded your current quota\",\"type\":\"insufficient_quota\",\"code\":\"insufficient_quota\"}}";
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.quota_exhausted, gatewayFailureKind(alloc, .too_many_requests, quota_body));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.rate_limited, gatewayFailureKind(alloc, .too_many_requests, "{\"error\":{\"code\":\"rate_limit_exceeded\"}}"));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.rate_limited, gatewayFailureKind(alloc, .too_many_requests, null));
+    // Only a 429 changes kind.
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.forbidden, gatewayFailureKind(alloc, .forbidden, quota_body));
 }
 
 fn fetchCredits(

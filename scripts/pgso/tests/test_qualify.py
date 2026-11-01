@@ -6,9 +6,11 @@ import json
 import os
 import pathlib
 import tempfile
+import types
 import unittest
 from unittest import mock
 
+from scripts.pgso import linux, macos
 from scripts.pgso.model import PgsoError
 from scripts.pgso.pipeline import PipelinePaths
 from scripts.pgso.profile_supplement import MappedProfile, ProfileSupplement
@@ -19,6 +21,7 @@ from scripts.pgso.qualify import (
     EvidenceRecorder,
     _read_hyperfine_samples,
     build_benchmark_pair,
+    build_external_o2_control,
     build_profile_linked_benchmarks,
     compare_samples,
     measure_alternating,
@@ -69,11 +72,11 @@ class PgsoQualificationTests(unittest.TestCase):
                 label = command[index + 1]
                 binary = command[index + 2].split(" ", 1)[0]
                 if label == "control":
-                    self.assertEqual(str(control), binary)
+                    self.assertEqual(str(self.measured_copy("control", control)), binary)
                     times = [1.0] * runs
                 else:
                     self.assertEqual("candidate", label)
-                    self.assertEqual(str(candidate), binary)
+                    self.assertEqual(str(self.measured_copy("candidate", candidate)), binary)
                     times = [0.9] * runs
                 results.append({"command": label, "times": times})
             export_path.parent.mkdir(parents=True, exist_ok=True)
@@ -81,6 +84,9 @@ class PgsoQualificationTests(unittest.TestCase):
             return CommandResult(command, 0, "", "", 0.01)
 
         return calls, fake_run
+
+    def measured_copy(self, label: str, binary: pathlib.Path) -> pathlib.Path:
+        return self.root / "measurements" / "binaries" / label / binary.name
 
     def write_hyperfine_export(self, results) -> pathlib.Path:
         path = self.root / "hyperfine.json"
@@ -244,14 +250,45 @@ class PgsoQualificationTests(unittest.TestCase):
 
         self.assertTrue(all(result.passed for result in results))
         self.assertEqual(b"canonical", canonical.read_bytes())
+        control_copy = self.measured_copy("control", control)
+        candidate_copy = self.measured_copy("candidate", candidate)
         self.assertEqual(
             [
-                (str(control), "help"),
-                (str(candidate), "help"),
+                (str(control_copy), "help"),
+                (str(candidate_copy), "help"),
             ],
             calls[:2],
         )
+        self.assertEqual((b"control", b"candidate"), (control_copy.read_bytes(), candidate_copy.read_bytes()))
+        self.assertEqual((b"control", b"candidate"), (control.read_bytes(), candidate.read_bytes()))
         self.assertNotIn(str(canonical), {command[0] for command in calls})
+
+    def test_startup_measurement_refuses_a_copy_that_differs_from_its_artifact(self) -> None:
+        control = self.root / "control" / "fx"
+        candidate = self.root / "candidate" / "fx"
+        hyperfine = self.root / "tools" / "hyperfine"
+        for path in (control, candidate, hyperfine):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"executable")
+
+        def truncated_copy(source, destination):
+            pathlib.Path(destination).write_bytes(b"exec")
+
+        with (
+            mock.patch("scripts.pgso.qualify.shutil.copyfile", side_effect=truncated_copy),
+            mock.patch("scripts.pgso.qualify.run_checked") as run,
+            self.assertRaisesRegex(PgsoError, "does not match"),
+        ):
+            measure_startup(
+                repo_root=self.root,
+                control_binary=control,
+                candidate_binary=candidate,
+                hyperfine_binary=hyperfine,
+                output_dir=self.root / "measurements",
+                samples=50,
+                timeout_s=10,
+            )
+        run.assert_not_called()
 
     def test_startup_measurement_runs_only_the_assigned_command(self) -> None:
         control = self.root / "control" / "fx"
@@ -671,6 +708,57 @@ class PgsoQualificationTests(unittest.TestCase):
                 prebuilt_pairs={"ui_activity": pair},
             )
 
+    def build_fake_external_control(
+        self, platform: object, target: str, tool_names: tuple[str, ...]
+    ) -> tuple[pathlib.Path, list[str]]:
+        tools = self.root / "tools"
+        tools.mkdir()
+        actions = self.root / "actions.log"
+
+        def fake(name: str) -> pathlib.Path:
+            path = tools / name
+            path.write_text(
+                "#!/usr/bin/env python3\n"
+                "import pathlib, sys\n"
+                f"with open({str(actions)!r}, 'a') as stream:\n"
+                f"    stream.write({name!r} + ' ' + ' '.join(sys.argv[1:]) + '\\n')\n"
+                "if '-o' in sys.argv:\n"
+                "    pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')\n",
+                encoding="utf-8",
+            )
+            path.chmod(0o755)
+            return path
+
+        toolchain = types.SimpleNamespace(
+            opt=fake("opt"),
+            llc=fake("llc"),
+            zig=fake("zig"),
+            target=target,
+            platform=platform,
+            tools=types.SimpleNamespace(**{name: fake(name) for name in tool_names}),
+        )
+        paths = PipelinePaths.create(self.root / "run", selector="ui_activity")
+
+        binary = build_external_o2_control(toolchain, paths)
+
+        self.assertEqual(paths.root / "external-control" / paths.binary_name, binary)
+        return binary, actions.read_text(encoding="utf-8").splitlines()
+
+    def test_external_control_is_optimized_linked_and_stripped_with_platform_tools(self) -> None:
+        binary, lines = self.build_fake_external_control(macos, "aarch64-macos", ("strip",))
+
+        self.assertEqual(["opt", "llc", "zig", "strip"], [line.split()[0] for line in lines])
+        self.assertIn("-Wl,-dead_strip", lines[2].split())
+        self.assertEqual(f"strip -S -x {binary}", lines[3])
+
+    def test_linux_external_control_is_stripped_by_its_link(self) -> None:
+        _, lines = self.build_fake_external_control(linux, "aarch64-linux", ())
+
+        self.assertEqual(["opt", "llc", "zig"], [line.split()[0] for line in lines])
+        link = lines[2].split()
+        self.assertIn("-Wl,--gc-sections", link)
+        self.assertIn("-s", link)
+
     def test_benchmark_pair_uses_the_external_control_for_minimum_macos(self) -> None:
         plan = BENCHMARK_PLANS[0]
         output = self.root / "pair"
@@ -692,10 +780,11 @@ class PgsoQualificationTests(unittest.TestCase):
                 "scripts.pgso.qualify.build_external_o2_control",
                 return_value=external,
             ),
-            mock.patch(
-                "scripts.pgso.qualify.read_macos_minos",
-                return_value="15.0",
-            ) as read_minos,
+            mock.patch.object(
+                macos,
+                "read_control_identity",
+                return_value={"minimum_macos": "15.0"},
+            ) as read_identity,
             mock.patch(
                 "scripts.pgso.qualify.build_instrumented",
                 return_value=(raw_profile,),
@@ -704,11 +793,13 @@ class PgsoQualificationTests(unittest.TestCase):
             mock.patch("scripts.pgso.qualify.apply_profile"),
             mock.patch("scripts.pgso.qualify.link_candidate", return_value=candidate),
         ):
-            pair = build_benchmark_pair(object(), self.root, output, plan)
+            pair = build_benchmark_pair(
+                types.SimpleNamespace(platform=macos, target=macos.TARGET), self.root, output, plan,
+            )
 
         self.assertEqual(external, pair.control_binary)
-        self.assertEqual(external, read_minos.call_args.args[1])
-        self.assertEqual("15.0", instrument.call_args.args[2])
+        self.assertEqual(external, read_identity.call_args.args[1])
+        self.assertEqual({"minimum_macos": "15.0"}, instrument.call_args.args[2])
 
     def test_builds_all_profile_linked_benchmarks_before_candidate_link(self) -> None:
         paths = PipelinePaths.create(self.root / "run")

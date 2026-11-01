@@ -232,9 +232,10 @@ fn decode_input(
         else => return null,
     };
     const auto_background = raw.object.get("yield_time_ms") == null and action == .run and !input.tty;
-    if (raw.object.get("yield_time_ms") == null) {
-        input.yield_time_ms = defaultYieldTime(action);
-    }
+    input.yield_time_ms = if (raw.object.get("yield_time_ms") == null)
+        defaultYieldTime(action)
+    else
+        boundedYieldTime(action, input.yield_time_ms);
     if (argument_problem(input) != null) return null;
     const owned = try ctx.allocator.create(OwnedInput);
     owned.* = .{
@@ -254,6 +255,17 @@ fn defaultYieldTime(action: Action) u32 {
         .run => managed_contract.default_yield_time_ms,
         .interact => managed_contract.default_wait_ceiling_ms,
         .stop => 0,
+    };
+}
+
+/// A wait longer than the action allows is shortened to its limit rather
+/// than refused: the call still runs, and a command that is still going
+/// returns its session_id for the next interact.
+fn boundedYieldTime(action: Action, requested_ms: u32) u32 {
+    return switch (action) {
+        .run => @min(requested_ms, managed_contract.max_yield_time_ms),
+        .interact => @min(requested_ms, managed_contract.max_wait_ceiling_ms),
+        .stop => requested_ms,
     };
 }
 
@@ -398,10 +410,11 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
             try canonical.put(arena, field_name, value);
         }
     }
-    const candidate = std.json.parseFromValueLeaky(Input, arena, .{ .object = canonical }, .{}) catch |err| switch (err) {
+    var candidate = std.json.parseFromValueLeaky(Input, arena, .{ .object = canonical }, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return correction_json(alloc, problems.items, null),
     };
+    candidate.yield_time_ms = boundedYieldTime(candidate.action, candidate.yield_time_ms);
     if (argument_problem(candidate)) |problem| {
         try problems.append(arena, problem);
         repairable = false;
@@ -441,10 +454,8 @@ fn argument_problem(input: Input) ?[]const u8 {
             if (input.timeout_ms == 0) return "timeout_ms must be at least 1; choose the intended deadline.";
             if (input.profile != null and input.shell != null) return "Choose either profile or shell.";
             if (!input.tty and input.shell != null) return "shell applies only with tty=true; remove shell for an ordinary command, or set tty=true for an interactive terminal.";
-            if (input.yield_time_ms > managed_contract.max_yield_time_ms) return "yield_time_ms must be between 0 and 30000 for run.";
         },
         .interact => {
-            if (input.yield_time_ms > managed_contract.max_wait_ceiling_ms) return "yield_time_ms must be between 0 and 300000 for interact.";
             if (input.chars) |chars| {
                 if (chars.len > terminal_contracts.max_write_bytes) return "chars exceed 65536 bytes.";
             }
@@ -2135,7 +2146,6 @@ test "shell request correction suggests only unambiguous repairs without executi
         .{ .input = "{\"command\":\"true\",\"session_id\":\"shell-3\"}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"background\":true}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\"}}", .retry = null },
-        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":30001}", .retry = null },
         .{ .input = "{\"request\":{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":\"1000\",\"timeout_ms\":0}}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":4294967296}", .retry = null },
         .{ .input = "{\"action\":\"stop\",\"session_id\":\"shell-3\",\"force\":\"true\"}", .retry = null },
@@ -2432,17 +2442,6 @@ test "shell interaction wait bounds empty observations without delaying writes" 
         );
     }
 
-    const failure = try validateInteract(
-        .{ .allocator = std.testing.allocator },
-        .{
-            .action = .interact,
-            .session_id = "shell-1",
-            .yield_time_ms = managed_contract.max_wait_ceiling_ms + 1,
-        },
-    ) orelse return error.TestUnexpectedResult;
-    defer std.testing.allocator.free(failure);
-    try std.testing.expect(std.mem.find(u8, failure, "between 0 and 300000") != null);
-
     const overflow = try decode(
         .{ .allocator = std.testing.allocator },
         "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"yield_time_ms\":4294967296}",
@@ -2453,6 +2452,33 @@ test "shell interaction wait bounds empty observations without delaying writes" 
             return error.TestUnexpectedResult;
         },
         .failure => |message| std.testing.allocator.free(message),
+    }
+}
+
+test "shell caps a wait over the action limit instead of refusing the call" {
+    // Models often ask run to wait minutes for a slow command. The call runs
+    // with the longest wait the action allows; a command still going after
+    // it returns its session_id for interact.
+    const alloc = std.testing.allocator;
+    const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
+    const cases = [_]struct { args: []const u8, expected_ms: u32 }{
+        .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":30001}", .expected_ms = managed_contract.max_yield_time_ms },
+        .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":300000}", .expected_ms = managed_contract.max_yield_time_ms },
+        .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":1000}", .expected_ms = 1_000 },
+        .{ .args = "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"yield_time_ms\":300001}", .expected_ms = managed_contract.max_wait_ceiling_ms },
+        .{ .args = "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"yield_time_ms\":45000}", .expected_ms = 45_000 },
+    };
+    for (cases) |case| {
+        switch (try decode(ctx, case.args)) {
+            .failure => |failure| {
+                defer alloc.free(failure);
+                return error.TestUnexpectedResult;
+            },
+            .input => |input| {
+                defer input.deinit(alloc);
+                try std.testing.expectEqual(case.expected_ms, input.as(OwnedInput).value.yield_time_ms);
+            },
+        }
     }
 }
 

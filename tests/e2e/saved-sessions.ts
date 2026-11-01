@@ -112,10 +112,18 @@ export function compactionRecordPath(home: string, id: string, name: string): st
 }
 
 /// The command replays session `id` kept: each is one of its blobs, named in
-/// the session by its handle, `fx-command-replay-<hash>.bin` (D44).
+/// the session by its handle, `fx-command-replay-<run>-<hash>.bin` (D44, D91).
+/// A handle from before D91 has no run id.
 export function commandReplays(home: string, id: string): { name: string; path: string }[] {
-  const names = [...new Set(savedText(home, id).match(/fx-command-replay-[0-9a-f]{64}\.bin/g) ?? [])];
-  return names.map((name) => ({ name, path: join(sessionDir(home, id), "blobs", name.slice("fx-command-replay-".length, -".bin".length)) }));
+  const names = [...new Set(savedText(home, id).match(commandReplayHandles) ?? [])];
+  return names.map((name) => ({ name, path: join(sessionDir(home, id), "blobs", commandReplayHash(name)) }));
+}
+
+const commandReplayHandles = /fx-command-replay-(?:[0-9a-f]{12}-)?[0-9a-f]{64}\.bin/g;
+
+/// The hash of the blob a command replay handle names, which comes last.
+export function commandReplayHash(handle: string): string {
+  return /([0-9a-f]{64})\.bin$/.exec(handle)![1]!;
 }
 
 /// Every tool call a saved history holds, finished or left open by an

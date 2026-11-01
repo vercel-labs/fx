@@ -98,6 +98,7 @@ fn streamStatusVerb(stream: StreamState) []const u8 {
         .subagent => "delegating",
         .open => "opening",
         .ask => "asking",
+        .mcp => "calling",
     };
 }
 
@@ -230,7 +231,7 @@ fn buildThinkingLabelFull(buf: []u8, stream: StreamState) []const u8 {
     return out.buffered();
 }
 
-fn activityParts(stream: StreamState) [6]ActivityPart {
+fn activityParts(stream: StreamState) [7]ActivityPart {
     return .{
         .{ .count = stream.read_count, .singular = "file", .plural = "files", .verb = "read" },
         .{ .count = stream.write_count, .singular = "file", .plural = "files", .verb = "wrote" },
@@ -238,6 +239,7 @@ fn activityParts(stream: StreamState) [6]ActivityPart {
         .{ .count = stream.command_count, .singular = "command", .plural = "commands", .verb = "started" },
         .{ .count = stream.subagent_count, .singular = "subagent", .plural = "subagents", .verb = "created" },
         .{ .count = stream.open_count, .singular = "file", .plural = "files", .verb = "opened" },
+        .{ .count = stream.mcp_count, .singular = "MCP call", .plural = "MCP calls", .verb = "made" },
     };
 }
 

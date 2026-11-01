@@ -8,6 +8,7 @@ const model_provider = @import("../config/model_provider.zig");
 const context_limits = @import("../config/context_limits.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -21,6 +22,11 @@ pub const Digest = [Sha256.digest_length]u8;
 // frames: previous/after snapshots may live in a result-store artifact with
 // only the handle inline. Version 1 and 2 frames never carry the field and
 // remain readable.
+//
+// CommittedFilePresentation.review_lines came after the last release that
+// wrote these frames, so no frame of any version carries it. The session
+// store keeps an edit's rows in a file_review item of their own, which older
+// fx versions skip, never inside the tool_result piece they read.
 pub const conversation_schema_version: u8 = 3;
 
 /// Every historical frame version a reader must still accept. Writers always
@@ -41,6 +47,19 @@ pub const ArtifactCompleteness = enum {
 
 pub const ConversationText = struct {
     text: []const u8,
+};
+
+/// A context note's item data (D93): its text and the absolute paths of the
+/// instruction files it delivered.
+pub const ConversationContextNote = struct {
+    text: []const u8,
+    sources: []const types.ContextNoteSource = &.{},
+};
+
+/// A runtime context's item data (D94): the system message texts the turn
+/// captured for the session and sent ahead of the history.
+pub const ConversationRuntimeContext = struct {
+    messages: []const []const u8,
 };
 
 pub const ConversationAssistant = struct {
@@ -122,7 +141,7 @@ pub const ConversationInterruption = struct {
             turn_summary: ?types.TurnSummary = null,
             cancellation_origin: std.json.Value = .{ .string = "turn" },
         };
-        const wire = try std.json.innerParse(Wire, alloc, source, options);
+        const wire = try json_decode.innerParse(Wire, alloc, source, options);
         // The default enum decoder also accepts numeric tags, not just names.
         if (wire.cancellation_origin != .string) return error.UnexpectedToken;
         const origin = std.meta.stringToEnum(types.CancellationOrigin, wire.cancellation_origin.string) orelse
@@ -184,6 +203,13 @@ pub const ConversationEvent = union(enum) {
     turn_completed: ConversationTurnCompleted,
     interrupted: ConversationInterruption,
     context_checkpoint: ConversationCheckpoint,
+    /// A system note fx added at a step boundary. Only a v2 session saves
+    /// one, as its `context_note` item (D93).
+    context_note: ConversationContextNote,
+    /// The runtime context a turn captured for the session, right after its
+    /// user message. Only a v2 session saves one, as its `runtime_context`
+    /// item (D94).
+    runtime_context: ConversationRuntimeContext,
 };
 
 pub const ConversationEnvelope = struct {
@@ -262,6 +288,10 @@ pub fn validateConversationTransition(
             return error.UnresolvedToolCall;
         },
         .user, .assistant, .steering, .interrupted => {},
+        // This checks a v1 log, which never holds a context note or runtime
+        // context; only a v2 session saves them (D93, D94).
+        .context_note => return rejectInvalidConversationEvent("context-note-v1"),
+        .runtime_context => return rejectInvalidConversationEvent("runtime-context-v1"),
     }
 }
 
@@ -303,6 +333,16 @@ pub fn validateConversationEventShape(event: ConversationEvent, schema_version: 
             }
         },
         .steering => |value| try validateConversationText(value.text),
+        .context_note => |value| {
+            try validateConversationText(value.text);
+            for (value.sources) |source| {
+                if (source.path.len == 0) return rejectInvalidConversationEvent("context-note-source");
+            }
+        },
+        .runtime_context => |value| {
+            if (value.messages.len == 0) return rejectInvalidConversationEvent("runtime-context-empty");
+            for (value.messages) |text| try validateConversationText(text);
+        },
         .tool_call => |call| {
             try validateConversationIdentity(call.call_id);
             try validateConversationIdentity(call.tool_name);
@@ -367,6 +407,7 @@ pub fn validateConversationEventShape(event: ConversationEvent, schema_version: 
                 if (presentation.content_handle) |handle| {
                     try validateConversationIdentity(handle);
                 }
+                if (presentation.review_lines) |rows| try validateReviewLines(rows);
             }
             if ((result.command_replay_ref == null) !=
                 (result.command_replay_bytes == null))
@@ -432,6 +473,22 @@ fn validateConversationIdentity(value: []const u8) ConversationTransitionError!v
     }
 }
 
+/// Checks a saved edit's full-diff rows and the identities they belong to,
+/// as a tool result's presentation would carry them.
+pub fn validateCommittedFileReview(
+    call_id: []const u8,
+    lifecycle_id: types.ToolLifecycleId,
+    rows: []const types.CommittedFilePresentationLine,
+) ConversationTransitionError!void {
+    try validateConversationIdentity(call_id);
+    try validateConversationIdentity(lifecycle_id.call_id);
+    try validateReviewLines(rows);
+}
+
+fn validateReviewLines(rows: []const types.CommittedFilePresentationLine) ConversationTransitionError!void {
+    for (rows) |row| try validateOptionalConversationText(row.text);
+}
+
 fn findPendingToolCall(
     pending_calls: []const PendingToolCall,
     call_id: []const u8,
@@ -464,7 +521,7 @@ pub fn decodeConversationFrameLeaky(
     if (bytes.len == 0 or bytes.len > event_frame_max_bytes or bytes[bytes.len - 1] != '\n') {
         return error.InvalidConversationFrame;
     }
-    const value = std.json.parseFromSliceLeaky(ConversationEnvelope, arena, bytes, .{
+    const value = json_decode.parseFromSliceLeaky(ConversationEnvelope, arena, bytes, .{
         .allocate = allocate,
         .max_value_len = event_frame_max_bytes,
     }) catch |err| switch (err) {
@@ -479,6 +536,9 @@ pub fn decodeConversationFrameLeaky(
     }
     validateConversationEventShape(value.event, value.schema_version) catch
         return error.InvalidConversationFrame;
+    // Every caller reads a v1 log, which never holds a context note or
+    // runtime context; only a v2 session saves them (D93, D94).
+    if (value.event == .context_note or value.event == .runtime_context) return error.InvalidConversationFrame;
     return value;
 }
 
@@ -585,6 +645,11 @@ pub fn appendExecutionConversationEvents(
     events: *std.ArrayList(ConversationEvent),
     execution: types.ExecutionMemory,
 ) !void {
+    // Right after the user message, where every save of the turn has it, so
+    // a streamed turn keeps the same prefix (D94).
+    if (execution.runtime_context) |texts| try events.append(alloc, .{ .runtime_context = .{ .messages = texts } });
+    var note_index: usize = 0;
+    try appendContextNoteConversationEvents(alloc, events, execution.context_notes, &note_index, 0);
     var steering_index: usize = 0;
     while (steering_index < execution.steering.len and
         execution.steering[steering_index].after_tool_step_count == 0)
@@ -647,6 +712,7 @@ pub fn appendExecutionConversationEvents(
             } });
         }
         const completed_steps = step_index + 1;
+        try appendContextNoteConversationEvents(alloc, events, execution.context_notes, &note_index, completed_steps);
         while (steering_index < execution.steering.len and
             execution.steering[steering_index].after_tool_step_count == completed_steps)
         {
@@ -656,6 +722,25 @@ pub fn appendExecutionConversationEvents(
     }
     if (steering_index != execution.steering.len) {
         return rejectInvalidConversationEvent("steering-boundary");
+    }
+    if (note_index != execution.context_notes.len) {
+        return rejectInvalidConversationEvent("context-note-boundary");
+    }
+}
+
+/// The notes at the boundary after `completed_steps` steps, which come
+/// before that boundary's steering (D93). Advances `index` past them.
+fn appendContextNoteConversationEvents(
+    alloc: Allocator,
+    events: *std.ArrayList(ConversationEvent),
+    notes: []const types.PersistedContextNote,
+    index: *usize,
+    completed_steps: usize,
+) !void {
+    while (index.* < notes.len and notes[index.*].after_tool_step_count == completed_steps) : (index.* += 1) {
+        // Like empty steering, an empty note is not saved.
+        const note = notes[index.*];
+        if (note.text.len > 0) try events.append(alloc, .{ .context_note = .{ .text = note.text, .sources = note.sources } });
     }
 }
 
@@ -3187,6 +3272,13 @@ test "conversation frame decoder stays bounded under fuzzed bytes" {
             "{}\n",
             "{\"schema_version\":1}\n",
             "{\"schema_version\":1,\"seq\":1,\"timestamp_ms\":0,\"event\":{\"assistant\":{\"text\":\"ok\"}}}\n",
+            // An edit's result with full-diff rows, so mutations reach their parsing.
+            "{\"schema_version\":3,\"seq\":1,\"timestamp_ms\":1,\"event\":{\"tool_result\":{\"call_id\":\"call-edit\",\"tool_name\":\"edit_file\"," ++
+                "\"status\":\"success\",\"artifact_ref\":\"result.txt\",\"stored_bytes\":0,\"completeness\":\"complete\"," ++
+                "\"committed_file_presentation\":{\"path\":\"src/a.zig\",\"kind\":\"edited\",\"lines\":[],\"additions\":1,\"deletions\":1," ++
+                "\"truncated\":false,\"previous_content\":null,\"after_content\":null,\"lifecycle_id\":{\"turn_id\":1,\"call_id\":\"call-edit\"}," ++
+                "\"content_handle\":null,\"review_lines\":[{\"kind\":\"elision\",\"old_line\":null,\"new_line\":null,\"text\":\"3 unchanged lines\"}," ++
+                "{\"kind\":\"deletion\",\"old_line\":4,\"new_line\":null,\"text\":\"old\"},{\"kind\":\"addition\",\"old_line\":null,\"new_line\":4,\"text\":\"new\"}]}}}}\n",
         }) ++ @import("fuzz_corpus").session_conversation_frame.*),
     });
 }

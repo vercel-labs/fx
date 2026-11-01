@@ -5,6 +5,7 @@
 const std = @import("std");
 const report = @import("report.zig");
 const cache = @import("cache.zig");
+const sort_utils = @import("../core/shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -91,7 +92,7 @@ pub fn build(gpa: Allocator, entry: ?cache.Entry, period: Period, now_ms: i64) A
             }
         }
     }
-    std.mem.sort(report.ModelRow, merged.items, {}, costDescending);
+    sort_utils.sort(report.ModelRow, merged.items, {}, costDescending);
 
     return .{
         .arena = arena,

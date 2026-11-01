@@ -7,6 +7,7 @@ const horizontal_navigation = @import("../input/horizontal_navigation.zig");
 const picker_state = @import("../input/picker_state.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const display_width = @import("../shared/display_width.zig");
 const list_window = @import("../shared/list_window.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
@@ -1482,11 +1483,18 @@ pub fn CompletionRuntime(comptime App: type) type {
             const count = model_capabilities.reasoningEffortOptionCount(capabilities);
             if (count == 0) return 0;
 
-            const normalized_query = std.mem.trim(u8, query, " \t");
+            // A named level keeps its label inline, so the labels slice
+            // into `efforts`, which outlives the filter.
+            var efforts: [types.ReasoningEffort.max_options + 1]types.ReasoningEffort = undefined;
+            var labels: [types.ReasoningEffort.max_options + 1][]const u8 = undefined;
+            for (efforts[0..count], labels[0..count], 0..) |*effort, *label, i| {
+                effort.* = model_capabilities.reasoningEffortAtIndex(capabilities, i);
+                label.* = effort.displayLabel();
+            }
+            const kept: fuzzy_match.Filter(fuzzy_match.LabelMatches) = .init(.{ .labels = labels[0..count], .query = query }, count);
             var result_count: usize = 0;
-            for (0..count) |i| {
-                const effort = model_capabilities.reasoningEffortAtIndex(capabilities, i);
-                if (normalized_query.len > 0 and !text_utils.containsIgnoreCase(effort.displayLabel(), normalized_query)) continue;
+            for (efforts[0..count], 0..) |effort, i| {
+                if (!kept.keeps(i)) continue;
                 out[result_count] = effort;
                 result_count += 1;
             }

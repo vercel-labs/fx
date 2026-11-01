@@ -8,9 +8,28 @@ pub fn parseToolArgsObject(alloc: std.mem.Allocator, args_json: []const u8) !std
     return parsed.value.object;
 }
 
+/// Some models send an object argument as JSON text. This reads the text back
+/// into the object it names, allocated in `alloc`, and leaves any other value
+/// as it is. Text that is not an object is error.InvalidCompositeArgument.
 pub fn normalizeCompositeObjectValue(
     alloc: std.mem.Allocator,
     value: *std.json.Value,
+) !void {
+    return normalizeCompositeValue(alloc, value, .object);
+}
+
+/// The array counterpart of normalizeCompositeObjectValue.
+pub fn normalizeCompositeArrayValue(
+    alloc: std.mem.Allocator,
+    value: *std.json.Value,
+) !void {
+    return normalizeCompositeValue(alloc, value, .array);
+}
+
+fn normalizeCompositeValue(
+    alloc: std.mem.Allocator,
+    value: *std.json.Value,
+    kind: std.meta.Tag(std.json.Value),
 ) !void {
     if (value.* != .string) return;
     const decoded = try std.json.parseFromSliceLeaky(
@@ -19,7 +38,7 @@ pub fn normalizeCompositeObjectValue(
         value.string,
         .{ .allocate = .alloc_always },
     );
-    if (decoded != .object) return error.InvalidCompositeArgument;
+    if (std.meta.activeTag(decoded) != kind) return error.InvalidCompositeArgument;
     value.* = decoded;
 }
 
@@ -151,5 +170,34 @@ test "composite object normalization preserves objects and decodes JSON strings"
     try std.testing.expectError(
         error.InvalidCompositeArgument,
         normalizeCompositeObjectValue(arena, &invalid),
+    );
+}
+
+test "composite array normalization preserves arrays and decodes JSON strings" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var array = try std.json.parseFromSliceLeaky(std.json.Value, arena, "[1,2]", .{});
+    try normalizeCompositeArrayValue(arena, &array);
+    try std.testing.expectEqual(@as(usize, 2), array.array.items.len);
+
+    var encoded = std.json.Value{ .string = "[{\"question\":\"Q\"}]" };
+    try normalizeCompositeArrayValue(arena, &encoded);
+    try std.testing.expectEqualStrings("Q", encoded.array.items[0].object.get("question").?.string);
+
+    var number = std.json.Value{ .integer = 3 };
+    try normalizeCompositeArrayValue(arena, &number);
+    try std.testing.expectEqual(@as(i64, 3), number.integer);
+
+    var object_text = std.json.Value{ .string = "{}" };
+    try std.testing.expectError(
+        error.InvalidCompositeArgument,
+        normalizeCompositeArrayValue(arena, &object_text),
+    );
+    var not_json = std.json.Value{ .string = "not json" };
+    try std.testing.expectError(
+        error.SyntaxError,
+        normalizeCompositeArrayValue(arena, &not_json),
     );
 }

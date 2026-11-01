@@ -414,7 +414,7 @@ fn questionDescriptionColumn(row_budget: usize) usize {
 
 /// Terminal block rendered after an entire question batch resolves.
 /// All answered → each entry's question wraps under its batch ordinal with
-/// the muted answer hanging beneath. Cancelled → single `■ Cancelled\n`.
+/// the muted answer hanging beneath. Cancelled → single `▪ Cancelled\n`.
 pub fn composeQuestionResolutions(
     alloc: Allocator,
     prompt: *const question_prompt.QuestionPrompt,
@@ -512,7 +512,7 @@ fn writeResolutionField(
 
 fn writeCancelledResolution(writer: *std.Io.Writer) !void {
     try writer.writeAll(ui_render.red_style);
-    try writer.writeAll("■");
+    try writer.writeAll("▪");
     try writer.writeAll(ui_render.reset_style);
     try writer.writeAll(" Cancelled");
     try writer.writeByte('\n');
@@ -714,7 +714,7 @@ test "compose question resolutions emits answered summary block" {
     const cancelled_text = try composeQuestionResolutions(std.testing.allocator, &prompt, true, 60);
     defer std.testing.allocator.free(cancelled_text);
     const expected_cancelled = try std.testing.allocator.print(
-        "{s}■{s} Cancelled\n",
+        "{s}▪{s} Cancelled\n",
         .{ ui_render.red_style, ui_render.reset_style },
     );
     defer std.testing.allocator.free(expected_cancelled);

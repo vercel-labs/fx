@@ -230,8 +230,12 @@ function requestUserText(requestIndex: number): string {
     "";
 }
 
+// A named skill's text follows the typed prompt on the turn's message (D95 in
+// tests/tla/session_manager/system-design.md).
+const NAMED_SKILL_TEXT = /\n\nExplicitly invoked skill content for this query:\n[\s\S]*$/;
+
 function finalUserText(requestIndex = 0): string {
-  return requestUserText(requestIndex).replace(IMAGE_LOCATION_NOTES, "");
+  return requestUserText(requestIndex).replace(IMAGE_LOCATION_NOTES, "").replace(NAMED_SKILL_TEXT, "");
 }
 
 function imageLocationNotes(requestIndex = 0): string {

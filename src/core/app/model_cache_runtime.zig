@@ -11,7 +11,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
-const text_utils = @import("../shared/text_utils.zig");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const types = @import("../shared/types.zig");
 const test_builtin_gateway = if (@import("builtin").is_test)
     @import("../../builtins/gateway.zig")
@@ -42,6 +42,10 @@ const picker_revalidate_floor_ms: i64 = 5_000;
 /// 20 s, and so on, up to five minutes, so an outage is never hammered.
 const failure_backoff_base_ms: i64 = 5_000;
 const failure_backoff_cap_ms: i64 = 5 * std.time.ms_per_min;
+
+/// How long a request waits for a failed catalog's retry before it goes out
+/// without the catalog's limits.
+const failed_catalog_retry_wait_ms: i64 = 2_000;
 
 fn failureBackoffMs(failure_streak: u32) i64 {
     var delay = failure_backoff_base_ms;
@@ -299,39 +303,77 @@ pub fn modelMenuFilteredItemCount(
     provider_filter: ModelProviderFilter,
     query: []const u8,
 ) usize {
-    var count: usize = 0;
-    for (items) |item| {
-        if (modelMenuItemMatches(item, provider_filter, query)) count += 1;
-    }
-    return count;
+    return modelMenuRanking(items, provider_filter, query).count();
 }
 
+/// Returns the row at `display_index`. Better matches list first, and rows
+/// that match equally well keep catalog order.
 pub fn modelMenuItemAt(
     items: []const ModelMenuItem,
     provider_filter: ModelProviderFilter,
     query: []const u8,
     display_index: usize,
 ) ?*const ModelMenuItem {
-    var current: usize = 0;
-    for (items) |*item| {
-        if (!modelMenuItemMatches(item.*, provider_filter, query)) continue;
-        if (current == display_index) return item;
-        current += 1;
-    }
-    return null;
+    const position = modelMenuRanking(items, provider_filter, query).at(display_index) orelse return null;
+    return &items[position];
 }
 
-fn modelMenuItemMatches(
-    item: ModelMenuItem,
+/// The inverse of `modelMenuItemAt` for the first item with `id`.
+fn modelMenuDisplayIndex(
+    items: []const ModelMenuItem,
     provider_filter: ModelProviderFilter,
     query: []const u8,
-) bool {
-    if (!providerMatchesFilter(item.provider, provider_filter)) return false;
-    const query_text = std.mem.trim(u8, query, " \t\r\n");
-    return query_text.len == 0 or
-        text_utils.containsIgnoreCase(item.id, query_text) or
-        text_utils.containsIgnoreCase(item.provider, query_text);
+    id: []const u8,
+) ?usize {
+    const position = for (items, 0..) |item, position| {
+        if (std.mem.eql(u8, item.id, id)) break position;
+    } else return null;
+    return modelMenuRanking(items, provider_filter, query).rankOf(position);
 }
+
+/// Matches a model on its full id, provider prefix included, so one query
+/// can name both the provider and the model, and on the model's own name
+/// after the last `/`, so typing that name exactly lists it first:
+/// `gpt-4o` finds `openai/gpt-4o` before `openai/gpt-4o-mini`.
+pub fn modelIdMatch(query: []const u8, id: []const u8) ?fuzzy_match.Match {
+    const slash = std.mem.findScalarLast(u8, id, '/') orelse return fuzzy_match.match(query, &.{.{ .text = id }});
+    return fuzzy_match.match(query, &.{ .{ .text = id }, .{ .text = id[slash + 1 ..] } });
+}
+
+/// The Models menu in catalog order, without the rows outside the provider
+/// tab.
+const ModelMenuMatches = struct {
+    items: []const ModelMenuItem,
+    provider_filter: ModelProviderFilter,
+    query: []const u8,
+
+    pub fn matchAt(self: ModelMenuMatches, position: usize) ?fuzzy_match.Match {
+        const item = self.items[position];
+        if (!providerMatchesFilter(item.provider, self.provider_filter)) return null;
+        return modelIdMatch(self.query, item.id);
+    }
+};
+
+fn modelMenuRanking(
+    items: []const ModelMenuItem,
+    provider_filter: ModelProviderFilter,
+    query: []const u8,
+) fuzzy_match.Ranking(ModelMenuMatches) {
+    return .{
+        .context = .{ .items = items, .provider_filter = provider_filter, .query = query },
+        .len = items.len,
+    };
+}
+
+/// The catalog's ids matched the same way, for inline `/model` suggestions.
+const CatalogIdMatches = struct {
+    entries: []const model_catalog.ModelCatalogEntry,
+    query: []const u8,
+
+    pub fn matchAt(self: CatalogIdMatches, position: usize) ?fuzzy_match.Match {
+        return modelIdMatch(self.query, self.entries[position].id);
+    }
+};
 
 fn providerFilter(provider: []const u8) ModelProviderFilter {
     return if (std.ascii.eqlIgnoreCase(provider, "anthropic"))
@@ -370,8 +412,9 @@ pub const Runtime = struct {
     thread: ?std.Thread = null,
     state: ModelCacheState = .idle,
     /// A fetch is running. Only the first load for an access shows as
-    /// `.loading`; a revalidation or retry leaves the state readers see alone,
-    /// so no reader ever waits on it.
+    /// `.loading`; a revalidation or retry leaves the state readers see alone.
+    /// A request waits up to `failed_catalog_retry_wait_ms` for a failed
+    /// catalog's retry, and on nothing else but a first load.
     fetch_in_flight: bool = false,
     /// Consecutive failed fetches. A success or reset clears it.
     failure_streak: u32 = 0,
@@ -513,7 +556,8 @@ pub const Runtime = struct {
             self.mutex.unlock(io_mod.getIo());
             return false;
         }
-        // Only a first load blocks request resolution. A revalidation or retry
+        // A first load blocks request resolution, and a failed catalog's retry
+        // holds it for at most `failed_catalog_retry_wait_ms`. A revalidation
         // runs behind the state readers already see.
         const first_load = self.state == .idle;
         if (first_load) self.state = .loading;
@@ -740,6 +784,7 @@ pub const Runtime = struct {
         model: []const u8,
         cancel_flag: *std.atomic.Value(bool),
     ) model_capabilities.ResolveError!model_capabilities.Capabilities {
+        var retry_wait_until_ms: ?i64 = null;
         while (true) {
             self.finishThreadIfDone();
             self.mutex.lockUncancelable(io_mod.getIo());
@@ -760,9 +805,19 @@ pub const Runtime = struct {
                 }
                 return model_capabilities.resolveCapabilities(model, metadata);
             }
+            // A request waits a moment for a failed catalog's retry, such as
+            // the one a submitted prompt starts, so a retry that lands quickly
+            // gives this request its limits. A slow retry never holds it.
+            const retry_in_flight = state == .failed and self.fetch_in_flight;
             self.mutex.unlock(io_mod.getIo());
+            const wait_for_retry = retry_in_flight and wait: {
+                const now = model_catalog.clockMs();
+                const until = retry_wait_until_ms orelse now + failed_catalog_retry_wait_ms;
+                retry_wait_until_ms = until;
+                break :wait now < until;
+            };
 
-            switch (state) {
+            switch (if (wait_for_retry) .loading else state) {
                 .loading => {
                     if (cancel_flag.load(.seq_cst)) {
                         debug_trace.logf(
@@ -802,19 +857,23 @@ pub const Runtime = struct {
         return entry.id;
     }
 
+    /// Fills `out` with catalog ids that match `query`, ranked like the model
+    /// menu, and returns how many it wrote. The ids borrow catalog storage.
     pub fn modelCompletions(self: *Self, query: []const u8, out: [][]const u8) usize {
         self.finishThreadIfDone();
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         if (self.state != .ready) return 0;
 
+        const ranking: fuzzy_match.Ranking(CatalogIdMatches) = .{
+            .context = .{ .entries = self.catalog.items, .query = query },
+            .len = self.catalog.items.len,
+        };
+        var matches = ranking.iterator();
         var count: usize = 0;
-        for (self.catalog.items) |entry| {
-            if (count >= out.len) break;
-            if (query.len == 0 or text_utils.containsIgnoreCase(entry.id, query)) {
-                out[count] = entry.id;
-                count += 1;
-            }
+        while (count < out.len) : (count += 1) {
+            const position = matches.next() orelse break;
+            out[count] = self.catalog.items[position].id;
         }
         return count;
     }
@@ -1034,13 +1093,9 @@ fn hydrateMenuSnapshot(
         .all;
     const selected_index = if (!previous_ready) 0 else selected: {
         const previous = menu.itemAt(menu.selected_index) orelse break :selected 0;
-        var display_index: usize = 0;
-        for (items.items) |item| {
-            if (!modelMenuItemMatches(item, filter, menu.query())) continue;
-            if (std.mem.eql(u8, item.id, previous.id)) break :selected display_index;
-            display_index += 1;
-        }
-        break :selected @min(menu.selected_index, display_index -| 1);
+        if (modelMenuDisplayIndex(items.items, filter, menu.query(), previous.id)) |index| break :selected index;
+        const match_count = modelMenuFilteredItemCount(items.items, filter, menu.query());
+        break :selected @min(menu.selected_index, match_count -| 1);
     };
     // Shift the window with the selection so its row stays put on screen.
     const window_start = if (previous_ready)
@@ -1398,7 +1453,7 @@ test "model picker revalidates past the reopen floor while activity waits for th
     }
 }
 
-test "model cache retries a failed catalog behind the failed state so requests never wait on it" {
+test "model cache retries a failed catalog behind the failed state so requests wait on it only briefly" {
     const public: credentials.CatalogAccess = .{ .public_only = .no_credential };
     var runtime = Runtime.init(std.testing.allocator, "/v1/models");
     defer runtime.deinit();
@@ -1416,10 +1471,17 @@ test "model cache retries a failed catalog behind the failed state so requests n
     try std.testing.expect(runtime.isFailed());
     try std.testing.expect(!runtime.isLoading());
 
-    // A set cancel flag fails any wait at once, so a returned value proves
-    // the request resolved without waiting on the retry.
+    // A set cancel flag fails any wait at once, so the error proves the
+    // request waits on the retry.
     var cancelled = std.atomic.Value(bool).init(true);
-    _ = try runtime.resolveForRequest("first", &cancelled);
+    try std.testing.expectError(error.Cancelled, runtime.resolveForRequest("first", &cancelled));
+    // A retry that has not landed holds a request only for the bound.
+    var live = std.atomic.Value(bool).init(false);
+    const started_ms = model_catalog.clockMs();
+    const unresolved = try runtime.resolveForRequest("first", &live);
+    try std.testing.expect(model_catalog.clockMs() - started_ms >= failed_catalog_retry_wait_ms);
+    try std.testing.expectEqual(@as(?u32, null), unresolved.max_output_tokens);
+    try std.testing.expect(fetchInFlight(&runtime));
     try runtime.openMenu();
     try std.testing.expectEqual(ModelMenuLoadState.loading, runtime.menu.load_state);
 
@@ -1959,6 +2021,104 @@ test "model menu owns resolved catalog state and filters without changing catalo
     const selected = (try runtime.menu.selectedModelAlloc(alloc)).?;
     defer alloc.free(selected);
     try std.testing.expectEqualStrings("standalone", selected);
+}
+
+test "model menu ranks fuzzy matches below verbatim ones and keeps the selection" {
+    const alloc = std.testing.allocator;
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("openai/gpt-4.5-preview"), .model_type = @constCast("language") },
+        .{ .id = @constCast("openai/gpt-5"), .model_type = @constCast("language") },
+        .{ .id = @constCast("anthropic/claude-opus-4.8"), .model_type = @constCast("language") },
+        .{ .id = @constCast("acme/gpt5-lite"), .model_type = @constCast("language") },
+    };
+    var menu: ModelMenu = .{};
+    defer menu.deinit(alloc);
+    try hydrateMenuSnapshot(alloc, &menu, &entries);
+    menu.active = true;
+
+    menu.setQuery("gpt5");
+    try std.testing.expectEqual(@as(usize, 3), menu.filteredItemCount());
+    try std.testing.expectEqualStrings("acme/gpt5-lite", menu.itemAt(0).?.id);
+    try std.testing.expectEqualStrings("openai/gpt-5", menu.itemAt(1).?.id);
+    try std.testing.expectEqualStrings("openai/gpt-4.5-preview", menu.itemAt(2).?.id);
+    try std.testing.expect(menu.itemAt(3) == null);
+
+    menu.provider_index = @backingInt(ModelProviderFilter.openai);
+    try std.testing.expectEqual(@as(usize, 2), menu.filteredItemCount());
+    try std.testing.expectEqualStrings("openai/gpt-5", menu.itemAt(0).?.id);
+    try std.testing.expectEqualStrings("openai/gpt-4.5-preview", menu.itemAt(1).?.id);
+    menu.provider_index = @backingInt(ModelProviderFilter.all);
+
+    try std.testing.expect(menu.moveVisibleItems(1, 3));
+    try std.testing.expectEqualStrings("openai/gpt-5", menu.itemAt(menu.selected_index).?.id);
+
+    // A revalidated catalog that adds a better match keeps the cursor on the
+    // same model even though its row moves down.
+    const revalidated = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("acme/gpt5-pro"), .model_type = @constCast("language") },
+    } ++ entries;
+    try hydrateMenuSnapshot(alloc, &menu, &revalidated);
+    try std.testing.expectEqual(@as(usize, 2), menu.selected_index);
+    try std.testing.expectEqualStrings("openai/gpt-5", menu.itemAt(menu.selected_index).?.id);
+}
+
+test "a model's own name ranks it above longer ids that contain it" {
+    const alloc = std.testing.allocator;
+    const entries = [_]model_catalog.ModelCatalogEntry{
+        .{ .id = @constCast("openai/gpt-4o-mini"), .model_type = @constCast("language") },
+        .{ .id = @constCast("azure/gpt-4o-mini-tts"), .model_type = @constCast("language") },
+        .{ .id = @constCast("openai/gpt-4o"), .model_type = @constCast("language") },
+        .{ .id = @constCast("standalone"), .model_type = @constCast("language") },
+    };
+    var menu: ModelMenu = .{};
+    defer menu.deinit(alloc);
+    try hydrateMenuSnapshot(alloc, &menu, &entries);
+    menu.active = true;
+
+    menu.setQuery("GPT-4o");
+    try std.testing.expectEqual(@as(usize, 3), menu.filteredItemCount());
+    try std.testing.expectEqualStrings("openai/gpt-4o", menu.itemAt(0).?.id);
+    try std.testing.expectEqualStrings("openai/gpt-4o-mini", menu.itemAt(1).?.id);
+    try std.testing.expectEqualStrings("azure/gpt-4o-mini-tts", menu.itemAt(2).?.id);
+
+    menu.setQuery("stand");
+    try std.testing.expectEqualStrings("standalone", menu.itemAt(0).?.id);
+    try std.testing.expectEqual(@as(?fuzzy_match.Match, .{ .tier = .prefix, .field = 0 }), modelIdMatch("stand", "standalone"));
+    try std.testing.expectEqual(@as(?fuzzy_match.Match, .{ .tier = .exact, .field = 1 }), modelIdMatch("gpt-4o", "openai/gpt-4o"));
+    try std.testing.expectEqual(@as(?fuzzy_match.Match, .{ .tier = .substring, .field = 0 }), modelIdMatch("ai/gpt", "openai/gpt-4o"));
+}
+
+test "model completions rank fuzzy matches below verbatim ones" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    for ([_][]const u8{
+        "openai/gpt-4.5-preview",
+        "openai/gpt-5",
+        "anthropic/claude-opus-4.8",
+        "acme/gpt5-lite",
+    }) |model| {
+        const id = try alloc.dupe(u8, model);
+        errdefer alloc.free(id);
+        const model_type = try alloc.dupe(u8, "language");
+        errdefer alloc.free(model_type);
+        try runtime.catalog.append(alloc, .{ .id = id, .model_type = model_type });
+    }
+    runtime.state = .ready;
+
+    var completions: [4][]const u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), runtime.modelCompletions("gpt5", &completions));
+    try std.testing.expectEqualStrings("acme/gpt5-lite", completions[0]);
+    try std.testing.expectEqualStrings("openai/gpt-5", completions[1]);
+    try std.testing.expectEqualStrings("openai/gpt-4.5-preview", completions[2]);
+
+    try std.testing.expectEqual(@as(usize, 2), runtime.modelCompletions("gpt5", completions[0..2]));
+    try std.testing.expectEqualStrings("openai/gpt-5", completions[1]);
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.modelCompletions("anthropic opus", &completions));
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4.8", completions[0]);
+    try std.testing.expectEqual(@as(usize, 4), runtime.modelCompletions("", &completions));
+    try std.testing.expectEqualStrings("openai/gpt-4.5-preview", completions[0]);
 }
 
 test "model menu provider navigation skips absent and redundant filters" {

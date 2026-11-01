@@ -25,7 +25,12 @@ if (process.argv[2] !== "--installed") {
     await writeFile(resolve(consumer, "package.json"), '{"private":true,"type":"module"}\n');
     const archive = input.endsWith(".tgz") ? input : resolve(temp,
       JSON.parse(run("npm", ["pack", input, "--ignore-scripts", "--pack-destination", temp, "--json"], temp))[0].filename);
-    run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", archive], consumer);
+    // The platform package for this machine, from `--native-dir <dir>`, as
+    // npm would install it from libfx's optional dependencies.
+    const { localNativeTarball, nativeDirArgument } = await import("./native-package.mjs");
+    const nativeDir = nativeDirArgument();
+    assert.ok(nativeDir || backend !== "native", "the native backend needs --native-dir <dir of platform package tarballs>");
+    run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", archive, ...(nativeDir ? [localNativeTarball(nativeDir)] : [])], consumer);
     await cp(fileURLToPath(import.meta.url), resolve(consumer, "example.mjs"));
     console.log(run(process.execPath, [...process.execArgv, "example.mjs", "--installed", backend, format], consumer).trim());
   } finally {

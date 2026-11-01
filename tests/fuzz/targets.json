@@ -6,12 +6,17 @@
     {"name": "image_route", "module": "fx", "test": "the core keeps the model's laws on arbitrary event sequences", "iterations": 5000000},
     {"name": "earlier_image_notes", "module": "fx", "test": "earlier images withheld from a request always leave a note", "iterations": 100000},
     {"name": "mcp_elicitation", "module": "fx", "test": "elicitation request and response parsers stay bounded under fuzzed bytes", "iterations": 1500000},
+    {"name": "mcp_search_page", "module": "fx", "test": "MCP search pages agree with the schemas they load under fuzzed tools and limits", "iterations": 50000},
     {"name": "session_optional_fields", "module": "fx", "test": "durable session optional fields handle fuzzed ownership paths", "iterations": 3000000},
     {"name": "session_work_provenance", "module": "fx", "test": "per-turn work provenance parser handles fuzzed ownership paths", "iterations": 2100000},
+    {"name": "diff_rows", "module": "fx", "test": "diff rows stay terminal-safe and saveable on fuzzed file text", "iterations": 200000},
     {"name": "session_conversation_frame", "module": "fx", "test": "conversation frame decoder stays bounded under fuzzed bytes", "iterations": 3000000},
+    {"name": "session_conversation_piece", "module": "fx", "test": "v2 conversation pieces stay bounded under fuzzed bytes", "iterations": 300000},
+    {"name": "stable_tool_result_stamps", "module": "fx", "test": "rebuilt tool results keep the times their messages carry", "iterations": 50000},
     {"name": "session_log_scan", "module": "session_manager", "test": "scanning never panics on arbitrary bytes", "iterations": 5000000},
     {"name": "session_schema_header", "module": "session_manager", "test": "header parsing never panics on arbitrary bytes", "iterations": 5000000},
     {"name": "display_width", "module": "fx", "test": "fuzz display unit boundaries", "iterations": 620000},
+    {"name": "fuzzy_match", "module": "fx", "test": "fuzzy match keeps the model's laws on arbitrary bytes", "iterations": 300000},
     {"name": "tool_argument_diagnostic", "module": "fx", "test": "fuzz tool argument diagnostic", "iterations": 3000000},
     {"name": "skill_file", "module": "fx", "test": "parseSkillFile keeps fuzzed borrowed slices inside the input", "iterations": 5000000},
     {"name": "skill_display_name", "module": "fx", "test": "skill display name parsing stays bounded", "iterations": 5000000},
@@ -24,12 +29,14 @@
     {"name": "chat_completions_stream", "module": "fx", "test": "chat completions streams give the same result however they are cut into events and reads", "iterations": 120000},
     {"name": "terminal_grid", "module": "fx", "test": "terminal grid state survives fragmented feeds, checkpoints, and repaints", "iterations": 50000},
     {"name": "transcript_paint", "module": "fx", "test": "transcript painting keeps the shadow terminal in step with the screen", "iterations": 8000},
+    {"name": "markdown_lists", "module": "fx", "test": "Markdown lists render the same however assistant text is split", "iterations": 900000},
     {"name": "url_policy", "module": "fx", "test": "url policy admits only URLs it reads back the same way", "iterations": 2400000},
     {"name": "http_response", "module": "fx", "test": "web_fetch response parser reads a response the same however it is split", "iterations": 1500000},
     {"name": "acp_jsonrpc", "module": "fx", "test": "ACP frames stay one parseable line and read the same however they are split", "iterations": 400000},
     {"name": "mcp_wire", "module": "fx", "test": "MCP wire decoding returns only whole JSON values from valid input", "iterations": 900000},
     {"name": "shell_parity", "module": "fx", "test": "shell parity holds for generated commands", "iterations": 600},
     {"name": "command_lex", "module": "fx", "test": "lexing generated commands is consistent and round-trips through quoting", "iterations": 2700000},
-    {"name": "command_classification", "module": "fx", "test": "classifying generated commands stays inside the command and agrees with the lexer", "iterations": 4800000}
+    {"name": "command_classification", "module": "fx", "test": "classifying generated commands stays inside the command and agrees with the lexer", "iterations": 4800000},
+    {"name": "ask_questions_text", "module": "fx", "test": "ask_user_question questions sent as JSON text decode or refuse arbitrary bytes", "iterations": 250000}
   ]
 }

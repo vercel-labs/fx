@@ -18,6 +18,16 @@ function rawToolCalls(model: string, calls: Array<{ id: string; name: string; ar
   return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
 }
 
+// A tool call whose reply ran out of output tokens mid-arguments.
+function cutToolCall(model: string, command: string) {
+  const args = JSON.stringify({ request: { action: "run", command } });
+  const chunks = [
+    { id: "chat-cut", model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call-cut", type: "function", function: { name: "shell", arguments: args.slice(0, args.length - 8) } }] }, finish_reason: null }] },
+    { id: "chat-cut", model, choices: [{ index: 0, delta: {}, finish_reason: "length" }] },
+  ];
+  return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+}
+
 describe("configured providers", () => {
   test.each(["reasoning", "reasoning_content"])("replays %s through a tool result and saved-session continuation", async field => {
     let calls = 0;
@@ -66,6 +76,38 @@ describe("configured providers", () => {
       expect(messages.at(-1).content).toBe("Summarize what you just did.");
       expect(messages.at(-2).reasoning_content).toBe("Both files have been read.");
       expect(messages.at(-2).tool_calls).toBeUndefined();
+    } finally { f.close(); }
+  }, 25000);
+
+  test("a tool call cut off by the provider's own limit is resent once with fx's limit", async () => {
+    let calls = 0;
+    const f = fixture(body => ++calls === 1 ? cutToolCall(body.model, "printf ran > cut.txt") : completion(body.model, "finished after the resend"));
+    try {
+      // No limit in the metadata, so the first request names none.
+      (f.settings.providers.local.model_metadata as any)["local-model"] = { context_window: 262144, supports_tool_use: true };
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "Run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).final_output).toBe("finished after the resend");
+      expect(f.requests).toHaveLength(2);
+      expect(f.requests[0].body.max_tokens).toBeUndefined();
+      expect(f.requests[1].body.max_tokens).toBe(32768);
+      expect(JSON.stringify(f.requests[1].body.messages)).not.toContain("call-cut");
+      expect(result.stderr).toContain("Retrying with a higher limit.");
+      expect(existsSync(join(f.workspace, "cut.txt"))).toBe(false);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("a tool call cut off at the model's own limit is not resent when that would repeat the request", async () => {
+    let calls = 0;
+    const f = fixture(body => ++calls === 1 ? cutToolCall(body.model, "printf ran > cut.txt") : completion(body.model, "a resend must not be sent"));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "Run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      expect(result.code).toBe(1);
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].body.max_tokens).toBe(8192);
+      expect(result.stderr).toContain("so I did not run them");
+      expect(existsSync(join(f.workspace, "cut.txt"))).toBe(false);
     } finally { f.close(); }
   }, 25000);
 

@@ -656,6 +656,10 @@ const AskContext = struct {
     image_snapshot_temp_dir: ?[]u8 = null,
     prompt_snapshot_committed: bool = false,
     last_recovery_status: ?types.RouteRecoveryStatus = null,
+    /// The recovery status kind last printed as a notice. fx ask cannot
+    /// redraw a line, so it prints a module status only when its kind
+    /// changes, not on every one-second refresh.
+    last_recovery_notice_kind: ?types.RouteRecoveryStatus.Kind = null,
 
     fn init(alloc: Allocator, cfg: Config, deps: RunDeps, workspace_root: []const u8) AskContext {
         const lifecycle_runtime = hooks.Runtime.init(alloc);
@@ -1540,11 +1544,15 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     for (startup.config_diagnostics) |diagnostic| {
         var notice_writer: std.Io.Writer.Allocating = .init(alloc);
         defer notice_writer.deinit();
-        try notice_writer.writer.print(
-            "fx ask: config {s}: {s}",
-            .{ @tagName(diagnostic.layer), @tagName(diagnostic.cause) },
-        );
-        try config_runtime.writeDiagnosticMetadata(&notice_writer.writer, diagnostic);
+        if (diagnostic.note()) |text| {
+            try notice_writer.writer.print("fx ask: note: {s}", .{text});
+        } else {
+            try notice_writer.writer.print(
+                "fx ask: config {s}: {s}",
+                .{ @tagName(diagnostic.layer), @tagName(diagnostic.cause) },
+            );
+            try config_runtime.writeDiagnosticMetadata(&notice_writer.writer, diagnostic);
+        }
         try notice_writer.writer.writeByte('\n');
         const notice = try notice_writer.toOwnedSlice();
         defer alloc.free(notice);
@@ -1811,6 +1819,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         // process_queued_prompt is synchronous here; AskContext keeps the
         // immutable snapshot allocations alive for the whole call.
         .context_snapshot = ctx.context_snapshot,
+        .stale_shell_handles = ctx.session.takeStaleShellHandles(),
     };
 
     const deps = agentRuntimeDeps(&ctx);
@@ -2031,6 +2040,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .append_static_context = appendStaticContext,
         .validate_tool_call = validateToolCall,
         .snapshot_mcp_definition = snapshotMcpDefinition,
+        .resolve_unselected_mcp_tool = resolveUnselectedMcpTool,
         .prepare_skill_call = prepareSkillCall,
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
@@ -2045,6 +2055,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .append_turn_piece = if (ctx.v2 != null) appendTurnPiece else null,
+        .record_usage = if (ctx.v2 != null) recordUsage else null,
         .save_prompt_images = if (ctx.v2 != null) savePromptImages else null,
         .rewind_to_checkpoint = if (ctx.v2 != null) rewindToCheckpoint else null,
         .propagate_grant = propagateGrant,
@@ -2055,6 +2066,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .push_system_notice = pushSystemNotice,
         .push_context_notice = pushContextNotice,
         .push_route_recovery_status = pushRouteRecoveryStatus,
+        .begin_route_recovery_request = beginRouteRecoveryRequest,
         .push_command_output_complete = pushCommandOutputComplete,
         .push_http_error = pushHttpError,
         .refresh_gateway_credential = refreshGatewayCredential,
@@ -2230,14 +2242,13 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .access_scope = ctx.workspace_access.scope(ctx.workspace_root),
         .interactive = false,
         .permission_mode = ctx.permission_mode,
-        .stale_shell_handles = ctx.session.has_stale_shell_handles,
     }, arena, messages);
 }
 
-fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
+fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     try ctx.deps.context_registry.appendDefaultStatic(.{
-        .project_context = project_context orelse ctx.modelVisibleProjectContext(),
+        .project_context = ctx.modelVisibleProjectContext(),
     }, arena, messages);
     var snapshot = if (ctx.mcp_host) |h|
         try h.catalog.modelSnapshot(arena)
@@ -2254,6 +2265,11 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?
 fn snapshotMcpDefinition(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     return tool_runtime.snapshotMcpDefinition(ctx.toolContext(), arena, name, known);
+}
+
+fn resolveUnselectedMcpTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return tool_runtime.resolveUnselectedMcpTool(ctx.toolContext(), arena, name);
 }
 
 fn validateToolCall(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
@@ -3015,6 +3031,16 @@ fn rewindToCheckpoint(raw_ctx: *anyopaque, user: types.UserTurn, kept: types.Exe
     if (rewound.abandoned.len > 0) if (ctx.subagent_host) |children_host| children_host.children.forget();
 }
 
+/// `AgentRuntimeDeps.record_usage` on v2: each reply's usage reaches the
+/// log as it arrives, so a killed run keeps it (D92).
+fn recordUsage(raw_ctx: *anyopaque, usage: types.Usage) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = ctx.v2 orelse return;
+    try v2.recordUsage(usage);
+}
+
 /// The prompt's images become the session's blobs before its first request
 /// (D89). A failure leaves the rest inline, with no path, as the adapter
 /// does for one image the store refuses.
@@ -3034,7 +3060,10 @@ fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
     switch (event) {
-        .clear_route_recovery_status => ctx.last_recovery_status = null,
+        .clear_route_recovery_status => {
+            ctx.last_recovery_status = null;
+            ctx.last_recovery_notice_kind = null;
+        },
         .provider_resolved => |slug| {
             if (ctx.resolved_provider) |old| ctx.alloc.free(old);
             ctx.resolved_provider = try ctx.alloc.dupe(u8, slug);
@@ -3318,24 +3347,34 @@ fn pushContextNotice(raw_ctx: *anyopaque, text: []const u8) !void {
     try pushSystemNotice(raw_ctx, text);
 }
 
+/// `--json` reports the last request's recovery, so a new request forgets
+/// the previous one's, such as an earlier step's `recovered`. The turn loop
+/// calls this before the request's ticker starts.
+fn beginRouteRecoveryRequest(raw_ctx: *anyopaque) void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.last_recovery_status = null;
+    ctx.last_recovery_notice_kind = null;
+}
+
 fn pushRouteRecoveryStatus(raw_ctx: *anyopaque, status: types.RouteRecoveryStatus) !void {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     ctx.last_recovery_status = status;
-    const terminal = status.kind == .terminal_provider_error;
-    const json_progress = switch (status.kind) {
-        .auto_retry,
-        .auto_recovered,
-        .manual_retry_without_fast,
-        .manual_recovered_without_fast,
-        .terminal_provider_error,
-        => true,
+    const notice = switch (status.kind) {
+        .waiting, .retrying, .need_user => notice: {
+            const changed = ctx.last_recovery_notice_kind != status.kind;
+            ctx.last_recovery_notice_kind = status.kind;
+            break :notice changed and ctx.output_mode != .quiet;
+        },
+        // The success or the error itself is the notice; --json reports how
+        // the request ended.
+        .recovered, .failed => false,
+        .terminal_provider_error => true,
         .unsafe_assistant_output,
         .unsafe_tool_start,
         .content_filter,
-        => false,
+        => ctx.output_mode != .json and ctx.output_mode != .quiet,
     };
-    if ((ctx.output_mode == .json and !json_progress) or
-        (ctx.output_mode == .quiet and !terminal)) return;
+    if (!notice) return;
     var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
     try pushSystemNotice(raw_ctx, status.label(&label_buf));
 }
@@ -3951,11 +3990,15 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         }
         try out.writer.writeAll("}");
     }
-    try out.writer.writeAll("],\"usage\":");
-    try std.json.Stringify.value(.{
-        .input_tokens = result.usage.input_tokens,
-        .output_tokens = result.usage.output_tokens,
-    }, .{}, &out.writer);
+    try out.writer.writeAll("],\"usage\":{\"input_tokens\":");
+    try std.json.Stringify.value(result.usage.input_tokens, .{}, &out.writer);
+    try out.writer.writeAll(",\"output_tokens\":");
+    try std.json.Stringify.value(result.usage.output_tokens, .{}, &out.writer);
+    // Present only when the provider reports caching, so a missing count
+    // never reads as zero cached tokens.
+    if (result.usage.cache_read_tokens) |tokens| try out.writer.print(",\"cache_read_tokens\":{d}", .{tokens});
+    if (result.usage.cache_write_tokens) |tokens| try out.writer.print(",\"cache_write_tokens\":{d}", .{tokens});
+    try out.writer.writeAll("}");
     if (result.error_code) |error_code| {
         try out.writer.writeAll(",\"error\":");
         try std.json.Stringify.value(error_code, .{}, &out.writer);
@@ -3966,38 +4009,8 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     }
     if (result.recovery) |recovery| {
         var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
-        try out.writer.writeAll(",\"recovery\":{\"state\":");
-        try std.json.Stringify.value(
-            if (recovery.kind == .terminal_provider_error)
-                // A genuine lifecycle pause (action == .paused) is resumable; a
-                // terminal stop (no action) is not. JSON consumers need the
-                // distinction.
-                if (recovery.action == .paused) "paused" else "failed"
-            else if (recovery.isRecovered()) "recovered" else "active",
-            .{},
-            &out.writer,
-        );
-        try out.writer.writeAll(",\"kind\":");
-        try std.json.Stringify.value(@tagName(recovery.kind), .{}, &out.writer);
-        if (recovery.cause) |cause| {
-            try out.writer.writeAll(",\"cause\":");
-            try std.json.Stringify.value(@tagName(cause), .{}, &out.writer);
-        }
-        if (recovery.action) |action| {
-            try out.writer.writeAll(",\"action\":");
-            try std.json.Stringify.value(@tagName(action), .{}, &out.writer);
-        }
-        if (recovery.required_action != .none) {
-            try out.writer.writeAll(",\"required_action\":");
-            try std.json.Stringify.value(@tagName(recovery.required_action), .{}, &out.writer);
-        }
-        try out.writer.print(",\"attempt\":{d},\"attempt_limit\":{d},\"delay_seconds\":{d},\"message\":", .{
-            recovery.reportedAttempt(),
-            recovery.attempt_limit,
-            recovery.delay_seconds,
-        });
-        try std.json.Stringify.value(recovery.label(&label_buf), .{}, &out.writer);
-        try out.writer.writeAll("}");
+        try out.writer.writeAll(",\"recovery\":");
+        try recovery.report(&label_buf).writeJson(&out.writer);
     }
     try out.writer.writeAll("}\n");
     return try out.toOwnedSlice();
@@ -4317,29 +4330,41 @@ fn testProcessQueuedPrompt(_: *agent_runtime.Agent, deps: *const agent_runtime.A
 fn testProcessQueuedPromptRecoveryLifecycle(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     try std.testing.expectEqual(hooks.ScopeKind.ask, lifecycle.scope.kind);
-    try deps.push_route_recovery_status(deps.ctx, .{
-        .kind = .auto_retry,
-        .failed_attempt = 1,
-        .attempt_limit = 10,
-        .cause = .network_interrupted,
-        .action = .waiting_for_connectivity,
-    });
+    // One-second refreshes of the same kind print once.
+    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .waiting, .text = testRecoveryText("Offline · next try in 2s · 0s"), .attempt = 1 });
+    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .waiting, .text = testRecoveryText("Offline · next try in 1s · 1s"), .attempt = 1 });
+    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .retrying, .text = testRecoveryText("Offline · retrying · attempt 2 · 2s"), .attempt = 2 });
     try deps.push_event(deps.ctx, .clear_route_recovery_status);
+    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .recovered, .attempt = 2 });
     try testPushAssistantText(deps, "assistant text");
+}
+
+const testRecoveryText = types.testRecoveryText;
+
+fn testProcessQueuedPromptRecoveredThenFailed(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
+    try std.testing.expect(semantic_presentation == null);
+    const begin = deps.begin_route_recovery_request.?;
+    // The first step's request recovers from a 503.
+    begin(deps.ctx);
+    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .waiting, .text = testRecoveryText("Gateway error · next try in 1s · attempt 1 · 0s"), .attempt = 1 });
+    try deps.push_event(deps.ctx, .clear_route_recovery_status);
+    try deps.push_route_recovery_status(deps.ctx, .{ .kind = .recovered, .attempt = 2 });
+    // The second step's request fails with HTTP 400 on its first try.
+    begin(deps.ctx);
+    try deps.push_http_error(deps.ctx, .bad_request, "bad request body", null);
+    return error.ModelError;
 }
 
 fn testProcessQueuedPromptRetryAdmissionFailure(_: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, _: agent_runtime.LifecycleContext, _: agent_runtime.Config, _: worker_runtime.QueuedPrompt) !void {
     try std.testing.expect(semantic_presentation == null);
     try deps.push_route_recovery_status(deps.ctx, .{
-        .kind = .auto_retry,
-        .failed_attempt = 1,
-        .attempt_limit = 2,
-        .delay_seconds = 4,
+        .kind = .waiting,
+        .text = testRecoveryText("Gateway error · next try in 4s · attempt 1 · 0s"),
+        .attempt = 1,
     });
     try deps.push_route_recovery_status(deps.ctx, .{
         .kind = .terminal_provider_error,
-        .failed_attempt = 1,
-        .attempt_limit = 2,
+        .attempt = 1,
         .diagnostic = types.ModelFailureDiagnostic.init("TestProviderSerializationFailed"),
     });
     return error.TestProviderSerializationFailed;
@@ -4409,12 +4434,13 @@ fn testProcessQueuedPromptChecksExecOnlyTerminal(_: *agent_runtime.Agent, deps: 
     for (advertised_shell.input_schema.properties) |property| {
         try std.testing.expect(!std.mem.eql(u8, property.name, "tty"));
     }
-    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "shell.interact") != null);
+    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "action=interact") != null);
+    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "tty") == null);
     try std.testing.expectEqualStrings(builtin_tools.web_search.description, cfg.custom_tool_guidance);
     try std.testing.expectEqualStrings("test model overlay", cfg.model_prompt_overlay.?);
     const runtime_shell = deps.tool_registry.lookup("shell") orelse
         return error.TestExpectedEqual;
-    try std.testing.expect(std.mem.find(u8, runtime_shell.description, "shell.interact") != null);
+    try std.testing.expect(std.mem.find(u8, runtime_shell.description, "action=interact") != null);
     try testPushAssistantText(deps, "assistant text");
 }
 
@@ -4425,7 +4451,8 @@ fn testProcessQueuedPromptChecksFullTerminal(_: *agent_runtime.Agent, deps: *con
     const advertised_shell = for (cfg.advertised_functions) |function| {
         if (std.mem.eql(u8, function.name, "shell")) break function;
     } else return error.TestExpectedEqual;
-    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "shell.interact") != null);
+    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "action=interact") != null);
+    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "tty=true") != null);
     try testPushAssistantText(deps, "assistant text");
 }
 
@@ -4725,7 +4752,7 @@ const TestContextRegistryFixture = struct {
         defer messages.deinit(arena);
 
         const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
-        try append_static(deps.ctx, arena, null, &messages);
+        try append_static(deps.ctx, arena, &messages);
         try deps.append_runtime_context(deps.ctx, arena, &messages);
         try std.testing.expectEqual(
             ctx.permission_mode,
@@ -4901,7 +4928,7 @@ test "CLI prompt projection configures web search then blocks native execution" 
     defer messages.deinit(arena);
     const deps = agentRuntimeDeps(&ctx);
     const append_static = deps.append_static_context orelse return error.TestExpectedEqual;
-    try append_static(deps.ctx, arena, null, &messages);
+    try append_static(deps.ctx, arena, &messages);
     try deps.append_runtime_context(deps.ctx, arena, &messages);
 
     try std.testing.expectEqualStrings("stale-key", ctx.web_search_runtime.api_key);
@@ -7504,9 +7531,29 @@ test "render final JSON reports the successful recovery attempt" {
         .exit_code = 0,
         .assistant_output = try alloc.dupe(u8, "recovered"),
         .recovery = .{
-            .kind = .auto_recovered,
-            .succeeded_attempt = 3,
-            .attempt_limit = 10,
+            .kind = .recovered,
+            .attempt = 3,
+        },
+    };
+    defer result.deinit(alloc);
+
+    const json = try renderFinalJsonResult(alloc, result);
+    defer alloc.free(json);
+    // The module shape (decision 38): `recovered` carries only the attempt,
+    // with no message, budget, or delay fields.
+    try std.testing.expect(std.mem.find(u8, json, ",\"recovery\":{\"state\":\"recovered\",\"attempt\":3}}") != null);
+}
+
+test "render final JSON names what a needs-you status needs" {
+    const alloc = std.testing.allocator;
+    const result = PromptRunResult{
+        .exit_code = 1,
+        .assistant_output = try alloc.dupe(u8, ""),
+        .recovery = .{
+            .kind = .need_user,
+            .need = .rejected,
+            .text = testRecoveryText("The provider rejected this request · press Esc"),
+            .attempt = 1,
         },
     };
     defer result.deinit(alloc);
@@ -7516,13 +7563,10 @@ test "render final JSON reports the successful recovery attempt" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
     const recovery = parsed.value.object.get("recovery").?.object;
-    try std.testing.expectEqual(@as(i64, 3), recovery.get("attempt").?.integer);
-    try std.testing.expectEqualStrings("recovered", recovery.get("state").?.string);
-    try std.testing.expectEqualStrings(
-        "✓ recovered · succeeded on attempt 3",
-        recovery.get("message").?.string,
-    );
-    try std.testing.expect(std.mem.find(u8, recovery.get("message").?.string, "provider_error") == null);
+    try std.testing.expectEqualStrings("need_user", recovery.get("state").?.string);
+    try std.testing.expectEqualStrings("rejected", recovery.get("need").?.string);
+    try std.testing.expectEqual(@as(i64, 1), recovery.get("attempt").?.integer);
+    try std.testing.expectEqualStrings("The provider rejected this request · press Esc", recovery.get("message").?.string);
 }
 
 test "render final JSON includes the latest terminal recovery diagnostic" {
@@ -7532,8 +7576,7 @@ test "render final JSON includes the latest terminal recovery diagnostic" {
         .assistant_output = try alloc.dupe(u8, ""),
         .recovery = .{
             .kind = .terminal_provider_error,
-            .failed_attempt = 2,
-            .attempt_limit = 2,
+            .attempt = 2,
             .cause = .provider_unavailable,
             .diagnostic = types.ModelFailureDiagnostic.init(
                 "HTTP 503 · no_available_providers: No providers are currently available",
@@ -8384,11 +8427,36 @@ test "fx ask JSON recovery keeps stdout structured and reports progress on stder
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stdout_capture.bytes.items, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("assistant text", parsed.value.object.get("output").?.string);
-    try std.testing.expect(parsed.value.object.get("recovery") == null);
+    const recovery = parsed.value.object.get("recovery").?.object;
+    try std.testing.expectEqualStrings("recovered", recovery.get("state").?.string);
+    try std.testing.expectEqual(@as(i64, 2), recovery.get("attempt").?.integer);
+    try std.testing.expect(recovery.get("message") == null);
+    // A host that cannot redraw prints a status only when its kind changes.
     try std.testing.expectEqualStrings(
-        "[notice] ⚠ Network interrupted · waiting for connection\n",
+        "[notice] Offline · next try in 2s · 0s\n[notice] Offline · retrying · attempt 2 · 2s\n",
         stderr_capture.bytes.items,
     );
+}
+
+test "fx ask JSON reports only the last request's recovery" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    const deps = testPromptRunDepsWithProcess(
+        &stdout_capture,
+        &stderr_capture,
+        testProcessQueuedPromptRecoveredThenFailed,
+    );
+
+    const exit_code = try runWithDeps(alloc, &.{ "--json", "hello" }, testConfig(), deps);
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stdout_capture.bytes.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("exit_code").?.integer);
+    // An earlier step's `recovered` does not describe the request that failed.
+    try std.testing.expect(parsed.value.object.get("recovery") == null);
 }
 
 test "fx ask JSON reports the consumed attempt after retry admission failure" {
@@ -8410,12 +8478,12 @@ test "fx ask JSON reports the consumed attempt after retry admission failure" {
     const recovery = parsed.value.object.get("recovery").?.object;
     try std.testing.expectEqualStrings("failed", recovery.get("state").?.string);
     try std.testing.expectEqual(@as(i64, 1), recovery.get("attempt").?.integer);
-    try std.testing.expectEqual(@as(i64, 0), recovery.get("delay_seconds").?.integer);
+    try std.testing.expect(recovery.get("delay_seconds") == null);
     try std.testing.expectEqualStrings(
         "TestProviderSerializationFailed",
         parsed.value.object.get("error").?.string,
     );
-    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "retrying request in 4s") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "next try in 4s") != null);
     try std.testing.expect(std.mem.find(u8, stderr_capture.bytes.items, "stopped after 1 attempt") != null);
 }
 

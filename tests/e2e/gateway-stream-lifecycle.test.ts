@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   AMBIGUOUS_CAPABILITY_CLAUSES,
@@ -49,6 +49,11 @@ import {
 const MODEL = "openai/gpt-5.5";
 const DEFAULT_MODEL = "spacexai/grok-4.7";
 const DELAY_MS = 32_500;
+// What the shell description tells the model to run for a service that
+// outlives fx; macOS has no setsid command (src/builtins/tools.zig).
+const DETACH_COMMAND = process.platform === "darwin"
+  ? "perl -MPOSIX -e 'fork&&exit;setsid;exec@ARGV' <cmd> >log 2>&1 &"
+  : "setsid <cmd> >log 2>&1 &";
 const MALFORMED_ARGUMENTS = '{"depth":1,"depth":2}';
 const MALFORMED_CALL_ID = "malformed_ask_1";
 const MALFORMED_TOOL_NAME = "ask_user_question";
@@ -495,17 +500,13 @@ function parseAskJson(stdout: string): {
   error?: string;
   session_id: string;
   tool_calls: Array<{ name: string; status: string }>;
-  usage: { input_tokens: number | null; output_tokens: number | null };
+  usage: { input_tokens: number | null; output_tokens: number | null; cache_read_tokens?: number; cache_write_tokens?: number };
+  // The recovery module's shape (decision 38). `recovered` has no message.
   recovery?: {
     state: string;
-    kind: string;
-    cause?: string;
-    action?: string;
-    required_action?: string;
     attempt: number;
-    attempt_limit: number;
-    durable: boolean;
-    message: string;
+    need?: string;
+    message?: string;
   };
 } {
   return JSON.parse(stdout.trim());
@@ -592,7 +593,16 @@ function advertisedSkillPath(body: string, location: string): string {
   const prefix = `Root ${match[1]}: `;
   const root = taggedBlock(body, "available_skills").split("\n").find((line) => line.startsWith(prefix));
   if (!root) throw new Error(`Missing root for ${location}`);
-  return join(root.slice(prefix.length), decodeURIComponent(match[2]!));
+  // A root inside the workspace is shown relative to the turn context's workspace_root.
+  const shown = root.slice(prefix.length);
+  const base = isAbsolute(shown) ? shown : join(turnContextWorkspaceRoot(body), shown);
+  return join(base, decodeURIComponent(match[2]!));
+}
+
+function turnContextWorkspaceRoot(body: string): string {
+  const match = /^workspace_root: (.+)$/m.exec(promptText(body));
+  if (!match) throw new Error("Missing workspace_root in the turn context");
+  return match[1]!;
 }
 
 function toolResultOutput(body: string, callId: string): string {
@@ -1154,10 +1164,10 @@ describe("gateway stream lifecycle", () => {
         "Run shell commands through shell.run. Commands that complete quickly return in one call; commands still running after yield_time_ms return one owned session_id available across turns. Use shell.interact with session_id: omit chars to observe without writing input, or provide chars to send input. Use shell.stop only when termination is requested. output_delta is terminal-safe; unsafe bytes are escaped while full_output_handle retains exact output. Do not run a separate command to test output safety or shell usability. Never detach with &, nohup, setsid, or double-forking. Each call starts a new shell with the user startup files applied; aliases, functions, and PATH are available, but cd, export, and alias changes do not carry over. In zsh, quote glob patterns meant for another program; unmatched globs are errors. Each Python process a call starts is fresh; Python 3.10+ can `import proto_fx as harness` for persistent kernels, subagents, tools, and permission-checked file edits until the call returns.",
       );
       expect(toolByName(oracleRequest, "skill")?.description).toContain(
-        "the task clearly matches one",
+        "relative to the skill, not the workspace",
       );
       expect(toolByName(oracleRequest, "ask_user_question")?.description).toContain(
-        "precise, mutually exclusive paths",
+        "when a decision blocks you",
       );
       expect(gateway.requests[0]!.body).not.toContain(
         "Treat it as interrupting any previous tool plan.",
@@ -1776,7 +1786,7 @@ describe("gateway stream lifecycle", () => {
       expect(gateway.requestCount()).toBe(1);
       expect(prompt).toContain("LINKED_INSTRUCTION_SENTINEL");
       expect(prompt).toContain(
-        `<project-rules from="${join(root.workspace, "AGENTS.md")}">`,
+        '<project-rules from="AGENTS.md">',
       );
       expect(prompt).toContain("LINKED_SKILL_SENTINEL");
       expect(prompt).toContain(
@@ -2034,7 +2044,8 @@ describe("gateway stream lifecycle", () => {
       expect(promptText(gateway.requests[0]!.body)).toContain(
         'reason="oversized rule file"',
       );
-      expect(promptText(gateway.requests[1]!.body)).toContain(
+      // Rules and omissions a tool call reaches ride on its result (D93).
+      expect(toolResultOutput(gateway.requests[1]!.body, "project_omission_read")).toContain(
         'reason="selection cap"',
       );
     } finally {
@@ -2467,10 +2478,8 @@ describe("gateway stream lifecycle", () => {
       expect(skillSchema?.inputSchema.required).toEqual(["location"]);
       expect(capabilitySearchSchema).toBeDefined();
       expect(capabilitySearchSchema?.inputSchema.required).toEqual(["query"]);
-      expect((capabilitySearchSchema?.inputSchema.properties.query as {
-        minLength?: number;
-        maxLength?: number;
-      })).toMatchObject({ minLength: 1, maxLength: 4096 });
+      // The decoder bounds the query, so the schema carries only its type.
+      expect(capabilitySearchSchema?.inputSchema.properties.query.type).toBe("string");
       expect(capabilitySearchSchema?.inputSchema.properties.kind).toBeUndefined();
       expect(capabilitySearchSchema?.inputSchema.properties.limit).toBeUndefined();
       expect(capabilitySearchSchema?.inputSchema.properties.cursor).toBeUndefined();
@@ -3519,8 +3528,13 @@ describe("gateway stream lifecycle", () => {
         expect(deferredBody).toContain(buildRule);
         expect(deferredBody).not.toContain(siblingRule);
         expect(deferredBody.indexOf(rootRule)).toBeLessThan(deferredBody.indexOf(buildRule));
-        expect(toolResultOutput(deferredBody, firstCallId)).toBe(
-          "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.",
+        // The deferred call's result carries the rules it waited for (D93).
+        const deferredResult = toolResultOutput(deferredBody, firstCallId);
+        expect(deferredResult.startsWith(
+          "Scoped project instructions were added before execution. Review them and reissue this tool call if it is still appropriate.\n\n",
+        )).toBe(true);
+        expect(deferredResult).toContain(
+          `<scoped-rules from="build/AGENTS.md" scope="build">\n${buildRule}\n</scoped-rules>`,
         );
         expect(existsSync(targetPath)).toBe(true);
 
@@ -5427,6 +5441,116 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
+  test("a service started the way the shell description says keeps serving after fx ask exits", async () => {
+    const root = createFixtureRoot("shell-setsid-service");
+    const tracePath = join(root.root, "trace.log");
+    const pidPath = join(root.workspace, "service.pid");
+    const callId = "shell_setsid_service_start";
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const address = probe.address();
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    if (address === null || typeof address === "string") throw new Error("no loopback port");
+    const port = address.port;
+    const serverPath = join(root.root, "service.py");
+    const logPath = join(root.root, "service.log");
+    // A bare socket server. http.server looks up the host name between bind
+    // and listen, which can outlast the call's timeout on macOS runners.
+    writeFileSync(
+      serverPath,
+      [
+        "import os, socket, sys",
+        "with open(sys.argv[2], 'w') as f: f.write(str(os.getpid()))",
+        "server = socket.socket()",
+        "server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
+        "server.bind(('127.0.0.1', int(sys.argv[1])))",
+        "server.listen()",
+        "while True:",
+        "    conn, _ = server.accept()",
+        "    try:",
+        "        if conn.recv(65536):",
+        "            conn.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\nConnection: close\\r\\n\\r\\nok')",
+        "    except OSError:",
+        "        pass",
+        "    conn.close()",
+        "",
+      ].join("\n"),
+    );
+    let step = 0;
+    let started: ShellResult | null = null;
+    let servicePid: number | null = null;
+    let gatewayObservationError: unknown;
+    const gateway = startGateway((body) => {
+      switch (step++) {
+        case 0: {
+          // Run exactly the command the description gives the model, so the
+          // test fails when that advice does not work on this platform.
+          const description = toolByName(parseGatewayRequest(body), "shell")?.description ?? "";
+          const advice = /To keep a service running, use `([^`]+)`/.exec(description)?.[1];
+          if (!advice?.includes("<cmd>") || !advice.includes(">log")) {
+            gatewayObservationError = new Error(`the shell description gives no detach command: ${advice}`);
+            return fakeGatewayFinalText("No command to run.");
+          }
+          const command = [
+            advice
+              .replace("<cmd>", `python3 ${JSON.stringify(serverPath)} ${port} ${JSON.stringify(pidPath)}`)
+              .replace(">log", `>${JSON.stringify(logPath)}`),
+            `until python3 -c 'import socket; socket.create_connection(("127.0.0.1", ${port}), 1).close()' 2>/dev/null; do sleep 0.1; done`,
+            "printf SERVICE-READY",
+          ].join("\n");
+          return fakeShellRun(callId, command, { profile: "clean", timeout_ms: 15_000 });
+        }
+        case 1:
+          try {
+            started = shellResult(body, callId);
+          } catch (error) {
+            gatewayObservationError = error;
+          }
+          return fakeGatewayFinalText("The service is running.");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    });
+
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--yolo", "--no-save", "Start the service and leave it running."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 25_000,
+        },
+      );
+      if (gatewayObservationError) throw gatewayObservationError;
+      servicePid = Number.parseInt(readFileSync(pidPath, "utf8"), 10);
+      expect(result.code).toBe(0);
+      expect(gateway.requestCount()).toBe(2);
+      expect(started).toMatchObject({
+        state: "completed",
+        exit_code: 0,
+        error: null,
+        output_delta: "SERVICE-READY",
+      });
+      // Connect only after fx has exited, as a later check of the machine would.
+      await Bun.sleep(500);
+      const response = await fetch(`http://127.0.0.1:${port}/`);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("ok");
+    } finally {
+      if (existsSync(logPath)) {
+        const serviceLog = readFileSync(logPath, "utf8");
+        if (serviceLog.length > 0) console.error(`service.log:\n${serviceLog}`);
+      }
+      if (servicePid !== null && Number.isSafeInteger(servicePid) && servicePid > 0) {
+        try {
+          process.kill(servicePid, "SIGKILL");
+        } catch {}
+      }
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("saved shell replay handle remains readable after resume without re-execution", async () => {
     const root = createFixtureRoot("saved-terminal-replay");
     const firstTracePath = join(root.root, "first-trace.log");
@@ -5586,6 +5710,136 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 20_000);
+
+  test("a killed ask keeps each reply's token usage in its log, and a resume keeps counting", async () => {
+    const root = createFixtureRoot("usage-survives-sigkill");
+    let requests = 0;
+    const gateway = startGateway(() => {
+      requests += 1;
+      if (requests === 1) {
+        return fakeGatewaySse([
+          { type: "tool-call", toolCallId: "usage_kill_1", toolName: "shell", input: { request: { action: "run", command: "sleep 3", yield_time_ms: 30_000 } } },
+          {
+            type: "finish",
+            finishReason: { unified: "tool-calls", raw: "tool-calls" },
+            usage: { inputTokens: { total: 100, noCache: 20, cacheRead: 80 }, outputTokens: { total: 7, reasoning: 2 } },
+          },
+        ]);
+      }
+      return fakeGatewaySse([
+        { type: "text-delta", id: "answer_1", delta: "Done." },
+        {
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: { inputTokens: { total: 50, cacheRead: 40 }, outputTokens: { total: 3 } },
+        },
+      ]);
+    });
+    const usageValues = (id: string) =>
+      (logLines(root.home, id) as Array<{ kind: string; key?: string; value?: unknown }>).filter((line) => line.kind === "set" && line.key === "usage").map((line) => line.value);
+    // As Harbor runs fx: the agent phase ends with a kill, not a turn end.
+    const proc = Bun.spawn([FX_BIN, "ask", "--yolo", "--json", "--", "Run the usage fixture."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+
+    try {
+      let id: string | undefined;
+      const deadline = Date.now() + 10_000;
+      while (id === undefined && Date.now() < deadline) {
+        try {
+          const ids = savedSessionIds(root.home);
+          if (ids.length === 1 && usageValues(ids[0]!).length > 0) id = ids[0];
+        } catch {
+          // The store or its log does not exist yet.
+        }
+        if (id === undefined) await Bun.sleep(25);
+      }
+      expect(id).toBeDefined();
+      proc.kill("SIGKILL");
+      await proc.exited;
+
+      const killedLog = logLines(root.home, id!);
+      expect(killedLog.some((line) => line.kind === "turn_committed")).toBe(false);
+      expect(usageValues(id!).at(-1)).toEqual({
+        input_tokens: 100,
+        output_tokens: 7,
+        cache_read_tokens: 80,
+        cache_write_tokens: null,
+        reasoning_tokens: 2,
+      });
+
+      const resumed = await runFx(["ask", "--yolo", "--json", "--resume-id", id!, "--", "Finish up."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "resume-trace.log")),
+        timeoutMs: 15_000,
+      });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(parseAskJson(resumed.stdout).usage).toEqual({ input_tokens: 50, output_tokens: 3, cache_read_tokens: 40 });
+      expect(usageValues(id!).at(-1)).toEqual({
+        input_tokens: 150,
+        output_tokens: 10,
+        cache_read_tokens: 120,
+        cache_write_tokens: null,
+        reasoning_tokens: 2,
+      });
+    } finally {
+      if (proc.exitCode === null) proc.kill("SIGKILL");
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a subagent saves its replies' token usage in its own log, apart from its parent's", async () => {
+    const root = createFixtureRoot("usage-subagent");
+    const finish = (unified: string, input: number, cacheRead: number, output: number) => ({
+      type: "finish",
+      finishReason: { unified, raw: unified },
+      usage: { inputTokens: { total: input, cacheRead }, outputTokens: { total: output } },
+    });
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        return fakeGatewaySse([{ type: "text-delta", id: "child_answer", delta: "CHILD_DONE" }, finish("stop", 7000, 700, 70)]);
+      }
+      if (hasCurrentToolResult(body, "usage_child")) {
+        return fakeGatewaySse([{ type: "text-delta", id: "parent_answer", delta: "PARENT_DONE" }, finish("stop", 200, 20, 2)]);
+      }
+      return fakeGatewaySse([
+        { type: "tool-call", toolCallId: "usage_child", toolName: "subagent", input: { request: { action: "run", task: "Reply CHILD_DONE." } } },
+        finish("tool-calls", 100, 10, 1),
+      ]);
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const savedUsage = (id: string) =>
+      (logLines(root.home, id) as Array<{ kind: string; key?: string; value?: unknown }>)
+        .filter((line) => line.kind === "set" && line.key === "usage")
+        .map((line) => line.value)
+        .at(-1);
+
+    try {
+      const result = await runFx(["ask", "--yolo", "--json", "--", "Delegate the usage task."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).final_output).toBe("PARENT_DONE");
+      const [parent] = rootSessionIds(root.home);
+      const children = savedSessionIds(root.home).filter((id) => id !== parent);
+      expect(children.length).toBe(1);
+      expect(savedUsage(parent!)).toEqual({ input_tokens: 300, output_tokens: 3, cache_read_tokens: 30, cache_write_tokens: null, reasoning_tokens: null });
+      expect(savedUsage(children[0]!)).toEqual({ input_tokens: 7000, output_tokens: 70, cache_read_tokens: 700, cache_write_tokens: null, reasoning_tokens: null });
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
 
   test.skipIf(process.platform !== "linux")(
     "a second headless shell run survives replacing the running fx binary",
@@ -5872,7 +6126,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(latest.code).toBe(0);
       const sessionId = JSON.parse(latest.stdout).id as string;
       // One command replay, kept as a blob of the session.
-      const replays = new Set(savedText(root.home, sessionId).match(/fx-command-replay-[a-f0-9]{64}\.bin/g) ?? []);
+      const replays = new Set(savedText(root.home, sessionId).match(/fx-command-replay-[a-f0-9]{12}-[a-f0-9]{64}\.bin/g) ?? []);
       expect(replays.size).toBe(1);
       const replayHash = /([a-f0-9]{64})\.bin$/.exec([...replays][0]!)![1]!;
       expect(existsSync(join(sessionDir(root.home, sessionId), "blobs", replayHash))).toBe(true);
@@ -6968,16 +7222,18 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const trace = readFileSync(tracePath, "utf8");
 
       expect(result.code).toBe(0);
-      expect(result.stderr).toContain("Provider unavailable · provider_error: turn route failure one · retrying request");
-      expect(result.stderr).toContain("Provider unavailable · provider_error: turn route failure two · retrying request in 1s");
-      expect(result.stderr).toContain("recovered · succeeded on attempt 3");
+      // The notices carry the module's wording, never the provider's detail.
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 2s · attempt 2 · \d+s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 3 · \d+s$/m);
+      expect(result.stderr).not.toContain("turn route failure");
       expect(result.stdout).toContain("Recovered in ask turn.");
       expect(gateway.requestCount()).toBe(3);
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain(`selected_model=${MODEL}`);
       expect(trace).toContain(`route=${MODEL}`);
-      expect(trace).toContain("semantic_attempt=1/10");
-      expect(trace).toContain("semantic_attempt=2/10");
+      expect(trace).toContain(" attempt=1 http_status=200");
+      expect(trace).toContain(" attempt=2 http_status=200");
       expect(trace).toContain("retry=true");
       expect(trace).toContain("detail=provider_error: turn route failure one");
       expect(trace).toContain("detail=provider_error: turn route failure two");
@@ -7005,7 +7261,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           socketFailure ??= error;
         });
         connections += 1;
-        if (connections === 1) {
+        // The first connection is usually the one fx warms at launch. A
+        // pooled connection reset before use is resent silently on a fresh
+        // connection, so the second reset is the one that lands on a fresh
+        // connection, which fx reports and the turn retries.
+        if (connections <= 2) {
           socket.resetAndDestroy();
           return;
         }
@@ -7080,21 +7340,151 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(result.code).toBe(0);
         expect(result.signal).toBeNull();
         expect(result.stderr).toMatch(
-          /^\[notice\] ⚠ Network interrupted · [^\n]+ · retrying request$/m,
+          /^\[notice\] Connection lost · next try in 1s · attempt 1 · 0s$/m,
         );
-        expect(result.stderr).toContain("recovered · succeeded on attempt 2");
+        expect(result.stderr).toMatch(
+          /^\[notice\] Connection lost · retrying · attempt 2 · \d+s$/m,
+        );
         expect(json.exit_code).toBe(0);
         expect(json.output).toBe(expectedOutput);
-        expect(json.recovery?.state).toBe("recovered");
-        expect(json.recovery?.attempt).toBe(2);
-        expect(connections).toBe(2);
+        expect(json.recovery).toEqual({ state: "recovered", attempt: 2 });
+        expect(connections).toBe(3);
         expect(requests).toBe(1);
         expect(socketFailure).toBeUndefined();
-        expect(opens).toHaveLength(2);
-        expect(opens.every((line) => line.includes("attempt=1"))).toBe(true);
-        expect(trace).toContain("provider_attempts=1/10");
+        expect(opens).toHaveLength(3);
+        expect(occurrenceCount(trace, "event=stale_connection_retry")).toBe(1);
+        // The silent resend is the gateway's second try within the first
+        // send; the recovery retry is a new send that starts at attempt 1.
+        expect(opens.map((line) => /attempt=(\d+)/.exec(line)?.[1])).toEqual(["1", "2", "1"]);
+        expect(trace).toContain(" attempt=1 saw_content=");
         expect(trace).toContain("recovery=retry_request");
         expect(trace).toContain("event=stream_complete");
+      } finally {
+        for (const socket of sockets) socket.destroy();
+        if (server.listening) {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        }
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }
+  }, 60_000);
+
+  test("default fx ask resends without a warning when the gateway closed a pooled connection", async () => {
+    const expectedOutput = "Answered after a closed pooled connection.";
+    const toolCallBody = await fakeGatewayToolCall("read_notes", "read_file", {
+      path: "notes.txt",
+    }).text();
+    const finalBody = await fakeGatewayFinalText(expectedOutput).text();
+
+    for (let iteration = 1; iteration <= 4; iteration += 1) {
+      const root = createFixtureRoot(`closed-pooled-connection-${iteration}`);
+      const tracePath = join(root.root, "trace.log");
+      writeFileSync(join(root.workspace, "notes.txt"), "pooled connection fixture\n");
+      const sockets = new Set<Socket>();
+      // The launch warm-up connection usually carries the first request, but
+      // it can also sit unused, so count only connections that carried one.
+      const requestSockets = new Set<Socket>();
+      let connections = 0;
+      let requests = 0;
+      let socketFailure: Error | undefined;
+      const server = createServer((socket) => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+        socket.on("error", (error) => {
+          socketFailure ??= error;
+        });
+        connections += 1;
+
+        let request = Buffer.alloc(0);
+        let requestHandled = false;
+        socket.on("data", (chunk) => {
+          requestSockets.add(socket);
+          if (requestHandled) return;
+          if (request.length + chunk.length > 1024 * 1024) {
+            socketFailure ??= new Error("pooled connection fixture request exceeded 1 MiB");
+            socket.destroy();
+            return;
+          }
+          request = Buffer.concat([request, chunk]);
+          const headerEnd = request.indexOf("\r\n\r\n");
+          if (headerEnd < 0) return;
+          const headers = request.subarray(0, headerEnd).toString("utf8");
+          const lengthMatch = /\r\ncontent-length:\s*(\d+)/i.exec(`\r\n${headers}`);
+          const contentLength = lengthMatch ? Number.parseInt(lengthMatch[1]!, 10) : 0;
+          if (request.length < headerEnd + 4 + contentLength) return;
+
+          requestHandled = true;
+          requests += 1;
+          if (requests === 1) {
+            // Keep-alive response, then the connection closes the way a
+            // gateway drops an idle one. fx pools it and finds it dead when
+            // it sends the tool result.
+            socket.end(
+              "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: text/event-stream\r\n" +
+                `Content-Length: ${Buffer.byteLength(toolCallBody)}\r\n\r\n` +
+                toolCallBody,
+            );
+            return;
+          }
+          socket.end(
+            "HTTP/1.1 200 OK\r\n" +
+              "Content-Type: text/event-stream\r\n" +
+              `Content-Length: ${Buffer.byteLength(finalBody)}\r\n` +
+              "Connection: close\r\n\r\n" +
+              finalBody,
+          );
+        });
+      });
+
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(0, "127.0.0.1", resolve);
+        });
+        const address = server.address();
+        if (address === null || typeof address === "string") {
+          throw new Error("missing pooled connection fixture address");
+        }
+        const result = await runFx(
+          ["ask", "--json", "--auto", "--no-save", "Read notes.txt, then answer."],
+          {
+            cwd: root.workspace,
+            env: {
+              FX_SOUND: "0",
+              HOME: root.home,
+              AI_GATEWAY_API_KEY: "fake-gateway-lifecycle-key",
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_E2E_GATEWAY_CHAT_URL:
+                `http://127.0.0.1:${address.port}/v1/ai/chat/completions`,
+              FX_MODEL: MODEL,
+              FX_TRACE_LOG: tracePath,
+              FX_TRACE_SCOPES: "agent,core,gateway,stream",
+            },
+            timeoutMs: 15_000,
+          },
+        );
+        const trace = readFileSync(tracePath, "utf8");
+        if (result.code !== 0 || result.signal !== null) {
+          throw new Error(
+            `closed pooled connection iteration ${iteration} failed: code=${result.code} signal=${result.signal}\n` +
+              `stdout:\n${result.stdout}\nstderr:\n${result.stderr}\ntrace:\n${trace}`,
+          );
+        }
+        const json = parseAskJson(result.stdout);
+
+        expect(json.exit_code).toBe(0);
+        expect(json.output).toBe(expectedOutput);
+        expect(json.tool_calls.map((call) => call.name)).toEqual(["read_file"]);
+        expect(json.recovery).toBeUndefined();
+        expect(result.stderr).not.toContain("Network interrupted");
+        expect(result.stderr).not.toContain("retrying request");
+        expect(connections).toBeGreaterThanOrEqual(2);
+        expect(requestSockets.size).toBe(2);
+        expect(requests).toBe(2);
+        expect(socketFailure).toBeUndefined();
+        expect(trace).toContain("event=stale_connection_retry");
+        expect(trace).not.toContain("recovery=retry_request");
       } finally {
         for (const socket of sockets) socket.destroy();
         if (server.listening) {
@@ -7201,19 +7591,18 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.code).toBe(0);
       expect(result.signal).toBeNull();
       expect(result.stdout).toContain(expectedOutput);
-      expect(result.stderr).toContain(
-        "Provider unavailable · HTTP 503 · provider temporarily unavailable · retrying request",
-      );
-      expect(result.stderr).toMatch(
-        /Network interrupted · [^\r\n]+ · retrying request/,
-      );
-      expect(result.stderr).not.toContain("retrying request in 16s");
-      expect(result.stderr).toContain("recovered · succeeded on attempt 7");
+      // Each 503 waits exactly its Retry-After, which does not advance the
+      // backoff, so the reset that follows starts again at one second.
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 5 · \d+s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 6 · \d+s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · retrying · attempt 7 · \d+s$/m);
+      expect(result.stderr).not.toMatch(/next try in (?:[2-9]|\d\d)s/);
       expect(connections).toBe(7);
       expect(requests).toBe(6);
       expect(socketFailure).toBeUndefined();
       expect(trace).toContain("event=receive_head_error");
-      expect(trace).toContain("provider_attempts=6/10");
+      expect(trace).toContain(" attempt=6 saw_content=");
       expect(trace).toContain("recovery=retry_request");
     } finally {
       for (const socket of sockets) socket.destroy();
@@ -7246,8 +7635,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const trace = readFileSync(tracePath, "utf8");
       expect(result.code).toBe(0);
       expect(result.stdout).toContain("Recovered without executing the unstarted tool.");
-      expect(result.stderr).toContain("regenerating unstarted tool");
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
       expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[1]!.body).toContain("fx did not execute that call");
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("saw_tool_start=true");
       expect(trace).toContain("retry=true");
@@ -7391,6 +7781,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(new Set(boundedNames).size).toBe(5);
       expect(boundedNames).toContain(DYNAMIC_MCP_TOOL_NAME);
       expect(boundedNames.every((name: string) => name.startsWith("mcp_fixture_"))).toBe(true);
+      // Each tool on the page says the search loaded its schema.
+      for (const tool of boundedOutput.mcp_tools) {
+        expect(tool.schema_loaded).toBe(true);
+        expect(tool.purpose).toBeUndefined();
+        expect(tool.context_limit).toBeUndefined();
+      }
 
       const selectedRequest = gatewayRequest(gateway.requests[1]!.body);
       const selectedTool = selectedRequest.tools.find((tool) =>
@@ -8443,7 +8839,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(gateway.requests[3]!.headers.get("ai-language-model-id")).toBe(smallModel);
       expect(gateway.requests[4]!.headers.get("ai-language-model-id")).toBe(MODEL);
       for (const catalog of [parentCatalog, childCatalog]) {
-        expect(catalog).toContain(resumedWorkspace);
+        // A root inside the workspace is shown relative to it.
+        expect(catalog).toContain("Root 0: .agents/skills\n");
         expect(catalog).not.toContain("original-workspace-only");
         for (const name of skillNames) expect(catalog).toContain(`- ${name}:`);
       }
@@ -8807,6 +9204,264 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     55_000,
   );
 
+  // The provider's own default limit ran out before any text: reasoning only.
+  const emptyLengthLimitedReply = () => fakeGatewaySse([
+    { type: "reasoning-start", id: "spent_reasoning" },
+    { type: "reasoning-delta", id: "spent_reasoning", delta: "thinking until the provider stops" },
+    { type: "reasoning-end", id: "spent_reasoning" },
+    {
+      type: "finish",
+      finishReason: { unified: "length", raw: "length" },
+      usage: { inputTokens: { total: 3 }, outputTokens: { total: 4096 } },
+    },
+  ]);
+
+  // The whole limit went to reasoning, and the tool call after it was cut off.
+  const CUT_CALL_SENTINEL = "cut-call-ran.txt";
+  const cutToolCallReply = () => fakeGatewaySse([
+    { type: "reasoning-start", id: "spent_reasoning" },
+    { type: "reasoning-delta", id: "spent_reasoning", delta: "thinking until the limit runs out" },
+    { type: "reasoning-end", id: "spent_reasoning" },
+    { type: "tool-input-start", id: "cut_call", toolName: "shell" },
+    {
+      type: "tool-call",
+      toolCallId: "cut_call",
+      toolName: "shell",
+      input: { request: { action: "run", command: `printf ran > ${CUT_CALL_SENTINEL}` } },
+    },
+    {
+      type: "finish",
+      finishReason: { unified: "length", raw: "length" },
+      usage: { inputTokens: { total: 3 }, outputTokens: { total: 8_000 } },
+    },
+  ]);
+
+  async function askWithReplies(
+    label: string,
+    replies: Array<() => Response>,
+    model: Record<string, unknown> = {},
+  ) {
+    const root = createFixtureRoot(label);
+    const tracePath = join(root.root, "trace.log");
+    let index = 0;
+    const gateway = startDynamicFakeGateway(
+      () => (replies[index++] ?? (() => new Response("unexpected request", { status: 500 })))(),
+      { models: [{ id: MODEL, type: "language", tags: ["tool-use"], ...model }] },
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Answer briefly."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 30_000 },
+      );
+      return {
+        result,
+        json: parseAskJson(result.stdout),
+        bodies: gateway.requests.map((request) =>
+          JSON.parse(request.body) as { maxOutputTokens?: number; reasoning?: string }
+        ),
+        trace: readFileSync(tracePath, "utf8"),
+        cutCallRan: existsSync(join(root.workspace, CUT_CALL_SENTINEL)),
+      };
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }
+
+  test("an empty reply cut short by the provider's default limit is asked again with a limit", async () => {
+    // A window this large bounds the retry at fx's full-window limit.
+    const { result, json, bodies, trace } = await askWithReplies("empty-length-retry", [
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("answered after the limit retry"),
+    ], { context_window: 1_000_000 });
+
+    expect(result.code).toBe(0);
+    expect(json.output).toContain("answered after the limit retry");
+    expect(json.final_output).toContain("answered after the limit retry");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
+    expect(json.final_output).not.toContain("ran out of output tokens");
+    // The catalog names no limit, so only the retry sends one.
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]!.maxOutputTokens).toBeUndefined();
+    expect(bodies[1]!.maxOutputTokens).toBe(32_768);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("Retrying with a higher limit.");
+    expect(trace).toContain("event=length_limited_resend");
+  }, 40_000);
+
+  test("an empty reply's retry limit stays inside the model's known context window", async () => {
+    const { result, bodies } = await askWithReplies("empty-length-window", [
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("answered inside the window"),
+    ], { context_window: 65_536 });
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]!.maxOutputTokens).toBeUndefined();
+    expect(bodies[1]!.maxOutputTokens).toBe(8_192);
+  }, 40_000);
+
+  test("an empty reply still cut short after the retry says so instead of Done.", async () => {
+    const { result, json, bodies } = await askWithReplies("empty-length-twice", [
+      emptyLengthLimitedReply,
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("a third request must not be sent"),
+    ]);
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(2);
+    expect(json.final_output).toBe("The reply ran out of output tokens before any text.");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
+  }, 40_000);
+
+  test("an empty reply cut short at the catalog's own limit is not asked again when that would repeat the request", async () => {
+    // No lower effort and no higher limit: a resend would be the same request.
+    const { result, json, bodies, trace } = await askWithReplies("empty-length-catalog-limit", [
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("a retry must not be sent"),
+    ], { context_window: 200_000, max_tokens: 8_000 });
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]!.maxOutputTokens).toBe(8_000);
+    expect(json.final_output).toBe("The reply ran out of output tokens before any text.");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
+    expect(trace).not.toContain("event=length_limited_resend");
+  }, 40_000);
+
+  test("an empty reply cut short at the catalog's own limit is asked again once at low effort", async () => {
+    const { result, json, bodies, trace } = await askWithReplies("empty-length-low-effort", [
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("answered at low effort"),
+    ], {
+      context_window: 200_000,
+      max_tokens: 8_000,
+      reasoning_options: [{ type: "effort", values: ["none", "low", "high"] }],
+    });
+
+    expect(result.code).toBe(0);
+    expect(json.final_output).toContain("answered at low effort");
+    expect(bodies).toHaveLength(2);
+    // The catalog's limit stays; only the effort changes.
+    expect(bodies[0]!.maxOutputTokens).toBe(8_000);
+    expect(bodies[1]!.maxOutputTokens).toBe(8_000);
+    expect(bodies[0]!.reasoning).toBeUndefined();
+    expect(bodies[1]!.reasoning).toBe("low");
+    expect(`${result.stdout}\n${result.stderr}`).toContain("Retrying with low effort.");
+    expect(trace).toContain("event=length_limited_resend");
+  }, 40_000);
+
+  test("a reply that spent its limit before a cut-off tool call is resent at low effort without running the call", async () => {
+    const { result, json, bodies, trace, cutCallRan } = await askWithReplies("cut-tool-call-resend", [
+      cutToolCallReply,
+      () => fakeGatewayToolCall("listed", "glob_files", { pattern: "*" }),
+      () => fakeGatewayFinalText("finished after the resend"),
+    ], {
+      context_window: 1_050_000,
+      max_tokens: 8_000,
+      reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh", "max"] }],
+    });
+
+    expect(result.code).toBe(0);
+    expect(json.final_output).toContain("finished after the resend");
+    expect(cutCallRan).toBe(false);
+    expect(json.tool_calls).toHaveLength(1);
+    expect(bodies).toHaveLength(3);
+    expect(bodies[0]!.reasoning).toBeUndefined();
+    expect(bodies[1]!.reasoning).toBe("low");
+    // The lower effort is for the resend only; the next step goes back.
+    expect(bodies[2]!.reasoning).toBeUndefined();
+    // The cut-off call never reaches the model's history.
+    expect(JSON.stringify(bodies[1])).not.toContain(CUT_CALL_SENTINEL);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("Retrying with low effort.");
+    expect(result.stderr).not.toContain("did not run them");
+    expect(trace).toContain("event=length_limited_resend");
+    expect(trace).toContain("dropped_tool_calls=1");
+  }, 40_000);
+
+  test("a resent reply cut off again ends the turn without running either call", async () => {
+    const { result, bodies, trace, cutCallRan } = await askWithReplies("cut-tool-call-twice", [
+      cutToolCallReply,
+      cutToolCallReply,
+      () => fakeGatewayFinalText("a third request must not be sent"),
+    ], {
+      context_window: 1_050_000,
+      max_tokens: 8_000,
+      reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+    });
+
+    expect(result.code).toBe(1);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]!.reasoning).toBe("low");
+    expect(cutCallRan).toBe(false);
+    expect(result.stderr).toContain("so I did not run them");
+    expect(result.stderr).not.toContain("preserved above");
+    expect(trace).toContain("event=provider_completion_blocked");
+  }, 40_000);
+
+  test("commands with the same output get their own handles, and each reads back after resume", async () => {
+    const root = createFixtureRoot("distinct-replay-handles");
+    const tracePath = join(root.root, "trace.log");
+    const handles: string[] = [];
+    const run = (id: string, command: string) => fakeGatewayToolCall(id, "shell", {
+      request: { action: "run", command, profile: "clean", yield_time_ms: 30000 },
+    });
+    const read = (id: string, handle: string) => fakeGatewayToolCall(id, "read_tool_result", {
+      request: { handle, query: "SAME_OUTPUT" },
+    });
+    let step = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      switch (step++) {
+        case 0:
+          return run("same-a", "printf 'SAME_OUTPUT\\n'");
+        case 1:
+          handles.push(JSON.parse(toolResultOutput(body, "same-a")).full_output_handle);
+          return run("same-b", "echo SAME_OUTPUT");
+        case 2:
+          handles.push(JSON.parse(toolResultOutput(body, "same-b")).full_output_handle);
+          return fakeGatewayFinalText("DISTINCT_HANDLES_RECORDED");
+        case 3:
+          return read("read-a", handles[0]!);
+        case 4:
+          expect(toolResultOutput(body, "read-a")).toContain("SAME_OUTPUT");
+          return read("read-b", handles[1]!);
+        case 5:
+          expect(toolResultOutput(body, "read-b")).toContain("SAME_OUTPUT");
+          return fakeGatewayFinalText("DISTINCT_HANDLES_READ");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const env = fixtureEnv(root, gateway, tracePath);
+      const first = await runFx(
+        ["ask", "--json", "--auto", "Run both commands."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(first.code).toBe(0);
+      const firstJson = parseAskJson(first.stdout);
+      expect(firstJson.output).toContain("DISTINCT_HANDLES_RECORDED");
+      expect(handles).toHaveLength(2);
+      const shape = /^fx-command-replay-([0-9a-f]{12})-([0-9a-f]{64})\.bin$/;
+      const [a, b] = handles.map((handle) => shape.exec(handle));
+      expect(a).not.toBeNull();
+      expect(b).not.toBeNull();
+      // One stored copy of the output, named by two runs of their own.
+      expect(a![2]).toBe(b![2]);
+      expect(handles[0]).not.toBe(handles[1]);
+
+      const resumed = await runFx(
+        ["ask", "--json", "--auto", "--resume", firstJson.session_id, "Read both outputs."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(resumed.code).toBe(0);
+      expect(parseAskJson(resumed.stdout).output).toContain("DISTINCT_HANDLES_READ");
+      expect(step).toBe(6);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 70_000);
+
   test("provider error finish reconciles without authorizing local tool execution", async () => {
     const root = createFixtureRoot("provider-error");
     const tracePath = join(root.root, "trace.log");
@@ -8840,10 +9495,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.tool_calls).toEqual([]);
       expect(existsSync(sentinelPath)).toBe(false);
       expect(gateway.requestCount()).toBe(2);
-      expect(result.stderr).toContain(
-        "Provider unavailable · provider_error · checking uncertain tool state",
-      );
-      expect(result.stderr).toContain("recovered · succeeded on attempt 2");
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 2 });
       expect(trace).toContain("termination cause=valid_finish finish_reason=error");
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("retry=true");
@@ -8978,23 +9631,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.signal).toBeNull();
       expect(result.timedOut).toBe(false);
       expect(json.output).not.toContain("⚠ API error");
-      expect(json.recovery?.state).toBe("recovered");
-      expect(json.recovery?.attempt).toBe(3);
-      expect(json.recovery?.message).not.toContain("provider_error");
-      expect(json.recovery?.message).not.toContain("first route failure");
-      expect(result.stderr).toContain(
-        "Provider unavailable · provider_error: first route failure · retrying request",
-      );
-      expect(result.stderr).toContain(
-        "Provider unavailable · provider_error: second route failure · retrying request in 1s",
-      );
-      expect(result.stderr).toContain("recovered · succeeded on attempt 3");
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 3 · \d+s$/m);
+      expect(result.stderr).not.toContain("route failure");
       expect(gateway.requestCount()).toBe(3);
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain(`selected_model=${MODEL}`);
       expect(trace).toContain(`route=${MODEL}`);
-      expect(trace).toContain("semantic_attempt=1/10");
-      expect(trace).toContain("semantic_attempt=2/10");
+      expect(trace).toContain(" attempt=1 http_status=200");
+      expect(trace).toContain(" attempt=2 http_status=200");
       expect(trace).toContain("retry=true");
       expect(trace).toContain("detail=provider_error: first route failure");
       expect(trace).toContain("detail=provider_error: second route failure");
@@ -9004,7 +9650,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
-  test("gateway stream timeout probes the connection without spending the attempt budget", async () => {
+  test("gateway stream timeout waits and resends as a dropped connection", async () => {
     const root = createFixtureRoot("gateway-stream-timeout");
     const tracePath = join(root.root, "trace.log");
     let timeouts = 2;
@@ -9029,15 +9675,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.exit_code).toBe(0);
       expect(json.output).toBe("Recovered after the gateway stream timeout.");
       expect(gateway.requestCount()).toBe(3);
-      expect(json.recovery?.state).toBe("recovered");
-      expect(json.recovery?.attempt).toBe(1);
-      expect(json.recovery?.attempt_limit).toBe(10);
-      expect(result.stderr).toContain("Gateway stream timed out · checking the connection");
-      expect(result.stderr).toContain("checking the connection · 1s");
-      expect(result.stderr).not.toContain("retrying request");
-      expect(result.stderr).not.toContain("automatic retry paused");
+      // Each timeout is one counted send; nothing probes the connection.
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 2s · attempt 2 · \d+s$/m);
       expect(trace).toContain("event=route_failure");
-      expect(trace).toContain("retry=false");
+      expect(trace).toContain("retry=true");
       expect(trace).toContain("detail=gateway_stream_timeout: stream exceeded maximum duration");
     } finally {
       gateway.stop();
@@ -9045,7 +9688,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 20_000);
 
-  test("finish-only gateway stream timeout probes the connection without spending the attempt budget", async () => {
+  test("finish-only gateway stream timeout waits and resends as a dropped connection", async () => {
     const root = createFixtureRoot("finish-only-gateway-stream-timeout");
     const tracePath = join(root.root, "trace.log");
     let timeouts = 2;
@@ -9070,14 +9713,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.exit_code).toBe(0);
       expect(json.output).toBe("Recovered after the finish-only timeout.");
       expect(gateway.requestCount()).toBe(3);
-      expect(json.recovery?.state).toBe("recovered");
-      expect(json.recovery?.attempt).toBe(1);
-      expect(result.stderr).toContain("Gateway stream timed out · checking the connection");
-      expect(result.stderr).not.toContain("retrying request");
-      expect(result.stderr).not.toContain("automatic retry paused");
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1 · 0s$/m);
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("http_status=200");
-      expect(trace).toContain("retry=false");
+      expect(trace).toContain("retry=true");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -9110,56 +9750,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.exit_code).toBe(0);
       expect(json.output).toBe("Recovered beyond the old budget.");
       expect(gateway.requestCount()).toBe(13);
-      expect(json.recovery?.state).toBe("recovered");
-      expect(json.recovery?.attempt).toBe(13);
-      expect(json.recovery?.attempt_limit).toBe(10);
-      expect(result.stderr).toContain(
-        "Provider unavailable · HTTP 503 · provider temporarily unavailable · retrying request",
-      );
-      expect(result.stderr).toContain("recovered · succeeded on attempt 13");
-      expect(result.stderr).not.toContain("recovery paused");
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 13 });
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 13 · \d+s$/m);
+      // No attempt count is ever shown as a fraction of a limit.
+      expect(result.stderr).not.toMatch(/attempt \d+\//);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 30_000);
-
-  test("identical interrupted responses stop as a no-progress stall after three attempts", async () => {
-    const root = createFixtureRoot("identical-stall-stop");
-    const tracePath = join(root.root, "trace.log");
-    const gateway = startGateway(() => sse("data: [DONE]\n\n"));
-    try {
-      const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
-        {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 15_000,
-        },
-      );
-      const json = parseAskJson(result.stdout);
-      const trace = readFileSync(tracePath, "utf8");
-
-      expect(result.code).toBe(1);
-      expect(json.exit_code).toBe(1);
-      expect(gateway.requestCount()).toBe(3);
-      expect(json.recovery?.state).toBe("failed");
-      expect(json.recovery?.cause).toBe("response_interrupted");
-      expect(json.recovery?.attempt).toBe(3);
-      expect(json.recovery?.attempt_limit).toBe(10);
-      expect(json.recovery?.required_action).toBe("surface_stall");
-      expect(json.recovery?.message).toContain("kept failing at the same point · stopped");
-      expect(result.stderr).toContain(
-        "⚠ Response ended early · stream interrupted · kept failing at the same point · stopped",
-      );
-      expect(result.stderr).not.toContain("recovery paused");
-      expect(trace).toContain("termination cause=done_without_finish");
-    } finally {
-      gateway.stop();
-      rmSync(root.root, { recursive: true, force: true });
-    }
-  }, 20_000);
-
 
   test("CLI recovery prints one complete response after checkpointed partial output", async () => {
     const root = createFixtureRoot("partial-autonomous-recovery");
@@ -9195,10 +9795,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.code).toBe(0);
       expect(recovered.output).toBe(finalText);
       expect(recovered.final_output).toBe(finalText);
-      expect(recovered.recovery?.state).toBe("recovered");
-      expect(recovered.recovery?.message).not.toContain(
-        "provider temporarily unavailable",
-      );
+      expect(recovered.recovery).toEqual({ state: "recovered", attempt: 11 });
       expect(gateway.requestCount()).toBe(11);
       expect(gateway.requests[10]!.body).not.toContain(partialText);
       expectOnlyLeadingSystemMessages(gateway.requests[10]!.body);
@@ -9644,10 +10241,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.exit_code).toBe(1);
       expect(json.error).toBeUndefined();
       expect(json.output).toContain("visible partial output");
-      expect(json.output).not.toContain("did not execute the returned tool calls");
+      expect(json.output).not.toContain("did not run them");
       expect(json.tool_calls).toEqual([]);
       expect(result.stderr).toContain("response hit provider length limit");
-      expect(result.stderr).toContain("did not execute the returned tool calls");
+      expect(result.stderr).toContain("so I did not run them");
       expect(existsSync(sentinelPath)).toBe(false);
       expect(gateway.requestCount()).toBe(1);
       expect(trace).toContain("event=provider_completion_blocked");
@@ -9707,16 +10304,54 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("empty provider finish reason fails closed before tool execution", async () => {
+  test("a gateway stream the upstream ended early is resent", async () => {
+    // The gateway names the cut without an HTTP status, as teammates saw it.
+    const root = createFixtureRoot("gateway-stream-terminated");
+    const tracePath = join(root.root, "trace.log");
+    let requestIndex = 0;
+    const gateway = startGateway(() =>
+      requestIndex++ === 0
+        ? sse(
+          'data: {"type":"error","error":{"code":"gateway_stream_terminated","message":"Upstream stream ended before terminal chunk"}}\n\n' +
+            "data: [DONE]\n\n",
+        )
+        : fakeGatewayFinalText("Answered after the upstream cut."),
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(0);
+      expect(json.output).toBe("Answered after the upstream cut.");
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 2 });
+      expect(gateway.requestCount()).toBe(2);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("an unreadable provider finish is resent without running its tool", async () => {
     const root = createFixtureRoot("empty-finish-reason");
     const tracePath = join(root.root, "trace.log");
     const sentinelPath = join(root.workspace, "command-must-not-run.txt");
+    let requestIndex = 0;
     const gateway = startGateway(() =>
-      sse(
-        'data: {"type":"tool-call","toolCallId":"command_1","toolName":"shell","input":{"request":{"action":"run","command":"printf executed > command-must-not-run.txt","timeout_ms":30000}}}\n\n' +
-          'data: {"type":"finish","finishReason":{"unified":"","raw":"provider_error"}}\n\n' +
-          "data: [DONE]\n\n",
-      ),
+      requestIndex++ === 0
+        ? sse(
+          'data: {"type":"tool-call","toolCallId":"command_1","toolName":"shell","input":{"request":{"action":"run","command":"printf executed > command-must-not-run.txt","timeout_ms":30000}}}\n\n' +
+            'data: {"type":"finish","finishReason":{"unified":"","raw":"provider_error"}}\n\n' +
+            "data: [DONE]\n\n",
+        )
+        : fakeGatewayFinalText("Answered after the unreadable finish."),
     );
     try {
       const result = await runFx(
@@ -9730,20 +10365,202 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const json = parseAskJson(result.stdout);
       const trace = readFileSync(tracePath, "utf8");
 
-      expect(result.code).toBe(1);
-      expect(json.exit_code).toBe(1);
-      expect(json.error).toBe("InvalidProviderFinishReason");
+      // The stream ends as one without a finish: fx never runs its tool and
+      // sends the same request again.
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.output).toBe("Answered after the unreadable finish.");
       expect(json.tool_calls).toEqual([]);
       expect(existsSync(sentinelPath)).toBe(false);
-      expect(gateway.requestCount()).toBe(1);
+      expect(gateway.requestCount()).toBe(2);
+      expect(gateway.requests[1]!.body).toContain("Run the fixture command.");
       expect(trace).toContain("termination cause=invalid_finish");
-      expect(trace).toContain("err=InvalidProviderFinishReason");
+      expect(trace).not.toContain("InvalidProviderFinishReason");
       expect(trace).not.toContain("event=before_tool_execution");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }
   });
+
+  test("an invalid request error event ends fx ask after one request", async () => {
+    const root = createFixtureRoot("invalid-request-event");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() =>
+      sse(
+        `data: ${JSON.stringify({
+          type: "error",
+          error: { code: "invalid_request_error", message: "INVALID_FIXTURE_REQUEST" },
+        })}\n\n` +
+          'data: {"type":"finish","finishReason":{"unified":"error"}}\n\n' +
+          "data: [DONE]\n\n",
+      )
+    );
+    try {
+      const started = Date.now();
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+
+      // A resend would repeat the same request, so the turn ends at once.
+      expect(result.code).toBe(1);
+      expect(parseAskJson(result.stdout).exit_code).toBe(1);
+      expect(gateway.requestCount()).toBe(1);
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(result.stderr).toContain("invalid_request_error: INVALID_FIXTURE_REQUEST");
+      expect(result.stderr).not.toContain("next try in");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("a non-retryable error code without a finish ends fx ask after one request", async () => {
+    const root = createFixtureRoot("invalid-request-no-finish");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() =>
+      sse(
+        `data: ${JSON.stringify({
+          type: "error",
+          error: { code: "invalid_request_error", message: "INVALID_WITHOUT_FINISH" },
+        })}\n\n` + "data: [DONE]\n\n",
+      )
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+
+      // The code wins over the missing finish: the turn ends on its notice.
+      expect(result.code).toBe(1);
+      expect(parseAskJson(result.stdout).exit_code).toBe(1);
+      expect(gateway.requestCount()).toBe(1);
+      expect(result.stderr).toContain("invalid_request_error: INVALID_WITHOUT_FINISH");
+      expect(result.stderr).not.toContain("next try in");
+      expect(result.stderr).not.toContain("kept failing");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("a stream that keeps ending without a finish is retried past three requests", async () => {
+    // The old no-progress stop ended this request on its third send. Only Esc
+    // stops one now.
+    const root = createFixtureRoot("never-finishes");
+    const tracePath = join(root.root, "trace.log");
+    let requestIndex = 0;
+    const gateway = startGateway(() =>
+      requestIndex++ < 3 ? sse("data: [DONE]\n\n") : fakeGatewayFinalText("Finished on the fourth send."),
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_TRACE_SCOPES: "agent,core,gateway,stream,recovery",
+          },
+          timeoutMs: 20_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+      const trace = readFileSync(tracePath, "utf8");
+
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.output).toBe("Finished on the fourth send.");
+      expect(gateway.requestCount()).toBe(4);
+      expect(json.recovery).toEqual({ state: "recovered", attempt: 4 });
+      expect(result.stderr).not.toContain("kept failing");
+      expect(trace).toContain("termination cause=done_without_finish");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("an HTTP error after a retry reports the request failed", async () => {
+    const root = createFixtureRoot("retry-then-bad-request");
+    const tracePath = join(root.root, "trace.log");
+    let requestIndex = 0;
+    const gateway = startGateway(() =>
+      requestIndex++ === 0
+        ? unavailableResponse("1")
+        : new Response(JSON.stringify({ error: { message: "bad request body" } }), {
+            status: 400,
+            headers: { "content-type": "application/json" },
+          })
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Return the fixture response."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(1);
+      expect(gateway.requestCount()).toBe(2);
+      // Not the `retrying` the request showed before the error.
+      expect(json.recovery).toEqual({ state: "failed", attempt: 2 });
+      expect(result.stderr).toContain("bad request body");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("fx ask JSON reports only the last request's recovery", async () => {
+    const root = createFixtureRoot("stale-recovery");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "notes.txt"), "fixture notes\n");
+    let requestIndex = 0;
+    const gateway = startGateway(() => {
+      const index = requestIndex++;
+      // The first step recovers from a 503 and calls a tool; the second
+      // step's request fails with HTTP 400 on its first try.
+      if (index === 0) return unavailableResponse("1");
+      if (index === 1) return fakeGatewayToolCall("read_notes", "read_file", { path: "notes.txt" });
+      return new Response(JSON.stringify({ error: { message: "bad request body" } }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Read notes.txt, then answer."],
+        {
+          cwd: root.workspace,
+          env: fixtureEnv(root, gateway, tracePath),
+          timeoutMs: 15_000,
+        },
+      );
+      const json = parseAskJson(result.stdout);
+
+      expect(result.code).toBe(1);
+      expect(json.exit_code).toBe(1);
+      expect(gateway.requestCount()).toBe(3);
+      expect(json.recovery).toBeUndefined();
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   test("missing provider finish recovers across framing and content variants", async () => {
     const cases = [
@@ -9806,38 +10623,35 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         if (fixture.streamedText) {
           expect(retryPrompt.some(message => message.role === "assistant")).toBe(false);
           expect(retryPrompt.some(message => contentText(message.content) === fixture.streamedText)).toBe(false);
-          expect(retryPrompt.at(-1)?.role).toBe("user");
-          expect(contentText(retryPrompt.at(-1)?.content)).toContain(
-            "Restart that response from the beginning",
-          );
           if (fixture.name === "partial") {
-            expect(result.stderr).toContain("Response interrupted. Restarting.");
+            expect(result.stderr).toContain("↻ Restarted the answer");
           }
-        } else {
-          expect(retryBody).not.toContain("Restart that response");
         }
+        // The resend is the same request, with no word to the model that the
+        // answer was interrupted.
+        expect(retryPrompt.at(-1)?.role).toBe("user");
+        expect(contentText(retryPrompt.at(-1)?.content)).toContain("Return the fixture response.");
+        expect(retryBody).not.toContain("previous response was interrupted");
         expect(trace).toContain("event=prompt_finish");
         expect(trace).toContain("outcome_kind=assistant");
-        expect(result.stderr).toContain("Response ended early");
-        expect(result.stderr).toContain(
-          fixture.streamedText ? "restarting response" : "retrying request",
-        );
+        // A stream that ends without its finish is a dropped connection.
+        expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1 · 0s$/m);
+        expect(result.stderr).toMatch(/^\[notice\] Connection lost · retrying · attempt 2 · \d+s$/m);
         expect(result.stderr).not.toContain("/10");
-        expect(result.stderr).toContain("recovered · succeeded on attempt 2");
 
         const json = parseAskJson(result.stdout);
         expect(json.exit_code).toBe(0);
         expect(json.error).toBeUndefined();
         expect(json.output).toBe(recoveredText);
         expect(json.tool_calls).toEqual([]);
-        expect(json.recovery?.state).toBe("recovered");
-        expect(json.recovery?.attempt).toBe(2);
+        expect(json.recovery).toEqual({ state: "recovered", attempt: 2 });
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }
     }
-  });
+    // Each case waits one backoff step, up to a second, before its resend.
+  }, 60_000);
 
   test("a restarted reply refused as too long compacts and finishes the turn", async () => {
     const root = createFixtureRoot("restarted-reply-overflow");
@@ -9889,7 +10703,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       });
       const json = parseAskJson(result.stdout);
 
-      expect(result.stderr).toContain("Response interrupted. Restarting.");
+      expect(result.stderr).toContain("↻ Restarted the answer");
       expect(result.stderr).not.toContain("HTTP 400");
       expect(result.code).toBe(0);
       expect(json.exit_code).toBe(0);
@@ -9899,21 +10713,25 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       // The cut-off reply, its refused restart, the compaction's summary
       // requests, and the restart sent again over the compacted conversation.
       const requests = gateway.requests.slice(seedRequests).map((request) => request.body);
-      const restart = "Restart that response from the beginning";
+      // The restart is the same request again, with no word to the model that
+      // it was interrupted.
+      const note = "previous response was interrupted";
       const isSummary = (raw: string) => {
         const body = JSON.parse(raw);
         return body.toolChoice?.type === "none" && body.tools?.length === 0;
       };
       expect(requests.length).toBeGreaterThanOrEqual(4);
-      expect(promptText(requests[0]!)).not.toContain(restart);
-      expect(promptText(requests[1]!)).toContain(restart);
+      expect(promptText(requests[0]!)).not.toContain(note);
+      expect(promptText(requests[1]!)).not.toContain(note);
+      expect(promptText(requests[1]!)).toContain("Continue.");
       expect(requests[1]).not.toContain("compacted_conversation");
       const summaries = requests.slice(2, -1);
       expect(summaries.every(isSummary)).toBe(true);
       expect(summaries[0]).toContain("seed-notes.txt");
       const retry = requests.at(-1)!;
       expect(isSummary(retry)).toBe(false);
-      expect(promptText(retry)).toContain(restart);
+      expect(promptText(retry)).not.toContain(note);
+      expect(promptText(retry)).toContain("Continue.");
       expect(retry).toContain("compacted_conversation");
       expect(retry).toContain("RESTARTED_OVERFLOW_SUMMARY");
       expect(retry).not.toContain("RESTARTED_OVERFLOW_SEED_NOTES");
@@ -10097,9 +10915,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const json = parseAskJson(result.stdout);
       const trace = readFileSync(tracePath, "utf8");
 
+      // The turn stops for review with fx's own terminal wording.
       expect(result.code).toBe(1);
-      expect(json.recovery?.state).toBe("paused");
-      expect(json.recovery?.required_action).toBe("inspect_uncertain_tool");
+      expect(json.recovery?.state).toBe("failed");
+      expect(json.recovery?.message).toContain("Tool state needs review");
+      expect(json.recovery?.need).toBeUndefined();
       expect(gateway.requestCount()).toBe(2);
       expect(gateway.requests[1]!.body).toContain(
         '"toolChoice":{"type":"none"}',

@@ -1,28 +1,26 @@
-import { access, readFile } from "node:fs/promises";
+import { access } from "node:fs/promises";
 import { closeSync } from "node:fs";
 import { createRequire } from "node:module";
 import { Socket } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { bundledAssetUrl } from "./bundled-asset.js";
 import { CoreOutput } from "./core-output.js";
-import { loadModule, withModuleFailure } from "./wasm-module.js";
 import { fetchCleanupAction, cleanupTimeoutMs, cleanupByteLimit } from "./fetch-cleanup.js";
 import { createDurableAgentFactory, memory, wakeHandler } from "./durable.js";
 import { fxHarness } from "./fx-harness.js";
 import {
-  createFxEngine as createWasmAgent,
-  createFxTerminal as createWasmTerminal,
+  createFxEngine as createEngine,
   createMemoryPersistence,
   FxFencedError,
   FxJournalVersionError,
-  encodeXtermKeyEvent,
   fxSdkApiVersion,
   listModels,
   normalizeAgentOptions,
   supportsJspi,
-  xtermAdapter,
-} from "./fx-sdk.js";
+} from "./engine.js";
+import { encodeXtermKeyEvent, xtermAdapter } from "./xterm.js";
 
 export { createMemoryPersistence, encodeXtermKeyEvent, FxFencedError, FxJournalVersionError, fxSdkApiVersion, listModels, memory, supportsJspi, wakeHandler, xtermAdapter };
 export const libfxApiVersion = 3;
@@ -33,10 +31,7 @@ const fetchOperationApplied = 1;
 const fetchOperationBackpressure = 2;
 
 const nodeRequire = createRequire(import.meta.url);
-const defaultCoreWasm = new URL("./fx-core.wasm", import.meta.url);
-const defaultTermWasm = new URL("./fx-term.wasm", import.meta.url);
 let nativeBackendPromise;
-const wasmFilePromises = new Map();
 
 const backendReasonCodes = {
   unsupportedPlatform: "LIBFX_UNSUPPORTED_PLATFORM",
@@ -49,25 +44,24 @@ const backendReasonCodes = {
   wasmLoad: "LIBFX_WASM_LOAD_FAILED",
 };
 
-function bundledAssetUrl(asset) {
-  if (asset.protocol !== "" || typeof asset.href !== "string" ||
-      typeof __webpack_base_uri__ === "undefined" || typeof __webpack_public_path__ !== "string" ||
-      !asset.href.startsWith(__webpack_public_path__)) {
-    throw new TypeError("Bundled asset URL has no filesystem mapping");
-  }
-  // Webpack's relative URL is a public asset address, not a Node URL instance.
-  return new URL(asset.href.slice(__webpack_public_path__.length), __webpack_base_uri__);
+function sentence(message) {
+  return `${message[0].toUpperCase()}${message.slice(1)}.`;
 }
 
-function jspiFallbackError(surface, nativeError) {
-  const nativeDetail = nativeError ? ` Native loading failed: ${nativeError.message}.` : " No compatible native addon was found.";
+function jspiFallbackError(surface, native, nativeError) {
+  const missingPackage = !nativeError && native?.failure === "missing" ? native.nativePackage : undefined;
+  const nativeDetail = nativeError ? ` Native loading failed: ${nativeError.message}.`
+    : missingPackage ? ` ${sentence(nativeFailureReason(native).message)}`
+    : " No compatible native addon was found.";
+  const remedy = missingPackage
+    ? `Install ${missingPackage}, which libfx lists as an optional dependency, or run Node with --experimental-wasm-jspi.`
+    : "Run Node with --experimental-wasm-jspi or install a libfx package containing a compatible native addon.";
   const error = new Error(
     `libfx could not start the ${surface} backend.${nativeDetail} ` +
-    "The WebAssembly fallback requires JavaScript Promise Integration (JSPI). " +
-    "Run Node with --experimental-wasm-jspi or install a libfx package containing a compatible native addon.",
+    `The WebAssembly fallback requires JavaScript Promise Integration (JSPI). ${remedy}`,
   );
   error.code = "LIBFX_JSPI_REQUIRED";
-  error.cause = nativeError;
+  error.cause = nativeError ?? native?.probeError;
   return error;
 }
 
@@ -79,7 +73,8 @@ async function loadNativeCandidate(candidate) {
       // Bundlers trace the asset URL; Node must load the native file at runtime.
       return Reflect.apply(nodeRequire, undefined, [fileURLToPath(candidate)]);
     }
-    const imported = await import(candidate.href);
+    // A module the caller names is its own file, which Node loads as is.
+    const imported = await import(/* webpackIgnore: true */ /* turbopackIgnore: true */ candidate.href);
     return imported.default ?? imported;
   }
   if (typeof candidate === "object") return candidate.default ?? candidate;
@@ -89,37 +84,54 @@ async function loadNativeCandidate(candidate) {
   if (candidate.endsWith(".node")) {
     return Reflect.apply(nodeRequire, undefined, [isAbsolute(candidate) ? candidate : resolve(candidate)]);
   }
-  const imported = await import(candidate.startsWith("file:") ? candidate : pathToFileURL(candidate).href);
+  const imported = await import(/* webpackIgnore: true */ /* turbopackIgnore: true */ candidate.startsWith("file:") ? candidate : pathToFileURL(candidate).href);
   return imported.default ?? imported;
 }
 
-function defaultNativeCandidate() {
-  // Local path bindings let deployment tracers retain these assets in the generated CommonJS entry.
-  if (process.platform === "linux" && process.arch === "x64") {
-    const asset = new URL("./libfx.linux-x64.node", import.meta.url);
-    if (asset.protocol === "") return fileURLToPath(bundledAssetUrl(asset));
-    const path = fileURLToPath(asset);
-    return path;
+// Each platform's addon ships in a package of its own, which libfx lists as
+// an optional dependency, so a package manager installs only the one for its
+// machine. The package's index.js names the addon with a literal
+// `new URL("./libfx.node", import.meta.url)`, so a bundler that bundles
+// libfx copies that one addon and traces it.
+const nativePackages = {
+  "darwin-arm64": "@libfx/libfx-darwin-arm64",
+  "darwin-x64": "@libfx/libfx-darwin-x64",
+  "linux-arm64": "@libfx/libfx-linux-arm64-gnu",
+  "linux-x64": "@libfx/libfx-linux-x64-gnu",
+};
+
+// Each specifier is a literal, so Node, Turbopack, and file tracers find the
+// installed package. A missing one fails here at run time, and inside `try`
+// it does not fail a Turbopack build. webpack folds the `typeof` test and
+// sees only a context over the platform packages that are installed, so it
+// does not warn about the ones that are missing.
+async function importNativePackage(name) {
+  try {
+    if (typeof __webpack_require__ === "function") {
+      return await import(
+        /* webpackInclude: /[\\/]libfx-(darwin|linux)-[a-z0-9-]+[\\/]index\.js$/ */
+        `@libfx/libfx-${name.slice("@libfx/libfx-".length)}`
+      );
+    } else {
+      if (name === "@libfx/libfx-darwin-arm64") return await import("@libfx/libfx-darwin-arm64");
+      if (name === "@libfx/libfx-darwin-x64") return await import("@libfx/libfx-darwin-x64");
+      if (name === "@libfx/libfx-linux-arm64-gnu") return await import("@libfx/libfx-linux-arm64-gnu");
+      if (name === "@libfx/libfx-linux-x64-gnu") return await import("@libfx/libfx-linux-x64-gnu");
+    }
+  } catch (error) {
+    return { error };
   }
-  if (process.platform === "linux" && process.arch === "arm64") {
-    const asset = new URL("./libfx.linux-arm64.node", import.meta.url);
-    if (asset.protocol === "") return fileURLToPath(bundledAssetUrl(asset));
-    const path = fileURLToPath(asset);
-    return path;
-  }
-  if (process.platform === "darwin" && process.arch === "x64") {
-    const asset = new URL("./libfx.darwin-x64.node", import.meta.url);
-    if (asset.protocol === "") return fileURLToPath(bundledAssetUrl(asset));
-    const path = fileURLToPath(asset);
-    return path;
-  }
-  if (process.platform === "darwin" && process.arch === "arm64") {
-    const asset = new URL("./libfx.darwin-arm64.node", import.meta.url);
-    if (asset.protocol === "") return fileURLToPath(bundledAssetUrl(asset));
-    const path = fileURLToPath(asset);
-    return path;
-  }
-  return null;
+  return { error: new Error(`${name} is not a libfx native addon package`) };
+}
+
+// The path of the addon the platform package names, or the error that kept
+// the package from loading.
+async function defaultNativeCandidate(name) {
+  const imported = await importNativePackage(name);
+  if (imported.error) return imported;
+  const asset = imported.default;
+  if (!(asset instanceof URL)) return { error: new TypeError(`${name} does not export its addon's URL`) };
+  return { candidate: fileURLToPath(asset.protocol === "" ? bundledAssetUrl(asset) : asset) };
 }
 
 function validateNativeBackend(backend) {
@@ -180,9 +192,16 @@ async function loadAndValidateNativeCandidate(candidate, artifactMissing = false
 }
 
 async function discoverNativeBackend() {
-  const candidate = defaultNativeCandidate();
-  if (!candidate) {
+  const nativePackage = nativePackages[`${process.platform}-${process.arch}`];
+  if (!nativePackage) {
     return { backend: null, error: null, failure: "unsupported" };
+  }
+  // The package's index.js only names its addon, so a package that cannot be
+  // found is not installed or not part of the bundle.
+  const { candidate, error: packageError } = await defaultNativeCandidate(nativePackage);
+  if (packageError) {
+    if (missingArtifact(packageError)) return { backend: null, error: null, probeError: packageError, failure: "missing", nativePackage };
+    return { backend: null, error: packageError, failure: "load" };
   }
   try {
     await access(candidate);
@@ -202,35 +221,6 @@ async function resolveNativeBackend(nativeAddon) {
   }
   nativeBackendPromise ??= discoverNativeBackend();
   return nativeBackendPromise;
-}
-
-function wasmInput(input) {
-  const path = wasmFilePath(input);
-  if (path === null) {
-    if (input instanceof URL) return input.href;
-    return input;
-  }
-  const cached = wasmFilePromises.get(path);
-  if (cached) return cached;
-  const pendingRead = readFile(path);
-  let pending;
-  pending = withModuleFailure(pendingRead, () => {
-    if (wasmFilePromises.get(path) === pending) wasmFilePromises.delete(path);
-  });
-  wasmFilePromises.set(path, pending);
-  pendingRead.catch(() => {
-    if (wasmFilePromises.get(path) === pending) wasmFilePromises.delete(path);
-  });
-  return pending;
-}
-
-function wasmFilePath(input) {
-  if (input instanceof URL) {
-    if (input.protocol === "") input = bundledAssetUrl(input);
-    if (input.protocol === "file:") return fileURLToPath(input);
-  }
-  if (typeof input === "string" && !URL.canParse(input)) return resolve(input);
-  return null;
 }
 
 function reason(code, message, error) {
@@ -253,7 +243,9 @@ function nativeFailureReason(result) {
     case "missing":
       return reason(
         backendReasonCodes.missingArtifact,
-        `native addon artifact was not found${detailError?.message ? `: ${detailError.message}` : ""}`,
+        result.nativePackage
+          ? `the native addon package ${result.nativePackage} for ${process.platform}-${process.arch} is not installed`
+          : `native addon artifact was not found${detailError?.message ? `: ${detailError.message}` : ""}`,
         detailError,
       );
     case "load":
@@ -326,15 +318,14 @@ export async function getBackendInfo(value = {}) {
       available: false,
       reason: reason(
         backendReasonCodes.jspiUnavailable,
-        "WebAssembly backend requires JavaScript Promise Integration (JSPI)",
+        "WebAssembly backend requires JavaScript Promise Integration (JSPI); run Node with --experimental-wasm-jspi",
       ),
     });
     return { surface, backend: "unavailable", attempts };
   }
-  const defaultWasm = surface === "agent" ? defaultCoreWasm : defaultTermWasm;
-  const wasmSource = wasm ?? defaultWasm;
   try {
-    await loadModule(await wasmInput(wasmSource));
+    const { probeWasm } = await import("./node-wasm.js");
+    await probeWasm(surface, wasm);
     attempts.push({ backend: "wasm-jspi", available: true, reason: null });
     return { surface, backend: "wasm-jspi", attempts };
   } catch (error) {
@@ -610,7 +601,7 @@ function createNativeCoreRuntime(addon, options) {
 }
 
 function createNativeAgent(addon, options) {
-  return createWasmAgent({
+  return createEngine({
     ...options,
     runtimeFactory(runtimeOptions) {
       return createNativeCoreRuntime(addon, runtimeOptions);
@@ -618,17 +609,18 @@ function createNativeAgent(addon, options) {
   });
 }
 
-async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWasm, options) {
+async function createWithFallback(surface, nativeMethod, options) {
   const { nativeAddon, backend = "auto", ...unvalidatedOptions } = options ?? {};
   if (!new Set(["auto", "native", "wasm"]).has(backend)) {
     throw new TypeError('backend must be "auto", "native", or "wasm"');
   }
   const runtimeOptions = surface === "agent" ? normalizeAgentOptions(unvalidatedOptions) : unvalidatedOptions;
 
+  let native = null;
   let nativeError;
   let nativeAttempted = false;
   if (backend !== "wasm") {
-    const native = await resolveNativeBackend(nativeAddon);
+    native = await resolveNativeBackend(nativeAddon);
     nativeError = native.error;
     if (typeof native.backend?.[nativeMethod] === "function") {
       nativeAttempted = true;
@@ -643,7 +635,12 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
       }
     }
     if (backend === "native") {
-      const error = nativeError ?? new Error(`native addon does not provide ${nativeMethod}()`);
+      const missingPackage = native.failure === "missing" ? native.nativePackage : undefined;
+      const error = nativeError ?? new Error(native.backend
+        ? `native addon does not provide ${nativeMethod}()`
+        : missingPackage
+          ? `${sentence(nativeFailureReason(native).message)} Install ${missingPackage}, which libfx lists as an optional dependency.`
+          : nativeFailureReason(native).message, native.probeError ? { cause: native.probeError } : undefined);
       error.code ??= "LIBFX_NATIVE_UNAVAILABLE";
       throw error;
     }
@@ -651,10 +648,10 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
 
   if (!supportsJspi()) {
     if (nativeAttempted) throw nativeError;
-    throw jspiFallbackError(surface, nativeError);
+    throw jspiFallbackError(surface, native, nativeError);
   }
-  const wasmSource = runtimeOptions.wasm ?? defaultWasm;
-  return wasmFactory({ ...runtimeOptions, wasm: await wasmInput(wasmSource) });
+  const wasmBackend = await import("./node-wasm.js");
+  return surface === "agent" ? wasmBackend.createWasmEngine(runtimeOptions) : wasmBackend.createWasmTerminal(runtimeOptions);
 }
 
 /**
@@ -663,13 +660,7 @@ async function createWithFallback(surface, nativeMethod, wasmFactory, defaultWas
  * runs durable sessions on these.
  */
 export async function createFxEngine(options = {}) {
-  return createWithFallback(
-    "agent",
-    "createCore",
-    createWasmAgent,
-    defaultCoreWasm,
-    options,
-  );
+  return createWithFallback("agent", "createCore", options);
 }
 
 // The durability a session gets when the caller names none: Vercel's World
@@ -723,5 +714,5 @@ export const createFxAgent = createDurableAgentFactory({
 });
 
 export function createFxTerminal(options = {}) {
-  return createWithFallback("terminal", "createFxTerminal", createWasmTerminal, defaultTermWasm, options);
+  return createWithFallback("terminal", "createFxTerminal", options);
 }

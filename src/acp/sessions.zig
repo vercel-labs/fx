@@ -1620,6 +1620,11 @@ fn sendUserHistoryTurn(
     session_id: []const u8,
     user: types.UserTurn,
 ) !void {
+    // A turn the terminal app sent to resume an interrupted request replays
+    // as the line it showed, not as fx's note to the model.
+    if (std.mem.eql(u8, user.text, session_runtime.resumed_request_prompt)) {
+        return sendAgentHistoryChunk(state, alloc, session_id, session_runtime.resumed_request_notice.body);
+    }
     var message_id: acp_types.MessageIdBuffer = undefined;
     const stable_message_id = acp_types.generateMessageId(&message_id);
     if (user.text.len > 0) {
@@ -1882,6 +1887,9 @@ fn planExecutionReplay(
     }
     // Entries past the last step still replay, in order, rather than vanish.
     _ = try appendSteeringReplay(arena, &frames, execution.steering, steering_index, null);
+    // `execution.context_notes` and `execution.runtime_context` never replay:
+    // they are fx's context for the model, not messages of the conversation
+    // (D93, D94).
     return frames.toOwnedSlice(arena);
 }
 
@@ -2467,6 +2475,36 @@ test "ACP interrupted history replay hides model-only abort context" {
     try std.testing.expect(std.mem.find(u8, captured, "cancelled") != null);
     try std.testing.expect(std.mem.find(u8, captured, "Interrupted by user after completing") == null);
     try std.testing.expect(std.mem.find(u8, captured, "<turn_aborted>") == null);
+}
+
+test "ACP history replays a resumed request as its line, not fx's note" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-resumed-history.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+
+    {
+        var state = try initAcpSessionTestState(arena, workspace, capture);
+        defer state.deinit();
+        try sendTestHistoryTurn(&state, arena, "session-1", .{ .assistant = .{
+            .user = .{ .text = try arena.dupe(u8, session_runtime.resumed_request_prompt) },
+            .assistant = try arena.dupe(u8, "RESUMED_ANSWER"),
+        } });
+    }
+
+    const captured = try readCaptured(&capture, alloc);
+    defer alloc.free(captured);
+    try std.testing.expect(std.mem.find(u8, captured, "user_message_chunk") == null);
+    try std.testing.expect(std.mem.find(u8, captured, "session_resumed") == null);
+    const line = std.mem.find(u8, captured, session_runtime.resumed_request_notice.body).?;
+    try std.testing.expect(std.mem.find(u8, captured[line..], "RESUMED_ANSWER") != null);
 }
 
 fn readCaptured(capture_file: *std.Io.File, alloc: Allocator) ![]u8 {

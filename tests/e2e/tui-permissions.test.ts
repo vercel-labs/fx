@@ -1160,7 +1160,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         },
         {
           name: "cancelled",
-          outcome: "■ Cancelled",
+          outcome: "▪ Cancelled",
           resolve: async (session: TmuxSession) => {
             await session.sendKeys("Escape");
           },

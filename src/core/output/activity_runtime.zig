@@ -35,6 +35,9 @@ pub const ToolPresentationRecord = struct {
 pub const ActivityProjection = union(enum) {
     pub const Tone = enum {
         thinking,
+        /// The thinking row's bullet and color without its blink, for a
+        /// status that is not the thinking row itself.
+        live,
         neutral,
         warning,
         success,
@@ -43,6 +46,10 @@ pub const ActivityProjection = union(enum) {
 
     pub const TurnThinking = struct {
         label: []const u8,
+        /// Shown in place of `label` when the row is narrower than it, so a
+        /// status that ends with an action never loses the action to
+        /// clipping.
+        short_label: ?[]const u8 = null,
         tone: Tone = .thinking,
         /// Tail of the reasoning streamed for this step, shown under the
         /// status row while the turn is still thinking. Borrowed, and empty

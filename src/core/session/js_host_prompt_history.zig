@@ -1,5 +1,6 @@
 const std = @import("std");
 const prompt_history_provider = @import("prompt_history_provider.zig");
+const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 const initial_capacity: usize = 4 * 1024;
@@ -69,7 +70,7 @@ fn loadRecent(
             return error.PromptHistoryHostFailure;
         }
         defer alloc.free(buffer);
-        const parsed = try std.json.parseFromSlice([]const []const u8, alloc, buffer[0..length], .{});
+        const parsed = try json_decode.parseFromSlice([]const []const u8, alloc, buffer[0..length], .{});
         defer parsed.deinit();
         const entries = try alloc.alloc(prompt_history_provider.LoadedEntry, parsed.value.len);
         errdefer alloc.free(entries);

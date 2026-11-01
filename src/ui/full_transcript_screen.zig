@@ -1984,7 +1984,7 @@ test "cancelled command detail keeps its semantic heading without raw arguments"
     const entries = [_]transcript_blocks.TranscriptEntry{.{ .raw_bytes = .{
         .id = 1,
         .created_at_ms = 0,
-        .bytes = @constCast("■ Cancelled ./z.sh\n"),
+        .bytes = @constCast("▪ Cancelled ./z.sh\n"),
         .class = .tool_status,
     } }};
     var details = [_]ToolDetailRecord{.{

@@ -4,6 +4,7 @@ const question_answer = @import("../../core/agent/question_answer.zig");
 const core_types = @import("../../core/shared/types.zig");
 const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
+const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 
 const Allocator = std.mem.Allocator;
@@ -184,7 +185,12 @@ fn parseQuestionBatch(arena: Allocator, args_json: []const u8) QuestionBatchPars
     if (parsed.value != .object) return error.InvalidArguments;
     const args = parsed.value.object;
 
-    const questions_value = args.get("questions") orelse return error.MissingQuestions;
+    var questions_value = args.get("questions") orelse return error.MissingQuestions;
+    // Some models send the array as JSON text. It names the same batch.
+    tool_args.normalizeCompositeArrayValue(arena, &questions_value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.QuestionsNotArray,
+    };
     if (questions_value != .array) return error.QuestionsNotArray;
 
     const questions_arr = questions_value.array;
@@ -405,6 +411,60 @@ test "ask_user_question normalizes descriptions and encodes ordered answers" {
     try std.testing.expect(fake.called);
     try std.testing.expect(fake.saw_trimmed);
     try std.testing.expectEqualStrings("[{\"question\":\"Choose?\",\"answer\":\"Yes\"}]", output);
+}
+
+test "ask_user_question accepts the questions array sent as JSON text" {
+    const alloc = std.testing.allocator;
+    var fake = FakeRequester{};
+    const output = try executeWithRequester(
+        alloc,
+        "{\"questions\":\"[{\\\"question\\\":\\\" Choose? \\\",\\\"options\\\":[{\\\"label\\\":\\\" Yes \\\"},{\\\"label\\\":\\\"No\\\"}]}]\"}",
+        .{
+            .ctx = &fake,
+            .response_alloc = alloc,
+            .request = FakeRequester.request,
+        },
+    );
+    defer alloc.free(output);
+
+    try std.testing.expect(fake.called);
+    try std.testing.expectEqualStrings("[{\"question\":\"Choose?\",\"answer\":\"Yes\"}]", output);
+    try expectRequesterOutput("{\"questions\":\"not json\"}", "(ask_user_question: \"questions\" must be an array)");
+    try expectRequesterOutput("{\"questions\":\"{}\"}", "(ask_user_question: \"questions\" must be an array)");
+}
+
+const max_fuzz_questions_text_bytes: usize = 16 * 1024;
+
+fn fuzzQuestionsText(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [max_fuzz_questions_text_bytes + 1]u8 = undefined;
+    const text = buffer[0..smith.slice(&buffer)];
+    // Text that is not UTF-8 fails the argument parse before questions is
+    // read, so it never reaches the JSON-text decode this target covers.
+    if (!std.unicode.utf8ValidateSlice(text)) return;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args_json = try std.json.Stringify.valueAlloc(arena, .{ .questions = text }, .{});
+    if (parseQuestionBatch(arena, args_json)) |entries| {
+        try std.testing.expect(entries.len >= 1 and entries.len <= question_answer.max_questions);
+    } else |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {},
+    }
+}
+
+test "ask_user_question questions sent as JSON text decode or refuse arbitrary bytes" {
+    try std.testing.fuzz({}, fuzzQuestionsText, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "[{\"question\":\"Pick one?\",\"options\":[{\"label\":\"A\"},{\"label\":\"B\"}]}]",
+            "[{\"question\":\"Pick one?\",\"options\":[{\"label\":\"A\"}]}]",
+            "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]",
+            "{}",
+            "[",
+        }) ++ @import("fuzz_corpus").ask_questions_text.*),
+    });
 }
 
 test "ask_user_question flattens model-controlled prompt text for terminal display" {

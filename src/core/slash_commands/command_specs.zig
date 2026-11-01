@@ -1,6 +1,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const display_width = @import("../shared/display_width.zig");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const list_window = @import("../shared/list_window.zig");
 const mod_registry = @import("../mods/registry.zig");
 
@@ -424,11 +425,7 @@ pub fn renderSlashWelcome(alloc: Allocator, registry: SlashRegistry) ![]u8 {
 }
 
 pub fn helpCatalogCount(registry: SlashRegistry, query: []const u8) usize {
-    var count: usize = 0;
-    for (std.meta.tags(SlashPresentationCategory)) |category| {
-        count += helpCatalogCategoryCount(registry, query, category);
-    }
-    return count;
+    return helpCatalogCountForCategory(registry, null, query);
 }
 
 pub fn helpCatalogCountForCategory(
@@ -436,31 +433,15 @@ pub fn helpCatalogCountForCategory(
     category: ?SlashPresentationCategory,
     query: []const u8,
 ) usize {
-    return if (category) |value|
-        helpCatalogCategoryCount(registry, query, value)
-    else
-        helpCatalogCount(registry, query);
+    return helpCatalogFilter(registry, category, query).count();
 }
 
 pub fn helpCatalogCategoryCount(registry: SlashRegistry, query: []const u8, category: SlashPresentationCategory) usize {
-    var count: usize = 0;
-    for (registry.commands) |spec| {
-        if (spec.presentation_category != category or !helpCatalogSpecMatches(spec, query)) continue;
-        count += 1;
-    }
-    return count;
+    return helpCatalogCountForCategory(registry, category, query);
 }
 
 pub fn helpCatalogSpecAt(registry: SlashRegistry, query: []const u8, display_index: usize) ?*const SlashSpec {
-    var current: usize = 0;
-    for (std.meta.tags(SlashPresentationCategory)) |category| {
-        for (registry.commands) |*spec| {
-            if (spec.presentation_category != category or !helpCatalogSpecMatches(spec.*, query)) continue;
-            if (current == display_index) return spec;
-            current += 1;
-        }
-    }
-    return null;
+    return helpCatalogSpecAtForCategory(registry, null, query, display_index);
 }
 
 pub fn helpCatalogSpecAtForCategory(
@@ -469,44 +450,57 @@ pub fn helpCatalogSpecAtForCategory(
     query: []const u8,
     display_index: usize,
 ) ?*const SlashSpec {
-    const value = category orelse return helpCatalogSpecAt(registry, query, display_index);
-    var current: usize = 0;
-    for (registry.commands) |*spec| {
-        if (spec.presentation_category != value or !helpCatalogSpecMatches(spec.*, query)) continue;
-        if (current == display_index) return spec;
-        current += 1;
-    }
-    return null;
+    const position = helpCatalogFilter(registry, category, query).at(display_index) orelse return null;
+    return &registry.commands[position % registry.commands.len];
 }
 
-fn helpCatalogSpecMatches(spec: SlashSpec, query: []const u8) bool {
-    if (spec.help_entry == null or spec.completion_description == null or spec.presentation_category == null) return false;
+const help_categories = std.meta.tags(SlashPresentationCategory);
 
-    var tokens = std.mem.tokenizeAny(u8, query, " \t\r\n");
-    while (tokens.next()) |token| {
-        if (containsIgnoreCase(spec.command, token) or
-            containsIgnoreCase(spec.help_entry.?, token) or
-            containsIgnoreCase(spec.completion_description.?, token) or
-            containsIgnoreCase(spec.presentation_category.?.label(), token))
-        {
-            continue;
+/// The `/help` menu in its order, category and then registry order, kept by
+/// `fuzzy_match.Filter`. Base position `c * commands.len + i` holds command
+/// `i` only when it is in the `c`th category, and only that category's
+/// commands when the menu shows one.
+const HelpCatalogMatches = struct {
+    commands: []const SlashSpec,
+    category: ?SlashPresentationCategory,
+    query: []const u8,
+
+    pub fn matchAt(self: HelpCatalogMatches, position: usize) ?fuzzy_match.Match {
+        const spec = self.commands[position % self.commands.len];
+        const category = help_categories[position / self.commands.len];
+        if (spec.presentation_category != category) return null;
+        if (self.category) |shown| {
+            if (shown != category) return null;
         }
-        for (spec.aliases) |alias| {
-            if (containsIgnoreCase(alias, token)) break;
-        } else return false;
+        return helpCatalogSpecMatch(spec, self.query);
     }
-    return true;
+};
+
+fn helpCatalogFilter(registry: SlashRegistry, category: ?SlashPresentationCategory, query: []const u8) fuzzy_match.Filter(HelpCatalogMatches) {
+    return .init(.{ .commands = registry.commands, .category = category, .query = query }, registry.commands.len * help_categories.len);
 }
 
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-    var start: usize = 0;
-    while (start + needle.len <= haystack.len) : (start += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[start .. start + needle.len], needle)) return true;
-    }
-    return false;
+/// The `/help` menu matches a command by its name and every alias, and by
+/// the words of its help entry, description, and category.
+fn helpCatalogSpecMatch(spec: SlashSpec, query: []const u8) ?fuzzy_match.Match {
+    const help_entry = spec.help_entry orelse return null;
+    const description = spec.completion_description orelse return null;
+    const category = spec.presentation_category orelse return null;
+
+    var fields: [help_field_limit]fuzzy_match.Field = undefined;
+    fields[0] = .{ .text = spec.command };
+    const alias_count = @min(spec.aliases.len, help_field_limit - 4);
+    for (spec.aliases[0..alias_count], fields[1..][0..alias_count]) |alias, *field| field.* = .{ .text = alias };
+    const text_start = 1 + alias_count;
+    fields[text_start] = .{ .text = help_entry, .kind = .text };
+    fields[text_start + 1] = .{ .text = description, .kind = .text };
+    fields[text_start + 2] = .{ .text = category.label(), .kind = .text };
+    return fuzzy_match.match(query, fields[0 .. text_start + 3]);
 }
+
+/// Commands keep their aliases short; a mod's command past this many has
+/// its extra aliases ignored when matching.
+const help_field_limit = 16;
 
 pub fn topLevelUsage(registry: TopLevelRegistry, kind: TopLevelKind) []const u8 {
     return topLevelSpec(registry, kind).usage;
@@ -530,64 +524,58 @@ pub fn firstSlashCompletion(registry: SlashRegistry, prefix: []const u8) ?[]cons
     return null;
 }
 
-const slash_completion_match_rank_count: usize = 3;
-
-const SlashCompletionCommandMatch = struct {
-    command: []const u8,
-    rank: usize,
-};
-
 const SlashCompletionMatch = struct {
     spec: *const SlashSpec,
     command: []const u8,
 };
 
-fn completionCommandMatchRank(command: []const u8, prefix: []const u8) ?usize {
-    if (std.mem.eql(u8, command, prefix)) return 0;
-    if (std.mem.startsWith(u8, command, prefix)) return 1;
-    if (prefix.len <= 1 or command.len <= 1) return null;
-    if (std.mem.find(u8, command[1..], prefix[1..]) != null) return 2;
-    return null;
+/// A ranked listing orders by field only below `ranked_field_limit`, so the
+/// `/` menu matches a command and at most that many less one of the aliases
+/// shown in completion.
+const completion_field_limit = fuzzy_match.ranked_field_limit;
+
+/// The names the `/` menu matches a command by: the command, then the
+/// aliases it shows in completion. The matched one is the one shown.
+fn completionFields(spec: SlashSpec, buf: *[completion_field_limit]fuzzy_match.Field) []const fuzzy_match.Field {
+    buf[0] = .{ .text = spec.command };
+    if (!spec.show_aliases_in_completion) return buf[0..1];
+    const alias_count = @min(spec.aliases.len, completion_field_limit - 1);
+    for (spec.aliases[0..alias_count], buf[1..][0..alias_count]) |alias, *field| field.* = .{ .text = alias };
+    return buf[0 .. 1 + alias_count];
 }
 
-fn bestCompletionCommandMatch(spec: SlashSpec, prefix: []const u8) ?SlashCompletionCommandMatch {
-    var best: ?SlashCompletionCommandMatch = if (completionCommandMatchRank(spec.command, prefix)) |rank|
-        .{ .command = spec.command, .rank = rank }
-    else
-        null;
+/// The `/` menu's commands in registry order, for `fuzzy_match.Ranking`.
+/// The prefix keeps its `/`, which matches every command's leading `/` and
+/// is ignored between words.
+const SlashCommandMatches = struct {
+    commands: []const SlashSpec,
+    prefix: []const u8,
 
-    if (spec.show_aliases_in_completion) {
-        for (spec.aliases) |alias| {
-            const rank = completionCommandMatchRank(alias, prefix) orelse continue;
-            if (best == null or rank < best.?.rank) {
-                best = .{ .command = alias, .rank = rank };
-            }
-        }
+    pub fn matchAt(self: SlashCommandMatches, position: usize) ?fuzzy_match.Match {
+        const spec = self.commands[position];
+        if (spec.help_entry == null) return null;
+        var buf: [completion_field_limit]fuzzy_match.Field = undefined;
+        return fuzzy_match.match(self.prefix, completionFields(spec, &buf));
     }
-    return best;
+};
+
+fn slashCommandRanking(registry: SlashRegistry, prefix: []const u8) fuzzy_match.Ranking(SlashCommandMatches) {
+    return .{ .context = .{ .commands = registry.commands, .prefix = prefix }, .len = registry.commands.len };
 }
 
+/// The command or alias the `/` menu shows for `spec`, or null when it
+/// does not match.
 pub fn matchedCompletionCommand(spec: SlashSpec, prefix: []const u8) ?[]const u8 {
-    return (bestCompletionCommandMatch(spec, prefix) orelse return null).command;
+    var buf: [completion_field_limit]fuzzy_match.Field = undefined;
+    const fields = completionFields(spec, &buf);
+    const found = fuzzy_match.match(prefix, fields) orelse return null;
+    return fields[found.field].text;
 }
 
 fn nthSlashCommandCompletionMatch(registry: SlashRegistry, prefix: []const u8, n: usize) ?SlashCompletionMatch {
-    var idx: usize = 0;
-    for (0..slash_completion_match_rank_count) |rank| {
-        for (registry.commands) |*spec| {
-            if (spec.help_entry == null) continue;
-            const match = bestCompletionCommandMatch(spec.*, prefix) orelse continue;
-            if (match.rank != rank) continue;
-            if (idx == n) {
-                return .{
-                    .spec = spec,
-                    .command = match.command,
-                };
-            }
-            idx += 1;
-        }
-    }
-    return null;
+    const position = slashCommandRanking(registry, prefix).at(n) orelse return null;
+    const spec = &registry.commands[position];
+    return .{ .spec = spec, .command = matchedCompletionCommand(spec.*, prefix) orelse return null };
 }
 
 pub fn slashCompletionPrefix(registry: SlashRegistry, input: []const u8) ?[]const u8 {
@@ -602,11 +590,7 @@ pub fn slashCompletionPrefix(registry: SlashRegistry, input: []const u8) ?[]cons
 
 pub fn slashCompletionCount(registry: SlashRegistry, prefix: []const u8) usize {
     if (runtimeArgQuery(registry, prefix)) |query| {
-        var count: usize = 0;
-        for (registry.arguments) |entry| {
-            if (runtimeArgMatches(registry, entry.full, query)) count += 1;
-        }
-        return count;
+        return runtimeArgFilter(registry, query).count();
     }
     if (allowlistArgCompletionPrefix(prefix)) |query| {
         return allowlistArgCompletionCount(query);
@@ -624,12 +608,7 @@ pub fn slashCompletionCount(registry: SlashRegistry, prefix: []const u8) usize {
         return workspaceArgCompletionCount(query);
     }
     if (prefix.len == 0 or prefix[0] != '/') return 0;
-    var count: usize = 0;
-    for (registry.commands) |spec| {
-        if (spec.help_entry == null) continue;
-        if (matchedCompletionCommand(spec, prefix) != null) count += 1;
-    }
-    return count;
+    return slashCommandRanking(registry, prefix).count();
 }
 
 pub fn nthSlashCompletion(registry: SlashRegistry, prefix: []const u8, n: usize) ?[]const u8 {
@@ -909,22 +888,31 @@ fn runtimeArgQuery(registry: SlashRegistry, prefix: []const u8) ?[]const u8 {
     return std.mem.trimStart(u8, prefix[command.len..], " ");
 }
 
-/// A verb matches before its first space, and `VERB NAME` after it.
-fn runtimeArgMatches(registry: SlashRegistry, full: []const u8, query: []const u8) bool {
-    const rest = full[runtimeArgCommand(registry).len + 1 ..];
-    const naming = std.mem.findScalar(u8, query, ' ') != null;
-    if (naming != (std.mem.findScalar(u8, rest, ' ') != null)) return false;
-    return std.ascii.startsWithIgnoreCase(rest, query);
+/// Before the first space a verb matches by prefix. After it the verb must
+/// be complete, and the name matches as every menu matches. The list keeps
+/// its order (`fuzzy_match.Filter`).
+const RuntimeArgMatches = struct {
+    registry: SlashRegistry,
+    query: []const u8,
+
+    pub fn matchAt(self: RuntimeArgMatches, position: usize) ?fuzzy_match.Match {
+        const rest = self.registry.arguments[position].full[runtimeArgCommand(self.registry).len + 1 ..];
+        const query_space = std.mem.findScalar(u8, self.query, ' ');
+        const rest_space = std.mem.findScalar(u8, rest, ' ');
+        if ((query_space == null) != (rest_space == null)) return null;
+        const verb_end = rest_space orelse
+            return if (std.ascii.startsWithIgnoreCase(rest, self.query)) .{ .tier = .prefix, .field = 0 } else null;
+        if (!std.ascii.eqlIgnoreCase(rest[0..verb_end], self.query[0..query_space.?])) return null;
+        return fuzzy_match.match(self.query[query_space.? + 1 ..], &.{.{ .text = rest[verb_end + 1 ..] }});
+    }
+};
+
+fn runtimeArgFilter(registry: SlashRegistry, query: []const u8) fuzzy_match.Filter(RuntimeArgMatches) {
+    return .init(.{ .registry = registry, .query = query }, registry.arguments.len);
 }
 
 fn nthRuntimeArg(registry: SlashRegistry, query: []const u8, n: usize) ?mod_registry.ArgumentCompletion {
-    var idx: usize = 0;
-    for (registry.arguments) |entry| {
-        if (!runtimeArgMatches(registry, entry.full, query)) continue;
-        if (idx == n) return entry;
-        idx += 1;
-    }
-    return null;
+    return registry.arguments[runtimeArgFilter(registry, query).at(n) orelse return null];
 }
 
 fn argCompletionPrefix(prefix: []const u8, command: []const u8) ?[]const u8 {

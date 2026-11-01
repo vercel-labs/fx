@@ -3,7 +3,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("file_picker_path.zig");
 const file_completion_state = @import("file_completion_state.zig");
 const editor_state = @import("editor_state.zig");
-const text_utils = @import("../shared/text_utils.zig");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -546,12 +546,14 @@ pub fn isBareEffortCommandAtCursor(editor: *const editor_state.State) bool {
     return std.ascii.eqlIgnoreCase(trimmed, effort_prefix[0 .. effort_prefix.len - 1]);
 }
 
+/// Copies the options `query` keeps into `out`, in order, as every fx menu
+/// filters (`fuzzy_match.Filter`).
 pub fn filterCompletionLabels(query: []const u8, options: []const []const u8, out: [][]const u8) usize {
-    const normalized_query = std.mem.trim(u8, query, " \t");
+    const kept: fuzzy_match.Filter(fuzzy_match.LabelMatches) = .init(.{ .labels = options, .query = query }, options.len);
     var count: usize = 0;
-    for (options) |option| {
+    for (options, 0..) |option, position| {
         if (count >= out.len) break;
-        if (normalized_query.len == 0 or text_utils.containsIgnoreCase(option, normalized_query)) {
+        if (kept.keeps(position)) {
             out[count] = option;
             count += 1;
         }
@@ -567,12 +569,12 @@ pub fn filterAnnotatedLabels(
     annotations: [][]const u8,
     count: usize,
 ) usize {
-    const normalized_query = std.mem.trim(u8, query, " \t");
-    if (normalized_query.len == 0) return count;
-
+    // `init` reads every label before any moves, and the loop only writes
+    // at or below the label it reads next.
+    const keep: fuzzy_match.Filter(fuzzy_match.LabelMatches) = .init(.{ .labels = labels[0..count], .query = query }, count);
     var kept: usize = 0;
     for (0..count) |i| {
-        if (!text_utils.containsIgnoreCase(labels[i], normalized_query)) continue;
+        if (!keep.keeps(i)) continue;
         labels[kept] = labels[i];
         annotations[kept] = annotations[i];
         kept += 1;

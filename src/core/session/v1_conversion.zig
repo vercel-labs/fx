@@ -26,6 +26,8 @@ const relationship_index_codec = @import("session_relationship_index_codec.zig")
 const result_store = @import("result_store.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const child_state = @import("../subagent/child_state.zig");
+const json_decode = @import("../shared/json_decode.zig");
+const sort_utils = @import("../shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Event = session_event.ConversationEvent;
@@ -80,7 +82,7 @@ pub fn kindOf(store: *session_store.Store, alloc: Allocator, id: []const u8) !Ki
         .bytes => |bytes| blk: {
             defer alloc.free(bytes);
             const Probe = struct { subagent_child: ?bool = null };
-            const parsed = std.json.parseFromSlice(Probe, alloc, bytes, .{ .ignore_unknown_fields = true }) catch break :blk null;
+            const parsed = json_decode.parseFromSlice(Probe, alloc, bytes, .{ .ignore_unknown_fields = true }) catch break :blk null;
             defer parsed.deinit();
             break :blk parsed.value.subagent_child;
         },
@@ -224,7 +226,7 @@ fn parentOf(store: *session_store.Store, alloc: Allocator, id: []const u8) !?[]u
     for ([_][]const u8{ "owner.json", "control.json" }) |name| {
         const bytes = (try readFileIfPresent(a, &subagent, name, child_state.max_state_bytes + 1)) orelse continue;
         const Named = struct { parent_id: ?[]const u8 = null };
-        const named = std.json.parseFromSliceLeaky(Named, a, bytes, .{ .ignore_unknown_fields = true }) catch continue;
+        const named = json_decode.parseFromSliceLeaky(Named, a, bytes, .{ .ignore_unknown_fields = true }) catch continue;
         if (named.parent_id) |parent| return try alloc.dupe(u8, parent);
     }
     return null;
@@ -662,7 +664,7 @@ fn readMetadata(alloc: Allocator, dir: *io_mod.VerifiedDir) !Metadata {
 
 fn isConversationMetadata(a: Allocator, bytes: []const u8) bool {
     const Probe = struct { schema_version: u64 = 0 };
-    const probe = std.json.parseFromSliceLeaky(Probe, a, bytes, .{ .ignore_unknown_fields = true }) catch return false;
+    const probe = json_decode.parseFromSliceLeaky(Probe, a, bytes, .{ .ignore_unknown_fields = true }) catch return false;
     return probe.schema_version == session_codec.session_metadata_schema_version;
 }
 
@@ -835,6 +837,9 @@ const FrameReader = struct {
                 try reader.builder.appendSteering(value.text);
                 try reader.keep(event, seq);
             },
+            // v1 logs never hold a context note or runtime context; only a v2
+            // session saves them (D93, D94).
+            .context_note, .runtime_context => return error.InvalidConversationFrame,
             // The builder only checks the turn; its copy lives in the arena.
             .turn_completed => |value| {
                 try reader.requireOpen();
@@ -1177,7 +1182,7 @@ pub fn fingerprintOf(a: Allocator, dir: *io_mod.VerifiedDir) ![64]u8 {
         } else false;
         if (!skip) try names.append(a, try a.dupe(u8, entry.name));
     }
-    std.mem.sort([]const u8, names.items, {}, lessThan);
+    sort_utils.sort([]const u8, names.items, {}, lessThan);
     for ([_][]const u8{ "subagent/children.json", "client/system-prompt.txt", "client/mcp-tool-identities.json" }) |name| try names.append(a, name);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;

@@ -10,6 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
+import { startIdleDropProxy, type IdleDrop } from "./fixtures/idle-drop-proxy";
 import {
   startContentLengthMcpHttpFixture,
   type ContentLengthResponseType,
@@ -39,21 +40,25 @@ let contentLengthFixture: Awaited<
 > | null = null;
 let gateway: ReturnType<typeof startFakeGateway> | null = null;
 let tui: TmuxSession | null = null;
+let proxy: Awaited<ReturnType<typeof startIdleDropProxy>> | null = null;
 
 afterEach(async () => {
   const activeTui = tui;
   const activeGateway = gateway;
   const activeFixture = fixture;
   const activeContentLengthFixture = contentLengthFixture;
+  const activeProxy = proxy;
   const activeCleanupRoot = cleanupRoot;
   tui = null;
   gateway = null;
   fixture = null;
   contentLengthFixture = null;
+  proxy = null;
   cleanupRoot = null;
 
   if (activeTui) await activeTui.kill();
   activeGateway?.stop();
+  activeProxy?.stop();
   activeFixture?.stop();
   if (activeContentLengthFixture) await activeContentLengthFixture.stop();
   if (activeCleanupRoot) {
@@ -447,6 +452,50 @@ describe("modern MCP Streamable HTTP", () => {
           .filter((method) => method !== "subscriptions/listen"),
       ).toEqual(["server/discover", "tools/list", "tools/call"]);
     }, 30_000);
+  }
+
+  // A load balancer drops a keep-alive connection once it sits idle, by
+  // resetting it or by closing it. fx keeps connections for the next request,
+  // so each later call must find its connection gone and go out on a new one,
+  // once, instead of failing until fx restarts.
+  for (const drop of ["reset", "close"] as const satisfies readonly IdleDrop[]) {
+    test(`tool calls after the server ${drop === "reset" ? "reset" : "closed"} an idle connection go through, each once`, async () => {
+      contentLengthFixture = await startContentLengthMcpHttpFixture("json");
+      proxy = await startIdleDropProxy(contentLengthFixture.url, drop);
+      const root = createRoot(`idle-${drop}`, proxy);
+      // Each call comes after the proxy dropped every connection fx kept.
+      const later = (id: string, text: string) => async () => {
+        await Bun.sleep(600);
+        return fakeGatewayToolCall(id, TOOL_NAME, { text });
+      };
+      gateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
+        later("call_one", "one"),
+        later("call_two", "two"),
+        later("call_three", "three"),
+        fakeGatewayFinalText("Idle connections replaced."),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Call the echo tool three times."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway), timeoutMs: 30_000 },
+      );
+
+      expect(result.code).toBe(0);
+      const last = gateway.requests.at(-1)?.body ?? "";
+      for (const [id, text] of [["call_one", "one"], ["call_two", "two"], ["call_three", "three"]]) {
+        expect(toolResultText(last, id)).toContain(`${MODERN_HTTP_TOOL_RESULT}:${text}`);
+      }
+      // None was sent twice.
+      expect(
+        contentLengthFixture.requests
+          .filter((entry) => entry.message.method === "tools/call")
+          .map((entry) => entry.message.params?.arguments?.text),
+      ).toEqual(["one", "two", "three"]);
+      expect(proxy.dropped).toBeGreaterThanOrEqual(3);
+    }, 40_000);
   }
 
   test("live Tools subscription coalesces a storm and atomically exposes the changed tool", async () => {

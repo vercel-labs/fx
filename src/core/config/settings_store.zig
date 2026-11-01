@@ -343,11 +343,26 @@ const SettingsMutation = union(enum) {
     }
 };
 
+/// What a tightening read-only open changed: `~/.fx` or `settings.json` let
+/// group or others write, and the open took that write access away.
+pub const Tightened = struct {
+    home: bool = false,
+    settings: bool = false,
+
+    pub fn any(self: Tightened) bool {
+        return self.home or self.settings;
+    }
+};
+
 pub const Store = struct {
     durable_home: ?io_mod.VerifiedDir,
     display_root: []u8,
     availability: Availability,
     mode: OpenMode,
+    /// A read-only open removes group and other write access instead of
+    /// refusing it. Only `initFromHomeTighteningReadOnly` sets it.
+    tighten_loose_modes: bool = false,
+    tightened: Tightened = .{},
     commit_count: usize = 0,
     forced_fingerprint_conflicts: usize = 0,
     fail_parent_sync_after_rename: bool = false,
@@ -364,6 +379,19 @@ pub const Store = struct {
     }
 
     pub fn initFromHome(alloc: Allocator, home_path: []const u8, mode: OpenMode) !Store {
+        return openFromHome(alloc, home_path, mode, false);
+    }
+
+    /// A read-only open for startup: when `~/.fx` or `settings.json` lets
+    /// group or others write, it removes that access and records it in
+    /// `tightened` so startup can tell the user, instead of refusing to load.
+    /// It still refuses when the change fails, for example on a folder the
+    /// user does not own.
+    pub fn initFromHomeTighteningReadOnly(alloc: Allocator, home_path: []const u8) !Store {
+        return openFromHome(alloc, home_path, .read_only, true);
+    }
+
+    fn openFromHome(alloc: Allocator, home_path: []const u8, mode: OpenMode, tighten: bool) !Store {
         const zio = io_mod.getIo();
         var home = std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => {
@@ -400,9 +428,17 @@ pub const Store = struct {
         }
         const stat = try durable_home.stat(zio);
         if (stat.kind != .directory) return error.DurablePathUnsafe;
-        const durable_mode = stat.permissions.toMode() & 0o777;
+        var durable_mode = stat.permissions.toMode() & 0o777;
         if (mode == .writable and durable_mode != 0o700) {
             return error.PrivateStatePermissionsUnsupported;
+        }
+        var tightened_home = false;
+        if (mode == .read_only and tighten and durableModeWritableByGroupOrOther(durable_mode)) {
+            durable_home.setPermissions(zio, std.Io.File.Permissions.fromMode(withoutGroupOrOtherWrite(durable_mode))) catch {
+                return error.PrivateStatePermissionsUnsupported;
+            };
+            durable_mode = (try durable_home.stat(zio)).permissions.toMode() & 0o777;
+            tightened_home = true;
         }
         if (mode == .read_only and durableModeWritableByGroupOrOther(durable_mode)) {
             return error.PrivateStatePermissionsUnsupported;
@@ -413,6 +449,8 @@ pub const Store = struct {
             .display_root = try io_mod.dirRealpathAlloc(alloc, durable_home, "."),
             .availability = .writable,
             .mode = mode,
+            .tighten_loose_modes = tighten,
+            .tightened = .{ .home = tightened_home },
         };
     }
 
@@ -763,9 +801,16 @@ pub const Store = struct {
             };
         }
         const verified_stat = if (self.mode == .writable) try file.stat(zio) else stat;
-        const primary_mode = verified_stat.permissions.toMode() & 0o777;
+        var primary_mode = verified_stat.permissions.toMode() & 0o777;
         if (self.mode == .writable and primary_mode != 0o600) {
             return error.PrivateStatePermissionsUnsupported;
+        }
+        if (self.mode == .read_only and self.tighten_loose_modes and durableModeWritableByGroupOrOther(primary_mode)) {
+            file.setPermissions(zio, std.Io.File.Permissions.fromMode(withoutGroupOrOtherWrite(primary_mode))) catch {
+                return error.PrivateStatePermissionsUnsupported;
+            };
+            primary_mode = (try file.stat(zio)).permissions.toMode() & 0o777;
+            self.tightened.settings = true;
         }
         if (self.mode == .read_only and durableModeWritableByGroupOrOther(primary_mode)) {
             return error.PrivateStatePermissionsUnsupported;
@@ -788,6 +833,10 @@ pub const Store = struct {
 
     fn durableModeWritableByGroupOrOther(mode: std.posix.mode_t) bool {
         return mode & 0o022 != 0;
+    }
+
+    fn withoutGroupOrOtherWrite(mode: std.posix.mode_t) std.posix.mode_t {
+        return mode & ~@as(std.posix.mode_t, 0o022);
     }
 
     fn createSequencedCopy(
@@ -3414,6 +3463,48 @@ test "read only settings rejects group or world writable policy files" {
         error.PrivateStatePermissionsUnsupported,
         store.loadPrimary(alloc),
     );
+}
+
+test "tightening read-only open removes group and other write access and records it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", "{\"permission_mode\":\"auto\"}\n");
+    var root_dir = try tmp.dir.openDir(io_mod.getIo(), "home/.fx", .{ .iterate = true });
+    defer root_dir.close(io_mod.getIo());
+    root_dir.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o775)) catch return error.SkipZigTest;
+    var file = try root_dir.openFile(io_mod.getIo(), "settings.json", .{ .mode = .read_write });
+    file.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o664)) catch {
+        file.close(io_mod.getIo());
+        return error.SkipZigTest;
+    };
+    file.close(io_mod.getIo());
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+
+    // The plain read-only open still refuses.
+    try std.testing.expectError(error.PrivateStatePermissionsUnsupported, Store.initFromHome(alloc, home, .read_only));
+
+    {
+        var store = try Store.initFromHomeTighteningReadOnly(alloc, home);
+        defer store.deinit(alloc);
+        try std.testing.expect(store.tightened.home and !store.tightened.settings);
+        var primary = try store.loadPrimary(alloc);
+        defer primary.deinit(alloc);
+        try std.testing.expect(primary == .valid);
+        try std.testing.expect(store.tightened.home and store.tightened.settings);
+    }
+    const home_stat = try tmp.dir.statFile(io_mod.getIo(), "home/.fx", .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o755), home_stat.permissions.toMode() & 0o777);
+    const file_stat = try root_dir.statFile(io_mod.getIo(), "settings.json", .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o644), file_stat.permissions.toMode() & 0o777);
+
+    var again = try Store.initFromHomeTighteningReadOnly(alloc, home);
+    defer again.deinit(alloc);
+    var reloaded = try again.loadPrimary(alloc);
+    defer reloaded.deinit(alloc);
+    try std.testing.expect(!again.tightened.any());
 }
 
 test "three fingerprint conflicts return SettingsConcurrentModification" {

@@ -1,16 +1,14 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
 const builtin_gateway = @import("gateway.zig");
-const terminal_contracts = @import("../core/terminal/contracts.zig");
-const managed_execution_contract = @import("../core/execution/managed_execution_contract.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
-const subagent_domain = @import("../core/subagent/domain.zig");
 const tool_projection = @import("../core/tooling/tool_projection.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const tool_mcp_dispatch = @import("../core/tooling/tool_mcp_dispatch.zig");
 const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const tool_specs = @import("../core/tooling/tool_specs.zig");
 const types = @import("../core/shared/types.zig");
-const lexical_relevance = @import("../core/shared/lexical_relevance.zig");
 const compactor = @import("../core/compactor/compactor.zig");
 const capability_retrieval = @import("../core/tooling/capability_retrieval.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
@@ -63,7 +61,7 @@ const shell_executable_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
         .{ .name = "kind", .json_type = .string, .shape = &.{ .enum_values = &.{"executable"} } },
         .{ .name = "path", .json_type = .string, .description = "Absolute path to Bash or zsh." },
-        .{ .name = "clean_start", .json_type = .boolean, .description = "Skip startup files when true." },
+        .{ .name = "clean_start", .json_type = .boolean },
     },
     .required = &.{ "kind", "path" },
     .additional_properties = false,
@@ -73,7 +71,8 @@ const shell_executable_schema = model_tool_schema.ObjectSchema{
 // model write the call's JSON by hand, which repeats keys and breaks escaping.
 // `shell_impl.actionFieldContract` owns which action accepts which field; the
 // test "shell schema fields match the runtime action contract" keeps the two
-// in sync, and each description names the action its field belongs to.
+// in sync, and each description opens with "For <action>" naming the action
+// its field belongs to.
 const shell_properties = [_]model_tool_schema.Property{
     .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "run", "interact", "stop" } }, .description = "run starts a command; interact observes or writes to the session identified by session_id; stop terminates it. The shell command itself goes in command. Send only the fields marked for the chosen action." },
     .{ .name = "command", .json_type = .string, .bounds = &.{ .max_length = terminal_contracts.max_command_bytes }, .description = "run: shell command to execute exactly once." },
@@ -104,7 +103,7 @@ const shell_process_properties = [_]model_tool_schema.Property{
 const skill_description =
     "Load an installed skill or one required relative text resource completely. Copy the exact advertised location. Resolve paths mentioned in skill instructions from the selected skill directory, not the workspace. Read referenced text with the same location and its relative resource path. Use when: the user explicitly invokes a listed skill or the task clearly matches one. Do not use when: installing a missing skill.";
 const capability_search_description =
-    "Find installed skills and configured MCP tools for a described capability. Optionally restrict MCP results to one exact configured server. Results describe this query; no_match does not rule out another query. Use returned skill locations with skill. Matching MCP schemas are loaded automatically within the schema budget; call advertised tools directly or use mcp_select_tool for explicit selection. Do not guess identities.";
+    "Search installed skills and configured MCP tools for a capability. Matching MCP tools become callable on your next step.";
 const install_skill_description =
     "Install a reusable skill from a supported source into the skill storage managed by fx. Use when: the user asks to install a skill or pastes a skills installation command. Do not use when: no installation is required, install packages, fetch unrelated repositories, or modify project code.";
 const mcp_select_tool_description =
@@ -115,14 +114,14 @@ const ask_user_question_description = std.fmt.comptimePrint(
 );
 const ask_user_question_option_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
-        .{ .name = "label", .json_type = .string, .description = "Short precise action label, 1-5 words." },
-        .{ .name = "description", .json_type = .string, .description = "Optional one-line consequence or scope of this option." },
+        .{ .name = "label", .json_type = .string, .description = "1-5 words." },
+        .{ .name = "description", .json_type = .string },
     },
     .required = &.{"label"},
 };
 const ask_user_question_question_schema = model_tool_schema.ObjectSchema{
     .properties = &.{
-        .{ .name = "question", .json_type = .string, .description = "Specific blocking decision shown to the user; do not ask for facts tools can inspect." },
+        .{ .name = "question", .json_type = .string },
         .{ .name = "options", .json_type = .array, .bounds = &.{ .min_items = 2, .max_items = 6 }, .shape = &.{ .array_objects = &ask_user_question_option_schema } },
     },
     .required = &.{ "question", "options" },
@@ -212,8 +211,8 @@ pub const write_file = ToolSpec{
         .description = write_file_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "path", .json_type = .string, .description = "File path relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy." },
-                .{ .name = "content", .json_type = .string, .description = "Complete file contents to write." },
+                .{ .name = "path", .json_type = .string, .description = path_description },
+                .{ .name = "content", .json_type = .string },
             },
             .required = &.{ "path", "content" },
         },
@@ -242,9 +241,9 @@ pub const edit_file = ToolSpec{
         .description = edit_file_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "path", .json_type = .string, .description = "File path relative to the workspace root, or an external path using an absolute path, ~/..., or a relative workspace escape such as ../...; external access is subject to permission policy." },
-                .{ .name = "old_string", .json_type = .string, .description = "Exact text to find in the file. Must match exactly once." },
-                .{ .name = "new_string", .json_type = .string, .description = "Text to replace old_string with." },
+                .{ .name = "path", .json_type = .string, .description = path_description },
+                .{ .name = "old_string", .json_type = .string },
+                .{ .name = "new_string", .json_type = .string },
             },
             .required = &.{ "path", "old_string", "new_string" },
         },
@@ -273,7 +272,7 @@ pub const web_fetch = ToolSpec{
         .description = web_fetch_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "url", .json_type = .string, .description = "Known public HTTP(S) URL to fetch." },
+                .{ .name = "url", .json_type = .string },
             },
             .required = &.{"url"},
             .additional_properties = false,
@@ -439,9 +438,10 @@ pub const shell = ToolSpec{
 
 const shell_process_only = blk: {
     var spec = shell;
+    spec.description = shell_process_description;
     spec.model_schema = .{
         .name = "shell",
-        .description = shell_description,
+        .description = shell_process_description,
         .input_schema = .{
             .properties = &shell_process_properties,
             .required = &.{"action"},
@@ -517,8 +517,8 @@ pub const capability_search = ToolSpec{
         .description = capability_search_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "query", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = lexical_relevance.max_query_bytes }, .description = "Natural-language capability needed for the current task." },
-                .{ .name = "server", .json_type = .string, .bounds = &.{ .min_length = 1 }, .description = "Optional exact configured MCP server alias." },
+                .{ .name = "query", .json_type = .string, .description = "What you need to do." },
+                .{ .name = "server", .json_type = .string, .description = "Limit to one MCP server." },
             },
             .required = &.{"query"},
             .additional_properties = false,
@@ -548,8 +548,8 @@ pub const skill = ToolSpec{
         .description = skill_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "location", .json_type = .string, .description = "The exact advertised location of the selected skill." },
-                .{ .name = "resource", .json_type = .string, .description = "Optional relative text resource within the selected skill. Omit or pass an empty string to read SKILL.md." },
+                .{ .name = "location", .json_type = .string, .description = "The skill's location from the skill list." },
+                .{ .name = "resource", .json_type = .string, .description = "A file inside the skill, such as template.md. Omit for SKILL.md." },
             },
             .required = &.{"location"},
             .additional_properties = false,
@@ -642,7 +642,7 @@ pub const mcp_select_tool = ToolSpec{
         .description = mcp_select_tool_description,
         .input_schema = .{
             .properties = &.{
-                .{ .name = "name", .json_type = .string, .description = "Exact dynamic MCP tool name discovered in configured metadata, such as mcp_server_tool." },
+                .{ .name = "name", .json_type = .string },
             },
             .required = &.{"name"},
         },
@@ -702,23 +702,17 @@ pub const vision = ToolSpec{
                 .{
                     .name = "image_ids",
                     .json_type = .array,
-                    .description = "Ordered unique IDs of user-authorized images to inspect.",
                     .bounds = &.{ .min_items = 1 },
                     .shape = &.{ .array_values = .{ .json_type = .integer } },
                 },
                 .{
                     .name = "paths",
                     .json_type = .array,
-                    .description = "Ordered unique local image paths supplied by the user. Relative paths resolve from the workspace; ~/ resolves from the user's home directory.",
+                    .description = "Relative to the workspace, or ~/...",
                     .bounds = &.{ .min_items = 1 },
                     .shape = &.{ .array_values = .{ .json_type = .string } },
                 },
-                .{
-                    .name = "focus",
-                    .json_type = .string,
-                    .description = "Specific visual evidence to extract from every requested image.",
-                    .bounds = &.{ .min_length = 1 },
-                },
+                .{ .name = "focus", .json_type = .string, .description = "What to look for." },
             },
             .required = &.{"focus"},
             .additional_properties = false,
@@ -751,7 +745,7 @@ const read_tool_result_properties = [_]model_tool_schema.Property{
     .{
         .name = "search",
         .json_type = .array,
-        .bounds = &.{ .min_items = 1, .max_items = compactor.max_search_phrases },
+        .bounds = &.{ .max_items = compactor.max_search_phrases },
         .shape = &.{ .array_values = .{ .json_type = .string } },
         .description = "Use by itself without handle. One to three searches over turns, tool calls, and earlier compactions saved by compaction. Words may match in any order; rarer words and exact phrases rank higher.",
     },
@@ -939,7 +933,73 @@ pub const all = [_]tool_dispatch.Tool{
     checklist,
 };
 
-pub const registry = tool_dispatch.Registry{ .tools = all[0..] };
+/// fx's own tools. libfx's Node-API addon never runs them, because its agents
+/// run only the host's tools, so it builds without their code: there, each
+/// tool keeps only its name, which is enough for an MCP tool's alias to still
+/// never take one.
+pub const registry = tool_dispatch.Registry{ .tools = if (build_options.builtin_tools) all[0..] else names_only[0..] };
+
+const names_only = blk: {
+    var tools: [all.len]tool_dispatch.Tool = undefined;
+    for (&tools, all) |*tool, real| tool.* = .{
+        .name = real.name,
+        .description = "",
+        .model_schema = .{ .name = real.name, .description = "" },
+        .model_visible = false,
+        .decode = unavailableDecode,
+        .call = unavailableCall,
+        .reads_only_fn = unavailableReadsOnly,
+        .irreversible_fn = unavailableIrreversible,
+    };
+    break :blk tools;
+};
+
+// A call that reaches a tool kept only by name gets the answer fx gives for
+// any tool it doesn't have, which the model can read and recover from.
+fn unavailableDecode(ctx: tool_dispatch.DispatchContext, _: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
+    return .{ .failure = try unsupported(ctx) };
+}
+
+fn unavailableCall(ctx: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    return .{ .failure = try unsupported(ctx) };
+}
+
+fn unsupported(ctx: tool_dispatch.DispatchContext) error{OutOfMemory}![]u8 {
+    return ctx.allocator.print("Unsupported tool: {s}", .{ctx.tool_call_name});
+}
+
+fn unavailableReadsOnly(_: tool_dispatch.ToolInput) bool {
+    return false;
+}
+
+fn unavailableIrreversible(_: tool_dispatch.ToolInput) bool {
+    return true;
+}
+
+test "without the tools' code, the registry keeps every tool's name and answers Unsupported tool" {
+    try std.testing.expectEqual(all.len, names_only.len);
+    for (names_only, all) |tool, real| {
+        try std.testing.expectEqualStrings(real.name, tool.name);
+        try std.testing.expect(!tool.model_visible);
+    }
+    const names = tool_dispatch.Registry{ .tools = names_only[0..] };
+    for (advertisement_order) |name| try std.testing.expect(names.lookup(name) != null);
+    try std.testing.expect(names.lookup("not_a_builtin_tool") == null);
+
+    const entry = names.lookup("shell").?;
+    const ctx = tool_dispatch.DispatchContext{ .allocator = std.testing.allocator, .tool_call_name = "shell" };
+    const decoded = try entry.decode(ctx, "{\"action\":\"run\",\"command\":\"true\"}");
+    defer std.testing.allocator.free(decoded.failure);
+    try std.testing.expectEqualStrings("Unsupported tool: shell", decoded.failure);
+
+    const NoInput = struct {
+        fn deinit(_: *anyopaque, _: std.mem.Allocator) void {}
+    };
+    var unused: u8 = 0;
+    const called = try entry.call(ctx, .{ .ptr = &unused, .deinit_fn = NoInput.deinit });
+    defer called.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Unsupported tool: shell", called.failure);
+}
 
 pub const advertisement_order = [_][]const u8{
     "read_file",
@@ -1181,10 +1241,13 @@ test "shell schema fields match the runtime action contract" {
             try std.testing.expect(schemaProperty(schema, name) != null);
         }
     }
-    // Each field's description opens with an action that accepts the field.
+    // Each field's description opens with "For <action>" naming an action
+    // that accepts the field.
     for (shell_properties[1..]) |property| {
+        try std.testing.expect(std.mem.startsWith(u8, property.description, "For "));
+        const named = property.description["For ".len..];
         const owner = for (actions) |action| {
-            if (std.mem.startsWith(u8, property.description, @tagName(action))) break action;
+            if (std.mem.startsWith(u8, named, @tagName(action))) break action;
         } else return error.TestExpectedEqual;
         try std.testing.expect(nameInSet(shell_impl.actionFieldContract(owner).allowed, property.name));
     }
@@ -1211,6 +1274,10 @@ test "process-only shell retains observation without tty input" {
     for ([_][]const u8{ "\"chars\":", "\"tty\":", "\"shell\":{" }) |field| {
         try std.testing.expect(std.mem.find(u8, schema_json, field) == null);
     }
+    // The description names no field this schema lacks.
+    for ([_][]const u8{ "tty", "chars" }) |field| {
+        try std.testing.expect(std.mem.find(u8, shellProcessOnlySpec().description, field) == null);
+    }
 }
 
 test "built-in tool lookup and metadata use registered defaults" {
@@ -1232,16 +1299,12 @@ test "built-in read_file owns product metadata schema and callbacks" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("read_file", read_file.name);
-    try std.testing.expect(std.mem.find(u8, read_file.description, "bounded line-numbered output") != null);
-    try std.testing.expect(std.mem.find(u8, read_file.description, "external access is subject to permission policy") != null);
+    try std.testing.expect(std.mem.find(u8, read_file.description, "numbered lines") != null);
+    try std.testing.expect(std.mem.find(u8, read_file.description, "image file") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"start_line\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"line_count\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "external path") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "~/...") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "../...") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "permission policy") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "outside the workspace") == null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\",\"description\":\"Relative to the workspace, or absolute.\"}") != null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.read_file, read_file.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, read_file.activity_kind);
     try std.testing.expect(!read_file.requires_approval);
@@ -1262,16 +1325,11 @@ test "built-in write_file owns product metadata schema and callbacks" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("write_file", write_file.name);
-    try std.testing.expect(std.mem.find(u8, write_file.description, "Create or overwrite a file") != null);
-    try std.testing.expect(std.mem.find(u8, write_file.description, "external access is subject to permission policy") != null);
+    try std.testing.expect(std.mem.find(u8, write_file.description, "complete content") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\",\"content\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"path\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"content\"") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "external path") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "~/...") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "../...") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "permission policy") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "outside the workspace") == null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\",\"description\":\"Relative to the workspace, or absolute.\"}") != null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.write_file, write_file.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.write, write_file.activity_kind);
     try std.testing.expect(write_file.requires_approval);
@@ -1293,15 +1351,10 @@ test "built-in edit_file owns product metadata schema and callbacks" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("edit_file", edit_file.name);
-    try std.testing.expect(std.mem.find(u8, edit_file.description, "replacing one exact old_string occurrence") != null);
-    try std.testing.expect(std.mem.find(u8, edit_file.description, "external access is subject to permission policy") != null);
+    try std.testing.expect(std.mem.find(u8, edit_file.description, "appear exactly once") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"path\",\"old_string\",\"new_string\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "replace_all") == null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "external path") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "~/...") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "../...") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "permission policy") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "outside the workspace") == null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"path\":{\"type\":\"string\",\"description\":\"Relative to the workspace, or absolute.\"}") != null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.edit_file, edit_file.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.edit, edit_file.activity_kind);
     try std.testing.expect(edit_file.requires_approval);
@@ -1323,10 +1376,11 @@ test "built-in web_fetch owns product metadata and schema" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("web_fetch", web_fetch.name);
-    try std.testing.expect(std.mem.find(u8, web_fetch.description, "known public HTTP(S) URL") != null);
-    try std.testing.expect(std.mem.find(u8, web_fetch.description, "GitHub metadata") != null);
-    try std.testing.expect(std.mem.find(u8, web_fetch.description, "broad or current web research") != null);
-    try std.testing.expect(std.mem.find(u8, web_fetch.description, "prompt injection") != null);
+    try std.testing.expect(std.mem.find(u8, web_fetch.description, "public http(s) URL") != null);
+    try std.testing.expect(std.mem.find(u8, web_fetch.description, "untrusted") != null);
+    try std.testing.expect(std.mem.find(u8, web_fetch.description, "the user named") != null);
+    try std.testing.expect(std.mem.find(u8, web_fetch.description, "Not for local repository facts") != null);
+    try std.testing.expect(std.mem.find(u8, web_fetch.description, "GitHub metadata that gh can answer") != null);
     try std.testing.expect(std.mem.find(u8, web_fetch.description, "web_search") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"additionalProperties\":false") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"url\":{\"type\":\"string\"") != null);
@@ -1399,10 +1453,7 @@ test "built-in skill owns product metadata schema and callbacks" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("skill", skill.name);
-    try std.testing.expect(std.mem.find(u8, skill.description, "relative text resource completely") != null);
-    try std.testing.expect(std.mem.find(u8, skill.description, "selected skill directory") != null);
-    try std.testing.expect(std.mem.find(u8, skill.description, "the task clearly matches one") != null);
-    try std.testing.expect(std.mem.find(u8, skill.description, "installing a missing skill") != null);
+    try std.testing.expect(std.mem.find(u8, skill.description, "relative to the skill, not the workspace") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"location\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"resource\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"offset\":{\"type\":\"integer\"") == null);
@@ -1477,8 +1528,8 @@ test "built-in install_skill owns product metadata and schema" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("install_skill", install_skill.name);
-    try std.testing.expect(std.mem.find(u8, install_skill.description, "supported source") != null);
-    try std.testing.expect(std.mem.find(u8, install_skill.description, "the user asks to install a skill") != null);
+    try std.testing.expect(std.mem.find(u8, install_skill.description, "when the user asks") != null);
+    try std.testing.expect(std.mem.find(u8, install_skill.description, "fx checks it") != null);
     try std.testing.expect(std.mem.find(u8, install_skill.description, "load an already-installed skill") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"source\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"skill\":{\"type\":\"string\"") != null);
@@ -1498,9 +1549,9 @@ test "built-in capability_search owns unified bounded metadata schema and callba
 
     try std.testing.expectEqualStrings("capability_search", capability_search.name);
     try std.testing.expect(std.mem.find(u8, capability_search.description, "configured MCP tools") != null);
-    try std.testing.expect(std.mem.find(u8, capability_search.description, "no_match does not rule out another query") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":4096") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"server\":{\"type\":\"string\",\"minLength\":1") != null);
+    try std.testing.expect(std.mem.find(u8, capability_search.description, "callable on your next step") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"query\":{\"type\":\"string\"") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"server\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"kind\"") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"limit\"") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"cursor\"") == null);
@@ -1525,7 +1576,7 @@ test "built-in mcp_select_tool owns product metadata schema and callbacks" {
     try std.testing.expect(std.mem.find(u8, schema_json, "\"name\":\"mcp_select_tool\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"name\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"name\"]") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "executable schema is advertised on the next model step") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "callable on your next step") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "mcp_search_tools") == null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.mcp_select_tool, mcp_select_tool.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, mcp_select_tool.activity_kind);
@@ -1559,10 +1610,7 @@ test "built-in ask_user_question owns product metadata schema and callbacks" {
     try std.testing.expect(std.mem.startsWith(u8, ask_user_question.description, "Ask the user 1-20 multiple-choice questions"));
     try std.testing.expect(std.mem.find(u8, schema_json, "\"questions\":{\"type\":\"array\",\"minItems\":1,\"maxItems\":20") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"options\":{\"type\":\"array\",\"minItems\":2,\"maxItems\":6") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "Specific blocking decision shown to the user") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "do not ask for facts tools can inspect") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "Short precise action label") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "consequence or scope") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"label\":{\"type\":\"string\",\"description\":\"1-5 words.\"}") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"question\",\"options\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"questions\"]") != null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.ask_user_question, ask_user_question.executor_kind);
@@ -1631,12 +1679,12 @@ test "built-in vision owns product metadata schema and callbacks" {
     defer std.testing.allocator.free(schema_json);
 
     try std.testing.expectEqualStrings("vision", vision.name);
-    try std.testing.expect(std.mem.find(u8, vision.description, "authorized images attached by the user") != null);
-    try std.testing.expect(std.mem.find(u8, vision.description, "local image paths") != null);
+    try std.testing.expect(std.mem.find(u8, vision.description, "exactly one source") != null);
+    try std.testing.expect(std.mem.find(u8, vision.description, "image files the user named") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"image_ids\":{\"type\":\"array\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"paths\":{\"type\":\"array\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"minItems\":1") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"focus\":{\"type\":\"string\",\"minLength\":1") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"focus\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"additionalProperties\":false") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"focus\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"minProperties\":2") != null);
@@ -1706,10 +1754,9 @@ test "built-in read_tool_result owns product metadata schema and callbacks" {
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("read_tool_result", read_tool_result.name);
-    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "opaque handle from the active session or process") != null);
-    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "Pass handle with query") != null);
+    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "pass query") != null);
+    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "pass search instead of a handle") != null);
     try std.testing.expect(std.mem.find(u8, read_tool_result.description, "request.") == null);
-    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "inspect results from another session or process") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"mode\"") == null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"oneOf\"") == null);
     const input_schema = parsed.value.object.get("inputSchema").?.object;
@@ -1723,7 +1770,7 @@ test "built-in read_tool_result owns product metadata schema and callbacks" {
         try std.testing.expect(properties.get(name) != null);
     }
     try std.testing.expectEqual(@as(i64, 3), properties.get("search").?.object.get("maxItems").?.integer);
-    try std.testing.expect(std.mem.find(u8, properties.get("search").?.object.get("description").?.string, "without handle") != null);
+    try std.testing.expect(std.mem.find(u8, properties.get("search").?.object.get("description").?.string, "Without a handle") != null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.read_tool_result, read_tool_result.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, read_tool_result.activity_kind);
     try std.testing.expect(!read_tool_result.requires_approval);

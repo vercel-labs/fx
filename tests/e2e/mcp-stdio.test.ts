@@ -1058,6 +1058,123 @@ describe("modern MCP stdio compatibility", () => {
     await expectFixtureProcessesExited(wire);
   }, 45_000);
 
+  test.skipIf(!tmuxAvailable())(
+    "the TUI runs a later turn's direct call to an MCP tool an earlier turn loaded",
+    async () => {
+      // The shell can ask, so it says so in every request's capabilities.
+      const root = createRoot("tui-later-turn-direct-call", MODERN_FIXTURE, {
+        expectedElicitation: "both",
+      });
+      const stderrPath = join(root.root, "stderr.log");
+      const activeGateway = startFakeGateway([
+        fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
+        fakeGatewayToolCall("first_call", TOOL_NAME, { text: "first" }),
+        fakeGatewayFinalText("FIRST_TURN_DONE"),
+        fakeGatewayToolCall("later_call", TOOL_NAME, { text: "later" }),
+        fakeGatewayFinalText("LATER_TURN_DONE"),
+      ], {
+        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+      });
+      gateway = activeGateway;
+      tui = await TmuxSession.create({
+        isolated: true,
+        cwd: root.workspace,
+        width: 140,
+        height: 40,
+        stderrPath,
+        env: fixtureEnv(root, activeGateway),
+      });
+
+      await tui.waitForComposer(15_000);
+      await tui.sendText("Load the fixture echo tool and call it.");
+      await tui.waitForText("FIRST_TURN_DONE", 20_000);
+      await tui.waitForComposer(10_000);
+      expect(toolResultText(activeGateway.requests[2]!.body, "first_call")).toContain(`${MODERN_RESULT}:first`);
+      await tui.sendText("Call the echo tool again.");
+      await tui.waitForText("LATER_TURN_DONE", 20_000);
+      await tui.waitForComposer(10_000);
+
+      expect(activeGateway.requests).toHaveLength(5);
+      // The later turn starts without the tool: the model calls it directly.
+      const laterTools = (JSON.parse(activeGateway.requests[3]!.body) as {
+        tools?: Array<{ name: string }>;
+      }).tools?.map((tool) => tool.name) ?? [];
+      expect(laterTools).not.toContain(TOOL_NAME);
+      const laterResult = toolResultText(activeGateway.requests[4]!.body, "later_call");
+      expect(laterResult).toContain(`${MODERN_RESULT}:later`);
+      expect(laterResult).not.toContain("not selected");
+      const calls = readWire(root.wireLogPath).filter(
+        (entry) => entry.message.method === "tools/call",
+      );
+      expect(calls.map((entry) => entry.message.params?.arguments)).toEqual([
+        { text: "first" },
+        { text: "later" },
+      ]);
+
+      // Each turn's tool group counts its MCP call as one, never as a command.
+      const scrollback = await tui.captureFullScrollback();
+      expect(scrollback).toContain("1 MCP call");
+      expect(scrollback).not.toMatch(/\b\d+ commands?\b/);
+      expect(scrollback).not.toContain("not selected");
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await tui.kill();
+      tui = null;
+      await expectFixtureProcessesExited(readWire(root.wireLogPath));
+    },
+    60_000,
+  );
+
+  test("a resumed fx ask runs a direct call to an MCP tool an earlier turn loaded", async () => {
+    const root = createRoot("ask-later-turn-direct-call", MODERN_FIXTURE);
+    const firstGateway = startToolGateway("FIRST_ASK_DONE");
+    gateway = firstGateway;
+    const first = await runFx(
+      ["ask", "--json", "--auto", "Load the fixture echo tool and call it."],
+      { cwd: root.workspace, env: fixtureEnv(root, firstGateway), timeoutMs: 20_000 },
+    );
+    expect(first.code).toBe(0);
+    const sessionId = JSON.parse(first.stdout).session_id;
+    expect(sessionId).toBeTruthy();
+    firstGateway.stop();
+    gateway = null;
+
+    const missingTool = "mcp_fixture_missing";
+    const laterGateway = startFakeGateway([
+      fakeGatewayToolCall("missing_call", missingTool, { text: "nothing" }),
+      fakeGatewayToolCall("later_call", TOOL_NAME, { text: "later" }),
+      fakeGatewayFinalText("LATER_ASK_DONE"),
+    ], {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    gateway = laterGateway;
+    const later = await runFx(
+      ["ask", "--json", "--auto", "--resume", sessionId, "Call the echo tool again."],
+      { cwd: root.workspace, env: fixtureEnv(root, laterGateway), timeoutMs: 20_000 },
+    );
+    expect(later.code).toBe(0);
+    expect(JSON.parse(later.stdout)).toMatchObject({
+      session_id: sessionId,
+      output: expect.stringContaining("LATER_ASK_DONE"),
+    });
+    expect(laterGateway.requests).toHaveLength(3);
+    // A name no live server has still fails without reaching any server.
+    const missingResult = toolResultText(laterGateway.requests[1]!.body, "missing_call");
+    expect(missingResult).toMatch(/not selected for this model step|Unsupported tool/);
+    expect(missingResult).toContain(missingTool);
+    expect(missingResult).not.toContain(MODERN_RESULT);
+    const laterResult = toolResultText(laterGateway.requests[2]!.body, "later_call");
+    expect(laterResult).toContain(`${MODERN_RESULT}:later`);
+    expect(laterResult).not.toContain("not selected");
+    const wire = readWire(root.wireLogPath);
+    const calls = wire.filter((entry) => entry.message.method === "tools/call");
+    expect(calls.map((entry) => entry.message.params?.arguments)).toEqual([
+      { text: "hello" },
+      { text: "later" },
+    ]);
+    await expectFixtureProcessesExited(wire);
+  }, 45_000);
+
   for (const childMode of ["persistent"] as const) {
     const label = "persistent";
     test(`${label} child's search never offers a tool a permission rule denies`, async () => {
@@ -2095,6 +2212,38 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     );
     expect(calls).toHaveLength(1);
     expect(calls[0]?.message.params?.inputResponses).toBeUndefined();
+    await expectFixtureProcessesExited(wire);
+  }, 30_000);
+
+  test("fx ask tells the model that a stdio call outlived its operation timeout", async () => {
+    const root = createRoot("ask-operation-timeout", MODERN_FIXTURE, {
+      mode: "stall_operation",
+      operationTimeoutMs: 1_500,
+    });
+    const activeGateway = startToolGateway("Operation timeout complete.");
+    gateway = activeGateway;
+    const result = await runFx(
+      ["ask", "--json", "--auto", "--no-save", "Call the stalled MCP fixture."],
+      {
+        cwd: root.workspace,
+        env: fixtureEnv(root, activeGateway),
+        timeoutMs: 20_000,
+      },
+    );
+
+    // fx stops waiting, cancels the call on the server, and tells the model
+    // why and how to wait longer, rather than that the call was cancelled.
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).output).toContain("Operation timeout complete.");
+    expect(activeGateway.requests).toHaveLength(3);
+    const toolResult = toolResultText(activeGateway.requests[2]?.body ?? "", "call_mcp");
+    expect(toolResult).toStartWith("fx stopped waiting for MCP server 'fixture': it did not answer within its operation timeout.");
+    expect(toolResult).toContain("Raise operation_timeout_ms for this server in its MCP config if it needs longer.");
+    expect(toolResult).not.toContain("Cancelled");
+    const wire = readWire(root.wireLogPath);
+    const call = wire.filter((entry) => entry.message.method === "tools/call").at(-1);
+    const cancelled = wire.find((entry) => entry.message.method === "notifications/cancelled");
+    expect(cancelled?.message.params?.requestId).toBe(call?.message.id);
     await expectFixtureProcessesExited(wire);
   }, 30_000);
 
@@ -3390,7 +3539,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
 
       await tui.sendInterruptEscapePair(10_000);
       await tui.waitForText("Cancelled mcp_fixture_echo", 10_000);
-      await tui.waitForText("■ Cancelled", 5_000);
+      await tui.waitForText("▪ Cancelled", 5_000);
       const cancel_deadline = Date.now() + 5_000;
       while (Date.now() < cancel_deadline) {
         if (

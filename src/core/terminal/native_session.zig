@@ -9,6 +9,7 @@ const host_capabilities = @import("../hosts/host.zig");
 const session_layout = @import("../session/session_layout.zig");
 const process_identity = @import("../execution/process_identity.zig");
 const managed_execution_contract = @import("../execution/managed_execution_contract.zig");
+const json_decode = @import("../shared/json_decode.zig");
 const process_provider_mod = @import(
     "../execution/process_provider.zig",
 );
@@ -356,7 +357,7 @@ pub fn runLauncher(alloc: Allocator) !void {
     const config_bytes = try alloc.alloc(u8, config_len);
     defer alloc.free(config_bytes);
     try readExactFd(std.posix.STDIN_FILENO, config_bytes);
-    var parsed = try std.json.parseFromSlice(
+    var parsed = try json_decode.parseFromSlice(
         LauncherConfig,
         alloc,
         config_bytes,
@@ -1644,7 +1645,7 @@ const Session = struct {
                 .{ self.id, @errorName(err) },
             );
         };
-        if (!self.signalProcess(.kill)) self.markLost();
+        if (!self.killTerminal()) self.markLost();
     }
 
     fn launchNative(self: *Session, request: contracts.StartRequest) !void {
@@ -1816,7 +1817,7 @@ const Session = struct {
         self.mutex.lockUncancelable(zio);
         const running = self.lifecycle == .starting or self.lifecycle == .running;
         self.mutex.unlock(zio);
-        if (running) _ = self.signalProcess(.kill);
+        if (running) _ = self.killTerminal();
         self.closeLiveness();
     }
 
@@ -1919,7 +1920,7 @@ const Session = struct {
     /// the signal missed it.
     fn killForExit(self: *Session) void {
         if (self.isLive()) {
-            _ = self.signalProcess(.kill);
+            _ = self.killTerminal();
             self.markLost();
         }
         if (self.exit_tree) |*tree| {
@@ -2077,6 +2078,22 @@ const Session = struct {
         return self.signalNative(signalValue(signal));
     }
 
+    /// Kills everything the terminal runs, including processes that job
+    /// control or a nested shell moved out of its process group. Falls back
+    /// to the process group when the process tree cannot be read. Returns
+    /// whether the kill reached the terminal.
+    fn killTerminal(self: *Session) bool {
+        const complete = self.signalTerminalProcesses(.kill) catch |err| {
+            debug_trace.logf(
+                "terminal_host",
+                "terminal tree kill failed id={s} err={s}; falling back to shell group",
+                .{ self.id, @errorName(err) },
+            );
+            return self.signalProcess(.kill);
+        };
+        return complete orelse false;
+    }
+
     fn signalTarget(self: *Session) ?SignalTarget {
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
@@ -2119,6 +2136,10 @@ const Session = struct {
             else => return error.ProcessIdentityUnavailable,
         };
         if (!self.matchesSignalTarget(target)) return false;
+        // Killing the process group ends the launcher, which hangs up the
+        // terminal's foreground job, and a shell outside the group that sees
+        // its job end runs its next command. Stopped first, nothing can.
+        if (signal == .kill) descendants.stopAll();
 
         const shell_group_delivery = if (failSignalStageForTest("shell_group"))
             ProcessGroupDelivery.failed
@@ -3415,7 +3436,7 @@ fn closeAction(
         still_live = session.lifecycle == .starting or
             session.lifecycle == .running;
         session.mutex.unlock(zio);
-        if (still_live and !session.signalProcess(.kill)) session.markLost();
+        if (still_live and !session.killTerminal()) session.markLost();
     }
 
     if (still_live) {

@@ -17,6 +17,7 @@ const native_session = @import("native_session.zig");
 const terminal_store = @import("store.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const json_decode = @import("../shared/json_decode.zig");
 const process_provider_mod = @import(
     "../execution/process_provider.zig",
 );
@@ -1272,7 +1273,7 @@ const LiveTerminalFixture = struct {
         );
         defer alloc.free(bytes);
         const Record = struct { pid: ?[]const u8 = null, lifecycle: contracts.Lifecycle };
-        const parsed = try std.json.parseFromSlice(Record, alloc, bytes, .{
+        const parsed = try json_decode.parseFromSlice(Record, alloc, bytes, .{
             .ignore_unknown_fields = true,
         });
         defer parsed.deinit();
@@ -1299,7 +1300,7 @@ const LiveTerminalFixture = struct {
         );
         defer alloc.free(bytes);
         const Record = struct { lifecycle: contracts.Lifecycle };
-        const parsed = try std.json.parseFromSlice(Record, alloc, bytes, .{
+        const parsed = try json_decode.parseFromSlice(Record, alloc, bytes, .{
             .ignore_unknown_fields = true,
         });
         defer parsed.deinit();

@@ -2485,7 +2485,9 @@ fn handleKernelSnapshot(
             open_turn_names_images = session_codec.checkpointNamesImages(journal.pending_resume.?, null, null);
         }
     }
-    const snapshot_bytes = if (open_turn_names_images)
+    const snapshot_bytes = if (yielded and session_codec.executionUsesNotesSchema(journal.pending_resume.?.execution))
+        journal_events.encodeSnapshotWithNotes(alloc, at_seq, journal.cursor.turn, journal.last_turn_id.slice(), open_turn.written(), checkpoint)
+    else if (open_turn_names_images)
         journal_events.encodeSnapshotNamingImages(alloc, at_seq, journal.cursor.turn, journal.last_turn_id.slice(), open_turn.written(), checkpoint)
     else
         journal_events.encodeSnapshot(alloc, at_seq, journal.cursor.turn, journal.last_turn_id.slice(), if (yielded) open_turn.written() else null, checkpoint);

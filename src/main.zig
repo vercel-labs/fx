@@ -6,7 +6,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
 
-pub const version = "0.0.14";
+pub const version = "0.0.16";
 
 const app_lifecycle = @import("core/app/app_lifecycle.zig");
 const provider_runtime = @import("core/app/provider_runtime.zig");
@@ -787,6 +787,8 @@ const App = struct {
                     }) catch null;
                 } else SessionAppRuntime.writeUpgradeNotice(&app, app_version, build_update_channel, relaunch.previous_revision orelse "", build_revision) catch |err|
                     debug_trace.logf("session", "event=upgrade_notice_unavailable err={s}", .{@errorName(err)});
+            } else {
+                SessionAppRuntime.queueInterruptedTurnHint(&app);
             }
         }
         const env_disabled = if (io_mod.getenv("FX_AUTO_UPGRADE")) |val|
@@ -842,6 +844,11 @@ const App = struct {
 
     pub fn rebindAfterInit(self: *App) void {
         SessionAppRuntime.rebindAfterMove(self);
+        // The WebAssembly terminal runs `/usage` fetches in its event loop,
+        // which they pulse through the app while they wait.
+        if (comptime host_target.is_wasm) {
+            self.usage_dashboard.host = usage_host.cooperativeHost(App, self, self.usage_dashboard.host.home);
+        }
     }
 
     pub fn setNotificationPreferences(
@@ -1004,6 +1011,10 @@ const App = struct {
         // These delete image snapshots and log discarded drafts.
         self.worker.deinit(std.heap.c_allocator);
         self.clearPendingImages();
+        // Full-detail loads read saved results through the session store,
+        // so their threads end before it closes.
+        self.shell.stopBackgroundLoads();
+        shutdown_trace.mark("transcript_loads_stopped");
         SessionAppRuntime.deinitPersistenceForProcessExit(self);
         self.question_prompt.deinit(self.alloc);
         shutdown_trace.mark("persistence_finalized");
@@ -1226,6 +1237,10 @@ const App = struct {
 
     /// `/login` signs in to the built-in API providers (D147); gateway login
     /// stays unsupported in proto-fx.
+    pub fn beginRecoverySignIn(self: *App) !void {
+        try AuthAppRuntime.beginRecoverySignIn(self);
+    }
+
     pub fn runLoginCommand(self: *App) !void {
         try AuthAppRuntime.runLoginCommand(self);
     }
@@ -1598,6 +1613,28 @@ const App = struct {
         SessionAppRuntime.startResumedSessionWarmup(self);
     }
 
+    /// Sends the request a resumed session left unfinished, once the worker
+    /// runs.
+    pub fn startPendingResume(self: *App) void {
+        SessionAppRuntime.startPendingResume(self);
+    }
+
+    /// Queues the turn that resumes a request a previous fx process left
+    /// unfinished. `note` is what the model reads; the transcript shows a
+    /// resume line instead of a user card.
+    pub fn queueResumedRequest(self: *App, note: []const u8, resumed: types.RecoveryResume) !bool {
+        var queued = try self.snapshotPrompt(note, &.{}, null, null, 0, false);
+        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        queued.recovery_resume = resumed;
+        try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
+        HerdrAppRuntime.reportWorking(self);
+        WorkerAppRuntime.syncState(
+            self,
+            app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
+        );
+        return true;
+    }
+
     pub fn resumeSelectedSession(self: *App) !bool {
         return SessionAppRuntime.resumeSelectedSession(self);
     }
@@ -1664,7 +1701,7 @@ const App = struct {
             0,
             false,
         );
-        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        errdefer self.releaseUnadmittedPrompt(queued);
         try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
         HerdrAppRuntime.reportWorking(self);
         return true;
@@ -1687,10 +1724,17 @@ const App = struct {
             turn_id,
             user_prompt_already_presented,
         );
-        errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
+        errdefer self.releaseUnadmittedPrompt(queued);
         try self.worker.enqueuePrompt(std.heap.c_allocator, queued);
         HerdrAppRuntime.reportWorking(self);
         return true;
+    }
+
+    /// Frees a prompt the worker refused, giving back the stale shell handles
+    /// note it took so the next prompt carries it.
+    fn releaseUnadmittedPrompt(self: *App, queued: worker_runtime.QueuedPrompt) void {
+        if (queued.stale_shell_handles) self.session.returnStaleShellHandles(queued.turn_id);
+        worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
     }
 
     // Caller owns the returned prompt until worker admission succeeds.
@@ -1807,6 +1851,7 @@ const App = struct {
             .recovery_checkpoint = recovery_checkpoint_copy,
             .recovery_source_already_presented = recovery_checkpoint != null,
             .user_prompt_already_presented = user_prompt_already_presented,
+            .stale_shell_handles = self.session.takeStaleShellHandles(),
         };
     }
 
@@ -2187,6 +2232,10 @@ const App = struct {
         return AgentAppRuntime.validateToolCall(self, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
+    pub fn resolveUnselectedMcpTool(self: *App, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+        return AgentAppRuntime.resolveUnselectedMcpTool(self, arena, name, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    }
+
     pub fn checkToolAvailability(self: *App, arena: Allocator, call: ToolCall) !?[]const u8 {
         return AgentAppRuntime.checkToolAvailability(self, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
@@ -2475,8 +2524,8 @@ const App = struct {
         try AgentAppRuntime.appendTransientRuntimeContextMessage(self, arena, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
-    pub fn appendStaticContextMessage(self: *App, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
-        try AgentAppRuntime.appendStaticContextMessage(self, arena, project_context, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    pub fn appendStaticContextMessage(self: *App, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
+        try AgentAppRuntime.appendStaticContextMessage(self, arena, messages, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
         if (comptime host_target.is_wasm) {
             try messages.append(arena, .{
                 .role = .system,
@@ -3129,6 +3178,7 @@ const App = struct {
             try AuthAppRuntime.collectStartupCredentialFacts(self);
             AuthAppRuntime.collectDeferredStartupInventory(self);
         }
+        if (comptime host_profile.durable_sessions) SessionAppRuntime.collectInterruptedTurnHint(self);
         InputSubmitRuntime.collectPendingSubmissionFacts(self);
         InputAppRuntime.collectFilePickerFacts(self);
 
@@ -3809,11 +3859,13 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
         std.mem.eql(u8, command, "provider") or
         std.mem.eql(u8, command, "setup") or
         std.mem.eql(u8, command, "upgrade") or
+        std.mem.eql(u8, command, "update") or
         // Resolve a stored credential, which reads the platform key store out of process.
         std.mem.eql(u8, command, "status") or
         std.mem.eql(u8, command, "doctor") or
         std.mem.eql(u8, command, "models") or
         std.mem.eql(u8, command, "credits") or
+        std.mem.eql(u8, command, "balance") or
         // Reads AI Gateway usage reports over HTTP with a deadline.
         std.mem.eql(u8, command, "usage") or
         // `ttsr test --llm` asks a model (D253).
@@ -3838,6 +3890,7 @@ test "auth and upgrade commands use early threaded io without full entry config"
     const args = &.{@as([:0]const u8, "upgrade")};
     try std.testing.expect(!needsFullEntryConfig(args));
     try std.testing.expect(needsEarlyThreadedIo(args));
+    try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "update")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "slack")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "login")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "logout")}));
@@ -3847,6 +3900,20 @@ test "auth and upgrade commands use early threaded io without full entry config"
     try std.testing.expect(!needsEarlyThreadedIo(&.{ @as([:0]const u8, "ttsr"), "test", "x" }));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "usage")}));
     try std.testing.expect(needsEarlyThreadedIo(&.{@as([:0]const u8, "setup")}));
+}
+
+test "every alias of an early threaded io command uses early threaded io" {
+    const alloc = std.testing.allocator;
+    for (builtin_commands.top_level_specs) |spec| {
+        const token = try alloc.dupeSentinel(u8, spec.token, 0);
+        defer alloc.free(token);
+        if (!needsEarlyThreadedIo(&.{token})) continue;
+        for (spec.aliases) |alias| {
+            const alias_arg = try alloc.dupeSentinel(u8, alias, 0);
+            defer alloc.free(alias_arg);
+            try std.testing.expect(needsEarlyThreadedIo(&.{alias_arg}));
+        }
+    }
 }
 
 test "credential-reading commands use early threaded io without full entry config" {
@@ -4985,6 +5052,7 @@ test {
     _ = @import("mcp/mcp.zig");
     _ = @import("core/mcp_host/runtime.zig");
     _ = @import("core/mcp_host/wire_tests.zig");
+    _ = @import("core/recovery/recovery.zig");
     _ = @import("napi_fetch_state.zig");
     _ = @import("core/config/model_provider.zig");
     _ = @import("core/config/configured_provider.zig");
@@ -5000,9 +5068,11 @@ test {
     _ = @import("gateway/claude_agent.zig");
     _ = @import("gateway/cursor.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
+    _ = @import("gateway/json_depth.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
     _ = @import("acp/libfx_hooks.zig");
+    _ = @import("acp/types.zig");
     _ = @import("core/mcp_host/model.zig");
     _ = @import("core/output/activity_status.zig");
     _ = @import("core/agent/agent_runtime.zig");
@@ -5011,6 +5081,7 @@ test {
     _ = @import("core/agent/runtime/execution_memory.zig");
     _ = @import("core/agent/runtime/tool_admission.zig");
     _ = @import("core/agent/runtime/prompt_context.zig");
+    _ = @import("core/agent/runtime/runtime_context.zig");
     _ = @import("core/app/app_agent_runtime.zig");
     _ = @import("core/app/app_auth_runtime.zig");
     _ = auth_runtime;
@@ -5083,6 +5154,7 @@ test {
     _ = @import("core/shared/debug_trace.zig");
     _ = @import("core/output/diff.zig");
     _ = @import("core/shared/display_width.zig");
+    _ = @import("core/shared/gateway_error_format.zig");
     _ = @import("core/cli/doctor_runtime.zig");
     _ = @import("core/auth/login_flow.zig");
     _ = @import("core/auth/chatgpt_oauth.zig");

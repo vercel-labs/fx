@@ -61,6 +61,7 @@ pub fn build(b: *std.Build) void {
     // Whether this is a libfx artifact, which leaves out what only the fx
     // binary uses, such as its E2E test controls.
     build_options.addOption(bool, "libfx", false);
+    build_options.addOption(bool, "builtin_tools", true);
 
     const fuzz_corpora = readFuzzCorpora(b);
     const fuzz_corpus = addFuzzCorpusModule(b, fuzz_corpora);
@@ -381,6 +382,7 @@ fn addWasmArtifact(
     wasm_options.addOption([]const u8, "zig_exe", "");
     wasm_options.addOption(WasmSurface, "wasm_surface", surface);
     wasm_options.addOption(bool, "libfx", true);
+    wasm_options.addOption(bool, "builtin_tools", true);
 
     const wasm_root = switch (surface) {
         .core => "src/wasm_core_main.zig",
@@ -429,6 +431,8 @@ fn addNapiArtifact(
     napi_options.addOption([]const u8, "zig_exe", "");
     napi_options.addOption(NapiSurface, "napi_surface", surface);
     napi_options.addOption(bool, "libfx", true);
+    // libfx agents run only the host's tools, so the addon leaves fx's out.
+    napi_options.addOption(bool, "builtin_tools", false);
 
     const root = switch (surface) {
         .core => "src/napi_core_main.zig",
@@ -442,6 +446,17 @@ fn addNapiArtifact(
             .target = target,
             .optimize = .safe,
             .link_libc = true,
+            // Node never unwinds C++ exceptions through the addon, and its Zig
+            // code already bounds-checks in ReleaseSafe, so unwind tables and
+            // stack canaries only add size. Unlike the fx executable, the
+            // addon keeps frame pointers: Apple's arm64 ABI requires them,
+            // crash reports and profilers of the app walk them through the
+            // addon, and on x86-64 they make it about 0.2 MB smaller.
+            .stack_check = false,
+            .stack_protector = false,
+            .omit_frame_pointer = false,
+            .unwind_tables = .none,
+            .error_tracing = false,
             .strip = true,
         }),
     });

@@ -1,18 +1,9 @@
 const std = @import("std");
 const debug_trace = @import("debug_trace.zig");
 const display_width = @import("display_width.zig");
+const ascii_case = @import("ascii_case.zig");
 
-pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-
-    const last_start = haystack.len - needle.len;
-    var i: usize = 0;
-    while (i <= last_start) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
-}
+pub const containsIgnoreCase = ascii_case.containsIgnoreCase;
 
 /// Returns `text` repeated `count` times as a comptime string literal.
 pub inline fn repeat(comptime text: []const u8, comptime count: usize) *const [text.len * count:0]u8 {
@@ -416,6 +407,63 @@ pub fn encodeTerminalSafeInline(
     return encodeTerminalSafe(alloc, flattened.items, max_encoded_bytes);
 }
 
+/// Appends one line of file text ready to draw. Tabs stay, since they only
+/// move along the row, and a trailing carriage return from a CRLF line ending
+/// is dropped. Every other control byte, C1 control, and invalid UTF-8 byte
+/// becomes the visible escape `encodeTerminalSafe` writes, so the terminal
+/// never acts on the file's own sequences.
+pub fn appendTerminalSafeLine(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    raw: []const u8,
+) error{OutOfMemory}!void {
+    const line = if (raw.len > 0 and raw[raw.len - 1] == '\r') raw[0 .. raw.len - 1] else raw;
+    var index: usize = 0;
+    while (index < line.len) {
+        if (line[index] == '\t') {
+            try out.append(alloc, '\t');
+            index += 1;
+            continue;
+        }
+        var token_buf: [12]u8 = undefined;
+        const token = terminalSafeToken(line, index, &token_buf);
+        try out.appendSlice(alloc, token.bytes);
+        index += token.source_len;
+    }
+}
+
+/// A copy of `raw` that is valid UTF-8. Each byte outside a valid sequence
+/// becomes the `\xNN` escape `encodeTerminalSafe` writes for it; everything
+/// else, control bytes included, is kept for the renderer to handle. Caller
+/// owns the result.
+pub fn dupeValidUtf8(alloc: std.mem.Allocator, raw: []const u8) error{OutOfMemory}![]u8 {
+    if (std.unicode.utf8ValidateSlice(raw)) return alloc.dupe(u8, raw);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var index: usize = 0;
+    while (index < raw.len) {
+        const sequence_len = validUtf8SequenceLength(raw, index) orelse {
+            var buf: [12]u8 = undefined;
+            try out.appendSlice(alloc, writeByteEscape(&buf, raw[index]));
+            index += 1;
+            continue;
+        };
+        try out.appendSlice(alloc, raw[index .. index + sequence_len]);
+        index += sequence_len;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// The length of the valid UTF-8 sequence at `index`, or null when the byte
+/// there does not start one, by the same rule `terminalSafeToken` applies.
+fn validUtf8SequenceLength(raw: []const u8, index: usize) ?usize {
+    if (raw[index] < 0x80) return 1;
+    const sequence_len = std.unicode.utf8ByteSequenceLength(raw[index]) catch return null;
+    if (index + sequence_len > raw.len) return null;
+    _ = display_width.decodeUtf8Sequence(raw[index .. index + sequence_len]) catch return null;
+    return sequence_len;
+}
+
 /// Returns true when `raw` is valid printable terminal text and
 /// `encodeTerminalSafe` would preserve it byte-for-byte.
 pub fn isTerminalSafe(raw: []const u8) bool {
@@ -428,6 +476,22 @@ pub fn isTerminalSafe(raw: []const u8) bool {
         index += token.source_len;
     }
     return true;
+}
+
+/// Returns true when `url` can be an OSC 8 link target as it is: printable
+/// ASCII with no space, so nothing in it can end the sequence. Show any other
+/// address as text instead.
+pub fn isLinkTarget(url: []const u8) bool {
+    if (url.len == 0) return false;
+    for (url) |c| if (c <= ' ' or c >= 0x7f) return false;
+    return true;
+}
+
+test "a link target is printable ASCII with no space" {
+    try std.testing.expect(isLinkTarget("https://mcp.example.com/authorize?state=a%20b&x=1#y"));
+    for ([_][]const u8{ "", "https://h/a b", "https://h/a\x1b\\\x1b]8;;evil", "https://h/a\x07", "https://h/\xc3\xa9", "https://h/\x7f" }) |odd| {
+        try std.testing.expect(!isLinkTarget(odd));
+    }
 }
 
 pub fn terminalSafeVisibleWidth(raw: []const u8) usize {
@@ -1543,4 +1607,33 @@ test "utf8ForwardBoundary snaps past the codepoint tail" {
     try std.testing.expectEqual(@as(usize, 4), utf8ForwardBoundary(text, 3));
     try std.testing.expectEqual(@as(usize, 4), utf8ForwardBoundary(text, 4));
     try std.testing.expectEqual(@as(usize, text.len), utf8ForwardBoundary(text, text.len + 3));
+}
+
+test "appendTerminalSafeLine keeps tabs and shows a file's control sequences as text" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try appendTerminalSafeLine(alloc, &out, "a\tb\x1b[2J\x1b[Hc\u{9b}31md\xffe\r");
+    try std.testing.expectEqualStrings("a\tb\\x1b[2J\\x1b[Hc\\u{009b}31md\\xffe", out.items);
+
+    // Only a trailing carriage return ends a line; one inside it would return
+    // to the start of the row and draw over its gutter.
+    out.clearRetainingCapacity();
+    try appendTerminalSafeLine(alloc, &out, "good\rbad\r");
+    try std.testing.expectEqualStrings("good\\x0dbad", out.items);
+}
+
+test "dupeValidUtf8 escapes only bytes outside valid sequences" {
+    const alloc = std.testing.allocator;
+    const kept = try dupeValidUtf8(alloc, "tab\tesc\x1b ok ⋯");
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("tab\tesc\x1b ok ⋯", kept);
+
+    // A truncated sequence and an encoded surrogate are invalid byte by byte,
+    // as `encodeTerminalSafe` sees them.
+    const fixed = try dupeValidUtf8(alloc, "a\xff\xfe\x00\xc3(b\xed\xa0\x80");
+    defer alloc.free(fixed);
+    try std.testing.expectEqualStrings("a\\xff\\xfe\x00\\xc3(b\\xed\\xa0\\x80", fixed);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(fixed));
 }

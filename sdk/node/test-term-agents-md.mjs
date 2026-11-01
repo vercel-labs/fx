@@ -149,31 +149,31 @@ function readRules({ path, signal }) {
 const [readable] = await systemTextsWith(workspaceWith(readRules), "readable");
 expectIncludes(readable, "<project-instructions-guidance>", "readable");
 expectIncludes(readable, "<global-rules from=\"/home/visitor/.fx/AGENTS.md\">\nGLOBAL_RULE_SENTINEL\n</global-rules>", "readable");
-expectIncludes(readable, "<project-rules from=\"/workspace/AGENTS.md\">\nPROJECT_RULE_SENTINEL\n</project-rules>", "readable");
+expectIncludes(readable, "<project-rules from=\"AGENTS.md\">\nPROJECT_RULE_SENTINEL\n</project-rules>", "readable");
 expectExcludes(readable, "host cannot read instruction files", "readable");
 if (reads.join(",") !== "/home/visitor/.fx/AGENTS.md,/workspace/AGENTS.md") {
   throw new Error(`readable: unexpected readFile paths: ${reads.join(",")}`);
 }
 
-// A tool call makes later turns rebuild context from history; that rebuild
-// must use the host workspace root, not the WebAssembly process root.
+// A tool call must not change a later turn's rules. They name workspace files
+// relative to the host workspace root, not the WebAssembly process root.
 const toolTurn = { turns: 2, respond: (request) => (request === 1 ? shellCall("call-1", "pwd") : null) };
 const readableAfterTool = await systemTextsWith(workspaceWith(readRules), "readable-after-tool", toolTurn);
 const readableTurnTwo = readableAfterTool.at(-1);
-expectIncludes(readableTurnTwo, "<project-rules from=\"/workspace/AGENTS.md\">\nPROJECT_RULE_SENTINEL\n</project-rules>", "readable-after-tool");
+expectIncludes(readableTurnTwo, "<project-rules from=\"AGENTS.md\">\nPROJECT_RULE_SENTINEL\n</project-rules>", "readable-after-tool");
 expectExcludes(readableTurnTwo, "from=\"/AGENTS.md\"", "readable-after-tool");
-expectExcludes(readableTurnTwo, "<scoped-rules from=\"/workspace/AGENTS.md\"", "readable-after-tool");
+expectExcludes(readableTurnTwo, "<scoped-rules from=\"AGENTS.md\"", "readable-after-tool");
 if (reads.some((path) => !path.startsWith("/workspace/") && !path.startsWith("/home/visitor/"))) {
   throw new Error(`readable-after-tool: readFile requested a path outside root and home: ${reads.join(",")}`);
 }
 
 const [unreadable] = await systemTextsWith(workspaceWith(null), "unreadable");
-expectIncludes(unreadable, "<project-rules-omitted from=\"/workspace/AGENTS.md\" reason=\"host cannot read instruction files\" />", "unreadable");
+expectIncludes(unreadable, "<project-rules-omitted from=\"AGENTS.md\" reason=\"host cannot read instruction files\" />", "unreadable");
 expectExcludes(unreadable, "<project-rules from=", "unreadable");
 
 const unreadableAfterTool = await systemTextsWith(workspaceWith(null), "unreadable-after-tool", toolTurn);
 const unreadableTurnTwo = unreadableAfterTool.at(-1);
-expectIncludes(unreadableTurnTwo, "<project-rules-omitted from=\"/workspace/AGENTS.md\" reason=\"host cannot read instruction files\" />", "unreadable-after-tool");
+expectIncludes(unreadableTurnTwo, "<project-rules-omitted from=\"AGENTS.md\" reason=\"host cannot read instruction files\" />", "unreadable-after-tool");
 expectExcludes(unreadableTurnTwo, "from=\"/AGENTS.md\"", "unreadable-after-tool");
 
 const [failing] = await systemTextsWith(workspaceWith(({ path }) => {
@@ -181,7 +181,7 @@ const [failing] = await systemTextsWith(workspaceWith(({ path }) => {
   return new Uint8Array([0x72, 0x75, 0xff, 0x6c, 0x65]);
 }), "failing");
 expectIncludes(failing, "<project-rules-omitted from=\"/home/visitor/.fx/AGENTS.md\" reason=\"unreadable rule file\" />", "failing");
-expectIncludes(failing, "<project-rules-omitted from=\"/workspace/AGENTS.md\" reason=\"unreadable rule file\" />", "failing");
+expectIncludes(failing, "<project-rules-omitted from=\"AGENTS.md\" reason=\"unreadable rule file\" />", "failing");
 expectExcludes(failing, "<global-rules", "failing");
 
 console.log("headless AGENTS.md passed: host readFile delivers global and project rules across tool turns, and missing access or unreadable files are reported to the model");

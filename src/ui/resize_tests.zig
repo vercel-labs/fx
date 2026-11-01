@@ -1651,8 +1651,8 @@ test "streamed markdown lists reflow through shrink and grow" {
     const ordered_initial = try findRowContaining(&h, "second-");
     const nested_initial = try findRowContaining(&h, "third-");
     try std.testing.expect(first_initial < ordered_initial and ordered_initial < nested_initial);
-    try expectRowPrefix(&h, ordered_initial, "  1. second-");
-    try expectRowPrefix(&h, ordered_initial + 1, "     ");
+    try expectRowPrefix(&h, ordered_initial, "    1. second-");
+    try expectRowPrefix(&h, ordered_initial + 1, "       ");
     try expectRowPrefix(&h, nested_initial, "    • third-");
     try expectRowPrefix(&h, nested_initial + 1, "      ");
 
@@ -1663,7 +1663,7 @@ test "streamed markdown lists reflow through shrink and grow" {
     const nested_narrow = try findRowContaining(&h, "third-");
     try std.testing.expect(first_narrow < ordered_narrow and ordered_narrow < nested_narrow);
     try expectRowPrefix(&h, first_narrow + 1, "    ");
-    try expectRowPrefix(&h, ordered_narrow + 1, "     ");
+    try expectRowPrefix(&h, ordered_narrow + 1, "       ");
     try expectRowPrefix(&h, nested_narrow + 1, "      ");
 
     try h.driveResize(26, 40, 4, true);
@@ -1673,8 +1673,69 @@ test "streamed markdown lists reflow through shrink and grow" {
     const nested_wide = try findRowContaining(&h, "third-");
     try std.testing.expect(first_wide < ordered_wide and ordered_wide < nested_wide);
     try expectRowPrefix(&h, first_wide + 1, "    ");
-    try expectRowPrefix(&h, ordered_wide + 1, "     ");
+    try expectRowPrefix(&h, ordered_wide + 1, "       ");
     try expectRowPrefix(&h, nested_wide + 1, "      ");
+}
+
+test "streamed ordered list markers stay aligned through shrink and grow" {
+    var h = try Harness.init(std.testing.allocator, 24, 40, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var formatted: std.ArrayList(u8) = .empty;
+    defer formatted.deinit(h.alloc);
+    try processor.push(
+        h.alloc,
+        "8. eight\n" ++
+            "9. nine-abcdefghijklmnopqrstuvwxyz\n" ++
+            "   - child-abcdefghijklmnopqrstuvwxyz\n" ++
+            "10. ten-abcdefghijklmnopqrstuvwxyz\n" ++
+            "100. hundred\n",
+        &formatted,
+    );
+    try processor.flush(h.alloc, &formatted);
+
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, formatted.items);
+    try h.renderTranscriptFrame();
+    try h.flush();
+    try expectAlignedOrderedList(&h);
+
+    try h.driveResize(17, 40, 4, true);
+    try expectAlignedOrderedList(&h);
+
+    try h.driveResize(30, 40, 4, true);
+    try expectAlignedOrderedList(&h);
+}
+
+/// Checks the list from "streamed ordered list markers stay aligned through
+/// shrink and grow": every marker ends in the same column, and each wrapped
+/// row starts where its item's text starts.
+fn expectAlignedOrderedList(h: *Harness) !void {
+    const eight = try findRowContaining(h, "eight");
+    const nine = try findRowContaining(h, "nine-");
+    const child = try findRowContaining(h, "child-");
+    const ten = try findRowContaining(h, "ten-");
+    const hundred = try findRowContaining(h, "hundred");
+    try std.testing.expect(eight < nine and nine < child and child < ten and ten < hundred);
+    try expectRowPrefix(h, eight, "    8. eight");
+    try expectRowPrefix(h, nine, "    9. nine-");
+    try expectRowPrefix(h, child, "       \xe2\x80\xa2 child-");
+    try expectRowPrefix(h, ten, "   10. ten-");
+    try expectRowPrefix(h, hundred, "  100. hundred");
+
+    for ([_][3]u16{ .{ nine, child, 7 }, .{ child, ten, 9 }, .{ ten, hundred, 7 } }) |item| {
+        try std.testing.expect(item[1] - item[0] > 1);
+        var row = item[0] + 1;
+        while (row < item[1]) : (row += 1) {
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(h.alloc);
+            try h.vt.rowText(row, &text);
+            const indent = text.items.len - std.mem.trimStart(u8, text.items, " ").len;
+            try std.testing.expectEqual(@as(usize, item[2]), indent);
+        }
+    }
 }
 
 test "streamed longer code fence keeps inner fences inside the block" {
@@ -1764,14 +1825,14 @@ test "streamed plus and paren list markers wrap under their text" {
     try expectGridNotContains(&h, "+ plus");
 
     const paren_row = try findRowContaining(&h, "paren-");
-    try expectRowPrefix(&h, paren_row, "  1) paren-");
-    try expectRowPrefix(&h, paren_row + 1, "     ");
+    try expectRowPrefix(&h, paren_row, "    1) paren-");
+    try expectRowPrefix(&h, paren_row + 1, "       ");
 
     try h.driveResize(14, 40, 4, true);
     const plus_narrow = try findRowContaining(&h, "plus-");
     const paren_narrow = try findRowContaining(&h, "paren-");
     try expectRowPrefix(&h, plus_narrow + 1, "    ");
-    try expectRowPrefix(&h, paren_narrow + 1, "     ");
+    try expectRowPrefix(&h, paren_narrow + 1, "       ");
 }
 
 test "streamed blockquote keeps heading and bullet styling inside the quote" {
@@ -1945,50 +2006,50 @@ test "streamed markdown task lists reflow through shrink and grow" {
     try h.renderTranscriptFrame();
     try h.flush();
 
-    const completed_initial = try findRowContaining(&h, "complete");
+    const completed_initial = try findRowContaining(&h, "1. \xe2\x9c\x93");
     const nested_initial = try findRowContaining(&h, "nested-");
     try std.testing.expect(first_initial < completed_initial and completed_initial < nested_initial);
-    try expectRowPrefix(&h, completed_initial + 1, "       ");
+    try expectRowPrefix(&h, completed_initial + 1, "         ");
     try expectRowPrefix(&h, nested_initial + 1, "      ");
     try expectGridNotContains(&h, "[ ]");
     try expectGridNotContains(&h, "[x]");
     try expectGridNotContains(&h, "[X]");
 
-    const completed_marker = h.vt.cellAt(completed_initial, 6) orelse return error.TestMissingTaskMarker;
+    const completed_marker = h.vt.cellAt(completed_initial, 8) orelse return error.TestMissingTaskMarker;
     try std.testing.expectEqual(@as(u21, '\u{2713}'), completed_marker.codepoint);
     try std.testing.expect(completed_marker.style.fg.eql(.{ .indexed = 252 }));
-    const completed_body = h.vt.cellAt(completed_initial, 8) orelse return error.TestMissingTaskBody;
+    const completed_body = h.vt.cellAt(completed_initial, 10) orelse return error.TestMissingTaskBody;
     try std.testing.expectEqual(@as(u21, 'c'), completed_body.codepoint);
     try std.testing.expect(completed_body.style.fg.eql(.default));
 
     try h.driveResize(15, 40, 4, true);
 
     const first_narrow = try findRowContaining(&h, "first-");
-    const completed_narrow = try findRowContaining(&h, "complete");
+    const completed_narrow = try findRowContaining(&h, "1. \xe2\x9c\x93");
     const nested_narrow = try findRowContaining(&h, "nested-");
     try std.testing.expect(first_narrow < completed_narrow and completed_narrow < nested_narrow);
     try expectRowPrefix(&h, first_narrow + 1, "    ");
-    try expectRowPrefix(&h, completed_narrow + 1, "       ");
+    try expectRowPrefix(&h, completed_narrow + 1, "         ");
     try expectRowPrefix(&h, nested_narrow + 1, "      ");
 
-    const completed_narrow_marker = h.vt.cellAt(completed_narrow, 6) orelse return error.TestMissingTaskMarker;
+    const completed_narrow_marker = h.vt.cellAt(completed_narrow, 8) orelse return error.TestMissingTaskMarker;
     try std.testing.expect(completed_narrow_marker.style.fg.eql(.{ .indexed = 252 }));
-    const completed_narrow_body = h.vt.cellAt(completed_narrow, 8) orelse return error.TestMissingTaskBody;
+    const completed_narrow_body = h.vt.cellAt(completed_narrow, 10) orelse return error.TestMissingTaskBody;
     try std.testing.expect(completed_narrow_body.style.fg.eql(.default));
 
     try h.driveResize(26, 40, 4, true);
 
     const first_wide = try findRowContaining(&h, "first-");
-    const completed_wide = try findRowContaining(&h, "complete");
+    const completed_wide = try findRowContaining(&h, "1. \xe2\x9c\x93");
     const nested_wide = try findRowContaining(&h, "nested-");
     try std.testing.expect(first_wide < completed_wide and completed_wide < nested_wide);
     try expectRowPrefix(&h, first_wide + 1, "    ");
-    try expectRowPrefix(&h, completed_wide + 1, "       ");
+    try expectRowPrefix(&h, completed_wide + 1, "         ");
     try expectRowPrefix(&h, nested_wide + 1, "      ");
 
-    const completed_wide_marker = h.vt.cellAt(completed_wide, 6) orelse return error.TestMissingTaskMarker;
+    const completed_wide_marker = h.vt.cellAt(completed_wide, 8) orelse return error.TestMissingTaskMarker;
     try std.testing.expect(completed_wide_marker.style.fg.eql(.{ .indexed = 252 }));
-    const completed_wide_body = h.vt.cellAt(completed_wide, 8) orelse return error.TestMissingTaskBody;
+    const completed_wide_body = h.vt.cellAt(completed_wide, 10) orelse return error.TestMissingTaskBody;
     try std.testing.expect(completed_wide_body.style.fg.eql(.default));
 }
 
@@ -3585,7 +3646,7 @@ test "resized question cancellation keeps the idle footer bottom anchored" {
     _ = try h.shell.appendReplaceableTranscriptLineClassified(
         alloc,
         &h.metrics,
-        "\x1b[2m■ Cancelled\x1b[0m\n",
+        "\x1b[2m▪ Cancelled\x1b[0m\n",
         .question_resolution,
     );
     question.discard(alloc, "test_cleanup");
@@ -3603,7 +3664,7 @@ test "resized question cancellation keeps the idle footer bottom anchored" {
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
 
-    const cancelled_row = try findRowContaining(&h, "■ Cancelled");
+    const cancelled_row = try findRowContaining(&h, "▪ Cancelled");
     const footer_row = try findFirstDividerRowAfter(&h, cancelled_row);
     try expectExactlyOneBlankRowBetween(&h, cancelled_row, footer_row);
     try std.testing.expectEqual(

@@ -64,6 +64,8 @@ VERIFICATION_E2E_TESTS = (
     "tui-compaction-activity.test.ts",
     "compaction-policy.test.ts",
     "tui-composer-edit-contracts.test.ts",
+    "tui-permissions-panel.test.ts",
+    "tui-effort-menu.test.ts",
     "tui-usage.test.ts",
     "tui-decision-prompts.test.ts",
     "poisoned-repository.test.ts",
@@ -75,6 +77,7 @@ VERIFICATION_E2E_TESTS = (
     "tui-slash-commands.test.ts",
     "tui-slash-extra.test.ts",
     "tui-slash-menu.test.ts",
+    "tui-status-session.test.ts",
     "ultrafast-fake-gateway.test.ts",
     "web-fetch-permission-progress.test.ts",
     "web-search-permission-progress.test.ts",
@@ -374,7 +377,7 @@ class PgsoCorpusTests(unittest.TestCase):
             tuple(test_file for test_file, _ in corpus.intentional_exclusions),
         )
         self.assertEqual(35, len(corpus.scenarios))
-        self.assertEqual(61, len(corpus.candidate_scenarios))
+        self.assertEqual(64, len(corpus.candidate_scenarios))
         self.assertEqual(
             {
                 "direct-help": 100,
@@ -513,6 +516,7 @@ class PgsoCorpusTests(unittest.TestCase):
         *,
         fail_scenario: str | None = None,
         omit_profile_for: str | None = None,
+        **run_options,
     ):
         output = self.root / "output"
         profile_dir = output / "profiles" / "raw"
@@ -566,8 +570,43 @@ class PgsoCorpusTests(unittest.TestCase):
             toolchain=object(),
             command_runner=command_runner,
             profile_merger=profile_merger,
+            **run_options,
         )
         return result, calls, merges, binary, merged_profile
+
+    def test_startup_scenarios_keep_their_profiles_before_the_shared_merge(self) -> None:
+        corpus = self.make_corpus(
+            self.make_scenario("first"),
+            self.make_scenario("direct-help"),
+        )
+        startup_dir = self.root / "output" / "profiles" / "startup"
+        kept: list[tuple[tuple[str, ...], pathlib.Path]] = []
+
+        def keeper(_toolchain, raw_profiles, output, _log_path):
+            self.assertTrue(all(raw.exists() for raw in raw_profiles))
+            kept.append((tuple(raw.name for raw in raw_profiles), output))
+
+        _, _, merges, _, _ = self.run_fixture(
+            corpus,
+            startup_scenarios=("direct-help",),
+            startup_profile_dir=startup_dir,
+            startup_profile_keeper=keeper,
+        )
+
+        self.assertEqual(1, len(kept))
+        self.assertEqual(startup_dir / "direct-help.profdata", kept[0][1])
+        self.assertEqual(merges[1], kept[0][0])
+        self.assertEqual(2, len(merges))
+
+    def test_startup_scenarios_must_be_in_the_corpus(self) -> None:
+        corpus = self.make_corpus(self.make_scenario("first"))
+
+        with self.assertRaisesRegex(PgsoError, "startup scenarios are missing"):
+            self.run_fixture(
+                corpus,
+                startup_scenarios=("direct-help",),
+                startup_profile_dir=self.root / "startup",
+            )
 
     def test_run_uses_a_hermetic_environment_and_owns_per_scenario_profiles(self) -> None:
         corpus = self.make_corpus(
@@ -837,7 +876,9 @@ class PgsoCorpusTests(unittest.TestCase):
             self.make_scenario("keychain")
         )
 
-        with mock.patch.object(pathlib.Path, "home", return_value=host_home):
+        with mock.patch.object(pathlib.Path, "home", return_value=host_home), mock.patch(
+            "scripts.pgso.corpus.sys.platform", "darwin"
+        ):
             self.run_fixture(self.make_corpus(scenario))
 
         link = (
@@ -851,6 +892,22 @@ class PgsoCorpusTests(unittest.TestCase):
         )
         self.assertTrue(link.is_symlink())
         self.assertEqual(host_keychains.resolve(), link.resolve())
+
+    def test_keychain_scenarios_run_without_a_keychain_on_linux(self) -> None:
+        host_home = self.root / "host-home"
+        host_home.mkdir()
+        scenario = dataclasses_replace_allow_keychain(
+            self.make_scenario("keychain")
+        )
+
+        with mock.patch.object(pathlib.Path, "home", return_value=host_home), mock.patch(
+            "scripts.pgso.corpus.sys.platform", "linux"
+        ):
+            self.run_fixture(self.make_corpus(scenario))
+
+        scenario_home = self.root / "output" / "profiles" / "home" / "keychain"
+        self.assertTrue(scenario_home.is_dir())
+        self.assertFalse((scenario_home / "Library").exists())
 
     def test_run_stops_and_records_a_failed_scenario(self) -> None:
         corpus = self.make_corpus(

@@ -34,6 +34,7 @@ pub const native = provider_set.Set{
     .web_search = &web_search_bank.default_bank,
     .gateway = .{},
     .codex = .{
+        .capabilities = .{ .sends_output_limit = false },
         .presentation = provider_catalog.find(.codex),
         .auth_strategy = .chatgpt,
         .title_model = openai_codex_models.title_model,

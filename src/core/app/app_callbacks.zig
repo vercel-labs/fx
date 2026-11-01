@@ -312,6 +312,7 @@ pub fn Bindings(comptime App: type) type {
                 .append_static_context = agentAppendStaticContext,
                 .validate_tool_call = agentValidateToolCall,
                 .snapshot_mcp_definition = agentSnapshotMcpDefinition,
+                .resolve_unselected_mcp_tool = if (comptime @hasDecl(App, "resolveUnselectedMcpTool")) agentResolveUnselectedMcpTool else null,
                 .prepare_skill_call = if (comptime @hasField(App, "skills") and @hasDecl(App, "toolRegistry")) agentPrepareSkillCall else null,
                 .check_tool_availability = agentCheckToolAvailability,
                 .request_tool_permission = agentRequestToolPermission,
@@ -340,12 +341,20 @@ pub fn Bindings(comptime App: type) type {
                     if (app.session_persistence.v2 != null) agentAppendTurnPiece else null
                 else
                     null,
+                .record_usage = if (comptime @hasField(App, "session_persistence"))
+                    if (app.session_persistence.v2 != null) agentRecordUsage else null
+                else
+                    null,
                 .save_prompt_images = if (comptime @hasField(App, "session_persistence"))
                     if (app.session_persistence.v2 != null) agentSavePromptImages else null
                 else
                     null,
                 .rewind_to_checkpoint = if (comptime @hasField(App, "session_persistence"))
                     if (app.session_persistence.v2 != null) agentRewindToCheckpoint else null
+                else
+                    null,
+                .save_recovery_record = if (comptime @hasField(App, "session_persistence"))
+                    if (app.session_persistence.v2 != null) agentSaveRecoveryRecord else null
                 else
                     null,
                 .propagate_grant = agentPropagateGrant,
@@ -364,8 +373,8 @@ pub fn Bindings(comptime App: type) type {
                     refreshGatewayCredential
                 else
                     null,
-                .request_route_recovery = if (comptime @hasDecl(@TypeOf(app.worker), "requestRouteRecoveryAnswerBlocking"))
-                    agentRequestRouteRecovery
+                .ask_out_of_credits = if (comptime @hasDecl(@TypeOf(app.worker), "requestRouteRecoveryAnswerBlocking"))
+                    agentAskOutOfCredits
                 else
                     null,
                 .available_model_capabilities = agentAvailableModelCapabilities,
@@ -851,10 +860,10 @@ pub fn Bindings(comptime App: type) type {
             return result;
         }
 
-        fn agentAppendStaticContext(ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
+        fn agentAppendStaticContext(ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "appendStaticContextMessage")) {
-                try app.appendStaticContextMessage(arena, project_context, messages);
+                try app.appendStaticContextMessage(arena, messages);
             }
         }
 
@@ -941,6 +950,11 @@ pub fn Bindings(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "snapshotMcpDefinition")) return app.snapshotMcpDefinition(arena, name, known);
             return .unavailable;
+        }
+
+        fn agentResolveUnselectedMcpTool(ctx: *anyopaque, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            return app.resolveUnselectedMcpTool(arena, name);
         }
 
         fn agentValidateToolCall(ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
@@ -1178,6 +1192,16 @@ pub fn Bindings(comptime App: type) type {
             try app_session_runtime.Runtime(App).rewindToCheckpoint(app, user, kept);
         }
 
+        fn agentSaveRecoveryRecord(ctx: *anyopaque, record: types.RecoveryRecordWrite) anyerror!bool {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            return app_session_runtime.Runtime(App).saveRecoveryRecord(app, record);
+        }
+
+        fn agentRecordUsage(ctx: *anyopaque, usage: types.Usage) anyerror!void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app_session_runtime.Runtime(App).recordUsage(app, usage);
+        }
+
         fn agentSavePromptImages(ctx: *anyopaque, alloc: std.mem.Allocator, images: []types.ImageAttachment) anyerror!void {
             const app: *App = @ptrCast(@alignCast(ctx));
             try app_session_runtime.Runtime(App).savePromptImages(app, alloc, images);
@@ -1206,10 +1230,15 @@ pub fn Bindings(comptime App: type) type {
         fn agentPushText(ctx: *anyopaque, emission: agent_runtime.TextEmission) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             switch (emission) {
-                .assistant_started => {},
+                .assistant_started => try app_worker_runtime.Runtime(App).pushEvent(app, .{
+                    .assistant_presentation = .attempt_start,
+                }),
                 .assistant_source => {},
                 .assistant_rendered => |text| try app_worker_runtime.Runtime(App).pushText(app, text),
-                .assistant_restarted => |text| try app_worker_runtime.Runtime(App).pushText(app, text),
+                // pushEvent copies the payload into the queue's ownership.
+                .assistant_restarted => |text| try app_worker_runtime.Runtime(App).pushEvent(app, .{
+                    .assistant_presentation = .{ .attempt_restart = @constCast(text) },
+                }),
                 .operational => |text| try app_worker_runtime.Runtime(App).pushText(app, text),
             }
         }
@@ -1335,62 +1364,27 @@ pub fn Bindings(comptime App: type) type {
             try app_worker_runtime.Runtime(App).pushEvent(app, .{ .api_status_text = label });
         }
 
-        fn agentRequestRouteRecovery(ctx: *anyopaque, arena: Allocator, request: agent_runtime.RouteRecoveryRequest) !agent_runtime.RouteRecoveryDecision {
+        /// Asks what to do when the account is out of credits. Esc on the
+        /// picker cancels.
+        fn agentAskOutOfCredits(ctx: *anyopaque) !agent_runtime.OutOfCreditsChoice {
             const app: *App = @ptrCast(@alignCast(ctx));
-            const question = switch (request.finish_reason) {
-                .content_filter => "Response blocked by content filter. What should fx do?",
-                else => if (request.replay_safe)
-                    try arena.print(
-                        "Route failed after {d} attempt{s} for {s}. What should fx do?",
-                        .{
-                            request.semantic_attempts,
-                            if (request.semantic_attempts == 1) "" else "s",
-                            request.route_model,
-                        },
-                    )
-                else switch (request.unsafe_no_retry_reason orelse .assistant_output) {
-                    .assistant_output => "Route failed after assistant output started. What should fx do?",
-                    .tool_start => "Route failed after tool use started. What should fx do?",
-                },
+            const options = [_]types.QuestionOption{
+                .{ .label = "I added credits, retry", .description = "Send the request again." },
+                .{ .label = "Switch to another model", .description = "Open the model picker with your message back in the composer." },
+                .{ .label = "Cancel this turn", .description = "Stop this request." },
             };
-            var options_buf: [3]types.QuestionOption = undefined;
-            var option_count: usize = 0;
-            if (request.finish_reason == .provider_error and request.replay_safe and request.fast_mode) {
-                options_buf[option_count] = .{
-                    .label = "Disable Fast",
-                    .description = "Retry the selected model without Fast.",
-                };
-                option_count += 1;
-            }
-            options_buf[option_count] = .{
-                .label = "Change model",
-                .description = "Open the model picker and leave this prompt stopped.",
-            };
-            option_count += 1;
-            options_buf[option_count] = .{
-                .label = "Try again later",
-                .description = "Stop this prompt and try again later.",
-            };
-            option_count += 1;
-
             const entry = types.QuestionBatchEntry{
-                .question = question,
-                .options = options_buf[0..option_count],
+                .question = "Out of credits. What should fx do?",
+                .options = &options,
             };
             const answers = try app.worker.requestRouteRecoveryAnswerBlocking(std.heap.c_allocator, &.{entry});
             defer if (answers) |owned| {
                 for (owned) |label| std.heap.c_allocator.free(label);
                 std.heap.c_allocator.free(owned);
             };
-            const label = if (answers) |owned|
-                if (owned.len > 0) owned[0] else "Try again later"
-            else
-                "Try again later";
-            if (std.mem.eql(u8, label, "Disable Fast")) return .disable_fast;
-            if (std.mem.eql(u8, label, "Change model") or std.mem.eql(u8, label, "Switch model")) {
-                try app_worker_runtime.Runtime(App).pushEvent(app, .open_model_picker);
-                return .switch_model;
-            }
+            const label = if (answers) |owned| (if (owned.len > 0) owned[0] else "") else "";
+            if (std.mem.eql(u8, label, options[0].label)) return .retry;
+            if (std.mem.eql(u8, label, options[1].label)) return .switch_model;
             return .cancel;
         }
 
@@ -1618,7 +1612,7 @@ const FakeWorker = struct {
             switch (event) {
                 .assistant_presentation => |presentation| switch (presentation) {
                     .table, .code_block => return error.TestSemanticPresentationPublicationFailure,
-                    .text, .thematic_rule => {},
+                    .text, .thematic_rule, .attempt_start, .attempt_restart => {},
                 },
                 else => {},
             }

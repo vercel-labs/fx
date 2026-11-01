@@ -7,6 +7,7 @@ const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const acp_runner = @import("../cli/acp_runner.zig");
 const cli_surface = @import("../cli/cli_surface.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const types = @import("../shared/types.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const process_provider = @import("../execution/process_provider.zig");
@@ -318,9 +319,9 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
         }
         return initFailure(deps, launch, alloc, first_err);
     };
-    if (comptime !cooperative) {
-        if (@hasDecl(App, "rebindAfterInit")) app.rebindAfterInit();
-    }
+    // `App.init` built the app in a local and copied it here: whatever holds
+    // a pointer to the app needs this address instead.
+    if (@hasDecl(App, "rebindAfterInit")) app.rebindAfterInit();
     var app_needs_deinit = true;
     defer if (app_needs_deinit) {
         if (comptime cooperative) {
@@ -343,6 +344,7 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
             return err;
         };
         app.startModelCacheWarmup();
+        if (resume_requested and @hasDecl(App, "startPendingResume")) app.startPendingResume();
     }
 
     app.run() catch |err| {
@@ -453,8 +455,9 @@ fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *
 
 fn reportShutdownFailure(deps: RunDeps, err: anyerror) void {
     var buffer: [256]u8 = undefined;
-    const text = std.mem.print(&buffer, "proto-fx: session save failed: {s}\n", .{@errorName(err)}) catch
-        "proto-fx: session save failed\n";
+    var plain_buf: [96]u8 = undefined;
+    const text = std.mem.print(&buffer, "proto-fx: couldn't save the session: {s}\n", .{types.plainErrorText(@errorName(err), &plain_buf)}) catch
+        "proto-fx: couldn't save the session\n";
     writeStderr(deps, text);
 }
 
@@ -990,6 +993,17 @@ test "app entry runs interactive startup callbacks in active order" {
     try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "deinit" });
 }
 
+test "a cooperative launch rebinds the app at its final address before running it" {
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    var launch: cli_surface.InteractiveLaunch = .{};
+    var app: TestApp = undefined;
+    const outcome = try runInteractiveWithDeps(TestApp, true, &app, std.testing.allocator, &launch, .local, capture.deps());
+
+    try std.testing.expectEqual(RunOutcome.returned, outcome);
+    try expectEvents(&.{ "init:none", "rebind-after-init", "run", "terminal-release", "deinit" });
+}
+
 test "app entry reports persistence failure after teardown instead of a successful handoff" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(.{ .interactive = .{} });
@@ -999,7 +1013,7 @@ test "app entry reports persistence failure after teardown instead of a successf
     capture.record_stderr_event = true;
     const outcome = try runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps());
     try std.testing.expectEqual(RunOutcome{ .exit = 1 }, outcome);
-    try std.testing.expectEqualStrings("proto-fx: session save failed: InputOutput\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("proto-fx: couldn't save the session: a disk read or write failed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
     try std.testing.expectEqualStrings("deinit", test_events[test_event_count - 2]);
     try std.testing.expectEqualStrings("stderr-attempt", test_events[test_event_count - 1]);
@@ -1456,7 +1470,7 @@ test "app entry returns failure when terminal closure cannot save the session" {
     capture.record_stderr_event = true;
     const outcome = try runWithDeps(TestApp, std.testing.allocator, &.{}, testConfig(), capture.deps());
     try std.testing.expectEqual(RunOutcome{ .exit = 1 }, outcome);
-    try std.testing.expectEqualStrings("proto-fx: session save failed: InputOutput\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("proto-fx: couldn't save the session: a disk read or write failed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
     try std.testing.expectEqualStrings("deinit", test_events[test_event_count - 2]);
     try std.testing.expectEqualStrings("stderr-attempt", test_events[test_event_count - 1]);

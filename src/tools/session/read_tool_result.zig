@@ -50,7 +50,14 @@ pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_di
         }
         break :blk request.object;
     } else parsed.value.object;
-    if (args.get("search")) |value| return decodeSearch(ctx.allocator, value);
+    if (args.get("search")) |value| {
+        // search reads saved history and ignores a handle, so a call that
+        // sends both meant to look inside the handle's output.
+        if (args.get("handle")) |handle| if (handle != .null) {
+            return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result: search finds saved turns and takes no handle; to find text in this handle's output, pass query instead") };
+        };
+        return decodeSearch(ctx.allocator, value);
+    }
     const handle_value = args.get("handle") orelse {
         return .{ .failure = try ctx.allocator.dupe(u8, "read_tool_result requires string field \"handle\"") };
     };
@@ -298,6 +305,32 @@ test "read_tool_result decodes range and query inputs" {
         .query => |query| try std.testing.expectEqualStrings("needle", query),
         .range => return error.TestUnexpectedDecodeFailure,
         .search => return error.TestUnexpectedDecodeFailure,
+    }
+}
+
+test "read_tool_result refuses search with a handle and points to query" {
+    const alloc = std.testing.allocator;
+    const decoded = try decode(.{ .allocator = alloc }, "{\"handle\":\"h.txt\",\"search\":[\"CHECKSUM\"]}");
+    switch (decoded) {
+        .input => |input| {
+            input.deinit(alloc);
+            return error.TestUnexpectedResult;
+        },
+        .failure => |failure| {
+            defer alloc.free(failure);
+            try std.testing.expect(std.mem.find(u8, failure, "pass query") != null);
+        },
+    }
+    const without_handle = try decode(.{ .allocator = alloc }, "{\"handle\":null,\"search\":[\"CHECKSUM\"]}");
+    switch (without_handle) {
+        .input => |input| {
+            defer input.deinit(alloc);
+            try std.testing.expect(input.as(Input).selector == .search);
+        },
+        .failure => |failure| {
+            alloc.free(failure);
+            return error.TestUnexpectedResult;
+        },
     }
 }
 

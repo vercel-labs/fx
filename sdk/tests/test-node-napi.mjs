@@ -33,6 +33,7 @@ const scripts = [
   "test-default-import.mjs",
   "test-list-models.mjs",
   "test-libfx-loader.mjs",
+  "test-browser-import.mjs",
   "test-agent-bootstrap.mjs",
   "test-agent-step-limit.mjs",
   "test-agent-effort.mjs",

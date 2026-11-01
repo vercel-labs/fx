@@ -212,7 +212,7 @@ pub fn post_url(alloc: Allocator, definition: *const definitions.Definition, url
             detail = redacted;
         }
 
-        return .{ .failed = .{ .kind = failure_kind(response.head.status), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
+        return .{ .failed = .{ .kind = client_mod.httpFailureKind(alloc, .fromHttpStatus(response.head.status), detail), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
     var result = consume_fn(alloc, reader, request, watch.progress()) catch |err| return watch.failure(err);
     if (watch.finish()) |err| {
@@ -220,21 +220,6 @@ pub fn post_url(alloc: Allocator, definition: *const definitions.Definition, url
         return err;
     }
     return result;
-}
-
-pub fn failure_kind(status: std.http.Status) streams.FailureKind {
-    return switch (status) {
-        .bad_request => .invalid_request,
-        .unauthorized => .unauthorized,
-        .forbidden => .forbidden,
-        .payload_too_large => .request_too_large,
-        .too_many_requests => .rate_limited,
-        .internal_server_error => .server_error,
-        .bad_gateway => .bad_gateway,
-        .service_unavailable => .unavailable,
-        .gateway_timeout => .gateway_timeout,
-        else => .provider_error,
-    };
 }
 
 /// Parses a successful streamed reply from `reader`, telling `progress` about
@@ -414,9 +399,19 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
         },
     };
     errdefer result.deinit(alloc);
-    if (result == .failed) {
-        const outcome = reviewFailureOutcome(result.failed.kind);
-        debug_trace.logf("permission", "event=auto_review_transport result={s} reason=provider_failure failure_kind={s}", .{ @tagName(outcome), @tagName(result.failed.kind) });
+    // A review the output limit cut off holds no decision, and the same
+    // review would be cut off again, so it stays unavailable.
+    const cut_off = result == .completed and result.completed.completion.finish_reason == .length;
+    if (result == .failed or cut_off) {
+        const outcome = if (result == .failed)
+            reviewFailureOutcome(result.failed.kind)
+        else
+            classifier.TransportOutcome.permanent_failure;
+        debug_trace.logf("permission", "event=auto_review_transport result={s} reason={s} failure_kind={s}", .{
+            @tagName(outcome),
+            if (result == .failed) @as([]const u8, "provider_failure") else "review_cut_off",
+            if (result == .failed) @tagName(result.failed.kind) else "none",
+        });
         result.deinit(alloc);
         return outcome;
     }

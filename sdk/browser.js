@@ -1,37 +1,12 @@
-import { createDurableAgentFactory, memory } from "./durable.js";
-import { fxHarness } from "./fx-harness.js";
-import {
-  createFxEngine as createWasmAgent,
-  createFxTerminal as createWasmTerminal,
-  createMemoryPersistence,
-  FxFencedError,
-  FxJournalVersionError,
-  encodeXtermKeyEvent,
-  fxSdkApiVersion,
-  listModels,
-  supportsJspi,
-  xtermAdapter,
-} from "./fx-sdk.js";
-
-export { createMemoryPersistence, encodeXtermKeyEvent, FxFencedError, FxJournalVersionError, fxSdkApiVersion, listModels, memory, supportsJspi, xtermAdapter };
-export const libfxApiVersion = 3;
-
-const defaultCoreWasm = new URL("./fx-core.wasm", import.meta.url).href;
-const defaultTermWasm = new URL("./fx-term.wasm", import.meta.url).href;
-
-/** One fx session on WebAssembly, with no durability of its own. */
-export function createFxEngine(options = {}) {
-  return createWasmAgent({ ...options, wasm: options.wasm ?? defaultCoreWasm });
-}
-
-/** An agent whose sessions live in this page unless `durability` says otherwise. */
-export const createFxAgent = createDurableAgentFactory({
-  name: "createFxAgent",
-  label: "fx agent",
-  defaultDurability: async () => memory(),
-  harness: fxHarness({ createEngine: createFxEngine }),
-});
-
-export function createFxTerminal(options = {}) {
-  return createWasmTerminal({ ...options, wasm: options.wasm ?? defaultTermWasm });
-}
+// `libfx` in browsers, and `libfx/browser`. Importing it does no work: each
+// factory names its WebAssembly module only when called, so a server can render
+// a client component that imports it.
+//
+// This module only re-exports, and each .wasm is named in the module of the
+// factory that loads it. A bundler that skips unused re-exports, such as
+// Rolldown with lazy barrel optimization, then emits only the .wasm an app uses.
+export { createFxAgent, createFxEngine, libfxApiVersion } from "./browser-agent.js";
+export { createFxTerminal } from "./browser-terminal.js";
+export { memory } from "./durable.js";
+export { createMemoryPersistence, FxFencedError, FxJournalVersionError, fxSdkApiVersion, listModels, supportsJspi } from "./engine.js";
+export { encodeXtermKeyEvent, xtermAdapter } from "./xterm.js";

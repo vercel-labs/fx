@@ -26,6 +26,11 @@ pub const Options = struct {
     max_in_flight: usize = 32,
     /// Rung after each post, for a host that reads many clients.
     bell: ?*Bell = null,
+    /// Once the client has sent nothing for this long, the connections it
+    /// kept are closed rather than used again: a network can drop one that
+    /// sat idle without either end hearing of it, and a request sent on it
+    /// would wait out its timeout.
+    max_idle_ms: u32 = 60_000,
 };
 
 pub const Method = enum { post, get, delete };
@@ -137,6 +142,10 @@ pub const Client = struct {
     /// Bytes of messages posted and not yet taken: at most one largest
     /// message, so a fast server waits instead of growing fx.
     budget: Budget,
+    /// When a request last started or ended, in the awake clock's
+    /// milliseconds; under `used_lock`.
+    last_used_ms: i64 = 0,
+    used_lock: Io.Mutex = .init,
 
     /// `options.url` must outlive the client.
     pub fn init(c: *Client, io: Io, gpa: std.mem.Allocator, options: Options) Error!void {
@@ -408,21 +417,13 @@ pub const Client = struct {
     fn run(c: *Client, key: u64, method: Method, body: ?[]u8, headers: []const std.http.Header) Io.Cancelable!Result {
         // One that can't go out as it is never does: nothing takes it.
         if (!http_headers.sendable(headers)) return .{ .how = .http_failure };
-        var req = c.http.request(switch (method) {
-            .post => .POST,
-            .get => .GET,
-            .delete => .DELETE,
-        }, c.uri, .{
+        defer _ = c.markUsed();
+        var req = (try c.openSent(method, c.uri, .{
             .headers = .{ .content_type = if (body != null) .{ .override = "application/json" } else .default, .accept_encoding = .{ .override = "identity" } },
             .extra_headers = headers,
             .redirect_behavior = .unhandled,
-        }) catch return .{ .how = .broken };
+        }, body)) orelse return .{ .how = .broken };
         defer req.deinit();
-        req.accept_encoding = identity_only;
-        if (body) |b| {
-            req.transfer_encoding = .{ .content_length = b.len };
-            req.sendBodyComplete(b) catch return .{ .how = .broken };
-        } else req.sendBodiless() catch return .{ .how = .broken };
         var response = req.receiveHead(&.{}) catch return .{ .how = .broken };
         const status: u16 = @backingInt(response.head.status);
         // The head's bytes don't outlive reading the body.
@@ -484,6 +485,79 @@ pub const Client = struct {
         }
     }
 
+    /// Opens `method` on `uri`, on a connection kept for its server or a new
+    /// one, and sends `body`. A send that fails never brought the server the
+    /// whole request, so it is made once more, on a new connection; and the
+    /// connection it failed on is closed, where `std.http` would keep it for
+    /// the next request to fail on too. Null when it couldn't go out.
+    fn openSent(c: *Client, method: Method, uri: std.Uri, options: std.http.Client.RequestOptions, body: ?[]u8) Io.Cancelable!?std.http.Client.Request {
+        var fresh = false;
+        while (true) {
+            var with = options;
+            with.connection = try c.takeKept(uri, fresh);
+            var req = c.http.request(switch (method) {
+                .post => .POST,
+                .get => .GET,
+                .delete => .DELETE,
+            }, uri, with) catch {
+                if (with.connection) |kept| c.http.connection_pool.release(kept, c.io);
+                return null;
+            };
+            req.accept_encoding = identity_only;
+            const sending = if (body) |b| send: {
+                req.transfer_encoding = .{ .content_length = b.len };
+                break :send req.sendBodyComplete(b);
+            } else req.sendBodiless();
+            sending catch {
+                req.connection.?.closing = true;
+                req.deinit();
+                if (fresh) return null;
+                fresh = true;
+                continue;
+            };
+            return req;
+        }
+    }
+
+    /// A connection kept for `uri`'s server, taken from the pool, or null for
+    /// a new one. Those kept that the server closed or reset while they sat
+    /// idle are closed here, before anything is sent on them, and so is
+    /// every one kept when `fresh` is set or the client sat idle past
+    /// `max_idle_ms`.
+    fn takeKept(c: *Client, uri: std.Uri, fresh: bool) Io.Cancelable!?*std.http.Client.Connection {
+        // Through a proxy, `std.http` finds its own.
+        if (c.http.http_proxy != null or c.http.https_proxy != null) return null;
+        const protocol = std.http.Client.Protocol.fromUri(uri) orelse return null;
+        var host: [Io.net.HostName.max_len]u8 = undefined;
+        const criteria: std.http.Client.ConnectionPool.Criteria = .{
+            .host = Io.net.HostName.fromUri(uri, &host) catch return null,
+            .port = uri.port orelse switch (protocol) {
+                .plain => 80,
+                .tls => 443,
+            },
+            .protocol = protocol,
+        };
+        const stale = fresh or c.markUsed() > c.options.max_idle_ms;
+        const pool = &c.http.connection_pool;
+        while (try pool.findConnection(c.io, criteria)) |kept| {
+            if (!stale and !closedByServer(kept)) return kept;
+            kept.closing = true;
+            pool.release(kept, c.io);
+        }
+        return null;
+    }
+
+    /// Notes that a request starts or ends now, and returns how long none
+    /// had before.
+    fn markUsed(c: *Client) i64 {
+        const at = now(c.io);
+        c.used_lock.lockUncancelable(c.io);
+        defer c.used_lock.unlock(c.io);
+        const idle = at - c.last_used_ms;
+        c.last_used_ms = at;
+        return idle;
+    }
+
     /// Reads a JSON body into `body` a step at a time, counting each step
     /// before it is read. One past `max_message` is `TooLong`.
     fn readBody(c: *Client, reader: *Io.Reader, read: *Read, body: *std.ArrayList(u8)) (Io.Cancelable || error{ TooLong, ReadFailed, OutOfMemory })!void {
@@ -519,21 +593,13 @@ pub const Client = struct {
     fn fetchRun(c: *Client, key: u64, method: Method, uri: std.Uri, body: ?[]u8, content_type: []const u8, headers: []const std.http.Header) Io.Cancelable!@FieldType(Posted, "fetched") {
         const none: @FieldType(Posted, "fetched") = .{ .key = key };
         if (!http_headers.sendable(headers)) return none;
-        var req = c.http.request(switch (method) {
-            .post => .POST,
-            .get => .GET,
-            .delete => .DELETE,
-        }, uri, .{
+        defer _ = c.markUsed();
+        var req = (try c.openSent(method, uri, .{
             .headers = .{ .content_type = if (body != null) .{ .override = content_type } else .default, .accept_encoding = .{ .override = "identity" } },
             .extra_headers = headers,
             .redirect_behavior = .unhandled,
-        }) catch return none;
+        }, body)) orelse return none;
         defer req.deinit();
-        req.accept_encoding = identity_only;
-        if (body) |b| {
-            req.transfer_encoding = .{ .content_length = b.len };
-            req.sendBodyComplete(b) catch return none;
-        } else req.sendBodiless() catch return none;
         var response = req.receiveHead(&.{}) catch return none;
         var got: @FieldType(Posted, "fetched") = .{ .key = key, .status = @backingInt(response.head.status) };
         var challenge: std.ArrayList(u8) = .empty;
@@ -634,6 +700,15 @@ test {
 
 fn now(io: Io) i64 {
     return Io.Clock.awake.now(io).toMilliseconds();
+}
+
+/// Whether the server closed or reset a kept connection while it sat idle.
+/// Nothing is due on one between requests, so anything to read, its end
+/// included, means it can't carry another.
+fn closedByServer(kept: *std.http.Client.Connection) bool {
+    if (kept.reader().bufferedLen() > 0 or kept.stream_reader.interface.bufferedLen() > 0) return true;
+    var ready = [_]std.posix.pollfd{.{ .fd = kept.stream_reader.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    return (std.posix.poll(&ready, 0) catch return true) > 0;
 }
 
 /// A Content-Type naming JSON, with any parameters such as `charset`.
@@ -961,4 +1036,161 @@ test "a timed wait starts no task, so it works where none can run" {
     try c.init(threaded.io(), testing.allocator, .{ .url = "http://127.0.0.1:1/mcp" });
     defer c.deinit();
     try testing.expect((try c.next(20)) == .timeout);
+}
+
+/// What a test server does to each connection once it has answered on it.
+const Drop = enum { keep, reset, close };
+
+/// Reads one request on `r`, head and body, so none is left unread when the
+/// connection closes: a close with unread bytes is a reset.
+fn readRequest(r: *Io.Reader) !void {
+    const name = "content-length:";
+    var length: usize = 0;
+    while (true) {
+        const line = try r.takeDelimiterInclusive('\n');
+        if (line.len <= 2) break;
+        if (std.ascii.startsWithIgnoreCase(line, name)) length = try std.fmt.parseInt(usize, std.mem.trim(u8, line[name.len..], " \r\n"), 10);
+    }
+    try r.discardAll(length);
+}
+
+/// Answers each request on `stream` with a result, keeping the connection
+/// for the next, until `drop` ends it after the first answer. One the client
+/// ends is held open, unanswered, until the test does.
+fn answerKept(stream: Io.net.Stream, drop: Drop, requests: *std.atomic.Value(u32)) !void {
+    defer stream.close(testing.io);
+    var in: [4096]u8 = undefined;
+    var r = stream.reader(testing.io, &in);
+    var out: [1024]u8 = undefined;
+    var w = stream.writer(testing.io, &out);
+    const answer = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+    while (true) {
+        readRequest(&r.interface) catch return Io.sleep(testing.io, .fromSeconds(30), .awake);
+        _ = requests.fetchAdd(1, .monotonic);
+        try w.interface.print("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {d}\r\n\r\n", .{answer.len});
+        try w.interface.writeAll(answer);
+        try w.interface.flush();
+        switch (drop) {
+            .keep => {},
+            .close => return,
+            .reset => {
+                // Once the client has read the answer: a reset, not an end.
+                try Io.sleep(testing.io, .fromMilliseconds(50), .awake);
+                try std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.LINGER, std.mem.asBytes(&std.posix.linger{ .onoff = 1, .linger = 0 }));
+                return;
+            },
+        }
+    }
+}
+
+fn serveKept(server: *Io.net.Server, drop: Drop, connections: *std.atomic.Value(u32), requests: *std.atomic.Value(u32)) !void {
+    var answering: [4]?Io.Future(@typeInfo(@TypeOf(answerKept)).@"fn".return_type.?) = @splat(null);
+    defer for (&answering) |*a| if (a.*) |*f| f.cancel(testing.io) catch {};
+    for (&answering) |*a| {
+        const stream = try server.accept(testing.io);
+        _ = connections.fetchAdd(1, .monotonic);
+        a.* = try testing.io.concurrent(answerKept, .{ stream, drop, requests });
+    }
+    try Io.sleep(testing.io, .fromSeconds(30), .awake);
+}
+
+/// A server that keeps connections alive, counting them and the requests on
+/// them. It must not move once started.
+const Kept = struct {
+    server: Io.net.Server,
+    connections: std.atomic.Value(u32) = .init(0),
+    requests: std.atomic.Value(u32) = .init(0),
+    serving: ?Io.Future(@typeInfo(@TypeOf(serveKept)).@"fn".return_type.?) = null,
+    url_buffer: [64]u8 = undefined,
+    url: []const u8 = "",
+
+    fn start(k: *Kept, drop: Drop) !void {
+        var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+        k.* = .{ .server = try address.listen(testing.io, .{ .reuse_address = true }) };
+        k.url = try std.mem.print(&k.url_buffer, "http://127.0.0.1:{d}/mcp", .{k.server.socket.address.getPort()});
+        k.serving = try testing.io.concurrent(serveKept, .{ &k.server, drop, &k.connections, &k.requests });
+    }
+
+    fn stop(k: *Kept) void {
+        if (k.serving) |*f| f.cancel(testing.io) catch {};
+        k.server.deinit(testing.io);
+    }
+};
+
+/// How the request `c` sent last ended, past its messages.
+fn endingOf(c: *Client) !Ending {
+    while (true) switch (try c.next(5_000)) {
+        .ended => |e| return e.how,
+        .timeout => return error.TestTimeout,
+        else => {},
+    };
+}
+
+fn fetchedStatus(c: *Client) !u16 {
+    while (true) switch (try c.next(5_000)) {
+        .fetched => |f| return f.status,
+        .timeout => return error.TestTimeout,
+        else => {},
+    };
+}
+
+test "a kept connection the server reset or closed while idle isn't sent on again: each request goes out once, on a new one" {
+    for ([_]Drop{ .reset, .close }) |drop| {
+        var kept: Kept = undefined;
+        try kept.start(drop);
+        defer kept.stop();
+        var c: Client = undefined;
+        try c.init(testing.io, testing.allocator, .{ .url = kept.url });
+        defer c.deinit();
+        try c.send(1, .post, "{}", &.{});
+        try testing.expectEqual(Ending.complete, try endingOf(&c));
+        // The server drops each connection after one answer, so the next
+        // request and the sign-in request after it find theirs gone.
+        try Io.sleep(testing.io, .fromMilliseconds(300), .awake);
+        try c.send(2, .post, "{}", &.{});
+        try testing.expectEqual(Ending.complete, try endingOf(&c));
+        try Io.sleep(testing.io, .fromMilliseconds(300), .awake);
+        try c.fetch(3, .post, kept.url, "{}", "application/json", &.{});
+        try testing.expectEqual(@as(u16, 200), try fetchedStatus(&c));
+        try testing.expectEqual(@as(u32, 3), kept.connections.load(.monotonic));
+        try testing.expectEqual(@as(u32, 3), kept.requests.load(.monotonic));
+    }
+}
+
+test "a request whose send fails goes out once more, on a new connection, and reaches the server once" {
+    var kept: Kept = undefined;
+    try kept.start(.keep);
+    defer kept.stop();
+    var c: Client = undefined;
+    try c.init(testing.io, testing.allocator, .{ .url = kept.url });
+    defer c.deinit();
+    try c.send(1, .post, "{}", &.{});
+    try testing.expectEqual(Ending.complete, try endingOf(&c));
+    // The connection kept for the next request can't send any more, and
+    // nothing says so until a send on it fails.
+    const node = c.http.connection_pool.free.last orelse return error.TestUnexpectedResult;
+    const connection: *std.http.Client.Connection = @alignCast(@fieldParentPtr("pool_node", node));
+    try connection.stream_reader.stream.shutdown(testing.io, .send);
+    try c.send(2, .post, "{}", &.{});
+    try testing.expectEqual(Ending.complete, try endingOf(&c));
+    try testing.expectEqual(@as(u32, 2), kept.connections.load(.monotonic));
+    try testing.expectEqual(@as(u32, 2), kept.requests.load(.monotonic));
+}
+
+test "a kept connection is used again, unless the client sat idle past max_idle_ms" {
+    for ([_]u32{ 60_000, 0 }, [_]u32{ 1, 2 }) |max_idle_ms, connections| {
+        var kept: Kept = undefined;
+        try kept.start(.keep);
+        defer kept.stop();
+        var c: Client = undefined;
+        try c.init(testing.io, testing.allocator, .{ .url = kept.url, .max_idle_ms = max_idle_ms });
+        defer c.deinit();
+        for (1..3) |key| {
+            try c.send(key, .post, "{}", &.{});
+            try testing.expectEqual(Ending.complete, try endingOf(&c));
+            try Io.sleep(testing.io, .fromMilliseconds(20), .awake);
+        }
+        try testing.expectEqual(connections, kept.connections.load(.monotonic));
+        try testing.expectEqual(@as(u32, 2), kept.requests.load(.monotonic));
+    }
 }

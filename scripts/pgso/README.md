@@ -19,6 +19,12 @@ The driver requires:
 
 The pipeline does not use the host CPU as the release target. The final candidate must match the control's architecture, minimum macOS version, SDK compatibility stamp, main-stack request, and dynamic-library dependency versions. It must contain a valid code signature, contain no profile sections or profile-runtime dependency, and produce no profile output when executed.
 
+The target-specific steps live in a platform module, which [`platforms.py`](platforms.py) selects for the requested target: the host check, native tools, the instrumented and candidate links, the control properties the candidate must match, and the candidate's layout checks. [`macos.py`](macos.py) builds `aarch64-macos`, and [`linux.py`](linux.py) builds `aarch64-linux`. The profile, outlining, corpus, and measurement stages are shared.
+
+The Linux platform runs on an arm64 Linux host and needs `ld.lld`, `llvm-readelf`, the `aarch64-unknown-linux-gnu` profile runtime, and `lib/libLLVM.so` from the same LLVM root. Zig links the static musl control with its own `ld.lld`, so the control build records that exact link (`--verbose-link`), and the instrumented and candidate links rerun it with only the Zig object replaced. The candidate must match the control's ELF class, type, machine, OS ABI, segment types, first load address, stack segment, and whether it has interpreter, dynamic, TLS, and note segments. It must contain no profile sections.
+
+Profile use compiles the functions it judges cold for size, which slows Linux's short commands such as `fx help`. So training keeps a profile for each of the startup scenarios `direct-help`, `direct-version`, `direct-status`, `direct-doctor`, and `direct-sessions`. Before profile use, a first pass applies the production profile to find the startup functions marked `minsize`, and their records are removed from the production profile. Startup functions that stay hot, those the build inlines away, and those any heavy benchmark runs keep their records: the benchmarks build from the production profile, so removing a record they rely on would slow them. Every startup function is also marked `nooutline`, so neither outliner moves its code into shared helpers far from the rest of the startup code. The candidate link places the startup functions first, in the order they first run. Distributed builds don't carry the startup profiles, so they reject Linux. `.github/workflows/pgso-linux-arm64.yml` runs `all` for `aarch64-linux` in one job on a GitHub-hosted arm64 runner and uploads the manifest, logs, measurements, and candidate. The stable release calls it and ships that candidate as the Linux arm64 binary once the binary's SHA-256 matches the qualified candidate in the manifest.
+
 Training records execution counts and first-use function timestamps in the same
 continuous profiles. Counter supplements preserve the temporal traces. The
 main PGSO executable uses LLVM's temporal function order through the native
@@ -79,22 +85,64 @@ Generated IR helpers are kept in one dense linker cluster ordered by their
 hottest profiled caller so outlining does not scatter startup code across cold
 pages.
 
-Two size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
+LLVM's IR outliner does not compare constants nested inside a constant
+expression. Two regions that differ only in an instruction's constant can share
+one parameter that also replaces a nested constant, so one of them reads the
+wrong address. Before each outliner run, `ir_size.py expand-constant-exprs`
+rebuilds the constant expressions that instructions use as instructions, so the
+outliner compares every constant. Afterwards, `ir_size.py check-outlined` fails
+the run if an outlined function still holds a constant expression the outliner
+rebuilt from a parameter. Benchmark candidates take the same two steps.
+
+The IR outliner also matches `a > b` with `b < a` by reversing the operands it
+compares, but it passes the reversed region's operands to the outlined function
+in their original order, so that region computes `a < b`. A PGSO build turned a
+skill file read's bounds check around this way and panicked on the first chunk.
+After `expand-constant-exprs` and before each outliner run, `ir_size.py
+swap-compares` rewrites each greater-than comparison as the less-than
+comparison with its operands swapped, so the outliner only matches comparisons
+written the same way.
+
+Four size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
 library. Right after Zig emits bitcode, `outline-helpers` marks small shared
 std helpers `noinline`: the allocator's slice `free`, `remap`, and aligned
-allocation, the writer's `write`, `writeAll`, and allocating-writer setup and
-teardown, and the byte list's `appendSlice` and `deinit`. Zig otherwise copies
+allocation, the writer's `write`, `writeAll`, `writeByte`, and
+allocating-writer setup and teardown, the byte list's `appendSlice`, every
+list's `deinit`, `mem.eql`, `mem.startsWith`, `ascii.eqlIgnoreCase`, and the
+`Io.Mutex` lock and unlock. Zig otherwise copies
 them into thousands of call sites (`free` alone into about 11,000). The pass
 runs before instrumentation, so training, profile use, and the recorded
 bitcode identity all include it. It reports matches per pattern and fails if
 the allocator `free` helper does not match. After profile use and outlining,
 `sparse-constants` rewrites copies from mostly undefined internal constants
-into stores of their defined bytes, then `globaldce,verify` drops the dead
-constants. Zig emits such a constant for each `return error.X` from a
-function returning a large error union. Undefined bytes become "destination
-unchanged", a refinement of copying undefined bytes; explicit values,
-including zeros, are still stored. Benchmark artifacts receive both passes so
-their candidates keep the production code shape. The candidate link passes
+into stores of their defined bytes. Zig emits such a constant for each
+`return error.X` from a function returning a large error union. Undefined
+bytes become "destination unchanged", a refinement of copying undefined
+bytes; explicit values, including zeros, are still stored. The constants it
+cannot rewrite, because a load, a PHI, or a call still reads them, go to
+`overlay-constants`, along with `return null` results of large optionals. It
+packs them into one constant where they overlap: they are `unnamed_addr`, so
+only their defined bytes matter, and two may share bytes wherever neither
+defines a byte the other defines differently. Each becomes an alias of its
+offset. Members that hot code reads, or that are under 64 bytes, never
+receive another member's nonzero byte in their undefined bytes, so their
+copies still compile as before. `zero-fill-globals` then moves internal
+writable globals of at least 4 KB whose nonzero bytes fit in 64 bytes to
+zero-fill, which takes no space in the file, and stores those bytes at the
+start of `main`, or of the function Zig's `main` alias names. Even one nonzero
+byte otherwise writes the whole global out; std's `Progress` state is 18 KB for
+a single 255. Nothing reads these globals before `main`, and no later stage
+folds the stores back into an initializer. `compact-error-names` then reads
+every error name through one function: Zig's `__zig_error_name_table` holds a
+16-byte pointer and length per error, about 26 KB of relocated data, and each
+`@errorName` reads it in place. The function returns the same pointer and
+length from 16-bit offsets into one blob of the same NUL-terminated names.
+Where a PHI merges an entry with another pointer, or a call passes it to a
+function that only reads it, such as a pair copy the IR outliner made, the
+pair goes to a stack slot laid out like the entry. Any entry or use the pass
+does not recognize leaves
+the table unchanged. `globaldce,verify` then drops the dead constants. Benchmark artifacts receive every pass so their candidates keep
+the production code shape. The candidate link passes
 `-no_compact_unwind`: fx builds without unwind tables, and newer Apple linkers
 otherwise emit about 160 KB of compact unwind data.
 
@@ -133,7 +181,7 @@ Candidate behavior qualification records each scenario's debug trace under `cand
 
 ## Qualification policy
 
-Startup compares `help`, `--version`, `status --json`, `doctor --json`, and `sessions --json`. It first executes each verified immutable artifact once to require successful output and empty stderr. Timing then uses pinned Hyperfine with no intermediate shell, ten warmups per artifact in each of at least 100 alternating rounds, and at least 1,000 measured samples per artifact. No contiguous block exceeds ten measured runs, so short machine-noise bursts are distributed between control and candidate while p95 retains 50 tail observations. Startup measurement sets `FX_DISABLE_KEYCHAIN=1` so the compiler comparison cannot be dominated by host-global macOS Keychain subprocess latency; the deterministic behavior corpus remains responsible for exercising Keychain integration. No per-sample Python process management or evidence-file write is included in the timed boundary, and measurement never replaces `zig-out/bin/fx`. Heavy qualification compares file indexing at 100,000 paths, UI activity, and approval transcript, diff, combined, and large-payload workloads.
+Startup compares `help`, `--version`, `status --json`, `doctor --json`, and `sessions --json`. It first copies each verified immutable artifact into the measurement directory and checks that the copy's SHA-256 matches, so both binaries start from the same page-cache state: on Linux a binary whose pages were read back from disk can start 10 to 15 percent slower than one written moments ago. It then executes each copy once to require successful output and empty stderr. Timing then uses pinned Hyperfine with no intermediate shell, ten warmups per artifact in each of at least 100 alternating rounds, and at least 1,000 measured samples per artifact. No contiguous block exceeds ten measured runs, so short machine-noise bursts are distributed between control and candidate while p95 retains 50 tail observations. Startup measurement sets `FX_DISABLE_KEYCHAIN=1` so the compiler comparison cannot be dominated by host-global macOS Keychain subprocess latency; the deterministic behavior corpus remains responsible for exercising Keychain integration. No per-sample Python process management or evidence-file write is included in the timed boundary, and measurement never replaces `zig-out/bin/fx`. Heavy qualification compares file indexing at 100,000 paths, UI activity, and approval transcript, diff, combined, and large-payload workloads.
 
 Heavy comparisons use at least 50 measured samples for each artifact and alternate pair order AB then BA. Command failures and timeouts fail qualification and are never replaced. A candidate fails when either p50 or p95 is more than 10% slower than its matching control. The existing Linux startup workflow remains the authority for the repository's absolute 2 ms command budget.
 

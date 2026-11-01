@@ -10,6 +10,7 @@ const std = @import("std");
 const report = @import("report.zig");
 const codex = @import("codex.zig");
 const grok = @import("grok.zig");
+const json_decode = @import("../core/shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -199,7 +200,7 @@ pub fn encode(alloc: Allocator, identity: Identity, entry: Entry) ![]u8 {
 /// string, so `bytes` may be freed right after.
 pub fn decode(gpa: Allocator, identity: Identity, bytes: []const u8) ?Owned {
     var arena = std.heap.ArenaAllocator.init(gpa);
-    const wire = std.json.parseFromSliceLeaky(Wire, arena.allocator(), bytes, .{ .allocate = .alloc_always }) catch {
+    const wire = json_decode.parseFromSliceLeaky(Wire, arena.allocator(), bytes, .{ .allocate = .alloc_always }) catch {
         arena.deinit();
         return null;
     };
@@ -478,4 +479,76 @@ test "store never writes an entry its reader would reject" {
     defer kept.deinit();
     try testing.expectEqual(@as(i64, 5), kept.entry.finished.?.day);
     try testing.expect(kept.entry.today == null);
+}
+
+/// Parses with `std.json` and with `json_decode`, which must agree.
+fn expectSameWire(input: []const u8) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const options: std.json.ParseOptions = .{ .allocate = .alloc_always };
+    const expected = std.json.parseFromSliceLeaky(Wire, arena, input, options);
+    const actual = json_decode.parseFromSliceLeaky(Wire, arena, input, options);
+    if (expected) |value| {
+        try testing.expectEqualDeep(value, try actual);
+    } else |err| {
+        try testing.expectError(err, actual);
+    }
+}
+
+test "decode reads every cache file exactly as std.json does" {
+    const codex_body =
+        \\{"plan_type":"pro",
+        \\ "rate_limit":{"allowed":true,"limit_reached":false,
+        \\  "primary_window":{"used_percent":42,"limit_window_seconds":18000,"reset_after_seconds":7980,"reset_at":1791759980},
+        \\  "secondary_window":{"used_percent":18.5,"limit_window_seconds":604800,"reset_after_seconds":300000,"reset_at":null}},
+        \\ "additional_rate_limits":[{"limit_name":"cloud tasks","metered_feature":"cloud","rate_limit":{"allowed":true,"limit_reached":false,
+        \\  "primary_window":{"used_percent":3,"limit_window_seconds":86400,"reset_after_seconds":100,"reset_at":1791752100}}}],
+        \\ "credits":{"has_credits":true,"unlimited":false,"balance":"12.40"},
+        \\ "spend_control":{"reached":true,"individual_limit":null}}
+    ;
+    const grok_body =
+        \\{"config":{"creditUsagePercent":42.5,
+        \\"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-06-01T00:00:00Z","end":"2026-06-08T00:00:00Z"},
+        \\"onDemandCap":{"val":5000},"onDemandUsed":{"val":300},"prepaidBalance":{"val":1250},
+        \\"productUsage":[{"product":"PRODUCT_GROK_BUILD","usagePercent":61.2},{"product":"PRODUCT_CHAT"}]}}
+    ;
+    var codex_usage = try codex.parse(testing.allocator, codex_body, 1_791_752_000_000);
+    defer codex_usage.deinit();
+    var grok_usage = try grok.parseBilling(testing.allocator, grok_body);
+    defer grok_usage.deinit();
+    const id = identityOf(.member, "acct_1", "team_1");
+    const bytes = try encode(testing.allocator, id, .{
+        .today = .{ .day = 20737, .at_ms = 9, .models = oneRow(1.5) },
+        .finished = .{ .day = 20736, .at_ms = 8, .days_7 = oneRow(7), .month = oneRow(30) },
+        .budget = .{ .at_ms = 7, .value = .{ .limit = 100, .spent = 2.5, .period = .weekly } },
+        .codex = .{ .at_ms = 6, .value = codex_usage.usage },
+        .grok = .{ .at_ms = 5, .value = grok_usage.usage },
+    });
+    defer testing.allocator.free(bytes);
+    try expectSameWire(bytes);
+
+    // Damaged copies must fail, or parse, the same way.
+    var prng: std.Random.DefaultPrng = .init(0x75736167);
+    const random = prng.random();
+    const alphabet = "{}[]\",:-.0123456789eanrtlu ";
+    var buf: [8192]u8 = undefined;
+    for (0..2000) |_| {
+        var len = bytes.len;
+        @memcpy(buf[0..len], bytes);
+        const at = random.uintLessThan(usize, len);
+        switch (random.uintLessThan(u8, 3)) {
+            0 => {
+                @memmove(buf[at .. len - 1], buf[at + 1 .. len]);
+                len -= 1;
+            },
+            1 => {
+                @memmove(buf[at + 1 .. len + 1], buf[at..len]);
+                buf[at] = alphabet[random.uintLessThan(usize, alphabet.len)];
+                len += 1;
+            },
+            else => buf[at] = alphabet[random.uintLessThan(usize, alphabet.len)],
+        }
+        try expectSameWire(buf[0..len]);
+    }
 }
