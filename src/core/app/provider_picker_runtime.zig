@@ -69,6 +69,14 @@ pub fn Runtime(comptime App: type) type {
                 column.count = 1;
                 return column.count;
             }
+            if (comptime @hasDecl(@TypeOf(app.auth), "teamListLoading")) {
+                if (app.auth.teamListLoading()) {
+                    column.labels[0] = "loading teams...";
+                    column.annotations[0] = "";
+                    column.count = 1;
+                    return column.count;
+                }
+            }
             const active_provider = provider_runtime.provider(app);
             var count: usize = 0;
             switch (query.stage) {
@@ -251,7 +259,10 @@ pub fn Runtime(comptime App: type) type {
             if (!hasQuery(app)) return false;
             if (app.auth.sourceInventoryRefreshActive()) return true;
             if (comptime @hasDecl(@TypeOf(app.auth), "teamListLoading")) {
-                if (app.auth.teamListLoading()) return true;
+                if (app.auth.teamListLoading()) {
+                    debug_trace.logf("provider", "provider picker ignored enter reason=team_list_loading", .{});
+                    return true;
+                }
             }
             const query = app.input_runtime.picker.activeProviderPickerQuery(&app.input_runtime.edit_state) orelse return false;
             var column: ColumnBuffer = .{};

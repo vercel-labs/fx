@@ -1263,6 +1263,11 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandShowCredits(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
+            // The lookup runs in a `std.Io` task so a slow Gateway or issuer
+            // never holds the input loop; `collectCreditsFacts` writes its result.
+            if (comptime @hasField(App, "credits_lookup") and !@import("builtin").single_threaded) {
+                return startCreditsLookup(app);
+            }
             const input: gateway_provider.CreditsLookupInput = .{
                 .credential = app.auth.apiKey(),
                 .credential_source = if (comptime @hasDecl(@TypeOf(app.auth), "credentialSource"))
@@ -1271,49 +1276,44 @@ pub fn Handlers(comptime App: type) type {
                     null,
                 .tenant = app.auth.gatewayTeam(),
             };
-            // The lookup runs on a worker so a slow Gateway or issuer never
-            // holds the input loop; `collectCreditsFacts` writes its result.
-            if (comptime @hasField(App, "credits_lookup") and !@import("builtin").single_threaded) {
-                // A due token still names the session; the worker renews it
-                // before asking for credits.
-                const queued = app.auth.queuedPromptCredential();
-                const source = app.auth.credentialSource();
-                const renewal: ?credits_lookup.Renewal = if (source) |active|
-                    if (credentials.sourceRefreshable(active) and app.auth.credentialNeedsRefresh())
-                        .{ .transport = app.auth.oauthTransport(), .source = active, .account_id = app.auth.accountId() }
-                    else
-                        null
-                else
-                    null;
-                const worker_input: gateway_provider.CreditsLookupInput = .{
-                    .credential = if (queued) |credential| credential.api_key else null,
-                    .credential_source = source,
-                    .tenant = if (queued) |credential| credential.gateway_team else null,
-                };
-                const started = app.credits_lookup.start(app.creditsProvider(), worker_input, renewal) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => {
-                        debug_trace.logf("credits", "lookup start failed err={s}", .{@errorName(err)});
-                        try app.writeDomainNotice(.{
-                            .topic = "credits",
-                            .tone = .@"error",
-                            .body = "Could not check credits. Try again.",
-                        }, true);
-                        return;
-                    },
-                };
-                if (started == .busy) {
-                    try app.writeDomainNotice(.{
-                        .topic = "credits",
-                        .tone = .neutral,
-                        .body = "Credits are still loading.",
-                    }, true);
-                }
-                return;
-            }
             var snapshot = app.creditsProvider().fetch(app.alloc, input);
             defer snapshot.deinit(app.alloc);
             try writeCreditsNotice(app, snapshot);
+        }
+
+        fn startCreditsLookup(app: *App) !void {
+            // A due token still names the session; the task renews it before
+            // asking for credits.
+            const queued = app.auth.queuedPromptCredential();
+            const source = app.auth.credentialSource();
+            const renewal: ?credits_lookup.Renewal = if (source) |active|
+                if (credentials.sourceRefreshable(active) and app.auth.credentialNeedsRefresh())
+                    .{ .transport = app.auth.oauthTransport(), .source = active, .account_id = app.auth.accountId() }
+                else
+                    null
+            else
+                null;
+            const input: gateway_provider.CreditsLookupInput = .{
+                .credential = if (queued) |credential| credential.api_key else null,
+                .credential_source = source,
+                .tenant = if (queued) |credential| credential.gateway_team else null,
+            };
+            const started = app.credits_lookup.start(app.creditsProvider(), input, renewal) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                debug_trace.logf("credits", "lookup start failed err={s}", .{@errorName(err)});
+                return app.writeDomainNotice(.{
+                    .topic = "credits",
+                    .tone = .@"error",
+                    .body = "fx could not start a background task to check credits. Try again.",
+                }, true);
+            };
+            if (started == .busy) {
+                try app.writeDomainNotice(.{
+                    .topic = "credits",
+                    .tone = .neutral,
+                    .body = "Credits are still loading.",
+                }, true);
+            }
         }
 
         /// Writes the `/credits` result once its background lookup finishes,

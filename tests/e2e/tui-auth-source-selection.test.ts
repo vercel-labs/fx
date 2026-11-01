@@ -388,6 +388,8 @@ function startFakeOAuth(
     rejectAllDeviceClients?: boolean;
     tokenDelayMs?: number;
     revokeDelayMs?: number;
+    discoveryDelayMs?: number;
+    teamsDelayMs?: number;
     rejectRefreshGrant?: boolean;
     beforeRefreshResponse?: () => void | Promise<void>;
     teams?: Array<{ id: string; slug: string; name: string }>;
@@ -417,6 +419,7 @@ function startFakeOAuth(
       const baseUrl = `http://127.0.0.1:${server.port}`;
       switch (url.pathname) {
         case "/.well-known/openid-configuration":
+          if (options.discoveryDelayMs) await Bun.sleep(options.discoveryDelayMs);
           return Response.json({
             issuer: baseUrl,
             device_authorization_endpoint: `${baseUrl}/oauth/device`,
@@ -476,6 +479,7 @@ function startFakeOAuth(
           });
         }
         case "/v2/teams":
+          if (options.teamsDelayMs) await Bun.sleep(options.teamsDelayMs);
           return Response.json({ teams: options.teams ?? [] });
         case "/oauth/revoke": {
           if (options.revokeDelayMs) await Bun.sleep(options.revokeDelayMs);
@@ -2314,6 +2318,48 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
 
     expect(gateway.requests).toHaveLength(1);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Esc while a Vercel sign-in prepares stops its request and saves nothing",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-sign-in-preparing-esc-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    // Issuer discovery stays slow enough to see the preparing state.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, 1, { discoveryDelayMs: 5_000 });
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane(
+      (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForPane(
+      (pane) => pane.includes("oauth") && pane.includes("api-key"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    const preparing = await session.waitForPane(
+      (pane) => pane.includes("Sign in with Vercel") && pane.includes("Preparing sign-in"),
+      2_000,
+    );
+    expect(preparing).not.toContain("Authorize with Vercel");
+
+    await session.sendKeys("Escape");
+    await session.waitForPane((pane) => !pane.includes("Preparing sign-in"), 1_000);
+    // Past the discovery delay, a sign-in that kept going would have asked
+    // for a device code.
+    await Bun.sleep(5_500);
+    expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(0);
+    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    expect(session.isAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -7775,6 +7821,79 @@ tmuxTest(
       (pane) => pane.includes("example-internal-team"),
       TIMEOUT,
     );
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "closing /provider while its team list loads drops the late list",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-provider-team-list-close-"));
+    stderrPath = join(home, "stderr.log");
+    const tracePath = join(home, "trace.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teamsDelayMs: 3_000,
+      teams: [{ id: "team_123", slug: "example-internal-team", name: "Example Internal Team" }],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, tracePath, {
+      FX_TRACE_SCOPES: "auth,provider",
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane(
+      (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForPane(
+      (pane) => pane.includes("oauth") && pane.includes("api-key"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForText("loading teams...", 1_000);
+
+    await session.sendKeys("Escape");
+    await session.waitForPane((pane) => !pane.includes("loading teams..."), 1_000);
+    // Past the teams delay, the late list must not reopen a picker.
+    await Bun.sleep(3_500);
+    expect(await session.capturePane()).not.toContain("Vercel team · Search:");
+    expect(oauth.requests.filter((request) => request.path === "/v2/teams")).toHaveLength(1);
+    expect(readFileSync(tracePath, "utf8")).toContain("team list dropped reason=picker_moved");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "/credits with a login that needs a new sign-in says so",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-auth-credits-renewal-rejected-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    // The issuer rejects every refresh grant.
+    oauth = startFakeOAuth(null);
+    creditsGateway = startFakeCreditsGateway();
+    // Current at launch, so nothing renews it before /credits; due a few
+    // seconds later.
+    const refreshDueAt = Date.now() + 5_000;
+    writeSeededFxLogin(home, refreshDueAt + 60_000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_E2E_GATEWAY_CREDITS_URL: creditsGateway.url,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await Bun.sleep(Math.max(0, refreshDueAt - Date.now()) + 250);
+
+    await session.sendText("/credits");
+    await session.waitForText("Your sign-in has expired. Run /login, then check credits again.", TIMEOUT);
+    expect(creditsGateway.requests).toEqual([]);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,

@@ -301,38 +301,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             defer if (hold_turn_start) app.worker.releaseTurnStartHold();
-            if (logout_provider == .grok) {
-                const local = grok_oauth.logoutLocally(std.heap.c_allocator) catch {
-                    try writeAuthNotice(app, .{
-                        .topic = "auth",
-                        .tone = .@"error",
-                        .body = "Could not durably sign out of Grok. The current source is unchanged.",
-                    });
-                    return;
-                };
-                var revocation: ?auth_runtime.RemoteRevocation = if (local.refresh_token) |token| .{ .grok = token } else null;
-                defer if (revocation) |pending| releaseRemoteRevocation(pending);
-                const outcome = local.result;
-                const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterGrokLogout"))
-                    try app.auth.reconcileAfterGrokLogout(app.alloc)
-                else
-                    false;
-                applyCredentialChange(app, changed);
-                try writeAuthNotice(app, switch (outcome.deletion) {
-                    .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Grok." },
-                    .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Grok login session found." },
-                    .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Grok, but could not confirm the profile directory update." },
-                });
-                if (outcome.revocation_failed) {
-                    try writeRemoteRevocationWarning(app, .grok_subscription);
-                }
-                try reconcileSubscriptionLogout(app, .grok);
-                if (revocation) |pending| {
-                    revocation = null;
-                    try startRemoteRevocation(app, pending);
-                }
-                return;
-            }
+            if (logout_provider == .grok) return logoutGrok(app);
             if (logout_provider == .codex) {
                 const outcome = chatgpt_oauth.logout() catch {
                     try writeAuthNotice(app, .{
@@ -355,6 +324,46 @@ pub fn Runtime(comptime App: type) type {
                 try reconcileSubscriptionLogout(app, .codex);
                 return;
             }
+            return logoutFxLogin(app);
+        }
+
+        /// Signs out of Grok locally, then revokes its refresh token at the
+        /// issuer in the background.
+        fn logoutGrok(app: *App) !void {
+            const local = grok_oauth.logoutLocally(std.heap.c_allocator) catch {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "Could not durably sign out of Grok. The current source is unchanged.",
+                });
+                return;
+            };
+            var revocation: ?auth_runtime.RemoteRevocation = if (local.refresh_token) |token| .{ .grok = token } else null;
+            defer if (revocation) |pending| releaseRemoteRevocation(pending);
+            const outcome = local.result;
+            const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterGrokLogout"))
+                try app.auth.reconcileAfterGrokLogout(app.alloc)
+            else
+                false;
+            applyCredentialChange(app, changed);
+            try writeAuthNotice(app, switch (outcome.deletion) {
+                .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Grok." },
+                .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Grok login session found." },
+                .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Grok, but could not confirm the profile directory update." },
+            });
+            if (outcome.revocation_failed) {
+                try writeRemoteRevocationWarning(app, .grok_subscription);
+            }
+            try reconcileSubscriptionLogout(app, .grok);
+            if (revocation) |pending| {
+                revocation = null;
+                try startRemoteRevocation(app, pending);
+            }
+        }
+
+        /// Signs out of fx login locally, then revokes the session at the
+        /// issuer in the background.
+        fn logoutFxLogin(app: *App) !void {
             const local = login_flow.logoutLocally(std.heap.c_allocator) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
                     try writeAuthNotice(app, .{
@@ -384,7 +393,10 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Frees a revocation that /logout prepared but could not start
+        /// because a later step failed.
         fn releaseRemoteRevocation(revocation: auth_runtime.RemoteRevocation) void {
+            debug_trace.logf("auth", "remote revocation dropped reason=logout_error source={t}", .{revocation.source()});
             var owned = revocation;
             owned.deinit();
         }
@@ -799,12 +811,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 .fx_login;
             app.auth.pulseSignIn(app.alloc);
-            if (comptime @hasDecl(@TypeOf(app.auth), "takeSignInBrowserPending")) {
-                if (app.auth.takeSignInBrowserPending()) {
-                    app.shell.render_requests.request(.footer);
-                    if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
-                }
-            }
+            try openPreparedSignInBrowser(app);
             switch (app.auth.pollSignInTransition(app.alloc)) {
                 .none => {},
                 .cancelled => {
@@ -1853,6 +1860,15 @@ pub fn Runtime(comptime App: type) type {
                 // FX_NO_OPEN_BROWSER opts out for headless/SSH sessions.
                 if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
             }
+        }
+
+        /// Shows the device code the sign-in worker just prepared and opens
+        /// the browser for it, as beginSignIn does for a code ready at once.
+        fn openPreparedSignInBrowser(app: *App) !void {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "takeSignInBrowserPending")) return;
+            if (!app.auth.takeSignInBrowserPending()) return;
+            app.shell.render_requests.request(.footer);
+            if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
         }
 
         fn openSignInBrowser(app: *App) !void {

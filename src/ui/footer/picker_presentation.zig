@@ -109,7 +109,9 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
             .action => |action| switch (action) {
                 .connections => if (view.available_sources.count() > 0) "connected" else "not connected",
                 .switch_provider => view.choiceLabel(.{ .provider = view.active_provider }),
-                .change_team => if (!view.fx_login_session_available)
+                .change_team => if (view.team_list_loading)
+                    "loading teams..."
+                else if (!view.fx_login_session_available)
                     "sign in to manage"
                 else if (view.current_team != null)
                     "selected"

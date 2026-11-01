@@ -1402,6 +1402,8 @@ pub const PickerView = struct {
     include_skip: bool,
     stage: PickerStage = .root,
     fx_login_session_available: bool = false,
+    /// A team list is loading in the background for a picker.
+    team_list_loading: bool = false,
     teams: []const login_flow.Team = &.{},
     current_team: ?[]const u8 = null,
     team_query: []const u8 = &.{},
@@ -1510,7 +1512,12 @@ pub const PickerView = struct {
                 .grok_login => if (self.available_sources.contains(.grok_subscription)) "connected" else "",
                 .setup, .switch_credential, .switch_provider => "",
                 .automatic => "use the first available source",
-                .change_team => if (self.fx_login_session_available) "choose a team" else "sign in first",
+                .change_team => if (self.team_list_loading)
+                    "loading teams..."
+                else if (self.fx_login_session_available)
+                    "choose a team"
+                else
+                    "sign in first",
             },
             .team => |index| if (self.teamIsCurrent(index)) "current" else "",
         };
@@ -2380,6 +2387,7 @@ pub const Runtime = struct {
             .include_skip = self.picker_include_skip,
             .stage = self.picker_stage,
             .fx_login_session_available = self.fx_login_session_available,
+            .team_list_loading = self.team_list_task != null,
             .teams = if (self.team_selection) |*selection| selection.teams.items else &.{},
             .current_team = if (self.team_selection) |*selection|
                 selection.currentTeam()
