@@ -415,10 +415,14 @@ pub const State = struct {
         /// The sign-in waiting for the browser, as its server, a 0 byte, and
         /// its address, so the menu can say so. Owned; the next one replaces it.
         sign_in: ?[]u8 = null,
+        /// The server `/mcp add` just added, to sign in to once the host has
+        /// loaded it and it asks for a login (`State.signInAfterAdd`). Owned.
+        sign_in_when_loaded: ?[]u8 = null,
 
         fn deinit(sink: *HostSink) void {
             if (sink.menu_tools) |*done| done.arena.deinit();
             if (sink.sign_in) |waiting| std.heap.c_allocator.free(waiting);
+            if (sink.sign_in_when_loaded) |name| std.heap.c_allocator.free(name);
             for (sink.notices.items) |n| std.heap.c_allocator.free(n.text);
             sink.notices.deinit(std.heap.c_allocator);
             for (sink.typed.items) |name| std.heap.c_allocator.free(name);
@@ -512,6 +516,19 @@ pub const State = struct {
             if (!std.mem.eql(u8, waiting[0..end], server)) return;
             std.heap.c_allocator.free(waiting);
             sink.sign_in = null;
+        }
+
+        /// Puts back the sign-in `State.signInAfterAdd` still waits on,
+        /// unless `/mcp add` named another server meanwhile. Takes `name`.
+        fn keepSignInWhenLoaded(sink: *HostSink, name: []u8) void {
+            sink.mutex.lockUncancelable(io_mod.getIo());
+            defer sink.mutex.unlock(io_mod.getIo());
+            if (sink.sign_in_when_loaded == null) {
+                sink.sign_in_when_loaded = name;
+                return;
+            }
+            debug_trace.logf("mcp", "MCP sign-in after add dropped server={s} reason=another server was added", .{name});
+            std.heap.c_allocator.free(name);
         }
 
         /// Takes ownership of `text`.
@@ -697,7 +714,7 @@ pub const State = struct {
                 .surface = .shell,
                 .home = job.home,
                 .workspace_root = job.workspace_root,
-                .hosts = .{ .context = self, .get = getHost, .release = putHost, .changed = configChanged },
+                .hosts = .{ .context = self, .get = getHost, .release = putHost, .changed = configChanged, .sign_in_when_loaded = signInWhenLoaded },
                 .cancel = &self.host_closing,
             }, args);
             const sink = self.host_sink orelse return;
@@ -723,7 +740,68 @@ pub const State = struct {
             const self: *State = @ptrCast(@alignCast(context));
             self.host_reload_requested.store(true, .release);
         }
+
+        fn signInWhenLoaded(context: *anyopaque, name: []const u8) void {
+            const self: *State = @ptrCast(@alignCast(context));
+            const sink = self.host_sink orelse return;
+            const copy = std.heap.c_allocator.dupe(u8, name) catch {
+                debug_trace.logf("mcp", "MCP sign-in after add dropped server={s} reason=out of memory", .{name});
+                return;
+            };
+            sink.mutex.lockUncancelable(io_mod.getIo());
+            defer sink.mutex.unlock(io_mod.getIo());
+            if (sink.sign_in_when_loaded) |old| {
+                debug_trace.logf("mcp", "MCP sign-in after add dropped server={s} reason=another server was added", .{old});
+                std.heap.c_allocator.free(old);
+            }
+            sink.sign_in_when_loaded = copy;
+        }
     };
+
+    /// On the UI thread, after each reload check: once the host has loaded
+    /// the server `/mcp add` added and it asks for a login, signs in the way
+    /// a typed `/mcp login` does, so the address and the outcome reach the
+    /// transcript. A server that loads without asking, is held, or is gone
+    /// ends the wait; one still connecting keeps it.
+    pub fn signInAfterAdd(self: *State) void {
+        const sink = self.host_sink orelse return;
+        const name = take: {
+            sink.mutex.lockUncancelable(io_mod.getIo());
+            defer sink.mutex.unlock(io_mod.getIo());
+            const name = sink.sign_in_when_loaded orelse return;
+            sink.sign_in_when_loaded = null;
+            break :take name;
+        };
+        var keep = false;
+        defer if (keep) sink.keepSignInWhenLoaded(name) else std.heap.c_allocator.free(name);
+        // The tick that loads the change hasn't come yet.
+        if (self.host_reload_requested.load(.acquire)) {
+            keep = true;
+            return;
+        }
+        const lease = self.leaseHost() orelse return debug_trace.logf("mcp", "MCP sign-in after add dropped server={s} reason=no MCP host", .{name});
+        defer lease.deinit();
+        var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+        defer arena.deinit();
+        const statuses = lease.host.runtime.statusesNow(arena.allocator()) catch return debug_trace.logf("mcp", "MCP sign-in after add dropped server={s} reason=out of memory", .{name});
+        const status = for (statuses) |s| {
+            if (std.mem.eql(u8, s.name, name)) break s;
+        } else return debug_trace.logf("mcp", "MCP sign-in after add dropped server={s} reason=not in the loaded config", .{name});
+        if (!status.needs_login) {
+            keep = status.state == .idle or status.state == .connecting or status.state == .retrying;
+            if (!keep) debug_trace.logf("mcp", "MCP sign-in after add not needed server={s} state={s}", .{ name, @tagName(status.state) });
+            return;
+        }
+        // Its address and outcome go to the transcript, as a typed login's do.
+        sink.markTyped(name);
+        lease.host.runtime.login(name, mcp_verbs.canOpenBrowser()) catch |err| {
+            debug_trace.logf("mcp", "MCP sign-in after add failed server={s} err={s}", .{ name, @errorName(err) });
+            sink.mutex.lockUncancelable(io_mod.getIo());
+            _ = sink.untype(name);
+            sink.mutex.unlock(io_mod.getIo());
+            sink.push(std.heap.c_allocator.print("Couldn't start signing in to {s}. Try /mcp login {s}.", .{ name, name }) catch return, true);
+        };
+    }
 
     pub fn hostMenuActive(self: *const State) bool {
         return self.host_menu.active;
