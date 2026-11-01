@@ -4,7 +4,8 @@ The check reads the real source rather than a model of it:
 
   env       every FX_* name in src/ is registered with a job and a stability,
             test hooks and only test hooks start with FX_TEST_, every other
-            env var read by name is listed, and nothing is stale
+            env var read by name is listed, nothing is stale, and the
+            overrides fx config list reports are stable
   flags     flags are kebab-case and carry no value inside their name
   parsing   CLI code reads flags through cli_flags and the option lists help
             renders, so no command compares an argument with a flag by hand
@@ -38,6 +39,7 @@ COMMAND_SPECS = "src/core/slash_commands/command_specs.zig"
 CLI_SURFACE = "src/core/cli/cli_surface.zig"
 CLI_ASK = "src/core/cli/cli_ask.zig"
 CONFIG_RUNTIME = "src/core/config/config_runtime.zig"
+ENV_SETTINGS = "src/core/config/env_settings.zig"
 SETTINGS_KEYS = "src/core/config/settings_keys.zig"
 ACP_SESSIONS = "src/acp/sessions.zig"
 ACP_SERVER = "src/acp/server.zig"
@@ -216,6 +218,7 @@ class Checker:
 
     def run(self) -> list[Problem]:
         self.check_env()
+        self.check_documented_overrides()
         self.check_flags()
         self.check_parsing()
         self.check_settings()
@@ -284,6 +287,25 @@ class Checker:
                 )
         for name in sorted(external - set(seen_external)):
             self.report(None, "env", f"external_env lists {name}, which src/ no longer reads; remove it")
+
+    def check_documented_overrides(self) -> None:
+        """fx config list shows the variables env_settings.collect reads as the
+        documented FX_* setting overrides, and every variable fx.sh documents is
+        stable. An unregistered name is check_env's to report."""
+        registered = self.registry.get("env", {})
+        overrides: dict[str, Line] = {}
+        for line in function_body(self.lines(ENV_SETTINGS), "collect"):
+            for match in FX_LITERAL.finditer(line.text):
+                overrides.setdefault(match.group(1), line)
+        for name, line in sorted(overrides.items()):
+            stability = registered.get(name, {}).get("stability")
+            if name in registered and stability != "stable":
+                self.report(
+                    line,
+                    "env",
+                    f"{name} is an override fx config list reports, so fx.sh documents it; "
+                    f"its stability is {stability!r}, and documented variables are stable",
+                )
 
     def check_flags(self) -> None:
         flags: dict[str, Line] = {}
