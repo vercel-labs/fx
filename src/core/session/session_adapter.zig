@@ -2464,15 +2464,23 @@ pub const Session = struct {
     /// takes no lock: a visitor may call back into this session, as the app
     /// does to read a command replay's side file while it draws a turn.
     pub fn visitHistory(self: *Session, alloc: Allocator, visitor: anytype) !void {
-        var sink: VisitorSink(@TypeOf(visitor), false) = .{ .alloc = alloc, .visitor = visitor };
+        var sink: VisitorSink(@TypeOf(visitor), .skip) = .{ .alloc = alloc, .visitor = visitor };
         try replay(self.source(), alloc, alloc, .start, null, ReplaySink.init(&sink));
     }
 
+    /// What a `visitHistory` reader does at a compaction summary. The
+    /// transcript shows turns only, as v1's does, so a summary is never handed
+    /// to the visitor.
+    const AtSummary = enum {
+        /// Replay on past it.
+        skip,
+        /// End the replay with `error.CycleEnd`: one cycle has been read.
+        end_cycle,
+    };
+
     /// The replay sink behind the `visitHistory` readers: hands each turn to
-    /// the visitor, frees it, and counts it. The transcript shows turns only,
-    /// as v1's does, so a compaction summary is skipped, or ends the replay
-    /// with `error.CycleEnd` when `stop_at_summary` is set.
-    fn VisitorSink(comptime Visitor: type, comptime stop_at_summary: bool) type {
+    /// the visitor, frees it, and counts it.
+    fn VisitorSink(comptime Visitor: type, comptime at_summary: AtSummary) type {
         return struct {
             alloc: Allocator,
             visitor: Visitor,
@@ -2485,7 +2493,10 @@ pub const Session = struct {
             }
 
             fn summary(_: *@This(), _: []const u8) !void {
-                if (stop_at_summary) return error.CycleEnd;
+                switch (at_summary) {
+                    .skip => {},
+                    .end_cycle => return error.CycleEnd,
+                }
             }
         };
     }
@@ -2501,7 +2512,7 @@ pub const Session = struct {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const state = try self.handle.state(scratch.allocator());
-        var sink: VisitorSink(@TypeOf(visitor), false) = .{ .alloc = alloc, .visitor = visitor };
+        var sink: VisitorSink(@TypeOf(visitor), .skip) = .{ .alloc = alloc, .visitor = visitor };
         const offset = state.compaction_offset orelse {
             try replay(self.source(), alloc, alloc, .start, null, ReplaySink.init(&sink));
             return false;
@@ -2548,7 +2559,7 @@ pub const Session = struct {
     /// the next compaction line. A turn the next compaction splits is not
     /// visited; the next cycle shows it whole (`cycleStart`).
     pub fn visitHistoryCycle(self: *Session, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !void {
-        var sink: VisitorSink(@TypeOf(visitor), true) = .{ .alloc = alloc, .visitor = visitor };
+        var sink: VisitorSink(@TypeOf(visitor), .end_cycle) = .{ .alloc = alloc, .visitor = visitor };
         const from: sm.From = if (start) |cursor| .{ .at = try self.source().cycleStart(alloc, cursor) } else .start;
         const skip_offset: ?u64 = if (start) |cursor| cursor.offset else null;
         replay(self.source(), alloc, alloc, from, skip_offset, ReplaySink.init(&sink)) catch |err| switch (err) {

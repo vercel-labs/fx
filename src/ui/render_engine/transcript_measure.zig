@@ -20,24 +20,11 @@ pub fn walkText(start_row: u32, start_col: u16, bytes: []const u8, cols: u16) Wa
         const ch = bytes[i];
 
         // A run of printable ASCII is one cell per byte: advance it a row at
-        // a time with the wrap rule below. A rune after the run may join its
-        // last byte into one cluster, so that byte goes the slow way.
+        // a time with the wrap rule below.
         if (ch >= 0x20 and ch <= 0x7e) {
-            var end = i + 1;
-            while (end < bytes.len and bytes[end] >= 0x20 and bytes[end] <= 0x7e) end += 1;
-            if (end < bytes.len and bytes[end] >= 0x80) end -= 1;
-            var remaining = end - i;
-            while (remaining > 0) {
-                if (display_width.shouldWrapAt(col, 1, cols)) {
-                    col = 1;
-                    row += 1;
-                }
-                const room: usize = @as(usize, cols) + 1 - col;
-                const take = @min(remaining, room);
-                col += @intCast(take);
-                remaining -= take;
-            }
+            const end = asciiRunEnd(bytes, i);
             if (end > i) {
+                advanceCells(&row, &col, end - i, cols);
                 i = end;
                 continue;
             }
@@ -90,6 +77,32 @@ pub fn walkText(start_row: u32, start_col: u16, bytes: []const u8, cols: u16) Wa
         i += unit.byte_len;
     }
     return .{ .end_row = row, .end_col = col };
+}
+
+/// The end of the run of printable ASCII that starts at `start`. A rune after
+/// the run may join its last byte into one cluster, so that byte is left out
+/// and goes the slow way.
+fn asciiRunEnd(bytes: []const u8, start: usize) usize {
+    var end = start + 1;
+    while (end < bytes.len and bytes[end] >= 0x20 and bytes[end] <= 0x7e) end += 1;
+    if (end < bytes.len and bytes[end] >= 0x80) end -= 1;
+    return end;
+}
+
+/// Advances the cursor over `cells` one-cell glyphs, a row at a time, with
+/// `walkText`'s wrap rule.
+fn advanceCells(row: *u32, col: *u16, cells: usize, cols: u16) void {
+    var remaining = cells;
+    while (remaining > 0) {
+        if (display_width.shouldWrapAt(col.*, 1, cols)) {
+            col.* = 1;
+            row.* += 1;
+        }
+        const room: usize = @as(usize, cols) + 1 - col.*;
+        const take = @min(remaining, room);
+        col.* += @intCast(take);
+        remaining -= take;
+    }
 }
 
 // Transcript rows can carry SGR + OSC-8 + other escape sequences (image

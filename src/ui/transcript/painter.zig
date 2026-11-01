@@ -2645,6 +2645,26 @@ fn checkControlBoundaryAgainstFull(
     return error.TranscriptOracleMismatch;
 }
 
+/// The oracle for a projection resume advanced from `base_offset`: feeds the
+/// whole prefix up to `offset` and compares the endpoint. A mismatch fails a
+/// test.
+fn checkResumeEndpointAgainstFull(
+    alloc: Allocator,
+    bytes: []const u8,
+    cols: u16,
+    base_offset: usize,
+    offset: usize,
+    advanced: *const PreparedResumeDocumentAppend,
+) !void {
+    var full = try prepareControlBoundary(alloc, bytes, cols, offset);
+    defer full.deinit(alloc);
+    if (std.mem.eql(u8, full.resume_bytes, advanced.endpoint_resume_bytes) and
+        full.cursor_col == advanced.endpoint_cursor_col and
+        full.pending_wrap == advanced.endpoint_pending_wrap) return;
+    debug_trace.logf("render", "projection resume oracle mismatch offset={d} base={d}", .{ offset, base_offset });
+    return error.TranscriptOracleMismatch;
+}
+
 fn captureControlBoundary(
     alloc: Allocator,
     state: *const vt_emulator.Grid,
@@ -2823,15 +2843,7 @@ fn replacePreparedProjectionResumeBytesForFlowOffset(
                 );
                 defer advanced.deinit(alloc);
                 if (source_preparation.prefix_oracle) {
-                    var full = try prepareControlBoundary(alloc, prepared.bytes, cols, offset);
-                    defer full.deinit(alloc);
-                    if (!std.mem.eql(u8, full.resume_bytes, advanced.endpoint_resume_bytes) or
-                        full.cursor_col != advanced.endpoint_cursor_col or
-                        full.pending_wrap != advanced.endpoint_pending_wrap)
-                    {
-                        debug_trace.logf("render", "projection resume oracle mismatch offset={d} base={d}", .{ offset, base_offset });
-                        return error.TranscriptOracleMismatch;
-                    }
+                    try checkResumeEndpointAgainstFull(alloc, prepared.bytes, cols, base_offset, offset, &advanced);
                 }
                 if (prepared.projection_resume_bytes.len > 0) {
                     alloc.free(prepared.projection_resume_bytes);

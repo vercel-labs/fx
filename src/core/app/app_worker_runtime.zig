@@ -308,15 +308,27 @@ fn batchSegmentIsInterrupted(events: []const WorkerEvent, cancelled_turn_id: ?u6
     return segmentInterrupted(scanSegment(.fresh, events), cancelled_turn_id);
 }
 
+/// Whether `event` begins a new prompt, and so a new segment.
+fn startsSegment(event: WorkerEvent) bool {
+    return switch (event) {
+        .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt, .begin_resumed_prompt => true,
+        else => false,
+    };
+}
+
+/// Whether a time-bounded drain has passed its deadline; never for an
+/// unbounded one.
+fn budgetSpent(deadline_ns: ?i128) bool {
+    const deadline = deadline_ns orelse return false;
+    return io_mod.nanoTimestamp() >= deadline;
+}
+
 /// Continues `state` over `events`, which carry on the segment `state`
 /// describes, stopping where the next prompt begins.
 fn scanSegment(state: HeadSegmentScan, events: []const WorkerEvent) HeadSegmentScan {
     var scan = state;
     for (events, 0..) |event, index| {
-        if (index > 0) switch (event) {
-            .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt, .begin_resumed_prompt => break,
-            else => {},
-        };
+        if (index > 0 and startsSegment(event)) break;
         scan = scanSegmentEvent(scan, event);
         if (scan == .settled) break;
     }
@@ -969,19 +981,14 @@ pub fn Runtime(comptime App: type) type {
 
             events: while (batch.claim()) |event| {
                 if (!first_event) {
-                    const starts_segment = switch (event) {
-                        .begin_prompt, .begin_prompt_with_skill_bindings, .begin_presented_prompt, .begin_resumed_prompt => true,
-                        else => false,
-                    };
-                    if (deadline_ns) |deadline| {
-                        if (io_mod.nanoTimestamp() >= deadline) {
-                            try retainClaimedEventAndSuffixForBudget(
-                                app,
-                                &batch,
-                                if (starts_segment) null else segment_scan,
-                            );
-                            break :events;
-                        }
+                    const starts_segment = startsSegment(event);
+                    if (budgetSpent(deadline_ns)) {
+                        try retainClaimedEventAndSuffixForBudget(
+                            app,
+                            &batch,
+                            if (starts_segment) null else segment_scan,
+                        );
+                        break :events;
                     }
                     if (starts_segment) {
                         interrupted_segment = batchSegmentIsInterrupted(batch.claimedAndRemaining(), taken.cancelled_turn_id);
@@ -5460,23 +5467,17 @@ test "a time-bounded drain with a large budget applies the whole batch" {
 }
 
 test "a time-bounded split keeps an earlier turn's tail when a later turn is cancelled" {
-    try expectBudgetMatchesUnbounded(&.{
+    const two_turns = [_]BudgetEvent{
         .{ .phase = 5 },
         .{ .text = "a" },
         .{ .text = "b" },
         .{ .prompt = "next" },
         .{ .phase = 6 },
         .{ .text = "c" },
-    }, null, "a,b,c");
+    };
+    try expectBudgetMatchesUnbounded(&two_turns, null, "a,b,c");
     // The cancel is in the first take, so that batch is never split.
-    try expectBudgetMatchesUnbounded(&.{
-        .{ .phase = 5 },
-        .{ .text = "a" },
-        .{ .text = "b" },
-        .{ .prompt = "next" },
-        .{ .phase = 6 },
-        .{ .text = "c" },
-    }, 6, "a,b");
+    try expectBudgetMatchesUnbounded(&two_turns, 6, "a,b");
 }
 
 test "a time-bounded split resumes the earlier turn's scan after a cancel between slices" {
