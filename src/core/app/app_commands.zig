@@ -1320,13 +1320,14 @@ pub fn Handlers(comptime App: type) type {
                     .body = "fx could not start a background task to check credits. Try again.",
                 }, true);
             };
-            if (started == .busy) {
-                try app.writeDomainNotice(.{
-                    .topic = "credits",
-                    .tone = .neutral,
-                    .body = "Credits are still loading.",
-                }, true);
-            }
+            try app.writeDomainNotice(.{
+                .topic = "credits",
+                .tone = .neutral,
+                .body = switch (started) {
+                    .started => "Checking credits…",
+                    .busy => "Credits are still loading.",
+                },
+            }, true);
         }
 
         /// Writes the `/credits` result once its background lookup finishes,

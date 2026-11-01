@@ -195,6 +195,7 @@ describe.skipIf(!tmuxAvailable())("tui: credits slash command", () => {
         await session.waitForComposer(10_000);
 
         await session.sendText("/credits");
+        await session.waitForText("Checking credits…", 1_000);
         const draft = "TYPING_WHILE_CREDITS_LOAD";
         await session.sendLiteral(draft);
         await session.waitForPane((pane) => pane.includes(draft), 1_000);
