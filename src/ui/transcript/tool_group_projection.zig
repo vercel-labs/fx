@@ -140,6 +140,14 @@ pub const SummaryStyle = struct {
     reset_style: []const u8 = "",
     /// Rows and counts that need attention: failures and denials.
     attention_style: []const u8 = "",
+    /// A finished checklist task (D234).
+    success_style: []const u8 = "",
+    /// A checklist phase heading and the task now in progress.
+    accent_style: []const u8 = "",
+    /// A blocked checklist task.
+    warning_style: []const u8 = "",
+    /// A dropped checklist task.
+    dropped_style: []const u8 = "",
     /// Printed command output, in the tool-output gray.
     output_style: []const u8 = "",
 };
@@ -824,7 +832,7 @@ fn formatGroupBlock(
         for (rows[1..]) |row| {
             try lines.append(alloc, .{ .entry = .{ .entry_id = row.entry_id, .entry_class = .tool_status, .projection_part = .group_child } });
             try out.writer.writeByte('\n');
-            try writeTierRow(scratch, &out.writer, if (row.kind == .arg) "   └─ " else "   ", row, cols, style);
+            try writeTierRow(scratch, &out.writer, if (row.kind == .arg) "   └─ " else if (row.own_tree) "    " else "   ", row, cols, style);
         }
         const bytes = try out.toOwnedSlice();
         errdefer alloc.free(bytes);
@@ -867,7 +875,8 @@ fn formatGroupBlock(
         const prefix = switch (row.kind) {
             .item, .fold => if (index == last_top) "└─ " else "├─ ",
             .arg => if (index > last_top) "   └─ " else "│  └─ ",
-            .body => if (index > last_top) "   " else "│  ",
+            // A checklist row carries its own tree branches, so it hangs.
+            .body => if (row.own_tree) "    " else if (index > last_top) "   " else "│  ",
         };
         try writeTierRow(scratch, &out.writer, prefix, row, cols, style);
     }
@@ -941,11 +950,17 @@ fn writeTierRow(
         const is_command = if (row.detail) |record| record.activity_kind == .command else row.kind == .fold;
         if (is_command) row.text = try command_summary.clipAtWord(scratch, row.text, room);
     }
+    // A closed task reads struck through, as proto strikes its done work.
+    if (row.strike) row.text = try scratch.print("\x1b[9m{s}\x1b[29m", .{row.text});
     switch (row.style) {
         // A styled row carries its tree prefix in the same span.
         .attention => try writeStyled(writer, style.attention_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text }), cols)),
         .dim => try writeStyled(writer, style.text_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text }), cols)),
         .output => try writeStyled(writer, style.output_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text }), cols)),
+        .success => try writeStyled(writer, style.success_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text }), cols)),
+        .accent => try writeStyled(writer, style.accent_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text }), cols)),
+        .warning => try writeStyled(writer, style.warning_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text }), cols)),
+        .dropped => try writeStyled(writer, style.dropped_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text }), cols)),
         .normal => {
             try writer.writeAll(shown_prefix);
             // Style the whole row, then clip it: the clip closes any style
@@ -3394,6 +3409,44 @@ test "styled minimal summary preserves the clipped width" {
         try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 2);
     }
     try std.testing.expectEqual(@as(usize, 2), line_count);
+}
+
+test "a checklist group paints proto's checklist with status colors and strike" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "Updated checklist", .class = .tool_status } },
+    };
+    var record = ToolDetailRecord{
+        .entry_id = 1,
+        .tool_name = @constCast("checklist"),
+        .activity_kind = .read,
+        .arguments_json = @constCast("{\"op\":\"init\",\"list\":[{\"phase\":\"Build\",\"items\":[\"Write parser\",\"Add tests\"]},{\"phase\":\"Ship\",\"items\":[\"Tag release\"]}]}"),
+        .outcome = .completed,
+    };
+    record.result = @constCast("Initialized 3 tasks in 2 phases; in progress: \"Write parser\"\n  Build:\n    - [X] Write parser\n    - [ ] Add tests (in progress)\n  Ship:\n    - [ ] Tag release (blocked: review)");
+    const details = [_]ToolDetailRecord{record};
+    const style = SummaryStyle{
+        .marker_style = "<m>",
+        .text_style = "<dim>",
+        .reset_style = "<r>",
+        .attention_style = "<at>",
+        .success_style = "<ok>",
+        .accent_style = "<ac>",
+        .warning_style = "<wa>",
+        .dropped_style = "<dr>",
+    };
+    var projection = try buildStyledFocusedInterruptible(alloc, &entries, &details, 120, null, false, style, .{}, null);
+    defer projection.deinit(alloc);
+    const bytes = projection.entry_actions.items[0].override.bytes;
+    // Phase headings read as proto's numbered phases; tasks hang on their
+    // own tree with a checkbox, and closed work is struck through.
+    try std.testing.expect(std.mem.find(u8, bytes, "<ac>    I. Build  1/2\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "<ok>    \x1b[9m├─ ■ Write parser\x1b[29m\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "<ac>    └─ □ Add tests\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "<ac>    II. Ship  0/1\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "<wa>    └─ □ Tag release (blocked: review)\x1b[0m") != null);
+    // Nothing paints in the attention color: no checklist row failed.
+    try std.testing.expect(std.mem.find(u8, bytes, "<at>") == null);
 }
 
 test "expanded tool title stays primary while the group summary stays secondary" {

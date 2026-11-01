@@ -50,7 +50,7 @@ pub const Item = struct {
     continuation: ?[]const u8 = null,
 };
 
-pub const Style = enum { normal, dim, attention, output };
+pub const Style = enum { normal, dim, attention, output, success, accent, warning, dropped };
 pub const Kind = enum { item, fold, arg, body };
 
 pub const Row = struct {
@@ -60,6 +60,11 @@ pub const Row = struct {
     text: []const u8,
     /// The record an item row's command may be highlighted from.
     detail: ?*const ToolDetailRecord = null,
+    /// Closed task text the renderer draws struck through.
+    strike: bool = false,
+    /// A row under a checklist call: it carries its own tree branches,
+    /// so it hangs instead of continuing the group's rail.
+    own_tree: bool = false,
     /// The call has not settled; its row gets the running glyph.
     running: bool = false,
 };
@@ -497,7 +502,33 @@ fn appendItem(arena: Allocator, rows: *std.ArrayList(Row), item: Item, style: St
     }
     if (tail) try bodies.appendCommandBody(arena, rows, item);
     if (item.detail) |record| if (try checklistView(arena, record)) |view| {
-        for (view.body) |line| try bodies.appendBody(arena, rows, item.entry_id, try bodies.safeLine(arena, line));
+        for (view.body) |body_row| {
+            const painted = checklistRowStyle(body_row);
+            try rows.append(arena, .{
+                .entry_id = item.entry_id,
+                .kind = .body,
+                .style = painted.style,
+                .strike = painted.strike,
+                .own_tree = true,
+                .text = try bodies.safeLine(arena, body_row.text),
+            });
+        }
+    };
+}
+
+/// How a checklist body row paints (D234): proto's colors by role and
+/// status, with closed tasks struck through.
+fn checklistRowStyle(row: checklist_presentation.BodyRow) struct { style: Style, strike: bool } {
+    return switch (row.role) {
+        .phase => .{ .style = .accent, .strike = false },
+        .note => .{ .style = .dim, .strike = false },
+        .task => switch (row.status orelse .pending) {
+            .completed => .{ .style = .success, .strike = true },
+            .in_progress => .{ .style = .accent, .strike = false },
+            .blocked => .{ .style = .warning, .strike = false },
+            .abandoned => .{ .style = .dropped, .strike = true },
+            .pending => .{ .style = .dim, .strike = false },
+        },
     };
 }
 
@@ -952,9 +983,17 @@ test "checklist rows read by what changed, with the list or the progress under t
     };
     const rows = try plan(arena, &items);
     var texts: std.ArrayList([]const u8) = .empty;
-    for (rows) |row| try texts.append(arena, row.text);
+    for (rows) |row| try texts.append(arena, try arena.print("{s}:{s}:{s}", .{ @tagName(row.style), row.text, if (row.strike) "struck" else "plain" }));
     const joined = try std.mem.join(arena, "\n", texts.items);
-    try std.testing.expectEqualStrings("Planned 2 tasks\n→ Write parser\n○ Add tests\nCompleted Write parser\n1 of 2 done · next: Add tests", joined);
+    try std.testing.expectEqualStrings(
+        \\normal:Planned 2 tasks:plain
+        \\accent:├─ □ Write parser:plain
+        \\dim:└─ □ Add tests:plain
+        \\normal:Completed Write parser:plain
+        \\dim:1 of 2 done · next: Add tests:plain
+    , joined);
+    // Checklist body rows hang on their own tree; item rows do not.
+    for (rows) |row| try std.testing.expectEqual(row.kind == .body, row.own_tree);
 }
 
 fn shellRun(arena: Allocator, entry_id: u32, command: []const u8, output: []const u8, exit_code: i32) !ToolDetailRecord {
