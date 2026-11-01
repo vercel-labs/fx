@@ -883,7 +883,8 @@ const RemoteRevocationTask = struct {
     transport: oauth_transport.Provider,
     target: RemoteRevocation,
     future: std.Io.Future(void) = undefined,
-    done: std.atomic.Value(bool) = .init(false),
+    /// Set when the revocation returns, so shutdown can wait on it.
+    done: std.Io.Event = .unset,
     cancel: std.atomic.Value(bool) = .init(false),
     failed: bool = false,
 
@@ -908,7 +909,7 @@ const RemoteRevocationTask = struct {
             debug_trace.logf("auth", "remote revocation failed source={t} err={s}", .{ self.target.source(), @errorName(err) });
             self.failed = true;
         };
-        self.done.store(true, .release);
+        self.done.set(io_mod.getIo());
     }
 
     /// Awaits the task, releases it, and returns its outcome.
@@ -1972,12 +1973,20 @@ pub const Runtime = struct {
         // The user asked to end these sessions at their issuer, so shutdown
         // gives revocations in flight a short grace period. A stalled issuer
         // must not hold exit, so whatever is left after it is cancelled.
-        const grace_deadline_ms = io_mod.milliTimestamp() + remote_revocation_shutdown_grace_ms;
+        const io = io_mod.getIo();
+        const grace_deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+            .raw = .fromMilliseconds(remote_revocation_shutdown_grace_ms),
+            .clock = .awake,
+        });
         for (self.remote_revocation_tasks.items) |task| {
-            while (!task.done.load(.acquire) and io_mod.milliTimestamp() < grace_deadline_ms) {
-                io_mod.sleep(10 * std.time.ns_per_ms);
+            // A spurious wakeup also reports a timeout, so the clock decides.
+            while (!task.done.isSet() and std.Io.Clock.Timestamp.now(io, .awake).compare(.lt, grace_deadline)) {
+                task.done.waitTimeout(io, .{ .deadline = grace_deadline }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => break,
+                };
             }
-            if (!task.done.load(.acquire)) {
+            if (!task.done.isSet()) {
                 debug_trace.logf("auth", "remote revocation dropped reason=shutdown source={t}", .{task.target.source()});
                 task.cancel.store(true, .seq_cst);
             }
@@ -3101,7 +3110,7 @@ pub const Runtime = struct {
     /// Returns one finished revocation's outcome, or null when none finished.
     pub fn takeRemoteRevocation(self: *Self) ?RemoteRevocationOutcome {
         for (self.remote_revocation_tasks.items, 0..) |task, index| {
-            if (!task.done.load(.acquire)) continue;
+            if (!task.done.isSet()) continue;
             _ = self.remote_revocation_tasks.swapRemove(index);
             return task.finish();
         }
