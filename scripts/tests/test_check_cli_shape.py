@@ -115,6 +115,13 @@ const model = io_mod.getenv("FX_MODEL");
 const home = io_mod.getenv("HOME");
 """
 
+ENV_SETTINGS = """\
+pub fn collect(arena: Allocator) ![]Override {
+    if (getenv("FX_MODEL")) |value| try list.append(arena, .{ .variable = "FX_MODEL", .key = "model", .value = value });
+    return list.toOwnedSlice(arena);
+}
+"""
+
 
 def registry() -> dict:
     return {
@@ -138,6 +145,7 @@ class CheckCliShapeTests(unittest.TestCase):
             check_cli_shape.CLI_SURFACE: CLI_SURFACE,
             check_cli_shape.CLI_ASK: CLI_ASK,
             check_cli_shape.CONFIG_RUNTIME: CONFIG_RUNTIME,
+            check_cli_shape.ENV_SETTINGS: ENV_SETTINGS,
             check_cli_shape.SETTINGS_KEYS: SETTINGS_KEYS,
             check_cli_shape.ACP_SESSIONS: ACP_SESSIONS,
             check_cli_shape.ACP_SERVER: ACP_SERVER,
@@ -206,6 +214,14 @@ class CheckCliShapeTests(unittest.TestCase):
         self.assertEqual([], self.run_check())
         self.registry["env"]["FX_TEST_GATEWAY_CHAT_URL"]["job"] = "integration"
         self.assertOnly(self.run_check(), "env", "FX_TEST_GATEWAY_CHAT_URL has job 'integration'")
+
+    def test_overrides_fx_config_list_reports_are_stable(self) -> None:
+        self.registry["env"]["FX_MODEL"]["stability"] = "internal"
+        problems = self.run_check()
+        self.assertOnly(problems, "env", "FX_MODEL is an override fx config list reports")
+        self.assertEqual((check_cli_shape.ENV_SETTINGS, 2), (problems[0].path, problems[0].number))
+        self.registry["env"]["FX_MODEL"]["stability"] = "stable"
+        self.assertEqual([], self.run_check())
 
     def test_unprefixed_env_var_fails_unless_listed(self) -> None:
         self.files["src/env.zig"] += 'const legacy = io_mod.getenv("FLASH_SYNC_UPDATES");\n'
