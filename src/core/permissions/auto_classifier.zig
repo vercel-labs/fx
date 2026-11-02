@@ -557,7 +557,7 @@ pub const Reviewer = struct {
             .request = request,
             .trusted_root_context = trusted_root_context,
         };
-        const decision = try self.decide(alloc, prompt, deadline);
+        const decision = try self.decide(alloc, prompt, deadline, .checked);
         if (!self.require_caution_proof or decision != .valid or decision.valid.decision != .caution) return decision;
         return self.confirmCaution(alloc, decision, prompt);
     }
@@ -575,13 +575,17 @@ pub const Reviewer = struct {
         trusted_root_context: []const u8,
     };
 
-    /// Sends `prompt` and returns its proof-checked decision, retrying one
-    /// transport failure and one malformed completion.
+    /// Whether `decide` clears a caution whose quote fails the proof check.
+    const CautionQuotes = enum { checked, unchecked };
+
+    /// Sends `prompt` and returns its decision, retrying one transport
+    /// failure and one malformed completion.
     fn decide(
         self: Reviewer,
         alloc: std.mem.Allocator,
         prompt: ReviewPrompt,
         deadline: std.Io.Clock.Timestamp,
+        quotes: CautionQuotes,
     ) !ParseOutcome {
         const review_turn = prompt.request.review_turn;
         const cancel_flag = prompt.cancel_flag;
@@ -656,7 +660,10 @@ pub const Reviewer = struct {
                     checkBudget(send_deadline, cancel_flag) catch |err| return constructionFailure(err);
                     const parsed = try parseCompletion(alloc, owned.completion);
                     if (!recovery_available or parsed != .invalid or !parsed.invalid.is_malformed_completion()) {
-                        return self.requireCautionProof(alloc, parsed, owned.completion, prompt.request, prompt.trusted_root_context);
+                        return switch (quotes) {
+                            .checked => self.requireCautionProof(alloc, parsed, owned.completion, prompt.request, prompt.trusted_root_context),
+                            .unchecked => parsed,
+                        };
                     }
                     debug_trace.logf(
                         "permission",
@@ -671,9 +678,11 @@ pub const Reviewer = struct {
     }
 
     /// Takes ownership of `caution`, a caution that passed the quote check.
-    /// A single review can still misjudge a real quote, so one fresh review of
-    /// the same request must also return a proven caution to hold the action;
-    /// otherwise it clears. A confirmation that cannot complete keeps the hold.
+    /// A single review can still misjudge a real quote, so the action clears
+    /// only when one fresh review of the same request returns a clear. That
+    /// review's own quote is not checked: the first review already proved the
+    /// harm, and a second caution that quotes the wrong text still agrees. A
+    /// confirmation that cannot complete keeps the hold.
     fn confirmCaution(
         self: Reviewer,
         alloc: std.mem.Allocator,
@@ -684,7 +693,7 @@ pub const Reviewer = struct {
         errdefer held.deinit(alloc);
         const target_call_id = prompt.request.review_turn.target_call_id;
         debug_trace.logf("permission", "event=auto_review_confirm_start target_call_id={s}", .{target_call_id});
-        var second = try self.decide(alloc, prompt, reviewAttemptDeadline(self.timeout_ms));
+        var second = try self.decide(alloc, prompt, reviewAttemptDeadline(self.timeout_ms), .unchecked);
         defer second.deinit(alloc);
         const result: []const u8 = switch (second) {
             .valid => |valid| @tagName(valid.decision),
@@ -2514,7 +2523,8 @@ test "a proven caution holds only when a second review confirms it" {
     const cases = [_]Case{
         .{ .first = proven, .second = .caution, .expected = .caution, .sends = 2 },
         .{ .first = proven, .second = .clear, .expected = .clear, .sends = 2, .rationale = unconfirmed_caution_rationale },
-        .{ .first = proven, .second = .unproven, .expected = .clear, .sends = 2, .rationale = unconfirmed_caution_rationale },
+        // A second caution agrees even when its own quote would fail the check.
+        .{ .first = proven, .second = .unproven, .expected = .caution, .sends = 2 },
         // No contrary answer arrived, so the first proven caution stands.
         .{ .first = proven, .second = .unavailable, .expected = .caution, .sends = 2 },
         // Clears and unproven cautions need no confirmation.
