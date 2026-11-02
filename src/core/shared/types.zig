@@ -1789,6 +1789,63 @@ pub const ProviderFinishReason = enum {
     }
 };
 
+/// The provider's own finish reason behind the unified one, such as Gemini's
+/// `UNEXPECTED_TOOL_CALL` behind `other`. Kept inline so a completion owns no
+/// more memory: a byte outside printable ASCII becomes `?`, and the copy stops
+/// at `capacity` bytes. Empty when the provider sent none.
+pub const ProviderFinishRaw = struct {
+    pub const capacity = 48;
+
+    bytes: [capacity]u8 = @splat(0),
+    len: u8 = 0,
+
+    pub fn init(raw: []const u8) ProviderFinishRaw {
+        var result: ProviderFinishRaw = .{};
+        const kept = raw[0..@min(raw.len, capacity)];
+        for (kept, result.bytes[0..kept.len]) |byte, *out| {
+            out.* = if (byte >= 0x21 and byte <= 0x7e) byte else '?';
+        }
+        result.len = @intCast(kept.len);
+        return result;
+    }
+
+    pub fn slice(self: *const ProviderFinishRaw) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+test "provider finish raw keeps a bounded printable copy" {
+    try std.testing.expectEqualStrings("UNEXPECTED_TOOL_CALL", ProviderFinishRaw.init("UNEXPECTED_TOOL_CALL").slice());
+    try std.testing.expectEqualStrings("", ProviderFinishRaw.init("").slice());
+    try std.testing.expectEqualStrings("A?B?C??", ProviderFinishRaw.init("A\x07B C\xc3\xa9").slice());
+    const long = ProviderFinishRaw.init(text_utils.repeat("X", 100));
+    try std.testing.expectEqualStrings(text_utils.repeat("X", ProviderFinishRaw.capacity), long.slice());
+}
+
+fn fuzzProviderFinishRaw(_: void, smith: *std.testing.Smith) anyerror!void {
+    var input_buffer: [256]u8 = undefined;
+    const input_len: usize = @intCast(smith.slice(&input_buffer));
+    const input = input_buffer[0..input_len];
+    const raw = ProviderFinishRaw.init(input);
+    const kept = raw.slice();
+    try std.testing.expectEqual(@min(input.len, ProviderFinishRaw.capacity), kept.len);
+    for (kept, input[0..kept.len]) |byte, source| {
+        try std.testing.expect(byte >= 0x21 and byte <= 0x7e);
+        try std.testing.expectEqual(if (source >= 0x21 and source <= 0x7e) source else '?', byte);
+    }
+}
+
+test "fuzz provider finish raw" {
+    try std.testing.fuzz({}, fuzzProviderFinishRaw, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "UNEXPECTED_TOOL_CALL",
+            "",
+            "BAD\x07REASON",
+            "\xc3\xa9 \x00\xff",
+        }) ++ @import("fuzz_corpus").provider_finish_raw.*),
+    });
+}
+
 pub const ProviderFailureCause = enum {
     gateway_stream_timeout,
     non_retryable,
@@ -1853,6 +1910,8 @@ pub const ModelCompletion = struct {
     /// Provider-owned opaque response items for the next stateless request in this turn.
     provider_state_json: ?[]const u8 = null,
     finish_reason: ?ProviderFinishReason = null,
+    /// The provider's own reason for `finish_reason`, for notices and traces.
+    finish_reason_raw: ProviderFinishRaw = .{},
     usage: Usage = .{},
 };
 

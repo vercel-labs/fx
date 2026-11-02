@@ -1644,6 +1644,76 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   }, TIMEOUT * 2);
 
+  test("two empty replies that stop for another reason show the stop and its reason instead of Done.", async () => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-empty-other-")));
+    const home = join(root, "home");
+    const workspacePath = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspacePath, { recursive: true });
+    writeFileSync(join(home, ".fx", "settings.json"), "{}");
+    const workspace = realpathSync(workspacePath);
+    // Gemini's UNEXPECTED_TOOL_CALL arrives as `other`, with no text and no tool call.
+    const emptyOther = () => fakeGatewaySse([
+      { type: "finish", finishReason: { unified: "other", raw: "UNEXPECTED_TOOL_CALL" } },
+    ]);
+    const queuedGateway = startFakeGateway(
+      [emptyOther(), emptyOther(), fakeGatewayFinalText("LATER_PROMPT_OK")],
+      { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] },
+    );
+    gateway = queuedGateway;
+
+    session = await TmuxSession.create({
+      cwd: workspace,
+      stderrPath,
+      width: 120,
+      height: 40,
+      env: {
+        HOME: home,
+        TMPDIR: root,
+        AI_GATEWAY_API_KEY: "fake-empty-other-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_SOUND: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: MODEL,
+      },
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Move the project and rename it.");
+    await session.waitForText("The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL).", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(2);
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).toContain("Asking it to continue.");
+    expect(scrollback).not.toContain("Done.");
+
+    await session.sendText("/trace");
+    const rootDir = root;
+    await waitForCondition(
+      () => readdirSync(rootDir).some((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md")),
+      "trace report file",
+    );
+    const report = readFileSync(
+      join(rootDir, readdirSync(rootDir).find((entry) => entry.startsWith("fx-trace-") && entry.endsWith(".md"))!),
+      "utf8",
+    );
+    const network = report.split("## Network Calls")[1]?.split("\n## ")[0] ?? "";
+    expect(network).toContain("stop_reason=other provider_stop_reason=UNEXPECTED_TOOL_CALL");
+
+    await session.sendText("Confirm a later prompt is still usable.");
+    await session.waitForText("LATER_PROMPT_OK", TIMEOUT);
+    await session.waitForStableComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(3);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+  }, TIMEOUT * 2);
+
   test("trace report explains a rejected image when the model catalog is unavailable", async () => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-trace-catalog-")));
     const home = join(root, "home");

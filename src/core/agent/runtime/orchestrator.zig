@@ -87,6 +87,34 @@ const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 
 const http_error_detail_max_bytes: usize = 4096;
 const empty_length_limited_reply = "The reply ran out of output tokens before any text.";
+// The AI SDK folds the stop reasons it does not list, such as Gemini's
+// UNEXPECTED_TOOL_CALL, into `other`. A reply that stops that way with no text
+// and no tool call has stalled mid-task, so the turn asks once for the next step
+// (`tests/tla/agent_runtime/EmptyReply.tla` EverySeparateEmptyNudged).
+const empty_reply_nudge_prompt =
+    "Your last reply had no text and no tool call. Continue the task: call the next tool you need, or give your final answer.";
+
+/// What fx shows for a reply that stopped for `other` with no text and no tool
+/// call, naming the provider's own reason when it sent one.
+fn emptyReplyNotice(arena: Allocator, provider_reason: []const u8, asking: bool) ![]const u8 {
+    const next = if (asking) " Asking it to continue." else "";
+    if (provider_reason.len == 0) return try arena.print("The model stopped without a reply (finish reason: other).{s}", .{next});
+    return try arena.print("The model stopped without a reply (provider reason: {s}).{s}", .{ provider_reason, next });
+}
+
+test "empty reply notice names the provider's reason when it sent one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings(
+        "The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Asking it to continue.",
+        try emptyReplyNotice(arena, "UNEXPECTED_TOOL_CALL", true),
+    );
+    try std.testing.expectEqualStrings(
+        "The model stopped without a reply (finish reason: other).",
+        try emptyReplyNotice(arena, "", false),
+    );
+}
 
 fn lengthResendNotice(raised_limit: bool, lowered_effort: bool) []const u8 {
     const prefix = empty_length_limited_reply ++ " Retrying with";
@@ -6982,6 +7010,10 @@ fn processQueuedPromptLoop(
     defer interrupted_persisted_ptr.* = interrupted_persisted;
     var silent_tool_steps: usize = 0;
     var continuation_injected = false;
+    // The last reply stopped for `other` with nothing in it and was answered
+    // with the empty-reply nudge. A step that shows text or calls a tool clears
+    // it, so each separate stall in a long turn gets one nudge.
+    var empty_reply_nudged = false;
     // The limit the turn's one retry of an empty, cut-short reply set. Later
     // steps keep it until the catalog names a limit of its own.
     var length_retry_output_tokens: ?u32 = null;
@@ -9096,11 +9128,12 @@ fn processQueuedPromptLoop(
             "agent",
             "assistant_completion",
             step_ctx,
-            "content_bytes={d} tool_call_count={d} finish_reason={s}",
+            "content_bytes={d} tool_call_count={d} finish_reason={s} provider_finish_reason={s}",
             .{
                 if (completion.content) |content| content.len else 0,
                 completion.tool_calls.len,
                 finish_reason.label(),
+                completion.finish_reason_raw.slice(),
             },
         );
         try runtime_telemetry.traceReturnedToolCalls(arena, step_ctx, completion.tool_calls);
@@ -9213,8 +9246,11 @@ fn processQueuedPromptLoop(
         if (completion.tool_calls.len == 0) {
             const has_content =
                 std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0;
+            const empty_other = finish_reason == .other and !has_content;
+            if (!empty_other) empty_reply_nudged = false;
             const needs_continuation =
                 disposition == .completed and
+                !empty_other and
                 !continuation_injected and
                 silent_tool_steps >= 2 and
                 !has_content;
@@ -9263,6 +9299,57 @@ fn processQueuedPromptLoop(
 
             if (disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1) and
                 try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, history_text, history_replay)) continue;
+
+            if (empty_other) {
+                const provider_reason = completion.finish_reason_raw.slice();
+                // One nudge per stall, and never past the step limit
+                // (`tests/tla/agent_runtime/EmptyReply.tla` NoDoubleNudge, StepsBounded).
+                const nudge = !empty_reply_nudged and agent_steps.allowsStep(config.agent_step_limit, step + 1);
+                const notice = try emptyReplyNotice(arena, provider_reason, nudge);
+                debug_trace.eventf("agent", if (nudge) "empty_reply_nudge" else "empty_reply_failed", step_ctx, "provider_finish_reason={s} after_nudge={s}", .{
+                    provider_reason,
+                    if (empty_reply_nudged) "true" else "false",
+                });
+                try deps.push_text(deps.ctx, .{ .operational = notice });
+                if (nudge) {
+                    empty_reply_nudged = true;
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                    if (provider_replay) |state| {
+                        try within_turn_suffix.append(arena, .{
+                            .role = .assistant,
+                            .content = completion.content,
+                            .provider_replay = state,
+                        });
+                    }
+                    try within_turn_suffix.append(arena, .{ .role = .user, .content = empty_reply_nudge_prompt });
+                    continue;
+                }
+                // A second empty reply in a row, or one with no step left:
+                // the turn failed, and the notice says why instead of "Done."
+                // (`tests/tla/agent_runtime/EmptyReply.tla` NoPlaceholder).
+                try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                const persisted_text = try runtime_finalization.stopTerminalText(
+                    arena,
+                    stop_state.retained_candidate,
+                    notice,
+                );
+                stop_state.terminal_materializing = stop_state.retained_candidate != null;
+                try finishCommonAssistantTerminal(
+                    deps,
+                    finalization,
+                    arena,
+                    job,
+                    within_turn_suffix.items,
+                    &summary_accumulator,
+                    persisted_text,
+                    .failed,
+                    null,
+                    &finish_trace,
+                    "empty_reply",
+                    null,
+                );
+                return;
+            }
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 if (!has_content) {
@@ -9771,6 +9858,7 @@ fn processQueuedPromptLoop(
         try appendRunningToolCalls(deps, finalization, job, within_turn_suffix.items, effective_tool_calls);
 
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;
+        empty_reply_nudged = false;
         if (step_has_content) {
             const first_tool_is_ask = effective_tool_calls.len > 0 and
                 runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, effective_tool_calls[0]) == .ask;
