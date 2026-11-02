@@ -1663,7 +1663,11 @@ rewriting a cached prompt prefix):
 
 Settled for the runtime context (2026-10-24, so a changed branch, date or
 permission mode does not rewrite a cached prompt prefix):
-- **D94 Decision:** a session sends one runtime context ahead of the
+- **D94 Decision (superseded by D130 and D131):** proto-fx carries the
+  runtime context as the turn context instead. It sends no frozen copy
+  ahead of the history and no `<fx-context-update>` notes, and a saved
+  `runtime_context` item is read and ignored. The original decision
+  follows. A session sends one runtime context ahead of the
   history on every request: the system messages a host adds after the
   stable instructions, such as the `<fx-turn-context>` block with its date
   and git branch, the permission mode and the other runtime notes. The
@@ -2070,17 +2074,19 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
 
 - **D130 Decision:** a request's instructions hold only text that stays the
   same for the whole session. The context fx captures for a turn (the
-  `<fx-turn-context>` facts, access, permission mode and runtime guidance,
-  and the instructions of a skill the person invoked) rides as user
-  messages just before the person's text and is saved on the user turn as
-  `turn_context` and `skill_context`, so later steps and turns resend the
+  `<fx-turn-context>` facts, access, permission mode and runtime guidance)
+  rides as a user message just before the person's text and is saved on
+  the user turn as `turn_context`, so later steps and turns resend the
   bytes the turn first sent. The runtime context is saved only when it
   differs from the latest one in the active window, so an unchanged
-  workspace adds nothing and a compaction that drops it brings it back.
-  The compactor leaves these messages out of summaries. **Why:** a prefix
-  cache matches from the first byte, and the volatile context sat in the
-  head, so a new date, a `git checkout` or a skill rewrote every request
-  after it; proto keeps volatile context out of the cached head the same
+  workspace adds nothing and a compaction that drops it brings it back,
+  on the next turn or, when an in-turn compaction cuts the turn that
+  carried it, on the turn's next request. The compactor leaves these
+  messages out of summaries. A named skill's text follows D95; an earlier
+  proto-fx saved it as `skill_context`, which is read and dropped.
+  **Why:** a prefix cache matches from the first byte, and the volatile
+  context sat in the head, so a new date, a `git checkout` or a skill
+  rewrote every request after it; proto keeps volatile context out of the cached head the same
   way. **Alternative:** a separate context lane between instructions and
   messages, which `validate_prompt_lanes` would have to admit for every
   provider and which Codex still flattens into `instructions`.

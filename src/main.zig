@@ -5080,7 +5080,6 @@ test {
     _ = @import("core/agent/runtime/execution_memory.zig");
     _ = @import("core/agent/runtime/tool_admission.zig");
     _ = @import("core/agent/runtime/prompt_context.zig");
-    _ = @import("core/agent/runtime/runtime_context.zig");
     _ = @import("core/app/app_agent_runtime.zig");
     _ = @import("core/app/app_auth_runtime.zig");
     _ = auth_runtime;

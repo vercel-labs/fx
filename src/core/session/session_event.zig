@@ -74,7 +74,6 @@ pub const ConversationUser = struct {
     work_id: ?[]const u8 = null,
     origin: types.UserOrigin = .user,
     turn_context: ?[]const u8 = null,
-    skill_context: ?[]const u8 = null,
 };
 
 pub const ConversationToolCall = struct {
@@ -321,7 +320,6 @@ pub fn validateConversationEventShape(event: ConversationEvent, schema_version: 
             }
             if (value.work_id) |work_id| try validateConversationIdentity(work_id);
             if (value.turn_context) |text| try validateConversationText(text);
-            if (value.skill_context) |text| try validateConversationText(text);
         },
         .assistant => |value| {
             if (schema_version == 1 and (value.text.len == 0 or value.provider_replay != null)) return rejectInvalidConversationEvent("assistant-schema-v1");
@@ -560,7 +558,6 @@ pub fn appendHistoryTurnConversationEvents(
                 .work_id = entry.user.work_id,
                 .origin = entry.user.origin,
                 .turn_context = entry.user.turn_context,
-                .skill_context = entry.user.skill_context,
             } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
             const follows_standalone = entry.execution.tool_steps.len > 0 and
@@ -580,7 +577,6 @@ pub fn appendHistoryTurnConversationEvents(
                 .work_id = entry.user.work_id,
                 .origin = entry.user.origin,
                 .turn_context = entry.user.turn_context,
-                .skill_context = entry.user.skill_context,
             } });
             try appendExecutionConversationEvents(alloc, events, entry.execution);
             if (entry.tool_call) |call| {

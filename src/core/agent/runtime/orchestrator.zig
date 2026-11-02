@@ -47,7 +47,6 @@ const runtime_finalization = @import("finalization.zig");
 const runtime_deps = @import("deps.zig");
 const runtime_lifecycle = @import("lifecycle.zig");
 const runtime_prompt_context = @import("prompt_context.zig");
-const runtime_context_state = @import("runtime_context.zig");
 const compactor = @import("../../compactor/compactor.zig");
 const runtime_text_completion = @import("text_completion.zig");
 const runtime_stream_rules = @import("stream_rules.zig");
@@ -2814,23 +2813,6 @@ fn seedNoteSources(
     };
 }
 
-/// Appends context committed in the previous step as one user message at
-/// the tail of the turn so far (D241). It stays there for the turn's later
-/// steps; the next turn finds it again through the retained targets.
-fn deliverPendingProjectContext(
-    arena: Allocator,
-    pending: *?[]const u8,
-    within_turn_suffix: *std.ArrayList(ChatMessage),
-) Allocator.Error!void {
-    const content = pending.* orelse return;
-    try within_turn_suffix.append(arena, .{
-        .role = .user,
-        .content = content,
-        .context_origin = .turn_context,
-    });
-    pending.* = null;
-}
-
 fn candidateHasApplicableContextDelta(
     arena: Allocator,
     context_registry: context_contract.Registry,
@@ -2884,24 +2866,21 @@ const ParentTurnDeliveryState = struct {
 
 const CapturedTurnContext = struct {
     turn_context: ?[]const u8 = null,
-    skill_context: ?[]const u8 = null,
+    /// The whole runtime context, also when `turn_context` leaves it out
+    /// because the window already carries it.
+    runtime_text: []const u8 = "",
 };
 
-/// Captures the runtime and explicit skill context for one turn (D130,
-/// D131), with the project context earlier turns' tool calls reached
-/// (D261). The runtime context is left out when it matches the latest one
-/// `window` already carries, so an unchanged workspace adds nothing. Every
-/// slice is owned by `arena` or borrowed from `explicit_skill`.
+/// Captures the runtime context for one turn (D130, D131). It is left out
+/// when it matches the latest one `window` already carries, so an unchanged
+/// workspace adds nothing. Every slice is owned by `arena`.
 fn captureTurnContext(
     arena: Allocator,
     deps: *const AgentRuntimeDeps,
-    explicit_skill: ?[]const u8,
-    project_tail: ?[]const u8,
     window: []const ChatMessage,
 ) !CapturedTurnContext {
     var runtime: std.ArrayList(ChatMessage) = .empty;
     try deps.append_runtime_context(deps.ctx, arena, &runtime);
-    if (project_tail) |text| try runtime.append(arena, .{ .role = .user, .content = text });
     var joined: std.Io.Writer.Allocating = .init(arena);
     for (runtime.items) |message| {
         const text = message.content orelse continue;
@@ -2910,11 +2889,25 @@ fn captureTurnContext(
         try joined.writer.writeAll(text);
     }
     const runtime_text = joined.written();
-    const skill_text = explicit_skill orelse "";
     return .{
         .turn_context = if (runtime_text.len == 0 or latestTurnContextMatches(window, runtime_text)) null else runtime_text,
-        .skill_context = if (skill_text.len == 0) null else skill_text,
+        .runtime_text = runtime_text,
     };
+}
+
+/// The turn context a request sends (D130, D131): the one the turn captured,
+/// or, when the turn left an unchanged context to an earlier turn and an
+/// in-turn compaction cut that turn, the unchanged context again.
+fn turnContextForRequest(
+    captured: ?[]const u8,
+    runtime_text: []const u8,
+    compaction_handoff: ?[]const u8,
+    compaction_history_tail: []const ChatMessage,
+) ?[]const u8 {
+    if (captured) |text| return text;
+    if (compaction_handoff == null or runtime_text.len == 0) return null;
+    if (latestTurnContextMatches(compaction_history_tail, runtime_text)) return null;
+    return runtime_text;
 }
 
 fn latestTurnContextMatches(window: []const ChatMessage, text: []const u8) bool {
@@ -3752,9 +3745,7 @@ fn response_language_context_conflicts(
     for (messages) |message| {
         // The person's own words never count; the context fx sends as user
         // messages (D130) does, as it did when it was an instruction.
-        if (message.role == .user and
-            message.context_origin != .turn_context and
-            message.context_origin != .skill_context) continue;
+        if (message.role == .user and message.context_origin != .turn_context) continue;
         const content = message.content orelse continue;
         const probe = content[0..@min(content.len, 4096)];
         const actual = response_language.evidence(probe).script orelse continue;
@@ -5884,33 +5875,7 @@ fn processQueuedPromptInner(
             if (explicit_section.?.load_notice) |notice| try push_notice(deps.ctx, notice);
         }
     }
-    var reconstructed_context = reconstruct: while (true) {
-        const snapshot = reconstructProjectContext(arena, deps, config, job) catch |err| {
-            if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
-            if (try append_immediate_steering_after_cancel(deps, arena, &within_turn_suffix, turn_id, "")) continue :reconstruct;
-            runtime_telemetry.traceCancelObserved(finish_trace.ctx, false);
-            var terminal_materializing = false;
-            try runtime_interruption.persistInterruptedTurnOnce(
-                deps,
-                finalization,
-                job,
-                null,
-                null,
-                completed_tool_names.items,
-                &interrupted_persisted,
-                finish_trace.ctx,
-                within_turn_suffix.items,
-                null,
-                &terminal_materializing,
-            );
-            finish_trace.finish("interrupted");
-            return;
-        };
-        break :reconstruct snapshot;
-    };
-    defer if (reconstructed_context) |*reconstructed| reconstructed.snapshot.deinit(arena);
     var prepared_job = job;
-    if (reconstructed_context) |reconstructed| prepared_job.context_snapshot = reconstructed.snapshot;
     // A named skill's text rides on the turn's own message, so the
     // instructions stay as they were cached; the turn saves a short note in
     // its place (D95).
@@ -5922,7 +5887,7 @@ fn processQueuedPromptInner(
         }
     }
     // The instructions carry the session's own project context, read again;
-    // what earlier turns' tool calls reached rides in the turn context (D261).
+    // rules earlier tool calls reached are notes in the history (D93).
     try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, &stable_prefix);
     const active_history = job.history;
     const history_messages_before = stable_prefix.items.len;
@@ -5960,20 +5925,11 @@ fn processQueuedPromptInner(
         "history_turns={d} gateway_messages={d} added_gateway_messages={d} interrupted_turns={d} history_turn_kinds={s} projected_message_roles={s} partial_interrupted_closures={d}",
         .{ active_history.len, stable_prefix.items.len + history_messages.items.len, history_messages.items.len, interrupted_turns, history_turn_kinds, projected_roles, partial_interrupted_closures },
     );
-    // The turn's runtime and skill context, captured once and saved with
-    // the turn, so every later step and turn resends the same bytes (D130,
-    // D131).
-    const captured_context = try captureTurnContext(
-        arena,
-        deps,
-        if (explicit_section) |section| section.text else null,
-        if (reconstructed_context) |reconstructed| reconstructed.tail else null,
-        history_messages.items,
-    );
+    // The turn's runtime context, captured once and saved with the turn, so
+    // every later step and turn resends the same bytes (D130, D131).
+    const captured_context = try captureTurnContext(arena, deps, history_messages.items);
     job.turn_context = captured_context.turn_context;
-    job.skill_context = captured_context.skill_context;
     prepared_job.turn_context = captured_context.turn_context;
-    prepared_job.skill_context = captured_context.skill_context;
     for (job.grants) |grant| {
         try local_grants.append(arena, .{ .tool_name = grant.tool_name, .target_path = grant.target_path });
     }
@@ -6007,6 +5963,7 @@ fn processQueuedPromptInner(
         lifecycle,
         config,
         job,
+        captured_context.runtime_text,
         .{
             .catalog = if (skill_section) |*section| section else null,
             .explicit = if (explicit_section) |*section| section else null,
@@ -6368,88 +6325,6 @@ fn commitContextCompaction(
     }
     if (active_prefix != null or retained_from != null) return error.ContextCompactionUnavailable;
     return deps.propagate_history_turn(deps.ctx, .{ .compacted_summary = summary });
-}
-
-const ReconstructedContext = struct {
-    /// Everything the turn has delivered, for the turn's delivery state.
-    snapshot: context_contract.GatheredContextSnapshot,
-    /// The queued prompt's own project context read again, when a rule
-    /// file changed since it was queued; null keeps the queued bytes.
-    head: ?[]const u8 = null,
-    /// What the retained targets add to the session's own project context.
-    tail: ?[]const u8 = null,
-};
-
-/// Gathers the project context earlier turns' tool calls reached. Its new
-/// part rides in the turn context, never the instructions, so the head of
-/// every request stays as the session's first turn sent it (D261).
-fn reconstructProjectContext(
-    alloc: Allocator,
-    deps: *const AgentRuntimeDeps,
-    config: Config,
-    job: QueuedPrompt,
-) !?ReconstructedContext {
-    if (!deps.context_enabled) return null;
-    var retained = try tool_preparation.retainedContextTargets(
-        alloc,
-        job.history,
-        if (job.recovery_checkpoint) |checkpoint| checkpoint.execution else null,
-        config.workspace_root,
-        deps.tool_registry,
-        config.cancel_flag,
-    );
-    defer retained.deinit(alloc);
-    if (retained.items.len == 0) return null;
-    const registry = deps.context_registry orelse return error.ContextRegistryUnavailable;
-    var targets: std.ArrayList(context_contract.ApplicableTarget) = .empty;
-    defer targets.deinit(alloc);
-    const prior = job.context_snapshot.evaluated_endpoints;
-    for (prior[0..@min(prior.len, 128)]) |endpoint| {
-        try targets.append(alloc, .{ .path = endpoint, .kind = .directory });
-    }
-    const image_targets = try context_contract.applicableTargetsForImages(alloc, job.images);
-    defer if (image_targets.len > 0) alloc.free(image_targets);
-    try targets.appendSlice(alloc, image_targets[0..@min(image_targets.len, 32)]);
-    try targets.appendSlice(alloc, retained.items);
-    if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    var snapshot = try registry.gatherDefaultSnapshot(alloc, .{
-        .workspace_root = config.workspace_root,
-        .access_scope = config.access_scope,
-        .targets = targets.items,
-        .bounded_reconstruction = true,
-        .context_limits = config.context_limits,
-    });
-    errdefer snapshot.deinit(alloc);
-    if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    for (snapshot.notices) |notice| try deps.pushContextNotice(notice);
-    const prior_count = @min(prior.len, 128);
-    var base = try registry.gatherDefaultSnapshot(alloc, .{
-        .workspace_root = config.workspace_root,
-        .access_scope = config.access_scope,
-        .targets = targets.items[0..prior_count],
-        .bounded_reconstruction = true,
-        .context_limits = config.context_limits,
-    });
-    defer base.deinit(alloc);
-    if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    var added = try registry.selectDefaultApplicableContext(alloc, .{
-        .workspace_root = config.workspace_root,
-        .access_scope = config.access_scope,
-        .targets = targets.items[prior_count..],
-        .delivered_sources = base.delivered_sources,
-        .evaluated_endpoints = base.evaluated_endpoints,
-        .context_limits = config.context_limits,
-    });
-    defer added.deinit(alloc);
-    const tail: ?[]const u8 = if (added.content) |content| if (content.len > 0) try alloc.dupe(u8, content) else null else null;
-    if (config.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    debug_trace.logf("context", "reconstructed retained_targets={d} delivered_sources={d} bytes={d} tail_bytes={d}", .{ retained.items.len, snapshot.delivered_sources.len, snapshot.modelVisibleBytes().len, if (tail) |text| text.len else 0 });
-    const queued = job.context_snapshot.modelVisibleBytes();
-    const head: ?[]const u8 = if (queued.len == 0 or std.mem.eql(u8, queued, base.modelVisibleBytes()))
-        null
-    else
-        try alloc.dupe(u8, base.modelVisibleBytes());
-    return .{ .snapshot = snapshot, .head = head, .tail = tail };
 }
 
 fn appendStablePromptContext(
@@ -7010,6 +6885,9 @@ fn processQueuedPromptLoop(
     lifecycle: LifecycleContext,
     config: Config,
     job: QueuedPrompt,
+    /// The turn's whole runtime context, which `job.turn_context` leaves out
+    /// when an earlier turn already carries it (D130).
+    runtime_context_text: []const u8,
     skills: PreparedSkills,
     initial_request_capabilities: model_capabilities.Capabilities,
     finalization: *TurnFinalizationGuard,
@@ -7216,15 +7094,6 @@ fn processQueuedPromptLoop(
     // The turn's first model request resumes the one a previous fx process
     // left unfinished, when there is one.
     var recovery_resume = job.recovery_resume;
-    // The session sends one runtime context ahead of the history; a change
-    // joins the conversation instead (D94).
-    var runtime_context = try runtime_context_state.State.init(
-        arena,
-        job.history,
-        if (job.recovery_checkpoint) |checkpoint| checkpoint.execution else null,
-    );
-    finalization.captured_runtime_context = runtime_context.captured;
-    debug_trace.logf("context", "runtime context saved_copy={} known_update={}", .{ runtime_context.frozen != null, runtime_context.known_update != null });
     // The workspace's stream rules for this turn (D175).
     var stream_rules = runtime_stream_rules.init(deps, &config);
     stream_rules.begin();
@@ -7271,20 +7140,6 @@ fn processQueuedPromptLoop(
         }
         _ = overlay_arena_state.reset(.retain_capacity);
         const overlay_arena = overlay_arena_state.allocator();
-        // A changed runtime context joins this boundary before its steering,
-        // as the notes above do (D93, D94).
-        var current_runtime_context: std.ArrayList(ChatMessage) = .empty;
-        try deps.append_runtime_context(deps.ctx, overlay_arena, &current_runtime_context);
-        const was_captured = runtime_context.captured != null;
-        const runtime_update = try runtime_context.refresh(arena, overlay_arena, current_runtime_context.items);
-        if (!was_captured and runtime_context.captured != null) {
-            finalization.captured_runtime_context = runtime_context.captured;
-            debug_trace.logf("context", "runtime context captured step={d} messages={d}", .{ current_step_index, runtime_context.messages().len });
-        }
-        if (runtime_update) |note| {
-            try within_turn_suffix.append(arena, .{ .role = .system, .content = note, .context_note = true });
-            debug_trace.logf("context", "runtime context update queued step={d} bytes={d}", .{ current_step_index, note.len });
-        }
         const steering_action = try observe_steering_boundary(
             deps,
             arena,
@@ -7309,9 +7164,12 @@ fn processQueuedPromptLoop(
             return;
         }
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
-        // The turn's context was captured once when it began (D130, D131);
-        // it rides as the turn's own context messages, never as system text.
-        try session_runtime.appendTurnContextChatMessages(overlay_arena, &ephemeral_overlay, job.turn_context, job.skill_context);
+        try session_runtime.appendTurnContextChatMessage(overlay_arena, &ephemeral_overlay, turnContextForRequest(
+            job.turn_context,
+            runtime_context_text,
+            active_compaction_handoff,
+            active_compaction_history_tail,
+        ));
         try runtime_stream_rules.beforeStep(&stream_rules, arena, history_messages.items, &within_turn_suffix);
         // Results that settle mid-turn ride at the tail of this step's
         // request, after everything the cache already holds (D132).
@@ -7512,6 +7370,15 @@ fn processQueuedPromptLoop(
                 );
                 credential_reload_pending = false;
             }
+            // A compaction since the step began may have cut the turn that
+            // carried the context.
+            ephemeral_overlay.clearRetainingCapacity();
+            try session_runtime.appendTurnContextChatMessage(overlay_arena, &ephemeral_overlay, turnContextForRequest(
+                job.turn_context,
+                runtime_context_text,
+                active_compaction_handoff,
+                active_compaction_history_tail,
+            ));
             provider_prompt = try build_provider_prompt_with_response_language_control(
                 overlay_arena,
                 stable_prefix,

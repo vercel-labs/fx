@@ -290,7 +290,7 @@ fn legacyEarlier(arena: Allocator, store: ?Store, summary: []const u8) !?summari
 }
 
 fn isTurnContext(message: types.ChatMessage) bool {
-    return message.context_origin == .turn_context or message.context_origin == .skill_context;
+    return message.context_origin == .turn_context;
 }
 
 fn appendItems(arena: Allocator, items: *std.ArrayList(summarize.Item), message: types.ChatMessage) !void {

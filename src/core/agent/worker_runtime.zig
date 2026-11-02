@@ -146,11 +146,10 @@ pub const QueuedPrompt = struct {
     /// Worker begin publishes only its identity so the UI can consume the
     /// pending owner without painting a duplicate card.
     user_prompt_already_presented: bool = false,
-    /// The turn's frozen runtime and skill context (D130). Set only by the
+    /// The turn's frozen runtime context (D130). Set only by the
     /// orchestrator on its own copy, borrowed from the turn arena; the
-    /// worker never sets or frees them.
+    /// worker never sets or frees it.
     turn_context: ?[]const u8 = null,
-    skill_context: ?[]const u8 = null,
     /// The first turn after a resume whose history names shell handles this
     /// process does not own. The turn starts with a note saying so (D93).
     stale_shell_handles: bool = false,
@@ -162,7 +161,6 @@ pub const QueuedPrompt = struct {
             .images = self.images,
             .origin = self.prompt_origin,
             .turn_context = if (self.turn_context) |text| @constCast(text) else null,
-            .skill_context = if (self.skill_context) |text| @constCast(text) else null,
         };
     }
 };

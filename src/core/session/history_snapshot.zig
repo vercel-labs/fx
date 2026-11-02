@@ -176,12 +176,11 @@ fn decodeAny(comptime T: type, alloc: Allocator, cur: *ByteCursor) DecodeError!T
 }
 
 /// Fields added to the log's events after this frozen format, which caches
-/// never carry: a user message's origin (D111) and its turn and skill
-/// context (D130) postdate every v1 cache.
+/// never carry: a user message's origin (D111) and its turn context (D130)
+/// postdate every v1 cache.
 fn notInCache(comptime T: type, comptime field_name: []const u8) bool {
     return T == session_event.ConversationUser and (std.mem.eql(u8, field_name, "origin") or
-        std.mem.eql(u8, field_name, "turn_context") or
-        std.mem.eql(u8, field_name, "skill_context"));
+        std.mem.eql(u8, field_name, "turn_context"));
 }
 
 /// Fields added to the encoded types after the last release that wrote

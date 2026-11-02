@@ -2237,6 +2237,13 @@ fn appendFileEvidenceMessage(alloc: Allocator, messages: *std.ArrayList(message.
 }
 
 /// `appendFileEvidenceMessage` for chat messages.
+fn appendFileEvidenceChatMessage(alloc: Allocator, messages: *std.ArrayList(core_types.ChatMessage), execution: core_types.ExecutionMemory) !void {
+    if (execution.files.len == 0) return;
+    const text = try formatExecutionFileContext(alloc, execution.files);
+    errdefer alloc.free(text);
+    try messages.append(alloc, .{ .role = .user, .content = text });
+}
+
 fn appendHistoryMessagesImpl(
     alloc: Allocator,
     messages: *std.ArrayList(message.Message),
@@ -2425,14 +2432,9 @@ pub fn appendExecutionMemoryChatMessages(
             }
         }
     }
-    // Notes after the last step follow its results, as the turn sent them,
-    // and come before the file context a saved turn adds.
+    // Notes after the last step follow its results, as the turn sent them.
+    // A saved turn's file evidence comes after the whole turn (D242).
     try appendContextNoteChatMessages(alloc, messages, execution.context_notes, &note_index, null);
-    if (execution.files.len > 0) {
-        const text = try formatExecutionFileContext(alloc, execution.files);
-        errdefer alloc.free(text);
-        try messages.append(alloc, .{ .role = .user, .content = text });
-    }
     while (steering_index < execution.steering.len) : (steering_index += 1) {
         const steering = execution.steering[steering_index];
         if (steering.assistant_prefix) |prefix| {
@@ -2496,20 +2498,17 @@ fn appendUserTurnChatMessages(
     messages: *std.ArrayList(core_types.ChatMessage),
     user: UserTurn,
 ) Allocator.Error!void {
-    try appendTurnContextChatMessages(alloc, messages, user.turn_context, user.skill_context);
+    try appendTurnContextChatMessage(alloc, messages, user.turn_context);
     try messages.append(alloc, .{ .role = .user, .content = user.text, .images = user.images, .context_origin = .user_turn });
 }
 
-/// The context messages that open a turn, in the order fx sends them.
-/// Borrows both strings.
-pub fn appendTurnContextChatMessages(
+/// The context message that opens a turn (D130). Borrows `turn_context`.
+pub fn appendTurnContextChatMessage(
     alloc: Allocator,
     messages: *std.ArrayList(core_types.ChatMessage),
     turn_context: ?[]const u8,
-    skill_context: ?[]const u8,
 ) Allocator.Error!void {
     if (turn_context) |text| try messages.append(alloc, .{ .role = .user, .content = text, .context_origin = .turn_context });
-    if (skill_context) |text| try messages.append(alloc, .{ .role = .user, .content = text, .context_origin = .skill_context });
 }
 
 fn appendHistoryChatMessagesImpl(
@@ -2535,6 +2534,7 @@ fn appendHistoryChatMessagesImpl(
                 if (entry.assistant.len > 0 or entry.provider_replay != null) {
                     try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant, .provider_replay = entry.provider_replay });
                 }
+                try appendFileEvidenceChatMessage(alloc, messages, entry.execution);
             },
             .interrupted => |entry| {
                 try appendUserTurnChatMessages(alloc, messages, entry.user);
@@ -2568,11 +2568,13 @@ fn appendHistoryChatMessagesImpl(
                     try messages.append(alloc, .{ .role = .assistant, .content = assistant_content });
                 }
                 if (interrupted_projection == .steering_continuation) {
+                    try appendFileEvidenceChatMessage(alloc, messages, entry.execution);
                     continue;
                 }
                 const text = try formatInterruptedHistoryContext(alloc, entry);
                 errdefer alloc.free(text);
                 try messages.append(alloc, .{ .role = .user, .content = text });
+                try appendFileEvidenceChatMessage(alloc, messages, entry.execution);
             },
         }
     }
@@ -2868,7 +2870,7 @@ test "resume history preserves steering between tool episodes" {
     try std.testing.expectEqualStrings("after second", messages.items[6].content.?.asText());
 }
 
-test "resume history keeps context notes between tool episodes, before steering and the file context (D93)" {
+test "resume history keeps context notes between tool episodes and before steering, with the file context after the turn (D93, D242)" {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -2931,9 +2933,9 @@ test "resume history keeps context notes between tool episodes, before steering 
         .{ .assistant, null },
         .{ .tool, "second result" },
         .{ .system, "note after second" },
-        .{ .user, null },
         .{ .user, "after second" },
         .{ .assistant, "finished" },
+        .{ .user, null },
     };
     try std.testing.expectEqual(expected.len, messages.items.len);
     for (expected, messages.items) |want, got| {
@@ -2941,9 +2943,10 @@ test "resume history keeps context notes between tool episodes, before steering 
         try std.testing.expectEqual(want[0] == .system, got.context_note);
         if (want[1]) |text| try std.testing.expectEqualStrings(text, got.content.?);
     }
-    // The file context a saved turn adds follows the last step's note, which
-    // rides on that step's result, and comes before the last steering.
-    try std.testing.expect(std.mem.find(u8, messages.items[8].content.?, "first") != null);
+    // The last step's note rides on that step's result, before the last
+    // steering, and the file context the saved turn adds follows the whole
+    // turn, so it only extends what the turn's requests sent (D242).
+    try std.testing.expect(std.mem.find(u8, messages.items[10].content.?, "Session file evidence") != null);
 }
 
 test "resume projection replays assistant tool execution memory before final answer and its file evidence after it" {

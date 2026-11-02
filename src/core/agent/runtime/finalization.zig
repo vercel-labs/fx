@@ -41,10 +41,6 @@ pub const TurnFinalizationGuard = struct {
     state: State = .open,
     outcome: ?types.TurnPresentationOutcome = null,
     compacted_execution: execution_memory.CompactedExecutionBoundary = .{},
-    /// The runtime context this turn captured for the session, if it did.
-    /// Every save of the turn carries it, so a streamed turn keeps one prefix
-    /// (D94). Borrowed from the turn's arena.
-    captured_runtime_context: ?[][]u8 = null,
     lease_allocator: Allocator = std.heap.c_allocator,
     agent_terminal_leases: std.ArrayList([]u8) = .empty,
 
@@ -62,12 +58,9 @@ pub const TurnFinalizationGuard = struct {
     }
 
     /// The execution memory a save of this turn records: the part after any
-    /// in-turn compaction cut, with the runtime context the turn captured.
-    /// Borrows `execution` and the captured texts.
+    /// in-turn compaction cut. Borrows `execution`.
     pub fn persistedExecution(self: *const TurnFinalizationGuard, arena: Allocator, execution: types.ExecutionMemory) !types.ExecutionMemory {
-        var projected = try self.compacted_execution.project(arena, execution);
-        projected.runtime_context = self.captured_runtime_context;
-        return projected;
+        return self.compacted_execution.project(arena, execution);
     }
 
     pub fn deinit(self: *TurnFinalizationGuard) void {

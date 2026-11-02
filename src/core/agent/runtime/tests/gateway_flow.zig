@@ -4078,6 +4078,45 @@ test "a named skill's text stays in the turn once after an in-turn compaction cu
     try std.testing.expect(std.mem.startsWith(u8, saved.context_notes[0].text, "<fx-skill-used>"));
 }
 
+test "an unchanged turn context rides again after an in-turn compaction cuts the turn that carried it (D130)" {
+    const alloc = std.testing.allocator;
+    const needle = "RUNTIME_CONTEXT_NEEDLE";
+    const original_result = "RECENT_ONLY\n" ++ text_utils.repeat("r", 10_000);
+    var gateway = FakeGateway.init(alloc, &.{
+        .{ .tool_calls = &.{toolCall("recent-only", "read_file", "{\"path\":\"large.txt\"}")} },
+        .{ .content = "Turn in progress\nIn between: The read completed with RECENT_ONLY." },
+        .{ .content = "Completed from the observed result." },
+    });
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    hooks.runtime_context_text = needle;
+    const model = "provider/recent-only";
+    const capabilities = [_]ModelCapabilityOverride{.{ .model = model, .capabilities = .{ .context_window = 3_000 } }};
+    hooks.available_capability_overrides = &capabilities;
+    hooks.permission_decisions = &.{.once};
+    hooks.exec_plans = &.{.{ .result = .{ .model_output = original_result } }};
+    // The earlier turn already carried this exact runtime context.
+    var history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("earlier prompt"), .turn_context = @constCast(needle) },
+        .assistant = @constCast("earlier answer"),
+    } }};
+    var fixture = PromptFixture{};
+    var job = fixture.job();
+    job.model = @constCast(model);
+    job.history = &history;
+    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    // Unchanged, so the turn adds no copy of its own before the cut.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[0], needle));
+    try expectBodyContains(&gateway, 2, "compacted_conversation");
+    // What the compaction kept carries no copy of it, so the turn carries
+    // the context again, once.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[2], needle));
+    try std.testing.expectEqualStrings("Completed from the observed result.", hooks.finish_assistant_text.?);
+}
+
 test "automatic compaction summarizes a newest exchange larger than the input window" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4849,11 +4888,11 @@ test "processQueuedPrompt final summary counts submitted input once across Gatew
     const job = fixture.job();
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
+    // Without a cache figure the second step counts only what its prompt
+    // grew by, an estimate (D211).
     const summary = hooks.finish_summary.?;
-    var prompt_estimator = token_estimate.StreamingEstimator{};
-    prompt_estimator.consume(job.prompt);
     try std.testing.expectEqual(types.TurnTokenProgress{
-        .input_tokens = prompt_estimator.estimate(),
+        .input_tokens = 200_000,
         .output_tokens = 50_000,
         .input_exact = false,
     }, summary.token_progress);
@@ -5422,48 +5461,6 @@ test "processQueuedPrompt omits an empty custom tool guidance message" {
     const roles = [_]types.ChatRole{ .system, .system, .user };
     try expectGatewayPromptRoles(&gateway, 0, &roles);
     try expectGatewayPromptStringEntry(&gateway, 0, 0, "system");
-}
-
-test "processQueuedPrompt keeps the runtime context ahead of the history and carries a change on the step's tool result (D94)" {
-    const alloc = std.testing.allocator;
-    const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a\"}")};
-    const completions = [_]FakeCompletion{
-        .{ .content = "Checking.", .tool_calls = &calls },
-        .{ .content = "Final" },
-    };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    const overlays = [_][]const u8{ "runtime overlay step one", "runtime overlay step two" };
-    hooks.runtime_context_texts = &overlays;
-    var fixture = PromptFixture{};
-
-    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
-
-    try std.testing.expectEqual(@as(usize, 2), gateway.request_bodies.items.len);
-    try expectBodyContains(&gateway, 0, "runtime overlay step one");
-    try expectBodyNotContains(&gateway, 0, "runtime overlay step two");
-    try expectBodyContains(&gateway, 1, "Checking.");
-    try expectBodyContains(&gateway, 1, "\"toolName\":\"read_file\"");
-    // The tool result ends with the update.
-    try expectBodyContains(&gateway, 1, "\"value\":\"ok\\n\\n<fx-context-update>\\n");
-    // The first step's copy stays ahead of the history, so the cached prefix
-    // holds; the change rides once on the step's tool result.
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[1], "runtime overlay step one"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[1], "runtime overlay step two"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, gateway.request_bodies.items[1], "<fx-context-update>"));
-    const first_request_roles = [_]types.ChatRole{ .system, .system, .system, .user };
-    const second_request_roles = [_]types.ChatRole{ .system, .system, .system, .user, .assistant, .tool };
-    try expectGatewayPromptRoles(&gateway, 0, &first_request_roles);
-    try expectGatewayPromptRoles(&gateway, 1, &second_request_roles);
-    const second_request_order = [_][]const u8{ "runtime overlay step one", "user prompt", "Checking.", "ok", "<fx-context-update>", "runtime overlay step two" };
-    try expectBodyContainsInOrder(&gateway, 1, &second_request_order);
-    // The turn saves the copy it captured and the update at its boundary.
-    const saved = hooks.history_turns.items[0].assistant.execution;
-    try std.testing.expectEqualStrings("runtime overlay step one", saved.runtime_context.?[0]);
-    try std.testing.expectEqual(@as(usize, 1), saved.context_notes.len);
-    try std.testing.expectEqual(@as(usize, 1), saved.context_notes[0].after_tool_step_count);
 }
 
 test "processQueuedPrompt refreshes and acknowledges parent deliveries for each tool step" {
