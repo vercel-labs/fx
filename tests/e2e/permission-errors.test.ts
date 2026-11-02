@@ -14,6 +14,7 @@ import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewayHeldDecision,
   fakeGatewayPermissionDecision,
   fakeShellRun,
   startFakeGateway,
@@ -274,10 +275,7 @@ describe("generic permission typed errors", () => {
         {
           classifierResponses: Array.from(
             { length: 4 },
-            (_, index) => fakeGatewayPermissionDecision(
-              "caution",
-              `auto_review_${index + 1}`,
-            ),
+            (_, index) => fakeGatewayHeldDecision(`auto_review_${index + 1}`),
           ),
         },
       );

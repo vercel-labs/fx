@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
+import { reviewedActionEvidence } from "./tmux-helpers";
 
 async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
   const prefix = deltas.map(delta => `data: ${JSON.stringify({ choices: [{ index: 0, delta }] })}\n\n`).join("");
@@ -482,7 +483,9 @@ describe("configured providers", () => {
           }
           return completion(body.model, "The action looks safe.");
         }
-        return toolCompletion(body.model, "permission_decision", { decision: outcome === "caution" ? "caution" : "clear" });
+        return toolCompletion(body.model, "permission_decision", outcome === "caution"
+          ? { decision: "caution", category: "system_harm", evidence: reviewedActionEvidence(JSON.stringify(body)) }
+          : { decision: "clear" });
       }
       if (body.messages.some((message: any) => message.role === "tool")) return completion(body.model, "review finished");
       return toolCompletion(body.model, "shell", { request: { action: "run", command: `python3 -c 'from pathlib import Path; p=Path(${JSON.stringify(marker)}); p.write_text(p.read_text()+"one\\n")'` } });
@@ -495,9 +498,10 @@ describe("configured providers", () => {
       const result = await runFx(["ask", "--json", "--no-save", "Run the local fixture once."], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
       expect(readFileSync(marker, "utf8")).toBe(["clear", "malformed"].includes(outcome) ? "one\n" : "");
-      expect(reviews).toBe(["clear", "caution", "missing", "malformed"].includes(outcome) ? 2 : 1);
+      // A held caution adds one confirming review of the same request.
+      expect(reviews).toBe(outcome === "caution" ? 3 : ["clear", "missing", "malformed"].includes(outcome) ? 2 : 1);
       const requests = f.requests.filter(request => request.body.tools?.some((tool: any) => tool.function?.name === "permission_decision"));
-      if (reviews === 2) expect(requests[1].body).toEqual(requests[0].body);
+      for (const request of requests.slice(1)) expect(request.body).toEqual(requests[0].body);
       expect(f.requests.every(request => request.path === "/v1/chat/completions")).toBe(true);
     } finally { f.close(); }
   }, 20000);
@@ -505,7 +509,11 @@ describe("configured providers", () => {
   test.each(["caution", "invalid"])("%s custom permission reviews never authorize execution", async decision => {
     let marker = "";
     const f = fixture(body => {
-      if (body.tools?.some((tool: any) => tool.function?.name === "permission_decision")) return toolCompletion(body.model, "permission_decision", { decision, rationale: "fixture review" });
+      if (body.tools?.some((tool: any) => tool.function?.name === "permission_decision")) return toolCompletion(body.model, "permission_decision", {
+        decision,
+        rationale: "fixture review",
+        ...(decision === "caution" ? { category: "system_harm", evidence: reviewedActionEvidence(JSON.stringify(body)) } : {}),
+      });
       if (body.messages.some((message: any) => message.role === "tool")) return completion(body.model, "action held");
       return toolCompletion(body.model, "shell", { request: { action: "run", command: `python3 -c 'open("${marker}", "w").write("bad")'` } });
     });
