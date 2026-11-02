@@ -1,6 +1,6 @@
 # TLA+ models
 
-TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK and MCP models on `main` and on pull requests that change the code they cover, as `scripts/detect-ci-need.sh` decides, and the recovery model, with the driver that walks the recovery module along it, on every pull request. Run the others when you change the behavior they describe.
+TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK and MCP models on `main` and on pull requests that change the code they cover, as `scripts/detect-ci-need.sh` decides; the `fx mcp call` model on `main` and on pull requests labeled `ci:tla-mcp-call`; and the recovery model, with the driver that walks the recovery module along it, on every pull request. Run the others when you change the behavior they describe.
 
 | Folder | What it models | Checker |
 |---|---|---|
@@ -57,6 +57,8 @@ npm ci --prefix sdk/durable
 ## MCP in CI
 
 CI's `TLA+ MCP models and drivers` job runs each engine model's smoke config (`mcp/run.py check`), `mcp_host/check.sh`, and both MCP drivers, on `main` and on pull requests that change MCP code, these models, their drivers, or the files the drivers load. The engine models' planted bugs (`mcp/check.sh`) run only by hand: they measure the checks, not the code.
+
+`.github/workflows/tla-mcp-call.yml` runs `mcp_call/check.sh`, planted bugs included, on every push to `main` and on pull requests labeled `ci:tla-mcp-call`.
 
 ## MCP models without a driver here
 

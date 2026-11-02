@@ -37,7 +37,7 @@ The bridge is built. An item stays open until its own done criterion has evidenc
 ## D. Proof through the binary, CI, and docs
 
 - [ ] **D1** Binary stage: `verify` drives the built `zig-out/bin/fx` with a fake MCP server and gateway, records each bridge run from its trace log, and has TLC check every run against `McpCall.tla`, as `image_route`'s `binary-to-spec.ts` does. Done when the stage prints PASS and rejects doctored runs.
-- [ ] **D2** CI: decide whether `tests/tla/mcp_call/check.sh` joins the TLA+ CI job. `tests/AGENTS.md` says CI runs only the `sdk/`, `mcp/`, and `mcp_host/` models, and `scripts/detect-ci-need.sh` already triggers on `src/core/mcp_host/`. Done when the decision is made, and wired if yes.
+- [x] **D2** CI: decide whether `tests/tla/mcp_call/check.sh` joins the TLA+ CI job. Decided: it runs in its own workflow, `.github/workflows/tla-mcp-call.yml`, on every push to `main` and on pull requests labeled `ci:tla-mcp-call`, not on every pull request. `tests/AGENTS.md` says CI runs only the `sdk/`, `mcp/`, and `mcp_host/` models, and `scripts/detect-ci-need.sh` already triggers on `src/core/mcp_host/`. Done when the decision is made, and wired if yes.
 - [x] **D3** E2E wiring: every new root E2E file has a weight in `tests/e2e/ci-shard-weights.json` and one classification in `scripts/pgso/corpus.json`. Done when `cd tests/e2e && bun test ci-shards.test.ts` passes. The E2E tests went into `mcp-stdio.test.ts`, which is already classified.
 - [ ] **D4** Docs: `--help` from the command spec, the fx.sh MCP and CLI pages in a companion `fx-web` pull request, and a changelog entry at release. Done when the PR links the docs PR. Status: `--help` is done (`fx mcp call -h`).
 
