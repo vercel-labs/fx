@@ -66,9 +66,6 @@ pub const ShortcutAction = union(enum) {
     insert_newline,
 };
 
-/// Which way Alt+←/→ moves through the agents.
-pub const SwitchDirection = enum { next, previous };
-
 /// Typed result of UI-owned terminal escape decoding.
 pub const Action = union(enum) {
     history_up,
@@ -95,9 +92,9 @@ pub const Action = union(enum) {
     toggle_permission_mode,
     open_all_sessions,
     open_model_catalog,
-    /// Alt+←/→. Its composer shortcut is the word jump the keys keep when
-    /// there is no other agent to switch to.
-    switch_agent: SwitchDirection,
+    /// Ctrl+X: opens the agent list whatever the composer holds, or goes
+    /// back from it while it is open.
+    open_agent_list,
     insert_newline,
     paste_start,
     paste_end,

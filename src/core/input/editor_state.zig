@@ -98,14 +98,6 @@ pub const State = struct {
         return self.input.items[selection.start..selection.end];
     }
 
-    /// Whether a word jump toward the draft's start (or end) would leave
-    /// the draft as it is: nothing is selected and the cursor already
-    /// sits at that edge. An empty draft stays either way.
-    pub fn staysForWordJump(self: *const State, toward_start: bool) bool {
-        if (self.selectionRange() != null) return false;
-        return if (toward_start) self.cursor == 0 else self.cursor >= self.input.items.len;
-    }
-
     pub fn discardSelection(self: *State) ?usize {
         const dropped_bytes = if (self.selectionRange()) |selection|
             selection.end - selection.start
@@ -250,30 +242,6 @@ pub fn deleteRange(
         cursor.* = clamped_start;
     }
     return true;
-}
-
-test "a word jump stays only at the draft's edge with nothing selected" {
-    const alloc = std.testing.allocator;
-    var state: State = .{};
-    defer state.deinit(alloc);
-    try std.testing.expect(state.staysForWordJump(true));
-    try std.testing.expect(state.staysForWordJump(false));
-
-    try state.setText(alloc, "hello world");
-    state.cursor = state.input.items.len;
-    try std.testing.expect(state.staysForWordJump(false));
-    try std.testing.expect(!state.staysForWordJump(true));
-    state.cursor = 0;
-    try std.testing.expect(state.staysForWordJump(true));
-    try std.testing.expect(!state.staysForWordJump(false));
-    state.cursor = "hello ".len;
-    try std.testing.expect(!state.staysForWordJump(true));
-    try std.testing.expect(!state.staysForWordJump(false));
-
-    // A selection collapses on the jump, so the jump is not a no-op.
-    state.cursor = 0;
-    state.selection_anchor = "hello".len;
-    try std.testing.expect(!state.staysForWordJump(true));
 }
 
 test "editor state owns selection and Unicode cursor transitions" {
