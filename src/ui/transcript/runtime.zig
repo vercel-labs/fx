@@ -4792,7 +4792,9 @@ pub const TranscriptRuntime = struct {
     /// footer says so until a cycle loads or the view resets.
     transcript_archive_failed: bool = false,
     /// A Ctrl+O read stopped at a damaged session log line, so some older
-    /// turns are missing; the viewer footer says so.
+    /// turns are missing; the viewer footer says so. The line stays damaged,
+    /// so this lasts until the transcript is cleared, not only while Ctrl+O
+    /// is open: reopening it can reuse a page without reading the log.
     transcript_archive_damaged: bool = false,
     /// Which entry of the requested cycle Ctrl+O lands on once it loads.
     transcript_archive_boundary: ?ArchiveLanding = null,
@@ -6803,6 +6805,7 @@ pub const TranscriptRuntime = struct {
     pub fn clearFullTranscriptDetails(self: *TranscriptRuntime, alloc: Allocator) void {
         self.compact_transcript_source_cache.deinit(alloc);
         self.resetFullTranscriptPageNavigation();
+        self.transcript_archive_damaged = false;
         if (self.full_transcript_window_load.busy()) {
             self.full_transcript_installed_page_retired =
                 self.full_transcript_installed_page != null;
@@ -7647,7 +7650,6 @@ pub const TranscriptRuntime = struct {
         self.transcript_archive_request = null;
         self.transcript_archive_boundary = null;
         self.transcript_archive_failed = false;
-        self.transcript_archive_damaged = false;
         self.full_transcript_prepared_page_visible = false;
         self.full_transcript_open_request = null;
         self.full_transcript_restore_open_pending = false;

@@ -281,8 +281,8 @@ test "transcript window: Ctrl+O shows the cycle before the compaction with the n
     runtime.moveToFullTranscriptPage(back_down, .first);
     try runtime.installTranscriptArchive(alloc, 1, true, try archivedCycle(alloc, 1, &.{ "older one\n", "older two\n", "older three\n" }), false);
     try std.testing.expect(!runtime.transcript_archive_failed);
-    // A cycle read across a damaged log line says so until the view
-    // closes, even after an undamaged cycle loads.
+    // A cycle read across a damaged log line says so from then on, even
+    // after an undamaged cycle loads.
     try runtime.installTranscriptArchive(alloc, 1, true, try archivedCycle(alloc, 1, &.{ "older one\n", "older two\n", "older three\n" }), true);
     try std.testing.expect(runtime.transcript_archive_damaged);
     try std.testing.expect(!runtime.transcript_archive_failed);
@@ -297,13 +297,18 @@ test "transcript window: Ctrl+O shows the cycle before the compaction with the n
     try std.testing.expectEqual(@as(usize, 0), runtime.full_transcript_page_anchor.entry_index);
     try std.testing.expect(runtime.transcript_archive_damaged);
     try std.testing.expect(!runtime.transcript_archive_failed);
+    // Closing takes the failed-load notice away, but the damaged line is
+    // still in the log, so the damage notice stays until the transcript is
+    // cleared.
     runtime.moveToFullTranscriptPage(further, .last);
     runtime.failTranscriptArchive();
     runtime.closeFullTranscriptState();
     try std.testing.expect(!runtime.transcript_archive_failed);
-    try std.testing.expect(!runtime.transcript_archive_damaged);
+    try std.testing.expect(runtime.transcript_archive_damaged);
     try std.testing.expect(runtime.transcript_archive == null);
     try std.testing.expect(runtime.full_transcript_page_anchor == .tail);
+    runtime.clearFullTranscriptDetails(alloc);
+    try std.testing.expect(!runtime.transcript_archive_damaged);
 }
 
 test "transcript window: Ctrl+O pages the cycles before one the window still holds" {

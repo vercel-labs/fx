@@ -174,7 +174,7 @@ describe.skipIf(!tmuxAvailable())("tui: transcript window", () => {
   );
 
   test(
-    "a damaged line in an older cycle: Ctrl+O shows what it can read and says older history couldn't be read",
+    "a damaged line in an older cycle: Ctrl+O shows what it can read and says older history couldn't be read, also when reopened",
     async () => {
       const built = await buildSession(4, 20_000);
       const session = built.session;
@@ -193,6 +193,15 @@ describe.skipIf(!tmuxAvailable())("tui: transcript window", () => {
         expect(walk.seen).toEqual([marker(3), marker(2), marker(0)]);
         expect(walk.top).toContain("part of older history couldn't be read");
         expect(walk.top).not.toContain("couldn't load older history");
+        // Reopened, Ctrl+O can show the page it built without reading the
+        // log again; the damaged line is still there, so it still says so.
+        await session.sendHexBytes(["0f"]);
+        await session.waitForText("esc close", TIMEOUT);
+        const reopened = await session.capturePane();
+        expect(reopened).toContain("part of older history couldn't be read");
+        expect(reopened).not.toContain(NAVIGATION);
+        await session.sendHexBytes(["0f"]);
+        await session.waitForComposer(TIMEOUT);
       } finally {
         await session.kill();
         built.gateway.stop();
