@@ -478,6 +478,7 @@ pub const FakeAgentRuntimeDeps = struct {
     executed_call_ids: std.ArrayList([]u8) = .empty,
     rejected_names: std.ArrayList([]u8) = .empty,
     failed_names: std.ArrayList([]u8) = .empty,
+    failed_outputs: std.ArrayList([]u8) = .empty,
     inner_usage_names: std.ArrayList([]u8) = .empty,
     inner_usages: std.ArrayList(types.ToolUsage) = .empty,
     validated_names: std.ArrayList([]u8) = .empty,
@@ -694,6 +695,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.executed_call_ids);
         freeStringList(self.alloc, &self.rejected_names);
         freeStringList(self.alloc, &self.failed_names);
+        freeStringList(self.alloc, &self.failed_outputs);
         freeStringList(self.alloc, &self.inner_usage_names);
         self.inner_usages.deinit(self.alloc);
         freeStringList(self.alloc, &self.validated_names);
@@ -1588,9 +1590,10 @@ pub const FakeAgentRuntimeDeps = struct {
         try self.record("rejected:{s}", .{call.name});
     }
 
-    fn recordFailed(raw: *anyopaque, _: Allocator, call: ToolCall, _: []const u8, _: ?[]const u8) !void {
+    fn recordFailed(raw: *anyopaque, _: Allocator, call: ToolCall, model_output: []const u8, _: ?[]const u8) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.failed_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
+        try self.failed_outputs.append(self.alloc, try self.alloc.dupe(u8, model_output));
         try self.record("failed:{s}", .{call.name});
     }
 

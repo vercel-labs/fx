@@ -7105,6 +7105,115 @@ test "child target failures settle the batch before and after permission without
     }
 }
 
+const UnreachableToolProbe = struct {
+    hooks: FakeAgentRuntimeDeps,
+    unreachable_name: []const u8,
+    resolves: usize = 0,
+
+    // Mirrors the child adapters: a tool the child cannot reach has no target.
+    fn target(raw: *anyopaque, arena: std.mem.Allocator, call: ToolCall, _: []const []const u8) ![]const u8 {
+        const hooks: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        const self: *@This() = @fieldParentPtr("hooks", hooks);
+        if (std.mem.eql(u8, call.name, self.unreachable_name)) return error.UnsupportedTool;
+        return arena.dupe(u8, call.name);
+    }
+
+    fn resolve(raw: *anyopaque, _: std.mem.Allocator, _: ToolCall, _: []const u8, _: []const u8, _: tool_dispatch.PermissionTargetKind) !runtime_deps.ResolvedLiveToolAuthority {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.resolves += 1;
+        return .{
+            .authority = .{
+                .generation = 1,
+                .root_id = "root",
+                .tools = &.{"mcp_select_tool"},
+                .integrations = &.{},
+                .rules = .{ .rules = &.{} },
+                .grants = &.{},
+                .permission_mode = .auto,
+            },
+            .decision = .allow,
+        };
+    }
+
+    fn run(self: *@This(), gateway: *FakeGateway) !void {
+        const alloc = std.testing.allocator;
+        var deps = self.hooks.deps();
+        deps.agent_stream_provider = gateway.provider();
+        deps.permission_target_for_call = target;
+        deps.live_tool_authority = .{ .context = self, .resolve_fn = resolve };
+        var agent: @import("../agent.zig").Agent = .{};
+        defer agent.deinit(alloc);
+        var fixture = PromptFixture{};
+        const config = fixture.config();
+        var job = fixture.job();
+        job.permission_mode = .auto;
+        try runtime_orchestrator.processAgentPrompt(
+            &agent,
+            &deps,
+            null,
+            test_support.testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, config.workspace_root),
+            config,
+            job,
+        );
+    }
+};
+
+test "child call to an unselected dynamic tool fails the call and the turn continues" {
+    const alloc = std.testing.allocator;
+    const calls = [_]ToolCall{toolCall("direct", "mcp_slack_read_channel", "{}")};
+    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "recovered" } };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var probe = UnreachableToolProbe{
+        .hooks = FakeAgentRuntimeDeps.init(alloc),
+        .unreachable_name = "mcp_slack_read_channel",
+    };
+    defer probe.hooks.deinit();
+
+    try probe.run(&gateway);
+
+    try std.testing.expectEqual(@as(usize, 2), gateway.index);
+    try std.testing.expectEqual(@as(usize, 0), probe.resolves);
+    try std.testing.expectEqual(@as(usize, 0), probe.hooks.executed_names.items.len);
+    try std.testing.expectEqual(@as(usize, 0), probe.hooks.permission_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), probe.hooks.failed_outputs.items.len);
+    try std.testing.expect(std.mem.find(u8, probe.hooks.failed_outputs.items[0], "not selected") != null);
+    try std.testing.expect(std.mem.find(u8, probe.hooks.failed_outputs.items[0], "mcp_select_tool") != null);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, probe.hooks.finalized_outcome.?);
+}
+
+test "child call to a selected tool outside its admission is refused and the turn continues" {
+    const alloc = std.testing.allocator;
+    const select_calls = [_]ToolCall{toolCall("select", "mcp_select_tool", "{\"name\":\"mcp_fixture_echo\"}")};
+    const dynamic_calls = [_]ToolCall{toolCall("outside", "mcp_fixture_echo", "{}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &select_calls },
+        .{ .tool_calls = &dynamic_calls },
+        .{ .content = "recovered" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var probe = UnreachableToolProbe{
+        .hooks = FakeAgentRuntimeDeps.init(alloc),
+        .unreachable_name = "mcp_fixture_echo",
+    };
+    defer probe.hooks.deinit();
+    probe.hooks.permission_decisions = &.{.once};
+    probe.hooks.exec_plans = &.{.{ .result = .{
+        .model_output = "selected",
+        .selected_dynamic_tools = &.{.{ .name = "mcp_fixture_echo", .schema_json = "{\"type\":\"function\",\"name\":\"mcp_fixture_echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}" }},
+    } }};
+
+    try probe.run(&gateway);
+
+    try std.testing.expectEqual(@as(usize, 3), gateway.index);
+    try std.testing.expectEqual(@as(usize, 1), probe.hooks.executed_names.items.len);
+    try std.testing.expectEqualStrings("mcp_select_tool", probe.hooks.executed_names.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), probe.hooks.failed_outputs.items.len);
+    try std.testing.expectEqualStrings("Unsupported tool: mcp_fixture_echo", probe.hooks.failed_outputs.items[0]);
+    try std.testing.expectEqual(types.TurnPresentationOutcome.completed, probe.hooks.finalized_outcome.?);
+}
+
 test "child live authority revalidates after permission before effect" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall(
