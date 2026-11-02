@@ -4587,7 +4587,11 @@ describe("cli: rtk", () => {
   test("rtk reduces real git status advice while preserving every path and branch", async () => {
     const fixture = createRtkFixture(true);
     const git = (args: string[]) => {
-      const result = spawnSync("git", args, { cwd: fixture.workspace, encoding: "utf8", env: { ...process.env, LC_ALL: "C" } });
+      const result = spawnSync("git", args, {
+        cwd: fixture.workspace,
+        encoding: "utf8",
+        env: { ...process.env, HOME: fixture.home, PATH: "/usr/bin:/bin", LC_ALL: "C" },
+      });
       expect(result.status, result.stderr).toBe(0);
       return result.stdout;
     };
