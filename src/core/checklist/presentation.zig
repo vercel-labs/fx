@@ -83,45 +83,36 @@ pub fn romanNumeral(arena: Allocator, one_based: usize) Allocator.Error![]const 
 
 /// The rows for a settled call. `failed` calls read by their reason.
 pub fn view(arena: Allocator, args_json: []const u8, result: []const u8, failed: bool) Allocator.Error!?View {
+    if (failed) return .{ .headline = "Checklist not updated", .body = try reasonBody(arena, result) };
     const parsed = checklist.parseRequest(arena, args_json, true) catch return error.OutOfMemory;
     const request = switch (parsed) {
         .request => |value| value,
-        .invalid => return if (failed) .{ .headline = "Checklist not updated", .body = try noteBody(arena, try firstLine(arena, result)) } else null,
+        .invalid => return null,
     };
-    if (failed) return .{ .headline = "Checklist not updated", .body = try noteBody(arena, try firstLine(arena, result)) };
-    const headline = try headlineFor(arena, request);
     var body: std.ArrayList(BodyRow) = .empty;
     switch (request.op) {
         .init, .view => try appendTree(arena, &body, result),
         else => if (readAck(arena, result)) |ack| {
+            var progress: std.Io.Writer.Allocating = .init(arena);
+            const writer = &progress.writer;
+            writer.print("{d} of {d} done", .{ ack.done, ack.total }) catch return error.OutOfMemory;
             if (ack.phase_done) |phase| {
-                if (ack.next_phase) |next_phase| {
-                    try body.append(arena, .{ .text = try arena.print("{d} of {d} done · {s} complete, next: {s}", .{ ack.done, ack.total, phase, next_phase }) });
-                } else {
-                    try body.append(arena, .{ .text = try arena.print("{d} of {d} done · {s} complete", .{ ack.done, ack.total, phase }) });
-                }
+                writer.print(" · {s} complete", .{phase}) catch return error.OutOfMemory;
+                if (ack.next_phase) |next| writer.print(", next: {s}", .{next}) catch return error.OutOfMemory;
             } else if (ack.next) |next| {
-                try body.append(arena, .{ .text = try arena.print("{d} of {d} done · next: {s}", .{ ack.done, ack.total, next }) });
-            } else {
-                try body.append(arena, .{ .text = try arena.print("{d} of {d} done", .{ ack.done, ack.total }) });
+                writer.print(" · next: {s}", .{next}) catch return error.OutOfMemory;
             }
+            try body.append(arena, .{ .text = progress.written() });
         },
     }
-    return .{ .headline = headline, .body = body.items };
+    return .{ .headline = try headlineFor(arena, request), .body = body.items };
 }
 
-fn noteBody(arena: Allocator, lines: []const []const u8) Allocator.Error![]const BodyRow {
-    const out = try arena.alloc(BodyRow, lines.len);
-    for (lines, 0..) |line, index| out[index] = .{ .text = line };
-    return out;
-}
-
-fn firstLine(arena: Allocator, text: []const u8) Allocator.Error![]const []const u8 {
-    const line = std.mem.trim(u8, text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len], " \t\r");
+/// A failed call's reason: the first line of what it returned, if any.
+fn reasonBody(arena: Allocator, result: []const u8) Allocator.Error![]const BodyRow {
+    const line = std.mem.trim(u8, result[0 .. std.mem.findScalar(u8, result, '\n') orelse result.len], " \t\r");
     if (line.len == 0) return &.{};
-    const out = try arena.alloc([]const u8, 1);
-    out[0] = line;
-    return out;
+    return arena.dupe(BodyRow, &.{.{ .text = line }});
 }
 
 fn headlineFor(arena: Allocator, request: checklist.Request) Allocator.Error![]const u8 {
@@ -187,66 +178,69 @@ fn appendTree(arena: Allocator, body: *std.ArrayList(BodyRow), result: []const u
     for (phases.items) |phase| total += phase.tasks.items.len;
     const compact = total > max_task_rows;
 
-    // The tasks each phase would show, picked before drawing so the tree
-    // branches and the hidden count are known.
-    var selections: std.ArrayList(std.ArrayList(TreeTask)) = .empty;
+    // Pick the open tasks with their phase's last closed task above them.
+    // Closed phases are only filler: they cannot spend the budget before
+    // an open phase later in the list gets its rows.
+    var selections: std.ArrayList(struct {
+        tasks: []const TreeTask,
+        has_open: bool,
+        shown: usize = 0,
+    }) = .empty;
+    var any_open = false;
     for (phases.items) |phase| {
-        var picked: std.ArrayList(TreeTask) = .empty;
-        if (!compact) {
-            try picked.appendSlice(arena, phase.tasks.items);
-        } else {
-            // proto keeps the last closed task above the open ones; with
-            // nothing open it keeps the list's head.
-            var last_closed: ?TreeTask = null;
-            var open: std.ArrayList(TreeTask) = .empty;
-            for (phase.tasks.items) |task| {
-                if (checklist.isClosed(task.status)) last_closed = task else try open.append(arena, task);
-            }
-            if (open.items.len == 0) {
-                try picked.appendSlice(arena, phase.tasks.items[0..@min(phase.tasks.items.len, max_task_rows)]);
-            } else {
-                if (last_closed) |task| try picked.append(arena, task);
-                for (open.items) |task| {
-                    if (picked.items.len == max_task_rows) break;
-                    try picked.append(arena, task);
-                }
-            }
+        const has_open = for (phase.tasks.items) |task| {
+            if (!checklist.isClosed(task.status)) break true;
+        } else false;
+        any_open = any_open or has_open;
+        if (!compact or !has_open) {
+            try selections.append(arena, .{ .tasks = phase.tasks.items, .has_open = has_open });
+            continue;
         }
-        try selections.append(arena, picked);
+        var last_closed: ?TreeTask = null;
+        for (phase.tasks.items) |task| if (checklist.isClosed(task.status)) {
+            last_closed = task;
+        };
+        var picked: std.ArrayList(TreeTask) = .empty;
+        if (last_closed) |task| try picked.append(arena, task);
+        for (phase.tasks.items) |task| {
+            if (picked.items.len == max_task_rows) break;
+            if (!checklist.isClosed(task.status)) try picked.append(arena, task);
+        }
+        try selections.append(arena, .{ .tasks = picked.items, .has_open = true });
     }
 
-    // The row budget then cuts the tail, phase by phase; rows the
-    // selection or the budget left out are counted for the trailing note.
-    var shown_per_phase: std.ArrayList(usize) = .empty;
     var budget_left: usize = max_task_rows;
-    var hidden: usize = 0;
-    for (phases.items, selections.items) |phase, picked| {
-        const take = @min(picked.items.len, budget_left);
-        try shown_per_phase.append(arena, take);
-        budget_left -= take;
-        hidden += phase.tasks.items.len - take;
+    for ([_]bool{ true, false }) |want_open| {
+        for (selections.items) |*picked| {
+            if (picked.has_open != want_open) continue;
+            picked.shown = @min(picked.tasks.len, budget_left);
+            budget_left -= picked.shown;
+        }
     }
+    var hidden: usize = 0;
     var last_task_phase: usize = 0;
-    for (shown_per_phase.items, 0..) |shown, index| if (shown > 0) {
-        last_task_phase = index;
-    };
+    for (phases.items, selections.items, 0..) |phase, picked, index| {
+        hidden += phase.tasks.items.len - picked.shown;
+        if (picked.shown > 0) last_task_phase = index;
+    }
 
-    var numbered: usize = 0;
     for (phases.items, 0..) |phase, phase_index| {
         if (phase.tasks.items.len == 0) continue;
-        numbered += 1;
         const picked = selections.items[phase_index];
-        const shown_count = shown_per_phase.items[phase_index];
+        const shown_count = picked.shown;
         if (phases.items.len > 1) {
             var done: usize = 0;
             for (phase.tasks.items) |task| done += @intFromBool(checklist.isClosed(task.status));
             try body.append(arena, .{
-                .text = try arena.print("{s}. {s}  {d}/{d}", .{ try romanNumeral(arena, numbered), phase.name, done, phase.tasks.items.len }),
+                .text = try arena.print("{s}. {s}  {d}/{d}", .{ try romanNumeral(arena, phase_index + 1), phase.name, done, phase.tasks.items.len }),
                 .role = .phase,
             });
         }
         const summary_follows = hidden > 0 and phase_index == last_task_phase;
-        for (picked.items[0..shown_count], 0..) |task, index| {
+        // Filler shows recent closed work; only an entirely closed list
+        // keeps its head, in source order.
+        const start = if (compact and any_open and !picked.has_open) picked.tasks.len - shown_count else 0;
+        for (picked.tasks[start..][0..shown_count], 0..) |task, index| {
             const branch = if (index + 1 == shown_count and !summary_follows) "└─ " else "├─ ";
             const note: []const u8 = if (task.status == .blocked)
                 if (task.blocker) |reason| try arena.print(" (blocked: {s})", .{reason}) else " (blocked)"
@@ -365,6 +359,57 @@ test "init and view show the list as proto's checklist, phases numbered and task
         \\II. Ship  0/1
         \\└─ □ Tag release (blocked: waiting on review)
     , joined);
+}
+
+test "empty phases retain their source ordinal in the displayed tree" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var list = try checklist.testList(testing.allocator, &.{
+        .{ "Empty", &.{} },
+        .{ "Build", &.{.{ "Write parser", .in_progress }} },
+    });
+    defer list.deinit();
+    const result = try @import("summary.zig").resultText(a, &list, &list, .{ .op = .view }, &.{});
+    try testing.expect(std.mem.find(u8, result, "Active phase 2/2") != null);
+    const shown = (try view(a, "{\"op\":\"view\"}", result, false)).?;
+    try testing.expectEqual(@as(usize, 2), shown.body.len);
+    try testing.expectEqualStrings("II. Build  0/1", shown.body[0].text);
+    try testing.expectEqualStrings("└─ □ Write parser", shown.body[1].text);
+}
+
+test "a long multi-phase list budgets open phases before completed phases" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var result: std.Io.Writer.Allocating = .init(a);
+    try result.writer.writeAll("  Finished:\n");
+    for (1..max_task_rows + 1) |index| try result.writer.print("    - [X] old task {d}\n", .{index});
+    try result.writer.writeAll("  Build:\n    - [X] Last closed\n    - [ ] Write parser (in progress)");
+    const shown = (try view(a, "{\"op\":\"view\"}", result.written(), false)).?;
+    var task_rows: usize = 0;
+    var active_row: ?usize = null;
+    for (shown.body, 0..) |row, index| {
+        if (row.role != .task) continue;
+        task_rows += 1;
+        if (row.status == .in_progress) active_row = index;
+    }
+    try testing.expectEqual(max_task_rows, task_rows);
+    try testing.expect(active_row != null);
+    try testing.expectEqualStrings("├─ ■ Last closed", shown.body[active_row.? - 1].text);
+    try testing.expectEqualStrings("├─ □ Write parser", shown.body[active_row.?].text);
+    try testing.expectEqualStrings("└─ … 2 more", shown.body[shown.body.len - 1].text);
+    // Finished phases fill only the spare rows, with their recent work.
+    try testing.expectEqualStrings("├─ ■ old task 3", shown.body[1].text);
+
+    // With no work open anywhere, the same budget keeps the list's head.
+    const closed_result = try std.mem.replaceOwned(u8, a, result.written(), "[ ] Write parser (in progress)", "[X] Write parser");
+    const closed = (try view(a, "{\"op\":\"view\"}", closed_result, false)).?;
+    try testing.expectEqualStrings("├─ ■ old task 1", closed.body[1].text);
+    try testing.expectEqualStrings("├─ ■ old task 12", closed.body[max_task_rows].text);
+    try testing.expectEqualStrings("└─ … 2 more", closed.body[closed.body.len - 1].text);
 }
 
 test "a long list keeps its open tasks with the last closed one above them, then a count" {

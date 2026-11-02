@@ -3014,21 +3014,25 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   protocol's form of proto's RPC checklist state. **Alternative:** a
   custom `_fx/checklist` notification no client renders.
 
-- **D234 Decision:** a checklist row in the transcript says what changed,
-  "Planned 5 tasks in 2 phases", "Completed Write parser", "Blocked Tag
-  release · waiting on review", and under it the list after `init` and
-  `view` drawn as proto draws its checklist: phases numbered "I. Build
-  1/2" and each task a tree row "├─ □ Write parser" with a checkbox
+- **D234 Decision:** a checklist row in the inline or full transcript says
+  what changed, "Planned 5 tasks in 2 phases", "Completed Write parser",
+  "Blocked Tag release · waiting on review", and under it the list after
+  `init` and `view` drawn as proto draws its checklist: phases numbered
+  by their source position, "I. Build 1/2", with empty phases not drawn,
+  and each task a tree row "├─ □ Write parser" with a checkbox
   (■ done, □ otherwise), done and dropped tasks struck through, colors
   by status (done green, in progress accent, pending dim, blocked
   warning with "(blocked: reason)", dropped red), or the progress after
   other changes, "3 of 5 done · Write files complete, next: Verify". A
-  long list keeps its open tasks with the last closed one above them,
-  then "… N more". Viewing is routine and folds; changes stay. **Why:**
-  proto's framed checklist, checkboxes and tree included, in proto-fx's
-  row style. **Alternative:** proto's live panel above the composer,
-  which needs the checklist in the terminal's own state and is not
-  ported.
+  long list reserves its shared row budget for open tasks and each open
+  phase's last closed task above them; finished phases fill spare rows
+  with recent work. Only a list with nothing open keeps its head, then
+  "… N more" counts omitted tasks. Viewing is routine and folds inline;
+  changes stay. **Why:** proto's framed checklist, checkboxes and tree
+  included, in proto-fx's row style. **Alternative:** showing the list
+  only in the live panel above the composer, which was ported in D252;
+  that panel complements these historical transcript rows rather than
+  replacing them.
 
 - **D235 Decision:** every document a browser tab loads during a browser
   call answers to the same domain policy as `open` (D198): `tab.goto`
