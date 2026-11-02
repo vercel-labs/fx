@@ -21,6 +21,7 @@ import {
   fakeGatewayPermissionDecision,
   fakeGatewaySse,
   fakeGatewayToolCall,
+  reviewedActionEvidence,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -2243,6 +2244,81 @@ describe("lean auto mode reliability", () => {
       expect(readFileSync(tracePath, "utf8")).toContain(
         "event=auto_review_caution_unproven reason=missing_category",
       );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a proven caution holds only after one identical second review agrees",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.workspace, "confirmed-caution-ran");
+      const tracePath = join(root.root, "confirmed-caution.trace");
+      const gateway = startGateway(
+        [
+          commandCall(`touch ${JSON.stringify(marker)}`, "confirmed_caution_action"),
+          fakeGatewayFinalText("Confirmed caution held."),
+        ],
+        [fakeGatewayHeldDecision("confirmed_review")],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Create the marker file."],
+        {
+          cwd: root.workspace,
+          env: { ...gatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "permission" },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(existsSync(marker)).toBe(false);
+      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.confirmationRequests).toHaveLength(1);
+      expect(gateway.confirmationRequests[0]!.body).toBe(gateway.classifierRequests[0]!.body);
+      expect(readFileSync(tracePath, "utf8")).toContain("event=auto_review_confirm_result result=caution");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a caution the second review clears lets the action run",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.workspace, "unconfirmed-caution-ran");
+      const tracePath = join(root.root, "unconfirmed-caution.trace");
+      const command = `touch ${JSON.stringify(marker)}`;
+      const gateway = startGateway(
+        [
+          commandCall(command, "unconfirmed_caution_action"),
+          fakeGatewayFinalText("Unconfirmed caution cleared."),
+        ],
+        [
+          // A proven caution built without the fake's held marker, so the
+          // confirmation takes the next queued answer: a clear.
+          (body) => fakeGatewayToolCall("first_review", "permission_decision", {
+            decision: "caution",
+            category: "system_harm",
+            evidence: reviewedActionEvidence(body),
+          }),
+          fakeGatewayPermissionDecision("clear", "second_review"),
+        ],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Create the marker file."],
+        {
+          cwd: root.workspace,
+          env: { ...gatewayEnv(root, gateway), FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "permission" },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(existsSync(marker)).toBe(true);
+      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(gateway.classifierRequests[1]!.body).toBe(gateway.classifierRequests[0]!.body);
+      expect(readFileSync(tracePath, "utf8")).toContain("event=auto_review_confirm_result result=clear");
     },
     TIMEOUT,
   );

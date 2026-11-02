@@ -182,6 +182,9 @@ export function fakeShellRun(
   });
 }
 
+// Marks a fake review decision that fx will hold, without reading its stream.
+const HELD_REVIEW_HEADER = "x-fake-review-held";
+
 // A caution without `evidence` reaches fx as an unproven caution, which fx
 // clears. Use fakeGatewayHeldDecision for a review that must hold the action.
 export function fakeGatewayPermissionDecision(
@@ -191,12 +194,14 @@ export function fakeGatewayPermissionDecision(
   evidence?: string,
   category: "prompt_injection" | "system_harm" = "system_harm",
 ) {
-  return fakeGatewayToolCall(toolCallId, "permission_decision", {
+  const response = fakeGatewayToolCall(toolCallId, "permission_decision", {
     risk: decision === "clear" ? "low" : "high",
     decision,
     rationale,
     ...(evidence === undefined ? {} : { category, evidence }),
   });
+  if (decision === "caution" && evidence !== undefined) response.headers.set(HELD_REVIEW_HEADER, "1");
+  return response;
 }
 
 // fx holds an action only when the review names a harm and quotes evidence
@@ -208,6 +213,26 @@ export function fakeGatewayHeldDecision(
 ) {
   return (body: string) =>
     fakeGatewayPermissionDecision("caution", toolCallId, rationale, reviewedActionEvidence(body));
+}
+
+// fx confirms a held decision with a second, identical review request. A fake
+// reviewer answers that confirmation the way it answered the first request,
+// and only that one request, so format and transport retries still take the
+// next queued answer.
+export function confirmationReplay() {
+  let held: { body: string; response: Response } | undefined;
+  return {
+    replay(body: string): Response | undefined {
+      if (held?.body !== body) return undefined;
+      const { response } = held;
+      held = undefined;
+      return response;
+    },
+    record(body: string, response: Response): Response {
+      held = response.headers.has(HELD_REVIEW_HEADER) ? { body, response: response.clone() } : undefined;
+      return response;
+    },
+  };
 }
 
 export function reviewedActionEvidence(body: string): string {
@@ -418,8 +443,12 @@ function serveFakeGateway(
 ) {
   const requests: Array<{ body: string; headers: Headers }> = [];
   const classifierRequests: Array<{ body: string; headers: Headers }> = [];
+  // fx's second, identical review of a held action, kept apart so
+  // classifierRequests counts one entry per review.
+  const confirmationRequests: Array<{ body: string; headers: Headers }> = [];
   const evaluationRequests: Array<{ body: string; headers: Headers }> = [];
   const classifierResponses = [...(options.classifierResponses ?? [])];
+  const confirmations = confirmationReplay();
   const titleRequests: Array<{ body: string; headers: Headers }> = [];
   const titleResponses = [...(options.titleResponses ?? [])];
   const modelRequests: FakeGatewayModelRequest[] = [];
@@ -479,12 +508,19 @@ function serveFakeGateway(
       const body = await req.text();
       const headers = new Headers(req.headers);
       if (body.includes("\"permission_decision\"")) {
+        const confirmation = confirmations.replay(body);
+        if (confirmation) {
+          confirmationRequests.push({ body, headers });
+          return confirmation;
+        }
         classifierRequests.push({ body, headers });
         const next = classifierResponses.shift();
-        if (next) return typeof next === "function" ? await next(body) : next;
-        return options.classifierDecision === "caution"
-          ? fakeGatewayHeldDecision()(body)
-          : fakeGatewayPermissionDecision("clear");
+        const response = next
+          ? typeof next === "function" ? await next(body) : next
+          : options.classifierDecision === "caution"
+            ? fakeGatewayHeldDecision()(body)
+            : fakeGatewayPermissionDecision("clear");
+        return confirmations.record(body, response);
       }
       if (body.includes(TITLE_GENERATION_MARKER)) {
         titleRequests.push({ body, headers });
@@ -501,6 +537,7 @@ function serveFakeGateway(
     chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     requests,
     classifierRequests,
+    confirmationRequests,
     evaluationRequests,
     titleRequests,
     modelRequests,

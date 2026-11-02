@@ -498,9 +498,10 @@ describe("configured providers", () => {
       const result = await runFx(["ask", "--json", "--no-save", "Run the local fixture once."], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
       expect(readFileSync(marker, "utf8")).toBe(["clear", "malformed"].includes(outcome) ? "one\n" : "");
-      expect(reviews).toBe(["clear", "caution", "missing", "malformed"].includes(outcome) ? 2 : 1);
+      // A held caution adds one confirming review of the same request.
+      expect(reviews).toBe(outcome === "caution" ? 3 : ["clear", "missing", "malformed"].includes(outcome) ? 2 : 1);
       const requests = f.requests.filter(request => request.body.tools?.some((tool: any) => tool.function?.name === "permission_decision"));
-      if (reviews === 2) expect(requests[1].body).toEqual(requests[0].body);
+      for (const request of requests.slice(1)) expect(request.body).toEqual(requests[0].body);
       expect(f.requests.every(request => request.path === "/v1/chat/completions")).toBe(true);
     } finally { f.close(); }
   }, 20000);
