@@ -11,7 +11,7 @@ const label_capacity = types.RouteRecoveryStatus.label_max_bytes + @max(warning_
 /// The status row for a route recovery status. A recovery-module status shows
 /// its `text`, or its `short` form when the row is narrower than `text`,
 /// behind the sign its tone calls for. The module refreshes its own countdown
-/// and clock once a second, so the row never computes time itself.
+/// once a second, so the row never computes time itself.
 const RouteRecoveryStatus = struct {
     status: types.RouteRecoveryStatus,
     label: [label_capacity]u8 = undefined,

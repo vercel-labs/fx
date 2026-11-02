@@ -7381,9 +7381,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
       expect(result.code).toBe(0);
       // The notices carry the module's wording, never the provider's detail.
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 2s · attempt 2 · \d+s$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 3 · \d+s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 2s · attempt 2$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 3$/m);
       expect(result.stderr).not.toContain("turn route failure");
       expect(result.stdout).toContain("Recovered in ask turn.");
       expect(gateway.requestCount()).toBe(3);
@@ -7498,10 +7498,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(result.code).toBe(0);
         expect(result.signal).toBeNull();
         expect(result.stderr).toMatch(
-          /^\[notice\] Connection lost · next try in 1s · attempt 1 · 0s$/m,
+          /^\[notice\] Connection lost · next try in 1s · attempt 1$/m,
         );
         expect(result.stderr).toMatch(
-          /^\[notice\] Connection lost · retrying · attempt 2 · \d+s$/m,
+          /^\[notice\] Connection lost · retrying · attempt 2$/m,
         );
         expect(json.exit_code).toBe(0);
         expect(json.output).toBe(expectedOutput);
@@ -7751,10 +7751,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.stdout).toContain(expectedOutput);
       // Each 503 waits exactly its Retry-After, which does not advance the
       // backoff, so the reset that follows starts again at one second.
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 5 · \d+s$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 6 · \d+s$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Connection lost · retrying · attempt 7 · \d+s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 5$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 6$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · retrying · attempt 7$/m);
       expect(result.stderr).not.toMatch(/next try in (?:[2-9]|\d\d)s/);
       expect(connections).toBe(7);
       expect(requests).toBe(6);
@@ -7793,7 +7793,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const trace = readFileSync(tracePath, "utf8");
       expect(result.code).toBe(0);
       expect(result.stdout).toContain("Recovered without executing the unstarted tool.");
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
       expect(gateway.requestCount()).toBe(2);
       expect(gateway.requests[1]!.body).toContain("fx did not execute that call");
       expect(trace).toContain("event=route_failure");
@@ -9712,7 +9712,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.tool_calls).toEqual([]);
       expect(existsSync(sentinelPath)).toBe(false);
       expect(gateway.requestCount()).toBe(2);
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
       expect(json.recovery).toEqual({ state: "recovered", attempt: 2 });
       expect(trace).toContain("termination cause=valid_finish finish_reason=error");
       expect(trace).toContain("event=route_failure");
@@ -9849,8 +9849,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.timedOut).toBe(false);
       expect(json.output).not.toContain("⚠ API error");
       expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 3 · \d+s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 3$/m);
       expect(result.stderr).not.toContain("route failure");
       expect(gateway.requestCount()).toBe(3);
       expect(trace).toContain("event=route_failure");
@@ -9894,8 +9894,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(gateway.requestCount()).toBe(3);
       // Each timeout is one counted send; nothing probes the connection.
       expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
-      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1 · 0s$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 2s · attempt 2 · \d+s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 2s · attempt 2$/m);
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("retry=true");
       expect(trace).toContain("detail=gateway_stream_timeout: stream exceeded maximum duration");
@@ -9931,7 +9931,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.output).toBe("Recovered after the finish-only timeout.");
       expect(gateway.requestCount()).toBe(3);
       expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
-      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1$/m);
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("http_status=200");
       expect(trace).toContain("retry=true");
@@ -9968,8 +9968,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.output).toBe("Recovered beyond the old budget.");
       expect(gateway.requestCount()).toBe(13);
       expect(json.recovery).toEqual({ state: "recovered", attempt: 13 });
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 13 · \d+s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 13$/m);
       // No attempt count is ever shown as a fraction of a limit.
       expect(result.stderr).not.toMatch(/attempt \d+\//);
     } finally {
@@ -10549,7 +10549,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.output).toBe("Answered after the upstream cut.");
       expect(json.recovery).toEqual({ state: "recovered", attempt: 2 });
       expect(gateway.requestCount()).toBe(2);
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -10852,8 +10852,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(trace).toContain("event=prompt_finish");
         expect(trace).toContain("outcome_kind=assistant");
         // A stream that ends without its finish is a dropped connection.
-        expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1 · 0s$/m);
-        expect(result.stderr).toMatch(/^\[notice\] Connection lost · retrying · attempt 2 · \d+s$/m);
+        expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1$/m);
+        expect(result.stderr).toMatch(/^\[notice\] Connection lost · retrying · attempt 2$/m);
         expect(result.stderr).not.toContain("/10");
 
         const json = parseAskJson(result.stdout);
