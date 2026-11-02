@@ -1879,7 +1879,8 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// The update's notice, in the fresh session an update relaunch
-        /// opens when the session it handed over had no turn to resume (D81).
+        /// opens when the session it handed over had no turn to resume (D81),
+        /// drawn on a cleared terminal like a resumed one.
         pub fn writeUpgradeNotice(
             app: *App,
             version: []const u8,
@@ -1887,6 +1888,7 @@ pub fn Runtime(comptime App: type) type {
             previous_revision: []const u8,
             revision: []const u8,
         ) !void {
+            try requestUpgradeRelaunchRedraw(app);
             var body: std.Io.Writer.Allocating = .init(app.alloc);
             defer body.deinit();
             try writeUpgradeNoticeBody(&body.writer, .{
@@ -1963,7 +1965,16 @@ pub fn Runtime(comptime App: type) type {
             const v2 = try session_adapter.Session.resumeSession(app.alloc, v2_store, v2_target, app.workspace_root, .app);
             try installResumedV2Session(app, v2, notice);
             errdefer closeWritableSession(app);
+            if (notice == .upgrade) try requestUpgradeRelaunchRedraw(app);
             try app.commitStartupResumeReplayAnchor();
+        }
+
+        /// An update relaunch takes over the previous build's screen. Its
+        /// first frame clears the terminal and its scrollback and draws the
+        /// conversation from the top, as a resize does, instead of drawing a
+        /// second copy below the old one.
+        fn requestUpgradeRelaunchRedraw(app: *App) !void {
+            try app.shell.requestTerminalReset(&app.metrics);
         }
 
         fn resumeRequestedJsHostSession(app: *App) !void {
@@ -5658,6 +5669,7 @@ const TestApp = struct {
     startup_resume_anchor_saw_writable: bool = false,
     startup_resume_anchor_history_len: usize = 0,
     startup_resume_anchor_notice_count: usize = 0,
+    startup_resume_anchor_saw_reset: bool = false,
     action_description_allocates_scratch: bool = false,
     live_resume_prepare_count: usize = 0,
     live_resume_finish_count: usize = 0,
@@ -5795,6 +5807,7 @@ const TestApp = struct {
         self.startup_resume_anchor_saw_writable = self.session_persistence.v2 != null;
         self.startup_resume_anchor_history_len = self.session.historyLen();
         self.startup_resume_anchor_notice_count = self.notices.items.len;
+        self.startup_resume_anchor_saw_reset = self.shell.terminal_reset_pending;
         if (self.fail_startup_resume_anchor) return error.TestStartupResumeAnchorFailure;
     }
 
@@ -7704,6 +7717,9 @@ test "resume restores complete command output stored behind a result handle" {
     app.requested_resume = .{ .id = try commitSessionFixture(&app, history[0]) };
     try Runtime(TestApp).resumeRequestedSession(&app);
 
+    // A plain startup resume draws below the shell's earlier output.
+    try std.testing.expectEqual(@as(usize, 1), app.startup_resume_anchor_count);
+    try std.testing.expect(!app.startup_resume_anchor_saw_reset);
     try std.testing.expect(std.mem.find(u8, app.command_stdout.items, "SIDECAR_STDOUT_MARKER") != null);
     try std.testing.expect(std.mem.find(u8, app.command_stdout.items, "PREVIEW_STDOUT_MARKER") == null);
     try std.testing.expect(std.mem.find(u8, app.command_stderr.items, "SIDECAR_STDERR_MARKER") != null);
@@ -8383,6 +8399,8 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expect(app.requested_resume == null);
     try std.testing.expectEqual(@as(usize, 1), app.startup_resume_anchor_count);
     try std.testing.expect(app.startup_resume_anchor_saw_writable);
+    // The relaunch's first frame clears the terminal before it draws.
+    try std.testing.expect(app.startup_resume_anchor_saw_reset);
     try std.testing.expectEqual(@as(usize, 3), app.startup_resume_anchor_history_len);
     try std.testing.expectEqual(@as(usize, 1), app.startup_resume_anchor_notice_count);
     try std.testing.expectEqualStrings(session_id, app.session_persistence.v2.?.id());
