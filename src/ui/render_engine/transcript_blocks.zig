@@ -1023,7 +1023,7 @@ pub fn renderTableForTranscript(
 }
 
 /// Small enough that a table entry stays within the largest transcript entry.
-pub const max_frozen_table_columns = 24;
+pub const max_frozen_table_columns = 20;
 
 /// Content widths of a table's columns, fixed while it streams. Empty means
 /// the table lays itself out at every render.

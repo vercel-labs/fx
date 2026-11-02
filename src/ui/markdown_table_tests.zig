@@ -288,13 +288,16 @@ test "a streaming table taller than the viewport keeps the widths its scrolled r
 }
 
 test "a table entry fits the transcript entry size retention budgets assume" {
+    // A table must not be the variant that sets the size of every entry.
     const tb = @import("render_engine/transcript_blocks.zig");
     const info = @typeInfo(tb.TranscriptEntry).@"union";
-    var user_turn_size: usize = 0;
+    var largest_other: usize = 0;
     var table_size: usize = 0;
     inline for (info.field_names, info.field_types) |name, field_type| {
-        if (comptime std.mem.eql(u8, name, "user_turn")) user_turn_size = @sizeOf(field_type);
-        if (comptime std.mem.eql(u8, name, "assistant_table")) table_size = @sizeOf(field_type);
+        if (comptime std.mem.eql(u8, name, "assistant_table"))
+            table_size = @sizeOf(field_type)
+        else
+            largest_other = @max(largest_other, @sizeOf(field_type));
     }
-    try std.testing.expect(table_size <= user_turn_size);
+    try std.testing.expect(table_size <= largest_other);
 }
