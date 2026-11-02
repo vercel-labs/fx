@@ -21,7 +21,6 @@ const display_width = @import("../../core/shared/display_width.zig");
 const checklist = @import("../../core/checklist/checklist.zig");
 const checklist_panel = @import("checklist_panel.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
-const thinking_text = @import("../../core/shared/thinking_text.zig");
 const types = @import("../../core/shared/types.zig");
 const workspace_access = @import("../../core/workspace/workspace_access.zig");
 const file_index = @import("../../core/workspace/file_index.zig");
@@ -708,11 +707,10 @@ pub fn activityProjectionRows(projection: ActivityProjection, cols: u16) u16 {
     return switch (projection) {
         .turn_thinking => |thinking| if (thinking.tone == .thinking and thinking.detail_styled)
             1 +| styledRowCount(thinking.detail)
-        else if (thinking.tone == .thinking) blk: {
-            var folded_buf: [thinking_text.preview_capacity]u8 = undefined;
-            const prose = thinking_text.proseOnlyInto(&folded_buf, thinking.detail);
-            break :blk 1 +| activity_runtime.reasoningPreviewRowCount(prose, cols);
-        } else wrappedStatusRowCount(thinking.label, cols, max_static_status_activity_rows),
+        else if (thinking.tone == .thinking)
+            1 +| activity_runtime.reasoningPreviewRowCount(thinking.detail, cols)
+        else
+            wrappedStatusRowCount(thinking.label, cols, max_static_status_activity_rows),
         .none, .tool_slot => 1,
     };
 }
@@ -1377,6 +1375,30 @@ test "thinking activity reserves rows for the reasoning preview" {
         "one two three four five six seven eight",
         activityProjectionDetail(preview).?,
     );
+}
+
+test "thinking activity measures folded reasoning after its opener leaves the tail" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    var shell = TranscriptRuntime{};
+    defer shell.deinit(std.testing.allocator);
+    shell.layout.cols = 80;
+    var ctx: RenderContext = .{
+        .stream = .{ .active = true },
+        .has_api_key = true,
+        .model = "gpt-5.1",
+        .shimmer_pos = 0,
+        .input = &input,
+    };
+    _ = ctx.stream.reasoning.apply(.{ .chunk = "```\n" });
+    for (0..240) |_| _ = ctx.stream.reasoning.apply(.{ .chunk = "private_code_payload_kept_out_of_the_preview\n" });
+    _ = ctx.stream.reasoning.apply(.{ .chunk = "```\nAfter the code." });
+    ctx.reasoning_preview = ctx.stream.reasoning.text();
+
+    var label_buf: [256]u8 = undefined;
+    const projection = frameOwnedActivityProjection(&label_buf, &shell, ctx, null);
+    try std.testing.expectEqual(@as(u16, 3), activityProjectionRows(projection, 80));
+    try std.testing.expectEqualStrings("... (240 lines of code)\nAfter the code.", projection.turn_thinking.detail);
 }
 
 test "frame-owned activity keeps the reasoning preview until a text block starts" {

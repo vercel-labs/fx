@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("testing_allocator.zig");
 const text_utils = @import("text_utils.zig");
+const thinking_text = @import("thinking_text.zig");
 const tool_input_preview = @import("tool_input_preview.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const recovery = @import("../recovery/recovery.zig");
@@ -319,8 +320,9 @@ pub const StreamState = struct {
     }
 };
 
-/// The newest bytes of the current reasoning trace, made terminal safe, for
-/// the footer's preview. Both backends apply the same three events to it.
+/// The newest bytes of the current reasoning trace, made terminal safe and
+/// with fenced code folded, for the footer's preview. Both backends apply the
+/// same three events to it.
 pub const ReasoningTail = struct {
     pub const capacity: usize = 4096;
 
@@ -329,6 +331,13 @@ pub const ReasoningTail = struct {
     /// The leading bytes already made terminal safe. Any rest is a sequence
     /// the next chunk completes.
     safe: usize = 0,
+    /// The fence state of the bytes dropped off the front, so a code block
+    /// whose opener is gone still folds.
+    dropped: thinking_text.ProseState = .{},
+    /// `buf[0..safe]` with its fenced code folded: what the footer shows.
+    /// Folded once per change, so measuring and painting a frame agree.
+    prose_buf: [thinking_text.preview_capacity]u8 = undefined,
+    prose_len: usize = 0,
     /// A visible assistant text block began this step. Tool-call argument
     /// streaming does not count: only visible text replaces the preview.
     text_started: bool = false,
@@ -342,7 +351,7 @@ pub const ReasoningTail = struct {
 
     /// What the footer shows; empty once this step's text started.
     pub fn text(self: *const ReasoningTail) []const u8 {
-        return if (self.text_started) "" else self.buf[0..self.safe];
+        return if (self.text_started) "" else self.prose_buf[0..self.prose_len];
     }
 
     /// Applies one event. True when the preview changed.
@@ -356,6 +365,7 @@ pub const ReasoningTail = struct {
                 self.clear();
             },
         }
+        self.prose_len = thinking_text.proseOnlyInto(&self.prose_buf, self.buf[0..self.safe], self.dropped).len;
         return before != 0 or self.text().len != 0;
     }
 
@@ -367,19 +377,21 @@ pub const ReasoningTail = struct {
     fn clear(self: *ReasoningTail) void {
         self.len = 0;
         self.safe = 0;
+        self.dropped = .{};
     }
 
     fn append(self: *ReasoningTail, chunk: []const u8) void {
         var input = chunk;
-        if (input.len >= capacity) {
-            input = input[input.len - capacity ..];
-            while (input.len > 0 and (input[0] & 0xc0) == 0x80) input = input[1..];
-            self.clear();
+        while (input.len > 0) {
+            // Process oversized chunks too: their discarded opener still
+            // determines how the retained code and closing fence fold.
+            const take = @min(input.len, capacity);
+            if (self.len + take > capacity) self.dropFront(self.len + take - capacity);
+            @memcpy(self.buf[self.len..][0..take], input[0..take]);
+            self.len += take;
+            self.safe += text_utils.blankTerminalUnsafe(self.buf[self.safe..self.len]);
+            input = input[take..];
         }
-        if (self.len + input.len > capacity) self.dropFront(self.len + input.len - capacity);
-        @memcpy(self.buf[self.len..][0..input.len], input);
-        self.len += input.len;
-        self.safe += text_utils.blankTerminalUnsafe(self.buf[self.safe..self.len]);
     }
 
     /// Drops at least `excess` leading bytes, at a line boundary when the
@@ -393,6 +405,7 @@ pub const ReasoningTail = struct {
             cut = excess;
             while (cut < self.len and (self.buf[cut] & 0xc0) == 0x80) cut += 1;
         }
+        self.dropped.advance(self.buf[0..cut]);
         @memmove(self.buf[0 .. self.len - cut], self.buf[cut..self.len]);
         self.len -= cut;
         self.safe -= @min(self.safe, cut);
@@ -425,6 +438,44 @@ test "the reasoning tail keeps the newest trace, safe for the terminal" {
     try std.testing.expectEqualStrings("later", tail.text());
     try std.testing.expect(tail.apply(.begin));
     try std.testing.expectEqualStrings("", tail.text());
+}
+
+test "reasoning preview folds code and later prose after tail rollover" {
+    const alloc = std.testing.allocator;
+    const code_line = "private_code_payload_kept_out_of_the_preview\n";
+    for ([_][]const u8{ "```", "~~~~" }) |fence| {
+        var trace: std.Io.Writer.Allocating = .init(alloc);
+        defer trace.deinit();
+        try trace.writer.print("{s}\n", .{fence});
+        for (0..240) |_| try trace.writer.writeAll(code_line);
+        try trace.writer.print("{s}\nAfter the code.", .{fence});
+        const text = trace.written();
+        try std.testing.expect(text.len > ReasoningTail.capacity);
+
+        for ([_]usize{ 1, 47, ReasoningTail.capacity * 2 }) |chunk_size| {
+            var tail: ReasoningTail = .{};
+            var offset: usize = 0;
+            while (offset < text.len) {
+                const end = @min(offset + chunk_size, text.len);
+                _ = tail.apply(.{ .chunk = text[offset..end] });
+                offset = end;
+            }
+            try std.testing.expectEqualStrings("... (240 lines of code)\nAfter the code.", tail.text());
+
+            _ = tail.apply(.begin);
+            _ = tail.apply(.{ .chunk = "A fresh plan." });
+            try std.testing.expectEqualStrings("A fresh plan.", tail.text());
+        }
+    }
+}
+
+test "reasoning tail retains a long fence across cuts inside a code line" {
+    var tail: ReasoningTail = .{};
+    _ = tail.apply(.{ .chunk = "~~~~~\n" });
+    const code: [ReasoningTail.capacity * 3]u8 = @splat('x');
+    _ = tail.apply(.{ .chunk = &code });
+    _ = tail.apply(.{ .chunk = "\n~~~\nstill code\n~~~~~\nAfter the code." });
+    try std.testing.expectEqualStrings("... (3 lines of code)\nAfter the code.", tail.text());
 }
 
 pub const RouteRecoveryUnsafeReason = enum {
@@ -1760,8 +1811,6 @@ pub const UserTurn = struct {
     /// turn in the window already carried. Projected before `text`, so the
     /// bytes a later request resends match the ones this turn sent.
     turn_context: ?[]u8 = null,
-    /// Explicitly invoked skill instructions sent with this turn (D130).
-    skill_context: ?[]u8 = null,
 };
 
 /// Borrows both strings; use dupeProviderReplay/freeProviderReplay for ownership.
@@ -1820,7 +1869,7 @@ pub const ChatMessage = struct {
     /// is saved as a short note (D95). Borrowed.
     context_note_saved_text: ?[]const u8 = null,
     // Source provenance for compaction, never permission authority.
-    context_origin: enum { ordinary, user_turn, handoff, turn_context, skill_context } = .ordinary,
+    context_origin: enum { ordinary, user_turn, handoff, turn_context } = .ordinary,
     standalone_response: bool = false,
     /// Ends a stable run of system instructions that a provider may cache on
     /// its own. Set only by `appendStablePromptContext` in
@@ -3683,7 +3732,6 @@ pub fn freeUserTurn(alloc: std.mem.Allocator, user: UserTurn) void {
     freeImageAttachmentSlice(alloc, user.images);
     if (user.work_id) |work_id| alloc.free(work_id);
     if (user.turn_context) |text| alloc.free(text);
-    if (user.skill_context) |text| alloc.free(text);
 }
 
 pub fn dupeUserTurn(alloc: std.mem.Allocator, user: UserTurn) !UserTurn {
@@ -3696,8 +3744,6 @@ pub fn dupeUserTurn(alloc: std.mem.Allocator, user: UserTurn) !UserTurn {
     const work_id = if (user.work_id) |value| try alloc.dupe(u8, value) else null;
     errdefer if (work_id) |value| alloc.free(value);
     const turn_context = if (user.turn_context) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (turn_context) |value| alloc.free(value);
-    const skill_context = if (user.skill_context) |value| try alloc.dupe(u8, value) else null;
 
     return .{
         .text = text,
@@ -3705,7 +3751,6 @@ pub fn dupeUserTurn(alloc: std.mem.Allocator, user: UserTurn) !UserTurn {
         .work_id = work_id,
         .origin = user.origin,
         .turn_context = turn_context,
-        .skill_context = skill_context,
     };
 }
 
