@@ -1033,7 +1033,10 @@ fn composeTranscriptViewerFooterFrame(
         .full => if (shell.transcript_archive_failed)
             "couldn't load older history · pgup to retry · esc close"
         else if (shell.transcript_archive_damaged)
-            "part of older history couldn't be read · pgup/pgdn scroll · esc close"
+            // fx doctor names the session and the command that copies its
+            // good turns; the scroll hint goes, as for a failed read, so it
+            // fits 80 columns.
+            "part of older history couldn't be read · fx doctor · esc close"
         else
             "full detail · ctrl+o close · pgup/pgdn scroll · esc close",
         .inline_mode => unreachable,
@@ -1402,7 +1405,7 @@ test "transcript viewer footer says when older history could not load or is dama
         .{ .failed = true, .damaged = false, .text = "┃ couldn't load older history · pgup to retry · esc close" },
         // A failed read says to retry even when an earlier read hit damage.
         .{ .failed = true, .damaged = true, .text = "┃ couldn't load older history · pgup to retry · esc close" },
-        .{ .failed = false, .damaged = true, .text = "┃ part of older history couldn't be read · pgup/pgdn scroll · esc close" },
+        .{ .failed = false, .damaged = true, .text = "┃ part of older history couldn't be read · fx doctor · esc close" },
         .{ .failed = false, .damaged = false, .text = "┃ full detail · ctrl+o close · pgup/pgdn scroll · esc close" },
     }) |case| {
         shell.transcript_archive_failed = case.failed;
