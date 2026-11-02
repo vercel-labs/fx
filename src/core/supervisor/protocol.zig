@@ -22,7 +22,7 @@ const Allocator = std.mem.Allocator;
 
 /// Bumped whenever a request or response changes shape. A client refuses a
 /// supervisor that answers `ping` with another version.
-pub const version: u32 = 14;
+pub const version: u32 = 15;
 
 pub const Heartbeat = struct {
     prompt: []const u8 = "",
@@ -33,6 +33,17 @@ pub const Heartbeat = struct {
 };
 
 pub const HeartbeatAction = enum { status, set, pause, @"resume", clear };
+
+/// A message queued for after the agent yields (`/queue`, `->`). The
+/// supervisor delivers the first due entry each time the session is idle.
+pub const QueueEntry = struct {
+    id: u64,
+    text: []const u8,
+    /// Wall-clock time it may be delivered from; 0 means at the next yield.
+    due_at_ms: i64 = 0,
+};
+
+pub const QueueAction = enum { status, add, cancel };
 
 /// The answers a person can give a forwarded permission request.
 pub const PermissionOption = enum { allow_once, allow_always, reject_once };
@@ -95,6 +106,17 @@ pub const HeartbeatRequest = struct {
     action: HeartbeatAction = .status,
     interval_ms: ?u64 = null,
     prompt: ?[]const u8 = null,
+};
+
+pub const QueueRequest = struct {
+    session_id: []const u8,
+    action: QueueAction = .status,
+    /// `add`: the messages, in delivery order.
+    texts: []const []const u8 = &.{},
+    /// `add`: how long they wait before they may be delivered.
+    delay_ms: i64 = 0,
+    /// `cancel`: the 1-based position to drop; null drops every entry.
+    position: ?usize = null,
 };
 
 pub const History = struct {
@@ -163,6 +185,7 @@ pub const Request = union(enum) {
     stop: SessionRef,
     delete: SessionRef,
     heartbeat: HeartbeatRequest,
+    queue: QueueRequest,
     children: ChildrenRequest,
     history: History,
     history_page: HistoryPageRequest,
@@ -313,6 +336,8 @@ pub const SessionSummary = struct {
     running_jobs: u32 = 0,
     /// When the running turn started (wall clock), 0 when none runs.
     turn_started_at_ms: i64 = 0,
+    /// Messages waiting for the agent to yield, in delivery order.
+    queue: []const QueueEntry = &.{},
 };
 
 pub const SessionList = struct {
@@ -347,6 +372,14 @@ pub fn Snapshot(comptime Frame: type) type {
 pub const HeartbeatState = struct {
     ok: bool = true,
     heartbeat: Heartbeat = .{},
+};
+
+pub const QueueState = struct {
+    ok: bool = true,
+    action: QueueAction = .status,
+    queue: []const QueueEntry = &.{},
+    /// Entries `add` queued or `cancel` dropped.
+    changed: usize = 0,
 };
 
 pub const KernelInfo = struct { state: []const u8, diagnostics: []const u8 };
@@ -437,6 +470,8 @@ test "requests round trip with their command beside the fields" {
         .ping,
         .{ .create = .{ .cwd = "/tmp/work", .@"resume" = "abc" } },
         .{ .heartbeat = .{ .session_id = "s", .action = .set, .interval_ms = 5000, .prompt = "check" } },
+        .{ .queue = .{ .session_id = "s", .action = .add, .texts = &.{ "one", "two" }, .delay_ms = 60_000 } },
+        .{ .queue = .{ .session_id = "s", .action = .cancel, .position = 2 } },
         .{ .permission = .{ .session_id = "s", .request_id = 7, .option = .allow_always } },
         .{ .history = .{ .session_id = "s", .child_id = "c", .after_live_sequence = 3 } },
         // Node-targeted requests name the node beside the root session.

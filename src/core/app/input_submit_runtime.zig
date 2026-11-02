@@ -13,6 +13,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const input_limit_feedback = @import("input_limit_feedback.zig");
+const queue_input = @import("../input/queue_input.zig");
 
 pub const PendingPhase = enum {
     awaiting_frame,
@@ -743,6 +744,12 @@ pub fn SubmitRuntime(comptime App: type) type {
                 try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
                 return;
             }
+            if (comptime @hasDecl(App, "queueFromComposer")) {
+                if (queue_input.parseQueueShorthand(left_trimmed) != null) {
+                    try submitQueuedMessage(app, left_trimmed, max_prompt_history);
+                    return;
+                }
+            }
             if (pendingImagesPrefixEnd(
                 app.input_runtime.edit_state.input.items,
                 expanded.text,
@@ -1078,6 +1085,35 @@ pub fn SubmitRuntime(comptime App: type) type {
                 command_copy,
             );
             try App.handleCommand(app, command_copy);
+        }
+
+        /// A draft that starts with `->` or `=>` queues its message for
+        /// after the agent yields instead of steering the running turn.
+        fn submitQueuedMessage(app: *App, text: []const u8, max_prompt_history: usize) !void {
+            const draft = try app.alloc.dupe(u8, std.mem.trim(u8, text, " \t\r\n"));
+            defer app.alloc.free(draft);
+            clearComposerForQueue(app);
+            recordAcceptedSlashCommandHistory(app, max_prompt_history, draft);
+            try App.queueFromComposer(app, queue_input.parseQueueShorthand(draft).?);
+        }
+
+        /// Ctrl+Enter: queues the whole draft, as `->` before it would.
+        pub fn submitQueuedDraft(app: *App, max_prompt_history: usize) !void {
+            if (comptime !@hasDecl(App, "queueFromComposer")) return;
+            const expanded = try paste_blocks.expand(app.alloc, app.input_runtime.edit_state.input.items, app.input_runtime.entities.pasted_blocks.items);
+            defer if (expanded.owned) app.alloc.free(expanded.text);
+            const draft = try app.alloc.dupe(u8, std.mem.trim(u8, expanded.text, " \t\r\n"));
+            defer app.alloc.free(draft);
+            if (draft.len == 0) return;
+            clearComposerForQueue(app);
+            recordAcceptedSlashCommandHistory(app, max_prompt_history, draft);
+            try App.queueFromComposer(app, queue_input.parseQueueShorthand(draft) orelse draft);
+        }
+
+        fn clearComposerForQueue(app: *App) void {
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            app.shell.render_requests.request(.footer);
         }
 
         fn projectRetainedImageTokens(

@@ -2188,7 +2188,7 @@ test "input escape parser maps kitty keypad keys to their main-row characters" {
 test "input escape parser keeps keypad Enter, navigation, and Delete contracts" {
     try expectEscapeAction("[57414u", .{ .remapped_byte = '\r' });
     try expectEscapeAction("[57414;1u", .{ .remapped_byte = '\r' });
-    try expectEscapeAction("[57414;5u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[57414;5u", .submit_queued);
     try expectEscapeAction("[57414;2u", .insert_newline);
     try expectEscapeAction("[57414;3u", .insert_newline);
     try expectEscapeAction("[57419;1u", .cursor_up);
@@ -4852,7 +4852,7 @@ test "input escape parser handles cmd+arrow as home/end" {
     try std.testing.expectEqual(@as(u8, 0), stage);
 }
 
-test "input escape parser treats ctrl+enter as ordinary submit" {
+test "input escape parser reads ctrl+enter as a queued submit" {
     // ESC[13;5u is Kitty's Ctrl+Enter encoding.
     var stage: u8 = 1;
     var param: u16 = 0;
@@ -4862,7 +4862,7 @@ test "input escape parser treats ctrl+enter as ordinary submit" {
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '3'));
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, ';'));
     try std.testing.expectEqual(@as(?InputEscapeAction, null), consumeInputEscapeByte(&stage, &param, &param2, '5'));
-    try std.testing.expectEqual(@as(?InputEscapeAction, .{ .remapped_byte = '\r' }), consumeInputEscapeByte(&stage, &param, &param2, 'u'));
+    try std.testing.expectEqual(@as(?InputEscapeAction, .submit_queued), consumeInputEscapeByte(&stage, &param, &param2, 'u'));
     try std.testing.expectEqual(@as(u8, 0), stage);
 }
 

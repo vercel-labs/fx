@@ -96,6 +96,8 @@ pub const Action = union(enum) {
     cycle_role_model_forward,
     cycle_role_model_backward,
     insert_newline,
+    /// Ctrl+Enter: queue the draft for after the agent yields.
+    submit_queued,
     paste_start,
     paste_end,
     composer_shortcut: ShortcutAction,

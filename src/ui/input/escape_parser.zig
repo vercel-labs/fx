@@ -198,8 +198,8 @@ fn kittyUnicodeKeyAction(keycode: u16, modifiers: u16, meta_prefixed: bool) Inpu
         } else if (keycode == kp_page_up or keycode == kp_page_down) {
             return pageKeyAction(keycode, mods);
         } else if (keycode == kp_enter) {
-            // Reuse the main-row Enter branch: Ctrl submits, Shift and Alt
-            // insert a newline, and a bare press submits.
+            // Reuse the main-row Enter branch: Ctrl queues the draft, Shift
+            // and Alt insert a newline, and a bare press submits.
             return kittyUnicodeKeyAction(13, modifiers, meta_prefixed);
         } else if (keycode == kp_delete) {
             return forwardDeleteKeyAction(mods);
@@ -215,7 +215,7 @@ fn kittyUnicodeKeyAction(keycode: u16, modifiers: u16, meta_prefixed: bool) Inpu
         }
         return if (keycode == kitty_up_key) .cursor_up else .cursor_down;
     }
-    if (keycode == 13 and mods == ctrl_modifier and !meta_prefixed) return .{ .remapped_byte = '\r' };
+    if (keycode == 13 and mods == ctrl_modifier and !meta_prefixed) return .submit_queued;
     if (keycode == 13 and (mods & (shift_modifier | alt_modifier)) != 0) {
         return .insert_newline;
     }

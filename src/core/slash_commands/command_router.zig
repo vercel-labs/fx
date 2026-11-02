@@ -48,6 +48,7 @@ pub const ParsedCommand = union(enum) {
     context,
     subagents,
     heartbeat: []const u8,
+    queue: []const u8,
     kernel: []const u8,
     unknown,
 };
@@ -98,6 +99,7 @@ pub const CommandHandlers = struct {
     show_context: *const fn (ctx: *anyopaque) anyerror!void,
     browse_subagents: *const fn (ctx: *anyopaque) anyerror!void,
     handle_heartbeat: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    handle_queue: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     handle_kernel: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     unknown: *const fn (ctx: *anyopaque, cmd: []const u8) anyerror!void,
 };
@@ -151,6 +153,7 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .context => .context,
         .subagents => .subagents,
         .heartbeat => .{ .heartbeat = payload },
+        .queue => .{ .queue = payload },
         .kernel => .{ .kernel = payload },
     };
 }
@@ -224,6 +227,7 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .context => try handlers.show_context(handlers.ctx),
         .subagents => try handlers.browse_subagents(handlers.ctx),
         .heartbeat => |rest| try handlers.handle_heartbeat(handlers.ctx, rest),
+        .queue => |rest| try handlers.handle_queue(handlers.ctx, rest),
         .kernel => |rest| try handlers.handle_kernel(handlers.ctx, rest),
         .unknown => try handlers.unknown(handlers.ctx, cmd),
     }
@@ -361,6 +365,10 @@ test "parse extracts fast and detached session command payloads" {
     switch (parse(testSlashRegistry(), "/fast on")) {
         .fast => |rest| try std.testing.expectEqualStrings("on", rest),
         else => return error.TestExpectedEqual,
+    }
+    switch (parse(testSlashRegistry(), "/queue 3h run the benchmarks")) {
+        .queue => |rest| try std.testing.expectEqualStrings("3h run the benchmarks", rest),
+        else => return error.TestUnexpectedResult,
     }
     switch (parse(testSlashRegistry(), "/heartbeat start 60 check the build")) {
         .heartbeat => |rest| try std.testing.expectEqualStrings("start 60 check the build", rest),
@@ -611,6 +619,7 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .show_context = unexpectedNoPayload,
         .browse_subagents = unexpectedNoPayload,
         .handle_heartbeat = unexpectedPayload,
+        .handle_queue = unexpectedPayload,
         .handle_kernel = unexpectedPayload,
         .unknown = unexpectedPayload,
     };

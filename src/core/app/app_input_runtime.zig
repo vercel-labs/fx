@@ -186,6 +186,8 @@ pub fn Runtime(comptime App: type) type {
         const ResolvedEscapeRoute = union(enum) {
             done,
             remapped_byte: u8,
+            /// Queue the draft for after the agent yields.
+            submit_queued,
         };
 
         const routeSlashCompletionMove = completion_rt.routeSlashCompletionMove;
@@ -651,6 +653,7 @@ pub fn Runtime(comptime App: type) type {
                                 std.debug.assert(replay_byte == null);
                                 replay_byte = byte;
                             },
+                            .submit_queued => try submit_rt.submitQueuedDraft(app, max_prompt_history),
                         }
                     },
                 }
@@ -930,6 +933,19 @@ pub fn Runtime(comptime App: type) type {
             was_cancel_pending: bool,
             max_input_len: usize,
         ) !ResolvedEscapeRoute {
+            // Ctrl+Enter queues a plain composer's draft; over a prompt, a
+            // menu or another screen it is Enter.
+            if (resolved == .submit_queued) {
+                const plain_composer = comptime @hasDecl(App, "queueFromComposer");
+                if (plain_composer and !app.question_prompt.isActive() and !app.approval_prompt.isActive() and
+                    !app.shell.fullTranscriptActive() and activeCompactCommandMenu(app) == null and
+                    !settingsMenuActive(app) and !helpMenuActive(app) and !skillsMenuActive(app) and !modelMenuActive(app))
+                {
+                    disarmCtrlCExit(app, "semantic_action");
+                    return .submit_queued;
+                }
+                return .{ .remapped_byte = '\r' };
+            }
             switch (resolved) {
                 .remapped_byte, .paste_start, .paste_end, .ignore => {},
                 else => disarmCtrlCExit(app, "semantic_action"),
@@ -1065,6 +1081,7 @@ pub fn Runtime(comptime App: type) type {
                 .insert_newline,
                 .composer_shortcut,
                 .toggle_full_transcript,
+                .submit_queued,
                 => unreachable,
                 .page_up,
                 .page_down,

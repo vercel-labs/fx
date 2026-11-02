@@ -1,6 +1,6 @@
 //! Turns the supervisor starts on its own, without a frontend asking: a
-//! session's heartbeat and the notices for background jobs that settled with
-//! nobody waiting (D111). Each runs on the session's executor from `tick`.
+//! session's heartbeat, the notices for background jobs that settled with
+//! nobody waiting (D111), and messages queued for after the agent yields. Each runs on the session's executor from `tick`.
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const Session = @import("session.zig").Session;
@@ -18,7 +18,25 @@ pub fn tick(self: *Session, now: i64) void {
     if (!self.record.stopped) {
         deliverJobNotice(self);
         deliverMail(self);
+        deliverQueued(self, now);
     }
+}
+
+/// Starts a turn with the first due queued message once the agent has
+/// yielded: nothing runs, and the last queued message's turn has ended.
+/// It never steers a running turn; that is what queuing means.
+fn deliverQueued(self: *Session, now: i64) void {
+    const host = self.host orelse return;
+    const index = self.record.dueQueued(now) orelse return;
+    if (host.busy() or self.queuedInFlight()) return;
+    _ = self.prompt(self.record.queue.items[index].text, .queued) catch |err| {
+        if (err != error.SessionBusy) std.debug.print("proto-fx: queued message admission failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    const alloc = self.daemon.alloc;
+    var next_record = self.record.clone(alloc) catch return;
+    next_record.removeQueued(alloc, index);
+    self.daemon.commit(self, &next_record, false) catch |err| std.debug.print("proto-fx: queue save failed: {s}\n", .{@errorName(err)});
 }
 
 /// Delivers messages from other agents (D188): every worker's waiting

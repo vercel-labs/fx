@@ -279,6 +279,7 @@ pub fn Handlers(comptime App: type) type {
                 .show_context = commandNeedsDetachedSession,
                 .browse_subagents = commandNeedsDetachedSession,
                 .handle_heartbeat = commandNeedsDetachedSessionWithArgs,
+                .handle_queue = commandNeedsDetachedSessionWithArgs,
                 .handle_kernel = commandNeedsDetachedSessionWithArgs,
                 .unknown = commandUnknown,
             };

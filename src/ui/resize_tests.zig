@@ -6425,7 +6425,7 @@ test "slash main page renders header categories selection range and contextual c
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 44 · type to filter");
+    try expectGridContains(&h, "Commands 45 · type to filter");
     try expectGridContains(&h, "1–6");
     try expectGridContains(&h, "/help");
     try expectGridContains(&h, "General");
@@ -6446,7 +6446,7 @@ test "slash main page renders header categories selection range and contextual c
 
     try expectGridContains(&h, "ask");
     try expectGridContains(&h, "test-model");
-    try expectGridNotContains(&h, "Commands 44");
+    try expectGridNotContains(&h, "Commands 45");
     try expectGridNotContains(&h, "↑↓ navigate");
 }
 

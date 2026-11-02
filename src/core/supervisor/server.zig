@@ -48,6 +48,8 @@ const SavedRow = struct {
     cwd: []const u8,
     stopped: bool = false,
     heartbeat: protocol.Heartbeat = .{},
+    queue: []const protocol.QueueEntry = &.{},
+    next_queue_id: u64 = 1,
     updated_at_ms: i64 = 0,
     owned: bool = true,
     /// Why its restore failed. A start skips such a session rather than
@@ -61,6 +63,8 @@ const SavedRow = struct {
             .cwd = cwd,
             .stopped = record.stopped,
             .heartbeat = record.heartbeat,
+            .queue = record.queue.items,
+            .next_queue_id = record.next_queue_id,
             .updated_at_ms = record.updated_at_ms,
             .owned = record.reopens(),
             .failure = record.failure,
@@ -330,6 +334,9 @@ pub const Daemon = struct {
         copy.name = try arena.dupe(u8, row.name);
         copy.cwd = try arena.dupe(u8, row.cwd);
         copy.heartbeat.prompt = try arena.dupe(u8, row.heartbeat.prompt);
+        const queue = try arena.dupe(protocol.QueueEntry, row.queue);
+        for (queue) |*entry| entry.text = try arena.dupe(u8, entry.text);
+        copy.queue = queue;
         if (row.failure) |failure| copy.failure = try arena.dupe(u8, failure);
         return copy;
     }
@@ -547,6 +554,12 @@ pub const Daemon = struct {
             session.record.stopped = row.stopped;
             session.record.heartbeat = row.heartbeat;
             session.record.heartbeat.prompt = if (row.heartbeat.prompt.len > 0) try self.alloc.dupe(u8, row.heartbeat.prompt) else "";
+            session.record.next_queue_id = row.next_queue_id;
+            for (row.queue) |entry| {
+                const text = try self.alloc.dupe(u8, entry.text);
+                errdefer self.alloc.free(text);
+                try session.record.queue.append(self.alloc, .{ .id = entry.id, .text = text, .due_at_ms = entry.due_at_ms });
+            }
             if (row.failure) |failure| {
                 // Recorded once when it failed; skipped quietly since. An
                 // attach still tries it again.

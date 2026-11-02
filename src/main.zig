@@ -1382,6 +1382,20 @@ const App = struct {
         }
     }
 
+    /// Queues the composer's `->` / `=>` message for after the agent yields.
+    /// The detached supervisor holds the queue, so a session it does not run
+    /// cannot queue.
+    pub fn queueFromComposer(self: *App, text: []const u8) !void {
+        switch (self.backend) {
+            .in_process => try self.writeDomainNotice(.{
+                .topic = "queue",
+                .tone = .neutral,
+                .body = "Queuing needs a detached session, which this host does not run.",
+            }, true),
+            .detached => try DetachedBackend.queueMessages(self, text, 0),
+        }
+    }
+
     fn enqueueInProcessPrompt(self: *App, prompt: []const u8, skill_tokens: []const registered_entities.SkillTokenSpan) !bool {
         const context_targets = if (self.context_enabled)
             try context_contract.applicableTargetsForImages(self.alloc, self.pending_images.items)

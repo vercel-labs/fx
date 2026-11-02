@@ -84,6 +84,8 @@ pub const Session = struct {
     pending: std.ArrayList(Pending) = .empty,
     commands: std.ArrayList(PendingCommand) = .empty,
     heartbeat_request: ?i64 = null,
+    /// The queued message sent to the host whose turn has not ended yet.
+    queue_request: ?i64 = null,
     /// Job notices, and notices of messages from other agents (D188), sent
     /// to the host and not answered yet.
     notice_requests: std.ArrayList(NoticeRequest) = .empty,
@@ -195,6 +197,8 @@ pub const Session = struct {
     fn hasWork(self: *Session) bool {
         const host = self.host orelse return false;
         if (host.busy() or self.record.heartbeatArmed()) return true;
+        // A queued message is still to be delivered.
+        if (!self.record.stopped and self.record.queue.items.len > 0) return true;
         // A background job's result is still to be delivered.
         if (host.runningJobs() > 0) return true;
         // A cell runs inside a turn, so this only catches one that outlives
@@ -319,6 +323,7 @@ pub const Session = struct {
             },
             .stop => return self.stop(arena),
             .heartbeat => |request| return self.heartbeat(arena, request),
+            .queue => |request| return self.queue(arena, request),
             .children => |request| {
                 const node_id = request.node_id orelse self.id;
                 const bytes = try self.children(arena, node_id);
@@ -448,6 +453,7 @@ pub const Session = struct {
         /// Keep the response the host writes before dispatchFrame returns.
         capture,
         heartbeat,
+        queued,
         /// A job notice, or messages from other agents (D188): its answer
         /// says whether the model got it.
         job_notice,
@@ -476,6 +482,11 @@ pub const Session = struct {
                 defer self.events_mutex.unlock(io_mod.getIo());
                 self.heartbeat_request = id;
             },
+            .queued => {
+                self.events_mutex.lockUncancelable(io_mod.getIo());
+                defer self.events_mutex.unlock(io_mod.getIo());
+                self.queue_request = id;
+            },
             .job_notice, .peer_message => {
                 self.events_mutex.lockUncancelable(io_mod.getIo());
                 defer self.events_mutex.unlock(io_mod.getIo());
@@ -502,6 +513,7 @@ pub const Session = struct {
             self.capture = null;
         };
         if (self.heartbeat_request == id) self.heartbeat_request = null;
+        if (self.queue_request == id) self.queue_request = null;
         for (self.commands.items, 0..) |command, index| if (command.id == id) {
             self.daemon.alloc.free(command.name);
             _ = self.commands.orderedRemove(index);
@@ -570,7 +582,7 @@ pub const Session = struct {
         return protocol.encode(arena, protocol.PromptAdmitted{ .request_id = 0 });
     }
 
-    pub const PromptOrigin = enum { user, heartbeat, job_notice, peer_message };
+    pub const PromptOrigin = enum { user, heartbeat, queued, job_notice, peer_message };
 
     pub fn prompt(self: *Session, text: []const u8, origin: PromptOrigin) !i64 {
         if (text.len == 0 or text.len > max_prompt_bytes) return error.InvalidPrompt;
@@ -592,6 +604,7 @@ pub const Session = struct {
             ._meta = .{ .fx = .{ .steer = true, .notice = origin == .job_notice or origin == .peer_message, .peer = origin == .peer_message } },
         }, switch (origin) {
             .heartbeat => .heartbeat,
+            .queued => .queued,
             .job_notice => .job_notice,
             .peer_message => .peer_message,
             .user => .none,
@@ -636,6 +649,7 @@ pub const Session = struct {
             for (self.pending.items) |entry| self.daemon.alloc.free(entry.frame);
             self.pending.clearRetainingCapacity();
             self.heartbeat_request = null;
+            self.queue_request = null;
             self.version += 1;
         }
         self.daemon.noteListChange();
@@ -692,6 +706,27 @@ pub const Session = struct {
         try self.daemon.commit(self, &next_record, false);
         if (request.action != .@"resume") self.withdrawHeartbeat();
         return protocol.encode(arena, protocol.HeartbeatState{ .heartbeat = self.record.heartbeat });
+    }
+
+    fn queue(self: *Session, arena: Allocator, request: protocol.QueueRequest) ![]const u8 {
+        const alloc = self.daemon.alloc;
+        if (request.action == .status) return protocol.encode(arena, protocol.QueueState{ .queue = self.record.queue.items });
+        if (self.record.stopped) return error.SessionStopped;
+        var next_record = try self.record.clone(alloc);
+        const changed = next_record.applyQueue(alloc, request, io_mod.milliTimestamp()) catch |err| {
+            next_record.deinit(alloc);
+            return err;
+        };
+        try self.daemon.commit(self, &next_record, false);
+        self.noteWork();
+        return protocol.encode(arena, protocol.QueueState{ .action = request.action, .queue = self.record.queue.items, .changed = changed });
+    }
+
+    /// Whether a queued message is with the host and its turn still runs.
+    pub fn queuedInFlight(self: *Session) bool {
+        self.events_mutex.lockUncancelable(io_mod.getIo());
+        defer self.events_mutex.unlock(io_mod.getIo());
+        return self.queue_request != null;
     }
 
     /// Takes back a heartbeat prompt still waiting to steer the turn.
@@ -980,6 +1015,7 @@ pub const Session = struct {
                 return .silent;
             };
             if (self.heartbeat_request == response_id) self.heartbeat_request = null;
+            if (self.queue_request == response_id) self.queue_request = null;
             for (self.notice_requests.items, 0..) |notice, index| if (notice.id == response_id) {
                 _ = self.notice_requests.swapRemove(index);
                 try self.notice_answers.append(alloc, .{ .id = response_id, .delivered = noticeDelivered(head), .mail = notice.mail });

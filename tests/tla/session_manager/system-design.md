@@ -3331,6 +3331,24 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   **Alternative:** clamping each invariant in the painter, which hides
   the state that broke and leaves the screen out of step with the record.
 
+- **D297 Decision:** a message can be queued for after the agent yields,
+  as in proto: `/queue <message>`, `/queue <delay> <message>` (`3h`,
+  `1h30m`, at most 365d), a prompt that starts with `->` or `=>`, or
+  Ctrl+Enter where the terminal reports it. A sequential enumerated list
+  (`1.` `2.`, `a)` `b)`, `i.` `ii.`) queues one message per item. The
+  detached supervisor owns the queue in the session's record: it is saved
+  with the session, shown to every viewer in the session summary and on
+  the footer's dotted rail, and survives detaching and reattaching. Each
+  tick, when the host is idle and no queued message's turn is still open,
+  the supervisor starts a turn with the first entry that is due, after its
+  heartbeat, job notices and mail; it never steers a running turn.
+  `/queue` lists the queue and `/queue --cancel <n|all>` drops entries;
+  stopping the session holds them. A session the supervisor does not run
+  cannot queue. Supervisor protocol version 15. **Why:** steering cuts
+  into the running turn; a follow-up that should wait for the result, or
+  run later, had no way in. **Alternative:** a queue in the frontend,
+  which stops when the frontend exits.
+
 ## Design Risks And Failure Behavior
 
 - **Stale index.** A crash between publish and the index append hides a

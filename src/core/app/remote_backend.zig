@@ -29,6 +29,7 @@ const provider_registry = @import("../config/provider_registry.zig");
 const remote_runtime = @import("app_remote_runtime.zig");
 const remote_view = @import("remote_view.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
+const queue_input = @import("../input/queue_input.zig");
 
 /// A session the supervisor runs: the attached root, or a node below it.
 pub const Node = struct {
@@ -408,6 +409,7 @@ pub fn Runtime(comptime App: type) type {
             handlers.handle_mcp = commandMcp;
             handlers.browse_subagents = commandSubagents;
             handlers.handle_heartbeat = commandHeartbeat;
+            handlers.handle_queue = commandQueue;
             handlers.handle_kernel = commandKernel;
             handlers.login = commandLogin;
             handlers.logout = commandLogout;
@@ -641,6 +643,40 @@ pub fn Runtime(comptime App: type) type {
                 .interval_ms = request.interval_ms,
                 .prompt = request.prompt,
             } });
+        }
+
+        fn commandQueue(ctx: *anyopaque, rest: []const u8) !void {
+            const app = appFrom(ctx);
+            switch (queue_input.parseQueueArgs(rest)) {
+                .status => try sendQueue(app, .{ .session_id = "" }),
+                .err => |message| try notice(app, "queue", message),
+                .cancel => |target| try sendQueue(app, .{ .session_id = "", .action = .cancel, .position = switch (target) {
+                    .all => null,
+                    .position => |position| position,
+                } }),
+                .add => |entry| try queueMessages(app, entry.text, entry.delay_ms),
+            }
+        }
+
+        /// Queues `text` in the attached session for after the agent
+        /// yields, `delay_ms` later when more than zero: one message per
+        /// item of an enumerated list, else the whole text. `/queue` and the
+        /// composer's `->` / `=>` both end here.
+        pub fn queueMessages(app: *App, text: []const u8, delay_ms: i64) !void {
+            const messages = try queue_input.splitQueuedMessages(app.alloc, text);
+            defer app.alloc.free(messages);
+            defer queue_input.freeMessages(app.alloc, messages);
+            if (messages.len == 0) return notice(app, "queue", queue_input.queue_usage);
+            try sendQueue(app, .{ .session_id = "", .action = .add, .texts = messages, .delay_ms = delay_ms });
+        }
+
+        /// Sends `request` to the attached root session; `session_id` is
+        /// filled in here.
+        fn sendQueue(app: *App, request: client_protocol.QueueRequest) !void {
+            const id = try wireSession(app, commandTarget(app, .queue), "queuing messages") orelse return;
+            var addressed = request;
+            addressed.session_id = id;
+            try app.remote.enqueue(.queue, .{ .queue = addressed });
         }
 
         fn commandKernel(ctx: *anyopaque, rest: []const u8) !void {

@@ -5,6 +5,8 @@ const Allocator = std.mem.Allocator;
 
 const max_heartbeat_prompt_bytes = 64 * 1024;
 const max_heartbeat_interval_ms: u64 = 365 * 24 * 60 * 60 * 1000;
+const max_queue_text_bytes = 64 * 1024;
+const max_queue_entries = 64;
 
 /// What the supervisor saves and lists about a session. Only the executor
 /// changes it, and only by `commit` for saved fields; readers lock it.
@@ -25,6 +27,10 @@ pub const Record = struct {
     jobs: u32 = 0,
     model: []u8 = &.{},
     mode: []u8 = &.{},
+    /// Messages for after the agent yields; each owns its text.
+    queue: std.ArrayList(protocol.QueueEntry) = .empty,
+    /// The id the next queued message takes.
+    next_queue_id: u64 = 1,
 
     pub fn init(alloc: Allocator, name: []const u8) !Record {
         return .{ .name = try alloc.dupe(u8, name) };
@@ -46,6 +52,8 @@ pub const Record = struct {
         if (self.heartbeat.prompt.len > 0) copy.heartbeat.prompt = try alloc.dupe(u8, self.heartbeat.prompt);
         copy.model = try alloc.dupe(u8, self.model);
         copy.mode = try alloc.dupe(u8, self.mode);
+        copy.queue = .fromOwnedSlice(try dupeQueue(alloc, self.queue.items));
+        copy.next_queue_id = self.next_queue_id;
         return copy;
     }
 
@@ -55,6 +63,8 @@ pub const Record = struct {
         if (self.heartbeat.prompt.len > 0) alloc.free(self.heartbeat.prompt);
         alloc.free(self.model);
         alloc.free(self.mode);
+        for (self.queue.items) |entry| alloc.free(entry.text);
+        self.queue.deinit(alloc);
         self.* = undefined;
     }
 
@@ -75,6 +85,7 @@ pub const Record = struct {
             .updated_at_ms = record.updated_at_ms,
             .running_jobs = record.jobs,
             .turn_started_at_ms = if (record.running) record.turn_started_ms else 0,
+            .queue = try dupeQueue(arena, record.queue.items),
         };
     }
 
@@ -100,7 +111,7 @@ pub const Record = struct {
             eql(u8, self.mode, other.mode) and self.stopped == other.stopped and self.live == other.live and
             self.saved == other.saved and self.running == other.running and self.turn_started_ms == other.turn_started_ms and self.jobs == other.jobs and self.updated_at_ms == other.updated_at_ms and
             eql(u8, a.prompt, b.prompt) and a.interval_ms == b.interval_ms and a.next_run_ms == b.next_run_ms and
-            a.paused == b.paused and a.run_count == b.run_count;
+            a.paused == b.paused and a.run_count == b.run_count and sameQueue(self.queue.items, other.queue.items);
     }
 
     /// A restart reopens this session: it has a conversation, or a stop or
@@ -134,6 +145,57 @@ pub const Record = struct {
             },
             .clear => self.setHeartbeat(alloc, .{}),
         }
+    }
+
+    /// Applies a queue change other than `status` at time `now` and returns
+    /// how many entries it queued or dropped. On failure the record is
+    /// unchanged.
+    pub fn applyQueue(self: *Record, alloc: Allocator, request: protocol.QueueRequest, now: i64) !usize {
+        switch (request.action) {
+            .status => return 0,
+            .add => {
+                if (request.texts.len == 0) return error.InvalidPrompt;
+                if (self.queue.items.len + request.texts.len > max_queue_entries) return error.QueueFull;
+                if (request.delay_ms < 0) return error.InvalidDelay;
+                for (request.texts) |text| {
+                    if (text.len == 0 or text.len > max_queue_text_bytes) return error.InvalidPrompt;
+                }
+                try self.queue.ensureUnusedCapacity(alloc, request.texts.len);
+                const texts = try dupeTexts(alloc, request.texts);
+                defer alloc.free(texts);
+                for (texts) |text| {
+                    self.queue.appendAssumeCapacity(.{
+                        .id = self.next_queue_id,
+                        .text = text,
+                        .due_at_ms = if (request.delay_ms > 0) now + request.delay_ms else 0,
+                    });
+                    self.next_queue_id += 1;
+                }
+                return texts.len;
+            },
+            .cancel => {
+                const position = request.position orelse {
+                    const dropped = self.queue.items.len;
+                    for (self.queue.items) |entry| alloc.free(entry.text);
+                    self.queue.clearRetainingCapacity();
+                    return dropped;
+                };
+                if (position == 0 or position > self.queue.items.len) return error.NoSuchQueuedMessage;
+                self.removeQueued(alloc, position - 1);
+                return 1;
+            },
+        }
+    }
+
+    /// The first queued message that may be delivered at `now`.
+    pub fn dueQueued(self: *const Record, now: i64) ?usize {
+        for (self.queue.items, 0..) |entry, index| if (entry.due_at_ms <= now) return index;
+        return null;
+    }
+
+    /// Drops queued message `index`.
+    pub fn removeQueued(self: *Record, alloc: Allocator, index: usize) void {
+        alloc.free(self.queue.orderedRemove(index).text);
     }
 
     /// The heartbeat fires on schedule while the host is open.
@@ -222,6 +284,68 @@ test "a running record carries its turn's start to the summary" {
     try std.testing.expect(!record.sameView(&copy));
     copy.running = false;
     try std.testing.expectEqual(@as(i64, 0), (try copy.summary(arena.allocator(), "id", "/Users/example/ws", 0)).turn_started_at_ms);
+}
+
+fn dupeQueue(alloc: Allocator, queue: []const protocol.QueueEntry) ![]protocol.QueueEntry {
+    const copy = try alloc.alloc(protocol.QueueEntry, queue.len);
+    errdefer alloc.free(copy);
+    for (copy, queue, 0..) |*entry, source, index| {
+        errdefer for (copy[0..index]) |done| alloc.free(done.text);
+        entry.* = source;
+        entry.text = try alloc.dupe(u8, source.text);
+    }
+    return copy;
+}
+
+/// Copies of every text, all or none. Caller owns the slice and the texts.
+fn dupeTexts(alloc: Allocator, texts: []const []const u8) ![][]const u8 {
+    const copy = try alloc.alloc([]const u8, texts.len);
+    errdefer alloc.free(copy);
+    for (copy, texts, 0..) |*text, source, index| {
+        errdefer for (copy[0..index]) |done| alloc.free(done);
+        text.* = try alloc.dupe(u8, source);
+    }
+    return copy;
+}
+
+/// Entries never change once queued, so the same ids and due times are the
+/// same queue.
+fn sameQueue(a: []const protocol.QueueEntry, b: []const protocol.QueueEntry) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (x.id != y.id or x.due_at_ms != y.due_at_ms) return false;
+    return true;
+}
+
+test "a queue adds in order, delivers the first due entry, and cancels by position" {
+    const alloc = std.testing.allocator;
+    var record = try Record.init(alloc, "session");
+    defer record.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), try record.applyQueue(alloc, .{ .session_id = "s", .action = .add, .texts = &.{"later"}, .delay_ms = 60_000 }, 1_000));
+    try std.testing.expectEqual(@as(usize, 2), try record.applyQueue(alloc, .{ .session_id = "s", .action = .add, .texts = &.{ "first", "second" } }, 1_000));
+    try std.testing.expectEqual(@as(usize, 3), record.queue.items.len);
+    try std.testing.expectEqual(@as(i64, 61_000), record.queue.items[0].due_at_ms);
+    // The delayed entry waits; the first one due goes first.
+    try std.testing.expectEqual(@as(?usize, 1), record.dueQueued(2_000));
+    try std.testing.expectEqual(@as(?usize, 0), record.dueQueued(61_000));
+
+    var copy = try record.clone(alloc);
+    defer copy.deinit(alloc);
+    try std.testing.expect(record.sameView(&copy));
+    try std.testing.expectEqual(@as(usize, 1), try copy.applyQueue(alloc, .{ .session_id = "s", .action = .cancel, .position = 2 }, 0));
+    try std.testing.expect(!record.sameView(&copy));
+    try std.testing.expectEqualStrings("later", copy.queue.items[0].text);
+    try std.testing.expectEqualStrings("second", copy.queue.items[1].text);
+    try std.testing.expectEqual(@as(u64, 3), copy.queue.items[1].id);
+    try std.testing.expectError(error.NoSuchQueuedMessage, copy.applyQueue(alloc, .{ .session_id = "s", .action = .cancel, .position = 3 }, 0));
+    try std.testing.expectError(error.InvalidPrompt, copy.applyQueue(alloc, .{ .session_id = "s", .action = .add, .texts = &.{""} }, 0));
+    try std.testing.expectEqual(@as(usize, 2), try copy.applyQueue(alloc, .{ .session_id = "s", .action = .cancel }, 0));
+    try std.testing.expectEqual(@as(usize, 0), copy.queue.items.len);
+
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const shown = try record.summary(arena.allocator(), "id", "/Users/example/ws", 0);
+    try std.testing.expectEqual(@as(usize, 3), shown.queue.len);
+    try std.testing.expectEqualStrings("first", shown.queue[1].text);
 }
 
 /// A failed open as one line: the error, then the host's reason if any.

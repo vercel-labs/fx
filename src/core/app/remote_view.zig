@@ -13,6 +13,7 @@ const browser_mod = @import("../input/session_browser.zig");
 const types = @import("../shared/types.zig");
 const tool_input_preview = @import("../shared/tool_input_preview.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const queue_input = @import("../input/queue_input.zig");
 const presentation = @import("../agent/assistant_presentation.zig");
 const callbacks = @import("app_callbacks.zig");
 const sessions = @import("app_session_runtime.zig");
@@ -29,6 +30,13 @@ const integer = remote_runtime.integer;
 const boolean = remote_runtime.boolean;
 const itemsOf = remote_runtime.itemsOf;
 pub const SnapshotView = client_protocol.Snapshot(std.json.Value);
+
+/// When a queued message goes: `after this turn`, or its countdown.
+pub fn writeQueueWhen(w: *std.Io.Writer, entry: client_protocol.QueueEntry, now: i64) !void {
+    if (entry.due_at_ms <= now) return w.writeAll("after this turn");
+    try w.writeAll("in ");
+    try queue_input.formatQueueDue(w, entry.due_at_ms, now);
+}
 
 pub fn Runtime(comptime App: type) type {
     return struct {
@@ -128,6 +136,35 @@ pub fn Runtime(comptime App: type) type {
                 try app.alloc.print("{s} · every {d}s · {s}", .{ if (heartbeat.paused) "Paused" else "Running", @divTrunc(heartbeat.interval_ms, 1000), heartbeat.prompt });
             defer app.alloc.free(body);
             try notice(app, "heartbeat", body);
+        }
+
+        /// What a `/queue` request did, or the queue itself for `status`.
+        pub fn showQueue(app: *App, state: client_protocol.QueueState) !void {
+            var body: std.Io.Writer.Allocating = .init(app.alloc);
+            defer body.deinit();
+            const w = &body.writer;
+            const now = io_mod.milliTimestamp();
+            switch (state.action) {
+                .add => {
+                    try w.print("Queued {d} message{s} to run ", .{ state.changed, if (state.changed == 1) "" else "s" });
+                    const last = state.queue[state.queue.len - 1];
+                    if (last.due_at_ms > 0) {
+                        try w.writeAll("in ");
+                        try queue_input.formatQueueDue(w, last.due_at_ms, now);
+                    } else try w.writeAll("when the agent yields");
+                    try w.writeAll(". /queue lists them, /queue --cancel <n|all> drops them.");
+                },
+                .cancel => try w.print("Dropped {d} queued message{s}.", .{ state.changed, if (state.changed == 1) "" else "s" }),
+                .status => if (state.queue.len == 0) try w.writeAll("Nothing is queued.") else {
+                    for (state.queue, 1..) |entry, position| {
+                        if (position > 1) try w.writeByte('\n');
+                        try w.print("{d}. ", .{position});
+                        try writeQueueWhen(w, entry, now);
+                        try w.print(" · {s}", .{entry.text});
+                    }
+                },
+            }
+            try notice(app, "queue", body.written());
         }
 
         pub fn showKernel(app: *App, kernel: client_protocol.KernelInfo) !void {
@@ -519,6 +556,7 @@ pub fn Runtime(comptime App: type) type {
             }
             remote.permission_mode = types.PermissionMode.parse(summary.mode) orelse remote.permission_mode;
             remote.running_jobs = summary.running_jobs;
+            if (try remote.adoptQueue(app.alloc, summary.queue)) app.shell.render_requests.request(.footer);
             // The inactive local engine mirrors the attached projection for settings panels.
             app.permission_engine.mode = remote.permission_mode;
             const running = summary.status == .running or summary.status == .awaiting_approval;

@@ -20,6 +20,7 @@ const provider_runtime = @import("provider_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
 const io_mod = @import("../shared/io.zig");
+const queue_input = @import("../input/queue_input.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
@@ -407,6 +408,33 @@ fn buildSteeringProjection(comptime App: type, app: *App) !SteeringProjection {
         projection.pending_feedback = snapshot.pending_feedback;
         snapshot.pending_feedback = &.{};
     }
+    // A detached session's queued messages wait on the same rail.
+    if (comptime @hasField(App, "remote")) if (app.remote.queued_messages.items.len > 0) {
+        const queued = app.remote.queued_messages.items;
+        const messages = try app.alloc.alloc([]u8, projection.messages.len + queued.len);
+        var filled = projection.messages.len;
+        errdefer {
+            for (messages[projection.messages.len..filled]) |message| app.alloc.free(message);
+            app.alloc.free(messages);
+        }
+        const now = io_mod.milliTimestamp();
+        for (queued) |entry| {
+            var row: std.Io.Writer.Allocating = .init(app.alloc);
+            errdefer row.deinit();
+            try row.writer.writeAll("Queued ");
+            if (entry.due_at_ms > now) {
+                try row.writer.writeAll("for ");
+                try queue_input.formatClockTime(&row.writer, entry.due_at_ms, now);
+            } else try row.writer.writeAll("for after this turn");
+            try row.writer.print(": {s}", .{entry.text});
+            messages[filled] = try row.toOwnedSlice();
+            filled += 1;
+        }
+        @memcpy(messages[0..projection.messages.len], projection.messages);
+        if (projection.messages.len > 0) app.alloc.free(projection.messages);
+        projection.messages = messages;
+        projection.waits_for_boundary = true;
+    };
     return projection;
 }
 

@@ -19,7 +19,7 @@ const Allocator = std.mem.Allocator;
 const SnapshotView = remote_view.SnapshotView;
 /// What a reply answers. `poll` is a pushed session update, and `resync` the
 /// resubscribe after a reconnect.
-pub const Kind = enum { startup, startup_last, startup_remembered, attach, poll, resync, list, children, history, history_page, submit, cancel, rpc, heartbeat, kernel, rename, config, command, delete, unwatch };
+pub const Kind = enum { startup, startup_last, startup_remembered, attach, poll, resync, list, children, history, history_page, submit, cancel, rpc, heartbeat, queue, kernel, rename, config, command, delete, unwatch };
 /// A request waiting to be sent, or sent and waiting for its reply.
 const Request = struct {
     kind: Kind,
@@ -263,6 +263,9 @@ pub const State = struct {
     model: []u8 = &.{},
     /// The attached session's running background jobs, for the footer.
     running_jobs: u32 = 0,
+    /// Messages the attached session holds for after the agent yields, for
+    /// the footer. Each owns its text.
+    queued_messages: std.ArrayList(client_protocol.QueueEntry) = .empty,
     cwd: []u8 = &.{},
     workspace_label: []u8 = &.{},
     incarnation: []u8 = &.{},
@@ -306,7 +309,29 @@ pub const State = struct {
         if (self.incarnation.len > 0) alloc.free(self.incarnation);
         for (self.submitted_text.items) |text| alloc.free(text);
         self.submitted_text.deinit(alloc);
+        for (self.queued_messages.items) |entry| alloc.free(entry.text);
+        self.queued_messages.deinit(alloc);
         self.* = .{};
+    }
+
+    /// Adopts the attached session's queue, unless it is the one held.
+    pub fn adoptQueue(self: *State, alloc: Allocator, queue: []const client_protocol.QueueEntry) !bool {
+        if (queue.len == self.queued_messages.items.len) {
+            for (queue, self.queued_messages.items) |new, held| {
+                if (new.id != held.id or new.due_at_ms != held.due_at_ms) break;
+            } else return false;
+        }
+        var adopted: std.ArrayList(client_protocol.QueueEntry) = .empty;
+        errdefer {
+            for (adopted.items) |entry| alloc.free(entry.text);
+            adopted.deinit(alloc);
+        }
+        try adopted.ensureTotalCapacity(alloc, queue.len);
+        for (queue) |entry| adopted.appendAssumeCapacity(.{ .id = entry.id, .text = try alloc.dupe(u8, entry.text), .due_at_ms = entry.due_at_ms });
+        for (self.queued_messages.items) |entry| alloc.free(entry.text);
+        self.queued_messages.deinit(alloc);
+        self.queued_messages = adopted;
+        return true;
     }
 
     /// The node the composer shows: the viewed child, or the root.
@@ -750,6 +775,11 @@ pub fn Runtime(comptime App: type) type {
                     var state = try decode(client_protocol.HeartbeatState, app, value);
                     defer state.deinit();
                     try View.showHeartbeat(app, state.value.heartbeat);
+                },
+                .queue => {
+                    var state = try decode(client_protocol.QueueState, app, value);
+                    defer state.deinit();
+                    try View.showQueue(app, state.value);
                 },
                 .kernel => {
                     var state = try decode(client_protocol.KernelState, app, value);
