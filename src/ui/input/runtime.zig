@@ -2146,6 +2146,23 @@ test "input escape parser resolves unmodified kitty Backspace to a delete byte" 
     try expectEscapeAction("[9;1u", .{ .remapped_byte = '\t' });
 }
 
+test "input escape parser maps Ctrl+Backspace to word deletion" {
+    const reports = [_][]const u8{
+        "[127;5u",
+        "[127;6u",
+        "[127;69u",
+        "[127;133u",
+        "[127;5:1u",
+        "[127;5:2u",
+        "[27;5;127~",
+    };
+    for (reports) |report| {
+        try expectEscapeAction(report, .delete_word_left);
+    }
+    try expectEscapeAction("[127;5:3u", .ignore);
+    try expectEscapeAction("[127;13u", .delete_to_line_start);
+}
+
 test "input escape parser resolves unmapped single-parameter CSI u to ignore" {
     // A null result would leave the leading ESC's pending-cancel armed.
     try expectEscapeAction("[49u", .ignore);
