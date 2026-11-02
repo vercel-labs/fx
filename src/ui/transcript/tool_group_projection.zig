@@ -29,6 +29,7 @@ pub const Projection = struct {
         for (self.owned_overrides.items) |owned| {
             alloc.free(owned.bytes);
             alloc.free(owned.line_provenance);
+            alloc.free(owned.expanded_rows);
         }
         self.owned_overrides.deinit(alloc);
         self.entry_actions.deinit(alloc);
@@ -51,6 +52,20 @@ pub const Projection = struct {
             .kind = kind,
             .bytes = bytes,
         } };
+    }
+
+    /// An expanded group's child, with the styles of its rows when it has
+    /// them. Takes ownership of `bytes` and `rows`.
+    fn setExpandedOverride(
+        self: *Projection,
+        alloc: std.mem.Allocator,
+        entry_index: usize,
+        bytes: []u8,
+        rows: []const ExpandedRow,
+    ) !void {
+        errdefer alloc.free(rows);
+        try self.setOwnedOverride(alloc, entry_index, .tool_status, bytes);
+        self.owned_overrides.items[self.owned_overrides.items.len - 1].expanded_rows = rows;
     }
 
     fn setOwnedGroup(self: *Projection, alloc: std.mem.Allocator, index: usize, group: GroupBlock) !void {
@@ -107,6 +122,7 @@ pub const Projection = struct {
             } else {
                 alloc.free(owned.bytes);
                 alloc.free(owned.line_provenance);
+                alloc.free(owned.expanded_rows);
             }
         }
         self.owned_overrides.items.len = retained_index;
@@ -119,6 +135,7 @@ pub const Projection = struct {
                 .entry_index = start_index + owned.entry_index,
                 .bytes = owned.bytes,
                 .line_provenance = owned.line_provenance,
+                .expanded_rows = owned.expanded_rows,
             });
         }
         suffix.entry_actions.items.len = 0;
@@ -126,10 +143,18 @@ pub const Projection = struct {
     }
 };
 
+/// Styling and wrap rails for a logical checklist row. Its text is already
+/// rendered by the inline tier path; colors are applied at materialization.
+const ExpandedRow = struct {
+    style: tiers.Style = .normal,
+    continuation_prefix: ?[]const u8 = null,
+};
+
 const OwnedOverride = struct {
     entry_index: usize,
     bytes: []u8,
     line_provenance: []const transcript_blocks.LineProvenance = &.{},
+    expanded_rows: []const ExpandedRow = &.{},
 };
 
 pub const SummaryStyle = struct {
@@ -807,52 +832,57 @@ fn plainStatusPhrase(
     return try reprojectTruncatedCommandPhrase(scratch, raw_phrase, detail) orelse raw_phrase;
 }
 
-/// One planned row, clipped to `cols` and drawn in its tier's voice:
-/// attention in the status color, outcomes plain with their command
-/// highlighted, routine rows and output dim.
+fn tierStyle(style: SummaryStyle, tier: tiers.Style) []const u8 {
+    return switch (tier) {
+        .normal => "",
+        .attention => style.attention_style,
+        .dim => style.text_style,
+        .output => style.output_style,
+        .success => style.success_style,
+        .accent => style.accent_style,
+        .warning => style.warning_style,
+        .dropped => style.dropped_style,
+    };
+}
+
+/// One planned row drawn in its tier's voice, clipped to `cols` inline
+/// or left whole for the expanded view to wrap at materialization.
 fn writeTierRow(
     scratch: std.mem.Allocator,
     writer: *std.Io.Writer,
     prefix: []const u8,
     planned: tiers.Row,
-    cols: u16,
+    cols: ?u16,
     style: SummaryStyle,
 ) !void {
     // A narrow terminal may not fit the tree connector; the clip wins.
-    const shown_prefix = try clipSummary(scratch, prefix, cols);
-    const room = cols -| @as(u16, @intCast(display_width.visibleWidth(shown_prefix)));
+    const shown_prefix = if (cols) |width| try clipSummary(scratch, prefix, width) else prefix;
+    const room = if (cols) |width| width -| @as(u16, @intCast(display_width.visibleWidth(shown_prefix))) else null;
     var row = planned;
     // A command cut to the width ends at a word, not inside one (D294).
-    if (row.kind != .body and display_width.visibleWidth(row.text) > room) {
+    if (room) |width| if (row.kind != .body and display_width.visibleWidth(row.text) > width) {
         const is_command = if (row.detail) |record| record.activity_kind == .command else row.kind == .fold;
-        if (is_command) row.text = try command_summary.clipAtWord(scratch, row.text, room);
-    }
+        if (is_command) row.text = try command_summary.clipAtWord(scratch, row.text, width);
+    };
     // A closed task reads struck through, as proto strikes its done work.
     if (row.strike) row.text = try scratch.print("\x1b[9m{s}\x1b[29m", .{row.text});
-    switch (row.style) {
+    if (row.style != .normal) {
         // A styled row carries its tree prefix in the same span.
-        .attention => try writeStyled(writer, style.attention_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text }), cols)),
-        .dim => try writeStyled(writer, style.text_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text }), cols)),
-        .output => try writeStyled(writer, style.output_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text }), cols)),
-        .success => try writeStyled(writer, style.success_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text }), cols)),
-        .accent => try writeStyled(writer, style.accent_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text }), cols)),
-        .warning => try writeStyled(writer, style.warning_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text }), cols)),
-        .dropped => try writeStyled(writer, style.dropped_style, try clipSummary(scratch, try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text }), cols)),
-        .normal => {
-            try writer.writeAll(shown_prefix);
-            // Style the whole row, then clip it: the clip closes any style
-            // it cuts through.
-            const highlighted = if (row.kind == .item)
-                try highlightCommandPhrase(scratch, row.text, row.detail, "") orelse row.text
-            else
-                row.text;
-            const accented = if (row.kind == .item and entryShowsDiffStats(row.detail))
-                try accentTrailingDiffStats(scratch, highlighted, "")
-            else
-                highlighted;
-            try writer.writeAll(try clipSummary(scratch, accented, room));
-        },
+        const text = try std.mem.concat(scratch, u8, &.{ shown_prefix, row.text });
+        return writeStyled(writer, tierStyle(style, row.style), if (cols) |width| try clipSummary(scratch, text, width) else text);
     }
+    try writer.writeAll(shown_prefix);
+    // Style the whole row, then clip it: the clip closes any style
+    // it cuts through.
+    const highlighted = if (row.kind == .item)
+        try highlightCommandPhrase(scratch, row.text, row.detail, "") orelse row.text
+    else
+        row.text;
+    const accented = if (row.kind == .item and entryShowsDiffStats(row.detail))
+        try accentTrailingDiffStats(scratch, highlighted, "")
+    else
+        highlighted;
+    try writer.writeAll(if (room) |width| try clipSummary(scratch, accented, width) else accented);
 }
 
 /// The minimum tail length accepted as an identity match in
@@ -978,6 +1008,7 @@ fn formatExpandedChild(
     entry: TranscriptEntry,
     detail: ?*const ToolDetailRecord,
     connector: []const u8,
+    expanded_rows: ?*std.ArrayList(ExpandedRow),
 ) ![]u8 {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(scratch_state);
@@ -991,6 +1022,15 @@ fn formatExpandedChild(
         raw_phrase,
         detail,
     ) orelse raw_phrase;
+    if (detail) |record| if (std.mem.eql(u8, record.tool_name, "checklist")) {
+        const planned = try tiers.single(scratch, .{
+            .entry_id = record.entry_id,
+            .detail = record,
+            .phrase = phrase,
+            .continuation = statusContinuation(entry, detail),
+        });
+        return formatExpandedChecklist(alloc, scratch, planned, connector, expanded_rows);
+    };
     // Expanded rows carry no ambient text style, so tokens highlight over the
     // terminal default foreground.
     const display_phrase = try highlightCommandPhrase(scratch, phrase, detail, "") orelse phrase;
@@ -1022,7 +1062,7 @@ test "expanded subagent row preserves status continuation" {
         .tool_name = @constCast("subagent"),
         .activity_kind = .subagent,
     };
-    const row = try formatExpandedChild(alloc, entry, &detail, "└");
+    const row = try formatExpandedChild(alloc, entry, &detail, "└", null);
     defer alloc.free(row);
 
     try std.testing.expectEqualStrings(
@@ -1030,12 +1070,55 @@ test "expanded subagent row preserves status continuation" {
         row,
     );
 
-    const middle_row = try formatExpandedChild(alloc, entry, &detail, "├");
+    const middle_row = try formatExpandedChild(alloc, entry, &detail, "├", null);
     defer alloc.free(middle_row);
     try std.testing.expectEqualStrings(
         "├─ reviewer working · inspect auth\n│  gpt-5.5 · high · 12k/256k 4%",
         middle_row,
     );
+}
+
+/// A checklist child drawn by the inline planner and renderer, numbered
+/// phases, status roles and strike included. The rows' styles go to
+/// `expanded_rows` rather than into the bytes, so a new width or palette
+/// repaints them at materialization.
+fn formatExpandedChecklist(
+    alloc: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    planned: []const tiers.Row,
+    connector: []const u8,
+    expanded_rows: ?*std.ArrayList(ExpandedRow),
+) ![]u8 {
+    // The rail the child's later rows hang from: none under the last child.
+    const rail = if (std.mem.eql(u8, connector, "└")) "   " else "│  ";
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    for (planned, 0..) |row, index| {
+        if (index > 0) try out.writer.writeByte('\n');
+        const prefix = if (index == 0)
+            try scratch.print("{s}─ ", .{connector})
+        else if (row.own_tree)
+            "    "
+        else if (row.kind == .arg)
+            try scratch.print("{s}└─ ", .{rail})
+        else
+            rail;
+        const start = out.written().len;
+        try writeTierRow(scratch, &out.writer, prefix, row, null, .{});
+        const rows = expanded_rows orelse continue;
+        // A task row wraps under its own branch, a phase under its heading.
+        const continuation_prefix = if (!row.own_tree)
+            rail
+        else if (std.mem.startsWith(u8, row.text, "├"))
+            "    │  "
+        else if (std.mem.startsWith(u8, row.text, "└"))
+            "       "
+        else
+            "    ";
+        const line_count = std.mem.count(u8, out.written()[start..], "\n") + 1;
+        try rows.appendNTimes(alloc, .{ .style = row.style, .continuation_prefix = continuation_prefix }, line_count);
+    }
+    return out.toOwnedSlice();
 }
 
 fn installExpandedGroup(
@@ -1056,13 +1139,21 @@ fn installExpandedGroup(
         const entry_id = toolStatusEntryId(entry) orelse continue;
         const detail = detailForEntry(details, detail_indices, entry_id, null);
         const connector = if (child_index + 1 == status_indices.len) "└" else "├";
-        const child = try formatExpandedChild(alloc, entry, detail, connector);
+        var expanded_rows: std.ArrayList(ExpandedRow) = .empty;
+        defer expanded_rows.deinit(alloc);
+        // The first child carries the group's header row above it.
+        if (child_index == 0) try expanded_rows.append(alloc, .{});
+        const child = try formatExpandedChild(alloc, entry, detail, connector, &expanded_rows);
         defer alloc.free(child);
         const bytes = if (child_index == 0)
             try alloc.print("{s}\n{s}", .{ header, child })
         else
             try alloc.dupe(u8, child);
-        try projection.setOwnedOverride(alloc, status_index, .tool_status, bytes);
+        const rows = expanded_rows.toOwnedSlice(alloc) catch |err| {
+            alloc.free(bytes);
+            return err;
+        };
+        try projection.setExpandedOverride(alloc, status_index, bytes, rows);
     }
 }
 
@@ -1200,7 +1291,7 @@ pub fn buildExpandedRelationshipsInterruptible(
     details: []const ToolDetailRecord,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !Projection {
-    return buildWithStyleAndStats(
+    const relationships = try buildWithStyleAndStats(
         alloc,
         entries,
         details,
@@ -1213,6 +1304,14 @@ pub fn buildExpandedRelationshipsInterruptible(
         null,
         checkpoint,
     );
+    // Groups can be installed out of transcript order. Sort their owned
+    // rows once so materialization can join row styles in a linear pass.
+    sort_utils.sort(OwnedOverride, relationships.owned_overrides.items, {}, struct {
+        fn lessThan(_: void, left: OwnedOverride, right: OwnedOverride) bool {
+            return left.entry_index < right.entry_index;
+        }
+    }.lessThan);
+    return relationships;
 }
 
 pub fn materializeExpandedRelationshipsRangeInterruptible(
@@ -1230,15 +1329,25 @@ pub fn materializeExpandedRelationshipsRangeInterruptible(
         alloc,
         relationships.entry_actions.items.len - start_index,
     );
-    for (relationships.entry_actions.items[start_index..]) |action| {
+    var owned_index: usize = 0;
+    for (relationships.entry_actions.items[start_index..], start_index..) |action, entry_index| {
         try build_checkpoint.tick(checkpoint);
         switch (action) {
             .keep => projection.entry_actions.appendAssumeCapacity(.keep),
             .hide => projection.entry_actions.appendAssumeCapacity(.hide),
             .override => |override| {
+                while (owned_index < relationships.owned_overrides.items.len and
+                    relationships.owned_overrides.items[owned_index].entry_index < entry_index) : (owned_index += 1)
+                {}
+                const expanded_rows: []const ExpandedRow = if (owned_index < relationships.owned_overrides.items.len and
+                    relationships.owned_overrides.items[owned_index].entry_index == entry_index)
+                    relationships.owned_overrides.items[owned_index].expanded_rows
+                else
+                    &.{};
                 const bytes = try materializeExpandedOverride(
                     alloc,
                     override.bytes,
+                    expanded_rows,
                     cols,
                     style,
                 );
@@ -1255,26 +1364,32 @@ pub fn materializeExpandedRelationshipsRangeInterruptible(
 fn materializeExpandedOverride(
     alloc: std.mem.Allocator,
     bytes: []const u8,
+    expanded_rows: []const ExpandedRow,
     cols: u16,
     style: SummaryStyle,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     var lines = std.mem.splitScalar(u8, bytes, '\n');
-    var first = true;
-    while (lines.next()) |line| {
-        if (!first) try out.writer.writeByte('\n');
-        first = false;
-        const styled = if (std.mem.startsWith(u8, line, "●"))
-            try applySummaryStyle(alloc, line, style)
-        else
-            null;
+    var line_index: usize = 0;
+    while (lines.next()) |line| : (line_index += 1) {
+        if (line_index > 0) try out.writer.writeByte('\n');
+        const row: ExpandedRow = if (line_index < expanded_rows.len) expanded_rows[line_index] else .{};
+        var styled: ?[]u8 = null;
         defer if (styled) |value| alloc.free(value);
+        if (std.mem.startsWith(u8, line, "●")) {
+            styled = try applySummaryStyle(alloc, line, style);
+        } else if (tierStyle(style, row.style).len > 0) {
+            var colored: std.Io.Writer.Allocating = .init(alloc);
+            errdefer colored.deinit();
+            try writeStyled(&colored.writer, tierStyle(style, row.style), line);
+            styled = try colored.toOwnedSlice();
+        }
         const wrapped = try transcript_blocks.wrapFullToolStatus(
             alloc,
             styled orelse line,
             cols,
-            expandedContinuationPrefix(line),
+            row.continuation_prefix orelse expandedContinuationPrefix(line),
         );
         defer alloc.free(wrapped);
         try out.writer.writeAll(wrapped);
@@ -3286,6 +3401,89 @@ test "a checklist group paints proto's checklist with status colors and strike" 
     try std.testing.expect(std.mem.find(u8, bytes, "<wa>    └─ □ Tag release (blocked: review)\x1b[0m") != null);
     // Nothing paints in the attention color: no checklist row failed.
     try std.testing.expect(std.mem.find(u8, bytes, "<at>") == null);
+}
+
+test "expanded checklist children reuse the numbered tree and status styles" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "Updated checklist", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "Read notes.txt", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("checklist"),
+            .activity_kind = .read,
+            .arguments_json = @constCast("{\"op\":\"view\"}"),
+            .result = @constCast("Overall: 2/5 done, 2 open, 1 blocked.\n  Build:\n    - [X] Write parser\n    - [ ] Add tests (in progress)\n    - [ ] Old approach (dropped)\n  Ship:\n    - [ ] Tag release (blocked: review)\n    - [ ] Publish notes"),
+            .outcome = .completed,
+        },
+        // Presentation groups install before ungrouped calls, so their owned
+        // overrides begin out of transcript order. Colors must still match.
+        .{
+            .entry_id = 2,
+            .tool_name = @constCast("read_file"),
+            .activity_kind = .read,
+            .outcome = .completed,
+            .presentation_group_id = .{ .turn_id = 1, .anchor_step_id = 1 },
+        },
+    };
+    const style = SummaryStyle{
+        .text_style = "<dim>",
+        .success_style = "<ok>",
+        .accent_style = "<ac>",
+        .warning_style = "<wa>",
+        .dropped_style = "<dr>",
+    };
+    var expanded = try buildExpandedStyledInterruptible(alloc, &entries, &details, 120, style, null);
+    defer expanded.deinit(alloc);
+    const bytes = expanded.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, bytes, "└─ Viewed the checklist") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "<ac>    I. Build  2/3\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "<ok>    \x1b[9m├─ ■ Write parser\x1b[29m\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "<ac>    ├─ □ Add tests\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "<dr>    \x1b[9m└─ □ Old approach\x1b[29m\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "<ac>    II. Ship  0/2\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "<wa>    ├─ □ Tag release (blocked: review)\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "<dim>    └─ □ Publish notes\x1b[0m") != null);
+
+    // The cached relationships retain semantic styles, not a frozen palette.
+    var relationships = try buildExpandedRelationshipsInterruptible(alloc, &entries, &details, null);
+    defer relationships.deinit(alloc);
+    var repainted = try materializeExpandedRelationshipsRangeInterruptible(alloc, &relationships, 0, 120, .{
+        .success_style = "<new-ok>",
+        .accent_style = "<new-ac>",
+    }, null);
+    defer repainted.deinit(alloc);
+    const repainted_bytes = repainted.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, repainted_bytes, "<new-ac>    II. Ship  0/2\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, repainted_bytes, "<new-ok>    \x1b[9m├─ ■ Write parser\x1b[29m\x1b[0m") != null);
+
+    var narrow = try materializeExpandedRelationshipsRangeInterruptible(alloc, &relationships, 0, 16, .{
+        .success_style = "\x1b[32m",
+        .accent_style = "\x1b[34m",
+    }, null);
+    defer narrow.deinit(alloc);
+    var grid = try paintExpandedRowsForTest(alloc, narrow.entry_actions.items[0].override.bytes, 16);
+    defer grid.deinit();
+    var done_row: ?u16 = null;
+    var row: u16 = 1;
+    while (row <= grid.rows) : (row += 1) {
+        if (grid.cellAt(row, 8).?.codepoint == '■') {
+            done_row = row;
+            break;
+        }
+    }
+    try std.testing.expect(done_row != null);
+    const wrapped_task = grid.cellAt(done_row.? + 1, 8).?;
+    try std.testing.expectEqual(@as(u21, 'p'), wrapped_task.codepoint);
+    try std.testing.expect(wrapped_task.style.fg.eql(.{ .indexed = 2 }));
+    try std.testing.expect(wrapped_task.style.flags.strike);
+    // Its continuation rail is structural, not green or struck through.
+    const rail = grid.cellAt(done_row.? + 1, 5).?;
+    try std.testing.expectEqual(@as(u21, '│'), rail.codepoint);
+    try std.testing.expect(rail.style.fg.eql(.default));
+    try std.testing.expect(!rail.style.flags.strike);
 }
 
 test "expanded tool title stays primary while the group summary stays secondary" {

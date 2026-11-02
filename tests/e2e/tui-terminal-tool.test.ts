@@ -761,16 +761,18 @@ test.skipIf(!tmuxAvailable())(
 
     // `interact` carries no command argument, so the Observed heading is the
     // only place Ctrl-O can show the launch command. It must wrap under the
-    // tree rail instead of trailing. Heading continuations start "│ word";
-    // detail rows start "│  key: value".
+    // tree rail instead of trailing. Heading continuations and argument
+    // details share the "│  " rail; details start with "key: value".
     const fullObservedHeading = (grid: string[]) => {
       const rows = grid.map((line) => line.trimEnd());
       const start = rows.findIndex((line) => line.startsWith("├─ Observed "));
       if (start < 0) return null;
       const parts = [rows[start]!.slice("├─ ".length)];
       for (const line of rows.slice(start + 1)) {
-        if (!line.startsWith("│ ") || line.startsWith("│  ")) break;
-        parts.push(line.slice("│ ".length));
+        if (!line.startsWith("│  ")) break;
+        const continuation = line.slice("│  ".length);
+        if (/^[a-zA-Z_][\w-]*:\s/.test(continuation)) break;
+        parts.push(continuation);
       }
       return parts.join(" ");
     };

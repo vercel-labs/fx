@@ -3666,6 +3666,7 @@ fn buildProjectionWithDiffResolverInterruptible(
             .title_style = ui_render.tool_title_style,
             .text_style = ui_render.statusline_style,
             .reset_style = "\x1b[0m",
+            .attention_style = ui_render.red_style,
             .success_style = ui_render.green_style,
             .accent_style = ui_render.bold_style,
             .warning_style = ui_render.warning_style,

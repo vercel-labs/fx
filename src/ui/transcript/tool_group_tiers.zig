@@ -379,23 +379,20 @@ fn appendRun(arena: Allocator, rows: *std.ArrayList(Row), run: []const Item, kin
 fn appendExploreRun(arena: Allocator, rows: *std.ArrayList(Row), run: []const Item) !void {
     for (run) |item| {
         const running = isLive(item.detail);
-        var emitted = false;
-        if (exploredItem(arena, item)) |actions| {
-            for (actions) |action| {
-                try rows.append(arena, .{
-                    .entry_id = item.entry_id,
-                    .kind = .item,
-                    .style = .dim,
-                    .text = try arena.print("{s} {s}", .{
-                        if (running) action.kind.present() else action.kind.past(),
-                        action.target,
-                    }),
-                    .running = running,
-                });
-                emitted = true;
-            }
+        const actions = exploredItem(arena, item) orelse &.{};
+        for (actions) |action| {
+            try rows.append(arena, .{
+                .entry_id = item.entry_id,
+                .kind = .item,
+                .style = .dim,
+                .text = try arena.print("{s} {s}", .{
+                    if (running) action.kind.present() else action.kind.past(),
+                    action.target,
+                }),
+                .running = running,
+            });
         }
-        if (!emitted) try rows.append(arena, .{
+        if (actions.len == 0) try rows.append(arena, .{
             .entry_id = item.entry_id,
             .kind = .item,
             .style = .dim,
@@ -424,50 +421,6 @@ fn keepsOutput(arena: Allocator, item: Item, record: *const ToolDetailRecord) bo
     if (record.outcome == .denied) return false;
     if (isFailure(record)) return true;
     return exploredItem(arena, item) == null;
-}
-
-/// Adjacent reads as one row, codex's way: actions of a kind share their
-/// verb, "Explored · Read a.ts, b.ts · Searched "x" in c.ts", and a call
-/// still running reads in the present tense.
-fn exploredText(arena: Allocator, run: []const Item) ![]const u8 {
-    const Action = struct { kind: command_summary.Kind, target: []const u8, running: bool };
-    var actions: std.ArrayList(Action) = .empty;
-    for (run) |item| {
-        const running = isLive(item.detail);
-        if (exploredItem(arena, item)) |found| {
-            for (found) |action| try actions.append(arena, .{ .kind = action.kind, .target = action.target, .running = running });
-        } else {
-            // A file read names its file and lines, not its whole path.
-            const target = targetOf(item.phrase);
-            const name = std.Io.Dir.path.basename(target[0 .. std.mem.findScalar(u8, target, ':') orelse target.len]);
-            const range = if (std.mem.findScalar(u8, target, ':')) |at| target[at..] else "";
-            try actions.append(arena, .{ .kind = .read, .target = try arena.print("{s}{s}", .{ name, range }), .running = running });
-        }
-    }
-    var out: std.Io.Writer.Allocating = .init(arena);
-    const writer = &out.writer;
-    try writer.writeAll("Explored · ");
-    var index: usize = 0;
-    while (index < actions.items.len) {
-        const first = actions.items[index];
-        var names: std.ArrayList([]const u8) = .empty;
-        var end = index;
-        while (end < actions.items.len and actions.items[end].kind == first.kind and actions.items[end].running == first.running) : (end += 1) {
-            const target = actions.items[end].target;
-            for (names.items) |known| {
-                if (std.mem.eql(u8, known, target)) break;
-            } else try names.append(arena, target);
-        }
-        if (index > 0) try writer.writeAll(" · ");
-        try writer.print("{s} ", .{if (first.running) first.kind.present() else first.kind.past()});
-        for (names.items[0..@min(names.items.len, explore_names)], 0..) |name, position| {
-            if (position > 0) try writer.writeAll(", ");
-            try writer.writeAll(name);
-        }
-        if (names.items.len > explore_names) try writer.print(", +{d}", .{names.items.len - explore_names});
-        index = end;
-    }
-    return out.written();
 }
 
 fn appendItem(arena: Allocator, rows: *std.ArrayList(Row), item: Item, style: Style, tail: bool) !void {
