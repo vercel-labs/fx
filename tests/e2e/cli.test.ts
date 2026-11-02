@@ -2516,7 +2516,7 @@ describe("cli: setup", () => {
       expect(r.code).toBe(1);
       expect(r.stdout).toBe("");
       expect(r.stderr).toBe(
-        "fx setup is deprecated and stops working in fx 0.0.17; use fx login vercel --api-key\n" +
+        "fx setup is deprecated and stops working in fx 0.0.18; use fx login vercel --api-key\n" +
           "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n",
       );
     },
@@ -2582,7 +2582,7 @@ exit 99
         });
         expect(r.code).toBe(1);
         expect(r.stdout).toBe("");
-        expect(r.stderr).toContain("fx setup is deprecated and stops working in fx 0.0.17; use fx login vercel --api-key\n");
+        expect(r.stderr).toContain("fx setup is deprecated and stops working in fx 0.0.18; use fx login vercel --api-key\n");
         expect(r.stderr).toContain("interactive terminal is required");
         expect(existsSync(invocationLog)).toBe(false);
       } finally {
