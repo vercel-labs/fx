@@ -232,98 +232,28 @@ fn blockKindForEntry(entry: TranscriptEntry) TranscriptBlockKind {
     };
 }
 
-/// A step's reasoning trace. Its record stays full-only in the store; the
-/// compact transcript shows its first few prose lines.
-pub fn isThinkingNotice(notice: anytype) bool {
-    return !notice.inline_hidden and
-        std.mem.eql(u8, notice.topic, "thinking") and
-        notice.visibility == .full_only;
-}
-
 pub fn isEntryVisibleInCompactPresentation(entry: TranscriptEntry) bool {
     return switch (entry) {
         .semantic_notice => |notice| !notice.inline_hidden and
-            (notice.visibility == .compact_and_full or isThinkingNotice(notice)),
+            notice.visibility == .compact_and_full,
         inline else => |payload| !payload.inline_hidden,
     };
 }
 
-test "compact reasoning shows a heading and five prose lines with code folded" {
-    const alloc = std.testing.allocator;
-    const entry = TranscriptEntry{ .semantic_notice = .{
-        .id = 1,
-        .topic = "thinking",
-        .tone = .information,
-        .body = "Line one.\nLine two.\nLine three.\n```\ncode one\ncode two\n```\nLine four.\nLine five.\nLine six.",
-        .visibility = .full_only,
-    } };
-    const block = try renderEntryToBlock(alloc, entry, 40, .{});
-    defer block.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, block.bytes, "Thinking") != null);
-    try std.testing.expect(std.mem.find(u8, block.bytes, "Line one.") != null);
-    try std.testing.expect(std.mem.find(u8, block.bytes, "Line five.") != null);
-    try std.testing.expect(std.mem.find(u8, block.bytes, "Line six.") == null);
-    try std.testing.expect(std.mem.find(u8, block.bytes, "code one") == null);
-    try std.testing.expect(std.mem.find(u8, block.bytes, "(2 lines of code)") != null);
-    try std.testing.expect(std.mem.find(u8, block.bytes, "…") != null);
-}
-
-/// Rows of a reasoning trace the compact transcript shows. The full trace
-/// stays in ctrl+o.
-const reasoning_inline_rows = 5;
-const reasoning_inline_indent = 2;
-const reasoning_inline_max_bytes = 64 * 1024;
-
-/// A step's reasoning as proto shows one: a muted heading, then the first
-/// few prose lines in dim italic. Fenced code is folded away before the
-/// lines are counted, so the cap covers what a person can read.
-fn renderReasoningTrace(alloc: Allocator, body: []const u8, cols: u16) ![]u8 {
-    const folded = try thinking_text.proseOnly(alloc, body);
-    defer alloc.free(folded);
-    const room = @max(@as(usize, cols) -| reasoning_inline_indent, 1);
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, "  ");
-    try out.appendSlice(alloc, ui_render.dim_style);
-    try out.appendSlice(alloc, "Thinking");
-    try out.appendSlice(alloc, ui_render.reset_style);
-
-    var shown: usize = 0;
-    var truncated = false;
-    var lines = std.mem.splitScalar(u8, folded, '\n');
-    while (lines.next()) |raw| {
-        const trimmed = std.mem.trim(u8, raw, " \t\r");
-        if (trimmed.len == 0) continue;
-        // One source line at a time: `encodeTerminalSafe` escapes the line
-        // break itself, and the wrap below is per display row.
-        const safe = try text_utils.encodeTerminalSafeInline(alloc, trimmed, reasoning_inline_max_bytes);
-        defer alloc.free(safe.bytes);
-        var line: []const u8 = safe.bytes;
-        while (line.len > 0) {
-            if (shown == reasoning_inline_rows) {
-                truncated = true;
-                break;
-            }
-            var chunk = display_width.wrapCutIgnoringAnsi(line, room);
-            if (chunk.len == 0) chunk = line[0..display_width.displayUnitAt(line, 0).byte_len];
-            try out.append(alloc, '\n');
-            try out.appendSlice(alloc, "  ");
-            try out.appendSlice(alloc, ui_render.thinking_style);
-            try out.appendSlice(alloc, chunk);
-            try out.appendSlice(alloc, ui_render.reset_style);
-            shown += 1;
-            line = std.mem.trimStart(u8, line[chunk.len..], " \t");
-        }
-        if (truncated) break;
+test "compact presentation omits reasoning whose folded prose is blank" {
+    for ([_][]const u8{ "", " \t\r\n \n", "\n  ``" }) |body| {
+        const entry = TranscriptEntry{ .semantic_notice = .{
+            .id = 1,
+            .topic = "thinking",
+            .tone = .information,
+            .body = body,
+            .visibility = .full_only,
+        } };
+        try std.testing.expect(!isEntryVisibleInCompactPresentation(entry));
+        const block = try renderEntryToBlock(std.testing.allocator, entry, 40, .{});
+        defer block.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("", block.bytes);
     }
-    if (truncated) {
-        try out.appendSlice(alloc, " ");
-        try out.appendSlice(alloc, ui_render.dim_style);
-        try out.appendSlice(alloc, "…");
-        try out.appendSlice(alloc, ui_render.reset_style);
-    }
-    return out.toOwnedSlice(alloc);
 }
 
 pub fn entryClassForEntry(entry: TranscriptEntry) TranscriptEntryClass {
@@ -2113,14 +2043,6 @@ fn renderEntryToBlockForPresentationInterruptible(
             .bytes = "",
             .stored_tail_newlines = 0,
         };
-    }
-    if (presentation == .compact) {
-        switch (entry) {
-            .semantic_notice => |notice| if (isThinkingNotice(notice)) {
-                return normalizeOwnedRenderedBlock(alloc, kind, try renderReasoningTrace(alloc, notice.body, cols));
-            },
-            else => {},
-        }
     }
     return switch (entry) {
         .raw_bytes => |e| if (e.class == .tool_status and presentation == .full) blk: {

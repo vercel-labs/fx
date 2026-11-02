@@ -92,16 +92,6 @@ fn searchFoundNothing(record: *const ToolDetailRecord) bool {
     return std.mem.trim(u8, record.result orelse "", " \t\r\n").len == 0;
 }
 
-/// Whether a call only explores: a file read, a search, or a shell run that
-/// only reads, lists and searches. An agent thinks between these, so its
-/// thoughts do not split a block of them (D290).
-pub fn isExploration(record: *const ToolDetailRecord) bool {
-    if (record.activity_kind == .read) return true;
-    var buffer: [32 * 1024]u8 = undefined;
-    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
-    return explored(fixed.allocator(), record) != null;
-}
-
 /// What a shell run reads, lists and searches when that is all it does,
 /// or null (D290). Presentation only: it never decides what runs.
 pub fn explored(arena: Allocator, record: *const ToolDetailRecord) ?[]const command_summary.Action {

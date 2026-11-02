@@ -33,7 +33,6 @@ pub var tag_style: []const u8 = shared_theme.fx_dark.tag_style;
 pub var subtitle_style: []const u8 = shared_theme.fx_dark.subtitle_style;
 pub var tool_title_style: []const u8 = shared_theme.fx_dark.tool_title_style;
 pub var tool_stdout_style: []const u8 = shared_theme.fx_dark.tool_stdout_style;
-pub var thinking_style: []const u8 = shared_theme.fx_dark.thinking_style;
 pub var system_notice_label_style: []const u8 = shared_theme.fx_dark.system_notice_label_style;
 pub var system_notice_text_style: []const u8 = shared_theme.fx_dark.system_notice_text_style;
 pub var dim_style: []const u8 = shared_theme.fx_dark.dim_style;
@@ -84,7 +83,6 @@ pub fn applyTheme(theme: shared_theme.Theme, terminal_bg: ?TerminalRgb) void {
     subtitle_style = theme.subtitle_style;
     tool_title_style = theme.tool_title_style;
     tool_stdout_style = theme.tool_stdout_style;
-    thinking_style = theme.thinking_style;
     system_notice_label_style = theme.system_notice_label_style;
     system_notice_text_style = theme.system_notice_text_style;
     dim_style = theme.dim_style;

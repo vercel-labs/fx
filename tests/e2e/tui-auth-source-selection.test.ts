@@ -6978,7 +6978,12 @@ tmuxTest(
       const rows = grid.split("\n");
       const promptRow = rows.findIndex((row) => row.includes(prompt));
       expect(promptRow).toBeGreaterThanOrEqual(0);
-      expect(rows.findIndex((row) => row.includes("Thinking"))).toBe(promptRow + 2);
+      // The transcript carries no thinking trace between tool calls; the
+      // spinner's preview at the bottom is the only thinking view.
+      const thinkingRows = rows.filter((row) => row.includes("Thinking"));
+      for (const row of thinkingRows) {
+        expect(row.trim()).toMatch(/^[• ] Thinking \(/);
+      }
     }
 
     await session.sendKeys("Enter");

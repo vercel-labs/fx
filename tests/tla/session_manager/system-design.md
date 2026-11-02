@@ -2618,7 +2618,12 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   provider startup. **Why:** proto's judge selection. **Alternative:**
   always the session's model, which spends the large model on yes or no.
 
-- **D208 Decision:** a step's reasoning heading shows only for a real
+- **D208 Decision (superseded):** the transcript carries no thinking
+  between tool calls anymore, so a step's reasoning heading and its
+  title rule are gone. A turn's reasoning shows only as the footer's live
+  preview, the five-line capped tail under the Thinking spinner, and a
+  persisted thinking notice replays as nothing. The original decision
+  follows. A step's reasoning heading shows only for a real
   title: a summary's `#` or whole-line bold title, or a first line on its
   own of at most 60 bytes and 8 words that starts with a capital and does
   not end in `:`, `.`, `,`, `;`, `!`, `?` or an ellipsis. A trace that

@@ -316,128 +316,6 @@ test "a rewind's divider spans the row with its label centered" {
     try std.testing.expectEqual(@as(usize, 30), display_width.visibleWidth(block.bytes));
 }
 
-const SegmentKey = struct {
-    group: types.ToolPresentationGroupId,
-    /// Counts the reasoning headings that opened a block of this group.
-    segment: u32,
-};
-
-fn isReasoningHeading(entry: TranscriptEntry) bool {
-    return switch (entry) {
-        .semantic_notice => |notice| transcript_blocks.isThinkingNotice(notice),
-        else => false,
-    };
-}
-
-/// The tool row a reasoning heading belongs before: the row just above it,
-/// past hidden and attached entries. Null when prose or another heading
-/// comes first, so the heading stays where it is.
-fn headingOwner(entries: []const TranscriptEntry, heading_index: usize) ?usize {
-    var index = heading_index;
-    while (index > 0) {
-        index -= 1;
-        const entry = entries[index];
-        if (toolStatusEntryId(entry) != null) return index;
-        if (isAttachedEntry(entry) or !transcript_blocks.isEntryVisibleInCompactPresentation(entry)) continue;
-        return null;
-    }
-    return null;
-}
-
-/// `group` with the step's reasoning heading and a blank line above it.
-fn prependHeading(alloc: std.mem.Allocator, group: GroupBlock, heading: TranscriptEntry, cols: u16) !GroupBlock {
-    defer alloc.free(group.bytes);
-    defer alloc.free(group.lines);
-    const rendered = try transcript_blocks.renderEntryToBlock(alloc, heading, cols, .{});
-    defer rendered.deinit(alloc);
-    const text = std.mem.trimEnd(u8, rendered.bytes, "\n");
-    // A reasoning trace can render as a heading and several prose rows, so
-    // every row it prints needs its own provenance entry.
-    const heading_rows = std.mem.countScalar(u8, text, '\n') + 1;
-    const lines = try alloc.alloc(transcript_blocks.LineProvenance, heading_rows + 1 + group.lines.len);
-    errdefer alloc.free(lines);
-    @memset(lines[0..heading_rows], .{ .entry = .{ .entry_id = heading.id(), .entry_class = transcript_blocks.entryClassForEntry(heading) } });
-    lines[heading_rows] = .block_separator;
-    @memcpy(lines[heading_rows + 1 ..], group.lines);
-    const bytes = try alloc.print("{s}\n\n{s}", .{ text, group.bytes });
-    return .{ .bytes = bytes, .lines = lines };
-}
-
-test "a multi-row reasoning trace above a tool group has provenance for every row" {
-    const alloc = std.testing.allocator;
-    const heading = TranscriptEntry{ .semantic_notice = .{
-        .id = 3,
-        .topic = "thinking",
-        .tone = .information,
-        .body = "First thought.\nSecond thought.\nThird thought.\nFourth thought.\nFifth thought.\nSixth thought.",
-        .visibility = .full_only,
-    } };
-    const group_lines = try alloc.alloc(transcript_blocks.LineProvenance, 1);
-    group_lines[0] = .{ .entry = .{ .entry_id = 4, .entry_class = .tool_status, .projection_part = .group_child } };
-    const group: GroupBlock = .{ .bytes = try alloc.dupe(u8, "● Ran sleep 45"), .lines = group_lines };
-    const block = try prependHeading(alloc, group, heading, 80);
-    defer alloc.free(block.bytes);
-    defer alloc.free(block.lines);
-    const rows = std.mem.countScalar(u8, block.bytes, '\n') + 1;
-    try std.testing.expectEqual(rows, block.lines.len);
-    try std.testing.expect(block.lines[rows - 2] == .block_separator);
-    try std.testing.expectEqual(@as(u32, 4), block.lines[rows - 1].entry.entry_id);
-}
-
-test "thoughts between reads and searches leave one block" {
-    const alloc = std.testing.allocator;
-    const group: types.ToolPresentationGroupId = .{ .turn_id = 1, .anchor_step_id = 1 };
-    const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "read", .class = .tool_status } },
-        .{ .semantic_notice = .{ .id = 2, .topic = "thinking", .tone = .information, .body = "First thought.", .visibility = .full_only } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "read", .class = .tool_status } },
-        .{ .semantic_notice = .{ .id = 4, .topic = "thinking", .tone = .information, .body = "Second thought.", .visibility = .full_only } },
-        .{ .raw_bytes = .{ .id = 5, .bytes = "read", .class = .tool_status } },
-    };
-    const details = [_]ToolDetailRecord{
-        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .presentation_group_id = group },
-        .{ .entry_id = 3, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .presentation_group_id = group },
-        .{ .entry_id = 5, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .presentation_group_id = group },
-    };
-
-    var projection = try build(alloc, &entries, &details, 120);
-    defer projection.deinit(alloc);
-
-    // One block holds all three reads; the later rows are hidden in it.
-    const block = projection.entry_actions.items[0].override.bytes;
-    try std.testing.expect(std.mem.find(u8, block, "Read 3 files") != null);
-    try std.testing.expect(projection.entry_actions.items[2] == .hide);
-    try std.testing.expect(projection.entry_actions.items[4] == .hide);
-}
-
-test "a thought beside a command still opens a new block" {
-    const alloc = std.testing.allocator;
-    const group: types.ToolPresentationGroupId = .{ .turn_id = 1, .anchor_step_id = 1 };
-    const entries = [_]TranscriptEntry{
-        .{ .raw_bytes = .{ .id = 1, .bytes = "read", .class = .tool_status } },
-        .{ .semantic_notice = .{ .id = 2, .topic = "thinking", .tone = .information, .body = "First thought.", .visibility = .full_only } },
-        .{ .raw_bytes = .{ .id = 3, .bytes = "command", .class = .tool_status } },
-        .{ .semantic_notice = .{ .id = 4, .topic = "thinking", .tone = .information, .body = "Second thought.", .visibility = .full_only } },
-        .{ .raw_bytes = .{ .id = 5, .bytes = "read", .class = .tool_status } },
-    };
-    const details = [_]ToolDetailRecord{
-        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .presentation_group_id = group },
-        .{ .entry_id = 3, .tool_name = @constCast("run_command"), .activity_kind = .command, .outcome = .completed, .presentation_group_id = group },
-        .{ .entry_id = 5, .tool_name = @constCast("read_file"), .activity_kind = .read, .outcome = .completed, .presentation_group_id = group },
-    };
-
-    var projection = try build(alloc, &entries, &details, 120);
-    defer projection.deinit(alloc);
-
-    // The command starts its own block, drawn with the thought above it.
-    const first = projection.entry_actions.items[0].override.bytes;
-    try std.testing.expect(std.mem.find(u8, first, "First thought.") != null);
-    try std.testing.expect(std.mem.find(u8, first, "run_command") == null);
-    const second = projection.entry_actions.items[2].override.bytes;
-    try std.testing.expect(std.mem.find(u8, second, "run_command") != null);
-    try std.testing.expect(std.mem.find(u8, second, "Second thought.") != null);
-}
-
 fn isAttachedEntry(entry: TranscriptEntry) bool {
     return switch (entry) {
         .raw_bytes => |raw| raw.class == .command_output or raw.class == .diff_block,
@@ -1222,8 +1100,6 @@ pub fn incrementalRebuildStart(
 ) ?usize {
     if (dirty_entry_index >= entries.len) return null;
     var first = dirty_entry_index;
-    // A reasoning heading is drawn with the tool row above it.
-    if (isReasoningHeading(entries[first])) first = headingOwner(entries, first) orelse first;
     const dirty_entry_id = entries[first].id();
 
     const dirty_group = presentationGroupId(sortedDetailForEntry(details, dirty_entry_id));
@@ -1521,32 +1397,10 @@ fn buildWithStyleAndStats(
         presentation_groups.deinit(alloc);
     }
     var presentation_group_by_id: std.AutoHashMapUnmanaged(
-        SegmentKey,
+        types.ToolPresentationGroupId,
         usize,
     ) = .empty;
     defer presentation_group_by_id.deinit(alloc);
-    const SegmentState = struct {
-        segment: u32 = 0,
-        /// Whether the group's previous row only explores.
-        last_explored: bool = false,
-    };
-    var segment_by_group: std.AutoHashMapUnmanaged(types.ToolPresentationGroupId, SegmentState) = .empty;
-    defer segment_by_group.deinit(alloc);
-
-    // A step's reasoning heading arrives just after the step's first tool
-    // row. In the compact view it opens that step's block, so the block
-    // starts a new segment of its presentation group, unless that row and
-    // the one before it only explore.
-    const heading_for_status = try alloc.alloc(?usize, if (mode == .compact) entries.len else 0);
-    defer alloc.free(heading_for_status);
-    @memset(heading_for_status, null);
-    if (mode == .compact) {
-        for (entries, 0..) |entry, entry_index| {
-            if (!isReasoningHeading(entry)) continue;
-            const owner = headingOwner(entries, entry_index) orelse continue;
-            heading_for_status[owner] = entry_index;
-        }
-    }
 
     for (entries, 0..) |entry, entry_index| {
         try build_checkpoint.tick(checkpoint);
@@ -1555,17 +1409,7 @@ fn buildWithStyleAndStats(
         const detail = detailForEntry(details, &detail_indices, entry_id, stats);
         if (statusNamesAsk(entry, detail) or (mode == .compact and isRewind(detail))) continue;
         const group_id = presentationGroupId(detail) orelse continue;
-        const segment = try segment_by_group.getOrPut(alloc, group_id);
-        if (!segment.found_existing) segment.value_ptr.* = .{};
-        const exploring = if (detail) |record| tiers.isExploration(record) else false;
-        // A thought opens a new block, except between two rows that only
-        // explore: an agent thinks between reads and searches, and each
-        // thought would otherwise leave a block of one or two rows.
-        if (mode == .compact and heading_for_status[entry_index] != null and
-            !(exploring and segment.value_ptr.last_explored)) segment.value_ptr.segment += 1;
-        segment.value_ptr.last_explored = exploring;
-
-        const result = try presentation_group_by_id.getOrPut(alloc, .{ .group = group_id, .segment = segment.value_ptr.segment });
+        const result = try presentation_group_by_id.getOrPut(alloc, group_id);
         if (!result.found_existing) {
             result.value_ptr.* = presentation_groups.items.len;
             try presentation_groups.append(alloc, .{ .anchor_index = entry_index });
@@ -1680,7 +1524,7 @@ fn buildWithStyleAndStats(
                 );
             }
 
-            var bytes = try formatGroupBlock(
+            const bytes = try formatGroupBlock(
                 alloc,
                 entries,
                 group.status_indices.items,
@@ -1693,10 +1537,6 @@ fn buildWithStyleAndStats(
                 style,
                 styles,
             );
-            if (heading_for_status[group.anchor_index]) |heading_index| {
-                projection.entry_actions.items[heading_index] = .hide;
-                bytes = try prependHeading(alloc, bytes, entries[heading_index], cols);
-            }
             try projection.setOwnedGroup(alloc, index, bytes);
             index += 1;
             continue;

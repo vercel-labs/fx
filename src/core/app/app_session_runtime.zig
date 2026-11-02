@@ -3445,6 +3445,13 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.title_generation.requestStop();
         }
 
+        /// A persisted thinking trace replays as nothing: the transcript no
+        /// longer carries thinking between tool calls, and a live turn shows
+        /// reasoning only as the footer's preview under the Thinking spinner.
+        fn replaySkipsNotice(notice: types.SemanticNotice) bool {
+            return std.mem.eql(u8, notice.topic, "thinking");
+        }
+
         fn LiveHistorySink(comptime SinkApp: type) type {
             return struct {
                 app: *SinkApp,
@@ -3456,6 +3463,7 @@ pub fn Runtime(comptime App: type) type {
                 const Self = @This();
 
                 fn appendNotice(self: *Self, notice: types.SemanticNotice) !void {
+                    if (replaySkipsNotice(notice)) return;
                     try self.app.writeDomainNotice(notice, true);
                 }
 
@@ -3762,6 +3770,7 @@ pub fn Runtime(comptime App: type) type {
                 }
 
                 fn appendNotice(self: *Self, notice: types.SemanticNotice) !void {
+                    if (replaySkipsNotice(notice)) return;
                     _ = try self.projection.appendNotice(notice);
                 }
 
