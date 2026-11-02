@@ -2622,7 +2622,7 @@ fn sessionGrantsAllowAll(grants: []const PermissionGrant, tool_name: []const u8,
 pub fn permissionTargetForCall(input: Input, arena: Allocator, call: ToolCall) ![]const u8 {
     if (isAvailableDynamicTool(input, call.name)) return arena.dupe(u8, call.name);
     if (registeredWebSearchTarget(input, call.name)) |target_name| return arena.dupe(u8, target_name);
-    const tool = registeredTool(input, call.name) orelse return error.UnsupportedTool;
+    const tool = registeredTool(input, call.name) orelse return unreachableToolError(input, call.name);
     if (try isRunCommandCall(input, arena, call)) {
         return commandPermissionTarget(input, arena, call);
     }
@@ -2635,6 +2635,43 @@ pub fn permissionTargetForCall(input: Input, arena: Allocator, call: ToolCall) !
         call,
         tool.permission_target_kind,
     );
+}
+
+/// Splits a call with no target the way the dispatcher does
+/// (`tool_mcp_registry.resolve`): with MCP running, an unadvertised name is
+/// unselected; anything else is unsupported.
+fn unreachableToolError(input: Input, name: []const u8) error{ DynamicToolNotSelected, UnsupportedTool } {
+    if (input.mcp_runtime.context != null and
+        !tool_mcp_runtime.isAdvertisedDynamicToolName(input.advertised_dynamic_tool_names, name))
+    {
+        return error.DynamicToolNotSelected;
+    }
+    return error.UnsupportedTool;
+}
+
+test "a call with no target splits into unselected and unsupported like the dispatcher" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var input = testInputWithClassifier(&worker, permission_auto_classifier.Classifier.disabled());
+    input.tool_registry = .{ .tools = &.{test_builtin_tools.read_file} };
+    const call: ToolCall = .{ .id = "direct", .name = "mcp_slack_read", .arguments_json = "{}" };
+
+    // No MCP runtime: nothing can be selected.
+    input.mcp_runtime = .{};
+    try std.testing.expectError(error.UnsupportedTool, permissionTargetForCall(input, arena_state.allocator(), call));
+
+    // MCP running and the name not advertised this step: select it first.
+    var runtime_context: u8 = 0;
+    input.mcp_runtime = .{ .context = &runtime_context };
+    input.advertised_dynamic_tool_names = &.{};
+    try std.testing.expectError(error.DynamicToolNotSelected, permissionTargetForCall(input, arena_state.allocator(), call));
+
+    // Advertised but not available, as outside a subagent's servers.
+    input.advertised_dynamic_tool_names = &.{"mcp_slack_read"};
+    try std.testing.expectError(error.UnsupportedTool, permissionTargetForCall(input, arena_state.allocator(), call));
+    try std.testing.expectError(error.UnsupportedTool, permissionTargetForLiveAuthority(input, arena_state.allocator(), call));
 }
 
 /// Resolves the target used only for inherited live-authority checks. A

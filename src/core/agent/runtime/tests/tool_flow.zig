@@ -7049,6 +7049,8 @@ test "child target failures settle the batch before and after permission without
     const cases = [_]struct { after_permission: bool = false, target_error: anyerror = error.NotDir, provider_error: ?anyerror = null, fatal: ?anyerror = null }{
         .{},
         .{ .after_permission = true },
+        .{ .target_error = error.DynamicToolNotSelected },
+        .{ .after_permission = true, .target_error = error.UnsupportedTool },
         .{ .target_error = error.OutOfMemory, .fatal = error.OutOfMemory },
         .{ .target_error = error.Cancelled, .fatal = error.Cancelled },
         .{ .provider_error = error.FileNotFound, .fatal = error.FileNotFound },
@@ -7108,13 +7110,14 @@ test "child target failures settle the batch before and after permission without
 const UnreachableToolProbe = struct {
     hooks: FakeAgentRuntimeDeps,
     unreachable_name: []const u8,
+    target_error: anyerror,
     resolves: usize = 0,
 
     // Mirrors the child adapters: a tool the child cannot reach has no target.
     fn target(raw: *anyopaque, arena: std.mem.Allocator, call: ToolCall, _: []const []const u8) ![]const u8 {
         const hooks: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         const self: *@This() = @fieldParentPtr("hooks", hooks);
-        if (std.mem.eql(u8, call.name, self.unreachable_name)) return error.UnsupportedTool;
+        if (std.mem.eql(u8, call.name, self.unreachable_name)) return self.target_error;
         return arena.dupe(u8, call.name);
     }
 
@@ -7167,6 +7170,7 @@ test "child call to an unselected dynamic tool fails the call and the turn conti
     var probe = UnreachableToolProbe{
         .hooks = FakeAgentRuntimeDeps.init(alloc),
         .unreachable_name = "mcp_slack_read_channel",
+        .target_error = error.DynamicToolNotSelected,
     };
     defer probe.hooks.deinit();
 
@@ -7196,6 +7200,7 @@ test "child call to a selected tool outside its admission is refused and the tur
     var probe = UnreachableToolProbe{
         .hooks = FakeAgentRuntimeDeps.init(alloc),
         .unreachable_name = "mcp_fixture_echo",
+        .target_error = error.UnsupportedTool,
     };
     defer probe.hooks.deinit();
     probe.hooks.permission_decisions = &.{.once};

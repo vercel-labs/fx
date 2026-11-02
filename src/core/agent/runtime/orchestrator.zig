@@ -2355,7 +2355,7 @@ fn resolveLiveToolAuthority(
             call,
             advertised_dynamic_tool_names,
         ) catch |err| {
-        const failure = (try liveAuthorityUnsupportedToolMessage(deps, arena, call, advertised_dynamic_tool_names, err)) orelse
+        const failure = (try liveAuthorityUnreachableToolMessage(arena, call, err)) orelse
             (try tooling_tool_admission.permissionTargetResolutionFailureMessage(arena, call, err)) orelse
             return err;
         debug_trace.logf("permission", "event=live_authority_target_failure call_id={s} tool_name={s} err={s}", .{ call.id, call.name, @errorName(err) });
@@ -2383,19 +2383,12 @@ fn resolveLiveToolAuthority(
 
 /// A child's call to a tool it cannot reach fails the call, not the turn, with
 /// the text the root dispatcher gives the same call. The call never executes.
-fn liveAuthorityUnsupportedToolMessage(
-    deps: *const AgentRuntimeDeps,
-    arena: Allocator,
-    call: ToolCall,
-    advertised_dynamic_tool_names: []const []const u8,
-    err: anyerror,
-) !?[]const u8 {
-    if (err != error.UnsupportedTool) return null;
-    const can_select = deps.tool_registry.lookup("mcp_select_tool") != null;
-    if (can_select and !tool_mcp_runtime.isAdvertisedDynamicToolName(advertised_dynamic_tool_names, call.name)) {
-        return try tool_mcp_runtime.notSelectedOutput(arena, call.name);
-    }
-    return try arena.print("Unsupported tool: {s}", .{call.name});
+fn liveAuthorityUnreachableToolMessage(arena: Allocator, call: ToolCall, err: anyerror) !?[]const u8 {
+    return switch (err) {
+        error.DynamicToolNotSelected => try tool_mcp_runtime.notSelectedOutput(arena, call.name),
+        error.UnsupportedTool => try arena.print("Unsupported tool: {s}", .{call.name}),
+        else => null,
+    };
 }
 
 fn liveAuthorityRejectsExecution(
