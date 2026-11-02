@@ -140,7 +140,7 @@ pub const StreamChunkContext = struct {
         if (self.raw_text.items.len > 0) {
             try flushAssistantStream(self);
             try self.hooks.push_text(self.hooks.ctx, .{
-                .assistant_restarted = "\n\n[Response interrupted. Restarting.]\n\n",
+                .assistant_restarted = "\n\n↻ Restarted the answer\n\n",
             });
             debug_trace.logf("agent", "restarting response preview_bytes={d} superseded_preview_bytes={d}", .{
                 self.raw_text.items.len,
@@ -575,7 +575,7 @@ pub fn finishLengthLimitedToolCallCompletion(
     completion: types.ModelCompletion,
     streamed_content_len: usize,
 ) ![]const u8 {
-    const blocker = "Provider response hit the length limit, so I did not execute the returned tool calls. Latest partial response is preserved above; retry with a narrower prompt or inspect stored tool output before continuing.";
+    const blocker = "The reply ran out of output tokens before its tool calls were complete, so I did not run them. Send your message again to retry, or ask for a smaller step.";
 
     const has_content = completion.content != null and completion.content.?.len > 0;
     const normalized = if (has_content) try normalizeAssistantTextForDisplay(arena, completion.content.?) else "";
@@ -1167,7 +1167,7 @@ test "source-only consumers preserve bytes without Markdown work across restart"
     try std.testing.expectEqualStrings("Replacement.", stream_ctx.accepted_source());
     try std.testing.expectEqualStrings(source, stream_ctx.interrupted_source.items);
     try std.testing.expectEqual(@as(usize, 1), capture.text_spans.items.len);
-    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "Response interrupted") != null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[0], "Restarted the answer") != null);
 }
 
 test "recovery starts a fresh response while retaining interrupted evidence" {
@@ -1182,7 +1182,7 @@ test "recovery starts a fresh response while retaining interrupted evidence" {
     try stream_ctx.beginRecoveryAttempt();
     try std.testing.expectEqualStrings("", stream_ctx.accepted_source());
     try std.testing.expectEqualStrings("software", stream_ctx.interruption_source_or(""));
-    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[capture.text_spans.items.len - 1], "Response interrupted") != null);
+    try std.testing.expect(std.mem.find(u8, capture.text_spans.items[capture.text_spans.items.len - 1], "Restarted the answer") != null);
     try streamAssistantChunk(&stream_ctx, "2. A complete replacement.");
     try flushAssistantStream(&stream_ctx);
     try std.testing.expectEqualStrings("2. A complete replacement.", stream_ctx.accepted_source());

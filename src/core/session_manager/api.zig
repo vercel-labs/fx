@@ -423,6 +423,24 @@ pub const Manager = struct {
         };
     }
 
+    /// The session `host` last opened in `workspace`, from the index alone,
+    /// as `openResume` picks it for `.last_opened`. The caller frees it.
+    pub fn lastOpened(m: *Manager, gpa: std.mem.Allocator, workspace: []const u8, host: Host) OpenError!?[]u8 {
+        try checkText(workspace);
+        if (!try readyToRead(m)) return null;
+        const id = (try m.resolve(workspace, .{ .last_opened = host })) orelse return null;
+        defer m.gpa.free(id);
+        return try gpa.dupe(u8, id);
+    }
+
+    /// Whether another process has session `id` open for writing. When none
+    /// has, this holds its lock for an instant (`session.zig` `isBusy`).
+    pub fn isBusy(m: *Manager, id: []const u8) OpenError!bool {
+        try checkId(id);
+        if (!try readyToRead(m)) return error.NotFound;
+        return session_mod.isBusy(&m.env, id);
+    }
+
     pub fn getBlob(m: *Manager, gpa: std.mem.Allocator, id: []const u8, hash: []const u8) BlobError![]u8 {
         try checkId(id);
         if (!schema.validBlobHash(hash)) return error.InvalidArgument;
@@ -1119,6 +1137,30 @@ const api_tests = struct {
         const c = try m.openResume(.{ .target = .{ .last_opened = .app }, .workspace = "/x", .host = .app });
         try testing.expectEqualStrings(id, c.id());
         c.release();
+    }
+
+    test "lastOpened names the app's session from the index, and isBusy sees its writer" {
+        var f: Fixture = undefined;
+        try f.init();
+        defer f.deinit();
+        const m = f.manager;
+        const s = try m.openNew(.{ .workspace = "/w", .host = .app });
+        _ = try s.append(&.{ .turn_started, .turn_committed });
+        const id = try gpa.dupe(u8, s.id());
+        defer gpa.free(id);
+        s.release();
+
+        const found = (try m.lastOpened(gpa, "/w", .app)).?;
+        defer gpa.free(found);
+        try testing.expectEqualStrings(id, found);
+        try testing.expect(try m.lastOpened(gpa, "/elsewhere", .app) == null);
+        try testing.expect(try m.lastOpened(gpa, "/w", .sdk) == null);
+
+        try testing.expect(!try m.isBusy(id));
+        const open = try m.openResume(.{ .target = .{ .id = id }, .workspace = "/w", .host = .app });
+        try testing.expect(try m.isBusy(id));
+        open.release();
+        try testing.expect(!try m.isBusy(id));
     }
 
     fn expectListedIn(m: *api.Manager, workspace: []const u8, want: ?[]const u8) !void {

@@ -42,10 +42,10 @@ const ImageUrl = struct {
 
     pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !ImageUrl {
         if (try source.peekNextTokenType() == .string) {
-            return .{ .url = try std.json.innerParse([]const u8, alloc, source, options) };
+            return .{ .url = try json_decode.innerParse([]const u8, alloc, source, options) };
         }
         const Wrapped = struct { url: []const u8 };
-        const wrapped = try std.json.innerParse(Wrapped, alloc, source, options);
+        const wrapped = try json_decode.innerParse(Wrapped, alloc, source, options);
         return .{ .url = wrapped.url };
     }
 };
@@ -63,7 +63,7 @@ const MessageContent = struct {
 
     pub fn jsonParse(alloc: Allocator, source: anytype, options: std.json.ParseOptions) !MessageContent {
         if (try source.peekNextTokenType() == .array_begin) {
-            return .{ .parts = try std.json.innerParse([]const ImagePart, alloc, source, options) };
+            return .{ .parts = try json_decode.innerParse([]const ImagePart, alloc, source, options) };
         }
         try source.skipValue();
         return .{};

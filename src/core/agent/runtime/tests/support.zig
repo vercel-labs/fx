@@ -4,10 +4,12 @@ const agent_stream_provider = @import("../../stream_provider.zig");
 const command_admission = @import("../../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../../permissions/auto_classifier.zig");
 const types = @import("../../../shared/types.zig");
+const cache_warmer = @import("../cache_warmer.zig");
 const permissions = @import("../../../permissions/permissions.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
 const builtin_context = @import("../../../../builtins/context.zig");
 const builtin_gateway = @import("../../../../builtins/gateway.zig");
+const gateway_client = @import("../../../../gateway/client.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
@@ -38,7 +40,6 @@ const runtime_config = @import("../config.zig");
 const runtime_deps = @import("../deps.zig");
 const runtime_lifecycle = @import("../lifecycle.zig");
 const runtime_agent = @import("../agent.zig");
-const model_response_recovery = @import("../model_response_recovery.zig");
 const runtime_orchestrator = @import("../orchestrator.zig");
 const runtime_tool_contracts = @import("../tool_contracts.zig");
 
@@ -209,7 +210,6 @@ pub const FakeCompletion = struct {
     usage: types.Usage = .{},
     generation_id: ?[]const u8 = null,
     delivery_ambiguous: bool = false,
-    pause_before_output: bool = false,
     cancel_before_output: bool = false,
     cancel_after_chunks: bool = false,
     cancel_during_tool_stream: bool = false,
@@ -246,7 +246,6 @@ pub const FakeGateway = struct {
     request_api_keys: std.ArrayList([]u8) = .empty,
     request_session_ids: std.ArrayList(?[]u8) = .empty,
     admitted_requests: usize = 0,
-    recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     observe_request: ?*const fn (agent_stream_provider.ModelRequest) anyerror!void = null,
     /// A continued tail means history projection ended on an assistant
     /// message. Only tests of that repair may accept it.
@@ -310,11 +309,6 @@ pub const FakeGateway = struct {
             return err;
         }
 
-        if (completion.pause_before_output) {
-            if (self.recovery_pause_flag) |flag| flag.store(true, .seq_cst);
-            request.cancel_flag.store(true, .seq_cst);
-            return error.Cancelled;
-        }
         if (completion.cancel_before_output) {
             request.cancel_flag.store(true, .seq_cst);
             return .{ .completed = .{} };
@@ -347,7 +341,7 @@ pub const FakeGateway = struct {
             errdefer if (failure_schema) |value| alloc.free(value);
             const failure_request_shape = if (completion.failure_request_shape) |value| try alloc.dupe(u8, value) else null;
             return .{ .failed = .{
-                .kind = .fromHttpStatus(completion.status),
+                .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(completion.status), err_body),
                 .detail = err_body,
                 .retry_after_seconds = completion.retry_after_seconds,
                 .diagnostics = .{
@@ -377,38 +371,16 @@ pub const FakeGateway = struct {
         } };
     }
 
+    /// The production classification, recorded as `src/builtins/gateway.zig`
+    /// records it for the real gateway.
     fn recordNetworkFailureEvidence(
         request: agent_stream_provider.ModelRequest,
         err: anyerror,
     ) void {
-        const cause: agent_stream_provider.NetworkFailureCause = if (err == error.SystemResumed)
-            .system_resumed
-        else if (err == error.TlsInitializationFailed or
-            err == error.ConnectionSetupTimedOut or
-            err == error.UnknownHostName or
-            err == error.NameServerFailure or
-            err == error.NoAddressReturned or
-            err == error.DetectingNetworkConfigurationFailed or
-            err == error.AddressUnavailable or
-            err == error.ConnectionPending or
-            err == error.ConnectionRefused or
-            err == error.HostUnreachable or
-            err == error.NetworkUnreachable or
-            err == error.NetworkDown or
-            err == error.WouldBlock or
-            err == error.WriteFailed or
-            err == error.ReadFailed or
-            err == error.HttpConnectionClosing or
-            err == error.ConnectionResetByPeer or
-            err == error.ConnectionTimedOut or
-            err == error.Timeout)
-            .transport_interrupted
-        else
-            return;
-        request.attempt_evidence.network_failure = .{
-            .cause = cause,
-            .delivery = request.delivery.load(),
-        };
+        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
+            err,
+            request.delivery.load(),
+        );
     }
 };
 
@@ -484,6 +456,10 @@ pub const FakeAgentRuntimeDeps = struct {
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
     root_permission_mode: ?PermissionMode = null,
+    cache_warmer: ?*cache_warmer.Warmer = null,
+    /// Records each usage the agent loop saves, as a saved session would.
+    record_usages: bool = false,
+    recorded_usages: std.ArrayList(types.Usage) = .empty,
     validation_mcp_runtime_generation: ?u64 = null,
     validation_mcp_tool_name: ?[]const u8 = null,
     execute_mutex: std.Io.Mutex = .init,
@@ -561,16 +537,6 @@ pub const FakeAgentRuntimeDeps = struct {
     swap_link_on_execute: ?[]const u8 = null,
     swap_link_target_on_execute: ?[]const u8 = null,
     static_context_text: ?[]const u8 = null,
-    parent_turn_context_text: ?[]const u8 = null,
-    parent_turn_context_texts: []const []const u8 = &.{},
-    parent_turn_context_index: usize = 0,
-    parent_turn_context_after_execute: ?[]const u8 = null,
-    parent_turn_context_sequence: ?u64 = null,
-    parent_turn_prepare_count: usize = 0,
-    parent_turn_ack_count: usize = 0,
-    parent_turn_last_ack_sequence: u64 = 0,
-    parent_turn_last_ack_prepare_count: usize = 0,
-    parent_turn_ack_contract_valid: bool = true,
     runtime_context_text: ?[]const u8 = null,
     runtime_context_texts: []const []const u8 = &.{},
     runtime_context_index: usize = 0,
@@ -616,6 +582,12 @@ pub const FakeAgentRuntimeDeps = struct {
     cancel_on_text_match: ?[]const u8 = null,
     cancel_on_auto_retry_status: ?*std.atomic.Value(bool) = null,
     cancel_on_auto_retry_attempt: ?usize = null,
+    /// Presses Enter (sets the flag) when a request waits for the user.
+    continue_on_need_user: ?*std.atomic.Value(bool) = null,
+    /// Presses Esc (sets the flag) when a request waits for the user.
+    cancel_on_need_user: ?*std.atomic.Value(bool) = null,
+    /// Records prompts handed back to the composer.
+    record_restored_prompt: bool = false,
     cancel_on_permission: ?*std.atomic.Value(bool) = null,
     cancel_on_permission_name: ?[]const u8 = null,
     cancel_on_execute: ?*std.atomic.Value(bool) = null,
@@ -640,14 +612,10 @@ pub const FakeAgentRuntimeDeps = struct {
     command_replay_output: ?[]const u8 = null,
     command_replay_capability: ?*session_child_store.SessionChildCapability = null,
     last_file_request_allocators_distinct: bool = false,
-    route_recovery_decisions: []const runtime_deps.RouteRecoveryDecision = &.{},
-    enable_route_recovery: bool = true,
-    route_recovery_index: usize = 0,
-    route_recovery_count: usize = 0,
-    last_route_recovery_replay_safe: bool = false,
-    last_route_recovery_fast_mode: bool = false,
-    last_route_recovery_finish_reason: ?types.ProviderFinishReason = null,
-    last_route_recovery_unsafe_reason: ?types.RouteRecoveryUnsafeReason = null,
+    /// Answers to the out-of-credits picker, in order; past the end it cancels.
+    out_of_credits_choices: []const runtime_deps.OutOfCreditsChoice = &.{},
+    out_of_credits_index: usize = 0,
+    out_of_credits_count: usize = 0,
     default_model_capabilities: model_capabilities.Capabilities = .{
         .image_input_support = .non_native,
         .context_window = 1_000_000,
@@ -662,9 +630,20 @@ pub const FakeAgentRuntimeDeps = struct {
     credential_refresh_sources: std.ArrayList(types.CredentialSource) = .empty,
     credential_refresh_modes: std.ArrayList(runtime_deps.CredentialRefreshMode) = .empty,
     credential_refresh_error: ?anyerror = null,
+    /// A forced refresh finds nothing, as when the refresh token is rejected.
+    credential_refresh_fail_force: bool = false,
     last_credential_refresh_expected_account: ?[]u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
+    /// Keeps the recovery module's record, as a host that resumes requests
+    /// does.
+    enable_recovery_record: bool = false,
+    /// The newest record the hook saved; null once cleared.
+    recovery_record: ?[32]u8 = null,
+    recovery_record_writes: usize = 0,
+    recovery_record_clears: usize = 0,
+    /// The turn has pieces on disk, so a save between sends lands.
+    recovery_turn_written: bool = true,
     /// Returned by every session writer check; null confirms the writer.
     session_writer_error: ?anyerror = null,
     session_writer_checks: usize = 0,
@@ -677,11 +656,10 @@ pub const FakeAgentRuntimeDeps = struct {
     capture_restored_prompts: bool = false,
     restored_prompts: std.ArrayList([]u8) = .empty,
     cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
-    pause_on_auto_retry_status: bool = false,
-    pause_on_auto_retry_attempt: ?usize = null,
-    recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     route_recovery_status_error_attempt: ?usize = null,
     steering_messages: []const []const u8 = &.{},
+    /// Who wrote the fake's steering messages.
+    steering_author: worker_runtime.MessageAuthor = .user,
     steering_take_at: usize = 1,
     steering_take_count: usize = 0,
     immediate_steering_messages: []const []const u8 = &.{},
@@ -697,6 +675,7 @@ pub const FakeAgentRuntimeDeps = struct {
     }
 
     pub fn deinit(self: *FakeAgentRuntimeDeps) void {
+        self.recorded_usages.deinit(self.alloc);
         freeStringList(self.alloc, &self.log);
         freeStringList(self.alloc, &self.texts);
         freeStringList(self.alloc, &self.assistant_sources);
@@ -780,8 +759,6 @@ pub const FakeAgentRuntimeDeps = struct {
                 null,
             .finalize_turn = finalizeTurn,
             .release_agent_terminal_lease = releaseAgentTerminalLease,
-            .prepare_parent_turn_context = prepareParentTurnContext,
-            .acknowledge_parent_turn_context = acknowledgeParentTurnContext,
             .append_runtime_context = appendRuntimeContext,
             .append_static_context = appendStaticContext,
             .validate_tool_call = validateToolCall,
@@ -800,7 +777,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 .set = setRecoveryCheckpoint,
                 .clear = clearRecoveryCheckpoint,
             } else null,
-            .restore_failed_prompt = if (self.capture_restored_prompts) restoreFailedPrompt else null,
+            .restore_failed_prompt = if (self.capture_restored_prompts or self.record_restored_prompt) restoreFailedPrompt else null,
             .confirm_session_writer = confirmSessionWriter,
             .propagate_grant = @This().propagateGrant,
             .push_event = pushEvent,
@@ -814,7 +791,8 @@ pub const FakeAgentRuntimeDeps = struct {
             .push_command_output_complete = commandOutputComplete,
             .push_http_error = httpError,
             .refresh_gateway_credential = refreshGatewayCredential,
-            .request_route_recovery = if (self.enable_route_recovery) requestRouteRecovery else null,
+            .ask_out_of_credits = askOutOfCredits,
+            .save_recovery_record = if (self.enable_recovery_record) saveRecoveryRecord else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
             .model_catalog_unavailable = catalogUnavailable,
@@ -829,6 +807,8 @@ pub const FakeAgentRuntimeDeps = struct {
             .record_tool_call_rejected = recordRejected,
             .record_tool_call_failed = recordFailed,
             .report_inner_tool_usage = reportCapturedInnerToolUsage,
+            .cache_warmer = self.cache_warmer,
+            .record_usage = if (self.record_usages) recordUsage else null,
         };
     }
 
@@ -845,6 +825,8 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn restoreFailedPrompt(raw: *anyopaque, prompt: []const u8) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (self.record_restored_prompt) try self.record("restore_failed_prompt:{s}", .{prompt});
+        if (!self.capture_restored_prompts) return;
         const owned = try self.alloc.dupe(u8, prompt);
         errdefer self.alloc.free(owned);
         try self.restored_prompts.append(self.alloc, owned);
@@ -921,6 +903,7 @@ pub const FakeAgentRuntimeDeps = struct {
         else
             null;
         if (self.credential_refresh_error) |err| return err;
+        if (self.credential_refresh_fail_force and mode == .force) return null;
         if (self.credential_refresh_index >= self.credential_refresh_tokens.len) return null;
         const token = self.credential_refresh_tokens[self.credential_refresh_index];
         self.credential_refresh_index += 1;
@@ -948,8 +931,8 @@ pub const FakeAgentRuntimeDeps = struct {
             },
         };
         if (source.len == 0) return if (kind == .cancelled) .interrupt else .none;
-        const messages = try arena.alloc([]u8, source.len);
-        for (source, messages) |text, *copy| copy.* = try arena.dupe(u8, text);
+        const messages = try arena.alloc(worker_runtime.SteeringMessage, source.len);
+        for (source, messages) |text, *copy| copy.* = .{ .text = try arena.dupe(u8, text), .author = self.steering_author };
         return .{ .continue_turn = messages };
     }
 
@@ -965,12 +948,9 @@ pub const FakeAgentRuntimeDeps = struct {
         const result = try self.steering_worker.?.takeSteeringBoundary(self.alloc, turn_id, kind);
         return switch (result) {
             .continue_turn => |owned| blk: {
-                defer {
-                    for (owned) |text| self.alloc.free(text);
-                    self.alloc.free(owned);
-                }
-                const messages = try arena.alloc([]u8, owned.len);
-                for (owned, messages) |text, *copy| copy.* = try arena.dupe(u8, text);
+                defer worker_runtime.freeSteeringMessages(self.alloc, owned);
+                const messages = try arena.alloc(worker_runtime.SteeringMessage, owned.len);
+                for (owned, messages) |message, *copy| copy.* = .{ .text = try arena.dupe(u8, message.text), .author = message.author };
                 break :blk .{ .continue_turn = messages };
             },
             .none => .none,
@@ -979,17 +959,30 @@ pub const FakeAgentRuntimeDeps = struct {
         };
     }
 
-    fn requestRouteRecovery(raw: *anyopaque, _: Allocator, request: runtime_deps.RouteRecoveryRequest) !runtime_deps.RouteRecoveryDecision {
+    fn saveRecoveryRecord(raw: *anyopaque, write: types.RecoveryRecordWrite) !bool {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        self.route_recovery_count += 1;
-        self.last_route_recovery_replay_safe = request.replay_safe;
-        self.last_route_recovery_fast_mode = request.fast_mode;
-        self.last_route_recovery_finish_reason = request.finish_reason;
-        self.last_route_recovery_unsafe_reason = request.unsafe_no_retry_reason;
-        if (self.route_recovery_index < self.route_recovery_decisions.len) {
-            const decision = self.route_recovery_decisions[self.route_recovery_index];
-            self.route_recovery_index += 1;
-            return decision;
+        if (!self.recovery_turn_written) return false;
+        switch (write) {
+            .keep => return false,
+            .save => |bytes| {
+                self.recovery_record = bytes;
+                self.recovery_record_writes += 1;
+            },
+            .clear => {
+                self.recovery_record = null;
+                self.recovery_record_clears += 1;
+            },
+        }
+        return true;
+    }
+
+    fn askOutOfCredits(raw: *anyopaque) !runtime_deps.OutOfCreditsChoice {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.out_of_credits_count += 1;
+        if (self.out_of_credits_index < self.out_of_credits_choices.len) {
+            const choice = self.out_of_credits_choices[self.out_of_credits_index];
+            self.out_of_credits_index += 1;
+            return choice;
         }
         return .cancel;
     }
@@ -1026,51 +1019,6 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn record(self: *FakeAgentRuntimeDeps, comptime fmt: []const u8, args: anytype) !void {
         try self.log.append(self.alloc, try self.alloc.print(fmt, args));
-    }
-
-    fn prepareParentTurnContext(raw: *anyopaque, arena: Allocator) !?runtime_deps.PreparedParentTurnContext {
-        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        self.parent_turn_prepare_count += 1;
-        const text = if (self.parent_turn_context_texts.len > 0) blk: {
-            const index = @min(self.parent_turn_context_index, self.parent_turn_context_texts.len - 1);
-            self.parent_turn_context_index += 1;
-            break :blk self.parent_turn_context_texts[index];
-        } else self.parent_turn_context_text orelse return null;
-        const acknowledgements = try arena.alloc(runtime_deps.ParentTurnDeliveryAck, 1);
-        acknowledgements[0] = .{
-            .child_id = try arena.dupe(u8, "child"),
-            .target_session_id = try arena.dupe(u8, "parent"),
-            .through_sequence = self.parent_turn_context_sequence orelse
-                @as(u64, @intCast(self.parent_turn_prepare_count)),
-            .delivery_id = try arena.dupe(u8, "delivery"),
-            .start_offset = 0,
-            .total_bytes = 0,
-        };
-        return .{
-            .content = try arena.dupe(u8, text),
-            .acknowledgements = acknowledgements,
-        };
-    }
-
-    fn acknowledgeParentTurnContext(
-        raw: *anyopaque,
-        _: Allocator,
-        acknowledgements: []const runtime_deps.ParentTurnDeliveryAck,
-    ) void {
-        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        self.parent_turn_ack_count += acknowledgements.len;
-        self.parent_turn_ack_contract_valid = self.parent_turn_ack_contract_valid and
-            self.parent_turn_prepare_count == self.parent_turn_last_ack_prepare_count + 1;
-        self.parent_turn_last_ack_prepare_count = self.parent_turn_prepare_count;
-        for (acknowledgements) |ack| {
-            self.parent_turn_ack_contract_valid = self.parent_turn_ack_contract_valid and
-                std.mem.eql(u8, ack.child_id, "child") and
-                std.mem.eql(u8, ack.target_session_id, "parent") and
-                std.mem.eql(u8, ack.delivery_id, "delivery");
-        }
-        if (acknowledgements.len != 0) {
-            self.parent_turn_last_ack_sequence = acknowledgements[acknowledgements.len - 1].through_sequence;
-        }
     }
 
     fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -1561,11 +1509,6 @@ pub const FakeAgentRuntimeDeps = struct {
                     self.swap_link_target_on_execute = null;
                 }
             }
-            if (self.parent_turn_context_after_execute) |text| {
-                self.parent_turn_context_text = text;
-                self.parent_turn_context_texts = &.{};
-                self.parent_turn_context_after_execute = null;
-            }
         }
 
         if (swap_link) |link| {
@@ -1647,6 +1590,11 @@ pub const FakeAgentRuntimeDeps = struct {
         self.inner_usages.append(self.alloc, usage) catch return;
     }
 
+    fn recordUsage(ctx: *anyopaque, usage: types.Usage) anyerror!void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(ctx));
+        try self.recorded_usages.append(self.alloc, usage);
+    }
+
     fn recordRejected(raw: *anyopaque, _: Allocator, call: ToolCall, _: []const u8, _: ?[]const u8) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.rejected_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
@@ -1713,6 +1661,7 @@ pub const FakeAgentRuntimeDeps = struct {
                 try self.full_detail_records.append(self.alloc, owned);
                 try self.record("full_detail_record:{s}:{s}", .{ notice.topic, notice.body });
             },
+            .open_model_picker => try self.record("event:open_model_picker", .{}),
             .clear_route_recovery_status => {
                 self.route_recovery_clear_count += 1;
                 try self.record("event:clear_route_recovery_status", .{});
@@ -1838,32 +1787,29 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn routeRecoveryStatus(raw: *anyopaque, status: types.RouteRecoveryStatus) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        if (status.kind == .auto_retry and
-            status.retry_deadline == null and
-            self.route_recovery_status_error_attempt == status.failed_attempt)
+        // Fails publishing the retrying status of one resend.
+        if (status.kind == .retrying and
+            self.route_recovery_status_error_attempt == status.attempt)
         {
             return error.TestRouteRecoveryPublicationFailed;
         }
         try self.route_recovery_statuses.append(self.alloc, status);
-        if (status.kind == .auto_retry and status.retry_deadline != null) {
+        if (status.kind == .need_user) {
+            if (self.continue_on_need_user) |flag| flag.store(true, .seq_cst);
+            if (self.cancel_on_need_user) |flag| flag.store(true, .seq_cst);
+        }
+        // Presses Esc while the request waits after the matching attempt.
+        if (status.kind == .waiting) {
             if (self.cancel_on_auto_retry_status) |flag| {
                 if (self.cancel_on_auto_retry_attempt == null or
-                    self.cancel_on_auto_retry_attempt.? == status.failed_attempt)
+                    self.cancel_on_auto_retry_attempt.? == status.attempt)
                 {
                     flag.store(true, .seq_cst);
                 }
             }
         }
-        if (self.pause_on_auto_retry_status and
-            status.kind == .auto_retry and
-            status.retry_deadline != null and
-            (self.pause_on_auto_retry_attempt == null or
-                self.pause_on_auto_retry_attempt.? == status.failed_attempt))
-        {
-            if (self.recovery_pause_flag) |flag| flag.store(true, .seq_cst);
-        }
         var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
-        try self.record("route_recovery_status:{s}", .{status.label(&label_buf)});
+        try self.record("route_recovery_status:{s}:{s}", .{ @tagName(status.kind), status.label(&label_buf) });
     }
 
     fn commandOutputComplete(raw: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) !void {
@@ -1914,7 +1860,6 @@ pub const PromptFixture = struct {
         return .{
             .system_prompt = "system",
             .gateway_retry_count = 1,
-            .max_provider_attempts = model_response_recovery.default_max_provider_attempts,
             .gateway_chat_url = "https://example.invalid",
             .agent_step_limit = 8,
             .cancel_flag = &self.cancel_flag,

@@ -1643,7 +1643,7 @@ pub fn parseRecoveryCheckpointWithImages(alloc: Allocator, value: std.json.Value
         .user = user,
         .assistant_source = assistant_source,
         .execution = execution,
-        .cause = std.meta.stringToEnum(types.ModelRecoveryCause, try requireString(object, "cause")) orelse
+        .cause = recoveryCauseFromText(try requireString(object, "cause")) orelse
             return error.InvalidDurableField,
         .action = std.meta.stringToEnum(types.ModelRecoveryAction, try requireString(object, "action")) orelse
             return error.InvalidDurableField,
@@ -1658,6 +1658,14 @@ pub fn parseRecoveryCheckpointWithImages(alloc: Allocator, value: std.json.Value
         .consumed_provider_attempts = consumed_provider_attempts,
         .outstanding_reservation = try requireBool(object, "outstanding_reservation"),
     };
+}
+
+/// Checkpoints from before fx stopped closing connections when the Mac wakes
+/// can name the cause `system_resumed`. fx recovered from it exactly like a
+/// lost connection, so it loads as one.
+fn recoveryCauseFromText(text: []const u8) ?types.ModelRecoveryCause {
+    if (std.mem.eql(u8, text, "system_resumed")) return .connectivity_lost;
+    return std.meta.stringToEnum(types.ModelRecoveryCause, text);
 }
 
 test "legacy route checkpoints retain history without resumable authority" {
@@ -6407,6 +6415,64 @@ fn fuzzDurableSessionOptionalFields(_: void, smith: *std.testing.Smith) !void {
         .max_value_bytes = buffer.len,
     }) catch return;
     state.deinit(std.testing.allocator);
+}
+
+test "a recovery checkpoint saved with the old system_resumed cause loads as a lost connection" {
+    const alloc = std.testing.allocator;
+    const state = DurableSessionState{
+        .id = @constCast("session-old-wake"),
+        .origin_workspace_root = @constCast("/tmp/origin"),
+        .workspace_root = @constCast("/tmp/current"),
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+        .conversation_language = session.ConversationLanguage.literal("en"),
+        .preferences = .{
+            .provider = .gateway,
+            .model = @constCast("zai/glm-5.2"),
+            .effort = .auto,
+            .fast_mode = false,
+            .ultrafast_mode = false,
+        },
+        .history = &.{},
+        .total_input_tokens = 0,
+        .total_output_tokens = 0,
+        .recovery_checkpoint = .{
+            .turn_id = 7,
+            .user = .{ .text = @constCast("keep working") },
+            .assistant_source = @constCast(""),
+            .cause = .connectivity_lost,
+            .action = .waiting_for_connectivity,
+            .tool_state = .confirmed,
+            .authority = .{
+                .provider = .gateway,
+                .model = @constCast("zai/glm-5.2"),
+                .credential_source = .ai_gateway_api_key,
+            },
+            .requested_fast_mode = false,
+            .fast_mode = false,
+            .requested_ultrafast_mode = false,
+            .ultrafast_mode = false,
+            .max_provider_attempts = 10,
+            .consumed_provider_attempts = 1,
+            .outstanding_reservation = false,
+        },
+    };
+
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    _ = try encodeState(state, &encoded.writer);
+    const current = "\"cause\":\"connectivity_lost\"";
+    const old = try std.mem.replaceOwned(u8, alloc, encoded.written(), current, "\"cause\":\"system_resumed\"");
+    defer alloc.free(old);
+    try std.testing.expect(std.mem.find(u8, old, "\"cause\":\"system_resumed\"") != null);
+
+    var source = std.Io.Reader.fixed(old);
+    var decoded = try decodeState(alloc, &source, .{});
+    defer decoded.deinit(alloc);
+    const restored = decoded.recovery_checkpoint.?;
+    try std.testing.expectEqual(types.ModelRecoveryCause.connectivity_lost, restored.cause);
+    try std.testing.expectEqual(types.ModelRecoveryAction.waiting_for_connectivity, restored.action);
+    try std.testing.expectEqual(@as(u64, 7), restored.turn_id);
 }
 
 test "recovery checkpoint image and tool source refs round trip with independent ownership" {

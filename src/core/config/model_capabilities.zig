@@ -162,6 +162,53 @@ test "empty length retry limit stays inside a known context window" {
     try std.testing.expectEqual(@as(?u32, null), emptyLengthRetryOutputTokens(.{ .context_window = 7 }));
 }
 
+/// The effort for the one resend of a reply that spent its whole output limit
+/// with nothing usable: `low` when the model offers it below the effort the
+/// request used, so the resend reasons less; null resends at the same effort.
+/// An effort the model does not list was never sent, so that request used the
+/// model's default.
+pub fn lengthResendEffort(capabilities: Capabilities, current: types.ReasoningEffort) ?types.ReasoningEffort {
+    const low = types.ReasoningEffort.literal("low");
+    const low_index = reasoningEffortIndex(capabilities, low);
+    if (low_index == 0) return null;
+    const current_index = reasoningEffortIndex(capabilities, current);
+    return if (current_index == 0 or low_index < current_index) low else null;
+}
+
+test "length resend lowers effort to low only when that reasons less" {
+    const efforts = [_]types.ReasoningEffort{
+        types.ReasoningEffort.literal("none"),
+        types.ReasoningEffort.literal("minimal"),
+        types.ReasoningEffort.literal("low"),
+        types.ReasoningEffort.literal("high"),
+    };
+    const caps = Capabilities{ .reasoning_efforts = .fromSlice(&efforts) };
+    const low = types.ReasoningEffort.literal("low");
+    const cases = [_]struct { current: types.ReasoningEffort, expected: ?types.ReasoningEffort }{
+        .{ .current = .auto, .expected = low },
+        .{ .current = types.ReasoningEffort.literal("high"), .expected = low },
+        .{ .current = types.ReasoningEffort.literal("unlisted"), .expected = low },
+        .{ .current = low, .expected = null },
+        .{ .current = types.ReasoningEffort.literal("minimal"), .expected = null },
+        .{ .current = types.ReasoningEffort.literal("none"), .expected = null },
+    };
+    for (cases) |case| {
+        const got = lengthResendEffort(caps, case.current);
+        if (case.expected) |expected| {
+            try std.testing.expect(got != null and got.?.eql(expected));
+        } else {
+            try std.testing.expectEqual(@as(?types.ReasoningEffort, null), got);
+        }
+    }
+
+    const without_low = [_]types.ReasoningEffort{
+        types.ReasoningEffort.literal("medium"),
+        types.ReasoningEffort.literal("high"),
+    };
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), lengthResendEffort(.{ .reasoning_efforts = .fromSlice(&without_low) }, .auto));
+    try std.testing.expectEqual(@as(?types.ReasoningEffort, null), lengthResendEffort(.{}, .auto));
+}
+
 /// Output tokens to request and reserve for one model call, or null to leave the limit unset.
 pub fn requestOutputTokens(capabilities: Capabilities) ?u32 {
     const advertised = capabilities.max_output_tokens orelse return null;

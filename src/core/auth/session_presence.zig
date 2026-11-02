@@ -17,9 +17,9 @@ pub fn profileFile(
 pub fn requireWritableProfileFile(file_name: []const u8, lock_name: []const u8) error{CredentialStorageUnavailable}!bool {
     if (comptime host_target.is_wasm) return false;
     const home = io_mod.homeDir() orelse return error.CredentialStorageUnavailable;
-    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch return error.CredentialStorageUnavailable;
+    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }) catch return error.CredentialStorageUnavailable;
     defer home_dir.close(io_mod.getIo());
-    var profile_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+    var profile_dir = home_dir.openDir(io_mod.getIo(), profile_paths.rootName(), .{
         .iterate = true,
         .follow_symlinks = false,
     }) catch |err| {
@@ -67,14 +67,14 @@ fn profileFileFromHome(
     const home = home_value orelse return .unavailable;
     var home_dir = std.Io.Dir.openDirAbsolute(
         io_mod.getIo(),
-        home,
+        profile_paths.rootParent(home),
         .{ .iterate = true },
     ) catch |err| return if (err == error.FileNotFound) .missing else .unavailable;
     defer home_dir.close(io_mod.getIo());
 
     var profile_dir = home_dir.openDir(
         io_mod.getIo(),
-        profile_paths.root_dir_name,
+        profile_paths.rootName(),
         .{ .iterate = true, .follow_symlinks = false },
     ) catch |err| return if (err == error.FileNotFound) .missing else .unavailable;
     defer profile_dir.close(io_mod.getIo());

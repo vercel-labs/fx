@@ -2140,7 +2140,7 @@ fn checkShellParity(command: []const u8, mode: ParityMode) !void {
 
 /// Finds the shell, or returns null to skip it. The Linux unit test job and
 /// the nightly Fuzz workflow install every shell and set
-/// `FX_SHELL_PARITY_ALL_SHELLS`, so a missing shell there fails instead of
+/// `FX_TEST_SHELL_PARITY_ALL_SHELLS`, so a missing shell there fails instead of
 /// quietly narrowing the check. Tests read the process environment from
 /// `std.testing.environ`, since fx's own environment is never set up in them.
 fn parityShellPath(shell: ParityShell) !?[]const u8 {
@@ -2148,7 +2148,7 @@ fn parityShellPath(shell: ParityShell) !?[]const u8 {
         std.Io.Dir.accessAbsolute(std.testing.io, path, .{}) catch continue;
         return path;
     }
-    if (try std.testing.environ.contains(std.testing.allocator, "FX_SHELL_PARITY_ALL_SHELLS")) {
+    if (try std.testing.environ.contains(std.testing.allocator, "FX_TEST_SHELL_PARITY_ALL_SHELLS")) {
         // The failure output names the path where the shell was expected.
         std.testing.expectEqualStrings(shell.paths[0], "") catch {};
         return error.TestShellParityShellMissing;

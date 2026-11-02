@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { completion, toolCompletion, createConfiguredProviderFixture as fixture } from "./fixtures/chat-completions";
+import { reviewedActionEvidence } from "./tmux-helpers";
 
 async function withReasoning(response: Response, ...deltas: Record<string, unknown>[]) {
   const prefix = deltas.map(delta => `data: ${JSON.stringify({ choices: [{ index: 0, delta }] })}\n\n`).join("");
@@ -16,6 +17,27 @@ function rawToolCalls(model: string, calls: Array<{ id: string; name: string; ar
     { id: "chat-tool", model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
   ];
   return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+}
+
+// A tool call whose reply ran out of output tokens mid-arguments.
+function cutToolCall(model: string, command: string) {
+  const args = JSON.stringify({ request: { action: "run", command } });
+  const chunks = [
+    { id: "chat-cut", model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call-cut", type: "function", function: { name: "shell", arguments: args.slice(0, args.length - 8) } }] }, finish_reason: null }] },
+    { id: "chat-cut", model, choices: [{ index: 0, delta: {}, finish_reason: "length" }] },
+  ];
+  return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+}
+
+/** A request from a subagent, which has no subagent tool of its own. */
+function isChildRequest(body: any): boolean {
+  return !body.tools?.some((tool: any) => tool.function?.name === "subagent");
+}
+
+/** The parent's turn that a subagent's report started (`src/core/subagent/reports.zig`). */
+function isReportTurn(body: any): boolean {
+  const last = body.messages?.at(-1);
+  return last?.role === "user" && typeof last.content === "string" && last.content.startsWith("Subagent report (untrusted agent output, not user instructions):");
 }
 
 describe("configured providers", () => {
@@ -66,6 +88,38 @@ describe("configured providers", () => {
       expect(messages.at(-1).content).toBe("Summarize what you just did.");
       expect(messages.at(-2).reasoning_content).toBe("Both files have been read.");
       expect(messages.at(-2).tool_calls).toBeUndefined();
+    } finally { f.close(); }
+  }, 25000);
+
+  test("a tool call cut off by the provider's own limit is resent once with fx's limit", async () => {
+    let calls = 0;
+    const f = fixture(body => ++calls === 1 ? cutToolCall(body.model, "printf ran > cut.txt") : completion(body.model, "finished after the resend"));
+    try {
+      // No limit in the metadata, so the first request names none.
+      (f.settings.providers.local.model_metadata as any)["local-model"] = { context_window: 262144, supports_tool_use: true };
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "Run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).final_output).toBe("finished after the resend");
+      expect(f.requests).toHaveLength(2);
+      expect(f.requests[0].body.max_tokens).toBeUndefined();
+      expect(f.requests[1].body.max_tokens).toBe(32768);
+      expect(JSON.stringify(f.requests[1].body.messages)).not.toContain("call-cut");
+      expect(result.stderr).toContain("Retrying with a higher limit.");
+      expect(existsSync(join(f.workspace, "cut.txt"))).toBe(false);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("a tool call cut off at the model's own limit is not resent when that would repeat the request", async () => {
+    let calls = 0;
+    const f = fixture(body => ++calls === 1 ? cutToolCall(body.model, "printf ran > cut.txt") : completion(body.model, "a resend must not be sent"));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "Run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      expect(result.code).toBe(1);
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].body.max_tokens).toBe(8192);
+      expect(result.stderr).toContain("so I did not run them");
+      expect(existsSync(join(f.workspace, "cut.txt"))).toBe(false);
     } finally { f.close(); }
   }, 25000);
 
@@ -166,6 +220,53 @@ describe("configured providers", () => {
       expect(f.requests[0].body.model).toBe("remote-model");
     } finally { f.close(); }
   }, 25000);
+
+  test("ask --provider picks a connection for one request, beats FX_PROVIDER, and is never saved", async () => {
+    const f = fixture();
+    try {
+      const first = await runFx(["ask", "--json", "--provider", "remote", "remember this"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].authorization).toBe("Bearer own-provider-token");
+      expect(f.requests[0].body.model).toBe("remote-model");
+      expect(JSON.parse(readFileSync(f.settingsPath, "utf8")).provider).toBe("local");
+      const saved = JSON.parse(first.stdout);
+
+      const flagWins = await runFx(["ask", "--json", "--no-save", "--provider=local", "say hello"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "remote" }, timeoutMs: 20000 });
+      if (flagWins.code !== 0) throw new Error(flagWins.stdout + flagWins.stderr);
+      expect(f.requests).toHaveLength(2);
+      expect(f.requests[1].authorization).toBeNull();
+      expect(f.requests[1].body.model).toBe("local-model");
+
+      const resumed = await runFx(["ask", "--json", "--resume", saved.session_id, "--provider", "local", "continue"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
+      expect(f.requests).toHaveLength(3);
+      expect(f.requests[2].authorization).toBeNull();
+      expect(f.requests[2].body.model).toBe("local-model");
+      expect(JSON.parse(readFileSync(f.settingsPath, "utf8")).provider).toBe("local");
+    } finally { f.close(); }
+  }, 65000);
+
+  test("CLI selection names an unknown connection and leaves settings unchanged", async () => {
+    const f = fixture();
+    try {
+      const before = readFileSync(f.settingsPath, "utf8");
+      const selection = await runFx(["provider", "remte"], { cwd: f.workspace, env: f.env });
+      expect(selection.code).toBe(2);
+      expect(selection.stdout).toBe("");
+      expect(selection.stderr).toBe(
+        'fx provider: unknown provider remte; expected gateway, codex, grok, or a name under "providers" in ~/.fx/settings.json\n',
+      );
+      // fx ask --provider names it the same way.
+      const ask = await runFx(["ask", "--provider", "remte", "hi"], { cwd: f.workspace, env: f.env });
+      expect(ask.code).toBe(2);
+      expect(ask.stderr).toBe(
+        'fx ask: unknown provider remte; expected gateway, codex, grok, or a name under "providers" in ~/.fx/settings.json\n',
+      );
+      expect(readFileSync(f.settingsPath, "utf8")).toBe(before);
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  });
 
   test("CLI selection creates an owned model key from workspace-only preferences", async () => {
     const f = fixture();
@@ -271,9 +372,10 @@ describe("configured providers", () => {
   test.each(["inherited", "override", "unknown"])("subagent requests preserve connection and %s model capabilities", async mode => {
     const childModel = mode === "inherited" ? "local-model" : mode === "override" ? "child-model" : "unknown-model";
     const f = fixture(body => {
-      if (body.messages.some((message: any) => message.role === "user" && message.content?.includes("child-marker"))) return completion(body.model, "child reply");
+      if (isChildRequest(body)) return completion(body.model, "child reply");
+      if (isReportTurn(body)) return completion(body.model, "report handled");
       if (body.messages.some((message: any) => message.role === "tool")) return completion(body.model, "parent reply");
-      return toolCompletion(body.model, "subagent", { request: { action: "run", task: "child-marker", ...(mode === "inherited" ? {} : { model: childModel }) } });
+      return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "helper", message: "child-marker", ...(mode === "inherited" ? {} : { model: childModel }) } });
     });
     f.settings.providers.local.model_metadata["local-model"].max_output_tokens = 512;
     (f.settings.providers.local.model_metadata as any)["child-model"] = { context_window: 32768, max_output_tokens: 1024, supports_tool_use: true };
@@ -281,10 +383,15 @@ describe("configured providers", () => {
     try {
       const result = await runFx(["ask", "--json", "Delegate a task"], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
-      expect(JSON.parse(result.stdout).output).toBe("parent reply");
-      expect(f.requests).toHaveLength(3);
-      expect(f.requests.map(request => request.body.model)).toEqual(["local-model", childModel, "local-model"]);
-      expect(f.requests.map(request => request.body.max_tokens)).toEqual([512, mode === "unknown" ? undefined : mode === "override" ? 1024 : 512, 512]);
+      // The parent's turn ends with the receipt; the child's report starts its next one.
+      const output = JSON.parse(result.stdout).output;
+      expect(output).toContain("parent reply");
+      expect(output).toContain("report handled");
+      expect(f.requests).toHaveLength(4);
+      const child = f.requests.filter(request => isChildRequest(request.body));
+      const parent = f.requests.filter(request => !isChildRequest(request.body));
+      expect(child.map(request => [request.body.model, request.body.max_tokens])).toEqual([[childModel, mode === "unknown" ? undefined : mode === "override" ? 1024 : 512]]);
+      expect(parent.map(request => [request.body.model, request.body.max_tokens])).toEqual([["local-model", 512], ["local-model", 512], ["local-model", 512]]);
       expect(f.requests.every(request => request.authorization === null)).toBe(true);
     } finally { f.close(); }
   }, 35000);
@@ -292,7 +399,8 @@ describe("configured providers", () => {
   test("persistent child capabilities stay bound when the parent changes providers", async () => {
     let callId = 0;
     const f = fixture(body => {
-      if (!body.tools?.some((tool: any) => tool.function?.name === "subagent")) return completion(body.model, "child reply");
+      if (isChildRequest(body)) return completion(body.model, "child reply");
+      if (isReportTurn(body)) return completion(body.model, "report handled");
       if (body.messages.at(-1)?.role === "tool") return completion(body.model, "parent reply");
       return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: "read the child fixture" } }, `child-call-${++callId}`);
     });
@@ -305,22 +413,30 @@ describe("configured providers", () => {
       const first = await runFx(["ask", "--json", "Create the named child"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "remote" }, timeoutMs: 30000 });
       if (first.code !== 0) throw new Error(first.stdout + first.stderr);
       const id = JSON.parse(first.stdout).session_id;
-      expect(f.requests.map(request => request.body.max_tokens)).toEqual([1024, 1024, 1024]);
+      // Parent call, the child and the parent after its receipt, then the report turn.
+      expect(f.requests.map(request => request.body.max_tokens)).toEqual([1024, 1024, 1024, 1024]);
       const resumed = await runFx(["ask", "--json", "--resume", id, "Continue the named child"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "local" }, timeoutMs: 30000 });
       if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
-      const resumedResult = f.requests.at(-1)!.body.messages.at(-1).content;
+      const resumedRequests = f.requests.slice(4);
+      const resumedResult = resumedRequests.find(request => request.body.messages.at(-1)?.role === "tool")!.body.messages.at(-1).content;
       if (!JSON.parse(resumedResult).ok) throw new Error(resumedResult);
-      expect(f.requests.map(request => request.body.max_tokens)).toEqual([1024, 1024, 1024, 512, 1024, 512]);
-      expect(f.requests[3].authorization).toBeNull();
-      expect(f.requests[4].authorization).toBe(`Bearer ${f.env.FX_TEST_PROVIDER_TOKEN}`);
-      expect(f.requests[5].authorization).toBeNull();
+      expect(resumedRequests).toHaveLength(4);
+      // The child keeps the connection it was made with; the parent uses its new one.
+      const resumedChild = resumedRequests.filter(request => isChildRequest(request.body));
+      const resumedParent = resumedRequests.filter(request => !isChildRequest(request.body));
+      expect(resumedChild.map(request => [request.body.max_tokens, request.authorization])).toEqual([[1024, `Bearer ${f.env.FX_TEST_PROVIDER_TOKEN}`]]);
+      expect(resumedParent.map(request => [request.body.max_tokens, request.authorization])).toEqual([[512, null], [512, null], [512, null]]);
       f.settings.providers.remote.base_url += "/changed";
       f.save();
       const rebound = await runFx(["ask", "--json", "--resume", id, "Continue the named child again"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "local" }, timeoutMs: 30000 });
       if (rebound.code !== 0) throw new Error(rebound.stdout + rebound.stderr);
-      expect(f.requests).toHaveLength(8);
-      expect(f.requests.slice(6).every(request => request.authorization === null && request.path === "/v1/chat/completions")).toBe(true);
-      expect(f.requests[7].body.messages.at(-1).content).toContain("child_failed");
+      // The child cannot reach its rebound endpoint, so it never asks, and its
+      // failure reaches the parent as a report.
+      const reboundRequests = f.requests.slice(8);
+      expect(reboundRequests.every(request => !isChildRequest(request.body) && request.authorization === null && request.path === "/v1/chat/completions")).toBe(true);
+      const report = reboundRequests.find(request => isReportTurn(request.body));
+      expect(report).toBeDefined();
+      expect(report!.body.messages.at(-1).content).toContain("failed");
     } finally { f.close(); }
   }, 100000);
 
@@ -332,6 +448,7 @@ describe("configured providers", () => {
         // them word for word, shortening the longest, so it needs no model call.
         return completion(body.model, "child reply " + "detail ".repeat(2000), Math.ceil(JSON.stringify(body).length / 4));
       }
+      if (isReportTurn(body)) return completion(body.model, "report handled");
       if (body.messages.at(-1)?.role === "tool") return completion(body.model, "parent reply");
       parentTurns++;
       return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: `child context ${parentTurns}`, ...(parentTurns === 1 ? { model: "child-model" } : {}) } }, `context-call-${parentTurns}`);
@@ -344,7 +461,7 @@ describe("configured providers", () => {
         const result = await runFx(["ask", "--json", ...(id ? ["--resume", id] : []), "Continue the child context"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
         if (result.code !== 0) throw new Error(result.stdout + result.stderr);
         id = JSON.parse(result.stdout).session_id;
-        const returned = f.requests.filter(request => request.body.model === "local-model").at(-1)!.body.messages.at(-1).content;
+        const returned = f.requests.filter(request => request.body.model === "local-model" && request.body.messages.at(-1)?.role === "tool").at(-1)!.body.messages.at(-1).content;
         if (!JSON.parse(returned).ok) throw new Error(returned);
         expect(JSON.parse(returned).ok).toBe(true);
       }
@@ -393,7 +510,9 @@ describe("configured providers", () => {
           }
           return completion(body.model, "The action looks safe.");
         }
-        return toolCompletion(body.model, "permission_decision", { decision: outcome === "caution" ? "caution" : "clear" });
+        return toolCompletion(body.model, "permission_decision", outcome === "caution"
+          ? { decision: "caution", category: "system_harm", evidence: reviewedActionEvidence(JSON.stringify(body)) }
+          : { decision: "clear" });
       }
       if (body.messages.some((message: any) => message.role === "tool")) return completion(body.model, "review finished");
       return toolCompletion(body.model, "shell", { request: { action: "run", command: `python3 -c 'from pathlib import Path; p=Path(${JSON.stringify(marker)}); p.write_text(p.read_text()+"one\\n")'` } });
@@ -406,9 +525,10 @@ describe("configured providers", () => {
       const result = await runFx(["ask", "--json", "--no-save", "Run the local fixture once."], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
       expect(readFileSync(marker, "utf8")).toBe(["clear", "malformed"].includes(outcome) ? "one\n" : "");
-      expect(reviews).toBe(["clear", "caution", "missing", "malformed"].includes(outcome) ? 2 : 1);
+      // A held caution adds one confirming review of the same request.
+      expect(reviews).toBe(outcome === "caution" ? 3 : ["clear", "missing", "malformed"].includes(outcome) ? 2 : 1);
       const requests = f.requests.filter(request => request.body.tools?.some((tool: any) => tool.function?.name === "permission_decision"));
-      if (reviews === 2) expect(requests[1].body).toEqual(requests[0].body);
+      for (const request of requests.slice(1)) expect(request.body).toEqual(requests[0].body);
       expect(f.requests.every(request => request.path === "/v1/chat/completions")).toBe(true);
     } finally { f.close(); }
   }, 20000);
@@ -416,7 +536,11 @@ describe("configured providers", () => {
   test.each(["caution", "invalid"])("%s custom permission reviews never authorize execution", async decision => {
     let marker = "";
     const f = fixture(body => {
-      if (body.tools?.some((tool: any) => tool.function?.name === "permission_decision")) return toolCompletion(body.model, "permission_decision", { decision, rationale: "fixture review" });
+      if (body.tools?.some((tool: any) => tool.function?.name === "permission_decision")) return toolCompletion(body.model, "permission_decision", {
+        decision,
+        rationale: "fixture review",
+        ...(decision === "caution" ? { category: "system_harm", evidence: reviewedActionEvidence(JSON.stringify(body)) } : {}),
+      });
       if (body.messages.some((message: any) => message.role === "tool")) return completion(body.model, "action held");
       return toolCompletion(body.model, "shell", { request: { action: "run", command: `python3 -c 'open("${marker}", "w").write("bad")'` } });
     });

@@ -34,7 +34,7 @@ const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const sort_utils = @import("../core/shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
-const FetchGatewayGetResultFn = *const fn (Allocator, ?[]const u8, []const u8) anyerror!gateway_client.GetResult;
+const FetchGatewayGetResultFn = *const fn (Allocator, ?[]const u8, []const u8, *std.atomic.Value(bool)) anyerror!gateway_client.GetResult;
 
 const Request = web_search_contract.ProviderRequest;
 const Response = web_search_contract.ProviderResponse;
@@ -49,7 +49,7 @@ pub const retry_count: usize = 3;
 pub const chat_url_env = "FX_GATEWAY_CHAT_URL";
 pub const default_model_catalog_base_url = "https://ai-gateway.vercel.sh";
 const base_url_env = "FX_GATEWAY_BASE_URL";
-const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
+const e2e_gateway_models_url_env = "FX_TEST_GATEWAY_MODELS_URL";
 const oauth_request_timeout_ms: i64 = 15_000;
 const oauth_response_max_bytes: usize = 64 * 1024;
 
@@ -750,9 +750,10 @@ fn streamAgentCompletion(
 }
 
 /// Gateway reports the last provider it tried, so a provider's size rejection
-/// can arrive as a 400 from a later fallback. Classify it as too large.
+/// can arrive as a 400 from a later fallback. Classify it as too large. A 429
+/// whose body names a used-up quota is not a rate limit a wait outlives.
 fn gatewayFailureKind(alloc: Allocator, status: std.http.Status, err_body: ?[]const u8) agent_stream_provider_contract.FailureKind {
-    const kind = agent_stream_provider_contract.FailureKind.fromHttpStatus(status);
+    const kind = gateway_client.httpFailureKind(alloc, agent_stream_provider_contract.FailureKind.fromHttpStatus(status), err_body);
     if (kind != .invalid_request) return kind;
     const body = err_body orelse return kind;
     return if (vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body)) .request_too_large else kind;
@@ -768,6 +769,16 @@ test "Gateway 400 with a provider 413 attempt is a size failure" {
     try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.rate_limited, gatewayFailureKind(alloc, .too_many_requests, fallback_body));
 }
 
+test "Gateway 429 naming a used-up quota is not a rate limit" {
+    const alloc = std.testing.allocator;
+    const quota_body = "{\"error\":{\"message\":\"You exceeded your current quota\",\"type\":\"insufficient_quota\",\"code\":\"insufficient_quota\"}}";
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.quota_exhausted, gatewayFailureKind(alloc, .too_many_requests, quota_body));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.rate_limited, gatewayFailureKind(alloc, .too_many_requests, "{\"error\":{\"code\":\"rate_limit_exceeded\"}}"));
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.rate_limited, gatewayFailureKind(alloc, .too_many_requests, null));
+    // Only a 429 changes kind.
+    try std.testing.expectEqual(agent_stream_provider_contract.FailureKind.forbidden, gatewayFailureKind(alloc, .forbidden, quota_body));
+}
+
 fn fetchCredits(
     _: ?*anyopaque,
     alloc: Allocator,
@@ -779,11 +790,13 @@ fn fetchCredits(
     if (input.credential_source == .grok_subscription) {
         return creditsErrorSnapshot(alloc, "AI Gateway credits are unavailable for a Grok subscription.");
     }
+    var local_cancel = std.atomic.Value(bool).init(false);
     return fetchCreditsWithFetch(
         alloc,
         input.credential,
         input.tenant,
-        gateway_client.fetchGatewayGetResult,
+        input.cancel_flag orelse &local_cancel,
+        gateway_client.fetchGatewayGetResultCancellable,
     );
 }
 
@@ -796,6 +809,7 @@ fn fetchCreditsWithFetch(
     alloc: Allocator,
     api_key: ?[]const u8,
     gateway_team: ?[]const u8,
+    cancel_flag: *std.atomic.Value(bool),
     fetch_fn: FetchGatewayGetResultFn,
 ) output_contracts.CreditsSnapshot {
     var team_path: ?[]u8 = null;
@@ -810,7 +824,7 @@ fn fetchCreditsWithFetch(
         }
     }
 
-    var result = fetch_fn(alloc, api_key, team_path orelse credits_path) catch {
+    var result = fetch_fn(alloc, api_key, team_path orelse credits_path, cancel_flag) catch {
         return creditsErrorSnapshot(alloc, "failed to fetch credits from gateway");
     };
     defer result.deinit(alloc);
@@ -902,7 +916,8 @@ const OAuthHttpOperation = struct {
         };
         defer client.deinit();
 
-        const response_buffer = try self.alloc.alloc(u8, oauth_response_max_bytes + 1);
+        const max_bytes = self.request.max_response_bytes orelse oauth_response_max_bytes;
+        const response_buffer = try self.alloc.alloc(u8, max_bytes + 1);
         defer secret.zeroAndFree(self.alloc, response_buffer);
         var response_writer = std.Io.Writer.fixed(response_buffer);
 
@@ -933,7 +948,7 @@ const OAuthHttpOperation = struct {
             else => return err,
         };
         const body = response_writer.buffered();
-        if (body.len > oauth_response_max_bytes) return error.OAuthResponseTooLarge;
+        if (body.len > max_bytes) return error.OAuthResponseTooLarge;
 
         return .{
             .disposition = if (result.status == .ok) .accepted else .rejected,
@@ -2018,10 +2033,13 @@ test "built-in gateway defaults preserve active provider policy" {
     try std.testing.expectEqualStrings("FX_GATEWAY_CHAT_URL", chat_url_env);
 }
 
+var test_credits_never_cancelled = std.atomic.Value(bool).init(false);
+
 fn stubFetchCreditsError(
     _: Allocator,
     _: ?[]const u8,
     _: []const u8,
+    _: *std.atomic.Value(bool),
 ) anyerror!gateway_client.GetResult {
     return error.StubFetchFailed;
 }
@@ -2030,6 +2048,7 @@ fn stubFetchInvalidCreditsJson(
     alloc: Allocator,
     _: ?[]const u8,
     _: []const u8,
+    _: *std.atomic.Value(bool),
 ) anyerror!gateway_client.GetResult {
     return .{
         .status = .ok,
@@ -2041,6 +2060,7 @@ fn stubFetchCreditsObject(
     alloc: Allocator,
     _: ?[]const u8,
     _: []const u8,
+    _: *std.atomic.Value(bool),
 ) anyerror!gateway_client.GetResult {
     return .{
         .status = .ok,
@@ -2055,6 +2075,7 @@ fn stubCaptureCreditsPath(
     alloc: Allocator,
     _: ?[]const u8,
     path: []const u8,
+    _: *std.atomic.Value(bool),
 ) anyerror!gateway_client.GetResult {
     captured_credits_path_len = @min(path.len, captured_credits_path.len);
     @memcpy(
@@ -2071,6 +2092,7 @@ fn stubFetchForbiddenCredits(
     alloc: Allocator,
     _: ?[]const u8,
     _: []const u8,
+    _: *std.atomic.Value(bool),
 ) anyerror!gateway_client.GetResult {
     return .{
         .status = .forbidden,
@@ -2105,6 +2127,7 @@ test "built-in credits provider names the team query only when valid" {
             std.testing.allocator,
             null,
             case.team,
+            &test_credits_never_cancelled,
             stubCaptureCreditsPath,
         );
         defer snapshot.deinit(std.testing.allocator);
@@ -2120,6 +2143,7 @@ test "built-in credits provider maps fetch failure" {
         std.testing.allocator,
         null,
         null,
+        &test_credits_never_cancelled,
         stubFetchCreditsError,
     );
     defer snapshot.deinit(std.testing.allocator);
@@ -2138,6 +2162,7 @@ test "built-in credits provider maps Gateway HTTP denial" {
         std.testing.allocator,
         null,
         null,
+        &test_credits_never_cancelled,
         stubFetchForbiddenCredits,
     );
     defer snapshot.deinit(std.testing.allocator);
@@ -2156,6 +2181,7 @@ test "built-in credits provider rejects malformed JSON" {
         std.testing.allocator,
         null,
         null,
+        &test_credits_never_cancelled,
         stubFetchInvalidCreditsJson,
     );
     defer snapshot.deinit(std.testing.allocator);
@@ -2186,6 +2212,7 @@ test "built-in credits provider returns owned string fields" {
         std.testing.allocator,
         null,
         null,
+        &test_credits_never_cancelled,
         stubFetchCreditsObject,
     );
     defer snapshot.deinit(std.testing.allocator);

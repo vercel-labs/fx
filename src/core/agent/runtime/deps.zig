@@ -1,5 +1,6 @@
 const std = @import("std");
 const observation = @import("observation.zig");
+const cache_warmer = @import("cache_warmer.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const auth_runtime = @import("../../auth/auth_runtime.zig");
@@ -43,6 +44,9 @@ pub const TurnProgress = struct {
     /// The text of the message that issued `running_calls`, so a crash also
     /// leaves what fx already showed (D51).
     running_assistant: ?[]const u8 = null,
+    /// The recovery module's record for the send this write goes before,
+    /// saved in the same write (`tests/tla/recovery/Resume.tla`).
+    recovery_record: types.RecoveryRecordWrite = .keep,
 };
 
 /// Borrows checkpoint slices only for the call. A sink must synchronously copy
@@ -145,39 +149,15 @@ fn localModelCapabilities(_: *anyopaque, _: Allocator, model: []const u8) !model
     return model_capabilities.capabilitiesForModel(model);
 }
 
-pub const RouteRecoveryDecision = enum {
-    disable_fast,
+/// The user's answer when the account is out of credits.
+pub const OutOfCreditsChoice = enum {
+    /// "I added credits, retry": resend the request.
+    retry,
+    /// "Switch to another model": end the turn with the prompt back in the
+    /// composer and the model picker open.
     switch_model,
+    /// "Cancel this turn", or Esc.
     cancel,
-};
-
-pub const ParentTurnDeliveryAck = struct {
-    child_id: []const u8,
-    target_session_id: []const u8,
-    through_sequence: u64,
-    delivery_id: []const u8,
-    start_offset: u64,
-    total_bytes: u64,
-};
-
-/// Slices are owned by the allocator passed to `prepare_parent_turn_context`
-/// and remain valid until that allocator is reset or deinitialized. The caller
-/// must finish every acknowledgement callback before ending that lifetime;
-/// acknowledgement callbacks borrow these slices only for the callback.
-pub const PreparedParentTurnContext = struct {
-    content: []const u8,
-    acknowledgements: []const ParentTurnDeliveryAck,
-};
-
-pub const RouteRecoveryRequest = struct {
-    selected_model: []const u8,
-    route_model: []const u8,
-    fast_mode: bool,
-    replay_safe: bool,
-    finish_reason: types.ProviderFinishReason,
-    semantic_attempts: usize,
-    unsafe_no_retry_reason: ?types.RouteRecoveryUnsafeReason = null,
-    provider_failure_detail: ?[]const u8 = null,
 };
 
 pub const CredentialRefreshMode = auth_runtime.CredentialRefreshMode;
@@ -223,9 +203,6 @@ pub const AgentRuntimeDeps = struct {
         kind: worker_runtime.SteeringBoundaryKind,
     ) anyerror!worker_runtime.SteeringBoundaryResult = null,
     release_agent_terminal_lease: *const fn (ctx: *anyopaque, session_id: []const u8) anyerror!void = terminalLeaseCleanupUnavailable,
-    wait_for_subagent: ?*const fn (ctx: *anyopaque, turn_id: u64, step_id: u64) anyerror!bool = null,
-    prepare_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator) anyerror!?PreparedParentTurnContext = null,
-    acknowledge_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator, acknowledgements: []const ParentTurnDeliveryAck) void = null,
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
     append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
     validate_tool_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!ToolCallValidationResult = null,
@@ -257,10 +234,20 @@ pub const AgentRuntimeDeps = struct {
     /// Called at every model-request boundary with the turn so far, so each
     /// completed piece is saved as it happens rather than at the turn's end.
     append_turn_piece: ?*const fn (ctx: *anyopaque, progress: TurnProgress) anyerror!void = null,
+    /// Saves or clears the recovery module's record in the open turn outside
+    /// the writes before and after each send, which carry it in
+    /// `TurnProgress.recovery_record`. Returns false when the turn has no
+    /// pieces on disk yet. Null on hosts that never resume a request, which
+    /// keep no record.
+    save_recovery_record: ?*const fn (ctx: *anyopaque, record: types.RecoveryRecordWrite) anyerror!bool = null,
     /// Called once with each main-model completion's provider usage, as soon
     /// as it arrives, so a saved session keeps the usage of every reply even
     /// when the turn never ends. A failure is traced and never fails the turn.
     record_usage: ?*const fn (ctx: *anyopaque, usage: types.Usage) anyerror!void = null,
+    /// Keeps the conversation's Claude prompt cache warm between requests.
+    /// Owned by the conversation's `SessionRuntime`; null where no one waits
+    /// on the conversation, as in `fx ask` and subagents.
+    cache_warmer: ?*cache_warmer.Warmer = null,
     /// Saves the turn's prompt images in the session before its first
     /// request is built, so the note naming each saved file is true when
     /// that request is sent (D89). It sets `blob_path`, allocated with
@@ -285,13 +272,19 @@ pub const AgentRuntimeDeps = struct {
     /// host provides one; ordinary system notices remain unaffected.
     push_context_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
     push_route_recovery_status: *const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = discardRouteRecoveryStatus,
+    /// A new model request starts. A host that reports the last request's
+    /// recovery, as `fx ask --json` does, forgets the previous request's
+    /// here. Null: the host keeps no per-request report.
+    begin_route_recovery_request: ?*const fn (ctx: *anyopaque) void = null,
     /// A turn that can never recover hands the user's prompt back to the
     /// composer so nothing typed is lost. Null: host keeps the prompt as-is.
     restore_failed_prompt: ?*const fn (ctx: *anyopaque, prompt: []const u8) anyerror!void = null,
     push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
     push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
     refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8) anyerror!?[]u8 = null,
-    request_route_recovery: ?*const fn (ctx: *anyopaque, arena: Allocator, request: RouteRecoveryRequest) anyerror!RouteRecoveryDecision = null,
+    /// Asks the user what to do when the account is out of credits, and
+    /// blocks until they answer. Only the TUI sets it.
+    ask_out_of_credits: ?*const fn (ctx: *anyopaque) anyerror!OutOfCreditsChoice = null,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
     resolve_model_capabilities: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities = localModelCapabilities,
     /// Reports that the model catalog is known to be failed or unreachable, so

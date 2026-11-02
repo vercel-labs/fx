@@ -138,7 +138,7 @@ pub const ConversationInterruption = struct {
             turn_summary: ?types.TurnSummary = null,
             cancellation_origin: std.json.Value = .{ .string = "turn" },
         };
-        const wire = try std.json.innerParse(Wire, alloc, source, options);
+        const wire = try json_decode.innerParse(Wire, alloc, source, options);
         // The default enum decoder also accepts numeric tags, not just names.
         if (wire.cancellation_origin != .string) return error.UnexpectedToken;
         const origin = std.meta.stringToEnum(types.CancellationOrigin, wire.cancellation_origin.string) orelse

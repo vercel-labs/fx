@@ -32,9 +32,9 @@ function fixture(label: string) {
   const processes: Process[] = [];
   const apps: App[] = [];
   const env = () => testEnvironment({
-    HOME: home, AI_GATEWAY_API_KEY: "synthetic-fork-fixture", FX_SKIP_ONBOARDING: "1",
+    HOME: home, AI_GATEWAY_API_KEY: "synthetic-fork-fixture", FX_TEST_SKIP_ONBOARDING: "1",
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
     FX_MODEL: FAKE_GATEWAY_MODEL, FX_PERMISSION_MODE: "full-access", NO_COLOR: "1",
     FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "wiring",
   });

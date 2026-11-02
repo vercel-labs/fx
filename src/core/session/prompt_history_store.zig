@@ -61,11 +61,11 @@ pub const Store = struct {
 
     pub fn initFromHome(alloc: Allocator, home_path: []const u8) !Store {
         const zio = io_mod.getIo();
-        var home = try std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true });
+        var home = try std.Io.Dir.openDirAbsolute(zio, profile_paths.rootParent(home_path), .{ .iterate = true });
         defer home.close(zio);
 
         var durable_home: ?io_mod.VerifiedDir = null;
-        if (home.openDir(zio, profile_paths.root_dir_name, .{
+        if (home.openDir(zio, profile_paths.rootName(), .{
             .iterate = true,
             .follow_symlinks = false,
         })) |dir| {
@@ -221,12 +221,12 @@ pub const Store = struct {
             if (self.fail_layout_creation) return error.DurableLayoutFailed;
             const zio = io_mod.getIo();
             var home = io_mod.VerifiedDir{
-                .dir = std.Io.Dir.openDirAbsolute(zio, self.home_path, .{
+                .dir = std.Io.Dir.openDirAbsolute(zio, profile_paths.rootParent(self.home_path), .{
                     .iterate = true,
                 }) catch return error.DurableLayoutFailed,
             };
             defer home.close();
-            self.durable_home = io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name) catch |err| switch (err) {
+            self.durable_home = io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.rootName()) catch |err| switch (err) {
                 error.PrivateStatePermissionsUnsupported, error.DurablePathUnsafe => return err,
                 else => return error.DurableLayoutFailed,
             };

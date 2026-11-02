@@ -240,7 +240,7 @@ fn failureMetricCode(kind: agent_stream_provider.FailureKind) u16 {
         .unauthorized => 401,
         .forbidden => 403,
         .request_too_large => 413,
-        .rate_limited => 429,
+        .rate_limited, .quota_exhausted => 429,
         .server_error => 500,
         .bad_gateway => 502,
         .unavailable => 503,

@@ -641,7 +641,7 @@ test("a resume that restarts a reply the last process had started sends that sta
   // The new engine's host saw none of the turn: it gets what the last
   // process had sent of the reply, then the restart.
   assert.ok(text.startsWith("answer to remember plums"), JSON.stringify(text));
-  assert.ok(text.includes("[Response interrupted. Restarting.]"), JSON.stringify(text));
+  assert.ok(text.includes("↻ Restarted the answer"), JSON.stringify(text));
 });
 
 test("a turn's result waits until its end is stored", async () => {

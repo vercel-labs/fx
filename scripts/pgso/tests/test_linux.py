@@ -8,7 +8,7 @@ import types
 import unittest
 from unittest import mock
 
-from scripts.pgso import linux, platforms
+from scripts.pgso import linux, macos, platforms
 from scripts.pgso.model import PgsoError, sha256_file
 from scripts.pgso.pipeline import PipelinePaths
 from scripts.pgso.runner import CommandResult
@@ -50,8 +50,8 @@ class LinuxPlatformTests(unittest.TestCase):
             llvm_profdata=self.root / "llvm-profdata",
             profile_runtime=self.root / "libclang_rt.profile.a",
             tools=linux.Tools(ld_lld=self.root / "llvm" / "ld.lld", readelf=self.root / "llvm" / "llvm-readelf"),
-            platform=linux,
-            target=linux.TARGET,
+            platform=linux.ARM64,
+            target=linux.ARM64.TARGET,
         )
 
     def write_control_link(self, *, inputs: tuple[pathlib.Path, ...]) -> list[str]:
@@ -72,8 +72,35 @@ class LinuxPlatformTests(unittest.TestCase):
             linux.record_control_build(self.toolchain(), result, self.paths)
         return argv
 
-    def test_the_registry_selects_linux_for_aarch64_linux(self) -> None:
-        self.assertIs(linux, platforms.for_target("aarch64-linux"))
+    def test_the_registry_selects_each_linux_architecture(self) -> None:
+        self.assertIs(linux.ARM64, platforms.for_target("aarch64-linux"))
+        self.assertIs(linux.X86_64, platforms.for_target("x86_64-linux"))
+        self.assertEqual("Linux x86_64", linux.X86_64.DISPLAY_NAME)
+
+    def test_only_x86_64_has_a_larger_size_ceiling(self) -> None:
+        self.assertEqual(7.000, macos.SIZE_CEILING_MIB)
+        self.assertEqual(7.000, linux.ARM64.SIZE_CEILING_MIB)
+        self.assertEqual(8.250, linux.X86_64.SIZE_CEILING_MIB)
+
+    def test_every_platform_provides_what_the_pipeline_reads(self) -> None:
+        names = (
+            "TARGET", "DISPLAY_NAME", "HOST_ARCH", "LIBLLVM_NAME", "SIZE_CEILING_MIB", "CONTROL_BUILD_FLAGS",
+            "STARTUP_SCENARIOS", "ZIG_CC_LINK_FLAGS", "check_host", "discover_tools",
+            "os_versions", "record_control_build", "external_control_strip_argv",
+            "read_control_identity", "control_identity_from_evidence", "link_instrumented",
+            "public_api_flags", "candidate_object_flags", "link_candidate_binary",
+            "inspect_candidate", "candidate_evidence",
+        )
+        for platform in (macos, linux.ARM64, linux.X86_64):
+            for name in names:
+                with self.subTest(platform=platform.TARGET, name=name):
+                    self.assertTrue(hasattr(platform, name))
+
+    def test_zig_cc_links_for_the_toolchain_target(self) -> None:
+        toolchain = self.toolchain()
+        toolchain.target = linux.X86_64.TARGET
+        argv = linux._zig_cc_argv(toolchain, (self.root / "a.o",), self.root / "out")
+        self.assertEqual("x86_64-linux", argv[argv.index("-target") + 1])
 
     def test_elf_layout_reads_the_static_control_contract(self) -> None:
         layout = linux.parse_elf_layout(CONTROL_HEADERS, "", CONTROL_SECTIONS)
@@ -269,7 +296,7 @@ class LinuxPlatformTests(unittest.TestCase):
         root = self.root / "llvm" / "bin"
         root.mkdir(parents=True)
         resource = self.root / "llvm" / "lib" / "clang" / "22"
-        runtime = resource / "lib" / linux.PROFILE_RUNTIME_TRIPLE / "libclang_rt.profile.a"
+        runtime = resource / "lib" / linux.ARM64.PROFILE_RUNTIME_TRIPLE / "libclang_rt.profile.a"
         runtime.parent.mkdir(parents=True)
         runtime.write_bytes(b"archive")
         # As in the LLVM release, ld.lld is a link to lld.
@@ -282,7 +309,7 @@ class LinuxPlatformTests(unittest.TestCase):
         clang.write_text(f"#!/bin/sh\necho {resource}\n")
         clang.chmod(0o755)
 
-        tools, found = linux.discover_tools(self.root / "zig", clang)
+        tools, found = linux.ARM64.discover_tools(self.root / "zig", clang)
 
         resolved_root = root.resolve()
         self.assertEqual(
@@ -291,19 +318,32 @@ class LinuxPlatformTests(unittest.TestCase):
         )
         self.assertEqual("ld.lld", tools.ld_lld.name)
         self.assertEqual(runtime.resolve(), found)
+        # Each architecture reads only its own runtime.
+        with self.assertRaisesRegex(PgsoError, "x86_64-unknown-linux-gnu"):
+            linux.X86_64.discover_tools(self.root / "zig", clang)
+        x86_runtime = resource / "lib" / linux.X86_64.PROFILE_RUNTIME_TRIPLE / "libclang_rt.profile.a"
+        x86_runtime.parent.mkdir(parents=True)
+        x86_runtime.write_bytes(b"archive")
+        self.assertEqual(x86_runtime.resolve(), linux.X86_64.discover_tools(self.root / "zig", clang)[1])
         (root / "llvm-readelf").unlink()
         with self.assertRaisesRegex(PgsoError, "missing executable: llvm-readelf"):
-            linux.discover_tools(self.root / "zig", clang)
+            linux.ARM64.discover_tools(self.root / "zig", clang)
 
-    def test_host_must_be_native_linux_aarch64(self) -> None:
-        with mock.patch("platform.system", return_value="Linux"), mock.patch("platform.machine", return_value="aarch64"):
-            self.assertEqual("aarch64", linux.check_host())
-        with mock.patch("platform.system", return_value="Darwin"), self.assertRaisesRegex(PgsoError, "requires a Linux host"):
-            linux.check_host()
-        with mock.patch("platform.system", return_value="Linux"), mock.patch(
-            "platform.machine", return_value="x86_64"
-        ), self.assertRaisesRegex(PgsoError, "requires an aarch64 host"):
-            linux.check_host()
+    def test_host_must_be_native_linux_of_the_same_architecture(self) -> None:
+        for platform, other in ((linux.ARM64, "x86_64"), (linux.X86_64, "aarch64")):
+            with self.subTest(target=platform.TARGET):
+                with mock.patch("platform.system", return_value="Linux"), mock.patch(
+                    "platform.machine", return_value=platform.HOST_ARCH
+                ):
+                    self.assertEqual(platform.HOST_ARCH, platform.check_host())
+                with mock.patch("platform.system", return_value="Darwin"), self.assertRaisesRegex(
+                    PgsoError, "requires a Linux host"
+                ):
+                    platform.check_host()
+                with mock.patch("platform.system", return_value="Linux"), mock.patch(
+                    "platform.machine", return_value=other
+                ), self.assertRaisesRegex(PgsoError, f"requires an {platform.HOST_ARCH} host, not {other}"):
+                    platform.check_host()
 
 
 if __name__ == "__main__":

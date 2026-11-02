@@ -59,7 +59,7 @@ function fixture(name: string) {
     },
   });
   const env = testEnvironment({
-    HOME: home, AI_GATEWAY_API_KEY: "synthetic-prompt-images-fixture", FX_SKIP_ONBOARDING: "1",
+    HOME: home, AI_GATEWAY_API_KEY: "synthetic-prompt-images-fixture", FX_TEST_SKIP_ONBOARDING: "1",
     FX_GATEWAY_BASE_URL: `http://127.0.0.1:${server.port}`,
     FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     FX_MODEL: MODEL, NO_COLOR: "1",

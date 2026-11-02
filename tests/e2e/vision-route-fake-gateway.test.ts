@@ -1462,7 +1462,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             firstJson.session_id,
             "Continue with the saved native image context.",
           ],
@@ -1567,7 +1567,7 @@ describe("Vision route fake Gateway", () => {
               "--json",
               "--auto",
               "--no-color",
-              "--resume-id",
+              "--resume",
               sessionId,
               `Reread ${entry.name} image.`,
             ],
@@ -1864,7 +1864,7 @@ describe("Vision route fake Gateway", () => {
 
         // The next turn, in a new process, cannot reach the catalog.
         const resumed = await runFx(
-          ["ask", "--json", "--auto", "--no-color", "--resume-id", firstJson.session_id, "Testing"],
+          ["ask", "--json", "--auto", "--no-color", "--resume", firstJson.session_id, "Testing"],
           { cwd: root.workspace, env: fakeGatewayEnv(root, down, KIMI_MODEL), timeoutMs: TIMEOUT },
         );
         const resumedJson = parseFxJson(resumed);
@@ -1996,7 +1996,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             firstJson.session_id,
             "--image",
             secondImagePath,
@@ -2019,7 +2019,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             firstJson.session_id,
             "Reread only the second historical image.",
           ],
@@ -2117,7 +2117,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             sessionId,
             "--image",
             newImagePath,
@@ -2163,7 +2163,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             sessionId,
             "Reread only the second repaired legacy image.",
           ],
@@ -2474,7 +2474,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             sessionId,
             "Inspect both saved images.",
           ],
@@ -2543,7 +2543,7 @@ describe("Vision route fake Gateway", () => {
             "--json",
             "--auto",
             "--no-color",
-            "--resume-id",
+            "--resume",
             sessionId,
             "Inspect all saved images.",
           ],
@@ -3304,7 +3304,7 @@ for (const sourceChange of ["removed", "changed"] as const) {
       expectSavedBlob(root.home, id, original);
       if (sourceChange === "removed") rmSync(input);
       else writeMarkedImage(input, "REPLACEMENT_MUST_NOT_BE_USED");
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", id, "Describe the saved image again."], options);
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", id, "Describe the saved image again."], options);
       expect(parseFxJson(resumed).output).toContain("RECOVERY_IMAGE_COMPLETE");
       expect(gateway.chatRequests).toHaveLength(4);
       const parts = nativeFileParts(gateway.chatRequests[2]!.body);
@@ -3339,7 +3339,7 @@ test.skipIf(!tmuxAvailable())("TUI keeps a failed turn's image through a cold re
     await session.sendText(`/image ${input}`);
     await session.waitForText("attached image:", TIMEOUT);
     await session.sendText("Describe this image.");
-    await session.waitForText("RequiredVisionToolCallMissing", TIMEOUT);
+    await session.waitForText("required vision tool call missing", TIMEOUT);
     await session.waitForStableComposer(TIMEOUT);
     const [id] = rootSessionIds(root.home) as [string];
     // The failed turn keeps the captured image as its session's blob (D89).
@@ -3417,7 +3417,11 @@ describe("request size budget", () => {
   function startSizeCappedGateway(
     rejection: { status: number; body: string },
     images: Map<string, string>,
-    { cap = SIZE_CAP_BYTES, answer = "read" }: { cap?: number; answer?: "read" | "describe" } = {},
+    {
+      cap = SIZE_CAP_BYTES,
+      answer = "read",
+      count = SIZE_IMAGE_COUNT,
+    }: { cap?: number; answer?: "read" | "describe"; count?: number } = {},
   ) {
     const byData = new Map([...images].map(([name, data]) => [data, name]));
     const requests: SizeRequest[] = [];
@@ -3443,11 +3447,11 @@ describe("request size budget", () => {
         }
         if (!tools) return sseText("Summary: the user asked fx to read six images.");
         if (answer === "describe") return sseText("done: described the images");
-        if (issued < SIZE_IMAGE_COUNT) {
+        if (issued < count) {
           issued += 1;
-          return sseToolCall("read_file", { path: `img0${issued}.png` }, `call_img_${issued}`);
+          return sseToolCall("read_file", { path: sizeImageName(issued) }, `call_img_${issued}`);
         }
-        return sseText(`done: read ${SIZE_IMAGE_COUNT} images`);
+        return sseText(`done: read ${count} images`);
       },
     });
     return {
@@ -3466,13 +3470,17 @@ describe("request size budget", () => {
     };
   }
 
-  function writeSizeImages(workspace: string) {
+  function sizeImageName(index: number) {
+    return `img${String(index).padStart(2, "0")}.png`;
+  }
+
+  // By default six images of about 1 MB of base64 each, distinct bytes per file.
+  function writeSizeImages(workspace: string, count = SIZE_IMAGE_COUNT, bytes = 750_000) {
     const images = new Map<string, string>();
-    for (let index = 1; index <= SIZE_IMAGE_COUNT; index++) {
-      // About 1 MB of base64 each, distinct bytes per file.
-      const png = paddedPng(solidPng(64, 64), 750_000 + index);
-      writeFileSync(join(workspace, `img0${index}.png`), png);
-      images.set(`img0${index}.png`, png.toString("base64"));
+    for (let index = 1; index <= count; index++) {
+      const png = paddedPng(solidPng(64, 64), bytes + index);
+      writeFileSync(join(workspace, sizeImageName(index)), png);
+      images.set(sizeImageName(index), png.toString("base64"));
     }
     return images;
   }
@@ -3520,6 +3528,55 @@ describe("request size budget", () => {
       }
     }, TIMEOUT * 3);
   }
+
+  test("a session past its size limit leaves its oldest images out a block at a time", async () => {
+    const root = createIsolatedRoot();
+    // 24 images of about 40 KB of base64 against a 600 KB limit: the first
+    // refusal teaches fx a limit of about 450 KB, which holds about ten of
+    // them, and a block ends at a quarter of it, about three images.
+    const count = 24;
+    const images = writeSizeImages(root.workspace, count, 30_000);
+    const gateway = startSizeCappedGateway({ status: 413, body: payloadTooLargeBody }, images, {
+      cap: 600_000,
+      count,
+    });
+    try {
+      const result = await runFx(["ask", "--json", "--auto", "--no-color", "Read img01.png through img24.png one at a time with read_file."], {
+        cwd: root.workspace,
+        env: gateway.env(root),
+        timeoutMs: TIMEOUT * 2,
+      });
+      const json = parseFxJson(result);
+      expect(json.output).toContain(`done: read ${count} images`);
+
+      const rejected = gateway.requests.filter((request) => request.status !== 200);
+      expect(rejected).toHaveLength(1);
+      const rejectedIndex = gateway.requests.indexOf(rejected[0]!);
+      const learnedLimit = Math.floor(rejected[0]!.body.length / 4) * 3;
+      const after = gateway.requests.slice(rejectedIndex + 1);
+      expect(after.length).toBeGreaterThan(8);
+      const oldestSent: string[] = [];
+      for (const [index, request] of after.entries()) {
+        expect(request.body.length).toBeLessThanOrEqual(learnedLimit);
+        expect(request.body).toContain(SIZE_NOTICE);
+        // The newest image read is always sent. A request carries every image
+        // read before it, and the retry repeats the refused request.
+        expect(request.images).toContain(sizeImageName(Math.min(count, rejectedIndex + index)));
+        oldestSent.push(request.images[0]!);
+      }
+      // Leaving out one more image per request would change the oldest image
+      // sent, and with it the cached prompt, on every request; a block at a
+      // time changes it at most every other request.
+      const changes = oldestSent.filter((name, index) => index > 0 && name !== oldestSent[index - 1]).length;
+      expect(changes * 2).toBeLessThanOrEqual(after.length);
+      // It never moves back to an image already left out.
+      const order = oldestSent.map((name) => Number.parseInt(name.slice(3, 5), 10));
+      for (let index = 1; index < order.length; index++) expect(order[index]!).toBeGreaterThanOrEqual(order[index - 1]!);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, TIMEOUT * 3);
 
   test("a size limit two retries can't reach still leaves out images instead of compacting", async () => {
     const root = createIsolatedRoot();

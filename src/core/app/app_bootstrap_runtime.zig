@@ -1,4 +1,5 @@
 const std = @import("std");
+const agents = @import("../agents/agents.zig");
 const build_options = @import("build_options");
 const app_lifecycle = @import("app_lifecycle.zig");
 const provider_runtime = @import("provider_runtime.zig");
@@ -159,6 +160,7 @@ fn BootstrapDeps(comptime App: type) type {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
         pub const LaunchOverrides = struct {
             provider: ?model_provider.ProviderId = null,
             model: ?[]const u8 = null,
@@ -168,10 +170,13 @@ pub fn Runtime(comptime App: type) type {
             /// Borrowed from the launch arguments; StartupState dupes on apply.
             provider_order: ?[]const []const u8 = null,
             provider_strict: ?bool = null,
+            /// `--permission-mode` for this launch; the saved mode is untouched.
+            permission_mode: ?types.PermissionMode = null,
         };
 
         pub fn bootstrap(
             app: *App,
+            agent: *AppAgent,
             footer_rows: u16,
             default_model: []const u8,
             default_agent_step_limit: usize,
@@ -181,6 +186,7 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             try bootstrapWithDeps(
                 app,
+                agent,
                 footer_rows,
                 default_model,
                 default_agent_step_limit,
@@ -215,6 +221,7 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             try app_session_runtime.Runtime(App).initializePersistence(
                 app,
+                &app.main_agent,
                 required,
             );
         }
@@ -236,6 +243,7 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             try app_session_runtime.Runtime(App).configureStartupPreferences(
                 app,
+                &app.main_agent,
                 provider,
                 configured_model,
                 model_source,
@@ -256,11 +264,11 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn beginFreshPersistedSessionDefault(app: *App) !void {
-            try app_session_runtime.Runtime(App).beginFreshPersistedSession(app);
+            try app_session_runtime.Runtime(App).beginFreshPersistedSession(app, &app.main_agent);
         }
 
         fn enableSessionStoresDefault(app: *App) void {
-            app_session_runtime.Runtime(App).enableSessionStores(app);
+            app_session_runtime.Runtime(App).enableSessionStores(app, &app.main_agent);
         }
 
         // Neutral one-line summary inline; the full detail stays behind Ctrl+O.
@@ -288,24 +296,20 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
-        /// Reports skill discovery issues inline and to the model's context.
-        pub fn writeSkillDiagnosticsNotice(app: *App) !void {
+        /// Records skill discovery issues in the full transcript only. Most
+        /// roots belong to other agent tools, so the inline transcript stays
+        /// quiet. Claiming the body keeps later skill calls from repeating it.
+        pub fn writeSkillDiagnosticsNotice(app: *App, agent: *AppAgent) !void {
             if (app.skills.diagnostics.len == 0) return;
             var notice_writer: std.Io.Writer.Allocating = .init(app.alloc);
             defer notice_writer.deinit();
             skill_runtime.writeDiagnosticSummary(app.alloc, &notice_writer.writer, app.skills.diagnostics) catch return error.OutOfMemory;
             const skills_body = notice_writer.toOwnedSlice() catch return error.OutOfMemory;
             defer app.alloc.free(skills_body);
-            if (comptime @hasField(App, "session") and @hasDecl(@TypeOf(app.session), "claimContextNotice")) {
-                _ = try app.session.claimContextNotice(app.alloc, skills_body);
+            if (comptime agents.hasAgentField(App, "session") and @hasDecl(@TypeOf(agent.session), "claimContextNotice")) {
+                _ = try agent.session.claimContextNotice(app.alloc, skills_body);
             }
-
-            const skills_summary = try app.alloc.print("{d} discovery issue{s}; some skills may be missing", .{
-                app.skills.diagnostics.len,
-                if (app.skills.diagnostics.len == 1) "" else "s",
-            });
-            defer app.alloc.free(skills_summary);
-            try writeCollapsedStartupNotice(app, "skills", skills_summary, skills_body);
+            try app.writeDomainNotice(.{ .topic = "skills", .tone = .neutral, .body = skills_body, .visibility = .full_only }, true);
         }
 
         /// Hands a Keychain-backed launch credential to an auth worker so the
@@ -337,7 +341,7 @@ pub fn Runtime(comptime App: type) type {
         /// provider/model/effort, system prompt size, advertised tools, skill
         /// catalog size, and MCP server states. Live-session only; resume does
         /// not replay it, matching other full-only startup detail.
-        fn writeSessionAssemblyNotice(app: *App, provider_label: []const u8) !void {
+        fn writeSessionAssemblyNotice(app: *App, agent: *AppAgent, provider_label: []const u8) !void {
             var mcp_servers: std.ArrayList(SessionAssemblyMcpServer) = .empty;
             // Names are duped: the statuses are released with their arena
             // before the body is rendered.
@@ -365,22 +369,22 @@ pub fn Runtime(comptime App: type) type {
                 };
             }
             const system_prompt_bytes: ?usize = if (comptime @hasDecl(App, "promptPolicy"))
-                app.promptPolicy().system_prompt.len
+                app.promptPolicy(agent).system_prompt.len
             else
                 null;
             const tool_names: []const []const u8 = if (comptime @hasDecl(App, "toolAdvertisementSet"))
-                app.toolAdvertisementSet().order
+                app.toolAdvertisementSet(agent).order
             else
                 &.{};
-            const effort_label: []const u8 = if (comptime @hasField(App, "effort"))
-                app.effort.label()
+            const effort_label: []const u8 = if (comptime agents.hasAgentField(App, "effort"))
+                agent.effort.label()
             else
                 "auto";
             var body: std.Io.Writer.Allocating = .init(app.alloc);
             defer body.deinit();
             try writeSessionAssemblyBody(&body.writer, .{
                 .provider = provider_label,
-                .model = provider_runtime.model(app),
+                .model = provider_runtime.modelOf(app, agent),
                 .effort = effort_label,
                 .system_prompt_bytes = system_prompt_bytes,
                 .tool_names = tool_names,
@@ -397,6 +401,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn bootstrapWithDeps(
             app: *App,
+            agent: *AppAgent,
             footer_rows: u16,
             default_model: []const u8,
             default_agent_step_limit: usize,
@@ -511,7 +516,7 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 try provider_runtime.replaceModel(app, selected_model);
             }
-            const active_model = provider_runtime.model(app);
+            const active_model = provider_runtime.modelOf(app, agent);
             // Per-launch --effort/--fast flags shape runtime state only; the
             // configured and stored preferences keep their pre-flag values.
             const persisted_effort = startup.effort;
@@ -536,25 +541,47 @@ pub fn Runtime(comptime App: type) type {
                 launch_overrides.fast,
                 launch_overrides.provider,
             );
-            app.permission_engine.mode = startup.permission_mode;
+            // Every later instance starts from what the first did.
+            if (comptime @hasField(App, "instances")) {
+                try app.instances.seed.capturePreferences(
+                    app.alloc,
+                    startup.provider,
+                    startup.configured_model,
+                    startup.model_source,
+                    active_model,
+                    persisted_effort,
+                    persisted_fast_mode,
+                    startup.fast_mode_model_bound,
+                    persisted_ultrafast_mode,
+                    startup.ultrafast_process_override,
+                    launch_overrides.effort,
+                    launch_overrides.fast,
+                    launch_overrides.provider,
+                );
+            }
+            // `--permission-mode` and its shortcuts reach every instance,
+            // and are never saved.
+            const permission_mode = launch_overrides.permission_mode orelse startup.permission_mode;
+            app_permission_runtime.Runtime(App).initMode(app, agent, permission_mode);
             app.permission_engine.replaceRules(app.alloc, startup.takePermissionRules());
             app.agent_step_limit = startup.agent_step_limit;
-            app.worker.agent_turn_settings.max_tool_result_bytes = startup.max_tool_result_bytes;
-            app.worker.agent_turn_settings.auto_compact_percent = startup.auto_compact_percent;
+            agent.worker.agent_turn_settings.max_tool_result_bytes = startup.max_tool_result_bytes;
+            agent.worker.agent_turn_settings.auto_compact_percent = startup.auto_compact_percent;
             if (comptime @hasField(App, "context_limits")) app.context_limits = startup.context_limits;
-            app.worker.agent_turn_settings.first_call_tool_choice = startup.first_call_tool_choice;
-            app.worker.agent_turn_settings.fast_mode = startup.fast_mode;
-            app.worker.agent_turn_settings.ultrafast_mode = startup.ultrafast_mode;
-            app.worker.agent_turn_settings.effort = startup.effort;
+            agent.worker.agent_turn_settings.first_call_tool_choice = startup.first_call_tool_choice;
+            agent.worker.agent_turn_settings.fast_mode = startup.fast_mode;
+            agent.worker.agent_turn_settings.ultrafast_mode = startup.ultrafast_mode;
+            agent.worker.agent_turn_settings.effort = startup.effort;
             // Worker-owned memory uses the C allocator, matching worker deinit.
-            try app.worker.setProviderRouting(std.heap.c_allocator, startup.provider_order, startup.provider_strict);
+            try agent.worker.setProviderRouting(std.heap.c_allocator, startup.provider_order, startup.provider_strict);
             app.context_enabled = startup.context_enabled;
             app.fast_mode = startup.fast_mode;
             app.input_runtime.slash_menu_categories = startup.slash_menu_categories;
             app.shell.collapse_tool_calls = startup.collapse_tool_calls;
             app.auto_upgrade_enabled = startup.auto_upgrade;
             app.upgrader.configure_channel(startup.update_channel);
-            app.effort = startup.effort;
+            agent.effort = startup.effort;
+            if (comptime @hasField(App, "instances")) try app.instances.seed.captureAgent(app.alloc, agent, permission_mode);
             if (comptime @hasField(App, "review_model")) app.review_model = startup.takeReviewModel();
             app.shell.setCommandOutputRenderPolicy(
                 app_render_runtime.Runtime(App).shellStyles(),
@@ -565,6 +592,7 @@ pub fn Runtime(comptime App: type) type {
             app.statusline_session = startup.statusline_session;
             if (comptime @hasField(App, "session_title_generation")) {
                 app.session_title_generation = startup.session_title_generation;
+                if (comptime @hasField(App, "cache_warming")) app.cache_warming = startup.cache_warming;
             }
             if (comptime @hasField(App, "workspace_identity")) {
                 app.workspace_identity.enabled = startup.statusline_workspace;
@@ -581,7 +609,7 @@ pub fn Runtime(comptime App: type) type {
                 app.requested_resume != null,
             );
             if (comptime @hasDecl(App, "loadMcpHost")) if (deps.load_mcp_host) |load_host| {
-                try app.loadMcpHost(load_host);
+                try app.loadMcpHost(agent, load_host);
             };
 
             const skills_deferred = try beginStartupSkillsLoad(app);
@@ -617,10 +645,10 @@ pub fn Runtime(comptime App: type) type {
                 try app.writeTranscriptClassified(welcome_message, true, .welcome);
                 // Fresh sessions only: on resume the transcript must stay
                 // empty until the deferred session load replays history.
-                try writeSessionAssemblyNotice(app, startup.provider.label());
+                try writeSessionAssemblyNotice(app, agent, startup.provider.label());
             }
             // A deferred catalog reports its discovery issues when it lands.
-            if (!skills_deferred) try writeSkillDiagnosticsNotice(app);
+            if (!skills_deferred) try writeSkillDiagnosticsNotice(app, agent);
             if (comptime @hasField(App, "auth")) {
                 if (!credential_deferred) {
                     try app_auth_runtime.Runtime(App).writeStartupCredentialFailure(app, startup.provider, startup.credential_load_failure);
@@ -663,6 +691,10 @@ pub fn Runtime(comptime App: type) type {
                     defer app.alloc.free(summary);
                     try writeCollapsedStartupNotice(app, "config", summary, detail_writer.written());
                 }
+                for (startup.config_diagnostics) |diagnostic| {
+                    const text = diagnostic.note() orelse continue;
+                    try app.writeDomainNotice(.{ .topic = "note", .tone = .information, .body = text }, true);
+                }
             }
             if (comptime @hasField(App, "prompt_history")) {
                 if (prompt_history_unavailable) {
@@ -698,7 +730,7 @@ pub fn Runtime(comptime App: type) type {
             if (app.requested_resume == null) {
                 try deps.begin_fresh_persisted_session(app);
                 deps.enable_session_stores(app);
-                app_session_runtime.Runtime(App).syncTerminalTitleWith(app, deps.terminal_title);
+                app_session_runtime.Runtime(App).syncTerminalTitleWith(app, agent, deps.terminal_title);
             }
 
             app.shell.render_requests.request(.first_frame);
@@ -794,14 +826,16 @@ const TestApp = struct {
     selected_model: std.ArrayList(u8) = .empty,
     permission_engine: permissions.PermissionEngine = .{},
     agent_step_limit: usize = 0,
-    worker: worker_runtime.WorkerRuntime = .{},
     input_runtime: core_input_runtime.Runtime = .{},
     terminal_input_runtime: ui_input.Runtime = .{},
     context_enabled: bool = true,
     fast_mode: bool = false,
     auto_upgrade_enabled: bool = true,
     upgrader: auto_upgrade.AutoUpgrade = .{},
-    effort: types.ReasoningEffort = .auto,
+    main_agent: struct {
+        effort: types.ReasoningEffort = .auto,
+        worker: worker_runtime.WorkerRuntime = .{},
+    } = .{},
     permission_state: app_permission_runtime.State = .{},
     statusline_context: bool = false,
     statusline_session: bool = false,
@@ -827,7 +861,7 @@ const TestApp = struct {
         self.workspace_identity.deinit(self.alloc);
         self.selected_model.deinit(self.alloc);
         self.permission_engine.deinit(self.alloc);
-        self.worker.deinit(std.heap.c_allocator);
+        self.agent().worker.deinit(std.heap.c_allocator);
         self.skills.deinit(std.heap.c_allocator);
         self.input_runtime.deinit(self.alloc);
         self.terminal_input_runtime.deinit(self.alloc);
@@ -867,6 +901,10 @@ const TestApp = struct {
             });
         defer self.alloc.free(notice);
         try self.writeTranscriptClassified(notice, record, .subagent_status);
+    }
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
     }
 };
 
@@ -1082,6 +1120,7 @@ fn runBootstrapForTest(app: *TestApp, capture: *TestCapture) !void {
 
     try Runtime(TestApp).bootstrapWithDeps(
         app,
+        &app.main_agent,
         4,
         "default-model",
         24,
@@ -1101,6 +1140,7 @@ fn runBootstrapWithOverridesForTest(app: *TestApp, capture: *TestCapture, overri
 
     try Runtime(TestApp).bootstrapWithDeps(
         app,
+        &app.main_agent,
         4,
         "default-model",
         24,
@@ -1128,8 +1168,8 @@ test "app_bootstrap_runtime applies interactive launch flag overrides" {
     try std.testing.expectEqualStrings("launch-model", capture.runtimeModel());
     try std.testing.expectEqualStrings("launch-model", app.selected_model.items);
     try std.testing.expect(app.fast_mode);
-    try std.testing.expect(!app.worker.agent_turn_settings.ultrafast_mode);
-    try std.testing.expect(app.effort.eql(types.ReasoningEffort.literal("low")));
+    try std.testing.expect(!app.agent().worker.agent_turn_settings.ultrafast_mode);
+    try std.testing.expect(app.agent().effort.eql(types.ReasoningEffort.literal("low")));
     // Stored preferences keep the configured values; the flags stay per-launch.
     try std.testing.expect(capture.configured_effort.eql(types.ReasoningEffort.literal("high")));
     try std.testing.expect(!capture.configured_fast_mode);
@@ -1156,7 +1196,7 @@ test "app_bootstrap_runtime applies provider routing launch overrides" {
         .provider_strict = true,
     });
 
-    const settings = app.worker.agent_turn_settings;
+    const settings = app.agent().worker.agent_turn_settings;
     try std.testing.expectEqual(@as(usize, 2), settings.provider_order.len);
     try std.testing.expectEqualStrings("azure", settings.provider_order[0]);
     try std.testing.expectEqualStrings("anthropic", settings.provider_order[1]);
@@ -1257,15 +1297,15 @@ test "app_bootstrap_runtime transfers startup state and starts a fresh session" 
     try std.testing.expectEqualStrings("model-x", app.selected_model.items);
     try std.testing.expectEqual(types.PermissionMode.auto, app.permission_engine.mode);
     try std.testing.expectEqual(@as(usize, 19), app.agent_step_limit);
-    try std.testing.expectEqual(@as(usize, 131072), app.worker.agent_turn_settings.max_tool_result_bytes);
-    try std.testing.expectEqual(types.ToolChoice.none, app.worker.agent_turn_settings.first_call_tool_choice);
-    try std.testing.expect(app.worker.agent_turn_settings.fast_mode);
-    try std.testing.expect(!app.worker.agent_turn_settings.ultrafast_mode);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.worker.agent_turn_settings.effort);
+    try std.testing.expectEqual(@as(usize, 131072), app.agent().worker.agent_turn_settings.max_tool_result_bytes);
+    try std.testing.expectEqual(types.ToolChoice.none, app.agent().worker.agent_turn_settings.first_call_tool_choice);
+    try std.testing.expect(app.agent().worker.agent_turn_settings.fast_mode);
+    try std.testing.expect(!app.agent().worker.agent_turn_settings.ultrafast_mode);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.agent().worker.agent_turn_settings.effort);
     try std.testing.expect(!app.context_enabled);
     try std.testing.expect(app.fast_mode);
     try std.testing.expect(!app.auto_upgrade_enabled);
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.effort);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), app.agent().effort);
     try std.testing.expect(app.workspace_identity.enabled);
     try std.testing.expectEqualStrings("/skills", app.skills.dir);
     try std.testing.expectEqualStrings("welcome\n", app.transcript.items);
@@ -1332,10 +1372,10 @@ test "app_bootstrap_runtime renders startup notices without a resume cache" {
         &.{
             "load_skills",
             "welcome",
-            "welcome",
         },
         capture.eventSlice(),
     );
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "* skills: skill discovery warning:") != null);
 }
 
 test "app_bootstrap_runtime deinitializes app after bootstrap dependency failure" {
@@ -1359,7 +1399,7 @@ test "app_bootstrap_runtime propagates skill discovery allocation failure" {
     try std.testing.expectEqual(@as(usize, 1), app.deinit_calls);
 }
 
-test "app_bootstrap_runtime reports a bounded skill discovery warning" {
+test "app_bootstrap_runtime keeps skill discovery warnings in the full transcript only" {
     const alloc = std.testing.allocator;
     var capture = TestCapture.init(alloc);
     capture.emit_skill_diagnostic = true;
@@ -1370,11 +1410,15 @@ test "app_bootstrap_runtime reports a bounded skill discovery warning" {
 
     try std.testing.expectEqual(@as(usize, 1), app.skills.diagnostics.len);
     try std.testing.expect(capture.early_notice_palette_initialized);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "* skills: 1 discovery issue; some skills may be missing (ctrl+o to view)\n") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "* skills: skill discovery warning:") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "hostile&#x0a;path/body-sentinel") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "metadata is invalid (missing_name)") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, " [full-only]\n") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "discovery issue") == null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "ctrl+o to view") == null);
+    const start = std.mem.find(u8, app.transcript.items, "* skills: skill discovery warning:") orelse return error.TestExpectedEqual;
+    const end = std.mem.findScalarPos(u8, app.transcript.items, start, '\n') orelse return error.TestExpectedEqual;
+    const notice = app.transcript.items[start..end];
+    try std.testing.expect(std.mem.find(u8, notice, "hostile&#x0a;path/body-sentinel") != null);
+    try std.testing.expect(std.mem.find(u8, notice, "metadata is invalid (missing_name)") != null);
+    try std.testing.expect(std.mem.endsWith(u8, notice, " [full-only]"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, app.transcript.items, "* skills:"));
 }
 
 test "app_bootstrap_runtime collapses config diagnostics into one neutral summary" {
@@ -1451,8 +1495,8 @@ test "app_bootstrap_runtime records a full-only session assembly record" {
 
     // The record lives in the full-detail side list, not the transcript.
     try std.testing.expectEqualStrings("welcome\n", app.transcript.items);
-    try std.testing.expectEqual(@as(usize, 1), app.shell.full_detail_records.items.len);
-    const record = app.shell.full_detail_records.items[0].notice;
+    try std.testing.expectEqual(@as(usize, 1), app.shell.notebook.full_detail_records.items.len);
+    const record = app.shell.notebook.full_detail_records.items[0].notice;
     try std.testing.expectEqualStrings("session", record.topic);
     try std.testing.expectEqual(types.NoticeTone.neutral, record.tone);
     try std.testing.expectEqual(types.NoticeVisibility.full_only, record.visibility);

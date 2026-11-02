@@ -202,7 +202,7 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
             detail = redacted;
         }
 
-        return .{ .failed = .{ .kind = .fromHttpStatus(response.head.status), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
+        return .{ .failed = .{ .kind = client_mod.httpFailureKind(alloc, .fromHttpStatus(response.head.status), detail), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
     var result = consume(alloc, reader, request, watch.progress()) catch |err| return watch.failure(err);
     if (watch.finish()) |err| {
@@ -345,7 +345,10 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
         else => return .permanent_failure,
     };
     errdefer result.deinit(alloc);
-    if (result == .failed) {
+    // A review the output limit cut off holds no decision, and the same
+    // review would be cut off again, so it stays unavailable.
+    const cut_off = result == .completed and result.completed.completion.finish_reason == .length;
+    if (result == .failed or cut_off) {
         result.deinit(alloc);
         return .permanent_failure;
     }

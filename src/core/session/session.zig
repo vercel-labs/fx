@@ -1,6 +1,9 @@
 const std = @import("std");
+const agent_frame = @import("../shared/agent_frame.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const kernel_agent = @import("../agent/runtime/agent.zig");
+const cache_warmer = @import("../agent/runtime/cache_warmer.zig");
+const host_target = @import("../hosts/target.zig");
 const core_types = @import("../shared/types.zig");
 const history_range = @import("../shared/history_range.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -36,7 +39,16 @@ pub const failed_turn_notice: core_types.SemanticNotice = .{
     .body = "failed",
 };
 
+/// A turn fx itself stopped, by crashing or closing, which the next launch
+/// sends again.
+pub const stopped_turn_notice: core_types.SemanticNotice = .{
+    .topic = "system",
+    .tone = .warning,
+    .body = "fx stopped before this turn finished",
+};
+
 pub fn interruptedTurnNotice(entry: InterruptedHistoryTurn) core_types.SemanticNotice {
+    if (entry.stopped_by_exit) return stopped_turn_notice;
     return switch (entry.terminal_reason) {
         .cancelled => interrupted_turn_notice,
         .failed => failed_turn_notice,
@@ -48,6 +60,25 @@ pub const interrupted_turn_context =
     "The previous turn ended before completion. Any tools or commands may have partially executed. " ++
     "Do not continue this request unless the user explicitly asks to continue.\n" ++
     "</turn_aborted>";
+
+/// What the model reads in place of a user message when the app resumes a
+/// request a previous fx process left unfinished. The turn before it is the
+/// interrupted one, and a tool that was running there is answered as
+/// possibly run.
+pub const resumed_request_prompt =
+    "<session_resumed>\n" ++
+    "fx stopped before the previous turn finished, because it crashed or its window was closed. " ++
+    "A tool that was running may have partly run. Check what finished, rerun only what is safe to repeat, " ++
+    "and continue the previous request.\n" ++
+    "</session_resumed>";
+
+/// What the transcript shows in place of `resumed_request_prompt`, live and
+/// when the session is replayed.
+pub const resumed_request_notice: core_types.SemanticNotice = .{
+    .topic = "session",
+    .tone = .neutral,
+    .body = "Resuming the interrupted request",
+};
 
 pub fn projectSnapshotLocator(buffer: []u8, path: []const u8) ![]const u8 {
     if (!std.Io.Dir.path.isAbsolute(path)) return path;
@@ -558,6 +589,17 @@ fn make_owned_legacy_image_turn(
         .media_type = @constCast("image/png"),
     }});
     return turn;
+}
+
+test "a turn fx stopped by crashing or closing reads as stopped, not failed or cancelled" {
+    const stopped: InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .terminal_reason = .failed, .stopped_by_exit = true };
+    try std.testing.expectEqualStrings("fx stopped before this turn finished", interruptedTurnNotice(stopped).body);
+    try std.testing.expectEqual(core_types.NoticeTone.warning, interruptedTurnNotice(stopped).tone);
+    // Esc and a turn that failed keep their own notices.
+    const cancelled: InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .terminal_reason = .cancelled };
+    try std.testing.expectEqualStrings("cancelled", interruptedTurnNotice(cancelled).body);
+    const failed: InterruptedHistoryTurn = .{ .user = .{ .text = @constCast("go") }, .terminal_reason = .failed };
+    try std.testing.expectEqualStrings("failed", interruptedTurnNotice(failed).body);
 }
 
 test "legacy image repair rewrites repeated per-turn ordinals to stable session ids" {
@@ -1371,6 +1413,10 @@ fn collectShellIdsWithKey(alloc: Allocator, text: []const u8, key: []const u8, o
 
 pub const SessionRuntime = struct {
     agent: kernel_agent.Agent = .{},
+    /// Keeps this conversation's Claude prompt cache warm while it waits;
+    /// created by its first use. Every history rewrite disarms it, since
+    /// the next request no longer starts with the armed one.
+    cache_warmer: ?*cache_warmer.Warmer = null,
     context_notice_hashes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     context_notice_lock: std.Io.Mutex = .init,
     web_fetch_artifacts: WebFetchArtifactState = .none,
@@ -1405,6 +1451,7 @@ pub const SessionRuntime = struct {
     }
 
     pub fn deinit(self: *SessionRuntime, alloc: Allocator) void {
+        self.closeCacheWarmer();
         self.clearWebFetchArtifacts();
         self.permission_state.deinit(alloc);
         self.agent.deinit(alloc);
@@ -1425,6 +1472,33 @@ pub const SessionRuntime = struct {
     pub fn returnStaleShellHandles(self: *SessionRuntime, turn_id: u64) void {
         self.has_stale_shell_handles = true;
         debug_trace.logf("session", "stale shell handles note returned from dropped prompt turn_id={d}", .{turn_id});
+    }
+
+    /// The conversation's cache warmer, created on first use. Null on
+    /// WebAssembly, which has no threads, or when it cannot be created.
+    pub fn cacheWarmer(self: *SessionRuntime) ?*cache_warmer.Warmer {
+        if (comptime host_target.is_wasm) return null;
+        if (self.cache_warmer == null) {
+            self.cache_warmer = cache_warmer.Warmer.create() catch |err| {
+                debug_trace.logf("cache_warming", "event=unavailable err={s}", .{@errorName(err)});
+                return null;
+            };
+        }
+        return self.cache_warmer;
+    }
+
+    /// Stops the warmer and its pings. The warmer is created again if the
+    /// conversation is used after this.
+    pub fn closeCacheWarmer(self: *SessionRuntime) void {
+        if (comptime host_target.is_wasm) return;
+        const warmer = self.cache_warmer orelse return;
+        self.cache_warmer = null;
+        warmer.destroy();
+    }
+
+    fn disarmCacheWarming(self: *SessionRuntime, why: []const u8) void {
+        if (comptime host_target.is_wasm) return;
+        if (self.cache_warmer) |warmer| warmer.disarm(why);
     }
 
     pub fn reset(self: *SessionRuntime, alloc: Allocator) void {
@@ -1582,6 +1656,7 @@ pub const SessionRuntime = struct {
     }
 
     pub fn clearHistory(self: *SessionRuntime, alloc: Allocator) void {
+        self.disarmCacheWarming("history_cleared");
         self.agent.clearHistory(alloc);
         self.unversioned_history_len = 0;
     }
@@ -1658,6 +1733,7 @@ pub const SessionRuntime = struct {
         turn: HistoryTurn,
     ) void {
         if (isCurrentCompactionCheckpoint(turn)) {
+            self.disarmCacheWarming("history_compacted");
             self.agent.clearHistory(alloc);
             self.unversioned_history_len = 0;
         }
@@ -1671,6 +1747,7 @@ pub const SessionRuntime = struct {
     /// Takes ownership of a fully prepared replacement only after durable commit.
     pub fn commitCompactedHistory(self: *SessionRuntime, alloc: Allocator, history: []HistoryTurn) void {
         const uncertain = self.unversioned_history_len != 0;
+        self.disarmCacheWarming("history_compacted");
         self.agent.clearHistory(alloc);
         self.agent.history.deinit(alloc);
         self.agent.history = std.ArrayList(HistoryTurn).fromOwnedSlice(history);
@@ -2381,15 +2458,22 @@ fn appendContextNoteChatMessages(
 }
 
 /// Steering comes from whoever drives this session, so compaction keeps it as
-/// user text rather than a generated notice. Empty entries only mark a
-/// checkpoint boundary. Borrows `text`.
+/// user text rather than a generated notice. A subagent's report or message
+/// a boundary took is not the user's, so it stays ordinary text in its own
+/// frame. Empty entries only mark a checkpoint boundary. Borrows `text`.
 fn restoredSteeringChatMessage(text: []const u8) core_types.ChatMessage {
     return .{
         .role = .user,
         .content = text,
         .restored_steering = true,
-        .context_origin = if (text.len > 0) .user_turn else .ordinary,
+        .context_origin = if (text.len > 0 and !agent_frame.isFrame(text)) .user_turn else .ordinary,
     };
+}
+
+test "a restored subagent frame is never the user's text" {
+    const report = agent_frame.report_header ++ "{\"child_id\":\"c1\",\"work_id\":\"w1\"}\n";
+    try std.testing.expect(restoredSteeringChatMessage(report).context_origin == .ordinary);
+    try std.testing.expect(restoredSteeringChatMessage("focus on rendering").context_origin == .user_turn);
 }
 
 fn toolResultMemory(result: core_types.PersistedToolResult) core_types.ToolResultMemory {

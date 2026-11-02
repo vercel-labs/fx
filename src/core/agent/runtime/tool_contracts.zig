@@ -186,6 +186,8 @@ pub const ToolExecutionRequest = struct {
     /// Present for interactive tool calls so streamed command output can stay
     /// attached to the status row that owns this exact call.
     lifecycle_id: ?types.ToolLifecycleId = null,
+    /// The row group of that status row, for rows the call adds beside it.
+    presentation_group_id: ?types.ToolPresentationGroupId = null,
 };
 
 pub const DiffEntryPayload = diff.DiffEntryPayload;

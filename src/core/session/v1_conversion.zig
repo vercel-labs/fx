@@ -318,7 +318,7 @@ fn openMemberDir(store: *session_store.Store, id: []const u8) !?io_mod.VerifiedD
 /// not be checked (`tests/tla/session_manager/V1Conversion.tla` NoShadow).
 pub fn hasFolder(home: []const u8, id: []const u8) !bool {
     var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path = try std.mem.print(&buffer, "{s}/{s}/{s}/{s}", .{ home, profile_paths.root_dir_name, profile_paths.sessions_dir_name, id });
+    const path = try std.mem.print(&buffer, "{s}/{s}/{s}/{s}", .{ profile_paths.rootParent(home), profile_paths.rootName(), profile_paths.sessions_dir_name, id });
     _ = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = false }) catch |err| return switch (err) {
         error.FileNotFound => false,
         else => err,

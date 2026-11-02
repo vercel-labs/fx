@@ -7,6 +7,7 @@ const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
 const sse = @import("sse.zig");
+const json_depth = @import("json_depth.zig");
 const configured_provider = @import("../core/config/configured_provider.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -49,7 +50,6 @@ pub const Error = error{
     IncompleteStream,
     StreamClosed,
     ProviderError,
-    OutputTruncated,
     ContentFiltered,
     Refused,
     EventTooLarge,
@@ -67,7 +67,7 @@ pub const Error = error{
 const max_selected_tools = 256;
 const max_name_bytes = 128;
 const max_history_arguments_bytes = 1024 * 1024;
-const max_json_depth = 64;
+const max_json_depth = json_depth.max_depth;
 
 const Function = struct {
     name: []const u8,
@@ -188,28 +188,7 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
 }
 
 fn check_json_depth(text: []const u8) Error!void {
-    var depth: usize = 0;
-    var quoted = false;
-    var escaped = false;
-    for (text) |byte| {
-        if (quoted) {
-            if (escaped) {
-                escaped = false;
-            } else if (byte == '\\') {
-                escaped = true;
-            } else if (byte == '"') quoted = false;
-        } else switch (byte) {
-            '"' => quoted = true,
-            '{', '[' => {
-                if (depth == max_json_depth) return error.JsonTooDeep;
-                depth += 1;
-            },
-            '}', ']' => if (depth > 0) {
-                depth -= 1;
-            },
-            else => {},
-        }
-    }
+    if (json_depth.exceeds(text)) return error.JsonTooDeep;
 }
 
 /// Caller owns the bounded diagnostic. Normalize JSON before masking so later
@@ -915,8 +894,10 @@ pub const Reducer = struct {
         self.usage_final_fields = final_fields;
     }
 
-    /// Requires finish_reason followed by [DONE]. Length/filter/refusal are
-    /// explicit errors, never executable partial calls or successful tool turns.
+    /// Requires finish_reason followed by [DONE]. Filter and refusal are
+    /// explicit errors. A reply the output limit cut off returns with the
+    /// `length` reason, as the Gateway and Responses providers return it, so
+    /// the agent loop can resend it; it never runs that reply's partial calls.
     /// Results use stream_provider.Result.deinit with this reducer's allocator.
     pub fn finish(self: *Reducer, cancelled: bool) Error!stream_provider.Result {
         errdefer self.phase = .closed;
@@ -925,14 +906,17 @@ pub const Reducer = struct {
         if (self.phase != .done) return error.IncompleteStream;
         const reason = self.finish_reason.?;
         switch (reason) {
-            .length => return error.OutputTruncated,
             .content_filter => return error.ContentFiltered,
-            .stop, .tool_calls => {},
+            .stop, .tool_calls, .length => {},
             else => return error.InvalidFinishReason,
         }
         if (self.refusal_seen) return error.Refused;
-        if ((reason == .tool_calls) != (self.tools.items.len != 0)) return error.InconsistentFinishReason;
-        if (self.choice == .required and self.tools.items.len == 0) return error.RequiredToolMissing;
+        // A cut-off reply may stop anywhere, so only a finished one has to
+        // agree with its tool calls.
+        if (reason != .length) {
+            if ((reason == .tool_calls) != (self.tools.items.len != 0)) return error.InconsistentFinishReason;
+            if (self.choice == .required and self.tools.items.len == 0) return error.RequiredToolMissing;
+        }
         // Unadvertised names and invalid arguments are returned as sent. The tool
         // loop decides whether such a call runs and answers the rest, and the
         // permission reviewer retries a malformed decision.
@@ -2215,8 +2199,19 @@ test "chat completions terminal evidence and finish reasons are strict" {
         try test_accept(&reducer, test_stop);
         try std.testing.expectError(error.IncompleteStream, reducer.finish(false));
     }
+    // A cut-off reply returns as such, with or without the call it cut off,
+    // for the agent loop to resend; the loop never runs its calls.
+    const test_length = "{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}";
+    for ([_]?[]const u8{ test_call, null }) |call| {
+        var reducer = try Reducer.init(alloc, test_tool_request(), .{});
+        defer reducer.deinit();
+        if (call) |chunk| try test_accept(&reducer, chunk);
+        var result = try test_finish(&reducer, test_length);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(types.ProviderFinishReason.length, result.completed.completion.finish_reason.?);
+        try std.testing.expectEqual(@as(usize, if (call != null) 1 else 0), result.completed.completion.tool_calls.len);
+    }
     for ([_]struct { reason: []const u8, failure: Error }{
-        .{ .reason = "length", .failure = error.OutputTruncated },
         .{ .reason = "content_filter", .failure = error.ContentFiltered },
         .{ .reason = "stop", .failure = error.InconsistentFinishReason },
     }) |case| {
