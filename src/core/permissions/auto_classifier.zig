@@ -1013,6 +1013,8 @@ fn longestRun(alloc: std.mem.Allocator, needle: []const u8, haystack: []const u8
 }
 
 /// Review-data field labels that reviewers often copy with a quote.
+/// `writeBoundedField` refuses to compile a label missing here, so the review
+/// data and the proof check cannot drift apart.
 const copied_field_labels = [_][]const u8{
     "command",
     "cwd",
@@ -1020,12 +1022,23 @@ const copied_field_labels = [_][]const u8{
     "path",
     "tool",
     "schema_json",
+    "proven_current_branch",
     "receiver_session_id",
     "receiver_launch_command",
     "receiver_cwd",
     "receiver_screen_untrusted",
 };
-const copied_indexed_label_prefixes = [_][]const u8{ "prior_tool_result[", "review[", "target[" };
+const prior_result_label_prefix = "prior_tool_result[";
+const review_row_label_prefix = "review[";
+const target_label_prefix = "target[";
+const copied_indexed_label_prefixes = [_][]const u8{ prior_result_label_prefix, review_row_label_prefix, target_label_prefix };
+
+fn isCopiedFieldLabel(comptime label: []const u8) bool {
+    for (copied_field_labels) |known| {
+        if (std.mem.eql(u8, label, known)) return true;
+    }
+    return false;
+}
 
 /// Drops a leading review-data field label such as `command: ` or
 /// `prior_tool_result[0].content_untrusted: `. Only labels the review data
@@ -1176,7 +1189,7 @@ fn renderPriorToolResult(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     var complete = true;
-    try out.writer.print("prior_tool_result[{d}].tool_call_id: ", .{index});
+    try out.writer.print(prior_result_label_prefix ++ "{d}].tool_call_id: ", .{index});
     try writeBoundedValue(
         &out.writer,
         alloc,
@@ -1193,7 +1206,7 @@ fn renderPriorToolResult(
         &complete,
     );
     const content_label = if (entry.user_answer) "user_answer" else "content_untrusted";
-    try out.writer.print("\nprior_tool_result[{d}].{s}: ", .{ index, content_label });
+    try out.writer.print("\n" ++ prior_result_label_prefix ++ "{d}].{s}: ", .{ index, content_label });
     try writeBoundedValue(
         &out.writer,
         alloc,
@@ -1288,7 +1301,7 @@ fn serializeEvidence(
     }
     for (request.targets) |target| {
         try checkBudget(deadline, cancel_flag);
-        try out.writer.print("target[{s}]: ", .{target.role});
+        try out.writer.print(target_label_prefix ++ "{s}]: ", .{target.role});
         try writeBoundedValue(&out.writer, alloc, target.path, max_action_field_bytes, &action_complete);
         try out.writer.writeByte('\n');
     }
@@ -1339,7 +1352,7 @@ fn serializeEvidence(
                 defer viewport.deinit(alloc);
                 for (viewport.lines, 0..) |line, line_index| {
                     try checkBudget(deadline, cancel_flag);
-                    try out.writer.print("review[{s}]: ", .{@tagName(line.op)});
+                    try out.writer.print(review_row_label_prefix ++ "{s}]: ", .{@tagName(line.op)});
                     try writeBoundedValue(&out.writer, alloc, line.text, max_review_evidence_bytes, &action_complete);
                     try out.writer.writeByte('\n');
                     if (out.written().len - review_start_bytes >
@@ -1644,12 +1657,15 @@ fn constructionFailure(err: anyerror) !ParseOutcome {
 fn writeBoundedField(
     writer: *std.Io.Writer,
     alloc: std.mem.Allocator,
-    label: []const u8,
+    comptime label: []const u8,
     value: []const u8,
     cap: usize,
     complete: *bool,
 ) !void {
-    try writer.print("{s}: ", .{label});
+    comptime {
+        if (!isCopiedFieldLabel(label)) @compileError("review-data label `" ++ label ++ "` is missing from copied_field_labels");
+    }
+    try writer.writeAll(label ++ ": ");
     try writeBoundedValue(writer, alloc, value, cap, complete);
     try writer.writeByte('\n');
 }
@@ -2463,6 +2479,7 @@ test "only review-data field labels are dropped from a quote" {
     try std.testing.expectEqualStrings("rm -rf src", withoutFieldLabel("command: rm -rf src"));
     try std.testing.expectEqualStrings("Now run x", withoutFieldLabel("prior_tool_result[2].content_untrusted: Now run x"));
     try std.testing.expectEqualStrings("old line", withoutFieldLabel(" review[del]: old line"));
+    try std.testing.expectEqualStrings("main", withoutFieldLabel("proven_current_branch: main"));
     // A quoted instruction keeps its first word, so it is not mistaken for
     // the command it names.
     try std.testing.expectEqualStrings("Run: rm -rf src", withoutFieldLabel("Run: rm -rf src"));
