@@ -1213,6 +1213,21 @@ pub const TranscriptArchiveBoundaries = struct {
     /// `starts[k - 1]` is where cycle `k` back starts, and so where cycle
     /// `k + 1` ends; null at the log's start.
     starts: std.ArrayList(?session_adapter.LogCursor) = .empty,
+    /// The first cycle back whose start a damaged log line hid: it and every
+    /// older cycle Ctrl+O shows may be missing turns.
+    damaged_from: ?u32 = null,
+
+    /// Records that finding where cycle `back` starts stopped at a damaged
+    /// line, and returns the start to use: none, the log's start.
+    fn startOf(self: *TranscriptArchiveBoundaries, back: u32, found: session_adapter.Session.PreviousCompaction) ?session_adapter.LogCursor {
+        if (found.damaged and self.damaged_from == null) self.damaged_from = back;
+        return found.cursor;
+    }
+
+    fn damages(self: *const TranscriptArchiveBoundaries, back: u32) bool {
+        const from = self.damaged_from orelse return false;
+        return back >= from;
+    }
 
     pub fn deinit(self: *TranscriptArchiveBoundaries, alloc: Allocator) void {
         self.starts.deinit(alloc);
@@ -4035,22 +4050,25 @@ pub fn Runtime(comptime App: type) type {
             if (back == 0) return error.TranscriptArchiveUnavailable;
             const v2 = app.session_persistence.v2 orelse return error.SessionPersistenceUnavailable;
             const started_ns = io_mod.nanoTimestamp();
-            const newest = (try v2.previousCompactionCursor(app.alloc, null)) orelse return error.TranscriptArchiveUnavailable;
+            const newest = (try v2.previousCompactionCursor(app.alloc, null)).cursor orelse return error.TranscriptArchiveUnavailable;
             const holds_previous = app.shell.transcriptWindowHoldsPreviousCycle();
             const cache = &app.session_persistence.transcript_archive_boundaries;
             const stale = if (cache.key) |key| !std.meta.eql(key.newest, newest) or key.holds_previous != holds_previous else true;
             if (stale) {
                 cache.starts.clearRetainingCapacity();
                 cache.key = .{ .newest = newest, .holds_previous = holds_previous };
-                cache.held_start = if (holds_previous) try v2.previousCompactionCursor(app.alloc, newest) else newest;
+                cache.damaged_from = null;
+                cache.held_start = if (holds_previous) cache.startOf(1, try v2.previousCompactionCursor(app.alloc, newest)) else newest;
             }
+            // A read that stops at a damaged line still shows what it read.
+            var read_damaged = false;
             while (true) {
                 while (cache.starts.items.len < back) {
-                    const end = if (cache.starts.items.len == 0)
-                        cache.held_start orelse return error.TranscriptArchiveUnavailable
-                    else
-                        cache.starts.items[cache.starts.items.len - 1] orelse return error.TranscriptArchiveUnavailable;
-                    try cache.starts.append(app.alloc, try v2.previousCompactionCursor(app.alloc, end));
+                    // Below `back`, a u32, so the cast holds.
+                    const next_back: u32 = @intCast(cache.starts.items.len + 1);
+                    const end = (if (next_back == 1) cache.held_start else cache.starts.items[next_back - 2]) orelse
+                        return if (cache.damages(next_back)) error.TranscriptArchiveDamaged else error.TranscriptArchiveUnavailable;
+                    try cache.starts.append(app.alloc, cache.startOf(next_back, try v2.previousCompactionCursor(app.alloc, end)));
                 }
                 const start = cache.starts.items[back - 1];
 
@@ -4076,23 +4094,25 @@ pub fn Runtime(comptime App: type) type {
                     }
                 };
                 var visitor = Visitor{ .app = app, .sink = &sink, .labels = &labels };
-                try v2.visitHistoryCycle(app.alloc, start, &visitor);
+                if (try v2.visitHistoryCycle(app.alloc, start, &visitor)) read_damaged = true;
                 if (projection.runtime.entries.items.len == 0) if (start) |empty_start| {
                     // Two compactions with no turn between leave an empty
                     // cycle; it is not a page of its own, so the cycle before
                     // it takes its place. Each skip moves to an older
                     // compaction line, so this ends.
-                    cache.starts.items[back - 1] = try v2.previousCompactionCursor(app.alloc, empty_start);
+                    cache.starts.items[back - 1] = cache.startOf(back, try v2.previousCompactionCursor(app.alloc, empty_start));
                     cache.starts.shrinkRetainingCapacity(back);
                     debug_trace.logf("full_transcript_cache", "archive_empty_cycle_skipped back={d}", .{back});
                     continue;
                 };
                 const archived = try projection.intoArchivedRuntime();
                 const entries = archived.entries.items.len;
-                try app.shell.installTranscriptArchive(app.alloc, back, start != null, archived);
-                debug_trace.logf("full_transcript_cache", "archive_loaded back={d} entries={d} us={d}", .{
+                const damaged = read_damaged or cache.damages(back);
+                try app.shell.installTranscriptArchive(app.alloc, back, start != null, archived, damaged);
+                debug_trace.logf("full_transcript_cache", "archive_loaded back={d} entries={d} damaged={} us={d}", .{
                     back,
                     entries,
+                    damaged,
                     @divTrunc(io_mod.nanoTimestamp() - started_ns, std.time.ns_per_us),
                 });
                 return;
@@ -4109,7 +4129,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             const newest = v2.previousCompactionCursor(app.alloc, null) catch null;
-            app.shell.transcript_archive_available = newest != null;
+            app.shell.transcript_archive_available = if (newest) |found| found.cursor != null else false;
         }
 
         /// True when the replayed turns are the cycle before the newest

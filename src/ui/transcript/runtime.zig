@@ -4791,6 +4791,9 @@ pub const TranscriptRuntime = struct {
     /// The last older cycle Ctrl+O asked the log for could not be read. The
     /// footer says so until a cycle loads or the view resets.
     transcript_archive_failed: bool = false,
+    /// A Ctrl+O read stopped at a damaged session log line, so some older
+    /// turns are missing; the viewer footer says so.
+    transcript_archive_damaged: bool = false,
     /// Which entry of the requested cycle Ctrl+O lands on once it loads.
     transcript_archive_boundary: ?ArchiveLanding = null,
     full_transcript_installed_page: ?InstalledFullTranscriptPage = null,
@@ -7567,6 +7570,9 @@ pub const TranscriptRuntime = struct {
         back: u32,
         has_older: bool,
         archived: TranscriptRuntime,
+        /// Reading the cycle, or finding where it starts, stopped at a
+        /// damaged log line.
+        damaged: bool,
     ) !void {
         // Its ids are apart from the live ones (`archiveEntryIdBase`), so a
         // page can join it to the held entries.
@@ -7575,8 +7581,9 @@ pub const TranscriptRuntime = struct {
         owned.* = archived;
         self.discardTranscriptArchive();
         self.transcript_archive = .{ .back = back, .has_older = has_older, .runtime = owned, .alloc = alloc };
-        debug_trace.logf("full_transcript_cache", "archive_installed back={d} entries={d} has_older={}", .{ back, owned.entries.items.len, has_older });
+        debug_trace.logf("full_transcript_cache", "archive_installed back={d} entries={d} has_older={} damaged={}", .{ back, owned.entries.items.len, has_older, damaged });
         self.transcript_archive_failed = false;
+        if (damaged) self.transcript_archive_damaged = true;
         if (self.transcript_archive_request == back) self.transcript_archive_request = null;
         const land = self.transcript_archive_boundary orelse return;
         self.transcript_archive_boundary = null;
@@ -7599,6 +7606,18 @@ pub const TranscriptRuntime = struct {
     /// entries, and its footer says the older history could not load.
     pub fn failTranscriptArchive(self: *TranscriptRuntime) void {
         self.transcript_archive_failed = true;
+        self.endTranscriptArchiveRequest();
+    }
+
+    /// A damaged log line hides the cycle Ctrl+O asked for: it stays on the
+    /// entries it has, and its footer says older history couldn't be read.
+    /// Asking again reads the same damage, so it does not offer a retry.
+    pub fn damageTranscriptArchive(self: *TranscriptRuntime) void {
+        self.transcript_archive_damaged = true;
+        self.endTranscriptArchiveRequest();
+    }
+
+    fn endTranscriptArchiveRequest(self: *TranscriptRuntime) void {
         self.transcript_archive_request = null;
         self.transcript_archive_boundary = null;
         if (self.full_transcript_page_anchor == .archive) self.full_transcript_page_anchor = .{ .entry_index = 0 };
@@ -7628,6 +7647,7 @@ pub const TranscriptRuntime = struct {
         self.transcript_archive_request = null;
         self.transcript_archive_boundary = null;
         self.transcript_archive_failed = false;
+        self.transcript_archive_damaged = false;
         self.full_transcript_prepared_page_visible = false;
         self.full_transcript_open_request = null;
         self.full_transcript_restore_open_pending = false;

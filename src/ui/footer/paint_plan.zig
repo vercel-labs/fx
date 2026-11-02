@@ -1032,6 +1032,8 @@ fn composeTranscriptViewerFooterFrame(
     const navigation = switch (input.ctx.transcript_depth) {
         .full => if (shell.transcript_archive_failed)
             "couldn't load older history · pgup to retry · esc close"
+        else if (shell.transcript_archive_damaged)
+            "part of older history couldn't be read · pgup/pgdn scroll · esc close"
         else
             "full detail · ctrl+o close · pgup/pgdn scroll · esc close",
         .inline_mode => unreachable,
@@ -1364,7 +1366,7 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
     );
 }
 
-test "transcript viewer footer says when older history could not load" {
+test "transcript viewer footer says when older history could not load or is damaged" {
     const alloc = std.testing.allocator;
     var input = InputRuntime{};
     defer input.deinit(alloc);
@@ -1396,11 +1398,15 @@ test "transcript viewer footer says when older history could not load" {
         .picker_rows = 0,
         .banner_active = false,
     };
-    for ([_]struct { failed: bool, text: []const u8 }{
-        .{ .failed = true, .text = "┃ couldn't load older history · pgup to retry · esc close" },
-        .{ .failed = false, .text = "┃ full detail · ctrl+o close · pgup/pgdn scroll · esc close" },
+    for ([_]struct { failed: bool, damaged: bool, text: []const u8 }{
+        .{ .failed = true, .damaged = false, .text = "┃ couldn't load older history · pgup to retry · esc close" },
+        // A failed read says to retry even when an earlier read hit damage.
+        .{ .failed = true, .damaged = true, .text = "┃ couldn't load older history · pgup to retry · esc close" },
+        .{ .failed = false, .damaged = true, .text = "┃ part of older history couldn't be read · pgup/pgdn scroll · esc close" },
+        .{ .failed = false, .damaged = false, .text = "┃ full detail · ctrl+o close · pgup/pgdn scroll · esc close" },
     }) |case| {
         shell.transcript_archive_failed = case.failed;
+        shell.transcript_archive_damaged = case.damaged;
         const frame_plan = planFooterPaint(&shell, planner_input);
         var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
         defer frame.deinit(alloc);
