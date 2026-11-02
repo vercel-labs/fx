@@ -42,6 +42,7 @@ const auto_classifier_context = @import("../../permissions/auto_classifier_conte
 const subagent_model_contract = @import("../../subagent/model_contract.zig");
 
 const runtime_config = @import("config.zig");
+const rtk_projection = @import("rtk_projection.zig");
 const cache_warming = @import("cache_warming.zig");
 const runtime_finalization = @import("finalization.zig");
 const runtime_deps = @import("deps.zig");
@@ -7523,9 +7524,15 @@ fn processQueuedPromptLoop(
             // After the steering rewrap, which recognizes a parent's steering
             // by how its text starts.
             const located_messages = try image_attachments.noteAttachmentLocations(overlay_arena, steering_messages);
+            // RTK changes only this request's view; persistence and permission
+            // evidence still use the canonical messages above.
+            const reduced_messages = if (config.rtk)
+                try rtk_projection.projectMessages(overlay_arena, deps.tool_registry, config.advertised_tool_names, located_messages)
+            else
+                located_messages;
             // The one place context notes join their tool results, before
             // anything measures, observes, or sends the request (D93).
-            const noted_messages = try agent_stream_provider.carryContextNotes(overlay_arena, located_messages);
+            const noted_messages = try agent_stream_provider.carryContextNotes(overlay_arena, reduced_messages);
             const request_messages = try with_replyable_conversation_tail(overlay_arena, noted_messages);
             if (request_messages.ptr != noted_messages.ptr) {
                 debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{noted_messages.len});

@@ -30,9 +30,13 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
   fakeGatewaySse,
+  fakeGatewayToolCall,
+  fakeShellRun,
+  startDynamicFakeGateway,
   startFakeGateway,
 } from "./tmux-helpers";
-import { savedSession, sessionDir } from "./saved-sessions";
+import { savedSession, savedText, sessionDir } from "./saved-sessions";
+import { createRtkFixture, toolResultText } from "./fixtures/rtk";
 import {
   codexBreakdownBody,
   codexProfileBody,
@@ -4577,6 +4581,154 @@ describe("cli: issue", () => {
     },
     TIMEOUT,
   );
+});
+
+describe("cli: rtk", () => {
+  test("rtk reduces real git status advice while preserving every path and branch", async () => {
+    const fixture = createRtkFixture(true);
+    const git = (args: string[]) => {
+      const result = spawnSync("git", args, { cwd: fixture.workspace, encoding: "utf8", env: { ...process.env, LC_ALL: "C" } });
+      expect(result.status, result.stderr).toBe(0);
+      return result.stdout;
+    };
+    let commandResult: any;
+    let calls = 0;
+    const gateway = startDynamicFakeGateway((raw) => {
+      const request = JSON.parse(raw);
+      if (calls++ === 0) return fakeShellRun("rtk-status", "git status");
+      try { commandResult = JSON.parse(toolResultText(request, "rtk-status")); } catch {}
+      return fakeGatewayFinalText("RTK_STATUS_COMPLETE");
+    });
+    try {
+      git(["init", "-q", "--initial-branch=rtk-status"]);
+      writeFileSync(join(fixture.workspace, "tracked.txt"), "before\n");
+      git(["add", "tracked.txt"]);
+      git(["-c", "user.name=Example", "-c", "user.email=example@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "fixture"]);
+      writeFileSync(join(fixture.workspace, "tracked.txt"), "after\n");
+      const original = git(["status"]);
+      const result = await runFx(["ask", "--json", "--auto", "--no-save", "Inspect Git status."], {
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home, AI_GATEWAY_API_KEY: "rtk-fixture-key", VERCEL_OIDC_TOKEN: undefined,
+          FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1", LC_ALL: "C",
+        }, timeoutMs: TIMEOUT,
+      });
+      expect(result.code, result.stderr).toBe(0);
+      expect(commandResult.exit_code).toBe(0);
+      expect(commandResult.output_delta).toContain("git status advice lines omitted");
+      expect(commandResult.output_delta.length).toBeLessThan(original.length);
+      for (const text of ["On branch rtk-status", "tracked.txt", "cargo", "test-output.txt"]) {
+        expect(commandResult.output_delta).toContain(text);
+      }
+      expect(commandResult.full_output_handle).toBeString();
+    } finally { gateway.stop(); fixture.cleanup(); }
+  }, TIMEOUT);
+
+  test("rtk is a regular profile setting with schema, set, get, unset, and project protection", async () => {
+    const fixture = createRtkFixture();
+    const env = { HOME: fixture.home, FX_DISABLE_KEYCHAIN: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0" };
+    const run = (args: string[]) => runFx(args, { cwd: fixture.workspace, env });
+    try {
+      expect((await run(["config", "get", "rtk"])).stdout).toBe("false\n");
+      const schema = JSON.parse((await run(["config", "schema"])).stdout);
+      expect(schema.properties.rtk.type).toBe("boolean");
+      const project = JSON.parse((await run(["config", "schema", "--project"])).stdout);
+      expect(project.properties.rtk).toBeUndefined();
+      expect((await run(["config", "set", "rtk", "true"])).code).toBe(0);
+      expect((await run(["config", "get", "rtk"])).stdout).toBe("true\n");
+      expect(JSON.parse(readFileSync(join(fixture.home, ".fx/settings.json"), "utf8")).rtk).toBe(true);
+      expect((await run(["config", "set", "rtk", "maybe"])).code).toBe(2);
+      expect((await run(["config", "unset", "rtk"])).code).toBe(0);
+      writeFileSync(join(fixture.workspace, ".fx.json"), '{"rtk":true}\n');
+      const ignored = await run(["config", "get", "rtk"]);
+      expect(ignored.stdout).toBe("false\n");
+      expect(ignored.stderr).toContain("ignored_project_user_only_setting; key=rtk");
+    } finally { fixture.cleanup(); }
+  }, TIMEOUT);
+
+  test.each([
+    { name: "default", profile: undefined, override: undefined, enabled: false, save: true, exitCode: 0 },
+    { name: "profile enabled", profile: true, override: undefined, enabled: true, save: true, exitCode: 0 },
+    { name: "run override disables", profile: true, override: "rtk=false", enabled: false, save: true, exitCode: 0 },
+    { name: "no-save run override enables", profile: undefined, override: "rtk=true", enabled: true, save: false, exitCode: 0 },
+    { name: "failed command stays full", profile: true, override: undefined, enabled: false, save: true, exitCode: 1 },
+  ])("rtk $name preserves execution, diagnostics, original records, and recovery", async (scenario) => {
+    const fixture = createRtkFixture(scenario.profile, scenario.exitCode);
+    const requests: any[] = [];
+    let initialResult: any;
+    const gateway = startDynamicFakeGateway((raw) => {
+      const request = JSON.parse(raw);
+      requests.push(request);
+      if (requests.length === 1) return fakeShellRun("rtk-run", "./cargo test");
+      if (requests.length === 2) {
+        try { initialResult = JSON.parse(toolResultText(request, "rtk-run")); } catch {}
+        if (scenario.enabled && initialResult?.full_output_handle) {
+          return fakeGatewayToolCall("rtk-raw", "read_tool_result", {
+            request: { handle: initialResult.full_output_handle, byte_count: 8192 },
+          });
+        }
+      }
+      return fakeGatewayFinalText("RTK_FIXTURE_COMPLETE");
+    });
+    try {
+      const args = ["ask", "--json", "--auto"];
+      if (!scenario.save) args.push("--no-save");
+      if (scenario.override) args.push("--config", scenario.override);
+      args.push("Run the fixture tests and report the result.");
+      const result = await runFx(args, {
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home, AI_GATEWAY_API_KEY: "rtk-fixture-key", VERCEL_OIDC_TOKEN: undefined,
+          FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1",
+        }, timeoutMs: TIMEOUT,
+      });
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.stderr).toContain("test suite::rtk_pass_0 ... ok");
+      expect(result.stderr).toContain("RTK_DIAGNOSTIC: retain this warning");
+      expect(result.stderr).not.toContain("[rtk:");
+      expect(JSON.parse(result.stdout).output).toContain("RTK_FIXTURE_COMPLETE");
+      expect(readFileSync(join(fixture.workspace, "runs"), "utf8")).toBe("run\n");
+      expect(initialResult.exit_code).toBe(scenario.exitCode);
+      expect(initialResult.output_delta).toContain("RTK_DIAGNOSTIC: retain this warning");
+      if (scenario.enabled) {
+        expect(initialResult.output_delta).toContain("80 passing test lines omitted");
+        expect(initialResult.output_delta).not.toContain("test suite::rtk_pass_0 ... ok");
+        expect(initialResult.output_delta.length).toBeLessThan(fixture.raw.length);
+        expect(requests).toHaveLength(3);
+        const recovered = toolResultText(requests[2], "rtk-raw");
+        expect(recovered).toContain("test suite::rtk_pass_0 ... ok");
+        expect(recovered).toContain("test suite::rtk_pass_79 ... ok");
+        expect(recovered).not.toContain("[rtk:");
+      } else {
+        expect(initialResult.output_delta).toContain("test suite::rtk_pass_0 ... ok");
+        expect(initialResult.output_delta).not.toContain("[rtk:");
+      }
+      if (scenario.save) {
+        const sessionId = JSON.parse(result.stdout).session_id;
+        const saved = savedText(fixture.home, sessionId);
+        expect(saved).toContain("test suite::rtk_pass_0 ... ok");
+        expect(saved).not.toContain("[rtk:");
+        if (scenario.enabled) {
+          const resumed = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "--config", "rtk=false", "Inspect the original test output."], {
+            cwd: fixture.workspace,
+            env: {
+              HOME: fixture.home, AI_GATEWAY_API_KEY: "rtk-fixture-key", VERCEL_OIDC_TOKEN: undefined,
+              FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+              FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1",
+            }, timeoutMs: TIMEOUT,
+          });
+          expect(resumed.code, resumed.stderr).toBe(0);
+          const original = JSON.parse(toolResultText(requests.at(-1), "rtk-run"));
+          expect(original.output_delta).toContain("test suite::rtk_pass_0 ... ok");
+          expect(original.output_delta).not.toContain("[rtk:");
+          expect(readFileSync(join(fixture.workspace, "runs"), "utf8")).toBe("run\n");
+        }
+      }
+      expect(JSON.parse(readFileSync(join(fixture.home, ".fx/settings.json"), "utf8")).rtk).toBe(scenario.profile);
+    } finally { gateway.stop(); fixture.cleanup(); }
+  }, TIMEOUT);
 });
 
 describe("cli: ask success", () => {

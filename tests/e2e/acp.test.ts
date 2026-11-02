@@ -29,6 +29,7 @@ import {
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
 import { paddedPng, pngPixelSize, solidPng } from "./fixtures/image-encoding";
+import { createRtkFixture } from "./fixtures/rtk";
 import { copyV1Fixture, logLines, savedSessionIds, savedText, sessionDir } from "./saved-sessions";
 import {
   canonicalSubagentIdForStore,
@@ -1118,6 +1119,50 @@ test("ACP shell completed and replayed updates show the command output", async (
     fixture.close();
   }
 }, 45000);
+
+test.each([{ enabled: false }, { enabled: true }])("ACP rtk=$enabled reduces only the model view and preserves original updates", async ({ enabled }) => {
+  const fixture = createRtkFixture(enabled);
+  const gateway = startFakeGateway([
+    fakeShellRun("rtk-acp-run", "./cargo test"),
+    finalText("RTK_ACP_COMPLETE"),
+  ]);
+  let client: AcpClient | undefined;
+  try {
+    client = await AcpClient.create({
+      cwd: fixture.workspace,
+      env: {
+        HOME: fixture.home, AI_GATEWAY_API_KEY: "rtk-fixture-key", VERCEL_OIDC_TOKEN: undefined,
+        FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1",
+      },
+    });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }, 2) as any;
+    expect(created.error).toBeUndefined();
+    const prompt = await runPrompt(client, "Run the fixture tests.", TIMEOUT);
+    expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+    expect(gateway.requests).toHaveLength(2);
+    const result = JSON.parse(acpToolResultText(gateway.requests[1]!.body, "rtk-acp-run"));
+    expect(result.output_delta.includes("80 passing test lines omitted")).toBe(enabled);
+    expect(result.output_delta.includes("test suite::rtk_pass_0 ... ok")).toBe(!enabled);
+    expect(result.output_delta).toContain("RTK_DIAGNOSTIC: retain this warning");
+    const visible = acpContentText(prompt.messages
+      .filter((message: any) => message.method === "session/update" && message.params?.update?.toolCallId === "rtk-acp-run")
+      .map((message: any) => message.params.update.content));
+    expect(visible).toContain("test suite::rtk_pass_0 ... ok");
+    expect(visible).toContain("test suite::rtk_pass_79 ... ok");
+    expect(visible).not.toContain("[rtk:");
+    expect(readFileSync(join(fixture.workspace, "runs"), "utf8")).toBe("run\n");
+    const saved = savedText(fixture.home, created.result.sessionId);
+    expect(saved).toContain("test suite::rtk_pass_0 ... ok");
+    expect(saved).not.toContain("[rtk:");
+    expect(client.stderr).toBe("");
+  } finally {
+    await client?.close();
+    gateway.stop();
+    fixture.cleanup();
+  }
+}, TIMEOUT);
 
 test("ACP finishes tool calls that a cancel stopped before they ran", async () => {
   const root = createIsolatedRoot("fx-acp-cancel-cards-");

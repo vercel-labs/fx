@@ -78,6 +78,7 @@ pub const Settings = struct {
     session_titles: ?bool = null,
     /// Ping a waiting Claude conversation's prompt cache so it stays alive.
     cache_warming: ?bool = null,
+    rtk: ?bool = null,
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
@@ -156,6 +157,7 @@ pub const ConfigSources = struct {
     statusline_session: ConfigSource = .compiled_default,
     session_titles: ConfigSource = .compiled_default,
     cache_warming: ConfigSource = .compiled_default,
+    rtk: ConfigSource = .compiled_default,
     notification_turn_end: ConfigSource = .compiled_default,
     notification_attention_required: ConfigSource = .compiled_default,
     notification_max: ConfigSource = .compiled_default,
@@ -901,6 +903,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.collapse_tool_calls != null) sources.collapse_tool_calls = source;
     if (settings.session_titles != null) sources.session_titles = source;
     if (settings.cache_warming != null) sources.cache_warming = source;
+    if (settings.rtk != null) sources.rtk = source;
     if (settings.startup_scrollback != null) sources.startup_scrollback = source;
     if (settings.prompt_history_enabled != null) sources.prompt_history_enabled = source;
     if (settings.statusline_context != null) sources.statusline_context = source;
@@ -1815,6 +1818,11 @@ fn parseProfileOnlyFields(
         settings.cache_warming = value.bool;
     }
 
+    if (root.object.get("rtk")) |value| {
+        if (value != .bool) return error.InvalidRtkType;
+        settings.rtk = value.bool;
+    }
+
     if (root.object.get("auto_upgrade")) |auto_upgrade_value| {
         const value = auto_upgrade_value;
         if (value != .bool) return error.InvalidAutoUpgradeType;
@@ -2050,6 +2058,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.collapse_tool_calls) |value| target.collapse_tool_calls = value;
     if (incoming.session_titles) |value| target.session_titles = value;
     if (incoming.cache_warming) |value| target.cache_warming = value;
+    if (incoming.rtk) |value| target.rtk = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
     if (incoming.update_channel) |value| target.update_channel = value;
     if (incoming.theme) |value| {
@@ -3852,6 +3861,20 @@ test "project profile-only settings are ignored and diagnosed by key" {
     }) |key| {
         try expectIgnoredProjectKey(result.diagnostics, key);
     }
+}
+
+test "rtk is a typed profile preference and project files cannot enable it" {
+    var profile = try parseSettingsJson(std.testing.allocator, "{\"rtk\":true}");
+    defer profile.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?bool, true), profile.rtk);
+    try std.testing.expectError(error.InvalidRtkType, parseSettingsJson(std.testing.allocator, "{\"rtk\":\"true\"}"));
+    var project = try parseSettingsJsonForLayer(std.testing.allocator, "{\"rtk\":true}", .project);
+    defer project.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?bool, null), project.rtk);
+    var disabled = try parseSettingsJson(std.testing.allocator, "{\"rtk\":false}");
+    defer disabled.deinit(std.testing.allocator);
+    try mergeSettings(&profile, &disabled, std.testing.allocator);
+    try std.testing.expectEqual(@as(?bool, false), profile.rtk);
 }
 
 test "project auto_compact_percent is ignored with a diagnostic" {

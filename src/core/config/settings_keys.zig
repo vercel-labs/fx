@@ -137,6 +137,7 @@ pub const keys = [_]Key{
     .{ .name = "provider_strict", .where = .project_safe, .kind = .boolean, .description = "Send AI Gateway requests only to the providers in provider_order" },
     .{ .name = "providers", .where = .profile, .kind = .object, .map = true, .top_level_only = true, .description = "Named custom model connections" },
     .{ .name = "review_model", .where = .profile, .kind = .string, .description = "The AI Gateway model that reviews actions in auto mode" },
+    .{ .name = "rtk", .where = .profile, .kind = .boolean, .description = "Reduce supported shell output in model requests while retaining full output" },
     .{ .name = "sandbox", .where = .retired, .kind = .any, .description = retired_description },
     .{ .name = "session_titles", .where = .profile, .kind = .boolean, .description = "Name each session from its first prompt" },
     // Retired, but still read so that fx can explain the migration.
