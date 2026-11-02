@@ -4438,9 +4438,13 @@ fn testProcessQueuedPromptChecksExecOnlyTerminal(_: *agent_runtime.Agent, deps: 
     try std.testing.expect(std.mem.find(u8, advertised_shell.description, "tty") == null);
     try std.testing.expectEqualStrings(builtin_tools.web_search.description, cfg.custom_tool_guidance);
     try std.testing.expectEqualStrings("test model overlay", cfg.model_prompt_overlay.?);
+    // Only the model sees the process-only shell; the runtime keeps the
+    // full one.
     const runtime_shell = deps.tool_registry.lookup("shell") orelse
         return error.TestExpectedEqual;
-    try std.testing.expect(std.mem.find(u8, runtime_shell.description, "action=interact") != null);
+    try std.testing.expect(for (runtime_shell.model_schema.input_schema.properties) |property| {
+        if (std.mem.eql(u8, property.name, "tty")) break true;
+    } else false);
     try testPushAssistantText(deps, "assistant text");
 }
 
@@ -4451,8 +4455,11 @@ fn testProcessQueuedPromptChecksFullTerminal(_: *agent_runtime.Agent, deps: *con
     const advertised_shell = for (cfg.advertised_functions) |function| {
         if (std.mem.eql(u8, function.name, "shell")) break function;
     } else return error.TestExpectedEqual;
-    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "action=interact") != null);
-    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "tty=true") != null);
+    // The full shell: interactive sessions and their terminal fields.
+    try std.testing.expect(std.mem.find(u8, advertised_shell.description, "shell.interact") != null);
+    try std.testing.expect(for (advertised_shell.input_schema.properties) |property| {
+        if (std.mem.eql(u8, property.name, "tty")) break true;
+    } else false);
     try testPushAssistantText(deps, "assistant text");
 }
 

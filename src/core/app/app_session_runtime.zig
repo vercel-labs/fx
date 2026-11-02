@@ -10117,7 +10117,7 @@ test "appendFinishedPrompt keeps the session alive when the turn cannot be saved
     );
     // The user sees a warning instead of a disappearing process.
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
-    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "Couldn't save this turn") != null);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "proto-fx could not save it") != null);
 
     // A later clean turn still persists; the writer is not latched shut.
     const clean = try session_runtime.makeAssistantTurn(alloc, "next", "fine");

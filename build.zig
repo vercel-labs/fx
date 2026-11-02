@@ -110,6 +110,7 @@ pub fn build(b: *std.Build) void {
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .filters = b.option([]const []const u8, "tf", "test name filter") orelse &.{},
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     run_exe_tests.step.dependOn(b.getInstallStep());
