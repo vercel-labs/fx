@@ -5,6 +5,7 @@ const build_options = @import("build_options");
 const secret = @import("../core/auth/secret.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const local_address = @import("../core/shared/local_address.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
 const input_loop_guard = @import("../core/shared/input_loop_guard.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -21,7 +22,8 @@ const text_utils = @import("../core/shared/text_utils.zig");
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
         err == error.ConnectionResetByPeer or
-        err == error.ConnectionTimedOut;
+        err == error.ConnectionTimedOut or
+        err == error.LocalAddressGone;
 }
 
 pub fn networkFailureEvidence(
@@ -108,6 +110,7 @@ test "isRetryableGatewayError matches active retryable transport errors" {
     try std.testing.expect(isRetryableGatewayError(error.HttpConnectionClosing));
     try std.testing.expect(isRetryableGatewayError(error.ConnectionResetByPeer));
     try std.testing.expect(isRetryableGatewayError(error.ConnectionTimedOut));
+    try std.testing.expect(isRetryableGatewayError(error.LocalAddressGone));
     try std.testing.expect(!isRetryableGatewayError(error.AccessDenied));
 }
 
@@ -137,6 +140,7 @@ test "native network failure evidence covers setup send read and resume failures
         .{ .err = error.WriteFailed },
         .{ .err = error.ReadFailed },
         .{ .err = error.StreamStalled, .cause = .stream_stalled },
+        .{ .err = error.LocalAddressGone },
     };
 
     for (cases) |case| {
@@ -1013,6 +1017,8 @@ const ConnectedRequestWatch = struct {
         timed_out,
         cancelled,
         stalled,
+        /// The connection's local address left the machine.
+        address_gone,
     };
 
     phase: std.atomic.Value(Phase) = .init(.sending),
@@ -1161,7 +1167,7 @@ const ConnectedRequestWatch = struct {
     fn is_active(phase: Phase) bool {
         return switch (phase) {
             .sending, .awaiting_head, .streaming => true,
-            .completed, .timed_out, .cancelled, .stalled => false,
+            .completed, .timed_out, .cancelled, .stalled, .address_gone => false,
         };
     }
 
@@ -1170,6 +1176,7 @@ const ConnectedRequestWatch = struct {
             .timed_out => error.Timeout,
             .cancelled => error.Cancelled,
             .stalled => error.StreamStalled,
+            .address_gone => error.LocalAddressGone,
             .sending, .awaiting_head, .streaming, .completed => null,
         };
     }
@@ -2284,6 +2291,37 @@ const RequestCondition = struct {
 
 const BoundedRequestWatch = select_watch.Watch(RequestCondition);
 
+/// Finds a connection whose local address has left the machine. When the
+/// network changes under a request, the old connection can never answer
+/// again, yet its dead-peer probes go nowhere and take their full 45 seconds
+/// to fail it. The watch checks the address once a second instead
+/// (`local_address.missing`). Owned by the watcher thread.
+const LocalAddressWatch = struct {
+    /// Null for a socket without an IP address, one `getsockname` refused,
+    /// or a target without the check; such a connection is never reported
+    /// gone.
+    address: ?local_address.Address,
+    next_check: std.Io.Clock.Timestamp,
+
+    const interval_ms = 1_000;
+
+    fn init(handle: anytype, now: std.Io.Clock.Timestamp) LocalAddressWatch {
+        return .{ .address = local_address.of(handle), .next_check = later(now) };
+    }
+
+    /// Whether the address is gone, checked at most once per interval.
+    fn gone(self: *LocalAddressWatch, now: std.Io.Clock.Timestamp) bool {
+        const address = self.address orelse return false;
+        if (std.Io.Clock.Timestamp.compare(now, .lt, self.next_check)) return false;
+        self.next_check = later(now);
+        return local_address.missing(address);
+    }
+
+    fn later(now: std.Io.Clock.Timestamp) std.Io.Clock.Timestamp {
+        return .{ .clock = now.clock, .raw = now.raw.addDuration(.fromMilliseconds(interval_ms)) };
+    }
+};
+
 const GatewayCancelWatcher = struct {
     fn run(
         done: *std.atomic.Value(bool),
@@ -2292,9 +2330,17 @@ const GatewayCancelWatcher = struct {
         connected_watch: ?*ConnectedRequestWatch,
         stream: std.Io.net.Stream,
     ) void {
+        var address_watch = LocalAddressWatch.init(stream.socket.handle, std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake));
         while (!done.load(.seq_cst)) {
             if (cancel_flag.load(.seq_cst)) {
                 if (connected_watch == null or connected_watch.?.win(.cancelled)) {
+                    stream.shutdown(io_mod.getIo(), .both) catch {};
+                }
+                return;
+            }
+            if (address_watch.gone(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake))) {
+                if (connected_watch == null or connected_watch.?.win(.address_gone)) {
+                    debug_trace.logf("gateway", "event=local_address_gone dropped=connection reason=the network changed under it", .{});
                     stream.shutdown(io_mod.getIo(), .both) catch {};
                 }
                 return;
@@ -2566,6 +2612,59 @@ test "cancelling a request wins over its body stall window" {
     const body = try readWatchedBody(&server, 30);
     try std.testing.expectEqual(@as(?anyerror, error.Cancelled), body.err);
     try std.testing.expect(body.elapsed_ms < 2_000);
+}
+
+test "the local address watch keeps a live connection's own address" {
+    if (comptime !local_address.supported) return error.SkipZigTest;
+    var server: SilentBodyServer = .{ .server = undefined, .events = 0, .gap_ms = 0, .close = false };
+    try server.start();
+    defer server.stop();
+    const zio = io_mod.getIo();
+    const address = std.Io.net.IpAddress{ .ip4 = .loopback(server.server.socket.address.getPort()) };
+    var stream = try address.connect(zio, .{ .mode = .stream });
+    defer stream.close(zio);
+
+    const now = std.Io.Clock.Timestamp.now(zio, .awake);
+    var watch = LocalAddressWatch.init(stream.socket.handle, now);
+    try std.testing.expect(watch.address != null);
+    // The first check waits out the interval.
+    try std.testing.expect(!watch.gone(now));
+    try std.testing.expect(!watch.gone(LocalAddressWatch.later(now)));
+}
+
+test "a request whose local address leaves the machine fails at once as a lost connection" {
+    if (comptime !local_address.supported) return error.SkipZigTest;
+    local_address.test_missing = true;
+    defer local_address.test_missing = false;
+    var server: SilentBodyServer = .{ .server = undefined, .events = 0, .gap_ms = 0, .close = false };
+    try server.start();
+    defer server.stop();
+    const zio = io_mod.getIo();
+    const address = std.Io.net.IpAddress{ .ip4 = .loopback(server.server.socket.address.getPort()) };
+    var stream = try address.connect(zio, .{ .mode = .stream });
+    defer stream.close(zio);
+
+    // A model that thinks sends no headers, so the request waits on its head
+    // with nothing to time it out.
+    var cancel = std.atomic.Value(bool).init(false);
+    var watch: ConnectionWatch = .init(.{ .patient = true, .stall_timeout_ms = ConnectionWatch.bodyStallTimeoutMs(null) });
+    defer watch.stop();
+    try watch.start(&cancel, null, stream);
+    if (watch.armHead()) |err| return err;
+    // If the watch ever misses the address, Esc ends the read instead of
+    // hanging the test.
+    const canceller = try std.Thread.spawn(.{}, cancelAfterMs, .{ &cancel, 4_000 });
+    defer canceller.join();
+    const started = std.Io.Clock.Timestamp.now(zio, .awake);
+    var socket_buffer: [64]u8 = undefined;
+    var socket_reader = stream.reader(zio, &socket_buffer);
+    const err = if (socket_reader.interface.takeByte()) |_| error.TestUnexpectedByte else |read_err| watch.failure(read_err);
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
+
+    try std.testing.expectEqual(error.LocalAddressGone, err);
+    try std.testing.expect(elapsed_ms < 3_000);
+    const evidence = networkFailureEvidence(err, .possibly_sent) orelse return error.TestExpectedNetworkFailureEvidence;
+    try std.testing.expectEqual(agent_stream_provider.NetworkFailureCause.transport_interrupted, evidence.cause);
 }
 
 /// TCP keepalive for every watched connection. The gateway sends nothing while
