@@ -1,5 +1,6 @@
 const std = @import("std");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const input_loop_guard = @import("../core/shared/input_loop_guard.zig");
 const record_tape = @import("../core/workspace/record_tape.zig");
 const shell_runtime = @import("shell_runtime.zig");
 
@@ -74,6 +75,8 @@ pub fn pump_ready_input(terminal: anytype, should_exit: *bool, callbacks: EventL
 }
 
 pub fn run(terminal: anytype, should_exit: *bool, poll_timeout_ms: i32, callbacks: EventLoopCallbacks) !ExitCause {
+    input_loop_guard.enter();
+    defer input_loop_guard.leave();
     var buf: [128]u8 = undefined;
 
     while (!should_exit.*) {

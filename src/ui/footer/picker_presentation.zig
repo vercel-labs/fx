@@ -109,12 +109,7 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
             .action => |action| switch (action) {
                 .connections => if (view.available_sources.count() > 0) "connected" else "not connected",
                 .switch_provider => view.choiceLabel(.{ .provider = view.active_provider }),
-                .change_team => if (!view.fx_login_session_available)
-                    "sign in to manage"
-                else if (view.current_team != null)
-                    "selected"
-                else
-                    "choose a team",
+                .change_team => changeTeamSetupValue(view),
                 .switch_credential => if (view.active_source != null)
                     view.activeSourceLabel()
                 else
@@ -141,6 +136,12 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
         .provider, .change_team, .switch_credential => view.choiceDescription(choice),
         .sign_in, .api_key => "",
     };
+}
+
+fn changeTeamSetupValue(view: auth_runtime.PickerView) []const u8 {
+    if (view.team_list_loading) return auth_runtime.team_list_loading_label;
+    if (!view.fx_login_session_available) return "sign in to manage";
+    return if (view.current_team != null) "selected" else "choose a team";
 }
 
 fn detailValueColumn(width: u16) usize {
@@ -567,7 +568,7 @@ fn composeSignInPickerRow(
         else
             "   Sign in with Vercel",
         1, 4 => "",
-        2 => vercelOpenLabel(&label_buf, snapshot.verification_uri, width) orelse std.mem.print(
+        2 => if (snapshot.preparing) "" else vercelOpenLabel(&label_buf, snapshot.verification_uri, width) orelse std.mem.print(
             &label_buf,
             "   Open   {s}",
             .{snapshot.verification_uri},
@@ -585,7 +586,7 @@ fn composeSignInPickerRow(
                 "   Code   {s}",
                 .{snapshot.user_code},
             ) catch "   Code unavailable",
-        5 => switch (snapshot.state) {
+        5 => if (snapshot.preparing) "   Preparing sign-in…" else switch (snapshot.state) {
             .idle => "   Preparing sign-in…",
             .polling => "   Waiting for authorization…",
             .succeeded => "   Authorization complete",
@@ -925,7 +926,7 @@ pub fn composePickerStatusRowWithProvider(
         .provider_stage => switch (provider_stage) {
             .provider => "no matching providers",
             .method => "no matching sign-in methods",
-            .team => if (loading) "loading teams..." else if (failed) "unable to load teams" else "no matching teams",
+            .team => if (loading) auth_runtime.team_list_loading_label else if (failed) "unable to load teams" else "no matching teams",
             .key_source => "no matching key sources",
             .api_key => "",
         },
@@ -2534,6 +2535,33 @@ test "sign-in stage renders the complete device authorization screen" {
     defer narrow.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow.items, "Open   https://") != null);
     try std.testing.expect(std.mem.find(u8, narrow.items, "\x1b]8;") == null);
+}
+
+test "sign-in stage shows a preparing flow without an empty device link" {
+    const alloc = std.testing.allocator;
+    const view = auth_runtime.PickerView{
+        .active = true,
+        .available_sources = .empty,
+        .selected_choice = null,
+        .active_source = null,
+        .include_skip = false,
+        .stage = .sign_in,
+        .sign_in = .{ .state = .polling, .preparing = true },
+    };
+
+    var screen: std.ArrayList(u8) = .empty;
+    defer screen.deinit(alloc);
+    for (0..authPickerRowCount(view)) |row_index| {
+        var row = try composeAuthPickerRow(alloc, view, @intCast(row_index), 7, 100);
+        defer row.deinit(alloc);
+        try screen.appendSlice(alloc, row.items);
+        try screen.append(alloc, '\n');
+    }
+    try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Preparing sign-in…") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Waiting for authorization") == null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Open") == null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Code") == null);
 }
 
 test "Codex sign-in stage renders a bounded clickable authorization action" {

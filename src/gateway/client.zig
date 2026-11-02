@@ -6,6 +6,7 @@ const secret = @import("../core/auth/secret.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
+const input_loop_guard = @import("../core/shared/input_loop_guard.zig");
 const io_mod = @import("../core/shared/io.zig");
 const select_watch = @import("../core/shared/select_watch.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
@@ -460,6 +461,33 @@ pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, pat
         .body = try out.toOwnedSlice(),
     };
 }
+
+/// `fetchGatewayGetResult` with bounds: it fails with `error.Cancelled` once
+/// `cancel_flag` is set and with `error.Timeout` after
+/// `gateway_json_fetch_timeout_ms`, so a stalled endpoint cannot hold the caller.
+pub fn fetchGatewayGetResultCancellable(
+    alloc: std.mem.Allocator,
+    api_key: ?[]const u8,
+    path: []const u8,
+    cancel_flag: *std.atomic.Value(bool),
+) !GetResult {
+    var operation = GatewayGetOperation{ .alloc = alloc, .api_key = api_key, .path = path };
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(gateway_json_fetch_timeout_ms),
+    });
+    return runBoundedHttpOperation(GetResult, alloc, cancel_flag, deadline, &operation);
+}
+
+const GatewayGetOperation = struct {
+    alloc: std.mem.Allocator,
+    api_key: ?[]const u8,
+    path: []const u8,
+
+    fn run(self: *@This()) !GetResult {
+        return fetchGatewayGetResult(self.alloc, self.api_key, self.path);
+    }
+};
 
 pub fn fetchGatewayJsonCancellable(
     alloc: std.mem.Allocator,
@@ -1399,6 +1427,7 @@ pub fn streamGatewayCompletion(
     on_tool_start: ?ToolStartCallback,
     cancel_flag: *std.atomic.Value(bool),
 ) !StreamResult {
+    input_loop_guard.noteNetworkRequest("gateway_stream");
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const expected_provider_tool_name = try expectedProviderToolName(alloc, request.payload);
     return streamGatewayCompletionCore(
@@ -1422,6 +1451,7 @@ pub fn streamGatewayCompletionBounded(
     deadline: std.Io.Clock.Timestamp,
     cancel_flag: *std.atomic.Value(bool),
 ) !StreamResult {
+    input_loop_guard.noteNetworkRequest("gateway_stream");
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const expected_provider_tool_name = try expectedProviderToolName(alloc, request.payload);
     var operation = BoundedStreamingGatewayOperation{
@@ -2155,6 +2185,7 @@ pub fn runBoundedHttpOperation(
     deadline: std.Io.Clock.Timestamp,
     operation: anytype,
 ) !Result {
+    input_loop_guard.noteNetworkRequest("bounded_http");
     if (cancel_flag.load(.seq_cst)) {
         debug_trace.logf("stream", "bounded termination cause=cancellation phase=admission", .{});
         return error.Cancelled;

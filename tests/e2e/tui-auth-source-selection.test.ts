@@ -27,6 +27,7 @@ import {
   fakeGatewayFinalText,
   fakeGatewaySse,
   fakeGatewayToolCall,
+  heldFakeGatewayFinalText,
   startFakeGateway,
   TmuxSession,
   tmuxAvailable,
@@ -386,6 +387,9 @@ function startFakeOAuth(
     deviceError?: string;
     rejectAllDeviceClients?: boolean;
     tokenDelayMs?: number;
+    revokeDelayMs?: number;
+    discoveryDelayMs?: number;
+    teamsDelayMs?: number;
     rejectRefreshGrant?: boolean;
     beforeRefreshResponse?: () => void | Promise<void>;
     teams?: Array<{ id: string; slug: string; name: string }>;
@@ -415,6 +419,7 @@ function startFakeOAuth(
       const baseUrl = `http://127.0.0.1:${server.port}`;
       switch (url.pathname) {
         case "/.well-known/openid-configuration":
+          if (options.discoveryDelayMs) await Bun.sleep(options.discoveryDelayMs);
           return Response.json({
             issuer: baseUrl,
             device_authorization_endpoint: `${baseUrl}/oauth/device`,
@@ -474,8 +479,10 @@ function startFakeOAuth(
           });
         }
         case "/v2/teams":
+          if (options.teamsDelayMs) await Bun.sleep(options.teamsDelayMs);
           return Response.json({ teams: options.teams ?? [] });
         case "/oauth/revoke": {
+          if (options.revokeDelayMs) await Bun.sleep(options.revokeDelayMs);
           const form = await request.formData();
           const tokenTypeHint = form.get("token_type_hint");
           const token = form.get("token");
@@ -2155,6 +2162,61 @@ tmuxTest(
   60_000,
 );
 
+tmuxTest(
+  "a prompt sent during a running turn queues at once while its fx login refresh is due",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-queued-refresh-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    const firstTurn = heldFakeGatewayFinalText();
+    gateway = startFakeGateway([
+      () => firstTurn.response,
+      fakeGatewayFinalText("QUEUED_PROMPT_RESPONSE"),
+    ]);
+    // A refresh on the input loop would freeze the terminal this long.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      tokenDelayMs: 5_000,
+    });
+    // fx refreshes an fx login one minute before it expires, so this token
+    // serves the first turn and falls due while that turn still runs.
+    const refreshDueAt = Date.now() + 8_000;
+    writeSeededFxLogin(home, refreshDueAt + 60_000, oauth.issuerUrl, "team_123");
+
+    try {
+      session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+        AI_GATEWAY_API_KEY: undefined,
+      });
+      await session.waitForComposer(TIMEOUT);
+      await session.sendText("Start the long answer.");
+      while (gateway.requests.length < 1) {
+        if (Date.now() >= refreshDueAt) throw new Error("the first turn did not start before the refresh came due");
+        await Bun.sleep(25);
+      }
+      await session.waitForPane((pane) => pane.includes("Thinking"), TIMEOUT);
+      await Bun.sleep(Math.max(0, refreshDueAt - Date.now()) + 250);
+
+      const queued = "QUEUED_WHILE_REFRESH_DUE";
+      await session.sendText(queued);
+      const responsiveDraft = "TERMINAL_RESPONSIVE_WHILE_QUEUING";
+      await session.sendLiteral(responsiveDraft);
+      await session.waitForPane((pane) => pane.includes(responsiveDraft), 1_000);
+      // Nothing refreshed on the way in; the worker refreshes when the turn starts.
+      expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(0);
+      await session.sendKeys("C-u");
+      await session.sendKeys("C-k");
+
+      firstTurn.release("FIRST_TURN_RESPONSE");
+      await session.waitForText("QUEUED_PROMPT_RESPONSE", TIMEOUT);
+      expect(gateway.requests).toHaveLength(2);
+      expect(gateway.requests[1]!.body).toContain(queued);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      firstTurn.dispose();
+    }
+  },
+  60_000,
+);
+
 // The same recovery on the two subscriptions: their sign-in is a browser
 // flow, which the test completes the way the browser would.
 for (const provider of ["codex", "grok"] as const) {
@@ -2256,6 +2318,48 @@ tmuxTest(
     await session.waitForComposer(TIMEOUT);
 
     expect(gateway.requests).toHaveLength(1);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "Esc while a Vercel sign-in prepares stops its request and saves nothing",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-sign-in-preparing-esc-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    // Issuer discovery stays slow enough to see the preparing state.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, 1, { discoveryDelayMs: 5_000 });
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane(
+      (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForPane(
+      (pane) => pane.includes("oauth") && pane.includes("api-key"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    const preparing = await session.waitForPane(
+      (pane) => pane.includes("Sign in with Vercel") && pane.includes("Preparing sign-in"),
+      2_000,
+    );
+    expect(preparing).not.toContain("Authorize with Vercel");
+
+    await session.sendKeys("Escape");
+    await session.waitForPane((pane) => !pane.includes("Preparing sign-in"), 1_000);
+    // Past the discovery delay, a sign-in that kept going would have asked
+    // for a device code.
+    await Bun.sleep(5_500);
+    expect(oauth.requests.filter((request) => request.path === "/oauth/device")).toHaveLength(0);
+    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    expect(session.isAlive()).toBe(true);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,
@@ -3645,16 +3749,14 @@ tmuxTest(
     expect(gateway.requests).toHaveLength(4);
     expect(gateway.requests[3].headers.get("authorization")).toBe(`Bearer ${ACQUIRED_LOGIN_TOKEN}`);
 
+    const revokedBefore = completedRevocations(oauth).length;
     await session.sendText("/logout");
-    const loggedOut = await session.waitForText("Signed out of fx.", TIMEOUT);
-    expect(loggedOut).not.toContain("remote session could not be revoked");
+    await session.waitForText("Signed out of fx.", TIMEOUT);
     expect(existsSync(authPath)).toBe(false);
-    expect(
-      oauth.requests
-        .filter((request) => request.path === "/oauth/revoke")
-        .map((request) => request.revocation)
-        .slice(-2),
-    ).toEqual([
+    // The issuer revocation runs after the local sign-out, off the input loop.
+    await waitForRevocations(oauth, revokedBefore + 2);
+    expect(await session.captureFullScrollback()).not.toContain("remote session could not be revoked");
+    expect(completedRevocations(oauth).slice(-2)).toEqual([
       { tokenTypeHint: "refresh_token", validForm: true },
       { tokenTypeHint: "access_token", validForm: true },
     ]);
@@ -6534,6 +6636,86 @@ tmuxTest(
   60_000,
 );
 
+function completedRevocations(fakeOAuth: ReturnType<typeof startFakeOAuth>) {
+  return fakeOAuth.requests
+    .filter((request) => request.path === "/oauth/revoke" && request.revocation)
+    .map((request) => request.revocation);
+}
+
+async function waitForRevocations(
+  fakeOAuth: ReturnType<typeof startFakeOAuth>,
+  count: number,
+): Promise<void> {
+  const deadline = Date.now() + TIMEOUT;
+  while (completedRevocations(fakeOAuth).length < count) {
+    if (Date.now() > deadline) {
+      throw new Error(`Timed out waiting for ${count} token revocations; saw ${completedRevocations(fakeOAuth).length}`);
+    }
+    await Bun.sleep(25);
+  }
+}
+
+tmuxTest(
+  "quitting right after /logout does not wait on a stalled issuer",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-logout-quit-stalled-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    // Longer than the OAuth request deadline, so only cancellation ends it.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { revokeDelayMs: 20_000 });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/logout");
+    await session.waitForText("Signed out of fx.", 1_000);
+
+    const quitAt = Date.now();
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(10_000)).toBe(true);
+    session = null;
+    // Shutdown gives the revocation 2 seconds, then cancels it.
+    expect(Date.now() - quitAt).toBeLessThan(5_000);
+    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "logout signs out at once while the issuer revokes the session slowly",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-logout-slow-revoke-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    // Revoking inline would hold the terminal for both of these delays.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { revokeDelayMs: 3_000 });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/logout");
+    await session.waitForText("Signed out of fx.", 1_000);
+    expect(existsSync(join(home, ".fx", "auth.json"))).toBe(false);
+    const draft = "TYPING_WHILE_LOGOUT_REVOKES";
+    await session.sendLiteral(draft);
+    await session.waitForPane((pane) => pane.includes(draft), 1_000);
+    await session.sendKeys("C-u");
+    await session.sendKeys("C-k");
+
+    await waitForRevocations(oauth, 2);
+    expect(completedRevocations(oauth)).toEqual([
+      { tokenTypeHint: "refresh_token", validForm: true },
+      { tokenTypeHint: "access_token", validForm: true },
+    ]);
+    expect(await session.captureFullScrollback()).not.toContain("remote session could not be revoked");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
 tmuxTest(
   "logout preserves an active API key when fx login is inactive",
   async () => {
@@ -7554,6 +7736,164 @@ tmuxTest(
       `Bearer ${ACQUIRED_LOGIN_TOKEN}`,
     );
     expect(new URL(gateway.modelRequests[1].url).searchParams.get("teamId")).toBe("team_123");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "/credits renews a login that falls due without holding the terminal",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-auth-credits-renewal-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    // A renewal on the input loop would hold the terminal this long.
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, { tokenDelayMs: 3_000 });
+    creditsGateway = startFakeCreditsGateway();
+    // fx renews an fx login one minute before it expires, so this one is
+    // current at launch and falls due a few seconds later.
+    const refreshDueAt = Date.now() + 5_000;
+    writeSeededFxLogin(home, refreshDueAt + 60_000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_TEST_GATEWAY_CREDITS_URL: creditsGateway.url,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await Bun.sleep(Math.max(0, refreshDueAt - Date.now()) + 250);
+
+    await session.sendText("/credits");
+    const draft = "TYPING_WHILE_CREDITS_RENEW";
+    await session.sendLiteral(draft);
+    await session.waitForPane((pane) => pane.includes(draft), 1_000);
+    await session.sendKeys("C-u");
+    await session.sendKeys("C-k");
+
+    await session.waitForText("* credits: balance=42", TIMEOUT);
+    expect(oauth.requests.filter((request) => request.path === "/oauth/token")).toHaveLength(1);
+    expect(creditsGateway.requests).toEqual([{
+      method: "GET",
+      path: "/v1/credits",
+      authorization: `Bearer ${ACQUIRED_LOGIN_TOKEN}`,
+    }]);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "a team list larger than an OAuth response still opens the team picker",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-provider-large-team-list-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    // About 95 KiB of teams, past the 64 KiB OAuth response limit.
+    const padding = Array.from({ length: 300 }, (_, n) => ({
+      id: `team_pad_${n}`,
+      slug: `padding-team-${n}`,
+      name: `Padding team ${n} ` + "x".repeat(240),
+    }));
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teams: [
+        { id: "team_123", slug: "example-internal-team", name: "Example Internal Team" },
+        ...padding,
+      ],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane(
+      (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForPane(
+      (pane) => pane.includes("oauth") && pane.includes("api-key"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForPane(
+      // The /provider team column lists teams by slug.
+      (pane) => pane.includes("example-internal-team"),
+      TIMEOUT,
+    );
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "closing /provider while its team list loads drops the late list",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-provider-team-list-close-"));
+    stderrPath = join(home, "stderr.log");
+    const tracePath = join(home, "trace.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    oauth = startFakeOAuth(ACQUIRED_LOGIN_TOKEN, undefined, 3600, Infinity, {
+      teamsDelayMs: 3_000,
+      teams: [{ id: "team_123", slug: "example-internal-team", name: "Example Internal Team" }],
+    });
+    writeSeededFxLogin(home, Date.now() + 60 * 60 * 1000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, tracePath, {
+      FX_TRACE_SCOPES: "auth,provider",
+    });
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("/login");
+    await session.waitForPane(
+      (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForPane(
+      (pane) => pane.includes("oauth") && pane.includes("api-key"),
+      TIMEOUT,
+    );
+    await session.sendKeys("Enter");
+    await session.waitForText("loading teams...", 1_000);
+
+    await session.sendKeys("Escape");
+    await session.waitForPane((pane) => !pane.includes("loading teams..."), 1_000);
+    // Past the teams delay, the late list must not reopen a picker.
+    await Bun.sleep(3_500);
+    expect(await session.capturePane()).not.toContain("Vercel team · Search:");
+    expect(oauth.requests.filter((request) => request.path === "/v2/teams")).toHaveLength(1);
+    expect(readFileSync(tracePath, "utf8")).toContain("team list dropped reason=picker_moved");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  },
+  60_000,
+);
+
+tmuxTest(
+  "/credits with a login that needs a new sign-in says so",
+  async () => {
+    home = mkdtempSync(join(tmpdir(), "fx-tui-auth-credits-renewal-rejected-"));
+    stderrPath = join(home, "stderr.log");
+    writeFileSync(stderrPath, "");
+    gateway = startFakeGateway([]);
+    // The issuer rejects every refresh grant.
+    oauth = startFakeOAuth(null);
+    creditsGateway = startFakeCreditsGateway();
+    // Current at launch, so nothing renews it before /credits; due a few
+    // seconds later.
+    const refreshDueAt = Date.now() + 5_000;
+    writeSeededFxLogin(home, refreshDueAt + 60_000, oauth.issuerUrl, "team_123");
+
+    session = await startFx(home, stderrPath, gateway, oauth.issuerUrl, undefined, {
+      AI_GATEWAY_API_KEY: undefined,
+      FX_TEST_GATEWAY_CREDITS_URL: creditsGateway.url,
+    });
+    await session.waitForComposer(TIMEOUT);
+    await Bun.sleep(Math.max(0, refreshDueAt - Date.now()) + 250);
+
+    await session.sendText("/credits");
+    await session.waitForText("Your sign-in has expired. Run /login, then check credits again.", TIMEOUT);
+    expect(creditsGateway.requests).toEqual([]);
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   },
   60_000,

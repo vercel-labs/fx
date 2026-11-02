@@ -9,6 +9,7 @@ const io_mod = @import("../shared/io.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const credits_lookup = @import("credits_lookup.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
@@ -1273,15 +1274,71 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandShowCredits(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            var snapshot = app.creditsProvider().fetch(app.alloc, .{
+            // The lookup runs in a `std.Io` task so a slow Gateway or issuer
+            // never holds the input loop; `collectCreditsFacts` writes its result.
+            if (comptime @hasField(App, "credits_lookup") and !@import("builtin").single_threaded) {
+                return startCreditsLookup(app);
+            }
+            const input: gateway_provider.CreditsLookupInput = .{
                 .credential = app.auth.apiKey(),
                 .credential_source = if (comptime @hasDecl(@TypeOf(app.auth), "credentialSource"))
                     app.auth.credentialSource()
                 else
                     null,
                 .tenant = app.auth.gatewayTeam(),
-            });
+            };
+            var snapshot = app.creditsProvider().fetch(app.alloc, input);
             defer snapshot.deinit(app.alloc);
+            try writeCreditsNotice(app, snapshot);
+        }
+
+        fn startCreditsLookup(app: *App) !void {
+            // A due token still names the session; the task renews it before
+            // asking for credits.
+            const queued = app.auth.queuedPromptCredential();
+            const source = app.auth.credentialSource();
+            const renewal: ?credits_lookup.Renewal = if (source) |active|
+                if (credentials.sourceRefreshable(active) and app.auth.credentialNeedsRefresh())
+                    .{ .transport = app.auth.oauthTransport(), .source = active, .account_id = app.auth.accountId() }
+                else
+                    null
+            else
+                null;
+            const input: gateway_provider.CreditsLookupInput = .{
+                .credential = if (queued) |credential| credential.api_key else null,
+                .credential_source = source,
+                .tenant = if (queued) |credential| credential.gateway_team else null,
+            };
+            const started = app.credits_lookup.start(app.creditsProvider(), input, renewal) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                debug_trace.logf("credits", "lookup start failed err={s}", .{@errorName(err)});
+                return app.writeDomainNotice(.{
+                    .topic = "credits",
+                    .tone = .@"error",
+                    .body = "fx could not start a background task to check credits. Try again.",
+                }, true);
+            };
+            try app.writeDomainNotice(.{
+                .topic = "credits",
+                .tone = .neutral,
+                .body = switch (started) {
+                    .started => "Checking credits…",
+                    .busy => "Credits are still loading.",
+                },
+            }, true);
+        }
+
+        /// Writes the `/credits` result once its background lookup finishes,
+        /// after adopting a credential the lookup renewed.
+        pub fn collectCreditsFacts(app: *App) !void {
+            if (comptime !@hasField(App, "credits_lookup")) return;
+            var result = app.credits_lookup.take() orelse return;
+            defer result.deinit();
+            if (result.renewed) |*renewed| try app.adoptRenewedCredential(renewed);
+            try writeCreditsNotice(app, result.snapshot);
+        }
+
+        fn writeCreditsNotice(app: *App, snapshot: output_contracts.CreditsSnapshot) !void {
             const text = snapshot.renderInteractiveBody(app.alloc) catch {
                 try app.writeDomainNotice(.{
                     .topic = "credits",
