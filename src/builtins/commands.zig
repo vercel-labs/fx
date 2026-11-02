@@ -534,6 +534,8 @@ pub const launch_options = launch_wide_options ++ [_]command_specs.OptionDoc{
     .{ .flag = "--auto", .description = "" },
     .{ .flag = "--full-access", .description = "" },
     .{ .flag = "--yolo", .description = "" },
+    .{ .flag = "--profile <name>", .description = "" },
+    .{ .flag = "--instances <n>", .description = "" },
 };
 
 /// `usage: fx [--context-limit <spec>] ... <command>`, from `launch_options`,
@@ -588,6 +590,14 @@ pub const top_level_flags = [_]TopLevelFlag{
     .{
         .usage = "--effort <level>",
         .description = "Override the reasoning effort for an interactive session",
+    },
+    .{
+        .usage = "--profile <name>",
+        .description = "Run an interactive session in an agent profile from ~/.fx/agents or the repository's .fx/agents",
+    },
+    .{
+        .usage = "--instances <n>",
+        .description = "Start n fx instances in one interactive session, each with its own conversation; Down on an empty composer, Ctrl+X, or /agents lists them to switch",
     },
     .{
         .usage = "--fast, --no-fast",
@@ -683,6 +693,9 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .reset_session, .command = "/reset", .help_entry = "/reset", .completion_description = "reset the current session context", .presentation_category = .session },
     .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a saved session", .presentation_category = .session },
 
+    .{ .kind = .launch_instance, .command = "/launch", .help_entry = "/launch [profile]", .completion_description = "start another fx instance on this host", .presentation_category = .session, .has_args = true, .accepts_payload = true },
+    .{ .kind = .close_instance, .command = "/close", .help_entry = "/close", .completion_description = "close the fx instance on screen", .presentation_category = .session },
+    .{ .kind = .show_agents, .command = "/agents", .help_entry = "/agents", .completion_description = "list the open agents and switch to one", .presentation_category = .session },
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
     .{ .kind = .fork_session, .command = "/fork", .help_entry = "/fork", .completion_description = "fork the session before a prompt", .presentation_category = .session },
     .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
@@ -794,6 +807,9 @@ test "built-in slash commands register exact active order" {
         "/new",
         "/reset",
         "/resume",
+        "/launch",
+        "/close",
+        "/agents",
         "/rename",
         "/fork",
         "/login",

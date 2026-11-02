@@ -75,9 +75,9 @@ fn collectFinalityNominations(
     var nominations: std.ArrayList(FinalityNomination) = .empty;
     errdefer nominations.deinit(alloc);
 
-    const assistant_tail_entry_id: ?u32 = if (self.entries.items.len > 0) tail: {
-        const tail_index = self.entries.items.len - 1;
-        const tail_entry = self.entries.items[tail_index];
+    const assistant_tail_entry_id: ?u32 = if (self.notebook.entries.items.len > 0) tail: {
+        const tail_index = self.notebook.entries.items.len - 1;
+        const tail_entry = self.notebook.entries.items[tail_index];
         if (tail_entry != .assistant_turn or
             omitted_entry_id == tail_entry.id() or
             entryHiddenByActions(entry_actions, tail_index))
@@ -89,7 +89,7 @@ fn collectFinalityNominations(
 
     var group_terminality: std.AutoHashMapUnmanaged(types.ToolPresentationGroupId, bool) = .empty;
     defer group_terminality.deinit(alloc);
-    for (self.tool_details.items) |detail| {
+    for (self.notebook.tool_details.items) |detail| {
         if (detail.origin == .recorded) continue;
         const group = detail.presentation_group_id orelse continue;
         const result = try group_terminality.getOrPut(alloc, group);
@@ -99,7 +99,7 @@ fn collectFinalityNominations(
 
     var entry_tool_identities: std.AutoHashMapUnmanaged(u32, ToolFinalityIdentity) = .empty;
     defer entry_tool_identities.deinit(alloc);
-    for (self.tool_details.items) |detail| {
+    for (self.notebook.tool_details.items) |detail| {
         if (detail.origin == .recorded) continue;
         const identity: ToolFinalityIdentity = if (detail.presentation_group_id) |group|
             .{
@@ -121,7 +121,7 @@ fn collectFinalityNominations(
     var mutation_pin_entry_id: ?u32 = null;
     var turn_nominations: std.AutoHashMapUnmanaged(u64, ToolTurnNomination) = .empty;
     defer turn_nominations.deinit(alloc);
-    for (self.entries.items, 0..) |entry, index| {
+    for (self.notebook.entries.items, 0..) |entry, index| {
         const entry_id = entry.id();
         if (omitted_entry_id == entry_id) continue;
         if (entryHiddenByActions(entry_actions, index)) continue;
@@ -170,7 +170,7 @@ fn collectFinalityNominations(
         }
     }
 
-    for (self.entries.items, 0..) |entry, index| {
+    for (self.notebook.entries.items, 0..) |entry, index| {
         const entry_id = entry.id();
         if (omitted_entry_id == entry_id) continue;
         if (entryHiddenByActions(entry_actions, index)) continue;
@@ -295,7 +295,7 @@ pub const RetentionIdentity = struct {
     pub fn capture(self: anytype, alloc: Allocator, source: *const TranscriptPreparationSource) !RetentionIdentity {
         var extents: std.ArrayList(TextExtent) = .empty;
         errdefer extents.deinit(alloc);
-        for (self.entries.items) |entry| {
+        for (self.notebook.entries.items) |entry| {
             const bytes = switch (entry) {
                 .assistant_turn => |value| value.segments.text.items.len,
                 .raw_bytes => |value| value.bytes.len,
@@ -736,7 +736,7 @@ test "rewrite publication preserves preceding gaps without committing a new sepa
         .{ .raw_bytes = .{ .id = 1, .bytes = "live", .class = .tool_status } },
         .{ .raw_bytes = .{ .id = 3, .bytes = "new", .class = .unknown_raw } },
     };
-    const host = .{ .entries = .{ .items = &entries } };
+    const host = .{ .notebook = .{ .entries = .{ .items = &entries } } };
     var identity = try RetentionIdentity.capture(&host, alloc, &next);
     defer identity.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 4), identity.publication_release_floor);
@@ -760,7 +760,7 @@ test "rewrite publication prefix receipts exclude unpainted raw and assistant te
         const prefix = source.bytes[0..source.hard_line_starts[1]];
         var identity = try RetentionIdentity.capture(&runtime, alloc, &source);
         defer identity.deinit(alloc);
-        _ = try identity.retainPrefix(alloc, runtime.entries.items, prefix, 80);
+        _ = try identity.retainPrefix(alloc, runtime.notebook.entries.items, prefix, 80);
         const extent = for (identity.text_extents) |extent| {
             if (extent.entry_id == id) break extent;
         } else return error.MissingPublishedExtent;
@@ -1082,7 +1082,7 @@ pub fn renderCompactTranscriptBytes(
     defer projection.deinit(alloc);
     return transcript_blocks.renderEntriesWithProjectionToBytes(
         alloc,
-        self.entries.items,
+        self.notebook.entries.items,
         self.layout.cols,
         styles,
         projection.entry_actions.items,
@@ -1115,7 +1115,7 @@ pub fn prepareFullTranscriptViewportSourceInterruptible(
     else
         &.{};
     errdefer if (line_provenance.len > 0) alloc.free(line_provenance);
-    const tail_kind = tailVisibleBlockKind(self.entries.items);
+    const tail_kind = tailVisibleBlockKind(self.notebook.entries.items);
     const preview = try transcriptFlowPreviewFromSourceInterruptible(
         self,
         alloc,
@@ -1201,7 +1201,7 @@ fn prepareTranscriptSourceInternal(
     defer command_overrides.deinit(alloc);
     var compact_projection: ?tool_group_projection.Projection = null;
     defer if (compact_projection) |*projection| projection.deinit(alloc);
-    if (self.entries.items.len > 0 and self.layout.cols > 0) {
+    if (self.notebook.entries.items.len > 0 and self.layout.cols > 0) {
         compact_projection = try buildCompactTranscriptProjectionInterruptible(
             self,
             alloc,
@@ -1215,7 +1215,7 @@ fn prepareTranscriptSourceInternal(
         try buildCommandOutputActions(
             alloc,
             &command_overrides,
-            self.entries.items.len,
+            self.notebook.entries.items.len,
         )
     else
         &.{};
@@ -1228,12 +1228,12 @@ fn prepareTranscriptSourceInternal(
 
     var finality: transcript_release.Candidates = .{};
     errdefer finality.deinit(alloc);
-    if (self.entries.items.len > 0 and self.layout.cols > 0) {
+    if (self.notebook.entries.items.len > 0 and self.layout.cols > 0) {
         rendered_from_entries = true;
         const capture_provenance = true;
-        const replaceable_entry_id: ?u32 = if (self.replaceable_last_line and
-            self.entries.items[self.entries.items.len - 1] == .raw_bytes)
-            self.entries.items[self.entries.items.len - 1].raw_bytes.id
+        const replaceable_entry_id: ?u32 = if (self.notebook.replaceable_last_line and
+            self.notebook.entries.items[self.notebook.entries.items.len - 1] == .raw_bytes)
+            self.notebook.entries.items[self.notebook.entries.items.len - 1].raw_bytes.id
         else
             null;
         var finality_nominations = try collectFinalityNominations(
@@ -1251,15 +1251,15 @@ fn prepareTranscriptSourceInternal(
             finality_entry_ids[index] = nomination.entry_id;
             finality_entry_floor_bytes[index] = null;
         }
-        const summary_entry_ids = try alloc.alloc(?u32, self.folded_command_blocks.items.len);
+        const summary_entry_ids = try alloc.alloc(?u32, self.notebook.folded_command_blocks.items.len);
         defer alloc.free(summary_entry_ids);
-        for (self.folded_command_blocks.items, 0..) |block, index| {
+        for (self.notebook.folded_command_blocks.items, 0..) |block, index| {
             summary_entry_ids[index] = block.summary_entry_id;
         }
 
         const rendered = try transcript_blocks.renderEntriesForPreparationInterruptible(
             alloc,
-            self.entries.items,
+            self.notebook.entries.items,
             self.layout.cols,
             self.command_output_render.styles,
             .{
@@ -1310,9 +1310,9 @@ fn prepareTranscriptSourceInternal(
         }
         finality.tool_turn_floors = try tool_turn_floors.toOwnedSlice(alloc);
     } else {
-        bytes = try alloc.dupe(u8, self.transcript.items);
-        folded_summary_indices = try alloc.alloc(usize, self.folded_command_blocks.items.len);
-        for (self.folded_command_blocks.items, 0..) |block, index| {
+        bytes = try alloc.dupe(u8, self.notebook.transcript.items);
+        folded_summary_indices = try alloc.alloc(usize, self.notebook.folded_command_blocks.items.len);
+        for (self.notebook.folded_command_blocks.items, 0..) |block, index| {
             folded_summary_indices[index] = block.summary_transcript_index;
         }
         if (observationEnabled(self, alloc)) {
@@ -1320,10 +1320,10 @@ fn prepareTranscriptSourceInternal(
         }
     }
 
-    var replaceable_last_line = self.replaceable_last_line;
-    var replaceable_start = self.replaceable_start;
-    if (replaceable_last_line and self.entries.items.len > 0) {
-        const tail = &self.entries.items[self.entries.items.len - 1];
+    var replaceable_last_line = self.notebook.replaceable_last_line;
+    var replaceable_start = self.notebook.replaceable_start;
+    if (replaceable_last_line and self.notebook.entries.items.len > 0) {
+        const tail = &self.notebook.entries.items[self.notebook.entries.items.len - 1];
         switch (tail.*) {
             .raw_bytes => {
                 if (replaceable_entry_start_byte) |start| {
@@ -1343,9 +1343,9 @@ fn prepareTranscriptSourceInternal(
     const tail_start = if (rendered_from_entries)
         0
     else
-        cappedTailStart(bytes, self.max_transcript_bytes);
+        cappedTailStart(bytes, self.notebook.max_transcript_bytes);
     const cache_origin_untrimmed = tail_start == 0 and omitted_entry_id == null and
-        (rendered_from_entries or self.transcript_cache_origin_untrimmed);
+        (rendered_from_entries or self.notebook.transcript_cache_origin_untrimmed);
     const retained_len = bytes.len - tail_start;
     const removed_line_count = std.mem.count(u8, bytes[0..tail_start], "\n");
     const retained_origin_is_line_start =
@@ -1398,7 +1398,7 @@ fn prepareTranscriptSourceInternal(
     }
 
     const tail_kind = transcript_blocks.compactTailVisibleBlockKindForProjection(
-        self.entries.items,
+        self.notebook.entries.items,
         omitted_entry_id,
         entry_actions,
     );
@@ -1415,7 +1415,7 @@ fn prepareTranscriptSourceInternal(
     const welcome_boundary = if (tail_start == 0)
         try leadingWelcomeBoundary(
             alloc,
-            self.entries.items,
+            self.notebook.entries.items,
             self.layout.cols,
             self.command_output_render.styles,
         )
@@ -1426,7 +1426,7 @@ fn prepareTranscriptSourceInternal(
     else
         try leadingWelcomeCutLine(
             alloc,
-            self.entries.items,
+            self.notebook.entries.items,
             self.layout.cols,
             self.command_output_render.styles,
         );
@@ -1532,8 +1532,8 @@ fn buildCompactTranscriptProjectionInterruptible(
 ) !tool_group_projection.Projection {
     var projection = try tool_group_projection.buildStyledFocusedInterruptible(
         alloc,
-        self.entries.items,
-        self.tool_details.items,
+        self.notebook.entries.items,
+        self.notebook.tool_details.items,
         self.layout.cols,
         focused_entry_id,
         collapseToolCalls(self),
@@ -1587,19 +1587,19 @@ fn buildCommandOutputOverridesInterruptible(
     errdefer overrides.deinit(alloc);
     if (self.layout.cols == 0) return overrides;
 
-    if (self.tool_details.items.len > 0 or self.command_output_blocks.items.len > 0) {
-        for (self.entries.items, 0..) |entry, index| {
+    if (self.notebook.tool_details.items.len > 0 or self.notebook.command_output_blocks.items.len > 0) {
+        for (self.notebook.entries.items, 0..) |entry, index| {
             try build_checkpoint.tick(checkpoint);
             const result = try overrides.entry_indices.getOrPut(alloc, entry.id());
             if (!result.found_existing) result.value_ptr.* = index;
         }
     }
 
-    for (self.tool_details.items) |detail| {
+    for (self.notebook.tool_details.items) |detail| {
         try build_checkpoint.tick(checkpoint);
         if (!detail.isCapturedCommand()) continue;
         const entry_index = overrides.entry_indices.get(detail.entry_id) orelse continue;
-        const entry = self.entries.items[entry_index];
+        const entry = self.notebook.entries.items[entry_index];
         const raw = switch (entry) {
             .raw_bytes => |raw| raw,
             else => continue,
@@ -1621,7 +1621,7 @@ fn buildCommandOutputOverridesInterruptible(
         });
     }
 
-    for (self.command_output_blocks.items) |block| {
+    for (self.notebook.command_output_blocks.items) |block| {
         try build_checkpoint.poll(checkpoint);
         var projection = try command_output_runtime.renderCompactCommandOutputWithProcessPresentation(
             alloc,
@@ -1781,7 +1781,7 @@ pub fn foldedBlockAtTranscriptLine(
     transcript_index: usize,
 ) ?*const FoldedCommandBlock {
     if (!self.fullTranscriptActive()) return null;
-    for (self.folded_command_blocks.items, 0..) |*block, index| {
+    for (self.notebook.folded_command_blocks.items, 0..) |*block, index| {
         if (index < folded_summary_indices.len and
             folded_summary_indices[index] == transcript_index + 1)
         {
@@ -1798,7 +1798,7 @@ pub fn visibleTranscriptLineCountFromSource(
 ) usize {
     var total = transcript_total;
     if (!self.fullTranscriptActive()) return total;
-    for (self.folded_command_blocks.items, 0..) |block, index| {
+    for (self.notebook.folded_command_blocks.items, 0..) |block, index| {
         if (index >= folded_summary_indices.len) continue;
         const summary_index = folded_summary_indices[index];
         if (summary_index == 0 or summary_index > transcript_total) continue;
@@ -1847,18 +1847,20 @@ test "command output override preserves a hidden projection entry" {
 test "minimal projection does not take ownership of command output overrides" {
     const alloc = std.testing.allocator;
     const TestSource = struct {
-        entries: std.ArrayList(transcript_blocks.TranscriptEntry) = .empty,
-        tool_details: std.ArrayList(transcript_blocks.ToolDetailRecord) = .empty,
-        command_output_blocks: std.ArrayList(command_output_runtime.CommandOutputBlock) = .empty,
-        command_output_display: transcript_blocks.CommandOutputDisplayState = .{},
+        notebook: struct {
+            entries: std.ArrayList(transcript_blocks.TranscriptEntry) = .empty,
+            tool_details: std.ArrayList(transcript_blocks.ToolDetailRecord) = .empty,
+            command_output_blocks: std.ArrayList(command_output_runtime.CommandOutputBlock) = .empty,
+            command_output_display: transcript_blocks.CommandOutputDisplayState = .{},
+        } = .{},
         layout: struct { cols: u16 = 80 } = .{},
         command_output_render: command_output_runtime.CommandOutputRenderPolicy = .{},
 
         fn deinit(self: *@This(), allocator: Allocator) void {
-            for (self.command_output_blocks.items) |*block| block.deinit(allocator);
-            self.command_output_blocks.deinit(allocator);
-            self.tool_details.deinit(allocator);
-            self.entries.deinit(allocator);
+            for (self.notebook.command_output_blocks.items) |*block| block.deinit(allocator);
+            self.notebook.command_output_blocks.deinit(allocator);
+            self.notebook.tool_details.deinit(allocator);
+            self.notebook.entries.deinit(allocator);
         }
 
         fn fullTranscriptActive(_: *const @This()) bool {
@@ -1868,7 +1870,7 @@ test "minimal projection does not take ownership of command output overrides" {
 
     var source: TestSource = .{};
     defer source.deinit(alloc);
-    try source.entries.append(alloc, .{ .raw_bytes = .{
+    try source.notebook.entries.append(alloc, .{ .raw_bytes = .{
         .id = 1,
         .bytes = @constCast("original\n"),
     } });
@@ -1882,7 +1884,7 @@ test "minimal projection does not take ownership of command output overrides" {
     });
     block.total_lines = 1;
     block.retained_text_bytes = "replacement\n".len;
-    try source.command_output_blocks.append(alloc, block);
+    try source.notebook.command_output_blocks.append(alloc, block);
 
     const bytes = try renderCompactTranscriptBytes(&source, alloc);
     defer alloc.free(bytes);
