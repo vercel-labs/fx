@@ -7,7 +7,7 @@
     },
     "FX_AUTO_COMPACT_PERCENT": {
       "job": "setting-override",
-      "stability": "internal"
+      "stability": "stable"
     },
     "FX_AUTO_UPGRADE": {
       "job": "setting-override",
