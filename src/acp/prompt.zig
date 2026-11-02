@@ -439,6 +439,16 @@ const AcpContext = struct {
         try self.sendUpdate(out.writer.buffered());
     }
 
+    /// Command output reaches the client as printed when it renders terminal
+    /// escapes (`_meta.fx.ansiOutput`), and as plain text otherwise.
+    fn sendCommandOutputChunk(self: *AcpContext, tool_call_id: []const u8, chunk: []const u8) !void {
+        if (!self.state.ansi_output) return self.sendToolCallProgressText(tool_call_id, chunk);
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try acp_types.writeToolCallUpdate(&out.writer, tool_call_id, .in_progress, chunk);
+        try self.sendUpdate(out.writer.buffered());
+    }
+
     fn sendWebSearchProgress(self: *AcpContext, tool_call_id: []const u8, progress: types.WebSearchProgress) !void {
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
@@ -3266,7 +3276,7 @@ fn formatToolExecutionError(_: *anyopaque, arena: Allocator, tool_name: []const 
 fn onCommandOutputChunk(raw_ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId, _: command_output_content.Stream, chunk: []const u8) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const id = lifecycle_id orelse return;
-    try ctx.sendToolCallProgressText(id.call_id, chunk);
+    try ctx.sendCommandOutputChunk(id.call_id, chunk);
 }
 
 fn onMcpProgress(raw_ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text: []const u8) void {
@@ -4287,6 +4297,45 @@ test "ACP tool notifications preserve UTF-8 for clipped and unsafe output" {
             .{},
         );
         defer parsed.deinit();
+    }
+}
+
+test "ACP command output chunks keep ANSI only when the client asks" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const chunk = "\x1b[32mok\x1b[0m\n";
+    const expected = [_][]const u8{ "ok\n", chunk };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]bool{ false, true }, expected) |ansi_output, want| {
+        var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-ansi.jsonl", .{ .read = true, .truncate = true });
+        defer capture.close(io_mod.getIo());
+        {
+            var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+            defer state.deinit();
+            state.writer = .{ .stdout = capture };
+            state.ansi_output = ansi_output;
+            var ctx = AcpContext{
+                .alloc = alloc,
+                .state = &state,
+                .session_id = "session_1",
+            };
+            try onCommandOutputChunk(&ctx, .{ .turn_id = 1, .call_id = "call_shell" }, .stdout, chunk);
+            try capture.sync(io_mod.getIo());
+        }
+
+        var captured_file = try tmp.dir.openFile(io_mod.getIo(), "acp-ansi.jsonl", .{});
+        defer captured_file.close(io_mod.getIo());
+        const captured = try io_mod.readFileToEnd(alloc, &captured_file, 64 * 1024);
+        const line = std.mem.trimEnd(u8, captured, "\n");
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
+        const update = parsed.value.object.get("params").?.object.get("update").?.object;
+        try std.testing.expectEqualStrings("tool_call_update", update.get("sessionUpdate").?.string);
+        try std.testing.expectEqualStrings("in_progress", update.get("status").?.string);
+        const content = update.get("content").?.array.items[0].object.get("content").?.object;
+        try std.testing.expectEqualStrings(want, content.get("text").?.string);
     }
 }
 
