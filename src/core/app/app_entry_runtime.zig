@@ -1,5 +1,7 @@
 const std = @import("std");
+const profile_paths = @import("../shared/profile_paths.zig");
 const builtin = @import("builtin");
+const app_lifecycle = @import("app_lifecycle.zig");
 const app_process_runtime = @import("app_process_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
@@ -8,6 +10,7 @@ const cli_surface = @import("../cli/cli_surface.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const output_contracts = @import("../output/output_contracts.zig");
 const credentials = @import("../auth/credentials.zig");
 const process_provider = @import("../execution/process_provider.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
@@ -16,6 +19,8 @@ const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
+const terminal_env = @import("../shared/terminal_env.zig");
+const vt_emulator = @import("../terminal/engine.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const context_contract = @import("../workspace/context_contract.zig");
@@ -158,7 +163,7 @@ fn runWithDeps(comptime App: type, alloc: Allocator, args: []const [:0]const u8,
 
 pub fn runBeforeInteractive(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !BeforeInteractiveResult {
     const run_result = cli_surface.runIfRequested(alloc, args, cliSurfaceConfig(cfg)) catch |err| switch (err) {
-        error.UnknownCliCommand => return .{ .exit = 1 },
+        error.UnknownCliCommand => return .{ .exit = output_contracts.usage_exit_code },
         else => {
             tryWriteErrorMessage(.{}, err);
             return .{ .exit = 1 };
@@ -170,7 +175,7 @@ pub fn runBeforeInteractive(alloc: Allocator, args: []const [:0]const u8, cfg: C
 
 fn runBeforeInteractiveWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Config, deps: RunDeps) !BeforeInteractiveResult {
     const run_result = deps.run_if_requested(deps.cli_ctx, alloc, args, cliSurfaceConfig(cfg)) catch |err| switch (err) {
-        error.UnknownCliCommand => return .{ .exit = 1 },
+        error.UnknownCliCommand => return .{ .exit = output_contracts.usage_exit_code },
         else => {
             tryWriteErrorMessage(deps, err);
             return .{ .exit = 1 };
@@ -226,6 +231,10 @@ fn initFailure(deps: RunDeps, launch: *cli_surface.InteractiveLaunch, alloc: All
     switch (err) {
         error.NotATerminal => {
             writeStderr(deps, "fx requires an interactive terminal (TTY).\n");
+            return .{ .exit = 1 };
+        },
+        error.DumbTerminal => {
+            writeStderr(deps, "fx: TERM=dumb can't show the interactive session; use fx ask, or run fx in a terminal that supports cursor movement\n");
             return .{ .exit = 1 };
         },
         error.TerminalTooSmall => {
@@ -302,6 +311,9 @@ fn initFailure(deps: RunDeps, launch: *cli_surface.InteractiveLaunch, alloc: All
 
 fn runInteractiveWithDeps(comptime App: type, comptime cooperative: bool, app: *App, alloc: Allocator, launch: *cli_surface.InteractiveLaunch, auth_mode: credentials.AuthMode, deps: RunDeps) !RunOutcome {
     var resume_requested = launch.requested_resume != null;
+    // NO_COLOR keeps the session and removes its colors. Set before
+    // the session starts any other thread.
+    if (terminal_env.noColor()) vt_emulator.colors_enabled = false;
     app.* = App.init(alloc, launch, auth_mode) catch |first_err| fresh: {
         // An update relaunched a session that had no turn, which v2 never
         // saved (D2): the new build opens a fresh session instead (D81).
@@ -545,7 +557,7 @@ fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
 /// for any other error.
 fn v2StorageFaultMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
-        error.AccessDenied => "fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n",
+        error.AccessDenied => profile_paths.displayText("fx: this session cannot be opened for writing: permission denied. Check the permissions under ~/.fx/sessions/v2, then resume again.\n"),
         error.ReadOnlyFileSystem => "fx: this session cannot be opened for writing: the disk is read-only.\n",
         error.NoSpaceLeft => "fx: this session cannot be saved: the disk is full. Free some space, then resume again.\n",
         error.FileTooBig => "fx: this session cannot be saved: a file-size limit was reached.\n",

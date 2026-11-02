@@ -325,7 +325,6 @@ pub const ModelRecoveryCause = enum {
     provider_stream_timeout,
     provider_unavailable,
     rate_limited,
-    system_resumed,
     authentication,
     request_limit_reached,
     compaction_prepared,
@@ -361,7 +360,6 @@ pub const ModelFailureDiagnostic = struct {
             .provider_stream_timeout => "gateway_stream_timeout",
             .provider_unavailable => "provider_error",
             .rate_limited => "HTTP 429",
-            .system_resumed => "SystemResumed",
             .authentication => "AuthenticationExpired",
             .request_limit_reached => "ProviderRequestLimitReached",
             .compaction_prepared => "CompactionPrepared",
@@ -668,7 +666,6 @@ pub const RouteRecoveryStatus = struct {
             .provider_stream_timeout => "Gateway stream timed out",
             .provider_unavailable => "Provider unavailable",
             .rate_limited => "Rate limited",
-            .system_resumed => "Mac woke from sleep",
             .authentication => "Authentication expired",
             .request_limit_reached => "Provider request limit reached",
             .compaction_prepared => "Saved compaction",
@@ -2411,6 +2408,16 @@ pub const PermissionMode = enum {
             std.ascii.eqlIgnoreCase(raw, "full access") or
             std.ascii.eqlIgnoreCase(raw, "yolo")) return .yolo;
         return null;
+    }
+
+    /// The name fx saves and prints: `ask`, `auto`, or `full-access`.
+    /// `parse` still reads the older `yolo`.
+    pub fn label(self: PermissionMode) []const u8 {
+        return switch (self) {
+            .ask => "ask",
+            .auto => "auto",
+            .yolo => "full-access",
+        };
     }
 };
 

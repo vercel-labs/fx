@@ -1261,6 +1261,28 @@ test "full transcript page navigation preserves tail intent while the page loads
     try std.testing.expectEqual(@as(u32, 0), runtime.full_transcript.scroll_rows);
 }
 
+test "stopping background loads joins a full transcript load still running" {
+    var runtime = TranscriptRuntime{ .layout = testLayoutWithRows(12) };
+    runtime.layout.cols = 60;
+    defer runtime.deinit(std.testing.allocator);
+    try runtime.full_transcript_page_load.schedule(.{
+        .request = .{
+            .content_revision = 0,
+            .cols = 60,
+            .anchor = .tail,
+        },
+        .range = .{ .start = 0, .end = 0 },
+        .styles = .{},
+    });
+    try std.testing.expect(runtime.full_transcript_page_load.busy());
+
+    runtime.stopBackgroundLoads();
+    try std.testing.expect(!runtime.full_transcript_page_load.busy());
+    try std.testing.expect(!runtime.full_transcript_window_load.busy());
+    // The later teardown finds nothing left to join.
+    runtime.stopBackgroundLoads();
+}
+
 test "cancelled full transcript page completion is never installed" {
     var runtime = TranscriptRuntime{ .layout = testLayoutWithRows(12) };
     runtime.layout.cols = 60;
@@ -4669,6 +4691,16 @@ pub const TranscriptRuntime = struct {
     ) void {
         std.debug.assert(self.shadow_vt == null);
         self.detached_commit_alloc = alloc;
+    }
+
+    /// Ends the full-detail loads and waits for their threads. They read
+    /// saved results through the session store, so they must stop before a
+    /// process exit closes it under them.
+    pub fn stopBackgroundLoads(self: *TranscriptRuntime) void {
+        self.full_transcript_window_load.cancelActive();
+        self.full_transcript_page_load.cancelActive();
+        self.full_transcript_window_load.deinit();
+        self.full_transcript_page_load.deinit();
     }
 
     pub fn deinit(self: *TranscriptRuntime, alloc: Allocator) void {

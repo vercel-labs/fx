@@ -37,6 +37,7 @@
     {"name": "shell_parity", "module": "fx", "test": "shell parity holds for generated commands", "iterations": 600},
     {"name": "command_lex", "module": "fx", "test": "lexing generated commands is consistent and round-trips through quoting", "iterations": 2700000},
     {"name": "command_classification", "module": "fx", "test": "classifying generated commands stays inside the command and agrees with the lexer", "iterations": 4800000},
+    {"name": "cli_flags", "module": "fx", "test": "the flag parser keeps its laws on fuzzed command lines", "iterations": 1200000},
     {"name": "ask_questions_text", "module": "fx", "test": "ask_user_question questions sent as JSON text decode or refuse arbitrary bytes", "iterations": 250000}
   ]
 }

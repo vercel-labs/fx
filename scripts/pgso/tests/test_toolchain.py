@@ -52,8 +52,6 @@ esac""")
             "llvm-profdata",
             "llvm-ar",
             "llvm-nm",
-            "llvm-link",
-            "llvm-split",
         ):
             self.write_llvm_tool(name)
         self.write_clang()
@@ -117,14 +115,6 @@ esac"""
         )
         self.assertEqual((self.llvm_bin / "llvm-ar").resolve(), toolchain.llvm_ar)
         self.assertEqual((self.llvm_bin / "llvm-nm").resolve(), toolchain.llvm_nm)
-        self.assertEqual(
-            (self.llvm_bin / "llvm-link").resolve(),
-            toolchain.llvm_link,
-        )
-        self.assertEqual(
-            (self.llvm_bin / "llvm-split").resolve(),
-            toolchain.llvm_split,
-        )
         self.assertEqual((self.llvm_bin / "clang").resolve(), toolchain.clang)
         self.assertEqual(self.libllvm.resolve(), toolchain.libllvm)
         self.assertEqual(IR_SIZE_SCRIPT, toolchain.ir_size)

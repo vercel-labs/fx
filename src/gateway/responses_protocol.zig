@@ -6,6 +6,7 @@ const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const types = @import("../core/shared/types.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
+const json_depth = @import("json_depth.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
@@ -916,6 +917,9 @@ pub const Reducer = struct {
                 limits.aggregate_bytes,
             );
         }
+        // fx serializes parts of an event, such as a reasoning item or a tool
+        // input, and std.json.Stringify aborts past 256 levels.
+        if (json_depth.exceeds(json_text)) return error.InvalidEvent;
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.InvalidEvent,
@@ -1865,6 +1869,15 @@ test "Responses terminal failures retain provider diagnostics as outcomes" {
         try std.testing.expectEqual(types.ProviderFinishReason.provider_error, completion.finish_reason.?);
         try std.testing.expectEqualStrings("server_error: temporarily unavailable", completion.provider_failure_detail.?);
     }
+}
+
+test "Responses events nested past the depth limit are invalid" {
+    var stream = ToolRecordTest.init(std.testing.allocator);
+    defer stream.deinit();
+    // fx serializes a whole completed reasoning item, so one field 300 levels
+    // deep aborted fx.
+    const deep = text_utils.repeat("{\"a\":", 300) ++ "0" ++ text_utils.repeat("}", 300);
+    try std.testing.expectError(error.InvalidEvent, stream.apply("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_deep\",\"summary\":[],\"encrypted_content\":\"opaque\",\"extra\":" ++ deep ++ "}}"));
 }
 
 test "Responses terminal incomplete event does not require nested status" {

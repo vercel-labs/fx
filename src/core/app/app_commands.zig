@@ -1,4 +1,5 @@
 const std = @import("std");
+const profile_paths = @import("../shared/profile_paths.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
@@ -8,6 +9,7 @@ const io_mod = @import("../shared/io.zig");
 const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
+const credits_lookup = @import("credits_lookup.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const host = @import("../hosts/host.zig");
 const change_tracker_mod = @import("../workspace/change_tracker.zig");
@@ -289,6 +291,7 @@ pub fn Handlers(comptime App: type) type {
                 .login = commandLogin,
                 .logout = commandLogout,
                 .provider = commandProvider,
+                .setup_alias = commandSetupAlias,
                 .show_status = commandShowStatus,
                 .attach_image = commandAttachImage,
                 .manage_images = commandManageImages,
@@ -306,10 +309,9 @@ pub fn Handlers(comptime App: type) type {
                 .create_trace = commandCreateTrace,
                 .compact_history = commandCompactHistory,
                 .handle_settings = commandHandleSettings,
-                .handle_alias = commandHandleAlias,
                 .show_credits = commandShowCredits,
                 .paste_clipboard = commandPasteClipboard,
-                .toggle_fast = commandToggleFast,
+                .handle_fast = commandHandleFast,
                 .handle_ultrafast = commandHandleUltrafast,
                 .handle_statusline = commandHandleStatusline,
                 .rename_session = commandRenameSession,
@@ -339,10 +341,8 @@ pub fn Handlers(comptime App: type) type {
 
         pub fn collectMcpHostFacts(app: *App) !void {
             if (comptime !@hasDecl(App, "takeMcpHostNotices")) return;
-            app.applyMcpHostReload() catch |err| {
-                debug_trace.logf("mcp", "MCP reload failed err={s}", .{@errorName(err)});
-                try app.writeDomainNotice(.{ .topic = "mcp", .tone = .warning, .body = "The MCP config changed, but fx couldn't load it again. Your current servers are still active." }, true);
-            };
+            // A reload that fails leaves its warning among the notices.
+            app.applyMcpHostReload();
             const notices = app.takeMcpHostNotices();
             defer {
                 for (notices) |n| std.heap.c_allocator.free(n.text);
@@ -476,6 +476,17 @@ pub fn Handlers(comptime App: type) type {
             if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
             app.input_runtime.help_menu.open();
             app.shell.render_requests.request(.footer);
+        }
+
+        /// `/setup` is the deprecated alias of `/provider`.
+        fn commandSetupAlias(ctx: *anyopaque) !void {
+            const app: *App = @ptrCast(@alignCast(ctx));
+            try app.writeDomainNotice(.{
+                .topic = "",
+                .tone = .warning,
+                .body = "/setup " ++ command_specs.deprecated_until ++ "; use /login to sign in or add an API key, or /provider to choose a provider",
+            }, true);
+            try commandProvider(ctx);
         }
 
         fn commandLogin(ctx: *anyopaque) !void {
@@ -1095,6 +1106,7 @@ pub fn Handlers(comptime App: type) type {
                 .topic = "skills",
                 .tone = .warning,
                 .body = body,
+                .visibility = .full_only,
             }, true);
         }
 
@@ -1250,26 +1262,73 @@ pub fn Handlers(comptime App: type) type {
             try session_commands.Commands(App).handleSettings(app, rest);
         }
 
-        fn commandHandleAlias(ctx: *anyopaque, _: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            try app.writeDomainNotice(.{
-                .topic = "aliases",
-                .tone = .neutral,
-                .body = "Aliases are not yet configurable.",
-            }, true);
-        }
-
         fn commandShowCredits(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            var snapshot = app.creditsProvider().fetch(app.alloc, .{
+            // The lookup runs in a `std.Io` task so a slow Gateway or issuer
+            // never holds the input loop; `collectCreditsFacts` writes its result.
+            if (comptime @hasField(App, "credits_lookup") and !@import("builtin").single_threaded) {
+                return startCreditsLookup(app);
+            }
+            const input: gateway_provider.CreditsLookupInput = .{
                 .credential = app.auth.apiKey(),
                 .credential_source = if (comptime @hasDecl(@TypeOf(app.auth), "credentialSource"))
                     app.auth.credentialSource()
                 else
                     null,
                 .tenant = app.auth.gatewayTeam(),
-            });
+            };
+            var snapshot = app.creditsProvider().fetch(app.alloc, input);
             defer snapshot.deinit(app.alloc);
+            try writeCreditsNotice(app, snapshot);
+        }
+
+        fn startCreditsLookup(app: *App) !void {
+            // A due token still names the session; the task renews it before
+            // asking for credits.
+            const queued = app.auth.queuedPromptCredential();
+            const source = app.auth.credentialSource();
+            const renewal: ?credits_lookup.Renewal = if (source) |active|
+                if (credentials.sourceRefreshable(active) and app.auth.credentialNeedsRefresh())
+                    .{ .transport = app.auth.oauthTransport(), .source = active, .account_id = app.auth.accountId() }
+                else
+                    null
+            else
+                null;
+            const input: gateway_provider.CreditsLookupInput = .{
+                .credential = if (queued) |credential| credential.api_key else null,
+                .credential_source = source,
+                .tenant = if (queued) |credential| credential.gateway_team else null,
+            };
+            const started = app.credits_lookup.start(app.creditsProvider(), input, renewal) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                debug_trace.logf("credits", "lookup start failed err={s}", .{@errorName(err)});
+                return app.writeDomainNotice(.{
+                    .topic = "credits",
+                    .tone = .@"error",
+                    .body = "fx could not start a background task to check credits. Try again.",
+                }, true);
+            };
+            try app.writeDomainNotice(.{
+                .topic = "credits",
+                .tone = .neutral,
+                .body = switch (started) {
+                    .started => "Checking credits…",
+                    .busy => "Credits are still loading.",
+                },
+            }, true);
+        }
+
+        /// Writes the `/credits` result once its background lookup finishes,
+        /// after adopting a credential the lookup renewed.
+        pub fn collectCreditsFacts(app: *App) !void {
+            if (comptime !@hasField(App, "credits_lookup")) return;
+            var result = app.credits_lookup.take() orelse return;
+            defer result.deinit();
+            if (result.renewed) |*renewed| try app.adoptRenewedCredential(renewed);
+            try writeCreditsNotice(app, result.snapshot);
+        }
+
+        fn writeCreditsNotice(app: *App, snapshot: output_contracts.CreditsSnapshot) !void {
             const text = snapshot.renderInteractiveBody(app.alloc) catch {
                 try app.writeDomainNotice(.{
                     .topic = "credits",
@@ -1291,9 +1350,9 @@ pub fn Handlers(comptime App: type) type {
             try image_commands.Commands(App).attachClipboard(app);
         }
 
-        fn commandToggleFast(ctx: *anyopaque) !void {
+        fn commandHandleFast(ctx: *anyopaque, rest: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try session_commands.Commands(App).toggleFast(app);
+            try session_commands.Commands(App).handleFast(app, rest);
         }
 
         fn commandHandleUltrafast(ctx: *anyopaque, rest: []const u8) !void {
@@ -4433,7 +4492,7 @@ test "skills list opens menu without transcript inventory" {
     try std.testing.expect(std.mem.find(u8, rendered, "Visible skills (") == null);
 }
 
-test "skills list reports a bounded discovery warning with an escaped candidate path" {
+test "skills list keeps a bounded discovery warning in the full transcript only" {
     const alloc = std.testing.allocator;
     const skill_diagnostics = [_]skill_runtime.SkillDiagnostic{.{
         .path = "/tmp/hostile\npath/body-sentinel",
@@ -4455,12 +4514,13 @@ test "skills list reports a bounded discovery warning with an escaped candidate 
     const notice = app.shell.entries.items[0].semantic_notice;
     try std.testing.expectEqualStrings("skills", notice.topic);
     try std.testing.expectEqual(types.NoticeTone.warning, notice.tone);
+    try std.testing.expectEqual(types.NoticeVisibility.full_only, notice.visibility);
     try std.testing.expect(std.mem.find(u8, notice.body, "skill discovery warning:") != null);
     try std.testing.expect(std.mem.find(u8, notice.body, "hostile&#x0a;path/body-sentinel") != null);
     try std.testing.expect(std.mem.find(u8, notice.body, "metadata is invalid (missing_name)") != null);
     const rendered = try transcript_runtime.renderEntriesToBytes(alloc, app.shell.entries.items, 80, .{});
     defer alloc.free(rendered);
-    try std.testing.expect(std.mem.find(u8, rendered, "! skills: skill discovery warning:") != null);
+    try std.testing.expect(std.mem.find(u8, rendered, "skill discovery warning:") == null);
 }
 
 test "skills show focuses matching menu row without transcript body" {

@@ -136,7 +136,7 @@ describe.skipIf(SKIP)("tui: logical-line deletion", () => {
         writeFileSync(stderrPath, "");
 
         session = await TmuxSession.create({
-          cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_SKIP_ONBOARDING=1 ${FX_BIN} 2>${stderrPath}`,
+          cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_TEST_SKIP_ONBOARDING=1 ${FX_BIN} 2>${stderrPath}`,
           cwd: workDir,
           width: 120,
           height: 40,

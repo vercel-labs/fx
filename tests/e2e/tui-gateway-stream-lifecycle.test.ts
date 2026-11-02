@@ -131,7 +131,7 @@ for (const { cancelBeforeConsumption, lateFeedback } of [
   const options = { cwd: workspace, width: 120, height: 40, stderrPath: stderr, isolated: true, remainOnExit: true,
     env: { HOME: home, AI_GATEWAY_API_KEY: "fake-child-steering", FX_DISABLE_KEYCHAIN: "1",
       FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access",
-      FX_GATEWAY_BASE_URL: host.baseUrl, FX_GATEWAY_CHAT_URL: host.chatUrl, FX_E2E_GATEWAY_CHAT_URL: host.chatUrl,
+      FX_GATEWAY_BASE_URL: host.baseUrl, FX_GATEWAY_CHAT_URL: host.chatUrl, FX_TEST_GATEWAY_CHAT_URL: host.chatUrl,
       FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "agent,worker,tool,subagent,permission,session,input,interrupt" } };
   session = await TmuxSession.create(options);
   let parentId = "";
@@ -1362,7 +1362,7 @@ async function runCanonicalLifecycleFixture(
       FX_AUTO_UPGRADE: "0",
       FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
       FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-      FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+      FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
       FX_MODEL: MODEL,
       FX_TRACE_LOG: tracePath,
       FX_TRACE_SCOPES: undefined,
@@ -1416,7 +1416,7 @@ async function runCanonicalLifecycleFixture(
     reachedFinal = settled.matched;
     if (reachedFinal) {
       await session.sendText("/help");
-      const help = await waitForPaneOrDone(session, "Commands 38", donePath);
+      const help = await waitForPaneOrDone(session, "Commands 37", donePath);
       helpVisible = help.matched;
       requestCountAfterHelp = queuedGateway.requests.length;
       if (helpVisible) {
@@ -1545,8 +1545,8 @@ async function launchRouteRecoveryTui(
       FX_PERMISSION_MODE: "auto",
       FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
       FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-      FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-      FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+      FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+      FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
       FX_MODEL: model,
     },
   });
@@ -1587,6 +1587,63 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(readFileSync(stderrPath, "utf8")).toBe("");
   }, TIMEOUT * 2);
 
+  test("a reply whose limit ran out before a cut-off tool call is resent and the turn finishes", async () => {
+    const sentinel = "cut-call-ran.txt";
+    const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+      "fx-tui-length-resend-",
+      [
+        () => fakeGatewaySse([
+          { type: "reasoning-start", id: "spent" },
+          { type: "reasoning-delta", id: "spent", delta: "thinking until the limit runs out" },
+          { type: "reasoning-end", id: "spent" },
+          { type: "tool-input-start", id: "cut_call", toolName: "shell" },
+          {
+            type: "tool-call",
+            toolCallId: "cut_call",
+            toolName: "shell",
+            input: { request: { action: "run", command: `printf ran > ${sentinel}` } },
+          },
+          { type: "finish", finishReason: { unified: "length", raw: "length" } },
+        ]),
+        () => fakeGatewayFinalText("AFTER_LENGTH_RESEND"),
+        () => fakeGatewayFinalText("LATER_PROMPT_OK"),
+      ],
+      {
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["tool-use", "reasoning"],
+          context_window: 1_050_000,
+          max_tokens: 128_000,
+          reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
+        }],
+      },
+    );
+    await session!.sendText("Write the versioned test file.");
+    await session!.waitForText("AFTER_LENGTH_RESEND", TIMEOUT);
+    await session!.waitForStableComposer(TIMEOUT);
+    expect(queuedGateway.requests).toHaveLength(2);
+    expect(JSON.parse(queuedGateway.requests[0]!.body).reasoning).toBeUndefined();
+    expect(JSON.parse(queuedGateway.requests[1]!.body).reasoning).toBe("low");
+    expect(existsSync(join(root!, "workspace", sentinel))).toBe(false);
+    const scrollback = await session!.captureFullScrollback();
+    // The notice wraps at the pane's width.
+    expect(scrollback.replace(/\s+/g, " ")).toContain("Retrying with low effort.");
+    expect(scrollback).not.toContain("did not run them");
+    expect(scrollback).not.toContain("response hit provider length limit");
+    expect(scrollback).not.toContain("UnknownToolLifecycleIdentity");
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+    await session!.sendText("Confirm a later prompt is still usable.");
+    await session!.waitForText("LATER_PROMPT_OK", TIMEOUT);
+    await session!.waitForStableComposer(TIMEOUT);
+    // The later prompt goes back to the selected effort.
+    expect(queuedGateway.requests).toHaveLength(3);
+    expect(JSON.parse(queuedGateway.requests[2]!.body).reasoning).toBeUndefined();
+    await session!.sendText("/quit");
+    expect(await session!.waitForSessionEnd(TIMEOUT)).toBe(true);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, TIMEOUT * 2);
+
   test("trace report explains a rejected image when the model catalog is unavailable", async () => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-trace-catalog-")));
     const home = join(root, "home");
@@ -1619,8 +1676,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_PERMISSION_MODE: "auto",
         FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: MODEL,
       },
     });
@@ -1707,8 +1764,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_PERMISSION_MODE: "auto",
         FX_GATEWAY_BASE_URL: catalogGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: catalogGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: catalogGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${catalogGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_CHAT_URL: catalogGateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${catalogGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: MODEL,
       },
     });
@@ -1803,8 +1860,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_PERMISSION_MODE: "auto",
         FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: undefined,
       },
     });
@@ -1830,7 +1887,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     // The first launch stored the configured model with Fast mode off; the
     // resume leg's flags must win over those stored preferences for this launch.
     session = await TmuxSession.create({
-      cmd: `${FX_BIN} --fast --effort low --model ${LAUNCH_MODEL} --resume-last`,
+      cmd: `${FX_BIN} --fast --effort low --model ${LAUNCH_MODEL} --resume last`,
       cwd: workspace,
       width: 72,
       height: 24,
@@ -1844,8 +1901,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_PERMISSION_MODE: "auto",
         FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: undefined,
       },
     });
@@ -2137,7 +2194,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "yolo",
           FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -2458,7 +2515,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
           FX_MODEL: MODEL,
         },
       });
@@ -2501,7 +2558,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "provider route recovery counts down and accepts slow response headers",
+    "provider route recovery counts down, then shows the thinking row while the resend waits on silent headers",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-route-recovery-")));
       const home = join(root, "home");
@@ -2538,7 +2595,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
           FX_MODEL: MODEL,
         },
       });
@@ -2554,20 +2611,27 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => queuedGateway.requests.length === 2,
         "silent-head retry request",
       );
-      // While the resend waits on its silent head, the retrying row keeps
-      // counting on its own: the in-flight ticker refreshes it every second.
-      await session.waitForText("• Gateway error · retrying · attempt 2 · 6s", TIMEOUT);
-      await session.waitForText("• Gateway error · retrying · attempt 2 · 8s", TIMEOUT);
+      // The resend shows its retry status briefly. Its bullet blinks, so match
+      // the text alone.
+      await session.waitForText("Gateway error · retrying · attempt 2", TIMEOUT);
+      // The gateway sends no headers while a model thinks, so the response
+      // stays silent. The thinking row takes the line back instead of
+      // leaving "retrying" over a healthy connection.
+      await session.waitForPane(
+        (pane) => pane.includes("Thinking") && !pane.includes("retrying"),
+        TIMEOUT,
+      );
+      expect(queuedGateway.requests.length).toBe(2);
 
       const inFlightPane = await session.capturePane();
-      expect(inFlightPane).toContain("• Gateway error · retrying · attempt 2 · ");
+      expect(inFlightPane).not.toContain("Gateway error");
       expect(inFlightPane).not.toContain("next try in");
       expect(inFlightPane).not.toContain("attempt 2/");
 
       await session.resizeWindow(32, 24);
       const narrowPane = await session.capturePane();
-      expect(narrowPane).toContain("• Gateway error");
-      expect(narrowPane).not.toContain("attempt 2/");
+      expect(narrowPane).toContain("Thinking");
+      expect(narrowPane).not.toContain("retrying");
       expect(narrowPane).not.toContain("▲");
 
       await session.resizeWindow(72, 24);
@@ -2707,9 +2771,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await waitForCondition(() => continued.started, "autonomous continued response");
       expect(queuedGateway.requests).toHaveLength(11);
 
-      // The admitted retry keeps the recovery status instead of a fresh
-      // Thinking phase.
-      await session!.waitForText("• Gateway error · retrying · attempt 11", TIMEOUT);
+      // The resend shows its retry status, then the thinking row takes the
+      // line back while the held response stays silent. The bullet blinks,
+      // so match the text alone.
+      await session!.waitForText("Gateway error · retrying · attempt 11", TIMEOUT);
+      await session!.waitForPane((pane) => pane.includes("Thinking") && !pane.includes("retrying"), TIMEOUT);
       continued.release?.();
       try {
         await session!.waitForText(finalText, TIMEOUT);
@@ -2801,7 +2867,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         session = null;
         const resumedStderr = join(root!, "resumed-stderr.log");
         session = await TmuxSession.create({
-          cmd: `${FX_BIN} --resume-last`,
+          cmd: `${FX_BIN} --resume last`,
           cwd: join(root!, "workspace"),
           width: 100,
           height: 32,
@@ -2813,8 +2879,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             FX_PERMISSION_MODE: "auto",
             FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
             FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-            FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-            FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
             FX_MODEL: MODEL,
           },
         });
@@ -2823,9 +2889,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         // again on its own (`tests/tla/recovery/Resume.tla` AutoResumes).
         await waitForCondition(() => resumed.started, "admitted resumed response");
         await session.waitForText("Resuming the interrupted request", TIMEOUT);
-        // Until the first byte arrives, the status row says which attempt is
-        // resuming the request.
+        // Right after the send, the status row says which attempt is
+        // resuming the request; then the thinking row takes the line back.
         await session.waitForText("Resuming the interrupted request · attempt", TIMEOUT);
+        await session.waitForPane((pane) => pane.includes("Thinking") && !pane.includes("· attempt"), TIMEOUT);
         expect(queuedGateway.requests).toHaveLength(3);
 
         if (outcome === "finish") {
@@ -2976,7 +3043,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       session = null;
       const resumedStderrPath = join(root!, "resumed-stderr.log");
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: join(root!, "workspace"),
         width: 72,
         height: 24,
@@ -2990,8 +3057,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: directFastModel,
         },
       });
@@ -3303,7 +3370,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         session = null;
         const resumedStderr = join(root!, "resumed-stderr.log");
         session = await TmuxSession.create({
-          cmd: `${FX_BIN} --resume-last`,
+          cmd: `${FX_BIN} --resume last`,
           cwd: join(root!, "workspace"),
           width: 72,
           height: 24,
@@ -3316,8 +3383,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             FX_PERMISSION_MODE: "auto",
             FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
             FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-            FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-            FX_E2E_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+            FX_TEST_GATEWAY_MODELS_URL: `${queuedGateway.baseUrl}/coding-agent/v1/models`,
             FX_MODEL: MODEL,
           },
         });
@@ -3506,7 +3573,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -3584,7 +3651,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: streamingGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: streamingGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: streamingGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: streamingGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -3655,7 +3722,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: heldGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: heldGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: heldGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -3756,7 +3823,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: queuedGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: queuedGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -3835,7 +3902,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: heldGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: heldGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: heldGateway.chatUrl,
           FX_MODEL: MODEL,
         },
       });
@@ -3916,7 +3983,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: heldGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: heldGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: heldGateway.chatUrl,
           FX_MODEL: MODEL,
         },
       });
@@ -4010,7 +4077,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: splitGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: splitGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: splitGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: splitGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -4182,7 +4249,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "yolo",
           FX_GATEWAY_BASE_URL: recoveryGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: recoveryGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: recoveryGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: recoveryGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker,input,tool,scroll,frame_schedule",
@@ -4283,7 +4350,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_SOUND: "0",
           FX_GATEWAY_BASE_URL: lateTailGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: lateTailGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: lateTailGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: lateTailGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,gateway,stream,worker,input,prompt",
@@ -4409,7 +4476,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "yolo",
           FX_GATEWAY_BASE_URL: handoffGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: handoffGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: handoffGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: handoffGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
@@ -4507,7 +4574,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "yolo",
           FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
@@ -4654,8 +4721,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "yolo",
           FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${steeringGateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${steeringGateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: MODEL,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
@@ -4756,7 +4823,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "yolo",
           FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt",
@@ -4832,7 +4899,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "yolo",
           FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "agent,worker,input,tool,interrupt,history",
@@ -4939,8 +5006,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: steeringGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${steeringGateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CHAT_URL: steeringGateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${steeringGateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -5074,7 +5141,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: heldGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: heldGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: heldGateway.chatUrl,
           FX_MODEL: MODEL,
         },
       });
@@ -5172,7 +5239,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: heldGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: heldGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: heldGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: heldGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -5270,7 +5337,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: fakeGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: fakeGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -5529,7 +5596,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: scrollback_gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: scrollback_gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: scrollback_gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: scrollback_gateway.chatUrl,
           FX_MODEL: MODEL,
         },
       });
@@ -5629,7 +5696,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: readGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: readGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: readGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: readGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES: "tool",
@@ -5692,7 +5759,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: phase_gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: phase_gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: phase_gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: phase_gateway.chatUrl,
           FX_MODEL: MODEL,
         },
       });
@@ -5804,7 +5871,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: tableGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: tableGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: tableGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: tableGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -5916,7 +5983,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
               FX_PERMISSION_MODE: "ask",
               FX_GATEWAY_BASE_URL: mcpGateway.baseUrl,
               FX_GATEWAY_CHAT_URL: mcpGateway.chatUrl,
-              FX_E2E_GATEWAY_CHAT_URL: mcpGateway.chatUrl,
+              FX_TEST_GATEWAY_CHAT_URL: mcpGateway.chatUrl,
               FX_MODEL: MODEL,
             },
           });
@@ -6022,7 +6089,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "ask",
           FX_GATEWAY_BASE_URL: mcpGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: mcpGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: mcpGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: mcpGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_SOUND: "0",
         },
@@ -6107,7 +6174,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: refreshGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: refreshGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: refreshGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: refreshGateway.chatUrl,
           FX_MODEL: MODEL,
           FX_RECORD: tapePath,
         },
@@ -6235,7 +6302,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_PERMISSION_MODE: "auto",
         FX_GATEWAY_BASE_URL: unsupportedGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: unsupportedGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: unsupportedGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: unsupportedGateway.chatUrl,
         FX_MODEL: MODEL,
         FX_TRACE_LOG: tracePath,
         FX_TRACE_SCOPES: "tool,core",
@@ -6312,7 +6379,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       session = null;
 
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: workspace,
         width: 100,
         height: 30,
@@ -6385,7 +6452,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: childGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: childGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: childGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: childGateway.chatUrl,
           FX_MODEL: MODEL,
         },
       });
@@ -6458,7 +6525,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_PERMISSION_MODE: "auto",
         FX_GATEWAY_BASE_URL: childGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: childGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: childGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: childGateway.chatUrl,
         FX_MODEL: MODEL,
       };
       session = await TmuxSession.create({ cwd: workspace, env, stderrPath, width: 110, height: 35 });
@@ -6583,7 +6650,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_PERMISSION_MODE: "auto",
         FX_GATEWAY_BASE_URL: rowGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: rowGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: rowGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: rowGateway.chatUrl,
         FX_MODEL: MODEL,
       };
       session = await TmuxSession.create({ cwd: workspace, env, width: 110, height: 35, stderrPath });
@@ -6671,7 +6738,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_PERMISSION_MODE: "auto",
         FX_GATEWAY_BASE_URL: rowGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: rowGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: rowGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: rowGateway.chatUrl,
         FX_MODEL: MODEL,
       };
       session = await TmuxSession.create({ cwd: workspace, env, width: 110, height: 35, stderrPath });
@@ -6715,7 +6782,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
         await session.kill();
-        session = await TmuxSession.create({ cmd: `${FX_BIN} --resume-last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
+        session = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
         await session.waitForText(finalText, TIMEOUT);
         const resumed = await session.captureFullScrollback();
         expect(resumed).toContain("● 5 tool calls · 4 subagents · 1 read");
@@ -6810,7 +6877,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_PERMISSION_MODE: "auto",
         FX_GATEWAY_BASE_URL: summaryGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: summaryGateway.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: summaryGateway.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: summaryGateway.chatUrl,
         FX_MODEL: MODEL,
         FX_TRACE_LOG: tracePath,
         FX_TRACE_SCOPES: "tool",
@@ -6897,7 +6964,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       session = null;
 
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: workspace,
         width: 120,
         height: 30,
@@ -6945,7 +7012,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           FX_PERMISSION_MODE: "auto",
           FX_GATEWAY_BASE_URL: linkGateway.baseUrl,
           FX_GATEWAY_CHAT_URL: linkGateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: linkGateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: linkGateway.chatUrl,
           FX_MODEL: MODEL,
         },
       });
@@ -6996,7 +7063,7 @@ test.skipIf(!tmuxAvailable())("command rows reclip to the live width while runni
         HOME: home, AI_GATEWAY_API_KEY: "fake-live-reclip", FX_DISABLE_KEYCHAIN: "1",
         FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access",
         FX_GATEWAY_BASE_URL: host.baseUrl, FX_GATEWAY_CHAT_URL: host.chatUrl,
-        FX_E2E_GATEWAY_CHAT_URL: host.chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: host.chatUrl,
       },
     });
     await session.waitForStableComposer(TIMEOUT);
@@ -7029,4 +7096,159 @@ test.skipIf(!tmuxAvailable())("command rows reclip to the live width while runni
     host.stop?.();
     rmSync(root, { recursive: true, force: true });
   }
+}, 60_000);
+
+// Claude cache warming (src/core/agent/runtime/cache_warmer.zig): while the
+// session waits, fx resends its last request with a one-token reply before
+// Anthropic's cache entry expires. FX_TEST_CACHE_WARMING_TTL_MS shortens the
+// five-minute lifetime to two seconds, so a ping goes out every 1.8 seconds
+// and the last one at most 12 seconds after the request.
+const WARM_MODEL = "anthropic/claude-opus-5.5";
+const WARM_TTL_MS = 2_000;
+const WARM_CAP_MS = 6 * WARM_TTL_MS;
+const PING_CACHE_READ = 4_242;
+
+type WarmRequest = { body: string; headers: Headers; at: number };
+
+// Answers the agent's requests and its pings, and stamps each arrival; the
+// stamps pair by index with the gateway's own record of bodies and headers.
+function startWarmingGateway(arrivals: number[]) {
+  return startDynamicFakeGateway((body) => {
+    arrivals.push(Date.now());
+    const ping = JSON.parse(body).maxOutputTokens === 1;
+    return fakeGatewaySse([
+      ...(ping ? [] : [{ type: "text-delta", id: "answer_1", delta: "WARM_REPLY_DONE" }]),
+      {
+        type: "finish",
+        finishReason: ping ? { unified: "length", raw: "max_tokens" } : { unified: "stop", raw: "stop" },
+        usage: {
+          inputTokens: { total: 9_000, noCache: 0, cacheRead: ping ? PING_CACHE_READ : 1_000, cacheWrite: ping ? 0 : 8_000 },
+          outputTokens: { total: 1 },
+        },
+      },
+    ]);
+  }, {
+    models: [{
+      id: WARM_MODEL,
+      type: "language",
+      tags: ["explicit-caching", "reasoning", "tool-use"],
+      context_window: 1_000_000,
+      max_tokens: 64_000,
+      reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
+    }],
+    classifierDecision: "clear",
+  });
+}
+
+async function startWarmingSession(name: string, settings: object = {}) {
+  root = realpathSync(mkdtempSync(join(tmpdir(), `fx-cache-warming-${name}-`)));
+  const home = join(root, "home"), workspace = join(root, "workspace");
+  const trace = join(root, "trace.log"), stderr = join(root, "stderr.log");
+  mkdirSync(join(home, ".fx"), { recursive: true }); mkdirSync(workspace);
+  writeFileSync(join(home, ".fx/settings.json"), JSON.stringify(settings));
+  const arrivals: number[] = [];
+  const host = startWarmingGateway(arrivals);
+  gateway = host;
+  const requests = (): WarmRequest[] => host.requests.map((request, i) => ({ ...request, at: arrivals[i]! }));
+  session = await TmuxSession.create({
+    cwd: workspace, width: 120, height: 40, stderrPath: stderr, isolated: true, remainOnExit: true,
+    env: {
+      HOME: home, AI_GATEWAY_API_KEY: "fake-cache-warming", FX_DISABLE_KEYCHAIN: "1",
+      FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_MODEL: WARM_MODEL, FX_PERMISSION_MODE: "full-access",
+      FX_GATEWAY_BASE_URL: host.baseUrl, FX_GATEWAY_CHAT_URL: host.chatUrl, FX_E2E_GATEWAY_CHAT_URL: host.chatUrl,
+      FX_TEST_CACHE_WARMING_TTL_MS: String(WARM_TTL_MS),
+      FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "cache_warming,agent,session",
+    },
+  });
+  await session.waitForComposer();
+  return { host, home, trace, stderr, requests };
+}
+
+const isPing = (request: WarmRequest) => JSON.parse(request.body).maxOutputTokens === 1;
+
+// The saved session's cache-read total: the largest `set usage` value in
+// its log, since each one holds the running totals.
+function savedCacheReadTotal(home: string): number {
+  let total = 0;
+  const visit = (dir: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.name === "log.jsonl") {
+        for (const line of readFileSync(path, "utf8").split("\n")) {
+          if (!line.includes('"key":"usage"')) continue;
+          total = Math.max(total, JSON.parse(line).value?.cache_read_tokens ?? 0);
+        }
+      }
+    }
+  };
+  visit(join(home, ".fx", "sessions"));
+  return total;
+}
+
+test.skipIf(!tmuxAvailable())("an idle Claude session pings its exact last request until the cap, and the next prompt saves their usage", async () => {
+  const { home, trace, stderr, requests } = await startWarmingSession("idle");
+  await session!.sendText("warm this up");
+  await session!.waitForText("WARM_REPLY_DONE", TIMEOUT);
+  const agent = requests().filter((request) => !isPing(request));
+  expect(agent).toHaveLength(1);
+  expect(JSON.parse(agent[0]!.body).maxOutputTokens).toBe(64_000);
+  const armedAt = agent[0]!.at;
+
+  // Wait past the cap; no ping may follow it.
+  await Bun.sleep(WARM_CAP_MS + 2 * WARM_TTL_MS);
+  const pings = requests().filter(isPing);
+  expect(pings.length).toBeGreaterThanOrEqual(1);
+  expect(pings.length).toBeLessThanOrEqual(6);
+  const expected = JSON.parse(agent[0]!.body);
+  expected.maxOutputTokens = 1;
+  for (const ping of pings) {
+    // Every byte but the reply limit matches the request.
+    expect(ping.body).toBe(agent[0]!.body.replace(/"maxOutputTokens":\d+/, '"maxOutputTokens":1'));
+    expect(JSON.parse(ping.body)).toEqual(expected);
+    expect(ping.headers.get("x-session-affinity")).toBe(agent[0]!.headers.get("x-session-affinity"));
+    expect(ping.headers.get("ai-language-model-id")).toBe(WARM_MODEL);
+    expect(ping.at - armedAt).toBeLessThanOrEqual(WARM_CAP_MS + 1_000);
+  }
+  for (let i = 1; i < pings.length; i += 1) {
+    expect(pings[i]!.at - pings[i - 1]!.at).toBeGreaterThanOrEqual(WARM_TTL_MS * 0.9 - 100);
+  }
+  const traced = readFileSync(trace, "utf8");
+  expect(traced).toContain("event=armed model=anthropic/claude-opus-5.5");
+  expect(traced).toMatch(/event=stopped reason=(cap|late)/);
+
+  // The next prompt disarms the warmer and saves the pings' usage with the
+  // session's.
+  await session!.sendText("again");
+  await waitForCondition(() => requests().filter((request) => !isPing(request)).length === 2, "second request");
+  await session!.waitForText("WARM_REPLY_DONE", TIMEOUT);
+  await waitForCondition(() => savedCacheReadTotal(home) >= 2 * 1_000 + pings.length * PING_CACHE_READ, "ping usage saved");
+  expect(savedCacheReadTotal(home)).toBe(2 * 1_000 + pings.length * PING_CACHE_READ);
+
+  await session!.sendText("/quit");
+  await waitForCondition(() => session!.paneStatus().dead, "fx exit");
+  expect(session!.paneStatus().status).toBe(0);
+  session = null;
+  expect(readFileSync(stderr, "utf8")).toBe("");
+}, 90_000);
+
+test.skipIf(!tmuxAvailable())("/new stops the pings of the previous conversation", async () => {
+  const { trace, requests } = await startWarmingSession("new");
+  await session!.sendText("warm this up");
+  await session!.waitForText("WARM_REPLY_DONE", TIMEOUT);
+  await waitForCondition(() => requests().some(isPing), "first ping", WARM_TTL_MS * 3);
+  await session!.sendText("/new");
+  await waitForCondition(() => readFileSync(trace, "utf8").includes("event=disarmed why=history_cleared"), "disarm on /new");
+  const before = requests().filter(isPing).length;
+  await Bun.sleep(WARM_TTL_MS * 2);
+  expect(requests().filter(isPing).length).toBe(before);
+}, 60_000);
+
+test.skipIf(!tmuxAvailable())("cache_warming: false sends no pings", async () => {
+  const { trace, requests } = await startWarmingSession("off", { cache_warming: false });
+  await session!.sendText("warm this up");
+  await session!.waitForText("WARM_REPLY_DONE", TIMEOUT);
+  await Bun.sleep(WARM_TTL_MS * 2);
+  expect(requests().filter(isPing)).toHaveLength(0);
+  expect(readFileSync(trace, "utf8")).not.toContain("event=armed");
 }, 60_000);

@@ -1,5 +1,6 @@
 const std = @import("std");
 const observation = @import("observation.zig");
+const cache_warmer = @import("cache_warmer.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const auth_runtime = @import("../../auth/auth_runtime.zig");
@@ -264,6 +265,10 @@ pub const AgentRuntimeDeps = struct {
     /// as it arrives, so a saved session keeps the usage of every reply even
     /// when the turn never ends. A failure is traced and never fails the turn.
     record_usage: ?*const fn (ctx: *anyopaque, usage: types.Usage) anyerror!void = null,
+    /// Keeps the conversation's Claude prompt cache warm between requests.
+    /// Owned by the conversation's `SessionRuntime`; null where no one waits
+    /// on the conversation, as in `fx ask` and subagents.
+    cache_warmer: ?*cache_warmer.Warmer = null,
     /// Saves the turn's prompt images in the session before its first
     /// request is built, so the note naming each saved file is true when
     /// that request is sent (D89). It sets `blob_path`, allocated with

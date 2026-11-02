@@ -5,7 +5,9 @@ const build_options = @import("build_options");
 const secret = @import("../core/auth/secret.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const local_address = @import("../core/shared/local_address.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
+const input_loop_guard = @import("../core/shared/input_loop_guard.zig");
 const io_mod = @import("../core/shared/io.zig");
 const select_watch = @import("../core/shared/select_watch.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
@@ -13,22 +15,22 @@ const types = @import("../core/shared/types.zig");
 const atomic_value = @import("../core/mcp/atomic_value.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const sse = @import("sse.zig");
+const json_depth = @import("json_depth.zig");
 const host_stream_provider = @import("host_stream_provider.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
         err == error.ConnectionResetByPeer or
-        err == error.ConnectionTimedOut;
+        err == error.ConnectionTimedOut or
+        err == error.LocalAddressGone;
 }
 
 pub fn networkFailureEvidence(
     err: anyerror,
     delivery: DeliveryCertainty.State,
 ) ?agent_stream_provider.NetworkFailureEvidence {
-    const cause: agent_stream_provider.NetworkFailureCause = if (err == error.SystemResumed)
-        .system_resumed
-    else if (err == error.StreamStalled)
+    const cause: agent_stream_provider.NetworkFailureCause = if (err == error.StreamStalled)
         .stream_stalled
     else if (isConnectivityFailure(err))
         .connectivity_lost
@@ -78,36 +80,29 @@ fn isRetryableAgentNetworkError(err: anyerror) bool {
 
 fn connectedIoFailure(
     cancelled: bool,
-    system_resumed: bool,
     transport_error: anyerror,
 ) anyerror {
     if (cancelled) return error.Cancelled;
-    if (system_resumed) return error.SystemResumed;
     return transport_error;
 }
 
 fn connectedIoFailureWithWatch(
     watch: ?*ConnectedRequestWatch,
     cancelled: bool,
-    system_resumed: bool,
     transport_error: anyerror,
 ) anyerror {
-    const mapped = connectedIoFailure(cancelled, system_resumed, transport_error);
+    const mapped = connectedIoFailure(cancelled, transport_error);
     return if (watch) |state| state.finish_error(mapped) else mapped;
 }
 
-test "connected request failures prefer cancellation then wake evidence" {
+test "connected request failures prefer cancellation" {
     try std.testing.expectEqual(
         error.Cancelled,
-        connectedIoFailure(true, true, error.WriteFailed),
-    );
-    try std.testing.expectEqual(
-        error.SystemResumed,
-        connectedIoFailure(false, true, error.WriteFailed),
+        connectedIoFailure(true, error.WriteFailed),
     );
     try std.testing.expectEqual(
         error.WriteFailed,
-        connectedIoFailure(false, false, error.WriteFailed),
+        connectedIoFailure(false, error.WriteFailed),
     );
 }
 
@@ -115,6 +110,7 @@ test "isRetryableGatewayError matches active retryable transport errors" {
     try std.testing.expect(isRetryableGatewayError(error.HttpConnectionClosing));
     try std.testing.expect(isRetryableGatewayError(error.ConnectionResetByPeer));
     try std.testing.expect(isRetryableGatewayError(error.ConnectionTimedOut));
+    try std.testing.expect(isRetryableGatewayError(error.LocalAddressGone));
     try std.testing.expect(!isRetryableGatewayError(error.AccessDenied));
 }
 
@@ -144,7 +140,7 @@ test "native network failure evidence covers setup send read and resume failures
         .{ .err = error.WriteFailed },
         .{ .err = error.ReadFailed },
         .{ .err = error.StreamStalled, .cause = .stream_stalled },
-        .{ .err = error.SystemResumed, .cause = .system_resumed },
+        .{ .err = error.LocalAddressGone },
     };
 
     for (cases) |case| {
@@ -229,9 +225,9 @@ const gateway_transfer_buffer_bytes: usize = 256 * 1024;
 const provider_failure_detail_max_bytes: usize = 600;
 // Covers a 4 MiB string at worst-case JSON escaping plus SSE framing.
 const max_sse_event_line_bytes: usize = 32 * 1024 * 1024;
-const e2e_gateway_chat_url_env = "FX_E2E_GATEWAY_CHAT_URL";
-const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
-const e2e_gateway_credits_url_env = "FX_E2E_GATEWAY_CREDITS_URL";
+const e2e_gateway_chat_url_env = "FX_TEST_GATEWAY_CHAT_URL";
+const e2e_gateway_models_url_env = "FX_TEST_GATEWAY_MODELS_URL";
+const e2e_gateway_credits_url_env = "FX_TEST_GATEWAY_CREDITS_URL";
 const default_gateway_base_url = "https://ai-gateway.vercel.sh";
 pub const vercel_ai_gateway_team_header = "x-vercel-ai-gateway-team";
 pub const vercel_gateway_extended_time_header = "x-vercel-gateway-extended-time";
@@ -470,6 +466,33 @@ pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, pat
     };
 }
 
+/// `fetchGatewayGetResult` with bounds: it fails with `error.Cancelled` once
+/// `cancel_flag` is set and with `error.Timeout` after
+/// `gateway_json_fetch_timeout_ms`, so a stalled endpoint cannot hold the caller.
+pub fn fetchGatewayGetResultCancellable(
+    alloc: std.mem.Allocator,
+    api_key: ?[]const u8,
+    path: []const u8,
+    cancel_flag: *std.atomic.Value(bool),
+) !GetResult {
+    var operation = GatewayGetOperation{ .alloc = alloc, .api_key = api_key, .path = path };
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(gateway_json_fetch_timeout_ms),
+    });
+    return runBoundedHttpOperation(GetResult, alloc, cancel_flag, deadline, &operation);
+}
+
+const GatewayGetOperation = struct {
+    alloc: std.mem.Allocator,
+    api_key: ?[]const u8,
+    path: []const u8,
+
+    fn run(self: *@This()) !GetResult {
+        return fetchGatewayGetResult(self.alloc, self.api_key, self.path);
+    }
+};
+
 pub fn fetchGatewayJsonCancellable(
     alloc: std.mem.Allocator,
     api_key: ?[]const u8,
@@ -567,7 +590,7 @@ fn fetchGatewayJsonAtUrlCore(
 
     var cancel_watch_done = std.atomic.Value(bool).init(false);
     const cancel_watcher = if (req.connection) |conn|
-        try spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, null, null, null, conn.stream_writer.stream)
+        try spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, null, null, conn.stream_writer.stream)
     else
         null;
     defer {
@@ -912,9 +935,8 @@ test "only a reused connection the peer closed before the first response byte is
         .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.ReadFailed, .socket_error = error.NetworkDown },
         .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.ReadFailed },
         .{ .stage = .send, .reused = true, .transport_error = error.WriteFailed, .reported_error = error.WriteFailed },
-        // Cancellation and wake evidence outrank the socket error.
+        // Cancellation evidence outranks the socket error.
         .{ .stage = .send, .reused = true, .transport_error = error.WriteFailed, .reported_error = error.Cancelled, .socket_error = error.ConnectionResetByPeer },
-        .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.SystemResumed, .socket_error = error.ConnectionResetByPeer },
         // Once the server has started answering, resending could run the request twice.
         .{ .stage = .head, .reused = true, .transport_error = error.ReadFailed, .reported_error = error.ReadFailed, .socket_error = error.ConnectionResetByPeer, .received_bytes = 17 },
         .{ .stage = .head, .reused = true, .transport_error = error.HttpRequestTruncated, .reported_error = error.HttpRequestTruncated },
@@ -934,7 +956,7 @@ const ResponseHeadTiming = struct {
     /// Patient head-wait (agent streaming path): a long-thinking model and a
     /// hung gateway are byte-identical on the wire, and the gateway sends no
     /// heartbeat. Never abort a sent request on head silence alone; only a dead
-    /// socket, cancellation, or a system resume ends the wait.
+    /// socket, which the dead-peer probes find, or cancellation ends the wait.
     patient: bool = false,
     /// Mid-stream stall watchdog: once the head has arrived, a stream that
     /// produces no bytes for this long is treated as dead (positive evidence,
@@ -994,8 +1016,9 @@ const ConnectedRequestWatch = struct {
         completed,
         timed_out,
         cancelled,
-        system_resumed,
         stalled,
+        /// The connection's local address left the machine.
+        address_gone,
     };
 
     phase: std.atomic.Value(Phase) = .init(.sending),
@@ -1128,7 +1151,7 @@ const ConnectedRequestWatch = struct {
     ) bool {
         if (self.timing.patient) {
             // Patient head-wait never aborts. The wait ends only with data,
-            // a dead socket, cancel, or system resume.
+            // a dead socket, or cancel.
             if (self.phase.load(.seq_cst) != .awaiting_head) return false;
             if (std.Io.Clock.Timestamp.compare(now, .lt, self.response_head_deadline)) return false;
             return false;
@@ -1144,7 +1167,7 @@ const ConnectedRequestWatch = struct {
     fn is_active(phase: Phase) bool {
         return switch (phase) {
             .sending, .awaiting_head, .streaming => true,
-            .completed, .timed_out, .cancelled, .system_resumed, .stalled => false,
+            .completed, .timed_out, .cancelled, .stalled, .address_gone => false,
         };
     }
 
@@ -1152,8 +1175,8 @@ const ConnectedRequestWatch = struct {
         return switch (phase) {
             .timed_out => error.Timeout,
             .cancelled => error.Cancelled,
-            .system_resumed => error.SystemResumed,
             .stalled => error.StreamStalled,
+            .address_gone => error.LocalAddressGone,
             .sending, .awaiting_head, .streaming, .completed => null,
         };
     }
@@ -1411,6 +1434,7 @@ pub fn streamGatewayCompletion(
     on_tool_start: ?ToolStartCallback,
     cancel_flag: *std.atomic.Value(bool),
 ) !StreamResult {
+    input_loop_guard.noteNetworkRequest("gateway_stream");
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const expected_provider_tool_name = try expectedProviderToolName(alloc, request.payload);
     return streamGatewayCompletionCore(
@@ -1434,6 +1458,7 @@ pub fn streamGatewayCompletionBounded(
     deadline: std.Io.Clock.Timestamp,
     cancel_flag: *std.atomic.Value(bool),
 ) !StreamResult {
+    input_loop_guard.noteNetworkRequest("gateway_stream");
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const expected_provider_tool_name = try expectedProviderToolName(alloc, request.payload);
     var operation = BoundedStreamingGatewayOperation{
@@ -1772,11 +1797,10 @@ fn streamGatewayCompletionCoreWithOptions(
         debug_trace.eventf("gateway", "after_request_open", trace_ctx, "attempt={d}", .{attempt + 1});
 
         var cancel_watch_done = std.atomic.Value(bool).init(false);
-        var system_resumed = std.atomic.Value(bool).init(false);
         var connected_watch = ConnectedRequestWatch.init(core_options.response_head_timing);
         const cancel_watcher = if (watch_connected_socket)
             if (req.connection) |conn|
-                spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, &system_resumed, null, &connected_watch, conn.stream_writer.stream) catch |err| {
+                spawn_gateway_cancel_watcher(&cancel_watch_done, cancel_flag, null, &connected_watch, conn.stream_writer.stream) catch |err| {
                     debug_trace.eventf("gateway", "cancel_watcher_spawn_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
                     return @as(anyerror!StreamResult, err);
                 }
@@ -1805,7 +1829,6 @@ fn streamGatewayCompletionCoreWithOptions(
             const reported = connectedIoFailureWithWatch(
                 active_connected_watch,
                 cancel_flag.load(.seq_cst),
-                system_resumed.load(.seq_cst),
                 err,
             );
             const evidence: StaleConnectionEvidence = .{
@@ -1843,10 +1866,9 @@ fn streamGatewayCompletionCoreWithOptions(
             const mapped = connectedIoFailureWithWatch(
                 active_connected_watch,
                 cancel_flag.load(.seq_cst),
-                system_resumed.load(.seq_cst),
                 err,
             );
-            if (mapped == error.Cancelled or mapped == error.SystemResumed) {
+            if (mapped == error.Cancelled) {
                 return @as(anyerror!StreamResult, mapped);
             }
             const conn = req.connection.?;
@@ -1941,7 +1963,6 @@ fn streamGatewayCompletionCoreWithOptions(
             return @as(anyerror!StreamResult, connectedIoFailureWithWatch(
                 active_connected_watch,
                 cancel_flag.load(.seq_cst),
-                system_resumed.load(.seq_cst),
                 err,
             ));
         };
@@ -1961,7 +1982,7 @@ fn streamGatewayCompletionCoreWithOptions(
                 .raw = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake).raw.addDuration(.fromMilliseconds(pool_drain_budget_ms)),
             };
             const drain_thread = if (req.connection) |conn|
-                spawn_gateway_cancel_watcher(&drain_watch_done, cancel_flag, null, drain_deadline, null, conn.stream_writer.stream) catch null
+                spawn_gateway_cancel_watcher(&drain_watch_done, cancel_flag, drain_deadline, null, conn.stream_writer.stream) catch null
             else
                 null;
             const drain_ok = if (body_reader.discardRemaining()) |drained_bytes| blk: {
@@ -1987,10 +2008,6 @@ fn streamGatewayCompletionCoreWithOptions(
         if (cancel_flag.load(.seq_cst)) {
             deinitGatewayCompletion(alloc, &completion);
             return error.Cancelled;
-        }
-        if (system_resumed.load(.seq_cst)) {
-            deinitGatewayCompletion(alloc, &completion);
-            return error.SystemResumed;
         }
         completion.delivery_ambiguous = delivery_ambiguous;
         if (!resolved_model_seen_in_head) traceResolvedModelMissingOnce(model, trace_ctx);
@@ -2175,6 +2192,7 @@ pub fn runBoundedHttpOperation(
     deadline: std.Io.Clock.Timestamp,
     operation: anytype,
 ) !Result {
+    input_loop_guard.noteNetworkRequest("bounded_http");
     if (cancel_flag.load(.seq_cst)) {
         debug_trace.logf("stream", "bounded termination cause=cancellation phase=admission", .{});
         return error.Cancelled;
@@ -2273,16 +2291,46 @@ const RequestCondition = struct {
 
 const BoundedRequestWatch = select_watch.Watch(RequestCondition);
 
+/// Finds a connection whose local address has left the machine. When the
+/// network changes under a request, the old connection can never answer
+/// again, yet its dead-peer probes go nowhere and take their full 45 seconds
+/// to fail it. The watch checks the address once a second instead
+/// (`local_address.missing`). Owned by the watcher thread.
+const LocalAddressWatch = struct {
+    /// Null for a socket without an IP address, one `getsockname` refused,
+    /// or a target without the check; such a connection is never reported
+    /// gone.
+    address: ?local_address.Address,
+    next_check: std.Io.Clock.Timestamp,
+
+    const interval_ms = 1_000;
+
+    fn init(handle: anytype, now: std.Io.Clock.Timestamp) LocalAddressWatch {
+        return .{ .address = local_address.of(handle), .next_check = later(now) };
+    }
+
+    /// Whether the address is gone, checked at most once per interval.
+    fn gone(self: *LocalAddressWatch, now: std.Io.Clock.Timestamp) bool {
+        const address = self.address orelse return false;
+        if (std.Io.Clock.Timestamp.compare(now, .lt, self.next_check)) return false;
+        self.next_check = later(now);
+        return local_address.missing(address);
+    }
+
+    fn later(now: std.Io.Clock.Timestamp) std.Io.Clock.Timestamp {
+        return .{ .clock = now.clock, .raw = now.raw.addDuration(.fromMilliseconds(interval_ms)) };
+    }
+};
+
 const GatewayCancelWatcher = struct {
     fn run(
         done: *std.atomic.Value(bool),
         cancel_flag: *std.atomic.Value(bool),
-        system_resumed: ?*std.atomic.Value(bool),
         deadline: ?std.Io.Clock.Timestamp,
         connected_watch: ?*ConnectedRequestWatch,
         stream: std.Io.net.Stream,
     ) void {
-        var previous = SuspendClockSample.now();
+        var address_watch = LocalAddressWatch.init(stream.socket.handle, std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake));
         while (!done.load(.seq_cst)) {
             if (cancel_flag.load(.seq_cst)) {
                 if (connected_watch == null or connected_watch.?.win(.cancelled)) {
@@ -2290,16 +2338,9 @@ const GatewayCancelWatcher = struct {
                 }
                 return;
             }
-            const current = SuspendClockSample.now();
-            if (system_resumed != null and suspendGapDetected(previous, current)) {
-                if (cancel_flag.load(.seq_cst)) {
-                    if (connected_watch == null or connected_watch.?.win(.cancelled)) {
-                        stream.shutdown(io_mod.getIo(), .both) catch {};
-                    }
-                    return;
-                }
-                if (connected_watch == null or connected_watch.?.win(.system_resumed)) {
-                    system_resumed.?.store(true, .seq_cst);
+            if (address_watch.gone(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake))) {
+                if (connected_watch == null or connected_watch.?.win(.address_gone)) {
+                    debug_trace.logf("gateway", "event=local_address_gone dropped=connection reason=the network changed under it", .{});
                     stream.shutdown(io_mod.getIo(), .both) catch {};
                 }
                 return;
@@ -2323,33 +2364,10 @@ const GatewayCancelWatcher = struct {
                 }
                 if (watch.phase.load(.seq_cst) == .completed) return;
             }
-            previous = current;
             io_mod.sleep(10 * std.time.ns_per_ms);
         }
     }
 };
-
-const suspend_gap_tolerance_ns: i128 = 100 * std.time.ns_per_ms;
-
-const SuspendClockSample = struct {
-    awake_ns: i128,
-    boot_ns: i128,
-
-    fn now() SuspendClockSample {
-        const io = io_mod.getIo();
-        return .{
-            .awake_ns = @intCast(std.Io.Clock.Timestamp.now(io, .awake).raw.toNanoseconds()),
-            .boot_ns = @intCast(std.Io.Clock.Timestamp.now(io, .boot).raw.toNanoseconds()),
-        };
-    }
-};
-
-fn suspendGapDetected(previous: SuspendClockSample, current: SuspendClockSample) bool {
-    const awake_elapsed = current.awake_ns - previous.awake_ns;
-    const boot_elapsed = current.boot_ns - previous.boot_ns;
-    if (awake_elapsed < 0 or boot_elapsed < 0) return false;
-    return boot_elapsed - awake_elapsed > suspend_gap_tolerance_ns;
-}
 
 /// One shared concrete opener result so every backend reuses the same
 /// bounded-operation instantiation instead of specializing per file.
@@ -2427,7 +2445,7 @@ pub const ConnectionWatch = struct {
 
     pub fn start(self: *ConnectionWatch, cancel: *std.atomic.Value(bool), deadline: ?std.Io.Clock.Timestamp, connection: std.Io.net.Stream) !void {
         self.done.store(false, .seq_cst);
-        self.thread = try spawn_gateway_cancel_watcher(&self.done, cancel, null, deadline, &self.state, connection);
+        self.thread = try spawn_gateway_cancel_watcher(&self.done, cancel, deadline, &self.state, connection);
     }
 
     /// Starts the response-head wait. An error names the cause that already
@@ -2596,10 +2614,168 @@ test "cancelling a request wins over its body stall window" {
     try std.testing.expect(body.elapsed_ms < 2_000);
 }
 
+test "the local address watch keeps a live connection's own address" {
+    if (comptime !local_address.supported) return error.SkipZigTest;
+    var server: SilentBodyServer = .{ .server = undefined, .events = 0, .gap_ms = 0, .close = false };
+    try server.start();
+    defer server.stop();
+    const zio = io_mod.getIo();
+    const address = std.Io.net.IpAddress{ .ip4 = .loopback(server.server.socket.address.getPort()) };
+    var stream = try address.connect(zio, .{ .mode = .stream });
+    defer stream.close(zio);
+
+    const now = std.Io.Clock.Timestamp.now(zio, .awake);
+    var watch = LocalAddressWatch.init(stream.socket.handle, now);
+    try std.testing.expect(watch.address != null);
+    // The first check waits out the interval.
+    try std.testing.expect(!watch.gone(now));
+    try std.testing.expect(!watch.gone(LocalAddressWatch.later(now)));
+}
+
+test "a request whose local address leaves the machine fails at once as a lost connection" {
+    if (comptime !local_address.supported) return error.SkipZigTest;
+    local_address.test_missing = true;
+    defer local_address.test_missing = false;
+    var server: SilentBodyServer = .{ .server = undefined, .events = 0, .gap_ms = 0, .close = false };
+    try server.start();
+    defer server.stop();
+    const zio = io_mod.getIo();
+    const address = std.Io.net.IpAddress{ .ip4 = .loopback(server.server.socket.address.getPort()) };
+    var stream = try address.connect(zio, .{ .mode = .stream });
+    defer stream.close(zio);
+
+    // A model that thinks sends no headers, so the request waits on its head
+    // with nothing to time it out.
+    var cancel = std.atomic.Value(bool).init(false);
+    var watch: ConnectionWatch = .init(.{ .patient = true, .stall_timeout_ms = ConnectionWatch.bodyStallTimeoutMs(null) });
+    defer watch.stop();
+    try watch.start(&cancel, null, stream);
+    if (watch.armHead()) |err| return err;
+    // If the watch ever misses the address, Esc ends the read instead of
+    // hanging the test.
+    const canceller = try std.Thread.spawn(.{}, cancelAfterMs, .{ &cancel, 4_000 });
+    defer canceller.join();
+    const started = std.Io.Clock.Timestamp.now(zio, .awake);
+    var socket_buffer: [64]u8 = undefined;
+    var socket_reader = stream.reader(zio, &socket_buffer);
+    const err = if (socket_reader.interface.takeByte()) |_| error.TestUnexpectedByte else |read_err| watch.failure(read_err);
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
+
+    try std.testing.expectEqual(error.LocalAddressGone, err);
+    try std.testing.expect(elapsed_ms < 3_000);
+    const evidence = networkFailureEvidence(err, .possibly_sent) orelse return error.TestExpectedNetworkFailureEvidence;
+    try std.testing.expectEqual(agent_stream_provider.NetworkFailureCause.transport_interrupted, evidence.cause);
+}
+
+/// TCP keepalive for every watched connection. The gateway sends nothing while
+/// a model thinks, so silence alone cannot tell a thinking model from a
+/// connection whose server end is gone, and the stall window waits ten
+/// minutes. A live peer's kernel answers keepalive probes, so they leave a
+/// thinking model alone and turn a dead connection into a failed read: a reset
+/// at the first probe after the network returns, or `ConnectionTimedOut` once
+/// every probe goes unanswered. Both are retried like any dropped stream.
+const dead_peer_probe = struct {
+    /// Silence before the first probe.
+    const idle_s: c_int = 15;
+    /// Time between probes, and the longest a reset waits after the network
+    /// returns.
+    const interval_s: c_int = 5;
+    /// Unanswered probes before the read fails: 15 s + 6 x 5 s = 45 s.
+    const count: c_int = 6;
+};
+
+const SocketOption = struct { level: i32, name: u32, value: c_int };
+
+/// The socket options that turn on dead-peer probes for the target OS. Other
+/// targets get none and keep only the stall window.
+const dead_peer_probe_options: []const SocketOption = switch (builtin.target.os.tag) {
+    .macos => &.{
+        .{ .level = std.posix.SOL.SOCKET, .name = std.posix.SO.KEEPALIVE, .value = 1 },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPALIVE, .value = dead_peer_probe.idle_s },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPINTVL, .value = dead_peer_probe.interval_s },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPCNT, .value = dead_peer_probe.count },
+    },
+    .linux => &.{
+        .{ .level = std.posix.SOL.SOCKET, .name = std.posix.SO.KEEPALIVE, .value = 1 },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPIDLE, .value = dead_peer_probe.idle_s },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPINTVL, .value = dead_peer_probe.interval_s },
+        .{ .level = std.posix.IPPROTO.TCP, .name = std.posix.TCP.KEEPCNT, .value = dead_peer_probe.count },
+    },
+    else => &.{},
+};
+
+const DeadPeerProbeRefusal = struct { name: u32, errno: std.posix.E };
+
+/// Applies `dead_peer_probe_options` to a socket. Returns the first option the
+/// kernel refused, or null; after a refusal the connection keeps only the
+/// stall window, as before. Calls the system directly because
+/// `std.posix.setsockopt` treats `EINVAL` as unreachable, and macOS returns
+/// `EINVAL` for a socket whose peer already reset it.
+fn enableDeadPeerProbes(handle: std.posix.socket_t) ?DeadPeerProbeRefusal {
+    inline for (dead_peer_probe_options) |option| {
+        const value: c_int = option.value;
+        const bytes = std.mem.asBytes(&value);
+        while (true) switch (std.posix.errno(std.posix.system.setsockopt(
+            handle,
+            option.level,
+            option.name,
+            bytes.ptr,
+            @intCast(bytes.len),
+        ))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => |errno| return .{ .name = option.name, .errno = errno },
+        };
+    }
+    return null;
+}
+
+test "dead-peer probes report a dead connection long before the stall window" {
+    const bound_ms = (dead_peer_probe.idle_s + dead_peer_probe.interval_s * dead_peer_probe.count) * std.time.ms_per_s;
+    try std.testing.expect(bound_ms < agent_stream_stall_timeout_ms);
+}
+
+test "a watched model connection probes for a dead peer" {
+    if (dead_peer_probe_options.len == 0) return error.SkipZigTest;
+    var server: SilentBodyServer = .{ .server = undefined, .events = 0, .gap_ms = 0, .close = false };
+    try server.start();
+    defer server.stop();
+    const zio = io_mod.getIo();
+    const address = std.Io.net.IpAddress{ .ip4 = .loopback(server.server.socket.address.getPort()) };
+    var stream = try address.connect(zio, .{ .mode = .stream });
+    defer stream.close(zio);
+    var cancel = std.atomic.Value(bool).init(false);
+    var watch: ConnectionWatch = .init(.{ .patient = true, .stall_timeout_ms = ConnectionWatch.bodyStallTimeoutMs(null) });
+    defer watch.stop();
+    try watch.start(&cancel, null, stream);
+    inline for (dead_peer_probe_options) |option| {
+        var value: c_int = 0;
+        var len: std.posix.socklen_t = @sizeOf(c_int);
+        try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.posix.system.getsockopt(
+            stream.socket.handle,
+            option.level,
+            option.name,
+            std.mem.asBytes(&value).ptr,
+            &len,
+        )));
+        // BSD reports a set flag as its bit, not as 1.
+        if (option.value == 1) try std.testing.expect(value != 0) else try std.testing.expectEqual(option.value, value);
+    }
+}
+
+test "a refused probe option is reported instead of failing the request" {
+    if (dead_peer_probe_options.len == 0) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "not-a-socket", .{});
+    defer file.close(std.testing.io);
+    const refusal = enableDeadPeerProbes(file.handle) orelse return error.TestExpectedRefusal;
+    try std.testing.expectEqual(std.posix.E.NOTSOCK, refusal.errno);
+}
+
 fn spawn_gateway_cancel_watcher(
     done: *std.atomic.Value(bool),
     cancel_flag: *std.atomic.Value(bool),
-    system_resumed: ?*std.atomic.Value(bool),
     deadline: ?std.Io.Clock.Timestamp,
     connected_watch: ?*ConnectedRequestWatch,
     stream: std.Io.net.Stream,
@@ -2607,30 +2783,16 @@ fn spawn_gateway_cancel_watcher(
     if (builtin.is_test) {
         if (test_cancel_watcher_spawn_error) |err| return err;
     }
+    if (enableDeadPeerProbes(stream.socket.handle)) |refusal| {
+        debug_trace.logf("gateway", "event=dead_peer_probe_unavailable option={d} errno={d}", .{ refusal.name, @backingInt(refusal.errno) });
+    }
     return std.Thread.spawn(.{}, GatewayCancelWatcher.run, .{
         done,
         cancel_flag,
-        system_resumed,
         deadline,
         connected_watch,
         stream,
     });
-}
-
-test "suspend gap classification compares boot and awake clocks" {
-    const before = SuspendClockSample{ .awake_ns = 1_000, .boot_ns = 10_000 };
-    try std.testing.expect(!suspendGapDetected(before, .{
-        .awake_ns = before.awake_ns + 10 * std.time.ns_per_ms,
-        .boot_ns = before.boot_ns + 10 * std.time.ns_per_ms,
-    }));
-    try std.testing.expect(!suspendGapDetected(before, .{
-        .awake_ns = before.awake_ns + 10 * std.time.ns_per_ms,
-        .boot_ns = before.boot_ns + 10 * std.time.ns_per_ms + suspend_gap_tolerance_ns,
-    }));
-    try std.testing.expect(suspendGapDetected(before, .{
-        .awake_ns = before.awake_ns + 10 * std.time.ns_per_ms,
-        .boot_ns = before.boot_ns + 10 * std.time.ns_per_ms + suspend_gap_tolerance_ns + 1,
-    }));
 }
 
 test "connected request watch keeps the first terminal winner" {
@@ -2638,11 +2800,6 @@ test "connected request watch keeps the first terminal winner" {
     try std.testing.expect(cancelled.win(.cancelled));
     try std.testing.expect(!cancelled.win_response_head_timeout());
     try std.testing.expectEqual(error.Cancelled, cancelled.finish().?);
-
-    var resumed = ConnectedRequestWatch.init(.{});
-    try std.testing.expect(resumed.win(.system_resumed));
-    try std.testing.expect(!resumed.win(.cancelled));
-    try std.testing.expectEqual(error.SystemResumed, resumed.finish().?);
 
     var ordinary = ConnectedRequestWatch.init(.{});
     try std.testing.expect(ordinary.finish() == null);
@@ -4247,6 +4404,12 @@ fn consumeSseStreamTraced(
         data_event_count += 1;
 
         defer _ = event_arena.reset(.retain_capacity);
+        // fx serializes parts of an event, such as a tool input or provider
+        // metadata, and std.json.Stringify aborts past 256 levels.
+        if (json_depth.exceeds(json_text)) {
+            debug_trace.logf("sse", "event type=too_deep bytes={d} max_depth={d}", .{ json_text.len, json_depth.max_depth });
+            return error.InvalidGatewaySseEvent;
+        }
         const root = std.json.parseFromSliceLeaky(std.json.Value, event_arena.allocator(), json_text, .{}) catch |err| {
             if (err == error.OutOfMemory) return err;
             traceMalformedSseEvent(json_text.len);
@@ -4738,6 +4901,32 @@ test "provider framing assembles Gateway data fields" {
         defer deinitGatewayCompletion(std.testing.allocator, &completion);
         try std.testing.expectEqualStrings("CONTROL_PREFIX\nEXPECTED_FINAL", completion.content.?);
     }
+}
+
+test "provider framing rejects a Gateway event nested past the depth limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "deep-sse.log" });
+    defer alloc.free(path);
+    debug_trace.resetForTest();
+    defer debug_trace.resetForTest();
+    try debug_trace.configureForTestWithScopes(alloc, path, "sse");
+    // A tool input 300 levels deep aborted fx when it was serialized.
+    const deep_input = text_utils.repeat("{\"a\":", 300) ++ "0" ++ text_utils.repeat("}", 300);
+    var reader = std.Io.Reader.fixed("data: {\"type\":\"tool-call\",\"toolCallId\":\"deep\",\"toolName\":\"read_file\",\"input\":" ++ deep_input ++ "}\n\n" ++
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"tool-calls\"}}\n\n");
+    var cancelled = std.atomic.Value(bool).init(false);
+    const Noop = struct {
+        fn chunk(_: *anyopaque, _: []const u8) void {}
+    };
+    try std.testing.expectError(error.InvalidGatewaySseEvent, consumeSseStream(std.testing.allocator, &reader, undefined, Noop.chunk, null, &cancelled));
+    debug_trace.shutdown();
+    const trace = try readTraceFileForTest(alloc, path);
+    defer alloc.free(trace);
+    try std.testing.expect(std.mem.find(u8, trace, "event type=too_deep") != null);
 }
 
 test "provider framing rejects malformed Gateway JSON" {
@@ -5355,7 +5544,9 @@ test "consumeSseStream names the error a provider's wrapper nests in the notice 
 
 test "consumeSseStream reads a deep chain of provider wrappers only one level down" {
     const alloc = std.testing.allocator;
-    const depth = 20_000;
+    // Past the levels a detail renders, and under the levels an event may
+    // nest before it is refused (`json_depth.max_depth`).
+    const depth = 50;
     var payload: std.Io.Writer.Allocating = .init(alloc);
     defer payload.deinit();
     const writer = &payload.writer;
@@ -5449,14 +5640,13 @@ test "consumeSseStream labels a provider error value too deep to render" {
     };
     const cases = [_]Case{
         // Wrappers whose `type` is the generic "error", with no code or message.
-        .{ .name = "d3", .head = event_head, .open = "{\"type\":\"error\",\"error\":", .leaf = "{\"type\":\"error\"}", .depth = 300, .tail = event_tail, .cause = .uncoded_error },
-        .{ .name = "d3 deep", .head = event_head, .open = "{\"type\":\"error\",\"error\":", .leaf = "{\"type\":\"error\"}", .depth = 20_000, .tail = event_tail, .cause = .uncoded_error },
+        .{ .name = "d3", .head = event_head, .open = "{\"type\":\"error\",\"error\":", .leaf = "{\"type\":\"error\"}", .depth = 50, .tail = event_tail, .cause = .uncoded_error },
         // A chain of `error` objects with no type at all.
-        .{ .name = "d4", .head = event_head, .open = "{\"error\":", .leaf = "{}", .depth = 300, .tail = event_tail, .cause = .uncoded_error },
+        .{ .name = "d4", .head = event_head, .open = "{\"error\":", .leaf = "{}", .depth = 50, .tail = event_tail, .cause = .uncoded_error },
         // Any other nesting under `error`.
-        .{ .name = "d5", .head = event_head, .open = "{\"a\":", .leaf = "{}", .depth = 300, .tail = event_tail, .cause = .uncoded_error },
+        .{ .name = "d5", .head = event_head, .open = "{\"a\":", .leaf = "{}", .depth = 50, .tail = event_tail, .cause = .uncoded_error },
         // An error finish that carries d4's value, with no error event.
-        .{ .name = "f1", .head = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"},\"error\":", .open = "{\"error\":", .leaf = "{}", .depth = 300, .tail = "}\n\n", .cause = .unexplained_error_finish },
+        .{ .name = "f1", .head = "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"error\"},\"error\":", .open = "{\"error\":", .leaf = "{}", .depth = 50, .tail = "}\n\n", .cause = .unexplained_error_finish },
     };
     for (cases) |case| {
         const payload = try testDeepPayload(alloc, case.head, case.open, case.leaf, case.depth, case.tail);
@@ -5468,6 +5658,10 @@ test "consumeSseStream labels a provider error value too deep to render" {
         try std.testing.expectEqualStrings("provider_error", completion.provider_failure_detail.?);
         try std.testing.expectEqual(@as(?types.ProviderFailureCause, case.cause), completion.provider_failure_cause);
     }
+    // An event nested past `json_depth.max_depth` is refused before it is read.
+    const too_deep = try testDeepPayload(alloc, event_head, "{\"type\":\"error\",\"error\":", "{\"type\":\"error\"}", 20_000, event_tail);
+    defer alloc.free(too_deep);
+    try std.testing.expectError(error.InvalidGatewaySseEvent, testStreamOutcome(too_deep));
 }
 
 test "consumeSseStream still renders a shallow provider error value that names nothing" {

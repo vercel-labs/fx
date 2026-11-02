@@ -249,17 +249,22 @@ fn stringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     };
 }
 
+/// A provider's error body can nest `path` and `param` without end. Past this
+/// many levels fx shows no path, so the walk cannot run out of stack.
+const max_param_path_depth = 16;
+
 fn formatParamPath(alloc: Allocator, value: std.json.Value) !?[]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    if (!try writeParamPath(&out.writer, value)) {
+    if (!try writeParamPath(&out.writer, value, 0)) {
         out.deinit();
         return null;
     }
     return try out.toOwnedSlice();
 }
 
-fn writeParamPath(writer: *std.Io.Writer, value: std.json.Value) !bool {
+fn writeParamPath(writer: *std.Io.Writer, value: std.json.Value, depth: usize) !bool {
+    if (depth == max_param_path_depth) return false;
     switch (value) {
         .string => |text| {
             if (text.len == 0) return false;
@@ -276,9 +281,9 @@ fn writeParamPath(writer: *std.Io.Writer, value: std.json.Value) !bool {
                     .number_string => |raw| try appendSafeToken(writer, raw),
                     .object => |object| {
                         if (object.get("path")) |path| {
-                            if (!try writeParamPath(writer, path)) try writer.writeAll("object");
+                            if (!try writeParamPath(writer, path, depth + 1)) try writer.writeAll("object");
                         } else if (object.get("param")) |param| {
-                            if (!try writeParamPath(writer, param)) try writer.writeAll("object");
+                            if (!try writeParamPath(writer, param, depth + 1)) try writer.writeAll("object");
                         } else {
                             try writer.writeAll("object");
                         }
@@ -289,8 +294,8 @@ fn writeParamPath(writer: *std.Io.Writer, value: std.json.Value) !bool {
             return true;
         },
         .object => |object| {
-            if (object.get("path")) |path| return writeParamPath(writer, path);
-            if (object.get("param")) |param| return writeParamPath(writer, param);
+            if (object.get("path")) |path| return writeParamPath(writer, path, depth + 1);
+            if (object.get("param")) |param| return writeParamPath(writer, param, depth + 1);
             return false;
         },
         else => return false,
@@ -500,6 +505,28 @@ test "formatSchemaDiagnostic renders live issue-object param path" {
         "path=prompt.0.content expected=string received=array",
         diagnostic.?,
     );
+}
+
+test "formatSchemaDiagnostic drops a param path nested past its depth limit" {
+    const alloc = std.testing.allocator;
+    const nested = text_utils.repeat("{\"path\":", 20) ++ "[\"prompt\"]" ++ text_utils.repeat("}", 20);
+    const detail = "{\"error\":{\"message\":\"Invalid input: expected string, received array\",\"param\":" ++ nested ++ "}}";
+    const diagnostic = try formatSchemaDiagnostic(alloc, detail);
+    defer if (diagnostic) |owned| alloc.free(owned);
+    try std.testing.expectEqualStrings("expected=string received=array", diagnostic.?);
+
+    // Ten thousand levels end the same way instead of exhausting the stack.
+    const very_deep = try alloc.alloc(u8, 10_000 * ("{\"path\":".len + 1) + 16);
+    defer alloc.free(very_deep);
+    var writer: std.Io.Writer = .fixed(very_deep);
+    for (0..10_000) |_| try writer.writeAll("{\"path\":");
+    try writer.writeAll("\"prompt\"");
+    for (0..10_000) |_| try writer.writeByte('}');
+    const body = try std.mem.concat(alloc, u8, &.{ "{\"error\":{\"message\":\"Invalid input: expected string, received array\",\"param\":", writer.buffered(), "}}" });
+    defer alloc.free(body);
+    const bounded = try formatSchemaDiagnostic(alloc, body);
+    defer if (bounded) |owned| alloc.free(owned);
+    try std.testing.expectEqualStrings("expected=string received=array", bounded.?);
 }
 
 test "formatSchemaDiagnostic ignores restricted provider body without schema path" {

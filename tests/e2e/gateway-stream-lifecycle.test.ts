@@ -135,9 +135,9 @@ for (const action of ["run", "message"] as const) {
         env: {
           PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root.home,
           AI_GATEWAY_API_KEY: "synthetic-steering", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
-          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_SKIP_ONBOARDING: "1", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access", FX_MAX_AGENT_STEPS: "5",
+          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TEST_SKIP_ONBOARDING: "1", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access", FX_MAX_AGENT_STEPS: "5",
           FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_TRACE_LOG: join(root.root, "trace.log"), FX_TRACE_SCOPES: "subagent,worker,agent,tool",
         },
       });
@@ -486,7 +486,7 @@ function fixtureEnv(
     VERCEL_OIDC_TOKEN: undefined,
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_MODEL: MODEL,
     FX_TRACE_LOG: tracePath,
     FX_TRACE_SCOPES: "agent,core,gateway,stream",
@@ -616,16 +616,18 @@ function toolResultOutput(body: string, callId: string): string {
   return contentText(result.output);
 }
 
+// A shell result leaves out every field that is null or false.
 type ShellResult = {
+  session_id?: string;
   state: string;
-  backend: string;
-  persistence: string;
+  backend?: string;
+  persistence?: string;
   output_delta: string;
-  full_output_handle: string | null;
-  exit_code: number | null;
-  signal: string | null;
-  termination_indeterminate: boolean;
-  error: string | null;
+  full_output_handle?: string;
+  exit_code?: number;
+  signal?: string;
+  termination_indeterminate?: true;
+  error?: string;
 };
 
 function shellResult(body: string, callId: string): ShellResult {
@@ -902,7 +904,7 @@ describe("gateway stream lifecycle", () => {
       ]));
       expect(gateway.requestCount()).toBe(3);
       expect(result.stderr).not.toContain("panic");
-      const resume = () => runFx(["ask", "--auto", "--json", "--resume-id", output.session_id, "Continue with the saved context."], {
+      const resume = () => runFx(["ask", "--auto", "--json", "--resume", output.session_id, "Continue with the saved context."], {
         cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 30_000,
       });
       const restored = await resume();
@@ -1296,7 +1298,7 @@ describe("gateway stream lifecycle", () => {
           env: {
             ...fixtureEnv(root, gateway, tracePath),
             FX_MODEL: undefined,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           timeoutMs: 30_000,
         },
@@ -1353,7 +1355,7 @@ describe("gateway stream lifecycle", () => {
           env: {
             ...fixtureEnv(root, gateway, tracePath),
             FX_MODEL: undefined,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           timeoutMs: 30_000,
         },
@@ -1370,6 +1372,103 @@ describe("gateway stream lifecycle", () => {
       );
       const request = JSON.parse(gateway.requests[0]!.body);
       expect(request).toMatchObject({
+        reasoning: "high",
+        providerOptions: { gateway: { speed: "fast" } },
+      });
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("ask --config overrides the settings files and yields to dedicated flags", async () => {
+    const root = createFixtureRoot("ask-config-overrides");
+    const tracePath = join(root.root, "trace.log");
+    const settingsPath = join(root.home, ".fx", "settings.json");
+    writeFileSync(settingsPath, JSON.stringify({ effort: "low", fast_mode: false }) + "\n");
+    const settingsBefore = readFileSync(settingsPath, "utf8");
+    const gateway = startDynamicFakeGateway(
+      () => fakeGatewayFinalText("CONFIG_OVERRIDES_COMPLETE"),
+      {
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["tool-use", "reasoning"],
+          fast_options: [{ type: "toggle" }],
+          reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+        }],
+      },
+    );
+    const env = {
+      ...fixtureEnv(root, gateway, tracePath),
+      FX_MODEL: undefined,
+      FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    };
+    const ask = (flags: string[]) =>
+      runFx(["ask", "--json", "--auto", "--no-save", "--model", MODEL, ...flags, "Use the settings overrides."], {
+        cwd: root.workspace,
+        env,
+        timeoutMs: 30_000,
+      });
+
+    try {
+      const overridden = await ask(["--config", "effort=low", "--config", "effort=high", "--config", "fast_mode=on"]);
+      expect(overridden.code).toBe(0);
+      expect(parseAskJson(overridden.stdout).output).toContain("CONFIG_OVERRIDES_COMPLETE");
+      expect(overridden.stderr).toBe("");
+      expect(JSON.parse(gateway.requests[0]!.body)).toMatchObject({
+        reasoning: "high",
+        providerOptions: { gateway: { speed: "fast" } },
+      });
+
+      const flagWins = await ask(["--config", "fast_mode=on", "--no-fast"]);
+      expect(flagWins.code).toBe(0);
+      const second = JSON.parse(gateway.requests[1]!.body);
+      expect(second).toMatchObject({ reasoning: "low" });
+      expect(second).not.toHaveProperty("providerOptions.gateway.speed");
+
+      expect(readFileSync(settingsPath, "utf8")).toBe(settingsBefore);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("issue applies the agent-run flags to the gateway request", async () => {
+    const root = createFixtureRoot("issue-agent-run-flags");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startDynamicFakeGateway(
+      () => fakeGatewayFinalText("ISSUE_FLAGS_COMPLETE"),
+      {
+        models: [{
+          id: MODEL,
+          type: "language",
+          tags: ["tool-use", "reasoning"],
+          fast_options: [{ type: "toggle" }],
+          reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+        }],
+      },
+    );
+
+    try {
+      const result = await runFx(
+        ["issue", "--auto", "--model", MODEL, "--effort", "high", "--fast", "Login fails after an upgrade"],
+        {
+          cwd: root.workspace,
+          env: {
+            ...fixtureEnv(root, gateway, tracePath),
+            FX_MODEL: undefined,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          },
+          timeoutMs: 30_000,
+        },
+      );
+
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("ISSUE_FLAGS_COMPLETE");
+      expect(gateway.requests).toHaveLength(1);
+      expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(MODEL);
+      expect(JSON.parse(gateway.requests[0]!.body)).toMatchObject({
         reasoning: "high",
         providerOptions: { gateway: { speed: "fast" } },
       });
@@ -1402,7 +1501,7 @@ describe("gateway stream lifecycle", () => {
           env: {
             ...fixtureEnv(root, gateway, tracePath),
             FX_MODEL: undefined,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           timeoutMs: 30_000,
         },
@@ -1453,7 +1552,7 @@ describe("gateway stream lifecycle", () => {
       const env = {
         ...fixtureEnv(root, gateway, tracePath),
         FX_MODEL: undefined,
-        FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
       };
       const first = await runFx(
         ["ask", "--json", "--auto", "Start the saved session."],
@@ -1466,7 +1565,7 @@ describe("gateway stream lifecycle", () => {
       const overridden = await runFx(
         [
           "ask", "--json", "--auto",
-          "--resume-id", sessionId,
+          "--resume", sessionId,
           "--model", MODEL,
           "--effort", "high",
           "--no-fast",
@@ -1484,7 +1583,7 @@ describe("gateway stream lifecycle", () => {
       expect(overriddenRequest).not.toHaveProperty("providerOptions.gateway.speed");
 
       const restored = await runFx(
-        ["ask", "--json", "--auto", "--resume-id", sessionId, "Continue without flags."],
+        ["ask", "--json", "--auto", "--resume", sessionId, "Continue without flags."],
         { cwd: root.workspace, env, timeoutMs: 30_000 },
       );
       expect(restored.code).toBe(0);
@@ -1526,7 +1625,7 @@ describe("gateway stream lifecycle", () => {
           env: {
             ...fixtureEnv(root, gateway, tracePath),
             FX_MODEL: undefined,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           },
           timeoutMs: 30_000,
         },
@@ -2799,7 +2898,7 @@ describe("gateway stream lifecycle", () => {
       rmSync(skillDirectory, { recursive: true, force: true });
       const resumeStderr = join(root.root, "resume-stderr.log");
       tui = await TmuxSession.create({
-        cmd: `${binary} --resume-last`,
+        cmd: `${binary} --resume last`,
         cwd: root.workspace,
         env: fixtureEnv(root, gateway, join(root.root, "resume-trace.log")),
         stderrPath: resumeStderr,
@@ -3346,7 +3445,7 @@ describe("gateway stream lifecycle", () => {
       expect(first.stderr).not.toContain("Reading");
       expect(gateway.requests).toHaveLength(2);
 
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", firstJson.session_id, "Continue."], {
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", firstJson.session_id, "Continue."], {
         cwd: root.workspace,
         env: { ...fixtureEnv(root, gateway, join(root.root, "resume.log")), FX_MODEL: DEFAULT_MODEL },
         timeoutMs: 20_000,
@@ -3850,7 +3949,7 @@ describe("gateway stream lifecycle", () => {
           "ask",
           "--json",
           "--auto",
-          "--resume-id",
+          "--resume",
           firstJson.session_id,
           "Persist the second ordinary turn.",
         ],
@@ -3923,7 +4022,7 @@ describe("gateway stream lifecycle", () => {
           { ...completed, seq: 4 },
         ];
         writeFileSync(path, frames.map((frame) => JSON.stringify(frame)).join("\n") + "\n");
-        const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", seed.session_id, "Continue without tools."], {
+        const resumed = await runFx(["ask", "--json", "--auto", "--resume", seed.session_id, "Continue without tools."], {
           cwd: root.workspace,
           env: fixtureEnv(root, gateway, join(root.root, "resume.log")),
           timeoutMs: 15_000,
@@ -3946,7 +4045,7 @@ describe("gateway stream lifecycle", () => {
         if (tmuxAvailable()) {
           const stderrPath = join(root.root, "tui-stderr.log");
           const tui = await TmuxSession.create({
-            cmd: `${FX_BIN} --resume-last`,
+            cmd: `${FX_BIN} --resume last`,
             cwd: root.workspace,
             env: fixtureEnv(root, gateway, join(root.root, "tui-trace.log")),
             stderrPath,
@@ -4003,7 +4102,7 @@ describe("gateway stream lifecycle", () => {
       expect(result.output).toBe(`${commentary}\n\n${answer}`);
       expect(result.final_output).toBe(`${commentary}\n\n${answer}`);
 
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Say it again."], {
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", result.session_id, "Say it again."], {
         cwd: root.workspace,
         env: fixtureEnv(root, gateway, join(root.root, "resume.log")),
         timeoutMs: 15_000,
@@ -4078,7 +4177,7 @@ describe("gateway stream lifecycle", () => {
           "ask",
           "--json",
           "--auto",
-          "--resume-id",
+          "--resume",
           firstJson.session_id,
           "Confirm what the saved session contains.",
         ],
@@ -4154,7 +4253,7 @@ describe("gateway stream lifecycle", () => {
             const kept = savedText(root.home, result.session_id);
             expect(kept).toContain("removed_call");
             if (metadata) expect(kept).toContain("removed-signature");
-            const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", result.session_id, "Confirm the saved result without running tools."], {
+            const resumed = await runFx(["ask", "--json", "--auto", "--resume", result.session_id, "Confirm the saved result without running tools."], {
               cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
             });
             expect(resumed.code).toBe(0);
@@ -4211,13 +4310,13 @@ describe("gateway stream lifecycle", () => {
       const sessionId = parseAskJson(first.stdout).session_id;
       const logPath = join(sessionDir(root.home, sessionId), "log.jsonl");
       const originalLog = readFileSync(logPath, "utf8");
-      const second = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Exercise the second fixture."], {
+      const second = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Exercise the second fixture."], {
         cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
       });
       expect(second.code).toBe(0);
       expect(parseAskJson(second.stdout).final_output).toBe("Second turn stored.");
       expect(gateway.requestCount()).toBe(4);
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Confirm the stored results without running tools."], {
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Confirm the stored results without running tools."], {
         cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000,
       });
       expect(resumed.code).toBe(0);
@@ -4295,7 +4394,7 @@ describe("gateway stream lifecycle", () => {
           "ask",
           "--json",
           "--auto",
-          "--resume-id",
+          "--resume",
           firstJson.session_id,
           "Continue after the saved malformed recovery.",
         ],
@@ -4441,7 +4540,7 @@ describe("gateway stream lifecycle", () => {
           cwd: root.workspace,
           env: {
             ...fixtureEnv(root, gateway, tracePath),
-            FX_COMMAND_TEST_INDETERMINATE_AFTER_EXIT: "1",
+            FX_TEST_COMMAND_INDETERMINATE_AFTER_EXIT: "1",
           },
           timeoutMs: 15_000,
         },
@@ -4463,11 +4562,12 @@ describe("gateway stream lifecycle", () => {
       expect(json.output).toContain("acknowledged without retry");
       expect(gateway.requestCount()).toBe(2);
       expect(readFileSync(effectPath, "utf8")).toBe("effect\n");
-      expect(JSON.parse(observedFailure)).toMatchObject({
+      const observedSnapshot = JSON.parse(observedFailure);
+      expect(observedSnapshot).toMatchObject({
         state: "completed",
-        exit_code: null,
         termination_indeterminate: true,
       });
+      expect(observedSnapshot).not.toHaveProperty("exit_code");
       expect(observedFailure).not.toContain("Unexpected");
       expect(json.tool_calls).toHaveLength(1);
       expect(json.tool_calls[0]).toMatchObject({
@@ -4521,7 +4621,7 @@ describe("gateway stream lifecycle", () => {
           cwd: root.workspace,
           env: {
             ...fixtureEnv(root, gateway, tracePath),
-            FX_COMMAND_TEST_OUTPUT_INCOMPLETE_AFTER_EXIT: "1",
+            FX_TEST_COMMAND_OUTPUT_INCOMPLETE_AFTER_EXIT: "1",
           },
           timeoutMs: 15_000,
         },
@@ -5262,7 +5362,8 @@ describe("gateway stream lifecycle", () => {
         case 1: {
           try {
             const ready = shellResult(body, readyCallId);
-            expect(ready).toMatchObject({ state: "completed", exit_code: 0, error: null });
+            expect(ready).toMatchObject({ state: "completed", exit_code: 0 });
+            expect(ready).not.toHaveProperty("error");
             expect(ready.output_delta.startsWith(readyMarker)).toBe(true);
             const pythonPath = ready.output_delta.slice(readyMarker.length).trim();
             expect(pythonPath.startsWith("/")).toBe(true);
@@ -5472,9 +5573,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(started).toMatchObject({
         state: "completed",
         exit_code: 0,
-        error: null,
         output_delta: expect.stringContaining("DAEMON-STARTED"),
       });
+      expect(started).not.toHaveProperty("error");
       expect(Number.isSafeInteger(daemonPid) && daemonPid! > 0).toBe(true);
       expect(Number.isSafeInteger(jobPid) && jobPid! > 0).toBe(true);
       expect(daemonAliveAfterStart).toBe(true);
@@ -5585,9 +5686,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(started).toMatchObject({
         state: "completed",
         exit_code: 0,
-        error: null,
         output_delta: "SERVICE-READY",
       });
+      expect(started).not.toHaveProperty("error");
       // Connect only after fx has exited, as a later check of the machine would.
       await Bun.sleep(500);
       const response = await fetch(`http://127.0.0.1:${port}/`);
@@ -5682,7 +5783,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             "ask",
             "--json",
             "--yolo",
-            "--resume-id",
+            "--resume",
             firstJson.session_id,
             "Read the saved replay again.",
           ],
@@ -5829,7 +5930,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         reasoning_tokens: 2,
       });
 
-      const resumed = await runFx(["ask", "--yolo", "--json", "--resume-id", id!, "--", "Finish up."], {
+      const resumed = await runFx(["ask", "--yolo", "--json", "--resume", id!, "--", "Finish up."], {
         cwd: root.workspace,
         env: fixtureEnv(root, gateway, join(root.root, "resume-trace.log")),
         timeoutMs: 15_000,
@@ -6194,7 +6295,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "ask",
           "--json",
           "--yolo",
-          "--resume-id",
+          "--resume",
           sessionId,
           "Inspect the cancelled command output.",
         ],
@@ -6247,7 +6348,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
                 "ask",
                 "--json",
                 "--auto",
-                "--resume-id",
+                "--resume",
                 sessionId,
                 `canonical turn ${turn}`,
               ];
@@ -6299,7 +6400,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             "ask",
             "--json",
             "--auto",
-            "--resume-id",
+            "--resume",
             sessionId,
             "canonical projection probe",
           ],
@@ -6450,7 +6551,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const compacted = await runFx(["session", "--id", id, "--json"], { cwd: root.workspace, env });
       expect(compacted.code).toBe(0);
       expect(JSON.parse(compacted.stdout).history.at(-1)?.summary).toContain("\"earlier\":\"The prior reads completed.");
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", id, "Continue with the saved result."], { cwd: root.workspace, env, timeoutMs: 30_000 });
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", id, "Continue with the saved result."], { cwd: root.workspace, env, timeoutMs: 30_000 });
       expect(resumed.code, resumed.stderr || resumed.stdout).toBe(0);
       expect(JSON.parse(resumed.stdout).final_output).toBe("COLD_REPLAY_DONE");
       expect(ordinary).toBe(9);
@@ -6580,7 +6681,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(savedText(root.home, sessionId)).toContain(pages[0]!.hash);
           // The compacted command is saved as T1 with the handle of its whole output.
           expect(readFileSync(compactionRecordPath(root.home, sessionId, "compacted-T1.txt")!, "utf8")).toContain(sourceHandle);
-          const resumed = await runFx(["ask", "--json", "--resume-id", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
+          const resumed = await runFx(["ask", "--json", "--resume", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
           expect(resumed.code).toBe(0);
           // Compaction folded the command into T1, so the read has no call
           // left to name.
@@ -6734,7 +6835,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             "ask",
             "--json",
             "--auto",
-            "--resume-id",
+            "--resume",
             sessionId,
             "compaction restart probe",
           ],
@@ -7280,9 +7381,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
       expect(result.code).toBe(0);
       // The notices carry the module's wording, never the provider's detail.
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 2s · attempt 2 · \d+s$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 3 · \d+s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 2s · attempt 2$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 3$/m);
       expect(result.stderr).not.toContain("turn route failure");
       expect(result.stdout).toContain("Recovered in ask turn.");
       expect(gateway.requestCount()).toBe(3);
@@ -7373,7 +7474,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               HOME: root.home,
               AI_GATEWAY_API_KEY: "fake-gateway-lifecycle-key",
               VERCEL_OIDC_TOKEN: undefined,
-              FX_E2E_GATEWAY_CHAT_URL:
+              FX_TEST_GATEWAY_CHAT_URL:
                 `http://127.0.0.1:${address.port}/v1/ai/chat/completions`,
               FX_MODEL: MODEL,
               FX_TRACE_LOG: tracePath,
@@ -7397,10 +7498,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(result.code).toBe(0);
         expect(result.signal).toBeNull();
         expect(result.stderr).toMatch(
-          /^\[notice\] Connection lost · next try in 1s · attempt 1 · 0s$/m,
+          /^\[notice\] Connection lost · next try in 1s · attempt 1$/m,
         );
         expect(result.stderr).toMatch(
-          /^\[notice\] Connection lost · retrying · attempt 2 · \d+s$/m,
+          /^\[notice\] Connection lost · retrying · attempt 2$/m,
         );
         expect(json.exit_code).toBe(0);
         expect(json.output).toBe(expectedOutput);
@@ -7512,7 +7613,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
               HOME: root.home,
               AI_GATEWAY_API_KEY: "fake-gateway-lifecycle-key",
               VERCEL_OIDC_TOKEN: undefined,
-              FX_E2E_GATEWAY_CHAT_URL:
+              FX_TEST_GATEWAY_CHAT_URL:
                 `http://127.0.0.1:${address.port}/v1/ai/chat/completions`,
               FX_MODEL: MODEL,
               FX_TRACE_LOG: tracePath,
@@ -7634,7 +7735,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
             HOME: root.home,
             AI_GATEWAY_API_KEY: "fake-gateway-lifecycle-key",
             VERCEL_OIDC_TOKEN: undefined,
-            FX_E2E_GATEWAY_CHAT_URL:
+            FX_TEST_GATEWAY_CHAT_URL:
               `http://127.0.0.1:${address.port}/v1/ai/chat/completions`,
             FX_MODEL: MODEL,
             FX_TRACE_LOG: tracePath,
@@ -7650,10 +7751,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.stdout).toContain(expectedOutput);
       // Each 503 waits exactly its Retry-After, which does not advance the
       // backoff, so the reset that follows starts again at one second.
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 5 · \d+s$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 6 · \d+s$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Connection lost · retrying · attempt 7 · \d+s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 5$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 6$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · retrying · attempt 7$/m);
       expect(result.stderr).not.toMatch(/next try in (?:[2-9]|\d\d)s/);
       expect(connections).toBe(7);
       expect(requests).toBe(6);
@@ -7692,7 +7793,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const trace = readFileSync(tracePath, "utf8");
       expect(result.code).toBe(0);
       expect(result.stdout).toContain("Recovered without executing the unstarted tool.");
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
       expect(gateway.requestCount()).toBe(2);
       expect(gateway.requests[1]!.body).toContain("fx did not execute that call");
       expect(trace).toContain("event=route_failure");
@@ -8192,7 +8293,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const originalLog = readFileSync(logPath, "utf8");
 
       phase = 1;
-      const resumed = await runFx(["ask", "--json", "--resume-id", id, "Continue without delegation."], {
+      const resumed = await runFx(["ask", "--json", "--resume", id, "Continue without delegation."], {
         cwd: root.workspace, env, timeoutMs: 15_000,
       });
       expect(resumed.code).toBe(0);
@@ -8207,7 +8308,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(readFileSync(tracePath, "utf8")).toContain(`child_id=${child} reason=session_load_failed error=NotFound`);
 
       phase = 2;
-      const reopened = await runFx(["ask", "--json", "--resume-id", id, "Continue again without delegation."], {
+      const reopened = await runFx(["ask", "--json", "--resume", id, "Continue again without delegation."], {
         cwd: root.workspace, env, timeoutMs: 15_000,
       });
       expect(reopened.code).toBe(0);
@@ -8680,7 +8781,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         const first = await runFx(["ask", "--json", "--auto", `Run the ${outcome} delegation.`], { cwd: root.workspace, env, timeoutMs: 10_000 });
         expect(first.code).toBe(0);
         const sessionId = parseAskJson(first.stdout).session_id;
-        const repeat = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Observe that same delegation again."], { cwd: root.workspace, env, timeoutMs: 10_000 });
+        const repeat = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Observe that same delegation again."], { cwd: root.workspace, env, timeoutMs: 10_000 });
         expect(repeat.code).toBe(0);
         expect(seen[outcome]).toHaveLength(2);
         expect(seen[outcome][1]).toEqual(seen[outcome][0]);
@@ -8934,7 +9035,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "ask",
           "--json",
           "--auto",
-          "--resume-id",
+          "--resume",
           firstJson.session_id,
           "RESUME_PERSISTENT_SECOND",
         ],
@@ -8966,7 +9067,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         [
           "ask",
           "--auto",
-          "--resume-id",
+          "--resume",
           internalChildId,
           "DIRECT_CHILD_RESUME_MUST_FAIL",
         ],
@@ -9101,7 +9202,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "ask",
           "--json",
           "--auto",
-          "--resume-id",
+          "--resume",
           parentId!,
           resumePrompt,
         ],
@@ -9332,6 +9433,26 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     },
   ]);
 
+  // The whole limit went to reasoning, and the tool call after it was cut off.
+  const CUT_CALL_SENTINEL = "cut-call-ran.txt";
+  const cutToolCallReply = () => fakeGatewaySse([
+    { type: "reasoning-start", id: "spent_reasoning" },
+    { type: "reasoning-delta", id: "spent_reasoning", delta: "thinking until the limit runs out" },
+    { type: "reasoning-end", id: "spent_reasoning" },
+    { type: "tool-input-start", id: "cut_call", toolName: "shell" },
+    {
+      type: "tool-call",
+      toolCallId: "cut_call",
+      toolName: "shell",
+      input: { request: { action: "run", command: `printf ran > ${CUT_CALL_SENTINEL}` } },
+    },
+    {
+      type: "finish",
+      finishReason: { unified: "length", raw: "length" },
+      usage: { inputTokens: { total: 3 }, outputTokens: { total: 8_000 } },
+    },
+  ]);
+
   async function askWithReplies(
     label: string,
     replies: Array<() => Response>,
@@ -9352,8 +9473,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       return {
         result,
         json: parseAskJson(result.stdout),
-        bodies: gateway.requests.map((request) => JSON.parse(request.body) as { maxOutputTokens?: number }),
+        bodies: gateway.requests.map((request) =>
+          JSON.parse(request.body) as { maxOutputTokens?: number; reasoning?: string }
+        ),
         trace: readFileSync(tracePath, "utf8"),
+        cutCallRan: existsSync(join(root.workspace, CUT_CALL_SENTINEL)),
       };
     } finally {
       gateway.stop();
@@ -9378,7 +9502,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     expect(bodies[0]!.maxOutputTokens).toBeUndefined();
     expect(bodies[1]!.maxOutputTokens).toBe(32_768);
     expect(`${result.stdout}\n${result.stderr}`).toContain("Retrying with a higher limit.");
-    expect(trace).toContain("event=empty_length_limited_retry");
+    expect(trace).toContain("event=length_limited_resend");
   }, 40_000);
 
   test("an empty reply's retry limit stays inside the model's known context window", async () => {
@@ -9406,7 +9530,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
   }, 40_000);
 
-  test("an empty reply cut short at the catalog's own limit is not asked again", async () => {
+  test("an empty reply cut short at the catalog's own limit is not asked again when that would repeat the request", async () => {
+    // No lower effort and no higher limit: a resend would be the same request.
     const { result, json, bodies, trace } = await askWithReplies("empty-length-catalog-limit", [
       emptyLengthLimitedReply,
       () => fakeGatewayFinalText("a retry must not be sent"),
@@ -9417,7 +9542,77 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     expect(bodies[0]!.maxOutputTokens).toBe(8_000);
     expect(json.final_output).toBe("The reply ran out of output tokens before any text.");
     expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
-    expect(trace).not.toContain("event=empty_length_limited_retry");
+    expect(trace).not.toContain("event=length_limited_resend");
+  }, 40_000);
+
+  test("an empty reply cut short at the catalog's own limit is asked again once at low effort", async () => {
+    const { result, json, bodies, trace } = await askWithReplies("empty-length-low-effort", [
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("answered at low effort"),
+    ], {
+      context_window: 200_000,
+      max_tokens: 8_000,
+      reasoning_options: [{ type: "effort", values: ["none", "low", "high"] }],
+    });
+
+    expect(result.code).toBe(0);
+    expect(json.final_output).toContain("answered at low effort");
+    expect(bodies).toHaveLength(2);
+    // The catalog's limit stays; only the effort changes.
+    expect(bodies[0]!.maxOutputTokens).toBe(8_000);
+    expect(bodies[1]!.maxOutputTokens).toBe(8_000);
+    expect(bodies[0]!.reasoning).toBeUndefined();
+    expect(bodies[1]!.reasoning).toBe("low");
+    expect(`${result.stdout}\n${result.stderr}`).toContain("Retrying with low effort.");
+    expect(trace).toContain("event=length_limited_resend");
+  }, 40_000);
+
+  test("a reply that spent its limit before a cut-off tool call is resent at low effort without running the call", async () => {
+    const { result, json, bodies, trace, cutCallRan } = await askWithReplies("cut-tool-call-resend", [
+      cutToolCallReply,
+      () => fakeGatewayToolCall("listed", "glob_files", { pattern: "*" }),
+      () => fakeGatewayFinalText("finished after the resend"),
+    ], {
+      context_window: 1_050_000,
+      max_tokens: 8_000,
+      reasoning_options: [{ type: "effort", values: ["low", "medium", "high", "xhigh", "max"] }],
+    });
+
+    expect(result.code).toBe(0);
+    expect(json.final_output).toContain("finished after the resend");
+    expect(cutCallRan).toBe(false);
+    expect(json.tool_calls).toHaveLength(1);
+    expect(bodies).toHaveLength(3);
+    expect(bodies[0]!.reasoning).toBeUndefined();
+    expect(bodies[1]!.reasoning).toBe("low");
+    // The lower effort is for the resend only; the next step goes back.
+    expect(bodies[2]!.reasoning).toBeUndefined();
+    // The cut-off call never reaches the model's history.
+    expect(JSON.stringify(bodies[1])).not.toContain(CUT_CALL_SENTINEL);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("Retrying with low effort.");
+    expect(result.stderr).not.toContain("did not run them");
+    expect(trace).toContain("event=length_limited_resend");
+    expect(trace).toContain("dropped_tool_calls=1");
+  }, 40_000);
+
+  test("a resent reply cut off again ends the turn without running either call", async () => {
+    const { result, bodies, trace, cutCallRan } = await askWithReplies("cut-tool-call-twice", [
+      cutToolCallReply,
+      cutToolCallReply,
+      () => fakeGatewayFinalText("a third request must not be sent"),
+    ], {
+      context_window: 1_050_000,
+      max_tokens: 8_000,
+      reasoning_options: [{ type: "effort", values: ["low", "high"] }],
+    });
+
+    expect(result.code).toBe(1);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]!.reasoning).toBe("low");
+    expect(cutCallRan).toBe(false);
+    expect(result.stderr).toContain("so I did not run them");
+    expect(result.stderr).not.toContain("preserved above");
+    expect(trace).toContain("event=provider_completion_blocked");
   }, 40_000);
 
   test("commands with the same output get their own handles, and each reads back after resume", async () => {
@@ -9517,7 +9712,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.tool_calls).toEqual([]);
       expect(existsSync(sentinelPath)).toBe(false);
       expect(gateway.requestCount()).toBe(2);
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
       expect(json.recovery).toEqual({ state: "recovered", attempt: 2 });
       expect(trace).toContain("termination cause=valid_finish finish_reason=error");
       expect(trace).toContain("event=route_failure");
@@ -9654,8 +9849,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(result.timedOut).toBe(false);
       expect(json.output).not.toContain("⚠ API error");
       expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 3 · \d+s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 3$/m);
       expect(result.stderr).not.toContain("route failure");
       expect(gateway.requestCount()).toBe(3);
       expect(trace).toContain("event=route_failure");
@@ -9699,8 +9894,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(gateway.requestCount()).toBe(3);
       // Each timeout is one counted send; nothing probes the connection.
       expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
-      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1 · 0s$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 2s · attempt 2 · \d+s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 2s · attempt 2$/m);
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("retry=true");
       expect(trace).toContain("detail=gateway_stream_timeout: stream exceeded maximum duration");
@@ -9736,7 +9931,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.output).toBe("Recovered after the finish-only timeout.");
       expect(gateway.requestCount()).toBe(3);
       expect(json.recovery).toEqual({ state: "recovered", attempt: 3 });
-      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1$/m);
       expect(trace).toContain("event=route_failure");
       expect(trace).toContain("http_status=200");
       expect(trace).toContain("retry=true");
@@ -9773,8 +9968,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.output).toBe("Recovered beyond the old budget.");
       expect(gateway.requestCount()).toBe(13);
       expect(json.recovery).toEqual({ state: "recovered", attempt: 13 });
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 13 · \d+s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 13$/m);
       // No attempt count is ever shown as a fraction of a limit.
       expect(result.stderr).not.toMatch(/attempt \d+\//);
     } finally {
@@ -9872,7 +10067,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(step.tool_results.map((result: { tool_call_id: string }) => result.tool_call_id)).toEqual(ids);
 
       responses.push(fakeGatewayFinalText("Resumed without more tools."));
-      const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", json.session_id, "What did you read?"], {
+      const resumed = await runFx(["ask", "--json", "--auto", "--resume", json.session_id, "What did you read?"], {
         cwd: root.workspace,
         env: { ...fixtureEnv(root, gateway, tracePath), FX_MODEL: DEFAULT_MODEL },
         timeoutMs: 15_000,
@@ -9940,7 +10135,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(readFileSync(tracePath, "utf8")).toContain(`field=${field} failure=${kind.startsWith("long-") ? "too_long" : "empty"}`);
 
         responses.push(fakeGatewayFinalText("The prior write is retained."));
-        const resumed = await runFx(["ask", "--json", "--auto", "--resume-id", json.session_id, "What was completed?"], {
+        const resumed = await runFx(["ask", "--json", "--auto", "--resume", json.session_id, "What was completed?"], {
           cwd: root.workspace, env, timeoutMs: 15_000,
         });
         expect(resumed.code).toBe(0);
@@ -10019,7 +10214,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       }
       responses.push(fakeGatewayFinalText("Resume complete."));
       const resumed = await runFx(
-        ["ask", "--json", "--auto", "--resume-id", json.session_id, "What did you just read?"],
+        ["ask", "--json", "--auto", "--resume", json.session_id, "What did you just read?"],
         { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 15_000 },
       );
       expect(resumed.code).toBe(0);
@@ -10263,10 +10458,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.exit_code).toBe(1);
       expect(json.error).toBeUndefined();
       expect(json.output).toContain("visible partial output");
-      expect(json.output).not.toContain("did not execute the returned tool calls");
+      expect(json.output).not.toContain("did not run them");
       expect(json.tool_calls).toEqual([]);
       expect(result.stderr).toContain("response hit provider length limit");
-      expect(result.stderr).toContain("did not execute the returned tool calls");
+      expect(result.stderr).toContain("so I did not run them");
       expect(existsSync(sentinelPath)).toBe(false);
       expect(gateway.requestCount()).toBe(1);
       expect(trace).toContain("event=provider_completion_blocked");
@@ -10354,7 +10549,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(json.output).toBe("Answered after the upstream cut.");
       expect(json.recovery).toEqual({ state: "recovered", attempt: 2 });
       expect(gateway.requestCount()).toBe(2);
-      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1 · 0s$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -10657,8 +10852,8 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         expect(trace).toContain("event=prompt_finish");
         expect(trace).toContain("outcome_kind=assistant");
         // A stream that ends without its finish is a dropped connection.
-        expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1 · 0s$/m);
-        expect(result.stderr).toMatch(/^\[notice\] Connection lost · retrying · attempt 2 · \d+s$/m);
+        expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1$/m);
+        expect(result.stderr).toMatch(/^\[notice\] Connection lost · retrying · attempt 2$/m);
         expect(result.stderr).not.toContain("/10");
 
         const json = parseAskJson(result.stdout);
@@ -10718,7 +10913,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       const seedRequests = gateway.requests.length;
       phase = "attempt";
 
-      const result = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Continue."], {
+      const result = await runFx(["ask", "--json", "--auto", "--resume", sessionId, "Continue."], {
         cwd: root.workspace,
         env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,core,gateway,stream,context_compaction" },
         timeoutMs: 15_000,

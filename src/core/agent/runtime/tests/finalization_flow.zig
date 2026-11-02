@@ -225,12 +225,16 @@ test "processQueuedPrompt preserves finish precedence over malformed argument re
     };
 
     for (cases) |case| {
-        const completions = [_]FakeCompletion{.{
+        const reply: FakeCompletion = .{
             .tool_calls = &calls,
             .finish_reason = case.finish_reason,
             .omit_finish = case.omit_finish,
-        }};
-        var gateway = FakeGateway.init(alloc, &completions);
+        };
+        // A cut-off reply with nothing usable is resent once with fx's limit;
+        // the resend's own cut-off reply ends the turn.
+        const completions = [_]FakeCompletion{ reply, reply };
+        const requests: usize = if (case.expected == .length_limited) 2 else 1;
+        var gateway = FakeGateway.init(alloc, completions[0..requests]);
         defer gateway.deinit();
         var hooks = FakeAgentRuntimeDeps.init(alloc);
         defer hooks.deinit();
@@ -253,7 +257,7 @@ test "processQueuedPrompt preserves finish precedence over malformed argument re
             ),
         }
 
-        try std.testing.expectEqual(@as(usize, 1), gateway.request_bodies.items.len);
+        try std.testing.expectEqual(requests, gateway.request_bodies.items.len);
         try std.testing.expectEqual(@as(usize, 0), hooks.validated_names.items.len);
         try std.testing.expectEqual(@as(usize, 0), hooks.availability_checked_names.items.len);
         try std.testing.expectEqual(@as(usize, 0), hooks.permission_names.items.len);
@@ -1258,7 +1262,7 @@ test "common Stop length-limited tool failure retains candidate" {
 
     const assistant = deps.finish_presentation_text.?;
     try std.testing.expect(std.mem.startsWith(u8, assistant, "candidate\npartial"));
-    try std.testing.expect(std.mem.find(u8, assistant, "did not execute") != null);
+    try std.testing.expect(std.mem.find(u8, assistant, "did not run them") != null);
     try std.testing.expect(std.mem.startsWith(u8, deps.history_turns.items[0].assistant.assistant, "partial\n"));
     try std.testing.expectEqualStrings("candidate", deps.history_turns.items[0].assistant.execution.tool_steps[0].assistant.?);
     try std.testing.expectEqual(

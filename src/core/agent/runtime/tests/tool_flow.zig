@@ -2145,7 +2145,7 @@ test "processQueuedPrompt length-limited calls bypass malformed local tool ident
     try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "Partial answer") != null);
-    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "did not execute") != null);
+    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "did not run them") != null);
 }
 
 test "local tool emits authoritative progress and terminal lifecycle by default" {
@@ -4143,7 +4143,7 @@ test "processQueuedPrompt length-limited calls bypass malformed provider result 
     try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "Partial provider answer") != null);
-    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "did not execute") != null);
+    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "did not run them") != null);
 }
 
 test "processQueuedPrompt rejects duplicate authoritative tool ids before effects" {

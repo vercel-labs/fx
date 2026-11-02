@@ -575,7 +575,7 @@ pub fn finishLengthLimitedToolCallCompletion(
     completion: types.ModelCompletion,
     streamed_content_len: usize,
 ) ![]const u8 {
-    const blocker = "Provider response hit the length limit, so I did not execute the returned tool calls. Latest partial response is preserved above; retry with a narrower prompt or inspect stored tool output before continuing.";
+    const blocker = "The reply ran out of output tokens before its tool calls were complete, so I did not run them. Send your message again to retry, or ask for a smaller step.";
 
     const has_content = completion.content != null and completion.content.?.len > 0;
     const normalized = if (has_content) try normalizeAssistantTextForDisplay(arena, completion.content.?) else "";

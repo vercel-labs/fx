@@ -13,16 +13,28 @@ const credentials = @import("../auth/credentials.zig");
 const oauth_session = @import("../auth/oauth_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
+const profile_paths = @import("../shared/profile_paths.zig");
 
 const Allocator = std.mem.Allocator;
 
 const vercel_api_origin = "https://api.vercel.com";
 /// Test-only: a file holding the current time in milliseconds, so the E2E
 /// driver can move `/usage`'s clock. Unset in normal use.
-const clock_file_env = "FX_E2E_USAGE_CLOCK_FILE";
+const clock_file_env = "FX_TEST_USAGE_CLOCK_FILE";
 
+/// A host with no home directory, for a dashboard that `host` replaces once
+/// the home is known.
+pub const unset: usage.Host = .{ .fetch_fn = fetch, .now_fn = now, .io_fn = io, .home = "" };
+
+/// `home` is the user's home directory; the cache follows `$FX_HOME`.
 pub fn host(home: []const u8) usage.Host {
-    return .{ .fetch_fn = fetch, .now_fn = now, .io_fn = io, .home = home };
+    return .{
+        .fetch_fn = fetch,
+        .now_fn = now,
+        .io_fn = io,
+        .home = profile_paths.rootParent(home),
+        .fx_dir_name = profile_paths.rootName(),
+    };
 }
 
 /// `host` for the WebAssembly terminal, which runs each fetch inside its event
@@ -133,7 +145,7 @@ const chatgpt_origin = "https://chatgpt.com";
 
 /// `https://chatgpt.com`, or a loopback origin set by E2E tests.
 fn chatgptOrigin() []const u8 {
-    const override = io_mod.getenv("FX_E2E_CHATGPT_ORIGIN") orelse return chatgpt_origin;
+    const override = io_mod.getenv("FX_TEST_CHATGPT_ORIGIN") orelse return chatgpt_origin;
     return if (client.isLoopbackHttpUrl(override)) override else chatgpt_origin;
 }
 
@@ -141,7 +153,7 @@ const grok_origin = "https://cli-chat-proxy.grok.com/v1";
 
 /// The Grok CLI proxy, or a loopback origin set by E2E tests.
 fn grokOrigin() []const u8 {
-    const override = io_mod.getenv("FX_E2E_GROK_ORIGIN") orelse return grok_origin;
+    const override = io_mod.getenv("FX_TEST_GROK_ORIGIN") orelse return grok_origin;
     return if (client.isLoopbackHttpUrl(override)) override else grok_origin;
 }
 

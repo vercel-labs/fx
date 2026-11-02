@@ -119,7 +119,6 @@ pub const ProviderAttemptOwner = enum {
 
 pub const NetworkFailureCause = enum {
     transport_interrupted,
-    system_resumed,
     /// The network path is provably down (refused, unreachable, DNS). Nothing
     /// was sent; probing it costs nothing and never consumes a provider
     /// attempt.

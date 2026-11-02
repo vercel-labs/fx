@@ -283,24 +283,6 @@ type Hold = {
 const phases: Record<number, string> = { 1: "sending", 2: "waiting", 3: "need" };
 const needs: Record<number, string> = { 6: "crash", 7: "old" };
 
-/// fx's own process. On Linux the pane's bash keeps the pane's watcher shell
-/// between it and fx, so the pane's direct child can be that shell, and a
-/// signal sent there never reaches fx.
-function fxPid(session: { processPid(): number }): number {
-  let pid = session.processPid();
-  for (let depth = 0; depth < 4; depth += 1) {
-    const name = execFileSync("ps", ["-o", "comm=", "-p", String(pid)], { encoding: "utf8" }).trim();
-    if (basename(name) === "fx") return pid;
-    let children: string[] = [];
-    try {
-      children = execFileSync("pgrep", ["-P", String(pid)], { encoding: "utf8" }).trim().split(/\s+/);
-    } catch {}
-    if (children.length !== 1) throw new Error(`process ${pid} (${name}) has ${children.length} children, none of them fx`);
-    pid = Number.parseInt(children[0]!, 10);
-  }
-  throw new Error("no fx process under the tmux pane");
-}
-
 class Run {
   root = realpathSync(join(out, "runs"));
   home = "";
@@ -489,7 +471,7 @@ class Run {
 
   async end(signal: "HUP" | "KILL" | null) {
     if (signal) {
-      Bun.spawnSync(["kill", `-${signal}`, String(fxPid(this.session))]);
+      Bun.spawnSync(["kill", `-${signal}`, String(this.session.processPid())]);
     } else if (this.openHold() || (await this.question()) !== "none") {
       this.session.sendKeysImmediate(["C-c", "C-c"]);
     } else {

@@ -1888,6 +1888,15 @@ fn localFileTargetPath(alloc: Allocator, uri_text: []const u8) Allocator.Error!?
     };
 }
 
+/// The session's cache warmer, when the profile keeps it on. Unit tests
+/// share the real provider bundles and never ping, and a libfx host owns
+/// its sessions' lifetimes, so its kernel sends no requests of its own.
+fn acpCacheWarmer(state: *server.ServerState, session: *server.ActiveSessionState) ?*@import("../core/agent/runtime/cache_warmer.zig").Warmer {
+    if (comptime @import("builtin").is_test or host_target.is_wasm) return null;
+    if (state.cfg.minimal_kernel or !state.cache_warming) return null;
+    return session.session_rt.cacheWarmer();
+}
+
 fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     const session = if (ctx.state.active_session) |*active| active else unreachable;
     return .{
@@ -1931,6 +1940,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         else
             null,
         .record_usage = if (session.v2 != null) recordUsage else null,
+        .cache_warmer = acpCacheWarmer(ctx.state, session),
         .save_prompt_images = if (session.v2 != null) savePromptImages else null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (session.journal != null)

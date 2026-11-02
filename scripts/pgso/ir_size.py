@@ -48,8 +48,9 @@ a constant expression when it matches regions, so two regions that differ
 only in an instruction's constant, one with 16 and one with 8898, can share a
 parameter that also replaces the nested 16: the second region then reads
 `@g + 8898`. With the expressions rebuilt as instructions, every constant is
-an operand the outliner compares. Run it on each partition right before
-`opt -passes=iroutliner`, with no pass between that could fold them back.
+an operand the outliner compares. Run it on the outliner's input right
+before `opt -passes=iroutliner`, with no pass between that could fold them
+back.
 PHI nodes, landing pads, call targets, and intrinsic calls keep their
 expressions: the outliner never moves an intrinsic call or a PHI's incoming
 constant into a region, and a call target must stay a direct callee.
@@ -62,8 +63,9 @@ reversed region's operands to the outlined function in their original order,
 so that region computes `a < b` instead of `a > b`. A PGSO build of the
 current source turned a skill file read's bounds check around this way and
 panicked on the first chunk. With no greater-than comparison left, the
-outliner matches only comparisons written the same way. Run it on each
-partition right before `opt -passes=iroutliner`, after expand-constant-exprs.
+outliner matches only comparisons written the same way. Run it on the
+outliner's input right before `opt -passes=iroutliner`, after
+expand-constant-exprs.
 
 check-outlined fails when an outlined function holds a constant expression
 that the outliner rebuilt from a parameter: an instruction LLVM named

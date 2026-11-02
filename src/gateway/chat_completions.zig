@@ -345,7 +345,10 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
         else => return .permanent_failure,
     };
     errdefer result.deinit(alloc);
-    if (result == .failed) {
+    // A review the output limit cut off holds no decision, and the same
+    // review would be cut off again, so it stays unavailable.
+    const cut_off = result == .completed and result.completed.completion.finish_reason == .length;
+    if (result == .failed or cut_off) {
         result.deinit(alloc);
         return .permanent_failure;
     }

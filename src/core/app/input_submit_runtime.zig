@@ -81,6 +81,9 @@ pub const PendingSkillRefresh = enum {
 
 pub const State = struct {
     pending: ?PendingSubmission = null,
+    /// The prompt from `fx "<prompt>"`, sent once the first frame is on
+    /// screen. Owned by the app allocator.
+    launch_prompt: ?[]u8 = null,
     retry_after_auth: bool = false,
     compaction_pending: bool = false,
     /// Identity only; auth retains its existing pending execution flag.
@@ -306,6 +309,45 @@ pub fn SubmitRuntime(comptime App: type) type {
                     .{@errorName(err)},
                 );
             };
+        }
+
+        /// Sends the `fx "<prompt>"` prompt once the first frame is on screen,
+        /// through the same path as typing it and pressing Enter.
+        pub fn collectLaunchPromptFacts(app: *App, max_prompt_history: usize) !void {
+            if (comptime !@hasField(App, "submission")) return;
+            const prompt = app.submission.launch_prompt orelse return;
+            if (app.shell.render_requests.hasReason(.first_frame)) return;
+            // Typed input waits out a live session switch; so does this.
+            if (comptime @hasField(App, "session_persistence")) {
+                if (app.session_persistence.pending_live_session_policy != null) return;
+            }
+            app.submission.launch_prompt = null;
+            defer app.alloc.free(prompt);
+            if (app.input_runtime.edit_state.input.items.len != 0) {
+                debug_trace.logf(
+                    "input",
+                    "event=launch_prompt_dropped reason=composer_not_empty prompt_bytes={d}",
+                    .{prompt.len},
+                );
+                return;
+            }
+            debug_trace.logf("input", "event=launch_prompt_submit prompt_bytes={d}", .{prompt.len});
+            try app.input_runtime.edit_state.setText(app.alloc, prompt);
+            try submit(app, max_prompt_history);
+        }
+
+        /// Frees a launch prompt that was never sent, such as when fx exits
+        /// before its first frame.
+        pub fn discardLaunchPrompt(app: *App, reason: []const u8) void {
+            if (comptime !@hasField(App, "submission")) return;
+            const prompt = app.submission.launch_prompt orelse return;
+            app.submission.launch_prompt = null;
+            debug_trace.logf(
+                "input",
+                "event=launch_prompt_dropped reason={s} prompt_bytes={d}",
+                .{ reason, prompt.len },
+            );
+            app.alloc.free(prompt);
         }
 
         pub fn collectPendingSubmissionFacts(app: *App) void {
@@ -719,7 +761,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             const left_trimmed = std.mem.trimStart(u8, expanded.text, " \t\r\n");
             const resolved_slash_submission = resolvedSlashSubmission(app, left_trimmed);
             if (knownSlashCommand(app, resolved_slash_submission)) |command| {
-                if (requiresPromptCredential(command, resolved_slash_submission) and !try preflightPrompt(app)) return;
+                if (requiresPromptCredential(command, resolved_slash_submission) and !try preflightQueuedPrompt(app)) return;
                 try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
                 return;
             }
@@ -736,7 +778,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             )) |command_start| {
                 const command_text = expanded.text[command_start..];
                 if (knownSlashCommand(app, command_text)) |command| {
-                    if (requiresPromptCredential(command, command_text) and !try preflightPrompt(app)) return;
+                    if (requiresPromptCredential(command, command_text) and !try preflightQueuedPrompt(app)) return;
                     try submitSlashCommand(
                         app,
                         command_text,
@@ -914,6 +956,17 @@ pub fn SubmitRuntime(comptime App: type) type {
                 return App.ensurePromptCredential(app);
             }
             return true;
+        }
+
+        /// A prompt that queues behind active work, or a command that needs a
+        /// credential, must not wait on a credential refresh: the input loop
+        /// would freeze until the network answers. The turn's worker, or the
+        /// command's own background lookup, renews a due token.
+        fn preflightQueuedPrompt(app: *App) !bool {
+            if (comptime @hasDecl(App, "admitQueuedPromptCredential")) {
+                return App.admitQueuedPromptCredential(app);
+            }
+            return preflightPrompt(app);
         }
 
         fn pendingAuthRoutesLocalCommand(app: *App) bool {
@@ -1105,13 +1158,19 @@ pub fn SubmitRuntime(comptime App: type) type {
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
         ) !PromptAdmission {
-            // Sending a prompt clears MCP notices the user has seen.
-            if (comptime @hasField(App, "mcp") and @hasDecl(@FieldType(App, "mcp"), "dismissHostStatus")) app.mcp.dismissHostStatus();
+            // Sending a prompt loads an MCP config changed outside this
+            // session, then clears the MCP notices the user has seen. What a
+            // load just brought, such as a server that needs a login, hasn't
+            // been seen yet, so it stays on the status line.
+            const mcp_loaded = if (comptime @hasDecl(App, "refreshMcpHostForPrompt")) app.refreshMcpHostForPrompt() else false;
+            if (comptime @hasField(App, "mcp") and @hasDecl(@FieldType(App, "mcp"), "dismissHostStatus")) {
+                if (!mcp_loaded) app.mcp.dismissHostStatus();
+            }
             switch (try installPendingSubmission(app, prompt, skill_tokens)) {
                 .installed => return .pending,
                 .unavailable => {},
             }
-            if (!try preflightPrompt(app)) return .rejected;
+            if (!try preflightQueuedPrompt(app)) return .rejected;
             const accepted = if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings"))
                 try App.enqueuePromptWithSkillBindings(app, prompt, skill_tokens)
             else

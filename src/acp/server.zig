@@ -349,6 +349,7 @@ pub const ServerState = struct {
     first_call_tool_choice: types.ToolChoice = .auto,
     context_enabled: bool = true,
     session_titles: bool = true,
+    cache_warming: bool = true,
     active_session: ?ActiveSessionState = null,
     active_prompt: ?*ActivePrompt = null,
     subagent_authority_mutex: std.Io.Mutex = .init,
@@ -2741,6 +2742,7 @@ fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_
         state.cfg.default_model,
         state.cfg.default_agent_step_limit,
         state.cfg.auth_mode,
+        null,
         state.cfg.model_override,
     );
 }
@@ -2907,6 +2909,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.first_call_tool_choice = startup.first_call_tool_choice;
     state.context_enabled = startup.context_enabled;
     state.session_titles = startup.session_title_generation;
+    state.cache_warming = startup.cache_warming;
 
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {
@@ -4119,6 +4122,8 @@ pub fn loadStartingMode(state: *ServerState, alloc: Allocator) StartingMode {
             }
         }
     }
+    // `fx acp --permission-mode` beats the saved mode, as FX_PERMISSION_MODE does.
+    if (state.cfg.permission_override) |mode| state.permission_mode = mode;
     return .{
         .id = state.cfg.mode_registry.startingModeId(state.permission_mode),
         .permission_mode = state.permission_mode,

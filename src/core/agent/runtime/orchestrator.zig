@@ -42,6 +42,7 @@ const auto_classifier_context = @import("../../permissions/auto_classifier_conte
 const subagent_model_contract = @import("../../subagent/model_contract.zig");
 
 const runtime_config = @import("config.zig");
+const cache_warming = @import("cache_warming.zig");
 const runtime_finalization = @import("finalization.zig");
 const runtime_deps = @import("deps.zig");
 const runtime_lifecycle = @import("lifecycle.zig");
@@ -85,8 +86,15 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 
 const http_error_detail_max_bytes: usize = 4096;
-const empty_length_retry_notice = "The reply ran out of output tokens before any text. Retrying with a higher limit.";
 const empty_length_limited_reply = "The reply ran out of output tokens before any text.";
+
+fn lengthResendNotice(raised_limit: bool, lowered_effort: bool) []const u8 {
+    const prefix = empty_length_limited_reply ++ " Retrying with";
+    if (raised_limit and lowered_effort) return prefix ++ " a higher limit and low effort.";
+    if (raised_limit) return prefix ++ " a higher limit.";
+    std.debug.assert(lowered_effort);
+    return prefix ++ " low effort.";
+}
 const assistant_prefill_recovery_prompt =
     "Continue from the preceding tool result.";
 pub const assistant_tail_continuation_prompt =
@@ -3823,6 +3831,60 @@ fn appendRunningToolCalls(
 /// owns the session, so no tool call runs in a session another process
 /// took over. A lost writer fails like the stream itself, through the same
 /// recovery path; other check failures are only traced.
+/// A real request is about to go out, so the warmer stops pinging the last
+/// one (`tests/tla/cache_warming/CacheWarming.tla` NoPingWhileSending), and
+/// the usage of its pings is saved with the session's.
+fn disarmCacheWarming(deps: *const AgentRuntimeDeps) void {
+    const warmer = deps.cache_warmer orelse return;
+    warmer.disarm("request");
+    const usage = warmer.takeUsage() orelse return;
+    const record = deps.record_usage orelse {
+        debug_trace.logf("cache_warming", "event=usage_not_saved reason=no_session read={d} write={d}", .{
+            usage.cache_read_tokens orelse 0, usage.cache_write_tokens orelse 0,
+        });
+        return;
+    };
+    record(deps.ctx, usage) catch |err| {
+        debug_trace.logf("cache_warming", "event=usage_not_saved err={s}", .{@errorName(err)});
+    };
+}
+
+const CacheWarmingRequest = struct {
+    candidate: cache_warming.Candidate,
+    provider: agent_stream_provider.Provider,
+    body: ?[]const u8,
+    session_id: ?[]const u8,
+    api_key: []const u8,
+    credential_source: ?types.CredentialSource,
+    account_id: ?[]const u8,
+    gateway_team: ?[]const u8,
+    started_ms: i64,
+};
+
+/// A main request completed: keep its cache entry warm until the next one.
+fn armCacheWarming(deps: *const AgentRuntimeDeps, request: CacheWarmingRequest) void {
+    const warmer = deps.cache_warmer orelse return;
+    if (cache_warming.skipReason(request.candidate)) |reason| {
+        if (reason != .not_claude) debug_trace.logf("cache_warming", "event=skipped reason={s} model={s}", .{ @tagName(reason), request.candidate.model });
+        return;
+    }
+    const body = request.body orelse {
+        debug_trace.logf("cache_warming", "event=skipped reason=no_prepared_body model={s}", .{request.candidate.model});
+        return;
+    };
+    warmer.arm(.{
+        .provider = request.provider,
+        .model = request.candidate.model,
+        .session_id = request.session_id,
+        .body = body,
+        .api_key = request.api_key,
+        .credential_source = request.credential_source,
+        .account_id = request.account_id,
+        .gateway_team = request.gateway_team,
+        .started_ms = request.started_ms,
+    });
+}
+
 fn streamMainCompletion(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -4673,6 +4735,122 @@ fn fitRequestImages(
     }
 }
 
+/// Rounds the images left out of `request` up to the end of a block
+/// (`request_image_budget.blockCut`), so a session past its image limit keeps
+/// the same images in its cached prompt until the cut reaches the next block.
+/// `sizes` holds every image the request had before any was left out. Returns
+/// the body to send: `body` itself when nothing more is left out, or when the
+/// rounded request would not fit.
+fn holdImagesToBlocks(
+    arena: Allocator,
+    provider: agent_stream_provider.Provider,
+    request: *agent_stream_provider.RequestData,
+    body: []const u8,
+    sizes: []const usize,
+    limits: request_image_budget.Limits,
+    tool_text_limit: usize,
+    trace_ctx: TraceContext,
+) ![]const u8 {
+    const kept = (try request_image_budget.imageSizes(arena, request.messages)).len;
+    const cut = sizes.len -| kept;
+    const rounded_cut = request_image_budget.blockCut(sizes, cut, limits);
+    if (rounded_cut <= cut) return body;
+    const projection = try request_image_budget.withhold(arena, request.messages, rounded_cut - cut, tool_text_limit);
+    var rounded = request.*;
+    rounded.messages = projection.messages;
+    const rebuilt = (try provider.buildRequest(arena, rounded)) orelse return body;
+    if (rebuilt.len > limits.max_request_bytes) {
+        debug_trace.eventf("images", "request_images_block_skipped", trace_ctx, "cut={d} block_cut={d} request_bytes={d} limit_bytes={d}", .{
+            cut,
+            rounded_cut,
+            rebuilt.len,
+            limits.max_request_bytes,
+        });
+        return body;
+    }
+    debug_trace.eventf("images", "request_images_withheld_to_block", trace_ctx, "cut={d} block_cut={d} request_bytes_before={d} request_bytes_after={d}", .{
+        cut,
+        rounded_cut,
+        body.len,
+        rebuilt.len,
+    });
+    request.* = rounded;
+    return rebuilt;
+}
+
+test "a session past its size limit leaves images out a block at a time" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A body as long as the request's text and images.
+    const Builder = struct {
+        fn build(_: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.RequestData) anyerror![]u8 {
+            var len: usize = 100;
+            for (request.messages) |message| {
+                const text: []const u8 = message.content orelse "";
+                len += text.len;
+                if (message.tool_result_memory) |memory| {
+                    for (memory.tool_images) |image| len += image.data.len;
+                }
+            }
+            const body = try alloc.alloc(u8, len);
+            @memset(body, 'x');
+            return body;
+        }
+        fn stream(_: ?*anyopaque, _: Allocator, _: agent_stream_provider.ModelRequest) anyerror!agent_stream_provider.Result {
+            return error.TestUnexpectedStream;
+        }
+    };
+    const provider = agent_stream_provider.Provider{ .stream_fn = Builder.stream, .build_request_fn = Builder.build };
+    const limits = request_image_budget.Limits{ .max_request_bytes = 100_000 };
+
+    var messages: [40]types.ChatMessage = undefined;
+    for (&messages, 0..) |*message, index| {
+        const data = try arena.alloc(u8, 4000);
+        @memset(data, 'A');
+        const images = try arena.alloc(types.ToolImage, 1);
+        images[0] = .{ .data = data, .mime_type = try arena.dupe(u8, "image/png") };
+        message.* = .{
+            .role = .tool,
+            .content = try arena.print("<path>shot-{d}.png</path>", .{index}),
+            .tool_result_memory = .{ .tool_images = images, .tool_image_handle = try arena.print("image-result-{d}", .{index}) },
+        };
+    }
+
+    var previous_cut: usize = 0;
+    var cut_changes: usize = 0;
+    var minimal_changes: usize = 0;
+    var previous_minimal: usize = 0;
+    for (1..messages.len + 1) |count| {
+        var request: agent_stream_provider.RequestData = .{
+            .model = "test/model",
+            .messages = messages[0..count],
+            .tool_choice = .auto,
+            .provider_options = .{},
+        };
+        const sizes = try request_image_budget.imageSizes(arena, request.messages);
+        const first = (try provider.buildRequest(arena, request)).?;
+        const fitted = try fitRequestImages(arena, provider, &request, first, limits, 4096, .{});
+        const minimal = sizes.len - (try request_image_budget.imageSizes(arena, request.messages)).len;
+        const body = try holdImagesToBlocks(arena, provider, &request, fitted, sizes, limits, 4096, .{});
+        const cut = sizes.len - (try request_image_budget.imageSizes(arena, request.messages)).len;
+
+        try std.testing.expect(body.len <= limits.max_request_bytes);
+        try std.testing.expect(cut >= minimal and cut >= previous_cut);
+        // The newest image is always sent.
+        try std.testing.expectEqual(@as(usize, 1), request.messages[count - 1].tool_result_memory.?.tool_images.len);
+        if (cut != previous_cut) cut_changes += 1;
+        if (minimal != previous_minimal) minimal_changes += 1;
+        previous_cut = cut;
+        previous_minimal = minimal;
+    }
+    // Leaving out one more image per request would change the cached prompt
+    // on every request past the limit. A block ends at a quarter of the
+    // limit, seven of these images, so the cut changes every seventh.
+    try std.testing.expect(minimal_changes >= 10);
+    try std.testing.expect(cut_changes * 4 <= minimal_changes);
+}
+
 test "size rejections retry with fewer images only while images remain" {
     const too_large = agent_stream_provider.Failure{ .kind = .request_too_large };
     const overflow_text = agent_stream_provider.Failure{
@@ -4836,6 +5014,13 @@ fn isTerminalProviderExecutedCompletion(completion: types.ModelCompletion) bool 
     if (completion.finish_reason != .stop) return false;
     const content = completion.content orelse return false;
     return content.len > 0 and types.allToolCallsProviderExecuted(completion.tool_calls);
+}
+
+fn hasProviderExecutedCall(tool_calls: []const types.ToolCall) bool {
+    for (tool_calls) |call| {
+        if (call.provenance == .provider_executed) return true;
+    }
+    return false;
 }
 
 noinline fn settle_deferred_tool_starts(
@@ -6800,6 +6985,11 @@ fn processQueuedPromptLoop(
     // The limit the turn's one retry of an empty, cut-short reply set. Later
     // steps keep it until the catalog names a limit of its own.
     var length_retry_output_tokens: ?u32 = null;
+    // The effort of the next step when it resends a reply that hit its output
+    // limit with nothing usable; null when the next step is not a resend. A
+    // resend's own reply is never resent, so one such reply costs at most one
+    // more request.
+    var length_resend_effort: ?types.ReasoningEffort = null;
     var last_step_ctx = finish_trace.ctx;
     var current_step_index: usize = 0;
     var last_tool_call_name: []const u8 = "none";
@@ -6894,6 +7084,9 @@ fn processQueuedPromptLoop(
             pending_context_notes.clearRetainingCapacity();
         }
         current_step_index = step + 1;
+        const resend_effort = length_resend_effort;
+        length_resend_effort = null;
+        const step_effort = resend_effort orelse config.effort;
         if (deps.observer) |observer| observer.beginStep(current_step_index);
         defer if (deps.observer) |observer| observer.endStep();
         const step_ctx: TraceContext = .{ .turn_id = turn_id, .step_id = debug_trace.nextStepId(), .subagent_id = config.subagent_id };
@@ -7347,11 +7540,11 @@ fn processQueuedPromptLoop(
                 try deps.push_text(deps.ctx, .{ .operational = "\n" });
             }
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
-            var provider_opts = try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, job.provider, gateway_model, config.effort, attempt_fast_mode, config.ultrafast_mode);
+            var provider_opts = try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, job.provider, gateway_model, step_effort, attempt_fast_mode, config.ultrafast_mode);
             provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
             provider_opts.provider_order = config.provider_order;
             provider_opts.provider_strict = config.provider_strict;
-            runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, attempt_fast_mode, config.effort, provider_opts);
+            runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, attempt_fast_mode, step_effort, provider_opts);
             // Fast drops silently when the catalog cannot confirm support.
             // Tell the user once per turn, but only when the catalog itself is
             // known to be down; a reachable catalog that simply lacks fast
@@ -7388,7 +7581,9 @@ fn processQueuedPromptLoop(
             // The request re-sends every image the session keeps, and
             // building it whole would hold all of them, encoded, at once.
             // Images that pass every limit by their own size leave before the
-            // build; `fitRequestImages` fits the rest to this model's limit.
+            // build; `fitRequestImages` fits the rest to this model's limit,
+            // and `holdImagesToBlocks` rounds what it left out to a block.
+            const request_image_sizes = try request_image_budget.imageSizes(overlay_arena, request_data.messages);
             const past_limit = try request_image_budget.withholdImagesPastLimit(
                 overlay_arena,
                 request_data.messages,
@@ -7406,15 +7601,26 @@ fn processQueuedPromptLoop(
                 overlay_arena,
                 request_data,
             )) |built_request_body| {
-                const request_body = try fitRequestImages(
+                const image_limits: request_image_budget.Limits = .{ .max_request_bytes = request_image_budget.maxRequestBytes(
+                    agent.requestByteLimit(gateway_model),
+                    deps.agent_stream_provider.max_request_bytes,
+                ) };
+                const fitted_body = try fitRequestImages(
                     overlay_arena,
                     deps.agent_stream_provider,
                     &request_data,
                     built_request_body,
-                    .{ .max_request_bytes = request_image_budget.maxRequestBytes(
-                        agent.requestByteLimit(gateway_model),
-                        deps.agent_stream_provider.max_request_bytes,
-                    ) },
+                    image_limits,
+                    config.max_tool_result_bytes,
+                    step_ctx,
+                );
+                const request_body = try holdImagesToBlocks(
+                    overlay_arena,
+                    deps.agent_stream_provider,
+                    &request_data,
+                    fitted_body,
+                    request_image_sizes,
+                    image_limits,
                     config.max_tool_result_bytes,
                     step_ctx,
                 );
@@ -7658,7 +7864,11 @@ fn processQueuedPromptLoop(
                 request_recovery.flushRecord();
             }
 
+            disarmCacheWarming(deps);
             const gateway_wait_started_ms = io_mod.milliTimestamp();
+            // When the answered request started: the provider keeps its cache
+            // entry for its lifetime from then.
+            var request_started_ms = gateway_wait_started_ms;
             var gateway_delivery = runtime_gateway_step.DeliveryCertainty.init();
             var gateway_attempt_evidence: runtime_gateway_step.AttemptEvidence = .{};
             var provider_events = ProviderEventContext{
@@ -7721,7 +7931,6 @@ fn processQueuedPromptLoop(
                 const failure_cause: types.ModelRecoveryCause = if (network_failure) |evidence|
                     switch (evidence.cause) {
                         .transport_interrupted => .network_interrupted,
-                        .system_resumed => .system_resumed,
                         .connectivity_lost => .connectivity_lost,
                         .stream_stalled => .provider_stream_timeout,
                     }
@@ -7938,6 +8147,7 @@ fn processQueuedPromptLoop(
                     model_request.delivery = &replay_delivery;
                     model_request.attempt_evidence = &replay_evidence;
                     const replay_wait_started_ms = io_mod.milliTimestamp();
+                    request_started_ms = replay_wait_started_ms;
                     stream_result = try streamMainCompletion(deps, arena, model_request);
                     pushNetworkRecord(deps, job.provider, gateway_model, replay_wait_started_ms, &stream_result);
                     parent_turn_delivery.observeGatewayDelivery(
@@ -7966,6 +8176,25 @@ fn processQueuedPromptLoop(
                 if (deps.record_usage) |record| record(deps.ctx, completion.usage) catch |err| {
                     debug_trace.logf("agent", "event=usage_not_saved err={s}", .{@errorName(err)});
                 };
+                armCacheWarming(deps, .{
+                    .candidate = .{
+                        .gateway_with_direct_credential = job.provider == .gateway and
+                            job.credential_source != .host_managed and active_api_key.len > 0,
+                        .model = gateway_model,
+                        .root_turn = config.origin == .root,
+                        .prompt_caching = request_data.provider_options.prompt_caching,
+                        .reasoning = request_data.provider_options.reasoning != null,
+                        .model_has_efforts = request_capabilities.reasoning_efforts.len > 0,
+                    },
+                    .provider = deps.agent_stream_provider,
+                    .body = prepared_request_body,
+                    .session_id = lifecycle.scope.session_id,
+                    .api_key = active_api_key,
+                    .credential_source = job.credential_source,
+                    .account_id = job.account_id,
+                    .gateway_team = job.gateway_team,
+                    .started_ms = request_started_ms,
+                });
                 // The completion buffer is step-scoped, so no cross-step
                 // dedupe: each completion reports its serving provider once.
                 // The push_event callback takes ownership of the payload on
@@ -8875,24 +9104,41 @@ fn processQueuedPromptLoop(
             },
         );
         try runtime_telemetry.traceReturnedToolCalls(arena, step_ctx, completion.tool_calls);
-        // A reply the provider cut short before any text or tool call, from a
-        // request that named no output limit, ran out of the provider's own
-        // default. A provider that takes fx's limit gets the request once more
-        // with one.
-        const empty_length_retry: ?u32 = if (disposition == .length_limited and
-            completion.tool_calls.len == 0 and
+        // A reply the provider cut short before any text, such as reasoning
+        // that never reached an answer followed at most by tool calls cut off
+        // mid-arguments, is dropped and asked once more when the resend can
+        // differ: with fx's limit when the request named none and the
+        // provider takes one, since the provider's own default ran out, and at
+        // `low` effort when that reasons less. A resend's own reply, visible
+        // text, tool calls the provider already ran, and a resend that would
+        // repeat the request end the turn as before.
+        const may_resend = disposition == .length_limited and
+            resend_effort == null and
             std.mem.trim(u8, partial_assistant, " \t\r\n").len == 0 and
+            !hasProviderExecutedCall(completion.tool_calls) and
+            agent_steps.allowsStep(config.agent_step_limit, step + 1);
+        const raised_limit: ?u32 = if (may_resend and
             length_retry_output_tokens == null and
             config.provider_capabilities.sends_output_limit and
-            model_capabilities.requestOutputTokens(request_capabilities) == null and
-            agent_steps.allowsStep(config.agent_step_limit, step + 1))
+            model_capabilities.requestOutputTokens(request_capabilities) == null)
             model_capabilities.emptyLengthRetryOutputTokens(request_capabilities)
         else
             null;
-        if (empty_length_retry) |limit| {
-            length_retry_output_tokens = limit;
-            debug_trace.eventf("agent", "empty_length_limited_retry", step_ctx, "max_output_tokens={d}", .{limit});
-            try deps.push_text(deps.ctx, .{ .operational = empty_length_retry_notice });
+        const lowered_effort = if (may_resend)
+            model_capabilities.lengthResendEffort(request_capabilities, step_effort)
+        else
+            null;
+        if (raised_limit != null or lowered_effort != null) {
+            if (raised_limit) |limit| length_retry_output_tokens = limit;
+            const effort = lowered_effort orelse step_effort;
+            length_resend_effort = effort;
+            try stream_ctx.provisional_statuses.finishRejectedCompletions(deps, arena, turn_id, completion.tool_calls, advertised_dynamic_tool_names);
+            debug_trace.eventf("agent", "length_limited_resend", step_ctx, "dropped_tool_calls={d} max_output_tokens={any} effort={s}", .{
+                completion.tool_calls.len,
+                raised_limit,
+                effort.label(),
+            });
+            try deps.push_text(deps.ctx, .{ .operational = lengthResendNotice(raised_limit != null, lowered_effort != null) });
             try deps.push_text(deps.ctx, .{ .operational = "\n" });
             continue;
         }
