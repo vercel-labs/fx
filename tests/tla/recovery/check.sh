@@ -20,6 +20,7 @@
 #
 #   unbounded-wait      a Retry-After past the 30-second cap               WaitBounded
 #   frozen-countdown    the countdown stops changing every second          StatusFresh
+#   no-handoff          a retry status left over a model thinking quietly  HandsOff
 #
 # Resume.tla models the app around the module across process exits.
 # resume.cfg and resume-deep.cfg are the design and must pass;
@@ -61,6 +62,7 @@ Recovery recovery-mutation-send-without-save SaveBeforeSend
 RecoveryTimed recovery-timed -
 RecoveryTimed recovery-mutation-unbounded-wait WaitBounded
 RecoveryTimed recovery-mutation-frozen-countdown StatusFresh
+RecoveryTimed recovery-mutation-no-handoff HandsOff
 Resume resume -
 Resume resume-deep -
 Resume resume-today AutoResumes

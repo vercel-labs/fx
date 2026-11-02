@@ -577,7 +577,7 @@ test "a transient failure waits with the module's status, then resends" {
     _ = try request.failed(.{ .kind = .dropped });
     const waiting = fake.route_recovery_statuses.items[0];
     try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.waiting, waiting.kind);
-    try std.testing.expectEqualStrings("Connection lost · next try in 1s · attempt 1 · 0s", waiting.text.slice());
+    try std.testing.expectEqualStrings("Connection lost · next try in 1s · attempt 1", waiting.text.slice());
     try std.testing.expectEqual(@as(usize, 1), waiting.attempt);
 
     const send = (try request.waitForSend()).?;
@@ -585,7 +585,7 @@ test "a transient failure waits with the module's status, then resends" {
     try std.testing.expectEqual(@as(u16, 2), request.attempt());
     const retrying = fake.route_recovery_statuses.items[fake.route_recovery_statuses.items.len - 1];
     try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.retrying, retrying.kind);
-    try std.testing.expect(std.mem.startsWith(u8, retrying.text.slice(), "Connection lost · retrying · attempt 2 · "));
+    try std.testing.expect(std.mem.startsWith(u8, retrying.text.slice(), "Connection lost · retrying · attempt 2"));
 }
 
 test "the first output clears the status and success reports the recovery" {
@@ -693,7 +693,7 @@ test "three server errors in a row with Fast on resend without Fast" {
     try std.testing.expect(send.no_fast);
     try std.testing.expect(request.send.no_fast);
     const retrying = fake.route_recovery_statuses.items[fake.route_recovery_statuses.items.len - 1];
-    try std.testing.expect(std.mem.startsWith(u8, retrying.text.slice(), "Gateway error · retrying without Fast · attempt 4 · "));
+    try std.testing.expect(std.mem.startsWith(u8, retrying.text.slice(), "Gateway error · retrying without Fast · attempt 4"));
 
     // The rest of the request stays off Fast.
     _ = try request.failed(.{ .kind = .dropped });
@@ -710,7 +710,7 @@ test "a server's Retry-After is honored up to the 30 second ceiling" {
 
     _ = try request.start(false, null);
     _ = try request.failed(.{ .kind = .server, .retry_after_ms = 3_000 });
-    try std.testing.expectEqualStrings("Gateway error · next try in 3s · attempt 1 · 0s", fake.route_recovery_statuses.items[0].text.slice());
+    try std.testing.expectEqualStrings("Gateway error · next try in 3s · attempt 1", fake.route_recovery_statuses.items[0].text.slice());
     var started_ms = request.nowMs();
     _ = (try request.waitForSend()).?;
     try std.testing.expectEqual(@as(u64, 3_000), request.nowMs() - started_ms);
@@ -736,13 +736,13 @@ test "the countdown refreshes once a second while waiting" {
     var buf: [8][]const u8 = undefined;
     const texts = statusTexts(&fake, &buf);
     try std.testing.expectEqual(@as(usize, 4), texts.len);
-    try std.testing.expectEqualStrings("Rate limited · next try in 3s · attempt 1 · 0s", texts[0]);
-    try std.testing.expectEqualStrings("Rate limited · next try in 2s · attempt 1 · 1s", texts[1]);
-    try std.testing.expectEqualStrings("Rate limited · next try in 1s · attempt 1 · 2s", texts[2]);
-    try std.testing.expectEqualStrings("Rate limited · retrying · attempt 2 · 3s", texts[3]);
+    try std.testing.expectEqualStrings("Rate limited · next try in 3s · attempt 1", texts[0]);
+    try std.testing.expectEqualStrings("Rate limited · next try in 2s · attempt 1", texts[1]);
+    try std.testing.expectEqualStrings("Rate limited · next try in 1s · attempt 1", texts[2]);
+    try std.testing.expectEqualStrings("Rate limited · retrying · attempt 2", texts[3]);
 }
 
-test "the in-flight ticker keeps the retrying status counting" {
+test "the in-flight ticker hands the line back to the thinking row" {
     var fake = support.FakeAgentRuntimeDeps.init(std.testing.allocator);
     defer fake.deinit();
     const deps = fake.deps();
@@ -756,26 +756,27 @@ test "the in-flight ticker keeps the retrying status counting" {
     _ = (try request.waitForSend()).?;
     const io = io_mod.getIo();
     request.mutex.lockUncancelable(io);
-    const before = fake.route_recovery_statuses.items.len;
+    const statuses_before = fake.route_recovery_statuses.items.len;
+    const clears_before = fake.route_recovery_clear_count;
     request.mutex.unlock(io);
 
     request.beginSend();
     if (comptime builtin.single_threaded) return error.SkipZigTest;
-    _ = request.virtual_now_ms.fetchAdd(1_000, .seq_cst);
+    // A model thinking in silence sends nothing, so only the ticker can end
+    // the retry status.
+    _ = request.virtual_now_ms.fetchAdd(2_000, .seq_cst);
     var waited_ms: usize = 0;
     while (waited_ms < 2_000) : (waited_ms += 5) {
         request.mutex.lockUncancelable(io);
-        const count = fake.route_recovery_statuses.items.len;
+        const clears = fake.route_recovery_clear_count;
         request.mutex.unlock(io);
-        if (count > before) break;
+        if (clears > clears_before) break;
         io.sleep(.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
     }
     request.endSend();
 
-    try std.testing.expectEqual(before + 1, fake.route_recovery_statuses.items.len);
-    const refreshed = fake.route_recovery_statuses.items[before];
-    try std.testing.expectEqual(types.RouteRecoveryStatus.Kind.retrying, refreshed.kind);
-    try std.testing.expectEqualStrings("Connection lost · retrying · attempt 2 · 2s", refreshed.text.slice());
+    try std.testing.expectEqual(clears_before + 1, fake.route_recovery_clear_count);
+    try std.testing.expectEqual(statuses_before, fake.route_recovery_statuses.items.len);
 }
 
 test "start tells the host a new request begins" {

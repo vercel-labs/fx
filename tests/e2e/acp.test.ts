@@ -1635,7 +1635,7 @@ describe("acp: model-independent", () => {
         // The module's status shape, then a `recovered` that carries only the
         // attempt that succeeded.
         expect(allUpdates).toMatch(
-          /"modelResponseRecovery":\{"state":"waiting","attempt":1,"message":"Connection lost · next try in 1s · attempt 1 · 0s"\}/,
+          /"modelResponseRecovery":\{"state":"waiting","attempt":1,"message":"Connection lost · next try in 1s · attempt 1"\}/,
         );
         expect(allUpdates).toContain(
           '"modelResponseRecovery":{"state":"recovered","attempt":4}',

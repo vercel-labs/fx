@@ -2558,7 +2558,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "provider route recovery counts down and accepts slow response headers",
+    "provider route recovery counts down, then shows the thinking row while the resend waits on silent headers",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-route-recovery-")));
       const home = join(root, "home");
@@ -2611,20 +2611,27 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         () => queuedGateway.requests.length === 2,
         "silent-head retry request",
       );
-      // While the resend waits on its silent head, the retrying row keeps
-      // counting on its own: the in-flight ticker refreshes it every second.
-      await session.waitForText("• Gateway error · retrying · attempt 2 · 6s", TIMEOUT);
-      await session.waitForText("• Gateway error · retrying · attempt 2 · 8s", TIMEOUT);
+      // The resend shows its retry status briefly. Its bullet blinks, so match
+      // the text alone.
+      await session.waitForText("Gateway error · retrying · attempt 2", TIMEOUT);
+      // The gateway sends no headers while a model thinks, so the response
+      // stays silent. The thinking row takes the line back instead of
+      // leaving "retrying" over a healthy connection.
+      await session.waitForPane(
+        (pane) => pane.includes("Thinking") && !pane.includes("retrying"),
+        TIMEOUT,
+      );
+      expect(queuedGateway.requests.length).toBe(2);
 
       const inFlightPane = await session.capturePane();
-      expect(inFlightPane).toContain("• Gateway error · retrying · attempt 2 · ");
+      expect(inFlightPane).not.toContain("Gateway error");
       expect(inFlightPane).not.toContain("next try in");
       expect(inFlightPane).not.toContain("attempt 2/");
 
       await session.resizeWindow(32, 24);
       const narrowPane = await session.capturePane();
-      expect(narrowPane).toContain("• Gateway error");
-      expect(narrowPane).not.toContain("attempt 2/");
+      expect(narrowPane).toContain("Thinking");
+      expect(narrowPane).not.toContain("retrying");
       expect(narrowPane).not.toContain("▲");
 
       await session.resizeWindow(72, 24);
@@ -2764,9 +2771,11 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await waitForCondition(() => continued.started, "autonomous continued response");
       expect(queuedGateway.requests).toHaveLength(11);
 
-      // The admitted retry keeps the recovery status instead of a fresh
-      // Thinking phase.
-      await session!.waitForText("• Gateway error · retrying · attempt 11", TIMEOUT);
+      // The resend shows its retry status, then the thinking row takes the
+      // line back while the held response stays silent. The bullet blinks,
+      // so match the text alone.
+      await session!.waitForText("Gateway error · retrying · attempt 11", TIMEOUT);
+      await session!.waitForPane((pane) => pane.includes("Thinking") && !pane.includes("retrying"), TIMEOUT);
       continued.release?.();
       try {
         await session!.waitForText(finalText, TIMEOUT);
@@ -2880,9 +2889,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         // again on its own (`tests/tla/recovery/Resume.tla` AutoResumes).
         await waitForCondition(() => resumed.started, "admitted resumed response");
         await session.waitForText("Resuming the interrupted request", TIMEOUT);
-        // Until the first byte arrives, the status row says which attempt is
-        // resuming the request.
+        // Right after the send, the status row says which attempt is
+        // resuming the request; then the thinking row takes the line back.
         await session.waitForText("Resuming the interrupted request · attempt", TIMEOUT);
+        await session.waitForPane((pane) => pane.includes("Thinking") && !pane.includes("· attempt"), TIMEOUT);
         expect(queuedGateway.requests).toHaveLength(3);
 
         if (outcome === "finish") {
