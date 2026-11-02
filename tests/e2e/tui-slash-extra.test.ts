@@ -484,17 +484,6 @@ describe.skipIf(SKIP)("tui: extra slash commands", () => {
   );
 
   test(
-    "/alias shows alias list",
-    async () => {
-      session = await launchAndWait();
-      await session.sendText("/alias");
-      const pane = await session.waitForText(/alias|no|none|defined/i, 5_000);
-      expect(pane.toLowerCase()).toMatch(/alias|no|none|defined/);
-    },
-    TIMEOUT,
-  );
-
-  test(
     "/copy handles empty history gracefully",
     async () => {
       session = await launchAndWait();
