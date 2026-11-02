@@ -9665,7 +9665,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
     expect(result.code).toBe(1);
     expect(bodies).toHaveLength(2);
-    expect(output).toContain("The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL).");
+    expect(output).toContain("The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Continue with a follow-up prompt if needed.");
     // One nudge, then the stop itself.
     expect(output.split("Asking it to continue.").length - 1).toBe(1);
     expect(output).not.toContain("Done.");
@@ -9740,7 +9740,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
 
     expect(result.code).toBe(1);
     expect(bodies).toHaveLength(1);
-    expect(output).toContain("The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL).");
+    expect(output).toContain("The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Continue with a follow-up prompt if needed.");
     expect(output).not.toContain("Asking it to continue.");
     expect(output).not.toContain("Agent step limit reached");
     expect(output).not.toContain("Done.");
@@ -9758,7 +9758,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     expect(result.code).toBe(1);
     expect(bodies).toHaveLength(2);
     expect(output).toContain("The model stopped without a reply (finish reason: other). Asking it to continue.");
-    expect(output).toContain(`The model stopped without a reply (provider reason: ${bounded}).`);
+    expect(output).toContain(`The model stopped without a reply (provider reason: ${bounded}). Continue with a follow-up prompt if needed.`);
     expect(output).not.toContain("X".repeat(39));
     expect(trace).toContain(`provider_finish_reason=${bounded}`);
     expect(output).not.toContain("Done.");
@@ -9872,6 +9872,85 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(JSON.stringify(logLines(root.home, id))).not.toContain("\"Done.\"");
     } finally {
       if (proc.exitCode === null) proc.kill("SIGKILL");
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("an empty reply that stops for another reason gives way to steering and a running child, with no Done.", async () => {
+    const root = createFixtureRoot("other-empty-steering-child");
+    const child = heldFakeGatewayFinalText();
+    const parentBodies: string[] = [];
+    let childRequests = 0;
+    const gateway = startDynamicFakeGateway(raw => {
+      const body = JSON.parse(raw);
+      const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
+      if (latest.includes("EMPTY_STEER_CHILD")) {
+        childRequests++;
+        return child.response;
+      }
+      parentBodies.push(raw);
+      if (parentBodies.length === 1) {
+        return fakeGatewayToolCall("empty-steer-delegation", "subagent", { request: { action: "run", task: "EMPTY_STEER_CHILD" } });
+      }
+      // Both replies end empty while the child still runs: fx waits for the
+      // child, steering wakes it the first time, the child's result the second.
+      if (parentBodies.length === 2 || parentBodies.length === 3) return emptyOtherReply()();
+      return fakeGatewayFinalText("EMPTY_STEER_ALL_DONE");
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const tracePath = join(root.root, "trace.log");
+    const stderrPath = join(root.root, "stderr.log");
+    const trace = () => existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+    const assistantTexts = (raw: string) => (JSON.parse(raw).prompt as PromptMessage[])
+      .filter(message => message.role === "assistant")
+      .map(message => contentText(message.content));
+    let tui: TmuxSession | undefined;
+    try {
+      tui = await TmuxSession.create({
+        cmd: JSON.stringify(FX_BIN), cwd: root.workspace, isolated: true, remainOnExit: true, stderrPath,
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root.home,
+          AI_GATEWAY_API_KEY: "fake-empty-steer-key", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TEST_SKIP_ONBOARDING: "1", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "subagent,worker,agent,tool",
+        },
+      });
+      await tui.waitForStableComposer(15000);
+      const waits = () => trace().split("event=steering_parent_waiting").length - 1;
+      await tui.sendText("EMPTY_STEER_START");
+      await tui.waitForPane(() => childRequests === 1, 10000);
+      // Steering while the child runs moves it to the background.
+      await tui.sendText("EMPTY_STEER_NOTE keep the config untouched");
+      await tui.waitForPane(() => parentBodies.length === 2 && waits() === 1, 10000);
+      await tui.sendText("EMPTY_STEER_SECOND keep the tests too");
+      await tui.waitForPane(() => parentBodies.length === 3 && waits() === 2, 10000);
+      child.release("EMPTY_STEER_CHILD_RESULT");
+      await tui.waitForText("EMPTY_STEER_ALL_DONE", 10000);
+
+      expect(childRequests).toBe(1);
+      expect(parentBodies).toHaveLength(4);
+      // The steering continues the turn after the first empty reply, and the
+      // child's result after the second; neither is a nudge, and neither saves
+      // a "Done." the model never wrote.
+      expect(parentBodies[1]).toContain("EMPTY_STEER_NOTE");
+      expect(parentBodies[2]).toContain("EMPTY_STEER_SECOND");
+      expect(parentBodies[3]).toContain("EMPTY_STEER_CHILD_RESULT");
+      for (const body of parentBodies.slice(2)) {
+        expect(body).not.toContain(EMPTY_REPLY_NUDGE);
+        expect(assistantTexts(body)).not.toContain("Done.");
+      }
+      const scrollback = await tui.captureFullScrollback();
+      expect(scrollback).not.toMatch(/^\s*Done\.\s*$/m);
+      await tui.sendText("/quit");
+      await tui.waitForPane(() => tui!.paneStatus().dead, 10000);
+      expect(tui.paneStatus().status).toBe(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(JSON.stringify(logLines(root.home, rootSessionIds(root.home)[0]!))).not.toContain("\"Done.\"");
+    } finally {
+      child.dispose();
+      await tui?.kill();
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
     }

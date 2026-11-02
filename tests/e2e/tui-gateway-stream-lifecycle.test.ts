@@ -1691,6 +1691,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     const scrollback = await session.captureFullScrollback();
     expect(scrollback).toContain("Asking it to continue.");
     expect(scrollback).not.toContain("Done.");
+    // The failed turn says what the user can do next, however the line wraps.
+    expect(scrollback.replace(/\s+/g, " ")).toContain(
+      "The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Continue with a follow-up prompt if needed.",
+    );
 
     await session.sendText("/trace");
     const rootDir = root;

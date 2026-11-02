@@ -1,6 +1,6 @@
 # TLA+ models
 
-TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK and MCP models on `main` and on pull requests that change the code they cover, as `scripts/detect-ci-need.sh` decides, and the recovery model, with the driver that walks the recovery module along it, on every pull request. Run the others when you change the behavior they describe.
+TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK and MCP models on `main` and on pull requests that change the code they cover, as `scripts/detect-ci-need.sh` decides, and the recovery and agent_runtime models, each with its driver, on every pull request. Run the others when you change the behavior they describe.
 
 | Folder | What it models | Checker |
 |---|---|---|
