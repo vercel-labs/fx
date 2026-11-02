@@ -412,6 +412,13 @@ const OwnedQuestionEntry = struct {
     submission: @FieldType(types.QuestionBatchEntry, "submission") = .none,
 };
 
+/// Runs with the worker mutex held after an answer is accepted and before the
+/// worker can resume. The callback must not call back into the worker.
+pub const QuestionResumeObserver = struct {
+    ctx: *anyopaque,
+    run: *const fn (*anyopaque) void,
+};
+
 pub const QuestionPromptSource = enum {
     agent_question,
     route_recovery,
@@ -2482,7 +2489,12 @@ pub const WorkerRuntime = struct {
         };
     }
 
-    pub fn submitQuestionBatchAnswer(self: *WorkerRuntime, alloc: std.mem.Allocator, answers: ?[]const []const u8) !void {
+    pub fn submitQuestionBatchAnswer(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        answers: ?[]const []const u8,
+        on_resume: ?QuestionResumeObserver,
+    ) !void {
         var new_response: QuestionResponse = .cancelled;
         if (answers) |labels| {
             const dup = try alloc.alloc([]u8, labels.len);
@@ -2505,6 +2517,9 @@ pub const WorkerRuntime = struct {
         }
         freeQuestionResponse(alloc, self.pending_question_response);
         self.pending_question_response = new_response;
+        if (answers != null) {
+            if (on_resume) |observer| observer.run(observer.ctx);
+        }
         self.worker_cond.broadcast(io_mod.getIo());
     }
 
@@ -7034,7 +7049,7 @@ test "question batch snapshot answer and cancellation" {
     try std.testing.expectEqualStrings("Continue?", snapshot.entries[0].question);
     try std.testing.expectEqualStrings("Yes", snapshot.entries[0].options[0].label);
     try std.testing.expect(snapshot.entries[0].question.ptr != entries[0].question.ptr);
-    try runtime.submitQuestionBatchAnswer(alloc, &.{"Yes"});
+    try runtime.submitQuestionBatchAnswer(alloc, &.{"Yes"}, null);
     thread.join();
     defer freeAnswers(alloc, state.answers);
     try std.testing.expect(state.err == null);
@@ -7047,11 +7062,56 @@ test "question batch snapshot answer and cancellation" {
     const cancel_thread = try std.Thread.spawn(.{}, runQuestionRequest, .{ &cancel_state, &cancel_runtime, &entries });
     var cancel_snapshot = try waitForQuestionSnapshot(&cancel_runtime);
     cancel_snapshot.deinit(alloc);
-    try cancel_runtime.submitQuestionBatchAnswer(alloc, null);
+    try cancel_runtime.submitQuestionBatchAnswer(alloc, null, null);
     cancel_thread.join();
     try std.testing.expect(cancel_state.err == null);
     try std.testing.expect(cancel_state.answers == null);
     try std.testing.expect(try cancel_runtime.snapshotPendingQuestionBatch(alloc) == null);
+}
+
+test "question resume observer runs only for accepted answers before releasing the worker" {
+    const alloc = std.testing.allocator;
+    const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
+    const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.pending_question_shared = try dupeOwnedQuestionBatch(alloc, &entries, .agent_question);
+
+    const Observer = struct {
+        runtime: *WorkerRuntime,
+        count: usize = 0,
+        worker_locked: bool = false,
+        answer_accepted: bool = false,
+
+        fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+            self.worker_locked = !self.runtime.worker_mutex.tryLock();
+            if (!self.worker_locked) self.runtime.worker_mutex.unlock(io_mod.getIo());
+            self.answer_accepted = self.runtime.pending_question_response == .answered;
+        }
+    };
+    var observer = Observer{ .runtime = &runtime };
+    const on_resume = QuestionResumeObserver{ .ctx = &observer, .run = Observer.run };
+    var empty_buffer: [0]u8 = .{};
+    var no_memory = std.heap.FixedBufferAllocator.init(&empty_buffer);
+    try std.testing.expectError(error.OutOfMemory, runtime.submitQuestionBatchAnswer(no_memory.allocator(), &.{"Yes"}, on_resume));
+    try std.testing.expectEqual(@as(usize, 0), observer.count);
+    try std.testing.expect(runtime.pending_question_response == .pending);
+
+    try runtime.submitQuestionBatchAnswer(alloc, &.{"Yes"}, on_resume);
+    try std.testing.expectEqual(@as(usize, 1), observer.count);
+    try std.testing.expect(observer.worker_locked);
+    try std.testing.expect(observer.answer_accepted);
+
+    try runtime.submitQuestionBatchAnswer(alloc, &.{"Yes"}, on_resume);
+    try std.testing.expectEqual(@as(usize, 1), observer.count);
+
+    var cancelled = WorkerRuntime{};
+    defer cancelled.deinit(alloc);
+    cancelled.pending_question_shared = try dupeOwnedQuestionBatch(alloc, &entries, .agent_question);
+    try cancelled.submitQuestionBatchAnswer(alloc, null, on_resume);
+    try std.testing.expectEqual(@as(usize, 1), observer.count);
 }
 
 test "question batch source distinguishes route recovery from agent questions" {
@@ -7067,7 +7127,7 @@ test "question batch source distinguishes route recovery from agent questions" {
     defer route_snapshot.deinit(alloc);
     try std.testing.expectEqual(QuestionPromptSource.route_recovery, route_snapshot.source);
     try std.testing.expectEqual(QuestionPromptSource.route_recovery, route_runtime.pendingQuestionBatchSource());
-    try route_runtime.submitQuestionBatchAnswer(alloc, &.{"Try again later"});
+    try route_runtime.submitQuestionBatchAnswer(alloc, &.{"Try again later"}, null);
     route_thread.join();
     defer freeAnswers(alloc, route_state.answers);
     try std.testing.expect(route_state.err == null);
@@ -7081,7 +7141,7 @@ test "question batch source distinguishes route recovery from agent questions" {
     defer agent_snapshot.deinit(alloc);
     try std.testing.expectEqual(QuestionPromptSource.agent_question, agent_snapshot.source);
     try std.testing.expectEqual(QuestionPromptSource.agent_question, agent_runtime.pendingQuestionBatchSource());
-    try agent_runtime.submitQuestionBatchAnswer(alloc, &.{"Try again later"});
+    try agent_runtime.submitQuestionBatchAnswer(alloc, &.{"Try again later"}, null);
     agent_thread.join();
     defer freeAnswers(alloc, agent_state.answers);
     try std.testing.expect(agent_state.err == null);
@@ -7111,7 +7171,7 @@ test "question request queues an ordered boundary after prior assistant text" {
     try std.testing.expectEqualStrings("before question", events.items[0].assistant_presentation.text);
     try std.testing.expect(events.items[1] == .question_requested);
 
-    try runtime.submitQuestionBatchAnswer(alloc, &.{"Yes"});
+    try runtime.submitQuestionBatchAnswer(alloc, &.{"Yes"}, null);
     thread.join();
     defer freeAnswers(alloc, state.answers);
     try std.testing.expect(state.err == null);

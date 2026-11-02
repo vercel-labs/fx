@@ -5498,7 +5498,7 @@ test "setup preserves the disabled secret-store failure" {
     try std.testing.expectEqual(@as(usize, 0), capture.setup_store_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.setup_read_calls);
     try std.testing.expectEqualStrings(
-        "fx setup is deprecated and stops working in fx 0.0.17; use fx login vercel --api-key\n" ++
+        "fx setup is deprecated and stops working in fx 0.0.18; use fx login vercel --api-key\n" ++
             "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n",
         capture.stderr.written(),
     );

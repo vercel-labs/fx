@@ -130,6 +130,15 @@ const mcp_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "logout NAME", .description = "Sign out and delete the login" },
     .{ .usage = "approve NAME", .description = "Approve a project server from .mcp.json", .options = &mcp_approve_options },
     .{ .usage = "reject NAME", .description = "Reject a project server" },
+    .{
+        .usage = "call TOOL [JSON | -]",
+        .description = "Run an MCP tool from a command fx's shell tool runs",
+        .subcommands = &.{
+            .{ .usage = "list SERVER", .description = "List a server's tools" },
+            .{ .usage = "search QUERY...", .description = "Find the tools that match QUERY" },
+            .{ .usage = "help TOOL", .description = "Show a tool's arguments" },
+        },
+    },
 };
 
 // The flags of the `fx mcp` and `/mcp` verbs, which `src/core/mcp_host/verbs.zig`
