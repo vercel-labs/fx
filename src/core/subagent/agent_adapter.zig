@@ -106,6 +106,9 @@ const Context = struct {
         result.interactive = false;
         result.output_chunk_ctx = self;
         result.on_output_chunk = pushLiveOutputChunk;
+        // A child's tool calls are no rows of the parent's, so neither are
+        // the calls its commands make.
+        result.nested_tool_lifecycle = null;
         result.web_search_progress_ctx = null;
         result.on_web_search_progress = null;
         result.web_fetch_progress_ctx = null;

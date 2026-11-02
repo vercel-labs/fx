@@ -6038,7 +6038,7 @@ describe("cli: completion", () => {
     [["fx", "config", "get", "theme", ""], ""],
     [["fx", "ask", "--permission-mode", ""], "ask auto full-access"],
     [["fx", "--model", "gpt-5", "ask", "--permission-m"], "--permission-mode"],
-    [["fx", "mcp", ""], "list show add remove login logout approve reject"],
+    [["fx", "mcp", ""], "list show add remove login logout approve reject call"],
     [["fx", "mcp", "add", "--g"], "--global"],
     [["fx", "usage", "--period", ""], "today 7d month"],
     [["fx", "login", ""], "vercel codex grok"],

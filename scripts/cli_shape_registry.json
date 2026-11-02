@@ -61,6 +61,14 @@
       "job": "setting-override",
       "stability": "stable"
     },
+    "FX_MCP_CALL_SOCKET": {
+      "job": "internal",
+      "stability": "internal"
+    },
+    "FX_MCP_CALL_TOKEN": {
+      "job": "internal",
+      "stability": "internal"
+    },
     "FX_MODEL": {
       "job": "setting-override",
       "stability": "stable"
