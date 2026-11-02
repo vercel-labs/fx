@@ -69,7 +69,7 @@ pub fn QuestionRuntime(comptime App: type) type {
             }
             app.pacer.clear(app.alloc);
             if (!route_recovery and !mcp_elicitation) try finalizeQuestionTranscript(app, true);
-            try app.worker.submitQuestionBatchAnswer(std.heap.c_allocator, null);
+            try app.worker.submitQuestionBatchAnswer(std.heap.c_allocator, null, null);
             app.question_prompt.discard(app.alloc, "cancelled");
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
             const gesture_transition = gesture_state.disarmEscapeClear(
@@ -91,10 +91,18 @@ pub fn QuestionRuntime(comptime App: type) type {
             if (!isRouteRecoveryPrompt(app) and !isMcpElicitationPrompt(app)) {
                 try finalizeQuestionTranscript(app, false);
             }
-            try app.worker.submitQuestionBatchAnswer(std.heap.c_allocator, labels.items);
+            try app.worker.submitQuestionBatchAnswer(std.heap.c_allocator, labels.items, if (comptime @hasDecl(App, "reportWorking")) .{
+                .ctx = app,
+                .run = reportQuestionResume,
+            } else null);
             app.question_prompt.resetAfterSubmission(app.alloc);
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
             app.shell.render_requests.request(.modal);
+        }
+
+        fn reportQuestionResume(raw: *anyopaque) void {
+            const app: *App = @ptrCast(@alignCast(raw));
+            app.reportWorking();
         }
 
         pub fn rerenderQuestionBlock(app: *App) !void {
