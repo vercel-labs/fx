@@ -1261,8 +1261,8 @@ describe("lean auto mode reliability", () => {
           },
         ],
         [
-          fakeGatewayPermissionDecision("caution", "escaped_descriptor_review"),
-          fakeGatewayPermissionDecision("caution", "spaced_descriptor_review"),
+          fakeGatewayHeldDecision("escaped_descriptor_review"),
+          fakeGatewayHeldDecision("spaced_descriptor_review"),
         ],
       );
       const result = await runFx(
