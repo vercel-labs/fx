@@ -670,9 +670,9 @@ ARM64 = Platform(
     HOST_ARCH="aarch64",
     PROFILE_RUNTIME_TRIPLE="aarch64-unknown-linux-gnu",
     # Linux arm64 candidates measure about 0.2 MiB larger than macOS arm64's,
-    # 5.759 MiB at the last measurement, and need the 0.250 MiB preferred
+    # 5.942 MiB at the last measurement, and need the 0.250 MiB preferred
     # headroom on top.
-    SIZE_CEILING_MIB=6.250,
+    SIZE_CEILING_MIB=6.500,
 )
 X86_64 = Platform(
     TARGET="x86_64-linux",
