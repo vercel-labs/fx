@@ -1,12 +1,13 @@
 const std = @import("std");
+const observation = @import("../agent/runtime/observation.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
-const session_store = @import("session_store.zig");
 const session = @import("session.zig");
 const stream_provider = @import("../agent/stream_provider.zig");
 const gateway_step = @import("../agent/runtime/gateway_step.zig");
 const types = @import("../shared/types.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -93,6 +94,7 @@ fn capUtf8(text: []const u8, max_bytes: usize) []const u8 {
 }
 
 pub const Request = struct {
+    observer: ?*observation.Observer = null,
     stream_provider: stream_provider.Provider,
     model: []const u8,
     api_key: []const u8,
@@ -162,6 +164,8 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
         request.stream_provider,
         alloc,
         .{
+            .observer = request.observer,
+            .purpose = .title,
             .credential = credential,
             .session_id = request.session_id,
             .model = request.model,
@@ -182,11 +186,6 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
             .cancel_flag = request.cancel_flag,
             .provider_attempt_owner = .transport,
         },
-        // Cosmetic side calls stay out of the session usage ledger: a title
-        // call without generation metadata would otherwise degrade the
-        // session's billing completeness and inflate its token totals.
-        null,
-        alloc,
     ) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (request.cancel_flag.load(.seq_cst)) return .{ .unavailable = .{ .reason = .cancelled } };
@@ -224,6 +223,8 @@ pub const Task = struct {
     /// Terminal state of the attempt, readable once `done` is set.
     pub const Status = enum { pending, generated, unavailable };
 
+    /// Borrowed; a caller installing this must join the task before releasing it.
+    observer: ?*observation.Observer = null,
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -245,6 +246,7 @@ pub const Task = struct {
     failure_detail: []const u8 = "",
 
     pub const Init = struct {
+        observer: ?*observation.Observer = null,
         session_id: []const u8,
         model: []const u8,
         prompt_excerpt: []const u8,
@@ -274,6 +276,7 @@ pub const Task = struct {
 
         const task = try alloc.create(Task);
         task.* = .{
+            .observer = init.observer,
             .session_id = session_id,
             .model = model,
             .prompt_excerpt = prompt_excerpt,
@@ -337,6 +340,7 @@ pub const Task = struct {
         defer self.done.store(true, .release);
         const alloc = std.heap.c_allocator;
         const outcome = run(alloc, .{
+            .observer = self.observer,
             .stream_provider = self.stream_provider,
             .model = self.model,
             .api_key = self.api_key orelse "",
@@ -370,30 +374,6 @@ pub const Task = struct {
     }
 };
 
-/// Installs a generated title only while the session still carries its
-/// automatic title (none persisted yet, or still equal to the locally derived
-/// one). A title the user set with `/rename` never compares equal to the
-/// derived title unless they retyped it, so their title is never overwritten.
-/// Returns true when the generated title was installed.
-pub fn installGeneratedTitle(
-    alloc: Allocator,
-    loaded: *session_store.LoadedWritableSession,
-    history: []const session.HistoryTurn,
-    title: []const u8,
-) !bool {
-    var display = try session_display_metadata.deriveFromHistory(alloc, history);
-    defer display.deinit(alloc);
-    const persisted = try loaded.conversationTitle(alloc);
-    defer if (persisted) |value| alloc.free(value);
-    if (persisted) |value| {
-        if (!display.present or !std.mem.eql(u8, value, display.title)) {
-            debug_trace.logf("session", "event=title_generation_apply result=dropped reason=user_title_present", .{});
-            return false;
-        }
-    }
-    return loaded.renameConversation(alloc, title);
-}
-
 test "shouldGenerate requires an enabled, supported, untitled first submit" {
     const open = Gate{
         .setting_enabled = true,
@@ -420,7 +400,7 @@ test "promptExcerpt trims and bounds usable text" {
     try std.testing.expect(promptExcerpt("/compact") == null);
     try std.testing.expectEqualStrings("/compact extra", promptExcerpt("/compact extra").?);
 
-    const long = "x" ** (max_prompt_excerpt_bytes + 100);
+    const long = text_utils.repeat("x", max_prompt_excerpt_bytes + 100);
     try std.testing.expectEqual(@as(usize, max_prompt_excerpt_bytes), promptExcerpt(long).?.len);
 }
 
@@ -466,7 +446,7 @@ test "sanitizeGeneratedTitle normalizes model output" {
 
 test "sanitizeGeneratedTitle enforces the byte cap on a UTF-8 boundary" {
     const alloc = std.testing.allocator;
-    const long = (try sanitizeGeneratedTitle(alloc, "word " ** 40)).?;
+    const long = (try sanitizeGeneratedTitle(alloc, text_utils.repeat("word ", 40))).?;
     defer alloc.free(long);
     try std.testing.expect(long.len <= max_generated_title_bytes);
     try std.testing.expect(std.unicode.utf8ValidateSlice(long));
@@ -484,12 +464,12 @@ test "sanitizeGeneratedTitle bounds oversized single-line model output" {
     const alloc = std.testing.allocator;
     // A pathological title response can emit several KB on one line; the cap
     // must hold without overrunning the pre-sized strip buffer.
-    const oversized = "x" ** 4096;
+    const oversized = text_utils.repeat("x", 4096);
     const capped = (try sanitizeGeneratedTitle(alloc, oversized)).?;
     defer alloc.free(capped);
     try std.testing.expectEqual(@as(usize, max_generated_title_bytes), capped.len);
 
-    const oversized_with_controls = ("ab\x07" ** 1024) ++ "";
+    const oversized_with_controls = text_utils.repeat("ab\x07", 1024) ++ "";
     const stripped = (try sanitizeGeneratedTitle(alloc, oversized_with_controls)).?;
     defer alloc.free(stripped);
     try std.testing.expect(stripped.len <= max_generated_title_bytes);
@@ -566,7 +546,10 @@ test "run sanitizes provider content into a generated title" {
         }
     };
     var cancelled = std.atomic.Value(bool).init(false);
+    var capture: @import("../agent/runtime/observation_testing.zig").Capture = .{};
+    var observer = capture.observer();
     const outcome = try run(std.testing.allocator, .{
+        .observer = &observer,
         .stream_provider = .{ .stream_fn = Fake.stream },
         .model = "test/title",
         .api_key = "key",
@@ -579,6 +562,9 @@ test "run sanitizes provider content into a generated title" {
     };
     defer std.testing.allocator.free(title);
     try std.testing.expectEqualStrings("Fix the renderer", title);
+    try std.testing.expectEqual(@as(usize, 1), capture.count(.model_start));
+    try std.testing.expectEqual(capture.count(.model_start), capture.count(.model_end));
+    try std.testing.expectEqual(@as(usize, 1), capture.purposes[@backingInt(observation.ModelPurpose.title)]);
 }
 
 test "run treats unsanitizable output as unavailable" {

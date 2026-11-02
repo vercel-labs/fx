@@ -1,0 +1,16 @@
+[
+  {
+    "module": "PR1073Interactive",
+    "description": "Switch before joining children",
+    "old": "/\\ up /\\ next # None /\\ ~child /\\ cur' = next",
+    "new": "/\\ up /\\ next # None /\\ cur' = next",
+    "invariant": "ParentOutlivesChild"
+  },
+  {
+    "module": "PR1073Interactive",
+    "description": "Upgrade relaunch drops the v2 selection",
+    "old": "relaunch' = backend",
+    "new": "relaunch' = \"v1\"",
+    "invariant": "FlagKept"
+  }
+]

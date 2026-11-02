@@ -6,7 +6,7 @@ import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../node.js";
+import { createFxEngine } from "../node.js";
 import { createMcpAdapter } from "../mcp.js";
 
 const imageError = process.argv[4] === "images-error";
@@ -18,6 +18,14 @@ const transport = process.argv[2] || "stdio";
 const backend = process.argv[3] || (transport === "stdio" ? "native" : "wasm");
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const toolDescription = "MCP tool usage and parameter guidance. ".repeat(64);
+// The HTTP server lists 80 more tools across its two pages, with echo last,
+// like a large server such as GitHub's with every toolset on.
+const extraTools = (first, count) => Array.from({ length: count }, (_, index) => ({
+  name: `extra_${first + index}`,
+  description: "Fixture tool that pads a large catalog",
+  inputSchema: { type: "object", properties: {} },
+}));
+const httpToolCount = 81;
 let mcpClosed = false;
 
 function rpcClient(send, close) {
@@ -68,8 +76,8 @@ if (transport === "stdio") {
 } else {
   const dispatch = ({ id, method, params }) => {
     if (method === "initialize") return { jsonrpc: "2.0", id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {}, resources: {}, prompts: {} }, serverInfo: { name: "http-fixture", version: "1" } } };
-    if (method === "tools/list" && params.cursor === undefined) return { jsonrpc: "2.0", id, result: { tools: [], nextCursor: "tools-page" } };
-    if (method === "tools/list") return { jsonrpc: "2.0", id, result: { tools: [{ name: "echo", description: toolDescription, inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] } }] } };
+    if (method === "tools/list" && params.cursor === undefined) return { jsonrpc: "2.0", id, result: { tools: extraTools(0, 40), nextCursor: "tools-page" } };
+    if (method === "tools/list") return { jsonrpc: "2.0", id, result: { tools: [...extraTools(40, 40), { name: "echo", description: toolDescription, inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] } }] } };
     if (method === "tools/call") return { jsonrpc: "2.0", id, result: imageMode ? { isError: imageError, content: [{ type: "image", mimeType: "image/png", data: imageData }], structuredContent: imageOnly ? undefined : { label: "screenshot" } } : { content: [{ type: "text", text: `mcp:${params.arguments.value}` }] } };
     if (method === "resources/read") return { jsonrpc: "2.0", id, result: { contents: [{ uri: params.uri, text: "resource context" }] } };
     if (method === "prompts/get") return { jsonrpc: "2.0", id, result: { messages: [{ role: "user", content: { type: "text", text: "prompt context" } }] } };
@@ -117,18 +125,27 @@ const gateway = createServer((request, response) => {
     if (gatewayRequests === 1) {
       assert.ok(body.includes("resource context") && body.includes("prompt context"));
       assert.ok(JSON.parse(body).tools.some((tool) => tool.name === "mcp_echo"));
-      if (transport === "http") assert.equal(JSON.parse(body).tools.find((tool) => tool.name === "mcp_echo").description, toolDescription);
+      if (transport === "http") {
+        assert.equal(JSON.parse(body).tools.find((tool) => tool.name === "mcp_echo").description, toolDescription);
+        assert.equal(JSON.parse(body).tools.filter((tool) => tool.name.startsWith("mcp_")).length, httpToolCount);
+      }
       response.end('data: {"type":"tool-call","toolCallId":"mcp_1","toolName":"mcp_echo","input":{"value":"hello"}}\n\ndata: {"type":"finish","finishReason":{"unified":"tool-calls","raw":"tool-calls"}}\n\ndata: [DONE]\n\n');
       return;
     }
     if (imageMode) {
-      const parts = JSON.parse(body).prompt.flatMap((message) => message.content ?? []);
+      const prompt = JSON.parse(body).prompt;
+      const parts = prompt.flatMap((message) => message.content ?? []);
       const result = parts.find((part) => part.type === "tool-result" && part.toolCallId === "mcp_1");
       assert.equal(result?.output.type, "content", JSON.stringify(result?.output));
-      assert.deepEqual(result.output.value.find((part) => part.type === "image-data"), { type: "image-data", data: imageData, mediaType: "image/png" });
-      if (imageOnly) assert.ok(result.output.value.every((part) => part.type === "image-data"));
+      assert.ok(result.output.value.every((part) => part.type === "text"));
+      if (imageOnly) assert.equal(result.output.value.length, 1);
       else assert.ok(result.output.value.some((part) => part.type === "text" && part.text.includes("screenshot")));
       if (imageError) assert.ok(result.output.value.some((part) => part.type === "text" && part.text.includes("Tool error")));
+      const files = prompt
+        .filter((message) => message.role === "user" && Array.isArray(message.content))
+        .flatMap((message) => message.content)
+        .filter((part) => part.type === "file");
+      assert.deepEqual(files, [{ type: "file", mediaType: "image/png", data: { type: "data", data: imageData } }]);
     } else assert.ok(body.includes("mcp:hello"));
     response.end('data: {"type":"text-delta","delta":"done"}\n\ndata: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"}}\n\ndata: [DONE]\n\n');
   });
@@ -148,7 +165,7 @@ try {
     gatewayChatUrl: `http://127.0.0.1:${gateway.address().port}/chat`,
     model: "mcp/model",
   };
-  agent = await createFxAgent(options);
+  agent = await createFxEngine(options);
   const turn = agent.prompt("use MCP");
   let text = "";
   for await (const event of turn) if (event.type === "text_delta") text += event.delta;
@@ -157,7 +174,7 @@ try {
   if (imageMode) {
     const checkpoint = await agent.checkpoint();
     await agent.close();
-    agent = await createFxAgent({ ...options, checkpoint });
+    agent = await createFxEngine({ ...options, checkpoint });
     const resumed = agent.prompt("Describe that screenshot again");
     for await (const event of resumed) {}
     assert.equal((await resumed.result).stopReason, "end_turn");

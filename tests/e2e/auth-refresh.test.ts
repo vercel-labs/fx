@@ -5,7 +5,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -18,6 +17,7 @@ import {
   fakeGatewayFinalText,
   startFakeGateway,
 } from "./tmux-helpers";
+import { savedSessionIds } from "./saved-sessions";
 
 const TIMEOUT = 30_000;
 const EXPIRED_REFRESH_TOKEN = "expired-refresh-token";
@@ -127,15 +127,6 @@ async function waitForFileText(path: string, text: string): Promise<void> {
   throw new Error(`Timed out waiting for ${text} in ${path}`);
 }
 
-function sessionIdsFromHome(home: string): string[] {
-  return readdirSync(join(home, ".fx", "sessions"), {
-    withFileTypes: true,
-  })
-    .filter((entry) => entry.isDirectory() && entry.name !== "latest")
-    .map((entry) => entry.name)
-    .sort();
-}
-
 test(
   "logout cannot be undone by an in-flight login refresh",
   async () => {
@@ -168,9 +159,9 @@ test(
       AI_GATEWAY_API_KEY: undefined,
       VERCEL_OIDC_TOKEN: undefined,
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_AUTO_UPGRADE: "0",
-      FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+      FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl,
       FX_MODEL: FAKE_GATEWAY_MODEL,
@@ -185,7 +176,7 @@ test(
       const logout = runFx(["logout"], {
         env: {
           ...env,
-          FX_E2E_AUTH_LOCK_CONTENTION: "1",
+          FX_TEST_AUTH_LOCK_CONTENTION: "1",
         },
         timeoutMs: TIMEOUT,
       });
@@ -250,9 +241,9 @@ test(
             AI_GATEWAY_API_KEY: undefined,
             VERCEL_OIDC_TOKEN: undefined,
             FX_DISABLE_KEYCHAIN: "1",
-            FX_SKIP_ONBOARDING: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
             FX_AUTO_UPGRADE: "0",
-            FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+            FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
             FX_MODEL: FAKE_GATEWAY_MODEL,
@@ -317,9 +308,9 @@ test(
       AI_GATEWAY_API_KEY: undefined,
       VERCEL_OIDC_TOKEN: undefined,
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_AUTO_UPGRADE: "0",
-      FX_E2E_OAUTH_ISSUER_URL: oauth.issuerUrl,
+      FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
     };
 
     try {
@@ -384,7 +375,7 @@ test(
             AI_GATEWAY_API_KEY: SELECTED_API_KEY,
             VERCEL_OIDC_TOKEN: undefined,
             FX_DISABLE_KEYCHAIN: "1",
-            FX_SKIP_ONBOARDING: "1",
+            FX_TEST_SKIP_ONBOARDING: "1",
             FX_AUTO_UPGRADE: "0",
             FX_TRACE_LOG: tracePath,
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
@@ -429,7 +420,7 @@ test(
 );
 
 test(
-  "saved API-key 401 discards only the new empty session and preserves resume last",
+  "saved API-key 401 keeps the rejected prompt as a new session, which resume last opens",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-auth-empty-session-e2e-")));
     const home = join(root, "home");
@@ -449,7 +440,7 @@ test(
       AI_GATEWAY_API_KEY: SELECTED_API_KEY,
       VERCEL_OIDC_TOKEN: undefined,
       FX_DISABLE_KEYCHAIN: "1",
-      FX_SKIP_ONBOARDING: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
       FX_AUTO_UPGRADE: "0",
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_GATEWAY_CHAT_URL: gateway.chatUrl,
@@ -470,7 +461,7 @@ test(
       expect(seedJson.output).toContain("SEED_SESSION_RESPONSE");
       expect(seedJson.session_id.length).toBeGreaterThan(0);
       const seedSessionId = seedJson.session_id as string;
-      expect(sessionIdsFromHome(home)).toEqual([seedSessionId]);
+      expect(savedSessionIds(home)).toEqual([seedSessionId]);
 
       const rejected = await runFx(
         ["ask", "--json", "--auto", "Reject this new saved session."],
@@ -481,14 +472,13 @@ test(
         "fx ask: AI_GATEWAY_API_KEY authentication failed · HTTP 401\n",
       );
       const rejectedJson = JSON.parse(rejected.stdout);
-      expect(rejectedJson).toMatchObject({
-        exit_code: 1,
-        session_id: "",
-        steps: 0,
-        tool_calls: [],
-      });
+      expect(rejectedJson).toMatchObject({ exit_code: 1, steps: 0, tool_calls: [] });
       expect(rejectedJson.error).toBeUndefined();
-      expect(sessionIdsFromHome(home)).toEqual([seedSessionId]);
+      // The rejected prompt is kept, as any interrupted turn is (D1).
+      const rejectedSessionId = rejectedJson.session_id as string;
+      expect(rejectedSessionId.length).toBeGreaterThan(0);
+      expect(rejectedSessionId).not.toBe(seedSessionId);
+      expect(savedSessionIds(home).sort()).toEqual([seedSessionId, rejectedSessionId].sort());
       expect(gateway.requests).toHaveLength(2);
 
       const sessionsResult = await runFx(
@@ -498,21 +488,12 @@ test(
       expect(sessionsResult.code).toBe(0);
       expect(sessionsResult.stderr).toBe("");
       const sessions = JSON.parse(sessionsResult.stdout);
-      expect(sessions.count).toBe(1);
-      expect(sessions.sessions).toHaveLength(1);
-      expect(sessions.sessions[0].id).toBe(seedSessionId);
-      expect(sessions.sessions[0].history_len).toBe(1);
+      expect(sessions.sessions.map((session: { id: string }) => session.id)).toEqual([rejectedSessionId, seedSessionId]);
+      expect(sessions.sessions[1].history_len).toBe(1);
       expect(gateway.requests).toHaveLength(2);
 
       const resumed = await runFx(
-        [
-          "ask",
-          "--json",
-          "--auto",
-          "--resume",
-          "last",
-          "Resume the seed session.",
-        ],
+        ["ask", "--json", "--auto", "--resume", "last", "Continue after the rejected request."],
         { cwd: workspace, env, timeoutMs: TIMEOUT },
       );
       expect(
@@ -521,9 +502,8 @@ test(
       ).toBe(0);
       expect(resumed.stderr).toBe("");
       const resumedJson = JSON.parse(resumed.stdout);
-      expect(resumedJson.session_id).toBe(seedSessionId);
+      expect(resumedJson.session_id).toBe(rejectedSessionId);
       expect(resumedJson.output).toContain("RESUMED_SESSION_RESPONSE");
-      expect(sessionIdsFromHome(home)).toEqual([seedSessionId]);
       expect(gateway.requests).toHaveLength(3);
 
       const detail = await runFx(
@@ -532,14 +512,13 @@ test(
       );
       expect(detail.code).toBe(0);
       expect(detail.stderr).toBe("");
-      expect(JSON.parse(detail.stdout).history_len).toBe(2);
+      expect(JSON.parse(detail.stdout).history_len).toBe(1);
 
       expect(gateway.requests[0].body).toContain("Persist the seed session.");
       expect(gateway.requests[1].body).toContain("Reject this new saved session.");
       expect(gateway.requests[1].body).not.toContain("SEED_SESSION_RESPONSE");
-      expect(gateway.requests[2].body).toContain("SEED_SESSION_RESPONSE");
-      expect(gateway.requests[2].body).toContain("Resume the seed session.");
-      expect(gateway.requests[2].body).not.toContain("Reject this new saved session.");
+      expect(gateway.requests[2].body).toContain("Continue after the rejected request.");
+      expect(gateway.requests[2].body).not.toContain("SEED_SESSION_RESPONSE");
     } finally {
       gateway.stop();
       rmSync(root, { recursive: true, force: true });
@@ -562,7 +541,7 @@ test(
       AI_GATEWAY_API_KEY: undefined,
       VERCEL_OIDC_TOKEN: undefined,
       FX_DISABLE_KEYCHAIN: "1",
-      FX_E2E_OAUTH_ISSUER_URL: issuerB.issuerUrl,
+      FX_TEST_OAUTH_ISSUER_URL: issuerB.issuerUrl,
       FX_GATEWAY_BASE_URL: gateway.baseUrl,
       FX_MODEL: FAKE_GATEWAY_MODEL,
     };

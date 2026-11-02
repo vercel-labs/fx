@@ -1,4 +1,4 @@
-const maxTools = 64;
+const maxPages = 64;
 const maxInstructionsBytes = 64 * 1024;
 
 function contentText(content, mode = "tool") {
@@ -33,6 +33,11 @@ export async function createMcpAdapter(client, options = {}) {
     throw new TypeError("MCP client must provide listTools() and callTool()");
   }
   const prefix = options.prefix ?? "";
+  if (options.propagateCorrelation !== undefined && typeof options.propagateCorrelation !== "boolean") throw new TypeError("MCP propagateCorrelation must be a boolean");
+  if (options.serverName !== undefined && (typeof options.serverName !== "string" || options.serverName.length === 0 || options.serverName.length > 256)) throw new TypeError("MCP serverName must be a bounded name");
+  let reportedName;
+  try { reportedName = client.getServerVersion?.()?.name; } catch {}
+  const serverName = options.serverName ?? (typeof reportedName === "string" && reportedName.length > 0 && reportedName.length <= 256 ? reportedName : null);
   if (typeof prefix !== "string" || !/^[A-Za-z0-9_-]*$/.test(prefix)) {
     throw new TypeError("MCP prefix must contain only letters, digits, underscore, or hyphen");
   }
@@ -40,10 +45,10 @@ export async function createMcpAdapter(client, options = {}) {
   const cursors = new Set();
   let cursor;
   for (let page = 0; ; page += 1) {
-    if (page >= maxTools) throw new RangeError("MCP tool pagination exceeded its page limit");
+    if (page >= maxPages) throw new RangeError("MCP tool pagination exceeded its page limit");
     const listed = await client.listTools(cursor === undefined ? undefined : { cursor });
     const tools = Array.isArray(listed) ? listed : listed?.tools;
-    if (!Array.isArray(tools) || tools.length > maxTools - catalog.length) throw new TypeError("MCP listTools() returned an invalid tool catalog");
+    if (!Array.isArray(tools)) throw new TypeError("MCP listTools() returned an invalid tool catalog");
     catalog.push(...tools);
     cursor = Array.isArray(listed) ? undefined : listed.nextCursor;
     if (cursor === undefined || cursor === null) break;
@@ -67,8 +72,15 @@ export async function createMcpAdapter(client, options = {}) {
       name,
       description: tool.description || "MCP tool",
       inputSchema: tool.inputSchema ?? { type: "object", properties: {} },
-      async execute(input, { signal }) {
-        const result = await client.callTool({ name: tool.name, arguments: input }, undefined, { signal });
+      // The server's hints are not trusted: a call is never run twice on its
+      // own. A host that knows a tool is safe to repeat can set this to true.
+      idempotent: false,
+      async execute(input, { signal, observation }) {
+        const correlationId = options.propagateCorrelation === true ? crypto.randomUUID() : undefined;
+        // Correlation is not progress reporting: progressToken requests remote
+        // notifications and some clients replace it with their JSON-RPC ID.
+        const send = () => client.callTool({ name: tool.name, arguments: input, ...(correlationId === undefined ? {} : { _meta: { "libfx/correlationId": correlationId } }) }, undefined, { signal });
+        const result = observation ? await observation.mcp({ server: serverName, tool: tool.name, correlationId }, send) : await send();
         const text = resultText(result);
         const images = (Array.isArray(result?.content) ? result.content : []).flatMap((item) => item?.type === "image" ? [item] : item?.type === "resource" && item.resource?.mimeType?.startsWith("image/") && typeof item.resource?.blob === "string" ? [{ type: "image", mimeType: item.resource.mimeType, data: item.resource.blob }] : []).map((item) => ({
           type: "image", mimeType: item.mimeType, data: item.data,

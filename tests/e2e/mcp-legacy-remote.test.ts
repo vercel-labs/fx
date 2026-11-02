@@ -13,8 +13,6 @@ import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
 import {
   LEGACY_REMOTE_TOOL_RESULT,
-  LEGACY_SSE_TOOL_RESULT,
-  startLegacyHttpSseFixture,
   startLegacyStreamableHttpFixture,
   type LegacyStreamableVersion,
 } from "./fixtures/mcp-legacy-remote";
@@ -37,7 +35,6 @@ const VERSIONS: LegacyStreamableVersion[] = [
 
 let cleanupRoot: string | null = null;
 let streamable: ReturnType<typeof startLegacyStreamableHttpFixture> | null = null;
-let legacySse: ReturnType<typeof startLegacyHttpSseFixture> | null = null;
 let gateway: ReturnType<typeof startFakeGateway> | null = null;
 let tui: TmuxSession | null = null;
 
@@ -45,18 +42,15 @@ afterEach(async () => {
   const activeTui = tui;
   const activeGateway = gateway;
   const activeStreamable = streamable;
-  const activeLegacySse = legacySse;
   const activeCleanupRoot = cleanupRoot;
   tui = null;
   gateway = null;
   streamable = null;
-  legacySse = null;
   cleanupRoot = null;
 
   if (activeTui) await activeTui.kill();
   activeGateway?.stop();
   activeStreamable?.stop();
-  activeLegacySse?.stop();
   if (activeCleanupRoot) {
     rmSync(activeCleanupRoot, { recursive: true, force: true });
   }
@@ -111,7 +105,7 @@ function fixtureEnv(
     FX_PERMISSION_MODE: "auto",
     FX_GATEWAY_BASE_URL: activeGateway.baseUrl,
     FX_GATEWAY_CHAT_URL: activeGateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: activeGateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: activeGateway.chatUrl,
     FX_MODEL: MODEL,
     FX_TRACE_LOG: root.traceLogPath,
     FX_TRACE_SCOPES: "mcp",
@@ -147,48 +141,25 @@ async function runAsk(
   );
 }
 
-function preserveLegacyFailure(
-  label: string,
-  root: ReturnType<typeof createRoot>,
-  result: Awaited<ReturnType<typeof runAsk>>,
-  activeFixture: ReturnType<typeof startLegacyHttpSseFixture>,
-  activeGateway: ReturnType<typeof startFakeGateway>,
-): void {
-  cleanupRoot = null;
-  writeFileSync(join(root.root, "fx-stdout.log"), result.stdout);
-  writeFileSync(join(root.root, "fx-stderr.log"), result.stderr);
-  writeFileSync(
-    join(root.root, "failure.json"),
-    JSON.stringify({
-      label,
-      result,
-      fixtureRequests: activeFixture.requests,
-      discoveryGets: activeFixture.discoveryGets,
-      toolsListCalls: activeFixture.toolsListCalls,
-      streamCancelled: activeFixture.streamCancelled,
-      gatewayRequests: activeGateway.requests.map((request) => request.body),
-    }, null, 2),
+// The result the model got for call `callId`, as JSON text.
+function toolResultText(body: string, callId: string): string {
+  for (const message of JSON.parse(body).prompt as Array<{ content: unknown }>) {
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content as Array<Record<string, unknown>>) {
+      if (part.type === "tool-result" && part.toolCallId === callId) return JSON.stringify(part.output);
+    }
+  }
+  throw new Error(`Missing tool result for ${callId}`);
+}
+
+// GETs that resume a stream; the listener is a GET with no event id.
+function resumes(fixture: ReturnType<typeof startLegacyStreamableHttpFixture>) {
+  return fixture.requests.filter((entry) =>
+    entry.httpMethod === "GET" && entry.headers["last-event-id"] !== undefined
   );
-  throw new Error(`fx ${label} failed; retained artifacts: ${root.root}`);
 }
 
 describe("version-scoped legacy MCP remote transports", () => {
-  for (const version of VERSIONS) {
-    test(`default MCP v1 initializes Streamable HTTP ${version} without probing discovery`, async () => {
-      streamable = startLegacyStreamableHttpFixture(version);
-      const root = createRoot(`default-v1-${version}`, "http", streamable.url);
-      gateway = startToolGateway("Default remote MCP v1 complete.");
-      const result = await runAsk(root, gateway, "Use the MCP tool.");
-      expect(result.code).toBe(0);
-      expect(streamable.initializeCalls).toBe(1);
-      expect(streamable.toolsListCalls).toBe(1);
-      expect(streamable.toolCallCalls).toBe(1);
-      const requests = streamable.requests.filter((entry) => entry.message?.method);
-      expect(requests[0]?.message?.method).toBe("initialize");
-      expect(requests.filter((entry) => entry.message?.method === "server/discover")).toHaveLength(0);
-    }, 30_000);
-  }
-
   for (const sdkDiscoveryError of [
     "uninitialized",
     "unsupported-version",
@@ -199,10 +170,6 @@ describe("version-scoped legacy MCP remote transports", () => {
         sdkDiscoveryError,
       });
       const root = createRoot(`sdk-discovery-${sdkDiscoveryError}`, "http", streamable.url);
-      const profilePath = join(root.home, ".fx", "mcp.json");
-      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-      profile.mcp.fixture.environment = { FX_MCP_PROTOCOL_VERSION: "2026-07-28" };
-      writeFileSync(profilePath, JSON.stringify(profile));
       gateway = startToolGateway("Stock SDK fallback complete.");
 
       const result = await runAsk(root, gateway, "Use the legacy MCP tool.");
@@ -222,104 +189,6 @@ describe("version-scoped legacy MCP remote transports", () => {
       expect(initialize?.message?.params?.protocolVersion).toBe("2025-11-25");
     }, 30_000);
   }
-
-  test.skipIf(!tmuxAvailable())(
-    "legacy list-change health reports an installed listener and lazy feature counts truthfully",
-    async () => {
-      streamable = startLegacyStreamableHttpFixture("2025-11-25", {
-        listChanged: true,
-        features: true,
-        sdkDiscoveryError: "uninitialized",
-      });
-      const root = createRoot("legacy-health", "http", streamable.url);
-      gateway = startFakeGateway([fakeGatewayFinalText("unused")], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-      tui = await TmuxSession.create({
-        isolated: true,
-        cwd: root.workspace,
-        width: 160,
-        height: 34,
-        env: fixtureEnv(root, gateway),
-      });
-
-      await tui.waitForComposer(15_000);
-      await tui.sendText("/mcp list");
-      const pane = await tui.waitForText("MCP health (1 server)", 10_000);
-      expect(pane).toContain("protocol=2025-11-25");
-      expect(pane).toContain(
-        "tools=1 resources=unknown templates=unknown prompts=unknown",
-      );
-      expect(pane).toContain("subscription=active");
-      expect(gateway.requests).toHaveLength(0);
-    },
-    30_000,
-  );
-
-  test("legacy Streamable HTTP uses typed feature flows and existing list-change listener", async () => {
-    streamable = startLegacyStreamableHttpFixture("2025-06-18", {
-      listChanged: true,
-      features: true,
-    });
-    const root = createRoot("features", "http", streamable.url);
-    gateway = startFakeGateway([
-      fakeGatewayToolCall("legacy_resource_list_one", "mcp_features", {
-        action: "resource_list",
-        server: "fixture",
-      }),
-      async () => {
-        await Bun.sleep(200);
-        return fakeGatewayToolCall("legacy_resource_list_two", "mcp_features", {
-          action: "resource_list",
-          server: "fixture",
-        });
-      },
-      fakeGatewayToolCall("legacy_resource_read", "mcp_features", {
-        action: "resource_read",
-        server: "fixture",
-        uri: "legacy://alpha",
-      }),
-      fakeGatewayToolCall("legacy_prompt_list", "mcp_features", {
-        action: "prompt_list",
-        server: "fixture",
-      }),
-      fakeGatewayToolCall("legacy_prompt_get", "mcp_features", {
-        action: "prompt_get",
-        server: "fixture",
-        prompt: "review",
-        arguments: { tone: "brief" },
-      }),
-      fakeGatewayToolCall("legacy_prompt_complete", "mcp_features", {
-        action: "prompt_complete",
-        server: "fixture",
-        prompt: "review",
-        argument: "tone",
-        value: "b",
-      }),
-      fakeGatewayFinalText("Legacy MCP features complete."),
-    ], {
-      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-    });
-
-    const result = await runAsk(root, gateway, "Use the legacy MCP features.");
-
-    expect(result.code).toBe(0);
-    expect(streamable.resourcesListCalls).toBe(2);
-    expect(streamable.requests.some((entry) =>
-      entry.message?.method === "subscriptions/listen"
-    )).toBe(false);
-    const bodies = gateway.requests.map((entry) => entry.body).join("\n");
-    expect(bodies).toContain("legacy-alpha-fresh");
-    expect(bodies).toContain("LEGACY_RESOURCE_TEXT");
-    expect(bodies).toContain("LEGACY_PROMPT_TEXT");
-    expect(bodies).toContain('\\"trust\\":\\"untrusted_external\\"');
-    expect(streamable.requests.filter((entry) =>
-      entry.message?.method === "resources/read"
-    )).toHaveLength(1);
-    expect(streamable.requests.filter((entry) =>
-      entry.message?.method === "completion/complete"
-    )).toHaveLength(1);
-  }, 30_000);
 
   for (const version of VERSIONS) {
     test(`Streamable HTTP ${version} refreshes Tools from its GET listener without reconnect`, async () => {
@@ -369,11 +238,7 @@ describe("version-scoped legacy MCP remote transports", () => {
       )!;
       expect(listener.headers["mcp-session-id"]).toBe(`session-${version}`);
       expect(listener.headers.accept).toBe("text/event-stream");
-      if (version === "2025-03-26") {
-        expect(listener.headers["mcp-protocol-version"]).toBeUndefined();
-      } else {
-        expect(listener.headers["mcp-protocol-version"]).toBe(version);
-      }
+      expect(listener.headers["mcp-protocol-version"]).toBe(version);
       const deadline = Date.now() + 5_000;
       while (
         streamable.listenerCancellations === 0 && Date.now() < deadline
@@ -381,55 +246,10 @@ describe("version-scoped legacy MCP remote transports", () => {
         await Bun.sleep(25);
       }
       expect(streamable.listenerCancellations).toBe(1);
-      expect(streamable.deleteCalls).toBe(1);
+      // The session's DELETE is skipped at exit (replace-v1 decision 11).
+      expect(streamable.deleteCalls).toBe(0);
     }, 30_000);
   }
-
-  test("deprecated HTTP+SSE routes live Tools changes through its existing reader", async () => {
-    legacySse = startLegacyHttpSseFixture({ listChanged: true });
-    const root = createRoot("sse-list-changed", "sse", legacySse.url);
-    const freshTool = "mcp_fixture_fresh";
-    gateway = startFakeGateway([
-      fakeGatewayToolCall("activate_sse_reader", "capability_search", {
-        query: "echo",
-      }),
-      async () => {
-        await Bun.sleep(100);
-        return fakeGatewayToolCall("search_fresh", "capability_search", {
-          query: "fresh",
-        });
-      },
-      fakeGatewayToolCall("select_fresh", "mcp_select_tool", {
-        name: freshTool,
-      }),
-      fakeGatewayToolCall("call_fresh", freshTool, { text: "changed" }),
-      fakeGatewayFinalText("HTTP+SSE live refresh complete."),
-    ], {
-      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-    });
-
-    const result = await runAsk(root, gateway, "Use the changed SSE tool.");
-
-    expect(result.code).toBe(0);
-    expect(legacySse.currentToolName).toBe("fresh");
-    expect(legacySse.toolsListCalls).toBe(2);
-    expect(legacySse.discoveryGets).toBe(1);
-    expect(legacySse.requests.some((entry) =>
-      entry.message?.method === "subscriptions/listen"
-    )).toBe(false);
-    const toolCalls = legacySse.requests.filter((entry) =>
-      entry.message?.method === "tools/call"
-    );
-    expect(toolCalls).toHaveLength(1);
-    expect(toolCalls[0]?.message?.params?.name).toBe("fresh");
-    expect(gateway.requests.some((entry) => entry.body.includes(freshTool)))
-      .toBe(true);
-    const deadline = Date.now() + 5_000;
-    while (legacySse.streamCancelled === 0 && Date.now() < deadline) {
-      await Bun.sleep(25);
-    }
-    expect(legacySse.streamCancelled).toBe(1);
-  }, 30_000);
 
   for (const version of VERSIONS) {
     test(`fresh fx ask calls Streamable HTTP ${version} with its lifecycle headers`, async () => {
@@ -447,7 +267,9 @@ describe("version-scoped legacy MCP remote transports", () => {
       const messages = streamable.requests
         .filter((entry) => entry.message)
         .map((entry) => entry.message!.method);
+      // fx asks for the 2026 discovery first, then initializes the 2025 way.
       expect(messages).toEqual([
+        "server/discover",
         "initialize",
         "notifications/initialized",
         "tools/list",
@@ -466,14 +288,13 @@ describe("version-scoped legacy MCP remote transports", () => {
         )
       ) {
         expect(entry.headers["mcp-session-id"]).toBe(`session-${version}`);
-        if (version === "2025-03-26") {
-          expect(entry.headers["mcp-protocol-version"]).toBeUndefined();
-        } else {
-          expect(entry.headers["mcp-protocol-version"]).toBe(version);
-        }
+        // Every later request names the agreed version, 2025-03-26 too.
+        expect(entry.headers["mcp-protocol-version"]).toBe(version);
         expect(entry.headers["x-workspace"]).toBe("legacy");
       }
-      expect(streamable.deleteCalls).toBe(1);
+      // fx exits without waiting on servers, so the session's DELETE is
+      // skipped at exit (replace-v1 decision 11).
+      expect(streamable.deleteCalls).toBe(0);
     }, 30_000);
 
     test(`Streamable HTTP ${version} resumes by GET without replaying tools/call`, async () => {
@@ -492,19 +313,39 @@ describe("version-scoped legacy MCP remote transports", () => {
           (entry) => entry.message?.method === "tools/call",
         ),
       ).toHaveLength(1);
+      // The listener is a GET too; the resume is the one naming an event.
       const resumed = streamable.requests.find(
-        (entry) => entry.httpMethod === "GET",
+        (entry) => entry.httpMethod === "GET" && entry.headers["last-event-id"] !== undefined,
       )!;
       expect(resumed.headers["last-event-id"]).toBe("call-event-1");
       expect(resumed.headers["mcp-session-id"]).toBe(`session-${version}`);
-      if (version === "2025-03-26") {
-        expect(resumed.headers["mcp-protocol-version"]).toBeUndefined();
-      } else {
-        expect(resumed.headers["mcp-protocol-version"]).toBe(version);
-      }
-      expect(streamable.resumeCalls).toBe(1);
+      expect(resumed.headers["mcp-protocol-version"]).toBe(version);
+      expect(streamable.requests.filter((entry) =>
+        entry.httpMethod === "GET" && entry.headers["last-event-id"] !== undefined
+      )).toHaveLength(1);
     }, 30_000);
   }
+
+  // fx reads at most 16 MiB of one message. Before, an answer over that was
+  // treated as a broken stream: fx resumed it twice, getting the same answer
+  // each time, then told the model the server went away.
+  test("Streamable HTTP ends a call whose answer is over fx's message limit at once, without resuming it", async () => {
+    streamable = startLegacyStreamableHttpFixture("2025-06-18", { mode: "oversized_resumable" });
+    const root = createRoot("oversized-answer", "http", streamable.url);
+    gateway = startToolGateway("Oversized answer handled.");
+
+    const result = await runAsk(root, gateway, "Call the oversized fixture.");
+
+    expect(result.code).toBe(0);
+    // What the model was told: the call's error text.
+    const told = /MCP server 'fixture' ended the call[^"\\]*/.exec(gateway.requests[2]?.body ?? "")?.[0] ?? "";
+    expect(told).toContain("its reply was larger than fx reads in one message, so fx dropped it");
+    expect(told).not.toContain("the server went away");
+    expect(streamable.requests.filter((entry) => entry.message?.method === "tools/call")).toHaveLength(1);
+    expect(streamable.requests.filter((entry) =>
+      entry.httpMethod === "GET" && entry.headers["last-event-id"] !== undefined
+    )).toHaveLength(0);
+  }, 60_000);
 
   test("Streamable HTTP accepts an omitted session and skips DELETE", async () => {
     streamable = startLegacyStreamableHttpFixture("2025-06-18", {
@@ -557,7 +398,7 @@ describe("version-scoped legacy MCP remote transports", () => {
     const result = await runAsk(root, gateway, "Call the mixed delimiter fixture.");
 
     expect(result.code).toBe(0);
-    expect(gateway.requests[2]?.body).toContain(
+    expect(toolResultText(gateway.requests[2]!.body, "call_mcp")).toContain(
       `${LEGACY_REMOTE_TOOL_RESULT}:hello`,
     );
     const deadline = Date.now() + 5_000;
@@ -578,24 +419,15 @@ describe("version-scoped legacy MCP remote transports", () => {
 
     expect(result.code).toBe(0);
     expect(streamable.toolCallCalls).toBe(1);
-    expect(streamable.resumeCalls).toBe(0);
-    expect(gateway.requests[2]?.body).toContain("InvalidHeaderValue");
+    // The id can't go in a header, so there is no resume, and the call is
+    // lost after the server got it.
+    expect(resumes(streamable)).toHaveLength(0);
+    expect(toolResultText(gateway.requests[2]!.body, "call_mcp")).toContain(
+      "MCP server 'fixture' ended the call: the server went away. The tool may have run.",
+    );
   }, 30_000);
 
-  test("Streamable HTTP releases local session state when DELETE is unsupported", async () => {
-    streamable = startLegacyStreamableHttpFixture("2025-06-18", {
-      deleteStatus: 405,
-    });
-    const root = createRoot("delete-unsupported", "http", streamable.url);
-    gateway = startToolGateway("DELETE unsupported complete.");
-
-    const result = await runAsk(root, gateway, "Call the DELETE fixture.");
-
-    expect(result.code).toBe(0);
-    expect(streamable.deleteCalls).toBe(1);
-  }, 30_000);
-
-  test("Streamable HTTP 2025-11-25 polling resumes after an empty priming event", async () => {
+  test("Streamable HTTP 2025-11-25 can't resume a call whose priming event has no id", async () => {
     streamable = startLegacyStreamableHttpFixture("2025-11-25", {
       mode: "poll",
     });
@@ -605,174 +437,140 @@ describe("version-scoped legacy MCP remote transports", () => {
     const result = await runAsk(root, gateway, "Call the polling fixture.");
 
     expect(result.code).toBe(0);
-    expect(streamable.resumeCalls).toBe(1);
-    const resumed = streamable.requests.find(
-      (entry) => entry.httpMethod === "GET",
-    )!;
-    expect(resumed.headers["last-event-id"]).toBe("");
+    // An empty id leaves nothing to resume from (the SSE standard sends no
+    // Last-Event-ID for it), and the answer may only come on the call's own
+    // stream, so the call is lost and the model hears it may have run.
+    expect(resumes(streamable)).toHaveLength(0);
+    expect(toolResultText(gateway.requests[2]!.body, "call_mcp")).toContain(
+      "MCP server 'fixture' ended the call: the server went away. The tool may have run.",
+    );
   }, 30_000);
 
-  for (const operation of ["tools", "resources", "prompts"] as const) {
-    test.skipIf(!tmuxAvailable())(
-      `Streamable HTTP 2025-11-25 ${operation} retries only after the matching URL completion`,
-      async () => {
-        let targetRequests = 0;
-        const target = Bun.serve({
-          port: 0,
-          fetch() {
-            targetRequests += 1;
-            return new Response("browser-only target");
+  test.skipIf(!tmuxAvailable())(
+    "Streamable HTTP 2025-11-25 tools retries only after the matching URL completion",
+    async () => {
+      let targetRequests = 0;
+      const target = Bun.serve({
+        port: 0,
+        fetch() {
+          targetRequests += 1;
+          return new Response("browser-only target");
+        },
+      });
+      try {
+        const targetUrl = `http://127.0.0.1:${target.port}/authorize?state=legacy-http`;
+        streamable = startLegacyStreamableHttpFixture("2025-11-25", {
+          mode: "url_required_error",
+          elicitationUrl: targetUrl,
+          urlRequiredOperation: "tools",
+        });
+        const root = createRoot("url-required-tools", "http", streamable.url);
+        const fakeBin = join(root.root, "fake-bin");
+        const openLog = join(root.root, "open.log");
+        mkdirSync(fakeBin);
+        for (const name of ["open", "xdg-open"]) {
+          const openPath = join(fakeBin, name);
+          writeFileSync(
+            openPath,
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$FX_E2E_OPEN_LOG\"\nexit 0\n",
+          );
+          chmodSync(openPath, 0o755);
+        }
+        gateway = startFakeGateway([
+          fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
+          fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
+          fakeGatewayFinalText("Legacy HTTP tools URL-required complete."),
+        ], {
+          models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+        });
+        const binary = join(REPO_ROOT, "zig-out", "bin", "fx");
+        tui = await TmuxSession.create({
+          isolated: true,
+          cwd: root.workspace,
+          width: 110,
+          height: 34,
+          cmd: `${JSON.stringify(binary)} ask --auto --no-save ${JSON.stringify("Call the legacy HTTP URL-required fixture.")}`,
+          remainOnExit: true,
+          env: {
+            ...fixtureEnv(root, gateway),
+            PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+            FX_E2E_OPEN_LOG: openLog,
           },
         });
-        try {
-          const targetUrl = `http://127.0.0.1:${target.port}/authorize?state=legacy-http`;
-          streamable = startLegacyStreamableHttpFixture("2025-11-25", {
-            mode: "url_required_error",
-            elicitationUrl: targetUrl,
-            urlRequiredOperation: operation,
-            features: operation !== "tools",
-          });
-          const root = createRoot(`url-required-${operation}`, "http", streamable.url);
-          const fakeBin = join(root.root, "fake-bin");
-          const openLog = join(root.root, "open.log");
-          mkdirSync(fakeBin);
-          for (const name of ["open", "xdg-open"]) {
-            const openPath = join(fakeBin, name);
-            writeFileSync(
-              openPath,
-              "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$FX_E2E_OPEN_LOG\"\nexit 0\n",
-            );
-            chmodSync(openPath, 0o755);
-          }
-          gateway = startFakeGateway([
-            ...(operation === "tools"
-              ? [
-                  fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
-                  fakeGatewayToolCall("call_mcp", TOOL_NAME, { text: "hello" }),
-                ]
-              : operation === "resources"
-              ? [
-                  fakeGatewayToolCall("legacy_resource_list", "mcp_features", {
-                    action: "resource_list",
-                    server: "fixture",
-                  }),
-                  fakeGatewayToolCall("legacy_resource_read", "mcp_features", {
-                    action: "resource_read",
-                    server: "fixture",
-                    uri: "legacy://alpha",
-                  }),
-                ]
-              : [
-                  fakeGatewayToolCall("legacy_prompt_list", "mcp_features", {
-                    action: "prompt_list",
-                    server: "fixture",
-                  }),
-                  fakeGatewayToolCall("legacy_prompt_get", "mcp_features", {
-                    action: "prompt_get",
-                    server: "fixture",
-                    prompt: "review",
-                    arguments: { tone: "brief" },
-                  }),
-                ]),
-            fakeGatewayFinalText(`Legacy HTTP ${operation} URL-required complete.`),
-          ], {
-            models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-          });
-          const binary = join(REPO_ROOT, "zig-out", "bin", "fx");
-          tui = await TmuxSession.create({
-            isolated: true,
-            cwd: root.workspace,
-            width: 110,
-            height: 34,
-            cmd: `${JSON.stringify(binary)} ask --auto --no-save ${JSON.stringify("Call the legacy HTTP URL-required fixture.")}`,
-            remainOnExit: true,
-            env: {
-              ...fixtureEnv(root, gateway),
-              PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
-              FX_E2E_OPEN_LOG: openLog,
-            },
-          });
 
-          await tui.waitForText(`Complete URL: ${targetUrl}`, 20_000);
-          await tui.sendText("1");
-          await tui.waitForText("I completed it / Retry", 20_000);
-          const method = operation === "tools"
-            ? "tools/call"
-            : operation === "resources"
-            ? "resources/read"
-            : "prompts/get";
-          const operationCalls = () => streamable!.requests.filter(
-            (entry) => entry.message?.method === method,
-          );
-          expect(operationCalls()).toHaveLength(1);
-          if (operation === "tools") {
-            const malformed = [
-              {
-                method: "notifications/elicitation/complete",
-                params: { elicitationId: "legacy-url-required-1" },
-              },
-              {
-                jsonrpc: "1.0",
-                method: "notifications/elicitation/complete",
-                params: { elicitationId: "legacy-url-required-1" },
-              },
-              {
-                jsonrpc: 2,
-                method: "notifications/elicitation/complete",
-                params: { elicitationId: "legacy-url-required-1" },
-              },
-              {
-                jsonrpc: "2.0",
-                method: "notifications/elicitation/completed",
-                params: { elicitationId: "legacy-url-required-1" },
-              },
-              {
-                jsonrpc: "2.0",
-                method: "notifications/elicitation/complete",
-                params: [],
-              },
-              {
-                jsonrpc: "2.0",
-                method: "notifications/elicitation/complete",
-                params: { elicitationId: false },
-              },
-              {
-                jsonrpc: "2.0",
-                method: "notifications/elicitation/complete",
-                params: { elicitationId: "" },
-              },
-              {
-                jsonrpc: "2.0",
-                method: "notifications/elicitation/complete",
-                params: { elicitationId: "x".repeat(257) },
-              },
-            ];
-            for (const notification of malformed) {
-              streamable.sendUrlCompletionFrame(notification);
-            }
-          }
-          streamable.sendUrlCompletion("wrong-url-id");
-          await Bun.sleep(100);
-          expect(operationCalls()).toHaveLength(1);
-          streamable.sendUrlCompletion("legacy-url-required-1");
-          streamable.sendUrlCompletion("legacy-url-required-1");
-          await tui.waitForText(`Legacy HTTP ${operation} URL-required complete.`, 20_000);
-          expect(readFileSync(openLog, "utf8").trim()).toBe(targetUrl);
-          expect(targetRequests).toBe(0);
-          const calls = streamable.requests.filter(
-            (entry) => entry.message?.method === method,
-          );
-          expect(calls).toHaveLength(2);
-          expect(calls[1]?.message?.id).not.toBe(calls[0]?.message?.id);
-          expect(calls[1]?.message?.params?.inputResponses).toBeUndefined();
-          expect(calls[1]?.message?.params?.requestState).toBeUndefined();
-        } finally {
-          target.stop(true);
+        await tui.waitForText(`Complete URL: ${targetUrl}`, 20_000);
+        await tui.sendText("1");
+        await tui.waitForText("I completed it / Retry", 20_000);
+        const method = "tools/call";
+        const operationCalls = () => streamable!.requests.filter(
+          (entry) => entry.message?.method === method,
+        );
+        expect(operationCalls()).toHaveLength(1);
+        const malformed = [
+          {
+            method: "notifications/elicitation/complete",
+            params: { elicitationId: "legacy-url-required-1" },
+          },
+          {
+            jsonrpc: "1.0",
+            method: "notifications/elicitation/complete",
+            params: { elicitationId: "legacy-url-required-1" },
+          },
+          {
+            jsonrpc: 2,
+            method: "notifications/elicitation/complete",
+            params: { elicitationId: "legacy-url-required-1" },
+          },
+          {
+            jsonrpc: "2.0",
+            method: "notifications/elicitation/completed",
+            params: { elicitationId: "legacy-url-required-1" },
+          },
+          {
+            jsonrpc: "2.0",
+            method: "notifications/elicitation/complete",
+            params: [],
+          },
+          {
+            jsonrpc: "2.0",
+            method: "notifications/elicitation/complete",
+            params: { elicitationId: false },
+          },
+          {
+            jsonrpc: "2.0",
+            method: "notifications/elicitation/complete",
+            params: { elicitationId: "" },
+          },
+          {
+            jsonrpc: "2.0",
+            method: "notifications/elicitation/complete",
+            params: { elicitationId: "x".repeat(257) },
+          },
+        ];
+        for (const notification of malformed) {
+          streamable.sendUrlCompletionFrame(notification);
         }
-      },
-      30_000,
-    );
-  }
+        streamable.sendUrlCompletion("wrong-url-id");
+        await Bun.sleep(100);
+        expect(operationCalls()).toHaveLength(1);
+        streamable.sendUrlCompletion("legacy-url-required-1");
+        streamable.sendUrlCompletion("legacy-url-required-1");
+        await tui.waitForText("Legacy HTTP tools URL-required complete.", 20_000);
+        expect(readFileSync(openLog, "utf8").trim()).toBe(targetUrl);
+        expect(targetRequests).toBe(0);
+        const calls = streamable.requests.filter(
+          (entry) => entry.message?.method === method,
+        );
+        expect(calls).toHaveLength(2);
+        expect(calls[1]?.message?.id).not.toBe(calls[0]?.message?.id);
+        expect(calls[1]?.message?.params?.inputResponses).toBeUndefined();
+        expect(calls[1]?.message?.params?.requestState).toBeUndefined();
+      } finally {
+        target.stop(true);
+      }
+    },
+    30_000,
+  );
 
   test("Streamable HTTP 2025-06-18 does not interpret the 2025-11 URL-required error", async () => {
     streamable = startLegacyStreamableHttpFixture("2025-06-18", {
@@ -810,7 +608,7 @@ describe("version-scoped legacy MCP remote transports", () => {
     expect(streamable.cancelledCalls).toBe(1);
   }, 30_000);
 
-  test("Streamable HTTP reinitializes an expired session without replaying the failed call", async () => {
+  test("Streamable HTTP reinitializes an expired session and retries the call it refused", async () => {
     const version = "2025-06-18";
     streamable = startLegacyStreamableHttpFixture(version, {
       mode: "expire_session",
@@ -849,22 +647,27 @@ describe("version-scoped legacy MCP remote transports", () => {
     expect(JSON.parse(result.stdout).output).toContain(
       "Session recovery complete.",
     );
-    expect(gateway.requests[2]?.body).toContain("tool_execution_failed");
-    expect(gateway.requests[3]?.body).toContain(
-      `${LEGACY_REMOTE_TOOL_RESULT}:recovered`,
-    );
-    expect(streamable.initializeCalls).toBe(2);
-    expect(streamable.toolCallCalls).toBe(2);
     const calls = streamable.requests.filter(
       (entry) => entry.message?.method === "tools/call",
     );
-    expect(calls).toHaveLength(2);
-    expect(calls[0]?.headers["mcp-session-id"]).toBe(
-      `session-${version}-1`,
-    );
-    expect(calls[1]?.headers["mcp-session-id"]).toBe(
-      `session-${version}-2`,
-    );
+    expect({
+      expired: toolResultText(gateway.requests[2]!.body, "expired_call").includes(`${LEGACY_REMOTE_TOOL_RESULT}:expired`),
+      recovered: toolResultText(gateway.requests[3]!.body, "recovered_call").includes(`${LEGACY_REMOTE_TOOL_RESULT}:recovered`),
+      initializeCalls: streamable.initializeCalls,
+      calls: calls.map((entry) => [entry.message?.params?.arguments?.text, entry.headers["mcp-session-id"], entry.message?.id]),
+    }).toEqual({
+      expired: true,
+      recovered: true,
+      initializeCalls: 2,
+      // A 404 means the server didn't take the call, so it goes again in the
+      // new session (LHTTP-02); the next call uses that session too, after
+      // the new session's tools are listed again (id 6, CAT-05).
+      calls: [
+        ["expired", `session-${version}-1`, 4],
+        ["expired", `session-${version}-2`, 4],
+        ["recovered", `session-${version}-2`, 7],
+      ],
+    });
     const reinitialize = streamable.requests.filter(
       (entry) => entry.message?.method === "initialize",
     )[1]!;
@@ -879,7 +682,8 @@ describe("version-scoped legacy MCP remote transports", () => {
     }
     expect(result.stdout).not.toContain("legacy-recovery-secret");
     expect(result.stderr).not.toContain("legacy-recovery-secret");
-    expect(streamable.deleteCalls).toBe(1);
+    // The session's DELETE is skipped at exit (replace-v1 decision 11).
+    expect(streamable.deleteCalls).toBe(0);
   }, 30_000);
 
   test("legacy Streamable HTTP keeps tools rejected by modern header projection", async () => {
@@ -896,7 +700,8 @@ describe("version-scoped legacy MCP remote transports", () => {
     );
 
     expect(result.code).toBe(0);
-    expect(gateway.requests[2]?.body).toContain(
+    // Header projection is a 2026 feature: a 2025 server's tools keep it.
+    expect(toolResultText(gateway.requests[2]!.body, "call_mcp")).toContain(
       `${LEGACY_REMOTE_TOOL_RESULT}:hello`,
     );
     expect(streamable.toolCallCalls).toBe(1);
@@ -923,191 +728,14 @@ describe("version-scoped legacy MCP remote transports", () => {
 
     expect(result.code).toBe(0);
     expect(streamable.toolCallCalls).toBe(1);
-    expect(gateway.requests[2]?.body).toContain("tool_execution_failed");
-    expect(gateway.requests[2]?.body).toContain("McpAuthenticationRequired");
-  }, 30_000);
-
-  test("fresh fx ask uses explicit HTTP+SSE endpoint discovery and message routing", async () => {
-    legacySse = startLegacyHttpSseFixture();
-    const root = createRoot(
-      "sse-ask",
-      "sse",
-      legacySse.url,
-      5_000,
-      {
-        headers: {},
-        header_env: { "X-Workspace": "MCP_SSE_WORKSPACE" },
-        bearer_token_env: "MCP_SSE_BEARER",
-      },
+    expect(toolResultText(gateway.requests[2]!.body, "call_mcp")).toContain(
+      "MCP server 'fixture' needs a login. Ask the user to run fx mcp login fixture in a terminal, then try again.",
     );
-    gateway = startToolGateway("HTTP+SSE complete.");
-
-    const result = await runAsk(
-      root,
-      gateway,
-      "Call the explicit SSE fixture.",
-      {
-        MCP_SSE_WORKSPACE: "sse-environment",
-        MCP_SSE_BEARER: "sse-bearer-secret",
-      },
-    );
-
-    expect(result.code).toBe(0);
-    expect(gateway.requests[2]?.body).toContain(
-      `${LEGACY_SSE_TOOL_RESULT}:hello`,
-    );
-    expect(legacySse.discoveryGets).toBe(1);
-    expect(
-      legacySse.requests.filter((entry) => entry.httpMethod === "POST")
-        .map((entry) => entry.path),
-    ).toEqual(["/messages", "/messages", "/messages", "/messages"]);
-    expect(
-      legacySse.requests.filter((entry) => entry.message)
-        .map((entry) => entry.message!.method),
-    ).toEqual([
-      "initialize",
-      "notifications/initialized",
-      "tools/list",
-      "tools/call",
-    ]);
-    for (const request of legacySse.requests) {
-      expect(request.headers["x-workspace"]).toBe("sse-environment");
-      expect(request.headers.authorization).toBe("Bearer sse-bearer-secret");
-    }
-    expect(result.stdout).not.toContain("sse-bearer-secret");
-    expect(result.stderr).not.toContain("sse-bearer-secret");
-    const deadline = Date.now() + 5_000;
-    while (legacySse.streamCancelled === 0 && Date.now() < deadline) {
-      await Bun.sleep(25);
-    }
-    expect(legacySse.streamCancelled).toBe(1);
-  }, 30_000);
-
-  test("HTTP+SSE captures scope challenges without replaying a tool call", async () => {
-    legacySse = startLegacyHttpSseFixture({ rejectToolAuth: true });
-    const root = createRoot(
-      "sse-auth-rejection",
-      "sse",
-      legacySse.url,
-      5_000,
-      { oauth: { resource: legacySse.url } },
-    );
-    gateway = startToolGateway("HTTP+SSE authentication required.");
-
-    const result = await runAsk(
-      root,
-      gateway,
-      "Call the protected explicit SSE fixture.",
-    );
-
-    expect(result.code).toBe(0);
-    expect(
-      legacySse.requests.filter(
-        (request) => request.message?.method === "tools/call",
-      ),
-    ).toHaveLength(1);
-    expect(gateway.requests[2]?.body).toContain("tool_execution_failed");
-    expect(gateway.requests[2]?.body).toContain("McpAuthenticationRequired");
-  }, 30_000);
-
-  test("HTTP+SSE routes bare-CR events without waiting for LF", async () => {
-    legacySse = startLegacyHttpSseFixture({ bareCr: true });
-    const root = createRoot("sse-bare-cr", "sse", legacySse.url, 1_000);
-    gateway = startToolGateway("HTTP+SSE bare CR complete.");
-
-    const result = await runAsk(root, gateway, "Call the bare-CR SSE fixture.");
-
-    if (
-      result.code !== 0 ||
-      !gateway.requests[2]?.body.includes(`${LEGACY_SSE_TOOL_RESULT}:hello`)
-    ) {
-      preserveLegacyFailure("legacy-sse-bare-cr", root, result, legacySse, gateway);
-    }
-
-    expect(result.code).toBe(0);
-    expect(gateway.requests[2]?.body).toContain(
-      `${LEGACY_SSE_TOOL_RESULT}:hello`,
-    );
-    expect(legacySse.discoveryGets).toBe(1);
-    const deadline = Date.now() + 5_000;
-    while (legacySse.streamCancelled === 0 && Date.now() < deadline) {
-      await Bun.sleep(25);
-    }
-    expect(legacySse.streamCancelled).toBe(1);
-  }, 30_000);
-
-  for (const selectedVersion of [null, "2025-03-26"] as const) {
-    const label = selectedVersion ?? "missing";
-    test(`HTTP+SSE rejects ${label} initialize version and closes discovery`, async () => {
-      legacySse = startLegacyHttpSseFixture({
-        protocolVersion: selectedVersion,
-      });
-      const root = createRoot(`sse-version-${label}`, "sse", legacySse.url);
-      gateway = startFakeGateway([
-        fakeGatewayToolCall("inspect_invalid_sse", "capability_search", {
-          query: "echo",
-        }),
-        fakeGatewayFinalText("Invalid SSE version isolated."),
-      ], {
-        models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-      });
-
-      const result = await runAsk(
-        root,
-        gateway,
-        "Do not use the invalid SSE fixture.",
-      );
-
-      expect(result.code).toBe(0);
-      expect(gateway.requests.every((request) => !request.body.includes(TOOL_NAME)))
-        .toBe(true);
-      expect(
-        legacySse.requests.filter((entry) => entry.message)
-          .map((entry) => entry.message!.method),
-      ).toEqual(["initialize"]);
-      const deadline = Date.now() + 5_000;
-      while (legacySse.streamCancelled === 0 && Date.now() < deadline) {
-        await Bun.sleep(25);
-      }
-      expect(legacySse.streamCancelled).toBe(1);
-    }, 30_000);
-  }
-
-  test("HTTP+SSE cleans up when discovery is followed by a malformed message", async () => {
-    legacySse = startLegacyHttpSseFixture({ malformedAfterEndpoint: true });
-    const root = createRoot(
-      "sse-malformed-after-endpoint",
-      "sse",
-      legacySse.url,
-    );
-    gateway = startFakeGateway([
-      fakeGatewayToolCall("inspect_malformed_sse", "capability_search", {
-        query: "echo",
-      }),
-      fakeGatewayFinalText("Malformed SSE startup isolated."),
-    ], {
-      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
-    });
-
-    const result = await runAsk(
-      root,
-      gateway,
-      "Do not use the malformed SSE fixture.",
-    );
-
-    expect(result.code).toBe(0);
-    expect(gateway.requests.every((request) => !request.body.includes(TOOL_NAME)))
-      .toBe(true);
-    const deadline = Date.now() + 5_000;
-    while (legacySse.streamCancelled === 0 && Date.now() < deadline) {
-      await Bun.sleep(25);
-    }
-    expect(legacySse.streamCancelled).toBe(1);
   }, 30_000);
 
   for (const version of VERSIONS) {
     test.skipIf(!tmuxAvailable())(
-      `TUI cancellation sends ${version} cancellation headers and cleans up`,
+      `TUI cancellation sends ${version} cancellation headers and quits without a session DELETE`,
       async () => {
         streamable = startLegacyStreamableHttpFixture(version, {
           mode: "stall_call",
@@ -1160,11 +788,8 @@ describe("version-scoped legacy MCP remote transports", () => {
         expect(cancellation.headers["mcp-session-id"]).toBe(
           `session-${version}`,
         );
-        if (version === "2025-03-26") {
-          expect(cancellation.headers["mcp-protocol-version"]).toBeUndefined();
-        } else {
-          expect(cancellation.headers["mcp-protocol-version"]).toBe(version);
-        }
+        // Every later request names the agreed version, 2025-03-26 too.
+        expect(cancellation.headers["mcp-protocol-version"]).toBe(version);
         expect(streamable.cancellationNotifications).toBe(1);
         expect(streamable.cancelledCalls).toBe(1);
 
@@ -1172,53 +797,108 @@ describe("version-scoped legacy MCP remote transports", () => {
         await tui.sendText("/quit");
         await tui.waitForSessionEnd(10_000);
         tui = null;
-        expect(streamable.deleteCalls).toBe(1);
+        // Exit leaves the session for the server to expire rather than
+        // holding the prompt for a DELETE round trip.
+        expect(streamable.deleteCalls).toBe(0);
       },
       40_000,
     );
   }
 
   test.skipIf(!tmuxAvailable())(
-    "TUI cancellation routes HTTP+SSE cancellation to the discovered message endpoint",
+    "/mcp remove ends a 2025 session with a DELETE, and fx keeps running",
     async () => {
-      legacySse = startLegacyHttpSseFixture({ stallCall: true });
-      const root = createRoot("cancel-sse", "sse", legacySse.url, 30_000);
-      gateway = startToolGateway("Cancelled HTTP+SSE complete.");
+      // The removal reloads fx's MCP host, which closes the old host's
+      // servers; a 2025 session waits there for its DELETE.
+      const version = "2025-06-18";
+      streamable = startLegacyStreamableHttpFixture(version);
+      const root = createRoot("remove-http", "http", streamable.url);
+      gateway = startFakeGateway([]);
       tui = await TmuxSession.create({
         isolated: true,
         cwd: root.workspace,
         width: 100,
         height: 30,
-        env: fixtureEnv(root, gateway),
+        env: { ...fixtureEnv(root, gateway) },
       });
 
       await tui.waitForComposer(15_000);
-      await tui.sendText("Call the stalled explicit SSE fixture.");
-      const callDeadline = Date.now() + 15_000;
+      const listDeadline = Date.now() + 15_000;
       while (
-        !legacySse.requests.some(
-          (entry) => entry.message?.method === "tools/call",
+        !streamable.requests.some(
+          (entry) => entry.message?.method === "tools/list",
         ) &&
-        Date.now() < callDeadline
+        Date.now() < listDeadline
       ) {
         await Bun.sleep(25);
       }
-      await tui.sendInterruptEscapePair(10_000);
-      await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
-      const cancelDeadline = Date.now() + 5_000;
-      while (
-        legacySse.cancellationNotifications === 0 &&
-        Date.now() < cancelDeadline
-      ) {
-        await Bun.sleep(25);
-      }
-      expect(legacySse.cancellationNotifications).toBe(1);
       expect(
-        legacySse.requests.find(
-          (entry) => entry.message?.method === "notifications/cancelled",
-        )?.path,
-      ).toBe("/messages");
+        streamable.requests.some(
+          (entry) => entry.message?.method === "tools/list",
+        ),
+      ).toBe(true);
+
+      await tui.sendText("/mcp remove fixture");
+      await tui.waitForText("Removed fixture from ~/.fx/mcp.json.", 10_000);
+      const deleteDeadline = Date.now() + 10_000;
+      while (streamable.deleteCalls === 0 && Date.now() < deleteDeadline) {
+        await Bun.sleep(25);
+      }
+      expect(streamable.deleteCalls).toBe(1);
+      const deleted = streamable.requests.find(
+        (entry) => entry.httpMethod === "DELETE",
+      )!;
+      expect(deleted.headers["mcp-session-id"]).toBe(`session-${version}`);
+
+      // fx is still running: the next command answers.
+      await tui.waitForComposer(10_000);
+      await tui.sendText("/mcp list");
+      await tui.waitForText("No MCP servers configured.", 10_000);
     },
     40_000,
+  );
+
+  // The server's own 5 s startup timeout ends the wait.
+  test(
+    "a 2025 server that never answers initialize fails after its timeout instead of hanging",
+    async () => {
+      const fixture = startLegacyStreamableHttpFixture("2025-11-25", { mode: "hold_initialize" });
+      streamable = fixture;
+      const root = createRoot("hold-initialize-v2", "http", fixture.url);
+      const started = Date.now();
+      const result = await runFx(["mcp", "show", "fixture", "--json"], {
+        cwd: root.workspace,
+        env: { HOME: root.home, FX_AUTO_UPGRADE: "0" },
+        timeoutMs: 90_000,
+      });
+      expect(result.signal).toBeNull();
+      expect(Date.now() - started).toBeLessThan(85_000);
+      expect(result.code).toBe(1);
+      expect(JSON.parse(result.stdout).error).toContain("initialize");
+      expect(fixture.initializeCalls).toBe(1);
+    },
+    120_000,
+  );
+
+  test(
+    "a 2025 server that never answers notifications/initialized fails with the reason instead of looking ready with no tools",
+    async () => {
+      const fixture = startLegacyStreamableHttpFixture("2025-11-25", { mode: "hold_initialized" });
+      streamable = fixture;
+      const root = createRoot("hold-initialized-v2", "http", fixture.url);
+      const started = Date.now();
+      const result = await runFx(["mcp", "show", "fixture", "--json"], {
+        cwd: root.workspace,
+        env: { HOME: root.home, FX_AUTO_UPGRADE: "0" },
+        timeoutMs: 90_000,
+      });
+      expect(result.signal).toBeNull();
+      expect(Date.now() - started).toBeLessThan(85_000);
+      expect(result.code).toBe(1);
+      expect(JSON.parse(result.stdout).error).toBe("it never answered fx's initialized notification");
+      // Everything after initialized waits for its answer.
+      expect(fixture.toolsListCalls).toBe(0);
+    },
+    120_000,
   );
 });

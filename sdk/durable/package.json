@@ -1,0 +1,11 @@
+{
+  "name": "libfx-durable-worlds",
+  "private": true,
+  "description": "The Workflow Worlds libfx bundles into libfx/durable-local and libfx/durable-vercel",
+  "type": "module",
+  "dependencies": {
+    "@vercel/oidc": "3.8.10",
+    "@workflow/world-local": "5.1.1",
+    "@workflow/world-vercel": "5.2.1"
+  }
+}

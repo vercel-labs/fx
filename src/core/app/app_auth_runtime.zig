@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
@@ -189,7 +190,7 @@ pub fn Runtime(comptime App: type) type {
                     else
                         "Authentication is unavailable. Run /provider to repair this source.";
                     debug_trace.logf("auth", "resumed credential unavailable source={t} err={s}", .{ failure.source, @errorName(failure.err) });
-                    const body = try std.fmt.allocPrint(app.alloc, "{s}: {s}", .{ credentials.sourceLabel(failure.source), message });
+                    const body = try app.alloc.print("{s}: {s}", .{ credentials.sourceLabel(failure.source), message });
                     defer app.alloc.free(body);
                     try app.writeDomainNotice(.{ .topic = "auth", .tone = .@"error", .body = body }, true);
                 },
@@ -300,35 +301,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             defer if (hold_turn_start) app.worker.releaseTurnStartHold();
-            if (logout_provider == .grok) {
-                const outcome = grok_oauth.logout(app.alloc, app.auth.oauthTransport()) catch {
-                    try writeAuthNotice(app, .{
-                        .topic = "auth",
-                        .tone = .@"error",
-                        .body = "Could not durably sign out of Grok. The current source is unchanged.",
-                    });
-                    return;
-                };
-                const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterGrokLogout"))
-                    try app.auth.reconcileAfterGrokLogout(app.alloc)
-                else
-                    false;
-                applyCredentialChange(app, changed);
-                try writeAuthNotice(app, switch (outcome.deletion) {
-                    .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Grok." },
-                    .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Grok login session found." },
-                    .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Grok, but could not confirm the profile directory update." },
-                });
-                if (outcome.revocation_failed) {
-                    try writeAuthNotice(app, .{
-                        .topic = "auth",
-                        .tone = .warning,
-                        .body = "The local Grok session was removed, but remote revocation could not be confirmed.",
-                    });
-                }
-                try reconcileSubscriptionLogout(app, .grok);
-                return;
-            }
+            if (logout_provider == .grok) return logoutGrok(app);
             if (logout_provider == .codex) {
                 const outcome = chatgpt_oauth.logout() catch {
                     try writeAuthNotice(app, .{
@@ -351,7 +324,44 @@ pub fn Runtime(comptime App: type) type {
                 try reconcileSubscriptionLogout(app, .codex);
                 return;
             }
-            const result = login_flow.logout(app.alloc, app.auth.oauthTransport()) catch |err| switch (err) {
+            return logoutFxLogin(app);
+        }
+
+        /// Signs out of Grok locally, then revokes its refresh token at the
+        /// issuer in the background.
+        fn logoutGrok(app: *App) !void {
+            const local = grok_oauth.logoutLocally(std.heap.c_allocator) catch {
+                try writeAuthNotice(app, .{
+                    .topic = "auth",
+                    .tone = .@"error",
+                    .body = "Could not durably sign out of Grok. The current source is unchanged.",
+                });
+                return;
+            };
+            var revocation: ?auth_runtime.RemoteRevocation = if (local.refresh_token) |token| .{ .grok = token } else null;
+            defer if (revocation) |pending| releaseRemoteRevocation(pending);
+            const outcome = local.result;
+            const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterGrokLogout"))
+                try app.auth.reconcileAfterGrokLogout(app.alloc)
+            else
+                false;
+            applyCredentialChange(app, changed);
+            try writeAuthNotice(app, switch (outcome.deletion) {
+                .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Grok." },
+                .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Grok login session found." },
+                .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Grok, but could not confirm the profile directory update." },
+            });
+            if (outcome.revocation_failed) {
+                try writeRemoteRevocationWarning(app, .grok_subscription);
+            }
+            try reconcileSubscriptionLogout(app, .grok);
+            try startRemoteRevocation(app, &revocation);
+        }
+
+        /// Signs out of fx login locally, then revokes the session at the
+        /// issuer in the background.
+        fn logoutFxLogin(app: *App) !void {
+            const local = login_flow.logoutLocally(std.heap.c_allocator) catch |err| switch (err) {
                 error.SessionDeleteFailed => {
                     try writeAuthNotice(app, .{
                         .topic = "auth",
@@ -361,7 +371,49 @@ pub fn Runtime(comptime App: type) type {
                     return;
                 },
             };
-            try applyLogoutResult(app, result);
+            var revocation: ?auth_runtime.RemoteRevocation = if (local.session) |session| .{ .fx_login = session } else null;
+            defer if (revocation) |pending| releaseRemoteRevocation(pending);
+            try applyLogoutResult(app, local.result);
+            try startRemoteRevocation(app, &revocation);
+        }
+
+        /// The local sign-out is already done. Revoking the session at its
+        /// issuer can take seconds, so it runs off the input loop, and a
+        /// failure is reported when `collectRemoteRevocationFacts` sees it.
+        /// Takes `pending`, leaving null so the caller's release skips it.
+        fn startRemoteRevocation(app: *App, pending: *?auth_runtime.RemoteRevocation) !void {
+            const revocation = pending.* orelse return;
+            pending.* = null;
+            const source = revocation.source();
+            if (!app.auth.beginRemoteRevocation(revocation)) {
+                try writeRemoteRevocationWarning(app, source);
+            }
+        }
+
+        /// Frees a revocation that /logout prepared but could not start
+        /// because a later step failed.
+        fn releaseRemoteRevocation(revocation: auth_runtime.RemoteRevocation) void {
+            debug_trace.logf("auth", "remote revocation dropped reason=logout_error source={t}", .{revocation.source()});
+            var owned = revocation;
+            owned.deinit();
+        }
+
+        /// Reports a remote revocation that finished with a failure.
+        pub fn collectRemoteRevocationFacts(app: *App) !void {
+            while (app.auth.takeRemoteRevocation()) |outcome| {
+                if (outcome.failed) try writeRemoteRevocationWarning(app, outcome.source);
+            }
+        }
+
+        fn writeRemoteRevocationWarning(app: *App, source: credentials.Source) !void {
+            try writeAuthNotice(app, .{
+                .topic = "auth",
+                .tone = .warning,
+                .body = if (source == .grok_subscription)
+                    "The local Grok session was removed, but remote revocation could not be confirmed."
+                else
+                    login_flow.remote_revocation_warning,
+            });
         }
 
         fn reconcileSubscriptionLogout(app: *App, removed: model_provider.ProviderId) !void {
@@ -428,7 +480,10 @@ pub fn Runtime(comptime App: type) type {
 
         /// Reports blocked provider interaction without changing the composer.
         pub fn reject_provider_picker_if_busy(app: *App) !bool {
-            if (!auth_transition.provider_work_busy(app.stream.active, app.worker.queuedPromptCount())) return false;
+            // A request waiting for the sign-in fx opened has nothing in
+            // flight; it reads the new credential when it continues.
+            const turn_busy = app.stream.active and !requestWaitsForSignIn(app);
+            if (!auth_transition.provider_work_busy(turn_busy, app.worker.queuedPromptCount())) return false;
             try app.writeDomainNotice(.{
                 .topic = "provider",
                 .tone = .neutral,
@@ -471,6 +526,100 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Explains a launch credential that could not be loaded, once the
+        /// launch lookup has settled without an active source.
+        pub fn writeStartupCredentialFailure(
+            app: *App,
+            provider: model_provider.ProviderId,
+            load_failure: ?credentials.LoadFailure,
+        ) !void {
+            const auth_view = app.auth.view();
+            const load_error: anyerror = if (load_failure) |failure|
+                failure.err
+            else if (auth_view.stored_key_status == .unavailable or auth_view.fx_login_status == .unavailable)
+                error.CredentialStorageUnavailable
+            else
+                return;
+            if (auth_view.active_source != null) return;
+            const body = try auth_runtime.preparationFailureText(app.alloc, provider, load_error);
+            defer app.alloc.free(body);
+            try app.writeDomainNotice(.{
+                .topic = "auth",
+                .tone = .warning,
+                .body = body,
+            }, true);
+        }
+
+        pub fn startupCredentialPending(app: *const App) bool {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "startupCredentialPending")) return false;
+            return app.auth.startupCredentialPending();
+        }
+
+        /// Probes the launch source inventory once the first frame is on screen.
+        pub fn collectDeferredStartupInventory(app: *App) void {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "takeDeferredStartupSourceInventory")) return;
+            if (app.shell.render_requests.hasReason(.first_frame)) return;
+            if (!app.auth.takeDeferredStartupSourceInventory()) return;
+            app.auth.refreshSourceInventory(app.alloc) catch |err| {
+                debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
+            };
+            app.shell.render_requests.request(.footer);
+        }
+
+        /// Settles the launch credential that was resolved after the first
+        /// frame, in the order the blocking launch path settles it before
+        /// its first frame: adoption, status, inventory, onboarding, notice.
+        pub fn collectStartupCredentialFacts(app: *App) !void {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "takeStartupCredentialLoad")) return;
+            var outcome = app.auth.takeStartupCredentialLoad() orelse return;
+            defer outcome.deinit();
+            // The blocking path aborts launch on these errors; only allocation
+            // failure can reach here for a Keychain-backed Gateway lookup.
+            const resolution = switch (outcome) {
+                .failed => |err| return err,
+                .resolved => |*resolution| resolution,
+            };
+
+            var adopted = false;
+            if (resolution.credential) |*credential| {
+                if (app.auth.credentialSource()) |selected| {
+                    debug_trace.logf("auth", "startup credential dropped source={t} reason=selected_during_load selected={t}", .{ credential.source, selected });
+                } else {
+                    var owned = try credential.clone(app.alloc);
+                    defer owned.deinit(app.alloc);
+                    adopted = app.auth.adoptCredential(app.alloc, &owned);
+                }
+            }
+            app.auth.recordStartupStatus(
+                resolution.stored_key_status,
+                resolution.fx_login_status,
+                resolution.failure,
+                app.auth.view().onboarding_skipped,
+            );
+            app.auth.refreshSourceInventory(app.alloc) catch |err| {
+                debug_trace.logf("auth", "startup source inventory refresh failed err={s}", .{@errorName(err)});
+            };
+            const auth_view = app.auth.view();
+            if (auth_view.active_source == null and !auth_view.onboarding_skipped and !app.auth.pickerView().active) {
+                app.auth.openOnboardingPicker(app.alloc);
+            }
+            const provider = if (comptime provider_runtime.supported(App)) provider_runtime.provider(app) else .gateway;
+            try writeStartupCredentialFailure(app, provider, resolution.failure);
+
+            // Model cache warmup waited for this credential (see startModelCacheWarmup).
+            if (adopted) {
+                applyCredentialChange(app, true);
+            } else if (comptime @hasDecl(App, "startModelCacheWarmup")) {
+                app.startModelCacheWarmup();
+            }
+            // Before the first frame commits, its own hook starts the prewarm.
+            if (adopted and !app.shell.render_requests.hasReason(.first_frame)) {
+                startPromptCredentialPrewarm(app);
+            }
+            debug_trace.logf("auth", "startup credential settled adopted={} source={?t}", .{ adopted, auth_view.active_source });
+            app.shell.render_requests.request(.footer);
+        }
+
         pub fn collectSourceInventoryFacts(app: *App) !void {
             const result = app.auth.takeSourceInventoryRefresh() orelse return;
             switch (result) {
@@ -486,8 +635,7 @@ pub fn Runtime(comptime App: type) type {
                     }
                     var unavailable = app.auth.pickerView().unavailable_sources.iterator();
                     while (unavailable.next()) |source| {
-                        const body = try std.fmt.allocPrint(
-                            app.alloc,
+                        const body = try app.alloc.print(
                             "{s} is unavailable. Check the saved credential or choose another option.",
                             .{credentials.sourceLabel(source)},
                         );
@@ -660,6 +808,7 @@ pub fn Runtime(comptime App: type) type {
             else
                 .fx_login;
             app.auth.pulseSignIn(app.alloc);
+            try openPreparedSignInBrowser(app);
             switch (app.auth.pollSignInTransition(app.alloc)) {
                 .none => {},
                 .cancelled => {
@@ -713,9 +862,11 @@ pub fn Runtime(comptime App: type) type {
             provider: model_provider.ProviderId,
         ) !void {
             try app.auth.refreshSourceInventory(app.alloc);
+            // Renewing the waiting request's own provider switches nothing,
+            // so the new credential is taken up at once.
             switch (auth_transition.signInCompletion(
                 provider,
-                comptime provider_runtime.supported(App),
+                (comptime provider_runtime.supported(App)) and !renewsWaitingRequest(app, provider),
             )) {
                 .vercel => unreachable,
                 .switch_provider => |target| {
@@ -785,8 +936,7 @@ pub fn Runtime(comptime App: type) type {
                 .saved => |changed| {
                     applyCredentialChange(app, changed);
                     rememberCredentialSource(app, .stored_key);
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
+                    const body = try app.alloc.print(
                         "Saved the API key to {s} and made it active.",
                         .{credentials.stored_key_backend_label},
                     );
@@ -819,8 +969,7 @@ pub fn Runtime(comptime App: type) type {
                     .body = "Could not verify that API key with AI Gateway. Nothing was stored.",
                 }, true),
                 .store_failed => {
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
+                    const body = try app.alloc.print(
                         "Could not save the API key to {s}. Nothing was stored.",
                         .{credentials.stored_key_backend_label},
                     );
@@ -832,8 +981,7 @@ pub fn Runtime(comptime App: type) type {
                     }, true);
                 },
                 .reload_failed => {
-                    const body = try std.fmt.allocPrint(
-                        app.alloc,
+                    const body = try app.alloc.print(
                         "Saved the API key to {s}, but could not make it active.",
                         .{credentials.stored_key_backend_label},
                     );
@@ -882,8 +1030,7 @@ pub fn Runtime(comptime App: type) type {
         /// when it did not. Failure is already explained to the user here.
         pub fn applySourceChoice(app: *App, source: credentials.Source) !bool {
             if (try rejectPendingPreparation(app)) return false;
-            const body = try std.fmt.allocPrint(
-                app.alloc,
+            const body = try app.alloc.print(
                 "Switched credential to {s}.",
                 .{credentials.sourceLabel(source)},
             );
@@ -937,21 +1084,23 @@ pub fn Runtime(comptime App: type) type {
 
         fn beginChatGptSignIn(app: *App) !void {
             if (comptime provider_runtime.supported(App)) {
-                const decision = decideProviderSwitch(.{
-                    .current = provider_runtime.provider(app),
-                    .target = .codex,
-                    .target_credential_ready = false,
-                    .intent = .post_oauth,
-                    .stream_active = app.stream.active,
-                    .queued_prompts = app.worker.queuedPromptCount(),
-                });
-                if (decision == .busy) {
-                    try app.writeDomainNotice(.{
-                        .topic = "auth",
-                        .tone = .warning,
-                        .body = "Codex sign-in is unavailable until active and queued work finishes.",
-                    }, true);
-                    return;
+                if (!renewsWaitingRequest(app, .codex)) {
+                    const decision = decideProviderSwitch(.{
+                        .current = provider_runtime.provider(app),
+                        .target = .codex,
+                        .target_credential_ready = false,
+                        .intent = .post_oauth,
+                        .stream_active = app.stream.active,
+                        .queued_prompts = app.worker.queuedPromptCount(),
+                    });
+                    if (decision == .busy) {
+                        try app.writeDomainNotice(.{
+                            .topic = "auth",
+                            .tone = .warning,
+                            .body = "Codex sign-in is unavailable until active and queued work finishes.",
+                        }, true);
+                        return;
+                    }
                 }
             }
             try app.flushBeforeBlockingExternalWork();
@@ -969,21 +1118,23 @@ pub fn Runtime(comptime App: type) type {
 
         fn beginGrokSignIn(app: *App) !void {
             if (comptime provider_runtime.supported(App)) {
-                const decision = decideProviderSwitch(.{
-                    .current = provider_runtime.provider(app),
-                    .target = .grok,
-                    .target_credential_ready = false,
-                    .intent = .post_oauth,
-                    .stream_active = app.stream.active,
-                    .queued_prompts = app.worker.queuedPromptCount(),
-                });
-                if (decision == .busy) {
-                    try app.writeDomainNotice(.{
-                        .topic = "auth",
-                        .tone = .warning,
-                        .body = "Grok sign-in is unavailable until active and queued work finishes.",
-                    }, true);
-                    return;
+                if (!renewsWaitingRequest(app, .grok)) {
+                    const decision = decideProviderSwitch(.{
+                        .current = provider_runtime.provider(app),
+                        .target = .grok,
+                        .target_credential_ready = false,
+                        .intent = .post_oauth,
+                        .stream_active = app.stream.active,
+                        .queued_prompts = app.worker.queuedPromptCount(),
+                    });
+                    if (decision == .busy) {
+                        try app.writeDomainNotice(.{
+                            .topic = "auth",
+                            .tone = .warning,
+                            .body = "Grok sign-in is unavailable until active and queued work finishes.",
+                        }, true);
+                        return;
+                    }
                 }
             }
             try app.flushBeforeBlockingExternalWork();
@@ -1063,7 +1214,7 @@ pub fn Runtime(comptime App: type) type {
             })) {
                 .prepare => {},
                 .no_change => {
-                    const body = try std.fmt.allocPrint(app.alloc, "Already using {s}.", .{provider_catalog.label(target)});
+                    const body = try app.alloc.print("Already using {s}.", .{provider_catalog.label(target)});
                     defer app.alloc.free(body);
                     try app.writeDomainNotice(.{
                         .topic = "provider",
@@ -1142,7 +1293,7 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             };
-            const body = try std.fmt.allocPrint(app.alloc, "Preparing {s}.", .{provider_catalog.label(input.target())});
+            const body = try app.alloc.print("Preparing {s}.", .{provider_catalog.label(input.target())});
             defer app.alloc.free(body);
             try app.writeDomainNotice(.{
                 .topic = "provider",
@@ -1268,7 +1419,8 @@ pub fn Runtime(comptime App: type) type {
             var owned_model = try app.alloc.dupe(u8, selected_model);
             defer app.alloc.free(owned_model);
 
-            if (auth_transition.provider_work_busy(app.stream.active, app.worker.queuedPromptCount())) {
+            const turn_busy = app.stream.active and !requestWaitsForSignIn(app);
+            if (auth_transition.provider_work_busy(turn_busy, app.worker.queuedPromptCount())) {
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .warning,
@@ -1284,10 +1436,8 @@ pub fn Runtime(comptime App: type) type {
             app.model_cache.adoptOwnedCatalog(access, &catalog);
             app.provider_selection.adoptOwned(target, &owned_model);
             if (credential) |*value| _ = app.auth.adoptCredential(app.alloc, value);
-            reconcileGatewayCredential(app);
 
-            const body = try std.fmt.allocPrint(
-                app.alloc,
+            const body = try app.alloc.print(
                 "Switched to {s} with {s}.",
                 .{ provider_catalog.label(target), provider_runtime.model(app) },
             );
@@ -1358,7 +1508,10 @@ pub fn Runtime(comptime App: type) type {
             blocked,
         };
 
-        pub fn loadTeamsForProviderPicker(app: *App) !TeamColumn {
+        /// Decides the team column from local state, or starts listing the
+        /// teams on a worker and returns null; `collectProviderPickerTeams`
+        /// in the provider picker resumes the choice with the result.
+        pub fn beginTeamsForProviderPicker(app: *App) !?TeamColumn {
             const view = app.auth.pickerView();
             if (view.unavailable_sources.contains(.fx_login)) {
                 const body = try auth_runtime.preparationFailureText(app.alloc, .gateway, error.CredentialStorageUnavailable);
@@ -1374,9 +1527,15 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             if (!view.fx_login_session_available) return .needs_sign_in;
-            try app.flushBeforeBlockingExternalWork();
+            if (comptime @import("builtin").single_threaded or !@hasDecl(@TypeOf(app.auth), "beginTeamList")) {
+                return try finishTeamsForProviderPicker(app, login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport()));
+            }
+            try app.auth.beginTeamList(app.alloc, .provider_picker);
+            return null;
+        }
 
-            var selection = login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport()) catch |err| {
+        pub fn finishTeamsForProviderPicker(app: *App, loaded: anyerror!login_flow.TeamSelection) !TeamColumn {
+            var selection = loaded catch |err| {
                 debug_trace.logf("auth", "provider picker team load failed err={s}", .{@errorName(err)});
                 // A session file that exists but can no longer be refreshed is
                 // not a listing failure: there is nothing to list until the
@@ -1416,9 +1575,33 @@ pub fn Runtime(comptime App: type) type {
 
         fn beginTeamPicker(app: *App) !void {
             if (!app.auth.pickerView().fx_login_session_available) return;
-            try app.flushBeforeBlockingExternalWork();
+            if (comptime @import("builtin").single_threaded or !@hasDecl(@TypeOf(app.auth), "beginTeamList")) {
+                return finishTeamPicker(app, login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport()));
+            }
+            // Listing teams can renew the session, and both talk to the
+            // network; `collectTeamListFacts` opens the picker.
+            try app.auth.beginTeamList(app.alloc, .change_team);
+            app.shell.render_requests.request(.footer);
+        }
 
-            var selection = login_flow.loadTeamSelection(app.alloc, app.auth.oauthTransport()) catch |err| {
+        /// Hands a finished team list to the screen that asked for it: the
+        /// team picker, if the auth picker is still open, or the `/provider`
+        /// picker.
+        pub fn collectTeamListFacts(app: *App) !void {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "takeTeamList")) return;
+            try provider_picker_runtime.Runtime(App).collectProviderPickerTeams(app);
+            const loaded = app.auth.takeTeamList(.change_team) orelse return;
+            if (!app.auth.picker_active) {
+                debug_trace.logf("auth", "team list dropped reason=picker_closed", .{});
+                var dropped = loaded;
+                if (dropped) |*selection| selection.deinit(app.alloc) else |_| {}
+                return;
+            }
+            try finishTeamPicker(app, loaded);
+        }
+
+        fn finishTeamPicker(app: *App, loaded: anyerror!login_flow.TeamSelection) !void {
+            var selection = loaded catch |err| {
                 debug_trace.logf("auth", "team picker load failed err={s}", .{@errorName(err)});
                 try app.writeDomainNotice(.{
                     .topic = "auth",
@@ -1505,7 +1688,7 @@ pub fn Runtime(comptime App: type) type {
             const selection = app.auth.loadedTeamSelection() orelse return false;
             if (index >= selection.teams.items.len) return false;
             const team = selection.teams.items[index];
-            const body = try std.fmt.allocPrint(app.alloc, "Changed Vercel team to {s} ({s}).", .{ team.name, team.slug });
+            const body = try app.alloc.print("Changed Vercel team to {s} ({s}).", .{ team.name, team.slug });
             defer app.alloc.free(body);
             if (validation == .rejected) {
                 cancelPromptRetryAfterAuth(app);
@@ -1676,6 +1859,15 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// Shows the device code the sign-in worker just prepared and opens
+        /// the browser for it, as beginSignIn does for a code ready at once.
+        fn openPreparedSignInBrowser(app: *App) !void {
+            if (comptime !@hasDecl(@TypeOf(app.auth), "takeSignInBrowserPending")) return;
+            if (!app.auth.takeSignInBrowserPending()) return;
+            app.shell.render_requests.request(.footer);
+            if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+        }
+
         fn openSignInBrowser(app: *App) !void {
             const url = (try app.auth.signInBrowserUrlAlloc(app.alloc)) orelse return;
             defer app.alloc.free(url);
@@ -1695,12 +1887,24 @@ pub fn Runtime(comptime App: type) type {
             applyCredentialRefreshChange(app, change);
         }
 
+        /// Adopts a credential a background task renewed off the input loop.
+        /// A renewal that switched account authority is dropped; the next
+        /// prompt's own check then reports the change.
+        pub fn adoptRenewedCredential(app: *App, renewed: *const credentials.Credential) !void {
+            if (app.auth.preparedCredentialChange(renewed.*) == .authority) {
+                debug_trace.logf("auth", "renewed credential dropped reason=authority_changed source={t}", .{renewed.source});
+                return;
+            }
+            var owned = try renewed.clone(app.alloc);
+            defer owned.deinit(app.alloc);
+            applyCredentialRefreshChange(app, app.auth.adoptPreparedCredential(app.alloc, &owned));
+        }
+
         fn applyCredentialRefreshChange(
             app: *App,
             change: auth_transition.CredentialChange,
         ) void {
             if (change == .none) return;
-            reconcileGatewayCredential(app);
             if (app.auth.modelCatalogAccess().authorizationCredential() == null) return;
             if (change == .authority) app.model_cache.reset();
             if (comptime @hasDecl(App, "startModelCacheWarmup")) {
@@ -1723,6 +1927,25 @@ pub fn Runtime(comptime App: type) type {
             return preparePromptCredential(app);
         }
 
+        /// Admits a prompt that queues behind active work without waiting on
+        /// the network. A credential past its refresh deadline still admits,
+        /// because the worker refreshes it before the turn's first request.
+        /// Only a failure that needs a new sign-in stops the prompt here.
+        pub fn admitQueuedPromptCredential(app: *App) !bool {
+            if (comptime host_target.is_wasm or !oauthAuthEnabled(App)) return admitPromptCredential(app);
+            if (!try ensurePromptCredential(app)) return false;
+            if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
+                if (app.auth.credentialFailure()) |failure| {
+                    if (failure.requiresSignIn()) {
+                        try beginCredentialRepair(app, failure);
+                        return false;
+                    }
+                }
+            }
+            if (app.auth.queuedPromptCredential() != null) return true;
+            return recoverPromptCredentialRefreshFailure(app, error.CredentialRefreshUnavailable);
+        }
+
         pub fn startPromptCredentialPrewarm(app: *App) void {
             if (comptime @hasDecl(@TypeOf(app.auth), "providerPreparationPending")) {
                 if (app.auth.providerPreparationPending()) return;
@@ -1742,6 +1965,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn collectPendingPromptCredential(
             app: *App,
         ) !PendingPromptCredentialReadiness {
+            if (startupCredentialPending(app)) return .pending;
             if (comptime @hasDecl(@TypeOf(app.auth), "providerPreparationPending")) {
                 if (app.auth.providerPreparationPending()) return .pending;
             }
@@ -1761,7 +1985,7 @@ pub fn Runtime(comptime App: type) type {
                     return switch (app.auth.beginPromptCredentialRefresh()) {
                         .started, .pending => .pending,
                         .not_needed => if (app.auth.gatewayCredential() != null) .current else .rejected,
-                        .failed => if (try admitPromptCredential(app)) .current else .rejected,
+                        .failed => return refreshTaskUnavailable(app),
                     };
                 },
                 .pending => return .pending,
@@ -1782,6 +2006,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn retryPendingPromptCredential(
             app: *App,
         ) !PendingPromptCredentialReadiness {
+            if (startupCredentialPending(app)) return .pending;
             if (comptime @hasDecl(@TypeOf(app.auth), "providerPreparationPending")) {
                 if (app.auth.providerPreparationPending()) return .pending;
             }
@@ -1791,7 +2016,13 @@ pub fn Runtime(comptime App: type) type {
             if (!try ensurePromptCredential(app)) return .rejected;
             if (comptime @hasDecl(@TypeOf(app.auth), "credentialFailure")) {
                 if (app.auth.credentialFailure()) |failure| {
-                    if (!failure.retryable()) {
+                    // Neither case reaches the network: a sign-in failure opens
+                    // the repair, and a source fx cannot refresh only rereads
+                    // what it holds. Every other source refreshes on the
+                    // background task below, which reports its own failure.
+                    if (!failure.retryable() and
+                        (failure.requiresSignIn() or !credentials.sourceRefreshable(failure.source)))
+                    {
                         return if (try preparePromptCredential(app)) .current else .rejected;
                     }
                 }
@@ -1800,8 +2031,16 @@ pub fn Runtime(comptime App: type) type {
             return switch (app.auth.beginPromptCredentialRefresh()) {
                 .started, .pending => .pending,
                 .not_needed => if (app.auth.gatewayCredential() != null) .current else .rejected,
-                .failed => if (try preparePromptCredential(app)) .current else .rejected,
+                .failed => refreshTaskUnavailable(app),
             };
+        }
+
+        /// The refresh thread could not start. Refreshing here instead would
+        /// hold the input loop on the network, so the prompt waits for the
+        /// user to retry, as after any temporary refresh failure.
+        fn refreshTaskUnavailable(app: *App) !PendingPromptCredentialReadiness {
+            _ = try recoverPromptCredentialRefreshFailure(app, error.CredentialRefreshTaskUnavailable);
+            return .rejected;
         }
 
         fn preparePromptCredential(app: *App) !bool {
@@ -1854,8 +2093,45 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn resumePromptAfterAuth(app: *App) !void {
+            // A request waiting for this sign-in continues with it.
+            if (comptime @hasDecl(@TypeOf(app.shell), "worker_status_state") and
+                @hasDecl(@TypeOf(app.worker), "requestRecoveryContinue"))
+            {
+                if (app.shell.worker_status_state().waitsForSignIn()) {
+                    debug_trace.logf("auth", "signed in; continuing the waiting request", .{});
+                    app.worker.requestRecoveryContinue();
+                }
+            }
             if (comptime @hasDecl(App, "resumePromptAfterAuth")) {
                 try app.resumePromptAfterAuth();
+            }
+        }
+
+        fn requestWaitsForSignIn(app: *App) bool {
+            if (comptime !@hasDecl(@TypeOf(app.shell), "worker_status_state")) return false;
+            return app.shell.worker_status_state().waitsForSignIn();
+        }
+
+        /// A request waits for `provider`'s sign-in and `provider` is the
+        /// one in use: signing in again renews the credential the request
+        /// sends with and switches nothing, so the active request does not
+        /// block it.
+        fn renewsWaitingRequest(app: *App, provider: model_provider.ProviderId) bool {
+            if (comptime !provider_runtime.supported(App)) return false;
+            return requestWaitsForSignIn(app) and provider_runtime.provider(app).eql(provider);
+        }
+
+        /// A request waits for the user to sign in again: opens the sign-in
+        /// for the selected source. Signing in continues the request
+        /// (`resumePromptAfterAuth`), and Esc ends it.
+        pub fn beginRecoverySignIn(app: *App) !void {
+            const source = app.auth.credentialSource() orelse return;
+            debug_trace.logf("auth", "request waits for sign-in source={t}", .{source});
+            switch (source) {
+                .fx_login => try beginSignIn(app, false),
+                .chatgpt_subscription => try beginChatGptSignIn(app),
+                .grok_subscription => try beginGrokSignIn(app),
+                .vercel_oidc_token, .ai_gateway_api_key, .stored_key, .host_managed, .configured => {},
             }
         }
 
@@ -1900,28 +2176,23 @@ pub fn Runtime(comptime App: type) type {
         ) ![]u8 {
             const source_label = credentials.sourceLabel(failure.source);
             return switch (failure.reason) {
-                .invalid_credential => std.fmt.allocPrint(
-                    alloc,
+                .invalid_credential => alloc.print(
                     "{s} sign-in expired.\npress enter to sign in again. Your prompt is saved.",
                     .{source_label},
                 ),
-                .invalid_storage => std.fmt.allocPrint(
-                    alloc,
+                .invalid_storage => alloc.print(
                     "{s}: Saved credential storage is unavailable.\nCheck credential storage, then press enter to retry. Your prompt is saved.",
                     .{source_label},
                 ),
-                .persistence_uncertain => std.fmt.allocPrint(
-                    alloc,
+                .persistence_uncertain => alloc.print(
                     "{s} refresh could not be saved.\npress enter to sign in again. Your prompt is saved.",
                     .{source_label},
                 ),
-                .authority_changed => std.fmt.allocPrint(
-                    alloc,
+                .authority_changed => alloc.print(
                     "{s} account or team changed during refresh.\nReview authentication before retrying. Your prompt is saved.",
                     .{source_label},
                 ),
-                .temporary_unavailable => std.fmt.allocPrint(
-                    alloc,
+                .temporary_unavailable => alloc.print(
                     "{s} credential refresh failed.\npress enter to retry. Your prompt is saved.",
                     .{source_label},
                 ),
@@ -1933,60 +2204,9 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(@TypeOf(app.auth), "cancelPromptCredentialRefresh")) {
                 app.auth.cancelPromptCredentialRefresh();
             }
-            reconcileGatewayCredential(app);
             app.model_cache.reset();
             if (comptime @hasDecl(App, "startModelCacheWarmup")) {
                 app.startModelCacheWarmup();
-            }
-        }
-
-        fn reconcileGatewayCredential(app: *App) void {
-            if (comptime !runtime_profile.allows(App, .generation_usage)) return;
-            if (comptime @hasField(App, "session") and
-                @hasField(@TypeOf(app.session), "usage"))
-            {
-                if (app.auth.gatewayCredential()) |credential| {
-                    if (gatewayCredentialSource(credential) == .host_managed) {
-                        if (comptime @hasDecl(@TypeOf(app.session.usage), "replaceHostManagedReconciliationAuthority")) {
-                            app.session.usage.replaceHostManagedReconciliationAuthority(
-                                app.alloc,
-                                provider_runtime.provider(app),
-                            );
-                        }
-                        return;
-                    }
-                    const subscription = if (comptime @hasField(@TypeOf(credential), "source"))
-                        credential.source == .chatgpt_subscription or credential.source == .grok_subscription
-                    else
-                        false;
-                    if (subscription) {
-                        app.session.usage.clearReconciliationCredential();
-                    } else {
-                        if (comptime @hasDecl(
-                            @TypeOf(app.session.usage),
-                            "replaceProviderReconciliationCredential",
-                        )) {
-                            if (optionalGatewayApiKey(credential)) |api_key| {
-                                app.session.usage.replaceProviderReconciliationCredential(
-                                    app.alloc,
-                                    .gateway,
-                                    credential.source,
-                                    null,
-                                    api_key,
-                                );
-                            }
-                        } else {
-                            if (optionalGatewayApiKey(credential)) |api_key| {
-                                app.session.usage.replaceReconciliationCredential(
-                                    app.alloc,
-                                    api_key,
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    app.session.usage.clearReconciliationCredential();
-                }
             }
         }
 
@@ -1994,7 +2214,7 @@ pub fn Runtime(comptime App: type) type {
             const failure = auth_runtime.classifyCredentialFailure(source, err);
             if (failure.reason == .invalid_storage or failure.reason == .persistence_uncertain) {
                 const notice = auth_runtime.preparationFailureNotice(auth_runtime.preparationError(failure).?).?;
-                const body = try std.fmt.allocPrint(app.alloc, "{s}: {s}", .{ credentials.sourceLabel(source), notice });
+                const body = try app.alloc.print("{s}: {s}", .{ credentials.sourceLabel(source), notice });
                 defer app.alloc.free(body);
                 try writeAuthNotice(app, .{ .topic = "auth", .tone = .@"error", .body = body });
                 return;
@@ -2285,6 +2505,7 @@ const TestTeamSelection = struct {
 };
 
 const TestAuth = struct {
+    startup_pending: bool = false,
     select_result: ?bool = false,
     sign_in_transition: login_flow.SignInTransition = .none,
     logout_changed: bool = false,
@@ -2304,6 +2525,8 @@ const TestAuth = struct {
     gateway_ready: bool = true,
     catalog_ready: bool = true,
     gateway_ready_after_refresh_count: ?usize = null,
+    /// A credential is selected but past its refresh deadline.
+    credential_due: bool = false,
     team_selection: TestTeamSelection = .{},
     sign_in_url: ?[]const u8 = null,
     picker_pop_count: usize = 0,
@@ -2338,7 +2561,7 @@ const TestAuth = struct {
         };
     }
 
-    fn beginPromptCredentialRefresh(self: *TestAuth) auth_runtime.PromptCredentialRefreshStart {
+    pub fn beginPromptCredentialRefresh(self: *TestAuth) auth_runtime.PromptCredentialRefreshStart {
         self.prompt_refresh_start_count += 1;
         return self.prompt_refresh_start;
     }
@@ -2347,7 +2570,7 @@ const TestAuth = struct {
         return .idle;
     }
 
-    fn cancelPromptCredentialRefresh(_: *TestAuth) void {}
+    pub fn cancelPromptCredentialRefresh(_: *TestAuth) void {}
 
     fn selectSource(self: *TestAuth, _: std.mem.Allocator, source: credentials.Source) !?bool {
         self.selected_source = source;
@@ -2381,6 +2604,10 @@ const TestAuth = struct {
 
     fn openSignInPickerFromRoot(self: *TestAuth, alloc: std.mem.Allocator) !bool {
         return self.openSignInPicker(alloc);
+    }
+
+    pub fn startupCredentialPending(self: *const TestAuth) bool {
+        return self.startup_pending;
     }
 
     fn openChatGptSignInPickerFromRoot(self: *TestAuth, alloc: std.mem.Allocator) !bool {
@@ -2439,7 +2666,7 @@ const TestAuth = struct {
         return false;
     }
 
-    fn pickerView(_: *const TestAuth) auth_runtime.PickerView {
+    pub fn pickerView(_: *const TestAuth) auth_runtime.PickerView {
         return .{
             .active = false,
             .available_sources = .empty,
@@ -2467,6 +2694,11 @@ const TestAuth = struct {
 
     fn gatewayCredential(self: *const TestAuth) ?TestGatewayCredential {
         return if (self.gateway_ready) .{ .api_key = "refreshed-key" } else null;
+    }
+
+    fn queuedPromptCredential(self: *const TestAuth) ?TestGatewayCredential {
+        if (self.gateway_ready) return .{ .api_key = "refreshed-key" };
+        return if (self.credential_due) .{ .api_key = "due-key" } else null;
     }
 
     fn adoptPreparedCredential(
@@ -2519,7 +2751,7 @@ const TestAuth = struct {
             .{ .ready = action };
     }
 
-    fn recordCredentialFailure(
+    pub fn recordCredentialFailure(
         self: *TestAuth,
         failure: auth_runtime.CredentialFailure,
         options: struct { notify: bool = true },
@@ -2537,7 +2769,7 @@ const TestAuth = struct {
         return true;
     }
 
-    fn credentialFailure(self: *const TestAuth) ?auth_runtime.CredentialFailure {
+    pub fn credentialFailure(self: *const TestAuth) ?auth_runtime.CredentialFailure {
         return self.credential_failure;
     }
 
@@ -2566,26 +2798,6 @@ const TestAuth = struct {
 
 const TestGatewayCredential = struct {
     api_key: []const u8,
-};
-
-const TestUsage = struct {
-    refresh_count: usize = 0,
-    clear_count: usize = 0,
-    last_key: ?[]const u8 = null,
-
-    fn replaceReconciliationCredential(
-        self: *TestUsage,
-        _: std.mem.Allocator,
-        api_key: []const u8,
-    ) void {
-        self.refresh_count += 1;
-        self.last_key = api_key;
-    }
-
-    fn clearReconciliationCredential(self: *TestUsage) void {
-        self.clear_count += 1;
-        self.last_key = null;
-    }
 };
 
 const TestRenderRequests = struct {
@@ -2644,9 +2856,6 @@ const TestApp = struct {
         }
     } = .{},
     model_cache: TestModelCache = .{},
-    session: struct {
-        usage: TestUsage = .{},
-    } = .{},
     model_cache_warmup_count: usize = 0,
     notice_write_count: usize = 0,
     transcript: std.ArrayList(u8) = .empty,
@@ -2664,7 +2873,7 @@ const TestApp = struct {
         self.transcript.deinit(self.alloc);
     }
 
-    fn startModelCacheWarmup(self: *TestApp) void {
+    pub fn startModelCacheWarmup(self: *TestApp) void {
         self.model_cache_warmup_count += 1;
     }
 
@@ -2684,12 +2893,12 @@ const TestApp = struct {
         return self.test_url_opener.opener();
     }
 
-    fn persistCredentialSourcePreference(self: *TestApp, source: credentials.Source) void {
+    pub fn persistCredentialSourcePreference(self: *TestApp, source: credentials.Source) void {
         self.preference_write_count += 1;
         if (self.preference_write_succeeds) self.last_preference_source = source;
     }
 
-    fn providerCatalog(self: *TestApp, _: model_provider.ProviderId) ?model_catalog.Provider {
+    pub fn providerCatalog(self: *TestApp, _: model_provider.ProviderId) ?model_catalog.Provider {
         return .{ .context = self, .fetch_fn = fetchTestCatalog };
     }
 
@@ -2779,7 +2988,7 @@ test "provider inventory completion does not reclaim a changed composer" {
 }
 
 test "provider picker preparation failure starts no inventory task" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
     var app: TestApp = .{ .alloc = failing.allocator() };
     defer app.deinit();
 
@@ -3039,11 +3248,6 @@ test "auth source changes invalidate the catalog and failed selection preserves 
     try std.testing.expectEqual(credentials.Source.stored_key, app.auth.selected_source.?);
     try std.testing.expectEqual(@as(usize, 2), app.model_cache.reset_count);
     try std.testing.expectEqual(@as(usize, 2), app.model_cache_warmup_count);
-    try std.testing.expectEqual(@as(usize, 2), app.session.usage.refresh_count);
-    try std.testing.expectEqualStrings(
-        "refreshed-key",
-        app.session.usage.last_key.?,
-    );
 
     app.auth.select_result = null;
     try std.testing.expect(!try runtime.selectCredentialSource(&app, .ai_gateway_api_key));
@@ -3078,8 +3282,7 @@ test "completed credential switch emits exactly one transcript line" {
     try std.testing.expectEqual(@as(usize, 1), app.preference_write_count);
     try std.testing.expectEqual(credentials.Source.stored_key, app.last_preference_source.?);
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
-    const expected = try std.fmt.allocPrint(
-        app.alloc,
+    const expected = try app.alloc.print(
         "Switched credential to {s}.\n",
         .{credentials.sourceLabel(.stored_key)},
     );
@@ -3248,24 +3451,12 @@ test "prompt credential refresh preserves catalog for secret rotation" {
     try std.testing.expectEqual(@as(usize, 2), app.auth.refresh_count);
     try std.testing.expectEqual(@as(usize, 0), app.model_cache.reset_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache_warmup_count);
-    try std.testing.expectEqual(@as(usize, 1), app.session.usage.refresh_count);
 
     app.auth.refresh_change = .authority;
     try runtime.refreshFxLoginCredentialIfNeeded(&app);
     try std.testing.expectEqual(@as(usize, 3), app.auth.refresh_count);
     try std.testing.expectEqual(@as(usize, 1), app.model_cache.reset_count);
     try std.testing.expectEqual(@as(usize, 2), app.model_cache_warmup_count);
-    try std.testing.expectEqual(@as(usize, 2), app.session.usage.refresh_count);
-}
-
-test "credential removal clears the reconciliation credential" {
-    var app: TestApp = .{};
-    app.auth.gateway_ready = false;
-
-    Runtime(TestApp).applyCredentialChange(&app, true);
-
-    try std.testing.expectEqual(@as(usize, 1), app.session.usage.clear_count);
-    try std.testing.expectEqual(@as(usize, 0), app.session.usage.refresh_count);
 }
 
 test "logout result reconciles live auth and renders only sanitized notices" {
@@ -3384,6 +3575,43 @@ test "prompt credential refresh allows only OutOfMemory to escape" {
     try std.testing.expect(!app.auth.picker_opened);
 }
 
+test "queued prompt admission leaves a due credential for the worker to refresh" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = .fx_login;
+    app.auth.gateway_ready = false;
+    app.auth.credential_due = true;
+
+    try std.testing.expect(try Runtime(TestApp).admitQueuedPromptCredential(&app));
+    try std.testing.expectEqual(@as(usize, 0), app.auth.refresh_count);
+    try std.testing.expectEqual(@as(usize, 0), app.auth.prompt_refresh_start_count);
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+}
+
+test "queued prompt admission starts repair for a failure that needs a new sign-in" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = .fx_login;
+    app.auth.credential_due = true;
+    app.auth.credential_failure = .{ .source = .fx_login, .reason = .invalid_credential };
+
+    try std.testing.expect(!try Runtime(TestApp).admitQueuedPromptCredential(&app));
+    try std.testing.expectEqual(@as(usize, 0), app.auth.refresh_count);
+    try std.testing.expectEqual(@as(usize, 1), app.auth.sign_in_start_count);
+}
+
+test "queued prompt admission rejects a missing credential without refreshing" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = .fx_login;
+    app.auth.gateway_ready = false;
+
+    try std.testing.expect(!try Runtime(TestApp).admitQueuedPromptCredential(&app));
+    try std.testing.expectEqual(@as(usize, 0), app.auth.refresh_count);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "fx login sign-in expired.") != null);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Your prompt is saved.") != null);
+}
+
 test "manual compaction missing credentials leave transcript feedback to its owner" {
     for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
         for ([_]bool{ false, true }) |for_compaction| {
@@ -3489,25 +3717,245 @@ test "compaction credential failure preserves the first ordinary recovery notice
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
 }
 
-test "prompt credential refresh falls back when its task cannot start" {
+test "prompt credential refresh reports a task that cannot start instead of refreshing inline" {
     var app: TestApp = .{};
     defer app.deinit();
     app.auth.active_source = .fx_login;
     app.auth.prompt_refresh_start = .failed;
     app.auth.gateway_ready = false;
-    app.auth.gateway_ready_after_refresh_count = 1;
 
     try std.testing.expectEqual(
-        PendingPromptCredentialReadiness.current,
+        PendingPromptCredentialReadiness.rejected,
         try Runtime(TestApp).collectPendingPromptCredential(&app),
     );
-    try std.testing.expectEqual(@as(usize, 1), app.auth.refresh_count);
+    try std.testing.expectEqual(
+        PendingPromptCredentialReadiness.rejected,
+        try Runtime(TestApp).retryPendingPromptCredential(&app),
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.auth.refresh_count);
+    try std.testing.expectEqual(@as(usize, 2), app.auth.prompt_refresh_start_count);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, app.transcript.items, "press enter to retry."));
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Your prompt is saved.") != null);
+}
 
-    app.auth.gateway_ready = false;
-    app.auth.gateway_ready_after_refresh_count = 2;
+test "retrying a refreshable source after a non-retryable failure refreshes in the background" {
+    for ([_]auth_runtime.CredentialFailureReason{ .invalid_storage, .authority_changed }) |reason| {
+        var app: TestApp = .{};
+        defer app.deinit();
+        app.auth.active_source = .fx_login;
+        app.auth.credential_failure = .{ .source = .fx_login, .reason = reason };
+        app.auth.prompt_refresh_start = .started;
+
+        try std.testing.expectEqual(
+            PendingPromptCredentialReadiness.pending,
+            try Runtime(TestApp).retryPendingPromptCredential(&app),
+        );
+        try std.testing.expectEqual(@as(usize, 0), app.auth.refresh_count);
+        try std.testing.expectEqual(@as(usize, 1), app.auth.prompt_refresh_start_count);
+    }
+}
+
+test "retrying after a sign-in failure opens the repair without refreshing" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = .fx_login;
+    app.auth.credential_failure = .{ .source = .fx_login, .reason = .invalid_credential };
+    app.auth.prompt_refresh_start = .started;
+
+    try std.testing.expectEqual(
+        PendingPromptCredentialReadiness.rejected,
+        try Runtime(TestApp).retryPendingPromptCredential(&app),
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.auth.refresh_count);
+    try std.testing.expectEqual(@as(usize, 0), app.auth.prompt_refresh_start_count);
+    try std.testing.expectEqual(@as(usize, 1), app.auth.sign_in_start_count);
+}
+
+test "retrying a source fx cannot refresh rereads it in place" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = .stored_key;
+    app.auth.credential_failure = .{ .source = .stored_key, .reason = .invalid_storage };
+    app.auth.prompt_refresh_start = .started;
+
     try std.testing.expectEqual(
         PendingPromptCredentialReadiness.current,
         try Runtime(TestApp).retryPendingPromptCredential(&app),
     );
-    try std.testing.expectEqual(@as(usize, 2), app.auth.refresh_count);
+    try std.testing.expectEqual(@as(usize, 1), app.auth.refresh_count);
+    try std.testing.expectEqual(@as(usize, 0), app.auth.prompt_refresh_start_count);
+}
+
+/// Installs exactly `entries` with the Keychain disabled, so the launch lookup
+/// reads only what a test provides and never the developer's real Keychain.
+const StartupCredentialTestEnv = struct {
+    map: std.process.Environ.Map,
+
+    fn install(alloc: std.mem.Allocator, entries: []const [2][]const u8) !*StartupCredentialTestEnv {
+        const self = try alloc.create(StartupCredentialTestEnv);
+        errdefer alloc.destroy(self);
+        self.* = .{ .map = std.process.Environ.Map.init(alloc) };
+        errdefer self.map.deinit();
+        try self.map.put("FX_DISABLE_KEYCHAIN", "1");
+        for (entries) |entry| try self.map.put(entry[0], entry[1]);
+        io_mod.setEnvironMap(&self.map);
+        return self;
+    }
+
+    fn deinit(self: *StartupCredentialTestEnv, alloc: std.mem.Allocator) void {
+        io_mod.resetEnvironForTest();
+        self.map.deinit();
+        alloc.destroy(self);
+    }
+};
+
+const StartupCredentialApp = struct {
+    alloc: std.mem.Allocator = std.testing.allocator,
+    auth: auth_runtime.Runtime = .{},
+    submission: @import("input_submit_runtime.zig").State = .{},
+    shell: struct {
+        render_requests: struct {
+            first_frame_pending: bool = false,
+            footer_requested: bool = false,
+
+            fn request(self: *@This(), _: anytype) void {
+                self.footer_requested = true;
+            }
+
+            fn hasReason(self: @This(), _: anytype) bool {
+                return self.first_frame_pending;
+            }
+        } = .{},
+    } = .{},
+    model_cache: struct {
+        resets: usize = 0,
+
+        fn reset(self: *@This()) void {
+            self.resets += 1;
+        }
+    } = .{},
+    warmups: usize = 0,
+    notices: usize = 0,
+
+    fn writeDomainNotice(self: *@This(), _: types.SemanticNotice, _: bool) !void {
+        self.notices += 1;
+    }
+
+    pub fn startModelCacheWarmup(self: *@This()) void {
+        self.warmups += 1;
+    }
+
+    fn waitForStartupCredential(self: *@This()) !void {
+        const task = self.auth.startup_credential_task orelse return error.TestExpectedStartupCredentialTask;
+        var waited_ms: usize = 0;
+        while (!task.done.load(.acquire)) : (waited_ms += 1) {
+            if (waited_ms >= 5000) return error.TestStartupCredentialTimedOut;
+            io_mod.sleep(std.time.ns_per_ms);
+        }
+    }
+};
+
+test "prompts wait while the launch credential is still loading" {
+    var app: TestApp = .{};
+    defer app.deinit();
+    app.auth.active_source = null;
+    app.auth.startup_pending = true;
+
+    try std.testing.expectEqual(PendingPromptCredentialReadiness.pending, try Runtime(TestApp).collectPendingPromptCredential(&app));
+    try std.testing.expectEqual(PendingPromptCredentialReadiness.pending, try Runtime(TestApp).retryPendingPromptCredential(&app));
+    try std.testing.expect(!app.auth.picker_opened);
+    try std.testing.expectEqual(@as(usize, 0), app.notice_write_count);
+}
+
+test "a deferred launch credential settles once, like the blocking launch" {
+    const alloc = std.testing.allocator;
+    var env = try StartupCredentialTestEnv.install(alloc, &.{.{ "AI_GATEWAY_API_KEY", "launch-key" }});
+    defer env.deinit(alloc);
+    var app: StartupCredentialApp = .{};
+    defer app.auth.deinit(app.alloc);
+    const runtime = Runtime(StartupCredentialApp);
+
+    try std.testing.expect(app.auth.beginStartupCredentialLoad(.{ .provider = .gateway, .preferred = .ai_gateway_api_key }));
+    try std.testing.expect(runtime.startupCredentialPending(&app));
+    try app.waitForStartupCredential();
+    try runtime.collectStartupCredentialFacts(&app);
+    try std.testing.expect(!runtime.startupCredentialPending(&app));
+    try std.testing.expectEqual(@as(?credentials.Source, .ai_gateway_api_key), app.auth.credentialSource());
+    try std.testing.expect(!app.auth.pickerView().active);
+    try std.testing.expectEqual(@as(usize, 1), app.model_cache.resets);
+    try std.testing.expectEqual(@as(usize, 1), app.warmups);
+    try std.testing.expectEqual(@as(usize, 0), app.notices);
+    try std.testing.expect(app.shell.render_requests.footer_requested);
+
+    try runtime.collectStartupCredentialFacts(&app);
+    try std.testing.expectEqual(@as(usize, 1), app.warmups);
+}
+
+test "a launch lookup that finds no credential opens onboarding when it settles" {
+    const alloc = std.testing.allocator;
+    var env = try StartupCredentialTestEnv.install(alloc, &.{});
+    defer env.deinit(alloc);
+    var app: StartupCredentialApp = .{};
+    defer app.auth.deinit(app.alloc);
+    const runtime = Runtime(StartupCredentialApp);
+
+    try std.testing.expect(app.auth.beginStartupCredentialLoad(.{ .provider = .gateway, .preferred = .ai_gateway_api_key }));
+    try std.testing.expect(!app.auth.pickerView().active);
+    try app.waitForStartupCredential();
+    try runtime.collectStartupCredentialFacts(&app);
+
+    try std.testing.expect(app.auth.credentialSource() == null);
+    try std.testing.expect(app.auth.pickerView().active);
+    try std.testing.expectEqual(@as(usize, 0), app.model_cache.resets);
+    try std.testing.expectEqual(@as(usize, 1), app.warmups);
+}
+
+test "a credential chosen during the launch lookup is kept" {
+    const alloc = std.testing.allocator;
+    var env = try StartupCredentialTestEnv.install(alloc, &.{.{ "AI_GATEWAY_API_KEY", "launch-key" }});
+    defer env.deinit(alloc);
+    var app: StartupCredentialApp = .{};
+    defer app.auth.deinit(app.alloc);
+    const runtime = Runtime(StartupCredentialApp);
+
+    try std.testing.expect(app.auth.beginStartupCredentialLoad(.{ .provider = .gateway, .preferred = .ai_gateway_api_key }));
+    var chosen: credentials.Credential = .{ .token = try alloc.dupe(u8, "chosen-token"), .source = .fx_login };
+    defer chosen.deinit(alloc);
+    _ = app.auth.adoptCredential(alloc, &chosen);
+    try app.waitForStartupCredential();
+    try runtime.collectStartupCredentialFacts(&app);
+
+    try std.testing.expectEqual(@as(?credentials.Source, .fx_login), app.auth.credentialSource());
+    try std.testing.expectEqual(@as(usize, 0), app.model_cache.resets);
+}
+
+test "a deferred launch inventory waits for the first frame and runs once" {
+    const alloc = std.testing.allocator;
+    var env = try StartupCredentialTestEnv.install(alloc, &.{.{ "AI_GATEWAY_API_KEY", "launch-key" }});
+    defer env.deinit(alloc);
+    var app: StartupCredentialApp = .{};
+    defer app.auth.deinit(app.alloc);
+    const runtime = Runtime(StartupCredentialApp);
+
+    app.auth.deferStartupSourceInventory();
+    app.shell.render_requests.first_frame_pending = true;
+    runtime.collectDeferredStartupInventory(&app);
+    try std.testing.expect(!app.auth.source_inventory.contains(.ai_gateway_api_key));
+    try std.testing.expect(!app.shell.render_requests.footer_requested);
+
+    app.shell.render_requests.first_frame_pending = false;
+    runtime.collectDeferredStartupInventory(&app);
+    try std.testing.expect(app.auth.source_inventory.contains(.ai_gateway_api_key));
+    try std.testing.expect(app.shell.render_requests.footer_requested);
+    try std.testing.expect(!app.auth.takeDeferredStartupSourceInventory());
+}
+
+test "quitting during the launch lookup waits for its worker" {
+    const alloc = std.testing.allocator;
+    var env = try StartupCredentialTestEnv.install(alloc, &.{});
+    defer env.deinit(alloc);
+    var auth: auth_runtime.Runtime = .{};
+    try std.testing.expect(auth.beginStartupCredentialLoad(.{ .provider = .gateway, .preferred = .ai_gateway_api_key }));
+    auth.deinit(alloc);
+    try std.testing.expect(!auth.startupCredentialPending());
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const model_provider = @import("../config/model_provider.zig");
+const http_pool = @import("../shared/http_pool.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -12,12 +13,28 @@ pub const Runtime = struct {
     model: std.ArrayList(u8) = .empty,
     definitions: @import("../config/configured_provider.zig").Registry = .{},
     model_requests_blocked: bool = false,
+    /// Process-long pooled HTTP client for gateway chat traffic. Heap-allocated
+    /// so the pointer stays stable when this Runtime is copied by value; null
+    /// when allocation failed (requests then dial per attempt, as before).
+    gateway_http_pool: ?*http_pool.HttpPool = null,
 
     pub fn init(alloc: Allocator) Self {
         return .{ .alloc = alloc };
     }
 
+    /// Creates the gateway pool once. Safe to call repeatedly. Allocation
+    /// failure leaves the pool absent rather than failing the caller.
+    pub fn ensureGatewayHttpPool(self: *Self) void {
+        if (self.gateway_http_pool != null) return;
+        const pool = self.alloc.create(http_pool.HttpPool) catch return;
+        pool.* = http_pool.HttpPool.init(self.alloc);
+        self.gateway_http_pool = pool;
+    }
+
     pub fn deinit(self: *Self) void {
+        if (self.gateway_http_pool) |pool| {
+            if (pool.deinit() == .destroyed) self.alloc.destroy(pool);
+        }
         self.model.deinit(self.alloc);
         self.definitions.deinit(self.alloc);
         self.* = undefined;

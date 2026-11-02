@@ -1,17 +1,19 @@
 const std = @import("std");
 const debug_trace = @import("debug_trace.zig");
 const display_width = @import("display_width.zig");
+const ascii_case = @import("ascii_case.zig");
 
-pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
+pub const containsIgnoreCase = ascii_case.containsIgnoreCase;
 
-    const last_start = haystack.len - needle.len;
-    var i: usize = 0;
-    while (i <= last_start) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
+/// Returns `text` repeated `count` times as a comptime string literal.
+pub inline fn repeat(comptime text: []const u8, comptime count: usize) *const [text.len * count:0]u8 {
+    return comptime blk: {
+        const units: [count][text.len]u8 = @splat(text[0..text.len].*);
+        var bytes: [text.len * count:0]u8 = @splat(0);
+        @memcpy(bytes[0 .. text.len * count], @as(*const [text.len * count]u8, @ptrCast(&units)));
+        const final = bytes;
+        break :blk &final;
+    };
 }
 
 pub fn isModelSafeText(text: []const u8) bool {
@@ -150,8 +152,7 @@ pub const IncrementalTerminalSafeEncoder = struct {
         try writer.writeAll(token.bytes);
         const remaining = self.pending_len - token.source_len;
         if (remaining > 0) {
-            std.mem.copyForwards(
-                u8,
+            @memmove(
                 self.pending[0..remaining],
                 self.pending[token.source_len..self.pending_len],
             );
@@ -174,7 +175,7 @@ pub const IncrementalUtf8Validator = struct {
             self.pending_len += copied;
             index += copied;
             if (self.pending_len < sequence_len) return;
-            _ = std.unicode.utf8Decode(self.pending[0..sequence_len]) catch return error.InvalidUtf8;
+            _ = display_width.decodeUtf8Sequence(self.pending[0..sequence_len]) catch return error.InvalidUtf8;
             self.pending_len = 0;
         }
 
@@ -186,7 +187,7 @@ pub const IncrementalUtf8Validator = struct {
                 self.pending_len = remaining.len;
                 return;
             }
-            _ = std.unicode.utf8Decode(bytes[index .. index + sequence_len]) catch return error.InvalidUtf8;
+            _ = display_width.decodeUtf8Sequence(bytes[index .. index + sequence_len]) catch return error.InvalidUtf8;
             index += sequence_len;
         }
     }
@@ -211,7 +212,7 @@ pub fn encodeTerminalSafePathTail(
     raw: []const u8,
     max_encoded_bytes: usize,
 ) error{ OutOfMemory, PathBasenameTooLong }!EncodedPathTail {
-    const basename = std.fs.path.basename(raw);
+    const basename = std.Io.Dir.path.basename(raw);
     if (basename.len == 0) return error.PathBasenameTooLong;
     const basename_source_start = raw.len - basename.len;
 
@@ -379,6 +380,124 @@ pub fn encodeTerminalSafe(
     };
 }
 
+/// Like `encodeTerminalSafe`, but first flattens every run of ASCII
+/// whitespace (including line breaks and tabs) into a single space and trims
+/// the ends, so multi-line human-readable text stays readable inside a
+/// one-line summary. Non-whitespace control bytes and invalid UTF-8 still get
+/// visible `\xNN` escapes.
+pub fn encodeTerminalSafeInline(
+    alloc: std.mem.Allocator,
+    raw: []const u8,
+    max_encoded_bytes: usize,
+) error{OutOfMemory}!EncodedText {
+    var flattened: std.ArrayList(u8) = .empty;
+    defer flattened.deinit(alloc);
+    var pending_space = false;
+    for (raw) |byte| {
+        if (std.ascii.isWhitespace(byte)) {
+            pending_space = flattened.items.len > 0;
+            continue;
+        }
+        if (pending_space) {
+            try flattened.append(alloc, ' ');
+            pending_space = false;
+        }
+        try flattened.append(alloc, byte);
+    }
+    return encodeTerminalSafe(alloc, flattened.items, max_encoded_bytes);
+}
+
+/// `raw` as a `{f}` format argument, written with the visible escapes
+/// `encodeTerminalSafe` uses, without allocating or shortening it. Messages
+/// use it to quote a word from the command line, the environment, or a file,
+/// so the terminal shows the word instead of acting on its escape sequences.
+pub fn terminalSafe(raw: []const u8) TerminalSafe {
+    return .{ .raw = raw };
+}
+
+const TerminalSafe = struct {
+    raw: []const u8,
+
+    pub fn format(self: TerminalSafe, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        var index: usize = 0;
+        while (index < self.raw.len) {
+            var token_buf: [12]u8 = undefined;
+            const token = terminalSafeToken(self.raw, index, &token_buf);
+            try writer.writeAll(token.bytes);
+            index += token.source_len;
+        }
+    }
+};
+
+test "terminalSafe writes what encodeTerminalSafe returns" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "plain --model", "dark\x1b]0;owned\x07\x1b[2J", "tab\there\r\n", "caf\xc3\xa9 \xff\xfe", "\x7f\xc2\x9b" }) |raw| {
+        var encoded = try encodeTerminalSafe(alloc, raw, std.math.maxInt(usize));
+        defer encoded.deinit(alloc);
+        const formatted = try alloc.print("{f}", .{terminalSafe(raw)});
+        defer alloc.free(formatted);
+        try std.testing.expectEqualStrings(encoded.bytes, formatted);
+        try std.testing.expect(isTerminalSafe(formatted));
+    }
+}
+
+/// Appends one line of file text ready to draw. Tabs stay, since they only
+/// move along the row, and a trailing carriage return from a CRLF line ending
+/// is dropped. Every other control byte, C1 control, and invalid UTF-8 byte
+/// becomes the visible escape `encodeTerminalSafe` writes, so the terminal
+/// never acts on the file's own sequences.
+pub fn appendTerminalSafeLine(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    raw: []const u8,
+) error{OutOfMemory}!void {
+    const line = if (raw.len > 0 and raw[raw.len - 1] == '\r') raw[0 .. raw.len - 1] else raw;
+    var index: usize = 0;
+    while (index < line.len) {
+        if (line[index] == '\t') {
+            try out.append(alloc, '\t');
+            index += 1;
+            continue;
+        }
+        var token_buf: [12]u8 = undefined;
+        const token = terminalSafeToken(line, index, &token_buf);
+        try out.appendSlice(alloc, token.bytes);
+        index += token.source_len;
+    }
+}
+
+/// A copy of `raw` that is valid UTF-8. Each byte outside a valid sequence
+/// becomes the `\xNN` escape `encodeTerminalSafe` writes for it; everything
+/// else, control bytes included, is kept for the renderer to handle. Caller
+/// owns the result.
+pub fn dupeValidUtf8(alloc: std.mem.Allocator, raw: []const u8) error{OutOfMemory}![]u8 {
+    if (std.unicode.utf8ValidateSlice(raw)) return alloc.dupe(u8, raw);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var index: usize = 0;
+    while (index < raw.len) {
+        const sequence_len = validUtf8SequenceLength(raw, index) orelse {
+            var buf: [12]u8 = undefined;
+            try out.appendSlice(alloc, writeByteEscape(&buf, raw[index]));
+            index += 1;
+            continue;
+        };
+        try out.appendSlice(alloc, raw[index .. index + sequence_len]);
+        index += sequence_len;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// The length of the valid UTF-8 sequence at `index`, or null when the byte
+/// there does not start one, by the same rule `terminalSafeToken` applies.
+fn validUtf8SequenceLength(raw: []const u8, index: usize) ?usize {
+    if (raw[index] < 0x80) return 1;
+    const sequence_len = std.unicode.utf8ByteSequenceLength(raw[index]) catch return null;
+    if (index + sequence_len > raw.len) return null;
+    _ = display_width.decodeUtf8Sequence(raw[index .. index + sequence_len]) catch return null;
+    return sequence_len;
+}
+
 /// Returns true when `raw` is valid printable terminal text and
 /// `encodeTerminalSafe` would preserve it byte-for-byte.
 pub fn isTerminalSafe(raw: []const u8) bool {
@@ -391,6 +510,22 @@ pub fn isTerminalSafe(raw: []const u8) bool {
         index += token.source_len;
     }
     return true;
+}
+
+/// Returns true when `url` can be an OSC 8 link target as it is: printable
+/// ASCII with no space, so nothing in it can end the sequence. Show any other
+/// address as text instead.
+pub fn isLinkTarget(url: []const u8) bool {
+    if (url.len == 0) return false;
+    for (url) |c| if (c <= ' ' or c >= 0x7f) return false;
+    return true;
+}
+
+test "a link target is printable ASCII with no space" {
+    try std.testing.expect(isLinkTarget("https://mcp.example.com/authorize?state=a%20b&x=1#y"));
+    for ([_][]const u8{ "", "https://h/a b", "https://h/a\x1b\\\x1b]8;;evil", "https://h/a\x07", "https://h/\xc3\xa9", "https://h/\x7f" }) |odd| {
+        try std.testing.expect(!isLinkTarget(odd));
+    }
 }
 
 pub fn terminalSafeVisibleWidth(raw: []const u8) usize {
@@ -424,7 +559,7 @@ pub fn clippedLabel(buf: []u8, text: []const u8, max_len: usize) []const u8 {
 
 pub fn sanitizeModelText(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     if (isModelSafeText(text)) return text;
-    return std.fmt.allocPrint(arena, "binary or non-utf8 tool output omitted ({d} bytes)", .{text.len});
+    return arena.print("binary or non-utf8 tool output omitted ({d} bytes)", .{text.len});
 }
 
 pub fn maskSecrets(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
@@ -437,7 +572,7 @@ pub fn maskSecrets(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
             modified = true;
             try out.writer.writeAll(text[i..span.prefix_end]);
             try out.writer.writeAll("[redacted]");
-            debug_trace.logf("core", "display secret redacted kind={s} bytes={d}", .{ span.kind, span.value_len });
+            debug_trace.logf("core", "secret redacted kind={s} bytes={d}", .{ span.kind, span.value_len });
             i = span.prefix_end + span.value_len;
         } else {
             try out.writer.writeByte(text[i]);
@@ -547,7 +682,7 @@ fn terminalSafeToken(raw: []const u8, index: usize, buf: *[12]u8) TerminalSafeTo
     }
 
     const sequence = raw[index .. index + sequence_len];
-    const codepoint = std.unicode.utf8Decode(sequence) catch {
+    const codepoint = display_width.decodeUtf8Sequence(sequence) catch {
         return .{ .source_len = 1, .bytes = writeByteEscape(buf, byte) };
     };
     if (isNonPrintingCodepoint(codepoint)) {
@@ -1142,10 +1277,49 @@ test "encodeTerminalSafe visibly escapes controls line breaks and invalid UTF-8"
         "A\\x1b[31m\\x0a\\x0d\\x07\\x7fB\\xff",
         encoded.bytes,
     );
-    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.bytes, 0x1b) == null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.bytes, '\n') == null);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, '\n') == null);
     try std.testing.expect(std.unicode.utf8ValidateSlice(encoded.bytes));
     try std.testing.expect(!encoded.truncated);
+}
+
+test "encodeTerminalSafeInline flattens whitespace runs and trims the ends" {
+    const raw = "  {\n  \"success\": false,\r\n\t\"info\": \"nope\"}\n";
+    var encoded = try encodeTerminalSafeInline(std.testing.allocator, raw, 256);
+    defer encoded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(
+        "{ \"success\": false, \"info\": \"nope\"}",
+        encoded.bytes,
+    );
+    try std.testing.expect(!encoded.truncated);
+}
+
+test "encodeTerminalSafeInline still escapes dangerous controls and invalid UTF-8" {
+    const raw = "a\x1b[31m\nb\x07\xff";
+    var encoded = try encodeTerminalSafeInline(std.testing.allocator, raw, 256);
+    defer encoded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("a\\x1b[31m b\\x07\\xff", encoded.bytes);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, '\n') == null);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(encoded.bytes));
+}
+
+test "encodeTerminalSafeInline collapses whitespace-only input to empty" {
+    var encoded = try encodeTerminalSafeInline(std.testing.allocator, " \n\t\r\n ", 256);
+    defer encoded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("", encoded.bytes);
+    try std.testing.expect(!encoded.truncated);
+}
+
+test "encodeTerminalSafeInline applies the byte budget after flattening" {
+    var encoded = try encodeTerminalSafeInline(std.testing.allocator, "one  two\nthree", 8);
+    defer encoded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("one t...", encoded.bytes);
+    try std.testing.expect(encoded.truncated);
 }
 
 test "isTerminalSafe matches byte-preserving terminal encoding" {
@@ -1182,7 +1356,7 @@ test "incremental terminal-safe encoding matches the whole-slice policy at every
         try encoder.append(&out.writer, raw[split..]);
         try encoder.finish(&out.writer);
         try std.testing.expectEqualStrings(expected.bytes, out.written());
-        try std.testing.expect(std.mem.indexOfScalar(u8, out.written(), 0x1b) == null);
+        try std.testing.expect(std.mem.findScalar(u8, out.written(), 0x1b) == null);
     }
 }
 
@@ -1212,7 +1386,7 @@ test "encodeTerminalSafe makes every byte value terminal-safe UTF-8" {
     for (encoded.bytes) |byte| {
         try std.testing.expect(byte >= 0x20 and byte != 0x7f);
     }
-    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.bytes, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, 0x1b) == null);
     try std.testing.expect(!encoded.truncated);
 }
 
@@ -1237,8 +1411,7 @@ test "encodeTerminalSafePathTail preserves a complete basename from a long sourc
     const prefix = try std.testing.allocator.alloc(u8, 5 * 1024);
     defer std.testing.allocator.free(prefix);
     @memset(prefix, 'a');
-    const raw = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const raw = try std.testing.allocator.print(
         "/{s}/note.txt",
         .{prefix},
     );
@@ -1332,7 +1505,7 @@ test "encodeTerminalSafePathTail keeps hostile UTF-8 and escape tokens whole" {
     defer encoded.deinit(std.testing.allocator);
 
     try std.testing.expect(std.unicode.utf8ValidateSlice(encoded.bytes));
-    try std.testing.expect(std.mem.indexOfScalar(u8, encoded.bytes, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, encoded.bytes, 0x1b) == null);
     try std.testing.expect(
         std.mem.find(u8, encoded.bytes, "\\x1b") != null,
     );
@@ -1430,4 +1603,33 @@ test "utf8ForwardBoundary snaps past the codepoint tail" {
     try std.testing.expectEqual(@as(usize, 4), utf8ForwardBoundary(text, 3));
     try std.testing.expectEqual(@as(usize, 4), utf8ForwardBoundary(text, 4));
     try std.testing.expectEqual(@as(usize, text.len), utf8ForwardBoundary(text, text.len + 3));
+}
+
+test "appendTerminalSafeLine keeps tabs and shows a file's control sequences as text" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try appendTerminalSafeLine(alloc, &out, "a\tb\x1b[2J\x1b[Hc\u{9b}31md\xffe\r");
+    try std.testing.expectEqualStrings("a\tb\\x1b[2J\\x1b[Hc\\u{009b}31md\\xffe", out.items);
+
+    // Only a trailing carriage return ends a line; one inside it would return
+    // to the start of the row and draw over its gutter.
+    out.clearRetainingCapacity();
+    try appendTerminalSafeLine(alloc, &out, "good\rbad\r");
+    try std.testing.expectEqualStrings("good\\x0dbad", out.items);
+}
+
+test "dupeValidUtf8 escapes only bytes outside valid sequences" {
+    const alloc = std.testing.allocator;
+    const kept = try dupeValidUtf8(alloc, "tab\tesc\x1b ok ⋯");
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("tab\tesc\x1b ok ⋯", kept);
+
+    // A truncated sequence and an encoded surrogate are invalid byte by byte,
+    // as `encodeTerminalSafe` sees them.
+    const fixed = try dupeValidUtf8(alloc, "a\xff\xfe\x00\xc3(b\xed\xa0\x80");
+    defer alloc.free(fixed);
+    try std.testing.expectEqualStrings("a\\xff\\xfe\x00\\xc3(b\\xed\\xa0\\x80", fixed);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(fixed));
 }

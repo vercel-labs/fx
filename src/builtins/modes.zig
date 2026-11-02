@@ -8,11 +8,13 @@ const tool_projection = @import("../core/tooling/tool_projection.zig");
 
 pub const ModeSpec = mode_contract.ModeSpec;
 pub const ToolPolicy = mode_contract.ToolPolicy;
-pub const default_mode_id = "ask";
+pub const default_mode_id = "auto";
 
+/// The CLI's `/permissions` modes, in the order ACP lists them.
 pub const all = [_]ModeSpec{
-    .{ .id = "code", .name = "Code", .description = "Write and modify code with full tool access", .permission_mode = .auto },
+    .{ .id = "auto", .name = "Auto", .description = "Check actions with an automatic safety review instead of asking", .permission_mode = .auto },
     .{ .id = "ask", .name = "Ask", .description = "Request permission before making any changes", .permission_mode = .ask },
+    .{ .id = "full-access", .name = "Full access", .description = "Run every action without asking, outside the sandbox", .permission_mode = .yolo },
 };
 
 pub const registry = mode_registry.Registry{
@@ -24,24 +26,29 @@ pub fn lookup(id: []const u8) ?*const ModeSpec {
     return registry.lookup(id);
 }
 
-test "built-in modes register exact ACP order and permission policy" {
-    const expected_ids = [_][]const u8{ "code", "ask" };
-    try std.testing.expectEqual(expected_ids.len, all.len);
-    for (expected_ids, all) |expected, mode| {
-        try std.testing.expectEqualStrings(expected, mode.id);
+test "built-in modes register the CLI permission modes in ACP order" {
+    const expected = [_]struct { id: []const u8, name: []const u8, permission_mode: @TypeOf(all[0].permission_mode) }{
+        .{ .id = "auto", .name = "Auto", .permission_mode = .auto },
+        .{ .id = "ask", .name = "Ask", .permission_mode = .ask },
+        .{ .id = "full-access", .name = "Full access", .permission_mode = .yolo },
+    };
+    try std.testing.expectEqual(expected.len, all.len);
+    for (expected, all) |want, mode| {
+        try std.testing.expectEqualStrings(want.id, mode.id);
+        try std.testing.expectEqualStrings(want.name, mode.name);
+        try std.testing.expectEqual(want.permission_mode, mode.permission_mode);
+        try std.testing.expectEqual(ToolPolicy.full, mode.tool_policy);
     }
 
-    try std.testing.expectEqualStrings("ask", default_mode_id);
+    try std.testing.expectEqualStrings("auto", default_mode_id);
     try std.testing.expectEqualStrings(default_mode_id, registry.default_mode_id);
-    try std.testing.expectEqual(@as(@TypeOf(all[0].permission_mode), .auto), lookup("code").?.permission_mode);
-    try std.testing.expectEqual(@as(@TypeOf(all[1].permission_mode), .ask), lookup("ask").?.permission_mode);
-    try std.testing.expectEqual(ToolPolicy.full, lookup("code").?.tool_policy);
-    try std.testing.expectEqual(ToolPolicy.full, lookup("ask").?.tool_policy);
+    try std.testing.expect(lookup("code") == null);
+    try std.testing.expect(lookup("yolo") == null);
     try std.testing.expect(lookup("unknown") == null);
 }
 
-test "ask and code mode projections carry included custom provider guidance" {
-    inline for (&.{ "ask", "code" }) |mode_id| {
+test "built-in mode projections carry included custom provider guidance" {
+    inline for (&.{ "auto", "ask", "full-access" }) |mode_id| {
         var projection = try registry.buildModelToolProjection(
             std.testing.allocator,
             builtin_tools.advertisement_set,

@@ -13,7 +13,6 @@ pub const Profile = struct {
     clipboard: bool,
     url_opening: bool,
     web_search: bool,
-    generation_usage: bool,
     tools: bool,
     js_host_clipboard: bool,
     js_host_config: bool,
@@ -44,7 +43,6 @@ pub const native = Profile{
     .clipboard = true,
     .url_opening = true,
     .web_search = true,
-    .generation_usage = true,
     .tools = true,
     .js_host_clipboard = false,
     .js_host_config = false,
@@ -58,7 +56,8 @@ pub const native = Profile{
 pub const wasm = Profile{
     .cooperative_agent = true,
     .durable_sessions = false,
-    .profile_usage = false,
+    // `/usage` reads through the JS host's fetch.
+    .profile_usage = true,
     .native_auth = false,
     .file_index = false,
     .mcp = false,
@@ -68,7 +67,6 @@ pub const wasm = Profile{
     .clipboard = false,
     .url_opening = false,
     .web_search = false,
-    .generation_usage = false,
     .tools = false,
     .js_host_clipboard = true,
     .js_host_config = true,

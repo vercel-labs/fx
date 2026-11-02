@@ -1,0 +1,8 @@
+{
+  "name": "fx-tla-image-route",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "verify": "bun ../drivers/image_route/verify.ts"
+  }
+}

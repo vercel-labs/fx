@@ -41,7 +41,7 @@ watchdog.unref();
 
 async function exercise(sdk, surface, options) {
   if (surface === "agent") {
-    const agent = await sdk.createFxAgent({ ...options, apiKey: "async-asset-key", model: "async/model", fetch: modelFetch });
+    const agent = await sdk.createFxEngine({ ...options, apiKey: "async-asset-key", model: "async/model", fetch: modelFetch });
     try {
       const turn = agent.prompt("hello");
       let text = "";

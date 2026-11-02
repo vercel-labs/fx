@@ -1,4 +1,5 @@
 const std = @import("std");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -83,7 +84,7 @@ pub const Target = union(Channel) {
         errdefer alloc.free(owned_version);
         const owned_revision = try alloc.dupe(u8, manifest_revision);
         errdefer alloc.free(owned_revision);
-        const artifact_ref = try std.fmt.allocPrint(alloc, "dev/{s}", .{manifest_revision});
+        const artifact_ref = try alloc.print("dev/{s}", .{manifest_revision});
         return .{ .dev = .{
             .version = owned_version,
             .revision = owned_revision,
@@ -141,8 +142,8 @@ pub const Target = union(Channel) {
 
     pub fn writeDisplayLabel(self: Target, out: []u8) ![]const u8 {
         return switch (self) {
-            .stable => |stable| std.fmt.bufPrint(out, "{s}", .{stable.version}),
-            .dev => |dev| std.fmt.bufPrint(out, "dev {s}", .{shortRevision(dev.revision)}),
+            .stable => |stable| std.mem.print(out, "{s}", .{stable.version}),
+            .dev => |dev| std.mem.print(out, "dev {s}", .{shortRevision(dev.revision)}),
         };
     }
 };
@@ -236,7 +237,7 @@ test "dev manifest rejects malformed and oversized external data" {
     );
     try std.testing.expectError(
         error.ManifestTooLarge,
-        Target.parseDevManifest(alloc, " " ** (max_manifest_bytes + 1)),
+        Target.parseDevManifest(alloc, text_utils.repeat(" ", max_manifest_bytes + 1)),
     );
 }
 

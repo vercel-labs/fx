@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const edit_history = @import("edit_history.zig");
 const editor_state = @import("editor_state.zig");
@@ -200,7 +201,7 @@ test "composer undo and redo apply the recorded transition and reset edit policy
 
     try fixture.edit.setText(alloc, "ab ");
     try fixture.record(alloc, 1, "", "b", 1, 2);
-    try fixture.picker.beginModelPickerFlow(alloc, "provider/model", 2, true, .effort);
+    try fixture.picker.beginModelPickerFlow(alloc, "provider/model", 2, true, false, .effort);
     fixture.picker.file_completion_index = 3;
     fixture.picker.file_completion_window_start = 1;
     fixture.entities.markFileCompletionSeparator(
@@ -269,7 +270,7 @@ test "composer undo rejects registered entities without mutating text" {
 }
 
 test "composer undo destination allocation failure preserves text and history" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var fixture: Fixture = .{};
     defer fixture.deinit(alloc);
 

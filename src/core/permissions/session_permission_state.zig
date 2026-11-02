@@ -297,7 +297,7 @@ pub fn migrateV1ToV2(alloc: Allocator, state: State) !State {
         try mergeMigrationCandidate(alloc, &migrated, rule, key);
     }
 
-    std.mem.sort(Rule, migrated.rules.items, {}, ruleIdLessThan);
+    std.mem.sortUnstable(Rule, migrated.rules.items, {}, ruleIdLessThan);
     try validateSchema(migrated, schema_version);
     return migrated;
 }
@@ -792,12 +792,12 @@ test "capacity rejects insertion while preserving replacement" {
     defer state.deinit(alloc);
     try state.rules.ensureTotalCapacity(alloc, max_rules);
     for (0..max_rules) |index| {
-        const canonical = try std.fmt.allocPrint(alloc, "command-{d}", .{index});
+        const canonical = try alloc.print("command-{d}", .{index});
         const key = try RuleKey.init(.command, canonical);
         state.rules.appendAssumeCapacity(.{
             .id = .{ .value = @intCast(index + 1) },
             .key = key,
-            .display_identity = try std.fmt.allocPrint(alloc, "command {d}", .{index}),
+            .display_identity = try alloc.print("command {d}", .{index}),
             .decision = .deny,
             .generation = @intCast(index + 1),
         });

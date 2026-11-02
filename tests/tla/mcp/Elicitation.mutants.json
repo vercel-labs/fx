@@ -1,0 +1,92 @@
+[
+  {
+    "description": "A mode the client didn't declare reaches the host (ELIC-03)",
+    "old": "IF readable /\\ m \\in declared /\\ Cardinality(Pending) < MaxPending",
+    "new": "IF readable /\\ Cardinality(Pending) < MaxPending",
+    "invariant": "ModeGate"
+  },
+  {
+    "description": "No limit on what the host holds",
+    "old": "IF readable /\\ m \\in declared /\\ Cardinality(Pending) < MaxPending",
+    "new": "IF readable /\\ m \\in declared",
+    "invariant": "Bounded"
+  },
+  {
+    "description": "A declined or cancelled one stays with the host, which can answer again",
+    "old": "THEN \"waiting\" ELSE \"done\"]",
+    "new": "THEN \"waiting\" ELSE \"shown\"]",
+    "invariant": "AnsweredOnce"
+  },
+  {
+    "description": "The client sends an accept whatever the host chose",
+    "old": "decided' = [decided EXCEPT ![r] = a]",
+    "new": "decided' = [decided EXCEPT ![r] = \"accept\"]",
+    "invariant": "HostDecides"
+  },
+  {
+    "description": "A url accept carries content (ELIC-09)",
+    "old": "IF a = \"accept\" /\\ mode[r] = \"form\" THEN \"content\" ELSE a",
+    "new": "IF a = \"accept\" THEN \"content\" ELSE a",
+    "invariant": "ContentGate"
+  },
+  {
+    "description": "Content that fails the schema is sent (ELIC-05)",
+    "old": "IF a = \"accept\" /\\ mode[r] = \"form\" /\\ ~valid\n         THEN UNCHANGED vars",
+    "new": "IF FALSE\n         THEN UNCHANGED vars",
+    "invariant": "ValidOnly"
+  },
+  {
+    "description": "A server's cancel leaves the request with the host",
+    "old": "THEN /\\ phase' = [phase EXCEPT ![r] = \"done\"]\n           /\\ withdrawn'",
+    "new": "THEN /\\ phase' = phase\n           /\\ withdrawn'",
+    "invariant": "NothingAfterWithdraw"
+  },
+  {
+    "description": "The session's end leaves what the host holds, which it then answers in another session",
+    "old": "/\\ phase' = [r \\in Reqs |-> IF r \\in Pending THEN \"done\" ELSE phase[r]]",
+    "new": "/\\ phase' = [r \\in Reqs |-> IF phase[r] = \"waiting\" THEN \"done\" ELSE phase[r]]",
+    "invariant": "NothingAfterWithdraw"
+  },
+  {
+    "description": "A completion leaves the elicitation waiting, so a second one is told (ELIC-08)",
+    "old": "phase[r] = \"waiting\" ->\n           /\\ phase' = [phase EXCEPT ![r] = \"done\"]",
+    "new": "phase[r] = \"waiting\" ->\n           /\\ phase' = phase",
+    "invariant": "CompleteOnce"
+  },
+  {
+    "description": "A completion is told for one the host hasn't accepted",
+    "old": "CASE phase[r] = \"waiting\" ->",
+    "new": "CASE phase[r] \\in {\"waiting\", \"shown\"} ->",
+    "invariant": "CompleteOnlyAccepted"
+  },
+  {
+    "description": "One listed in a -32042 error gets a response",
+    "old": "/\\ IF origin[r] = \"request\"\n                   THEN /\\ sent' = [sent EXCEPT ![r] = IF a",
+    "new": "/\\ IF TRUE\n                   THEN /\\ sent' = [sent EXCEPT ![r] = IF a",
+    "invariant": "RequiredUnanswered"
+  },
+  {
+    "description": "A request in a mode the client didn't declare gets no answer (ELIC-03)",
+    "old": "/\\ IF o = \"request\"\n                   THEN /\\ sent' = [sent EXCEPT ![r] = \"error\"]",
+    "new": "/\\ IF FALSE\n                   THEN /\\ sent' = [sent EXCEPT ![r] = \"error\"]",
+    "invariant": "ModeGate"
+  },
+  {
+    "description": "Nothing makes the host answer",
+    "old": "Spec == Init /\\ [][Next]_vars /\\ \\A r \\in Reqs: WF_vars(\\E a \\in Actions: Answer(r, a, TRUE))",
+    "new": "Spec == Init /\\ [][Next]_vars",
+    "property": "EveryElicitationEnds"
+  },
+  {
+    "description": "An early completion is forgotten when the host accepts",
+    "old": "eid[r] /\\ ~early[r] THEN \"waiting\" ELSE \"done\"]\n              /\\ told' = [told EXCEPT ![r] = IF a = \"accept\" /\\ mode[r] = \"url\" /\\ eid[r] /\\ early[r] THEN @ + 1 ELSE @]",
+    "new": "eid[r] THEN \"waiting\" ELSE \"done\"]\n              /\\ told' = told",
+    "invariant": "EarlyCompletionTold"
+  },
+  {
+    "description": "An early completion is told before the host accepts",
+    "old": "           /\\ early' = [early EXCEPT ![r] = TRUE]\n           /\\ UNCHANGED <<phase, origin, mode, eid, sent, declared, sends, shownEver, decided, withdrawn, told, invalidSent>>",
+    "new": "           /\\ early' = [early EXCEPT ![r] = TRUE]\n           /\\ told' = [told EXCEPT ![r] = @ + 1]\n           /\\ UNCHANGED <<phase, origin, mode, eid, sent, declared, sends, shownEver, decided, withdrawn, invalidSent>>",
+    "invariant": "CompleteOnlyAccepted"
+  }
+]

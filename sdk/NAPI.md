@@ -13,7 +13,9 @@ The relevant ownership boundaries are:
 | Native addon entry point and ACP transport | `src/napi_core_main.zig` |
 | Shared ACP server and agent behavior | `src/acp/` |
 | Node backend discovery and adaptation | `sdk/node.js` |
-| Public JavaScript agent implementation | `sdk/fx-sdk.js` |
+| Node WebAssembly fallback, imported only when it is used | `sdk/node-wasm.js` |
+| Bundled asset URLs under webpack | `sdk/bundled-asset.js` |
+| Public JavaScript agent implementation | `sdk/engine.js` |
 | Native build configuration | `build.zig` |
 | npm artifact assembly | `sdk/scripts/package-libfx.mjs` |
 | Native regression and security tests | `sdk/tests/test-native-core-*.mjs` |
@@ -42,22 +44,29 @@ Zig Runtime thread runs acp_server.runWithTransport()
         |
         +---- FetchBridge <----> sdk/node.js fetch + AbortController
         |
+        +---- AttachmentTable <----> writeCoreAttachment / takeCoreAttachment
+        |
         v
 newline-delimited ACP JSON-RPC
         |
         v
-shared createFxAgent() logic in sdk/fx-sdk.js
+shared engine logic in sdk/engine.js
 ```
 
 `sdk/node.js` supplies a `runtimeFactory` to the shared JavaScript agent implementation. The factory exposes the same small runtime contract expected from the WebAssembly host:
 
 - `write(data)` sends ACP bytes to the addon.
+- `writeAttachment(id, bytes)` copies raw prompt-image or checkpoint bytes to the addon before the frame that references them.
+- `takeAttachment(id)` returns raw checkpoint bytes the core published, or null.
+- `discardAttachments()` drops inbound bytes left by a frame that never reached the core.
 - `closeStdin()` closes the ACP input stream.
 - `setLineHandler(handler)` receives parsed ACP messages.
 - `exited` settles when the native runtime exits.
 - `abort()` aborts Node fetch and closes native input.
 
-Each core has one nonblocking Unix socketpair for readiness. The adapter takes ownership of the reader with `takeCoreReadyFd()` and watches it through `node:net`; Bun adopts the descriptor through `connect()`. The native writer signals when a fetch request becomes pending, output changes from empty to non-empty, or the core exits. Wake bytes carry no state: JavaScript drains the bounded fetch and output queues to quiescence and then checks exit state. While a body pump exists it calls `coreFetchActive()` for that fetch handle. An inactive handle aborts its matching `AbortController` on the next readiness event. ACP output is accumulated to newline boundaries and parsed as JSON. Gateway requests are transferred to Node as bounded request records; Node runs the configured `fetch`, streams bounded response chunks back to Zig, and owns the `AbortController`. This matches the WebAssembly host-fetch boundary and ensures the N-API core never uses the native `std.http` Gateway transport.
+Each core has one nonblocking Unix socketpair for readiness. The adapter takes ownership of the reader with `takeCoreReadyFd()` and watches it through `node:net`; Bun adopts the descriptor through `connect()`. The native writer signals when a fetch request becomes pending, output changes from empty to non-empty, semantic consumption completes, or the core exits. Wake bytes carry no state: JavaScript drains the bounded fetch and output queues to quiescence and then checks exit state. ACP output is accumulated to newline boundaries and parsed as JSON. Gateway requests are transferred to Node as a bounded JSON metadata record plus the raw request body; Node runs the configured `fetch`, streams bounded response chunks back to Zig, and owns the `AbortController`. This matches the WebAssembly host-fetch boundary and ensures the N-API core never uses the native `std.http` Gateway transport.
+
+The body pump observes the matching fetch through `coreFetchDisposition()` under one bridge lock. Separate consumption and active queries can produce a torn observation if the native worker completes between them. Explicit semantic consumption takes precedence over active or retired state and survives normal close and shutdown; HTTP EOF alone does not grant it. JavaScript stops forwarding consumed bytes and drains the remaining HTTP body within 100 ms and 64 KiB without delaying text or result delivery. Cancellation, failure, or an exceeded cleanup bound aborts the body. Runtime destruction waits for owned cleanup to settle. Older compatible addons without the disposition export retain the active-only conservative abort behavior.
 
 The shared JavaScript Agent wrapper emits bounded `transport.start`, `transport.response`, and `transport.error` diagnostics around that host-owned fetch. It allowlists request, generation, model, provider, status, attempt, endpoint, and elapsed-time fields rather than exposing credentials or arbitrary headers.
 
@@ -71,14 +80,18 @@ The native kernel installs host-stream and host model-catalog providers. It does
 
 | Export | Purpose |
 | --- | --- |
-| `libfxApiVersion` | Checks compatibility with the JavaScript loader. Currently `3`. Low-level `createCore` backends must declare this exact version. |
+| `libfxApiVersion` | Checks compatibility with the JavaScript loader. Currently `4`. Low-level `createCore` backends must declare this exact version. |
 | `createCore(options)` | Allocates a runtime and readiness socketpair, then starts its ACP thread. |
 | `takeCoreReadyFd(handle)` | Transfers the readiness reader descriptor to JavaScript exactly once. The caller owns its close. |
 | `writeCore(handle, buffer)` | Appends bytes to the bounded input queue. |
 | `closeCore(handle)` | Closes input and wakes a blocked ACP reader. |
 | `drainCore(handle)` | Returns up to 1 MiB of queued output as a Node Buffer. |
-| `takeCoreFetch(runtime)` | Takes the pending bounded Gateway request, including its positive `fetchHandle`, for Node-owned fetch. |
+| `writeCoreAttachment(handle, id, buffer)` | Copies one raw inbound payload, a prompt image or a restore checkpoint, into the bounded attachment table under a positive `uint32` id. |
+| `takeCoreAttachment(handle, id)` | Removes and returns one outbound payload, a checkpoint, as a Node Buffer, or `null`. |
+| `discardCoreAttachments(handle)` | Drops inbound payloads that no frame consumed. |
+| `takeCoreFetch(runtime)` | Takes the pending bounded Gateway request as `{ request, body }`: a JSON metadata Buffer with the positive `fetchHandle`, method, URL, and headers, and the raw request body Buffer. |
 | `coreFetchActive(runtime, fetchHandle)` | Reports whether that request may still receive host response operations. |
+| `coreFetchDisposition(runtime, fetchHandle)` | Atomically reports retired (`0`), active (`1`), or explicitly consumed (`2`) for the exact handle. Matching consumption takes precedence. This additive export is optional for version 4 addons. |
 | `startCoreFetchResponse(runtime, fetchHandle, status)` | Publishes the matching fetch response status. |
 | `pushCoreFetchResponse(runtime, fetchHandle, buffer)` | Appends a bounded matching response chunk. |
 | `finishCoreFetch(runtime, fetchHandle)` / `failCoreFetch(runtime, fetchHandle)` | Completes only the matching host stream successfully or with transport failure. |
@@ -89,7 +102,7 @@ The native kernel installs host-stream and host model-catalog providers. It does
 
 This ABI is internal. Consumers should use `createFxAgent()` from `sdk/node.js`; exposing the primitive functions keeps the native boundary small and testable.
 
-The addon ABI version is independent of the public JavaScript API version, which remains `2`. Only low-level core addons must declare version `3`.
+The addon ABI version is independent of the public JavaScript API version, which remains `2`. Only low-level core addons must declare version `4`.
 
 Response operations return numeric outcomes: `0` means the operation was stale and ignored, `1` means it was applied, and `2` means a response push encountered bounded backpressure. Stale callbacks never mutate a newer fetch. The addon does not write ambient diagnostics for these outcomes; the JavaScript adapter observes the numeric result and owns any explicit host reporting.
 
@@ -140,7 +153,7 @@ The native core is intentionally more restricted than the native `fx` CLI. Its A
 
 As a result, the model receives no native tool advertisement, cannot launch commands, cannot read workspace files through fx tools, cannot start ACP-provided MCP servers, and cannot access the native secret store. `home` and `workspaceRoot` still provide identity and session context to shared ACP code, but they do not grant a tool capability by themselves.
 
-Agent creation does not fetch the model catalog. When a prompt needs model capabilities or context capacity, the shared resolver obtains the catalog through the supplied host fetch and caches its metadata for that agent. Initial model-visible system context comes only from the host's explicit `instructions`, including text assembled by the MCP and skills adapters.
+Agent creation does not fetch the model catalog unless the host sets a named reasoning `effort` or enables `fast`; those overrides are validated against the catalog at creation. When a prompt needs model capabilities or context capacity, the shared resolver obtains the catalog through the supplied host fetch and caches its metadata for that agent. Initial model-visible system context comes only from the host's explicit `instructions`, including text assembled by the MCP and skills adapters.
 
 Host-stream requests do not opt into the Gateway extended-time header. Live paired testing showed that header caused a recurring multi-second pre-header tail for embedded requests. Session identity and affinity headers remain enabled. The shared JavaScript fetch edge retries a thrown host transport error at most once, before any response reaches the Agent. Cancellation prevents the retry, and a second failure keeps the existing rejection behavior.
 
@@ -148,7 +161,7 @@ This restriction is a security boundary. New tools or host effects must not be e
 
 ## Gateway endpoint policy
 
-The Gateway URL is validated independently in JavaScript and Zig. This duplication is intentional defense in depth because callers can load and call `libfx.node` directly, bypassing `sdk/fx-sdk.js`.
+The Gateway URL is validated independently in JavaScript and Zig. This duplication is intentional defense in depth because callers can load and call `libfx.node` directly, bypassing `sdk/engine.js`.
 
 Accepted endpoints are:
 
@@ -157,7 +170,7 @@ Accepted endpoints are:
 
 URLs with embedded credentials or fragments are rejected. Arbitrary HTTPS hosts, non-loopback HTTP hosts, and other schemes are rejected. Loopback HTTP exists only for local development and deterministic tests.
 
-Keep the validation in `sdk/fx-sdk.js`, `src/napi_core_main.zig`, and `streamable_http.validateEndpoint()` aligned. Loosening only one layer creates inconsistent behavior and may create a server-side request forgery path for callers using the low-level addon directly.
+Keep the validation in `sdk/engine.js`, `src/napi_core_main.zig`, and `streamable_http.validateEndpoint()` aligned. Loosening only one layer creates inconsistent behavior and may create a server-side request forgery path for callers using the low-level addon directly.
 
 ## Resource limits and backpressure
 
@@ -173,8 +186,10 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | Input queue | 8 MiB |
 | Output queue | 8 MiB |
 | Encoded output message | 64 MiB |
-| Fetch request body and serialized metadata | 8 MiB before body base64 encoding |
-| Fetch request record | 11,184,812 bytes including body base64 encoding |
+| Fetch request body and serialized metadata | 8 MiB |
+| One attachment | 4 MiB |
+| Pending inbound attachments | 8, totaling at most 8 MiB |
+| Pending outbound attachments | 4, totaling at most 8 MiB |
 | Fetch response queue | 8 MiB |
 | Gateway error body | 1 MiB |
 | One output drain | 1 MiB |
@@ -183,7 +198,9 @@ All untrusted values crossing the native boundary are bounded before allocation 
 | ACP history | 100 turns |
 | Agent steps | 64 |
 
-The fetch request budget covers the full model request, including retained history and metadata. Its base64 transfer frame has a separate derived bound; accepting one tool result does not reserve space for later requests.
+The fetch request budget covers the full model request, including retained history and metadata. The body crosses to Node unencoded beside its metadata, so the transfer adds no separate bound; accepting one tool result does not reserve space for later requests.
+
+Prompt images and kernel checkpoints also cross the boundary unencoded. JavaScript writes each inbound payload with `writeCoreAttachment()` and then sends the ACP frame that references its id, an image block's `_meta.fx.attachment` or `libfx/restore`'s `checkpointAttachment`; the core thread takes the payload once while handling that frame. `libfx/checkpoint` answers with `checkpointAttachment`, and JavaScript takes those bytes with `takeCoreAttachment()`. The attachment table has its own mutex and stores C-allocator copies, so the core thread never touches JavaScript memory. JavaScript discards unconsumed inbound payloads before attaching new ones.
 
 Host tool responses must also fit the 8 MiB input bound after JSON framing, including the trailing newline. A response that exceeds this bound becomes a small tool error so the model can continue and the agent remains usable.
 
@@ -224,13 +241,23 @@ Consequently:
 - publishing must preserve provenance and use the exact tested artifacts;
 - addon load failures must not be mistaken for a safe sandbox boundary.
 
-The JavaScript loader uses literal references to the four packaged
-`libfx.<platform>-<arch>.node` names and selects the matching supported tuple.
-Local package assembly renames `zig-out/lib/libfx.node` to that tuple's package
-name. The loader validates `libfxApiVersion` and the expected export shape
-before use. `backend: "native"` fails closed if a compatible addon is
+Each supported tuple's addon ships in its own platform package, such as
+`@libfx/libfx-linux-x64-gnu`, which libfx lists as an exact-version optional
+dependency. `node.js` imports only the package for the running tuple. Each
+platform package's `index.js` exports a literal
+`new URL("./libfx.node", import.meta.url)`, so bundlers copy the addon and
+file tracers follow it. Under webpack, `node.js` imports the platform package
+through one template expression limited to `@libfx/libfx-*/index.js`, which
+matches only the packages that are installed, so missing platforms produce no
+build warnings. Everywhere else it uses one literal `import()` per package.
+`node.js` then loads the addon through `createRequire()`. The loader validates
+`libfxApiVersion` and the expected export shape before use. A missing platform
+package is reported as `LIBFX_NATIVE_ARTIFACT_MISSING` with the package name. `backend: "native"` fails closed if a compatible addon is
 unavailable. `backend: "auto"` may fall back to WebAssembly when JSPI is
-available. Explicit `nativeAddon` objects, paths, and URLs remain separate from
+available. `node.js` never imports the WebAssembly host itself: it imports
+`node-wasm.js`, and through it `wasm-runtime.js`, only after native discovery
+fails or when `backend: "wasm"` is requested, so a process on the native
+backend never parses WebAssembly host code or reads a `.wasm` file. Explicit `nativeAddon` objects, paths, and URLs remain separate from
 packaged discovery.
 
 ## Build and packaging
@@ -251,33 +278,56 @@ zig build -Dnapi-surface=core -Doptimize=ReleaseSafe
 
 The N-API artifact currently forces `ReleaseSafe` in `build.zig`; the command-line optimization value does not change that module's mode. Retaining safety checks is intentional for code processing untrusted JavaScript and protocol input.
 
-Published packages contain one addon for each supported tuple:
+Each supported tuple has one platform package:
 
-- `linux-x64`;
-- `linux-arm64`;
-- `darwin-x64`;
-- `darwin-arm64`.
+| Tuple | Package | `os`, `cpu`, `libc` |
+| --- | --- | --- |
+| `linux-x64` | `@libfx/libfx-linux-x64-gnu` | `linux`, `x64`, `glibc` |
+| `linux-arm64` | `@libfx/libfx-linux-arm64-gnu` | `linux`, `arm64`, `glibc` |
+| `darwin-x64` | `@libfx/libfx-darwin-x64` | `darwin`, `x64` |
+| `darwin-arm64` | `@libfx/libfx-darwin-arm64` | `darwin`, `arm64` |
 
-`package-libfx.mjs` requires exactly those four names when assembling a
-publishable multi-platform package. It rejects missing, duplicate, or
-unexpected addon names. Package assembly also generates a self-contained
-`node.cjs` from the dependency-free ESM source with package-relative module
-URLs. The publish workflow builds and tests each addon on its native runner
+`package-libfx.mjs <out-dir> [libfx.<tuple>.node ...]` writes libfx to
+`<out-dir>/libfx` and each platform package beside it. A publishable set
+requires exactly one addon for each of the four tuples and rejects missing,
+duplicate, or unexpected addon names. With no addons, it packages
+`zig-out/lib/libfx.node` as the local tuple's package. `LIBFX_VERSION` sets
+the version of every package and of libfx's optional dependencies.
+`node.cjs` is `module.exports = require("./node.js")`. Node.js 20.19 and 22.12
+load an ES module with `require()`, so CommonJS and ES module callers share one
+copy of libfx and bundlers follow the same imports for both. Each durable
+bundle links a sourcemap that names its sources relative to `sdk/durable` and
+leaves their text out. The publish workflow builds and tests each addon on its native runner
 before combining the artifacts with both WebAssembly surfaces, the README, and
-the Apache-2.0 license.
+the Apache-2.0 license. Both WebAssembly surfaces are built ReleaseSmall and
+stripped, then `sdk/scripts/optimize-wasm.mjs` shrinks them with
+`wasm-opt -Oz`. CI runs the same pass before its SDK jobs, so they test the
+modules the package ships. A local `zig build` skips it.
 
 Package assembly and Next tests run without npm publishing credentials. The
-OIDC publisher uploads the tested archive. The workflow then downloads that
-immutable registry version, compares it byte-for-byte with the archive, and
-exercises its Node entrypoints and Next development, production, and isolated
-deployment output. Failed package qualification blocks publication. Next
+OIDC publisher uploads each platform package, skipping any version npm
+already has, and then libfx, so libfx never pins a package npm lacks. The
+workflow then downloads every immutable registry version and compares each
+byte-for-byte with its tested archive. Failed package qualification blocks publication. Next
 logs and structured results are retained as workflow artifacts, including
 on failure.
 
 CI and publication also run the package resilience matrix with a bounded
-lifecycle, tool, and concurrent workload. Longer soak runs remain manual.
+lifecycle, tool, and concurrent workload. CI's SDK package guards job also
+checks which of libfx's modules Node.js loads with and without the native
+addon, what agent-only and terminal browser bundles carry, the package sizes
+against `sdk/tests/package-size-budgets.json`, and the manifest and types with
+publint and attw. Longer soak runs remain manual.
 The Next and Vercel harnesses retain completed scenarios and structured errors
 when qualification fails, and report success only after cleanup succeeds.
+
+npm trusted publishing cannot create a package. Before the workflow can
+publish a new platform package, an owner of the `@libfx` scope publishes a
+placeholder version of it by hand, then adds a trusted publisher on npmjs.com
+for `vercel-labs/fx`, workflow `publish-libfx.yml`, and environment `npm`, with
+`npm publish` allowed. npm expires the trusted publisher if the workflow does
+not publish within two days. Until every pinned package can be published, the
+workflow stops before libfx.
 
 Live Vercel qualification is a separate release check. Run
 `node sdk/tests/test-vercel-package.mjs <tarball>` before publication, then run

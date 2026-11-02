@@ -1,0 +1,8 @@
+T1 shell: run echo CONV_STALL_TOOL
+Call ID: conv-stall-run
+
+Arguments:
+{"action":"run","command":"echo CONV_STALL_TOOL"}
+
+Result:
+{"session_id":null,"state":"completed","backend":"captured","persistence":"process","output_truncated":false,"output_incomplete":false,"output_terminal_safe":true,"full_output_handle":"fx-command-replay-8dc21807acb44c629afc741a76aa9ce1-0d3f22c9aee17f91.bin","exit_code":0,"signal":null,"termination_indeterminate":false,"duration_ms":15,"accepted_bytes":null,"error":null,"retry_guidance":null,"output_delta":"CONV_STALL_TOOL\n"}

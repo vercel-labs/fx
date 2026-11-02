@@ -6,7 +6,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -14,6 +13,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { readPermissionsPanel } from "./info-panel";
+import { logLines, rootSessionIds } from "./saved-sessions";
 import {
   fakeGatewayFinalText,
   fakeGatewayPermissionDecision,
@@ -242,12 +243,11 @@ describe("lean auto mode reliability", () => {
       expect(laterReview).not.toContain(accusation);
       expect(readFileSync(plan, "utf8")).toBe("48 runs\n");
       const sessionId = JSON.parse(result.stdout).session_id;
-      const events = readFileSync(join(root.home, ".fx", "sessions", sessionId, "events.jsonl"), "utf8")
-        .trim().split("\n").map((line) => JSON.parse(line));
-      const held = events.find((entry) => entry.event.tool_result?.call_id === "edit_plan").event.tool_result;
+      const held = (logLines(root.home, sessionId) as any[])
+        .find((line) => line.kind === "item" && line.type === "tool_result" && line.data?.call_id === "edit_plan").data;
       expect(held.review_feedback).toBe(true);
       const resumed = await runFx(
-        ["ask", "--auto", "--quiet", "--json", "--resume-id", sessionId, "Summarize the previous result without tools."],
+        ["ask", "--auto", "--quiet", "--json", "--resume", sessionId, "Summarize the previous result without tools."],
         { cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT },
       );
       expect(resumed.code).toBe(0);
@@ -258,12 +258,13 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
-    "resumed shell input review includes the user request and owned receiving process",
+    "shell input review includes the user request and owned receiving process",
     async () => {
       const root = createIsolatedRoot();
       const key = "sk-or-v1-" + "0123456789abcdef".repeat(4);
       const command = 'python3 -c \'import getpass; from pathlib import Path; value=getpass.getpass("Temporary OpenRouter key (hidden): "); Path("accepted.txt").write_text(str(len(value))); print("INPUT_ACCEPTED")\'';
       let handle = "";
+      let acceptedBeforeClear: boolean | null = null;
       const reviewInput = (decision: "clear" | "caution") => (body: string) => {
         const evidence = JSON.parse(body).prompt.map((message: { content: string | Array<{ text?: string }> }) =>
           typeof message.content === "string" ? message.content : message.content.map((part) => part.text ?? "").join("\n")
@@ -286,39 +287,34 @@ describe("lean auto mode reliability", () => {
             action: "run", command, profile: "clean", tty: true,
             yield_time_ms: 1000, timeout_ms: 45_000,
           } }),
+          // Terminals end with the fx process that started them, so the
+          // receiver and every input to it share one run.
           (body) => {
             const result = JSON.parse(toolResultText(body, "start_receiver"));
             expect(result.state).toBe("running");
             expect(result.output_delta).toContain("Temporary OpenRouter key");
             handle = result.session_id;
-            return fakeGatewayFinalText("Receiver waiting.");
+            return fakeGatewayToolCall("cautioned_input", "shell", { request: {
+              action: "interact", session_id: handle, chars: key + "\n", yield_time_ms: 1000,
+            } });
           },
-          () => fakeGatewayToolCall("foreign_input", "shell", { request: {
-            action: "interact", session_id: handle, chars: key + "\n", yield_time_ms: 1000,
-          } }),
-          (body) => {
-            expect(toolResultText(body, "foreign_input", "execution-denied")).toContain("review_evidence_incomplete");
-            return fakeGatewayFinalText("Other session could not write.");
-          },
-          () => fakeGatewayToolCall("cautioned_input", "shell", { request: {
-            action: "interact", session_id: handle, chars: key + "\n", yield_time_ms: 1000,
-          } }),
           (body) => {
             expect(toolResultText(body, "cautioned_input", "execution-denied")).toContain("review_caution");
-            return fakeGatewayFinalText("Input held.");
+            acceptedBeforeClear = existsSync(join(root.workspace, "accepted.txt"));
+            // A caution holds the exact action for the rest of the turn, so
+            // the reviewed retry ends the line with a carriage return instead.
+            return fakeGatewayToolCall("supply_key", "shell", { request: {
+              action: "interact", session_id: handle, chars: key + "\r", yield_time_ms: 1000,
+            } });
           },
-          () => fakeGatewayToolCall("supply_key", "shell", { request: {
-            action: "interact", session_id: handle, chars: key + "\n", yield_time_ms: 1000,
-          } }),
           (body) => {
             const result = toolResultText(body, "supply_key");
             expect(result).toContain("INPUT_ACCEPTED");
             expect(result).not.toContain(key);
-            return fakeGatewayFinalText("Input delivered.");
+            return fakeGatewayToolCall("finished_input", "shell", { request: {
+              action: "interact", session_id: handle, chars: "\n", yield_time_ms: 1000,
+            } });
           },
-          () => fakeGatewayToolCall("finished_input", "shell", { request: {
-            action: "interact", session_id: handle, chars: key + "\n", yield_time_ms: 1000,
-          } }),
           (body) => {
             expect(toolResultText(body, "finished_input", "execution-denied")).toContain("review_evidence_incomplete");
             return fakeGatewayFinalText("Finished receiver could not receive input.");
@@ -331,35 +327,15 @@ describe("lean auto mode reliability", () => {
         ],
       );
       const env = gatewayEnv(root, gateway);
-      const started = await runFx(["ask", "--quiet", "--json", "Start the temporary OpenRouter key collector."], {
+      const result = await runFx(["ask", "--quiet", "--json", `Use this key for the OpenRouter test: ${key}`], {
         cwd: root.workspace, env, timeoutMs: TIMEOUT,
       });
-      expect(started.code, started.stderr).toBe(0);
-      const savedSession = JSON.parse(started.stdout).session_id;
-      expect(savedSession).toBeTruthy();
-      const foreign = await runFx(["ask", "--quiet", "--json", "Send the input from a different saved session."], {
-        cwd: root.workspace, env, timeoutMs: TIMEOUT,
-      });
-      expect(foreign.code, foreign.stderr).toBe(0);
-      expect(gateway.classifierRequests).toHaveLength(1);
-      expect(existsSync(join(root.workspace, "accepted.txt"))).toBe(false);
-      const cautioned = await runFx(["ask", "--quiet", "--json", "--resume-id", savedSession, `Use this key for the OpenRouter test: ${key}`], {
-        cwd: root.workspace, env, timeoutMs: TIMEOUT,
-      });
-      expect(cautioned.code, cautioned.stderr).toBe(0);
-      expect(gateway.classifierRequests).toHaveLength(2);
-      expect(existsSync(join(root.workspace, "accepted.txt"))).toBe(false);
-      const resumed = await runFx(["ask", "--quiet", "--json", "--resume-id", savedSession, `Use this key for the OpenRouter test: ${key}`], {
-        cwd: root.workspace, env, timeoutMs: TIMEOUT,
-      });
-      expect(resumed.code, resumed.stderr).toBe(0);
+      expect(result.code, result.stderr).toBe(0);
+      // The cautioned input never reached the receiver; the cleared one did,
+      // and the finished receiver took no review.
+      expect(acceptedBeforeClear).toBe(false);
       expect(gateway.classifierRequests).toHaveLength(3);
       expect(readFileSync(join(root.workspace, "accepted.txt"), "utf8")).toBe(String(key.length));
-      const finished = await runFx(["ask", "--quiet", "--json", "--resume-id", savedSession, "Try sending to the now-finished receiver."], {
-        cwd: root.workspace, env, timeoutMs: TIMEOUT,
-      });
-      expect(finished.code, finished.stderr).toBe(0);
-      expect(gateway.classifierRequests).toHaveLength(3);
     },
     TIMEOUT,
   );
@@ -393,6 +369,44 @@ describe("lean auto mode reliability", () => {
       expect(result.stderr.toLowerCase()).not.toContain("permission required");
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(0);
+      const json = JSON.parse(result.stdout.trim()) as {
+        tool_calls: Array<{ name: string; status: string }>;
+      };
+      expect(json.tool_calls).toContainEqual(
+        expect.objectContaining({ name: "shell", status: "success" }),
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a transient reviewer transport failure retries once and clears",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.workspace, "review-retried.txt");
+      const gateway = startGateway(
+        [
+          commandCall(`printf 'ran\\n' > ${JSON.stringify(marker)}`, "needs_review"),
+          fakeGatewayFinalText("review recovered"),
+        ],
+        [
+          new Response("classifier upstream unavailable", { status: 500 }),
+          fakeGatewayPermissionDecision("clear", "retry_clear"),
+        ],
+      );
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Run the review retry probe."],
+        {
+          cwd: root.workspace,
+          env: gatewayEnv(root, gateway),
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, result.stderr).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(readFileSync(marker, "utf8")).toBe("ran\n");
       const json = JSON.parse(result.stdout.trim()) as {
         tool_calls: Array<{ name: string; status: string }>;
       };
@@ -459,6 +473,49 @@ describe("lean auto mode reliability", () => {
       expect(gateway.classifierRequests).toHaveLength(2);
       expect(gateway.requests).toHaveLength(4);
       expect(result.stdout).toContain("static command complete");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "routine commands with zsh extended glob words remain reviewer owned",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "npm-must-not-run");
+      const bin = installRecorder(root, "npm", marker);
+      const gateway = startGateway(
+        [
+          // With zsh's `extendedglob`, `^x` matches every file not named `x`
+          // and `x#` matches any run of `x`.
+          cleanCommandCall("npm test ^nomatch", "caret_glob"),
+          cleanCommandCall("npm install react@^18", "caret_in_word"),
+          cleanCommandCall("npm test x#", "hash_glob"),
+          (body) => {
+            expect(body).toContain("review_caution");
+            return fakeGatewayFinalText("glob words stayed reviewed");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "caret_glob_review"),
+          fakeGatewayPermissionDecision("caution", "caret_in_word_review"),
+          fakeGatewayPermissionDecision("caution", "hash_glob_review"),
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Run the tests."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(existsSync(marker)).toBe(false);
     },
     TIMEOUT,
   );
@@ -630,6 +687,14 @@ describe("lean auto mode reliability", () => {
       const review = reviewerText(gateway.classifierRequests[0]!.body);
       expect(review).toContain("review_context_kind: contextual");
       expect(review).toContain("Inspect the local site only");
+      // No later request shares a review's prefix, so the default GPT-5.6
+      // reviewer is asked to write nothing to its prompt cache.
+      expect(
+        gateway.classifierRequests[0]!.headers.get("ai-language-model-id"),
+      ).toBe("openai/gpt-5.6-luna");
+      expect(
+        JSON.parse(gateway.classifierRequests[0]!.body).providerOptions,
+      ).toEqual({ openai: { promptCacheOptions: { mode: "explicit" } } });
       expect(existsSync(marker)).toBe(true);
       expect(result.stderr).not.toContain(COMMAND_APPROVAL_PROMPT);
     },
@@ -1080,6 +1145,177 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "routine commands with words the shell reads differently remain reviewer owned",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "npm-must-not-run");
+      const bin = installRecorder(root, "npm", marker);
+      const gateway = startGateway(
+        [
+          // The shell passes a quoted or escaped `&&` to `npm test`, with
+          // `--global`.
+          cleanCommandCall("npm test '&&' npm run build --global", "quoted_separator"),
+          cleanCommandCall("npm test \\&\\& npm run build --global", "escaped_separator"),
+          // Every shell drops `#note` as a comment.
+          cleanCommandCall("npm test #note", "comment_word"),
+          // Inside double quotes the shell keeps a backslash before `s`, so
+          // npm gets `te\st`, not `test`.
+          cleanCommandCall("npm \"te\\st\"", "double_quoted_backslash"),
+          (body) => {
+            expect(body).toContain("review_caution");
+            return fakeGatewayFinalText("shell syntax stayed reviewed");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "quoted_separator_review"),
+          fakeGatewayPermissionDecision("caution", "escaped_separator_review"),
+          fakeGatewayPermissionDecision("caution", "comment_word_review"),
+          fakeGatewayPermissionDecision("caution", "double_quoted_backslash_review"),
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Run the tests."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(4);
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "git fetch with an option that names a program remains reviewer owned",
+    async () => {
+      const root = createIsolatedRoot();
+      runGit(root.workspace, ["init", "-q"]);
+      const marker = join(root.root, "upload-pack-must-not-run");
+      const bin = installRecorder(root, "upload-pack-probe", marker);
+      const gateway = startGateway(
+        [
+          // git runs the `--upload-pack` command to fetch from `.`.
+          cleanCommandCall("git fetch --upload-pack=upload-pack-probe .", "upload_pack"),
+          // git accepts any unambiguous prefix of a long option.
+          cleanCommandCall("git fetch --upl=upload-pack-probe .", "abbreviated_upload_pack"),
+          (body) => {
+            expect(body).toContain("review_caution");
+            return fakeGatewayFinalText("fetch options stayed reviewed");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "upload_pack_review"),
+          fakeGatewayPermissionDecision("caution", "abbreviated_upload_pack_review"),
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Fetch the latest changes."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a trailing 2>&1 stays review free only when the shell reads 2 as a file descriptor",
+    async () => {
+      const root = createIsolatedRoot();
+      runGit(root.workspace, ["init", "-q"]);
+      const gateway = startGateway(
+        [
+          cleanCommandCall("git status 2>&1", "bare_descriptor"),
+          (body) => {
+            expect(toolResultText(body, "bare_descriptor")).toContain("\"exit_code\":0");
+            // The shell passes `2` to git as an argument for both of these.
+            return cleanCommandCall("git status \\2>&1", "escaped_descriptor");
+          },
+          (body) => {
+            expect(toolResultText(body, "escaped_descriptor", "execution-denied")).toContain("review_caution");
+            return cleanCommandCall("git status 2 >&1", "spaced_descriptor");
+          },
+          (body) => {
+            expect(toolResultText(body, "spaced_descriptor", "execution-denied")).toContain("review_caution");
+            return fakeGatewayFinalText("descriptor forms checked");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "escaped_descriptor_review"),
+          fakeGatewayPermissionDecision("caution", "spaced_descriptor_review"),
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Check the repository status."],
+        { cwd: root.workspace, env: gatewayEnv(root, gateway), timeoutMs: TIMEOUT },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(2);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "git fetch from a repository that names a remote helper remains reviewer owned",
+    async () => {
+      const root = createIsolatedRoot();
+      runGit(root.workspace, ["init", "-q"]);
+      const marker = join(root.root, "remote-helper-must-not-run");
+      const bin = installRecorder(root, "git-remote-probe", marker);
+      const gateway = startGateway(
+        [
+          // git runs `git-remote-probe` from `PATH` for each of these.
+          cleanCommandCall("git fetch probe::x", "helper_prefix"),
+          cleanCommandCall("git fetch -- probe::x", "helper_after_separator"),
+          cleanCommandCall("git fetch probe://host/repository", "helper_scheme"),
+          (body) => {
+            expect(body).toContain("review_caution");
+            return fakeGatewayFinalText("remote helpers stayed reviewed");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "helper_prefix_review"),
+          fakeGatewayPermissionDecision("caution", "helper_after_separator_review"),
+          fakeGatewayPermissionDecision("caution", "helper_scheme_review"),
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Fetch the latest changes."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "existing startup targets remain reviewer owned",
     async () => {
       const root = createIsolatedRoot();
@@ -1409,27 +1645,20 @@ describe("lean auto mode reliability", () => {
         timeoutMs: TIMEOUT,
       });
       expect(first.code).toBe(0);
-      const sessionIds = readdirSync(join(root.home, ".fx", "sessions"), {
-        withFileTypes: true,
-      })
-        .filter((entry) =>
-          entry.isDirectory() &&
-          existsSync(join(root.home, ".fx", "sessions", entry.name, "session.json"))
-        )
-        .map((entry) => entry.name);
+      const sessionIds = rootSessionIds(root.home);
       expect(sessionIds).toHaveLength(1);
       const sessionId = sessionIds[0]!;
 
       for (const prompt of [olderPrompt, recentPrompt]) {
         const turn = await runFx(
-          ["ask", "--quiet", "--json", "--resume-id", sessionId, prompt],
+          ["ask", "--quiet", "--json", "--resume", sessionId, prompt],
           { cwd: root.workspace, env, timeoutMs: TIMEOUT },
         );
         expect(turn.code).toBe(0);
       }
 
       const current = await runFx(
-        ["ask", "--quiet", "--json", "--resume-id", sessionId, currentPrompt],
+        ["ask", "--quiet", "--json", "--resume", sessionId, currentPrompt],
         { cwd: root.workspace, env, timeoutMs: TIMEOUT },
       );
 
@@ -1827,7 +2056,7 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
-    "repeated exact unavailable reviews are attempted once without blocking a safe replan",
+    "an unavailable review retries transport once per attempt without blocking a safe replan",
     async () => {
       const root = createIsolatedRoot();
       const marker = join(root.workspace, "repeated-unavailable-must-not-run");
@@ -1849,6 +2078,7 @@ describe("lean auto mode reliability", () => {
         ],
         [
           () => new Response("reviewer unavailable", { status: 502 }),
+          () => new Response("reviewer unavailable", { status: 502 }),
           fakeGatewayPermissionDecision("clear", "must_not_retry_reviewer"),
         ],
       );
@@ -1869,11 +2099,13 @@ describe("lean auto mode reliability", () => {
 
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
       expect(existsSync(marker)).toBe(false);
-      expect(gateway.classifierRequests).toHaveLength(1);
+      // One review attempt: a first send plus one transport retry.
+      expect(gateway.classifierRequests).toHaveLength(2);
       expect(gateway.requests).toHaveLength(4);
       expect(JSON.parse(result.stdout).output).toContain("Unavailable review handled normally.");
       const trace = readFileSync(tracePath, "utf8");
       expect(trace.match(/event=auto_review_start/g)).toHaveLength(1);
+      expect(trace.match(/event=auto_review_transport_retry/g)).toHaveLength(1);
       expect(trace).toContain("fallback_reason=transport_transient");
     },
     TIMEOUT,
@@ -2171,22 +2403,13 @@ describe("lean auto mode reliability", () => {
       await activeSession.kill();
       activeSession = null;
 
-      const sessionIds = readdirSync(join(root.home, ".fx", "sessions"), {
-        withFileTypes: true,
-      })
-        .filter((entry) =>
-          entry.isDirectory() &&
-          existsSync(
-            join(root.home, ".fx", "sessions", entry.name, "session.json"),
-          )
-        )
-        .map((entry) => entry.name);
+      const sessionIds = rootSessionIds(root.home);
       expect(sessionIds).toHaveLength(1);
       const result = await runFx(
         [
           "ask",
           "--json",
-          "--resume-id",
+          "--resume",
           sessionIds[0]!,
           "Run the exact saved action.",
         ],
@@ -2289,12 +2512,8 @@ describe("lean auto mode reliability", () => {
       await activeSession.sendKeys("1");
       await activeSession.waitForText("saved-session permission rule updated", TIMEOUT);
 
-      await activeSession.sendText("/permissions");
-      await activeSession.waitForText("saved-session permission rules (1):", TIMEOUT);
-      const listed = await activeSession.captureFullScrollback();
-      const idMatch = listed.match(
-        /saved-session permission rules \(1\):\n\s*(\d+) deny/,
-      );
+      const listed = await readPermissionsPanel(activeSession, TIMEOUT, (panel) => panel.fields["Saved rules"] === "1");
+      const idMatch = /^(\d+) deny /.exec(listed.items["Saved rules"]?.[0] ?? "");
       expect(idMatch).not.toBeNull();
       const ruleId = idMatch![1];
 
@@ -2308,8 +2527,7 @@ describe("lean auto mode reliability", () => {
       await activeSession.waitForText("Revoke this saved-session permission rule?", TIMEOUT);
       await activeSession.sendKeys("1");
       await activeSession.waitForComposer(TIMEOUT);
-      await activeSession.sendText("/permissions");
-      await activeSession.waitForText("saved-session permission rules: none", TIMEOUT);
+      await readPermissionsPanel(activeSession, TIMEOUT, (panel) => panel.fields["Saved rules"] === "none");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
       await activeSession.sendText("/quit");

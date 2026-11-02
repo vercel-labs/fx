@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
@@ -353,7 +354,7 @@ test "bounded selection replacement preserves state on rejection" {
 
     _ = fixture.edit.beginSelection(2);
     _ = fixture.edit.extendSelection(6);
-    try fixture.picker.beginModelPickerFlow(alloc, "provider/model", 2, false, .effort);
+    try fixture.picker.beginModelPickerFlow(alloc, "provider/model", 2, false, false, .effort);
     fixture.picker.file_completion_index = 3;
     fixture.picker.file_completion_window_start = 1;
     fixture.vertical.preferred_column = 7;
@@ -514,8 +515,8 @@ test "range replacement removes matching image attachment" {
 }
 
 test "allocation failure leaves selection replacement unchanged" {
-    const backing = std.testing.allocator;
-    const replacement = [_]u8{'x'} ** 1024;
+    const backing = testing_allocator.no_resize;
+    const replacement: [1024]u8 = @splat('x');
     var failing = std.testing.FailingAllocator.init(backing, .{});
     const alloc = failing.allocator();
     var fixture: Fixture = .{};

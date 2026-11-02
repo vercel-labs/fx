@@ -26,15 +26,27 @@ const hooks = @import("../hooks/hooks.zig");
 const execution_memory = @import("../agent/execution_memory.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const io_mod = @import("../shared/io.zig");
-const session_codec = @import("../session/session_codec.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const types = @import("../shared/types.zig");
 const diff_mod = @import("../output/diff.zig");
 const domain = @import("domain.zig");
 const execution = @import("execution.zig");
 const tool_host = @import("tool_host.zig");
+const child_state = @import("child_state.zig");
 
 const Allocator = std.mem.Allocator;
+
+// A parent disable caps resumed children too; durable child opt-ins cannot bypass it.
+fn childUltrafastMode(parent_requested: bool, child_preference: bool) bool {
+    return parent_requested and child_preference;
+}
+
+test "Ultrafast parent disable caps durable child opt-ins" {
+    try std.testing.expect(childUltrafastMode(true, true));
+    try std.testing.expect(!childUltrafastMode(false, true));
+    try std.testing.expect(!childUltrafastMode(true, false));
+    try std.testing.expect(!childUltrafastMode(false, false));
+}
 
 fn childModelCapabilityResolver(
     parent: ?model_capabilities.Resolver,
@@ -136,7 +148,7 @@ pub fn run(
     cancel: *std.atomic.Value(bool),
 ) execution.ServiceError!execution.RunOutcome {
     var arena_state = std.heap.ArenaAllocator.init(turn.alloc);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     var routed_credential: ?credentials.Credential = null;
     defer if (routed_credential) |*credential| credential.deinit(turn.alloc);
@@ -169,8 +181,10 @@ pub fn run(
         routed_config.tool_context.credential_source = credential.source;
         routed_config.tool_context.account_id = credential.accountId();
     }
+    const ultrafast_mode = childUltrafastMode(config.tool_context.ultrafast_mode, admission.ultrafast_mode);
     routed_config.tool_context.model = admission.model;
     routed_config.tool_context.provider = admission.provider;
+    routed_config.tool_context.ultrafast_mode = ultrafast_mode;
     routed_config.tool_context.provider_capabilities = config.provider_set.select(admission.provider).capabilities;
     debug_trace.logf(
         "subagent",
@@ -202,9 +216,9 @@ pub fn run(
         .subagent_id = trace_context.subagent_id,
     };
     defer if (context.refreshed_credential) |*credential| credential.deinit(turn.alloc);
-    const recovery_checkpoint = turn.prepareRecoveryForActiveWork(arena) catch |err| {
+    turn.beginTurn() catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        turn.setFailureDiagnostic("recovery_admission_failed", @errorName(err));
+        turn.setFailureDiagnostic("turn_open_failed", @errorName(err));
         return error.ProviderFailed;
     };
     const history = turn.sessionRuntime().snapshotHistory(arena) catch return error.OutOfMemory;
@@ -234,12 +248,14 @@ pub fn run(
         .grants = types.dupePermissionGrantSlice(arena, admission.grants) catch return error.OutOfMemory,
         .agent_settings = .{
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
+            .auto_compact_percent = config.tool_context.auto_compact_percent,
             .first_call_tool_choice = config.tool_context.first_call_tool_choice,
             .fast_mode = config.tool_context.fast_mode,
+            .ultrafast_mode = ultrafast_mode,
             .effort = admission.effort,
+            .provider_order = if (admission.provider == .gateway) config.tool_context.provider_order else &.{},
+            .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
         },
-        .recovery_checkpoint = recovery_checkpoint,
-        .recovery_source_already_presented = recovery_checkpoint != null,
     };
     const child_tool_names = try withoutSubagentNames(
         arena,
@@ -252,8 +268,7 @@ pub fn run(
     const child_system_prompt = if (message.system_prompt_overlay.len == 0)
         config.system_prompt
     else
-        std.fmt.allocPrint(
-            arena,
+        arena.print(
             "{s}\n\n<subagent_instructions>\n{s}\n</subagent_instructions>",
             .{ config.system_prompt, message.system_prompt_overlay },
         ) catch return error.OutOfMemory;
@@ -295,9 +310,13 @@ pub fn run(
             .custom_tool_guidance = config.custom_tool_guidance,
             .agent_step_limit = config.tool_context.agent_step_limit,
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
+            .auto_compact_percent = config.tool_context.auto_compact_percent,
             .cancel_flag = cancel,
             .fast_mode = config.tool_context.fast_mode,
+            .ultrafast_mode = ultrafast_mode,
             .effort = admission.effort,
+            .provider_order = if (admission.provider == .gateway) config.tool_context.provider_order else &.{},
+            .provider_strict = admission.provider == .gateway and config.tool_context.provider_strict,
             .first_call_tool_choice = config.tool_context.first_call_tool_choice,
             .workspace_root = config.tool_context.workspace_root,
             .access_scope = config.tool_context.access_scope,
@@ -386,6 +405,7 @@ fn withoutSubagentFunctions(
 fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = context,
+        .observer = context.config.tool_context.observer,
         .agent_stream_provider = context.config.tool_context.agent_stream_provider,
         .tool_registry = context.config.tool_context.tool_registry,
         .context_registry = context.config.context_registry,
@@ -414,9 +434,6 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
-        .recovery_checkpoint = .{
-            .set = setRecoveryCheckpoint,
-        },
         .propagate_grant = discardGrant,
         .push_event = pushLiveEvent,
         .push_text = pushLiveText,
@@ -429,8 +446,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .refresh_gateway_credential = refreshGatewayCredential,
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
-        .usage = &context.turn.sessionRuntime().usage,
-        .usage_allocator = context.turn.alloc,
+        .record_usage = recordUsage,
     };
 }
 
@@ -443,19 +459,27 @@ fn availableModelCapabilities(raw: *anyopaque, model: []const u8) model_capabili
     return model_capabilities.capabilitiesForModel(model);
 }
 
-fn resolveModelCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
+fn resolveModelCapabilities(raw: *anyopaque, arena: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
     const context: *Context = @ptrCast(@alignCast(raw));
     if (context.cancel.load(.seq_cst)) return error.Cancelled;
+    // Prefer the host's shared resolver: it waits for the provider catalog and
+    // merges the loaded model cache, so gateway-hosted children resolve the
+    // same capabilities as the parent. The provider bundle's synchronous
+    // lookup is empty for providers that only fetch asynchronously (gateway),
+    // which previously left every gateway child at "unknown" support.
+    if (context.config.tool_context.model_capability_resolver) |resolver| {
+        return resolver.resolve(arena, model);
+    }
     return availableModelCapabilities(raw, model);
 }
 
 test "child runtime capability callbacks preserve fallback and child cancellation" {
-    const session_store = @import("../session/session_store.zig");
     const catalog = @import("../gateway/model_catalog.zig");
     const authority = @import("authority.zig");
     const Fixture = struct {
         fetches: usize = 0,
         lookups: usize = 0,
+        resolutions: usize = 0,
 
         fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) authority.HostResolveError!authority.HostAuthority {
             return authority.HostAuthority.capture(alloc, &.{}, &.{}, .{}, &.{});
@@ -470,33 +494,25 @@ test "child runtime capability callbacks preserve fallback and child cancellatio
             self.lookups += 1;
             return if (std.mem.eql(u8, model, "child-model")) .{ .context_window = 32768, .max_output_tokens = 512 } else .{};
         }
+        fn resolveCapabilities(raw: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.resolutions += 1;
+            return if (std.mem.eql(u8, model, "child-model")) .{ .supports_vision = true, .image_input_support = .native } else .{};
+        }
         fn output(_: *anyopaque, _: ?types.ToolLifecycleId, _: command_output_content.Stream, _: []const u8) anyerror!void {}
     };
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(root);
-    var store = try session_store.Store.initFromHome(alloc, root, root);
-    defer store.deinit(alloc);
-    var writable = try store.startWritableSession(alloc, .{
-        .id = @constCast("capability-parent"),
-        .origin_workspace_root = @constCast(root),
-        .workspace_root = @constCast(root),
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en"),
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-        .preferences = .{ .model = @constCast("parent-model"), .effort = .auto, .fast_mode = false },
-    });
-    defer writable.deinit(alloc);
-    const host = try tool_host.Runtime.create(alloc, &store, "capability-parent", .{ .resolve_fn = Fixture.resolve }, .{});
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const root = parent.home;
+    const host = try tool_host.Runtime.create(alloc, &parent.children, .{ .resolve_fn = Fixture.resolve }, .{});
     defer host.deinit();
-    var turn = try execution.TurnContext.init(alloc, &writable, 0);
+    const child = try parent.openChild("capability-child", &.{});
+    defer child.close();
+    var turn = try execution.TurnContext.init(alloc, child, 0);
     defer turn.deinit();
-    var admission = try domain.captureAdmission(alloc, .{ .parent_id = "capability-parent", .source_id = "capability-parent", .model = "parent-model", .effort = .auto });
+    var admission = try domain.captureAdmission(alloc, .{ .parent_id = parent.parent.id(), .source_id = parent.parent.id(), .model = "parent-model", .effort = .auto });
     defer admission.deinit(alloc);
     var fixture: Fixture = .{};
     var cancel = std.atomic.Value(bool).init(false);
@@ -549,10 +565,16 @@ test "child runtime capability callbacks preserve fallback and child cancellatio
     try std.testing.expectEqual(@as(?u32, 32768), available.context_window);
     try std.testing.expectEqualDeep(available, try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
     try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, deps.available_model_capabilities(deps.ctx, "unknown-fast"));
+    context.config.tool_context.model_capability_resolver = .{ .ctx = &fixture, .resolve_fn = Fixture.resolveCapabilities };
+    const resolved = try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model");
+    try std.testing.expectEqual(model_capabilities.ImageInputSupport.native, resolved.image_input_support);
+    try std.testing.expectEqual(@as(usize, 1), fixture.resolutions);
+    try std.testing.expectEqual(@as(?u32, 512), deps.available_model_capabilities(deps.ctx, "child-model").max_output_tokens);
     const lookups = fixture.lookups;
     cancel.store(true, .seq_cst);
     try std.testing.expectError(error.Cancelled, deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
     try std.testing.expectEqual(lookups, fixture.lookups);
+    try std.testing.expectEqual(@as(usize, 1), fixture.resolutions);
     try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
 }
 
@@ -647,10 +669,10 @@ fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayL
     }, arena, messages);
 }
 
-fn appendStaticContext(raw: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(types.ChatMessage)) !void {
+fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(types.ChatMessage)) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
     try context.config.context_registry.appendDefaultStatic(.{
-        .project_context = project_context orelse context.config.project_context,
+        .project_context = context.config.project_context,
     }, arena, messages);
     var snapshot = try snapshotModelCatalogForView(
         arena,
@@ -680,26 +702,36 @@ fn snapshotModelCatalogForView(
         for (view.tools) |tool| {
             if (std.mem.eql(u8, tool.server_name, server.name)) tool_count += 1;
         }
+        // Generation 0: the server's list hadn't loaded when the view was
+        // taken, so it starts when the subagent first needs it.
+        const on_demand = tool_count == 0 and server.catalog_generation == 0;
         servers[index] = .{
             .name = try alloc.dupe(u8, server.name),
-            .availability = .ready,
-            .tool_count = tool_count,
+            .availability = if (on_demand) .available_on_demand else .ready,
+            .tool_count = if (on_demand) null else tool_count,
         };
         initialized += 1;
     }
     return .{ .servers = servers };
 }
 
-test "subagent model catalog counts only tools in the captured MCP view" {
+test "subagent model catalog counts the captured view's tools and offers servers not yet listed" {
     const alloc = std.testing.allocator;
-    var servers = [_]mcp_access.ServerIdentity{.{
+    var servers = [_]mcp_access.ServerIdentity{ .{
         .name = @constCast("chrome-devtools"),
         .source = .profile,
         .scope = .profile,
         .connection_generation = 1,
         .catalog_generation = 2,
         .auth_generation = 3,
-    }};
+    }, .{
+        .name = @constCast("later"),
+        .source = .profile,
+        .scope = .profile,
+        .connection_generation = 0,
+        .catalog_generation = 0,
+        .auth_generation = 0,
+    } };
     var tools = [_]mcp_access.ToolIdentity{
         .{ .name = @constCast("mcp_chrome_one"), .server_name = @constCast("chrome-devtools") },
         .{ .name = @constCast("mcp_chrome_two"), .server_name = @constCast("chrome-devtools") },
@@ -708,7 +740,6 @@ test "subagent model catalog counts only tools in the captured MCP view" {
         .runtime_generation = 1,
         .owner_id = @constCast("child"),
         .parent_id = @constCast("parent"),
-        .features_visible = false,
         .servers = &servers,
         .tools = &tools,
     };
@@ -716,10 +747,13 @@ test "subagent model catalog counts only tools in the captured MCP view" {
     var snapshot = try snapshotModelCatalogForView(alloc, &view);
     defer snapshot.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), snapshot.servers.len);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.servers.len);
     try std.testing.expectEqualStrings("chrome-devtools", snapshot.servers[0].name);
     try std.testing.expectEqual(model_catalog.Availability.ready, snapshot.servers[0].availability);
     try std.testing.expectEqual(@as(?usize, 2), snapshot.servers[0].tool_count);
+    // A server whose list hadn't loaded is offered, not shown as empty.
+    try std.testing.expectEqual(model_catalog.Availability.available_on_demand, snapshot.servers[1].availability);
+    try std.testing.expectEqual(@as(?usize, null), snapshot.servers[1].tool_count);
 }
 
 test "subagent inherits model capabilities" {
@@ -856,7 +890,7 @@ fn resolveToolActionDisplayTarget(raw: *anyopaque, arena: Allocator, call: types
 
 fn describeToolActionDenied(raw: *anyopaque, arena: Allocator, call: types.ToolCall, file_path: ?[]const u8, label: []const u8, dynamic_names: []const []const u8) ![]const u8 {
     const action = try describeToolAction(raw, arena, call, file_path, dynamic_names);
-    return std.fmt.allocPrint(arena, "{s}: {s}", .{ label, action });
+    return arena.print("{s}: {s}", .{ label, action });
 }
 
 fn permissionTargetForCall(raw: *anyopaque, arena: Allocator, call: types.ToolCall, dynamic_names: []const []const u8) ![]const u8 {
@@ -880,13 +914,7 @@ fn executeToolCall(raw: *anyopaque, request: agent_runtime.ToolExecutionRequest)
 
 fn propagateHistoryTurn(raw: *anyopaque, turn: types.HistoryTurn) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
-    try context.turn.commit(
-        context.turn.active_work_id orelse return error.StaleWork,
-        turn,
-        context.input_tokens,
-        context.output_tokens,
-        io_mod.milliTimestamp(),
-    );
+    try context.turn.commit(context.turn.active_work_id orelse return error.StaleWork, turn);
 }
 
 fn commitContextCompaction(
@@ -896,21 +924,23 @@ fn commitContextCompaction(
     retained_from: ?types.ContextHistoryCut,
 ) !void {
     const context: *Context = @ptrCast(@alignCast(raw));
-    try context.turn.commitContextCompaction(summary, active_prefix, retained_from, io_mod.milliTimestamp());
-}
-
-fn setRecoveryCheckpoint(
-    raw: *anyopaque,
-    checkpoint: session_codec.RecoveryCheckpoint,
-) !void {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    try context.turn.setRecoveryCheckpoint(checkpoint, io_mod.milliTimestamp());
+    try context.turn.commitContextCompaction(summary, active_prefix, retained_from);
 }
 
 fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
     const context: *Context = @ptrCast(@alignCast(raw));
     if (usage.input_tokens) |value| context.input_tokens = value;
     if (usage.output_tokens) |value| context.output_tokens = value;
+    if (context.turn.live_metrics) |metrics| {
+        metrics.input_tokens.store(context.input_tokens, .monotonic);
+    }
+}
+
+/// Saves each reply's usage in the child's own log, as the root saves its
+/// own (D92). The parent's total leaves the child's out.
+fn recordUsage(raw: *anyopaque, usage: types.Usage) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    try context.turn.child.recordUsage(usage);
 }
 
 fn publishCommittedFileHandoff(_: *anyopaque, _: file_mutation.CommittedFileHandoff) agent_runtime.SecondaryPublicationReport {

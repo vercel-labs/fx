@@ -25,6 +25,11 @@ pub fn gridCellsEqual(
         right.style.hyperlink_id,
         if (left.style.hyperlink_id == 0) null else left_grid.hyperlinkUrl(left.style.hyperlink_id),
         if (right.style.hyperlink_id == 0) null else right_grid.hyperlinkUrl(right.style.hyperlink_id),
+    ) and resourceIdsMatchByBytes(
+        left.style.hyperlink_id,
+        right.style.hyperlink_id,
+        if (left.style.hyperlink_id == 0) null else left_grid.hyperlinkParams(left.style.hyperlink_id),
+        if (right.style.hyperlink_id == 0) null else right_grid.hyperlinkParams(right.style.hyperlink_id),
     );
 }
 
@@ -57,6 +62,11 @@ pub fn gridSurfaceCellsEqual(
         surface_cell.style.hyperlink_id,
         if (grid_cell.style.hyperlink_id == 0) null else grid.hyperlinkUrl(grid_cell.style.hyperlink_id),
         if (surface_cell.style.hyperlink_id == 0) null else surface.hyperlinkUrl(surface_cell.style.hyperlink_id),
+    ) and resourceIdsMatchByBytes(
+        grid_cell.style.hyperlink_id,
+        surface_cell.style.hyperlink_id,
+        if (grid_cell.style.hyperlink_id == 0) null else grid.hyperlinkParams(grid_cell.style.hyperlink_id),
+        if (surface_cell.style.hyperlink_id == 0) null else surface.hyperlinkParams(surface_cell.style.hyperlink_id),
     );
 }
 
@@ -127,6 +137,18 @@ test "grid cell comparison resolves hyperlink URI instead of numeric id" {
     var different_flags = right_cell;
     different_flags.style.flags.bold = true;
     try std.testing.expect(!gridCellsEqual(left, left_cell, right, different_flags));
+}
+
+test "grid cell comparison distinguishes OSC 8 identities on the same URI" {
+    var first = try vt_emulator.Grid.init(std.testing.allocator, 8, 1);
+    defer first.deinit();
+    try first.feed("\x1b]8;id=fx-1;https://example.com\x1b\\X\x1b]8;;\x1b\\");
+
+    var second = try vt_emulator.Grid.init(std.testing.allocator, 8, 1);
+    defer second.deinit();
+    try second.feed("\x1b]8;id=fx-2;https://example.com\x1b\\X\x1b]8;;\x1b\\");
+
+    try std.testing.expect(!gridCellsEqual(first, first.cellAt(1, 1).?, second, second.cellAt(1, 1).?));
 }
 
 test "grid cell comparison resolves combining suffix bytes instead of base glyph" {

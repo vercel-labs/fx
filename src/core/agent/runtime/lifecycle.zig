@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const hooks = @import("../../hooks/hooks.zig");
 const types = @import("../../shared/types.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -193,7 +194,64 @@ fn checkNonObjectPreparationAllocationFailures(alloc: Allocator) !void {
 }
 
 test "non-object preparation cleans every failed allocation" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkNonObjectPreparationAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkNonObjectPreparationAllocationFailures, .{});
+}
+
+fn expectMalformedFeedback(model_output: []const u8, failure: []const u8, raw: []const u8) !void {
+    try std.testing.expect(std.mem.find(u8, model_output, raw) == null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, model_output, .{});
+    defer parsed.deinit();
+    const details = parsed.value.object.get("error").?.object.get("details").?.object;
+    try std.testing.expectEqualStrings(failure, details.get("failure").?.string);
+    try std.testing.expectEqual(@as(i64, @intCast(raw.len)), details.get("received_bytes").?.integer);
+}
+
+test "malformed function arguments report the diagnosed input they replaced" {
+    const alloc = std.testing.allocator;
+    const context = LifecycleContext{
+        .view = hooks.RuntimeView.empty(),
+        .scope = .{ .kind = .ask, .workspace_root = "/fixture" },
+        .outcome_allocator = alloc,
+    };
+    const raw = "{\"path\":\"src/main.zig\",\"offset\":";
+    var from_raw = try prepareToolCallForLifecycle(alloc, context, null, 1, 0, .{
+        .id = "raw",
+        .name = "read_file",
+        .arguments_json = raw,
+    });
+    defer from_raw.deinit(alloc);
+    try std.testing.expect(from_raw == .blocked);
+    try std.testing.expectEqualStrings("{}", from_raw.call().arguments_json);
+    try std.testing.expectEqual(types.ToolArgumentIntegrity.malformed_json, from_raw.call().argument_integrity);
+    try expectMalformedFeedback(from_raw.blocked.model_output.?, "truncated", raw);
+
+    const provider_raw = "{\"path\":\"a\",}";
+    const provider_diagnostic = try types.ToolArgumentDiagnostic.diagnose(alloc, provider_raw);
+    var from_provider = try prepareToolCallForLifecycle(alloc, context, null, 1, 0, .{
+        .id = "provider",
+        .name = "read_file",
+        .arguments_json = "{}",
+        .argument_integrity = .malformed_json,
+        .argument_diagnostic = provider_diagnostic,
+    });
+    defer from_provider.deinit(alloc);
+    try std.testing.expect(from_provider == .blocked);
+    try expectMalformedFeedback(from_provider.blocked.model_output.?, "syntax_error", provider_raw);
+}
+
+fn checkMalformedPreparationAllocationFailures(alloc: Allocator) !void {
+    var prepared = try prepareToolCallForLifecycle(alloc, .{
+        .view = hooks.RuntimeView.empty(),
+        .scope = .{ .kind = .ask, .workspace_root = "/fixture" },
+        .outcome_allocator = alloc,
+    }, null, 1, 0, .{ .id = "call", .name = "read_file", .arguments_json = "{\"path\":[[[" });
+    defer prepared.deinit(alloc);
+    try std.testing.expect(prepared == .blocked);
+    try std.testing.expect(prepared.call().argument_diagnostic != null);
+}
+
+test "malformed preparation cleans every failed allocation" {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkMalformedPreparationAllocationFailures, .{});
 }
 
 pub noinline fn prepareToolCallForLifecycle(
@@ -233,6 +291,10 @@ fn prepareToolCallFromCheckpoint(
     if (integrity != .valid) {
         var rejected = call;
         rejected.argument_integrity = integrity;
+        // Raw arguments reach this point only when the provider did not classify them.
+        if (integrity == .malformed_json and call.argument_integrity == .valid) {
+            rejected.argument_diagnostic = try types.ToolArgumentDiagnostic.diagnose(result_allocator, call.arguments_json);
+        }
         return makePreparedBlocked(
             result_allocator,
             rejected,
@@ -397,7 +459,7 @@ fn makePreparedBlocked(
         .malformed_arguments => if (call.argument_integrity == .non_object_json)
             try tool_result_errors.nonObjectToolArgumentsJson(alloc, call.name)
         else
-            try tool_result_errors.malformedToolArgumentsJson(alloc, call.name),
+            try tool_result_errors.malformedToolArgumentsJson(alloc, call.name, call.argument_diagnostic),
         .lifecycle_block => try tool_result_errors.preToolUseBlockedJson(
             alloc,
             call.name,
@@ -431,5 +493,6 @@ fn dupeToolCallWithArguments(
     alloc.free(copy.arguments_json);
     copy.arguments_json = rewritten;
     copy.argument_integrity = .valid;
+    copy.argument_diagnostic = null;
     return copy;
 }

@@ -1,0 +1,16 @@
+[
+  {
+    "module": "PR1092Steering",
+    "description": "Cancellation retains feedback only, dropping steering",
+    "old": "Retain(e) == e.valid /\\ e.kind # \"plain\"",
+    "new": "Retain(e) == e.valid /\\ e.kind = \"feedback\"",
+    "invariant": "SavedExactlyMarkedTail"
+  },
+  {
+    "module": "PR1092Steering",
+    "description": "Cancellation also retains plain unmarked messages",
+    "old": "Retain(e) == e.valid /\\ e.kind # \"plain\"",
+    "new": "Retain(e) == e.valid",
+    "invariant": "SavedExactlyMarkedTail"
+  }
+]

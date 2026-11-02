@@ -1,0 +1,47 @@
+{
+  "writer": "v0.0.14",
+  "workspace": "/private/tmp/fx-v1-fixtures/workspace",
+  "kinds": {
+    "plain": [
+      "cb1PK0RGxCmY",
+      "ipnFQgSw1AoO",
+      "dnWzuZBsSKm5"
+    ],
+    "cancelled": [
+      "IerT7Kltrcr8"
+    ],
+    "family": [
+      "7hLXblLzOjbv",
+      "dvAUvp8xcGs3",
+      "CnPJVDFTOape"
+    ],
+    "image": [
+      "arwP9DL8vAJq"
+    ],
+    "remembered": [
+      "rtXn8_Z6_NNt",
+      "eUKLM4jhvCEZ"
+    ],
+    "empty": [
+      "FzuGY45exSVO"
+    ],
+    "rules": [
+      "DgckAHRFSHfz"
+    ],
+    "acp": [
+      "I_hlCQa-PcYV"
+    ],
+    "terminal": [
+      "NGasEM_htwlS"
+    ],
+    "unfinished": [
+      "ckpGrV2Zj6ZA"
+    ],
+    "side": [
+      "SaeSsHA48SP6"
+    ],
+    "many-images": [
+      "hrxGxCPw3U2p"
+    ]
+  }
+}

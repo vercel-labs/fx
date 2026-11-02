@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
+import { closeStatusPanel, waitForStatusPanel } from "./info-panel";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -82,7 +83,7 @@ async function startFx(
   const active = await TmuxSession.create({
     cmd: withGateway
       ? FX_BIN
-      : `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_SKIP_ONBOARDING=1 ${FX_BIN}`,
+      : `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_TEST_SKIP_ONBOARDING=1 ${FX_BIN}`,
     env: {
       HOME: testHome,
       ...(gateway
@@ -322,7 +323,7 @@ tmuxTest(
     await waitForExactComposerRow(active, "┃ /");
 
     await active.sendKeys("Enter");
-    await active.waitForText("Commands 35", READY_TIMEOUT);
+    await active.waitForText("Commands 37", READY_TIMEOUT);
     await active.sendKeys("Escape");
     await active.waitForPane(
       (pane) => hasEmptyComposer(pane) && !pane.includes("enter open"),
@@ -753,6 +754,81 @@ tmuxTest(
 );
 
 tmuxTest(
+  "composer accepts keypad digits, operators, navigation, and Enter",
+  async () => {
+    const active = await startFx(80, 24, true);
+
+    // Kitty reports keypad keys as dedicated codes: KP_1, KP_6, KP_DIVIDE,
+    // KP_SUBTRACT. Every one of them must reach the composer.
+    await active.sendHexBytes(hexSeq("\x1b[57400u"));
+    await active.sendHexBytes(hexSeq("\x1b[57405u"));
+    await active.sendHexBytes(hexSeq("\x1b[57410u"));
+    await active.sendHexBytes(hexSeq("\x1b[57412u"));
+    await waitForActiveFooter(active, (footer) => footer === "┃ 16/-");
+
+    // Keypad Left moves the caret instead of dropping the key.
+    await active.sendHexBytes(hexSeq("\x1b[57417u"));
+    await typeLiteral(active, "9");
+    await waitForActiveFooter(active, (footer) => footer === "┃ 16/9-");
+
+    // Keypad Delete deletes forward.
+    await active.sendHexBytes(hexSeq("\x1b[57426u"));
+    await waitForActiveFooter(active, (footer) => footer === "┃ 16/9");
+
+    // A keypad slash opens the slash menu when it is the first character.
+    await active.sendKeys("C-u");
+    await active.sendHexBytes(hexSeq("\x1b[57410u"));
+    await active.waitForPane(
+      (pane) =>
+        pane
+          .split("\n")
+          .some((line) =>
+            !isComposerLine(line) && line.trimStart().startsWith("/")
+          ),
+      READY_TIMEOUT,
+    );
+
+    // Keypad Enter submits the message.
+    await active.sendKeys("C-u");
+    await typeLiteral(active, "zz-numpad-enter");
+    await active.sendHexBytes(hexSeq("\x1b[57414u"));
+    await active.waitForPane(
+      (pane) => pane.includes("history prompt complete"),
+      READY_TIMEOUT,
+    );
+
+    expect(active.isAlive()).toBe(true);
+    expectCleanStderr();
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "composer accepts legacy application-keypad SS3 keys",
+  async () => {
+    const active = await startFx(80, 24, true);
+
+    // A terminal left in keypad application mode reports `ESC O <byte>`.
+    await active.sendHexBytes(hexSeq("\x1bOp")); // KP_0
+    await active.sendHexBytes(hexSeq("\x1bOy")); // KP_9
+    await active.sendHexBytes(hexSeq("\x1bOo")); // KP_DIVIDE
+    await active.sendHexBytes(hexSeq("\x1bOm")); // KP_SUBTRACT
+    await waitForActiveFooter(active, (footer) => footer === "┃ 09/-");
+
+    // Keypad Enter submits under the same encoding.
+    await active.sendHexBytes(hexSeq("\x1bOM"));
+    await active.waitForPane(
+      (pane) => pane.includes("history prompt complete"),
+      READY_TIMEOUT,
+    );
+
+    expect(active.isAlive()).toBe(true);
+    expectCleanStderr();
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
   "composer aliases edit through raw controls and meta delete",
   async () => {
     const active = await startFx(80, 24, true);
@@ -839,8 +915,15 @@ tmuxTest(
         (pane) => pane.includes(fullFooter) && pane.includes(response),
         READY_TIMEOUT,
       );
-      expect(pane).toContain("zz-history");
       expect(pane.split(response)).toHaveLength(2);
+      // The full transcript opens with session, context, and network records,
+      // so the resumed history marker sits above the initial tail viewport.
+      let top = pane;
+      for (let page = 0; page < 20 && !top.includes("zz-history"); page += 1) {
+        await active.sendHexBytes(["1b", "5b", "35", "7e"]);
+        top = await active.capturePane();
+      }
+      expect(top).toContain("zz-history");
     };
     const expectClearedInline = async () => {
       const footer = await waitForActiveFooter(
@@ -900,6 +983,40 @@ tmuxTest(
     expect(followup).toContain("history prompt complete");
     expect(followup).toContain(draft);
     expect(active.isAlive()).toBe(true);
+    expectCleanStderr();
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
+  "ctrl+o opens with a session assembly record and per-request network record",
+  async () => {
+    const active = await startFx(80, 24, true, false, 1);
+    await active.sendText("hello");
+    await active.waitForText("history prompt complete", READY_TIMEOUT);
+
+    // The records never appear in the inline transcript.
+    const inline = await active.capturePane();
+    expect(inline).not.toContain("session: provider:");
+    expect(inline).not.toContain("network: provider:");
+
+    await active.sendKeys("C-o");
+    await active.waitForText("full detail · ctrl+o close", READY_TIMEOUT);
+    // The records block sits at the top of the full transcript.
+    let top = await active.capturePane();
+    for (let page = 0; page < 10 && !top.includes("session: provider:"); page += 1) {
+      await active.sendKeys("PPage");
+      await Bun.sleep(50);
+      top = await active.capturePane();
+    }
+    expect(top).toContain("session: provider:");
+    expect(top).toContain("system prompt: ready");
+    expect(top).toContain("tools:");
+    expect(top).toContain("network: provider:");
+    expect(top).toContain("finish: stop");
+    expect(top).toContain("tokens: 3 in · 5 out");
+    await active.sendKeys("C-o");
+    await active.waitForComposer(READY_TIMEOUT);
     expectCleanStderr();
   },
   TIMEOUT,
@@ -1095,7 +1212,7 @@ tmuxTest(
         VERCEL_OIDC_TOKEN: undefined,
         FX_GATEWAY_BASE_URL: localGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: localGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
       },
@@ -1210,10 +1327,9 @@ tmuxTest(
 
     await typeLiteral(active, "/status");
     await active.sendKeys("Enter");
-    await active.waitForPane(
-      (pane) => pane.includes("model=") && pane.includes("[Image 1]"),
-      READY_TIMEOUT,
-    );
+    await waitForStatusPanel(active, READY_TIMEOUT);
+    await closeStatusPanel(active, READY_TIMEOUT);
+    await active.waitForPane((pane) => pane.includes("[Image 1]"), READY_TIMEOUT);
 
     expect(gateway?.requests).toHaveLength(0);
     const composer = (await active.capturePaneGrid())
@@ -1260,7 +1376,7 @@ tmuxTest(
         VERCEL_OIDC_TOKEN: undefined,
         FX_GATEWAY_BASE_URL: localGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: localGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
       },
@@ -1371,7 +1487,7 @@ tmuxTest(
         VERCEL_OIDC_TOKEN: undefined,
         FX_GATEWAY_BASE_URL: localGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: localGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
       },
@@ -1463,7 +1579,7 @@ tmuxTest(
         VERCEL_OIDC_TOKEN: undefined,
         FX_GATEWAY_BASE_URL: localGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: localGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
       },
@@ -1533,7 +1649,7 @@ tmuxTest(
         VERCEL_OIDC_TOKEN: undefined,
         FX_GATEWAY_BASE_URL: localGateway.baseUrl,
         FX_GATEWAY_CHAT_URL: localGateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_MODELS_URL: `${localGateway.baseUrl}/coding-agent/v1/models`,
         FX_MODEL: FAKE_GATEWAY_MODEL,
         FX_AUTO_UPGRADE: "0",
       },
@@ -1760,7 +1876,7 @@ tmuxTest(
       READY_TIMEOUT,
     );
     await active.resizeWindow(80, 24, 300);
-    await active.waitForText("Commands 35", READY_TIMEOUT);
+    await active.waitForText("Commands 37", READY_TIMEOUT);
     expect(gateway?.requests).toHaveLength(0);
     expectCleanStderr();
   },

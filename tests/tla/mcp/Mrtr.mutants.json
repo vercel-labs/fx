@@ -1,0 +1,50 @@
+[
+  {
+    "description": "The retry leaves out the requestState",
+    "old": "    /\\ sentState' = lastState\n",
+    "new": "    /\\ sentState' = 0\n",
+    "invariant": "StateEchoExact"
+  },
+  {
+    "description": "A round without a requestState keeps the older one, which the retry then echoes",
+    "old": "    /\\ lastState' = IF st THEN round ELSE 0\n",
+    "new": "    /\\ lastState' = IF st THEN round ELSE lastState\n",
+    "invariant": "StateEchoExact"
+  },
+  {
+    "description": "The retry carries no input responses",
+    "old": "    /\\ responded' = requested\n",
+    "new": "    /\\ responded' = 0\n",
+    "invariant": "ResponsesExact"
+  },
+  {
+    "description": "The host is asked for a capability the client never declared",
+    "old": "       ELSE IF n > 0 /\\ ~sup\n",
+    "new": "       ELSE IF FALSE\n",
+    "invariant": "NoAskUnsupported"
+  },
+  {
+    "description": "The chain goes past ten requests",
+    "old": "    /\\ IF round = MaxRequests\n",
+    "new": "    /\\ IF round = MaxRequests + 1\n",
+    "invariant": "RoundCap"
+  },
+  {
+    "description": "A retry goes out after the chain ended",
+    "old": "Provide ==\n    /\\ phase = \"asking\"\n",
+    "new": "Provide ==\n    /\\ phase \\in {\"asking\", \"done\"}\n",
+    "invariant": "NothingAfterEnd"
+  },
+  {
+    "description": "An input_required with neither field is taken for a requestState round",
+    "old": "    /\\ n > 0 \\/ st\n",
+    "new": "    /\\ TRUE\n",
+    "invariant": "BackoffNeedsState"
+  },
+  {
+    "description": "A round with only a requestState is never retried",
+    "old": "    /\\ WF_vars(BackoffDone)\n",
+    "new": "    \\* (no fairness for the backoff)\n",
+    "property": "EveryChainEnds"
+  }
+]

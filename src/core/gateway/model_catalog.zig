@@ -69,6 +69,15 @@ pub const Failure = struct {
     }
 };
 
+/// Milliseconds on the clock that times catalog refreshes. Natively it keeps
+/// counting while the machine sleeps, so a catalog goes stale overnight, and
+/// ignores wall-clock changes. The libfx wasm host backs it with wall time, so
+/// callers treat a reading earlier than a stored one as due.
+pub fn clockMs() i64 {
+    const timestamp = std.Io.Clock.boot.now(io_mod.getIo());
+    return @intCast(@divFloor(timestamp.nanoseconds, std.time.ns_per_ms));
+}
+
 pub fn failureForHttpStatus(status: std.http.Status) Failure {
     if (status == .unauthorized or status == .forbidden) {
         return .{ .category = .authentication, .http_status = status };
@@ -77,7 +86,7 @@ pub fn failureForHttpStatus(status: std.http.Status) Failure {
         return .{ .category = .rate_limited, .http_status = status, .retryable = true };
     }
 
-    const code = @intFromEnum(status);
+    const code = @backingInt(status);
     if (code >= 500 and code < 600) {
         return .{
             .category = .gateway_unavailable,
@@ -298,7 +307,7 @@ fn traceCatalogLoadOutcome(
             "model_catalog_load",
             .{},
             common_format ++ " http_status={d} retryable={s}",
-            common_args ++ .{ @intFromEnum(status), retryable },
+            common_args ++ .{ @backingInt(status), retryable },
         );
     } else {
         debug_trace.eventf(
@@ -313,12 +322,15 @@ fn traceCatalogLoadOutcome(
 
 pub const ModelCatalogEntry = struct {
     id: []u8,
+    /// The catalog's display name, trimmed; null when the catalog has none.
+    name: ?[]u8 = null,
     model_type: []u8,
     released: i64 = 0,
     has_tool_use: bool = false,
     has_reasoning: bool = false,
     reasoning_efforts: std.ArrayList(types.ReasoningEffort) = .empty,
     supports_fast_mode: bool = false,
+    supports_ultrafast_mode: bool = false,
     has_vision: bool = false,
     has_file_input: bool = false,
     has_web_search: bool = false,
@@ -336,6 +348,7 @@ pub fn freeModelCatalog(alloc: std.mem.Allocator, entries: *std.ArrayList(ModelC
 
 pub fn freeModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) void {
     alloc.free(entry.id);
+    if (entry.name) |name| alloc.free(name);
     alloc.free(entry.model_type);
     var reasoning_efforts = entry.reasoning_efforts;
     reasoning_efforts.deinit(alloc);
@@ -364,6 +377,8 @@ fn appendClonedModelCatalogEntry(alloc: std.mem.Allocator, entries: *std.ArrayLi
 fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !ModelCatalogEntry {
     const id = try alloc.dupe(u8, entry.id);
     errdefer alloc.free(id);
+    const name = if (entry.name) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (name) |value| alloc.free(value);
     const model_type = try alloc.dupe(u8, entry.model_type);
     errdefer alloc.free(model_type);
     var reasoning_efforts: std.ArrayList(types.ReasoningEffort) = .empty;
@@ -372,12 +387,14 @@ fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !M
 
     var cloned = ModelCatalogEntry{
         .id = id,
+        .name = name,
         .model_type = model_type,
         .released = entry.released,
         .has_tool_use = entry.has_tool_use,
         .has_reasoning = entry.has_reasoning,
         .reasoning_efforts = reasoning_efforts,
         .supports_fast_mode = entry.supports_fast_mode,
+        .supports_ultrafast_mode = entry.supports_ultrafast_mode,
         .has_vision = entry.has_vision,
         .has_file_input = entry.has_file_input,
         .has_web_search = entry.has_web_search,
@@ -703,7 +720,7 @@ test "catalog authentication fallback is anonymous and bounded" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "catalog-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "catalog-trace.log" });
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
     defer debug_trace.resetForTest();

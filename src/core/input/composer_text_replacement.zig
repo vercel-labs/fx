@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const edit_history = @import("edit_history.zig");
 const editor_state = @import("editor_state.zig");
@@ -164,6 +165,7 @@ const Fixture = struct {
             "provider/model",
             2,
             true,
+            false,
             .effort,
         );
         self.picker.slash_completion_index = 4;
@@ -241,7 +243,7 @@ test "whole composer replacement owns semantic cleanup and cursor state" {
 }
 
 test "whole composer replacement preserves all state when staging fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var fixture: Fixture = .{};
     defer fixture.deinit(alloc);
     try fixture.seed(alloc);
@@ -290,7 +292,7 @@ test "prepared replacement traces entities cleared by its caller before commit" 
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

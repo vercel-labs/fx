@@ -117,7 +117,7 @@ fn traceUnavailable(
 fn tmpPath(alloc: Allocator, dir: std.Io.Dir, name: []const u8) ![]u8 {
     const root = try io_mod.dirRealpathAlloc(alloc, dir, "");
     defer alloc.free(root);
-    return std.fs.path.join(alloc, &.{ root, name });
+    return std.Io.Dir.path.join(alloc, &.{ root, name });
 }
 
 fn writeAbsolute(path: []const u8, content: []const u8) !void {
@@ -169,7 +169,7 @@ fn expectSignalHandlerEqual(expected: std.posix.Sigaction, actual: std.posix.Sig
 }
 
 test "file size limit guard restores SIGXFSZ after normal use" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
 
     var original: std.posix.Sigaction = std.mem.zeroes(std.posix.Sigaction);
     std.posix.sigaction(std.posix.SIG.XFSZ, &.{
@@ -190,7 +190,7 @@ test "file size limit guard restores SIGXFSZ after normal use" {
 }
 
 test "file size limit setup restores SIGXFSZ on failure" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
 
     var original: std.posix.Sigaction = std.mem.zeroes(std.posix.Sigaction);
     std.posix.sigaction(std.posix.SIG.XFSZ, &.{
@@ -252,7 +252,7 @@ test "pushOperation evicts the oldest operation with stable ordering" {
     for (0..ChangeTracker.max_stack_size + 1) |i| {
         try tracker.pushOperation(alloc, .{
             .kind = .write,
-            .path = try std.fmt.allocPrint(alloc, "/tracked/file-{d}", .{i}),
+            .path = try alloc.print("/tracked/file-{d}", .{i}),
             .previous_content = null,
             .timestamp_ms = @intCast(i),
         });
@@ -357,7 +357,7 @@ test "undoLast reports deleted for a new write when the file is already absent" 
 }
 
 test "undoLast reports unavailable when a new file cannot be deleted" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -368,7 +368,7 @@ test "undoLast reports unavailable when a new file cannot be deleted" {
 
     const dir_path = try tmpPath(alloc, tmp.dir, "locked");
     defer alloc.free(dir_path);
-    const dir_path_z = try alloc.dupeZ(u8, dir_path);
+    const dir_path_z = try alloc.dupeSentinel(u8, dir_path, 0);
     defer alloc.free(dir_path_z);
     if (std.c.chmod(dir_path_z.ptr, 0o500) != 0) return error.SkipZigTest;
     defer _ = std.c.chmod(dir_path_z.ptr, 0o700);
@@ -423,7 +423,7 @@ test "undoLast pops before filesystem restore failures, reports them, and does n
 }
 
 test "undoLast leaves the original file intact when the restore write fails" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -462,7 +462,7 @@ test "undoLast leaves the original file intact when the restore write fails" {
 }
 
 test "undo refuses a file whose directory denies writes and leaves it intact" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -473,7 +473,7 @@ test "undo refuses a file whose directory denies writes and leaves it intact" {
 
     const dir_path = try tmpPath(alloc, tmp.dir, "locked");
     defer alloc.free(dir_path);
-    const dir_path_z = try alloc.dupeZ(u8, dir_path);
+    const dir_path_z = try alloc.dupeSentinel(u8, dir_path, 0);
     defer alloc.free(dir_path_z);
     if (std.c.chmod(dir_path_z.ptr, 0o500) != 0) return error.SkipZigTest;
     defer _ = std.c.chmod(dir_path_z.ptr, 0o700);
@@ -537,7 +537,7 @@ test "undo restore cannot be redirected by a symlink introduced after capture" {
 }
 
 test "a locked directory plus a failing write never leaves a half-replaced file" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -565,7 +565,7 @@ test "a locked directory plus a failing write never leaves a half-replaced file"
 
     const dir_path = try tmpPath(alloc, tmp.dir, "locked");
     defer alloc.free(dir_path);
-    const dir_path_z = try alloc.dupeZ(u8, dir_path);
+    const dir_path_z = try alloc.dupeSentinel(u8, dir_path, 0);
     defer alloc.free(dir_path_z);
     if (std.c.chmod(dir_path_z.ptr, 0o500) != 0) return error.SkipZigTest;
     defer _ = std.c.chmod(dir_path_z.ptr, 0o700);

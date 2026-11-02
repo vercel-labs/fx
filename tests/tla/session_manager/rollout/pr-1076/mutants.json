@@ -1,0 +1,16 @@
+[
+  {
+    "module": "PR1076RunningTools",
+    "description": "Execute without saving the call",
+    "old": "/\\ t \\in calls /\\ t \\notin started",
+    "new": "/\\ t \\notin started",
+    "invariant": "CallBeforeExecution"
+  },
+  {
+    "module": "PR1076RunningTools",
+    "description": "A later error replaces the original OS cause",
+    "old": "fault' = firstCause",
+    "new": "fault' = e",
+    "invariant": "FirstCauseSticky"
+  }
+]

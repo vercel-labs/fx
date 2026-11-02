@@ -1,0 +1,1 @@
+{"server":"mini","tool":"mcp_mini_browser_read","result":{"resultType":"complete","content":[{"type":"text","text":"CONV_PAGE_TEXT"}]}}

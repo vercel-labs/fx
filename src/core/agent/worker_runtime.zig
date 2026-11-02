@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const io_mod = @import("../shared/io.zig");
@@ -14,17 +15,26 @@ const session_runtime = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const compactor = @import("../compactor/compactor.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
 const assistant_presentation = @import("assistant_presentation.zig");
 const compaction_activity = @import("../output/compaction_activity.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 pub const AgentTurnSettings = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
+    auto_compact_percent: u8 = compactor.default_percent,
     first_call_tool_choice: types.ToolChoice = .auto,
     fast_mode: bool = false,
+    ultrafast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
+    /// Gateway provider routing for turns built from these settings. When set
+    /// on WorkerRuntime.agent_turn_settings the slice is owned by the worker
+    /// and released in WorkerRuntime.deinit; every other copy borrows it.
+    provider_order: []const []const u8 = &.{},
+    provider_strict: bool = false,
 };
 
 pub const SkillBinding = struct {
@@ -122,6 +132,9 @@ pub const QueuedPrompt = struct {
     /// Present only when an explicit host action resumes a durable paused
     /// model turn. The same ownership rules as the other queued fields apply.
     recovery_checkpoint: ?session_codec.RecoveryCheckpoint = null,
+    /// The request a previous fx process left unfinished, which this turn's
+    /// first model request resumes.
+    recovery_resume: ?types.RecoveryResume = null,
     /// True when this output surface already contains the checkpoint's
     /// assistant source. Recovery still restores the source for overlap and
     /// persistence, but publishes only novel continuation text.
@@ -130,6 +143,9 @@ pub const QueuedPrompt = struct {
     /// Worker begin publishes only its identity so the UI can consume the
     /// pending owner without painting a duplicate card.
     user_prompt_already_presented: bool = false,
+    /// The first turn after a resume whose history names shell handles this
+    /// process does not own. The turn starts with a note saying so (D93).
+    stale_shell_handles: bool = false,
 };
 
 pub const ContextCompactionTask = struct {
@@ -393,6 +409,7 @@ const OwnedQuestionOption = struct {
 const OwnedQuestionEntry = struct {
     question: []u8,
     options: []OwnedQuestionOption,
+    submission: @FieldType(types.QuestionBatchEntry, "submission") = .none,
 };
 
 pub const QuestionPromptSource = enum {
@@ -439,28 +456,6 @@ pub const ContextCompaction = struct {
 
 pub const ContextCompactionHandler = *const fn (*anyopaque, ContextCompaction) anyerror!void;
 
-pub const FreshPromptPreparation = struct {
-    turn_id: u64 = 0,
-    user: types.UserTurn,
-    prior_turn: ?types.HistoryTurn = null,
-};
-
-pub const FreshPromptHistory = struct {
-    history: []types.HistoryTurn,
-    authorized_image_catalog: []types.ImageAttachment,
-    root_user_intent_context: []u8,
-    unversioned_history_count: usize,
-
-    pub fn deinit(self: *FreshPromptHistory, alloc: std.mem.Allocator) void {
-        types.freeHistoryTurnSlice(alloc, self.history);
-        types.freeImageAttachmentSlice(alloc, self.authorized_image_catalog);
-        alloc.free(self.root_user_intent_context);
-        self.* = undefined;
-    }
-};
-
-pub const FreshPromptHandler = *const fn (*anyopaque, FreshPromptPreparation) anyerror!FreshPromptHistory;
-
 const HistoryPublication = struct {
     ctx: *anyopaque,
     commit_fn: *const fn (*anyopaque) anyerror!void,
@@ -485,7 +480,7 @@ const ContextCompactionPublication = struct {
 const HistoryPublicationResponse = union(enum) {
     idle,
     waiting: u64,
-    committed: ?FreshPromptHistory,
+    committed,
     failed: anyerror,
 };
 
@@ -493,14 +488,23 @@ pub const WorkerEvent = union(enum) {
     begin_prompt: types.UserTurn,
     begin_prompt_with_skill_bindings: BeginPromptWithSkillBindings,
     begin_presented_prompt: u64,
+    /// A turn that resumes a request a previous fx process left unfinished.
+    /// Its prompt is fx's note to the model, so no user card is written.
+    begin_resumed_prompt: u64,
     append_user_feedback: []u8,
     assistant_presentation: assistant_presentation.Event,
     notification: notification_contract.Notification,
     question_requested,
     open_model_picker,
     semantic_notice: types.SemanticNotice,
+    /// A full-only observability record (network call outcome) for the ctrl+o
+    /// full transcript's detail section. Never enters the transcript store.
+    full_detail_record: types.SemanticNotice,
     route_recovery_status: types.RouteRecoveryStatus,
     clear_route_recovery_status,
+    /// The gateway provider that served a request in this turn (display-only,
+    /// last value wins). Owned by the event; the consumer frees it.
+    provider_resolved: []u8,
     api_status_text: []u8,
     credential_refreshed: credentials.Credential,
     command_output: CommandOutputChunk,
@@ -510,10 +514,12 @@ pub const WorkerEvent = union(enum) {
     turn_phase_update: types.TurnPhaseUpdate,
     diff_block: diff_mod.DiffEntryPayload,
     context_compaction: ContextCompaction,
-    prepare_fresh_prompt: FreshPromptPreparation,
     finish_prompt: types.FinishedPrompt,
     session_grant: types.PermissionGrant,
     error_text: types.SemanticNotice,
+    /// A turn that can never recover hands the prompt back to the composer.
+    /// Owned by the event; the consumer frees it.
+    restore_failed_prompt: []u8,
 };
 
 pub const WorkerEventBatch = struct {
@@ -546,18 +552,18 @@ pub const WorkerRuntime = struct {
     worker_stop_requested: bool = false,
     finalization_failure: ?FinalizationFailure = null,
     worker_cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set when the user answers a request that waits for them; the request's
+    /// recovery reads and clears it (`RequestRecovery.continue_flag`).
+    recovery_continue_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// The active turn whose text steering admission owns the cancel flag.
     /// Guarded by `worker_mutex`; explicit cancellation clears this ownership.
     steering_cancel_turn_id: ?u64 = null,
     direct_steering_closed: bool = false,
-    worker_recovery_pause_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    worker_connectivity_wait_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// Set under `worker_mutex` once the active turn publishes its terminal
-    /// recovery pause. The turn may still be finalizing, but cannot perform
-    /// more model work, so one continuation may queue before processing clears.
-    recovery_continuation_ready: bool = false,
     /// When true, queued work will not start.
     turn_start_held: bool = false,
+    /// Independent of a pending submission's turn-start hold; protects queued
+    /// work until a fresh-session scrollback handoff succeeds or is cancelled.
+    session_transition_held: bool = false,
     next_permission_request_id: u64 = 1,
     pending_permission_response: ?permission_request.OwnedPermissionResponse = null,
     pending_permission_request_shared: ?permission_request.OwnedPermissionRequest = null,
@@ -568,7 +574,6 @@ pub const WorkerRuntime = struct {
     agent_turn_settings: AgentTurnSettings = .{},
     active_agent_turn_settings: ?AgentTurnSettings = null,
     active_context_snapshot: ?*const context_contract.GatheredContextSnapshot = null,
-    active_prompt_is_root_authority: bool = false,
     active_prompt_snapshot_ownership: ?*ActivePromptSnapshotOwnership = null,
     preserve_prompt_snapshot_turn_id: ?u64 = null,
 
@@ -631,7 +636,7 @@ pub const WorkerRuntime = struct {
     fn finishCompactionActivityLocked(self: *WorkerRuntime, turn_id: u64) void {
         const op = self.compaction_presentation.snapshot.operation orelse return;
         if (op.turn_id != turn_id or !op.active()) return;
-        debug_trace.logf("context_compaction", "unsettled operation at worker finish turn_id={d}", .{turn_id});
+        compactor.traceLog(true, "unsettled operation at worker finish turn_id={d}", .{turn_id});
         var feedback = compaction_activity.failure(
             if (self.isCancelRequested()) error.Cancelled else error.CompactionInterrupted,
             op.stage(),
@@ -669,6 +674,43 @@ pub const WorkerRuntime = struct {
 
         for (self.worker_events.items) |event| freeWorkerEvent(alloc, event);
         self.worker_events.deinit(alloc);
+
+        if (self.agent_turn_settings.provider_order.len > 0) {
+            for (self.agent_turn_settings.provider_order) |slug| alloc.free(@constCast(slug));
+            alloc.free(self.agent_turn_settings.provider_order);
+            self.agent_turn_settings.provider_order = &.{};
+        }
+    }
+
+    /// Copies a gateway provider routing list into worker ownership for
+    /// subsequent turns. `alloc` must match the allocator later passed to
+    /// deinit (hosts use the C allocator for worker-owned memory). Copied
+    /// turn settings borrow the worker-owned list.
+    pub fn setProviderRouting(self: *WorkerRuntime, alloc: std.mem.Allocator, order: []const []const u8, strict: bool) !void {
+        var owned: []const []const u8 = &.{};
+        if (order.len > 0) {
+            const slugs = try alloc.alloc([]const u8, order.len);
+            var filled: usize = 0;
+            errdefer {
+                for (slugs[0..filled]) |slug| alloc.free(@constCast(slug));
+                alloc.free(slugs);
+            }
+            for (order, 0..) |slug, index| {
+                slugs[index] = try alloc.dupe(u8, slug);
+                filled += 1;
+            }
+            owned = slugs;
+        }
+        if (self.agent_turn_settings.provider_order.len > 0) {
+            for (self.agent_turn_settings.provider_order) |slug| alloc.free(@constCast(slug));
+            alloc.free(self.agent_turn_settings.provider_order);
+        }
+        self.agent_turn_settings.provider_order = owned;
+        self.agent_turn_settings.provider_strict = strict;
+        for (self.queued_prompts.items) |*prompt| {
+            prompt.agent_settings.provider_order = owned;
+            prompt.agent_settings.provider_strict = strict;
+        }
     }
 
     pub fn requestStop(self: *WorkerRuntime) void {
@@ -690,15 +732,6 @@ pub const WorkerRuntime = struct {
     pub fn requestCancel(self: *WorkerRuntime) void {
         debug_trace.logf("worker", "cancel requested processing={s} queued={d}", .{ if (self.worker_processing) "true" else "false", self.queuedPromptCount() });
         debug_trace.eventf("interrupt", "cancel_requested", .{}, "processing={s} queued={d} active_tool_known=false", .{ if (self.worker_processing) "true" else "false", self.queuedPromptCount() });
-        self.markExplicitCancellation();
-    }
-
-    /// Interrupt the current gateway wait while preserving its recovery
-    /// checkpoint. The ordinary cancel flag wakes the existing socket watcher;
-    /// agent policy distinguishes the typed pause flag at the boundary.
-    pub fn requestRecoveryPause(self: *WorkerRuntime) void {
-        debug_trace.eventf("recovery", "pause_requested", .{}, "source=interactive_try_later", .{});
-        self.worker_recovery_pause_requested.store(true, .seq_cst);
         self.markExplicitCancellation();
     }
 
@@ -755,15 +788,17 @@ pub const WorkerRuntime = struct {
         return self.worker_cancel_requested.load(.seq_cst);
     }
 
+    /// The user answered a request that waits for them, for example with
+    /// Enter. A request that is not waiting ignores it.
+    pub fn requestRecoveryContinue(self: *WorkerRuntime) void {
+        self.recovery_continue_requested.store(true, .seq_cst);
+    }
+
     pub fn cancellationStopsTurn(self: *WorkerRuntime) bool {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         return self.worker_cancel_requested.load(.seq_cst) and
             self.steering_cancel_turn_id != self.active_turn_id;
-    }
-
-    pub fn isConnectivityWaitActive(self: *const WorkerRuntime) bool {
-        return self.worker_connectivity_wait_active.load(.seq_cst);
     }
 
     pub fn pushEvent(self: *WorkerRuntime, alloc: std.mem.Allocator, event: WorkerEvent) !void {
@@ -783,7 +818,6 @@ pub const WorkerRuntime = struct {
         self.worker_events.appendAssumeCapacity(event);
         self.applyActiveToolTransitionLocked(tool_transition);
         self.applyToolBoundaryPhaseLocked(event);
-        self.applyRecoveryStateEvent(event);
         self.worker_cond.broadcast(io_mod.getIo());
     }
 
@@ -815,34 +849,7 @@ pub const WorkerRuntime = struct {
             });
             return error.TurnFinalizationDeliveryFailed;
         };
-        self.applyRecoveryStateEvent(.{ .tool_lifecycle = .{
-            .turn_finished = event,
-        } });
         self.worker_cond.broadcast(io_mod.getIo());
-    }
-
-    fn applyRecoveryStateEvent(self: *WorkerRuntime, event: WorkerEvent) void {
-        switch (event) {
-            .route_recovery_status => |status| {
-                self.worker_connectivity_wait_active.store(
-                    status.action == .waiting_for_connectivity,
-                    .seq_cst,
-                );
-                self.recovery_continuation_ready = status.action == .paused;
-            },
-            .clear_route_recovery_status,
-            .finish_prompt,
-            .error_text,
-            => {
-                self.worker_connectivity_wait_active.store(false, .seq_cst);
-                self.recovery_continuation_ready = false;
-            },
-            .tool_lifecycle => |lifecycle| switch (lifecycle) {
-                .turn_finished => self.worker_connectivity_wait_active.store(false, .seq_cst),
-                .provisional, .authoritative_started, .progress, .terminal => return,
-            },
-            else => return,
-        }
     }
 
     pub fn latchFinalizationFailure(self: *WorkerRuntime, failure: FinalizationFailure) void {
@@ -1020,7 +1027,6 @@ pub const WorkerRuntime = struct {
             !recoveryContinuationAdmission(
                 self.worker_processing,
                 self.queuedWorkCountLocked(),
-                self.recovery_continuation_ready,
             ))
         {
             return error.RecoveryBusy;
@@ -1216,11 +1222,27 @@ pub const WorkerRuntime = struct {
         return messages;
     }
 
+    pub fn holdSessionTransition(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.session_transition_held = true;
+    }
+
+    pub fn releaseSessionTransitionHold(self: *WorkerRuntime) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        if (!self.session_transition_held) return;
+        self.session_transition_held = false;
+        self.worker_cond.broadcast(io_mod.getIo());
+    }
+
     /// Hold turn admission only when no turn is active or queued.
     pub fn tryHoldTurnStart(self: *WorkerRuntime) bool {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
-        if (self.worker_processing or self.queuedWorkCountLocked() > 0 or self.turn_start_held) {
+        if (self.worker_processing or self.queuedWorkCountLocked() > 0 or
+            self.turn_start_held or self.session_transition_held)
+        {
             return false;
         }
         self.turn_start_held = true;
@@ -1235,6 +1257,17 @@ pub const WorkerRuntime = struct {
         self.turn_start_held = false;
         debug_trace.logf("worker", "turn start hold released", .{});
         self.worker_cond.broadcast(io_mod.getIo());
+    }
+
+    /// Whether the queued prompt for `turn_id` carries the stale shell
+    /// handles note, so a caller that removes it can give the note back.
+    pub fn queuedPromptCarriesStaleShellHandles(self: *WorkerRuntime, turn_id: u64) bool {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        for (self.queued_prompts.items) |queued| {
+            if (queued.turn_id == turn_id) return queued.stale_shell_handles;
+        }
+        return false;
     }
 
     pub fn removeQueuedPrompt(
@@ -1319,7 +1352,7 @@ pub const WorkerRuntime = struct {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
 
-        while ((self.queued_prompts.items.len == 0 or self.turn_start_held) and
+        while ((self.queued_prompts.items.len == 0 or self.turn_start_held or self.session_transition_held) and
             !self.worker_stop_requested)
         {
             self.worker_processing = false;
@@ -1335,8 +1368,8 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
 
         while (((self.queued_prompts.items.len == 0 and
-            self.queued_context_compaction == null) or self.turn_start_held) and
-            !self.worker_stop_requested)
+            self.queued_context_compaction == null) or self.turn_start_held or
+            self.session_transition_held) and !self.worker_stop_requested)
         {
             self.worker_processing = false;
             self.active_turn_id = 0;
@@ -1348,11 +1381,11 @@ pub const WorkerRuntime = struct {
 
     /// Nonblocking queue take for single-threaded hosts. Returns null while the
     /// queue is empty, held, or stopped.
-    pub fn tryTakeNextPrompt(self: *WorkerRuntime, alloc: std.mem.Allocator) !?QueuedPrompt {
+    fn tryTakeNextPrompt(self: *WorkerRuntime, alloc: std.mem.Allocator) !?QueuedPrompt {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         if (self.queued_prompts.items.len == 0 or
-            self.turn_start_held or
+            self.turn_start_held or self.session_transition_held or
             self.worker_stop_requested)
         {
             return null;
@@ -1365,7 +1398,7 @@ pub const WorkerRuntime = struct {
         defer self.worker_mutex.unlock(io_mod.getIo());
         if ((self.queued_prompts.items.len == 0 and
             self.queued_context_compaction == null) or self.turn_start_held or
-            self.worker_stop_requested)
+            self.session_transition_held or self.worker_stop_requested)
         {
             return null;
         }
@@ -1377,9 +1410,6 @@ pub const WorkerRuntime = struct {
         if (self.queued_context_compaction) |task| {
             self.queued_context_compaction = null;
             self.worker_cancel_requested.store(false, .seq_cst);
-            self.worker_recovery_pause_requested.store(false, .seq_cst);
-            self.worker_connectivity_wait_active.store(false, .seq_cst);
-            self.recovery_continuation_ready = false;
             self.worker_processing = true;
             self.active_turn_id = task.turn_id;
             self.tool_phase_step_id = null;
@@ -1415,7 +1445,11 @@ pub const WorkerRuntime = struct {
         errdefer if (!transfer_history) {
             types.freeHistoryTurnSlice(alloc, job_history);
         };
-        if (queued.recovery_checkpoint == null and queued.user_prompt_already_presented) {
+        if (queued.recovery_resume != null) {
+            try self.worker_events.append(alloc, .{
+                .begin_resumed_prompt = queued.turn_id,
+            });
+        } else if (queued.recovery_checkpoint == null and queued.user_prompt_already_presented) {
             try self.worker_events.append(alloc, .{
                 .begin_presented_prompt = queued.turn_id,
             });
@@ -1444,9 +1478,6 @@ pub const WorkerRuntime = struct {
         job.history = job_history;
         self.steering_cancel_turn_id = null;
         self.worker_cancel_requested.store(false, .seq_cst);
-        self.worker_recovery_pause_requested.store(false, .seq_cst);
-        self.worker_connectivity_wait_active.store(false, .seq_cst);
-        self.recovery_continuation_ready = false;
         self.worker_processing = true;
         self.active_turn_id = job.turn_id;
         self.tool_phase_step_id = null;
@@ -1491,7 +1522,6 @@ pub const WorkerRuntime = struct {
         self.clearActiveToolCallsLocked();
         self.tool_phase_step_id = null;
         self.active_context_compaction = false;
-        self.worker_connectivity_wait_active.store(false, .seq_cst);
         self.worker_cond.broadcast(io_mod.getIo());
         self.worker_mutex.unlock(io_mod.getIo());
     }
@@ -1505,8 +1535,6 @@ pub const WorkerRuntime = struct {
         if (self.worker_processing or self.worker_stop_requested) return false;
         self.direct_steering_closed = false;
         self.worker_cancel_requested.store(false, .seq_cst);
-        self.worker_recovery_pause_requested.store(false, .seq_cst);
-        self.worker_connectivity_wait_active.store(false, .seq_cst);
         self.worker_processing = true;
         self.active_turn_id = turn_id;
         self.tool_phase_step_id = null;
@@ -1816,6 +1844,13 @@ pub const WorkerRuntime = struct {
         for (self.queued_prompts.items) |*prompt| prompt.agent_settings.fast_mode = enabled;
     }
 
+    pub fn syncQueuedPromptUltrafastMode(self: *WorkerRuntime, enabled: bool) void {
+        self.worker_mutex.lockUncancelable(io_mod.getIo());
+        defer self.worker_mutex.unlock(io_mod.getIo());
+        self.agent_turn_settings.ultrafast_mode = enabled;
+        for (self.queued_prompts.items) |*prompt| prompt.agent_settings.ultrafast_mode = enabled;
+    }
+
     pub fn syncQueuedPromptEffort(self: *WorkerRuntime, effort: types.ReasoningEffort) void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
@@ -1869,7 +1904,7 @@ pub const WorkerRuntime = struct {
     ) !void {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
-        const result = try self.awaitHistoryPublicationLocked(alloc, .{
+        try self.awaitHistoryPublicationLocked(alloc, .{
             .context_compaction = .{
                 .turn_id = self.active_turn_id,
                 .summary = summary,
@@ -1878,18 +1913,9 @@ pub const WorkerRuntime = struct {
                 .max_history_turns = max_history_turns,
             },
         });
-        std.debug.assert(result == null);
     }
 
-    pub fn prepareFreshPrompt(self: *WorkerRuntime, alloc: std.mem.Allocator, preparation: FreshPromptPreparation) !FreshPromptHistory {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        var request = preparation;
-        request.turn_id = self.active_turn_id;
-        return (try self.awaitHistoryPublicationLocked(alloc, .{ .prepare_fresh_prompt = request })) orelse error.InvalidHistoryPublication;
-    }
-
-    fn awaitHistoryPublicationLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, event: WorkerEvent) !?FreshPromptHistory {
+    fn awaitHistoryPublicationLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, event: WorkerEvent) !void {
         if (self.worker_stop_requested or self.isCancelRequested()) return error.Aborted;
         std.debug.assert(self.history_publication_response == .idle);
         const owned_event = try dupeWorkerEvent(alloc, event);
@@ -1897,12 +1923,7 @@ pub const WorkerRuntime = struct {
         defer if (owns_event) freeWorkerEvent(alloc, owned_event);
         try self.worker_events.ensureUnusedCapacity(alloc, 1);
         self.history_publication_response = .{ .waiting = self.active_turn_id };
-        defer {
-            if (self.history_publication_response == .committed) {
-                if (self.history_publication_response.committed) |*snapshot| snapshot.deinit(alloc);
-            }
-            self.history_publication_response = .idle;
-        }
+        defer self.history_publication_response = .idle;
         self.worker_events.appendAssumeCapacity(owned_event);
         owns_event = false;
         self.worker_cond.broadcast(io_mod.getIo());
@@ -1913,10 +1934,7 @@ pub const WorkerRuntime = struct {
             try self.worker_cond.wait(io_mod.getIo(), &self.worker_mutex);
         }
         switch (self.history_publication_response) {
-            .committed => |result| {
-                self.history_publication_response = .idle;
-                return result;
-            },
+            .committed => return,
             .failed => |err| return err,
             .waiting, .idle => return error.Aborted,
         }
@@ -1954,50 +1972,7 @@ pub const WorkerRuntime = struct {
             self.history_publication_response = .{ .failed = err };
             return;
         };
-        self.history_publication_response = .{ .committed = null };
-    }
-
-    pub fn resolveFreshPrompt(self: *WorkerRuntime, alloc: std.mem.Allocator, event: FreshPromptPreparation, ctx: *anyopaque, handler: FreshPromptHandler) void {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        if (self.history_publication_response != .waiting or self.history_publication_response.waiting != event.turn_id) {
-            debug_trace.logf("worker", "fresh prompt preparation dropped reason=stale turn_id={d}", .{event.turn_id});
-            return;
-        }
-        defer self.worker_cond.broadcast(io_mod.getIo());
-        if (self.worker_stop_requested or self.isCancelRequested()) {
-            self.history_publication_response = .{ .failed = error.Aborted };
-            return;
-        }
-        const snapshot = self.publishFreshPromptLocked(alloc, event, ctx, handler) catch |err| {
-            self.history_publication_response = .{ .failed = err };
-            return;
-        };
-        self.history_publication_response = .{ .committed = snapshot };
-    }
-
-    pub fn publishFreshPrompt(self: *WorkerRuntime, alloc: std.mem.Allocator, event: FreshPromptPreparation, ctx: *anyopaque, handler: FreshPromptHandler) !FreshPromptHistory {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        return self.publishFreshPromptLocked(alloc, event, ctx, handler);
-    }
-
-    fn publishFreshPromptLocked(self: *WorkerRuntime, alloc: std.mem.Allocator, event: FreshPromptPreparation, ctx: *anyopaque, handler: FreshPromptHandler) !FreshPromptHistory {
-        const prior_turn = event.prior_turn orelse return handler(ctx, event);
-        const Publication = struct {
-            ctx: *anyopaque,
-            handler: FreshPromptHandler,
-            event: FreshPromptPreparation,
-            result: ?FreshPromptHistory = null,
-
-            fn commit(raw: *anyopaque) !void {
-                const self_: *@This() = @ptrCast(@alignCast(raw));
-                self_.result = try self_.handler(self_.ctx, self_.event);
-            }
-        };
-        var publication: Publication = .{ .ctx = ctx, .handler = handler, .event = event };
-        try self.propagateHistoryTurnLocked(alloc, prior_turn, 0, .{ .ctx = &publication, .commit_fn = Publication.commit });
-        return publication.result.?;
+        self.history_publication_response = .committed;
     }
 
     pub fn publishContextCompaction(
@@ -2040,11 +2015,23 @@ pub const WorkerRuntime = struct {
         max_history_turns: usize,
         publication: ?HistoryPublication,
     ) !void {
-        errdefer |err| if (err == error.SessionPersistenceUncertain) {
-            if (self.active_prompt_snapshot_ownership) |ownership| {
-                _ = ownership.preserve();
+        self.propagateHistoryTurnToQueue(alloc, turn, max_history_turns, publication) catch |err| {
+            if (err == error.SessionPersistenceUncertain) {
+                if (self.active_prompt_snapshot_ownership) |ownership| {
+                    _ = ownership.preserve();
+                }
             }
+            return err;
         };
+    }
+
+    fn propagateHistoryTurnToQueue(
+        self: *WorkerRuntime,
+        alloc: std.mem.Allocator,
+        turn: types.HistoryTurn,
+        max_history_turns: usize,
+        publication: ?HistoryPublication,
+    ) !void {
         if (self.queued_prompts.items.len == 0) {
             if (publication) |value| try value.commit();
             return;
@@ -2100,8 +2087,7 @@ pub const WorkerRuntime = struct {
                     types.SnapshotFileOwnership,
                     ownership_count,
                 );
-                std.mem.copyForwards(
-                    types.SnapshotFileOwnership,
+                @memmove(
                     ownerships[0..prompt.snapshot_file_ownerships.len],
                     prompt.snapshot_file_ownerships,
                 );
@@ -2183,12 +2169,6 @@ pub const WorkerRuntime = struct {
         std.debug.assert(self.active_prompt_snapshot_ownership == ownership);
         self.active_prompt_snapshot_ownership = null;
         ownership.deinit();
-    }
-
-    pub fn preservePromptSnapshots(self: *WorkerRuntime, turn_id: u64, images: []const types.ImageAttachment) void {
-        self.worker_mutex.lockUncancelable(io_mod.getIo());
-        defer self.worker_mutex.unlock(io_mod.getIo());
-        _ = self.preservePromptSnapshotsLocked(turn_id, images);
     }
 
     fn preservePromptSnapshotsLocked(
@@ -2552,93 +2532,18 @@ pub const WorkerRuntime = struct {
     }
 };
 
+/// A resumed turn starts only on an idle worker with nothing queued.
 fn recoveryContinuationAdmission(
     processing: bool,
     queued_count: usize,
-    terminal_pause_ready: bool,
 ) bool {
-    return queued_count == 0 and (!processing or terminal_pause_ready);
+    return queued_count == 0 and !processing;
 }
 
-test "recovery continuation admission requires an empty idle or terminally paused worker" {
-    try std.testing.expect(recoveryContinuationAdmission(false, 0, false));
-    try std.testing.expect(!recoveryContinuationAdmission(true, 0, false));
-    try std.testing.expect(recoveryContinuationAdmission(true, 0, true));
-    try std.testing.expect(!recoveryContinuationAdmission(false, 1, true));
-}
-
-test "terminal recovery pause admits continuation before worker cleanup" {
-    const alloc = std.testing.allocator;
-    var runtime: WorkerRuntime = .{};
-    defer runtime.deinit(alloc);
-
-    const Fixture = struct {
-        fn make(allocator: std.mem.Allocator) !QueuedPrompt {
-            var prompt = try makePrompt(allocator, "continue preserved turn", "model");
-            errdefer freeQueuedPrompt(allocator, prompt);
-            prompt.recovery_checkpoint = try (session_codec.RecoveryCheckpoint{
-                .turn_id = 41,
-                .user = .{ .text = @constCast("unfinished prompt") },
-                .assistant_source = @constCast("partial response"),
-                .cause = .network_interrupted,
-                .action = .paused,
-                .authority = .{ .provider = .gateway, .model = @constCast("model") },
-                .requested_fast_mode = false,
-                .fast_mode = false,
-                .max_provider_attempts = 10,
-                .consumed_provider_attempts = 10,
-            }).dupe(allocator);
-            return prompt;
-        }
-    };
-
-    runtime.worker_processing = true;
-    try runtime.pushEvent(alloc, .{ .route_recovery_status = .{
-        .kind = .terminal_provider_error,
-        .failed_attempt = 10,
-        .attempt_limit = 10,
-        .cause = .network_interrupted,
-        .action = .paused,
-        .required_action = .continue_later,
-    } });
-    try runtime.pushTurnFinished(alloc, .{
-        .turn_id = 41,
-        .outcome = .paused,
-    });
-
-    const continuation = try Fixture.make(alloc);
-    runtime.enqueuePrompt(alloc, continuation) catch |err| {
-        freeQueuedPrompt(alloc, continuation);
-        return err;
-    };
-    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
-}
-
-test "connectivity wait state follows worker events before UI presentation" {
-    var runtime: WorkerRuntime = .{};
-    defer runtime.deinit(std.testing.allocator);
-
-    try runtime.pushEvent(std.testing.allocator, .{ .route_recovery_status = .{
-        .kind = .auto_retry,
-        .cause = .system_resumed,
-        .action = .waiting_for_connectivity,
-    } });
-    try std.testing.expect(runtime.isConnectivityWaitActive());
-
-    try runtime.pushEvent(std.testing.allocator, .{ .route_recovery_status = .{
-        .kind = .auto_retry,
-        .cause = .network_interrupted,
-        .action = .retrying_request,
-    } });
-    try std.testing.expect(!runtime.isConnectivityWaitActive());
-
-    try runtime.pushEvent(std.testing.allocator, .{ .route_recovery_status = .{
-        .kind = .auto_retry,
-        .cause = .system_resumed,
-        .action = .waiting_for_connectivity,
-    } });
-    try runtime.pushEvent(std.testing.allocator, .clear_route_recovery_status);
-    try std.testing.expect(!runtime.isConnectivityWaitActive());
+test "recovery continuation admission requires an empty idle worker" {
+    try std.testing.expect(recoveryContinuationAdmission(false, 0));
+    try std.testing.expect(!recoveryContinuationAdmission(true, 0));
+    try std.testing.expect(!recoveryContinuationAdmission(false, 1));
 }
 
 fn dupeOwnedQuestionEntry(alloc: std.mem.Allocator, entry: types.QuestionBatchEntry) !OwnedQuestionEntry {
@@ -2662,7 +2567,7 @@ fn dupeOwnedQuestionEntry(alloc: std.mem.Allocator, entry: types.QuestionBatchEn
         const desc_dup: ?[]u8 = if (src.description) |d| try alloc.dupe(u8, d) else null;
         options_dup[filled] = .{ .label = label_dup, .description = desc_dup };
     }
-    return .{ .question = question_dup, .options = options_dup };
+    return .{ .question = question_dup, .options = options_dup, .submission = entry.submission };
 }
 
 fn freeOwnedQuestionEntry(alloc: std.mem.Allocator, entry: OwnedQuestionEntry) void {
@@ -2730,7 +2635,7 @@ fn dupePendingEntrySnapshot(alloc: std.mem.Allocator, pending: OwnedQuestionEntr
         const desc_dup: ?[]const u8 = if (src.description) |d| try alloc.dupe(u8, d) else null;
         options_dup[filled] = .{ .label = label_dup, .description = desc_dup };
     }
-    return .{ .question = question_dup, .options = options_dup };
+    return .{ .question = question_dup, .options = options_dup, .submission = pending.submission };
 }
 
 fn dupePendingBatchSnapshot(alloc: std.mem.Allocator, pending: OwnedQuestionBatch) !PendingQuestionBatchSnapshot {
@@ -2763,7 +2668,7 @@ fn appendGrantToQueuedPrompt(alloc: std.mem.Allocator, prompt: *QueuedPrompt, to
     const current = prompt.grants;
     const next = try alloc.alloc(types.PermissionGrant, current.len + 1);
     errdefer alloc.free(next);
-    if (current.len > 0) std.mem.copyForwards(types.PermissionGrant, next[0..current.len], current);
+    if (current.len > 0) @memmove(next[0..current.len], current);
     next[current.len] = .{ .tool_name = tool_name_dup, .target_path = target_path_dup };
     alloc.free(current);
     prompt.grants = next;
@@ -2777,7 +2682,7 @@ fn appendHistoryTurnProjection(
 ) ![]types.HistoryTurn {
     _ = max_history_turns;
     const retained = if (turn == .compacted_summary and
-        std.mem.startsWith(u8, turn.compacted_summary.summary, types.context_handoff_open))
+        compactor.replacesPriorContext(turn.compacted_summary.summary))
         &.{}
     else
         current;
@@ -2846,6 +2751,9 @@ fn discardQueuedPrompt(
     prompt: QueuedPrompt,
     retained_images: []const types.ImageAttachment,
 ) void {
+    if (prompt.stale_shell_handles) {
+        debug_trace.logf("worker", "stale shell handles note dropped with queued prompt turn_id={d}", .{prompt.turn_id});
+    }
     if (prompt.recovery_checkpoint == null) {
         image_attachments.deleteUnreferencedImageSnapshots(prompt.images, retained_images);
     }
@@ -2865,7 +2773,7 @@ test "active prompt snapshot ownership discards every pre-transfer boundary" {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var name_buffer: [32]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buffer, "snapshot-{d}.bin", .{index});
+        const name = try std.mem.print(&name_buffer, "snapshot-{d}.bin", .{index});
         {
             var file = try tmp.dir.createFile(std.testing.io, name, .{});
             defer file.close(std.testing.io);
@@ -2890,68 +2798,62 @@ test "active prompt snapshot ownership discards every pre-transfer boundary" {
     }
 }
 
-test "session and checkpoint transfer preserve active and finished prompt snapshots" {
+test "session transfer preserves active and finished prompt snapshots" {
     const alloc = std.testing.allocator;
     const phases = [_]enum { take_before_begin, active, finished }{
         .take_before_begin,
         .active,
         .finished,
     };
-    for ([_]bool{ false, true }) |checkpoint_accepted| {
-        for (phases) |phase| {
-            var tmp = std.testing.tmpDir(.{});
-            defer tmp.cleanup();
-            const name = switch (phase) {
-                .take_before_begin => "take-before-begin.bin",
-                .active => "active.bin",
-                .finished => "finished.bin",
-            };
-            {
-                var file = try tmp.dir.createFile(std.testing.io, name, .{});
-                defer file.close(std.testing.io);
-                try file.writeStreamingAll(std.testing.io, "snapshot");
-            }
-            const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
-            defer alloc.free(path);
-            const images = [_]types.ImageAttachment{.{
-                .id = 1,
-                .path = @constCast("/tmp/source.png"),
-                .media_type = @constCast("image/png"),
-                .snapshot_path = path,
-                .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            }};
-
-            var runtime = WorkerRuntime{};
-            defer runtime.deinit(alloc);
-            runtime.active_turn_id = 41;
-            var active = ActivePromptSnapshotOwnership.init(&images);
-            if (phase != .take_before_begin) runtime.beginActivePromptSnapshots(&active);
-            if (phase == .finished) {
-                const ownership = (try runtime.handoffActivePromptSnapshots(alloc)) orelse
-                    return error.TestExpectedSnapshotOwnership;
-                try runtime.pushEvent(alloc, .{ .finish_prompt = .{
-                    .turn = .{ .assistant = .{
-                        .user = .{ .text = @constCast("prompt"), .images = @constCast(&images) },
-                        .assistant = @constCast("done"),
-                    } },
-                    .snapshot_file_ownership = ownership,
-                } });
-                ownership.release();
-                runtime.endActivePromptSnapshots(&active);
-                runtime.active_turn_id = 0;
-            }
-
-            if (checkpoint_accepted) {
-                runtime.preservePromptSnapshots(41, &images);
-            } else {
-                runtime.clearQueuedPromptsForSessionTransition(alloc, 41, &images);
-            }
-            if (phase == .take_before_begin) runtime.beginActivePromptSnapshots(&active);
-            if (phase != .finished) runtime.endActivePromptSnapshots(&active);
-            runtime.discardEvents(alloc);
-            try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
-            try std.Io.Dir.deleteFileAbsolute(std.testing.io, path);
+    for (phases) |phase| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const name = switch (phase) {
+            .take_before_begin => "take-before-begin.bin",
+            .active => "active.bin",
+            .finished => "finished.bin",
+        };
+        {
+            var file = try tmp.dir.createFile(std.testing.io, name, .{});
+            defer file.close(std.testing.io);
+            try file.writeStreamingAll(std.testing.io, "snapshot");
         }
+        const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, name);
+        defer alloc.free(path);
+        const images = [_]types.ImageAttachment{.{
+            .id = 1,
+            .path = @constCast("/tmp/source.png"),
+            .media_type = @constCast("image/png"),
+            .snapshot_path = path,
+            .snapshot_sha256 = @constCast("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        }};
+
+        var runtime = WorkerRuntime{};
+        defer runtime.deinit(alloc);
+        runtime.active_turn_id = 41;
+        var active = ActivePromptSnapshotOwnership.init(&images);
+        if (phase != .take_before_begin) runtime.beginActivePromptSnapshots(&active);
+        if (phase == .finished) {
+            const ownership = (try runtime.handoffActivePromptSnapshots(alloc)) orelse
+                return error.TestExpectedSnapshotOwnership;
+            try runtime.pushEvent(alloc, .{ .finish_prompt = .{
+                .turn = .{ .assistant = .{
+                    .user = .{ .text = @constCast("prompt"), .images = @constCast(&images) },
+                    .assistant = @constCast("done"),
+                } },
+                .snapshot_file_ownership = ownership,
+            } });
+            ownership.release();
+            runtime.endActivePromptSnapshots(&active);
+            runtime.active_turn_id = 0;
+        }
+
+        runtime.clearQueuedPromptsForSessionTransition(alloc, 41, &images);
+        if (phase == .take_before_begin) runtime.beginActivePromptSnapshots(&active);
+        if (phase != .finished) runtime.endActivePromptSnapshots(&active);
+        runtime.discardEvents(alloc);
+        try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
+        try std.Io.Dir.deleteFileAbsolute(std.testing.io, path);
     }
 }
 
@@ -3343,7 +3245,7 @@ test "compaction preserves active snapshots only after persistence succeeds" {
 }
 
 test "failed queued prompt dequeue retains borrowed snapshot ownership" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     {
@@ -3470,7 +3372,7 @@ test "multi-queue history propagation is allocation-failure atomic" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_path = try std.fs.path.join(alloc, &.{ root, "snapshot.bin" });
+    const snapshot_path = try std.Io.Dir.path.join(alloc, &.{ root, "snapshot.bin" });
     defer alloc.free(snapshot_path);
 
     var fail_index: usize = 0;
@@ -3875,11 +3777,11 @@ test "finish ownership handoff preserves allocator and filesystem ownership" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const snapshot_path = try std.fs.path.join(alloc, &.{ root, "snapshot.bin" });
+    const snapshot_path = try std.Io.Dir.path.join(alloc, &.{ root, "snapshot.bin" });
     defer alloc.free(snapshot_path);
 
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkFinishOwnershipHandoffAllocation,
         .{snapshot_path},
     );
@@ -3963,6 +3865,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
             } };
         },
         .begin_presented_prompt => |turn_id| .{ .begin_presented_prompt = turn_id },
+        .begin_resumed_prompt => |turn_id| .{ .begin_resumed_prompt = turn_id },
         .append_user_feedback => |text| .{ .append_user_feedback = try alloc.dupe(u8, text) },
         .assistant_presentation => |presentation| .{
             .assistant_presentation = try presentation.clone(alloc),
@@ -3971,8 +3874,10 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
         .question_requested => .question_requested,
         .open_model_picker => .open_model_picker,
         .semantic_notice => |notice| .{ .semantic_notice = try types.dupeSemanticNotice(alloc, notice) },
+        .full_detail_record => |notice| .{ .full_detail_record = try types.dupeSemanticNotice(alloc, notice) },
         .route_recovery_status => |status| .{ .route_recovery_status = status },
         .clear_route_recovery_status => .clear_route_recovery_status,
+        .provider_resolved => |slug| .{ .provider_resolved = try alloc.dupe(u8, slug) },
         .api_status_text => |text| .{ .api_status_text = try alloc.dupe(u8, text) },
         .credential_refreshed => |credential| .{
             .credential_refreshed = try credential.clone(alloc),
@@ -4017,15 +3922,6 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
                 .full = full,
             } };
         },
-        .prepare_fresh_prompt => |value| blk: {
-            const user = try types.dupeUserTurn(alloc, value.user);
-            errdefer types.freeUserTurn(alloc, user);
-            break :blk .{ .prepare_fresh_prompt = .{
-                .turn_id = value.turn_id,
-                .user = user,
-                .prior_turn = if (value.prior_turn) |prior| try types.dupeHistoryTurn(alloc, prior) else null,
-            } };
-        },
         .context_compaction => |value| blk: {
             const summary = try types.dupeHistoryTurn(alloc, .{ .compacted_summary = value.summary });
             errdefer types.freeHistoryTurn(alloc, summary);
@@ -4052,6 +3948,7 @@ pub fn dupeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) !WorkerEven
             } };
         },
         .error_text => |notice| .{ .error_text = try types.dupeSemanticNotice(alloc, notice) },
+        .restore_failed_prompt => |text| .{ .restore_failed_prompt = try alloc.dupe(u8, text) },
     };
 }
 
@@ -4063,7 +3960,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
             freeSkillBindings(alloc, begin.skill_bindings);
             freeSkillDisplaySpans(alloc, begin.skill_display_spans);
         },
-        .begin_presented_prompt => {},
+        .begin_presented_prompt, .begin_resumed_prompt => {},
         .append_user_feedback => |text| alloc.free(text),
         .assistant_presentation => |presentation| {
             var owned = presentation;
@@ -4072,8 +3969,10 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         .notification => {},
         .open_model_picker => {},
         .semantic_notice => |notice| types.freeSemanticNotice(alloc, notice),
+        .full_detail_record => |notice| types.freeSemanticNotice(alloc, notice),
         .route_recovery_status => {},
         .clear_route_recovery_status => {},
+        .provider_resolved => |slug| alloc.free(slug),
         .api_status_text => |text| alloc.free(text),
         .credential_refreshed => |credential| {
             var owned = credential;
@@ -4088,10 +3987,6 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
         },
         .tool_lifecycle => |lifecycle| freeToolLifecycleEvent(alloc, lifecycle),
         .diff_block => |payload| diff_mod.freeDiffEntryPayload(alloc, payload),
-        .prepare_fresh_prompt => |value| {
-            types.freeUserTurn(alloc, value.user);
-            if (value.prior_turn) |prior| types.freeHistoryTurn(alloc, prior);
-        },
         .context_compaction => |value| {
             types.freeHistoryTurn(alloc, .{ .compacted_summary = value.summary });
             if (value.active_prefix) |prefix| types.freeHistoryTurn(alloc, .{ .assistant = prefix });
@@ -4102,6 +3997,7 @@ pub fn freeWorkerEvent(alloc: std.mem.Allocator, event: WorkerEvent) void {
             alloc.free(grant.target_path);
         },
         .error_text => |notice| types.freeSemanticNotice(alloc, notice),
+        .restore_failed_prompt => |text| alloc.free(text),
         else => {},
     }
 }
@@ -4322,7 +4218,7 @@ test "direct steering applies at the boundary without cancellation and seals bef
 }
 
 test "direct steering output allocation failure preserves feedback and cancellation discards it" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var receipt = SteeringReceipt{};
     var runtime = WorkerRuntime{};
     try std.testing.expect(runtime.beginDirectProcessing(41));
@@ -4340,7 +4236,7 @@ test "direct steering output allocation failure preserves feedback and cancellat
 }
 
 test "direct steering rejects inactive cancelled and full-allocation admission without taking ownership" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
     const prompt = try makePrompt(alloc, "feedback", "model");
@@ -4796,7 +4692,7 @@ test "failed steering admission does not cancel the active turn" {
     runtime.active_turn_id = 41;
 
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     const prompt = QueuedPrompt{
@@ -4957,7 +4853,7 @@ test "steer retraction requires an active processing turn" {
 }
 
 test "failed steer retraction preserves the queue" {
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
     var runtime = WorkerRuntime{};
     defer runtime.deinit(backing);
     runtime.worker_processing = true;
@@ -5033,7 +4929,7 @@ test "steering presentation survives queue to feedback transfer without duplicat
 }
 
 test "steering snapshot allocation failure preserves queue and feedback ownership" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, struct {
         fn run(alloc: std.mem.Allocator) !void {
             const backing = std.testing.allocator;
             var runtime = WorkerRuntime{};
@@ -5181,6 +5077,27 @@ test "clear queued prompts also clears steering" {
     try std.testing.expect(boundary == .none);
 }
 
+test "a removed queued prompt reports the stale shell handles note it carried (D93)" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    var noted = try makePrompt(alloc, "after resume", "model");
+    noted.turn_id = 41;
+    noted.stale_shell_handles = true;
+    try runtime.enqueuePrompt(alloc, noted);
+    var plain = try makePrompt(alloc, "next", "model");
+    plain.turn_id = 42;
+    try runtime.enqueuePrompt(alloc, plain);
+
+    try std.testing.expect(runtime.queuedPromptCarriesStaleShellHandles(41));
+    try std.testing.expect(!runtime.queuedPromptCarriesStaleShellHandles(42));
+    try std.testing.expect(!runtime.queuedPromptCarriesStaleShellHandles(43));
+    try std.testing.expect(runtime.removeQueuedPrompt(alloc, 41, &.{}));
+    try std.testing.expect(!runtime.queuedPromptCarriesStaleShellHandles(41));
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+}
+
 test "idle interactive admission uses ordinary queue" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
@@ -5206,7 +5123,6 @@ test "takeEventBatch snapshots cancellation with detached events" {
 
     runtime.active_turn_id = 7;
     runtime.worker_cancel_requested.store(true, .seq_cst);
-    runtime.worker_recovery_pause_requested.store(true, .seq_cst);
     try runtime.pushEvent(alloc, .{ .assistant_presentation = .{
         .text = @constCast("late"),
     } });
@@ -5370,7 +5286,7 @@ fn checkStateSnapshotFailurePreservesPendingEvents(alloc: std.mem.Allocator) !vo
 
 test "state snapshot allocation failures preserve pending event ownership" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkStateSnapshotFailurePreservesPendingEvents,
         .{},
     );
@@ -5919,7 +5835,6 @@ test "waitAndTakeNextPrompt assigns turn id and resets cancellation for next pro
 
     try std.testing.expect(job.turn_id != 0);
     try std.testing.expect(!runtime.isCancelRequested());
-    try std.testing.expect(!runtime.worker_recovery_pause_requested.load(.seq_cst));
 
     var events = runtime.takeEvents();
     defer freeEventList(alloc, &events);
@@ -5945,13 +5860,6 @@ test "already-presented queued prompt emits identity without duplicating user pa
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
     try std.testing.expect(events.items[0] == .begin_presented_prompt);
     try std.testing.expectEqual(@as(u64, 9001), events.items[0].begin_presented_prompt);
-}
-
-test "requestRecoveryPause wakes the active operation without losing pause intent" {
-    var worker = WorkerRuntime{};
-    worker.requestRecoveryPause();
-    try std.testing.expect(worker.worker_recovery_pause_requested.load(.seq_cst));
-    try std.testing.expect(worker.worker_cancel_requested.load(.seq_cst));
 }
 
 test "enqueuePrompt stamps agent settings from worker runtime" {
@@ -6197,7 +6105,7 @@ test "submitted text only queues while a prompt is active" {
 }
 
 test "prompt take and grant append allocation failures preserve state" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
 
@@ -6251,7 +6159,7 @@ test "clear queued prompts preserves events and discard frees event payloads" {
         .tone = .information,
         .body = "notice",
     } }));
-    freeWorkerEvent(alloc, .{ .route_recovery_status = .{ .kind = .auto_retry, .failed_attempt = 1, .attempt_limit = 3 } });
+    freeWorkerEvent(alloc, .{ .route_recovery_status = .{ .kind = .waiting, .attempt = 1 } });
     freeWorkerEvent(alloc, .clear_route_recovery_status);
     freeWorkerEvent(alloc, .{ .command_output = .{ .stream = .stdout, .text = try alloc.dupe(u8, "out") } });
     freeWorkerEvent(alloc, .{ .command_output_complete = null });
@@ -6360,7 +6268,7 @@ fn checkToolLifecycleDupAllocationFailure(alloc: std.mem.Allocator) !void {
 
 test "typed lifecycle duplication frees every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkToolLifecycleDupAllocationFailure,
         .{},
     );
@@ -6638,7 +6546,7 @@ fn checkSemanticWorkerEventDuplicationAllocationFailure(alloc: std.mem.Allocator
 
 test "ordinary and error semantic worker events free partial duplication allocations" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkSemanticWorkerEventDuplicationAllocationFailure,
         .{},
     );
@@ -6697,7 +6605,7 @@ fn checkSemanticNoticeEnqueueAllocationFailure(alloc: std.mem.Allocator) !void {
 
 test "semantic notice enqueue frees partial topic body and queue allocations" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkSemanticNoticeEnqueueAllocationFailure,
         .{},
     );
@@ -7025,7 +6933,7 @@ test "approval cancellation leaves admitted steering available for the next turn
 }
 
 test "text enqueue allocation failure preserves active interactive state" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
     runtime.worker_processing = true;
@@ -7214,7 +7122,7 @@ test "question request rolls back pending state when its boundary event cannot b
     const options = [_]types.QuestionOption{.{ .label = "Yes", .description = null }};
     const entries = [_]types.QuestionBatchEntry{.{ .question = "Continue?", .options = &options }};
 
-    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     var probe_runtime = WorkerRuntime{};
     probe_runtime.worker_stop_requested = true;
     const probe_result = try probe_runtime.requestQuestionBatchAnswerBlocking(probe.allocator(), &entries);
@@ -7223,7 +7131,7 @@ test "question request rolls back pending state when its boundary event cannot b
     probe_runtime.deinit(probe.allocator());
     try std.testing.expectEqual(probe.allocated_bytes, probe.freed_bytes);
 
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{
         .fail_index = marker_append_alloc_index,
     });
     var runtime = WorkerRuntime{};
@@ -7251,7 +7159,7 @@ test "discarding queued recovery releases metadata without deleting saved images
         .path = @constCast("/missing/source.png"),
         .media_type = @constCast("image/png"),
         .snapshot_path = path,
-        .snapshot_sha256 = @constCast("a" ** 64),
+        .snapshot_sha256 = @constCast(text_utils.repeat("a", 64)),
     }};
     var runtime = WorkerRuntime{};
     defer runtime.deinit(alloc);
@@ -7276,4 +7184,20 @@ test "discarding queued recovery releases metadata without deleting saved images
     runtime.clearQueuedPrompts(alloc, &.{});
     try std.testing.expectEqual(@as(usize, 0), runtime.queuedPromptCount());
     try std.Io.Dir.accessAbsolute(std.testing.io, path, .{});
+}
+
+test "session transition hold keeps an existing queued prompt until released" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    try runtime.enqueuePrompt(alloc, try makePrompt(alloc, "queued", "test/model"));
+    runtime.holdSessionTransition();
+    try std.testing.expect(!runtime.tryHoldTurnStart());
+    try std.testing.expect((try runtime.tryTakeNextPrompt(alloc)) == null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.queuedPromptCount());
+    runtime.releaseSessionTransitionHold();
+    const prompt = (try runtime.tryTakeNextPrompt(alloc)).?;
+    defer freeQueuedPrompt(alloc, prompt);
+    try std.testing.expectEqualStrings("queued", prompt.prompt);
+    try std.testing.expect((try runtime.tryTakeNextPrompt(alloc)) == null);
 }

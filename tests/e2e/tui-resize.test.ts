@@ -39,6 +39,7 @@ import {
   type FooterBlock,
 } from "./tui-render-assertions";
 import { readTapeFrames, stdoutFrames } from "./render-lab/tape";
+import { logLines, onlySessionId, sessionDir } from "./saved-sessions";
 
 const SKIP = !tmuxAvailable();
 const TIMEOUT = 30_000;
@@ -1484,6 +1485,154 @@ async function runRapidSkillResizeAttempt(
 }
 
 describe.skipIf(SKIP)("tui: resize", () => {
+  for (const mode of ["choose-tree", "copy-mode"] as const) {
+    test(
+      `tmux ${mode} survives settled resize without auto closing`,
+      async () => {
+        const root = realpathSync(mkdtempSync(join(tmpdir(), `fx-resize-${mode}-`)));
+        tempDirs.push(root);
+        const tracePath = join(root, "trace.log");
+        const stderrPath = join(root, "stderr.log");
+        writeFileSync(stderrPath, "");
+        // Never change the developer's tmux prefix, bindings, or server state.
+        const socketName = `fx-resize-${mode}-${process.pid}-${Date.now()}`;
+        const tmux = (...args: string[]) => execFileSync(
+          "tmux",
+          ["-L", socketName, ...args],
+          { encoding: "utf8", stdio: "pipe" },
+        ).trim();
+        let client: ReturnType<typeof Bun.spawn> | undefined;
+        try {
+          // Isolate configuration too: the shared helper expects window index 0.
+          tmux("-f", "/dev/null", "new-session", "-d", "-s", "bootstrap", "sleep 120");
+          session = await createResizeSession({
+            isolated: true,
+            socketName,
+            width: 120,
+            height: 40,
+            stderrPath,
+            remainOnExit: true,
+            env: {
+              HOME: join(root, "home"),
+              AI_GATEWAY_API_KEY: undefined,
+              VERCEL_OIDC_TOKEN: undefined,
+              FX_AUTO_UPGRADE: "0",
+              FX_TRACE_LOG: tracePath,
+              FX_TRACE_SCOPES: "frame_schedule,frame_diff,frame_commit,scroll,resize",
+              NO_COLOR: "1",
+            },
+          });
+          const active = session;
+          tmux("kill-session", "-t", "bootstrap");
+          await active.waitForComposer(10_000);
+          const pane = tmux("display-message", "-p", "-t", active.name, "#{pane_id}");
+          const format = (value: string) =>
+            tmux("display-message", "-p", "-t", pane, value);
+          const waitForFormat = async (value: string, expected: string) => {
+            const deadline = Date.now() + 5_000;
+            let actual = "";
+            while (Date.now() < deadline) {
+              actual = format(value);
+              if (actual === expected) return;
+              await Bun.sleep(10);
+            }
+            throw new Error(`tmux ${value}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+          };
+          const waitForSettledResize = (afterLine: number) =>
+            waitForCommittedTraceAttempt(
+              tracePath,
+              afterLine,
+              (attempt) => attemptHasReason(attempt, "resize") &&
+                attemptLine(attempt, "tmux_clear_history_complete") !== undefined,
+              10_000,
+            );
+          tmux("set-option", "-g", "prefix", "C-a");
+          tmux("bind-key", "-T", "prefix", "s", "choose-tree", "-Zs");
+          tmux("bind-key", "-T", "prefix", "[", "copy-mode");
+          tmux("set-option", "-g", "status", "off");
+          client = Bun.spawn(["tmux", "-L", socketName, "attach-session", "-t", active.name], {
+            env: { ...process.env, TMUX: undefined, TERM: "xterm-256color" },
+            terminal: {
+              cols: 120,
+              rows: 40,
+              data() {}, // Drain client output; pane and trace helpers own assertions.
+            },
+          });
+          await waitForFormat("#{session_attached}", "1");
+          const terminal = client.terminal!;
+
+          const beforeSplit = readTraceLines(tracePath).length - 1;
+          tmux("split-window", "-v", "-d", "-t", pane, "sleep 120");
+          tmux("select-pane", "-t", pane);
+          await waitForSettledResize(beforeSplit);
+          await active.waitForComposer(10_000);
+          expect(format("#{window_zoomed_flag}")).toBe("0");
+          const draft = `draft survives ${mode}`;
+          terminal.write(draft);
+          await active.waitForText(draft, 5_000);
+
+          const beforeMode = readTraceLines(tracePath).length - 1;
+          // send-keys bypasses the client's prefix table. These are real PTY
+          // keystrokes, so choose-tree -Zs also exercises its implicit zoom.
+          terminal.write(mode === "choose-tree" ? "\x01s" : "\x01[");
+          const paneMode = mode === "choose-tree" ? "tree-mode" : "copy-mode";
+          await waitForFormat("#{pane_mode}", paneMode);
+          if (mode === "choose-tree") {
+            expect(format("#{window_zoomed_flag}")).toBe("1");
+          } else {
+            terminal.resize(100, 32);
+          }
+          const settled = await waitForSettledResize(beforeMode);
+          expect(attemptLine(settled, "tmux_clear_history_complete")).toBeDefined();
+          expect(format("#{pane_mode}")).toBe(paneMode);
+          expect(format("#{pane_in_mode}")).toBe("1");
+          // Also catch a delayed mode exit after the committed frame.
+          await Bun.sleep(250);
+          expect(format("#{pane_mode}")).toBe(paneMode);
+
+          // Leave intentionally, then prove neither the prefix nor the quit key
+          // leaked into the composer and that ordinary editing still works.
+          const beforeExit = readTraceLines(tracePath).length - 1;
+          terminal.write("q");
+          await waitForFormat("#{pane_in_mode}", "0");
+          if (mode === "choose-tree") {
+            await waitForFormat("#{window_zoomed_flag}", "0");
+            await waitForSettledResize(beforeExit);
+          }
+          await waitForSettledFooter(active);
+          terminal.write(" usable!");
+          terminal.write("\x7f");
+          const grid = (await active.waitForPane(
+            (text) => text.split("\n").some((line) =>
+              isInputRow(line) && line.trimEnd().endsWith(`${draft} usable`)
+            ),
+            5_000,
+          )).split("\n");
+          expect(findFooter(grid)).not.toBeNull();
+          expect(format("#{window_zoomed_flag}")).toBe("0");
+          expect(active.isPaneAlive()).toBe(true);
+          expect(client.exitCode).toBeNull();
+          expectEmptyStderr(stderrPath);
+        } finally {
+          try {
+            if (client) {
+              try {
+                client.kill("SIGKILL");
+                await client.exited;
+              } finally {
+                client.terminal?.close();
+              }
+            }
+          } finally {
+            // afterEach still owns the TmuxSession fixture and temporary files.
+            try { tmux("kill-server"); } catch {}
+          }
+        }
+      },
+      60_000,
+    );
+  }
+
   test(
     "welcome header starts at the first terminal row",
     async () => {
@@ -1664,7 +1813,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -1772,9 +1921,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
           HOME: home, AI_GATEWAY_API_KEY: "synthetic-retention-key",
           VERCEL_OIDC_TOKEN: undefined, FX_DISABLE_KEYCHAIN: "1",
           FX_E2E_DISABLE_DOTENV: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0",
-          FX_SKIP_ONBOARDING: "1", FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_TEST_SKIP_ONBOARDING: "1", FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_TRACE_SCOPES: "transcript_retention,scroll", FX_TRACE_LOG: tracePath,
           FX_RECORD: join(root, "terminal.fxtape"),
         },
@@ -1844,7 +1993,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       finish(1);
       await session.waitForStableComposer(15_000);
       await assertRows(tailCount);
-      await session.sendText("/status");
+      await session.sendText("/allowlist");
+      await session.waitForText("* allowlist: effective", 10_000);
       await session.waitForStableComposer(10_000);
       await assertRows(tailCount);
       await session.sendText("/quit");
@@ -1934,11 +2084,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
           AI_GATEWAY_API_KEY: "synthetic-command-retention", VERCEL_OIDC_TOKEN: undefined,
           FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
           FX_MODEL: FAKE_GATEWAY_MODEL, FX_MAX_AGENT_STEPS: "4",
-          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_SKIP_ONBOARDING: "1",
+          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TEST_SKIP_ONBOARDING: "1",
           FX_PERMISSION_MODE: "full-access",
           FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_TRACE_SCOPES: "transcript_retention,command_output,scroll,frame_plan,frame_commit,tool,ui_activity" +
             (viewerCols ? ",full_transcript,full_transcript_cache,resize" : ""),
           FX_TRACE_LOG: tracePath, FX_RECORD: tapePath, FX_RECORD_INPUT: "1",
@@ -2020,11 +2170,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           const traceOffset = readFileSync(tracePath, "utf8").length;
           writeFileSync(releasePath, "go");
           if (viewerCols) {
-            const sessionsRoot = join(home, ".fx", "sessions");
-            const ids = readdirSync(sessionsRoot, { withFileTypes: true })
-              .filter(entry => entry.isDirectory()).map(entry => entry.name);
-            expect(ids).toHaveLength(1);
-            const eventsPath = join(sessionsRoot, ids[0]!, "events.jsonl");
+            const eventsPath = join(sessionDir(home, onlySessionId(home)), "log.jsonl");
             // The main composer and text tail are hidden. Wait for the actual saved
             // assistant and its following completion record, not a viewer repaint.
             await session.waitForPane((pane) => {
@@ -2034,10 +2180,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
               // A concurrent append may end mid-record; only parse terminated lines.
               const records = text.split("\n").slice(0, -1).map(line => JSON.parse(line));
               const assistantIndex = records.findIndex(record =>
-                record.event.assistant?.text === laterResponse
+                record.kind === "item" && record.type === "assistant" && record.data?.text === laterResponse
               );
               const completed = assistantIndex >= 0 && records.slice(assistantIndex + 1)
-                .some(record => record.event.turn_completed !== undefined);
+                .some(record => record.kind === "turn_committed");
               return completed && requestCount === 4 &&
                 existsSync(join(workspace, "finished")) &&
                 existsSync(join(workspace, "sibling-finished")) &&
@@ -2089,11 +2235,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
             expect(gateway.requests).toHaveLength(4);
           });
           check("native history after output", () => expectHistory(afterOutput, true));
-          await session.sendText("/status");
-          await session.waitForText("agent_step_limit=", 10_000);
+          await session.sendText("/allowlist");
+          await session.waitForText("* allowlist: effective", 10_000);
           await session.waitForStableComposer(10_000);
-          const afterStatus = await capture("after-status");
-          check("native history after status", () => expectHistory(afterStatus, true));
+          const afterNotice = await capture("after-notice");
+          check("native history after a local notice", () => expectHistory(afterNotice, true));
           if (!pressure) check("control never prunes", () => {
             expect(readFileSync(tracePath, "utf8")).not.toMatch(/pruned (?:command output|entry)/);
           });
@@ -2104,14 +2250,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
             expectEmptyStderr(stderrPath);
           });
           check("persisted assistant paragraphs", () => {
-            const sessionsRoot = join(home, ".fx", "sessions");
-            const ids = readdirSync(sessionsRoot, { withFileTypes: true })
-              .filter(entry => entry.isDirectory()).map(entry => entry.name);
-            expect(ids).toHaveLength(1);
-            const events = readFileSync(join(sessionsRoot, ids[0]!, "events.jsonl"), "utf8")
-              .trim().split("\n").map(line => JSON.parse(line));
-            const responses = events.filter(record => record.event.assistant !== undefined)
-              .map(record => record.event.assistant.text);
+            const responses = logLines(home, onlySessionId(home))
+              .filter((line: any) => line.kind === "item" && line.type === "assistant")
+              .map((line: any) => line.data.text);
             expect(responses).toEqual([oldResponse, laterResponse]);
           });
           check("recording replay", () => {
@@ -2228,7 +2369,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_MAX_AGENT_STEPS: "4",
           FX_AUTO_UPGRADE: "0",
@@ -2385,7 +2526,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       const beforeCancelLine = readTraceLines(tracePath).length - 1;
       await active.sendKeys("Escape");
-      await active.waitForText("■ Cancelled", remainingTimeout());
+      await active.waitForText("▪ Cancelled", remainingTimeout());
       const cancellationAttempt = await waitForCommittedTraceAttempt(
         tracePath,
         beforeCancelLine,
@@ -2411,7 +2552,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       );
       await active.waitForPane((pane) => {
         const lastLine = pane.trimEnd().split("\n").at(-1)?.trim() ?? "";
-        return pane.includes("■ Cancelled") && lastLine.startsWith("ask ·");
+        return pane.includes("▪ Cancelled") && lastLine.startsWith("ask ·");
       }, remainingTimeout());
       const afterCancelScrollback = await captureScrollback("after-cancel");
 
@@ -2435,7 +2576,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       );
 
       expect(existsSync(markerPath)).toBe(false);
-      expect(afterCancelScrollback).toContain("■ Cancelled");
+      expect(afterCancelScrollback).toContain("▪ Cancelled");
       expect(afterCancelScrollback).not.toContain(approvalQuestion);
       expect(gateway.requests).toHaveLength(2);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -2563,10 +2704,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const source = [
         "Recommended fix",
         "",
-        "1. Continue polling while ready.",
+        "9. Continue polling while ready.",
         `   ${paragraph}`,
         "",
-        `2. ${paragraph}`,
+        `10. ${paragraph}`,
         "",
         "- Bullet heading.",
         `  ${paragraph}`,
@@ -2578,10 +2719,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
       ].join("\n");
       // Split both paragraph prefixes across deltas, including a spaces-only delta.
       const chunks = [
-        "Recommended fix\n\n1. Continue polling while ready.\n ",
+        "Recommended fix\n\n9. Continue polling while ready.\n ",
         "  ",
         paragraph.slice(0, 83),
-        `${paragraph.slice(83)}\n\n2. ${paragraph}\n\n- Bullet heading.\n `,
+        `${paragraph.slice(83)}\n\n10. ${paragraph}\n\n- Bullet heading.\n `,
         ` ${paragraph.slice(0, 83)}`,
         `${paragraph.slice(83)}\n\n- ${paragraph}\n\nWRAP_REPRO_END\n`,
       ];
@@ -2608,7 +2749,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_AUTO_UPGRADE: "0",
           FX_SOUND: "0",
@@ -2636,8 +2777,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
         const lines = scrollback.split("\n");
         const markers = [
           "Recommended fix",
-          "1. Continue polling while ready.",
-          "2. I recommend checking",
+          "9. Continue polling while ready.",
+          "10. I recommend checking",
           "• Bullet heading.",
           "• I recommend checking",
           "WRAP_REPRO_END",
@@ -2651,16 +2792,20 @@ describe.skipIf(SKIP)("tui: resize", () => {
           .toBe(normalize(source.replace(/^- /gm, "• ")));
         expect(countOccurrences(scrollback, "I recommend checking")).toBe(4);
 
-        for (const [start, end, indent, marker] of [
-          [rows[1]! + 1, rows[2]!, 5, ""],
-          [rows[2]!, rows[3]!, 5, "2. "],
-          [rows[3]! + 1, rows[4]!, 4, ""],
-          [rows[4]!, rows[5]!, 4, "• "],
+        // Ordered numbers are right-aligned, so the markers of items 9 and
+        // 10 end in the same column and their text starts two columns later.
+        expect(lines[rows[1]!]!.indexOf("9. Continue")).toBe(4);
+        expect(lines[rows[2]!]!.indexOf("10. I recommend")).toBe(3);
+        for (const [start, end, firstIndent, indent, marker] of [
+          [rows[1]! + 1, rows[2]!, 7, 7, ""],
+          [rows[2]!, rows[3]!, 3, 7, "10. "],
+          [rows[3]! + 1, rows[4]!, 4, 4, ""],
+          [rows[4]!, rows[5]!, 2, 4, "• "],
         ] as const) {
           const paragraphRows = lines.slice(start, end).filter((line) => line.trim() !== "");
           expect(paragraphRows.length).toBeGreaterThan(1);
           for (const [index, line] of paragraphRows.entries()) {
-            const expectedIndent = index === 0 && marker ? 2 : indent;
+            const expectedIndent = index === 0 ? firstIndent : indent;
             expect(line.length - line.trimStart().length).toBe(expectedIndent);
             expect(line.length).toBeLessThanOrEqual(cols);
           }
@@ -2882,7 +3027,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_RECORD: tapePath,
           FX_RECORD_INPUT: "1",
@@ -3015,7 +3160,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
           FX_TRACE_LOG: tracePath,
           FX_TRACE_SCOPES:
             "frame_schedule,frame_diff,frame_commit,scroll,resize,input",
-          NO_COLOR: "1",
+          // The selected slash row is found by its color, so this session keeps it.
+          NO_COLOR: undefined,
         },
         width: 120,
         height: 34,
@@ -3044,7 +3190,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.waitForText("/help", 10_000);
       await waitForSelectedSlashLabel(session, "/help");
       const shrinkStage = await session.captureFullScrollback();
-      expect(shrinkStage).toContain("Commands 35 · type to filter");
+      expect(shrinkStage).toContain("Commands 37 · type to filter");
       expect(shrinkStage).toContain("1–4");
       writeFileSync(join(root, "scrollback-after-shrink.txt"), shrinkStage);
 
@@ -3223,14 +3369,14 @@ describe.skipIf(SKIP)("tui: resize", () => {
     },
     {
       issue: "FXC-125",
-      label: "cost",
+      label: "usage",
       width: 120,
       height: 36,
-      surfaceMarker: "[30 days]",
+      surfaceMarker: "not signed in to AI Gateway",
       editedInput: "x",
       async openSurface(active) {
-        await active.sendText("/cost");
-        await active.waitForText("[30 days]", TIMEOUT);
+        await active.sendText("/usage");
+        await active.waitForText("not signed in to AI Gateway", TIMEOUT);
         await active.resizeWindow(60, 12, 500);
       },
     },
@@ -3297,7 +3443,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           surfaceCase.height,
           gateway
             ? {
-                FX_E2E_GATEWAY_MODELS_URL:
+                FX_TEST_GATEWAY_MODELS_URL:
                   `${gateway.baseUrl}/coding-agent/v1/models`,
               }
             : {},
@@ -3925,9 +4071,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
           AI_GATEWAY_API_KEY: "fake-resize-activity-key",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-          FX_E2E_GATEWAY_CREDITS_URL: undefined,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CREDITS_URL: undefined,
           FX_MODEL: FAKE_GATEWAY_MODEL,
         },
       );
@@ -4021,11 +4167,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 35", 5_000);
+      await session.waitForText("Commands 37", 5_000);
       await session.resizeWindow(76, 24, 400);
 
       const grid = await session.capturePaneGrid();
-      expect(grid.join("\n")).toContain("Commands 35");
+      expect(grid.join("\n")).toContain("Commands 37");
       expect(findInlineHelpPicker(grid)).not.toBeNull();
 
       await session.sendKeys("Escape");
@@ -4043,7 +4189,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 35", 5_000);
+      await session.waitForText("Commands 37", 5_000);
 
       const captureScrollback = () =>
         execSync(`tmux capture-pane -t ${session!.name} -p -S -`, {
@@ -4051,7 +4197,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           stdio: "pipe",
         });
       const expectHelpCatalog = (grid: string[]) => {
-        expect(grid.join("\n")).toContain("Commands 35");
+        expect(grid.join("\n")).toContain("Commands 37");
         expect(findInlineHelpPicker(grid)).not.toBeNull();
       };
 
@@ -4069,7 +4215,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const restored = captureScrollback();
       expect(restored.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
       expect(restored.match(/Run \/help for commands/g)).toHaveLength(1);
-      expect(restored).not.toContain("Commands 35");
+      expect(restored).not.toContain("Commands 37");
       expect(findFooter(await session.capturePaneGrid())).not.toBeNull();
     },
     TIMEOUT,
@@ -4601,7 +4747,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         expect(await session.captureFullScrollback()).toContain(marker);
 
         await session.sendText("/help");
-        await session.waitForText("Commands 35", 5_000);
+        await session.waitForText("Commands 37", 5_000);
         await session.resizeWindow(84, 28, 500);
 
         const catalog = await session.capturePaneGrid();
@@ -4615,7 +4761,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         );
         const scrollback = await session.captureFullScrollback();
         expect(scrollback).not.toContain(marker);
-        expect(scrollback).not.toContain("Commands 35");
+        expect(scrollback).not.toContain("Commands 37");
         const finalGrid = await session.capturePaneGrid();
         expect(findFooter(finalGrid), finalGrid.join("\n")).not.toBeNull();
 
@@ -4745,8 +4891,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const lightReplayStart = stdoutAfterLightTheme.lastIndexOf("\x1b[3J");
       expect(lightReplayStart).toBeGreaterThanOrEqual(0);
       const lightReplayAndTail = stdoutAfterLightTheme.slice(lightReplayStart);
-      expect(lightReplayAndTail).toContain("\x1b[38;5;247m");
-      expect(lightReplayAndTail).not.toContain("\x1b[38;5;245m");
+      expect(lightReplayAndTail).toContain(`\x1b[38;5;235m${inlineMarker}`);
+      expect(lightReplayAndTail).not.toContain(`\x1b[38;5;255m${inlineMarker}`);
       const resetCountAfter = countOccurrences(
         Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString(),
         "\x1b[3J",

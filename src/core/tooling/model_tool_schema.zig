@@ -1,4 +1,5 @@
 const std = @import("std");
+const text_utils = @import("../shared/text_utils.zig");
 
 pub const description_max_bytes: usize = 1024;
 pub const truncation_marker = "... [truncated]";
@@ -35,16 +36,11 @@ const PropertyBounds = struct {
 
 const no_property_bounds = PropertyBounds{};
 
-const NullableMetadata = struct {
-    description: []const u8 = "",
-};
-
 pub const Property = struct {
     name: []const u8,
     description: []const u8 = "",
     shape: ?*const PropertyShape = null,
     bounds: ?*const PropertyBounds = null,
-    nullable: ?*const NullableMetadata = null,
     json_type: JsonType,
 };
 
@@ -62,24 +58,6 @@ pub const FunctionSchema = struct {
     description: []const u8,
     input_schema: ObjectSchema = .{},
 };
-
-pub fn isSingleRequiredObjectUnionField(
-    schema: ObjectSchema,
-    field_name: []const u8,
-) bool {
-    if (schema.properties.len != 1 or schema.required.len != 1 or
-        schema.additional_properties != false or
-        !std.mem.eql(u8, schema.properties[0].name, field_name) or
-        !std.mem.eql(u8, schema.required[0], field_name))
-    {
-        return false;
-    }
-    const shape = schema.properties[0].shape orelse return false;
-    return switch (shape.*) {
-        .object => |object| object.one_of.len > 0,
-        else => false,
-    };
-}
 
 test "static property representation stays within the measured size budget" {
     try std.testing.expect(@sizeOf(Property) <= 64);
@@ -159,6 +137,17 @@ pub fn writeObjectSchema(
     writer: *std.Io.Writer,
     schema: ObjectSchema,
 ) anyerror!void {
+    return writeDescribedObjectSchema(alloc, writer, schema, "");
+}
+
+/// Writes `schema` with `description` as a member when it is not empty, so an
+/// object-valued property keeps the description it declares.
+fn writeDescribedObjectSchema(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    schema: ObjectSchema,
+    description: []const u8,
+) anyerror!void {
     if (schema.one_of.len > 0) {
         if (schema.properties.len > 0 or
             schema.required.len > 0 or
@@ -173,7 +162,9 @@ pub fn writeObjectSchema(
             if (index > 0) try writer.writeByte(',');
             try writeObjectSchema(alloc, writer, alternative);
         }
-        try writer.writeAll("]}");
+        try writer.writeByte(']');
+        try writeDescriptionMember(alloc, writer, description);
+        try writer.writeByte('}');
         return;
     }
 
@@ -199,7 +190,18 @@ pub fn writeObjectSchema(
         }
         try writer.writeByte(']');
     }
+    try writeDescriptionMember(alloc, writer, description);
     try writer.writeByte('}');
+}
+
+fn writeDescriptionMember(
+    alloc: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    description: []const u8,
+) anyerror!void {
+    if (description.len == 0) return;
+    try writer.writeAll(",\"description\":");
+    try writeCappedDescriptionJsonString(alloc, writer, description);
 }
 
 fn writePropertySchema(
@@ -207,27 +209,10 @@ fn writePropertySchema(
     writer: *std.Io.Writer,
     property: Property,
 ) anyerror!void {
-    if (property.nullable) |nullable| {
-        var concrete = property;
-        concrete.nullable = null;
-        try writer.writeAll("{\"anyOf\":[");
-        try writePropertySchema(alloc, writer, concrete);
-        try writer.writeAll(",{\"type\":\"null\"}]");
-        if (nullable.description.len > 0) {
-            try writer.writeAll(",\"description\":");
-            try writeCappedDescriptionJsonString(
-                alloc,
-                writer,
-                nullable.description,
-            );
-        }
-        try writer.writeByte('}');
-        return;
-    }
     if (property.shape) |shape| {
         switch (shape.*) {
             .object => |object_schema| {
-                try writeObjectSchema(alloc, writer, object_schema.*);
+                try writeDescribedObjectSchema(alloc, writer, object_schema.*, property.description);
                 return;
             },
             else => {},
@@ -253,10 +238,7 @@ fn writePropertySchema(
     if (bounds.max_length != no_u32_bound) try writer.print(",\"maxLength\":{d}", .{bounds.max_length});
     if (bounds.minimum != no_u64_bound) try writer.print(",\"minimum\":{d}", .{bounds.minimum});
     if (bounds.maximum != no_u64_bound) try writer.print(",\"maximum\":{d}", .{bounds.maximum});
-    if (property.description.len > 0) {
-        try writer.writeAll(",\"description\":");
-        try writeCappedDescriptionJsonString(alloc, writer, property.description);
-    }
+    try writeDescriptionMember(alloc, writer, property.description);
     if (bounds.min_items != no_u32_bound) try writer.print(",\"minItems\":{d}", .{bounds.min_items});
     if (bounds.max_items != no_u32_bound) try writer.print(",\"maxItems\":{d}", .{bounds.max_items});
     if (property.shape) |shape| {
@@ -284,59 +266,6 @@ fn writePropertySchema(
     try writer.writeByte('}');
 }
 
-test "nullable properties preserve concrete constraints and add one null branch" {
-    const alloc = std.testing.allocator;
-    const object_value_schema = ObjectSchema{
-        .properties = &.{.{ .name = "kind", .json_type = .string }},
-        .required = &.{"kind"},
-        .additional_properties = false,
-    };
-    const schema = FunctionSchema{
-        .name = "nullable",
-        .description = "nullable",
-        .input_schema = .{
-            .properties = &.{
-                .{
-                    .name = "choice",
-                    .json_type = .string,
-                    .description = "Concrete choice.",
-                    .nullable = &.{ .description = "Concrete choice. Set null when unused." },
-                    .shape = &.{ .enum_values = &.{ "one", "two" } },
-                },
-                .{
-                    .name = "config",
-                    .json_type = .object,
-                    .nullable = &.{ .description = "Set null when unused." },
-                    .shape = &.{ .object = &object_value_schema },
-                },
-            },
-            .required = &.{ "choice", "config" },
-        },
-    };
-
-    const json = try builtinFunctionSchemaJsonAlloc(alloc, schema);
-    defer alloc.free(json);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
-    defer parsed.deinit();
-
-    const properties = parsed.value.object.get("inputSchema").?.object.get("properties").?.object;
-    const choice = properties.get("choice").?.object;
-    try std.testing.expectEqualStrings(
-        "Concrete choice. Set null when unused.",
-        choice.get("description").?.string,
-    );
-    const choice_alternatives = choice.get("anyOf").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), choice_alternatives.len);
-    try std.testing.expectEqualStrings("string", choice_alternatives[0].object.get("type").?.string);
-    try std.testing.expectEqual(@as(usize, 2), choice_alternatives[0].object.get("enum").?.array.items.len);
-    try std.testing.expectEqualStrings("null", choice_alternatives[1].object.get("type").?.string);
-
-    const config_alternatives = properties.get("config").?.object.get("anyOf").?.array.items;
-    try std.testing.expectEqualStrings("object", config_alternatives[0].object.get("type").?.string);
-    try std.testing.expectEqual(false, config_alternatives[0].object.get("additionalProperties").?.bool);
-    try std.testing.expectEqualStrings("null", config_alternatives[1].object.get("type").?.string);
-}
-
 test "nested object schema serializes exact property bounds" {
     const alloc = std.testing.allocator;
     const nested = ObjectSchema{
@@ -362,6 +291,33 @@ test "nested object schema serializes exact property bounds" {
     try std.testing.expect(std.mem.find(u8, json, "\"maxProperties\":1") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"create\":{\"type\":\"object\",\"properties\":{") != null);
     try std.testing.expect(std.mem.find(u8, json, "\"additionalProperties\":false") != null);
+}
+
+test "object-valued properties keep their description" {
+    const alloc = std.testing.allocator;
+    const schema = FunctionSchema{
+        .name = "described",
+        .description = "described",
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "shell", .json_type = .object, .description = "Only with tty=true.", .shape = &.{ .object = &.{
+                    .properties = &.{.{ .name = "path", .json_type = .string }},
+                } } },
+                .{ .name = "request", .json_type = .object, .description = "Choose one request.", .shape = &.{ .object = &.{
+                    .one_of = &.{.{ .properties = &.{.{ .name = "handle", .json_type = .string }} }},
+                } } },
+            },
+        },
+    };
+
+    const json = try builtinFunctionSchemaJsonAlloc(alloc, schema);
+    defer alloc.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    const properties = parsed.value.object.get("inputSchema").?.object.get("properties").?.object;
+    try std.testing.expectEqualStrings("Only with tty=true.", properties.get("shell").?.object.get("description").?.string);
+    try std.testing.expectEqualStrings("Choose one request.", properties.get("request").?.object.get("description").?.string);
+    try std.testing.expect(properties.get("request").?.object.get("oneOf") != null);
 }
 
 test "object alternatives serialize as exclusive object branches" {
@@ -431,7 +387,7 @@ test "object alternatives reject contradictory ordinary object metadata" {
 
 test "cappedDescriptionAlloc appends explicit truncation marker" {
     const alloc = std.testing.allocator;
-    const oversized = "x" ** (description_max_bytes + 20);
+    const oversized = text_utils.repeat("x", description_max_bytes + 20);
 
     const capped = try cappedDescriptionAlloc(alloc, oversized);
     defer alloc.free(capped);
@@ -557,7 +513,7 @@ test "builtinFunctionSchemaJsonAlloc serializes every supported property shape" 
 
 test "dynamicFunctionSchemaJsonAlloc wraps rendered input schema in the flattened envelope" {
     const alloc = std.testing.allocator;
-    const description = ("d" ** (description_max_bytes + 1)) ++ "tail";
+    const description = text_utils.repeat("d", description_max_bytes + 1) ++ "tail";
     const json = try dynamicFunctionSchemaJsonAlloc(alloc, "mcp_fs_read", description, "{\"type\":\"object\",\"properties\":{}}");
     defer alloc.free(json);
 

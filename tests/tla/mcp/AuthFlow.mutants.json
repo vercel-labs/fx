@@ -1,0 +1,74 @@
+[
+  {
+    "description": "Metadata with another issuer is used",
+    "old": "    /\\ LET usable == metaOk /\\ pkceOk IN",
+    "new": "    /\\ LET usable == pkceOk IN",
+    "invariant": "MetaValidated"
+  },
+  {
+    "description": "Metadata without S256 is used",
+    "old": "    /\\ LET usable == metaOk /\\ pkceOk IN",
+    "new": "    /\\ LET usable == metaOk IN",
+    "invariant": "MetaValidated"
+  },
+  {
+    "description": "The state isn't checked",
+    "old": "           accept == stateOk /\\ CASE iss",
+    "new": "           accept == CASE iss",
+    "invariant": "RedeemGuard"
+  },
+  {
+    "description": "A missing iss is accepted though the metadata advertised it",
+    "old": "                                    [] iss = \"none\" -> ~advertised\n",
+    "new": "                                    [] iss = \"none\" -> TRUE\n",
+    "invariant": "RedeemGuard"
+  },
+  {
+    "description": "A wrong iss is accepted",
+    "old": "                                    [] iss = \"wrong\" -> FALSE\n",
+    "new": "                                    [] iss = \"wrong\" -> TRUE\n",
+    "invariant": "RedeemGuard"
+  },
+  {
+    "description": "An error is shown before the response is checked",
+    "old": "           display == err /\\ accept\n",
+    "new": "           display == err\n",
+    "invariant": "ErrSuppress"
+  },
+  {
+    "description": "A failed token request redeems the code again",
+    "old": "    /\\ redemptions' = [redemptions EXCEPT ![flows] = @ + 1]\n    /\\ flow' = \"idle\"\n",
+    "new": "    /\\ redemptions' = [redemptions EXCEPT ![flows] = @ + 1]\n    /\\ flow' = IF ok THEN \"idle\" ELSE \"redeeming\"\n",
+    "invariant": "VerifierOnce"
+  },
+  {
+    "description": "Any registration is presented to a new issuer",
+    "old": "            /\\ IF asIssuer \\in regs\n               THEN Authorize(asIssuer, asIssuer) /\\ UNCHANGED regs",
+    "new": "            /\\ IF regs # {}\n               THEN Authorize(CHOOSE r \\in regs : TRUE, asIssuer) /\\ UNCHANGED regs",
+    "invariant": "CredIsolation"
+  },
+  {
+    "description": "The token from the previous issuer is kept",
+    "old": "            /\\ IF tokenIssuer \\notin {None, asIssuer}\n",
+    "new": "            /\\ IF FALSE\n",
+    "invariant": "TokenAudience"
+  },
+  {
+    "description": "A step-up asks only for the challenged scopes",
+    "old": "    /\\ flowScopes' = granted \\cup challenge\n",
+    "new": "    /\\ flowScopes' = challenge\n",
+    "invariant": "ScopeUnion"
+  },
+  {
+    "description": "Authorization requests are not bounded",
+    "old": "    /\\ auths < MaxAuthorizations\n",
+    "new": "    /\\ auths < MaxAuthorizations + 1\n",
+    "invariant": "StepUpBound"
+  },
+  {
+    "description": "A sign-in step need not get an answer",
+    "old": "Spec == Init /\\ [][Next]_vars /\\ WF_vars(Progress)",
+    "new": "Spec == Init /\\ [][Next]_vars",
+    "property": "EverySignInEnds"
+  }
+]

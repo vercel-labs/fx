@@ -30,6 +30,9 @@ pub const CandidateStorage = enum {
 pub const ProjectionState = enum {
     current,
     stale,
+    /// The projection lagged its log or could not be read, and the summary
+    /// came from replaying the committed log instead.
+    replayed,
     missing,
     invalid,
 };
@@ -113,29 +116,16 @@ pub const SessionListPage = struct {
     }
 };
 
-/// A resumable writable session handle, re-exported from `session_log` so the
-/// store's public surface is self-contained.
-pub const LoadedWritableSession = session_log.LoadedWritableSession;
-
 /// Selector for a resume request: the most recent session, or a specific id.
 pub const ResumeTarget = union(enum) {
     last,
     id: []const u8,
 };
 
-/// Options controlling a resume. `log` is threaded into the canonical log layer;
-/// `seed_preferences` overrides the merged-config preferences on migration.
+/// Options for reading a v1 session. `allow_large_legacy` lifts the size
+/// bound on a legacy snapshot, for a conversion.
 pub const ResumeOptions = struct {
     allow_large_legacy: bool = false,
-    seed_preferences: ?session_codec.DurableSessionPreferences = null,
-    log: session_log.Options = .{},
-};
-
-/// Options controlling a storage-only migration.
-pub const MigrationOptions = struct {
-    allow_large: bool = false,
-    seed_preferences: ?session_codec.DurableSessionPreferences = null,
-    log: session_log.Options = .{},
 };
 
 /// A read-only load of a session: its summary, full durable state, and the
@@ -144,56 +134,11 @@ pub const ReadOnlyDetail = struct {
     summary: SessionSummary,
     state: session_codec.DurableSessionState,
     storage_format: StorageFormat,
-
-    /// Frees the owned summary and state and poisons the value.
-    pub fn deinit(self: *ReadOnlyDetail, alloc: Allocator) void {
-        self.summary.deinit(alloc);
-        self.state.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-/// A bounded, independently-owned chronological slice of canonical history.
-/// The session store remains the authority; callers must deinit this page.
-pub const HistoryPage = struct {
-    session_id: []u8,
-    revision_ms: i64,
-    history_len: usize,
-    turns: []session.HistoryTurn,
-    next_cursor: ?[]u8 = null,
-
-    pub fn deinit(self: *HistoryPage, alloc: Allocator) void {
-        alloc.free(self.session_id);
-        session.freeHistoryTurnSlice(alloc, self.turns);
-        if (self.next_cursor) |cursor| alloc.free(cursor);
-        self.* = undefined;
-    }
-};
-
-/// Outcome of a migration request.
-pub const SessionMigrationStatus = enum {
-    migrated,
-    already_current,
-};
-
-/// Result of a storage-only migration, including the source it migrated from.
-pub const SessionMigrationResult = struct {
-    session_id: []u8,
-    source_schema_version: u8,
-    source_bytes: u64,
-    status: SessionMigrationStatus,
-
-    /// Frees the owned session id and poisons the value.
-    pub fn deinit(self: *SessionMigrationResult, alloc: Allocator) void {
-        alloc.free(self.session_id);
-        self.* = undefined;
-    }
 };
 
 pub const SessionRecoveryStatus = enum {
     recovered,
     recovered_with_unverified_artifacts,
-    indeterminate,
 };
 
 pub const SessionRecoveryResult = struct {
@@ -201,7 +146,9 @@ pub const SessionRecoveryResult = struct {
     recovered_session_id: []u8,
     history_len: usize,
     status: SessionRecoveryStatus = .recovered,
-    usage_incomplete: bool = false,
+    /// The source's saved permission rules could not be read, so the copy
+    /// has none (D72).
+    permission_rules_dropped: bool = false,
 
     pub fn deinit(self: *SessionRecoveryResult, alloc: Allocator) void {
         alloc.free(self.source_session_id);
@@ -209,70 +156,6 @@ pub const SessionRecoveryResult = struct {
         self.* = undefined;
     }
 };
-
-/// One class of integrity problem `doctor` can report for a session.
-pub const DoctorIssueKind = enum {
-    authority_less_creation_orphan,
-    authority_transition_pending,
-    invalid_authority_transition,
-    missing_authority,
-    invalid_authority,
-    commit_intent_pending,
-    invalid_commit_intent,
-    oversized_legacy_snapshot,
-    projection_missing,
-    projection_invalid,
-    projection_stale,
-    commit_watermark_missing,
-    commit_watermark_invalid,
-    commit_watermark_mismatched,
-    canonical_state_invalid,
-    canonical_log_large,
-    canonical_log_compaction_overdue,
-    canonical_log_compaction_failed,
-    cleanup_candidate,
-    unsafe_path,
-};
-
-/// A single `doctor` finding. `bytes`/`growth_*` carry sizes for the size- and
-/// growth-based kinds and are null otherwise. Owns `session_id`.
-pub const DoctorDiagnostic = struct {
-    session_id: []u8,
-    kind: DoctorIssueKind,
-    bytes: ?u64 = null,
-    growth_bytes: ?u64 = null,
-    growth_frames: ?u64 = null,
-
-    /// Frees the owned session id and poisons the value.
-    pub fn deinit(self: *DoctorDiagnostic, alloc: Allocator) void {
-        alloc.free(self.session_id);
-        self.* = undefined;
-    }
-};
-
-/// Bounded `doctor` inspection output. Owns `diagnostics`; caller frees with
-/// `deinit`, or moves the list out with `takeDiagnostics`.
-pub const DoctorInspectionResult = struct {
-    diagnostics: std.ArrayList(DoctorDiagnostic) = .empty,
-    inspected_count: usize = 0,
-    truncated: bool = false,
-
-    pub fn deinit(self: *DoctorInspectionResult, alloc: Allocator) void {
-        for (self.diagnostics.items) |*diagnostic| diagnostic.deinit(alloc);
-        self.diagnostics.deinit(alloc);
-        self.* = undefined;
-    }
-
-    pub fn takeDiagnostics(self: *DoctorInspectionResult) std.ArrayList(DoctorDiagnostic) {
-        const diagnostics = self.diagnostics;
-        self.diagnostics = .empty;
-        return diagnostics;
-    }
-};
-
-/// Thresholds that decide when committed-log growth is reported as overdue or
-/// failed compaction. Defaults match the historical behavior.
-pub const DoctorInspectionOptions = struct {};
 
 /// Copyable store state shared with discovery and migration without introducing
 /// a dependency on the `Store` facade. `canonical_root` retains value semantics.

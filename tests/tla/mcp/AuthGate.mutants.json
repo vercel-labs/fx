@@ -1,0 +1,56 @@
+[
+  {
+    "description": "A request rejected during a refresh starts a second one",
+    "old": "       ELSE IF inflight > 0\n       THEN /\\ req' = [req EXCEPT ![k].phase = \"waiting\", ![k].again = TRUE]\n            /\\ UNCHANGED <<inflight, usedRt, sends>>",
+    "new": "       ELSE IF inflight > 0\n       THEN /\\ req' = [req EXCEPT ![k].phase = \"waiting\", ![k].again = TRUE]\n            /\\ inflight' = inflight + 1 /\\ usedRt' = rt /\\ UNCHANGED sends",
+    "invariant": "SingleFlightRefresh"
+  },
+  {
+    "description": "A rotated refresh token isn't kept",
+    "old": "    /\\ rt' = IF rotate THEN gen + 1 ELSE rt\n",
+    "new": "    /\\ rt' = rt\n",
+    "invariant": "RefreshUsesLatest"
+  },
+  {
+    "description": "A rejected request goes out again with the same token",
+    "old": "       ELSE IF Token > req[k].g\n",
+    "new": "       ELSE IF Token >= req[k].g\n",
+    "invariant": "NewerOnResend"
+  },
+  {
+    "description": "A second rejection sends the request yet again",
+    "old": "    /\\ IF req[k].again\n",
+    "new": "    /\\ IF FALSE\n",
+    "invariant": "SendsBound"
+  },
+  {
+    "description": "A request close to expiry waits without starting a refresh",
+    "old": "               THEN inflight' = 1 /\\ usedRt' = rt\n",
+    "new": "               THEN UNCHANGED <<inflight, usedRt>>\n",
+    "invariant": "WaitingHasRefresh"
+  },
+  {
+    "description": "A failed refresh leaves the requests waiting",
+    "old": "!.phase = \"failed\"]",
+    "new": "!.phase = \"waiting\"]",
+    "invariant": "WaitingHasRefresh"
+  },
+  {
+    "description": "A sign-in replaces the refresh but leaves the requests waiting",
+    "old": "    /\\ inflight' = 0\n    /\\ req' = Release(\"sent\")\n    /\\ sends' = Released(\"sent\")\n    /\\ UNCHANGED <<deadRt, usedRt, rejectedG>>",
+    "new": "    /\\ inflight' = 0\n    /\\ UNCHANGED <<req, sends, deadRt, usedRt, rejectedG>>",
+    "invariant": "WaitingHasRefresh"
+  },
+  {
+    "description": "The authorization server need not answer a refresh",
+    "old": "    /\\ WF_vars(Refreshed)\n",
+    "new": "    /\\ TRUE\n",
+    "property": "EveryRequestEnds"
+  },
+  {
+    "description": "A refusal that names an error is read as a passing failure, so the tokens are kept and the dead refresh token is sent again (Slack's HTTP-200 ok:false)",
+    "old": "    /\\ held' = FALSE\n    /\\ refreshable' = FALSE\n    /\\ inflight' = 0\n    /\\ req' = [k \\in Keys |-> IF req[k].phase = \"waiting\" THEN [req[k] EXCEPT !.phase = \"needs_sign_in\"] ELSE req[k]]\n    /\\ UNCHANGED <<gen, rt, valid, serverRt, usedRt, sends, rejectedG>>",
+    "new": "    /\\ inflight' = 0\n    /\\ req' = [k \\in Keys |-> IF req[k].phase = \"waiting\" THEN [req[k] EXCEPT !.phase = \"failed\"] ELSE req[k]]\n    /\\ UNCHANGED <<gen, held, refreshable, rt, valid, serverRt, usedRt, sends, rejectedG>>",
+    "invariant": "NoDeadRefresh"
+  }
+]

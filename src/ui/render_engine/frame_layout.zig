@@ -471,7 +471,7 @@ fn layoutId(layout: FrameLayout) u64 {
     hashRect(&hasher, layout.blank_area);
     hashRect(&hasher, layout.footer_gap_area);
     hashU16(&hasher, layout.solved_frame_height);
-    hashU16(&hasher, @intFromEnum(layout.placement_policy));
+    hashU16(&hasher, @backingInt(layout.placement_policy));
     const value = hasher.final();
     return if (value == 0) 1 else value;
 }

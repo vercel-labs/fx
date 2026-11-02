@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_index = @import("../workspace/file_index.zig");
 const file_picker_path = @import("file_picker_path.zig");
 const list_window = @import("../shared/list_window.zig");
@@ -71,6 +72,9 @@ pub const Receipt = struct {
     revision: u64,
     selected: ?usize,
     window_start: usize,
+    /// File rows the frame painted. The render runtime sets it from the
+    /// committed frame.
+    visible_rows: u16 = list_window.default_max_picker_rows,
 };
 
 pub const View = struct {
@@ -99,14 +103,27 @@ pub const State = struct {
     refresh_requested: bool = false,
     trusted: bool = false,
     selection_missing: bool = false,
+    /// File rows the last acknowledged frame painted; navigation scrolls the
+    /// window the user sees.
+    visible_rows: u16 = list_window.default_max_picker_rows,
     prepared: ?Snapshot = null,
     presented: ?Snapshot = null,
+
+    pub fn initInto(self: *State) void {
+        const state_info = @typeInfo(State).@"struct";
+        inline for (state_info.field_names, state_info.field_types, state_info.field_attrs) |field_name, field_type, field_attrs| {
+            if (comptime std.mem.eql(u8, field_name, "raw_query") or
+                std.mem.eql(u8, field_name, "lookup_query")) continue;
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
+        }
+    }
 
     pub fn deinit(self: *State, alloc: std.mem.Allocator) void {
         if (self.prepared) |*value| value.deinit(alloc);
         if (self.presented) |*value| value.deinit(alloc);
-        inline for (std.meta.fields(State)) |field| {
-            @field(self.*, field.name) = field.defaultValue().?;
+        const state_info = @typeInfo(State).@"struct";
+        inline for (state_info.field_names, state_info.field_types, state_info.field_attrs) |field_name, field_type, field_attrs| {
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
         }
     }
 
@@ -228,7 +245,7 @@ pub const State = struct {
             index.* = if (delta < 0) count - 1 else 0;
             window.* = 0;
             self.selection_missing = false;
-        } else list_window.advanceSelection(index, window, count, delta);
+        } else list_window.advanceSelectionWithin(index, window, count, delta, self.visible_rows);
     }
 
     pub fn view(self: *const State, index: usize, window: usize) View {
@@ -274,6 +291,7 @@ pub const State = struct {
         self.selection_missing = self.selection_missing or (receipt.selected == null and value.items().len > 0);
         index.* = receipt.selected orelse 0;
         window.* = receipt.window_start;
+        self.visible_rows = receipt.visible_rows;
         self.trusted = true;
     }
 };
@@ -290,11 +308,45 @@ test "file completion deinit restores every defined field for reuse" {
     state.refresh_requested = true;
     state.selection_missing = true;
     state.deinit(std.testing.allocator);
-    inline for (std.meta.fields(State)) |field| {
-        if (comptime std.mem.eql(u8, field.name, "raw_query") or std.mem.eql(u8, field.name, "lookup_query")) continue;
-        try std.testing.expectEqualDeep(field.defaultValue().?, @field(state, field.name));
+    const state_info = @typeInfo(State).@"struct";
+    inline for (state_info.field_names, state_info.field_types, state_info.field_attrs) |field_name, field_type, field_attrs| {
+        if (comptime std.mem.eql(u8, field_name, "raw_query") or std.mem.eql(u8, field_name, "lookup_query")) continue;
+        try std.testing.expectEqualDeep(field_attrs.defaultValue(field_type).?, @field(state, field_name));
     }
     state.deinit(std.testing.allocator);
+}
+
+test "file picker navigation scrolls within the rows the last frame painted" {
+    const alloc = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(alloc);
+    const q = file_picker_path.query_at("@./", 3).?;
+    _ = state.reconcile(q, 1, false);
+    var items: [30]file_index.SearchResult = undefined;
+    var names: [30][16]u8 = undefined;
+    for (&items, &names, 0..) |*item, *name, i| {
+        item.* = .{ .path = try std.mem.print(name, "./{d:0>2}.txt", .{i}), .kind = .file, .matched_spans = &.{} };
+    }
+    state.stage(alloc, .{}, .ready, try Rows.copy(alloc, &items));
+    var index: usize = 0;
+    var window: usize = 0;
+    var receipt = state.view(index, window).receipt.?;
+    receipt.visible_rows = 6;
+    state.acknowledge(alloc, receipt, &index, &window);
+    for (0..7) |_| state.navigate(&index, &window, 1);
+    try std.testing.expectEqual(@as(usize, 2), window);
+    // Moving back up keeps the window until the selection reaches its top.
+    for (0..5) |_| state.navigate(&index, &window, -1);
+    try std.testing.expectEqual(@as(usize, 2), window);
+    state.navigate(&index, &window, -1);
+    try std.testing.expectEqual(@as(usize, 1), window);
+
+    receipt = state.view(index, window).receipt.?;
+    receipt.visible_rows = 10;
+    state.acknowledge(alloc, receipt, &index, &window);
+    for (0..8) |_| state.navigate(&index, &window, 1);
+    try std.testing.expectEqual(@as(usize, 9), index);
+    try std.testing.expectEqual(@as(usize, 1), window);
 }
 
 test "file picker prepared rows cannot replace presented identity before acknowledgement" {
@@ -335,7 +387,7 @@ fn checkRowsAllocationFailures(alloc: std.mem.Allocator) !void {
 }
 
 test "file picker owned rows clean partial allocations" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRowsAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkRowsAllocationFailures, .{});
 }
 
 test "file picker missing selection requires navigation and retry never acknowledges" {

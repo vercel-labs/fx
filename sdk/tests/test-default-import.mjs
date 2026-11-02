@@ -11,7 +11,7 @@ globalThis.fetch = (...args) => {
 try {
   const entry = await import(`../node.js?default-import=${Date.now()}`);
   await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.equal(typeof entry.createFxAgent, "function");
+  assert.equal(typeof entry.createFxEngine, "function");
   assert.equal(typeof entry.listModels, "function");
   assert.equal("createMcpAdapter" in entry, false);
   assert.equal("createSkillsAdapter" in entry, false);

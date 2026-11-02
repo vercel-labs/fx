@@ -1,5 +1,6 @@
 const std = @import("std");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
+const host_stream = @import("host_stream_provider.zig");
 const builtin_gateway = @import("../builtins/gateway.zig");
 
 const Allocator = std.mem.Allocator;
@@ -29,9 +30,11 @@ fn fetch(
         if (flag.load(.seq_cst)) return .{ .failure = .{ .category = .cancellation } };
     }
 
-    const url = try std.fmt.allocPrint(alloc, "{s}{s}", .{
+    const team_path = try builtin_gateway.modelCatalogTeamPath(alloc, input.endpoint, input.access);
+    defer if (team_path) |owned| alloc.free(owned);
+    const url = try alloc.print("{s}{s}", .{
         builtin_gateway.default_model_catalog_base_url,
-        input.endpoint,
+        team_path orelse input.endpoint,
     });
     defer alloc.free(url);
 
@@ -39,14 +42,14 @@ fn fetch(
     var headers: std.ArrayList(Header) = .empty;
     defer headers.deinit(alloc);
     const authorization = if (input.access.authorizationCredential()) |credential|
-        try std.fmt.allocPrint(alloc, "Bearer {s}", .{credential})
+        try alloc.print("Bearer {s}", .{credential})
     else
         null;
     defer if (authorization) |value| alloc.free(value);
     if (authorization) |value| {
         try headers.append(alloc, .{ .name = "authorization", .value = value });
     }
-    if (input.access.teamContext()) |team| {
+    if (builtin_gateway.modelCatalogHeaderTeam(input.access)) |team| {
         try headers.append(alloc, .{ .name = "x-vercel-ai-gateway-team", .value = team });
     }
 
@@ -74,8 +77,9 @@ fn fetch(
     );
     if (response_len < 0) return .{ .failure = .{ .category = .transport, .retryable = true } };
     if (response_len > response.len) return .{ .failure = .{ .category = .resource_exhausted } };
-    if (status != 200) {
-        return .{ .failure = model_catalog.failureForHttpStatus(@enumFromInt(status)) };
+    const http_status = host_stream.httpStatus(status) orelse return .{ .failure = .{ .category = .transport } };
+    if (http_status != .ok) {
+        return .{ .failure = model_catalog.failureForHttpStatus(http_status) };
     }
 
     const catalog = builtin_gateway.parseModelCatalogForView(

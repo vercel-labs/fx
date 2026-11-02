@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const diff_mod = @import("../output/diff.zig");
 const file_mutation_contract = @import("../tooling/file_mutation_contract.zig");
 const types = @import("../shared/types.zig");
@@ -810,7 +811,7 @@ test "file request rejects one byte over every owned component boundary" {
 
 test "owned permission request cleans up partial allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkOwnedRequestAllocFailures,
         .{},
     );

@@ -1,0 +1,62 @@
+[
+  {
+    "description": "The large read is claimed while another reader holds it",
+    "old": "    /\\ First(r) /\\ large = None\n    /\\ large' = r",
+    "new": "    /\\ First(r)\n    /\\ large' = r",
+    "invariant": "CountedIsLarge"
+  },
+  {
+    "description": "The large read counts a unit with no room for it",
+    "old": "    /\\ used + 1 <= Max\n    /\\ got' = [got EXCEPT ![r] = @ + 1]\n    /\\ counted' = counted + 1",
+    "new": "    /\\ got' = [got EXCEPT ![r] = @ + 1]\n    /\\ counted' = counted + 1",
+    "invariant": "Bounded"
+  },
+  {
+    "description": "A reader reads past its allowance without the large read",
+    "old": "    /\\ want[r] > 0 /\\ got[r] < want[r] /\\ got[r] < Allowance\n",
+    "new": "    /\\ want[r] > 0 /\\ got[r] < want[r]\n",
+    "invariant": "OneLargeRead"
+  },
+  {
+    "description": "A small message takes the room the large read still needs, so the large read can starve",
+    "old": "    /\\ First(r) /\\ used + want[r] + Reserve <= Max",
+    "new": "    /\\ First(r) /\\ used + want[r] <= Max",
+    "property": "EveryMessagePosted"
+  },
+  {
+    "description": "The large read is claimed out of turn, so a small message at the head can starve",
+    "old": "    /\\ First(r) /\\ large = None\n    /\\ large' = r\n    /\\ line' = Tail(line)",
+    "new": "    /\\ InLine(r) /\\ large = None\n    /\\ large' = r\n    /\\ line' = Without(line, r)",
+    "property": "EveryMessagePosted"
+  },
+  {
+    "description": "Small messages post out of turn, so one at the head can starve",
+    "old": "    /\\ First(r) /\\ used + want[r] + Reserve <= Max\n    /\\ queue' = Append(queue, want[r])\n    /\\ used' = used + want[r]\n    /\\ want' = [want EXCEPT ![r] = 0]\n    /\\ got' = [got EXCEPT ![r] = 0]\n    /\\ line' = Tail(line)",
+    "new": "    /\\ InLine(r) /\\ used + want[r] + Reserve <= Max\n    /\\ queue' = Append(queue, want[r])\n    /\\ used' = used + want[r]\n    /\\ want' = [want EXCEPT ![r] = 0]\n    /\\ got' = [got EXCEPT ![r] = 0]\n    /\\ line' = Without(line, r)",
+    "property": "EveryMessagePosted"
+  },
+  {
+    "description": "A cancelled waiter keeps its place, and everyone behind it waits for ever",
+    "old": "    /\\ line' = Without(line, r)\n    /\\ IF large = r",
+    "new": "    /\\ line' = line\n    /\\ IF large = r",
+    "invariant": "LineIsWaiters"
+  },
+  {
+    "description": "Taking a message doesn't give its bytes back",
+    "old": "    /\\ used' = used - Head(queue)\n",
+    "new": "    /\\ used' = used\n",
+    "invariant": "UsedIsCounted"
+  },
+  {
+    "description": "A cancelled large read keeps what it counted",
+    "old": "            /\\ used' = used - counted\n",
+    "new": "            /\\ used' = used\n",
+    "invariant": "UsedIsCounted"
+  },
+  {
+    "description": "The large read posts without room for its allowance",
+    "old": "    /\\ used - counted + want[r] <= Max\n",
+    "new": "    /\\ TRUE\n",
+    "invariant": "Bounded"
+  }
+]

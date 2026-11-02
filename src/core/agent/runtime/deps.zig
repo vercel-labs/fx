@@ -1,8 +1,9 @@
 const std = @import("std");
+const observation = @import("observation.zig");
+const cache_warmer = @import("cache_warmer.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const auth_runtime = @import("../../auth/auth_runtime.zig");
-const session_usage = @import("../../session/session_usage.zig");
 const session_codec = @import("../../session/session_codec.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
@@ -32,10 +33,29 @@ const ToolExecutionResult = tool_contracts.ToolExecutionResult;
 const TransportPublicationOutcome = tool_contracts.TransportPublicationOutcome;
 pub const LiveToolAuthority = tool_contracts.LiveToolAuthority;
 
+/// The turn so far: the user's message and every piece completed since.
+/// Borrowed only for the call; a sink copies or serializes what it keeps.
+pub const TurnProgress = struct {
+    user: types.UserTurn,
+    execution: types.ExecutionMemory,
+    /// Tool calls the model issued that have no result yet, in their saved
+    /// form, so a crash while they run leaves them in the session (D28).
+    running_calls: []const types.ToolCall = &.{},
+    /// The text of the message that issued `running_calls`, so a crash also
+    /// leaves what fx already showed (D51).
+    running_assistant: ?[]const u8 = null,
+    /// The recovery module's record for the send this write goes before,
+    /// saved in the same write (`tests/tla/recovery/Resume.tla`).
+    recovery_record: types.RecoveryRecordWrite = .keep,
+};
+
 /// Borrows checkpoint slices only for the call. A sink must synchronously copy
 /// or serialize anything it retains, including when a save fails.
 pub const RecoveryCheckpointEffect = struct {
     set: *const fn (ctx: *anyopaque, checkpoint: session_codec.RecoveryCheckpoint) anyerror!void,
+    /// Terminally dead turns clear the durable checkpoint so a later resume
+    /// cannot resurrect a turn the product already called stopped.
+    clear: *const fn (ctx: *anyopaque) anyerror!void,
 };
 
 /// Presentation only. Called outside history publication's worker critical section.
@@ -129,9 +149,14 @@ fn localModelCapabilities(_: *anyopaque, _: Allocator, model: []const u8) !model
     return model_capabilities.capabilitiesForModel(model);
 }
 
-pub const RouteRecoveryDecision = enum {
-    disable_fast,
+/// The user's answer when the account is out of credits.
+pub const OutOfCreditsChoice = enum {
+    /// "I added credits, retry": resend the request.
+    retry,
+    /// "Switch to another model": end the turn with the prompt back in the
+    /// composer and the model picker open.
     switch_model,
+    /// "Cancel this turn", or Esc.
     cancel,
 };
 
@@ -151,17 +176,6 @@ pub const ParentTurnDeliveryAck = struct {
 pub const PreparedParentTurnContext = struct {
     content: []const u8,
     acknowledgements: []const ParentTurnDeliveryAck,
-};
-
-pub const RouteRecoveryRequest = struct {
-    selected_model: []const u8,
-    route_model: []const u8,
-    fast_mode: bool,
-    replay_safe: bool,
-    finish_reason: types.ProviderFinishReason,
-    semantic_attempts: usize,
-    unsafe_no_retry_reason: ?types.RouteRecoveryUnsafeReason = null,
-    provider_failure_detail: ?[]const u8 = null,
 };
 
 pub const CredentialRefreshMode = auth_runtime.CredentialRefreshMode;
@@ -185,6 +199,7 @@ pub const DiffMarkerStyles = struct {
 
 pub const AgentRuntimeDeps = struct {
     ctx: *anyopaque,
+    observer: ?*observation.Observer = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
     flush_assistant_stream_per_content_chunk: bool = false,
     render_assistant_text: bool = true,
@@ -210,9 +225,13 @@ pub const AgentRuntimeDeps = struct {
     prepare_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator) anyerror!?PreparedParentTurnContext = null,
     acknowledge_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator, acknowledgements: []const ParentTurnDeliveryAck) void = null,
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
-    append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
+    append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
     validate_tool_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!ToolCallValidationResult = null,
     snapshot_mcp_definition: ?*const fn (*anyopaque, Allocator, []const u8, types.McpToolBinding) anyerror!@import("../../tooling/tool_mcp_runtime.zig").DefinitionSnapshot = null,
+    /// Resolves a model call naming a live MCP tool that this step did not
+    /// advertise. A returned definition is advertised before admission, so
+    /// the call runs under the normal MCP validation and permission path.
+    resolve_unselected_mcp_tool: ?*const fn (ctx: *anyopaque, arena: Allocator, name: []const u8) anyerror!?@import("../../tooling/tool_mcp_runtime.zig").SelectedTool = null,
     prepare_skill_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, locations: ?*const skill_contract.Locations) anyerror!skill_contract.CallPreparation = null,
     check_tool_availability: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!?[]const u8 = null,
     request_tool_permission: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?LiveToolAuthority, revalidation: ?tool_contracts.LivePermissionRevalidation, advertised_dynamic_tool_names: []const []const u8, mcp_review_schema_json: ?[]const u8) anyerror!command_admission.PermissionOutcome,
@@ -222,6 +241,7 @@ pub const AgentRuntimeDeps = struct {
     describe_tool_action: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
     describe_tool_action_completed: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
     describe_tool_action_denied: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, label: []const u8, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
+    subagent_status_renderer: ?types.SubagentStatusRenderer = null,
     permission_target_for_call: *const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, advertised_dynamic_tool_names: []const []const u8) anyerror![]const u8,
     execute_tool_call: *const fn (ctx: *anyopaque, request: ToolExecutionRequest) anyerror!ToolExecutionResult,
     publish_committed_file_handoff: *const fn (ctx: *anyopaque, handoff: file_mutation.CommittedFileHandoff) tool_contracts.SecondaryPublicationReport,
@@ -232,6 +252,35 @@ pub const AgentRuntimeDeps = struct {
     /// Call-scoped output for the exact error returned through compaction, never retained.
     compaction_failure: ?*?compaction_activity.ErrorProvenance = null,
     recovery_checkpoint: ?RecoveryCheckpointEffect = null,
+    /// Called at every model-request boundary with the turn so far, so each
+    /// completed piece is saved as it happens rather than at the turn's end.
+    append_turn_piece: ?*const fn (ctx: *anyopaque, progress: TurnProgress) anyerror!void = null,
+    /// Saves or clears the recovery module's record in the open turn outside
+    /// the writes before and after each send, which carry it in
+    /// `TurnProgress.recovery_record`. Returns false when the turn has no
+    /// pieces on disk yet. Null on hosts that never resume a request, which
+    /// keep no record.
+    save_recovery_record: ?*const fn (ctx: *anyopaque, record: types.RecoveryRecordWrite) anyerror!bool = null,
+    /// Called once with each main-model completion's provider usage, as soon
+    /// as it arrives, so a saved session keeps the usage of every reply even
+    /// when the turn never ends. A failure is traced and never fails the turn.
+    record_usage: ?*const fn (ctx: *anyopaque, usage: types.Usage) anyerror!void = null,
+    /// Keeps the conversation's Claude prompt cache warm between requests.
+    /// Owned by the conversation's `SessionRuntime`; null where no one waits
+    /// on the conversation, as in `fx ask` and subagents.
+    cache_warmer: ?*cache_warmer.Warmer = null,
+    /// Saves the turn's prompt images in the session before its first
+    /// request is built, so the note naming each saved file is true when
+    /// that request is sent (D89). It sets `blob_path`, allocated with
+    /// `alloc`, which owns `images`, on each image it saves and clears its
+    /// `inline_data`, so the turn holds only the handle; those bytes stay
+    /// the caller's. An image the session cannot save keeps its bytes
+    /// inline and gets no path.
+    save_prompt_images: ?*const fn (ctx: *anyopaque, alloc: Allocator, images: []types.ImageAttachment) anyerror!void = null,
+    /// Confirms, without writing, that this process still owns the saved
+    /// session after a main-model completion and before its tool calls run.
+    /// Another process may have taken the session over.
+    confirm_session_writer: ?*const fn (ctx: *anyopaque) anyerror!void = null,
     propagate_grant: *const fn (ctx: *anyopaque, tool_name: []const u8, target_path: []const u8) anyerror!void,
     push_event: *const fn (ctx: *anyopaque, event: WorkerEvent) anyerror!void,
     push_text: *const fn (ctx: *anyopaque, emission: TextEmission) anyerror!void,
@@ -244,10 +293,19 @@ pub const AgentRuntimeDeps = struct {
     /// host provides one; ordinary system notices remain unaffected.
     push_context_notice: ?*const fn (ctx: *anyopaque, text: []const u8) anyerror!void = null,
     push_route_recovery_status: *const fn (ctx: *anyopaque, status: types.RouteRecoveryStatus) anyerror!void = discardRouteRecoveryStatus,
+    /// A new model request starts. A host that reports the last request's
+    /// recovery, as `fx ask --json` does, forgets the previous request's
+    /// here. Null: the host keeps no per-request report.
+    begin_route_recovery_request: ?*const fn (ctx: *anyopaque) void = null,
+    /// A turn that can never recover hands the user's prompt back to the
+    /// composer so nothing typed is lost. Null: host keeps the prompt as-is.
+    restore_failed_prompt: ?*const fn (ctx: *anyopaque, prompt: []const u8) anyerror!void = null,
     push_command_output_complete: *const fn (ctx: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) anyerror!void,
     push_http_error: *const fn (ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) anyerror!void,
     refresh_gateway_credential: ?*const fn (ctx: *anyopaque, alloc: Allocator, source: types.CredentialSource, mode: CredentialRefreshMode, expected_account_id: ?[]const u8) anyerror!?[]u8 = null,
-    request_route_recovery: ?*const fn (ctx: *anyopaque, arena: Allocator, request: RouteRecoveryRequest) anyerror!RouteRecoveryDecision = null,
+    /// Asks the user what to do when the account is out of credits, and
+    /// blocks until they answer. Only the TUI sets it.
+    ask_out_of_credits: ?*const fn (ctx: *anyopaque) anyerror!OutOfCreditsChoice = null,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
     resolve_model_capabilities: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities = localModelCapabilities,
     /// Reports that the model catalog is known to be failed or unreachable, so
@@ -256,10 +314,13 @@ pub const AgentRuntimeDeps = struct {
     model_catalog_unavailable: ?*const fn (ctx: *anyopaque) bool = null,
     format_tool_execution_error: *const fn (ctx: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) anyerror![]const u8,
     record_tool_call_rejected: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, model_output: []const u8, command_result_json: ?[]const u8) anyerror!void = null,
+    /// Records a call that reached the tool's own preflight/content checks and
+    /// failed them (never denied, never fully executed its effect). Kept
+    /// distinct from record_tool_call_rejected so diagnostics do not report
+    /// content failures as permission rejections.
+    record_tool_call_failed: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, model_output: []const u8, command_result_json: ?[]const u8) anyerror!void = null,
     report_usage: ?*const fn (ctx: *anyopaque, usage: types.Usage) void = null,
     report_inner_tool_usage: ?*const fn (ctx: *anyopaque, tool_name: []const u8, usage: types.ToolUsage) void = null,
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: Allocator = std.heap.c_allocator,
     // Accent for the +N / -N counts in a committed file's status line.
     // Captured by value at construction; that is safe only while the marker
     // colors never change after startup (they are theme-independent).
@@ -268,6 +329,27 @@ pub const AgentRuntimeDeps = struct {
     pub fn pushContextNotice(self: *const AgentRuntimeDeps, text: []const u8) !void {
         if (self.push_context_notice) |push| return push(self.ctx, text);
         return self.push_system_notice(self.ctx, text);
+    }
+
+    pub fn executeToolCall(self: *const AgentRuntimeDeps, request: ToolExecutionRequest) !ToolExecutionResult {
+        if (self.observer) |observer| observer.emit(.{ .tool_start = .{ .call = request.call } });
+        var observed_request = request;
+        observed_request.observer = self.observer orelse request.observer;
+        const result = self.execute_tool_call(self.ctx, observed_request) catch |err| {
+            if (self.observer) |observer| observer.emit(.{ .tool_end = .{
+                .call = request.call,
+                .status = if (err == error.Cancelled) "cancelled" else "failure",
+                .error_name = @errorName(err),
+            } });
+            return err;
+        };
+        if (self.observer) |observer| observer.emit(.{ .tool_end = .{
+            .call = request.call,
+            .output = result.model_output,
+            .status = if (result.cancelled) "cancelled" else @tagName(result.status),
+            .usage = result.inner_usage,
+        } });
+        return result;
     }
 };
 

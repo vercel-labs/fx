@@ -1,10 +1,14 @@
-import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const protocolVersion = "2026-07-28";
 const wireLogPath = process.env.FX_MCP_WIRE_LOG;
 const pidPath = process.env.FX_MCP_PID_PATH;
-const resultText = process.env.FX_MCP_RESULT_TEXT ?? "MODERN_MCP_TOOL_RESULT";
+// FX_MCP_RESULT_PAD_BYTES puts that many bytes before the result text, for
+// results too large to pass through the environment.
+const resultText = "p".repeat(Number(process.env.FX_MCP_RESULT_PAD_BYTES ?? "0")) +
+  (process.env.FX_MCP_RESULT_TEXT ?? "MODERN_MCP_TOOL_RESULT");
 const mode = process.env.FX_MCP_MODE ?? "normal";
+const imagePath = process.env.FX_MCP_IMAGE_PATH;
 const crashMarkerPath = process.env.FX_MCP_CRASH_MARKER;
 const recoveryFailureMarkerPath = crashMarkerPath
   ? `${crashMarkerPath}.recovery-failed`
@@ -23,6 +27,7 @@ const catalogDelayMs = Math.max(
   0,
   Number(process.env.FX_MCP_CATALOG_DELAY_MS ?? "0") || 0,
 );
+const compactField = process.env.FX_MCP_COMPACT_FIELD ? JSON.parse(process.env.FX_MCP_COMPACT_FIELD) : null;
 const elicitationUrl = process.env.FX_MCP_ELICITATION_URL ?? "https://example.test/connect";
 const collidingChoices = [
   { const: "Skip", title: "Skip" },
@@ -40,6 +45,13 @@ const stalledRequestIds = new Set();
 let buffer = Buffer.alloc(0);
 
 if (pidPath) writeFileSync(pidPath, String(process.pid));
+// Some servers keep running after their input closes, or ignore SIGTERM.
+if (process.env.FX_MCP_IGNORE_EOF === "1") setInterval(() => {}, 1 << 30);
+if (process.env.FX_MCP_IGNORE_TERM === "1") process.on("SIGTERM", () => {});
+const eofPath = process.env.FX_MCP_EOF_PATH;
+// A server slow to start: its first answer comes this late.
+const discoverDelayMs = Number(process.env.FX_MCP_DISCOVER_DELAY_MS ?? "0") || 0;
+if (eofPath) process.stdin.on("end", () => appendFileSync(eofPath, `${process.pid}\n`));
 if (environmentCapturePath) {
   writeFileSync(environmentCapturePath, JSON.stringify({
     configured: process.env.FX_MCP_ENV_SENTINEL,
@@ -48,6 +60,9 @@ if (environmentCapturePath) {
     home: process.env.HOME,
     httpsProxy: process.env.HTTPS_PROXY,
   }));
+}
+if (process.env.FX_MCP_ENV_NAMES_CAPTURE) {
+  writeFileSync(process.env.FX_MCP_ENV_NAMES_CAPTURE, JSON.stringify(Object.keys(process.env).sort()));
 }
 if (stallRecovery) setInterval(() => {}, 1000);
 
@@ -72,22 +87,31 @@ function log(message) {
   }
 }
 
-function hasModernMetadata(message) {
-  const meta = message.params?._meta;
-  const capabilities = meta?.["io.modelcontextprotocol/clientCapabilities"];
-  const advertiseElicitation = ["tools/call", "resources/read", "prompts/get"]
-    .includes(message.method);
-  const expectedCapabilities = advertiseElicitation && expectedElicitation === "form"
+// Requests that can elicit carry exactly the declared capabilities; any other
+// request carries none or the same ones, as the spec allows.
+function elicitationCapabilities() {
+  return expectedElicitation === "form"
     ? { elicitation: { form: {} } }
-    : advertiseElicitation && expectedElicitation === "url"
+    : expectedElicitation === "url"
       ? { elicitation: { url: {} } }
-      : advertiseElicitation && expectedElicitation === "both"
+      : expectedElicitation === "both"
         ? { elicitation: { form: {}, url: {} } }
         : {};
+}
+
+function hasModernMetadata(message) {
+  const meta = message.params?._meta;
+  const capabilities = JSON.stringify(meta?.["io.modelcontextprotocol/clientCapabilities"]);
+  const advertiseElicitation = ["tools/call", "resources/read", "prompts/get"]
+    .includes(message.method);
+  const declared = JSON.stringify(elicitationCapabilities());
+  const capabilitiesMatch = advertiseElicitation
+    ? capabilities === declared
+    : capabilities === "{}" || capabilities === declared;
   return meta?.["io.modelcontextprotocol/protocolVersion"] === protocolVersion &&
     meta?.["io.modelcontextprotocol/clientInfo"]?.name === "fx" &&
     typeof meta?.["io.modelcontextprotocol/clientInfo"]?.version === "string" &&
-    JSON.stringify(capabilities) === JSON.stringify(expectedCapabilities);
+    capabilitiesMatch;
 }
 
 function invalidMetadata(message) {
@@ -165,6 +189,11 @@ function handle(message) {
   }
 
   if (message.method === "server/discover") {
+    // Answer with output fx must reject; the process itself stays up.
+    if (mode === "startup_garbage") {
+      process.stdout.write("Server started on stdio\n");
+      return;
+    }
     if (
       mode === "crash_then_fail_recovery_once" &&
       recoveryGeneration &&
@@ -214,6 +243,8 @@ function handle(message) {
       }, 5);
     } else if (mode === "crash_once_new_tool" && recoveryGeneration) {
       setTimeout(() => send(response), 150);
+    } else if (discoverDelayMs > 0) {
+      setTimeout(() => sendDiscoverResponse(response), discoverDelayMs);
     } else {
       sendDiscoverResponse(response);
     }
@@ -476,7 +507,8 @@ function handle(message) {
         id: message.id,
         error: {
           code: -32603,
-          message: "Prompt request rejected by fixture",
+          message: process.env.FX_MCP_PROTOCOL_ERROR_MESSAGE ??
+            "Prompt request rejected by fixture",
           data: { method: message.method, retryable: false },
         },
       });
@@ -560,7 +592,9 @@ function handle(message) {
           content: [{
             type: "image",
             mimeType: "image/png",
-            data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=",
+            data: imagePath
+              ? readFileSync(imagePath).toString("base64")
+              : "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=",
           }],
         },
       });
@@ -575,13 +609,26 @@ function handle(message) {
           isError: true,
           content: [{
             type: "text",
-            text: "Invalid input: labels require at least one item",
+            text: "Invalid input: labels require at least one item\nretry rejected",
           }],
         },
       });
       return;
     }
     if (mode === "crash_always") process.exit(42);
+    if (mode === "exit_after_result") {
+      // Answer, then exit so the next call finds the connection already closed.
+      const result = {
+        jsonrpc: "2.0",
+        id: message.id,
+        result: {
+          resultType: "complete",
+          content: [{ type: "text", text: `${resultText}:${message.params?.arguments?.text ?? ""}` }],
+        },
+      };
+      process.stdout.write(`${JSON.stringify(result)}\n`, () => process.exit(0));
+      return;
+    }
     if (
       [
         "crash_once",
@@ -629,7 +676,10 @@ function handle(message) {
       mode === "mrtr_unsafe_form"
     ) {
       if (message.params?.inputResponses === undefined) {
-        const params = mode === "mrtr_url_required"
+        const params = compactField ? {
+          message: "Choose the next step",
+          requestedSchema: { type: "object", properties: { answer: compactField }, required: ["answer"] },
+        } : mode === "mrtr_url_required"
           ? {
               mode: "url",
               message: "Authorize in the external browser",
@@ -756,7 +806,7 @@ function handle(message) {
                 params,
               },
             },
-            requestState: { fixture: "opaque" },
+            requestState: "opaque",
           },
         });
         return;

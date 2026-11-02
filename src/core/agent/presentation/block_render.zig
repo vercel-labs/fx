@@ -84,9 +84,17 @@ fn writeQuotedBlockContent(
         try writeHeading(alloc, header.level, header.content, out, footnotes, link_id);
         return;
     }
-    if (try writeListLine(alloc, content, line_has_lf, out, footnotes, link_id)) return;
+    if (try writeListLine(alloc, content, line_has_lf, .as_written, out, footnotes, link_id)) return;
     try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(content, line_has_lf), out, false, footnotes, link_id);
 }
+
+/// How `writeListLine` draws ordered list numbers.
+pub const OrderedMarkers = enum {
+    as_written,
+    /// Padded by `orderedMarkerPad`. The caller moves the lines nested in
+    /// the item by the same amount.
+    right_aligned,
+};
 
 /// Renders an unordered, ordered, or task list line without a trailing
 /// newline. Returns false when `line` is not a list item.
@@ -94,6 +102,7 @@ pub fn writeListLine(
     alloc: Allocator,
     line: []const u8,
     line_has_lf: bool,
+    ordered_markers: OrderedMarkers,
     out: *std.ArrayList(u8),
     footnotes: ?*const payload.FootnoteSink,
     link_id: *u32,
@@ -111,6 +120,7 @@ pub fn writeListLine(
     }
     if (bp.parseOrderedList(line)) |parsed| {
         try out.appendSlice(alloc, parsed.indent);
+        if (ordered_markers == .right_aligned) try out.appendNTimes(alloc, ' ', orderedMarkerPad(parsed.marker));
         try ansi.writeDim(alloc, out, parsed.marker);
         try out.append(alloc, ' ');
         if (bp.parseTaskListItem(parsed.content)) |task| {
@@ -122,6 +132,16 @@ pub fn writeListLine(
         return true;
     }
     return false;
+}
+
+/// Ordered list numbers are right-aligned in this many columns, so the
+/// markers of items 1 through 999 end in the same column.
+const ordered_number_columns = 3;
+
+/// Returns the spaces that right-align the number of `marker`, such as `1.`
+/// or `12)`. A number wider than `ordered_number_columns` gets none.
+pub fn orderedMarkerPad(marker: []const u8) usize {
+    return ordered_number_columns -| (marker.len - 1);
 }
 
 pub fn writeDefinitionLine(
@@ -201,7 +221,7 @@ fn parseAndRenderRows(
     var line_idx: usize = 0;
     var start: usize = 0;
     while (start < buf.len) {
-        const end = std.mem.indexOfScalarPos(u8, buf, start, '\n') orelse buf.len;
+        const end = std.mem.findScalarPos(u8, buf, start, '\n') orelse buf.len;
         defer {
             line_idx += 1;
             start = end + 1;
@@ -316,7 +336,7 @@ fn writeTableRow(
 pub fn writeTableHeaderCell(alloc: Allocator, out: *std.ArrayList(u8), cell: []const u8) !void {
     try out.appendSlice(alloc, ansi.bold_open);
     var remaining = cell;
-    while (std.mem.indexOf(u8, remaining, ansi.bold_close)) |close_index| {
+    while (std.mem.find(u8, remaining, ansi.bold_close)) |close_index| {
         try out.appendSlice(alloc, remaining[0..close_index]);
         try out.appendSlice(alloc, ansi.bold_close);
         try out.appendSlice(alloc, ansi.bold_open);
@@ -435,7 +455,7 @@ pub fn parseTablePayloadWithFootnotes(
     var line_idx: usize = 0;
     var start: usize = 0;
     while (start < buf.len) {
-        const end = std.mem.indexOfScalarPos(u8, buf, start, '\n') orelse buf.len;
+        const end = std.mem.findScalarPos(u8, buf, start, '\n') orelse buf.len;
         defer {
             line_idx += 1;
             start = end + 1;
@@ -493,7 +513,7 @@ fn deinitRenderedRow(alloc: Allocator, row: *RenderedRow) void {
 
 pub fn writeFootnoteDefinitionMarker(alloc: Allocator, out: *std.ArrayList(u8), number: usize) !void {
     var marker: [32]u8 = undefined;
-    const bytes = try std.fmt.bufPrint(&marker, "[{d}] ", .{number});
+    const bytes = try std.mem.print(&marker, "[{d}] ", .{number});
     try ansi.writeDim(alloc, out, bytes);
 }
 
@@ -508,11 +528,11 @@ pub fn writeFootnoteBody(
     var start: usize = 0;
     var is_first = true;
     while (start <= body.len) {
-        const end = std.mem.indexOfScalarPos(u8, body, start, '\n') orelse body.len;
+        const end = std.mem.findScalarPos(u8, body, start, '\n') orelse body.len;
         if (!is_first) {
             try out.append(alloc, '\n');
             var marker: [32]u8 = undefined;
-            const marker_bytes = try std.fmt.bufPrint(&marker, "[{d}] ", .{number});
+            const marker_bytes = try std.mem.print(&marker, "[{d}] ", .{number});
             @memset(marker[0..marker_bytes.len], ' ');
             try ansi.writeDim(alloc, out, marker[0..marker_bytes.len]);
         }
@@ -531,7 +551,7 @@ pub fn renderCodeBlockPayload(
 ) !void {
     var start: usize = 0;
     while (start < block.code.len) {
-        const end = std.mem.indexOfScalarPos(u8, block.code, start, '\n') orelse block.code.len;
+        const end = std.mem.findScalarPos(u8, block.code, start, '\n') orelse block.code.len;
         try ansi.writeDim(alloc, out, ansi.vertical_rule_prefix);
         try out.appendSlice(alloc, block.code[start..end]);
         try out.append(alloc, '\n');

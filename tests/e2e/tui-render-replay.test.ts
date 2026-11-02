@@ -67,7 +67,7 @@ async function launch(options: {
   );
 
   const s = await TmuxSession.create({
-    cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_SKIP_ONBOARDING=1 ${FX_BIN}`,
+    cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_TEST_SKIP_ONBOARDING=1 ${FX_BIN}`,
     cwd: workDir,
     width: 88,
     height: 30,
@@ -114,7 +114,7 @@ async function launchAutomaticRecording(options: {
   const goldenPath = join(workDir, "grid.txt");
   const tracePath = join(workDir, "trace.log");
   const s = await TmuxSession.create({
-    cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_SKIP_ONBOARDING=1 ${FX_BIN}`,
+    cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_TEST_SKIP_ONBOARDING=1 ${FX_BIN}`,
     cwd: workDir,
     width: 180,
     height: 36,
@@ -373,8 +373,8 @@ describe("tui: render record/replay", () => {
       await session.sendText(marker);
       await session.waitForText("fx needs access to Vercel AI Gateway", 5_000);
       await session.sendKeys("C-u");
-      await session.sendText("/status");
-      await session.waitForText("permission_mode", 5_000);
+      await session.sendText("/allowlist");
+      await session.waitForText("* allowlist: effective", 5_000);
       await session.sendKeys("-l 'replay_input_tail_visible'");
       await session.waitForText(inputTail, 5_000);
       await session.resizeWindow(64, 24);
@@ -515,8 +515,8 @@ describe("tui: render record/replay", () => {
       await session.waitForText("fx needs access to Vercel AI Gateway", 5_000);
       await session.resizeWindow(72, 24);
       await session.sendKeys("C-u");
-      await session.sendText("/status");
-      await session.waitForText("permission_mode", 5_000);
+      await session.sendText("/allowlist");
+      await session.waitForText("* allowlist: effective", 5_000);
       const trace = await waitForTrace(
         launched.tracePath,
         (text) =>

@@ -1,0 +1,16 @@
+[
+  {
+    "module": "PR1081Subagents",
+    "description": "Child selects v1 despite a v2 parent",
+    "old": "childBackend' = [childBackend EXCEPT ![c] = backend]",
+    "new": "childBackend' = [childBackend EXCEPT ![c] = \"v1\"]",
+    "invariant": "OneBackend"
+  },
+  {
+    "module": "PR1081Subagents",
+    "description": "Repair marks a logged child lost",
+    "old": "THEN IF hasLog[c] THEN \"interrupted\" ELSE \"lost\" ELSE stage[c]",
+    "new": "THEN \"lost\" ELSE stage[c]",
+    "invariant": "LostOnlyWithoutLog"
+  }
+]

@@ -3,7 +3,7 @@ import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent, supportsJspi } from "../node.js";
+import { createFxEngine, supportsJspi } from "../node.js";
 
 const backend = process.argv[2] || "native";
 if (!new Set(["native", "wasm"]).has(backend)) {
@@ -24,17 +24,22 @@ const fetchOnceThenSucceed = async (_url, init) => {
   assert.equal(init.method, "POST");
   fetchCalls += 1;
   if (fetchCalls === 1) throw new TypeError("injected host transport failure");
+  const chunks = [
+    encoded.encode('data: {"type":"text-delta","delta":"recovered once"}\n\n'),
+    encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n\n'),
+    encoded.encode("data: [DONE]\n\n"),
+  ];
+  let chunkIndex = 0;
   return new Response(new ReadableStream({
-    start(controller) {
-      controller.enqueue(encoded.encode('data: {"type":"text-delta","delta":"recovered once"}\n\n'));
-      controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n\n'));
-      controller.enqueue(encoded.encode("data: [DONE]\n\n"));
-      controller.close();
+    async pull(controller) {
+      if (chunkIndex > 0) await new Promise((resolveWait) => setTimeout(resolveWait, 300));
+      controller.enqueue(chunks[chunkIndex++]);
+      if (chunkIndex === chunks.length) controller.close();
     },
   }), { status: 200, headers: { "content-type": "text/event-stream" } });
 };
 
-const agent = await createFxAgent({
+const agent = await createFxEngine({
   backend,
   nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
   ...(backend === "wasm"
@@ -69,6 +74,10 @@ try {
     events.filter((event) => event.type === "transport.response").map((event) => [event.attempt, event.status]),
     [[1, 200], [3, 200]],
   );
+  const activity = events.filter((event) => event.type === "transport.activity" && event.attempt === 3);
+  assert.ok(activity.length >= 2, "streaming model response chunks must produce periodic liveness events");
+  assert.ok(activity.every((event) => event.chunkBytes > 0));
+  assert.ok(activity.at(-1).totalBytes > activity[0].totalBytes, "liveness byte counts must be cumulative per attempt");
   console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Agent transport retry passed`);
 } finally {
   await agent.close();
@@ -78,7 +87,7 @@ const cancelEvents = [];
 let cancelFetchCalls = 0;
 let fetchStartedResolve;
 const fetchStarted = new Promise((resolveStarted) => { fetchStartedResolve = resolveStarted; });
-const cancelledAgent = await createFxAgent({
+const cancelledAgent = await createFxEngine({
   backend,
   nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
   ...(backend === "wasm"
@@ -118,7 +127,7 @@ console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Agent cancellat
 const retryBoundaryEvents = [];
 const retryBoundaryController = new AbortController();
 let retryBoundaryFetchCalls = 0;
-const retryBoundaryAgent = await createFxAgent({
+const retryBoundaryAgent = await createFxEngine({
   backend,
   nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
   ...(backend === "wasm"

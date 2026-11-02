@@ -40,8 +40,9 @@ const Scenario = enum {
     edge,
 
     fn parse(value: []const u8) !Scenario {
-        inline for (std.meta.fields(Scenario)) |field| {
-            if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+        const scenario_info = @typeInfo(Scenario).@"enum";
+        inline for (scenario_info.field_names, scenario_info.field_values) |field_name, field_value| {
+            if (std.mem.eql(u8, value, field_name)) return @fromBackingInt(@intCast(field_value));
         }
         return error.InvalidScenario;
     }

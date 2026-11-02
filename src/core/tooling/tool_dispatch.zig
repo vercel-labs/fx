@@ -1,4 +1,6 @@
 const std = @import("std");
+const observation = @import("../agent/runtime/observation.zig");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const core_permissions = @import("../permissions/permissions.zig");
@@ -166,9 +168,12 @@ pub const ToolResult = union(enum) {
 
 pub const ModelContentKind = enum { ordinary, complete_skill };
 
+/// Arguments: context, allocator, tool name, the model's call id, arguments
+/// JSON, result limit, and cancel flag.
 pub const HostToolProviderFn = *const fn (
     *anyopaque,
     Allocator,
+    []const u8,
     []const u8,
     []const u8,
     usize,
@@ -183,6 +188,7 @@ pub const HostToolProvider = struct {
         self: HostToolProvider,
         alloc: Allocator,
         name: []const u8,
+        call_id: []const u8,
         arguments_json: []const u8,
         max_result_bytes: usize,
         cancel_flag: ?*std.atomic.Value(bool),
@@ -191,6 +197,7 @@ pub const HostToolProvider = struct {
             self.context,
             alloc,
             name,
+            call_id,
             arguments_json,
             max_result_bytes,
             cancel_flag,
@@ -277,6 +284,10 @@ pub const DispatchContext = struct {
     terminal_owner_session_id: ?[]const u8 = null,
     terminal_transport_role: terminal_contracts.TransportRole = .interactive,
     lifecycle_allocator: Allocator = std.heap.c_allocator,
+    /// Thread-safe allocator whose frees return memory, for work that must not
+    /// outlive one call, such as a workspace scan. `allocator` is often the
+    /// turn's arena, which keeps everything until the turn ends.
+    scratch_allocator: Allocator = std.heap.c_allocator,
     command_timeout_ms: ?usize = null,
     captured_command_host: command_environment.Host = .native,
     run_command_backend: ?RunCommandBackend = null,
@@ -284,6 +295,7 @@ pub const DispatchContext = struct {
     vision_provider: ?VisionProvider = null,
     host_tool_provider: ?HostToolProvider = null,
     ask_question_ctx: ?*anyopaque = null,
+    observer: ?*observation.Observer = null,
     ask_question_batch: ?AskQuestionBatchFn = null,
     tool_capabilities: ToolCapabilities = .{},
     web_fetch_runtime: ?*web_fetch_runtime.Runtime = null,
@@ -300,7 +312,6 @@ pub const DispatchContext = struct {
     mcp_call_tool: ?tool_mcp_runtime.CallToolFn = null,
     mcp_search_tools: ?tool_mcp_runtime.SearchToolsFn = null,
     mcp_tool_schema: ?tool_mcp_runtime.ToolSchemaFn = null,
-    mcp_call_feature: ?tool_mcp_runtime.FeatureCallFn = null,
     mcp_access: tool_mcp_runtime.Access = .unrestricted,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
     mcp_call_options: tool_mcp_runtime.CallOptions = .{},
@@ -338,22 +349,6 @@ pub const ValidateFn = *const fn (DispatchContext, ToolInput) DispatchError!?[]u
 
 /// Function pointer that executes a validated and allowed tool input.
 pub const CallFn = *const fn (DispatchContext, ToolInput) DispatchError!ToolResult;
-
-/// Optional Core adapter selected by a registered tool descriptor when the
-/// ordinary decode/validate/call path needs a focused lifecycle wrapper.
-pub const AuthorizedCallAdapterFn = *const fn (
-    DispatchContext,
-    Registry,
-    message.ToolCall,
-) DispatchError!AuthorizedDispatchResult;
-
-/// Optional Core mapper selected by a registered tool descriptor after an
-/// authorized call has produced its structured dispatch result.
-pub const AuthorizedResultMapperFn = *const fn (
-    Allocator,
-    AuthorizedDispatchResult,
-    *?[]u8,
-) Allocator.Error!AuthorizedDispatchResult;
 
 pub const RunCommandCompatibility = struct {
     matches: *const fn ([]const u8) bool,
@@ -421,7 +416,6 @@ pub const ExecutorKind = enum {
     subagent,
     capability_search,
     mcp_select_tool,
-    mcp_features,
     ask_user_question,
     vision,
     host,
@@ -441,6 +435,9 @@ pub const RuntimeProviderKind = enum {
 };
 
 pub const CapturedCommandFn = *const fn (ToolInput) bool;
+/// Names the action a model call without one means, or null when it is not
+/// exactly one. See `Tool.infer_action_fn`.
+pub const InferActionFn = *const fn (std.json.ObjectMap) ?[]const u8;
 pub const ProcessLocalFn = *const fn (ToolInput) bool;
 
 pub const CallPresentation = struct {
@@ -461,11 +458,24 @@ pub const Tool = struct {
     description: []const u8,
     model_schema: model_tool_schema.FunctionSchema,
     model_visible: bool = true,
+    /// fx's own discovery or bookkeeping step rather than work the user asked
+    /// for. Hosts may hide these calls.
+    internal: bool = false,
     write_provider_advertisement_fn: ?WriteProviderAdvertisementFn = null,
     /// Set when the provider runs the tool instead of fx dispatch. Such a tool
     /// never reaches a call-time permission check, so advertisement is its only
     /// enforcement point and requires an already-settled allow.
     provider_executed: bool = false,
+    /// A host tool whose calls may run beside neighboring calls of other such
+    /// tools. A host tool that declares `writes`, or that is not idempotent
+    /// and does not declare `writes: false`, leaves it unset and runs alone.
+    /// Concurrency never changes a call's permission review.
+    host_concurrent: bool = false,
+    /// A host tool the host declares idempotent: running a call again has
+    /// the effect of running it once. A journaled session starts a call of
+    /// such a tool that is also concurrent without waiting for its intent to
+    /// be stored.
+    host_idempotent: bool = false,
     executor_kind: ExecutorKind = .read_file,
     activity_kind: core_types.ToolActivityKind = .read,
     requires_approval: bool = false,
@@ -483,9 +493,11 @@ pub const Tool = struct {
     captured_command_host: command_environment.Host = .native,
     captured_command_action: ?[]const u8 = null,
     captured_command_fn: ?CapturedCommandFn = null,
+    /// The orchestrator adds the inferred action to a model call that leaves
+    /// it out before the call is stored or admitted, so admission and decode
+    /// read the same arguments.
+    infer_action_fn: ?InferActionFn = null,
     process_local_fn: ?ProcessLocalFn = null,
-    authorized_call_adapter: ?AuthorizedCallAdapterFn = null,
-    authorized_result_mapper: ?AuthorizedResultMapperFn = null,
     cancel_if_requested_after_call: bool = false,
     run_command_compatibility: ?RunCommandCompatibility = null,
     take_file_mutation_input_fn: ?TakeFileMutationInputFn = null,
@@ -551,12 +563,18 @@ pub fn dispatchRunCommandCompatibility(
         registry,
         request.command,
     )) orelse return null;
-    if (std.mem.indexOfAny(u8, request.command, "|;&\n") != null) return null;
+    if (std.mem.findAny(u8, request.command, "|;&\n") != null) return null;
     return try matched.compatibility.execute(ctx, request.command);
 }
 
 pub fn toolActivityKind(registry: Registry, tool_name: []const u8) core_types.ToolActivityKind {
-    return if (registry.lookup(tool_name)) |tool| tool.activity_kind else .command;
+    return if (registry.lookup(tool_name)) |tool| tool.activity_kind else unregisteredActivityKind(tool_name);
+}
+
+/// A name the registry does not hold is an MCP server's tool when it has the
+/// `mcp_` prefix every MCP tool name gets, and is otherwise treated as a command.
+fn unregisteredActivityKind(tool_name: []const u8) core_types.ToolActivityKind {
+    return if (std.mem.startsWith(u8, tool_name, "mcp_")) .mcp else .command;
 }
 
 pub fn staticPresentation(tool: Tool) CallPresentation {
@@ -597,7 +615,7 @@ pub fn toolActivityKindForCall(
     call: core_types.ToolCall,
 ) core_types.ToolActivityKind {
     const presentation = toolCallPresentation(alloc, registry, call) orelse
-        return .command;
+        return unregisteredActivityKind(call.name);
     return presentation.activity_kind;
 }
 
@@ -857,7 +875,7 @@ pub fn dispatchToolCall(ctx: DispatchContext, registry: Registry, call: message.
 
     const admission = try admitToolCall(call_ctx, registry, call);
     switch (admission) {
-        .not_registered => return failure(try std.fmt.allocPrint(call_ctx.allocator, "unknown tool: {s}", .{call.name})),
+        .not_registered => return failure(try call_ctx.allocator.print("unknown tool: {s}", .{call.name})),
         .failure => |reason| return failure(reason),
         .admitted => |admitted| {
             defer admitted.deinit();
@@ -892,32 +910,10 @@ pub fn dispatchAuthorizedToolCall(
     ctx: DispatchContext,
     registry: Registry,
     call: message.ToolCall,
-    status_detail: *?[]u8,
 ) DispatchError!AuthorizedDispatchResult {
-    const tool = registry.lookup(call.name) orelse return .{
-        .status = .failure,
-        .body = try std.fmt.allocPrint(ctx.allocator, "unknown tool: {s}", .{call.name}),
-    };
-    const result = if (tool.authorized_call_adapter) |adapter|
-        try adapter(ctx, registry, call)
-    else
-        try dispatchAuthorizedToolCallDefault(ctx, registry, call);
-    if (tool.authorized_result_mapper) |mapper| {
-        return mapper(ctx.allocator, result, status_detail) catch |err| {
-            result.deinit(ctx.allocator);
-            return err;
-        };
-    }
-    return result;
-}
-
-/// Runs the ordinary authorized decode/validate/call path without consulting a
-/// descriptor's lifecycle adapter. Focused adapters use this to wrap one call
-/// without recursively selecting themselves again.
-pub fn dispatchAuthorizedToolCallDefault(ctx: DispatchContext, registry: Registry, call: message.ToolCall) DispatchError!AuthorizedDispatchResult {
     const validated = try decodeAndValidateRegisteredToolCall(ctx, registry, call);
     switch (validated) {
-        .not_registered => return .{ .status = .failure, .body = try std.fmt.allocPrint(ctx.allocator, "unknown tool: {s}", .{call.name}) },
+        .not_registered => return .{ .status = .failure, .body = try ctx.allocator.print("unknown tool: {s}", .{call.name}) },
         .failure => |reason| return .{ .status = .failure, .body = reason },
         .input => |input| {
             defer input.value.deinit(ctx.allocator);
@@ -1395,7 +1391,7 @@ fn checkAdmitToolCallAskFailureAllocationFailures(alloc: Allocator) !void {
 
 test "admitToolCall cleans decoded input across ask failure-body allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkAdmitToolCallAskFailureAllocationFailures,
         .{},
     );
@@ -1441,7 +1437,7 @@ test "dispatchToolCall traces denied web_search query without secrets or executi
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "web-search-denied-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "web-search-denied-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { mkdtemp } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../node.js";
+import { createFxEngine } from "../node.js";
 import { createSkillsAdapter } from "../skills.js";
 import { loadSkillFile } from "../skills-node.js";
 
@@ -52,7 +52,7 @@ await new Promise((resolveListen) => gateway.listen(0, "127.0.0.1", resolveListe
 
 let agent;
 try {
-  agent = await createFxAgent({
+  agent = await createFxEngine({
     backend,
     nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
     ...(backend === "wasm" ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")) } : {}),

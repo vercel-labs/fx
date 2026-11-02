@@ -176,14 +176,14 @@ fn configureAutomatic(
     fx_version: []const u8,
     show_inline_notice: bool,
 ) !void {
-    const home = if (io_mod.getenv("HOME")) |value| blk: {
+    const home = if (io_mod.homeDir()) |value| blk: {
         const trimmed = std.mem.trim(u8, value, " \t\r\n");
         break :blk if (trimmed.len > 0) trimmed else null;
     } else null;
     const root = if (home) |value|
         try profile_paths.recordingsDir(alloc, value)
     else
-        try std.fs.path.join(alloc, &.{ io_mod.getenv("TMPDIR") orelse "/tmp", "fx-recordings" });
+        try std.Io.Dir.path.join(alloc, &.{ io_mod.getenv("TMPDIR") orelse "/tmp", "fx-recordings" });
     defer alloc.free(root);
     try io_mod.makeDirRecursive(root);
 
@@ -192,7 +192,7 @@ fn configureAutomatic(
         var random_bytes: [6]u8 = undefined;
         io_mod.getIo().random(&random_bytes);
         const random_hex = std.fmt.bytesToHex(random_bytes, .lower);
-        const path = try std.fmt.allocPrint(alloc, "{s}/fx-record-{d}-{s}.fxtape", .{ root, nowMs(), random_hex });
+        const path = try alloc.print("{s}/fx-record-{d}-{s}.fxtape", .{ root, nowMs(), random_hex });
         defer alloc.free(path);
 
         configureWithOptions(alloc, path, initial_cols, initial_rows, fx_version, true, true, show_inline_notice) catch |err| switch (err) {
@@ -247,7 +247,7 @@ fn configureWithOptions(
 
 fn openTape(path: []const u8, exclusive: bool, private: bool) !std.Io.File {
     const zio = io_mod.getIo();
-    if (std.fs.path.isAbsolute(path)) {
+    if (std.Io.Dir.path.isAbsolute(path)) {
         if (private) {
             return std.Io.Dir.createFileAbsolute(zio, path, .{
                 .truncate = !exclusive,
@@ -310,7 +310,7 @@ fn writeFrameLocked(zio: std.Io, kind: Kind, payload: []const u8) void {
 
     var header: [9]u8 = undefined;
     std.mem.writeInt(i32, header[0..4], delta, .little);
-    header[4] = @intFromEnum(kind);
+    header[4] = @backingInt(kind);
     const len: u32 = @intCast(@min(payload.len, std.math.maxInt(u32)));
     std.mem.writeInt(u32, header[5..9], len, .little);
 
@@ -387,7 +387,7 @@ fn stopCaptureLocked(zio: std.Io, failed: bool) void {
 }
 
 fn ensureParentDir(path: []const u8) !void {
-    const parent = std.fs.path.dirname(path) orelse return;
+    const parent = std.Io.Dir.path.dirname(path) orelse return;
     if (parent.len == 0) return;
     try io_mod.makeDirRecursive(parent);
 }
@@ -453,7 +453,7 @@ pub const Parser = struct {
         self.pos = end;
         return .{
             .delta_ms = delta_ms,
-            .kind = @enumFromInt(kind_raw),
+            .kind = @fromBackingInt(@intCast(kind_raw)),
             .payload = self.bytes[start..end],
         };
     }
@@ -461,16 +461,10 @@ pub const Parser = struct {
 
 const header_len = magic.len + 2 + 2 + 8 + 1;
 
-var test_empty_env: std.process.Environ.Map = std.process.Environ.Map.init(std.heap.c_allocator);
-
-fn resetEnvForTest() void {
-    io_mod.setEnvironMap(&test_empty_env);
-}
-
 fn tapePath(alloc: Allocator, dir: std.Io.Dir, name: []const u8) ![]u8 {
     const root = try io_mod.dirRealpathAlloc(alloc, dir, ".");
     defer alloc.free(root);
-    return std.fs.path.join(alloc, &.{ root, name });
+    return std.Io.Dir.path.join(alloc, &.{ root, name });
 }
 
 fn readFile(alloc: Allocator, path: []const u8) ![]u8 {
@@ -582,7 +576,7 @@ test "writer helper frames parse back through Parser" {
 }
 
 test "parser rejects bad magic" {
-    const garbage = "NOTA\x01" ++ [_]u8{0} ** 32;
+    const garbage = "NOTA\x01" ++ @as([32]u8, @splat(0));
     try testing.expectError(error.BadTapeMagic, Parser.init(garbage));
 }
 
@@ -662,7 +656,7 @@ test "Parser.next returns TruncatedFramePayload for non-overflowing truncated pa
     try appendHeader(&bytes, testing.allocator, 80, 24, 123, "");
     var frame_header: [9]u8 = undefined;
     std.mem.writeInt(i32, frame_header[0..4], 0, .little);
-    frame_header[4] = @intFromEnum(Kind.stdout);
+    frame_header[4] = @backingInt(Kind.stdout);
     std.mem.writeInt(u32, frame_header[5..9], 5, .little);
     try bytes.appendSlice(testing.allocator, &frame_header);
     try bytes.appendSlice(testing.allocator, "ab");
@@ -680,7 +674,7 @@ test "Parser.next accepts unknown kind bytes" {
 
     var parser = try Parser.init(bytes.items);
     const frame = (try parser.next()).?;
-    try testing.expectEqual(@as(u8, 200), @intFromEnum(frame.kind));
+    try testing.expectEqual(@as(u8, 200), @backingInt(frame.kind));
     try testing.expectEqual(@as(i32, 7), frame.delta_ms);
     try testing.expectEqualStrings("x", frame.payload);
 }
@@ -690,7 +684,7 @@ test "Parser.next accepts malformed kind-specific payload lengths" {
     defer bytes.deinit(testing.allocator);
 
     try appendHeader(&bytes, testing.allocator, 80, 24, 123, "");
-    try appendFrame(&bytes, testing.allocator, 0, @intFromEnum(Kind.resize), "x");
+    try appendFrame(&bytes, testing.allocator, 0, @backingInt(Kind.resize), "x");
 
     var parser = try Parser.init(bytes.items);
     const frame = (try parser.next()).?;
@@ -719,8 +713,8 @@ test "recordStdin suppresses input by default" {
 
 test "debug recording request creates a private tape under home" {
     const alloc = testing.allocator;
-    resetEnvForTest();
-    defer resetEnvForTest();
+    io_mod.resetEnvironForTest();
+    defer io_mod.resetEnvironForTest();
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -747,7 +741,7 @@ test "debug recording request creates a private tape under home" {
             try testing.expect(std.mem.startsWith(u8, active.path, expected_dir));
             const file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), active.path, .{});
             defer file.close(io_mod.getIo());
-            if (@import("builtin").os.tag != .windows) {
+            if (@import("builtin").target.os.tag != .windows) {
                 const stat = try file.stat(io_mod.getIo());
                 try testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
             }
@@ -830,8 +824,8 @@ test "startup policy resolves recording environment without effects" {
 
 test "debug recording request uses the temporary fallback when HOME is empty" {
     const alloc = testing.allocator;
-    resetEnvForTest();
-    defer resetEnvForTest();
+    io_mod.resetEnvironForTest();
+    defer io_mod.resetEnvironForTest();
 
     var env = std.process.Environ.Map.init(alloc);
     defer env.deinit();
@@ -849,7 +843,7 @@ test "debug recording request uses the temporary fallback when HOME is empty" {
         .active => |active| {
             try testing.expect(std.mem.startsWith(u8, active.path, "/tmp/fx-recordings/"));
             shutdown();
-            if (std.fs.path.isAbsolute(active.path)) {
+            if (std.Io.Dir.path.isAbsolute(active.path)) {
                 std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), active.path) catch {};
             } else {
                 std.Io.Dir.cwd().deleteFile(io_mod.getIo(), active.path) catch {};
@@ -861,15 +855,15 @@ test "debug recording request uses the temporary fallback when HOME is empty" {
 
 test "configureFromEnv enables stdin for the accepted truthy values only" {
     const alloc = testing.allocator;
-    resetEnvForTest();
-    defer resetEnvForTest();
+    io_mod.resetEnvironForTest();
+    defer io_mod.resetEnvironForTest();
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const truthy_values = [_][]const u8{ "1", "TrUe", " ON " };
     for (truthy_values, 0..) |value, idx| {
-        const name = try std.fmt.allocPrint(alloc, "stdin-{d}.fxtape", .{idx});
+        const name = try alloc.print("stdin-{d}.fxtape", .{idx});
         defer alloc.free(name);
         const path = try tapePath(alloc, tmp.dir, name);
         defer alloc.free(path);
@@ -881,7 +875,7 @@ test "configureFromEnv enables stdin for the accepted truthy values only" {
 
         shutdown();
         io_mod.setEnvironMap(&env);
-        defer resetEnvForTest();
+        defer io_mod.resetEnvironForTest();
         try configureFromEnv(alloc, 80, 24, "v");
         recordStdin("typed");
         shutdown();
@@ -894,7 +888,7 @@ test "configureFromEnv enables stdin for the accepted truthy values only" {
         try testing.expectEqualStrings("typed", frame.payload);
         try testing.expect((try parser.next()) == null);
 
-        resetEnvForTest();
+        io_mod.resetEnvironForTest();
     }
 
     const path = try tapePath(alloc, tmp.dir, "stdin-yes.fxtape");

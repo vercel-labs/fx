@@ -288,7 +288,7 @@ async function runNativeRelaunchScenario(
   );
 
   await launchFx(context, controller, "native-first");
-  await submitSlashCommand(context, controller, "/status", "permission_mode", "native-first-status-visible");
+  await submitSlashCommand(context, controller, "/allowlist", "* allowlist: effective", "native-first-notice-visible");
   await quitFx(context, controller, "native-first");
 
   await runShellCommand(
@@ -333,9 +333,9 @@ async function runCommandKScenario(context: NativeContext, controller: NativeCon
   await submitSlashCommand(
     context,
     controller,
-    "/status",
-    "permission_mode",
-    "native-command-k-status-visible",
+    "/allowlist",
+    "* allowlist: effective",
+    "native-command-k-notice-visible",
   );
   await quitFx(context, controller, "native-command-k-before-clear");
 

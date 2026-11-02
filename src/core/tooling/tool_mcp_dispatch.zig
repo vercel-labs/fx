@@ -78,8 +78,7 @@ pub fn callSelect(
             err,
         ) };
     }) orelse {
-        return .{ .failure = try std.fmt.allocPrint(
-            ctx.allocator,
+        return .{ .failure = try ctx.allocator.print(
             "Dynamic MCP tool not found or not allowed: {s}",
             .{input.name},
         ) };

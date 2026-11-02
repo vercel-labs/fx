@@ -1,24 +1,28 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { onlySessionId, savedText, sessionDir } from "./saved-sessions";
 
 // The shared tmux helper imports eval helpers; do not load repository dotenv files.
 process.env.FX_E2E_DISABLE_DOTENV = "1";
 const {
-  FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewayFinalText,
-  heldFakeGatewayFinalText, startDynamicFakeGateway, hasEmptyComposer,
-  tmuxAvailable,
+  FAKE_GATEWAY_MODEL, TmuxSession, fakeGatewayFinalText, fakeGatewayToolCall,
+  fakeShellRun, heldFakeGatewayFinalText, startDynamicFakeGateway,
+  hasEmptyComposer, tmuxAvailable,
 } = await import("./tmux-helpers");
 
 const binary = resolve(import.meta.dir, "../../zig-out/bin/fx");
 const HEAD = "HISTORY_HEAD_29b7";
 const TAIL = "HISTORY_TAIL_16d3";
-const HANDOFF = `INTERNAL_HANDOFF_4e12: preserve ${HEAD} and ${TAIL}; follow the latest user request.`;
+// A fact entry, which the compacted conversation keeps whatever the turn
+// numbers.
+const HANDOFF = `Facts:\nF1: INTERNAL_HANDOFF_4e12: preserve ${HEAD} and ${TAIL}; follow the latest user request.`;
 const FOLLOWUP = "FOLLOWUP_OK_732c";
 const REOPEN = "REOPEN_OK_492a";
 const ACTIVITY = /Compacting \((?:\d+h)?(?:\d+m)?\d+s\)/;
-const COMPACTION_OUTPUT = /Compacting|compaction|Context compacted|No context to compact|Your existing context was kept|Synthetic summary rejection|INTERNAL_HANDOFF_4e12/i;
+const COMPACTION_OUTPUT = /Compacting|compaction|Context compacted|No context to compact|Synthetic summary rejection|INTERNAL_HANDOFF_4e12/i;
 
 type Trigger = "manual" | "auto" | "overflow" | "ordinary";
 type Outcome = "success" | "cancel" | "empty" | "provider-error";
@@ -27,9 +31,16 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+/// A session log's conversation: what a close or a reopen leaves as it was,
+/// since the store adds only its own `closed` and `snapshot` lines then.
+function conversationLines(text: string): string[] {
+  return text.split("\n").filter(Boolean).filter((line) => !["closed", "snapshot"].includes(JSON.parse(line).kind));
+}
+
+/// The compactions a session log holds.
 function checkpoints(bytes: Buffer): number {
   return bytes.toString().trim().split("\n").filter(Boolean)
-    .map((line) => JSON.parse(line)).filter((frame) => frame.event?.context_checkpoint).length;
+    .map((line) => JSON.parse(line)).filter((line) => line.kind === "compacted").length;
 }
 
 async function until(predicate: () => boolean, label: string, timeout = 20_000) {
@@ -47,6 +58,7 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   const workspace = join(root, "workspace");
   mkdirSync(join(home, ".fx"), { recursive: true });
   mkdirSync(workspace);
+  writeFileSync(join(workspace, "seed-notes.txt"), "seed notes\n");
   writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
     model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
   }));
@@ -74,12 +86,16 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
     if (summary) {
       summaries++;
       if (phase === "attempt" && outcome === "provider-error") {
-        return Response.json({ error: { message: "Synthetic summary rejection" } }, { status: 400 });
+        return Response.json({ error: { message: "Synthetic summary rejection for Bearer abcdef0123456789xyz" } }, { status: 400 });
       }
       if (phase === "attempt" && summaries === 1) return summaryHold.response;
       // Each chunk/retry needs a fresh Response, not a consumed held body.
       return fakeGatewayFinalText(phase === "attempt" && outcome === "empty" ? "" : HANDOFF);
     }
+    // Each seed turn reads a note before replying, so compaction has work to
+    // summarize. That extra request is not counted as ordinary.
+    const seedRead = `seed-read-${ordinary + 1}`;
+    if (phase === "seed" && !raw.includes(`"${seedRead}"`)) return fakeGatewayToolCall(seedRead, "read_file", { path: "seed-notes.txt" });
     ordinary++;
     if (phase === "seed") return fakeGatewayFinalText(seedReply(ordinary));
     if (phase === "attempt") {
@@ -97,11 +113,11 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   const env = {
     PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
     TERM: "xterm-256color", AI_GATEWAY_API_KEY: "synthetic-compaction-key",
-    FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_SKIP_ONBOARDING: "1",
+    FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_TEST_SKIP_ONBOARDING: "1",
     FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_MODEL: FAKE_GATEWAY_MODEL,
     FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
   };
   let sessionId = "";
   let eventsPath = "";
@@ -109,17 +125,17 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   let launchIndex = 0;
   const stderrPaths: string[] = [];
   const tapes: string[] = [];
-  async function cli(args: string[]) {
+  async function cli(args: string[], expectedStderr = "") {
     const child = Bun.spawn([binary, ...args], { cwd: workspace, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
     const timer = setTimeout(() => child.kill(), 30_000);
     try {
       const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       expect(code).toBe(0);
-      expect(stderr).toBe("");
+      expect(stderr).toBe(expectedStderr);
       return JSON.parse(stdout);
     } finally { clearTimeout(timer); }
   }
-  async function launch(withoutCredential = false) {
+  async function launch(withoutCredential = false, withTraceLog = true) {
     const tape = join(root, `terminal-${++launchIndex}.fxtape`);
     const stderr = join(root, `terminal-${launchIndex}.stderr`);
     tapes.push(tape);
@@ -129,6 +145,10 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
       FX_TRACE_SCOPES: "input,worker,session,scroll,agent,gateway,compaction",
     };
     if (withoutCredential) delete terminalEnv.AI_GATEWAY_API_KEY;
+    if (!withTraceLog) {
+      delete terminalEnv.FX_TRACE_LOG;
+      delete terminalEnv.FX_TRACE_SCOPES;
+    }
     // Do not inherit provider overrides, credentials, shell startup or dotenv state.
     const command = `/usr/bin/env -i ${Object.entries(terminalEnv).map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)} --resume ${shellQuote(sessionId)}`;
     terminal = await TmuxSession.create({
@@ -187,17 +207,18 @@ async function fixture(trigger: Trigger, outcome: Outcome = "success", longResum
   }
   try {
     for (let turn = 1; turn <= seedTurns; turn++) {
-      const reply = await cli(["ask", "--json", "--auto", ...(sessionId ? ["--resume", sessionId] : []), `Seed ordinary historical turn ${turn}.`]);
+      const reply = await cli(["ask", "--json", "--auto", ...(sessionId ? ["--resume", sessionId] : []), `Seed ordinary historical turn ${turn}.`], "Reading seed-notes.txt\n");
       if (sessionId) expect(reply.session_id).toBe(sessionId);
       else sessionId = reply.session_id;
       expect(sessionId).toBeTruthy();
       expect(ordinary).toBe(turn);
       expect(summaries).toBe(0);
     }
-    eventsPath = join(home, ".fx/sessions", sessionId, "events.jsonl");
+    eventsPath = join(sessionDir(home, sessionId), "log.jsonl");
     initial = readFileSync(eventsPath);
-    expect(initial.toString()).toContain(HEAD);
-    expect(initial.toString()).toContain(TAIL);
+    // A large read's body is one of the session's blobs (D44).
+    expect(savedText(home, sessionId)).toContain(HEAD);
+    expect(savedText(home, sessionId)).toContain(TAIL);
     expect(checkpoints(initial)).toBe(0);
     expect(summaries).toBe(0);
     expect(ordinary).toBe(seedTurns);
@@ -271,7 +292,9 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         if (trigger === "manual") {
           await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && hasEmptyComposer(pane), 10_000);
           expect(f.counts().ordinary).toBe(f.seedTurns);
-          expect(f.counts().summaries).toBeGreaterThan(1);
+          // The reply holds only facts, so fx asks once more for the notes
+          // of the turn that did work.
+          expect(f.counts().summaries).toBe(2);
         } else {
           await until(() => f.counts().ordinary === f.seedTurns + (trigger === "overflow" ? 2 : 1), "ordinary request after compaction");
           const pane = await terminal.waitForText(/Thinking \(/, 10_000);
@@ -397,7 +420,8 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && pane.includes(feedback) && hasEmptyComposer(pane), 15_000);
         expect(f.durable()).toBe(0);
         expect(f.counts().ordinary).toBe(f.seedTurns);
-        expect(f.counts().summaries).toBe(outcome === "empty" ? 2 : 1);
+        // A failed or empty summary is retried once on the fallback model.
+        expect(f.counts().summaries).toBe(outcome === "cancel" ? 1 : 2);
         const afterFailure = f.counts();
         if (outcome === "cancel") f.summaryHold.dispose();
         await terminal.sendKeys("Escape");
@@ -450,10 +474,11 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         await terminal.waitForPane((pane) => hasEmptyComposer(pane) &&
           !/Compaction cancelled|Compacting|Thinking/.test(pane), 5000);
         const interruptions = () => f.savedEvents().trim().split("\n")
-          .map((line) => JSON.parse(line)).filter((frame) => frame.event?.interrupted);
+          .map((line) => JSON.parse(line)).filter((line) => line.kind === "item" && line.type === "interruption");
         await until(() => interruptions().length === 1, "durable cancellation", 5000);
-        expect(interruptions()[0].event.interrupted.reason).toBe("cancelled");
-        expect(interruptions()[0].event.interrupted.cancellation_origin === "compaction").toBe(trigger === "auto");
+        expect(interruptions()[0].data.reason).toBe("cancelled");
+        // An ordinary cancellation leaves its origin out, which reads as "turn".
+        expect((interruptions()[0].data.cancellation_origin ?? "turn") === "compaction").toBe(trigger === "auto");
         const cancelledCounts = { summaries: trigger === "auto" ? 1 : 0,
           ordinary: f.seedTurns + (trigger === "ordinary" ? 1 : 0), overflowSent: false };
         expect(f.counts()).toEqual(cancelledCounts);
@@ -461,7 +486,8 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         const cancelledEvents = f.savedEvents();
         await f.close();
         expect(f.counts()).toEqual(cancelledCounts);
-        expect(f.savedEvents()).toBe(cancelledEvents);
+        expect(f.savedEvents().startsWith(cancelledEvents)).toBe(true);
+        expect(conversationLines(f.savedEvents())).toEqual(conversationLines(cancelledEvents));
 
         const reopened = await f.launch();
         await reopened.sendKeys("C-o");
@@ -476,7 +502,8 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
         expect(await reopened.captureFullScrollbackEscapes()).not.toMatch(COMPACTION_OUTPUT);
         await f.close();
         expect(f.counts()).toEqual(cancelledCounts);
-        expect(f.savedEvents()).toBe(cancelledEvents);
+        expect(f.savedEvents().startsWith(cancelledEvents)).toBe(true);
+        expect(conversationLines(f.savedEvents())).toEqual(conversationLines(cancelledEvents));
         expect(f.durable()).toBe(0);
         for (const tape of f.tapes) {
           const replay = await f.cli(["replay", tape, "--json"]);
@@ -487,6 +514,51 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       } finally { await f.cleanup(passed); }
     }, 60_000);
   }
+
+  test("manual failure then success: /trace records compaction decisions and failures without FX_TRACE", async () => {
+    const f = await fixture("manual", "provider-error");
+    let passed = false;
+    try {
+      const terminal = await f.launch(false, false);
+      await terminal.sendText("/compact");
+      await terminal.waitForText("Compaction failed. Try /compact again.", 15_000);
+      expect(f.durable()).toBe(0);
+      f.phase("followup");
+      await terminal.sendText("/compact");
+      await until(() => f.durable() === 1, "checkpoint after recovery compact");
+      await terminal.waitForPane((pane) => !ACTIVITY.test(pane) && hasEmptyComposer(pane), 10_000);
+
+      const before = new Set(readdirSync(f.root).filter((name) => name.startsWith("fx-trace-") && name.endsWith(".md")));
+      let report = "";
+      await terminal.sendText("/trace");
+      await until(() => {
+        const fresh = readdirSync(f.root).filter((name) => name.startsWith("fx-trace-") && name.endsWith(".md") && !before.has(name));
+        if (fresh.length === 0) return false;
+        const content = readFileSync(join(f.root, fresh[fresh.length - 1]), "utf8");
+        if (!content.includes("## Transcript Timeline")) return false;
+        report = content;
+        return true;
+      }, "trace report", 15_000);
+
+      // No FX_TRACE_LOG was configured, so the opt-in trace tail is absent while
+      // the always-on compaction section still carries the full story.
+      expect(report).not.toContain("## Trace Tail");
+      expect(report).toContain("## Context Compaction\n");
+      expect(report).toMatch(/last=\d+ failed=[1-9]\d* \(always recorded; does not require FX_TRACE\)/);
+      expect(report).toContain("event=summary_transport_failed");
+      // Provider error text is secret-masked before it reaches the report.
+      expect(report).toContain("[redacted]");
+      expect(report).not.toContain("abcdef0123456789xyz");
+      expect(report).toContain("event=transaction_failed");
+      expect(report).toContain("event=provider_start");
+      expect(report).toContain("event=provider_completed");
+      expect(report).toContain("event=committed");
+      const problems = report.split("## Problems")[1]?.split("##")[0] ?? "";
+      expect(problems).toContain("- context compaction");
+      await f.close();
+      passed = true;
+    } finally { await f.cleanup(passed); }
+  }, 120_000);
 
   test("missing credentials keep compaction feedback local without hiding ordinary auth errors", async () => {
     const f = await fixture("manual");
@@ -541,4 +613,108 @@ describe.skipIf(!tmuxAvailable())("tui: compaction activity", () => {
       passed = true;
     } finally { await f.cleanup(passed); }
   }, 60_000);
+
+  test("auto: steering sent during a turn stays user text through compaction", async () => {
+    const root = mkdtempSync(join(tmpdir(), "fx-compaction-steering-"));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace);
+    writeFileSync(join(home, ".fx/settings.json"), JSON.stringify({
+      model: FAKE_GATEWAY_MODEL, auto_upgrade: false, startup_scrollback: false,
+    }));
+    for (let n = 1; n <= 30; n++) {
+      writeFileSync(join(workspace, `probe-${n}.txt`), `STEER_PROBE_${n}_8d4 context pressure line\n`.repeat(250));
+    }
+    const task = "STEER_TASK_8d4: read the probe files and report progress.";
+    // Longer than the excerpt compaction used for generated notices.
+    const steering = "STEER_RULE_8d4: prefix every progress line with S1>. " +
+      "Keep all of this correction. ".repeat(80) + "STEER_END_8d4";
+    const ordinaryBodies: string[] = [];
+    const summaryBodies: string[] = [];
+    const gateway = startDynamicFakeGateway((raw) => {
+      const request = JSON.parse(raw);
+      if (request.toolChoice?.type === "none" && request.tools?.length === 0) {
+        summaryBodies.push(raw);
+        return fakeGatewayFinalText("STEER_SUMMARY_8d4: the probe files are being read.");
+      }
+      ordinaryBodies.push(raw);
+      const n = ordinaryBodies.length;
+      if (summaryBodies.length > 0) return fakeGatewayFinalText("STEER_DONE_8d4");
+      if (n === 1) return fakeShellRun("steer-window-8d4", "printf STEER_WINDOW_8d4; sleep 3");
+      if (n <= 31) return fakeGatewayToolCall(`steer-probe-${n - 1}-8d4`, "read_file", { path: `probe-${n - 1}.txt` });
+      return fakeGatewayFinalText("STEER_NOT_COMPACTED_8d4");
+    }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 60000, max_tokens: 4096 }] });
+    const env: Record<string, string> = {
+      PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: root,
+      TERM: "xterm-256color", AI_GATEWAY_API_KEY: "fake-compaction-key",
+      FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", FX_E2E_DISABLE_DOTENV: "1",
+      FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_PERMISSION_MODE: "full-access",
+      FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    };
+    const command = `/usr/bin/env -i ${Object.entries(env)
+      .map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} ${shellQuote(binary)}`;
+    let terminal: InstanceType<typeof TmuxSession> | undefined;
+    let passed = false;
+    try {
+      terminal = await TmuxSession.create({
+        cmd: command, cwd: workspace, env, isolated: true, remainOnExit: true,
+        stderrPath, width: 120, height: 40, startupWaitMs: 0,
+      });
+      await terminal.waitForStableComposer(15_000);
+      await terminal.sendText(task);
+      await terminal.waitForText("STEER_WINDOW_8d4", 15_000);
+      await terminal.sendText(steering);
+      await until(() => summaryBodies.length === 1, "automatic compaction", 60_000);
+      await terminal.waitForText("STEER_DONE_8d4", 20_000);
+
+      const steered = ordinaryBodies.filter((body) => body.includes("STEER_RULE_8d4"));
+      expect(steered.length).toBeGreaterThan(1);
+      expect(steered[0]).toContain("<user_steering>");
+
+      const source = JSON.parse(summaryBodies[0]!).prompt
+        .filter((message: { role: string }) => message.role === "user")
+        .map((message: { content: { text?: string }[] }) => message.content.map((part) => part.text ?? "").join(""))
+        .join("\n");
+      const at = source.indexOf("STEER_RULE_8d4");
+      expect(at).toBeGreaterThan(-1);
+      // Steering is the user's own message, labeled as added during the turn.
+      const header = source.slice(source.lastIndexOf("[", at), at);
+      expect(header).toBe("[User, added while the assistant worked]\n");
+      expect(source).toContain(steering);
+      // The task stays the live request, so the summarizer sees it only as context.
+      expect(source).toContain(`[Turn in progress]\n[User, this message stays in the conversation after the summary]\n${task}`);
+
+      const log = join(sessionDir(home, onlySessionId(home)), "log.jsonl");
+      await until(() => readFileSync(log, "utf8").includes("\"turn_committed\""), "saved turn", 10_000);
+      const handoff = readFileSync(log, "utf8").trim().split("\n")
+        .map((line) => JSON.parse(line)).find((line) => line.kind === "compacted")?.data.summary ?? "";
+      expect(handoff.startsWith("fx-compactor-v1\n")).toBe(true);
+      const state = JSON.parse(handoff.slice("fx-compactor-v1\n".length));
+      // Only the turn in progress was compacted; its steering is kept exactly.
+      expect(state.turns).toEqual([]);
+      expect(state.open.users).toEqual([steering]);
+      expect(state.tool_count).toBeGreaterThan(0);
+      expect(state.open.first_tool).toBe(1);
+
+      const afterCompaction = ordinaryBodies.at(-1)!;
+      expect(afterCompaction).toContain("<compacted_conversation>");
+      expect(afterCompaction).toContain("STEER_END_8d4");
+      expect(afterCompaction.split("STEER_TASK_8d4").length - 1).toBe(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      passed = true;
+    } finally {
+      if (!passed) {
+        writeFileSync(join(root, "failure.json"), JSON.stringify({ ordinary: ordinaryBodies.length, summaries: summaryBodies.length }, null, 2));
+        if (terminal) writeFileSync(join(root, "failure.scrollback.txt"), await terminal.captureFullScrollback());
+        console.error(`compaction steering evidence retained: ${root}`);
+      }
+      await terminal?.kill();
+      gateway.stop();
+      if (passed) rmSync(root, { recursive: true, force: true });
+    }
+  }, 90_000);
 });

@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const types = @import("../../shared/types.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
@@ -49,7 +51,27 @@ fn parallelSubagentPrefixLen(registry: tool_dispatch.Registry, calls: []const To
     return len;
 }
 
-pub const GroupKind = enum { none, read_only, subagent };
+/// Host tool calls that may run together, up to the first writer. A build
+/// without threads runs them one at a time.
+fn isConcurrentHostCall(registry: tool_dispatch.Registry, call: ToolCall) bool {
+    if (builtin.single_threaded) return false;
+    if (call.provider_result != null) return false;
+    const tool = registry.lookup(call.name) orelse return false;
+    return tool.executor_kind == .host and tool.host_concurrent;
+}
+
+/// Each running host call holds one of the host's pending requests, which
+/// journal barriers and permission prompts share, so a group stays well
+/// below that limit. Later calls form the next group.
+const max_parallel_host_calls = 16;
+
+fn parallelHostPrefixLen(registry: tool_dispatch.Registry, calls: []const ToolCall) usize {
+    var len: usize = 0;
+    while (len < calls.len and len < max_parallel_host_calls and isConcurrentHostCall(registry, calls[len])) : (len += 1) {}
+    return len;
+}
+
+pub const GroupKind = enum { none, read_only, subagent, host };
 
 pub const LeadingGroup = struct {
     kind: GroupKind = .none,
@@ -64,6 +86,8 @@ pub fn leadingParallelGroup(
     if (read_only_len > 0) return .{ .kind = .read_only, .len = read_only_len };
     const subagent_len = parallelSubagentPrefixLen(registry, calls);
     if (subagent_len > 0) return .{ .kind = .subagent, .len = subagent_len };
+    const host_len = parallelHostPrefixLen(registry, calls);
+    if (host_len > 0) return .{ .kind = .host, .len = host_len };
     return .{};
 }
 
@@ -83,12 +107,7 @@ pub const ParallelRunResult = struct {
     first_cancelled_index: ?usize = null,
 
     pub fn deinit(self: *ParallelRunResult, alloc: Allocator) void {
-        for (self.attempts) |attempt| {
-            switch (attempt) {
-                .completed => |result| freeParallelToolResult(alloc, result),
-                .cancelled => {},
-            }
-        }
+        for (self.attempts) |attempt| freeParallelToolAttempt(alloc, attempt);
         alloc.free(self.attempts);
         self.* = undefined;
     }
@@ -109,6 +128,12 @@ pub const ParallelHookExecContext = struct {
 
 const ParallelExecuteFn = *const fn (*anyopaque, Allocator, ToolCall, usize) anyerror!ToolExecutionResult;
 const ParallelFormatErrorFn = *const fn (*anyopaque, Allocator, []const u8, anyerror) anyerror![]const u8;
+const ParallelAttemptObserverFn = *const fn (*anyopaque, Allocator, ToolCall, ParallelToolAttempt, usize) void;
+
+pub const ParallelAttemptObserver = struct {
+    ctx: *anyopaque,
+    notify: ParallelAttemptObserverFn,
+};
 
 pub const ParallelRunOptions = struct {
     exec_ctx: *anyopaque,
@@ -116,6 +141,12 @@ pub const ParallelRunOptions = struct {
     format_ctx: *anyopaque,
     format_error: ParallelFormatErrorFn,
     cancel_flag: ?*std.atomic.Value(bool) = null,
+    attempt_observer: ?ParallelAttemptObserver = null,
+};
+
+const ParallelCompletionState = struct {
+    mutex: std.Io.Mutex = .init,
+    changed: std.Io.Condition = .init,
 };
 
 const ParallelWorkerSlot = struct {
@@ -124,6 +155,8 @@ const ParallelWorkerSlot = struct {
     result: ?ToolExecutionResult = null,
     err: ?anyerror = null,
     owner_cancelled_at_error: bool = false,
+    completed: bool = false,
+    observed: bool = false,
 };
 
 pub fn runSequentialCalls(
@@ -134,36 +167,32 @@ pub fn runSequentialCalls(
     const attempts = try alloc.alloc(ParallelToolAttempt, calls.len);
     var initialized: usize = 0;
     errdefer {
-        for (attempts[0..initialized]) |attempt| switch (attempt) {
-            .completed => |result| freeParallelToolResult(alloc, result),
-            .cancelled => {},
-        };
+        for (attempts[0..initialized]) |attempt| freeParallelToolAttempt(alloc, attempt);
         alloc.free(attempts);
     }
 
     var first_cancelled_index: ?usize = null;
     for (calls, 0..) |call, index| {
-        if (options.cancel_flag) |flag| {
-            if (flag.load(.seq_cst)) {
-                attempts[index] = .cancelled;
-                initialized += 1;
-                if (first_cancelled_index == null) first_cancelled_index = index;
-                continue;
-            }
-        }
-        const execution = options.execute(options.exec_ctx, alloc, call, index) catch |err| blk: {
-            const output = options.format_error(options.format_ctx, alloc, call.name, err) catch
-                try std.fmt.allocPrint(alloc, "Tool execution failed: {s}", .{@errorName(err)});
-            defer alloc.free(output);
-            break :blk ToolExecutionResult{
-                .status = .failure,
-                .model_output = output,
+        const attempt: ParallelToolAttempt = if (cancelRequested(options.cancel_flag)) cancelled: {
+            if (first_cancelled_index == null) first_cancelled_index = index;
+            break :cancelled .cancelled;
+        } else completed: {
+            const execution = options.execute(options.exec_ctx, alloc, call, index) catch |err| blk: {
+                const output = options.format_error(options.format_ctx, alloc, call.name, err) catch
+                    try alloc.print("Tool execution failed: {s}", .{@errorName(err)});
+                defer alloc.free(output);
+                break :blk ToolExecutionResult{
+                    .status = .failure,
+                    .model_output = output,
+                };
+            };
+            break :completed .{
+                .completed = try duplicateParallelToolResult(alloc, call, execution),
             };
         };
-        attempts[index] = .{
-            .completed = try duplicateParallelToolResult(alloc, call, execution),
-        };
+        attempts[index] = attempt;
         initialized += 1;
+        observeParallelAttempt(options, alloc, call, attempt, index);
     }
     return .{ .attempts = attempts, .first_cancelled_index = first_cancelled_index };
 }
@@ -173,9 +202,9 @@ pub fn runParallelCalls(
     calls: []const ToolCall,
     options: ParallelRunOptions,
 ) Allocator.Error!ParallelRunResult {
-    var slots = try alloc.alloc(ParallelWorkerSlot, calls.len);
+    var completion_state = ParallelCompletionState{};
+    const slots = try alloc.alloc(ParallelWorkerSlot, calls.len);
     defer alloc.free(slots);
-
     for (slots) |*slot| {
         slot.* = .{ .arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator) };
     }
@@ -186,9 +215,20 @@ pub fn runParallelCalls(
         }
     }
 
+    const initialized = try alloc.alloc(bool, calls.len);
+    defer alloc.free(initialized);
+    @memset(initialized, false);
+    const attempts = try alloc.alloc(ParallelToolAttempt, calls.len);
+    errdefer {
+        for (attempts, initialized) |attempt, is_initialized| {
+            if (is_initialized) freeParallelToolAttempt(alloc, attempt);
+        }
+        alloc.free(attempts);
+    }
+
     var started: usize = 0;
     for (calls, 0..) |call, index| {
-        slots[index].thread = std.Thread.spawn(.{}, parallelWorkerMain, .{ &slots[index], options, call, index }) catch |err| {
+        slots[index].thread = std.Thread.spawn(.{}, parallelWorkerMain, .{ &completion_state, &slots[index], options, call, index }) catch |err| {
             for (slots[0..started]) |*slot| {
                 if (slot.thread) |thread| thread.join();
                 slot.thread = null;
@@ -201,54 +241,25 @@ pub fn runParallelCalls(
         started += 1;
     }
 
-    for (slots) |*slot| {
+    var completed_count: usize = 0;
+    var first_cancelled_index: ?usize = null;
+    while (completed_count < started) : (completed_count += 1) {
+        const index = waitForCompletedSlot(&completion_state, slots);
+        const slot = &slots[index];
         if (slot.thread) |thread| {
             thread.join();
             slot.thread = null;
         }
-    }
-
-    const attempts = try alloc.alloc(ParallelToolAttempt, calls.len);
-    var initialized_count: usize = 0;
-    errdefer {
-        for (attempts[0..initialized_count]) |attempt| {
-            switch (attempt) {
-                .completed => |result| freeParallelToolResult(alloc, result),
-                .cancelled => {},
-            }
+        const attempt = try materializeParallelAttempt(alloc, calls[index], slot, options);
+        attempts[index] = attempt;
+        initialized[index] = true;
+        if (attempt == .cancelled) {
+            first_cancelled_index = if (first_cancelled_index) |current|
+                @min(current, index)
+            else
+                index;
         }
-        alloc.free(attempts);
-    }
-
-    var first_cancelled_index: ?usize = null;
-    for (calls, slots, 0..) |call, *slot, index| {
-        if (slot.err) |err| {
-            if (err == error.Cancelled and slot.owner_cancelled_at_error) {
-                attempts[index] = .cancelled;
-                initialized_count += 1;
-                if (first_cancelled_index == null) first_cancelled_index = index;
-                continue;
-            }
-        }
-
-        var formatted_failure: ?[]const u8 = null;
-        defer if (formatted_failure) |output| alloc.free(output);
-        const execution: ToolExecutionResult = if (slot.err) |err| .{
-            .status = .failure,
-            .model_output = blk: {
-                const output = options.format_error(options.format_ctx, alloc, call.name, err) catch |format_err| try std.fmt.allocPrint(
-                    alloc,
-                    "Tool execution failed: {s}; additionally failed to format error: {s}",
-                    .{ @errorName(err), @errorName(format_err) },
-                );
-                formatted_failure = output;
-                break :blk output;
-            },
-        } else slot.result.?;
-        attempts[index] = .{
-            .completed = try duplicateParallelToolResult(alloc, call, execution),
-        };
-        initialized_count += 1;
+        observeParallelAttempt(options, alloc, calls[index], attempt, index);
     }
 
     return .{
@@ -257,7 +268,14 @@ pub fn runParallelCalls(
     };
 }
 
-fn parallelWorkerMain(slot: *ParallelWorkerSlot, options: ParallelRunOptions, call: ToolCall, index: usize) void {
+fn parallelWorkerMain(
+    completion_state: *ParallelCompletionState,
+    slot: *ParallelWorkerSlot,
+    options: ParallelRunOptions,
+    call: ToolCall,
+    index: usize,
+) void {
+    defer markParallelWorkerCompleted(completion_state, slot);
     if (cancelRequested(options.cancel_flag)) {
         slot.err = error.Cancelled;
         slot.owner_cancelled_at_error = true;
@@ -272,13 +290,72 @@ fn parallelWorkerMain(slot: *ParallelWorkerSlot, options: ParallelRunOptions, ca
     };
 }
 
+fn markParallelWorkerCompleted(state: *ParallelCompletionState, slot: *ParallelWorkerSlot) void {
+    const io = io_mod.getIo();
+    state.mutex.lockUncancelable(io);
+    slot.completed = true;
+    state.changed.broadcast(io);
+    state.mutex.unlock(io);
+}
+
+fn waitForCompletedSlot(state: *ParallelCompletionState, slots: []ParallelWorkerSlot) usize {
+    const io = io_mod.getIo();
+    state.mutex.lockUncancelable(io);
+    defer state.mutex.unlock(io);
+    while (true) {
+        for (slots, 0..) |*slot, index| {
+            if (!slot.completed or slot.observed) continue;
+            slot.observed = true;
+            return index;
+        }
+        state.changed.waitUncancelable(io, &state.mutex);
+    }
+}
+
+fn materializeParallelAttempt(
+    alloc: Allocator,
+    call: ToolCall,
+    slot: *const ParallelWorkerSlot,
+    options: ParallelRunOptions,
+) !ParallelToolAttempt {
+    if (slot.err) |err| {
+        if (err == error.Cancelled and slot.owner_cancelled_at_error) return .cancelled;
+    }
+
+    var formatted_failure: ?[]const u8 = null;
+    defer if (formatted_failure) |output| alloc.free(output);
+    const execution: ToolExecutionResult = if (slot.err) |err| .{
+        .status = .failure,
+        .model_output = blk: {
+            const output = options.format_error(options.format_ctx, alloc, call.name, err) catch |format_err| try alloc.print(
+                "Tool execution failed: {s}; additionally failed to format error: {s}",
+                .{ @errorName(err), @errorName(format_err) },
+            );
+            formatted_failure = output;
+            break :blk output;
+        },
+    } else slot.result.?;
+    return .{ .completed = try duplicateParallelToolResult(alloc, call, execution) };
+}
+
+fn observeParallelAttempt(
+    options: ParallelRunOptions,
+    alloc: Allocator,
+    call: ToolCall,
+    attempt: ParallelToolAttempt,
+    index: usize,
+) void {
+    const observer = options.attempt_observer orelse return;
+    observer.notify(observer.ctx, alloc, call, attempt, index);
+}
+
 fn cancelRequested(cancel_flag: ?*std.atomic.Value(bool)) bool {
     return if (cancel_flag) |flag| flag.load(.seq_cst) else false;
 }
 
 pub fn parallelHookExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, index: usize) !ToolExecutionResult {
     const exec_ctx: *ParallelHookExecContext = @ptrCast(@alignCast(ctx));
-    return exec_ctx.hooks.execute_tool_call(exec_ctx.hooks.ctx, .{
+    return exec_ctx.hooks.executeToolCall(.{
         .skill_locations = exec_ctx.skill_locations,
         .call_allocator = alloc,
         .result_allocator = alloc,
@@ -350,6 +427,9 @@ fn duplicateParallelToolResult(alloc: Allocator, call: ToolCall, execution: Tool
         alloc,
         execution.tool_result_memory,
     );
+    if (execution.subagent_completion) |status| {
+        duplicated_execution.subagent_completion = try duplicateSubagentStatus(alloc, status);
+    }
 
     return .{
         .call_id = call_id,
@@ -363,37 +443,25 @@ fn duplicateToolResultMemory(
     source: ?types.ToolResultMemory,
 ) Allocator.Error!?types.ToolResultMemory {
     const memory = source orelse return null;
-    const output_handle = if (memory.output_handle) |handle|
-        try alloc.dupe(u8, handle)
-    else
-        null;
-    errdefer if (output_handle) |handle| alloc.free(handle);
-    const preview = if (memory.preview) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    errdefer if (preview) |value| alloc.free(value);
-    const command_output_replay = if (memory.command_output_replay) |replay|
-        try types.dupeCommandOutputReplay(alloc, replay)
-    else
-        null;
-    errdefer if (command_output_replay) |replay| types.freeCommandOutputReplay(alloc, replay);
+    return try types.dupeToolResultMemory(alloc, memory);
+}
 
-    const image_handle = if (memory.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null;
-    errdefer if (image_handle) |handle| alloc.free(handle);
-    const tool_images = try types.dupeToolImages(alloc, memory.tool_images);
+fn duplicateSubagentStatus(
+    alloc: Allocator,
+    status: types.SubagentStatus,
+) Allocator.Error!types.SubagentStatus {
+    const model = try alloc.dupe(u8, status.model);
+    errdefer alloc.free(model);
+    const session_title = if (status.session_title) |title|
+        try alloc.dupe(u8, title)
+    else
+        null;
     return .{
-        .tool_images = tool_images,
-        .tool_image_handle = image_handle,
-        .output_handle = output_handle,
-        .preview = preview,
-        .output_bytes = memory.output_bytes,
-        .stored_output_bytes = memory.stored_output_bytes,
-        .truncated = memory.truncated,
-        .model_view_covers_full_file = memory.model_view_covers_full_file,
-        .command_output_replay = command_output_replay,
-        .command_process_presentation = memory.command_process_presentation,
-        .terminal_action_presentation = memory.terminal_action_presentation,
+        .session_title = session_title,
+        .model = model,
+        .effort = status.effort,
+        .input_tokens = status.input_tokens,
+        .context_window = status.context_window,
     };
 }
 
@@ -401,6 +469,13 @@ pub fn reportInnerToolUsage(hooks: *const AgentRuntimeDeps, tool_name: []const u
     const usage = execution.inner_usage orelse return;
     const report = hooks.report_inner_tool_usage orelse return;
     report(hooks.ctx, tool_name, usage);
+}
+
+fn freeParallelToolAttempt(alloc: Allocator, attempt: ParallelToolAttempt) void {
+    switch (attempt) {
+        .completed => |result| freeParallelToolResult(alloc, result),
+        .cancelled => {},
+    }
 }
 
 fn freeParallelToolResult(alloc: Allocator, result: ParallelToolResult) void {
@@ -416,14 +491,10 @@ fn freeOwnedToolExecutionResult(alloc: Allocator, result: ToolExecutionResult) v
     if (result.interactive_notice) |notice| types.freeSemanticNotice(alloc, notice);
     freeContextNotices(alloc, result.context_notices);
     if (result.command_result_json) |value| alloc.free(value);
-    if (result.tool_result_memory) |memory| {
-        types.freeToolImages(alloc, memory.tool_images);
-        if (memory.tool_image_handle) |handle| alloc.free(handle);
-        if (memory.output_handle) |value| alloc.free(value);
-        if (memory.preview) |value| alloc.free(value);
-        if (memory.command_output_replay) |replay| {
-            types.freeCommandOutputReplay(alloc, replay);
-        }
+    if (result.tool_result_memory) |memory| types.freeToolResultMemory(alloc, memory);
+    if (result.subagent_completion) |status| {
+        alloc.free(status.model);
+        if (status.session_title) |title| alloc.free(title);
     }
 }
 
@@ -452,6 +523,7 @@ const ParallelTestPlan = struct {
     output: []const u8 = "",
     err: ?anyerror = null,
     delay_ms: u64 = 0,
+    gate: ?*std.Io.Event = null,
     cancel: bool = false,
 };
 
@@ -485,6 +557,12 @@ fn parallelTestExecute(ctx: *anyopaque, alloc: Allocator, call: ToolCall, index:
 
     const plan = fixture.plans[index];
     if (plan.delay_ms > 0) io_mod.sleep(plan.delay_ms * std.time.ns_per_ms);
+    if (plan.gate) |gate| {
+        try gate.waitTimeout(io_mod.getIo(), .{ .duration = .{
+            .clock = .awake,
+            .raw = .fromSeconds(5),
+        } });
+    }
     if (plan.cancel) fixture.cancel_flag.store(true, .seq_cst);
     if (plan.err) |err| return err;
     return .{ .status = .success, .model_output = try alloc.dupe(u8, plan.output) };
@@ -500,12 +578,48 @@ fn updateMaxInFlight(max_in_flight: *std.atomic.Value(usize), candidate: usize) 
 }
 
 fn parallelTestFormatError(_: *anyopaque, alloc: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
-    return std.fmt.allocPrint(alloc, "{s} failed with {s}", .{ tool_name, @errorName(err) });
+    return alloc.print("{s} failed with {s}", .{ tool_name, @errorName(err) });
 }
 
 fn toolCall(id: []const u8, name: []const u8, args: []const u8) ToolCall {
     return .{ .id = id, .name = name, .arguments_json = args };
 }
+
+const ParallelObserverCapture = struct {
+    indices: [2]usize = undefined,
+    count: usize = 0,
+    fast_observed: std.Io.Event = .unset,
+
+    fn notify(raw: *anyopaque, _: Allocator, _: ToolCall, _: ParallelToolAttempt, index: usize) void {
+        const self: *ParallelObserverCapture = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.count < self.indices.len);
+        self.indices[self.count] = index;
+        self.count += 1;
+        if (index == 1) self.fast_observed.set(io_mod.getIo());
+    }
+};
+
+const ParallelObserverRun = struct {
+    calls: []const ToolCall,
+    fixture: *ParallelTestFixture,
+    capture: *ParallelObserverCapture,
+    result: ?ParallelRunResult = null,
+    err: ?anyerror = null,
+
+    fn run(self: *ParallelObserverRun) void {
+        self.result = runParallelCalls(std.testing.allocator, self.calls, .{
+            .exec_ctx = self.fixture,
+            .execute = parallelTestExecute,
+            .format_ctx = self.fixture,
+            .format_error = parallelTestFormatError,
+            .cancel_flag = &self.fixture.cancel_flag,
+            .attempt_observer = .{ .ctx = self.capture, .notify = ParallelObserverCapture.notify },
+        }) catch |err| {
+            self.err = err;
+            return;
+        };
+    }
+};
 
 test "parallel classifier uses active registry metadata" {
     const builtin_tools = @import("../../../builtins/tools.zig");
@@ -542,6 +656,51 @@ test "parallel classifier keeps only a leading safe read-only group" {
     try std.testing.expect(isReadOnlyCall(registry, calls[0]));
     try std.testing.expect(isReadOnlyCall(registry, calls[1]));
     try std.testing.expect(!isReadOnlyCall(registry, calls[2]));
+}
+
+test "host calls run together until a writer, which runs alone" {
+    const host_tool_runtime = @import("../../tooling/host_tool_runtime.zig");
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\[{"name":"list","description":"List","inputSchema":{},"idempotent":true},
+        \\ {"name":"read","description":"Read","inputSchema":{},"writes":false},
+        \\ {"name":"write","description":"Write","inputSchema":{},"writes":true}]
+    , .{});
+    defer parsed.deinit();
+    var host = try host_tool_runtime.Runtime.init(std.testing.allocator, parsed.value);
+    defer host.deinit();
+    const registry = host.toolSet().registry;
+    const calls = [_]ToolCall{
+        toolCall("call_1", "list", "{}"),
+        toolCall("call_2", "read", "{}"),
+        toolCall("call_3", "write", "{}"),
+        toolCall("call_4", "read", "{}"),
+    };
+
+    const expected_first: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = 2 };
+    try std.testing.expectEqual(expected_first, leadingParallelGroup(registry, &calls));
+    // The writer is a fence: no group includes it, and the call after it
+    // starts a new group.
+    try std.testing.expectEqual(LeadingGroup{}, leadingParallelGroup(registry, calls[2..]));
+    const expected_last: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = 1 };
+    try std.testing.expectEqual(expected_last, leadingParallelGroup(registry, calls[3..]));
+}
+
+test "a host group holds at most max_parallel_host_calls calls" {
+    const host_tool_runtime = @import("../../tooling/host_tool_runtime.zig");
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\[{"name":"read","description":"Read","inputSchema":{},"idempotent":true}]
+    , .{});
+    defer parsed.deinit();
+    var host = try host_tool_runtime.Runtime.init(std.testing.allocator, parsed.value);
+    defer host.deinit();
+    const registry = host.toolSet().registry;
+    var calls: [max_parallel_host_calls + 4]ToolCall = undefined;
+    for (&calls) |*call| call.* = toolCall("call", "read", "{}");
+
+    const expected: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = max_parallel_host_calls };
+    try std.testing.expectEqual(expected, leadingParallelGroup(registry, &calls));
+    const rest: LeadingGroup = if (builtin.single_threaded) .{} else .{ .kind = .host, .len = 4 };
+    try std.testing.expectEqual(rest, leadingParallelGroup(registry, calls[max_parallel_host_calls..]));
 }
 
 test "parallel classifier keeps one leading registered subagent group" {
@@ -650,6 +809,50 @@ test "parallel read-only execution preserves order and failure fan-in" {
     try std.testing.expect(fixture.max_in_flight.load(.seq_cst) > 1);
 }
 
+test "parallel completion observer runs before slower siblings finish while results stay ordered" {
+    const alloc = std.testing.allocator;
+    var release_slow: std.Io.Event = .unset;
+    const calls = [_]ToolCall{
+        toolCall("slow", "read_file", "{\"path\":\"slow\"}"),
+        toolCall("fast", "grep_files", "{\"pattern\":\"fast\"}"),
+    };
+    const plans = [_]ParallelTestPlan{
+        .{ .output = "slow output", .gate = &release_slow },
+        .{ .output = "fast output" },
+    };
+    var fixture = ParallelTestFixture{ .plans = &plans };
+    var capture = ParallelObserverCapture{};
+    var run = ParallelObserverRun{
+        .calls = &calls,
+        .fixture = &fixture,
+        .capture = &capture,
+    };
+    var thread = try std.Thread.spawn(.{}, ParallelObserverRun.run, .{&run});
+    var joined = false;
+    defer if (!joined) {
+        release_slow.set(io_mod.getIo());
+        thread.join();
+    };
+
+    try capture.fast_observed.waitTimeout(io_mod.getIo(), .{ .duration = .{
+        .clock = .awake,
+        .raw = .fromSeconds(5),
+    } });
+    try std.testing.expectEqual(@as(usize, 1), capture.count);
+    try std.testing.expectEqual(@as(usize, 1), capture.indices[0]);
+
+    release_slow.set(io_mod.getIo());
+    thread.join();
+    joined = true;
+    if (run.err) |err| return err;
+    var result = run.result.?;
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, capture.indices[0..capture.count]);
+    try std.testing.expectEqualStrings("slow", result.attempts[0].completed.call_id);
+    try std.testing.expectEqualStrings("fast", result.attempts[1].completed.call_id);
+}
+
 test "parallel read-only execution preserves exact cancelled identity and completed peers" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
@@ -753,6 +956,28 @@ test "parallel read-only execution reports no active call when cancellation foll
     try std.testing.expect(run.attempts[1] == .completed);
 }
 
+fn checkParallelRunAllocationFailures(alloc: Allocator) !void {
+    const calls = [_]ToolCall{
+        toolCall("first", "read_file", "{\"path\":\"a\"}"),
+        toolCall("second", "grep_files", "{\"pattern\":\"b\"}"),
+    };
+    const plans = [_]ParallelTestPlan{
+        .{ .output = "first output" },
+        .{ .output = "second output" },
+    };
+    var fixture = ParallelTestFixture{ .plans = &plans };
+    var run = try runParallelCallsForTest(alloc, &calls, &fixture);
+    defer run.deinit(alloc);
+}
+
+test "parallel run cleans up every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        testing_allocator.no_resize,
+        checkParallelRunAllocationFailures,
+        .{},
+    );
+}
+
 fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
     const call = toolCall(
         "call_read",
@@ -771,6 +996,13 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
         },
         .context_notices = &.{ "first context notice", "second context notice" },
         .command_result_json = "{}",
+        .subagent_completion = .{
+            .session_title = "Reviewer",
+            .model = "openai/gpt-5.5",
+            .effort = types.ReasoningEffort.literal("high"),
+            .input_tokens = 12_000,
+            .context_window = 100_000,
+        },
         .tool_result_memory = .{
             .tool_images = &.{.{ .data = @constCast("cG5n"), .mime_type = @constCast("image/png") }},
             .tool_image_handle = "image-result-handle",
@@ -801,11 +1033,17 @@ fn checkParallelResultDuplicationAllocationFailures(alloc: Allocator) !void {
     try std.testing.expectEqual(@as(usize, 2), duplicated.execution.context_notices.len);
     try std.testing.expectEqualStrings("first context notice", duplicated.execution.context_notices[0]);
     try std.testing.expectEqualStrings("second context notice", duplicated.execution.context_notices[1]);
+    const subagent = duplicated.execution.subagent_completion.?;
+    try std.testing.expectEqualStrings("Reviewer", subagent.session_title.?);
+    try std.testing.expectEqualStrings("openai/gpt-5.5", subagent.model);
+    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), subagent.effort);
+    try std.testing.expectEqual(@as(u64, 12_000), subagent.input_tokens);
+    try std.testing.expectEqual(@as(?u32, 100_000), subagent.context_window);
 }
 
 test "parallel result duplication cleans up every allocation failure" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkParallelResultDuplicationAllocationFailures,
         .{},
     );

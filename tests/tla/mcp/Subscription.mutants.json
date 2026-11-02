@@ -1,0 +1,74 @@
+[
+ {
+  "description": "A notification goes to any active subscription that asked for its kind, whatever its id (SUBS-02)",
+  "old": "Targets(n, k) == {s \\in Subs: phase[s] = \"active\" /\\ cur[s] = n /\\ k \\in acked[s]}",
+  "new": "Targets(n, k) == {s \\in Subs: phase[s] = \"active\" /\\ k \\in acked[s]}",
+  "invariant": "SubDemux"
+ },
+ {
+  "description": "A notification is delivered before the acknowledgment, by what was asked (SUBS-01)",
+  "old": "Targets(n, k) == {s \\in Subs: phase[s] = \"active\" /\\ cur[s] = n /\\ k \\in acked[s]}",
+  "new": "Targets(n, k) == {s \\in Subs: phase[s] \\in {\"pending\", \"active\"} /\\ cur[s] = n /\\ k \\in asked[s] \\cup acked[s]}",
+  "invariant": "AckFirst"
+ },
+ {
+  "description": "An acknowledgment naming more than was asked is taken as it is",
+  "old": "             a == f \\cap asked[s]",
+  "new": "             a == f",
+  "invariant": "FilterRespected"
+ },
+ {
+  "description": "An acknowledgment of nothing asked leaves the subscription active",
+  "old": "            /\\ IF a = {}",
+  "new": "            /\\ IF FALSE",
+  "invariant": "ActiveListensForSomething"
+ },
+ {
+  "description": "A cancelled subscription keeps taking notifications",
+  "old": "    /\\ phase[s] \\in {\"pending\", \"active\", \"waiting\"}\n    /\\ phase' = [phase EXCEPT ![s] = \"off\"]",
+  "new": "    /\\ phase[s] \\in {\"pending\", \"active\", \"waiting\"}\n    /\\ phase' = phase",
+  "invariant": "NothingAfterEnd"
+ },
+ {
+  "description": "A result after the end is reported again",
+  "old": "Final(n) ==\n    IF Current(n)",
+  "new": "Final(n) ==\n    IF \\E s \\in Subs: cur[s] = n",
+  "invariant": "OneEnd"
+ },
+ {
+  "description": "A result is treated as an abrupt end and listened to again",
+  "old": "    THEN /\\ Ends(OwnerOf(n), n)\n         /\\ final' = [final EXCEPT ![n] = TRUE]\n         /\\ UNCHANGED <<cur, asked, acked, tries, next, stdio, up, owner, ackSeen, allowed, ghosts>>",
+  "new": "    THEN /\\ phase' = [phase EXCEPT ![OwnerOf(n)] = \"waiting\"]\n         /\\ over' = [over EXCEPT ![n] = TRUE]\n         /\\ final' = [final EXCEPT ![n] = TRUE]\n         /\\ UNCHANGED <<cur, asked, acked, tries, next, stdio, up, owner, ackSeen, allowed, told, ghosts>>",
+  "invariant": "NoRelistenAfterFinal"
+ },
+ {
+  "description": "A listen goes out again while the stdio process is down (SUBS-05)",
+  "old": "    /\\ phase[s] = \"waiting\"\n    /\\ ~stdio \\/ up",
+  "new": "    /\\ phase[s] = \"waiting\"",
+  "invariant": "NoSendWhileDown"
+ },
+ {
+  "description": "The process exit leaves its listens running (SUBS-05)",
+  "old": "    /\\ phase' = [s \\in Subs |-> IF s \\in Live THEN (IF tries[s] < MaxTries THEN \"waiting\" ELSE \"ended\") ELSE phase[s]]",
+  "new": "    /\\ phase' = phase",
+  "invariant": "NothingAfterEnd"
+ },
+ {
+  "description": "Giving up after the last try doesn't tell the host",
+  "old": "    ELSE /\\ Ends(s, cur[s])\n         /\\ UNCHANGED tries",
+  "new": "    ELSE /\\ phase' = [phase EXCEPT ![s] = \"ended\"]\n         /\\ over' = [over EXCEPT ![cur[s]] = TRUE]\n         /\\ UNCHANGED <<tries, told>>",
+  "invariant": "EndTold"
+ },
+ {
+  "description": "A subscription waiting after an abrupt end never listens again (SUBS-05)",
+  "old": "Resend(s) ==\n    /\\ phase[s] = \"waiting\"",
+  "new": "Resend(s) ==\n    /\\ FALSE",
+  "property": "ListensAgain"
+ },
+ {
+  "description": "Notifications are checked against what the subscription asked, not what was acknowledged",
+  "old": "Targets(n, k) == {s \\in Subs: phase[s] = \"active\" /\\ cur[s] = n /\\ k \\in acked[s]}",
+  "new": "Targets(n, k) == {s \\in Subs: phase[s] = \"active\" /\\ cur[s] = n /\\ k \\in asked[s]}",
+  "invariant": "FilterRespected"
+ }
+]

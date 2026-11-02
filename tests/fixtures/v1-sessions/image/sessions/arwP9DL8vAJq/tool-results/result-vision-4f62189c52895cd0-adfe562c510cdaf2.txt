@@ -1,0 +1,1 @@
+{"images":[{"image_id":1,"status":"failed","error":{"code":"provider_response_invalid","message":"Vision received an invalid provider response after one retry.","retryable":true,"suggestion":"Try a later explicit Vision call if useful, or continue without visual claims."}}]}

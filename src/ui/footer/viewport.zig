@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const types = @import("../../core/shared/types.zig");
 const render_engine = @import("../render_engine.zig");
@@ -248,7 +249,7 @@ pub fn paintFooterIntoSurface(
 }
 
 test "footer viewport installs composed frame without allocation" {
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
     var failing = std.testing.FailingAllocator.init(backing, .{});
     const alloc = failing.allocator();
     var viewport = FooterViewport{};

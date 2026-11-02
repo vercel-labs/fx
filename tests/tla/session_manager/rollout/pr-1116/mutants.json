@@ -1,0 +1,72 @@
+[
+  {
+    "module": "PR1116Blobs",
+    "description": "Persist a reference before its body is a blob",
+    "old": "/\\ up /\\ b \\in blobs /\\ b \\notin refs",
+    "new": "/\\ up /\\ b \\notin refs",
+    "invariant": "ReferenceAfterBlob"
+  },
+  {
+    "module": "PR1116Blobs",
+    "description": "Publish a blob without making it read-only",
+    "old": "readonly' = readonly \\cup {b}",
+    "new": "readonly' = readonly",
+    "invariant": "PublishedReadOnly"
+  },
+  {
+    "module": "PR1116Migration",
+    "description": "Publish a handle map before copying every body",
+    "old": "/\\ copying /\\ blobs = Handles /\\ ~settings",
+    "new": "/\\ copying /\\ ~settings",
+    "invariant": "MapReferencesDurableBlobs"
+  },
+  {
+    "module": "PR1116Migration",
+    "description": "Remove the old folder before moving terminal state",
+    "old": "/\\ copying /\\ settings /\\ terminal = \"new\"\n              /\\ side' = {}",
+    "new": "/\\ copying /\\ settings\n              /\\ side' = {}",
+    "invariant": "TerminalNeverLost"
+  },
+  {
+    "module": "PR1116Terminal",
+    "description": "App crash also removes hosted terminal folders",
+    "old": "Crash == /\\ appUp /\\ appUp' = FALSE /\\ known' = {}\n         /\\ UNCHANGED <<live, folders, running, age, cleaned>>",
+    "new": "Crash == /\\ appUp /\\ appUp' = FALSE /\\ known' = {} /\\ folders' = {}\n         /\\ UNCHANGED <<live, running, age, cleaned>>",
+    "invariant": "LiveTerminalRecoverable"
+  },
+  {
+    "module": "PR1116Terminal",
+    "description": "Resume assumes terminal state exists for every live session",
+    "old": "known' = folders \\cap live",
+    "new": "known' = live",
+    "invariant": "KnownStateHasFolder"
+  },
+  {
+    "module": "PR1116ChildCheckpoint",
+    "description": "Begin effects without saving the child turn",
+    "old": "/\\ up /\\ parentRecord /\\ childTurn /\\ ~ended /\\ effectStarted' = TRUE",
+    "new": "/\\ up /\\ parentRecord /\\ ~ended /\\ effectStarted' = TRUE",
+    "invariant": "CheckpointBeforeEffects"
+  },
+  {
+    "module": "PR1116ChildCheckpoint",
+    "description": "Crash repair marks checkpointed work lost",
+    "old": "IF childTurn THEN \"interrupted\" ELSE \"lost\"",
+    "new": "\"lost\"",
+    "invariant": "LostOnlyBeforeTurn"
+  },
+  {
+    "module": "PR1116Records",
+    "description": "Replacing a record map forgets earlier acknowledged aliases",
+    "old": "index' = index \\cup {r}",
+    "new": "index' = {r}",
+    "invariant": "AcknowledgedRecordsReadable"
+  },
+  {
+    "module": "PR1116Records",
+    "description": "Fork forgets the record blob links",
+    "old": "forkBodies' = bodies",
+    "new": "forkBodies' = {}",
+    "invariant": "ForkRecordsIndependent"
+  }
+]

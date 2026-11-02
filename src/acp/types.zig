@@ -18,54 +18,46 @@ pub fn generateMessageId(storage: *MessageIdBuffer) []const u8 {
 
 pub const protocol_version: u32 = 1;
 
+/// Returns the borrowed value at `_meta.fx.<key>` on an ACP params object.
+/// fx reads and writes its protocol extensions under that one namespace.
+pub fn fxMetaField(object: std.json.ObjectMap, key: []const u8) ?std.json.Value {
+    const meta = object.get("_meta") orelse return null;
+    if (meta != .object) return null;
+    const fx = meta.object.get("fx") orelse return null;
+    if (fx != .object) return null;
+    return fx.object.get(key);
+}
+
+/// Returns `_meta.fx.<key>` when it is a JSON boolean.
+pub fn fxMetaBool(object: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = fxMetaField(object, key) orelse return null;
+    return if (value == .bool) value.bool else null;
+}
+
+/// Returns `_meta.fx.<key>` when it is a JSON integer.
+pub fn fxMetaInteger(object: std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = fxMetaField(object, key) orelse return null;
+    return if (value == .integer) value.integer else null;
+}
+
+const model_recovery_update_prefix = "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"fx\":{\"modelResponseRecovery\":";
+
+/// What a session load reports for a request an earlier fx process was
+/// running when it stopped.
+/// `_meta.fx.modelResponseRecovery`: the recovery module's shape, as in
+/// `fx ask --json` (decision 38). Null clears the client's status.
 pub fn writeModelRecoveryInfoUpdate(
     writer: *std.Io.Writer,
     status: ?core_types.RouteRecoveryStatus,
-    durable: bool,
 ) !void {
-    try writer.writeAll("{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"fx\":{\"modelResponseRecovery\":");
+    try writer.writeAll(model_recovery_update_prefix);
     const recovery = status orelse {
         try writer.writeAll("null}}}");
         return;
     };
-    try writer.writeAll("{\"state\":");
-    try writeJsonStr(
-        if (recovery.isRecovered())
-            "recovered"
-        else if (recovery.kind == .terminal_provider_error)
-            "paused"
-        else
-            "active",
-        writer,
-    );
-    try writer.writeAll(",\"kind\":");
-    try writeJsonStr(@tagName(recovery.kind), writer);
-    if (recovery.cause) |cause| {
-        try writer.writeAll(",\"cause\":");
-        try writeJsonStr(@tagName(cause), writer);
-    }
-    if (recovery.action) |action| {
-        try writer.writeAll(",\"action\":");
-        try writeJsonStr(@tagName(action), writer);
-    }
-    if (recovery.required_action != .none) {
-        try writer.writeAll(",\"requiredAction\":");
-        try writeJsonStr(@tagName(recovery.required_action), writer);
-    }
-    const reported_attempt = recovery.reportedAttempt();
-    if (reported_attempt != 0) {
-        try writer.print(",\"attempt\":{d}", .{reported_attempt});
-    }
-    if (recovery.attempt_limit != 0) {
-        try writer.print(",\"attemptLimit\":{d}", .{recovery.attempt_limit});
-    }
-    if (recovery.delay_seconds != 0) {
-        try writer.print(",\"delaySeconds\":{d}", .{recovery.delay_seconds});
-    }
-    try writer.print(",\"durable\":{s},\"message\":", .{if (durable) "true" else "false"});
     var label_buf: [core_types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
-    try writeJsonStr(recovery.label(&label_buf), writer);
-    try writer.writeAll("}}}}");
+    try recovery.report(&label_buf).writeJson(writer);
+    try writer.writeAll("}}}");
 }
 
 pub const StopReason = enum {
@@ -74,6 +66,9 @@ pub const StopReason = enum {
     max_model_turns,
     refused,
     cancelled,
+    /// The host gave the turn a time to stop at, and it stopped before its
+    /// next model request with the turn kept open for a later resume.
+    yielded,
 
     pub fn jsonString(self: StopReason) []const u8 {
         return switch (self) {
@@ -82,6 +77,7 @@ pub const StopReason = enum {
             .max_model_turns => "max_model_turns",
             .refused => "refused",
             .cancelled => "cancelled",
+            .yielded => "yielded",
         };
     }
 };
@@ -144,6 +140,23 @@ pub fn writeAgentMessageChunk(w: *std.Io.Writer, message_id: []const u8, text: [
     try w.writeAll("}}");
 }
 
+/// ACP v1 Session Notice: shown to the user, never part of the session's
+/// history. Only for a client that advertised `session.notices`.
+pub fn writeNotice(w: *std.Io.Writer, severity: []const u8, title: []const u8) !void {
+    try w.writeAll("{\"sessionUpdate\":\"notice\",\"severity\":");
+    try writeJsonStr(severity, w);
+    try w.writeAll(",\"title\":");
+    try writeJsonStr(title, w);
+    try w.writeByte('}');
+}
+
+test "writeNotice writes an ACP v1 notice update" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeNotice(&out.writer, "info", "A \"quoted\" title");
+    try std.testing.expectEqualStrings("{\"sessionUpdate\":\"notice\",\"severity\":\"info\",\"title\":\"A \\\"quoted\\\" title\"}", out.written());
+}
+
 pub fn writeAgentThoughtChunk(w: *std.Io.Writer, text: []const u8) !void {
     try w.writeAll("{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":");
     try writeJsonStr(text, w);
@@ -173,6 +186,28 @@ pub fn writeUserImageChunk(
     try w.writeAll("}}");
 }
 
+/// Host-facing identity of a tool call, sent as `_meta.fx.toolCall` so
+/// clients never need to match on tool names.
+pub const ToolCallMeta = struct {
+    /// fx's own discovery or bookkeeping step, which hosts may hide.
+    internal: bool = false,
+    /// The MCP server and its own tool name, for MCP tool calls.
+    mcp: ?struct { server: []const u8, tool: []const u8 } = null,
+};
+
+fn writeToolCallMeta(w: *std.Io.Writer, meta: ToolCallMeta) !void {
+    try w.writeAll(",\"_meta\":{\"fx\":{\"toolCall\":{\"internal\":");
+    try w.writeAll(if (meta.internal) "true" else "false");
+    if (meta.mcp) |mcp| {
+        try w.writeAll(",\"mcp\":{\"server\":");
+        try writeJsonStr(mcp.server, w);
+        try w.writeAll(",\"tool\":");
+        try writeJsonStr(mcp.tool, w);
+        try w.writeByte('}');
+    }
+    try w.writeAll("}}}");
+}
+
 pub fn writeToolCall(
     w: *std.Io.Writer,
     tool_call_id: []const u8,
@@ -181,6 +216,7 @@ pub fn writeToolCall(
     kind: ToolCallKind,
     status: ToolCallStatus,
     raw_input: ?std.json.Value,
+    meta: ToolCallMeta,
 ) !void {
     try w.writeAll("{\"sessionUpdate\":\"tool_call\",\"toolCallId\":");
     try writeJsonStr(tool_call_id, w);
@@ -196,6 +232,7 @@ pub fn writeToolCall(
         try w.writeAll(",\"rawInput\":");
         try std.json.Stringify.value(value, .{}, w);
     }
+    try writeToolCallMeta(w, meta);
     try w.writeAll("}");
 }
 
@@ -226,14 +263,36 @@ pub fn writeToolCallUpdateWithCommandResult(
     try w.writeAll("}");
 }
 
-pub fn writeInitializeResponse(w: *std.Io.Writer, image_prompts: bool) !void {
+pub const AgentCapabilities = struct {
+    image_prompts: bool,
+    /// Accepts client `mcpServers` on session setup.
+    mcp_servers: bool = true,
+    /// Accepts steering prompts through `session/prompt` during a turn.
+    steering: bool = false,
+    /// Accepts a client system prompt on `session/new` in append mode.
+    system_prompt: bool = false,
+    /// Serves `type: "acp"` MCP servers over this connection.
+    mcp_over_acp: bool = false,
+    /// Speaks MCP's HTTP+SSE transport (2024-11-05), which fx's MCP engine doesn't.
+    mcp_sse: bool = true,
+};
+
+pub fn writeInitializeResponse(w: *std.Io.Writer, capabilities: AgentCapabilities) !void {
+    const mcp_servers = if (capabilities.mcp_servers) "true" else "false";
     try w.writeAll("{\"protocolVersion\":");
     try w.print("{d}", .{protocol_version});
     try w.writeAll(",\"agentCapabilities\":{");
     try w.writeAll("\"loadSession\":true,");
-    try w.print("\"promptCapabilities\":{{\"image\":{s},\"audio\":false,\"embeddedContext\":true}},", .{if (image_prompts) "true" else "false"});
-    try w.writeAll("\"mcpCapabilities\":{\"http\":true,\"sse\":true},");
-    try w.writeAll("\"sessionCapabilities\":{\"list\":{},\"resume\":{},\"close\":{}}");
+    try w.print("\"promptCapabilities\":{{\"image\":{s},\"audio\":false,\"embeddedContext\":true}},", .{if (capabilities.image_prompts) "true" else "false"});
+    try w.print("\"mcpCapabilities\":{{\"http\":{s},\"sse\":{s},\"acp\":{s}}},", .{
+        mcp_servers,
+        if (capabilities.mcp_servers and capabilities.mcp_sse) "true" else "false",
+        if (capabilities.mcp_over_acp) "true" else "false",
+    });
+    try w.writeAll("\"sessionCapabilities\":{\"list\":{},\"resume\":{},\"close\":{}");
+    if (capabilities.system_prompt) try w.writeAll(",\"systemPrompt\":{}");
+    try w.writeByte('}');
+    try w.print(",\"_meta\":{{\"fx\":{{\"steering\":{s}}}}}", .{if (capabilities.steering) "true" else "false"});
     try w.writeAll("},\"agentInfo\":{\"name\":\"fx\",\"title\":\"fx\",\"version\":");
     try writeJsonStr(build_options.app_version, w);
     try w.writeAll("},");
@@ -244,6 +303,60 @@ pub fn writePromptResponse(w: *std.Io.Writer, reason: StopReason) !void {
     try w.writeAll("{\"stopReason\":");
     try writeJsonStr(reason.jsonString(), w);
     try w.writeAll("}");
+}
+
+/// How a steering `session/prompt` fared in the turn that received it.
+pub const SteeringDelivery = enum {
+    absorbed,
+    dropped,
+};
+
+/// Answers a steering prompt with its receiving turn's stop reason. Usage is
+/// reported once, on the response to the prompt that started the turn.
+pub fn writeSteeringPromptResponse(w: *std.Io.Writer, reason: StopReason, delivery: SteeringDelivery) !void {
+    try w.writeAll("{\"stopReason\":");
+    try writeJsonStr(reason.jsonString(), w);
+    try w.writeAll(",\"_meta\":{\"fx\":{\"steering\":");
+    try writeJsonStr(@tagName(delivery), w);
+    try w.writeAll("}}}");
+}
+
+/// Replays delivered steering where the agent inserted it into the turn. A
+/// libfx steer carries the input id its host gave it.
+pub fn writeSteeringUserMessageChunk(
+    w: *std.Io.Writer,
+    message_id: []const u8,
+    text: []const u8,
+    request_id: ?jsonrpc.RequestId,
+    input_id: ?[]const u8,
+) !void {
+    try w.writeAll("{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":");
+    try writeJsonStr(message_id, w);
+    try w.writeAll(",\"content\":{\"type\":\"text\",\"text\":");
+    try writeJsonStr(text, w);
+    try w.writeAll("},\"_meta\":{\"fx\":{\"steering\":{\"requestId\":");
+    try jsonrpc.Writer.writeId(w, request_id);
+    if (input_id) |id| {
+        try w.writeAll(",\"inputId\":");
+        try writeJsonStr(id, w);
+    }
+    try w.writeAll("}}}}");
+}
+
+test "steering replay carries a libfx input id only when it has one" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeSteeringUserMessageChunk(&out.writer, "m1", "use tabs", .{ .integer = 4 }, null);
+    try std.testing.expectEqualStrings(
+        "{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":\"m1\",\"content\":{\"type\":\"text\",\"text\":\"use tabs\"},\"_meta\":{\"fx\":{\"steering\":{\"requestId\":4}}}}",
+        out.written(),
+    );
+    out.clearRetainingCapacity();
+    try writeSteeringUserMessageChunk(&out.writer, "m2", "be brief", null, "s1");
+    try std.testing.expectEqualStrings(
+        "{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":\"m2\",\"content\":{\"type\":\"text\",\"text\":\"be brief\"},\"_meta\":{\"fx\":{\"steering\":{\"requestId\":null,\"inputId\":\"s1\"}}}}",
+        out.written(),
+    );
 }
 
 pub fn writePromptResponseWithUsage(
@@ -286,12 +399,8 @@ pub fn writeSessionInfoUpdate(w: *std.Io.Writer, title: []const u8, updated_at: 
     try w.writeAll("}");
 }
 
-pub fn writeUsageUpdate(w: *std.Io.Writer, used: u64, size: u64, complete_cost: ?f64) !void {
-    try w.print("{{\"sessionUpdate\":\"usage_update\",\"used\":{d},\"size\":{d}", .{ used, size });
-    if (complete_cost) |amount| {
-        try w.print(",\"cost\":{{\"amount\":{d},\"currency\":\"USD\"}}", .{amount});
-    }
-    try w.writeAll("}");
+pub fn writeUsageUpdate(w: *std.Io.Writer, used: u64, size: u64) !void {
+    try w.print("{{\"sessionUpdate\":\"usage_update\",\"used\":{d},\"size\":{d}}}", .{ used, size });
 }
 
 test "writeAgentMessageChunk produces valid json" {
@@ -323,9 +432,13 @@ test "writeToolCall produces valid json" {
         .read,
         .pending,
         raw_input.value,
+        .{},
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
     defer parsed.deinit();
+    const tool_call_meta = parsed.value.object.get("_meta").?.object.get("fx").?.object.get("toolCall").?.object;
+    try std.testing.expect(!tool_call_meta.get("internal").?.bool);
+    try std.testing.expect(tool_call_meta.get("mcp") == null);
 
     try std.testing.expectEqualStrings("call_001", parsed.value.object.get("toolCallId").?.string);
     try std.testing.expectEqualStrings("read_file", parsed.value.object.get("name").?.string);
@@ -348,6 +461,7 @@ test "StopReason jsonString values" {
     try std.testing.expectEqualStrings("end_turn", StopReason.end_turn.jsonString());
     try std.testing.expectEqualStrings("cancelled", StopReason.cancelled.jsonString());
     try std.testing.expectEqualStrings("max_output_tokens", StopReason.max_output_tokens.jsonString());
+    try std.testing.expectEqualStrings("yielded", StopReason.yielded.jsonString());
 }
 
 test "ToolCallKind jsonString values" {
@@ -411,7 +525,7 @@ test "writeInitializeResponse contains required fields" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeInitializeResponse(&out.writer, true);
+    try writeInitializeResponse(&out.writer, .{ .image_prompts = true, .steering = true, .system_prompt = true, .mcp_over_acp = true });
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
     defer parsed.deinit();
 
@@ -430,6 +544,39 @@ test "writeInitializeResponse contains required fields" {
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"close\":{}") != null);
     try std.testing.expect(mcp_capabilities.get("http").?.bool);
     try std.testing.expect(mcp_capabilities.get("sse").?.bool);
+    try std.testing.expect(mcp_capabilities.get("acp").?.bool);
+    const session_capabilities = agent_capabilities.get("sessionCapabilities").?.object;
+    try std.testing.expectEqual(@as(usize, 0), session_capabilities.get("systemPrompt").?.object.count());
+    const fx_meta = agent_capabilities.get("_meta").?.object.get("fx").?.object;
+    try std.testing.expect(fx_meta.get("steering").?.bool);
+}
+
+test "writeInitializeResponse withholds MCP transports a host rejects" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeInitializeResponse(&out.writer, .{ .image_prompts = false, .mcp_servers = false });
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    const mcp_capabilities = parsed.value.object.get("agentCapabilities").?.object.get("mcpCapabilities").?.object;
+    try std.testing.expect(!mcp_capabilities.get("http").?.bool);
+    try std.testing.expect(!mcp_capabilities.get("sse").?.bool);
+}
+
+test "writeToolCall separates MCP server and tool identity" {
+    const alloc = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeToolCall(&out.writer, "call_mcp", "mcp_mini_browser_eval", "Evaluate JavaScript", .other, .pending, null, .{
+        .mcp = .{ .server = "mini", .tool = "browser_eval" },
+    });
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.writer.buffered(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("Evaluate JavaScript", parsed.value.object.get("title").?.string);
+    const meta = parsed.value.object.get("_meta").?.object.get("fx").?.object.get("toolCall").?.object;
+    try std.testing.expect(!meta.get("internal").?.bool);
+    try std.testing.expectEqualStrings("mini", meta.get("mcp").?.object.get("server").?.string);
+    try std.testing.expectEqualStrings("browser_eval", meta.get("mcp").?.object.get("tool").?.string);
 }
 
 test "writeUserMessageChunk produces valid json" {
@@ -441,11 +588,11 @@ test "writeUserMessageChunk produces valid json" {
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "User says hello") != null);
 }
 
-test "writeUsageUpdate omits unproven cost" {
+test "writeUsageUpdate reports context used and size" {
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try writeUsageUpdate(&out.writer, 8, 128_000, null);
+    try writeUsageUpdate(&out.writer, 8, 128_000);
     try std.testing.expectEqualStrings(
         "{\"sessionUpdate\":\"usage_update\",\"used\":8,\"size\":128000}",
         out.writer.buffered(),
@@ -461,39 +608,23 @@ test "writeSessionUpdate wraps update with sessionId" {
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"sessionUpdate\":\"test\"") != null);
 }
 
-test "model recovery info update is structured and clearable" {
+test "model recovery info update wraps the shared report and is clearable" {
+    // The report's shape is `types.zig` "recovery reports write the shape fx
+    // ask and ACP share"; this pins the ACP envelope around it.
     const alloc = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try writeModelRecoveryInfoUpdate(&out.writer, .{
-        .kind = .terminal_provider_error,
-        .failed_attempt = 4,
-        .attempt_limit = 10,
-        .cause = .system_resumed,
-        .action = .paused,
-        .required_action = .continue_later,
-        .delay_seconds = 4,
-        .diagnostic = core_types.ModelFailureDiagnostic.init("ConnectionResetByPeer"),
-    }, true);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"state\":\"paused\"") != null);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"cause\":\"system_resumed\"") != null);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"requiredAction\":\"continue_later\"") != null);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"attempt\":4") != null);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"delaySeconds\":4") != null);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"durable\":true") != null);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "ConnectionResetByPeer") != null);
+        .kind = .waiting,
+        .text = core_types.testRecoveryText("Gateway error · next try in 8s · attempt 4 · 1m 12s"),
+        .attempt = 4,
+    });
+    try std.testing.expectEqualStrings(
+        "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"fx\":{\"modelResponseRecovery\":{\"state\":\"waiting\",\"attempt\":4,\"message\":\"Gateway error · next try in 8s · attempt 4 · 1m 12s\"}}}}",
+        out.writer.buffered(),
+    );
 
     out.writer.end = 0;
-    try writeModelRecoveryInfoUpdate(&out.writer, .{
-        .kind = .auto_recovered,
-        .succeeded_attempt = 5,
-        .attempt_limit = 10,
-    }, true);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"state\":\"recovered\"") != null);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"attempt\":5") != null);
-    try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "ConnectionResetByPeer") == null);
-
-    out.writer.end = 0;
-    try writeModelRecoveryInfoUpdate(&out.writer, null, false);
+    try writeModelRecoveryInfoUpdate(&out.writer, null);
     try std.testing.expect(std.mem.find(u8, out.writer.buffered(), "\"modelResponseRecovery\":null") != null);
 }

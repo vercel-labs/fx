@@ -3,7 +3,6 @@ import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -11,6 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { savedText } from "./saved-sessions";
 import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
 const TIMEOUT = 20_000;
@@ -300,7 +300,7 @@ async function startAcpCodeSession(client: AcpClient) {
   await client.request("initialize", { protocolVersion: 1 }, 1);
   await client.request("session/new", { mcpServers: [] }, 2);
   await client.readLine();
-  await client.request("session/set_mode", { modeId: "code" }, 3);
+  await client.request("session/set_mode", { modeId: "auto" }, 3);
 }
 
 async function runAcpPrompt(client: AcpClient, text: string) {
@@ -379,10 +379,7 @@ describe("web_fetch Gateway fixture", () => {
         expect(gateway.requests[1].body).toContain("credential-bearing URLs");
         expectNoFetchProgress(result.stderr);
 
-        const sessionEvents = readFileSync(
-          join(root.home, ".fx", "sessions", json.session_id, "events.jsonl"),
-          "utf8",
-        );
+        const sessionEvents = savedText(root.home, json.session_id);
         expect(sessionEvents).toContain("web_fetch");
         expect(sessionEvents).toContain("https://user:pass@example.com/docs");
         expect(sessionEvents).not.toContain("[redacted]");
@@ -582,6 +579,7 @@ describe("web_fetch Gateway fixture", () => {
             url: "https://example.com/docs",
             prompt: "legacy",
           },
+          _meta: { fx: { toolCall: { internal: false } } },
         });
       } finally {
         await client.close();

@@ -67,7 +67,7 @@ It drives one tmux shell through this shape:
 1. Start a shell with temp `HOME`, `ZDOTDIR`, history, and workdir.
 2. Print shell markers and wrapped lines before Fx starts.
 3. Launch the freshly built `zig-out/bin/fx`.
-4. Run no-key slash commands such as `/status`.
+4. Run no-key slash commands that write to the transcript, such as `/allowlist`.
 5. Quit Fx.
 6. Print more shell markers in the same shell.
 7. Relaunch Fx.

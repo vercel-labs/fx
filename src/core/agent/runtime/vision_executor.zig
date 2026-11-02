@@ -1,10 +1,10 @@
 const std = @import("std");
+const observation = @import("observation.zig");
 const builtin = @import("builtin");
 const agent_stream_provider = @import("../stream_provider.zig");
 const context_limits = @import("../../config/context_limits.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
-const session_usage = @import("../../session/session_usage.zig");
 const types = @import("../../shared/types.zig");
 const image_provider = @import("image_provider.zig");
 const tool_contracts = @import("tool_contracts.zig");
@@ -26,6 +26,8 @@ const system_prompt =
     "Extract exactly one record for every requested image ID, in requested order.";
 
 pub const Config = struct {
+    observer: ?*observation.Observer = null,
+    parent_call_id: ?[]const u8 = null,
     stream_provider: agent_stream_provider.Provider,
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
@@ -33,8 +35,6 @@ pub const Config = struct {
     session_id: ?[]const u8 = null,
     retry_count: usize,
     cancel_flag: ?*std.atomic.Value(bool),
-    usage: ?*session_usage.Usage,
-    usage_allocator: Allocator,
     trace_ctx: debug_trace.TraceContext,
     output_limit: context_limits.Resolved,
 };
@@ -290,14 +290,14 @@ fn runBatchAttempt(
         verified_images,
         .{
             .stream_provider = config.stream_provider,
+            .observer = config.observer,
+            .parent_call_id = config.parent_call_id,
             .api_key = config.api_key,
             .credential_source = config.credential_source,
             .gateway_team = config.gateway_team,
             .session_id = config.session_id,
             .retry_count = config.retry_count,
             .cancel_flag = cancel_flag,
-            .usage = config.usage,
-            .usage_allocator = config.usage_allocator,
             .trace_ctx = config.trace_ctx,
             .capture_limit_bytes = @min(
                 output_limit_bytes +| 1,
@@ -387,8 +387,7 @@ fn runBatchAttempt(
 
 fn failedArguments(alloc: Allocator, err: anyerror) !tool_contracts.ToolExecutionResult {
     return .{
-        .model_output = try std.fmt.allocPrint(
-            alloc,
+        .model_output = try alloc.print(
             "Vision request rejected before image access: {s}",
             .{@errorName(err)},
         ),

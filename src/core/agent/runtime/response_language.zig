@@ -1,5 +1,6 @@
 const std = @import("std");
 const language_script = @import("../../shared/language_script.zig");
+const text_utils = @import("../../shared/text_utils.zig");
 
 const minimum_letters: usize = 5;
 const minimum_unexpected_prose_letters: usize = 8;
@@ -51,7 +52,10 @@ pub fn evidence(text: []const u8) Evidence {
     );
 }
 
-pub fn infer_expectation(prompt: []const u8) ?Script {
+// noinline: these prompt scans touch every prompt byte once per signal and
+// are the turn loop's hottest code. Keeping them in their own function keeps
+// their profile out of the turn loop, which can then compile for size.
+pub noinline fn infer_expectation(prompt: []const u8) ?Script {
     if (may_request_language_switch(prompt)) return null;
     const script = evidence(prompt).script orelse return null;
     return if (script == .latin and has_english_authority_signal(prompt)) script else null;
@@ -167,7 +171,7 @@ test "response language evidence distinguishes clear scripts" {
     );
     try std.testing.expectEqual(
         Script.latin,
-        evidence("English transcript payload with sparse 界 markers. " ** 16).script.?,
+        evidence(text_utils.repeat("English transcript payload with sparse 界 markers. ", 16)).script.?,
     );
 }
 

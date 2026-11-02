@@ -2,26 +2,8 @@
 """Generate projected schema-v3 sessions around large sparse event logs."""
 
 import argparse
-import hashlib
 import json
-import stat
 from pathlib import Path
-
-
-def stat_fingerprint(path: Path, expected_size: int) -> str:
-    info = path.stat()
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != expected_size:
-        raise ValueError(f"invalid event log stat for {path}")
-
-    encoded = bytearray([1])
-    encoded.extend(info.st_dev.to_bytes(8, "big"))
-    encoded.extend(info.st_ino.to_bytes(8, "big"))
-    encoded.extend(stat.S_IMODE(info.st_mode).to_bytes(8, "big"))
-    encoded.extend(info.st_nlink.to_bytes(8, "big"))
-    encoded.extend(info.st_size.to_bytes(8, "big"))
-    encoded.extend(info.st_mtime_ns.to_bytes(16, "big", signed=True))
-    encoded.extend(info.st_ctime_ns.to_bytes(16, "big", signed=True))
-    return hashlib.sha256(b"fx:event-file-stat:v1\0" + encoded).hexdigest()
 
 
 def write_private_json(path: Path, value: object) -> None:
@@ -94,7 +76,8 @@ def generate(home: Path, workspace: Path, count: int, log_size: int, deny_event_
                 "total_output_tokens": 0,
                 "last_event_seq": 1,
                 "event_log_bytes": log_size,
-                "event_log_stat_fingerprint": stat_fingerprint(event_log, log_size),
+                # fx decides staleness by log size and reads no stat identity.
+                "event_log_stat_fingerprint": "00" * 32,
                 "generation_base_seq": 1,
                 "generation_base_bytes": log_size,
                 "checkpoint_seq": None,

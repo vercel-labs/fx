@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const command_admission = @import("../../core/permissions/command_admission.zig");
 const command_contract = @import("../../core/execution/command_contract.zig");
@@ -7,6 +8,7 @@ const debug_trace = @import("../../core/shared/debug_trace.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const terminal_identity = @import("../../core/terminal/identity.zig");
 const terminal_action_executor = @import("../../core/terminal/action_executor.zig");
@@ -14,6 +16,7 @@ const terminal_managed_observer = @import("../../core/terminal/managed_observer.
 const terminal_operation = @import("../../core/terminal/operation.zig");
 const terminal_store = @import("../../core/terminal/store.zig");
 const shell_resolver = @import("../../core/terminal/shell_resolver.zig");
+const shell_snapshot = @import("../../core/terminal/shell_snapshot.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
 const terminal_contracts = @import("../../core/terminal/contracts.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
@@ -51,15 +54,16 @@ pub const Input = struct {
     tty: bool = false,
     yield_time_ms: u32 = managed_contract.default_yield_time_ms,
     timeout_ms: ?u64 = null,
+    reload: bool = false,
     session_id: ?[]const u8 = null,
     chars: ?[]const u8 = null,
     force: bool = false,
 };
 
 pub const public_field_names = blk: {
-    const fields = @typeInfo(Input).@"struct".fields;
-    var names: [fields.len][]const u8 = undefined;
-    for (fields, 0..) |field, index| names[index] = field.name;
+    const field_names = @typeInfo(Input).@"struct".field_names;
+    var names: [field_names.len][]const u8 = undefined;
+    for (field_names, 0..) |field_name, index| names[index] = field_name;
     break :blk names;
 };
 
@@ -72,7 +76,7 @@ pub const ActionFieldContract = struct {
 pub fn actionFieldContract(action: Action) ActionFieldContract {
     return switch (action) {
         .run => .{
-            .allowed = &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms" },
+            .allowed = &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms", "reload" },
             .required = &.{ "action", "command" },
             .conflicts = &.{.{ "profile", "shell" }},
         },
@@ -87,6 +91,82 @@ pub fn actionFieldContract(action: Action) ActionFieldContract {
     };
 }
 
+/// Names the action of a call that omits `action` when exactly one action
+/// takes every field it sends and gets every field it requires. Fields that
+/// decode treats as absent, null or the text "null", are ignored. A bare
+/// session_id fits both interact and stop, so it names neither. The
+/// orchestrator adds the result before the call is stored or admitted, so
+/// permission admission and decode read the same arguments
+/// (`tests/tla/shell_command/ShellContract.tla` AdmissionConsistency).
+pub fn inferAction(object: std.json.ObjectMap) ?[]const u8 {
+    if (object.get("action") != null) return null;
+    var found: ?Action = null;
+    for (std.enums.values(Action)) |action| {
+        if (!fieldsFitAction(object, actionFieldContract(action))) continue;
+        if (found != null) return null;
+        found = action;
+    }
+    return if (found) |action| @tagName(action) else null;
+}
+
+fn fieldsFitAction(object: std.json.ObjectMap, contract: ActionFieldContract) bool {
+    var fields = object.iterator();
+    while (fields.next()) |entry| {
+        if (isAbsentValue(entry.value_ptr.*)) continue;
+        if (!containsFieldName(contract.allowed, entry.key_ptr.*)) return false;
+    }
+    for (contract.required) |name| {
+        if (std.mem.eql(u8, name, "action")) continue;
+        const value = object.get(name) orelse return false;
+        if (isAbsentValue(value)) return false;
+    }
+    return true;
+}
+
+fn isAbsentValue(value: std.json.Value) bool {
+    return value == .null or
+        (value == .string and tool_args.isNullPlaceholderText(value.string));
+}
+
+fn containsFieldName(names: []const []const u8, name: []const u8) bool {
+    for (names) |candidate| {
+        if (std.mem.eql(u8, candidate, name)) return true;
+    }
+    return false;
+}
+
+test "inferAction names the one action a call's fields fit" {
+    const cases = [_]struct { args: []const u8, action: ?[]const u8 }{
+        .{ .args = "{\"command\":\"git status\"}", .action = "run" },
+        .{ .args = "{\"command\":\"make\",\"cwd\":\"src\",\"yield_time_ms\":30000,\"timeout_ms\":600000}", .action = "run" },
+        .{ .args = "{\"command\":\"python3\",\"tty\":true,\"session_id\":null,\"chars\":\"null\"}", .action = "run" },
+        .{ .args = "{\"session_id\":\"shell-1\",\"chars\":\"y\\n\"}", .action = "interact" },
+        .{ .args = "{\"session_id\":\"shell-1\",\"yield_time_ms\":5000}", .action = "interact" },
+        .{ .args = "{\"session_id\":\"shell-1\",\"force\":true}", .action = "stop" },
+        // A bare session_id could observe or stop the session.
+        .{ .args = "{\"session_id\":\"shell-1\"}", .action = null },
+        // A command beside a session could start one or write to one.
+        .{ .args = "{\"command\":\"ls\",\"session_id\":\"shell-1\"}", .action = null },
+        .{ .args = "{\"command\":\"ls\",\"force\":true}", .action = null },
+        .{ .args = "{\"command\":\"ls\",\"note\":\"why\"}", .action = null },
+        .{ .args = "{\"command\":null}", .action = null },
+        .{ .args = "{}", .action = null },
+        .{ .args = "{\"action\":\"run\",\"command\":\"ls\"}", .action = null },
+        .{ .args = "{\"action\":null,\"command\":\"ls\"}", .action = null },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.args, .{});
+        defer parsed.deinit();
+        const inferred = inferAction(parsed.value.object);
+        if (case.action) |expected| {
+            try std.testing.expectEqualStrings(expected, inferred orelse return error.TestExpectedEqual);
+        } else if (inferred) |unexpected| {
+            std.debug.print("{s} inferred {s}\n", .{ case.args, unexpected });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 const OwnedInput = struct {
     arena_state: std.heap.ArenaAllocator.State,
     value: Input,
@@ -97,6 +177,9 @@ const OwnedInput = struct {
     }
 };
 
+/// Decodes one shell call's arguments. How each argument shape is decoded,
+/// admitted, and shown in history is modeled in
+/// `tests/tla/shell_command/ShellContract.tla`.
 pub fn decode(
     ctx: tool_dispatch.DispatchContext,
     args_json: []const u8,
@@ -110,7 +193,7 @@ fn decode_input(
     args_json: []const u8,
 ) tool_dispatch.DispatchError!?tool_dispatch.ToolInput {
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     var raw = std.json.parseFromSliceLeaky(
         std.json.Value,
@@ -144,9 +227,10 @@ fn decode_input(
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
-    if (raw.object.get("yield_time_ms") == null) {
-        input.yield_time_ms = defaultYieldTime(action);
-    }
+    input.yield_time_ms = if (raw.object.get("yield_time_ms") == null)
+        defaultYieldTime(action)
+    else
+        boundedYieldTime(action, input.yield_time_ms);
     if (argument_problem(input) != null) return null;
     const owned = try ctx.allocator.create(OwnedInput);
     owned.* = .{
@@ -168,6 +252,17 @@ fn defaultYieldTime(action: Action) u32 {
     };
 }
 
+/// A wait longer than the action allows is shortened to its limit rather
+/// than refused: the call still runs, and a command that is still going
+/// returns its session_id for the next interact.
+fn boundedYieldTime(action: Action, requested_ms: u32) u32 {
+    return switch (action) {
+        .run => @min(requested_ms, managed_contract.max_yield_time_ms),
+        .interact => @min(requested_ms, managed_contract.max_wait_ceiling_ms),
+        .stop => requested_ms,
+    };
+}
+
 fn effective_interact_yield_time(has_input: bool, requested_ms: u32) u32 {
     if (!has_input) {
         return @min(
@@ -181,46 +276,46 @@ fn effective_interact_yield_time(has_input: bool, requested_ms: u32) u32 {
 // Advisory only: none of these values enters the executable decode path.
 fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: bool) Allocator.Error![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     if (args_json.len > 16 * 1024) {
-        return correction_json(alloc, &.{"Request is too large to suggest a repair; submit the intended action with only its required fields."}, null);
+        return correction_json(alloc, &.{"Arguments are too large to suggest a repair; submit the intended action with only its required fields."}, null);
     }
     const raw = std.json.parseFromSliceLeaky(std.json.Value, arena, args_json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return correction_json(alloc, &.{"Shell arguments must be a JSON object."}, null),
     };
     if (raw != .object or raw.object.count() > 32) {
-        return correction_json(alloc, &.{"Shell arguments must be one bounded request object."}, null);
+        return correction_json(alloc, &.{"Shell arguments must be one bounded object."}, null);
     }
 
     var problems: std.ArrayList([]const u8) = .empty;
     var repairable = true;
     var object = raw.object;
+    // Outside a required vision step the orchestrator unwraps an exact
+    // {"request":{...}} before decode, so a wrapper here usually has extra
+    // top-level fields or a string body. Either way, suggest the flat call.
     if (raw.object.get("request")) |wrapper| {
+        try problems.append(arena, "Put the action fields at the top level; shell takes no request wrapper.");
         var request = wrapper;
         if (request == .string) {
-            try problems.append(arena, "request must be an object, not a JSON string.");
             request = std.json.parseFromSliceLeaky(std.json.Value, arena, request.string, .{}) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return correction_json(alloc, problems.items, null),
             };
         }
         if (request != .object or request.object.count() > 32) {
-            return correction_json(alloc, &.{"request must be one object containing the intended action."}, null);
+            return correction_json(alloc, problems.items, null);
         }
         object = request.object;
-        if (raw.object.count() > 1) {
-            try problems.append(arena, "Only request is allowed at the top level; put action fields inside request.");
-            var outer = raw.object.iterator();
-            while (outer.next()) |entry| {
-                const name = entry.key_ptr.*;
-                if (std.mem.eql(u8, name, "request")) continue;
-                if (object.contains(name)) {
-                    repairable = false;
-                } else {
-                    try object.put(arena, name, entry.value_ptr.*);
-                }
+        var outer = raw.object.iterator();
+        while (outer.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (std.mem.eql(u8, name, "request")) continue;
+            if (object.contains(name)) {
+                repairable = false;
+            } else {
+                try object.put(arena, name, entry.value_ptr.*);
             }
         }
     }
@@ -230,10 +325,10 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
         if (value == .string) {
             if (std.meta.stringToEnum(Action, value.string)) |action| break :blk action;
         }
-        try problems.append(arena, "request.action must be run, interact, or stop.");
+        try problems.append(arena, "action must be run, interact, or stop; put the shell command in command.");
         return correction_json(alloc, problems.items, null);
     } else blk: {
-        try problems.append(arena, "request.action is required.");
+        try problems.append(arena, "action is required.");
         const command = object.get("command") orelse return correction_json(alloc, problems.items, null);
         if (command != .string or object.contains("session_id") or object.contains("chars") or object.contains("force")) {
             return correction_json(alloc, problems.items, null);
@@ -245,9 +340,8 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
     var scratch: ActionFieldCorrectionScratch = .{};
     if (try actionFieldCorrection(arena, action, object, &scratch)) |correction| {
         for (correction.invalid_fields) |name| {
-            try problems.append(arena, try std.fmt.allocPrint(
-                arena,
-                "request.{s} is not accepted for {s}.",
+            try problems.append(arena, try arena.print(
+                "{s} is not accepted for {s}.",
                 .{ text_utils.utf8PrefixByBytes(name, 64), @tagName(action) },
             ));
             // A non-null unknown field can express intent that cannot be reconstructed.
@@ -255,20 +349,21 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
             _ = object.orderedRemove(name);
         }
         for (correction.missing_fields) |name| {
-            try problems.append(arena, try std.fmt.allocPrint(arena, "request.{s} is required.", .{name}));
+            try problems.append(arena, try arena.print("{s} is required for {s}.", .{ name, @tagName(action) }));
             repairable = false;
         }
         for (correction.conflicts) |conflict| {
-            try problems.append(arena, try std.fmt.allocPrint(arena, "Choose either request.{s} or request.{s}.", .{ conflict[0], conflict[1] }));
+            try problems.append(arena, try arena.print("Choose either {s} or {s}.", .{ conflict[0], conflict[1] }));
             repairable = false;
         }
     }
 
     var canonical: std.json.ObjectMap = .empty;
-    inline for (@typeInfo(Input).@"struct".fields) |field| {
-        if (object.get(field.name)) |original| {
+    const input_info = @typeInfo(Input).@"struct";
+    inline for (input_info.field_names, input_info.field_types) |field_name, field_type| {
+        if (object.get(field_name)) |original| {
             var value = original;
-            const T = if (@typeInfo(field.type) == .optional) @typeInfo(field.type).optional.child else field.type;
+            const T = if (@typeInfo(field_type) == .optional) @typeInfo(field_type).optional.child else field_type;
             const expected = comptime switch (@typeInfo(T)) {
                 .int => "an integer",
                 .bool => "a boolean",
@@ -279,40 +374,41 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
             var type_reported = false;
             if (comptime @typeInfo(T) == .int) {
                 if (value == .string) {
-                    try problems.append(arena, "request." ++ field.name ++ " must be an integer.");
+                    try problems.append(arena, field_name ++ " must be an integer.");
                     type_reported = true;
                     if (std.fmt.parseInt(T, value.string, 10)) |number| {
                         value = if (std.math.cast(i64, number)) |integer|
                             .{ .integer = integer }
                         else
-                            .{ .number_string = try std.fmt.allocPrint(arena, "{d}", .{number}) };
+                            .{ .number_string = try arena.print("{d}", .{number}) };
                     } else |_| {
                         repairable = false;
                     }
                 }
             }
-            if (std.json.parseFromValueLeaky(field.type, arena, value, .{})) |_| {
+            if (std.json.parseFromValueLeaky(field_type, arena, value, .{})) |_| {
                 if (comptime T == ShellInput) {
                     var shell: std.json.ObjectMap = .empty;
-                    inline for (@typeInfo(ShellInput).@"struct".fields) |member| {
-                        if (value.object.get(member.name)) |supplied| {
-                            try shell.put(arena, member.name, supplied);
+                    inline for (@typeInfo(ShellInput).@"struct".field_names) |member_name| {
+                        if (value.object.get(member_name)) |supplied| {
+                            try shell.put(arena, member_name, supplied);
                         }
                     }
                     value = .{ .object = shell };
                 }
             } else |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
-                if (!type_reported) try problems.append(arena, "request." ++ field.name ++ " must be " ++ expected ++ ".");
+                if (!type_reported) try problems.append(arena, field_name ++ " must be " ++ expected ++ ".");
                 repairable = false;
             }
-            try canonical.put(arena, field.name, value);
+            try canonical.put(arena, field_name, value);
         }
     }
-    const candidate = std.json.parseFromValueLeaky(Input, arena, .{ .object = canonical }, .{}) catch |err| switch (err) {
+    var candidate = std.json.parseFromValueLeaky(Input, arena, .{ .object = canonical }, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return correction_json(alloc, problems.items, null),
     };
+    candidate.yield_time_ms = boundedYieldTime(candidate.action, candidate.yield_time_ms);
     if (argument_problem(candidate)) |problem| {
         try problems.append(arena, problem);
         repairable = false;
@@ -322,7 +418,7 @@ fn request_correction(alloc: Allocator, args_json: []const u8, supports_tty: boo
         repairable = false;
     }
     if (problems.items.len == 0) {
-        try problems.append(arena, "Submit one Shell action inside request.");
+        try problems.append(arena, "Submit one Shell action.");
     }
     return correction_json(alloc, problems.items, if (repairable) canonical else null);
 }
@@ -332,7 +428,6 @@ fn correction_json(
     problems: []const []const u8,
     candidate: ?std.json.ObjectMap,
 ) Allocator.Error![]u8 {
-    const Retry = struct { request: std.json.Value };
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     std.json.Stringify.value(.{ .@"error" = .{
@@ -340,7 +435,7 @@ fn correction_json(
         .executed = false,
         .problems = problems,
         .instruction = if (candidate != null) @as(?[]const u8, "Call shell once using retry_with exactly.") else null,
-        .retry_with = if (candidate) |object| @as(?Retry, .{ .request = .{ .object = object } }) else null,
+        .retry_with = if (candidate) |object| @as(?std.json.Value, .{ .object = object }) else null,
     } }, .{ .emit_null_optional_fields = false }, &out.writer) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
@@ -348,17 +443,15 @@ fn correction_json(
 fn argument_problem(input: Input) ?[]const u8 {
     switch (input.action) {
         .run => {
-            const command = input.command orelse return "request.command is required.";
-            if (command.len == 0 or command.len > terminal_contracts.max_command_bytes) return "request.command must contain 1-65536 bytes.";
-            if (input.timeout_ms == 0) return "request.timeout_ms must be at least 1; choose the intended deadline.";
-            if (input.profile != null and input.shell != null) return "Choose either request.profile or request.shell.";
-            if (!input.tty and input.shell != null) return "request.shell requires tty=true; choose the intended execution mode.";
-            if (input.yield_time_ms > managed_contract.max_yield_time_ms) return "request.yield_time_ms must be between 0 and 30000.";
+            const command = input.command orelse return "command is required for run.";
+            if (command.len == 0 or command.len > terminal_contracts.max_command_bytes) return "command must contain 1-65536 bytes.";
+            if (input.timeout_ms == 0) return "timeout_ms must be at least 1; choose the intended deadline.";
+            if (input.profile != null and input.shell != null) return "Choose either profile or shell.";
+            if (!input.tty and input.shell != null) return "shell applies only with tty=true; remove shell for an ordinary command, or set tty=true for an interactive terminal.";
         },
         .interact => {
-            if (input.yield_time_ms > managed_contract.max_wait_ceiling_ms) return "request.yield_time_ms must be between 0 and 300000.";
             if (input.chars) |chars| {
-                if (chars.len > terminal_contracts.max_write_bytes) return "request.chars exceed 65536 bytes.";
+                if (chars.len > terminal_contracts.max_write_bytes) return "chars exceed 65536 bytes.";
             }
         },
         .stop => {},
@@ -465,7 +558,7 @@ pub fn validate(
 ) tool_dispatch.DispatchError!?[]u8 {
     const input = erased.as(OwnedInput).value;
     var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena_state.deinit();
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
     return switch (input.action) {
         .run => validateRun(ctx, arena, input),
@@ -489,16 +582,14 @@ fn validateRun(
 ) tool_dispatch.DispatchError!?[]u8 {
     if (argument_problem(input)) |problem| return try ctx.allocator.dupe(u8, problem);
     _ = resolveCwd(arena, ctx, input.cwd) catch |err| {
-        return try std.fmt.allocPrint(
-            ctx.allocator,
+        return try ctx.allocator.print(
             "shell run cwd is invalid: {s}",
             .{@errorName(err)},
         );
     };
     if (!input.tty) {
         _ = commandEnvironment(arena, ctx, input.profile) catch |err| {
-            return try std.fmt.allocPrint(
-                ctx.allocator,
+            return try ctx.allocator.print(
                 "shell run profile is invalid: {s}",
                 .{@errorName(err)},
             );
@@ -533,13 +624,15 @@ fn callRun(
         else => return unavailable(ctx),
     };
     const command = input.command orelse return unavailable(ctx);
+    // Admission never lets a remembered grant authorize a reload, so the
+    // command runs under the startup files its approval was given for.
+    if (input.reload) shell_snapshot.processOwner().markDirty(.agent_reload);
     var request_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer request_arena_state.deinit();
+    defer mem_utils.deinit_arena(request_arena_state);
     const request_arena = request_arena_state.allocator();
     const cwd = resolveCwd(request_arena, ctx, input.cwd) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .failure = try std.fmt.allocPrint(
-            ctx.allocator,
+        return .{ .failure = try ctx.allocator.print(
             "shell run cwd is invalid: {s}",
             .{@errorName(err)},
         ) };
@@ -549,8 +642,7 @@ fn callRun(
         ctx,
         input.profile,
     ) catch |err| {
-        return .{ .failure = try std.fmt.allocPrint(
-            ctx.allocator,
+        return .{ .failure = try ctx.allocator.print(
             "shell run profile is invalid: {s}",
             .{@errorName(err)},
         ) };
@@ -586,7 +678,39 @@ fn callRun(
         return runtimeFailure(ctx, err);
     };
     defer prepared.deinit(ctx.allocator);
-    return finishPrepared(ctx, runtime, &prepared, .command);
+    const result = try finishPrepared(ctx, runtime, &prepared, .command);
+    return attachSnapshotNotice(ctx.allocator, result) catch |err| {
+        result.deinit(ctx.allocator);
+        return err;
+    };
+}
+
+/// Adds the pending shell snapshot fallback notice to a JSON run result, so
+/// the model and ACP clients learn once that startup files run per command.
+fn attachSnapshotNotice(
+    alloc: Allocator,
+    result: tool_dispatch.ToolResult,
+) Allocator.Error!tool_dispatch.ToolResult {
+    const body = switch (result) {
+        .success, .failure => |value| value,
+        .rich => return result,
+    };
+    if (body.len == 0 or body[body.len - 1] != '}') return result;
+    const notice = (try shell_snapshot.processOwner().takeResultNotice(alloc)) orelse return result;
+    defer alloc.free(notice);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    out.writer.writeAll(body[0 .. body.len - 1]) catch return error.OutOfMemory;
+    out.writer.writeAll(",\"notice\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(notice, .{}, &out.writer) catch return error.OutOfMemory;
+    out.writer.writeByte('}') catch return error.OutOfMemory;
+    const updated = try out.toOwnedSlice();
+    alloc.free(body);
+    return switch (result) {
+        .success => .{ .success = updated },
+        .failure => .{ .failure = updated },
+        .rich => unreachable,
+    };
 }
 
 fn callInteract(
@@ -595,8 +719,11 @@ fn callInteract(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const runtime = ctx.managed_executions orelse return unavailable(ctx);
     const session_id = input.session_id orelse return unavailable(ctx);
-    ensureOwnedTtyIndexed(ctx, runtime, session_id) catch |err|
-        return runtimeFailure(ctx, err);
+    switch (ensureOwnedTtyIndexed(ctx, runtime, session_id) catch |err|
+        return runtimeFailure(ctx, err)) {
+        .indexed => {},
+        .ended_with_owner => return terminalEndedWithOwner(ctx, session_id),
+    }
     const chars = input.chars orelse "";
     const yield_time_ms = effective_interact_yield_time(chars.len != 0, input.yield_time_ms);
     if (runtime.isTombstone(session_id)) {
@@ -629,8 +756,11 @@ fn callStop(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const runtime = ctx.managed_executions orelse return unavailable(ctx);
     const session_id = input.session_id orelse return unavailable(ctx);
-    ensureOwnedTtyIndexed(ctx, runtime, session_id) catch |err|
-        return runtimeFailure(ctx, err);
+    switch (ensureOwnedTtyIndexed(ctx, runtime, session_id) catch |err|
+        return runtimeFailure(ctx, err)) {
+        .indexed => {},
+        .ended_with_owner => return terminalEndedWithOwner(ctx, session_id),
+    }
     if (runtime.isTombstone(session_id)) {
         if (runtime.retainedTerminalSnapshot(ctx.allocator, session_id) catch |err|
             return runtimeFailure(ctx, err)) |retained|
@@ -687,7 +817,7 @@ fn callTtyRun(
     };
     defer ctx.allocator.free(@constCast(cwd));
     var shell_arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer shell_arena_state.deinit();
+    defer mem_utils.deinit_arena(shell_arena_state);
     var login_shell_buffer: [4096]u8 = undefined;
     const configured = shell_resolver.configuredLoginShellInto(&login_shell_buffer);
     const shell = ttyShell(shell_arena_state.allocator(), input, configured) catch |err|
@@ -700,7 +830,7 @@ fn callTtyRun(
     requireTtyShellAuthority(ctx, .{
         .command = command,
         .resolved_cwd = cwd,
-        .target_os = builtin.os.tag,
+        .target_os = builtin.target.os.tag,
         .environment = environment,
         .execution_mode = .tty,
     }) catch |err| return runtimeFailure(ctx, err);
@@ -1240,10 +1370,28 @@ fn ensureOwnedTtyIndexed(
     ctx: tool_dispatch.DispatchContext,
     runtime: *managed_execution.Runtime,
     session_id: []const u8,
-) !void {
-    if (runtime.stateFor(session_id) != null) return;
-    const observer = ttyObserverContext(ctx, runtime) orelse return;
-    try terminal_managed_observer.syncOwned(observer);
+) !terminal_managed_observer.SyncOutcome {
+    if (runtime.stateFor(session_id) != null) return .indexed;
+    const observer = ttyObserverContext(ctx, runtime) orelse return .indexed;
+    return terminal_managed_observer.syncOwned(observer, session_id);
+}
+
+/// Terminals end with the fx process that starts them and are never
+/// reattached, so the agent is told to start a new one.
+fn terminalEndedWithOwner(
+    ctx: tool_dispatch.DispatchContext,
+    session_id: []const u8,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
+    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
+    errdefer out.deinit();
+    std.json.Stringify.value(.{ .@"error" = .{
+        .tool = "shell",
+        .code = tool_result_errors.terminal_ended_error_code,
+        .session_id = session_id,
+        .message = "This terminal ended when the fx process that started it exited. It cannot be resumed. Start a new terminal with shell action run and tty true.",
+        .retryable = false,
+    } }, .{}, &out.writer) catch return error.OutOfMemory;
+    return .{ .failure = try out.toOwnedSlice() };
 }
 
 fn refreshTtyExecution(
@@ -1531,6 +1679,7 @@ fn formatSnapshotWithLimit(
         accepted_bytes,
         "",
         true,
+        false,
     );
 }
 
@@ -1549,6 +1698,7 @@ fn formatModelSafeSnapshotRaw(
             accepted_bytes,
             output_delta,
             output_truncated,
+            false,
         );
     }
     var encoded = try text_utils.encodeTerminalSafe(
@@ -1564,46 +1714,80 @@ fn formatModelSafeSnapshotRaw(
         accepted_bytes,
         encoded.bytes,
         output_truncated,
+        true,
     );
 }
 
-const shell_parse_retry_guidance = "The shell could not parse this command (unmatched quote or syntax error), so nothing executed. Rewrite the command with corrected quoting or escaping and submit the full corrected command instead of rerunning the same text.";
+// zsh parses a whole command before it runs any of it. bash, sh, and dash
+// parse and run a command one line at a time, so other lines may have run.
+const zsh_parse_retry_guidance = "The shell could not parse this command (unmatched quote or syntax error), so nothing executed. Rewrite the command with corrected quoting or escaping and submit the full corrected command instead of rerunning the same text.";
+const line_shell_parse_retry_guidance = "The shell could not parse this command (unmatched quote or syntax error). This shell runs a command line by line, so other lines may already have run. Check the output, then submit a corrected command instead of rerunning the same text, without repeating side effects that already happened.";
 const usage_error_retry_guidance = "The command exited with a usage error (missing or invalid arguments). Rebuild the command with the required arguments explicitly set, then submit the corrected command instead of rerunning it unchanged.";
 
-fn failureRetryGuidance(exit_code: ?i64, output: []const u8) ?[]const u8 {
+// `whole_output` is true when `output` holds everything the command printed:
+// no earlier observation delivered part of it and none was cut off.
+fn failureRetryGuidance(exit_code: ?i64, output: []const u8, whole_output: bool) ?[]const u8 {
     const code = exit_code orelse return null;
     if (code == 0) return null;
-    if (isShellParseErrorOutput(output)) return shell_parse_retry_guidance;
+    if (shellParseRetryGuidance(output, whole_output)) |guidance| return guidance;
     if (hasUsageBannerOutput(output)) return usage_error_retry_guidance;
     return null;
 }
 
-fn isShellParseErrorOutput(output: []const u8) bool {
+const ShellFamily = enum { zsh, line_by_line };
+
+fn shellParseRetryGuidance(output: []const u8, whole_output: bool) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, output, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (!hasShellErrorPrefix(trimmed)) continue;
-        if (text_utils.containsIgnoreCase(trimmed, "unmatched") or
+        const family = shellErrorFamily(trimmed) orelse continue;
+        // zsh's `[` and `test` builtins report a bad expression at run time as
+        // `parse error: condition expected`, and the command keeps running.
+        // zsh prints the same text for a `[[` test missing an operand, which
+        // fails to parse, so that error gets no guidance either.
+        if (text_utils.containsIgnoreCase(trimmed, "condition expected")) continue;
+        // bash 5.2 reports an unclosed quote with only this line; older
+        // versions follow it with `syntax error: unexpected end of file`.
+        if (!(text_utils.containsIgnoreCase(trimmed, "unmatched") or
+            text_utils.containsIgnoreCase(trimmed, "unexpected EOF while looking for matching") or
             text_utils.containsIgnoreCase(trimmed, "syntax error") or
             text_utils.containsIgnoreCase(trimmed, "parse error") or
-            text_utils.containsIgnoreCase(trimmed, "unterminated quoted string")) return true;
+            text_utils.containsIgnoreCase(trimmed, "unterminated quoted string"))) continue;
+        switch (family) {
+            // zsh checks a whole command before running any of it, so a parse
+            // error in the command itself is its only output. Any other output
+            // means something ran, such as part of the command, a startup file,
+            // or an exit hook, and the error may have come from an `eval` there.
+            // Output delivered by an earlier observation counts too. Give no
+            // guidance then rather than claim that nothing executed.
+            .zsh => if (whole_output and std.mem.eql(u8, std.mem.trim(u8, output, " \t\r\n"), trimmed)) return zsh_parse_retry_guidance,
+            .line_by_line => return line_shell_parse_retry_guidance,
+        }
     }
-    return false;
+    return null;
 }
 
 // Shell error prefixes may carry an absolute argv[0] path (fx spawns the
 // resolved login shell as /bin/bash, /bin/zsh, ...), so match the basename
 // of the token before the first colon rather than a raw line prefix.
-fn hasShellErrorPrefix(line: []const u8) bool {
-    const colon = std.mem.findScalar(u8, line, ':') orelse return false;
+// Snapshot and terminal runs pass the command to `eval`, so zsh names the
+// source `(eval)`, as it does for an `eval` inside the command. Under the
+// snapshot, bash names the script it sources from `/dev/fd/0`
+// (`snapshotScript` in shell_resolver.zig), followed by `eval:`. Anchoring
+// bash to that path keeps the `eval` errors of a script the command runs out.
+fn shellErrorFamily(line: []const u8) ?ShellFamily {
+    const colon = std.mem.findScalar(u8, line, ':') orelse return null;
     const token = line[0..colon];
-    if (token.len == 0 or std.mem.findScalar(u8, token, ' ') != null) return false;
+    if (token.len == 0 or std.mem.findScalar(u8, token, ' ') != null) return null;
+    if (std.mem.eql(u8, token, "(eval)")) return .zsh;
+    if (std.mem.eql(u8, token, "/dev/fd/0") and std.mem.startsWith(u8, line[colon + 1 ..], " eval:")) return .line_by_line;
     const base = if (std.mem.findLast(u8, token, "/")) |slash| token[slash + 1 ..] else token;
-    const names = [_][]const u8{ "zsh", "bash", "sh", "dash" };
-    for (names) |name| {
-        if (std.mem.eql(u8, base, name)) return true;
+    if (std.mem.eql(u8, base, "zsh")) return .zsh;
+    const line_shells = [_][]const u8{ "bash", "sh", "dash" };
+    for (line_shells) |name| {
+        if (std.mem.eql(u8, base, name)) return .line_by_line;
     }
-    return false;
+    return null;
 }
 
 fn hasUsageBannerOutput(output: []const u8) bool {
@@ -1619,12 +1803,22 @@ fn hasUsageBannerOutput(output: []const u8) bool {
     return false;
 }
 
+/// The shell result the model reads, which every later request of the
+/// session sends again. It holds only the fields that say something: one that
+/// is null or false is left out, so a command that printed nothing reads
+/// `{"state":"completed","exit_code":0,"duration_ms":12,"output_delta":""}`.
+/// `backend` and `persistence` come with the `session_id` of a session the
+/// model can still use, and otherwise only when they are not the default
+/// `captured` and `process`, such as a command that ran on a terminal.
+/// `output_terminal_safe` marks output whose unsafe bytes were written as
+/// escapes (`escaped`).
 fn formatSnapshotRaw(
     alloc: Allocator,
     snapshot: managed_execution.Snapshot,
     accepted_bytes: ?u32,
     output_delta: []const u8,
     output_truncated: bool,
+    escaped: bool,
 ) ![]u8 {
     const status = switch (snapshot.state) {
         .completed => |value| value,
@@ -1644,30 +1838,40 @@ fn formatSnapshotRaw(
         "Command output is incomplete. Inspect external state and available output before retrying; do not blindly rerun a command that may have changed state."
     else switch (snapshot.state) {
         .lost => "Execution status is indeterminate. Inspect external state before retrying; do not blindly rerun a command that may have changed state.",
-        .completed => failureRetryGuidance(projection.exit_code, snapshot.output_delta),
+        .completed => failureRetryGuidance(
+            projection.exit_code,
+            snapshot.output_delta,
+            snapshot.stdout_bytes +| snapshot.stderr_bytes == snapshot.output_delta.len,
+        ),
         .running, .stopped => null,
     };
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
+    const retained = snapshot.retained;
     try std.json.Stringify.value(.{
-        .session_id = if (snapshot.retained) snapshot.execution_id else null,
+        .session_id = if (retained) snapshot.execution_id else null,
         .state = snapshotStateName(snapshot.state),
-        .backend = @tagName(snapshot.backend),
-        .persistence = @tagName(snapshot.persistence),
-        .output_truncated = output_truncated,
-        .output_incomplete = snapshot.output_incomplete,
-        .output_terminal_safe = true,
+        .backend = if (retained or snapshot.backend != .captured) @tagName(snapshot.backend) else null,
+        .persistence = if (retained or snapshot.persistence != .process) @tagName(snapshot.persistence) else null,
+        .output_truncated = presentFlag(output_truncated),
+        .output_incomplete = presentFlag(snapshot.output_incomplete),
+        .output_terminal_safe = presentFlag(escaped),
         .full_output_handle = snapshot.output_file,
         .exit_code = projection.exit_code,
         .signal = projection.signal,
-        .termination_indeterminate = projection.termination_indeterminate,
+        .termination_indeterminate = presentFlag(projection.termination_indeterminate),
         .duration_ms = snapshot.duration_ms,
         .accepted_bytes = accepted_bytes,
         .@"error" = snapshot.error_name,
         .retry_guidance = retry_guidance,
         .output_delta = output_delta,
-    }, .{}, &out.writer);
+    }, .{ .emit_null_optional_fields = false }, &out.writer);
     return try out.toOwnedSlice();
+}
+
+/// A flag the result writes only when it is set.
+fn presentFlag(value: bool) ?bool {
+    return if (value) true else null;
 }
 
 fn snapshotStateName(state: managed_execution.SnapshotState) []const u8 {
@@ -1715,8 +1919,7 @@ fn runtimeFailure(
     err: anyerror,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     if (err == error.OutOfMemory) return error.OutOfMemory;
-    return .{ .failure = try std.fmt.allocPrint(
-        ctx.allocator,
+    return .{ .failure = try ctx.allocator.print(
         "{{\"error\":{{\"tool\":\"shell\",\"code\":\"{s}\",\"retryable\":false}}}}",
         .{@errorName(err)},
     ) };
@@ -1829,7 +2032,7 @@ pub fn isIrreversible(_: tool_dispatch.ToolInput) bool {
 test "shell action fields are closed and command authority covers every run" {
     try std.testing.expectEqualSlices(
         []const u8,
-        &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms" },
+        &.{ "action", "command", "cwd", "profile", "shell", "tty", "yield_time_ms", "timeout_ms", "reload" },
         actionFieldContract(.run).allowed,
     );
     try std.testing.expectEqualSlices(
@@ -1879,6 +2082,7 @@ test "shell request correction suggests only unambiguous repairs without executi
         .{ .input = "{\"request\":{\"command\":\"sleep 30\"},\"yield_time_ms\":\"30000\"}", .retry = "{\"action\":\"run\",\"command\":\"sleep 30\",\"yield_time_ms\":30000}" },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"background\":null}", .retry = "{\"action\":\"run\",\"command\":\"true\"}" },
         .{ .input = "{\"request\":\"{\\\"action\\\":\\\"run\\\",\\\"command\\\":\\\"true\\\"}\"}", .retry = "{\"action\":\"run\",\"command\":\"true\"}" },
+        .{ .input = "{\"request\":{\"action\":\"run\",\"command\":\"true\"}}", .retry = "{\"action\":\"run\",\"command\":\"true\"}" },
         .{ .input = "{\"action\":\"interact\",\"session_id\":\"shell-3\",\"yield_time_ms\":\"1000\",\"unused\":null}", .retry = "{\"action\":\"interact\",\"yield_time_ms\":1000,\"session_id\":\"shell-3\"}" },
         .{ .input = "{\"command\":\"true\",\"tty\":true}", .retry = null },
         .{ .input = "{}", .retry = null },
@@ -1887,7 +2091,6 @@ test "shell request correction suggests only unambiguous repairs without executi
         .{ .input = "{\"command\":\"true\",\"session_id\":\"shell-3\"}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"background\":true}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"/bin/bash\"}}", .retry = null },
-        .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":30001}", .retry = null },
         .{ .input = "{\"request\":{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":\"1000\",\"timeout_ms\":0}}", .retry = null },
         .{ .input = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":4294967296}", .retry = null },
         .{ .input = "{\"action\":\"stop\",\"session_id\":\"shell-3\",\"force\":\"true\"}", .retry = null },
@@ -1913,8 +2116,7 @@ test "shell request correction suggests only unambiguous repairs without executi
         try std.testing.expect(detail.get("problems").?.array.items.len > 0);
         try std.testing.expect((try tool_result_errors.inspectTerminalActionFieldCorrection(alloc, failure)) != null);
         if (case.retry) |expected| {
-            const request = detail.get("retry_with").?.object.get("request").?;
-            const json = try std.json.Stringify.valueAlloc(alloc, request, .{});
+            const json = try std.json.Stringify.valueAlloc(alloc, detail.get("retry_with").?, .{});
             defer alloc.free(json);
             try std.testing.expectEqualStrings(expected, json);
             const decoded = try decode(.{ .allocator = alloc }, json);
@@ -1943,10 +2145,10 @@ fn check_request_correction_allocations(alloc: Allocator, args_json: []const u8)
 }
 
 test "shell request correction releases partial allocations" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_request_correction_allocations, .{
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_request_correction_allocations, .{
         "{\"request\":{\"command\":\"true\"},\"yield_time_ms\":\"30000\"}",
     });
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_request_correction_allocations, .{
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_request_correction_allocations, .{
         "{\"command\":\"true\",\"tty\":true,\"shell\":{\"path\":\"/bin/bash\",\"kind\":\"executable\"}}",
     });
 }
@@ -1972,7 +2174,7 @@ test "shell request correction canonicalizes nested shell members" {
 test "shell request correction bounds feedback and preserves input bytes" {
     const alloc = std.testing.allocator;
     const command = "printf '\u{1f308}\\n'; echo \"$VALUE\"";
-    const key = "x" ** 63 ++ "\u{1f308}";
+    const key = text_utils.repeat("x", 63) ++ "\u{1f308}";
     const source = try std.json.Stringify.valueAlloc(alloc, .{
         .command = command,
         .x = null,
@@ -1982,10 +2184,10 @@ test "shell request correction bounds feedback and preserves input bytes" {
     defer alloc.free(correction);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, correction, .{});
     defer parsed.deinit();
-    const request = parsed.value.object.get("error").?.object.get("retry_with").?.object.get("request").?.object;
-    try std.testing.expectEqualStrings(command, request.get("command").?.string);
+    const retry = parsed.value.object.get("error").?.object.get("retry_with").?.object;
+    try std.testing.expectEqualStrings(command, retry.get("command").?.string);
 
-    const long_key = try std.fmt.allocPrint(alloc, "{{\"command\":\"true\",\"{s}\":null}}", .{key});
+    const long_key = try alloc.print("{{\"command\":\"true\",\"{s}\":null}}", .{key});
     defer alloc.free(long_key);
     const bounded = try request_correction(alloc, long_key, true);
     defer alloc.free(bounded);
@@ -2057,7 +2259,7 @@ test "TTY execution requires matching shell authority" {
     const command_ctx = command_admission.CommandContext{
         .command = "pwd",
         .resolved_cwd = "/workspace",
-        .target_os = builtin.os.tag,
+        .target_os = builtin.target.os.tag,
         .environment = .{ .clean = "/bin/bash" },
         .execution_mode = .tty,
     };
@@ -2185,17 +2387,6 @@ test "shell interaction wait bounds empty observations without delaying writes" 
         );
     }
 
-    const failure = try validateInteract(
-        .{ .allocator = std.testing.allocator },
-        .{
-            .action = .interact,
-            .session_id = "shell-1",
-            .yield_time_ms = managed_contract.max_wait_ceiling_ms + 1,
-        },
-    ) orelse return error.TestUnexpectedResult;
-    defer std.testing.allocator.free(failure);
-    try std.testing.expect(std.mem.find(u8, failure, "between 0 and 300000") != null);
-
     const overflow = try decode(
         .{ .allocator = std.testing.allocator },
         "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"yield_time_ms\":4294967296}",
@@ -2206,6 +2397,33 @@ test "shell interaction wait bounds empty observations without delaying writes" 
             return error.TestUnexpectedResult;
         },
         .failure => |message| std.testing.allocator.free(message),
+    }
+}
+
+test "shell caps a wait over the action limit instead of refusing the call" {
+    // Models often ask run to wait minutes for a slow command. The call runs
+    // with the longest wait the action allows; a command still going after
+    // it returns its session_id for interact.
+    const alloc = std.testing.allocator;
+    const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
+    const cases = [_]struct { args: []const u8, expected_ms: u32 }{
+        .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":30001}", .expected_ms = managed_contract.max_yield_time_ms },
+        .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":300000}", .expected_ms = managed_contract.max_yield_time_ms },
+        .{ .args = "{\"action\":\"run\",\"command\":\"true\",\"yield_time_ms\":1000}", .expected_ms = 1_000 },
+        .{ .args = "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"yield_time_ms\":300001}", .expected_ms = managed_contract.max_wait_ceiling_ms },
+        .{ .args = "{\"action\":\"interact\",\"session_id\":\"shell-1\",\"yield_time_ms\":45000}", .expected_ms = 45_000 },
+    };
+    for (cases) |case| {
+        switch (try decode(ctx, case.args)) {
+            .failure => |failure| {
+                defer alloc.free(failure);
+                return error.TestUnexpectedResult;
+            },
+            .input => |input| {
+                defer input.deinit(alloc);
+                try std.testing.expectEqual(case.expected_ms, input.as(OwnedInput).value.yield_time_ms);
+            },
+        }
     }
 }
 
@@ -2288,6 +2506,62 @@ test "lost shell snapshot preserves indeterminate execution guidance" {
     ) != null);
 }
 
+test "a finished command that printed nothing reads as its status alone" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-quiet"),
+        .command = @constCast("true"),
+        .cwd = @constCast("/tmp"),
+        .retained = false,
+        .state = .{ .completed = .{ .exit_code = 0 } },
+        .output_delta = @constCast(""),
+        .output_truncated = false,
+        .duration_ms = 12,
+    }, null);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"state\":\"completed\",\"exit_code\":0,\"duration_ms\":12,\"output_delta\":\"\"}",
+        body,
+    );
+}
+
+test "a finished terminal run still names its backend" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-tty"),
+        .command = @constCast("tty"),
+        .cwd = @constCast("/tmp"),
+        .retained = false,
+        .state = .{ .completed = .{ .exit_code = 7 } },
+        .backend = .tty,
+        .output_delta = @constCast("/dev/ttys001\n"),
+        .output_truncated = false,
+    }, null);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"state\":\"completed\",\"backend\":\"tty\",\"exit_code\":7,\"output_delta\":\"/dev/ttys001\\n\"}",
+        body,
+    );
+}
+
+test "a command still running names its session with the backend and persistence" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-live"),
+        .command = @constCast("sleep 30"),
+        .cwd = @constCast("/tmp"),
+        .retained = true,
+        .state = .running,
+        .output_delta = @constCast("partial\n"),
+        .output_truncated = false,
+    }, null);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"session_id\":\"shell-live\",\"state\":\"running\",\"backend\":\"captured\",\"persistence\":\"process\",\"output_delta\":\"partial\\n\"}",
+        body,
+    );
+}
+
 test "completed shell snapshot reports incomplete output without losing status" {
     const alloc = std.testing.allocator;
     const body = try formatSnapshot(alloc, .{
@@ -2325,6 +2599,7 @@ test "completed shell snapshot with shell parse error carries rewrite guidance" 
         .state = .{ .completed = .{ .exit_code = 1 } },
         .output_delta = @constCast("zsh:1: unmatched '\n"),
         .output_truncated = false,
+        .stderr_bytes = "zsh:1: unmatched '\n".len,
     }, null);
     defer alloc.free(body);
 
@@ -2334,9 +2609,31 @@ test "completed shell snapshot with shell parse error carries rewrite guidance" 
     try std.testing.expectEqualStrings("completed", object.get("state").?.string);
     try std.testing.expectEqual(@as(i64, 1), object.get("exit_code").?.integer);
     try std.testing.expectEqualStrings(
-        shell_parse_retry_guidance,
+        zsh_parse_retry_guidance,
         object.get("retry_guidance").?.string,
     );
+}
+
+test "completed zsh parse error after earlier delivered output carries no guidance" {
+    // An earlier `running` observation already delivered `built\n`, so the
+    // command ran before an `eval` inside it failed to parse.
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-parse-error-later"),
+        .command = @constCast("echo built; sleep 2; eval 'echo \"'"),
+        .cwd = @constCast("/tmp"),
+        .retained = false,
+        .state = .{ .completed = .{ .exit_code = 1 } },
+        .output_delta = @constCast("(eval):1: unmatched \"\n"),
+        .output_truncated = false,
+        .stdout_bytes = "built\n".len,
+        .stderr_bytes = "(eval):1: unmatched \"\n".len,
+    }, null);
+    defer alloc.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("retry_guidance") == null);
 }
 
 test "completed shell snapshot with usage error carries argument guidance" {
@@ -2377,7 +2674,7 @@ test "completed shell snapshot with ordinary failure has no retry guidance" {
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
-    try std.testing.expect(parsed.value.object.get("retry_guidance").? == .null);
+    try std.testing.expect(parsed.value.object.get("retry_guidance") == null);
 }
 
 test "failure guidance detects signatures in raw output when emitted text is encoded" {
@@ -2427,58 +2724,106 @@ test "incomplete output guidance takes precedence over failure guidance" {
 
 test "failure guidance detectors match only their signatures" {
     try std.testing.expectEqual(
-        shell_parse_retry_guidance,
-        failureRetryGuidance(1, "zsh:1: unmatched '\n"),
+        zsh_parse_retry_guidance,
+        failureRetryGuidance(1, "zsh:1: unmatched '\n", true),
     );
     // fx spawns the resolved login shell with an absolute argv[0], so bash
     // errors carry a /bin/bash prefix; bare-basename forms also occur when a
     // command spawns a shell subprocess itself.
     try std.testing.expectEqual(
-        shell_parse_retry_guidance,
-        failureRetryGuidance(2, "/bin/bash: -c: line 1: syntax error: unexpected end of file\n"),
+        line_shell_parse_retry_guidance,
+        failureRetryGuidance(2, "/bin/bash: -c: line 1: syntax error: unexpected end of file\n", true),
     );
     try std.testing.expectEqual(
-        shell_parse_retry_guidance,
-        failureRetryGuidance(2, "bash: -c: line 1: syntax error near unexpected token `)'\n"),
+        line_shell_parse_retry_guidance,
+        failureRetryGuidance(2, "bash: -c: line 1: syntax error near unexpected token `)'\n", true),
     );
     try std.testing.expectEqual(
-        shell_parse_retry_guidance,
-        failureRetryGuidance(2, "/bin/dash: 1: Syntax error: Unterminated quoted string\n"),
+        line_shell_parse_retry_guidance,
+        failureRetryGuidance(2, "/bin/dash: 1: Syntax error: Unterminated quoted string\n", true),
     );
     try std.testing.expectEqual(
-        shell_parse_retry_guidance,
-        failureRetryGuidance(1, "zsh: parse error near '\\n'\n"),
+        zsh_parse_retry_guidance,
+        failureRetryGuidance(1, "zsh: parse error near '\\n'\n", true),
+    );
+    // Snapshot and terminal runs evaluate the command, so zsh reports `(eval)`
+    // and bash reports the sourced snapshot script followed by `eval:`.
+    try std.testing.expectEqual(
+        zsh_parse_retry_guidance,
+        failureRetryGuidance(1, "(eval):1: unmatched \"\n", true),
+    );
+    try std.testing.expectEqual(
+        zsh_parse_retry_guidance,
+        failureRetryGuidance(1, "(eval):1: parse error near `)'\r\n", true),
+    );
+    try std.testing.expectEqual(
+        line_shell_parse_retry_guidance,
+        failureRetryGuidance(1, "/dev/fd/0: eval: line 2: unexpected EOF while looking for matching `\"'\n/dev/fd/0: eval: line 3: syntax error: unexpected end of file\n", true),
+    );
+    // bash 5.2 prints only the unexpected EOF line for an unclosed quote.
+    try std.testing.expectEqual(
+        line_shell_parse_retry_guidance,
+        failureRetryGuidance(1, "/dev/fd/0: eval: line 40: unexpected EOF while looking for matching `\"'\n", true),
+    );
+    try std.testing.expectEqual(
+        line_shell_parse_retry_guidance,
+        failureRetryGuidance(2, "/bin/bash: -c: line 1: unexpected EOF while looking for matching `\"'\n", true),
     );
     try std.testing.expectEqual(
         usage_error_retry_guidance,
-        failureRetryGuidance(2, "usage: grep [-abcdDEFGHhIiJLlMmnOopqRSsUVvwXxZz]\n"),
+        failureRetryGuidance(2, "usage: grep [-abcdDEFGHhIiJLlMmnOopqRSsUVvwXxZz]\n", true),
     );
     try std.testing.expectEqual(
         usage_error_retry_guidance,
-        failureRetryGuidance(64, "Usage: ls [-ABCFGHabcdfghiklmnopqrstuvwx1] [file ...]\n"),
+        failureRetryGuidance(64, "Usage: ls [-ABCFGHabcdfghiklmnopqrstuvwx1] [file ...]\n", true),
     );
     try std.testing.expectEqual(
         usage_error_retry_guidance,
-        failureRetryGuidance(2, "grep: unknown option\nusage: grep [-abcdDEFGHhIiJLlMmnOopqRSsUVvwXxZz]\n"),
+        failureRetryGuidance(2, "grep: unknown option\nusage: grep [-abcdDEFGHhIiJLlMmnOopqRSsUVvwXxZz]\n", true),
     );
 
     // Exit zero never carries failure guidance.
-    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(0, "usage: grep\n"));
-    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(null, "zsh:1: unmatched '\n"));
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(0, "usage: grep\n", true));
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(null, "zsh:1: unmatched '\n", true));
     // A compiler-style syntax error without a shell prefix is not a shell parse error.
-    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "main.c:4:5: error: expected ';' after expression (syntax error)\n"));
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "main.c:4:5: error: expected ';' after expression (syntax error)\n", true));
     // A non-shell token before the colon is not a shell prefix even when a shell name appears later.
-    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "error: bash: syntax error\n"));
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "error: bash: syntax error\n", true));
+    // An eval source alone is not enough; the line must still name a parse error.
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "(eval):1: no such file or directory: missing\n", true));
+    // A bash run-time error under the snapshot names `/dev/fd/0` without `eval:`.
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "/dev/fd/0: line 3: 1 +  : syntax error: operand expected (error token is \" \")\n", true));
+    // zsh's `[` builtin reports a bad expression at run time, after the command
+    // parsed. A `[[` test missing an operand prints the same text and is dropped too.
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "(eval):3: parse error: condition expected: =\n", true));
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "zsh:2: parse error: condition expected: $a\n", true));
+    // Other output beside a zsh parse error means something ran, so the error
+    // may have come from an `eval` in a startup file or in the command.
+    // Captured runs can also place later stdout before stderr, so the order
+    // of that output proves nothing.
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "(eval):1: unmatched \"\r\nls: /missing: No such file or directory\r\n", true));
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "BEFORE\nzsh:1: unmatched '\nAFTER\n", true));
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "RAN\n(eval):1: unmatched \"\n", true));
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "zsh:1: unmatched \"\nbye\n", true));
+    // Output an earlier observation delivered counts as other output for zsh.
+    // bash guidance already allows for lines that ran.
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "(eval):1: unmatched \"\n", false));
+    try std.testing.expectEqual(
+        line_shell_parse_retry_guidance,
+        failureRetryGuidance(1, "/dev/fd/0: eval: line 2: unexpected EOF while looking for matching `\"'\n", false),
+    );
+    // The `eval` of a bash script the command runs is not the snapshot's.
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(3, "./build.sh: eval: line 4: unexpected EOF while looking for matching `\"'\n", true));
     // Ordinary failures keep null guidance.
-    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(2, "grep: /nonexistent: No such file or directory\n"));
-    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, ""));
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(2, "grep: /nonexistent: No such file or directory\n", true));
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "", true));
     // A usage-looking line deep in output is not an argument rejection banner.
-    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "line one\nline two\nline three\nline four\nusage: not a banner\n"));
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "line one\nline two\nline three\nline four\nusage: not a banner\n", true));
 }
 
 test "shell snapshot keeps bounded head tail and control metadata" {
     const alloc = std.testing.allocator;
-    const output = "HEAD_SENTINEL\n" ++ ("x" ** (70 * 1024)) ++ "\nTAIL_SENTINEL";
+    const output = "HEAD_SENTINEL\n" ++ text_utils.repeat("x", 70 * 1024) ++ "\nTAIL_SENTINEL";
     const body = try formatSnapshot(alloc, .{
         .execution_id = @constCast("shell-large"),
         .command = @constCast("large-output"),
@@ -2541,7 +2886,7 @@ test "shell snapshot projects hostile bytes as readable terminal-safe text" {
 
 test "shell snapshot keeps a hostile output tail within the result limit" {
     const alloc = std.testing.allocator;
-    const raw = ("\xff" ** (70 * 1024)) ++ "\nCONTROL_TAIL";
+    const raw = text_utils.repeat("\xff", 70 * 1024) ++ "\nCONTROL_TAIL";
     const body = try formatSnapshot(alloc, .{
         .execution_id = @constCast("shell-hostile-large"),
         .command = @constCast("hostile-large-output"),
@@ -2593,7 +2938,7 @@ test "running shell snapshot leaves continuation intent to the caller" {
 }
 
 test "registered shell empty observation waits through one managed execution" {
-    if (comptime @import("builtin").os.tag == .wasi) return;
+    if (comptime @import("builtin").target.os.tag == .wasi) return;
     const alloc = std.testing.allocator;
     var runtime = managed_execution.Runtime.init(alloc);
     defer runtime.deinit();
@@ -2636,7 +2981,7 @@ test "registered shell empty observation waits through one managed execution" {
     const command_ctx = command_admission.CommandContext{
         .command = "sleep 2; printf done",
         .resolved_cwd = "/tmp",
-        .target_os = @import("builtin").os.tag,
+        .target_os = @import("builtin").target.os.tag,
         .environment = environment,
     };
     const authority = command_admission.CommandExecutionAuthority{
@@ -2645,8 +2990,6 @@ test "registered shell empty observation waits through one managed execution" {
             .source = .yolo,
         },
     };
-    var start_status_detail: ?[]u8 = null;
-    defer if (start_status_detail) |detail| alloc.free(detail);
     const started = try tool_dispatch.dispatchAuthorizedToolCall(
         .{
             .allocator = alloc,
@@ -2668,7 +3011,6 @@ test "registered shell empty observation waits through one managed execution" {
             .name = "shell",
             .arguments_json = "{\"action\":\"run\",\"command\":\"sleep 2; printf done\",\"cwd\":\"/tmp\",\"profile\":\"clean\",\"yield_time_ms\":0}",
         },
-        &start_status_detail,
     );
     defer started.deinit(alloc);
     try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, started.status);
@@ -2677,15 +3019,12 @@ test "registered shell empty observation waits through one managed execution" {
     defer started_json.deinit();
     const execution_id = started_json.value.object.get("session_id") orelse
         return error.TestExpectedEqual;
-    const interact_arguments = try std.fmt.allocPrint(
-        alloc,
+    const interact_arguments = try alloc.print(
         "{{\"action\":\"interact\",\"session_id\":\"{s}\",\"yield_time_ms\":1000}}",
         .{execution_id.string},
     );
     defer alloc.free(interact_arguments);
 
-    var wait_status_detail: ?[]u8 = null;
-    defer if (wait_status_detail) |detail| alloc.free(detail);
     var command_result_json: ?[]const u8 = null;
     defer if (command_result_json) |json| alloc.free(@constCast(json));
     var tool_result_memory: ?types.ToolResultMemory = null;
@@ -2711,7 +3050,6 @@ test "registered shell empty observation waits through one managed execution" {
             .name = "shell",
             .arguments_json = interact_arguments,
         },
-        &wait_status_detail,
     );
     defer waited.deinit(alloc);
     try std.testing.expectEqual(tool_dispatch.DispatchResult.Status.success, waited.status);
@@ -2729,14 +3067,14 @@ test "registered shell empty observation waits through one managed execution" {
 }
 
 test "shell delivery advances only after result commit" {
-    if (comptime @import("builtin").os.tag == .wasi) return;
+    if (comptime @import("builtin").target.os.tag == .wasi) return;
     const alloc = std.testing.allocator;
     var runtime = managed_execution.Runtime.init(alloc);
     defer runtime.deinit();
     const command_ctx = command_admission.CommandContext{
         .command = "printf commit-token",
         .resolved_cwd = "/tmp",
-        .target_os = @import("builtin").os.tag,
+        .target_os = @import("builtin").target.os.tag,
         .environment = .legacy,
     };
     var prepared = try runtime.startCaptured(alloc, .{
@@ -2782,4 +3120,31 @@ test "shell delivery advances only after result commit" {
         replayed.snapshot.execution_id,
         replayed.reservation_id,
     );
+}
+
+fn timedOutSnapshotCapture(_: shell_snapshot.CaptureRequest) shell_snapshot.CaptureOutcome {
+    return .{ .failed = .timed_out };
+}
+
+test "shell run result carries a snapshot fallback notice once" {
+    const alloc = std.testing.allocator;
+    shell_snapshot.resetProcessOwnerForTest(timedOutSnapshotCapture);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    try std.testing.expect((try shell_snapshot.processOwner().acquire("/bin/zsh", "/tmp", .{})) == .full_startup);
+
+    const plain = try attachSnapshotNotice(alloc, .{ .failure = try alloc.dupe(u8, "shell result is unavailable") });
+    defer plain.deinit(alloc);
+    try std.testing.expectEqualStrings("shell result is unavailable", plain.failure);
+
+    const first = try attachSnapshotNotice(alloc, .{ .success = try alloc.dupe(u8, "{\"state\":\"completed\"}") });
+    defer first.deinit(alloc);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, first.success, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("completed", parsed.value.object.get("state").?.string);
+    const notice = parsed.value.object.get("notice").?.string;
+    try std.testing.expect(std.mem.find(u8, notice, "did not finish within 10 s") != null);
+
+    const second = try attachSnapshotNotice(alloc, .{ .success = try alloc.dupe(u8, "{\"state\":\"completed\"}") });
+    defer second.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"state\":\"completed\"}", second.success);
 }

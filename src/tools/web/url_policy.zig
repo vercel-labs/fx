@@ -223,7 +223,7 @@ fn parseAuthority(authority: []const u8) Error!ParsedAuthority {
         };
     }
 
-    const colon = std.mem.lastIndexOfScalar(u8, authority, ':') orelse authority.len;
+    const colon = std.mem.findScalarLast(u8, authority, ':') orelse authority.len;
     if (colon == 0) return error.MissingHost;
     const host = authority[0..colon];
     const port = if (colon == authority.len) null else try parsePort(authority[colon + 1 ..]);
@@ -405,7 +405,7 @@ fn normalizePathQuery(alloc: Allocator, path_query: []const u8) ![]u8 {
         if (std.ascii.isWhitespace(char)) return error.RequestTargetWhitespace;
     }
     if (path_query.len == 0) return alloc.dupe(u8, "/");
-    if (path_query[0] == '?') return std.fmt.allocPrint(alloc, "/{s}", .{path_query});
+    if (path_query[0] == '?') return alloc.print("/{s}", .{path_query});
     return alloc.dupe(u8, path_query);
 }
 
@@ -413,14 +413,14 @@ fn formatRetrievalUrl(alloc: Allocator, scheme: Scheme, host: []const u8, explic
     const host_text = try hostForUrl(alloc, host);
     defer alloc.free(host_text);
     if (explicit_port) |port| {
-        return std.fmt.allocPrint(alloc, "{s}://{s}:{d}{s}", .{ scheme.text(), host_text, port, path_query });
+        return alloc.print("{s}://{s}:{d}{s}", .{ scheme.text(), host_text, port, path_query });
     }
-    return std.fmt.allocPrint(alloc, "{s}://{s}{s}", .{ scheme.text(), host_text, path_query });
+    return alloc.print("{s}://{s}{s}", .{ scheme.text(), host_text, path_query });
 }
 
 fn hostForUrl(alloc: Allocator, canonical_host: []const u8) ![]u8 {
     if (std.mem.findScalar(u8, canonical_host, ':') == null) return alloc.dupe(u8, canonical_host);
-    return std.fmt.allocPrint(alloc, "[{s}]", .{canonical_host});
+    return alloc.print("[{s}]", .{canonical_host});
 }
 
 fn absoluteRedirectUrl(alloc: Allocator, current: ValidatedUrl, location: []const u8) Error![]u8 {
@@ -431,7 +431,7 @@ fn absoluteRedirectUrl(alloc: Allocator, current: ValidatedUrl, location: []cons
         return alloc.dupe(u8, without_fragment);
     }
     if (std.mem.startsWith(u8, without_fragment, "//")) {
-        return std.fmt.allocPrint(alloc, "{s}:{s}", .{ current.scheme.text(), without_fragment });
+        return alloc.print("{s}:{s}", .{ current.scheme.text(), without_fragment });
     }
     if (hasUnsupportedAbsoluteScheme(without_fragment)) return error.UnsupportedScheme;
 
@@ -454,17 +454,17 @@ fn hasUnsupportedAbsoluteScheme(value: []const u8) bool {
 fn mergeRelativePath(alloc: Allocator, current_path_query: []const u8, relative: []const u8) ![]u8 {
     const current_path_end = std.mem.findScalar(u8, current_path_query, '?') orelse current_path_query.len;
     const current_path = current_path_query[0..current_path_end];
-    const base_end = if (std.mem.lastIndexOfScalar(u8, current_path, '/')) |slash| slash + 1 else 0;
+    const base_end = if (std.mem.findScalarLast(u8, current_path, '/')) |slash| slash + 1 else 0;
     const query_start = std.mem.findScalar(u8, relative, '?') orelse relative.len;
     const relative_path = relative[0..query_start];
     const relative_query = relative[query_start..];
 
-    const joined = try std.fmt.allocPrint(alloc, "{s}{s}", .{ current_path[0..base_end], relative_path });
+    const joined = try alloc.print("{s}{s}", .{ current_path[0..base_end], relative_path });
     defer alloc.free(joined);
 
     const normalized_path = try removeDotSegments(alloc, joined);
     defer alloc.free(normalized_path);
-    return std.fmt.allocPrint(alloc, "{s}{s}", .{ normalized_path, relative_query });
+    return alloc.print("{s}{s}", .{ normalized_path, relative_query });
 }
 
 fn removeDotSegments(alloc: Allocator, path: []const u8) ![]u8 {
@@ -650,12 +650,12 @@ test "web_fetch rejects public and private ipv4 mapped ipv6 literals" {
     };
 
     for (mapped) |embedded| {
-        const literal = try std.fmt.allocPrint(alloc, "::ffff:{s}", .{embedded});
+        const literal = try alloc.print("::ffff:{s}", .{embedded});
         defer alloc.free(literal);
         const address = try std.Io.net.IpAddress.parse(literal, 443);
         try std.testing.expect(!isPublicAddress(address));
 
-        const url = try std.fmt.allocPrint(alloc, "https://[{s}]/", .{literal});
+        const url = try alloc.print("https://[{s}]/", .{literal});
         defer alloc.free(url);
         try std.testing.expectError(error.NonPublicAddress, normalize(alloc, url));
     }
@@ -720,4 +720,106 @@ test "web_fetch cross host redirect returns reinvocation result without followin
     defer www.deinit(alloc);
     try std.testing.expectEqual(.follow, www.kind);
     try std.testing.expectEqualStrings("www.example.com", www.target.?.canonical_host);
+}
+
+test "url policy admits only URLs it reads back the same way" {
+    try std.testing.fuzz({}, fuzzUrlPolicy, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").url_policy.*),
+    });
+}
+
+const fuzz_url_pieces = [_][]const u8{
+    "https://",       "http://",       "HTTPS://",        "ftp://", "https:", "//",  "/",             "?",         "#",
+    "@",              ":",             ".",               "[",      "]",      "%",   "%2e",           "%2F",       "%41",
+    "..",             "example.com",   "WWW.Example.COM", "www.",   "a",      "b-c", "xn--bcher-kva", "localhost", "internal",
+    "local",          "127.0.0.1",     "8.8.8.8",         "0x7f",   "010",    "1",   "256",           "::1",       "2606:4700::1",
+    "::ffff:8.8.8.8", "fe80::1%25en0", ":443",            ":80",    ":8080",  ":0",  ":65536",        "user:pass", "q=1&r=2",
+    " ",              "\\",            "\xc3\xa9",        "~",
+};
+
+fn appendFuzzUrl(alloc: Allocator, smith: *std.testing.Smith, out: *std.ArrayList(u8)) !void {
+    for (0..smith.valueRangeAtMost(u8, 0, 16)) |_| {
+        if (smith.valueRangeAtMost(u8, 0, 7) == 0) {
+            try out.append(alloc, smith.value(u8));
+        } else {
+            try out.appendSlice(alloc, fuzz_url_pieces[smith.index(fuzz_url_pieces.len)]);
+        }
+    }
+}
+
+fn fuzzUrlPolicy(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(alloc);
+    try appendFuzzUrl(alloc, smith, &raw);
+    var url = normalize(alloc, raw.items) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    defer url.deinit(alloc);
+    try expectFuzzAdmittedUrl(alloc, url);
+
+    var location: std.ArrayList(u8) = .empty;
+    defer location.deinit(alloc);
+    try appendFuzzUrl(alloc, smith, &location);
+    var redirect = redirectTarget(alloc, url, location.items) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    defer redirect.deinit(alloc);
+    switch (redirect.kind) {
+        .follow => {
+            const target = redirect.target orelse return error.TestExpectedRedirectTarget;
+            try expectFuzzAdmittedUrl(alloc, target);
+            try std.testing.expectEqual(url.port, target.port);
+            try std.testing.expect(sameHostOrOptionalWww(url.canonical_host, target.canonical_host));
+        },
+        .cross_host => {
+            const reported = redirect.cross_host_url orelse return error.TestExpectedCrossHostUrl;
+            var other = try normalize(alloc, reported);
+            defer other.deinit(alloc);
+            try std.testing.expectEqualStrings(reported, other.retrieval_url);
+        },
+    }
+}
+
+fn expectFuzzAdmittedUrl(alloc: Allocator, url: ValidatedUrl) !void {
+    try std.testing.expectEqual(Scheme.https, url.scheme);
+    if (url.literal_address) |address| try std.testing.expect(isPublicAddress(address));
+
+    // Reading the retrieval URL again gives the same URL.
+    var again = try normalize(alloc, url.retrieval_url);
+    defer again.deinit(alloc);
+    try std.testing.expectEqualStrings(url.canonical_host, again.canonical_host);
+    try std.testing.expectEqual(url.port, again.port);
+    try std.testing.expectEqual(url.explicit_port, again.explicit_port);
+    try std.testing.expectEqualStrings(url.path_query, again.path_query);
+    try std.testing.expectEqualStrings(url.retrieval_url, again.retrieval_url);
+    try std.testing.expectEqual(url.literal_address == null, again.literal_address == null);
+
+    // The request target starts with a slash and holds nothing that would
+    // split a request line.
+    try std.testing.expect(url.path_query.len > 0 and url.path_query[0] == '/');
+    for (url.path_query) |byte| try std.testing.expect(byte > ' ' and byte != 0x7f and byte != '#');
+
+    // The host is lowercase ASCII with nothing that would end or change an
+    // authority. IPv6 literals keep their colons and nothing else.
+    for (url.canonical_host) |byte| {
+        try std.testing.expect(byte > ' ' and byte < 0x7f and !std.ascii.isUpper(byte));
+        try std.testing.expect(std.mem.findScalar(u8, "/?#@[]%\\", byte) == null);
+    }
+
+    // std.Uri reads the same host and port from the retrieval URL.
+    const uri = try std.Uri.parse(url.retrieval_url);
+    try std.testing.expectEqualStrings("https", uri.scheme);
+    try std.testing.expect(uri.user == null and uri.password == null);
+    try std.testing.expectEqual(url.explicit_port, uri.port);
+    var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+    const uri_host = try (uri.host orelse return error.TestExpectedUriHost).toRaw(&host_buffer);
+    if (std.mem.findScalar(u8, url.canonical_host, ':') != null) {
+        try std.testing.expect(uri_host.len == url.canonical_host.len + 2 and uri_host[0] == '[' and uri_host[uri_host.len - 1] == ']');
+        try std.testing.expectEqualStrings(url.canonical_host, uri_host[1 .. uri_host.len - 1]);
+    } else {
+        try std.testing.expectEqualStrings(url.canonical_host, uri_host);
+    }
 }

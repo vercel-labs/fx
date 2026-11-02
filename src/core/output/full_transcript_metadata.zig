@@ -1,4 +1,5 @@
 const std = @import("std");
+const local_time = @import("../shared/local_time.zig");
 
 pub const Kind = enum {
     prompt,
@@ -24,49 +25,35 @@ pub const Kind = enum {
     }
 };
 
+/// Formats `<local date and time> <zone> · <kind>` into `buf`. Returns null
+/// for timestamps outside the supported range or when `buf` is too small.
 pub fn formatHeader(
     buf: []u8,
     timestamp_ms: i64,
     kind: Kind,
 ) ?[]const u8 {
-    const max_supported_timestamp_ms: i64 = 253_402_300_799_999;
-    if (timestamp_ms <= 0 or timestamp_ms > max_supported_timestamp_ms) {
-        return null;
-    }
-    const epoch_seconds: std.time.epoch.EpochSeconds = .{
-        .secs = @intCast(@divTrunc(timestamp_ms, std.time.ms_per_s)),
-    };
-    const milliseconds: u16 = @intCast(@mod(
-        timestamp_ms,
-        std.time.ms_per_s,
-    ));
-    const day = epoch_seconds.getDaySeconds();
-    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    return std.fmt.bufPrint(
-        buf,
-        "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3} UTC · {s}",
-        .{
-            year_day.year,
-            @intFromEnum(month_day.month),
-            month_day.day_index + 1,
-            day.getHoursIntoDay(),
-            day.getMinutesIntoHour(),
-            day.getSecondsIntoMinute(),
-            milliseconds,
-            kind.label(),
-        },
-    ) catch null;
+    if (timestamp_ms <= 0) return null;
+    const reading = local_time.local(timestamp_ms) orelse return null;
+    return std.mem.print(buf, "{f} · {s}", .{ reading, kind.label() }) catch null;
 }
 
-test "full transcript metadata formats a stable UTC entry header" {
+test "full transcript metadata formats an entry header in local time" {
     var buf: [64]u8 = undefined;
-    const header = formatHeader(&buf, 1_704_164_645_006, .prompt);
-    try std.testing.expect(header != null);
     try std.testing.expectEqualStrings(
         "2024-01-02 03:04:05.006 UTC · Prompt",
-        header.?,
+        formatHeader(&buf, 1_704_164_645_006, .prompt).?,
     );
+    local_time.test_zone = .{ .offset_s = -5 * 3600, .name = "EST" };
+    defer local_time.test_zone = .utc;
+    try std.testing.expectEqualStrings(
+        "2024-01-01 22:04:05.006 EST · Tool",
+        formatHeader(&buf, 1_704_164_645_006, .tool).?,
+    );
+}
+
+test "full transcript metadata rejects unsupported timestamps" {
+    var buf: [64]u8 = undefined;
     try std.testing.expect(formatHeader(&buf, 0, .response) == null);
     try std.testing.expect(formatHeader(&buf, -1, .tool) == null);
+    try std.testing.expect(formatHeader(&buf, local_time.max_timestamp_ms + 1, .tool) == null);
 }

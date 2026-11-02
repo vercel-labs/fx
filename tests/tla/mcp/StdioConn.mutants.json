@@ -1,0 +1,74 @@
+[
+  {
+    "description": "A second process is started while the first is still running",
+    "old": "StartRequested ==\n    /\\ conn \\in {\"idle\", \"stopped\"}",
+    "new": "StartRequested ==\n    /\\ conn \\in {\"idle\", \"stopped\", \"running\"}",
+    "invariant": "OneProcess"
+  },
+  {
+    "description": "A stop marks the connection stopped without waiting for the process",
+    "old": "                conn' = \"closing\" /\\ stdinOpen' = FALSE /\\ armed' = armed \\cup {<<\"grace\", gen>>}\n         [] conn \\in Down ->",
+    "new": "                conn' = \"stopped\" /\\ stdinOpen' = FALSE /\\ armed' = armed\n         [] conn \\in Down ->",
+    "invariant": "NoOrphan"
+  },
+  {
+    "description": "A line from an earlier process is delivered after a restart",
+    "old": "Deliverable(g) == g = gen /\\ conn \\in Live",
+    "new": "Deliverable(g) == conn \\in Live",
+    "invariant": "NoStaleDelivery"
+  },
+  {
+    "description": "Messages are still written after stdin was closed for shutdown",
+    "old": "Send(k) ==\n    /\\ conn = \"running\"",
+    "new": "Send(k) ==\n    /\\ conn \\in Live",
+    "invariant": "WritesOnlyWhenOpen"
+  },
+  {
+    "description": "Planted bug, must be caught: server requests are answered in every era, including 2026",
+    "old": "ResponseAllowed == era # \"modern\"",
+    "new": "ResponseAllowed == TRUE",
+    "invariant": "NoClientResponsesModern"
+  },
+  {
+    "description": "A stop sends SIGTERM without closing stdin first",
+    "old": "                conn' = \"closing\" /\\ stdinOpen' = FALSE /\\ armed' = armed \\cup {<<\"grace\", gen>>}\n         [] conn \\in Down ->",
+    "new": "                conn' = \"closing\" /\\ stdinOpen' = TRUE /\\ armed' = armed \\cup {<<\"grace\", gen>>}\n         [] conn \\in Down ->",
+    "invariant": "SignalOrder"
+  },
+  {
+    "description": "A grace timer from an earlier process cuts the current one's grace period short",
+    "old": "    /\\ <<\"grace\", g>> \\in armed\n    /\\ IF g = gen /\\ conn = \"closing\"",
+    "new": "    /\\ <<\"grace\", g>> \\in armed\n    /\\ IF conn = \"closing\"",
+    "invariant": "SignalsOnTime"
+  },
+  {
+    "description": "One failure too many is allowed before the connection is marked failed",
+    "old": "    /\\ IF attempts + 1 >= MaxAttempts",
+    "new": "    /\\ IF attempts + 1 > MaxAttempts",
+    "invariant": "RestartBounded"
+  },
+  {
+    "description": "A backoff timer from an earlier failure ends the current backoff early",
+    "old": "    /\\ IF g = gen /\\ conn = \"backoff\"",
+    "new": "    /\\ IF conn = \"backoff\"",
+    "invariant": "NoEarlyRestart"
+  },
+  {
+    "description": "SIGTERM is never followed by SIGKILL",
+    "old": "          THEN conn' = \"killing\" /\\ sent' = sent \\cup {\"kill\"}\n          ELSE UNCHANGED <<conn, sent>>",
+    "new": "          THEN UNCHANGED <<conn, sent>>\n          ELSE UNCHANGED <<conn, sent>>",
+    "property": "Progress"
+  },
+  {
+    "description": "A process that exits during a stop leaves the connection idle instead of stopped",
+    "old": "    /\\ IF stopping\n          THEN conn' = \"stopped\" /\\ UNCHANGED <<attempts, armed>>\n          ELSE Failure\n    /\\ UNCHANGED <<gen, era, stopping, errored, sent, pipe,",
+    "new": "    /\\ IF stopping\n          THEN conn' = \"idle\" /\\ UNCHANGED <<attempts, armed>>\n          ELSE Failure\n    /\\ UNCHANGED <<gen, era, stopping, errored, sent, pipe,",
+    "property": "Progress"
+  },
+  {
+    "description": "A 2025 server's ping during the handshake is refused: responses only once detection says 2025",
+    "old": "ResponseAllowed == era # \"modern\"",
+    "new": "ResponseAllowed == era = \"legacy\"",
+    "invariant": "NoRefusedAnswer"
+  }
+]

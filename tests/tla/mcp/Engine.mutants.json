@@ -1,0 +1,116 @@
+[
+  {
+    "description": "A server starts with nothing needing it (LazyConnect)",
+    "old": "    /\\ phase[s] = \"idle\"\n    /\\ Demand(s) \\/ retry[s]\n    /\\ attempts[s] < MaxAttempts\n",
+    "new": "    /\\ phase[s] = \"idle\"\n    /\\ attempts[s] < MaxAttempts\n",
+    "invariant": "LazyConnect"
+  },
+  {
+    "description": "A call the host refused goes out anyway (SEC-01)",
+    "old": "              IF ~ok \\/ phase[s] = \"failed\" THEN \"done\"",
+    "new": "              IF phase[s] = \"failed\" THEN \"done\"",
+    "invariant": "PermissionBeforeCall"
+  },
+  {
+    "description": "A refused call's permission is recorded as given",
+    "old": "    /\\ allowed' = [allowed EXCEPT ![c] = ok]",
+    "new": "    /\\ allowed' = [allowed EXCEPT ![c] = TRUE]",
+    "invariant": "DeniedEndsThere"
+  },
+  {
+    "description": "Waiting calls stay behind when their server is ready",
+    "old": "    /\\ call' = [c \\in Calls |-> IF c \\in Waiting(s) THEN \"sent\" ELSE call[c]]\n    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped>>",
+    "new": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, call, ended, allowed, cause, host, stayed, dropped>>",
+    "invariant": "StatusConsistent"
+  },
+  {
+    "description": "A server gives up a try early",
+    "old": "    /\\ LET gaveUp == attempts[s] >= MaxAttempts IN",
+    "new": "    /\\ LET gaveUp == attempts[s] >= MaxAttempts - 1 IN",
+    "invariant": "BoundedReconnect"
+  },
+  {
+    "description": "A server never gives up, so a call waits on it forever",
+    "old": "    /\\ LET gaveUp == attempts[s] >= MaxAttempts IN",
+    "new": "    /\\ LET gaveUp == FALSE IN",
+    "property": "EveryCallEnds"
+  },
+  {
+    "description": "A host drop leaves calls in flight on a link that is gone",
+    "old": "    /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) \\/ (~keep /\\ c \\in Waiting(s)) THEN \"done\" ELSE call[c]]",
+    "new": "    /\\ call' = [c \\in Calls |-> IF ~keep /\\ c \\in Waiting(s) THEN \"done\" ELSE call[c]]",
+    "invariant": "StatusConsistent"
+  },
+  {
+    "description": "A failed or ready server takes a tool list need",
+    "old": "    /\\ phase[s] \\notin {\"ready\", \"failed\"}\n",
+    "new": "    /\\ TRUE\n",
+    "invariant": "StatusConsistent"
+  },
+  {
+    "description": "A failed start keeps the calls waiting on it, even when the server gives up",
+    "old": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) \\/ c \\in Waiting(s) THEN \"done\" ELSE call[c]]",
+    "new": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"done\" ELSE call[c]]",
+    "property": "WaitsForOneStart"
+  },
+  {
+    "description": "A call to a failed server waits instead of ending",
+    "old": "              IF ~ok \\/ phase[s] = \"failed\" THEN \"done\"",
+    "new": "              IF ~ok THEN \"done\"",
+    "invariant": "StatusConsistent"
+  },
+  {
+    "description": "A call goes out to a server still connecting",
+    "old": "              ELSE IF phase[s] = \"ready\" THEN \"sent\" ELSE \"waiting\"]",
+    "new": "              ELSE IF phase[s] \\in {\"ready\", \"connecting\"} THEN \"sent\" ELSE \"waiting\"]",
+    "invariant": "StatusConsistent"
+  },
+  {
+    "description": "A host drop resets every server",
+    "old": "    /\\ phase' = [phase EXCEPT ![s] = \"idle\"]\n    /\\ attempts' = [attempts EXCEPT ![s] = 0]\n    /\\ need' = [need EXCEPT ![s] = need[s] /\\ keep]",
+    "new": "    /\\ phase' = [t \\in Servers |-> \"idle\"]\n    /\\ attempts' = [attempts EXCEPT ![s] = 0]\n    /\\ need' = [need EXCEPT ![s] = need[s] /\\ keep]",
+    "property": "Isolation"
+  },
+  {
+    "description": "One server's failure loses another server's calls",
+    "old": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) \\/ c \\in Waiting(s) THEN \"done\" ELSE call[c]]",
+    "new": "       /\\ call' = [c \\in Calls |-> IF call[c] = \"sent\" \\/ c \\in Waiting(s) THEN \"done\" ELSE call[c]]",
+    "property": "Isolation"
+  },
+  {
+    "description": "A ready server keeps the tool list need",
+    "old": "    /\\ need' = [need EXCEPT ![s] = FALSE]\n    /\\ call' = [c \\in Calls |-> IF c \\in Waiting(s) THEN \"sent\" ELSE call[c]]",
+    "new": "    /\\ need' = need\n    /\\ call' = [c \\in Calls |-> IF c \\in Waiting(s) THEN \"sent\" ELSE call[c]]",
+    "invariant": "StatusConsistent"
+  },
+  {
+    "description": "A server down by a failure never starts again by itself",
+    "old": "    /\\ Demand(s) \\/ retry[s]\n    /\\ attempts[s] < MaxAttempts",
+    "new": "    /\\ Demand(s)\n    /\\ attempts[s] < MaxAttempts",
+    "property": "RetriesEnd"
+  },
+  {
+    "description": "A server's tries start over the moment it is up, so one that dies after every start loops",
+    "old": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ UNCHANGED <<attempts, ended, allowed, cause, host, stayed, dropped>>",
+    "new": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ asked' = [asked EXCEPT ![s] = FALSE]\n    /\\ attempts' = [attempts EXCEPT ![s] = 0]\n    /\\ UNCHANGED <<ended, allowed, cause, host, stayed, dropped>>",
+    "invariant": "StayedBeforeFreshTries"
+  },
+  {
+    "description": "A host disconnect leaves a server starting again by itself",
+    "old": "    /\\ retry' = [retry EXCEPT ![s] = FALSE]\n    /\\ dropped' = [dropped EXCEPT ![s] = TRUE]\n",
+    "new": "    /\\ dropped' = [dropped EXCEPT ![s] = TRUE]\n    /\\ UNCHANGED retry\n",
+    "invariant": "RetryOnlyAfterFailure"
+  },
+  {
+    "description": "A disconnect clears the tool list need without answering it, so a host waiting for it waits for ever",
+    "old": "    /\\ asked' = [asked EXCEPT ![s] = asked[s] /\\ keep]",
+    "new": "    /\\ asked' = asked",
+    "invariant": "AskedHasNeed"
+  },
+  {
+    "description": "A call waits through every try, not just one start",
+    "old": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) \\/ c \\in Waiting(s) THEN \"done\" ELSE call[c]]\n       /\\ ended' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"lost\"\n                                    ELSE IF c \\in Waiting(s) THEN \"failed\" ELSE ended[c]]",
+    "new": "       /\\ call' = [c \\in Calls |-> IF c \\in Sent(s) \\/ (gaveUp /\\ c \\in Waiting(s)) THEN \"done\" ELSE call[c]]\n       /\\ ended' = [c \\in Calls |-> IF c \\in Sent(s) THEN \"lost\"\n                                    ELSE IF gaveUp /\\ c \\in Waiting(s) THEN \"failed\" ELSE ended[c]]",
+    "property": "WaitsForOneStart"
+  }
+]

@@ -1,6 +1,9 @@
 const std = @import("std");
+const profile_paths = @import("../shared/profile_paths.zig");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const io_mod = @import("../shared/io.zig");
 const list_window = @import("../shared/list_window.zig");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
@@ -9,6 +12,7 @@ const skill_contract = @import("skill_contract.zig");
 const context_limits = @import("../config/context_limits.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const catalog_notice_name_count: usize = 8;
@@ -55,7 +59,7 @@ pub const OpenedSkillCandidate = struct {
 
     pub fn openResource(self: *OpenedSkillCandidate, resource: []const u8) !std.Io.File {
         const trimmed = std.mem.trim(u8, resource, " \t\r\n");
-        if (trimmed.len == 0 or std.fs.path.isAbsolute(trimmed)) return error.InvalidSkillResourcePath;
+        if (trimmed.len == 0 or std.Io.Dir.path.isAbsolute(trimmed)) return error.InvalidSkillResourcePath;
         var segments = std.mem.tokenizeAny(u8, trimmed, "/\\");
         var segment = segments.next() orelse return error.InvalidSkillResourcePath;
         if (invalidResourceSegment(segment)) return error.InvalidSkillResourcePath;
@@ -99,7 +103,7 @@ pub const SkillCandidateOpenResult = union(enum) {
 
 pub fn resourceIsSkillFile(resource: []const u8) bool {
     const trimmed = std.mem.trim(u8, resource, " \t\r\n");
-    if (trimmed.len == 0 or std.fs.path.isAbsolute(trimmed)) return false;
+    if (trimmed.len == 0 or std.Io.Dir.path.isAbsolute(trimmed)) return false;
     var segments = std.mem.tokenizeAny(u8, trimmed, "/\\");
     const segment = segments.next() orelse return false;
     return std.mem.eql(u8, segment, "SKILL.md") and segments.next() == null;
@@ -452,7 +456,7 @@ fn collectRootFingerprints(
         const candidate_digest = if (stat.kind == .directory)
             try candidateDirectoryDigest(alloc, root)
         else
-            [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+            @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0));
         fingerprints[filled] = .{
             .path = path,
             .exists = true,
@@ -478,7 +482,7 @@ fn candidateDirectoryDigest(
         hash.update(entry.name);
         hash.update(if (entry.linked) "\x01" else "\x00");
         const stat = if (entry.linked) linked: {
-            const candidate_path = try std.fs.path.join(alloc, &.{ root.path, entry.name });
+            const candidate_path = try std.Io.Dir.path.join(alloc, &.{ root.path, entry.name });
             defer alloc.free(candidate_path);
             var candidate_dir = openContainedDir(
                 alloc,
@@ -516,7 +520,7 @@ fn appendWorkspaceRoots(
     root_specs: []const skill_contract.RootSpec,
 ) !void {
     var current: ?[]const u8 = workspace_root;
-    while (current) |dir| : (current = std.fs.path.dirname(dir)) {
+    while (current) |dir| : (current = std.Io.Dir.path.dirname(dir)) {
         if (home) |home_root| {
             if (std.mem.eql(u8, dir, home_root)) break;
         }
@@ -528,7 +532,7 @@ fn appendWorkspaceRoots(
 }
 
 fn appendSpecRoot(alloc: Allocator, roots: *std.ArrayList(SkillRoot), base: []const u8, spec: skill_contract.RootSpec) !void {
-    try appendOwnedRoot(alloc, roots, try std.fs.path.join(alloc, &.{ base, spec.path }), spec.source, base);
+    try appendOwnedRoot(alloc, roots, try std.Io.Dir.path.join(alloc, &.{ base, spec.path }), spec.source, base);
 }
 
 fn appendDupeRoot(alloc: Allocator, roots: *std.ArrayList(SkillRoot), source: SkillSource, path: []const u8) !void {
@@ -589,9 +593,64 @@ fn canonicalPathHasReadAuthority(
     canonical_path: []const u8,
 ) error{OutOfMemory}!bool {
     if (pathInsideReadAuthorities(read_authority, &.{}, canonical_path)) return true;
+    if (pathInsideConfiguredSymlinkAuthorities(canonical_path)) return true;
     const extra_authorities = try externalSymlinkAuthorities(alloc);
     defer freeExternalAuthorities(alloc, extra_authorities);
     return pathInsideReadAuthorities(read_authority, extra_authorities, canonical_path);
+}
+
+/// Process-wide copy of the profile `skill_symlink_authorities` setting. Like
+/// FX_SKILL_SYMLINK_AUTHORITIES, it applies to every skill authority check in
+/// the process, so startup configures it once beside other process-scoped
+/// state instead of threading it through every discovery and refresh caller.
+/// Entries are owned by `std.heap.c_allocator` and guarded by the mutex because
+/// a workspace switch can replace them while background work reads skills.
+var configured_symlink_authorities_mutex: std.Io.Mutex = .init;
+var configured_symlink_authorities: [][]u8 = &.{};
+
+/// Replaces the configured symlink authorities with canonical copies of
+/// `paths`. Relative entries and entries containing `..` components are
+/// skipped, matching FX_SKILL_SYMLINK_AUTHORITIES. Entries that cannot be
+/// canonicalized (for example a directory that does not exist yet) are kept
+/// verbatim so they start matching once the directory appears.
+pub fn setConfiguredSymlinkAuthorities(paths: []const []const u8) error{OutOfMemory}!void {
+    const alloc = std.heap.c_allocator;
+    var next: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (next.items) |item| alloc.free(item);
+        next.deinit(alloc);
+    }
+    for (paths) |path| {
+        if (!std.Io.Dir.path.isAbsolute(path) or pathContainsDotDot(path)) continue;
+        const canonical = io_mod.realpathAlloc(alloc, path) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => try alloc.dupe(u8, path),
+        };
+        next.append(alloc, canonical) catch |err| {
+            alloc.free(canonical);
+            return err;
+        };
+    }
+    const owned = try next.toOwnedSlice(alloc);
+
+    const zio = io_mod.getIo();
+    configured_symlink_authorities_mutex.lockUncancelable(zio);
+    const previous = configured_symlink_authorities;
+    configured_symlink_authorities = owned;
+    configured_symlink_authorities_mutex.unlock(zio);
+
+    for (previous) |item| alloc.free(item);
+    if (previous.len > 0) alloc.free(previous);
+}
+
+fn pathInsideConfiguredSymlinkAuthorities(canonical_path: []const u8) bool {
+    const zio = io_mod.getIo();
+    configured_symlink_authorities_mutex.lockUncancelable(zio);
+    defer configured_symlink_authorities_mutex.unlock(zio);
+    for (configured_symlink_authorities) |authority| {
+        if (pathing.pathInside(authority, canonical_path)) return true;
+    }
+    return false;
 }
 
 /// Parses FX_SKILL_SYMLINK_AUTHORITIES (colon-separated absolute paths) into
@@ -613,7 +672,7 @@ fn externalSymlinkAuthorities(alloc: Allocator) ![][]const u8 {
     while (it.next()) |entry| {
         const trimmed = std.mem.trim(u8, entry, " \t");
         if (trimmed.len == 0) continue;
-        if (!std.fs.path.isAbsolute(trimmed)) continue;
+        if (!std.Io.Dir.path.isAbsolute(trimmed)) continue;
         if (pathContainsDotDot(trimmed)) continue;
         const owned = try alloc.dupe(u8, trimmed);
         errdefer alloc.free(owned);
@@ -626,7 +685,7 @@ fn externalSymlinkAuthorities(alloc: Allocator) ![][]const u8 {
 }
 
 fn pathContainsDotDot(path: []const u8) bool {
-    var it = std.fs.path.componentIterator(path);
+    var it = std.Io.Dir.path.componentIterator(path);
     while (it.next()) |component| {
         if (std.mem.eql(u8, component.name, "..")) return true;
     }
@@ -684,8 +743,8 @@ fn openSkillRoot(
 }
 
 fn rootPathIsMissing(path: []const u8) bool {
-    if (!std.fs.path.isAbsolute(path)) return false;
-    var components = std.fs.path.componentIterator(path);
+    if (!std.Io.Dir.path.isAbsolute(path)) return false;
+    var components = std.Io.Dir.path.componentIterator(path);
     const root = components.root() orelse return false;
     var component = components.next() orelse return false;
     var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), root, .{}) catch return false;
@@ -796,7 +855,7 @@ fn appendSkillCandidate(
     entry_name: []const u8,
     linked: bool,
 ) !void {
-    const candidate_path = try std.fs.path.join(alloc, &.{ root.path, entry_name });
+    const candidate_path = try std.Io.Dir.path.join(alloc, &.{ root.path, entry_name });
     defer alloc.free(candidate_path);
 
     var candidate_dir = if (linked) linked_candidate: {
@@ -932,7 +991,7 @@ fn inspectSkillCandidateFile(
 /// Opens and validates the exact advertised candidate without rescanning skill roots.
 /// The caller must deinitialize a `.current` candidate.
 pub fn openValidatedSkillCandidate(alloc: Allocator, skill: Skill) error{OutOfMemory}!SkillCandidateOpenResult {
-    const candidate_name = std.fs.path.basename(skill.path);
+    const candidate_name = std.Io.Dir.path.basename(skill.path);
     if (candidate_name.len == 0) return .{ .skipped = .unreadable };
 
     var candidate_dir = if (skill.read_authority) |read_authority| authorized: {
@@ -941,7 +1000,7 @@ pub fn openValidatedSkillCandidate(alloc: Allocator, skill: Skill) error{OutOfMe
             return if (err == error.FileNotFound) .missing else .{ .skipped = .unreadable };
         };
     } else strict: {
-        const parent_path = std.fs.path.dirname(skill.path) orelse return .{ .skipped = .unreadable };
+        const parent_path = std.Io.Dir.path.dirname(skill.path) orelse return .{ .skipped = .unreadable };
         var parent_dir = io_mod.openDirAbsoluteNoFollow(parent_path, .{}) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return if (err == error.FileNotFound) .missing else .{ .skipped = .unreadable };
@@ -1089,7 +1148,7 @@ pub fn skillSourceLabel(source: SkillSource) []const u8 {
         .workspace_claude => "workspace .claude/skills",
         .workspace_agents => "workspace .agents/skills",
         .workspace_claw => "workspace .claw/skills",
-        .global_fx => "global ~/.fx/skills",
+        .global_fx => profile_paths.displayText("global ~/.fx/skills"),
         .global_opencode => "global ~/.config/opencode/skills",
         .global_codex => "global ~/.codex/skills",
         .global_claude => "global ~/.claude/skills",
@@ -1270,69 +1329,72 @@ pub const SkillMenuIndex = struct {
     }
 };
 
-const SkillMenuView = struct {
+/// How the skills menus match a skill: by name, and by the words of its
+/// description, source, and path.
+fn skillMatch(skill: Skill, query: []const u8) ?fuzzy_match.Match {
+    return fuzzy_match.match(query, &.{
+        .{ .text = skill.name },
+        .{ .text = skill.description, .kind = .text },
+        .{ .text = skillSourceShortLabel(skill.source), .kind = .text },
+        .{ .text = skill.path, .kind = .text },
+    });
+}
+
+/// Whether a `$` mention menu stays open for `query`. Sending a prompt ends
+/// a mention at the first byte that cannot continue a skill name
+/// (`matchesSigilSkillAt`), so `$fx-commit.` is a finished mention and Enter
+/// must send it. A query holding such a byte keeps the menu open only for a
+/// skill whose name contains the query as typed, as `$my.sk` does for
+/// `my.skill`.
+fn mentionMenuOpen(skills: []const Skill, query: []const u8) bool {
+    for (query) |byte| {
+        if (!isSkillNameContinuation(byte)) break;
+    } else return skillMenuFilterQueryCount(skills, .all, query) > 0;
+    for (skills) |skill| {
+        const found = fuzzy_match.match(query, &.{.{ .text = skill.name }}) orelse continue;
+        if (found.tier.isAsTyped()) return true;
+    }
+    return false;
+}
+
+/// The skills menu's base order is source group, then catalog order, so
+/// base position `group * skills.len + index` holds skill `index` only when
+/// it is in source group `group`.
+const SkillMenuMatches = struct {
     skills: []const Skill,
     filter: SkillMenuSourceFilter,
     query: []const u8,
-    match_rank: usize = 0,
-    source_rank: usize = 0,
-    next_actual_index: usize = 0,
-    next_display_index: usize = 0,
 
-    fn init(skills: []const Skill, filter: SkillMenuSourceFilter, query: []const u8) SkillMenuView {
-        return .{
-            .skills = skills,
-            .filter = filter,
-            .query = query,
-        };
-    }
-
-    fn next(self: *SkillMenuView) ?SkillMenuViewEntry {
-        while (self.match_rank < skill_match_rank_count) {
-            while (self.next_actual_index < self.skills.len) {
-                const actual_index = self.next_actual_index;
-                self.next_actual_index += 1;
-
-                const skill = self.skills[actual_index];
-                if (skillMatchRank(skill, self.query) != self.match_rank) continue;
-                if (skillGroupRank(skill.source) != self.source_rank) continue;
-                if (!skillSourceMatchesFilter(skill.source, self.filter)) continue;
-
-                const display_index = self.next_display_index;
-                self.next_display_index += 1;
-                return .{
-                    .display_index = display_index,
-                    .actual_index = actual_index,
-                };
-            }
-
-            self.source_rank += 1;
-            if (self.source_rank == skill_group_count) {
-                self.source_rank = 0;
-                self.match_rank += 1;
-            }
-            self.next_actual_index = 0;
-        }
-
-        return null;
+    pub fn matchAt(self: SkillMenuMatches, position: usize) ?fuzzy_match.Match {
+        const skill = self.skills[position % self.skills.len];
+        if (skillGroupRank(skill.source) != position / self.skills.len) return null;
+        if (!skillSourceMatchesFilter(skill.source, self.filter)) return null;
+        return skillMatch(skill, self.query);
     }
 };
 
-const skill_match_rank_count: usize = 3;
+/// The skills that match, best first (`fuzzy_match.Ranking`), and otherwise
+/// by source group and catalog order.
+const SkillMenuView = struct {
+    skills: []const Skill,
+    matches: fuzzy_match.Ranking(SkillMenuMatches).Iterator,
+    next_display_index: usize = 0,
 
-fn skillMatchRank(skill: Skill, query: []const u8) ?usize {
-    const trimmed = std.mem.trim(u8, query, " \t\r\n/");
-    if (trimmed.len == 0) return 0;
-    if (std.ascii.startsWithIgnoreCase(skill.name, trimmed)) return 0;
-    if (asciiContainsIgnoreCase(skill.name, trimmed)) return 1;
-    if (asciiContainsIgnoreCase(skill.description, trimmed) or
-        asciiContainsIgnoreCase(skillSourceShortLabel(skill.source), trimmed) or
-        asciiContainsIgnoreCase(skill.path, trimmed))
-    {
-        return 2;
+    fn init(skills: []const Skill, filter: SkillMenuSourceFilter, query: []const u8) SkillMenuView {
+        const ranking: fuzzy_match.Ranking(SkillMenuMatches) = .{
+            .context = .{ .skills = skills, .filter = filter, .query = query },
+            .len = skills.len * skill_group_count,
+        };
+        return .{ .skills = skills, .matches = ranking.iterator() };
     }
-    return null;
-}
+
+    fn next(self: *SkillMenuView) ?SkillMenuViewEntry {
+        const position = self.matches.next() orelse return null;
+        const display_index = self.next_display_index;
+        self.next_display_index += 1;
+        return .{ .display_index = display_index, .actual_index = position % self.skills.len };
+    }
+};
 
 pub const SkillNameCompletion = struct {
     skill: Skill,
@@ -1350,20 +1412,6 @@ pub fn firstSkillNameCompletion(skills: []const Skill, query: []const u8) ?Skill
         };
     }
     return null;
-}
-
-fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-    var start: usize = 0;
-    while (start + needle.len <= haystack.len) : (start += 1) {
-        var i: usize = 0;
-        while (i < needle.len) : (i += 1) {
-            if (std.ascii.toLower(haystack[start + i]) != std.ascii.toLower(needle[i])) break;
-        }
-        if (i == needle.len) return true;
-    }
-    return false;
 }
 
 pub const SkillMenu = struct {
@@ -1418,7 +1466,7 @@ pub const SkillMenu = struct {
 
     pub fn setQuery(self: *SkillMenu, query_text: []const u8) void {
         const len = @min(query_text.len, self.query_buf.len);
-        if (len > 0) std.mem.copyForwards(u8, self.query_buf[0..len], query_text[0..len]);
+        if (len > 0) @memmove(self.query_buf[0..len], query_text[0..len]);
         self.query_len = len;
     }
 
@@ -1498,7 +1546,7 @@ const RootFingerprint = struct {
     inode: std.Io.File.INode = 0,
     mtime: std.Io.Timestamp = .zero,
     candidate_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
-        [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+        @splat(0),
 
     fn deinit(self: *RootFingerprint, alloc: Allocator) void {
         alloc.free(self.path);
@@ -1683,10 +1731,10 @@ fn refreshKnownCatalog(
 }
 
 fn statKnownSkill(skill: Skill) !std.Io.File.Stat {
-    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.mem.print(
         &path_buffer,
-        "{s}" ++ std.fs.path.sep_str ++ "SKILL.md",
+        "{s}" ++ std.Io.Dir.path.sep_str ++ "SKILL.md",
         .{skill.path},
     );
     return std.Io.Dir.cwd().statFile(
@@ -1712,7 +1760,7 @@ fn loadKnownSkill(alloc: Allocator, previous: Skill) !?Skill {
     };
     defer file.close(io_mod.getIo());
     const stat = file.stat(io_mod.getIo()) catch return null;
-    const entry_name = std.fs.path.basename(previous.path);
+    const entry_name = std.Io.Dir.path.basename(previous.path);
     const inspection = try inspectSkillCandidateFile(alloc, &file, entry_name);
     const candidate = switch (inspection) {
         .valid => |value| value,
@@ -1841,10 +1889,12 @@ pub const RefreshAction = union(enum) {
     list,
     show: []u8,
     notice: []u8,
+    /// Reports discovery issues once the launch catalog lands.
+    startup_notice,
 
     pub fn deinit(self: *RefreshAction, alloc: Allocator) void {
         switch (self.*) {
-            .list => {},
+            .list, .startup_notice => {},
             .show => |value| alloc.free(value),
             .notice => |value| alloc.free(value),
         }
@@ -2301,10 +2351,12 @@ pub const Runtime = struct {
             list,
             show: []const u8,
             notice: []const u8,
+            startup_notice,
         },
     ) !void {
         const owned: RefreshAction = switch (action) {
             .list => .list,
+            .startup_notice => .startup_notice,
             .show => |value| .{ .show = try alloc.dupe(u8, value) },
             .notice => |value| .{ .notice = try alloc.dupe(u8, value) },
         };
@@ -2504,7 +2556,7 @@ pub const Runtime = struct {
         self.menu.beginOpenFocused(filter, 0);
         self.rebuildPreparedMenuIndex();
         const display_index = if (self.menu_index_ready)
-            std.mem.indexOfScalar(
+            std.mem.findScalar(
                 u32,
                 self.menu_index.actual_indices.items,
                 @intCast(actual_index),
@@ -2580,7 +2632,7 @@ pub const Runtime = struct {
     pub fn menuVisible(self: Runtime) bool {
         if (!self.menu.active) return false;
         if (!self.menu.origin.isMention()) return true;
-        return skillMenuFilterQueryCount(self.items, .all, self.menu.query()) > 0;
+        return mentionMenuOpen(self.items, self.menu.query());
     }
 };
 
@@ -2599,8 +2651,7 @@ fn attachCatalogDiagnostics(
         .candidate => candidate_count += 1,
         .root => root_count += 1,
     };
-    const marker = try std.fmt.allocPrint(
-        alloc,
+    const marker = try alloc.print(
         "<skill_discovery_warning skipped_candidate_count=\"{d}\" incomplete_root_count=\"{d}\" missing_from_incomplete_roots=\"{s}\" />\n",
         .{ candidate_count, root_count, if (root_count > 0) "unknown" else "0" },
     );
@@ -2957,16 +3008,20 @@ fn buildSkillsSystemPromptSectionWithLimits(
     all_skills: []const Skill,
     limits: context_limits.Values,
 ) !BoundedPromptSection {
-    return buildSkillPrompt(alloc, all_skills, &.{}, limits, null);
+    return buildSkillPrompt(alloc, all_skills, &.{}, limits, null, null);
 }
 
-/// Borrows skill paths until the returned section is released.
+/// Borrows skill paths until the returned section is released. With a
+/// `workspace_root`, skill roots inside it are shown relative to it, so
+/// worktrees of one repository render the same catalog; resolution keeps the
+/// absolute roots.
 pub fn buildSkillPrompt(
     alloc: Allocator,
     skills: []const Skill,
     diagnostics: []const SkillDiagnostic,
     limits: context_limits.Values,
     context_window: ?u32,
+    workspace_root: ?[]const u8,
 ) !BoundedPromptSection {
     var visible: std.ArrayList(Skill) = .empty;
     defer visible.deinit(alloc);
@@ -2977,7 +3032,7 @@ pub fn buildSkillPrompt(
             !try tool_result_limits.modelProjectionPreservesText(identity_scratch.allocator(), skill.path)) continue;
         try visible.append(alloc, skill);
     }
-    var section = renderSkillPrompt(alloc, visible.items, limits, context_window, catalog_namespace(visible.items)) catch |err| {
+    var section = renderSkillPrompt(alloc, visible.items, limits, context_window, catalog_namespace(visible.items, workspace_root), workspace_root) catch |err| {
         if (err == error.WriteFailed) return error.OutOfMemory;
         return err;
     };
@@ -2986,7 +3041,7 @@ pub fn buildSkillPrompt(
     {
         errdefer section.deinit(alloc);
         if (visible.items.len < skills.len) {
-            const notice = try std.fmt.allocPrint(alloc, "{s}[context] {d} skill identities withheld because they cannot be safely represented to the model.\n", .{
+            const notice = try alloc.print("{s}[context] {d} skill identities withheld because they cannot be safely represented to the model.\n", .{
                 section.notice orelse "", skills.len - visible.items.len,
             });
             if (section.notice) |previous| alloc.free(previous);
@@ -3037,11 +3092,18 @@ const SkillPromptEntry = struct {
     }
 };
 
-fn catalog_namespace(skills: []const Skill) u64 {
+/// The model-visible form of a skill path.
+fn shownPath(workspace_root: ?[]const u8, path: []const u8) []const u8 {
+    return if (workspace_root) |root| pathing.workspaceRelative(root, path) else path;
+}
+
+/// Hashes what the catalog shows, so the namespace changes with the skill set
+/// and layout but not between worktrees of one repository.
+fn catalog_namespace(skills: []const Skill, workspace_root: ?[]const u8) u64 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("fx-skill-locations");
     for (skills) |skill| {
-        for ([_][]const u8{ skill.name, skill.path }) |value| {
+        for ([_][]const u8{ skill.name, shownPath(workspace_root, skill.path) }) |value| {
             var length: [8]u8 = undefined;
             std.mem.writeInt(u64, &length, @intCast(value.len), .little);
             hash.update(&length);
@@ -3059,6 +3121,7 @@ fn renderSkillPrompt(
     limits: context_limits.Values,
     context_window: ?u32,
     namespace: u64,
+    workspace_root: ?[]const u8,
 ) !BoundedPromptSection {
     if (skills.len == 0) return .{ .text = try alloc.dupe(u8, "") };
     const budget = SkillPromptBudget.resolve(limits.skill_catalog_bytes, context_window);
@@ -3081,7 +3144,7 @@ fn renderSkillPrompt(
         entries.deinit(alloc);
     }
     for (skills) |skill| {
-        const root = std.fs.path.dirname(skill.path) orelse "";
+        const root = std.Io.Dir.path.dirname(skill.path) orelse "";
         const root_index = index: {
             for (roots.items, 0..) |existing, index| {
                 if (std.mem.eql(u8, existing, root)) break :index index;
@@ -3090,7 +3153,7 @@ fn renderSkillPrompt(
             var line: std.Io.Writer.Allocating = .init(alloc);
             defer line.deinit();
             try line.writer.print("Root {d}: ", .{index});
-            try model_context_encoding.writeScalar(&line.writer, root);
+            try model_context_encoding.writeScalar(&line.writer, shownPath(workspace_root, root));
             try line.writer.writeByte('\n');
             const owned = try line.toOwnedSlice();
             errdefer alloc.free(owned);
@@ -3130,7 +3193,7 @@ fn renderSkillPrompt(
         var suffix: std.Io.Writer.Allocating = .init(alloc);
         defer suffix.deinit();
         try suffix.writer.print(" (location: skill:{x:0>16}:{d}/", .{ namespace, root_index });
-        try (std.Uri.Component{ .raw = std.fs.path.basename(skill.path) }).formatEscaped(&suffix.writer);
+        try (std.Uri.Component{ .raw = std.Io.Dir.path.basename(skill.path) }).formatEscaped(&suffix.writer);
         try suffix.writer.writeAll(")\n");
         const owned_suffix = try suffix.toOwnedSlice();
         errdefer alloc.free(owned_suffix);
@@ -3171,13 +3234,13 @@ fn renderSkillPrompt(
                 candidate_cost,
                 budget.cost(entry.prefix) + budget.cost(entry.suffix),
             );
-            marker_text = try std.fmt.bufPrint(&marker, "Omitted skills: {d}.\n", .{entries.items.len - index - 1});
+            marker_text = try std.mem.print(&marker, "Omitted skills: {d}.\n", .{entries.items.len - index - 1});
             if (candidate_cost + budget.cost(marker_text) > budget.limit) break;
             retained = index + 1;
             retained_roots = candidate_roots;
             minimum_cost = candidate_cost;
         }
-        marker_text = try std.fmt.bufPrint(&marker, "Omitted skills: {d}.\n", .{entries.items.len - retained});
+        marker_text = try std.mem.print(&marker, "Omitted skills: {d}.\n", .{entries.items.len - retained});
         minimum_cost += budget.cost(marker_text);
     }
 
@@ -3290,8 +3353,8 @@ fn writeBoundedEncodedScalar(alloc: Allocator, writer: *std.Io.Writer, value: []
     try model_context_encoding.writeScalar(&encoded.writer, value);
     const observed = encoded.written().len;
     var prefix_len = context_limits.utf8PrefixLength(encoded.written(), max_bytes);
-    if (std.mem.lastIndexOfScalar(u8, encoded.written()[0..prefix_len], '&')) |amp_index| {
-        if (std.mem.indexOfScalar(u8, encoded.written()[amp_index..prefix_len], ';') == null) {
+    if (std.mem.findScalarLast(u8, encoded.written()[0..prefix_len], '&')) |amp_index| {
+        if (std.mem.findScalar(u8, encoded.written()[amp_index..prefix_len], ';') == null) {
             prefix_len = amp_index;
         }
     }
@@ -3522,7 +3585,7 @@ test "skill runtime keeps menu count selection and query on one index" {
 }
 
 test "skill menu query navigation and close stay allocation free for ten thousand cycles" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const skills = [_]Skill{
         .{ .name = "alpha", .description = "first", .path = "/skills/alpha", .source = .global_fx },
         .{ .name = "beta", .description = "second", .path = "/skills/beta", .source = .global_codex },
@@ -3549,16 +3612,16 @@ test "skill menu query navigation and close stay allocation free for ten thousan
 }
 
 test "skill runtime replacement preserves the active catalog when index allocation fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const active = [_]Skill{
         .{ .name = "active", .description = "active", .path = "/skills/active", .source = .global_fx },
     };
-    const replacement = [_]Skill{.{
+    const replacement: [64]Skill = @splat(.{
         .name = "replacement",
         .description = "replacement",
         .path = "/skills/replacement",
         .source = .global_fx,
-    }} ** 64;
+    });
     var runtime = Runtime{ .items = @constCast(&active) };
     defer {
         runtime.items = &.{};
@@ -3640,7 +3703,7 @@ test "skill refresh publishes one generation and coalesces one latest request" {
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills/added");
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home);
-    const managed = try std.fs.path.join(alloc, &.{ home, ".fx", "skills" });
+    const managed = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "skills" });
     defer alloc.free(managed);
     var runtime = Runtime{ .dir = try alloc.dupe(u8, managed) };
     defer runtime.deinit(alloc);
@@ -3703,6 +3766,44 @@ test "skill refresh publishes one generation and coalesces one latest request" {
     }
     try std.testing.expectEqual(RefreshCompletion.adopted, terminal);
     try std.testing.expectEqual(@as(usize, 2), runtime.items.len);
+}
+
+test "an empty launch catalog fills from a refresh before its startup notice is due" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(
+        &tmp,
+        "home/.fx/skills/launch/SKILL.md",
+        "---\nname: launch\ndescription: discovered after the first frame\n---\nbody\n",
+    );
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var runtime = Runtime{};
+    defer runtime.deinit(alloc);
+    const policy: skill_contract.RootPolicy = .{ .managed_root_source = .global_fx };
+
+    // The launch records only the managed directory, then refreshes into it.
+    try runtime.replaceLoaded(alloc, try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "skills" }), &.{}, &.{});
+    const generation = try runtime.requestRefresh(alloc, home, home, policy);
+    try runtime.queueRefreshAction(alloc, generation, .startup_notice);
+    try std.testing.expectEqual(@as(usize, 0), runtime.items.len);
+    try std.testing.expect(runtime.takeReadyRefreshAction() == null);
+
+    var adopted = false;
+    for (0..100_000) |_| {
+        if (try runtime.pollRefresh(alloc, home, policy) == .adopted) adopted = true;
+        if (adopted and runtime.refresh_task == null) break;
+        std.Thread.yield() catch std.atomic.spinLoopHint();
+    }
+    try std.testing.expect(adopted);
+    try std.testing.expectEqual(@as(usize, 1), runtime.items.len);
+    try std.testing.expectEqualStrings("launch", runtime.items[0].name);
+
+    var ready = runtime.takeReadyRefreshAction() orelse return error.MissingStartupNotice;
+    defer ready.deinit(alloc);
+    try std.testing.expect(ready.succeeded);
+    try std.testing.expect(ready.action == .startup_notice);
 }
 
 test "overlapping skill refresh actions retain only the latest bounded action" {
@@ -3849,6 +3950,29 @@ test "skill menu visibility hides only zero-result mention queries" {
     try std.testing.expect(!runtime.menuVisible());
 }
 
+test "a mention menu closes once its query holds a byte that ends the mention" {
+    const skills = [_]Skill{
+        staticSkill("status-second", "Status fixture", .workspace_shared),
+        staticSkill("my.skill", "Dotted name", .global_fx),
+    };
+    var runtime = Runtime{ .items = @constCast(&skills) };
+    runtime.openMenuWithQuery(.dollar, .{ .start = 4, .end = 5 }, "");
+
+    runtime.menu.setQuery("statsec");
+    try std.testing.expect(runtime.menuVisible());
+    runtime.menu.setQuery("status-second");
+    try std.testing.expect(runtime.menuVisible());
+    runtime.menu.setQuery("status-second.");
+    try std.testing.expect(!runtime.menuVisible());
+    runtime.menu.setQuery("my.sk");
+    try std.testing.expect(runtime.menuVisible());
+    runtime.menu.setQuery("my.skill,");
+    try std.testing.expect(!runtime.menuVisible());
+
+    runtime.openMenuWithQuery(.command, null, "status-second.");
+    try std.testing.expect(runtime.menuVisible());
+}
+
 test "skill menu movement uses rendered visible rows before scrolling" {
     const skills = [_]Skill{
         staticSkill("skill-00", "skill 00", .global_fx),
@@ -3895,7 +4019,7 @@ test "skill menu focus refuses an ambiguous duplicate name" {
 }
 
 fn writeTempFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) !void {
-    if (std.fs.path.dirname(sub_path)) |parent| {
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| {
         try tmp.dir.createDirPath(io_mod.getIo(), parent);
     }
     var file = try tmp.dir.createFile(std.testing.io, sub_path, .{ .truncate = true });
@@ -3904,8 +4028,8 @@ fn writeTempFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []cons
 }
 
 fn createTempSymlinkOrSkip(tmp: *std.testing.TmpDir, target_path: []const u8, link_path: []const u8) !void {
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
-    if (std.fs.path.dirname(link_path)) |parent| {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    if (std.Io.Dir.path.dirname(link_path)) |parent| {
         try tmp.dir.createDirPath(io_mod.getIo(), parent);
     }
     tmp.dir.symLink(std.testing.io, target_path, link_path, .{ .is_directory = false }) catch |err| {
@@ -3917,23 +4041,23 @@ fn createTempSymlinkOrSkip(tmp: *std.testing.TmpDir, target_path: []const u8, li
 extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 fn createTempFifoOrSkip(alloc: Allocator, tmp: *std.testing.TmpDir, sub_path: []const u8) !void {
-    if (comptime @import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) {
+    if (comptime @import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
-    if (std.fs.path.dirname(sub_path)) |parent| {
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| {
         try tmp.dir.createDirPath(io_mod.getIo(), parent);
     }
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const path = try std.fs.path.join(alloc, &.{ root, sub_path });
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, sub_path });
     defer alloc.free(path);
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_z = try std.mem.printSentinel(&path_buf, "{s}", .{path}, 0);
     if (mkfifo(path_z, 0o600) != 0) return error.SkipZigTest;
 }
 
 fn openFileDescriptorCount() !usize {
-    const path = switch (@import("builtin").os.tag) {
+    const path = switch (@import("builtin").target.os.tag) {
         .linux => "/proc/self/fd",
         .macos => "/dev/fd",
         else => return error.SkipZigTest,
@@ -4068,11 +4192,11 @@ test "explicit skill matching parses natural language once for a large catalog" 
         const name = if (index == target_index)
             "release-notes"
         else
-            try std.fmt.bufPrint(&name_storage[index], "catalog-skill-{d}", .{index});
+            try std.mem.print(&name_storage[index], "catalog-skill-{d}", .{index});
         skill.* = staticSkill(name, "", .workspace_shared);
     }
 
-    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var counting = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const allocation_count = count: {
         const matches = try matchExplicitSkillIndices(
             counting.allocator(),
@@ -4230,7 +4354,7 @@ test "skill diagnostic summary escapes the active trace path" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "hostile\ntrace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "hostile\ntrace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -4276,7 +4400,7 @@ test "skill diagnostic trace preserves every exact path as one escaped line" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "skill-diagnostics.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "skill-diagnostics.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -4384,21 +4508,21 @@ test "skill catalog uses model capacity and preserves explicit byte overrides" {
     var storage: [16][24]u8 = undefined;
     var skills: [16]Skill = undefined;
     for (&skills, 0..) |*skill, index| {
-        const name = try std.fmt.bufPrint(&storage[index], "entry-{d}", .{index});
-        skill.* = .{ .name = name, .description = "useful instructions " ** 80, .path = name, .source = .global_fx };
+        const name = try std.mem.print(&storage[index], "entry-{d}", .{index});
+        skill.* = .{ .name = name, .description = text_utils.repeat("useful instructions ", 80), .path = name, .source = .global_fx };
     }
-    var unknown = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null);
+    var unknown = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null, null);
     defer unknown.deinit(alloc);
-    var large = try buildSkillPrompt(alloc, &skills, &.{}, .{}, 200_000);
+    var large = try buildSkillPrompt(alloc, &skills, &.{}, .{}, 200_000, null);
     defer large.deinit(alloc);
     try std.testing.expect(unknown.text.len <= 8000);
     try std.testing.expect(large.text.len > unknown.text.len);
     try std.testing.expect(large.text.len <= 16000);
     var limits = context_limits.Values{};
     limits.skill_catalog_bytes = .{ .value = .{ .bytes = 1600 }, .source = .user_global };
-    var small = try buildSkillPrompt(alloc, &skills, &.{}, limits, 200_000);
+    var small = try buildSkillPrompt(alloc, &skills, &.{}, limits, 200_000, null);
     defer small.deinit(alloc);
-    var same = try buildSkillPrompt(alloc, &skills, &.{}, limits, 1_000_000);
+    var same = try buildSkillPrompt(alloc, &skills, &.{}, limits, 1_000_000, null);
     defer same.deinit(alloc);
     try std.testing.expectEqualStrings(small.text, same.text);
     try std.testing.expect(small.text.len <= 1600);
@@ -4408,16 +4532,52 @@ test "skill catalog locations reject a changed identity mapping" {
     const alloc = std.testing.allocator;
     const first = [_]Skill{.{ .name = "review", .description = "Review", .path = "/first/review", .source = .global_fx }};
     const changed = [_]Skill{.{ .name = "review", .description = "Review", .path = "/second/review", .source = .global_fx }};
-    var before = try buildSkillPrompt(alloc, &first, &.{}, .{}, null);
+    var before = try buildSkillPrompt(alloc, &first, &.{}, .{}, null, null);
     defer before.deinit(alloc);
-    var after = try buildSkillPrompt(alloc, &changed, &.{}, .{}, null);
+    var after = try buildSkillPrompt(alloc, &changed, &.{}, .{}, null, null);
     defer after.deinit(alloc);
-    const location = try std.fmt.allocPrint(alloc, "skill:{x:0>16}:0/review", .{before.locations.namespace});
+    const location = try alloc.print("skill:{x:0>16}:0/review", .{before.locations.namespace});
     defer alloc.free(location);
     const resolved = try before.locations.resolve(alloc, location);
     defer alloc.free(resolved);
     try std.testing.expectEqualStrings("/first/review", resolved);
     try std.testing.expectError(error.StaleSkillLocation, after.locations.resolve(alloc, location));
+}
+
+test "skill catalogs of two worktrees of one repository render the same text" {
+    const alloc = std.testing.allocator;
+    const first = [_]Skill{
+        .{ .name = "local", .description = "Local", .path = "/src/wt1/.fx/skills/local", .source = .workspace_fx },
+        .{ .name = "global", .description = "Global", .path = "/home/u/.fx/skills/global", .source = .global_fx },
+    };
+    const second = [_]Skill{
+        .{ .name = "local", .description = "Local", .path = "/src/wt2/.fx/skills/local", .source = .workspace_fx },
+        .{ .name = "global", .description = "Global", .path = "/home/u/.fx/skills/global", .source = .global_fx },
+    };
+    var a = try buildSkillPrompt(alloc, &first, &.{}, .{}, null, "/src/wt1");
+    defer a.deinit(alloc);
+    var b = try buildSkillPrompt(alloc, &second, &.{}, .{}, null, "/src/wt2");
+    defer b.deinit(alloc);
+    try std.testing.expectEqualStrings(a.text, b.text);
+    try std.testing.expectEqual(a.locations.namespace, b.locations.namespace);
+    try std.testing.expect(std.mem.find(u8, a.text, "Root 0: .fx/skills\n") != null);
+    try std.testing.expect(std.mem.find(u8, a.text, "Root 1: /home/u/.fx/skills\n") != null);
+
+    // One token resolves to each worktree's own skill.
+    const location = try alloc.print("skill:{x:0>16}:0/local", .{a.locations.namespace});
+    defer alloc.free(location);
+    const in_first = try a.locations.resolve(alloc, location);
+    defer alloc.free(in_first);
+    const in_second = try b.locations.resolve(alloc, location);
+    defer alloc.free(in_second);
+    try std.testing.expectEqualStrings("/src/wt1/.fx/skills/local", in_first);
+    try std.testing.expectEqualStrings("/src/wt2/.fx/skills/local", in_second);
+
+    // Without a workspace root the catalog keeps absolute roots.
+    var absolute = try buildSkillPrompt(alloc, &first, &.{}, .{}, null, null);
+    defer absolute.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, absolute.text, "Root 0: /src/wt1/.fx/skills\n") != null);
+    try std.testing.expect(absolute.locations.namespace != a.locations.namespace);
 }
 
 test "skill catalog keeps secret-bearing descriptions and locations verbatim" {
@@ -4426,7 +4586,7 @@ test "skill catalog keeps secret-bearing descriptions and locations verbatim" {
         .{ .name = "safe", .description = "Release checks. API_KEY=description-secret-value", .path = "/root/safe", .source = .global_fx },
         .{ .name = "hidden", .description = "Sensitive location", .path = "/root/TOKEN=location-secret-value", .source = .global_fx },
     };
-    var section = try buildSkillPrompt(alloc, &skills, &.{}, .{}, 200_000);
+    var section = try buildSkillPrompt(alloc, &skills, &.{}, .{}, 200_000, null);
     defer section.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, section.text, "- safe:") != null);
     try std.testing.expect(std.mem.find(u8, section.text, "API_KEY=description-secret-value") != null);
@@ -4438,9 +4598,9 @@ fn checkSkillPromptAllocationFailures(alloc: Allocator) !void {
         .{ .name = "first", .description = "first instruction", .path = "/root-a/first", .source = .global_fx },
         .{ .name = "second", .description = "second instruction", .path = "/root-b/second", .source = .global_fx },
     };
-    var result = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null);
+    var result = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null, null);
     defer result.deinit(alloc);
-    const location = try std.fmt.allocPrint(alloc, "skill:{x:0>16}:1/second", .{result.locations.namespace});
+    const location = try alloc.print("skill:{x:0>16}:1/second", .{result.locations.namespace});
     defer alloc.free(location);
     const path = try result.locations.resolve(alloc, location);
     defer alloc.free(path);
@@ -4448,19 +4608,19 @@ fn checkSkillPromptAllocationFailures(alloc: Allocator) !void {
 }
 
 test "skill catalog releases partial projection allocations" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkSkillPromptAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkSkillPromptAllocationFailures, .{});
 }
 
 test "skill catalog shortens descriptions before omitting identities" {
     const alloc = std.testing.allocator;
     var skills = [_]Skill{
-        .{ .name = "alpha", .description = "First useful description. " ** 30, .path = "/tmp/skills/alpha", .source = .global_fx },
-        .{ .name = "beta", .description = "Second useful description. " ** 30, .path = "/tmp/skills/beta", .source = .global_fx },
-        .{ .name = "gamma", .description = "Third useful description. " ** 30, .path = "/tmp/skills/gamma", .source = .global_fx },
+        .{ .name = "alpha", .description = text_utils.repeat("First useful description. ", 30), .path = "/tmp/skills/alpha", .source = .global_fx },
+        .{ .name = "beta", .description = text_utils.repeat("Second useful description. ", 30), .path = "/tmp/skills/beta", .source = .global_fx },
+        .{ .name = "gamma", .description = text_utils.repeat("Third useful description. ", 30), .path = "/tmp/skills/gamma", .source = .global_fx },
     };
     var limits = context_limits.Values{};
     limits.skill_catalog_bytes = .{ .value = .{ .bytes = 768 }, .source = .command_line };
-    var result = try buildSkillPrompt(alloc, &skills, &.{}, limits, null);
+    var result = try buildSkillPrompt(alloc, &skills, &.{}, limits, null, null);
     defer result.deinit(alloc);
     for ([_][]const u8{ "alpha", "beta", "gamma" }) |name| {
         try std.testing.expect(std.mem.find(u8, result.text, name) != null);
@@ -4550,7 +4710,7 @@ test "skill catalog one-byte overflow reports every omitted name in stable order
 
 test "skill catalog omission notices bound hostile names and list length" {
     const alloc = std.testing.allocator;
-    const huge_name = "n" ** 4096;
+    const huge_name = text_utils.repeat("n", 4096);
     var skills: [20]Skill = undefined;
     for (&skills) |*skill| skill.* = staticSkill(huge_name, "", .workspace_shared);
     var limits = context_limits.Values{};
@@ -4561,7 +4721,7 @@ test "skill catalog omission notices bound hostile names and list length" {
 
     const notice = result.notice orelse return error.TestExpectedEqual;
     try std.testing.expect(notice.len < 16 * 1024);
-    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, notice, "n" ** skill_contract.max_name_bytes));
+    try std.testing.expectEqual(@as(usize, 8), std.mem.count(u8, notice, text_utils.repeat("n", skill_contract.max_name_bytes)));
     try std.testing.expect(std.mem.find(u8, notice, "+12 more") != null);
 }
 
@@ -4719,7 +4879,7 @@ test "loadVisibleSkills deduplicates symlinked workspace and global roots while 
     defer alloc.free(workspace_root);
     const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
     defer alloc.free(home_root);
-    const unused_managed_root = try std.fs.path.join(alloc, &.{ home_root, ".fx/skills" });
+    const unused_managed_root = try std.Io.Dir.path.join(alloc, &.{ home_root, ".fx/skills" });
     defer alloc.free(unused_managed_root);
 
     const workspace_roots = [_]skill_contract.RootSpec{
@@ -4750,11 +4910,11 @@ test "loadVisibleSkills deduplicates symlinked workspace and global roots while 
     try std.testing.expectEqualStrings("global workflow", discovery.skills[2].description);
     try std.testing.expectEqual(SkillSource.global_claude, discovery.skills[2].source);
 
-    const alpha_alias = try std.fs.path.join(alloc, &.{ workspace_root, ".claude/skills/alpha" });
+    const alpha_alias = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".claude/skills/alpha" });
     defer alloc.free(alpha_alias);
-    const beta_alias = try std.fs.path.join(alloc, &.{ workspace_root, ".claude/skills/beta" });
+    const beta_alias = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".claude/skills/beta" });
     defer alloc.free(beta_alias);
-    const global_alias = try std.fs.path.join(alloc, &.{ home_root, ".claude/skills/global" });
+    const global_alias = try std.Io.Dir.path.join(alloc, &.{ home_root, ".claude/skills/global" });
     defer alloc.free(global_alias);
     try std.testing.expectEqualStrings(alpha_alias, discovery.skills[0].path);
     try std.testing.expectEqualStrings(beta_alias, discovery.skills[1].path);
@@ -4841,7 +5001,7 @@ test "loadVisibleSkills discovers and reopens contained linked metadata" {
     defer alloc.free(home_root);
     const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(managed_root);
-    const logical_path = try std.fs.path.join(alloc, &.{ workspace_root, ".codex/skills/linked-leaf" });
+    const logical_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".codex/skills/linked-leaf" });
     defer alloc.free(logical_path);
 
     var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
@@ -4897,7 +5057,7 @@ test "linked metadata reauthorizes a target changed after preflight" {
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
     defer alloc.free(workspace_root);
-    const candidate_path = try std.fs.path.join(alloc, &.{ workspace_root, ".codex/skills/linked-leaf" });
+    const candidate_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".codex/skills/linked-leaf" });
     defer alloc.free(candidate_path);
     var candidate_dir = try io_mod.openDirAbsoluteNoFollow(candidate_path, .{});
     defer candidate_dir.close(io_mod.getIo());
@@ -4971,7 +5131,7 @@ test "linked metadata and resources stay on the opened candidate after rebinding
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
     defer alloc.free(workspace_root);
-    const candidate_path = try std.fs.path.join(alloc, &.{ workspace_root, ".codex/skills/linked" });
+    const candidate_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".codex/skills/linked" });
     defer alloc.free(candidate_path);
     var candidate_dir = try io_mod.openDirAbsoluteNoFollow(candidate_path, .{});
     defer candidate_dir.close(io_mod.getIo());
@@ -5024,7 +5184,7 @@ test "linked metadata outside authority is rejected before descriptor open" {
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
     defer alloc.free(workspace_root);
-    const candidate_path = try std.fs.path.join(alloc, &.{ workspace_root, ".codex/skills/linked-leaf" });
+    const candidate_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".codex/skills/linked-leaf" });
     defer alloc.free(candidate_path);
     var candidate_dir = try io_mod.openDirAbsoluteNoFollow(candidate_path, .{});
     defer candidate_dir.close(io_mod.getIo());
@@ -5040,6 +5200,8 @@ test "linked metadata outside authority is rejected before descriptor open" {
     try std.testing.expect(!mark.called);
 }
 
+// The FIFO reader stays open until the blocked writer joins, as
+// `tests/tla/session_manager/rollout/pr-1099/PR1099FIFO.tla` models.
 test "linked metadata FIFO is rejected before descriptor open" {
     const MarkOpen = struct {
         called: bool = false,
@@ -5080,11 +5242,11 @@ test "linked metadata FIFO is rejected before descriptor open" {
 
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
     defer alloc.free(workspace_root);
-    const fifo_path = try std.fs.path.join(alloc, &.{ workspace_root, "metadata.fifo" });
+    const fifo_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, "metadata.fifo" });
     defer alloc.free(fifo_path);
-    var fifo_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const fifo_path_z = try std.fmt.bufPrintZ(&fifo_path_buf, "{s}", .{fifo_path});
-    const candidate_path = try std.fs.path.join(alloc, &.{ workspace_root, ".codex/skills/fifo" });
+    var fifo_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const fifo_path_z = try std.mem.printSentinel(&fifo_path_buf, "{s}", .{fifo_path}, 0);
+    const candidate_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".codex/skills/fifo" });
     defer alloc.free(candidate_path);
     var candidate_dir = try io_mod.openDirAbsoluteNoFollow(candidate_path, .{});
     defer candidate_dir.close(io_mod.getIo());
@@ -5092,6 +5254,10 @@ test "linked metadata FIFO is rejected before descriptor open" {
     var writer = BlockedWriter{ .path = fifo_path_z };
     const writer_thread = try std.Thread.spawn(.{}, BlockedWriter.run, .{&writer});
     defer {
+        // The reader stays open until the join. The blocked writer wakes
+        // only while a reader exists, so a reader closed at once can be
+        // gone before the writer runs, and the join then never returns.
+        var reader: ?std.Io.File = null;
         if (!writer.finished.load(.seq_cst)) {
             const reader_fd = std.posix.openatZ(
                 std.posix.AT.FDCWD,
@@ -5099,12 +5265,10 @@ test "linked metadata FIFO is rejected before descriptor open" {
                 .{ .ACCMODE = .RDONLY, .NONBLOCK = true },
                 0,
             ) catch -1;
-            if (reader_fd >= 0) {
-                var reader = std.Io.File{ .handle = reader_fd, .flags = .{ .nonblocking = true } };
-                reader.close(io_mod.getIo());
-            }
+            if (reader_fd >= 0) reader = std.Io.File{ .handle = reader_fd, .flags = .{ .nonblocking = true } };
         }
         writer_thread.join();
+        if (reader) |file| file.close(io_mod.getIo());
     }
     while (!writer.started.load(.seq_cst)) std.Thread.yield() catch {};
     for (0..1000) |_| std.Thread.yield() catch {};
@@ -5145,7 +5309,7 @@ test "loadVisibleSkills discovers and reopens a contained linked workspace candi
     defer alloc.free(home_root);
     const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(managed_root);
-    const logical_path = try std.fs.path.join(alloc, &.{ workspace_root, ".codex/skills/linked-skill" });
+    const logical_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".codex/skills/linked-skill" });
     defer alloc.free(logical_path);
 
     var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
@@ -5203,7 +5367,7 @@ test "loadVisibleSkills diagnoses an unavailable linked workspace candidate" {
     defer alloc.free(home_root);
     const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(managed_root);
-    const logical_path = try std.fs.path.join(alloc, &.{ workspace_root, ".codex/skills/missing-skill" });
+    const logical_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".codex/skills/missing-skill" });
     defer alloc.free(logical_path);
 
     var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
@@ -5279,7 +5443,7 @@ test "loadVisibleSkills diagnoses an escaping linked workspace candidate" {
     defer alloc.free(home_root);
     const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(managed_root);
-    const logical_path = try std.fs.path.join(alloc, &.{ workspace_root, ".codex/skills/escaping-skill" });
+    const logical_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".codex/skills/escaping-skill" });
     defer alloc.free(logical_path);
 
     var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
@@ -5329,7 +5493,7 @@ test "loadVisibleSkills cleans contained-link authority allocation failures" {
     defer alloc.free(managed_root);
 
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkContainedLinkedSkillAllocationFailures,
         .{ workspace_root, home_root, managed_root },
     );
@@ -5403,14 +5567,14 @@ test "skill discovery rejects a symlinked selected root" {
     defer tmp.cleanup();
 
     try writeTempFile(&tmp, "real-root/external/SKILL.md", "---\nname: external\ndescription: must not load\n---\nbody\n");
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     tmp.dir.symLink(std.testing.io, "real-root", "linked-root", .{ .is_directory = true }) catch |err| {
         if (err == error.AccessDenied or err == error.FileSystem) return error.SkipZigTest;
         return err;
     };
     const tmp_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(tmp_root);
-    const linked_root = try std.fs.path.join(alloc, &.{ tmp_root, "linked-root" });
+    const linked_root = try std.Io.Dir.path.join(alloc, &.{ tmp_root, "linked-root" });
     defer alloc.free(linked_root);
 
     var discovery = try loadVisibleSkills(alloc, null, null, linked_root, test_managed_root_policy);
@@ -5425,14 +5589,14 @@ test "skill discovery reports a broken symlinked selected root" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     tmp.dir.symLink(std.testing.io, "missing-root", "broken-root", .{ .is_directory = true }) catch |err| {
         if (err == error.AccessDenied or err == error.FileSystem) return error.SkipZigTest;
         return err;
     };
     const tmp_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(tmp_root);
-    const broken_root = try std.fs.path.join(alloc, &.{ tmp_root, "broken-root" });
+    const broken_root = try std.Io.Dir.path.join(alloc, &.{ tmp_root, "broken-root" });
     defer alloc.free(broken_root);
 
     var discovery = try loadVisibleSkills(alloc, null, null, broken_root, test_managed_root_policy);
@@ -5451,7 +5615,7 @@ test "skill discovery rejects symlinked ancestors inside an automatic root" {
     try writeTempFile(&tmp, "outside/skills/external/SKILL.md", "---\nname: external\ndescription: must not load\n---\nbody\n");
     try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace");
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     tmp.dir.symLink(std.testing.io, "../../outside", "home/workspace/.agents", .{ .is_directory = true }) catch |err| {
         if (err == error.AccessDenied or err == error.FileSystem) return error.SkipZigTest;
         return err;
@@ -5480,7 +5644,7 @@ test "skill discovery reports a symlinked automatic root whose target lacks the 
     try tmp.dir.createDirPath(io_mod.getIo(), "outside");
     try tmp.dir.createDirPath(io_mod.getIo(), "home/workspace");
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
     tmp.dir.symLink(std.testing.io, "../../outside", "home/workspace/.agents", .{ .is_directory = true }) catch |err| {
         if (err == error.AccessDenied or err == error.FileSystem) return error.SkipZigTest;
         return err;
@@ -5536,11 +5700,11 @@ test "loadVisibleSkills orders valid candidates diagnoses invalid metadata and r
 
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "root");
     defer alloc.free(root);
-    const alpha_path = try std.fs.path.join(alloc, &.{ root, "alpha" });
+    const alpha_path = try std.Io.Dir.path.join(alloc, &.{ root, "alpha" });
     defer alloc.free(alpha_path);
-    const beta_path = try std.fs.path.join(alloc, &.{ root, "beta" });
+    const beta_path = try std.Io.Dir.path.join(alloc, &.{ root, "beta" });
     defer alloc.free(beta_path);
-    const bad_path = try std.fs.path.join(alloc, &.{ root, "bad" });
+    const bad_path = try std.Io.Dir.path.join(alloc, &.{ root, "bad" });
     defer alloc.free(bad_path);
 
     var discovery = try loadVisibleSkills(alloc, null, null, root, test_managed_root_policy);
@@ -5578,7 +5742,7 @@ test "loadVisibleSkills diagnoses a hostile no-frontmatter directory name" {
 
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "root");
     defer alloc.free(root);
-    const candidate_path = try std.fs.path.join(alloc, &.{ root, "hostile\nname" });
+    const candidate_path = try std.Io.Dir.path.join(alloc, &.{ root, "hostile\nname" });
     defer alloc.free(candidate_path);
 
     var discovery = try loadVisibleSkills(alloc, null, null, root, test_managed_root_policy);
@@ -5627,7 +5791,7 @@ test "loadVisibleSkills cleans every partial allocation failure" {
     defer alloc.free(managed_root);
 
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkLoadVisibleSkillsAllocationFailures,
         .{ workspace_root, home_root, managed_root },
     );
@@ -5677,7 +5841,7 @@ test "linked metadata cleans every partial allocation failure" {
 
     const descriptor_count_before = try openFileDescriptorCount();
     try std.testing.checkAllAllocationFailures(
-        alloc,
+        testing_allocator.no_resize,
         checkLinkedMetadataAllocationFailures,
         .{ workspace_root, home_root, managed_root },
     );
@@ -5688,25 +5852,11 @@ test "freeSkills accepts static empty slice" {
     freeSkills(std.testing.allocator, &.{});
 }
 
-var stable_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableEmptyTestEnviron() !*const std.process.Environ.Map {
-    if (stable_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_test_environ = map;
-    return map;
-}
-
 const TestEnviron = struct {
     alloc: Allocator,
     map: std.process.Environ.Map,
 
     fn install(alloc: Allocator) !*TestEnviron {
-        _ = try stableEmptyTestEnviron();
-
         const self = try alloc.create(TestEnviron);
         errdefer alloc.destroy(self);
 
@@ -5725,9 +5875,7 @@ const TestEnviron = struct {
     }
 
     fn deinit(self: *TestEnviron) void {
-        if (stable_test_environ) |map| {
-            io_mod.setEnvironMap(map);
-        }
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);
@@ -5847,6 +5995,71 @@ test "loadVisibleSkills discovers a linked candidate resolved via external symli
     candidate.deinit();
 }
 
+test "loadVisibleSkills discovers a linked candidate through configured symlink authorities" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTempFile(
+        &tmp,
+        "external-store/configured-skill/SKILL.md",
+        "---\nname: configured-skill\ndescription: configured external link\n---\n\nCONFIGURED_BODY\n",
+    );
+    try createTempSymlinkOrSkip(
+        &tmp,
+        "../../../../external-store/configured-skill",
+        "home/workspace/.codex/skills/configured-skill",
+    );
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx/skills");
+
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace_root);
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
+    defer alloc.free(managed_root);
+    const external_authority = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "external-store");
+    defer alloc.free(external_authority);
+    const dotdot_authority = try std.Io.Dir.path.join(alloc, &.{ external_authority, "..", "external-store" });
+    defer alloc.free(dotdot_authority);
+
+    const env = try TestEnviron.install(alloc);
+    defer env.deinit();
+
+    // Relative and `..` entries never grant authority, matching the env var.
+    try setConfiguredSymlinkAuthorities(&.{ "external-store", dotdot_authority });
+    defer setConfiguredSymlinkAuthorities(&.{}) catch {};
+    {
+        var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+        defer discovery.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), discovery.skills.len);
+        try std.testing.expectEqual(SkillDiagnosticCause.linked_candidate_unavailable, discovery.diagnostics[0].cause);
+    }
+
+    try setConfiguredSymlinkAuthorities(&.{external_authority});
+    {
+        var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+        defer discovery.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), discovery.skills.len);
+        try std.testing.expectEqualStrings("configured-skill", discovery.skills[0].name);
+        try std.testing.expectEqual(@as(usize, 0), discovery.diagnostics.len);
+
+        var candidate = switch (try openValidatedSkillCandidate(alloc, discovery.skills[0])) {
+            .current => |current| current,
+            .missing, .name_mismatch, .skipped => return error.TestExpectedCurrentSkill,
+        };
+        candidate.deinit();
+    }
+
+    try setConfiguredSymlinkAuthorities(&.{});
+    {
+        var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed_root, test_root_policy);
+        defer discovery.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), discovery.skills.len);
+        try std.testing.expectEqual(SkillDiagnosticCause.linked_candidate_unavailable, discovery.diagnostics[0].cause);
+    }
+}
+
 test "loadVisibleSkills still rejects external symlinks without an authority" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5870,7 +6083,7 @@ test "loadVisibleSkills still rejects external symlinks without an authority" {
     defer alloc.free(home_root);
     const managed_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/.fx/skills");
     defer alloc.free(managed_root);
-    const logical_path = try std.fs.path.join(alloc, &.{ workspace_root, ".codex/skills/escaping-skill" });
+    const logical_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".codex/skills/escaping-skill" });
     defer alloc.free(logical_path);
 
     const env = try TestEnviron.install(alloc);

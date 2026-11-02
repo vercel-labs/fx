@@ -30,6 +30,7 @@ const RunError = error{
     SelfExeNotFound,
     ReplaceFailed,
     OutOfMemory,
+    Cancelled,
 };
 
 pub fn run(
@@ -138,6 +139,7 @@ fn failureMessage(err: RunError) []const u8 {
         error.SelfExeNotFound => "could not determine path of running binary",
         error.ReplaceFailed => "failed to replace binary (permission denied?)",
         error.OutOfMemory => "out of memory",
+        error.Cancelled => "upgrade cancelled",
     };
 }
 
@@ -151,6 +153,7 @@ fn workerErrorToRunError(err: UpgradeError) RunError {
         .self_exe_not_found => error.SelfExeNotFound,
         .replace_failed => error.ReplaceFailed,
         .out_of_memory => error.OutOfMemory,
+        .cancelled => error.Cancelled,
     };
 }
 
@@ -178,7 +181,7 @@ fn upgradeWorkerInner(
     show_progress: bool,
 ) !void {
     const cdn_base = helpers.resolveCdnBase();
-    const fetched_target = helpers.fetchTarget(alloc, channel, cdn_base) catch {
+    const fetched_target = helpers.fetchTarget(alloc, channel, cdn_base, .{}) catch {
         result.err = .fetch_failed;
         return;
     };
@@ -193,7 +196,7 @@ fn upgradeWorkerInner(
     var rand_buf: [8]u8 = undefined;
     io_mod.getIo().random(&rand_buf);
     const rand_hex = std.fmt.bytesToHex(rand_buf, .lower);
-    const tmp_dir = try std.fmt.allocPrint(alloc, "{s}/fx-upgrade-{s}", .{ tmp_base, rand_hex });
+    const tmp_dir = try alloc.print("{s}/fx-upgrade-{s}", .{ tmp_base, rand_hex });
     defer alloc.free(tmp_dir);
     defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), tmp_dir) catch {};
 
@@ -202,10 +205,10 @@ fn upgradeWorkerInner(
         return;
     };
 
-    const archive_path = try std.fmt.allocPrint(alloc, "{s}/fx.tar.gz", .{tmp_dir});
+    const archive_path = try alloc.print("{s}/fx.tar.gz", .{tmp_dir});
     defer alloc.free(archive_path);
 
-    const archive_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform });
+    const archive_url = try alloc.print("{s}/{s}/fx-{s}.tar.gz", .{ cdn_base, target.artifactRef(), helpers.platform });
     defer alloc.free(archive_url);
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
@@ -215,19 +218,20 @@ fn upgradeWorkerInner(
         .ctx = progress,
         .start = progressDownloadStart,
         .update = progressDownloadUpdate,
-    }) catch {
+    }, .{}) catch {
         result.err = .download_failed;
         return;
     };
     progress.markFinishing();
 
-    const checksum_url = try std.fmt.allocPrint(alloc, "{s}/{s}/fx-{s}.tar.gz.sha256", .{ cdn_base, target.artifactRef(), helpers.platform });
+    const checksum_url = try alloc.print("{s}/{s}/fx-{s}.tar.gz.sha256", .{ cdn_base, target.artifactRef(), helpers.platform });
     defer alloc.free(checksum_url);
 
-    helpers.verifyChecksum(&client, archive_path, checksum_url) catch |err| {
+    helpers.verifyChecksum(&client, archive_path, checksum_url, .{}) catch |err| {
         result.err = switch (err) {
             error.ChecksumFetchFailed => .checksum_fetch_failed,
             error.ChecksumMismatch => .checksum_mismatch,
+            error.Cancelled => .cancelled,
         };
         return;
     };
@@ -237,10 +241,10 @@ fn upgradeWorkerInner(
         return;
     };
 
-    const extracted_bin = try std.fmt.allocPrint(alloc, "{s}/fx", .{tmp_dir});
+    const extracted_bin = try alloc.print("{s}/fx", .{tmp_dir});
     defer alloc.free(extracted_bin);
 
-    var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var self_exe_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const self_exe = helpers.currentExecutablePath(&self_exe_buf) catch {
         result.err = .self_exe_not_found;
         return;
@@ -267,18 +271,18 @@ const ProgressSnapshot = struct {
 };
 
 const ProgressState = struct {
-    phase: std.atomic.Value(u8) = .init(@intFromEnum(ProgressPhase.checking)),
+    phase: std.atomic.Value(u8) = .init(@backingInt(ProgressPhase.checking)),
     downloaded: std.atomic.Value(u64) = .init(0),
     total: std.atomic.Value(u64) = .init(0),
 
     fn markUpdateFound(self: *ProgressState) void {
-        self.phase.store(@intFromEnum(ProgressPhase.found), .release);
+        self.phase.store(@backingInt(ProgressPhase.found), .release);
     }
 
     fn markDownloadStart(self: *ProgressState, total: ?u64) void {
         self.downloaded.store(0, .release);
         self.total.store(total orelse 0, .release);
-        self.phase.store(@intFromEnum(if (total == null) ProgressPhase.downloading_unknown else ProgressPhase.downloading_known), .release);
+        self.phase.store(@backingInt(if (total == null) ProgressPhase.downloading_unknown else ProgressPhase.downloading_known), .release);
     }
 
     fn markDownloadProgress(self: *ProgressState, downloaded: u64, total: ?u64) void {
@@ -287,7 +291,7 @@ const ProgressState = struct {
     }
 
     fn markFinishing(self: *ProgressState) void {
-        self.phase.store(@intFromEnum(ProgressPhase.finishing), .release);
+        self.phase.store(@backingInt(ProgressPhase.finishing), .release);
     }
 
     fn snapshot(self: *ProgressState) ProgressSnapshot {
@@ -302,11 +306,11 @@ const ProgressState = struct {
 
 fn progressPhaseFromRaw(raw: u8) ProgressPhase {
     return switch (raw) {
-        @intFromEnum(ProgressPhase.checking) => .checking,
-        @intFromEnum(ProgressPhase.found) => .found,
-        @intFromEnum(ProgressPhase.downloading_known) => .downloading_known,
-        @intFromEnum(ProgressPhase.downloading_unknown) => .downloading_unknown,
-        @intFromEnum(ProgressPhase.finishing) => .finishing,
+        @backingInt(ProgressPhase.checking) => .checking,
+        @backingInt(ProgressPhase.found) => .found,
+        @backingInt(ProgressPhase.downloading_known) => .downloading_known,
+        @backingInt(ProgressPhase.downloading_unknown) => .downloading_unknown,
+        @backingInt(ProgressPhase.finishing) => .finishing,
         else => .checking,
     };
 }
@@ -399,6 +403,7 @@ const UpgradeError = enum {
     self_exe_not_found,
     replace_failed,
     out_of_memory,
+    cancelled,
 };
 
 fn versionLabel(v: []const u8) []const u8 {

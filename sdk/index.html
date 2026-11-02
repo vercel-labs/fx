@@ -56,7 +56,7 @@
     <button type="button" id="cancel" disabled>Cancel</button>
   </form>
   <script type="module">
-    import { createFxAgent, supportsJspi } from "./browser.js";
+    import { createFxEngine, supportsJspi } from "./browser.js";
     import { createSkillsAdapter } from "./skills.js";
 
     const configPrefix = "fx.core.config.";
@@ -76,6 +76,9 @@
     const forceUnsupported = params.has("force-unsupported");
     const hostToolEnabled = params.has("host-tool");
     const hostSkillEnabled = params.has("host-skill");
+    const blobPrompt = params.has("blob-prompt");
+    const crossRealmBlob = params.has("blob-iframe");
+    const blobPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
     const status = document.querySelector("#status");
     const timeline = document.querySelector("#timeline");
     const form = document.querySelector("form");
@@ -105,8 +108,19 @@
     let agent;
     let activeTurn = false;
     let currentTurn = null;
+    let blobIframe = null;
 
     const encoded = new TextEncoder();
+    function promptImage() {
+      const bytes = Uint8Array.from(atob(blobPng), (char) => char.charCodeAt(0));
+      if (!crossRealmBlob) return new Blob([bytes], { type: "image/png" });
+      blobIframe = document.createElement("iframe");
+      blobIframe.hidden = true;
+      document.body.append(blobIframe);
+      const file = new blobIframe.contentWindow.File([bytes], "image.png", { type: "image/png" });
+      test.crossRealm = !(file instanceof Blob);
+      return file;
+    }
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     const elapsed = (timestamp = performance.now()) => `+${((timestamp - startedAt) / 1000).toFixed(3)}s`;
     const json = (value) => JSON.stringify(value, null, 2);
@@ -157,9 +171,16 @@
         return Response.json({ object: "list", data: [
           { id: "sdk/catalog-alpha", type: "language", released: 2, tags: ["tool-use"] },
           { id: "sdk/catalog-beta", type: "language", released: 1, tags: ["reasoning"] },
+          ...(blobPrompt ? [{ id: "sdk/chrome-model", type: "language", tags: ["vision", "file-input"] }] : []),
         ] });
       }
       test.fetchCalls++;
+      if (blobPrompt) {
+        const payload = JSON.parse(new TextDecoder().decode(init.body));
+        test.blobSent = payload.prompt.some((message) =>
+          message.role === "user" && message.content?.some((part) =>
+            part.type === "file" && part.mediaType === "image/png" && part.data?.data === blobPng));
+      }
       if (transport === "stall") {
         let controller;
         const body = new ReadableStream({ start(value) { controller = value; } });
@@ -272,7 +293,10 @@
       status.textContent = "running";
       let cancelTimer;
       try {
-        const turn = agent.prompt(prompt);
+        const turn = agent.prompt(blobPrompt ? [
+          { type: "text", text: prompt },
+          { type: "image", data: promptImage() },
+        ] : prompt);
         currentTurn = turn;
         if (cancelAfter > 0) cancelTimer = setTimeout(() => turn.cancel(), cancelAfter);
         for await (const event of turn) {
@@ -291,6 +315,8 @@
         setState("failed", error);
       } finally {
         clearTimeout(cancelTimer);
+        blobIframe?.remove();
+        blobIframe = null;
         currentTurn = null;
         setActive(false);
       }
@@ -306,7 +332,7 @@
           name: "browser-skill",
           instructions: "BROWSER_SKILL_SENTINEL",
         }]) : { instructions: "", tools: [] };
-        agent = await createFxAgent({
+        agent = await createFxEngine({
           wasm: location.hostname === "localhost" || location.hostname === "127.0.0.1"
             ? "../zig-out/bin/fx-core.wasm"
             : "./fx-core.wasm",

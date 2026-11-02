@@ -1,0 +1,9 @@
+{
+  "name": "libfx-build-tools",
+  "private": true,
+  "description": "Tools that build libfx's packaged files",
+  "type": "module",
+  "devDependencies": {
+    "binaryen": "132.0.0"
+  }
+}

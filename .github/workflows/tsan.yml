@@ -1,0 +1,94 @@
+name: Thread Sanitizer
+
+# Nightly unit tests built with ThreadSanitizer. The job reports races and
+# never fails because of them: it lists each distinct race in the job summary
+# and uploads the full log. A pull request that changes this workflow runs it
+# once, so a change that breaks the nightly run shows before it merges.
+
+on:
+  schedule:
+    - cron: "47 7 * * *"
+  pull_request:
+    paths:
+      - .github/workflows/tsan.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tsan-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tsan:
+    name: Unit tests with ThreadSanitizer
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      # Report every race, keep running, and leave the exit status to the
+      # tests themselves. The unit tests run each command through the
+      # installed fx, which is sanitized too, and by default a sanitized
+      # process that still has other threads waits a second before it exits.
+      # That wait would hold every command open past what the command tests
+      # time, so it is off.
+      TSAN_OPTIONS: halt_on_error=0:abort_on_error=0:exitcode=0:atexit_sleep_ms=0
+    steps:
+      - uses: actions/checkout@v4
+
+      # Restores main's unit-test cache for the dependencies, compiler_rt, and
+      # libc it keeps. This job never saves a cache.
+      - name: Setup Zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.17.0"
+          cache-key: ci-unit-ReleaseSafe
+
+      # The session manager's tests take a minute, so their races are always
+      # reported, even if the fx tests below run out of time.
+      - name: Run the session manager tests
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          zig build test-session-manager -Doptimize=ReleaseSafe -Dsanitize-thread=true --summary all 2>&1 | tee -a tsan.log
+        continue-on-error: true
+
+      # ReleaseSafe, as the CI unit tests use, runs far faster than Debug
+      # under ThreadSanitizer.
+      - name: Run the fx unit tests
+        timeout-minutes: 80
+        run: |
+          set -o pipefail
+          zig build test -Doptimize=ReleaseSafe -Dsanitize-thread=true --summary all 2>&1 | tee -a tsan.log
+        continue-on-error: true
+
+      - name: Summarize races
+        if: always()
+        run: |
+          {
+            echo "## ThreadSanitizer"
+            echo
+            count=$(grep -c 'WARNING: ThreadSanitizer' tsan.log || true)
+            echo "Reports: ${count:-0}"
+            echo
+            if [ "${count:-0}" -gt 0 ]; then
+              echo "| Reports | Race |"
+              echo "|---|---|"
+              grep 'SUMMARY: ThreadSanitizer' tsan.log \
+                | sed -E 's/^.*SUMMARY: ThreadSanitizer: //; s/ \([^)]*\)//' \
+                | sort | uniq -c | sort -rn \
+                | awk '{ n = $1; $1 = ""; sub(/^ /, ""); printf "| %s | `%s` |\n", n, $0 }'
+            fi
+            echo
+            echo '```'
+            grep -E '^Build Summary' tsan.log || echo "no build summary"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsan-log
+          path: tsan.log
+          if-no-files-found: ignore

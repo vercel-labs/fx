@@ -23,8 +23,8 @@ class PgsoModelTests(unittest.TestCase):
             source_sha="a" * 40,
             target="aarch64-macos",
             host_arch="arm64",
-            zig_version="0.16.0",
-            llvm_version="21.1.8",
+            zig_version="0.17.0",
+            llvm_version="22.1.8",
             bitcode_sha256="b" * 64,
             corpus_sha256="c" * 64,
             update_channel="stable",
@@ -44,7 +44,7 @@ class PgsoModelTests(unittest.TestCase):
             "source_sha": "d" * 40,
             "target": "x86_64-macos",
             "host_arch": "x86_64",
-            "zig_version": "0.16.1",
+            "zig_version": "0.17.1",
             "llvm_version": "21.1.9",
             "bitcode_sha256": "e" * 64,
             "corpus_sha256": "f" * 64,
@@ -87,23 +87,23 @@ class PgsoModelTests(unittest.TestCase):
             self.assertEqual(sha256_file(path), evidence["sha256"])
 
     def test_size_gate_reports_exact_mib_and_preferred_headroom(self) -> None:
-        evidence = size_gate(7_837_920)
+        evidence = size_gate(6_887_888, 7.000)
 
         self.assertEqual(1.0, bytes_to_mib(1_048_576))
-        self.assertEqual(7_837_920, evidence.size_bytes)
-        self.assertEqual(7.474822998046875, evidence.size_mib)
-        self.assertEqual(7.800, evidence.ceiling_mib)
-        self.assertEqual(0.3251770019531248, evidence.headroom_mib)
+        self.assertEqual(6_887_888, evidence.size_bytes)
+        self.assertEqual(6.5688018798828125, evidence.size_mib)
+        self.assertEqual(7.000, evidence.ceiling_mib)
+        self.assertEqual(0.4311981201171875, evidence.headroom_mib)
         self.assertEqual(0.250, evidence.preferred_headroom_mib)
         self.assertTrue(evidence.preferred_headroom_met)
 
     def test_size_gate_enforces_the_integral_byte_boundary(self) -> None:
-        self.assertEqual(8_178_892, size_gate(8_178_892).size_bytes)
-        with self.assertRaisesRegex(PgsoError, "exceeds 7.800 MiB"):
-            size_gate(8_178_893)
+        self.assertEqual(7_340_032, size_gate(7_340_032, 7.000).size_bytes)
+        with self.assertRaisesRegex(PgsoError, "exceeds 7.000 MiB"):
+            size_gate(7_340_033, 7.000)
 
     def test_size_gate_records_insufficient_preferred_headroom(self) -> None:
-        evidence = size_gate(8_000_000)
+        evidence = size_gate(7_200_000, 7.000)
 
         self.assertFalse(evidence.preferred_headroom_met)
         self.assertGreater(evidence.headroom_mib, 0)
@@ -112,7 +112,7 @@ class PgsoModelTests(unittest.TestCase):
         for byte_count in (0, -1):
             with self.subTest(byte_count=byte_count):
                 with self.assertRaisesRegex(PgsoError, "artifact is empty"):
-                    size_gate(byte_count)
+                    size_gate(byte_count, 7.000)
 
     def test_require_empty_stderr_rejects_unexpected_output(self) -> None:
         require_empty_stderr("profile use", "")

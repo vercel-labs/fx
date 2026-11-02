@@ -3,7 +3,6 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -13,6 +12,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
+import { sessionDir } from "./saved-sessions";
 
 const TIMEOUT = 60_000;
 const OUTER_MODEL = "anthropic/claude-sonnet-4.6";
@@ -340,25 +340,20 @@ describe.skipIf(process.env.FX_WEB_FETCH_LIVE !== "1")("live web_fetch public UR
         expect(fetch?.web_fetch?.cache_hit).toBe(false);
         expect(fetch?.web_fetch?.artifact).toBe("stored");
 
-        const sessionDir = join(root.home, ".fx", "sessions", json.session_id);
-        const artifactDir = join(sessionDir, "artifacts", "web-fetch");
-        expect(existsSync(artifactDir)).toBe(true);
-        const files = readdirSync(artifactDir).filter((name) => name.startsWith("artifact-"));
+        // The download is a session blob, named in the log by its handle,
+        // artifact-<hash>.<ext> (D44, D49).
+        const sessionLog = readFileSync(join(sessionDir(root.home, json.session_id), "log.jsonl"), "utf8");
+        const files = [...new Set(sessionLog.match(/artifact-[0-9a-f]{64}\.[a-z0-9]+/g) ?? [])];
         expect(files).toHaveLength(1);
-        const artifactPath = join(artifactDir, files[0]!);
+        const artifactPath = join(sessionDir(root.home, json.session_id), "blobs", files[0]!.slice("artifact-".length, "artifact-".length + 64));
         const artifactBytes = readFileSync(artifactPath);
         expect(artifactBytes.length).toBe(fetch!.web_fetch!.bytes);
         expect(artifactBytes.subarray(0, 5).toString()).toBe("%PDF-");
 
         const artifactBase64Prefix = artifactBytes.toString("base64").slice(0, 16);
-        const sessionJson = readFileSync(join(sessionDir, "session.json"), "utf8");
-        expect(sessionJson).not.toContain("%PDF-");
-        expect(sessionJson).not.toContain(artifactBase64Prefix);
-        expect(sessionJson).not.toContain("Store the file and summarize safe metadata only.");
-        const sessionEvents = readFileSync(join(sessionDir, "events.jsonl"), "utf8");
-        expect(sessionEvents).not.toContain("%PDF-");
-        expect(sessionEvents).not.toContain(artifactBase64Prefix);
-        expect(sessionEvents).not.toContain("Store the file and summarize safe metadata only.");
+        expect(sessionLog).not.toContain("%PDF-");
+        expect(sessionLog).not.toContain(artifactBase64Prefix);
+        expect(sessionLog).not.toContain("Store the file and summarize safe metadata only.");
         const detail = await runFx(["session", "--id", json.session_id, "--json"], {
           cwd: root.workspace,
           env: fakeGatewayEnv(root, gateway),

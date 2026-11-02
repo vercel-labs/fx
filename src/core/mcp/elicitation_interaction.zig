@@ -1,9 +1,12 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const elicitation = @import("elicitation.zig");
 const mrtr = @import("mrtr.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
+const json_decode = @import("../shared/json_decode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -56,16 +59,7 @@ pub const Options = struct {
     browser: Browser,
     capabilities: elicitation.Capabilities,
     max_form_attempts: usize = 8,
-};
-
-const Response = struct {
-    key: []const u8,
-    json: []u8,
-
-    fn deinit(self: *Response, alloc: Allocator) void {
-        alloc.free(self.json);
-        self.* = undefined;
-    }
+    compact_forms: bool = false,
 };
 
 pub fn respond(
@@ -96,10 +90,10 @@ pub fn respond(
         );
     }
 
-    const responses = try alloc.alloc(Response, requests.len);
+    const responses = try alloc.alloc([]u8, requests.len);
     var response_count: usize = 0;
     errdefer {
-        for (responses[0..response_count]) |*response| response.deinit(alloc);
+        for (responses[0..response_count]) |response| alloc.free(response);
         alloc.free(responses);
     }
 
@@ -134,22 +128,22 @@ pub fn respond(
             },
             else => return error.UnsupportedInputRequest,
         };
-        responses[response_count] = .{ .key = request.key, .json = response_json };
+        responses[response_count] = response_json;
         response_count += 1;
     }
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeByte('{');
-    for (responses, 0..) |response, index| {
+    for (requests, responses, 0..) |request, response, index| {
         if (index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(response.key, .{}, &out.writer);
+        try std.json.Stringify.value(request.key, .{}, &out.writer);
         try out.writer.writeByte(':');
-        try out.writer.writeAll(response.json);
+        try out.writer.writeAll(response);
     }
     try out.writer.writeByte('}');
     const result = try out.toOwnedSlice();
-    for (responses) |*response| response.deinit(alloc);
+    for (responses) |response| alloc.free(response);
     alloc.free(responses);
     return result;
 }
@@ -167,12 +161,36 @@ const FieldValue = struct {
 
 const FieldAnswer = union(enum) {
     cancelled,
+    declined,
     value: ?[]u8,
 };
 
-const PresentedChoice = struct {
-    local_label: []const u8,
-    wire_value: []const u8,
+const FillAction = enum {
+    enter,
+    use_default,
+    skip,
+    cancelled,
+};
+
+const FillKind = enum {
+    scalar,
+    single_select,
+    multi_select,
+
+    fn action_label(self: FillKind) []const u8 {
+        return switch (self) {
+            .scalar => "Enter value",
+            .single_select => "Select value",
+            .multi_select => "Choose values",
+        };
+    }
+};
+
+const SingleAnswer = union(enum) {
+    cancelled,
+    invalid,
+    /// Owned by the caller with the allocator passed to `ask_single`.
+    answer: []u8,
 };
 
 fn answerForm(
@@ -194,6 +212,8 @@ fn answerForm(
         .{},
     );
     defer form.deinit(alloc);
+    const compact = options.compact_forms and form.fields.len == 1 and
+        form.fields[0].kind == .single_select and form.fields[0].choices.len <= 3;
 
     const values = try alloc.alloc(FieldValue, form.fields.len);
     for (form.fields, values) |field, *value| {
@@ -218,6 +238,7 @@ fn answerForm(
                 deadline_ms,
                 cancel_flag,
                 options.questioner,
+                compact,
             ) catch |err| switch (err) {
                 error.InvalidAnswer => {
                     invalid = true;
@@ -226,6 +247,7 @@ fn answerForm(
                 else => return err,
             };
             const value = switch (answer) {
+                .declined => return alloc.dupe(u8, "{\"action\":\"decline\"}"),
                 .cancelled => {
                     cancelled = true;
                     break;
@@ -265,6 +287,10 @@ fn answerForm(
             },
         };
         std.debug.assert(action == .accept);
+        if (compact) {
+            response_owned = false;
+            return response;
+        }
 
         const review_question = try buildReviewQuestion(
             alloc,
@@ -280,26 +306,31 @@ fn answerForm(
             .{ .label = "Decline" },
             .{ .label = "Cancel" },
         };
-        const review_entries = [_]types.QuestionBatchEntry{.{
-            .question = review_question,
-            .options = &review_options,
-        }};
-        const review_answers = try options.questioner.ask(alloc, &review_entries, deadline_ms, cancel_flag) orelse {
-            return alloc.dupe(u8, "{\"action\":\"cancel\"}");
+        const review_answer = switch (try ask_single(
+            alloc,
+            review_question,
+            &review_options,
+            .none,
+            deadline_ms,
+            cancel_flag,
+            options.questioner,
+        )) {
+            .cancelled => return alloc.dupe(u8, "{\"action\":\"cancel\"}"),
+            .invalid => continue,
+            .answer => |decision_text| decision_text,
         };
-        defer freeAnswers(alloc, review_answers);
-        if (review_answers.len != 1) continue;
-        if (std.mem.eql(u8, review_answers[0], "Submit")) {
+        defer alloc.free(review_answer);
+        if (std.mem.eql(u8, review_answer, "Submit")) {
             response_owned = false;
             return response;
         }
-        if (std.mem.eql(u8, review_answers[0], "Decline")) {
+        if (std.mem.eql(u8, review_answer, "Decline")) {
             return alloc.dupe(u8, "{\"action\":\"decline\"}");
         }
-        if (std.mem.eql(u8, review_answers[0], "Cancel")) {
+        if (std.mem.eql(u8, review_answer, "Cancel")) {
             return alloc.dupe(u8, "{\"action\":\"cancel\"}");
         }
-        if (!std.mem.eql(u8, review_answers[0], "Edit")) continue;
+        if (!std.mem.eql(u8, review_answer, "Edit")) continue;
     }
     return error.RetryLimitExceeded;
 }
@@ -313,7 +344,11 @@ fn answerField(
     deadline_ms: i64,
     cancel_flag: ?*const std.atomic.Value(bool),
     questioner: Questioner,
+    compact: bool,
 ) Error!FieldAnswer {
+    if (compact and !current.answered) {
+        return answerCompactField(alloc, server_name, request_message, field, deadline_ms, cancel_flag, questioner);
+    }
     if (current.answered) {
         const keep = try askToKeepCurrentValue(
             alloc,
@@ -353,8 +388,7 @@ fn answerField(
         null;
     defer if (display_description) |description| alloc.free(description);
     const question = if (display_description) |description|
-        try std.fmt.allocPrint(
-            alloc,
+        try alloc.print(
             "MCP server {s} requests {s}{s} — {s}\nReason: {s}",
             .{
                 server_name,
@@ -365,8 +399,7 @@ fn answerField(
             },
         )
     else
-        try std.fmt.allocPrint(
-            alloc,
+        try alloc.print(
             "MCP server {s} requests {s}{s}\nReason: {s}",
             .{
                 server_name,
@@ -376,93 +409,74 @@ fn answerField(
             },
         );
     defer alloc.free(question);
-    const value_action_label = if (field.kind == .single_select) "Select value" else "Enter value";
-
     if (field.default_json != null or !field.required) {
-        const fill_question = try std.fmt.allocPrint(
+        const fill_kind: FillKind = if (field.kind == .single_select) .single_select else .scalar;
+        switch (try choose_fill_action(
             alloc,
-            "MCP server {s}: choose how to fill {s}{s}.\nReason: {s}",
-            .{
-                server_name,
-                display_name,
-                if (field.required) " (required)" else " (optional)",
-                request_message,
-            },
-        );
-        defer alloc.free(fill_question);
-        var fill_options: std.ArrayList(types.QuestionOption) = .empty;
-        defer fill_options.deinit(alloc);
-        try fill_options.append(alloc, .{ .label = value_action_label });
-        if (field.default_json != null) {
-            try fill_options.append(alloc, .{ .label = "Use default" });
-        }
-        if (!field.required) try fill_options.append(alloc, .{ .label = "Skip" });
-        const fill_entries = [_]types.QuestionBatchEntry{.{
-            .question = fill_question,
-            .options = fill_options.items,
-        }};
-        const fill_answers = try questioner.ask(
-            alloc,
-            &fill_entries,
+            server_name,
+            request_message,
+            display_name,
+            field,
+            fill_kind,
             deadline_ms,
             cancel_flag,
-        ) orelse return .cancelled;
-        defer freeAnswers(alloc, fill_answers);
-        if (fill_answers.len != 1) return error.InvalidAnswer;
-        if (std.mem.eql(u8, fill_answers[0], "Use default") and field.default_json != null) {
-            return .{ .value = try alloc.dupe(u8, field.default_json.?) };
+            questioner,
+        )) {
+            .enter => {},
+            .use_default => return .{ .value = try alloc.dupe(u8, field.default_json.?) },
+            .skip => return .{ .value = null },
+            .cancelled => return .cancelled,
         }
-        if (std.mem.eql(u8, fill_answers[0], "Skip") and !field.required) {
-            return .{ .value = null };
-        }
-        if (!std.mem.eql(u8, fill_answers[0], value_action_label)) return error.InvalidAnswer;
     }
 
     var option_list: std.ArrayList(types.QuestionOption) = .empty;
-    defer option_list.deinit(alloc);
-    var owned_choice_text: std.ArrayList([]u8) = .empty;
     defer {
-        for (owned_choice_text.items) |text| alloc.free(text);
-        owned_choice_text.deinit(alloc);
+        if (field.kind == .single_select) {
+            for (option_list.items) |option| {
+                alloc.free(@constCast(option.label));
+                if (option.description) |description| alloc.free(@constCast(description));
+            }
+        }
+        option_list.deinit(alloc);
     }
-    var presented_choices: std.ArrayList(PresentedChoice) = .empty;
-    defer presented_choices.deinit(alloc);
     switch (field.kind) {
-        .boolean => {
-            try option_list.append(alloc, .{ .label = "True" });
-            try option_list.append(alloc, .{ .label = "False" });
-        },
+        .boolean => {},
         .single_select => for (field.choices, 0..) |choice, choice_index| {
             const label = try choiceLabelAlloc(alloc, choice_index, choice.title);
-            owned_choice_text.append(alloc, label) catch |err| {
-                alloc.free(label);
-                return err;
-            };
+            var owns_label = true;
+            errdefer if (owns_label) alloc.free(label);
             const description = if (choice.description) |raw| blk: {
                 const safe = try terminalSafeAlloc(alloc, raw);
-                owned_choice_text.append(alloc, safe) catch |err| {
-                    alloc.free(safe);
-                    return err;
-                };
                 break :blk safe;
             } else null;
-            try presented_choices.append(alloc, .{
-                .local_label = label,
-                .wire_value = choice.value,
-            });
+            var owns_description = description != null;
+            errdefer if (owns_description) alloc.free(@constCast(description.?));
             try option_list.append(alloc, .{ .label = label, .description = description });
+            owns_label = false;
+            owns_description = false;
         },
         .string, .number, .integer => {},
         .multi_select => unreachable,
     }
-    const entries = [_]types.QuestionBatchEntry{.{
-        .question = question,
-        .options = option_list.items,
-    }};
-    const answers = try questioner.ask(alloc, &entries, deadline_ms, cancel_flag) orelse return .cancelled;
-    defer freeAnswers(alloc, answers);
-    if (answers.len != 1) return error.InvalidAnswer;
-    const answer = answers[0];
+    const boolean_options = [_]types.QuestionOption{
+        .{ .label = "True" },
+        .{ .label = "False" },
+    };
+    const question_options: []const types.QuestionOption = switch (field.kind) {
+        .boolean => &boolean_options,
+        .single_select => option_list.items,
+        .string, .number, .integer => &.{},
+        .multi_select => unreachable,
+    };
+    const answer = try ask_one(
+        alloc,
+        question,
+        question_options,
+        deadline_ms,
+        cancel_flag,
+        questioner,
+    ) orelse return .cancelled;
+    defer alloc.free(answer);
 
     const result: []u8 = switch (field.kind) {
         .string => try stringifyString(alloc, answer),
@@ -473,7 +487,7 @@ fn answerField(
             try alloc.dupe(u8, "false")
         else
             return error.InvalidAnswer,
-        .single_select => try choiceJson(alloc, presented_choices.items, answer),
+        .single_select => try choiceJson(alloc, option_list.items, field.choices, answer),
         .multi_select => unreachable,
     };
     errdefer alloc.free(result);
@@ -482,6 +496,84 @@ fn answerField(
         else => return err,
     };
     return .{ .value = result };
+}
+
+// These local actions never share a namespace with server-supplied values.
+const CompactAction = union(enum) {
+    value: ?[]const u8,
+    decline,
+    cancel,
+};
+
+fn answerCompactField(
+    alloc: Allocator,
+    server_name: []const u8,
+    message: []const u8,
+    field: elicitation.Field,
+    deadline_ms: i64,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    questioner: Questioner,
+) Error!FieldAnswer {
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer mem_utils.deinit_arena(arena);
+    const temp = arena.allocator();
+    const display_name = try terminalSafeAlloc(temp, field.displayName());
+    const description = try terminalSafeAlloc(temp, field.description orelse "");
+    const question = try temp.print(
+        "MCP server {s} requests {s}{s}\n{s}\nReason: {s}\nChoose an option to submit.",
+        .{ server_name, display_name, if (field.required) " (required)" else " (optional)", description, message },
+    );
+    var choices: std.ArrayList(types.QuestionOption) = .empty;
+    var actions: std.ArrayList(CompactAction) = .empty;
+    std.debug.assert(field.kind == .single_select);
+    for (field.choices, 0..) |choice, index| {
+        try choices.append(temp, .{
+            .label = try choiceLabelAlloc(temp, index, choice.title),
+            .description = if (choice.description) |desc| try terminalSafeAlloc(temp, desc) else null,
+        });
+        try actions.append(temp, .{ .value = try stringifyString(temp, choice.value) });
+    }
+    if (field.default_json) |default| {
+        try choices.append(temp, .{ .label = "Use default", .description = try terminalSafeAlloc(temp, default) });
+        try actions.append(temp, .{ .value = default });
+    }
+    if (!field.required) {
+        try choices.append(temp, .{ .label = "Skip", .description = "Submit without this optional field" });
+        try actions.append(temp, .{ .value = null });
+    }
+    try choices.appendSlice(temp, &.{ .{ .label = "Decline" }, .{ .label = "Cancel" } });
+    try actions.appendSlice(temp, &.{ .decline, .cancel });
+    const answer = switch (try ask_single(
+        temp,
+        question,
+        choices.items,
+        .choice,
+        deadline_ms,
+        cancel_flag,
+        questioner,
+    )) {
+        .cancelled => return .cancelled,
+        .invalid => return error.InvalidAnswer,
+        .answer => |answer| answer,
+    };
+    const parsed = json_decode.parseFromSlice(struct {
+        option: usize,
+    }, temp, answer, .{}) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidAnswer;
+    const index = parsed.value.option;
+    if (index >= actions.items.len) return error.InvalidAnswer;
+    const json = switch (actions.items[index]) {
+        .decline => return .declined,
+        .cancel => return .cancelled,
+        .value => |value| value,
+    };
+    if (json) |value| {
+        elicitation.validateFieldJson(temp, field, value, .{}) catch |err| switch (err) {
+            error.InvalidResponse => return error.InvalidAnswer,
+            else => return err,
+        };
+        return .{ .value = try alloc.dupe(u8, value) };
+    }
+    return .{ .value = null };
 }
 
 const KeepCurrentDecision = enum { keep, edit, cancelled };
@@ -502,8 +594,7 @@ fn askToKeepCurrentValue(
     else
         try alloc.dupe(u8, "(skipped)");
     defer alloc.free(display_value);
-    const question = try std.fmt.allocPrint(
-        alloc,
+    const question = try alloc.print(
         "MCP server {s}: current value for {s} is {s}. Keep it or edit it?",
         .{ server_name, display_name, display_value },
     );
@@ -513,14 +604,18 @@ fn askToKeepCurrentValue(
         .{ .label = "Edit value" },
         .{ .label = "Cancel" },
     };
-    const entries = [_]types.QuestionBatchEntry{.{ .question = question, .options = &options }};
-    const answers = try questioner.ask(alloc, &entries, deadline_ms, cancel_flag) orelse
-        return .cancelled;
-    defer freeAnswers(alloc, answers);
-    if (answers.len != 1) return error.InvalidAnswer;
-    if (std.mem.eql(u8, answers[0], "Keep current")) return .keep;
-    if (std.mem.eql(u8, answers[0], "Edit value")) return .edit;
-    if (std.mem.eql(u8, answers[0], "Cancel")) return .cancelled;
+    const answer = try ask_one(
+        alloc,
+        question,
+        &options,
+        deadline_ms,
+        cancel_flag,
+        questioner,
+    ) orelse return .cancelled;
+    defer alloc.free(answer);
+    if (std.mem.eql(u8, answer, "Keep current")) return .keep;
+    if (std.mem.eql(u8, answer, "Edit value")) return .edit;
+    if (std.mem.eql(u8, answer, "Cancel")) return .cancelled;
     return error.InvalidAnswer;
 }
 
@@ -541,35 +636,22 @@ fn answerMultiSelect(
     const display_name = try terminalSafeAlloc(alloc, field.displayName());
     defer alloc.free(display_name);
     if (field.default_json != null or !field.required) {
-        const question = try std.fmt.allocPrint(
+        switch (try choose_fill_action(
             alloc,
-            "MCP server {s}: choose how to fill {s}{s}.\nReason: {s}",
-            .{
-                server_name,
-                display_name,
-                if (field.required) " (required)" else " (optional)",
-                request_message,
-            },
-        );
-        defer alloc.free(question);
-        var fill_options: std.ArrayList(types.QuestionOption) = .empty;
-        defer fill_options.deinit(alloc);
-        if (field.default_json != null) try fill_options.append(alloc, .{ .label = "Use default" });
-        try fill_options.append(alloc, .{ .label = "Choose values" });
-        if (!field.required) try fill_options.append(alloc, .{ .label = "Skip" });
-        const entries = [_]types.QuestionBatchEntry{.{
-            .question = question,
-            .options = fill_options.items,
-        }};
-        const answers = try questioner.ask(alloc, &entries, deadline_ms, cancel_flag) orelse
-            return .cancelled;
-        defer freeAnswers(alloc, answers);
-        if (answers.len != 1) return error.InvalidAnswer;
-        if (std.mem.eql(u8, answers[0], "Use default") and field.default_json != null) {
-            return .{ .value = try alloc.dupe(u8, field.default_json.?) };
+            server_name,
+            request_message,
+            display_name,
+            field,
+            .multi_select,
+            deadline_ms,
+            cancel_flag,
+            questioner,
+        )) {
+            .enter => {},
+            .use_default => return .{ .value = try alloc.dupe(u8, field.default_json.?) },
+            .skip => return .{ .value = null },
+            .cancelled => return .cancelled,
         }
-        if (std.mem.eql(u8, answers[0], "Skip") and !field.required) return .{ .value = null };
-        if (!std.mem.eql(u8, answers[0], "Choose values")) return error.InvalidAnswer;
     }
 
     var selected: std.ArrayList([]const u8) = .empty;
@@ -577,8 +659,7 @@ fn answerMultiSelect(
     for (field.choices) |choice| {
         const display_title = try terminalSafeAlloc(alloc, choice.title);
         defer alloc.free(display_title);
-        const question = try std.fmt.allocPrint(
-            alloc,
+        const question = try alloc.print(
             "MCP server {s}: include {s} in {s}?\nReason: {s}",
             .{ server_name, display_title, display_name, request_message },
         );
@@ -587,15 +668,19 @@ fn answerMultiSelect(
             .{ .label = "Include" },
             .{ .label = "Exclude" },
         };
-        const entries = [_]types.QuestionBatchEntry{.{ .question = question, .options = &choice_options }};
-        const answers = try questioner.ask(alloc, &entries, deadline_ms, cancel_flag) orelse return .cancelled;
-        defer freeAnswers(alloc, answers);
-        if (answers.len != 1 or
-            (!std.mem.eql(u8, answers[0], "Include") and !std.mem.eql(u8, answers[0], "Exclude")))
-        {
+        const answer = try ask_one(
+            alloc,
+            question,
+            &choice_options,
+            deadline_ms,
+            cancel_flag,
+            questioner,
+        ) orelse return .cancelled;
+        defer alloc.free(answer);
+        if (!std.mem.eql(u8, answer, "Include") and !std.mem.eql(u8, answer, "Exclude")) {
             return error.InvalidAnswer;
         }
-        if (std.mem.eql(u8, answers[0], "Include")) try selected.append(alloc, choice.value);
+        if (std.mem.eql(u8, answer, "Include")) try selected.append(alloc, choice.value);
     }
     if (field.min_items) |minimum| if (selected.items.len < minimum) return error.InvalidAnswer;
     if (field.max_items) |maximum| if (selected.items.len > maximum) return error.InvalidAnswer;
@@ -611,6 +696,62 @@ fn answerMultiSelect(
     return .{ .value = try out.toOwnedSlice() };
 }
 
+fn choose_fill_action(
+    alloc: Allocator,
+    server_name: []const u8,
+    request_message: []const u8,
+    display_name: []const u8,
+    field: elicitation.Field,
+    kind: FillKind,
+    deadline_ms: i64,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    questioner: Questioner,
+) Error!FillAction {
+    const question = try alloc.print(
+        "MCP server {s}: choose how to fill {s}{s}.\nReason: {s}",
+        .{
+            server_name,
+            display_name,
+            if (field.required) " (required)" else " (optional)",
+            request_message,
+        },
+    );
+    defer alloc.free(question);
+
+    var options: [3]types.QuestionOption = undefined;
+    var option_count: usize = 0;
+    if (kind == .multi_select and field.default_json != null) {
+        options[option_count] = .{ .label = "Use default" };
+        option_count += 1;
+    }
+    options[option_count] = .{ .label = kind.action_label() };
+    option_count += 1;
+    if (kind != .multi_select and field.default_json != null) {
+        options[option_count] = .{ .label = "Use default" };
+        option_count += 1;
+    }
+    if (!field.required) {
+        options[option_count] = .{ .label = "Skip" };
+        option_count += 1;
+    }
+
+    const answer = try ask_one(
+        alloc,
+        question,
+        options[0..option_count],
+        deadline_ms,
+        cancel_flag,
+        questioner,
+    ) orelse return .cancelled;
+    defer alloc.free(answer);
+    if (std.mem.eql(u8, answer, kind.action_label())) return .enter;
+    if (std.mem.eql(u8, answer, "Use default") and field.default_json != null) {
+        return .use_default;
+    }
+    if (std.mem.eql(u8, answer, "Skip") and !field.required) return .skip;
+    return error.InvalidAnswer;
+}
+
 fn retryInvalidForm(
     alloc: Allocator,
     server_name: []const u8,
@@ -618,8 +759,7 @@ fn retryInvalidForm(
     cancel_flag: ?*const std.atomic.Value(bool),
     questioner: Questioner,
 ) Error!bool {
-    const question = try std.fmt.allocPrint(
-        alloc,
+    const question = try alloc.print(
         "A response for MCP server {s} did not satisfy the requested form constraints. Edit the form or cancel?",
         .{server_name},
     );
@@ -628,12 +768,21 @@ fn retryInvalidForm(
         .{ .label = "Edit" },
         .{ .label = "Cancel" },
     };
-    const entries = [_]types.QuestionBatchEntry{.{ .question = question, .options = &options }};
-    const answers = try questioner.ask(alloc, &entries, deadline_ms, cancel_flag) orelse return false;
-    defer freeAnswers(alloc, answers);
-    if (answers.len != 1) return false;
-    if (std.mem.eql(u8, answers[0], "Edit")) return true;
-    if (std.mem.eql(u8, answers[0], "Cancel")) return false;
+    const answer = switch (try ask_single(
+        alloc,
+        question,
+        &options,
+        .none,
+        deadline_ms,
+        cancel_flag,
+        questioner,
+    )) {
+        .cancelled, .invalid => return false,
+        .answer => |answer| answer,
+    };
+    defer alloc.free(answer);
+    if (std.mem.eql(u8, answer, "Edit")) return true;
+    if (std.mem.eql(u8, answer, "Cancel")) return false;
     return false;
 }
 
@@ -717,16 +866,22 @@ fn validateNumberAnswer(
 
 fn choiceJson(
     alloc: Allocator,
-    choices: []const PresentedChoice,
+    options: []const types.QuestionOption,
+    choices: []const elicitation.Choice,
     answer: []const u8,
 ) Error![]u8 {
-    const value = selectedChoiceValue(choices, answer) orelse return error.InvalidAnswer;
+    const value = selectedChoiceValue(options, choices, answer) orelse return error.InvalidAnswer;
     return stringifyString(alloc, value);
 }
 
-fn selectedChoiceValue(choices: []const PresentedChoice, answer: []const u8) ?[]const u8 {
-    for (choices) |choice| {
-        if (std.mem.eql(u8, answer, choice.local_label)) return choice.wire_value;
+fn selectedChoiceValue(
+    options: []const types.QuestionOption,
+    choices: []const elicitation.Choice,
+    answer: []const u8,
+) ?[]const u8 {
+    if (options.len != choices.len) return null;
+    for (options, choices) |option, choice| {
+        if (std.mem.eql(u8, answer, option.label)) return choice.value;
     }
     return null;
 }
@@ -738,7 +893,7 @@ fn choiceLabelAlloc(
 ) Error![]u8 {
     const title = try terminalSafeAlloc(alloc, raw_title);
     defer alloc.free(title);
-    return std.fmt.allocPrint(alloc, "[{d}] {s}", .{ choice_index + 1, title });
+    return alloc.print("[{d}] {s}", .{ choice_index + 1, title });
 }
 
 fn answerUrl(
@@ -762,8 +917,7 @@ fn answerUrl(
         .punycode => "\nWarning: This host uses Punycode and may disguise its destination.",
         .non_ascii => "\nWarning: This host contains non-ASCII characters and may be visually ambiguous.",
     };
-    const question = try std.fmt.allocPrint(
-        alloc,
+    const question = try alloc.print(
         "MCP server {s} requests an external browser action. Target host: {s}\nComplete URL: {s}{s}\nOpen it? fx will not fetch this URL or see browser contents.",
         .{ display_server_name, display_host, display_url, warning },
     );
@@ -772,16 +926,21 @@ fn answerUrl(
         .{ .label = "Open URL" },
         .{ .label = "Decline" },
     };
-    const entries = [_]types.QuestionBatchEntry{.{ .question = question, .options = &consent_options }};
-    const answers = try options.questioner.ask(alloc, &entries, deadline_ms, cancel_flag) orelse {
+    const answer = try ask_one(
+        alloc,
+        question,
+        &consent_options,
+        deadline_ms,
+        cancel_flag,
+        options.questioner,
+    ) orelse {
         return alloc.dupe(u8, "{\"action\":\"cancel\"}");
     };
-    defer freeAnswers(alloc, answers);
-    if (answers.len != 1) return error.InvalidAnswer;
-    if (std.mem.eql(u8, answers[0], "Decline")) {
+    defer alloc.free(answer);
+    if (std.mem.eql(u8, answer, "Decline")) {
         return alloc.dupe(u8, "{\"action\":\"decline\"}");
     }
-    if (!std.mem.eql(u8, answers[0], "Open URL")) return error.InvalidAnswer;
+    if (!std.mem.eql(u8, answer, "Open URL")) return error.InvalidAnswer;
 
     if (try options.browser.open(alloc, url)) {
         // Accept records consent only. The originating MCP operation decides
@@ -789,8 +948,7 @@ fn answerUrl(
         return alloc.dupe(u8, "{\"action\":\"accept\"}");
     }
 
-    const failure_question = try std.fmt.allocPrint(
-        alloc,
+    const failure_question = try alloc.print(
         "fx could not open the browser for {s}. The URL was not fetched. Continue manually, retry the browser, or cancel?",
         .{display_host},
     );
@@ -802,22 +960,27 @@ fn answerUrl(
     };
     var retries: usize = 0;
     while (retries < 3) : (retries += 1) {
-        const failure_entries = [_]types.QuestionBatchEntry{.{
-            .question = failure_question,
-            .options = &failure_options,
-        }};
-        const decision = try options.questioner.ask(alloc, &failure_entries, deadline_ms, cancel_flag) orelse {
-            return alloc.dupe(u8, "{\"action\":\"cancel\"}");
+        const decision = switch (try ask_single(
+            alloc,
+            failure_question,
+            &failure_options,
+            .none,
+            deadline_ms,
+            cancel_flag,
+            options.questioner,
+        )) {
+            .cancelled => return alloc.dupe(u8, "{\"action\":\"cancel\"}"),
+            .invalid => continue,
+            .answer => |decision_text| decision_text,
         };
-        defer freeAnswers(alloc, decision);
-        if (decision.len != 1) continue;
-        if (std.mem.eql(u8, decision[0], "Continue manually")) {
+        defer alloc.free(decision);
+        if (std.mem.eql(u8, decision, "Continue manually")) {
             return alloc.dupe(u8, "{\"action\":\"accept\"}");
         }
-        if (std.mem.eql(u8, decision[0], "Cancel")) {
+        if (std.mem.eql(u8, decision, "Cancel")) {
             return alloc.dupe(u8, "{\"action\":\"cancel\"}");
         }
-        if (std.mem.eql(u8, decision[0], "Retry browser") and try options.browser.open(alloc, url)) {
+        if (std.mem.eql(u8, decision, "Retry browser") and try options.browser.open(alloc, url)) {
             return alloc.dupe(u8, "{\"action\":\"accept\"}");
         }
     }
@@ -840,16 +1003,15 @@ fn answerLegacyUrlCompletion(
         }
     }
     if (signal.status.load(.acquire) == .completed) {
-        return renderUniformResponses(alloc, requests, "accept");
+        return renderUniformResponses(alloc, requests, .accept);
     }
     if (signal.status.load(.acquire) == .cancelled) {
-        return renderUniformResponses(alloc, requests, "cancel");
+        return renderUniformResponses(alloc, requests, .cancel);
     }
 
     const display_server_name = try terminalSafeAlloc(alloc, server_name);
     defer alloc.free(display_server_name);
-    const question = try std.fmt.allocPrint(
-        alloc,
+    const question = try alloc.print(
         "Complete the browser flow requested by MCP server {s}. fx will continue automatically if the server confirms every URL request. Otherwise choose I completed it / Retry, or Cancel.",
         .{display_server_name},
     );
@@ -858,32 +1020,29 @@ fn answerLegacyUrlCompletion(
         .{ .label = "I completed it / Retry" },
         .{ .label = "Cancel" },
     };
-    const entries = [_]types.QuestionBatchEntry{.{
-        .question = question,
-        .options = &completion_options,
-    }};
-    const answers = try questioner.ask(
+    const answer_result = try ask_single(
         alloc,
-        &entries,
+        question,
+        &completion_options,
+        .none,
         deadline_ms,
         &signal.wake,
-    ) orelse {
-        return renderUniformResponses(
-            alloc,
-            requests,
-            if (signal.status.load(.acquire) == .completed) "accept" else "cancel",
-        );
-    };
-    defer freeAnswers(alloc, answers);
+        questioner,
+    );
     if (signal.status.load(.acquire) == .completed) {
-        return renderUniformResponses(alloc, requests, "accept");
+        return renderUniformResponses(alloc, requests, .accept);
     }
-    if (answers.len != 1) return error.InvalidAnswer;
-    if (std.mem.eql(u8, answers[0], "I completed it / Retry")) {
-        return renderUniformResponses(alloc, requests, "accept");
+    const answer = switch (answer_result) {
+        .cancelled => return renderUniformResponses(alloc, requests, .cancel),
+        .invalid => return error.InvalidAnswer,
+        .answer => |answer| answer,
+    };
+    defer alloc.free(answer);
+    if (std.mem.eql(u8, answer, "I completed it / Retry")) {
+        return renderUniformResponses(alloc, requests, .accept);
     }
-    if (std.mem.eql(u8, answers[0], "Cancel")) {
-        return renderUniformResponses(alloc, requests, "cancel");
+    if (std.mem.eql(u8, answer, "Cancel")) {
+        return renderUniformResponses(alloc, requests, .cancel);
     }
     return error.InvalidAnswer;
 }
@@ -891,7 +1050,7 @@ fn answerLegacyUrlCompletion(
 fn renderUniformResponses(
     alloc: Allocator,
     requests: []const mrtr.InputRequest,
-    action: []const u8,
+    action: elicitation.Action,
 ) Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -899,9 +1058,11 @@ fn renderUniformResponses(
     for (requests, 0..) |request, index| {
         if (index > 0) try out.writer.writeByte(',');
         try std.json.Stringify.value(request.key, .{}, &out.writer);
-        try out.writer.writeAll(":{\"action\":");
-        try std.json.Stringify.value(action, .{}, &out.writer);
-        try out.writer.writeByte('}');
+        try out.writer.writeAll(switch (action) {
+            .accept => ":{\"action\":\"accept\"}",
+            .cancel => ":{\"action\":\"cancel\"}",
+            .decline, .unknown => unreachable,
+        });
     }
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
@@ -916,9 +1077,53 @@ fn terminalSafeAlloc(alloc: Allocator, raw: []const u8) Error![]u8 {
     return encoded.bytes;
 }
 
-fn freeAnswers(alloc: Allocator, answers: [][]u8) void {
-    for (answers) |answer| alloc.free(answer);
+fn ask_one(
+    alloc: Allocator,
+    question: []const u8,
+    options: []const types.QuestionOption,
+    deadline_ms: i64,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    questioner: Questioner,
+) Error!?[]u8 {
+    return switch (try ask_single(
+        alloc,
+        question,
+        options,
+        .none,
+        deadline_ms,
+        cancel_flag,
+        questioner,
+    )) {
+        .cancelled => null,
+        .invalid => error.InvalidAnswer,
+        .answer => |answer| answer,
+    };
+}
+
+fn ask_single(
+    alloc: Allocator,
+    question: []const u8,
+    options: []const types.QuestionOption,
+    submission: @FieldType(types.QuestionBatchEntry, "submission"),
+    deadline_ms: i64,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    questioner: Questioner,
+) Error!SingleAnswer {
+    const entries = [_]types.QuestionBatchEntry{.{
+        .question = question,
+        .options = options,
+        .submission = submission,
+    }};
+    const answers = try questioner.ask(alloc, &entries, deadline_ms, cancel_flag) orelse
+        return .cancelled;
+    if (answers.len != 1) {
+        for (answers) |answer| alloc.free(answer);
+        alloc.free(answers);
+        return .invalid;
+    }
+    const answer = answers[0];
     alloc.free(answers);
+    return .{ .answer = answer };
 }
 
 test "interaction review shows every validated current value before submission" {
@@ -954,6 +1159,7 @@ test "interaction review shows every validated current value before submission" 
         .questioner = fixture.questioner(),
         .browser = fixture.browser(),
         .capabilities = .{ .form = true, .url = true },
+        .compact_forms = true,
     });
     defer alloc.free(response);
     try std.testing.expectEqualStrings(
@@ -1081,31 +1287,33 @@ test "single-select local identities preserve every colliding wire value" {
     var labels: [raw_titles.len][]u8 = undefined;
     var label_count: usize = 0;
     defer for (labels[0..label_count]) |label| alloc.free(label);
-    var choices: [raw_titles.len]PresentedChoice = undefined;
+    var options: [raw_titles.len]types.QuestionOption = undefined;
+    var choices: [raw_titles.len]elicitation.Choice = undefined;
     for (raw_titles, 0..) |title, index| {
         labels[index] = try choiceLabelAlloc(alloc, index, title);
         label_count += 1;
+        options[index] = .{ .label = labels[index] };
         choices[index] = .{
-            .local_label = labels[index],
-            .wire_value = wire_values[index],
+            .value = @constCast(wire_values[index]),
+            .title = @constCast(title),
         };
     }
 
-    for (choices, 0..) |choice, index| {
+    for (options, 0..) |option, index| {
         try std.testing.expectEqualStrings(
             wire_values[index],
-            selectedChoiceValue(&choices, choice.local_label).?,
+            selectedChoiceValue(&options, &choices, option.label).?,
         );
-        for (choices[index + 1 ..]) |other| {
-            try std.testing.expect(!std.mem.eql(u8, choice.local_label, other.local_label));
+        for (options[index + 1 ..]) |other| {
+            try std.testing.expect(!std.mem.eql(u8, option.label, other.label));
         }
     }
     try std.testing.expect(std.mem.endsWith(u8, labels[4], "Collision\\x1b[2J"));
     try std.testing.expect(std.mem.endsWith(u8, labels[5], "Collision\\x1b[2J"));
-    try std.testing.expect(selectedChoiceValue(&choices, "Skip") == null);
-    try std.testing.expect(selectedChoiceValue(&choices, "Use default") == null);
-    try std.testing.expect(selectedChoiceValue(&choices, "Duplicate") == null);
-    try std.testing.expect(selectedChoiceValue(&choices, "escape-raw") == null);
+    try std.testing.expect(selectedChoiceValue(&options, &choices, "Skip") == null);
+    try std.testing.expect(selectedChoiceValue(&options, &choices, "Use default") == null);
+    try std.testing.expect(selectedChoiceValue(&options, &choices, "Duplicate") == null);
+    try std.testing.expect(selectedChoiceValue(&options, &choices, "escape-raw") == null);
 }
 
 test "URL browser failure supports manual continuation and bounded retry" {
@@ -1313,10 +1521,95 @@ fn checkAcceptedFormAllocationFailures(alloc: Allocator) !void {
 
 test "form interaction owns every accepted response allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkAcceptedFormAllocationFailures,
         .{},
     );
+}
+
+test "compact form submits a choice or declines without a review" {
+    const alloc = std.testing.allocator;
+    for ([_]struct { answer: []const u8, expected: []const u8 }{
+        .{ .answer = "{\"option\":0}", .expected = "{\"form\":{\"action\":\"accept\",\"content\":{\"name\":\"Decline\"}}}" },
+        .{ .answer = "{\"option\":1}", .expected = "{\"form\":{\"action\":\"decline\"}}" },
+        .{ .answer = "{\"option\":2}", .expected = "{\"form\":{\"action\":\"cancel\"}}" },
+    }) |case| {
+        var fixture = Fixture{ .answers = &.{case.answer} };
+        const response = try respond(alloc, Fixture.origin(), .{
+            .input_requests_json =
+            \\{"form":{"method":"elicitation/create","params":{"message":"Name","requestedSchema":{"type":"object","properties":{"name":{"type":"string","enum":["Decline"]}},"required":["name"]}}}}
+            ,
+        }, .{ .questioner = fixture.questioner(), .browser = fixture.browser(), .capabilities = .{ .form = true }, .compact_forms = true });
+        defer alloc.free(response);
+        try std.testing.expectEqualStrings(case.expected, response);
+        try std.testing.expectEqual(@as(usize, 1), fixture.answer_index);
+        try std.testing.expect(!fixture.review_contained_values);
+    }
+}
+
+test "compact form defaults skip and choice labels preserve exact values" {
+    const alloc = std.testing.allocator;
+    for ([_]struct { answer: []const u8, content: []const u8 }{
+        .{ .answer = "{\"option\":0}", .content = "{\"name\":\"a\"}" },
+        .{ .answer = "{\"option\":1}", .content = "{\"name\":\"b\"}" },
+        .{ .answer = "{\"option\":2}", .content = "{\"name\":\"c\"}" },
+        .{ .answer = "{\"option\":3}", .content = "{\"name\":\"b\"}" },
+        .{ .answer = "{\"option\":4}", .content = "{}" },
+    }) |case| {
+        var fixture = Fixture{ .answers = &.{case.answer} };
+        const response = try respond(alloc, Fixture.origin(), .{
+            .input_requests_json =
+            \\{"form":{"method":"elicitation/create","params":{"message":"Choose","requestedSchema":{"type":"object","properties":{"name":{"type":"string","default":"b","oneOf":[{"const":"a","title":"Decline"},{"const":"b","title":"Cancel"},{"const":"c","title":"Decline"}]}}}}}}
+            ,
+        }, .{ .questioner = fixture.questioner(), .browser = fixture.browser(), .capabilities = .{ .form = true }, .compact_forms = true });
+        defer alloc.free(response);
+        const expected = try alloc.print("{{\"form\":{{\"action\":\"accept\",\"content\":{s}}}}}", .{case.content});
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, response);
+        try std.testing.expectEqual(@as(usize, 1), fixture.answer_index);
+    }
+}
+
+test "compact form keeps review for short text numbers and booleans" {
+    const alloc = std.testing.allocator;
+    for ([_]struct { kind: []const u8, answer: []const u8, value: []const u8 }{
+        .{ .kind = "string", .answer = "x", .value = "\"x\"" },
+        .{ .kind = "number", .answer = "0.5", .value = "0.5" },
+        .{ .kind = "integer", .answer = "1", .value = "1" },
+        .{ .kind = "boolean", .answer = "True", .value = "true" },
+    }) |case| {
+        var fixture = Fixture{ .answers = &.{ case.answer, "Submit" } };
+        const requests = try alloc.print(
+            "{{\"form\":{{\"method\":\"elicitation/create\",\"params\":{{\"message\":\"Value\",\"requestedSchema\":{{\"type\":\"object\",\"properties\":{{\"value\":{{\"type\":\"{s}\"}}}},\"required\":[\"value\"]}}}}}}}}",
+            .{case.kind},
+        );
+        defer alloc.free(requests);
+        const response = try respond(alloc, Fixture.origin(), .{ .input_requests_json = requests }, .{
+            .questioner = fixture.questioner(),
+            .browser = fixture.browser(),
+            .capabilities = .{ .form = true },
+            .compact_forms = true,
+        });
+        defer alloc.free(response);
+        const expected = try alloc.print("{{\"form\":{{\"action\":\"accept\",\"content\":{{\"value\":{s}}}}}}}", .{case.value});
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, response);
+        try std.testing.expect(fixture.review_contained_values);
+        try std.testing.expectEqual(@as(usize, 2), fixture.answer_index);
+    }
+}
+
+test "compact form keeps review for four choices" {
+    const alloc = std.testing.allocator;
+    var fixture = Fixture{ .answers = &.{ "[1] a", "Submit" } };
+    const response = try respond(alloc, Fixture.origin(), .{
+        .input_requests_json =
+        \\{"form":{"method":"elicitation/create","params":{"message":"Choose","requestedSchema":{"type":"object","properties":{"name":{"type":"string","enum":["a","b","c","d"]}},"required":["name"]}}}}
+        ,
+    }, .{ .questioner = fixture.questioner(), .browser = fixture.browser(), .capabilities = .{ .form = true }, .compact_forms = true });
+    defer alloc.free(response);
+    try std.testing.expectEqualStrings("{\"form\":{\"action\":\"accept\",\"content\":{\"name\":\"a\"}}}", response);
+    try std.testing.expect(fixture.review_contained_values);
 }
 
 const Fixture = struct {

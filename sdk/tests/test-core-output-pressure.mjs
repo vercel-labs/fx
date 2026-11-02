@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../node.js";
+import { createFxEngine } from "../node.js";
 
 const backend = process.argv[2] ?? "native";
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -20,7 +20,7 @@ const deadline = setTimeout(() => { throw new Error("bounded output did not sett
 let agent;
 
 async function start(fetch, onEvent, options = {}) {
-  agent = await createFxAgent({
+  agent = await createFxEngine({
     backend, nativeAddon, wasm, apiKey: "output-pressure-fixture", model: "fixture/output",
     fetch: (url, init) => init.method === "GET" ? catalogResponse() : fetch(url, init),
     onEvent, ...options,
@@ -116,7 +116,7 @@ try {
   });
   const closing = agent.prompt("close while unread");
   while (!pressure) await pause(5);
-  const independent = await createFxAgent({
+  const independent = await createFxEngine({
     backend, nativeAddon, wasm, apiKey: "independent-fixture", model: "fixture/output",
     fetch: async (_url, init) => init.method === "GET" ? catalogResponse() : new Response(delta("independent") + finish),
   });

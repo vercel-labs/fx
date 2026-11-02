@@ -56,6 +56,8 @@ pub const Decision = struct {
     screen_unavailable: ?contracts.ScreenUnavailableReason,
 };
 
+/// Decides what happens to a terminal record a process finds. The terminal
+/// lifecycle is modeled in `tests/tla/terminal/TerminalLifecycle.tla`.
 pub fn reconcile(input: Input) Decision {
     if (input.record != .valid) {
         return .{

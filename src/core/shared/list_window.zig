@@ -38,13 +38,18 @@ pub fn edgeFromStart(count: usize, start: usize, max_rows: u16) Window {
 /// Moves a picker selection by `delta`, wrapping at both ends, and scrolls the
 /// window to keep it visible.
 pub fn advanceSelection(index: *usize, window_start: *usize, count: usize, delta: i32) void {
+    advanceSelectionWithin(index, window_start, count, delta, default_max_picker_rows);
+}
+
+/// `advanceSelection` for a picker that shows up to `max_rows` rows.
+pub fn advanceSelectionWithin(index: *usize, window_start: *usize, count: usize, delta: i32, max_rows: u16) void {
     if (count == 0) return;
     const current: i32 = @intCast(index.* % count);
     var next = current + delta;
     if (next < 0) next = @as(i32, @intCast(count)) - 1;
     if (next >= @as(i32, @intCast(count))) next = 0;
     index.* = @intCast(next);
-    window_start.* = updateEdgeStart(window_start.*, count, index.*, default_max_picker_rows);
+    window_start.* = updateEdgeStart(window_start.*, count, index.*, max_rows);
 }
 
 pub fn updateEdgeStart(current_start: usize, count: usize, selected: usize, max_rows: u16) usize {
@@ -60,6 +65,23 @@ pub fn updateEdgeStart(current_start: usize, count: usize, selected: usize, max_
         start = clamped_selected - rows + 1;
     }
     return start;
+}
+
+test "selection scrolls only past the picker's own row count" {
+    var index: usize = 0;
+    var start: usize = 0;
+    const rows: u16 = 10;
+    for (0..9) |_| advanceSelectionWithin(&index, &start, 30, 1, rows);
+    try std.testing.expectEqual(@as(usize, 9), index);
+    try std.testing.expectEqual(@as(usize, 0), start);
+    advanceSelectionWithin(&index, &start, 30, 1, rows);
+    try std.testing.expectEqual(@as(usize, 10), index);
+    try std.testing.expectEqual(@as(usize, 1), start);
+    // Other pickers keep six rows.
+    index = 0;
+    start = 0;
+    for (0..6) |_| advanceSelection(&index, &start, 30, 1);
+    try std.testing.expectEqual(@as(usize, 1), start);
 }
 
 test "edge window start lets selection move back up before reverse scrolling" {

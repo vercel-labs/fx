@@ -142,8 +142,8 @@ fn composeHeaderRow(alloc: Allocator, projection: HelpMenuProjection, width: u16
     try appendHeaderTitle(alloc, &wide, projection.filteredItemCount());
     try wide.appendSlice(alloc, "  ");
     try appendCategoryTab(alloc, &wide, null, projection.category == null);
-    inline for (std.meta.fields(command_specs.SlashPresentationCategory)) |field| {
-        const category: command_specs.SlashPresentationCategory = @enumFromInt(field.value);
+    inline for (@typeInfo(command_specs.SlashPresentationCategory).@"enum".field_values) |field_value| {
+        const category: command_specs.SlashPresentationCategory = @fromBackingInt(@intCast(field_value));
         try wide.appendSlice(alloc, "  ");
         try appendCategoryTab(alloc, &wide, category, projection.category == category);
     }
@@ -151,7 +151,7 @@ fn composeHeaderRow(alloc: Allocator, projection: HelpMenuProjection, width: u16
         return cloneClippedRow(alloc, wide.items, width);
     }
 
-    const category_count = std.meta.fields(command_specs.SlashPresentationCategory).len + 1;
+    const category_count = @typeInfo(command_specs.SlashPresentationCategory).@"enum".field_names.len + 1;
     const active_index = helpCategoryIndex(projection.category);
     var packed_row: std.ArrayList(u8) = .empty;
     defer packed_row.deinit(alloc);
@@ -193,17 +193,17 @@ fn composeHeaderRow(alloc: Allocator, projection: HelpMenuProjection, width: u16
 
 fn helpCategoryAt(index: usize) ?command_specs.SlashPresentationCategory {
     if (index == 0) return null;
-    return @enumFromInt(index - 1);
+    return @fromBackingInt(@intCast(index - 1));
 }
 
 fn helpCategoryIndex(category: ?command_specs.SlashPresentationCategory) usize {
-    return if (category) |value| @intFromEnum(value) + 1 else 0;
+    return if (category) |value| @backingInt(value) + 1 else 0;
 }
 
 fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
     try row.appendSlice(alloc, ui_render.selected_completion_style);
     var buf: [48]u8 = undefined;
-    const title = std.fmt.bufPrint(&buf, "Commands {d}", .{count}) catch "Commands";
+    const title = std.mem.print(&buf, "Commands {d}", .{count}) catch "Commands";
     try row.appendSlice(alloc, title);
     try row.appendSlice(alloc, ui_render.reset_style);
 }
@@ -390,7 +390,7 @@ test "help menu renders category tabs and flat commands through the VT" {
         var row = try composeHelpMenuRow(alloc, projection, row_index, width, rows);
         defer row.deinit(alloc);
         var cursor_buf: [32]u8 = undefined;
-        const cursor = try std.fmt.bufPrint(&cursor_buf, "\x1b[{d};1H", .{row_index + 1});
+        const cursor = try std.mem.print(&cursor_buf, "\x1b[{d};1H", .{row_index + 1});
         try grid.feed(cursor);
         try grid.feed(row.items);
     }

@@ -1,5 +1,5 @@
 import { readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 export type ShardPlan = {
   shards: string[][];
@@ -92,6 +92,29 @@ export function buildShardPlan(
   return { shards, totals };
 }
 
+// Narrows a shard plan to a listed subset of the discovered files, such as the
+// macOS platform list, while keeping each file's checked-in weight.
+export function restrictToFiles(
+  discoveredFiles: string[],
+  manifestValue: unknown,
+  listValue: unknown,
+): { files: string[]; manifest: WeightEntry[] } {
+  if (!Array.isArray(listValue) || listValue.length === 0) {
+    throw new Error("file list must be a non-empty array");
+  }
+  const discovered = new Set(discoveredFiles);
+  const listed = new Set<string>();
+  for (const file of listValue) {
+    if (typeof file !== "string" || !discovered.has(file)) {
+      throw new Error(`listed file is not a discovered test: ${String(file)}`);
+    }
+    if (listed.has(file)) throw new Error(`duplicate listed file: ${file}`);
+    listed.add(file);
+  }
+  const manifest = parseManifest(manifestValue).filter((entry) => listed.has(entry.file));
+  return { files: [...listed], manifest };
+}
+
 export function selectShard(plan: ShardPlan, shardIndex: number): string[] {
   if (!Number.isSafeInteger(shardIndex) ||
       shardIndex < 0 || shardIndex >= plan.shards.length) {
@@ -108,15 +131,29 @@ function integerArgument(args: string[], name: string): number {
   return value;
 }
 
+function optionalArgument(args: string[], name: string): string | undefined {
+  const index = args.indexOf(name);
+  if (index < 0) return undefined;
+  if (index + 1 >= args.length) throw new Error(`missing ${name} value`);
+  return args[index + 1];
+}
+
 function run(args: string[]): void {
   const shardCount = integerArgument(args, "--shard-count");
   const shardIndex = integerArgument(args, "--shard-index");
-  const manifest = JSON.parse(
+  let manifest: unknown = JSON.parse(
     readFileSync(join(import.meta.dir, "ci-shard-weights.json"), "utf8"),
   );
-  const discovered = readdirSync(import.meta.dir, { withFileTypes: true })
+  let discovered = readdirSync(import.meta.dir, { withFileTypes: true })
     .filter((entry) => entry.isFile() && entry.name.endsWith(".test.ts"))
     .map((entry) => entry.name);
+  const listPath = optionalArgument(args, "--only");
+  if (listPath !== undefined) {
+    const list = JSON.parse(readFileSync(resolve(import.meta.dir, listPath), "utf8"));
+    const restricted = restrictToFiles(discovered, manifest, list);
+    discovered = restricted.files;
+    manifest = restricted.manifest;
+  }
   const plan = buildShardPlan(discovered, manifest, shardCount);
   const selected = selectShard(plan, shardIndex);
 

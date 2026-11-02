@@ -6,6 +6,7 @@ import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { localNativePackage, localNativeTarball } from "./native-package.mjs";
 
 const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 const captureLimit = 8 * 1024 * 1024;
@@ -21,6 +22,7 @@ function parseArgs(argv) {
     faultTimeoutMs: 45_000,
     jsonOut: null,
     npmBin: process.env.LIBFX_TEST_NPM_BIN ?? "npm",
+    nativeDir: null,
     keepTemp: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -46,11 +48,14 @@ function parseArgs(argv) {
     else if (key === "fault-timeout-ms") options.faultTimeoutMs = Number(value);
     else if (key === "json-out") options.jsonOut = value;
     else if (key === "npm-bin") options.npmBin = value;
+    else if (key === "native-dir") options.nativeDir = value;
     else throw new Error(`unknown option: ${argument}`);
   }
   if (!options.packageInput) {
-    throw new Error("usage: test-package-resilience.mjs --package <staged-directory-or-tarball> [options]");
+    throw new Error("usage: test-package-resilience.mjs --package <staged-directory-or-tarball> --native-dir <dir> [options]");
   }
+  if (!options.nativeDir) throw new Error("--native-dir must name a directory of platform package tarballs");
+  options.nativeDir = resolve(options.nativeDir);
   for (const key of ["cheapCycles", "toolWorkflows", "durationMs", "concurrency", "stageTimeoutMs", "faultTimeoutMs"]) {
     if (!Number.isInteger(options[key]) || options[key] <= 0) throw new Error(`${key} must be a positive integer`);
   }
@@ -93,15 +98,25 @@ async function packageIdentity(packageDir, input, inputType) {
   };
 }
 
-async function installPackage(input, consumerDir, npmBin) {
+async function installPackage(input, consumerDir, npmBin, nativeTarball) {
   const inputStat = await stat(input);
   await mkdir(join(consumerDir, "node_modules"), { recursive: true });
   await writeFile(join(consumerDir, "package.json"), '{"name":"libfx-resilience-consumer","private":true,"type":"module"}\n');
   if (inputStat.isDirectory()) {
     await cp(input, join(consumerDir, "node_modules", "libfx"), { recursive: true });
+    const nativeDir = join(consumerDir, "node_modules", localNativePackage);
+    await mkdir(nativeDir, { recursive: true });
+    await runProcess({
+      label: "platform package extraction",
+      command: "tar",
+      args: ["-xzf", nativeTarball, "--strip-components=1", "-C", nativeDir],
+      cwd: consumerDir,
+      timeoutMs: 60_000,
+      expectedStatus: 0,
+    });
     return "staged-directory-copy";
   }
-  const npmArgs = ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", input];
+  const npmArgs = ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--no-package-lock", input, nativeTarball];
   const npmIsJavaScript = npmBin.endsWith(".js") || npmBin.endsWith(".cjs");
   await runProcess({
     label: "tarball installation",
@@ -262,24 +277,32 @@ async function installedWorkerMain() {
   assert.deepEqual(Object.keys(cjs).sort(), exportNames, "ESM and CJS exports differ");
 
   if (config.mode === "cjs-happy") {
-    assert.equal(typeof cjs.createFxAgent, "function");
+    assert.equal(typeof cjs.createFxEngine, "function");
     const info = await cjs.getBackendInfo({ backend: "native" });
     assert.equal(info.backend, "native");
     console.log(JSON.stringify({ mode: config.mode, exportNames, info }));
     return;
   }
 
-  if (config.mode === "fault-missing-addon" || config.mode === "fault-corrupt-addon") {
+  if (["fault-missing-package", "fault-missing-addon", "fault-corrupt-addon"].includes(config.mode)) {
     const info = await esm.getBackendInfo({ backend: "native" });
     assert.equal(info.backend, "unavailable");
     const reason = info.attempts[0].reason;
-    assert.equal(reason.code, config.mode === "fault-missing-addon"
-      ? "LIBFX_NATIVE_ARTIFACT_MISSING"
-      : "LIBFX_NATIVE_LOAD_FAILED");
-    if (config.mode === "fault-missing-addon") assert.equal(reason.causeCode, "ENOENT");
-    else assert.equal(reason.causeCode, "ERR_DLOPEN_FAILED");
-    const factoryError = await expectedError(() => esm.createFxAgent({ backend: "native", apiKey: "test-placeholder" }));
+    assert.equal(reason.code, config.mode === "fault-corrupt-addon"
+      ? "LIBFX_NATIVE_LOAD_FAILED"
+      : "LIBFX_NATIVE_ARTIFACT_MISSING");
+    assert.equal(reason.causeCode, {
+      "fault-missing-package": "ERR_MODULE_NOT_FOUND",
+      "fault-missing-addon": "ENOENT",
+      "fault-corrupt-addon": "ERR_DLOPEN_FAILED",
+    }[config.mode]);
+    const factoryError = await expectedError(() => esm.createFxEngine({ backend: "native", apiKey: "test-placeholder" }));
     assert.ok(factoryError.code, "factory error must preserve a code");
+    // An uninstalled platform package is named, with how to install it.
+    if (config.mode === "fault-missing-package") {
+      assert.match(reason.message, new RegExp(`the native addon package ${config.nativePackage} for .* is not installed`));
+      assert.ok(factoryError.message.includes(`Install ${config.nativePackage}`), factoryError.message);
+    }
     console.log(JSON.stringify({ mode: config.mode, info, factoryError: errorRecord(factoryError) }));
     return;
   }
@@ -290,7 +313,7 @@ async function installedWorkerMain() {
     const forcedWasm = await esm.getBackendInfo({ backend: "wasm" });
     assert.equal(forcedWasm.backend, "unavailable");
     assert.equal(forcedWasm.attempts[0].reason.code, "LIBFX_JSPI_UNAVAILABLE");
-    const factoryError = await expectedError(() => esm.createFxAgent({ backend: "wasm", apiKey: "test-placeholder" }));
+    const factoryError = await expectedError(() => esm.createFxEngine({ backend: "wasm", apiKey: "test-placeholder" }));
     assert.equal(factoryError.code, "LIBFX_JSPI_REQUIRED");
     const automatic = await esm.getBackendInfo({ backend: "auto" });
     assert.equal(automatic.backend, "native");
@@ -303,13 +326,13 @@ async function installedWorkerMain() {
     const info = await esm.getBackendInfo({ backend: "native", nativeAddon: badAddon });
     assert.equal(info.backend, "unavailable");
     assert.equal(info.attempts[0].reason.code, "LIBFX_NATIVE_API_MISMATCH");
-    const factoryError = await expectedError(() => esm.createFxAgent({
+    const factoryError = await expectedError(() => esm.createFxEngine({
       backend: "native",
       nativeAddon: badAddon,
       apiKey: "test-placeholder",
     }));
     assert.equal(factoryError.code, "LIBFX_NATIVE_UNAVAILABLE");
-    assert.match(factoryError.message, /expected API version 3/);
+    assert.match(factoryError.message, /expected API version 4/);
     console.log(JSON.stringify({ mode: config.mode, info, factoryError: errorRecord(factoryError) }));
     return;
   }
@@ -318,16 +341,16 @@ async function installedWorkerMain() {
     const invalidProbe = await expectedError(() => esm.getBackendInfo(null));
     assert.ok(invalidProbe instanceof TypeError);
     assert.equal(invalidProbe.message, "getBackendInfo() options must be an object");
-    const invalidBackend = await expectedError(() => esm.createFxAgent({ backend: "other", apiKey: "test-placeholder" }));
+    const invalidBackend = await expectedError(() => esm.createFxEngine({ backend: "other", apiKey: "test-placeholder" }));
     assert.ok(invalidBackend instanceof TypeError);
     assert.equal(invalidBackend.message, 'backend must be "auto", "native", or "wasm"');
-    const invalidCheckpoint = await expectedError(() => esm.createFxAgent({
+    const invalidCheckpoint = await expectedError(() => esm.createFxEngine({
       backend: "native",
       apiKey: "test-placeholder",
       checkpoint: new Uint8Array([1, 2, 3]),
     }));
     assert.match(invalidCheckpoint.message, /Invalid or non-fresh libfx checkpoint/);
-    const recovery = await esm.createFxAgent({ backend: "native", apiKey: "test-placeholder" });
+    const recovery = await esm.createFxEngine({ backend: "native", apiKey: "test-placeholder" });
     const checkpoint = await recovery.checkpoint();
     await recovery.close();
     assert.ok(checkpoint.length > 48);
@@ -346,11 +369,11 @@ async function installedWorkerMain() {
     assert.equal(first.backend, "unavailable");
     assert.equal(first.attempts[0].reason.code, "LIBFX_WASM_LOAD_FAILED");
     if (config.mode === "fault-missing-wasm") assert.equal(first.attempts[0].reason.causeCode, "ENOENT");
-    const factoryError = await expectedError(() => esm.createFxAgent({ backend: "wasm", apiKey: "test-placeholder" }));
+    const factoryError = await expectedError(() => esm.createFxEngine({ backend: "wasm", apiKey: "test-placeholder" }));
     await writeFile(config.wasmPath, await readFile(config.restoreWasmPath));
     const second = await esm.getBackendInfo({ backend: "wasm" });
     assert.equal(second.backend, "wasm-jspi");
-    const recovery = await esm.createFxAgent({ backend: "wasm", apiKey: "test-placeholder" });
+    const recovery = await esm.createFxEngine({ backend: "wasm", apiKey: "test-placeholder" });
     const checkpoint = await recovery.checkpoint();
     await recovery.close();
     assert.ok(checkpoint.length > 48);
@@ -530,7 +553,7 @@ async function installedWorkerMain() {
     const started = performance.now();
     let agent;
     try {
-      agent = await esm.createFxAgent(baseOptions(backend, [lookupTool(marker, mode, state)]));
+      agent = await esm.createFxEngine(baseOptions(backend, [lookupTool(marker, mode, state)]));
       const observed = await withTimeout(consumeTurn(agent.prompt(`CALL ${marker}`)), 10_000, `tool workflow ${marker}`);
       assert.equal(observed.result.stopReason, "end_turn");
       assert.equal(observed.text, `done:${marker}`);
@@ -559,14 +582,14 @@ async function installedWorkerMain() {
     let source;
     let restored;
     try {
-      source = await esm.createFxAgent(baseOptions("native", tools));
+      source = await esm.createFxEngine(baseOptions("native", tools));
       const first = await consumeTurn(source.prompt(`CALL ${marker}`));
       assert.equal(first.text, `done:${marker}`);
       const checkpoint = await source.checkpoint();
       assert.ok(checkpoint.length > 48);
       await source.close();
       source = null;
-      restored = await esm.createFxAgent(baseOptions("native", tools, checkpoint));
+      restored = await esm.createFxEngine(baseOptions("native", tools, checkpoint));
       const second = await consumeTurn(restored.prompt(`RESTORE ${marker}`));
       assert.equal(second.text, `restored:${marker}`);
       assert.equal(state.callbacks, 1);
@@ -606,7 +629,7 @@ async function installedWorkerMain() {
     const runtimeEvents = [];
     let agent;
     try {
-      agent = await esm.createFxAgent({
+      agent = await esm.createFxEngine({
         ...baseOptions("native", [waitTool]),
         onEvent(event) { runtimeEvents.push(event); },
       });
@@ -651,7 +674,7 @@ async function installedWorkerMain() {
     const started = performance.now();
     const info = await esm.getBackendInfo({ backend });
     assert.equal(info.backend, "native");
-    const agent = await esm.createFxAgent({
+    const agent = await esm.createFxEngine({
       backend,
       apiKey: "test-placeholder",
       home: process.cwd(),
@@ -818,11 +841,14 @@ async function installedWorkerMain() {
 
 const workerSource = `#!/usr/bin/env node\n(${installedWorkerMain.toString()})().catch((error) => {\n  const record = { name: error?.name ?? typeof error, code: error?.code ?? null, message: error?.message ?? String(error), stack: error?.stack ?? null };\n  console.error(JSON.stringify({ workerFailure: record }));\n  process.exitCode = 1;\n});\n`;
 
-async function makeConsumer(root, name, sourcePackage) {
+async function makeConsumer(root, name, sourcePackage, { withNativePackage = true } = {}) {
   const consumer = join(root, name);
   await mkdir(join(consumer, "node_modules"), { recursive: true });
   await writeFile(join(consumer, "package.json"), '{"name":"libfx-resilience-consumer","private":true,"type":"module"}\n');
   await cp(sourcePackage, join(consumer, "node_modules", "libfx"), { recursive: true });
+  if (withNativePackage) {
+    await cp(join(dirname(sourcePackage), localNativePackage), join(consumer, "node_modules", localNativePackage), { recursive: true });
+  }
   await writeFile(join(consumer, "worker.mjs"), workerSource);
   return consumer;
 }
@@ -858,7 +884,7 @@ async function main() {
   const stages = [];
   try {
     const baseConsumer = join(tempRoot, "base-consumer");
-    const installMethod = await installPackage(options.packageInput, baseConsumer, options.npmBin);
+    const installMethod = await installPackage(options.packageInput, baseConsumer, options.npmBin, localNativeTarball(options.nativeDir));
     const basePackage = join(baseConsumer, "node_modules", "libfx");
     await writeFile(join(baseConsumer, "worker.mjs"), workerSource);
     const identity = await packageIdentity(basePackage, options.packageInput, installMethod);
@@ -889,13 +915,12 @@ async function main() {
     });
     stages.push({ name: "cjs-happy", status: "PASS", result: cjsBaseline.parsed });
 
-    const nativeFile = `libfx.${process.platform}-${process.arch}.node`;
-    for (const mode of ["fault-missing-addon", "fault-corrupt-addon"]) {
-      const consumer = await makeConsumer(tempRoot, mode, basePackage);
-      const addonPath = join(consumer, "node_modules", "libfx", nativeFile);
+    for (const mode of ["fault-missing-package", "fault-missing-addon", "fault-corrupt-addon"]) {
+      const consumer = await makeConsumer(tempRoot, mode, basePackage, { withNativePackage: mode !== "fault-missing-package" });
+      const addonPath = join(consumer, "node_modules", localNativePackage, "libfx.node");
       if (mode === "fault-missing-addon") await rm(addonPath);
-      else await writeFile(addonPath, "not a native addon");
-      const outcome = await runWorker({ consumer, config: { mode }, timeoutMs: options.faultTimeoutMs });
+      else if (mode === "fault-corrupt-addon") await writeFile(addonPath, "not a native addon");
+      const outcome = await runWorker({ consumer, config: { mode, nativePackage: localNativePackage }, timeoutMs: options.faultTimeoutMs });
       stages.push({ name: mode, status: "PASS_EXPECTED_FAULT", result: outcome.parsed });
     }
 

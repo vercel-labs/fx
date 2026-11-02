@@ -11,7 +11,7 @@ const Allocator = std.mem.Allocator;
 
 /// Names the backend that answers on this platform so operators can tell where a
 /// stored key lives without knowing how the backend is selected.
-const backend_label = if (builtin.os.tag == .macos) "macOS Keychain" else "profile file";
+const backend_label = if (builtin.target.os.tag == .macos) "macOS Keychain" else "profile file";
 
 const max_key_file_bytes: usize = 8 * 1024;
 
@@ -35,13 +35,13 @@ fn isDisabled() bool {
 /// Returns the stored key, or null when no key is stored. An error means the store
 /// could not be read, which callers must keep distinct from absence.
 fn load(alloc: Allocator) LoadError!?[]u8 {
-    if (comptime builtin.os.tag == .macos) return loadFromKeychain(alloc);
+    if (comptime builtin.target.os.tag == .macos) return loadFromKeychain(alloc);
     return loadFromProfile(alloc);
 }
 
 fn store(alloc: Allocator, value: []const u8) StoreError!void {
     if (value.len == 0) return error.StoredKeyWriteFailed;
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime builtin.target.os.tag == .macos) {
         keychain.storeValue(value) catch |err| return writeFailed("keychain", err);
         return;
     }
@@ -51,7 +51,7 @@ fn store(alloc: Allocator, value: []const u8) StoreError!void {
 /// Let the platform credential store own terminal input when it supports a
 /// secure prompt, keeping plaintext out of the fx process.
 fn storeInteractive() StoreError!bool {
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime builtin.target.os.tag == .macos) {
         keychain.storeInteractive() catch |err| return writeFailed("keychain_interactive", err);
         return true;
     }
@@ -64,18 +64,18 @@ fn isDisabledCallback(_: ?*anyopaque) bool {
 
 fn presenceCallback(_: ?*anyopaque) host.SecretStorePresence {
     if (isDisabled()) return .missing;
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime builtin.target.os.tag == .macos) {
         return keychain.contains() catch .unavailable;
     }
     return presenceInProfile();
 }
 
 fn presenceInProfile() host.SecretStorePresence {
-    const home = io_mod.getenv("HOME") orelse return .unavailable;
-    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{}) catch
+    const home = io_mod.homeDir() orelse return .unavailable;
+    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{}) catch
         return .unavailable;
     defer home_dir.close(io_mod.getIo());
-    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.rootName(), .{
         .follow_symlinks = false,
     }) catch |err| return if (err == error.FileNotFound) .missing else .unavailable;
     defer fx_dir.close(io_mod.getIo());
@@ -111,17 +111,17 @@ fn loadFromKeychain(alloc: Allocator) LoadError!?[]u8 {
 }
 
 fn loadFromProfile(alloc: Allocator) LoadError!?[]u8 {
-    const home = io_mod.getenv("HOME") orelse {
+    const home = io_mod.homeDir() orelse {
         debug_trace.logf("stored_key", "load failed step=home err=HomeNotSet", .{});
         return error.StoredKeyUnreadable;
     };
-    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
+    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }) catch |err| {
         debug_trace.logf("stored_key", "load failed step=open_home err={s}", .{@errorName(err)});
         return error.StoredKeyUnreadable;
     };
     defer home_dir.close(io_mod.getIo());
 
-    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.rootName(), .{
         .iterate = true,
         .follow_symlinks = false,
     }) catch |err| switch (err) {
@@ -180,15 +180,15 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) LoadError!?[]u8 {
 }
 
 fn storeInProfile(alloc: Allocator, value: []const u8) StoreError!void {
-    const home = io_mod.getenv("HOME") orelse return writeFailed("home", error.HomeNotSet);
+    const home = io_mod.homeDir() orelse return writeFailed("home", error.HomeNotSet);
     var home_dir = io_mod.VerifiedDir{
-        .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
+        .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }) catch |err| {
             return writeFailed("open_home", err);
         },
     };
     defer home_dir.close();
 
-    var fx_dir = io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name) catch |err| {
+    var fx_dir = io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.rootName()) catch |err| {
         return writeFailed("open_profile", err);
     };
     defer fx_dir.close();
@@ -211,7 +211,7 @@ fn writeFailed(step: []const u8, err: anyerror) StoreError {
 }
 
 test "stored key backend label names the platform store" {
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime builtin.target.os.tag == .macos) {
         try std.testing.expectEqualStrings("macOS Keychain", backend_label);
     } else {
         try std.testing.expectEqualStrings("profile file", backend_label);

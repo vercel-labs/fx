@@ -44,8 +44,8 @@ const LOCAL_MENU_ACTIONS = [
   { name: "settingsOpen", command: "/settings", marker: "Settings" },
   { name: "modelOpen", command: "/model", marker: "Models " },
   { name: "resumeOpen", command: "/resume", marker: "Sessions " },
-  { name: "mcpOpen", command: "/mcp", marker: "[Servers]" },
-  { name: "usageOpen", command: "/usage", marker: "[30 days]" },
+  { name: "mcpOpen", command: "/mcp", marker: "MCP servers" },
+  { name: "usageOpen", command: "/usage", marker: "usage: API key" },
   { name: "statuslineOpen", command: "/statusline", marker: "Status line" },
   { name: "workspaceOpen", command: "/workspace", marker: "enter use" },
 ] as const;
@@ -497,7 +497,7 @@ test.skipIf(!tmuxAvailable())(
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_AUTO_UPGRADE: "0",
           FX_DISABLE_KEYCHAIN: "1",
-          FX_SKIP_ONBOARDING: "1",
+          FX_TEST_SKIP_ONBOARDING: "1",
           FX_SOUND: "0",
           NO_COLOR: "1",
         },
@@ -603,7 +603,7 @@ test.skipIf(!tmuxAvailable())(
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_AUTO_UPGRADE: "0",
           FX_DISABLE_KEYCHAIN: "1",
-          FX_SKIP_ONBOARDING: "1",
+          FX_TEST_SKIP_ONBOARDING: "1",
           FX_SOUND: "0",
           NO_COLOR: "1",
         },
@@ -710,7 +710,6 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           FX_SOUND: "0",
           FX_RECORD: fixture.tapePath,
           FX_RECORD_INPUT: "1",
-          FX_TERMINAL_HOST_IDLE_MS: "250",
           NO_COLOR: "1",
         },
         stderrPath: fixture.stderrPath,
@@ -967,8 +966,9 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       await session.waitForComposer(TIMEOUT);
       const resourcesBefore = await waitForResourceStability(pid);
       expect(resourcesBefore.threads - preFeatureResources.threads).toBeLessThanOrEqual(2);
-      // Three terminal routes plus command-replay logs, commands, and tool-results routes.
-      expect(resourcesBefore.descriptors - preFeatureResources.descriptors).toBeLessThanOrEqual(6);
+      // Three terminal routes, the in-process terminal store's profile and
+      // sessions folders, plus command-replay logs, commands, and tool-results routes.
+      expect(resourcesBefore.descriptors - preFeatureResources.descriptors).toBeLessThanOrEqual(8);
       expect(resourcesBefore.rssKib - preFeatureResources.rssKib).toBeLessThan(16 * 1024);
 
       const peakResources = await peakResourcesWhile(pid, async () => {

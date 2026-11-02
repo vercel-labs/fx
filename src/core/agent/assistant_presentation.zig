@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const Allocator = std.mem.Allocator;
 
 const display_width = @import("../shared/display_width.zig");
@@ -13,6 +14,7 @@ const block_render = @import("presentation/block_render.zig");
 var link_id_counter: u32 = 1;
 
 pub const setInlineCodeTheme = ansi.setInlineCodeTheme;
+pub const applyTheme = ansi.applyTheme;
 pub const writeHorizontalRule = ansi.writeHorizontalRule;
 
 pub const TableColumnAlign = payload.TableColumnAlign;
@@ -30,6 +32,13 @@ pub const Event = union(enum) {
     table: TablePayload,
     code_block: CodeBlockPayload,
     thematic_rule,
+    /// An answer attempt starts. It waits for earlier text to show, so the
+    /// host knows where the attempt's output begins.
+    attempt_start,
+    /// The attempt broke off and the answer starts over. The host replaces
+    /// what it showed of the attempt when it still can, and otherwise shows
+    /// this line after it.
+    attempt_restart: []u8,
 
     pub fn clone(self: Event, alloc: Allocator) Allocator.Error!Event {
         return switch (self) {
@@ -37,13 +46,15 @@ pub const Event = union(enum) {
             .table => |table| .{ .table = try table.clone(alloc) },
             .code_block => |block| .{ .code_block = try block.clone(alloc) },
             .thematic_rule => .thematic_rule,
+            .attempt_start => .attempt_start,
+            .attempt_restart => |text| .{ .attempt_restart = try alloc.dupe(u8, text) },
         };
     }
 
     pub fn requiresTextDrain(self: Event) bool {
         return switch (self) {
-            .text => false,
-            .table, .code_block, .thematic_rule => true,
+            .text, .attempt_restart => false,
+            .table, .code_block, .thematic_rule, .attempt_start => true,
         };
     }
 
@@ -59,7 +70,8 @@ pub const Event = union(enum) {
                 break :blk total;
             },
             .code_block => |block| block.language.len +| block.code.len,
-            .thematic_rule => 1,
+            .thematic_rule, .attempt_start => 1,
+            .attempt_restart => |text| text.len,
         };
     }
 
@@ -68,7 +80,8 @@ pub const Event = union(enum) {
             .text => |text| alloc.free(text),
             .table => |*table| table.deinit(alloc),
             .code_block => |*block| block.deinit(alloc),
-            .thematic_rule => {},
+            .thematic_rule, .attempt_start => {},
+            .attempt_restart => |text| alloc.free(text),
         }
         self.* = undefined;
     }
@@ -138,6 +151,14 @@ const ActiveFootnote = struct {
     append_body: bool,
 };
 
+/// An ordered list item whose number was padded to right-align its marker.
+/// Source lines indented to `content_column` belong to the item and move
+/// right by `shift`, the padding of this item and the items it is nested in.
+const OpenOrderedItem = struct {
+    content_column: usize,
+    shift: usize,
+};
+
 pub const MarkdownProcessor = struct {
     line_buf: std.ArrayList(u8) = .empty,
     pending_top_level_line: std.ArrayList(u8) = .empty,
@@ -155,6 +176,8 @@ pub const MarkdownProcessor = struct {
     active_footnote: ?ActiveFootnote = null,
     next_footnote_number: usize = 0,
     previous_line_was_blank: bool = true,
+    /// Innermost last; each entry's shift already includes its parents'.
+    open_ordered_items: std.ArrayList(OpenOrderedItem) = .empty,
 
     pub fn deinit(self: *MarkdownProcessor, alloc: Allocator) void {
         self.line_buf.deinit(alloc);
@@ -163,6 +186,7 @@ pub const MarkdownProcessor = struct {
         self.code_buf.deinit(alloc);
         self.code_language.deinit(alloc);
         self.deinitFootnotes(alloc);
+        self.open_ordered_items.deinit(alloc);
     }
 
     pub fn reset(self: *MarkdownProcessor, alloc: Allocator) void {
@@ -172,6 +196,7 @@ pub const MarkdownProcessor = struct {
         self.code_buf.clearAndFree(alloc);
         self.code_language.clearAndFree(alloc);
         self.deinitFootnotes(alloc);
+        self.open_ordered_items.clearAndFree(alloc);
         self.in_code_block = false;
         self.code_fence = null;
         self.in_pipe_block = false;
@@ -239,6 +264,7 @@ pub const MarkdownProcessor = struct {
         defer self.active_blockquote = null;
         defer self.active_definition = false;
         defer self.active_footnote = null;
+        defer self.open_ordered_items.clearRetainingCapacity();
         const had_partial_line = self.line_buf.items.len > 0;
         const len_before = out.items.len;
         if (self.line_buf.items.len > 0) {
@@ -453,6 +479,8 @@ pub const MarkdownProcessor = struct {
             return;
         }
 
+        const shift = self.orderedItemShift(line);
+
         if (bp.isHorizontalRule(line)) {
             try ansi.writeHorizontalRule(alloc, out);
             return;
@@ -465,7 +493,7 @@ pub const MarkdownProcessor = struct {
 
         if (bp.parseBlockquote(line)) |parsed| {
             const blockquote = bp.BlockquotePrefix{
-                .indent = parsed.indent.len,
+                .indent = shift + parsed.indent.len,
                 .depth = parsed.depth,
             };
             self.active_blockquote = if (bp.isBlockquoteParagraph(parsed.content)) blockquote else null;
@@ -473,9 +501,30 @@ pub const MarkdownProcessor = struct {
             return;
         }
 
-        if (try block_render.writeListLine(alloc, line, line_has_lf, out, &fs, &link_id_counter)) return;
+        try out.appendNTimes(alloc, ' ', shift);
+        if (try block_render.writeListLine(alloc, line, line_has_lf, .right_aligned, out, &fs, &link_id_counter)) {
+            if (bp.parseOrderedList(line)) |item| {
+                try self.open_ordered_items.append(alloc, .{
+                    .content_column = item.indent.len + item.marker.len + 1,
+                    .shift = shift + block_render.orderedMarkerPad(item.marker),
+                });
+            }
+            return;
+        }
 
         try inline_render.writeInline(alloc, tu.withoutTerminalHardBreakMarker(line, line_has_lf), out, false, &fs, &link_id_counter);
+    }
+
+    /// Returns how far padded ordered markers move `line`, first closing the
+    /// open items it is not indented into. Blank lines keep items open.
+    fn orderedItemShift(self: *MarkdownProcessor, line: []const u8) usize {
+        if (tu.isBlankMarkdownLine(line)) return 0;
+        const indent = line.len - tu.leftTrim(line).len;
+        while (self.open_ordered_items.last()) |item| {
+            if (indent >= item.content_column) return item.shift;
+            _ = self.open_ordered_items.pop();
+        }
+        return 0;
     }
 
     fn finalizePipeBlock(
@@ -506,7 +555,7 @@ pub const MarkdownProcessor = struct {
 
         var start: usize = 0;
         while (start < self.pipe_buf.items.len) {
-            const end = std.mem.indexOfScalarPos(u8, self.pipe_buf.items, start, '\n') orelse self.pipe_buf.items.len;
+            const end = std.mem.findScalarPos(u8, self.pipe_buf.items, start, '\n') orelse self.pipe_buf.items.len;
             const line_has_lf = if (end + 1 == self.pipe_buf.items.len) self.pipe_last_line_has_lf else true;
             try self.processLine(alloc, self.pipe_buf.items[start..end], line_has_lf, out);
             if (line_has_lf) try out.append(alloc, '\n');
@@ -636,9 +685,9 @@ test "markdown link is blue and underlined inside its OSC 8 scope" {
     try processor.push(alloc, "see [docs](https://example.com) please\n", &out);
 
     var expected_buf: [256]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
-        "see \x1b]8;id=fx-{d};https://example.com\x1b\\\x1b[4mdocs\x1b[24m\x1b]8;;\x1b\\ please\n",
+        "see \x1b]8;id=fx-{d};https://example.com\x1b\\\x1b[38;5;75m\x1b[4mdocs\x1b[24m\x1b[39m\x1b]8;;\x1b\\ please\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -655,9 +704,9 @@ test "markdown link destination keeps balanced parentheses" {
     try processor.push(alloc, "[w](https://en.wikipedia.org/wiki/Foo_(bar)) tail\n", &out);
 
     var expected_buf: [256]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
-        "\x1b]8;id=fx-{d};https://en.wikipedia.org/wiki/Foo_(bar)\x1b\\\x1b[4mw\x1b[24m\x1b]8;;\x1b\\ tail\n",
+        "\x1b]8;id=fx-{d};https://en.wikipedia.org/wiki/Foo_(bar)\x1b\\\x1b[38;5;75m\x1b[4mw\x1b[24m\x1b[39m\x1b]8;;\x1b\\ tail\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -678,11 +727,11 @@ test "markdown link drops its title and unwraps angle destinations" {
     );
 
     var expected_buf: [512]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
-        "\x1b]8;id=fx-{d};https://example.com\x1b\\\x1b[4mt\x1b[24m\x1b]8;;\x1b\\ " ++
-            "\x1b]8;id=fx-{d};https://example.com/s\x1b\\\x1b[4ms\x1b[24m\x1b]8;;\x1b\\ " ++
-            "\x1b]8;id=fx-{d};https://example.com/a b\x1b\\\x1b[4ma\x1b[24m\x1b]8;;\x1b\\\n",
+        "\x1b]8;id=fx-{d};https://example.com\x1b\\\x1b[38;5;75m\x1b[4mt\x1b[24m\x1b[39m\x1b]8;;\x1b\\ " ++
+            "\x1b]8;id=fx-{d};https://example.com/s\x1b\\\x1b[38;5;75m\x1b[4ms\x1b[24m\x1b[39m\x1b]8;;\x1b\\ " ++
+            "\x1b]8;id=fx-{d};https://example.com/a b\x1b\\\x1b[38;5;75m\x1b[4ma\x1b[24m\x1b[39m\x1b]8;;\x1b\\\n",
         .{ id_before, id_before + 1, id_before + 2 },
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -710,9 +759,9 @@ test "markdown image renders its alt text with an image marker inside one OSC 8 
     try processor.push(alloc, "see ![architecture diagram](https://example.com/diagram.png) please\n", &out);
 
     var expected_buf: [512]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
-        "see \x1b]8;id=fx-{d};https://example.com/diagram.png\x1b\\\x1b[4m▧ architecture diagram\x1b[24m\x1b]8;;\x1b\\ please\n",
+        "see \x1b]8;id=fx-{d};https://example.com/diagram.png\x1b\\\x1b[38;5;75m\x1b[4m▧ architecture diagram\x1b[24m\x1b[39m\x1b]8;;\x1b\\ please\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -729,9 +778,9 @@ test "markdown image uses a stable fallback for empty alt text" {
     try processor.push(alloc, "![](https://example.com/diagram.png)\n", &out);
 
     var expected_buf: [256]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
-        "\x1b]8;id=fx-{d};https://example.com/diagram.png\x1b\\\x1b[4m▧ image\x1b[24m\x1b]8;;\x1b\\\n",
+        "\x1b]8;id=fx-{d};https://example.com/diagram.png\x1b\\\x1b[38;5;75m\x1b[4m▧ image\x1b[24m\x1b[39m\x1b]8;;\x1b\\\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -748,9 +797,9 @@ test "markdown image unescapes alt punctuation through the existing link emitter
     try processor.push(alloc, "![architecture \\*diagram\\*](https://example.com/diagram.png)\n", &out);
 
     var expected_buf: [256]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
-        "\x1b]8;id=fx-{d};https://example.com/diagram.png\x1b\\\x1b[4m▧ architecture *diagram*\x1b[24m\x1b]8;;\x1b\\\n",
+        "\x1b]8;id=fx-{d};https://example.com/diagram.png\x1b\\\x1b[38;5;75m\x1b[4m▧ architecture *diagram*\x1b[24m\x1b[39m\x1b]8;;\x1b\\\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -765,26 +814,26 @@ test "escaped and malformed markdown images remain literal without OSC 8" {
 
     try processor.push(alloc, "\\![alt](https://example.com/diagram.png) and \\!\n", &out);
     try std.testing.expectEqualStrings("![alt](https://example.com/diagram.png) and !\n", out.items);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b]8;") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
 
     out.clearRetainingCapacity();
     try processor.push(alloc, "![alt](https://example.com/diagram.png\n", &out);
     try std.testing.expectEqualStrings("![alt](https://example.com/diagram.png\n", out.items);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b]8;") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
 
     out.clearRetainingCapacity();
     try processor.push(alloc, "![alt](https://example.com/\x1bdiagram.png)\n", &out);
     try std.testing.expectEqualStrings("![alt](https://example.com/\x1bdiagram.png)\n", out.items);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b]8;") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
 
     var oversized_url: [max_link_url_bytes + 1]u8 = undefined;
     @memset(&oversized_url, 'a');
     var input_buf: [max_link_url_bytes + 16]u8 = undefined;
-    const oversized = try std.fmt.bufPrint(&input_buf, "![alt]({s})\n", .{oversized_url[0..]});
+    const oversized = try std.mem.print(&input_buf, "![alt]({s})\n", .{oversized_url[0..]});
     out.clearRetainingCapacity();
     try processor.push(alloc, oversized, &out);
     try std.testing.expectEqualStrings(oversized, out.items);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b]8;") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
 }
 
 test "markdown images preserve code isolation, chunk buffering, and heading underline" {
@@ -796,24 +845,24 @@ test "markdown images preserve code isolation, chunk buffering, and heading unde
 
     try processor.push(alloc, "`![literal](https://example.com/literal.png)`\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;245m![literal](https://example.com/literal.png)\x1b[39m\n",
+        "\x1b[38;5;255m![literal](https://example.com/literal.png)\x1b[39m\n",
         out.items,
     );
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b]8;") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
 
     out.clearRetainingCapacity();
     try processor.push(alloc, "![architecture", &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
     try processor.push(alloc, "](https://example.com/diagram.png)\n", &out);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "▧ architecture") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "▧ architecture") != null);
 
     out.clearRetainingCapacity();
     const id_before = link_id_counter;
     try processor.push(alloc, "### before ![diagram](https://example.com/diagram.png) after\n", &out);
     var expected_buf: [512]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
-        "\x1b[4mbefore \x1b]8;id=fx-{d};https://example.com/diagram.png\x1b\\\x1b[4m▧ diagram\x1b[24m\x1b]8;;\x1b\\\x1b[4m after\x1b[24m\n",
+        "\x1b[4mbefore \x1b]8;id=fx-{d};https://example.com/diagram.png\x1b\\\x1b[38;5;75m\x1b[4m▧ diagram\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[4m after\x1b[24m\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -830,8 +879,8 @@ test "table payload measures markdown images by their visible label" {
     defer table.deinit(alloc);
 
     const cell = table.rows[1].cells[0];
-    try std.testing.expect(std.mem.indexOf(u8, cell, "▧ diagram") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cell, "![diagram]") == null);
+    try std.testing.expect(std.mem.find(u8, cell, "▧ diagram") != null);
+    try std.testing.expect(std.mem.find(u8, cell, "![diagram]") == null);
     try std.testing.expectEqual(
         display_width.visibleWidthIgnoringAnsi("▧ diagram"),
         display_width.visibleWidthIgnoringAnsi(cell),
@@ -859,12 +908,12 @@ test "table payload links use the shared OSC 8 identifier sequence" {
     defer second.deinit(alloc);
 
     var first_id_buf: [64]u8 = undefined;
-    const first_id = try std.fmt.bufPrint(&first_id_buf, "\x1b]8;id=fx-{d};https://first.example", .{id_before});
-    try std.testing.expect(std.mem.indexOf(u8, first.rows[1].cells[0], first_id) != null);
+    const first_id = try std.mem.print(&first_id_buf, "\x1b]8;id=fx-{d};https://first.example", .{id_before});
+    try std.testing.expect(std.mem.find(u8, first.rows[1].cells[0], first_id) != null);
 
     var second_id_buf: [64]u8 = undefined;
-    const second_id = try std.fmt.bufPrint(&second_id_buf, "\x1b]8;id=fx-{d};https://second.example", .{id_before +% 1});
-    try std.testing.expect(std.mem.indexOf(u8, second.rows[1].cells[0], second_id) != null);
+    const second_id = try std.mem.print(&second_id_buf, "\x1b]8;id=fx-{d};https://second.example", .{id_before +% 1});
+    try std.testing.expect(std.mem.find(u8, second.rows[1].cells[0], second_id) != null);
 }
 
 test "bare URL is underlined and leaves sentence punctuation literal" {
@@ -878,9 +927,9 @@ test "bare URL is underlined and leaves sentence punctuation literal" {
     try processor.push(alloc, "visit https://example.com/docs, now\n", &out);
 
     var expected_buf: [256]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
-        "visit \x1b]8;id=fx-{d};https://example.com/docs\x1b\\\x1b[4mhttps://example.com/docs\x1b[24m\x1b]8;;\x1b\\, now\n",
+        "visit \x1b]8;id=fx-{d};https://example.com/docs\x1b\\\x1b[38;5;75m\x1b[4mhttps://example.com/docs\x1b[24m\x1b[39m\x1b]8;;\x1b\\, now\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -899,9 +948,9 @@ test "bare URL is recognized after streamed input chunks" {
     try processor.push(alloc, "://example.com/docs\n", &out);
 
     var expected_buf: [256]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
-        "visit \x1b]8;id=fx-{d};https://example.com/docs\x1b\\\x1b[4mhttps://example.com/docs\x1b[24m\x1b]8;;\x1b\\\n",
+        "visit \x1b]8;id=fx-{d};https://example.com/docs\x1b\\\x1b[38;5;75m\x1b[4mhttps://example.com/docs\x1b[24m\x1b[39m\x1b]8;;\x1b\\\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -922,11 +971,11 @@ test "angle autolinks use literal URI and email labels" {
     );
 
     var expected_buf: [1024]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
-        "see \x1b]8;id=fx-{d};https://example.com/docs\\_literal\x1b\\\x1b[4mhttps://example.com/docs\\_literal\x1b[24m\x1b]8;;\x1b\\ and " ++
-            "\x1b]8;id=fx-{d};mailto:dev@example.com\x1b\\\x1b[4mdev@example.com\x1b[24m\x1b]8;;\x1b\\ plus " ++
-            "\x1b]8;id=fx-{d};git+ssh://example.com/repo\x1b\\\x1b[4mgit+ssh://example.com/repo\x1b[24m\x1b]8;;\x1b\\\n",
+        "see \x1b]8;id=fx-{d};https://example.com/docs\\_literal\x1b\\\x1b[38;5;75m\x1b[4mhttps://example.com/docs\\_literal\x1b[24m\x1b[39m\x1b]8;;\x1b\\ and " ++
+            "\x1b]8;id=fx-{d};mailto:dev@example.com\x1b\\\x1b[38;5;75m\x1b[4mdev@example.com\x1b[24m\x1b[39m\x1b]8;;\x1b\\ plus " ++
+            "\x1b]8;id=fx-{d};git+ssh://example.com/repo\x1b\\\x1b[38;5;75m\x1b[4mgit+ssh://example.com/repo\x1b[24m\x1b[39m\x1b]8;;\x1b\\\n",
         .{ id_before, id_before +% 1, id_before +% 2 },
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -958,11 +1007,11 @@ test "rejected angle candidates suppress nested link emission" {
         "<https://escaped.example>\n" ++
         "<a:x> <dev@bad-.example> <https://has space>\n" ++
         "<not-an-autolink https://unterminated.example\n" ++
-        "\x1b[38;5;245m<https://code.example>\x1b[39m\n";
+        "\x1b[38;5;255m<https://code.example>\x1b[39m\n";
 
     try processor.push(alloc, input, &out);
     try std.testing.expectEqualStrings(expected, out.items);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b]8;") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
 }
 
 test "angle email autolink applies the destination cap including mailto" {
@@ -977,29 +1026,110 @@ test "angle email autolink applies the destination cap including mailto" {
     @memset(&local, 'a');
     const local_len = max_link_url_bytes - "mailto:".len - suffix.len + 1;
     var input_buf: [max_link_url_bytes + 32]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buf, "<{s}{s}>\n", .{ local[0..local_len], suffix });
+    const input = try std.mem.print(&input_buf, "<{s}{s}>\n", .{ local[0..local_len], suffix });
 
     try processor.push(alloc, input, &out);
     try std.testing.expectEqualStrings(input, out.items);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b]8;") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
 }
 
-test "bare URL remains literal in code and excluded boundaries" {
+test "standalone URL in code is linked while excluded boundaries stay literal" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
     defer processor.deinit(alloc);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
 
+    const id_before = link_id_counter;
     try processor.push(
         alloc,
         "`https://code.example` wordhttps://word.example <<https://angle.example>>\n",
         &out,
     );
-    try std.testing.expectEqualStrings(
-        "\x1b[38;5;245mhttps://code.example\x1b[39m wordhttps://word.example <<https://angle.example>>\n",
-        out.items,
+    var expected_buf: [512]u8 = undefined;
+    const expected = try std.mem.print(
+        &expected_buf,
+        "\x1b[38;5;255m\x1b]8;id=fx-{d};https://code.example\x1b\\https://code.example\x1b]8;;\x1b\\\x1b[39m wordhttps://word.example <<https://angle.example>>\n",
+        .{id_before},
     );
+    try std.testing.expectEqualStrings(expected, out.items);
+}
+
+test "inline code URLs keep literal bytes and trailing punctuation outside links" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    const id_before = link_id_counter;
+    try processor.push(alloc, "See `https://example.com/path_~*.` and `https://example.com/a\\_b`.\n", &out);
+    var expected_buf: [1024]u8 = undefined;
+    const expected = try std.mem.print(
+        &expected_buf,
+        "See \x1b[38;5;255m\x1b]8;id=fx-{d};https://example.com/path_~*\x1b\\https://example.com/path_~*\x1b]8;;\x1b\\.\x1b[39m and " ++
+            "\x1b[38;5;255m\x1b]8;id=fx-{d};https://example.com/a\\_b\x1b\\https://example.com/a\\_b\x1b]8;;\x1b\\\x1b[39m.\n",
+        .{ id_before, id_before +% 1 },
+    );
+    try std.testing.expectEqualStrings(expected, out.items);
+}
+
+test "inline code URLs preserve literal trailing URI punctuation" {
+    const alloc = std.testing.allocator;
+    const urls = [_][]const u8{
+        "https://example.com/a!",
+        "https://example.com/a?",
+        "https://example.com/a;",
+        "https://example.com/a:",
+        "https://example.com/a,",
+    };
+    for (urls) |url| {
+        var processor = MarkdownProcessor{};
+        defer processor.deinit(alloc);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        var input_buf: [128]u8 = undefined;
+        const input = try std.mem.print(&input_buf, "Open `{s}`\n", .{url});
+        const id_before = link_id_counter;
+        try processor.push(alloc, input, &out);
+        var expected_buf: [256]u8 = undefined;
+        const expected = try std.mem.print(
+            &expected_buf,
+            "Open \x1b[38;5;255m\x1b]8;id=fx-{d};{s}\x1b\\{s}\x1b]8;;\x1b\\\x1b[39m\n",
+            .{ id_before, url, url },
+        );
+        try std.testing.expectEqualStrings(expected, out.items);
+    }
+}
+
+test "non-URL and unsafe inline code stays literal" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        "`not a URL`\n",
+        "`curl https://example.com`\n",
+        "`https://example.com more`\n",
+        "`http://`\n",
+        "`https://example.com\x07`\n",
+        "`<https://example.com>`\n",
+    };
+    for (cases) |input| {
+        var processor = MarkdownProcessor{};
+        defer processor.deinit(alloc);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        try processor.push(alloc, input, &out);
+        try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
+    }
+
+    var oversized: [max_link_url_bytes + 1]u8 = undefined;
+    @memset(&oversized, 'a');
+    var input_buf: [max_link_url_bytes + 32]u8 = undefined;
+    const input = try std.mem.print(&input_buf, "`https://{s}`\n", .{oversized[0..]});
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try processor.push(alloc, input, &out);
     try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
 }
 
@@ -1013,7 +1143,7 @@ test "unsafe bare URL renders literally" {
     var oversized: [max_link_url_bytes + 1]u8 = undefined;
     @memset(&oversized, 'a');
     var input_buf: [max_link_url_bytes + 16]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buf, "https://{s}\n", .{oversized[0..]});
+    const input = try std.mem.print(&input_buf, "https://{s}\n", .{oversized[0..]});
 
     try processor.push(alloc, input, &out);
     try std.testing.expectEqualStrings(input, out.items);
@@ -1035,11 +1165,11 @@ test "bare URLs leave closing emphasis delimiters for the inline scanner" {
     );
 
     var expected_buf: [1024]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
-        "\x1b[1m\x1b]8;id=fx-{d};https://bold.example\x1b\\\x1b[4mhttps://bold.example\x1b[24m\x1b]8;;\x1b\\\x1b[22m " ++
-            "\x1b[3m\x1b]8;id=fx-{d};https://italic.example\x1b\\\x1b[4mhttps://italic.example\x1b[24m\x1b]8;;\x1b\\\x1b[23m " ++
-            "\x1b[9m\x1b]8;id=fx-{d};https://strike.example\x1b\\\x1b[4mhttps://strike.example\x1b[24m\x1b]8;;\x1b\\\x1b[29m tail\n",
+        "\x1b[1m\x1b]8;id=fx-{d};https://bold.example\x1b\\\x1b[38;5;75m\x1b[4mhttps://bold.example\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[22m " ++
+            "\x1b[3m\x1b]8;id=fx-{d};https://italic.example\x1b\\\x1b[38;5;75m\x1b[4mhttps://italic.example\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[23m " ++
+            "\x1b[9m\x1b]8;id=fx-{d};https://strike.example\x1b\\\x1b[38;5;75m\x1b[4mhttps://strike.example\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[29m tail\n",
         .{ id_before, id_before +% 1, id_before +% 2 },
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -1068,9 +1198,9 @@ test "heading underline resumes after a link closes its local underline" {
     try processor.push(alloc, "### before [link](https://example.com) after\nbody\n", &out);
 
     var expected_buf: [512]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
-        "\x1b[4mbefore \x1b]8;id=fx-{d};https://example.com\x1b\\\x1b[4mlink\x1b[24m\x1b]8;;\x1b\\\x1b[4m after\x1b[24m\nbody\n",
+        "\x1b[4mbefore \x1b]8;id=fx-{d};https://example.com\x1b\\\x1b[38;5;75m\x1b[4mlink\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[4m after\x1b[24m\nbody\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -1085,7 +1215,7 @@ test "two markdown links get distinct ids" {
 
     try processor.push(alloc, "[a](https://a.example) and [b](https://b.example)\n", &out);
     var seq_buf: [32]u8 = undefined;
-    const first_marker = try std.fmt.bufPrint(&seq_buf, "id=fx-", .{});
+    const first_marker = try std.mem.print(&seq_buf, "id=fx-", .{});
     var occurrences: usize = 0;
     var idx: usize = 0;
     while (std.mem.find(u8, out.items[idx..], first_marker)) |off| : (idx += off + first_marker.len) {
@@ -1105,7 +1235,7 @@ test "url over OSC 8 size cap renders literally" {
     @memset(&oversized_buf, 'a');
     const url = oversized_buf[0 .. max_link_url_bytes + 1];
     var input_buf: [4000]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buf, "see [x]({s}) end\n", .{url});
+    const input = try std.mem.print(&input_buf, "see [x]({s}) end\n", .{url});
 
     try processor.push(alloc, input, &out);
     try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
@@ -1162,7 +1292,7 @@ test "backslash escapes keep inline punctuation literal" {
         "literal *em* **bold** _italic_ __strong__ ~~strike~~ `code` [docs](https://example.com) \\ | ! # >\n",
         out.items,
     );
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b") == null);
 }
 
 test "backslash escapes survive heading preprocessing and code spans" {
@@ -1174,7 +1304,7 @@ test "backslash escapes survive heading preprocessing and code spans" {
 
     try processor.push(alloc, "## \\*\\*literal bold\\*\\* and `\\*code\\*`\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[1m**literal bold** and \x1b[38;5;245m\\*code\\*\x1b[39m\x1b[22m\n",
+        "\x1b[1m**literal bold** and \x1b[38;5;255m\\*code\\*\x1b[39m\x1b[22m\n",
         out.items,
     );
 }
@@ -1296,9 +1426,9 @@ test "link labels unescape visible punctuation" {
     try processor.push(alloc, "[docs \\*literal\\*](https://example.com)\n", &out);
 
     var expected_buf: [256]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
-        "\x1b]8;id=fx-{d};https://example.com\x1b\\\x1b[4mdocs *literal*\x1b[24m\x1b]8;;\x1b\\\n",
+        "\x1b]8;id=fx-{d};https://example.com\x1b\\\x1b[38;5;75m\x1b[4mdocs *literal*\x1b[24m\x1b[39m\x1b]8;;\x1b\\\n",
         .{id_before},
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -1398,8 +1528,8 @@ test "underscore emphasis renders in list, blockquote, and table cells" {
     defer table.deinit(alloc);
     out.clearRetainingCapacity();
     try renderTablePayload(alloc, table, &out);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[3mrow\x1b[23m") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[1mcell\x1b[22m") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b[3mrow\x1b[23m") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b[1mcell\x1b[22m") != null);
 }
 
 test "underscore formatted bare URLs retain path underscores and matching closers" {
@@ -1417,10 +1547,10 @@ test "underscore formatted bare URLs retain path underscores and matching closer
     );
 
     var expected_buf: [1024]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buf,
-        "\x1b[3m\x1b]8;id=fx-{d};https://example.com/snake_case\x1b\\\x1b[4mhttps://example.com/snake_case\x1b[24m\x1b]8;;\x1b\\\x1b[23m tail " ++
-            "\x1b[1m\x1b]8;id=fx-{d};https://example.com/snake_case\x1b\\\x1b[4mhttps://example.com/snake_case\x1b[24m\x1b]8;;\x1b\\\x1b[22m tail\n",
+        "\x1b[3m\x1b]8;id=fx-{d};https://example.com/snake_case\x1b\\\x1b[38;5;75m\x1b[4mhttps://example.com/snake_case\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[23m tail " ++
+            "\x1b[1m\x1b]8;id=fx-{d};https://example.com/snake_case\x1b\\\x1b[38;5;75m\x1b[4mhttps://example.com/snake_case\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[22m tail\n",
         .{ id_before, id_before +% 1 },
     );
     try std.testing.expectEqualStrings(expected, out.items);
@@ -1442,7 +1572,7 @@ test "underscore formatted URLs require exact active markers" {
         defer out.deinit(alloc);
 
         try processor.push(alloc, input, &out);
-        try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b]8;") == null);
+        try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
     }
 
     // Trailing underscores are outside the URL, as in GFM autolinks, so the
@@ -1465,7 +1595,7 @@ test "underscore formatted URLs require exact active markers" {
         defer out.deinit(alloc);
 
         try processor.push(alloc, case.input, &out);
-        try std.testing.expect(std.mem.indexOf(u8, out.items, case.url) != null);
+        try std.testing.expect(std.mem.find(u8, out.items, case.url) != null);
         try std.testing.expect(std.mem.startsWith(u8, out.items, case.prefix));
         try std.testing.expect(std.mem.endsWith(u8, out.items, case.tail));
     }
@@ -1482,7 +1612,7 @@ test "underscore emphasis preserves code literals and keeps unpaired markers lit
     try std.testing.expectEqualStrings(
         "_unclosed\n" ++
             "__unclosed\n" ++
-            "\x1b[38;5;245m_literal_ __literal__\x1b[39m\n",
+            "\x1b[38;5;255m_literal_ __literal__\x1b[39m\n",
         out.items,
     );
 }
@@ -1541,7 +1671,7 @@ test "table payload headers reassert outer bold after inline strong closes" {
     defer out.deinit(alloc);
 
     try renderTablePayload(alloc, table, &out);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         out.items,
         "\x1b[1mprefix \x1b[1mstrong\x1b[22m\x1b[1m suffix\x1b[22m",
@@ -1557,7 +1687,7 @@ test "double backtick code span keeps inner backticks and trims one padding spac
 
     try processor.push(alloc, "use `` a ` b `` and ``x`` here\n", &out);
     try std.testing.expectEqualStrings(
-        "use \x1b[38;5;245ma ` b\x1b[39m and \x1b[38;5;245mx\x1b[39m here\n",
+        "use \x1b[38;5;255ma ` b\x1b[39m and \x1b[38;5;255mx\x1b[39m here\n",
         out.items,
     );
 }
@@ -1571,7 +1701,7 @@ test "code span closes only on a backtick run of the same length" {
 
     try processor.push(alloc, "`a``b` and ``` lonely **bold**\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;245ma``b\x1b[39m and ``` lonely \x1b[1mbold\x1b[22m\n",
+        "\x1b[38;5;255ma``b\x1b[39m and ``` lonely \x1b[1mbold\x1b[22m\n",
         out.items,
     );
 }
@@ -1585,7 +1715,7 @@ test "numeric entities for control characters stay literal" {
 
     try processor.push(alloc, "x&#27;[2Ky &#x1b;[31m &#7; &#127;&#x9b; &#0; &#x41;\n", &out);
     try std.testing.expectEqualStrings("x&#27;[2Ky &#x1b;[31m &#7; &#127;&#x9b; \xef\xbf\xbd A\n", out.items);
-    try std.testing.expect(std.mem.indexOfScalar(u8, out.items, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, out.items, 0x1b) == null);
 }
 
 test "entity lookup is bounded and a long ampersand line renders in bounded time" {
@@ -1620,7 +1750,7 @@ test "code span content is not entity decoded but prose is" {
 
     try processor.push(alloc, "a &amp; b &lt;c&gt; &quot;d&quot; &#39;e&#39; &#x2192; `&amp;` &unknown; &amp\n", &out);
     try std.testing.expectEqualStrings(
-        "a & b <c> \"d\" 'e' \xe2\x86\x92 \x1b[38;5;245m&amp;\x1b[39m &unknown; &amp\n",
+        "a & b <c> \"d\" 'e' \xe2\x86\x92 \x1b[38;5;255m&amp;\x1b[39m &unknown; &amp\n",
         out.items,
     );
 }
@@ -1634,7 +1764,7 @@ test "heading strips emphasis markers around a multi backtick code span" {
 
     try processor.push(alloc, "## Run ``**raw**`` now\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[1mRun \x1b[38;5;245m**raw**\x1b[39m now\x1b[22m\n",
+        "\x1b[1mRun \x1b[38;5;255m**raw**\x1b[39m now\x1b[22m\n",
         out.items,
     );
 }
@@ -1647,7 +1777,7 @@ test "inline code backticks wrap with ANSI" {
     defer out.deinit(alloc);
 
     try processor.push(alloc, "run `zig build` now\n", &out);
-    try std.testing.expectEqualStrings("run \x1b[38;5;245mzig build\x1b[39m now\n", out.items);
+    try std.testing.expectEqualStrings("run \x1b[38;5;255mzig build\x1b[39m now\n", out.items);
 }
 
 test "inline code uses the selected light background" {
@@ -1661,7 +1791,7 @@ test "inline code uses the selected light background" {
     defer out.deinit(alloc);
 
     try processor.push(alloc, "run `zig build` now\n", &out);
-    try std.testing.expectEqualStrings("run \x1b[38;5;247mzig build\x1b[39m now\n", out.items);
+    try std.testing.expectEqualStrings("run \x1b[38;5;235mzig build\x1b[39m now\n", out.items);
 }
 
 test "stray asterisk between spaces stays literal" {
@@ -1694,7 +1824,7 @@ test "headings use level-specific ANSI styles" {
 
         try processor.push(alloc, case.input, &out);
         try std.testing.expectEqualStrings(case.expected, out.items);
-        try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[1;4m") == null);
+        try std.testing.expect(std.mem.find(u8, out.items, "\x1b[1;4m") == null);
     }
 }
 
@@ -1827,8 +1957,8 @@ test "definition state stops before a fenced code block" {
     );
     try processor.flushWithCompletions(alloc, &out, .{ .thematic_rule = &completion });
 
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[2m  \x1b[22maccepted\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\n: stale\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b[2m  \x1b[22maccepted\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\n: stale\n") != null);
 }
 
 test "definition state stops before a pipe table" {
@@ -1854,8 +1984,8 @@ test "definition state stops before a pipe table" {
     );
     try processor.flushWithCompletions(alloc, &out, .{ .thematic_rule = &completion });
 
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[2m  \x1b[22maccepted\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\n: stale\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b[2m  \x1b[22maccepted\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\n: stale\n") != null);
 }
 
 test "definition marker cannot skip a fenced code block" {
@@ -1881,8 +2011,8 @@ test "definition marker cannot skip a fenced code block" {
     );
     try processor.flushWithCompletions(alloc, &out, .{ .thematic_rule = &completion });
 
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "Status\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\n: stale\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "Status\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\n: stale\n") != null);
 }
 
 test "definition marker cannot skip a pipe table" {
@@ -1908,8 +2038,8 @@ test "definition marker cannot skip a pipe table" {
     );
     try processor.flushWithCompletions(alloc, &out, .{ .thematic_rule = &completion });
 
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "Status\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\n: stale\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "Status\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\n: stale\n") != null);
 }
 
 test "definition markers without a term stay literal" {
@@ -2093,7 +2223,7 @@ fn checkSetextLookaheadAllocationFailures(alloc: Allocator) !void {
 
 test "setext lookahead frees allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkSetextLookaheadAllocationFailures,
         .{},
     );
@@ -2130,7 +2260,7 @@ fn checkDefinitionListAllocationFailures(alloc: Allocator) !void {
 
 test "definition lists free allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkDefinitionListAllocationFailures,
         .{},
     );
@@ -2175,8 +2305,8 @@ test "table cell footnote references project deferred definitions" {
     );
     try processor.flush(alloc, &out);
 
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "[^state]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[2m[1] \x1b[22m") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "[^state]") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b[2m[1] \x1b[22m") != null);
     try std.testing.expect(std.mem.endsWith(
         u8,
         out.items,
@@ -2272,11 +2402,11 @@ test "escaped malformed and code footnote candidates remain literal" {
     );
     try processor.flush(alloc, &out);
 
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "[1]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "[^escaped]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "[^code]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "[^missing]:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "[^block]: literal code") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "[1]") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "[^escaped]") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "[^code]") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "[^missing]:") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "[^block]: literal code") != null);
 }
 
 fn checkFootnoteAllocationFailures(alloc: Allocator) !void {
@@ -2297,7 +2427,7 @@ fn checkFootnoteAllocationFailures(alloc: Allocator) !void {
 
 test "footnotes free allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkFootnoteAllocationFailures,
         .{},
     );
@@ -2390,8 +2520,8 @@ test "ordered list accepts paren markers and rejects long numbers" {
 
     try processor.push(alloc, "1) first\n12) twelfth\n1234567890. too long\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[2m1)\x1b[22m first\n" ++
-            "\x1b[2m12)\x1b[22m twelfth\n" ++
+        "  \x1b[2m1)\x1b[22m first\n" ++
+            " \x1b[2m12)\x1b[22m twelfth\n" ++
             "1234567890. too long\n",
         out.items,
     );
@@ -2457,7 +2587,7 @@ test "fenced code inside a list item drops the item indentation" {
 
     try processor.push(alloc, "1. step\n   ```sh\n   ls -la\n     nested\n   ```\n- next\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[2m1.\x1b[22m step\n" ++
+        "  \x1b[2m1.\x1b[22m step\n" ++
             "\x1b[2m\xe2\x94\x82 \x1b[22mls -la\n" ++
             "\x1b[2m\xe2\x94\x82 \x1b[22m  nested\n" ++
             "\x1b[2m\xe2\x80\xa2 \x1b[22mnext\n",
@@ -2474,7 +2604,7 @@ test "tab indented fence inside a list item closes on a tab indented fence" {
 
     try processor.push(alloc, "1. item\n\t```\n\tcode\n\t```\n\tprose after\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[2m1.\x1b[22m item\n" ++
+        "  \x1b[2m1.\x1b[22m item\n" ++
             "\x1b[2m\xe2\x94\x82 \x1b[22mcode\n" ++
             "\tprose after\n",
         out.items,
@@ -2538,6 +2668,22 @@ test "blockquote renders headings and list items inside the quote" {
     );
 }
 
+test "ordered lists inside a quote keep their markers as written" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "> 9. nine\n>    - child\n> 10. ten\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m9.\x1b[22m nine\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m   \x1b[2m\xe2\x80\xa2 \x1b[22mchild\n" ++
+            "\x1b[2m\xe2\x94\x82 \x1b[22m\x1b[2m10.\x1b[22m ten\n",
+        out.items,
+    );
+}
+
 test "literal bullet without trailing space stays prose" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
@@ -2557,7 +2703,132 @@ test "ordered list keeps number marker" {
     defer out.deinit(alloc);
 
     try processor.push(alloc, "1. step one\n", &out);
-    try std.testing.expectEqualStrings("\x1b[2m1.\x1b[22m step one\n", out.items);
+    try std.testing.expectEqualStrings("  \x1b[2m1.\x1b[22m step one\n", out.items);
+}
+
+test "ordered list markers end in one column through 999" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "9. nine\n10. ten\n100. hundred\n1000. thousand\n", &out);
+    try std.testing.expectEqualStrings(
+        "  \x1b[2m9.\x1b[22m nine\n" ++
+            " \x1b[2m10.\x1b[22m ten\n" ++
+            "\x1b[2m100.\x1b[22m hundred\n" ++
+            "\x1b[2m1000.\x1b[22m thousand\n",
+        out.items,
+    );
+}
+
+test "content nested in an ordered item moves with its padded marker" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(
+        alloc,
+        "1. Parent\n" ++
+            "   - child\n" ++
+            "   continuation\n" ++
+            "   > quoted\n" ++
+            "   lazy\n" ++
+            "\n" ++
+            "   after blank\n" ++
+            "   1. nested\n" ++
+            "      - grandchild\n" ++
+            "after list\n" ++
+            "   indented prose\n",
+        &out,
+    );
+    try std.testing.expectEqualStrings(
+        "  \x1b[2m1.\x1b[22m Parent\n" ++
+            "     \x1b[2m\xe2\x80\xa2 \x1b[22mchild\n" ++
+            "     continuation\n" ++
+            "     \x1b[2m\xe2\x94\x82 \x1b[22mquoted\n" ++
+            "     \x1b[2m\xe2\x94\x82 \x1b[22m   lazy\n" ++
+            "\n" ++
+            "     after blank\n" ++
+            "       \x1b[2m1.\x1b[22m nested\n" ++
+            "          \x1b[2m\xe2\x80\xa2 \x1b[22mgrandchild\n" ++
+            "after list\n" ++
+            "   indented prose\n",
+        out.items,
+    );
+}
+
+test "flushing assistant text closes open ordered items" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    try processor.push(alloc, "1. item\n", &out);
+    try processor.flush(alloc, &out);
+    try processor.push(alloc, "   prose\n", &out);
+    try std.testing.expectEqualStrings("  \x1b[2m1.\x1b[22m item\n   prose\n", out.items);
+}
+
+const fuzz_markdown_list_pieces = [_][]const u8{
+    "1. ",   "9. ",      "10. ",  "100) ", "1000. ", "123456789. ", "1234567890. ", "1.",
+    "- ",    "* ",       "+ ",    "[x] ",  "[ ] ",   " ",           "   ",          "    ",
+    "\t",    "\n",       "\n\n",  "\r\n",  "> ",     ">> ",         "```",          "~~~",
+    "|a|\n", "---\n",    "===\n", "# ",    "[^1]: ", ": ",          "word",         "**b**",
+    "`c`",   "\u{754c}",
+};
+
+/// Open items nest strictly inward, and each level pads by at most two.
+fn expectOpenOrderedItemsNested(processor: *const MarkdownProcessor) !void {
+    const items = processor.open_ordered_items.items;
+    for (items, 0..) |item, i| {
+        try std.testing.expect(item.shift <= 2 * (i + 1));
+        if (i == 0) continue;
+        try std.testing.expect(items[i - 1].content_column < item.content_column);
+        try std.testing.expect(items[i - 1].shift <= item.shift);
+    }
+}
+
+fn fuzzMarkdownLists(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(alloc);
+    for (0..smith.valueRangeAtMost(u8, 0, 64)) |_| {
+        try source.appendSlice(alloc, fuzz_markdown_list_pieces[smith.index(fuzz_markdown_list_pieces.len)]);
+    }
+
+    var whole = MarkdownProcessor{};
+    defer whole.deinit(alloc);
+    var whole_out: std.ArrayList(u8) = .empty;
+    defer whole_out.deinit(alloc);
+    try whole.push(alloc, source.items, &whole_out);
+    try expectOpenOrderedItemsNested(&whole);
+    try whole.flush(alloc, &whole_out);
+    try std.testing.expectEqual(@as(usize, 0), whole.open_ordered_items.items.len);
+
+    var split = MarkdownProcessor{};
+    defer split.deinit(alloc);
+    var split_out: std.ArrayList(u8) = .empty;
+    defer split_out.deinit(alloc);
+    var start: usize = 0;
+    while (start < source.items.len) {
+        const len: usize = smith.valueRangeAtMost(u16, 1, @intCast(source.items.len - start));
+        try split.push(alloc, source.items[start..][0..len], &split_out);
+        try expectOpenOrderedItemsNested(&split);
+        start += len;
+    }
+    try split.flush(alloc, &split_out);
+    try std.testing.expectEqualStrings(whole_out.items, split_out.items);
+}
+
+test "Markdown lists render the same however assistant text is split" {
+    try std.testing.fuzz({}, fuzzMarkdownLists, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").markdown_lists.*),
+    });
 }
 
 test "task list items render static pending and completed markers" {
@@ -2593,8 +2864,8 @@ test "ordered task list items retain their number markers" {
 
     try processor.push(alloc, "1. [ ] first\n2. [X] done\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[2m1.\x1b[22m \x1b[2m\xe2\x98\x90 \x1b[22mfirst\n" ++
-            "\x1b[2m2.\x1b[22m \x1b[38;5;252m\xe2\x9c\x93\x1b[39m done\n",
+        "  \x1b[2m1.\x1b[22m \x1b[2m\xe2\x98\x90 \x1b[22mfirst\n" ++
+            "  \x1b[2m2.\x1b[22m \x1b[38;5;252m\xe2\x9c\x93\x1b[39m done\n",
         out.items,
     );
 }
@@ -2678,9 +2949,9 @@ test "lazy blockquote continuations retain inline links" {
     defer out.deinit(alloc);
 
     try processor.push(alloc, "> source\nlazy [link](https://example.com/lazy)\n", &out);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\n\x1b[2m\xe2\x94\x82 \x1b[22mlazy ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b]8;id=fx-") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "https://example.com/lazy") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\n\x1b[2m\xe2\x94\x82 \x1b[22mlazy ") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;id=fx-") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "https://example.com/lazy") != null);
 }
 
 test "lazy blockquotes stop before structural rows and preserve EOF backslashes" {
@@ -3115,10 +3386,10 @@ test "indented code requires a blank boundary and yields to list and lazy quote 
     );
 
     try std.testing.expect(capture.block == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "    continuation") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "   three spaces") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[2m\xe2\x94\x82 \x1b[22m    lazy continuation") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[2m\xe2\x94\x82 \x1b[22m- list item") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "    continuation") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "   three spaces") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b[2m\xe2\x94\x82 \x1b[22m    lazy continuation") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b[2m\xe2\x94\x82 \x1b[22m- list item") == null);
 }
 
 test "reset clears an unfinished indented code block" {
@@ -3139,7 +3410,7 @@ test "reset clears an unfinished indented code block" {
 }
 
 test "code block payload clone frees language if code allocation fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var source = CodeBlockPayload{
         .language = try alloc.dupe(u8, "zig"),
         .code = try alloc.dupe(u8, "const value = 1;\n"),
@@ -3207,7 +3478,7 @@ test "line intake buffers partial lines and preserves standalone carriage return
     try processor.push(alloc, "run `zig", &out);
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
     try processor.push(alloc, " build` now\n", &out);
-    try std.testing.expectEqualStrings("run \x1b[38;5;245mzig build\x1b[39m now\n", out.items);
+    try std.testing.expectEqualStrings("run \x1b[38;5;255mzig build\x1b[39m now\n", out.items);
 
     out.clearRetainingCapacity();
     try processor.push(alloc, "left\rright\n", &out);
@@ -3276,8 +3547,8 @@ test "emphasis pairs by the delimiter stack and unmatched runs stay literal" {
             "\x1b[1mbold\x1b[22m then **open\n" ++
             "\x1b[9mgone\x1b[29m and ~~stays\n" ++
             "a ` b \x1b[1mbold\x1b[22m\n" ++
-            "\x1b[1mbold with \x1b[38;5;245mcode\x1b[39m inside\x1b[22m \x1b[3mit\x1b[23m\n" ++
-            "\x1b[3m\x1b[1mboth\x1b[22m\x1b[23m and \x1b[1m\x1b[38;5;245mcode\x1b[39m\x1b[22m\n" ++
+            "\x1b[1mbold with \x1b[38;5;255mcode\x1b[39m inside\x1b[22m \x1b[3mit\x1b[23m\n" ++
+            "\x1b[3m\x1b[1mboth\x1b[22m\x1b[23m and \x1b[1m\x1b[38;5;255mcode\x1b[39m\x1b[22m\n" ++
             "See \x1b[3mitalic\x1b[23m* plain\n" ++
             "text **** here \x1b[1mbold\x1b[22m and ~~~~ then \x1b[9mgone\x1b[29m and *** end\n" ++
             "\x1b[1ma \x1b[1mb\x1b[22m\x1b[1m c\x1b[22m and \x1b[3mx \x1b[3my\x1b[23m\x1b[3m z\x1b[23m\n" ++
@@ -3296,20 +3567,20 @@ test "emphasis lookahead agrees with links, code spans, and bare URLs" {
     // A backtick inside link text is not a code opener and a star inside a
     // code span is not a closer.
     try processor.push(alloc, "[use `](https://example.com) **bold** `code`\n[use `](https://example.com) *open `code*`\n", &out);
-    try std.testing.expect(std.mem.endsWith(u8, tu.nthLine(out.items, 0).?, " \x1b[1mbold\x1b[22m \x1b[38;5;245mcode\x1b[39m"));
-    try std.testing.expect(std.mem.endsWith(u8, tu.nthLine(out.items, 1).?, " *open \x1b[38;5;245mcode*\x1b[39m"));
+    try std.testing.expect(std.mem.endsWith(u8, tu.nthLine(out.items, 0).?, " \x1b[1mbold\x1b[22m \x1b[38;5;255mcode\x1b[39m"));
+    try std.testing.expect(std.mem.endsWith(u8, tu.nthLine(out.items, 1).?, " *open \x1b[38;5;255mcode*\x1b[39m"));
 
     // Emphasis around a multi backtick code span still pairs.
     out.clearRetainingCapacity();
     try processor.push(alloc, "See _a ``b`c`` d_ end\n", &out);
-    try std.testing.expectEqualStrings("See \x1b[3ma \x1b[38;5;245mb`c\x1b[39m d\x1b[23m end\n", out.items);
+    try std.testing.expectEqualStrings("See \x1b[3ma \x1b[38;5;255mb`c\x1b[39m d\x1b[23m end\n", out.items);
 
     // URL punctuation is never read as markup, and a delimiter that ends a
     // URL still closes the span around it.
     out.clearRetainingCapacity();
     try processor.push(alloc, "https://example.com/`x*y` **bold** `code`\n", &out);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, ";https://example.com/`x*y`\x1b\\") != null);
-    try std.testing.expect(std.mem.endsWith(u8, out.items, " \x1b[1mbold\x1b[22m \x1b[38;5;245mcode\x1b[39m\n"));
+    try std.testing.expect(std.mem.find(u8, out.items, ";https://example.com/`x*y`\x1b\\") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out.items, " \x1b[1mbold\x1b[22m \x1b[38;5;255mcode\x1b[39m\n"));
     // A trailing delimiter is trimmed from the URL and closes the span.
     out.clearRetainingCapacity();
     try processor.push(alloc, "*see https://example.com/a* and `code`\n", &out);
@@ -3317,7 +3588,7 @@ test "emphasis lookahead agrees with links, code spans, and bare URLs" {
     try std.testing.expect(std.mem.endsWith(
         u8,
         out.items,
-        ";https://example.com/a\x1b\\\x1b[4mhttps://example.com/a\x1b[24m\x1b]8;;\x1b\\\x1b[23m and \x1b[38;5;245mcode\x1b[39m\n",
+        ";https://example.com/a\x1b\\\x1b[38;5;75m\x1b[4mhttps://example.com/a\x1b[24m\x1b[39m\x1b]8;;\x1b\\\x1b[23m and \x1b[38;5;255mcode\x1b[39m\n",
     ));
     // Like a GFM autolink, a URL extends to the next whitespace regardless of
     // active styles, so interior punctuation belongs to the URL and the rest
@@ -3325,8 +3596,8 @@ test "emphasis lookahead agrees with links, code spans, and bare URLs" {
     out.clearRetainingCapacity();
     try processor.push(alloc, "*https://example.com/a*`some code` **bold** `x`\n", &out);
     try std.testing.expect(std.mem.startsWith(u8, out.items, "*\x1b]8;"));
-    try std.testing.expect(std.mem.indexOf(u8, out.items, ";https://example.com/a*`some\x1b\\") != null);
-    try std.testing.expect(std.mem.endsWith(u8, out.items, " code\x1b[38;5;245m**bold**\x1b[39mx`\n"));
+    try std.testing.expect(std.mem.find(u8, out.items, ";https://example.com/a*`some\x1b\\") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out.items, " code\x1b[38;5;255m**bold**\x1b[39mx`\n"));
     out.clearRetainingCapacity();
     try processor.push(alloc, "text **** https://example.com\n", &out);
     try std.testing.expect(std.mem.startsWith(u8, out.items, "text **** \x1b]8;"));
@@ -3408,7 +3679,7 @@ test "long lines of unmatched or unbalanced delimiters render in linear time" {
     const residual_started = io_mod.nanoTimestamp();
     try processor.push(alloc, line.items, &out);
     try std.testing.expect(@divTrunc(io_mod.nanoTimestamp() - residual_started, std.time.ns_per_ms) < 500);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[3mb c\x1b[23m_ ") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b[3mb c\x1b[23m_ ") != null);
     for (shapes) |shape| {
         out.clearRetainingCapacity();
         line.clearRetainingCapacity();
@@ -3430,7 +3701,7 @@ test "header with inline markdown" {
     defer out.deinit(alloc);
 
     try processor.push(alloc, "## Using `fx` in CI\n", &out);
-    try std.testing.expectEqualStrings("\x1b[1mUsing \x1b[38;5;245mfx\x1b[39m in CI\x1b[22m\n", out.items);
+    try std.testing.expectEqualStrings("\x1b[1mUsing \x1b[38;5;255mfx\x1b[39m in CI\x1b[22m\n", out.items);
 }
 
 test "inline code ignores bold markers inside" {
@@ -3441,7 +3712,7 @@ test "inline code ignores bold markers inside" {
     defer out.deinit(alloc);
 
     try processor.push(alloc, "use `**literal**` here\n", &out);
-    try std.testing.expectEqualStrings("use \x1b[38;5;245m**literal**\x1b[39m here\n", out.items);
+    try std.testing.expectEqualStrings("use \x1b[38;5;255m**literal**\x1b[39m here\n", out.items);
 }
 
 test "pipe table header separator has junction aligned with column pipes" {
@@ -3481,8 +3752,8 @@ test "single-column pipe table has no junction on separator" {
     try processor.push(alloc, input, &out);
     try processor.flush(alloc, &out);
 
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\xe2\x94\xbc") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\xe2\x94\xbc") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80") != null);
 }
 
 test "pipe table with markdown in cells aligns dividers across all rows" {
@@ -3540,8 +3811,8 @@ test "three-column pipe table aligns junctions with every column pipe" {
 
     const expected_separator =
         "\xe2\x94\x80\xe2\x94\x80\xe2\x94\xbc\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\xbc\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\n";
-    try std.testing.expect(std.mem.indexOf(u8, out.items, expected_separator) != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "1 \xe2\x94\x82 22 \xe2\x94\x82 333\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, expected_separator) != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "1 \xe2\x94\x82 22 \xe2\x94\x82 333\n") != null);
 }
 
 test "pipe table without separator falls back to plain lines" {
@@ -3591,9 +3862,9 @@ test "borderless GFM table (no leading/trailing pipes) is detected and rendered"
     try processor.push(alloc, input, &out);
     try processor.flush(alloc, &out);
 
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\xe2\x94\x82") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\xe2\x94\xbc") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\x1b[1mName\x1b[22m") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\xe2\x94\x82") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\xe2\x94\xbc") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\x1b[1mName\x1b[22m") != null);
 }
 
 test "borderless separator with spaces around pipe is accepted" {
@@ -3610,8 +3881,8 @@ test "borderless separator with spaces around pipe is accepted" {
     try processor.push(alloc, input, &out);
     try processor.flush(alloc, &out);
 
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\xe2\x94\x82") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\xe2\x94\xbc") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\xe2\x94\x82") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\xe2\x94\xbc") != null);
 }
 
 test "paragraph with single inline pipe falls back to plain (no separator)" {
@@ -3626,9 +3897,9 @@ test "paragraph with single inline pipe falls back to plain (no separator)" {
         "Then review the output.\n";
     try processor.push(alloc, input, &out);
 
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\xe2\x94\x82") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "Use cmd | grep foo") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "Then review the output.") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\xe2\x94\x82") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "Use cmd | grep foo") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "Then review the output.") != null);
 }
 
 test "header with nested **bold** stays fully bold across the whole line" {
@@ -3651,7 +3922,7 @@ test "header keeps italic and code inline" {
 
     try processor.push(alloc, "# *note* about `fx`\n", &out);
     try std.testing.expectEqualStrings(
-        "\x1b[1m\x1b[4m\x1b[3mnote\x1b[23m about \x1b[38;5;245mfx\x1b[39m\x1b[24m\x1b[22m\n",
+        "\x1b[1m\x1b[4m\x1b[3mnote\x1b[23m about \x1b[38;5;255mfx\x1b[39m\x1b[24m\x1b[22m\n",
         out.items,
     );
 }
@@ -3741,8 +4012,8 @@ test "horizontal rule with asterisks and spaces also renders" {
     defer out.deinit(alloc);
 
     try processor.push(alloc, "* * *\n", &out);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, table_horiz) != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "*") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, table_horiz) != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "*") == null);
 }
 
 test "hyphen-space line is a list, not a rule" {
@@ -3753,8 +4024,8 @@ test "hyphen-space line is a list, not a rule" {
     defer out.deinit(alloc);
 
     try processor.push(alloc, "- item\n", &out);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\xe2\x80\xa2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\xe2\x94\x80") == null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\xe2\x80\xa2") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "\xe2\x94\x80") == null);
 }
 
 test "nested unordered list preserves indent" {
@@ -3776,7 +4047,7 @@ test "nested ordered list preserves indent" {
     defer out.deinit(alloc);
 
     try processor.push(alloc, "    1. sub-step\n", &out);
-    try std.testing.expectEqualStrings("    \x1b[2m1.\x1b[22m sub-step\n", out.items);
+    try std.testing.expectEqualStrings("      \x1b[2m1.\x1b[22m sub-step\n", out.items);
 }
 
 test "right-aligned GFM column pads cell on the left" {
@@ -3793,7 +4064,7 @@ test "right-aligned GFM column pads cell on the left" {
     try processor.push(alloc, input, &out);
     try processor.flush(alloc, &out);
 
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "    5\n") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "    5\n") != null);
 }
 
 test "center-aligned GFM column pads both sides" {
@@ -3810,7 +4081,7 @@ test "center-aligned GFM column pads both sides" {
     try processor.push(alloc, input, &out);
     try processor.flush(alloc, &out);
 
-    try std.testing.expect(std.mem.indexOf(u8, out.items, " ok \n") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, " ok \n") != null);
 }
 
 test "pipe table parsing retains styled cells alignment and ragged rows" {
@@ -3848,6 +4119,6 @@ test "pipe table inside code block stays literal" {
         "```\n";
     try processor.push(alloc, input, &out);
 
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "| not | a |") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "| table | really |") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "| not | a |") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "| table | really |") != null);
 }

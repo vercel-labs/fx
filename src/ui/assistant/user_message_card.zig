@@ -9,25 +9,27 @@ const vt_emulator = @import("../../core/terminal/engine.zig");
 
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 
+const shared_theme = @import("../../core/shared/theme.zig");
+
 const reset_style = "\x1b[0m";
 const prompt_text_style = "\x1b[1m";
 const restore_prompt_text_style = reset_style ++ prompt_text_style;
 const user_turn_rail = "┃";
-const dark_marker_style = "\x1b[38;5;255m";
-const light_marker_style = "\x1b[38;5;235m";
 const osc8_prefix = "\x1b]8;;";
 const osc8_terminator = "\x1b\\";
 const osc8_close = osc8_prefix ++ osc8_terminator;
 
-const accent_dark = "\x1b[38;5;252m";
-const accent_light = "\x1b[38;5;238m";
-var accent_style: []const u8 = accent_dark;
+var accent_style: []const u8 = shared_theme.fx_dark.user_card_accent_style;
 
-var marker_style: []const u8 = dark_marker_style;
+var marker_style: []const u8 = shared_theme.fx_dark.user_card_marker_style;
 
-pub fn setStyle(light: bool, _: ?Rgb) void {
-    marker_style = if (light) light_marker_style else dark_marker_style;
-    accent_style = if (light) accent_light else accent_dark;
+pub fn setStyle(light: bool, terminal_bg: ?Rgb) void {
+    applyTheme(shared_theme.builtin(light), terminal_bg);
+}
+
+pub fn applyTheme(theme: shared_theme.Theme, _: ?Rgb) void {
+    marker_style = theme.user_card_marker_style;
+    accent_style = theme.user_card_accent_style;
 }
 
 pub fn promptMarkerStyle() []const u8 {

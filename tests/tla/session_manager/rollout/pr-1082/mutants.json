@@ -1,0 +1,16 @@
+[
+  {
+    "module": "PR1082Commands",
+    "description": "Listing exposes children",
+    "old": "listed' = (indexed \\cap live) \\ (Children \\cup deleted)",
+    "new": "listed' = (indexed \\cap live) \\ deleted",
+    "invariant": "ListedRootsExist"
+  },
+  {
+    "module": "PR1082Commands",
+    "description": "Recovery truncates its source",
+    "old": "counts' = [counts EXCEPT ![t] = counts[s]]",
+    "new": "counts' = [counts EXCEPT ![t] = counts[s], ![s] = 0]",
+    "invariant": "RecoveryKeepsSource"
+  }
+]

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -80,6 +81,9 @@ pub const PendingSkillRefresh = enum {
 
 pub const State = struct {
     pending: ?PendingSubmission = null,
+    /// The prompt from `fx "<prompt>"`, sent once the first frame is on
+    /// screen. Owned by the app allocator.
+    launch_prompt: ?[]u8 = null,
     retry_after_auth: bool = false,
     compaction_pending: bool = false,
     /// Identity only; auth retains its existing pending execution flag.
@@ -307,6 +311,45 @@ pub fn SubmitRuntime(comptime App: type) type {
             };
         }
 
+        /// Sends the `fx "<prompt>"` prompt once the first frame is on screen,
+        /// through the same path as typing it and pressing Enter.
+        pub fn collectLaunchPromptFacts(app: *App, max_prompt_history: usize) !void {
+            if (comptime !@hasField(App, "submission")) return;
+            const prompt = app.submission.launch_prompt orelse return;
+            if (app.shell.render_requests.hasReason(.first_frame)) return;
+            // Typed input waits out a live session switch; so does this.
+            if (comptime @hasField(App, "session_persistence")) {
+                if (app.session_persistence.pending_live_session_policy != null) return;
+            }
+            app.submission.launch_prompt = null;
+            defer app.alloc.free(prompt);
+            if (app.input_runtime.edit_state.input.items.len != 0) {
+                debug_trace.logf(
+                    "input",
+                    "event=launch_prompt_dropped reason=composer_not_empty prompt_bytes={d}",
+                    .{prompt.len},
+                );
+                return;
+            }
+            debug_trace.logf("input", "event=launch_prompt_submit prompt_bytes={d}", .{prompt.len});
+            try app.input_runtime.edit_state.setText(app.alloc, prompt);
+            try submit(app, max_prompt_history);
+        }
+
+        /// Frees a launch prompt that was never sent, such as when fx exits
+        /// before its first frame.
+        pub fn discardLaunchPrompt(app: *App, reason: []const u8) void {
+            if (comptime !@hasField(App, "submission")) return;
+            const prompt = app.submission.launch_prompt orelse return;
+            app.submission.launch_prompt = null;
+            debug_trace.logf(
+                "input",
+                "event=launch_prompt_dropped reason={s} prompt_bytes={d}",
+                .{ reason, prompt.len },
+            );
+            app.alloc.free(prompt);
+        }
+
         pub fn collectPendingSubmissionFacts(app: *App) void {
             if (comptime !@hasField(App, "submission")) return;
             collect_context_compaction(app);
@@ -437,6 +480,10 @@ pub fn SubmitRuntime(comptime App: type) type {
                 if (comptime !@hasDecl(@TypeOf(app.worker), "removeQueuedPrompt")) {
                     return false;
                 }
+                const carried_stale_note = if (comptime @hasDecl(@TypeOf(app.worker), "queuedPromptCarriesStaleShellHandles"))
+                    app.worker.queuedPromptCarriesStaleShellHandles(pending.draft.turn_id)
+                else
+                    false;
                 if (!app.worker.removeQueuedPrompt(
                     std.heap.c_allocator,
                     pending.draft.turn_id,
@@ -466,6 +513,13 @@ pub fn SubmitRuntime(comptime App: type) type {
                         .{@tagName(pending.phase)},
                     );
                     return false;
+                }
+                // The removed prompt never ran, so the next one tells the
+                // model its earlier shell handles are gone.
+                if (carried_stale_note) {
+                    if (comptime @hasField(App, "session") and @hasDecl(@TypeOf(app.session), "returnStaleShellHandles")) {
+                        app.session.returnStaleShellHandles(pending.draft.turn_id);
+                    }
                 }
             }
             clearPendingSubmission(app, "ctrl_c_pending_submission");
@@ -575,8 +629,7 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         fn finishPendingSubmissionFailure(app: *App, err: anyerror) void {
             const turn_id = app.submission.pending.?.draft.turn_id;
-            const body = std.fmt.allocPrint(
-                app.alloc,
+            const body = app.alloc.print(
                 "failed to submit prompt after presentation ({s})",
                 .{@errorName(err)},
             ) catch |notice_err| {
@@ -708,7 +761,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             const left_trimmed = std.mem.trimStart(u8, expanded.text, " \t\r\n");
             const resolved_slash_submission = resolvedSlashSubmission(app, left_trimmed);
             if (knownSlashCommand(app, resolved_slash_submission)) |command| {
-                if (requiresPromptCredential(command, resolved_slash_submission) and !try preflightPrompt(app)) return;
+                if (requiresPromptCredential(command, resolved_slash_submission) and !try preflightQueuedPrompt(app)) return;
                 try submitSlashCommand(app, left_trimmed, null, max_prompt_history);
                 return;
             }
@@ -725,7 +778,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             )) |command_start| {
                 const command_text = expanded.text[command_start..];
                 if (knownSlashCommand(app, command_text)) |command| {
-                    if (requiresPromptCredential(command, command_text) and !try preflightPrompt(app)) return;
+                    if (requiresPromptCredential(command, command_text) and !try preflightQueuedPrompt(app)) return;
                     try submitSlashCommand(
                         app,
                         command_text,
@@ -769,7 +822,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     error.UnsupportedImageType => try app.alloc.dupe(u8, "unsupported image type"),
                     error.FileNotFound => try app.alloc.dupe(u8, "image file not found"),
                     error.ImageTooLarge => try app.alloc.dupe(u8, image_attachments.image_too_large_notice),
-                    else => try std.fmt.allocPrint(app.alloc, "failed to attach image: {s}", .{@errorName(err)}),
+                    else => try app.alloc.print("failed to attach image: {s}", .{@errorName(err)}),
                 };
                 defer app.alloc.free(message);
                 try app.writeDomainNotice(.{
@@ -905,6 +958,17 @@ pub fn SubmitRuntime(comptime App: type) type {
             return true;
         }
 
+        /// A prompt that queues behind active work, or a command that needs a
+        /// credential, must not wait on a credential refresh: the input loop
+        /// would freeze until the network answers. The turn's worker, or the
+        /// command's own background lookup, renews a due token.
+        fn preflightQueuedPrompt(app: *App) !bool {
+            if (comptime @hasDecl(App, "admitQueuedPromptCredential")) {
+                return App.admitQueuedPromptCredential(app);
+            }
+            return preflightPrompt(app);
+        }
+
         fn pendingAuthRoutesLocalCommand(app: *App) bool {
             const input = std.mem.trimStart(
                 u8,
@@ -925,9 +989,9 @@ pub fn SubmitRuntime(comptime App: type) type {
 
         fn shouldRouteUnknownSlashCommand(app: *App, text: []const u8) bool {
             if (text.len == 0 or text[0] != '/') return false;
-            const command_end = std.mem.indexOfAny(u8, text, " \t\r\n") orelse text.len;
+            const command_end = std.mem.findAny(u8, text, " \t\r\n") orelse text.len;
             if (command_end != text.len) return false;
-            if (std.mem.indexOfScalar(u8, text[1..command_end], '/') != null) return false;
+            if (std.mem.findScalar(u8, text[1..command_end], '/') != null) return false;
             if (app.input_runtime.picker.isInlinePickerDismissed(.slash)) return false;
             if (app.input_runtime.picker.inlinePickerTriggerKind(&app.input_runtime.edit_state) != .slash) return false;
             return completion_rt.slashCompletionCandidateCount(app) == 0;
@@ -1094,11 +1158,19 @@ pub fn SubmitRuntime(comptime App: type) type {
             prompt: []const u8,
             skill_tokens: []const registered_entities.SkillTokenSpan,
         ) !PromptAdmission {
+            // Sending a prompt loads an MCP config changed outside this
+            // session, then clears the MCP notices the user has seen. What a
+            // load just brought, such as a server that needs a login, hasn't
+            // been seen yet, so it stays on the status line.
+            const mcp_loaded = if (comptime @hasDecl(App, "refreshMcpHostForPrompt")) app.refreshMcpHostForPrompt() else false;
+            if (comptime @hasField(App, "mcp") and @hasDecl(@FieldType(App, "mcp"), "dismissHostStatus")) {
+                if (!mcp_loaded) app.mcp.dismissHostStatus();
+            }
             switch (try installPendingSubmission(app, prompt, skill_tokens)) {
                 .installed => return .pending,
                 .unavailable => {},
             }
-            if (!try preflightPrompt(app)) return .rejected;
+            if (!try preflightQueuedPrompt(app)) return .rejected;
             const accepted = if (comptime @hasDecl(App, "enqueuePromptWithSkillBindings"))
                 try App.enqueuePromptWithSkillBindings(app, prompt, skill_tokens)
             else
@@ -1254,8 +1326,7 @@ pub fn SubmitRuntime(comptime App: type) type {
             if (outcome != .warning) return;
             const err = app.prompt_history.lastAppendError() orelse
                 error.PromptHistoryWriteFailed;
-            const notice = std.fmt.allocPrint(
-                app.alloc,
+            const notice = app.alloc.print(
                 "failed to save input history ({s}); submission continued",
                 .{@errorName(err)},
             ) catch |notice_err| {
@@ -2004,7 +2075,7 @@ fn checkPendingDraftConstructionAllocationFailure(alloc: std.mem.Allocator) !voi
 
 test "pending draft construction frees every partial allocation" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkPendingDraftConstructionAllocationFailure,
         .{},
     );
@@ -2206,6 +2277,7 @@ const PendingLifecycleFake = struct {
         held: bool = true,
         release_count: usize = 0,
         queued_turn_id: ?u64 = null,
+        queued_stale_shell_handles: bool = false,
         active_turn_id: u64 = 0,
         delete_count: usize = 0,
         cancel_count: usize = 0,
@@ -2214,6 +2286,10 @@ const PendingLifecycleFake = struct {
             if (!self.held) return;
             self.held = false;
             self.release_count += 1;
+        }
+
+        pub fn queuedPromptCarriesStaleShellHandles(self: *@This(), turn_id: u64) bool {
+            return self.queued_turn_id == turn_id and self.queued_stale_shell_handles;
         }
 
         pub fn removeQueuedPrompt(
@@ -2234,6 +2310,13 @@ const PendingLifecycleFake = struct {
 
         pub fn requestCancel(self: *@This()) void {
             self.cancel_count += 1;
+        }
+    } = .{},
+    session: struct {
+        returned_stale_note_turn: ?u64 = null,
+
+        pub fn returnStaleShellHandles(self: *@This(), turn_id: u64) void {
+            self.returned_stale_note_turn = turn_id;
         }
     } = .{},
     shell: struct {
@@ -2463,6 +2546,20 @@ test "Ctrl+C cancels pending ownership from every pre-worker phase" {
     try std.testing.expectEqual(@as(?u64, null), queued.worker.queued_turn_id);
     try std.testing.expectEqual(@as(usize, 1), queued.worker.delete_count);
     try std.testing.expectEqual(@as(usize, 1), queued.worker.release_count);
+}
+
+test "Ctrl+C on a queued prompt gives back the stale shell handles note it carried (D93)" {
+    const Runtime = SubmitRuntime(PendingLifecycleFake);
+    for ([_]bool{ true, false }) |carried| {
+        var app = try pendingLifecycleFake(std.testing.allocator, 806);
+        defer app.deinit();
+        Runtime.noteCommittedFrame(&app);
+        Runtime.collectPendingSubmissionFacts(&app);
+        app.worker.queued_stale_shell_handles = carried;
+        try std.testing.expect(Runtime.cancelPendingSubmission(&app));
+        try std.testing.expectEqual(@as(?u64, null), app.worker.queued_turn_id);
+        try std.testing.expectEqual(if (carried) @as(?u64, 806) else null, app.session.returned_stale_note_turn);
+    }
 }
 
 test "Ctrl+C requests cancellation after the pending turn leaves the queue" {

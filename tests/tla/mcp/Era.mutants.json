@@ -1,0 +1,74 @@
+[
+  {
+    "description": "A version the server keeps rejecting is probed a third time",
+    "old": "ELSE IF version \\in ModernVersions /\\ version \\in s /\\ tried[version] = 1",
+    "new": "ELSE IF version \\in ModernVersions /\\ version \\in s /\\ tried[version] >= 1",
+    "invariant": "ProbesBounded"
+  },
+  {
+    "description": "A server that answered like a modern one and then went quiet gets initialize",
+    "old": "    /\\ IF modernSeen /\\ Legacy \\notin advertised\n          THEN Fail /\\ UNCHANGED badFallback\n          ELSE StartInitialize(modernSeen, advertised)",
+    "new": "    /\\ StartInitialize(modernSeen, advertised)",
+    "invariant": "NoFallbackAfterModern"
+  },
+  {
+    "description": "-32020 or -32021 falls back to initialize",
+    "old": "ModernRejection ==\n    /\\ pending = \"discover\"\n    /\\ modernSeen' = TRUE\n    /\\ Fail\n    /\\ UNCHANGED <<advertised, process, lastMeta, processEra, flipped, initializedSent, badFallback, earlyOp, unlisted>>",
+    "new": "ModernRejection ==\n    /\\ pending = \"discover\"\n    /\\ modernSeen' = TRUE\n    /\\ StartInitialize(TRUE, advertised)\n    /\\ UNCHANGED <<advertised, process, lastMeta, processEra, flipped, initializedSent, earlyOp, unlisted>>",
+    "invariant": "NoFallbackAfterModern"
+  },
+  {
+    "description": "initialize is accepted whatever version the server answers with",
+    "old": "    /\\ IF v = Legacy\n          THEN /\\ state' = \"legacy\"",
+    "new": "    /\\ IF TRUE\n          THEN /\\ state' = \"legacy\"",
+    "invariant": "ChosenSupported"
+  },
+  {
+    "description": "notifications/initialized is never sent",
+    "old": "/\\ initializedSent' = initializedSent + 1",
+    "new": "/\\ initializedSent' = initializedSent",
+    "invariant": "LegacyOrder"
+  },
+  {
+    "description": "Operation requests go out while detection is still probing",
+    "old": "OperationSent ==\n    /\\ state \\in Ready",
+    "new": "OperationSent ==\n    /\\ state \\in Ready \\cup {\"probing\"}",
+    "invariant": "LegacyOrder"
+  },
+  {
+    "description": "Operation requests always carry the most preferred version, not the one chosen",
+    "old": "MetaFor == IF state = \"modern\" THEN version ELSE \"none\"",
+    "new": "MetaFor == IF state = \"modern\" THEN Preferred[1] ELSE \"none\"",
+    "invariant": "VersionOnEveryRequest"
+  },
+  {
+    "description": "A modern server that rejects every shared version mid-process is switched to initialize",
+    "old": "                  /\\ lastMeta' = \"unset\" /\\ UNCHANGED <<state, pending>>\n          ELSE Fail /\\ UNCHANGED lastMeta",
+    "new": "                  /\\ lastMeta' = \"unset\" /\\ UNCHANGED <<state, pending>>\n          ELSE IF Legacy \\in s THEN StartInitialize(TRUE, s) /\\ UNCHANGED lastMeta\n          ELSE Fail /\\ UNCHANGED lastMeta",
+    "invariant": "EraSticky"
+  },
+  {
+    "description": "A probe to a server that went quiet after a modern answer never ends",
+    "old": "          THEN Fail /\\ UNCHANGED badFallback\n          ELSE StartInitialize(modernSeen, advertised)",
+    "new": "          THEN FALSE\n          ELSE StartInitialize(modernSeen, advertised)",
+    "property": "ReachesEra"
+  },
+  {
+    "description": "An unanswered initialize never ends",
+    "old": "InitializeTimedOut ==\n    /\\ pending = \"initialize\"",
+    "new": "InitializeTimedOut ==\n    /\\ FALSE",
+    "property": "ReachesEra"
+  },
+  {
+    "description": "A server that doesn't implement discovery counts as having listed its versions",
+    "old": "    /\\ modernSeen' = TRUE\n    /\\ unlisted' = TRUE",
+    "new": "    /\\ modernSeen' = TRUE\n    /\\ unlisted' = FALSE",
+    "invariant": "ChosenSupported"
+  },
+  {
+    "description": "A server that doesn't implement discovery is served as legacy",
+    "old": "DiscoverNotImplemented ==\n    /\\ pending = \"discover\"\n    /\\ state' = \"modern\"",
+    "new": "DiscoverNotImplemented ==\n    /\\ pending = \"discover\"\n    /\\ state' = \"legacy\"",
+    "invariant": "LegacyOrder"
+  }
+]

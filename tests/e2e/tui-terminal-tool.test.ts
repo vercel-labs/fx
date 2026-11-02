@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -10,7 +11,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { rootSessionIds } from "./saved-sessions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -24,12 +26,10 @@ import {
 const TIMEOUT = 30_000;
 const sessions: TmuxSession[] = [];
 const roots: string[] = [];
-const homes: string[] = [];
 const gateways: Array<ReturnType<typeof startFakeGateway>> = [];
 
 afterEach(async () => {
   for (const session of sessions.splice(0)) await session.kill();
-  for (const home of homes.splice(0)) await cleanupTerminalHost(home);
   for (const gateway of gateways.splice(0)) gateway.stop();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -54,7 +54,6 @@ function createFixture(prefix: string) {
   writeFileSync(tracePath, "");
   writeFileSync(stderrPath, "");
   roots.push(root);
-  homes.push(home);
   return {
     root,
     home,
@@ -85,7 +84,6 @@ async function launch(
       FX_GATEWAY_CHAT_URL: gateway.chatUrl,
       FX_TRACE_LOG: fixture.tracePath,
       FX_TRACE_SCOPES: "shell,terminal,terminal_client,terminal_host,tool,agent",
-      FX_TERMINAL_HOST_IDLE_MS: "500",
     },
     width: 120,
     height: 32,
@@ -147,8 +145,10 @@ function schemaFromRequest(body: string): Record<string, unknown> {
   return shell.inputSchema as Record<string, unknown>;
 }
 
+/// Every hosted terminal's record; their state lives under `~/.fx/terminal`
+/// (D45).
 function terminalRecords(home: string): Array<Record<string, unknown>> {
-  const sessionsRoot = join(home, ".fx", "sessions");
+  const sessionsRoot = join(home, ".fx", "terminal");
   if (!existsSync(sessionsRoot)) return [];
   return readdirSync(sessionsRoot).flatMap((sessionId) => {
     const terminalRoot = join(sessionsRoot, sessionId, "terminal", "state");
@@ -161,20 +161,91 @@ function terminalRecords(home: string): Array<Record<string, unknown>> {
   });
 }
 
-async function cleanupTerminalHost(home: string): Promise<void> {
-  const identityPath = join(home, ".fx", "terminal-host-v7", "host.json");
-  const deadline = Date.now() + 3_000;
-  while (Date.now() < deadline) {
-    if (!existsSync(identityPath)) return;
-    await Bun.sleep(25);
-  }
+function askEnv(
+  fixture: ReturnType<typeof createFixture>,
+  gateway: ReturnType<typeof startFakeGateway>,
+): Record<string, string | undefined> {
+  return {
+    HOME: fixture.home,
+    SHELL: terminalFixtureShell(),
+    AI_GATEWAY_API_KEY: "fake-shell-tool-key",
+    VERCEL_OIDC_TOKEN: undefined,
+    FX_DISABLE_KEYCHAIN: "1",
+    FX_TEST_SKIP_ONBOARDING: "1",
+    FX_AUTO_UPGRADE: "0",
+    FX_PERMISSION_MODE: "yolo",
+    FX_MODEL: FAKE_GATEWAY_MODEL,
+    FX_GATEWAY_BASE_URL: gateway.baseUrl,
+    FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TRACE_LOG: fixture.tracePath,
+    FX_TRACE_SCOPES: "shell,terminal,terminal_client,terminal_host,terminal_store,shutdown",
+  };
+}
+
+function processAlive(pid: number): boolean {
   try {
-    const identity = JSON.parse(readFileSync(identityPath, "utf8"));
-    const pid = Number(identity.pid);
-    if (Number.isSafeInteger(pid) && pid > 0) process.kill(pid, "SIGTERM");
+    process.kill(pid, 0);
+    return true;
   } catch {
-    return;
+    return false;
   }
+}
+
+/** Pids of processes whose command line contains `fragment`. */
+function processesMatching(fragment: string, options: { exact?: boolean } = {}): number[] {
+  const listing = execFileSync("ps", ["-axo", "pid=,command="], { encoding: "utf8" });
+  return listing.split("\n").flatMap((line) => {
+    const match = line.trim().match(/^(\d+)\s+(.*)$/);
+    if (!match) return [];
+    const command = match[2]!.trim();
+    const matches = options.exact ? command === fragment : command.includes(fragment);
+    return matches ? [Number(match[1])] : [];
+  });
+}
+
+async function waitUntilGone(pids: number[], timeoutMs: number): Promise<number> {
+  const started = Date.now();
+  while (pids.some(processAlive)) {
+    if (Date.now() - started > timeoutMs) {
+      throw new Error(`processes still running after ${timeoutMs}ms: ${pids.filter(processAlive)}`);
+    }
+    await Bun.sleep(10);
+  }
+  return Date.now() - started;
+}
+
+function expectNoTerminalHostDaemon(fixture: ReturnType<typeof createFixture>): void {
+  expect(processesMatching(`${FX_BIN} --fx-internal-terminal-host`)).toEqual([]);
+  expect(existsSync(join(fixture.home, ".fx", "terminal-host-v7"))).toBe(false);
+}
+
+function terminalRecord(home: string, sessionId: string): Record<string, unknown> {
+  const record = terminalRecords(home).find((candidate) => candidate.session_id === sessionId);
+  if (!record) throw new Error(`missing terminal record ${sessionId}`);
+  return record;
+}
+
+/** The shell pid in a terminal record, or null before its launcher reports it. */
+function recordedPid(home: string, sessionId: string): number | null {
+  const pid = Number(terminalRecord(home, sessionId).pid);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+/** A running handle can return before the launcher records the shell pid. */
+async function waitForRecordedPid(home: string, sessionId: string): Promise<number> {
+  const started = Date.now();
+  while (Date.now() - started < TIMEOUT) {
+    const pid = recordedPid(home, sessionId);
+    if (pid !== null) return pid;
+    await Bun.sleep(10);
+  }
+  throw new Error(`terminal ${sessionId} never recorded its shell pid`);
+}
+
+function ttyRun(id: string, command: string, extra: Record<string, unknown> = {}) {
+  return fakeGatewayToolCall(id, "shell", {
+    request: { action: "run", command, profile: "clean", tty: true, ...extra },
+  });
 }
 
 async function waitForFile(path: string): Promise<void> {
@@ -222,11 +293,10 @@ test.skipIf(!tmuxAvailable())(
     expect(sessionId.length).toBeGreaterThan(0);
     expect(gateway.requests).toHaveLength(3);
     const schema = schemaFromRequest(gateway.requests[0]!.body);
-    const request = (schema.properties as Record<string, any>).request;
-    const actions = request.oneOf.map(
-      (branch: any) => branch.properties.action.enum[0],
-    );
-    expect(actions).toEqual(["run", "run", "interact", "stop"]);
+    const properties = schema.properties as Record<string, any>;
+    expect(properties.request).toBeUndefined();
+    expect(schema.required).toEqual(["action"]);
+    expect(properties.action.enum).toEqual(["run", "interact", "stop"]);
     expect(gateway.requests[0]!.body).not.toContain('"name":"terminal"');
     const runResult = toolResultEnvelope(
       gateway.requests[1]!.body,
@@ -355,7 +425,7 @@ test.skipIf(!tmuxAvailable())(
       "shell_stubborn_stop",
     );
     expect(stopResult).toContain('\\"state\\":\\"stopped\\"');
-    expect(stopResult).toContain('\\"termination_indeterminate\\":false');
+    expect(stopResult).not.toContain("termination_indeterminate");
     expect(toolResultEnvelope(
       gateway.requests[3]!.body,
       "shell_after_stop",
@@ -600,7 +670,6 @@ test.skipIf(!tmuxAvailable())(
         FX_GATEWAY_CHAT_URL: gateway.chatUrl,
         FX_TRACE_LOG: fixture.tracePath,
         FX_TRACE_SCOPES: "shell,terminal,terminal_client,terminal_host,tool,agent",
-        FX_TERMINAL_HOST_IDLE_MS: "500",
       },
       width: 160,
       height: 32,
@@ -624,6 +693,120 @@ test.skipIf(!tmuxAvailable())(
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   TIMEOUT,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "Ctrl-O shows session launch commands in full while the main view trails them",
+  async () => {
+    const fixture = createFixture("fx-shell-full-transcript-width-");
+    const words = Array.from({ length: 30 }, (_, index) => `word${index}`).join(" ");
+    const launchCommand = `echo ${words} FULL_LAUNCH_TAIL >/dev/null; sleep 60`;
+    let sessionId = "";
+    const gateway = startFakeGateway([
+      fakeGatewayToolCall("shell_full_width_run", "shell", {
+        request: {
+          action: "run",
+          command: launchCommand,
+          profile: "clean",
+          tty: true,
+          yield_time_ms: 0,
+        },
+      }),
+      (body) => {
+        sessionId = findSessionId(JSON.parse(body)) ?? "";
+        if (!sessionId) return new Response("missing session id", { status: 500 });
+        return fakeGatewayToolCall("shell_full_width_observe", "shell", {
+          request: { action: "interact", session_id: sessionId, chars: "" },
+        });
+      },
+      (body) => {
+        const id = sessionId || findSessionId(JSON.parse(body)) || "";
+        return fakeGatewayToolCall("shell_full_width_stop", "shell", {
+          request: { action: "stop", session_id: id },
+        });
+      },
+      fakeGatewayFinalText("FULL_WIDTH_FLOW_DONE"),
+    ]);
+    gateways.push(gateway);
+    const session = await TmuxSession.create({
+      isolated: true,
+      cwd: fixture.workspace,
+      env: {
+        HOME: fixture.home,
+        SHELL: terminalFixtureShell(),
+        AI_GATEWAY_API_KEY: "fake-shell-tool-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_PERMISSION_MODE: "yolo",
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      },
+      width: 100,
+      height: 72,
+      stderrPath: fixture.stderrPath,
+    });
+    sessions.push(session);
+    await session.waitForComposer(TIMEOUT);
+    await session.sendText("Run and observe the session.");
+    await session.waitForText("FULL_WIDTH_FLOW_DONE", TIMEOUT);
+    await Bun.sleep(300);
+
+    // The main view keeps each row on one line and trails what does not fit.
+    const mainRows = (await session.capturePaneGrid()).map((line) => line.trimEnd());
+    const mainObserved = mainRows.find((line) => line.startsWith("├ Observed "));
+    expect(mainObserved).toBeDefined();
+    expect(mainObserved).toEndWith("…");
+    expect(mainRows.join("\n")).not.toContain("FULL_LAUNCH_TAIL");
+
+    // `interact` carries no command argument, so the Observed heading is the
+    // only place Ctrl-O can show the launch command. It must wrap under the
+    // tree rail instead of trailing. Heading continuations start "│ word";
+    // detail rows start "│  key: value".
+    const fullObservedHeading = (grid: string[]) => {
+      const rows = grid.map((line) => line.trimEnd());
+      const start = rows.findIndex((line) => line.startsWith("├ Observed "));
+      if (start < 0) return null;
+      const parts = [rows[start]!.slice("├ ".length)];
+      for (const line of rows.slice(start + 1)) {
+        if (!line.startsWith("│ ") || line.startsWith("│  ")) break;
+        parts.push(line.slice("│ ".length));
+      }
+      return parts.join(" ");
+    };
+    const expectedHeading = `Observed ${launchCommand}`;
+    const settledFullGrid = async () => {
+      const deadline = Date.now() + TIMEOUT;
+      let grid = await session.capturePaneGrid();
+      while (fullObservedHeading(grid) !== expectedHeading && Date.now() < deadline) {
+        await Bun.sleep(50);
+        grid = await session.capturePaneGrid();
+      }
+      return grid;
+    };
+    await session.sendKeys("C-o");
+    await session.waitForText("full detail · ctrl+o close", TIMEOUT);
+    let grid = await settledFullGrid();
+    expect(fullObservedHeading(grid)).toBe(expectedHeading);
+    expect(grid.join("\n")).toContain("action: interact");
+    expect(grid.join("\n")).not.toContain("…");
+
+    await session.resizeWindow(60, 72);
+    grid = await settledFullGrid();
+    expect(fullObservedHeading(grid)).toBe(expectedHeading);
+    expect(grid.join("\n")).not.toContain("…");
+
+    // Closing Ctrl-O returns to the trailing main view and leaks none of the
+    // full-detail rows into scrollback.
+    await session.sendKeys("C-o");
+    await session.waitForPane((pane) => !pane.includes("full detail · ctrl+o close"), TIMEOUT);
+    const scrollback = await session.captureFullScrollback();
+    expect(scrollback).toContain("├ Observed echo word0");
+    expect(scrollback).not.toContain("FULL_LAUNCH_TAIL");
+    expect(scrollback).not.toContain("action: interact");
+    expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+  },
+  TIMEOUT * 2,
 );
 
 test.skipIf(!tmuxAvailable())(
@@ -674,7 +857,6 @@ test.skipIf(!tmuxAvailable())(
         FX_GATEWAY_CHAT_URL: gateway.chatUrl,
         FX_TRACE_LOG: fixture.tracePath,
         FX_TRACE_SCOPES: "shell,terminal,terminal_client,terminal_host,tool,agent",
-        FX_TERMINAL_HOST_IDLE_MS: "500",
         PS1: "RESUME_SHELL> ",
       },
       width: 160,
@@ -689,10 +871,7 @@ test.skipIf(!tmuxAvailable())(
     await session.sendText("/quit");
     await session.waitForText("RESUME_SHELL>", TIMEOUT);
 
-    const sessionsRoot = join(fixture.home, ".fx", "sessions");
-    const fxSessionIds = readdirSync(sessionsRoot, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && entry.name !== "latest")
-      .map((entry) => entry.name);
+    const fxSessionIds = rootSessionIds(fixture.home);
     expect(fxSessionIds).toHaveLength(1);
 
     await session.sendText(`${FX_BIN} --resume ${fxSessionIds[0]} 2>>${fixture.stderrPath}`);
@@ -875,7 +1054,7 @@ test.skipIf(!tmuxAvailable())(
     );
     expect(waitResult).toContain('\\"state\\":\\"completed\\"');
     expect(waitResult).toContain('\\"error\\":\\"TimeoutExpired\\"');
-    expect(waitResult).toContain('\\"termination_indeterminate\\":false');
+    expect(waitResult).not.toContain("termination_indeterminate");
     const record = terminalRecords(fixture.home).find((candidate) =>
       candidate.session_id === sessionId
     );
@@ -886,65 +1065,286 @@ test.skipIf(!tmuxAvailable())(
   TIMEOUT,
 );
 
+test("shell TTY timeout stops a nested interactive shell before its next command", async () => {
+  const fixture = createFixture("fx-shell-tty-timeout-tree-");
+  const pidFile = join(fixture.root, "nested-shell.pid");
+  const marker = join(fixture.root, "after-timeout");
+  const gateway = startFakeGateway([
+    // An interactive bash moves itself and its job out of the terminal's
+    // process group, so killing only that group leaves it to run `touch`.
+    ttyRun(
+      "shell_tty_tree_timeout_run",
+      `bash --norc --noprofile -i -c 'printf %s $$ > ${pidFile}; sleep 3; touch ${marker}'`,
+      { yield_time_ms: 30_000, timeout_ms: 1_000 },
+    ),
+    fakeGatewayFinalText("TREE_TIMEOUT_DONE"),
+  ]);
+  gateways.push(gateway);
+
+  const result = await runFx(["ask", "--json", "Run the nested shell."], {
+    cwd: fixture.workspace,
+    env: askEnv(fixture, gateway),
+    timeoutMs: TIMEOUT,
+  });
+  expect(result.code).toBe(0);
+  const runResult = toolResultEnvelope(gateway.requests[1]!.body, "shell_tty_tree_timeout_run");
+  expect(runResult).toContain('\\"error\\":\\"TimeoutExpired\\"');
+  await waitUntilGone([Number(readFileSync(pidFile, "utf8"))], 1_000);
+  expect(existsSync(marker)).toBe(false);
+}, TIMEOUT);
+
 test.skipIf(!tmuxAvailable())(
-  "resumed fx reindexes and stops its durable managed TTY",
+  "quit ends a managed TTY and resume reports it as ended",
   async () => {
     const fixture = createFixture("fx-shell-tty-resume-");
     let sessionId = "";
     const gateway = startFakeGateway([
-      fakeGatewayToolCall("shell_tty_resume_run", "shell", {
-        request: {
-          action: "run",
-          command:
-            "printf 'TTY_RESUME_READY\\n'; while IFS= read -r line; do printf 'TTY_RESUME_ECHO:%s\\n' \"$line\"; done",
-          profile: "clean",
-          tty: true,
-          yield_time_ms: 0,
-        },
-      }),
+      ttyRun(
+        "shell_tty_resume_run",
+        "printf 'TTY_RESUME_READY\\n'; sleep 37.25",
+        { yield_time_ms: 0 },
+      ),
       (body) => {
         sessionId = findSessionId(JSON.parse(body)) ?? "";
         return fakeGatewayFinalText("SHELL_TTY_RESUME_STARTED");
       },
+      () => fakeGatewayToolCall("shell_tty_resume_interact", "shell", {
+        request: { action: "interact", session_id: sessionId, chars: "x" },
+      }),
       () => fakeGatewayToolCall("shell_tty_resume_stop", "shell", {
-          request: {
-            action: "stop",
-            session_id: sessionId,
-            force: true,
-          },
-        }),
+        request: { action: "stop", session_id: sessionId, force: true },
+      }),
       fakeGatewayFinalText("SHELL_TTY_RESUME_OK"),
     ]);
     gateways.push(gateway);
 
     const first = await launch(fixture, gateway);
-    await first.sendText("Start the durable managed TTY.");
+    await first.sendText("Start the managed TTY.");
     await first.waitForText("SHELL_TTY_RESUME_STARTED", TIMEOUT);
     expect(sessionId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
+    const shellPid = await waitForRecordedPid(fixture.home, sessionId);
+    expect(processAlive(shellPid)).toBe(true);
     await first.sendText("/quit");
     expect(await first.waitForSessionEnd(TIMEOUT)).toBe(true);
+
+    // The terminal belonged to the fx process and ended with it, with no prompt.
+    await waitUntilGone([shellPid, ...processesMatching("sleep 37.25")], 1_000);
+    expect(terminalRecord(fixture.home, sessionId).lifecycle).toBe("lost");
+    expectNoTerminalHostDaemon(fixture);
 
     const resumed = await launch(
       fixture,
       gateway,
-      `${FX_BIN} --resume-last`,
+      `${FX_BIN} --resume last`,
     );
-    await resumed.sendText("Force-stop the exact retained managed TTY.");
+    await resumed.sendText("Use the earlier managed TTY.");
     await resumed.waitForText("SHELL_TTY_RESUME_OK", TIMEOUT);
 
-    const stopResult = toolResultEnvelope(
-      gateway.requests[3]!.body,
-      "shell_tty_resume_stop",
-    );
-    expect(stopResult).toContain('\\"state\\":\\"stopped\\"');
-    const scrollback = await resumed.captureFullScrollback();
-    expect(scrollback).toContain(`Stopped session ${sessionId}`);
-    expect(scrollback).not.toContain("Exited 143");
-    const record = terminalRecords(fixture.home).find((candidate) =>
-      candidate.session_id === sessionId
-    );
-    expect(record?.lifecycle).toBe("closed");
+    // Neither interact nor stop reattaches; both tell the agent to start anew.
+    for (const [index, id] of [
+      [3, "shell_tty_resume_interact"],
+      [4, "shell_tty_resume_stop"],
+    ] as const) {
+      const result = toolResultEnvelope(gateway.requests[index]!.body, id);
+      expect(result).toContain("TerminalEnded");
+      expect(result).toContain("ended when the fx process that started it exited");
+      expect(result).toContain("Start a new terminal");
+    }
+    // The transcript shows why the terminal is gone.
+    expect(await resumed.captureFullScrollback()).toContain("ended when fx exited");
+    expect(terminalRecord(fixture.home, sessionId).lifecycle).toBe("lost");
     expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
   },
   60_000,
 );
+
+test("fx ask exit ends its TTY terminal within one second", async () => {
+  const fixture = createFixture("fx-shell-tty-ask-exit-");
+  let sessionId = "";
+  const gateway = startFakeGateway([
+    ttyRun("shell_tty_ask_run", "sleep 37.25", { yield_time_ms: 0 }),
+    (body) => {
+      sessionId = findSessionId(JSON.parse(body)) ?? "";
+      return fakeGatewayFinalText("ASK_TTY_STARTED");
+    },
+  ]);
+  gateways.push(gateway);
+
+  const result = await runFx(["ask", "--json", "Start a long TTY."], {
+    cwd: fixture.workspace,
+    env: askEnv(fixture, gateway),
+    timeoutMs: TIMEOUT,
+  });
+  const exitedAt = Date.now();
+  expect(result.code).toBe(0);
+  expect(JSON.parse(result.stdout).output).toBe("ASK_TTY_STARTED");
+  expect(sessionId).toMatch(/^shell-[A-Za-z0-9_-]{22}$/);
+
+  // fx may exit before the launcher records the shell pid.
+  const shellPid = recordedPid(fixture.home, sessionId);
+  // Match the exact command line of a duration nothing else uses, so other
+  // processes that merely mention it do not count.
+  const sleepers = processesMatching("sleep 37.25", { exact: true });
+  for (const pid of [...(shellPid === null ? [] : [shellPid]), ...sleepers]) {
+    if (!processAlive(pid)) continue;
+    await waitUntilGone([pid], Math.max(0, 1_000 - (Date.now() - exitedAt)));
+  }
+  expect(processAlive(shellPid)).toBe(false);
+  expect(terminalRecord(fixture.home, sessionId).lifecycle).toBe("lost");
+  expectNoTerminalHostDaemon(fixture);
+  expect(readFileSync(fixture.tracePath, "utf8")).toContain(
+    "ended 1 terminal(s) for process exit",
+  );
+}, TIMEOUT);
+
+test("TTY runs in the requested cwd on a real PTY and reports the exact exit", async () => {
+  const fixture = createFixture("fx-shell-tty-pty-");
+  const nested = join(fixture.workspace, "nested");
+  mkdirSync(nested);
+  const gateway = startFakeGateway([
+    ttyRun(
+      "shell_tty_pty_run",
+      "printf 'CWD:%s\\n' \"$PWD\"; " +
+        "if [ -t 0 ] && [ -t 1 ]; then printf 'PTY:yes\\n'; fi; " +
+        "printf 'SIZE:%s\\n' \"$(stty size)\"; exit 7",
+      { cwd: nested, yield_time_ms: 30_000 },
+    ),
+    fakeGatewayFinalText("PTY_DONE"),
+  ]);
+  gateways.push(gateway);
+
+  const result = await runFx(["ask", "--json", "Probe the PTY."], {
+    cwd: fixture.workspace,
+    env: askEnv(fixture, gateway),
+    timeoutMs: TIMEOUT,
+  });
+  expect(result.code).toBe(0);
+  const envelope = toolResultEnvelope(gateway.requests[1]!.body, "shell_tty_pty_run");
+  expect(envelope).toContain(`CWD:${nested}`);
+  expect(envelope).toContain("PTY:yes");
+  expect(envelope).toContain("SIZE:24 80");
+  expect(envelope).toContain('\\"exit_code\\":7');
+  expect(envelope).toContain('\\"backend\\":\\"tty\\"');
+}, TIMEOUT);
+
+test.skipIf(!tmuxAvailable())(
+  "another fx process can neither drive nor end a running owner's terminal",
+  async () => {
+    const fixture = createFixture("fx-shell-tty-owner-");
+    let ownerTerminal = "";
+    const ownerGateway = startFakeGateway([
+      ttyRun("shell_tty_owner_run", "sleep 41.5", { yield_time_ms: 0 }),
+      (body) => {
+        ownerTerminal = findSessionId(JSON.parse(body)) ?? "";
+        return fakeGatewayFinalText("OWNER_TTY_STARTED");
+      },
+    ]);
+    gateways.push(ownerGateway);
+    const owner = await launch(fixture, ownerGateway);
+    await owner.sendText("Start the owned TTY.");
+    await owner.waitForText("OWNER_TTY_STARTED", TIMEOUT);
+    const shellPid = await waitForRecordedPid(fixture.home, ownerTerminal);
+
+    const intruderGateway = startFakeGateway([
+      () => fakeGatewayToolCall("intruder_interact", "shell", {
+        request: { action: "interact", session_id: ownerTerminal, chars: "exit\n" },
+      }),
+      () => fakeGatewayToolCall("intruder_stop", "shell", {
+        request: { action: "stop", session_id: ownerTerminal, force: true },
+      }),
+      fakeGatewayFinalText("INTRUDER_DONE"),
+    ]);
+    gateways.push(intruderGateway);
+    const intruder = await runFx(["ask", "--json", "Touch the other terminal."], {
+      cwd: fixture.workspace,
+      env: askEnv(fixture, intruderGateway),
+      timeoutMs: TIMEOUT,
+    });
+    expect(intruder.code).toBe(0);
+    const intrusion = JSON.parse(intruder.stdout) as {
+      tool_calls: Array<{ name: string; status: string }>;
+    };
+    expect(intrusion.tool_calls.map(({ status }) => status)).toEqual(["error", "error"]);
+
+    // The other process exited, but this terminal is still owned and running.
+    await Bun.sleep(300);
+    expect(processAlive(shellPid)).toBe(true);
+    expect(terminalRecord(fixture.home, ownerTerminal).lifecycle).toBe("running");
+
+    await owner.sendText("/quit");
+    expect(await owner.waitForSessionEnd(TIMEOUT)).toBe(true);
+    await waitUntilGone([shellPid], 1_000);
+    expect(terminalRecord(fixture.home, ownerTerminal).lifecycle).toBe("lost");
+  },
+  60_000,
+);
+
+test("TTY stop reaches a background job the terminal started", async () => {
+  const fixture = createFixture("fx-shell-tty-signal-");
+  const pidFile = join(fixture.root, "background.pid");
+  let sessionId = "";
+  const gateway = startFakeGateway([
+    ttyRun(
+      "shell_tty_signal_run",
+      `sleep 43.5 & printf '%s' "$!" > ${JSON.stringify(pidFile)}; printf 'BG_READY\\n'; wait`,
+      { yield_time_ms: 0 },
+    ),
+    async (body) => {
+      sessionId = findSessionId(JSON.parse(body)) ?? "";
+      await waitForFile(pidFile);
+      return fakeGatewayToolCall("shell_tty_signal_stop", "shell", {
+        request: { action: "stop", session_id: sessionId, force: true },
+      });
+    },
+    fakeGatewayFinalText("SIGNAL_DONE"),
+  ]);
+  gateways.push(gateway);
+
+  const result = await runFx(["ask", "--json", "Stop the background job."], {
+    cwd: fixture.workspace,
+    env: askEnv(fixture, gateway),
+    timeoutMs: TIMEOUT,
+  });
+  expect(result.code).toBe(0);
+  const stopResult = toolResultEnvelope(gateway.requests[2]!.body, "shell_tty_signal_stop");
+  expect(stopResult).toContain('\\"state\\":\\"stopped\\"');
+  const backgroundPid = Number(readFileSync(pidFile, "utf8"));
+  await waitUntilGone([backgroundPid], 1_000);
+  expect(terminalRecord(fixture.home, sessionId).lifecycle).toBe("closed");
+}, TIMEOUT);
+
+test("the full terminal budget starts, refuses one more, and ends together at exit", async () => {
+  const fixture = createFixture("fx-shell-tty-capacity-");
+  const budget = 64;
+  const responses: Parameters<typeof startFakeGateway>[0] = [];
+  for (let index = 0; index <= budget; index += 1) {
+    responses.push(ttyRun(`shell_tty_capacity_${index}`, "sleep 45.75", { yield_time_ms: 0 }));
+  }
+  responses.push(fakeGatewayFinalText("CAPACITY_DONE"));
+  const gateway = startFakeGateway(responses);
+  gateways.push(gateway);
+
+  const result = await runFx(["ask", "--json", "Fill the terminal budget."], {
+    cwd: fixture.workspace,
+    env: { ...askEnv(fixture, gateway), FX_MAX_AGENT_STEPS: "100" },
+    timeoutMs: 120_000,
+  });
+  const exitedAt = Date.now();
+  expect(result.code).toBe(0);
+  const statuses = (JSON.parse(result.stdout) as {
+    tool_calls: Array<{ status: string }>;
+  }).tool_calls.map(({ status }) => status);
+  expect(statuses.slice(0, budget).every((status) => status === "success")).toBe(true);
+  expect(statuses[budget]).toBe("error");
+  expect(toolResultEnvelope(gateway.requests[budget + 1]!.body, `shell_tty_capacity_${budget}`))
+    .toContain("Capacity");
+
+  const records = terminalRecords(fixture.home);
+  expect(records).toHaveLength(budget);
+  const shellPids = records.map((record) => Number(record.pid));
+  await waitUntilGone(
+    [...shellPids, ...processesMatching("sleep 45.75")],
+    Math.max(0, 1_500 - (Date.now() - exitedAt)),
+  );
+  expect(records.every((record) => record.lifecycle === "lost")).toBe(true);
+}, 150_000);

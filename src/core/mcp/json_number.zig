@@ -225,7 +225,7 @@ pub fn fromValue(
         .number_string => |lexeme| try Number.parse(alloc, lexeme, limits),
         .integer => |integer| blk: {
             var buffer: [64]u8 = undefined;
-            const lexeme = std.fmt.bufPrint(&buffer, "{d}", .{integer}) catch
+            const lexeme = std.mem.print(&buffer, "{d}", .{integer}) catch
                 return error.InvalidNumber;
             break :blk try Number.parse(alloc, lexeme, limits);
         },

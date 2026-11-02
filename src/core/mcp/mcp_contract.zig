@@ -3,7 +3,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 pub const default_startup_timeout_ms: u32 = 30_000;
-pub const default_operation_timeout_ms: u32 = 60_000;
+/// How long a request may go without an answer or progress. Tools such as
+/// browser automation run for minutes without reporting progress.
+pub const default_operation_timeout_ms: u32 = 5 * 60_000;
 pub const default_elicitation_timeout_ms: u32 = 30 * 60_000;
 pub const default_restart_limit: u8 = 1;
 
@@ -79,6 +81,7 @@ pub const McpAuthConfig = struct {
     client_secret_env: ?[]u8 = null,
     client_metadata_url: ?[]u8 = null,
     scopes: [][]u8 = &.{},
+    scopes_configured: bool = false,
     callback_port: ?u16 = null,
 
     pub fn deinit(self: *McpAuthConfig, alloc: Allocator) void {
@@ -102,81 +105,6 @@ pub const ProgressSink = struct {
     context: *anyopaque,
     callback: *const fn (*anyopaque, Progress) void,
 };
-
-/// Receives a borrowed, validated JSON-RPC notification object. Implementations
-/// must return promptly and must not retain pointers into the value.
-pub const NotificationSink = struct {
-    context: *anyopaque,
-    callback: *const fn (*anyopaque, std.json.Value) void,
-};
-
-/// Observes one borrowed, validated JSON-RPC response before the transport
-/// publishes it to the requesting thread. Implementations must return promptly
-/// and must not retain pointers into the value.
-pub const ResponseObserver = struct {
-    context: *anyopaque,
-    callback: *const fn (*anyopaque, Allocator, std.json.Value) anyerror!void,
-};
-
-/// Receives one owned-lifetime JSON-RPC server request frame. Transports invoke
-/// the optional preparation callback on the reader before dispatching later
-/// frames, so it must return promptly. They invoke the main callback outside
-/// reader and state locks so it may wait for input and write the response.
-pub const ServerRequestSink = struct {
-    context: *anyopaque,
-    prepare_callback: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!void = null,
-    callback: *const fn (*anyopaque, Allocator, []const u8) anyerror!void,
-};
-
-/// Acquires the final authorization guard immediately before a transport
-/// commits request bytes, then releases it as soon as commitment completes.
-pub const TransportPrecommit = struct {
-    context: *anyopaque,
-    acquire_callback: *const fn (*anyopaque) anyerror!void,
-    release_callback: *const fn (*anyopaque) void,
-    acquired: bool = false,
-
-    pub fn acquire(self: *TransportPrecommit) !void {
-        if (self.acquired) return;
-        try self.acquire_callback(self.context);
-        self.acquired = true;
-    }
-
-    pub fn release(self: *TransportPrecommit) void {
-        if (!self.acquired) return;
-        self.acquired = false;
-        self.release_callback(self.context);
-    }
-};
-
-test "transport precommit acquires and releases exactly once" {
-    const State = struct {
-        acquisitions: usize = 0,
-        releases: usize = 0,
-
-        fn acquire(raw: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.acquisitions += 1;
-        }
-
-        fn release(raw: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.releases += 1;
-        }
-    };
-    var state = State{};
-    var precommit = TransportPrecommit{
-        .context = &state,
-        .acquire_callback = State.acquire,
-        .release_callback = State.release,
-    };
-    try precommit.acquire();
-    try precommit.acquire();
-    precommit.release();
-    precommit.release();
-    try std.testing.expectEqual(@as(usize, 1), state.acquisitions);
-    try std.testing.expectEqual(@as(usize, 1), state.releases);
-}
 
 pub const McpTransport = enum { stdio, http, sse };
 
@@ -234,9 +162,18 @@ pub const McpServerConfig = struct {
     source: ConfigSource = .profile,
     scope: ConfigScope = .profile,
     required: bool = false,
+    /// Advertise this server's tool schemas on every model turn instead of
+    /// loading them on demand through capability search.
+    always_loaded: bool = false,
+    /// Host-issued registration for a server the host serves over its own
+    /// connection. Such a server speaks modern MCP through the runtime's
+    /// message carrier; `url` is only a placeholder.
+    acp_server_id: ?[]const u8 = null,
     transport: McpTransport = .stdio,
     command: ?[]const u8 = null,
     args: []const []const u8 = &.{},
+    /// Working directory for a stdio server; null inherits fx's own.
+    cwd: ?[]const u8 = null,
     url: ?[]const u8 = null,
     env: []McpEnvVar = &.{},
     headers: []McpHttpHeader = &.{},
@@ -268,7 +205,9 @@ pub const McpServerConfig = struct {
         alloc.free(self.name);
         if (self.command) |command| alloc.free(command);
         freeOwnedStrings(alloc, self.args);
+        if (self.cwd) |cwd| alloc.free(cwd);
         if (self.url) |url| alloc.free(url);
+        if (self.acp_server_id) |server_id| alloc.free(server_id);
         freeEnvVars(alloc, self.env);
         freeHttpHeaders(alloc, self.headers);
         freeHttpHeaderEnv(alloc, self.header_env);

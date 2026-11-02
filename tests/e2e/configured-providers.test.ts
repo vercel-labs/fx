@@ -9,6 +9,25 @@ async function withReasoning(response: Response, ...deltas: Record<string, unkno
   return new Response(prefix + await response.text(), { headers: response.headers });
 }
 
+// Tool calls whose arguments are sent verbatim, so they can be malformed.
+function rawToolCalls(model: string, calls: Array<{ id: string; name: string; arguments: string }>) {
+  const chunks = [
+    { id: "chat-tool", model, choices: [{ index: 0, delta: { tool_calls: calls.map((call, index) => ({ index, id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } })) }, finish_reason: null }] },
+    { id: "chat-tool", model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+  ];
+  return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+}
+
+// A tool call whose reply ran out of output tokens mid-arguments.
+function cutToolCall(model: string, command: string) {
+  const args = JSON.stringify({ request: { action: "run", command } });
+  const chunks = [
+    { id: "chat-cut", model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call-cut", type: "function", function: { name: "shell", arguments: args.slice(0, args.length - 8) } }] }, finish_reason: null }] },
+    { id: "chat-cut", model, choices: [{ index: 0, delta: {}, finish_reason: "length" }] },
+  ];
+  return new Response(chunks.map(value => `data: ${JSON.stringify(value)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+}
+
 describe("configured providers", () => {
   test.each(["reasoning", "reasoning_content"])("replays %s through a tool result and saved-session continuation", async field => {
     let calls = 0;
@@ -57,6 +76,38 @@ describe("configured providers", () => {
       expect(messages.at(-1).content).toBe("Summarize what you just did.");
       expect(messages.at(-2).reasoning_content).toBe("Both files have been read.");
       expect(messages.at(-2).tool_calls).toBeUndefined();
+    } finally { f.close(); }
+  }, 25000);
+
+  test("a tool call cut off by the provider's own limit is resent once with fx's limit", async () => {
+    let calls = 0;
+    const f = fixture(body => ++calls === 1 ? cutToolCall(body.model, "printf ran > cut.txt") : completion(body.model, "finished after the resend"));
+    try {
+      // No limit in the metadata, so the first request names none.
+      (f.settings.providers.local.model_metadata as any)["local-model"] = { context_window: 262144, supports_tool_use: true };
+      f.save();
+      const result = await runFx(["ask", "--json", "--no-save", "Run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      expect(JSON.parse(result.stdout).final_output).toBe("finished after the resend");
+      expect(f.requests).toHaveLength(2);
+      expect(f.requests[0].body.max_tokens).toBeUndefined();
+      expect(f.requests[1].body.max_tokens).toBe(32768);
+      expect(JSON.stringify(f.requests[1].body.messages)).not.toContain("call-cut");
+      expect(result.stderr).toContain("Retrying with a higher limit.");
+      expect(existsSync(join(f.workspace, "cut.txt"))).toBe(false);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("a tool call cut off at the model's own limit is not resent when that would repeat the request", async () => {
+    let calls = 0;
+    const f = fixture(body => ++calls === 1 ? cutToolCall(body.model, "printf ran > cut.txt") : completion(body.model, "a resend must not be sent"));
+    try {
+      const result = await runFx(["ask", "--json", "--no-save", "Run the command"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      expect(result.code).toBe(1);
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].body.max_tokens).toBe(8192);
+      expect(result.stderr).toContain("so I did not run them");
+      expect(existsSync(join(f.workspace, "cut.txt"))).toBe(false);
     } finally { f.close(); }
   }, 25000);
 
@@ -158,6 +209,53 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 25000);
 
+  test("ask --provider picks a connection for one request, beats FX_PROVIDER, and is never saved", async () => {
+    const f = fixture();
+    try {
+      const first = await runFx(["ask", "--json", "--provider", "remote", "remember this"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (first.code !== 0) throw new Error(first.stdout + first.stderr);
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].authorization).toBe("Bearer own-provider-token");
+      expect(f.requests[0].body.model).toBe("remote-model");
+      expect(JSON.parse(readFileSync(f.settingsPath, "utf8")).provider).toBe("local");
+      const saved = JSON.parse(first.stdout);
+
+      const flagWins = await runFx(["ask", "--json", "--no-save", "--provider=local", "say hello"], { cwd: f.workspace, env: { ...f.env, FX_PROVIDER: "remote" }, timeoutMs: 20000 });
+      if (flagWins.code !== 0) throw new Error(flagWins.stdout + flagWins.stderr);
+      expect(f.requests).toHaveLength(2);
+      expect(f.requests[1].authorization).toBeNull();
+      expect(f.requests[1].body.model).toBe("local-model");
+
+      const resumed = await runFx(["ask", "--json", "--resume", saved.session_id, "--provider", "local", "continue"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (resumed.code !== 0) throw new Error(resumed.stdout + resumed.stderr);
+      expect(f.requests).toHaveLength(3);
+      expect(f.requests[2].authorization).toBeNull();
+      expect(f.requests[2].body.model).toBe("local-model");
+      expect(JSON.parse(readFileSync(f.settingsPath, "utf8")).provider).toBe("local");
+    } finally { f.close(); }
+  }, 65000);
+
+  test("CLI selection names an unknown connection and leaves settings unchanged", async () => {
+    const f = fixture();
+    try {
+      const before = readFileSync(f.settingsPath, "utf8");
+      const selection = await runFx(["provider", "remte"], { cwd: f.workspace, env: f.env });
+      expect(selection.code).toBe(2);
+      expect(selection.stdout).toBe("");
+      expect(selection.stderr).toBe(
+        'fx provider: unknown provider remte; expected gateway, codex, grok, or a name under "providers" in ~/.fx/settings.json\n',
+      );
+      // fx ask --provider names it the same way.
+      const ask = await runFx(["ask", "--provider", "remte", "hi"], { cwd: f.workspace, env: f.env });
+      expect(ask.code).toBe(2);
+      expect(ask.stderr).toBe(
+        'fx ask: unknown provider remte; expected gateway, codex, grok, or a name under "providers" in ~/.fx/settings.json\n',
+      );
+      expect(readFileSync(f.settingsPath, "utf8")).toBe(before);
+      expect(f.requests).toHaveLength(0);
+    } finally { f.close(); }
+  });
+
   test("CLI selection creates an owned model key from workspace-only preferences", async () => {
     const f = fixture();
     try {
@@ -206,6 +304,37 @@ describe("configured providers", () => {
       expect(returned.tool_call_id).toBe("call-local");
       expect(returned.content).toContain("fixture contents");
       expect(f.requests.every(request => request.authorization === null)).toBe(true);
+    } finally { f.close(); }
+  }, 25000);
+
+  test("unknown tools and malformed arguments are answered and the turn continues", async () => {
+    const f = fixture(body => body.messages.some((message: any) => message.role === "tool")
+      ? completion(body.model, "recovered")
+      : rawToolCalls(body.model, [
+        { id: "call-read", name: "read_file", arguments: JSON.stringify({ path: "note.txt" }) },
+        { id: "call-missing", name: "missing_tool", arguments: "{}" },
+        { id: "call-malformed", name: "read_file", arguments: "{\"path\":\"note.txt\"" },
+      ]));
+    try {
+      writeFileSync(join(f.workspace, "note.txt"), "fixture contents");
+      const result = await runFx(["ask", "--json", "--no-save", "Read note.txt"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
+      if (result.code !== 0) throw new Error(result.stdout + result.stderr);
+      const output = JSON.parse(result.stdout);
+      expect(output.output).toBe("recovered");
+      expect(output.tool_calls.map((call: any) => [call.name, call.status]).sort()).toEqual([
+        ["missing_tool", "error"],
+        ["read_file", "error"],
+        ["read_file", "success"],
+      ]);
+      expect(f.requests).toHaveLength(2);
+      const messages = f.requests[1].body.messages;
+      const replayed = messages.find((message: any) => message.role === "assistant" && message.tool_calls?.length).tool_calls;
+      expect(replayed.map((call: any) => call.function.arguments)).toEqual([JSON.stringify({ path: "note.txt" }), "{}", "{}"]);
+      const results = Object.fromEntries(messages.filter((message: any) => message.role === "tool").map((message: any) => [message.tool_call_id, message.content]));
+      expect(results["call-read"]).toContain("fixture contents");
+      expect(results["call-missing"]).toBe("Unsupported tool: missing_tool");
+      expect(results["call-malformed"]).toContain("did not run the call");
+      expect(results["call-malformed"]).not.toContain("fixture contents");
     } finally { f.close(); }
   }, 25000);
 
@@ -286,18 +415,15 @@ describe("configured providers", () => {
 
   test("configured child compaction uses the model capability lookup", async () => {
     let parentTurns = 0;
-    let summaries = 0;
     const f = fixture(body => {
       if (body.model === "child-model") {
-        if (!body.tools?.length) {
-          summaries++;
-          return completion(body.model, "The child is retaining repeated context details and should continue acknowledging them.");
-        }
-        return completion(body.model, "child reply", Math.ceil(JSON.stringify(body).length / 4));
+        // Context pressure comes from the child's own replies. Compaction keeps
+        // them word for word, shortening the longest, so it needs no model call.
+        return completion(body.model, "child reply " + "detail ".repeat(2000), Math.ceil(JSON.stringify(body).length / 4));
       }
       if (body.messages.at(-1)?.role === "tool") return completion(body.model, "parent reply");
       parentTurns++;
-      return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: `child context ${parentTurns} ` + "detail ".repeat(2000), ...(parentTurns === 1 ? { model: "child-model" } : {}) } }, `context-call-${parentTurns}`);
+      return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: `child context ${parentTurns}`, ...(parentTurns === 1 ? { model: "child-model" } : {}) } }, `context-call-${parentTurns}`);
     });
     (f.settings.providers.local.model_metadata as any)["child-model"] = { context_window: 32768, max_output_tokens: 512, supports_tool_use: true };
     f.save();
@@ -311,8 +437,9 @@ describe("configured providers", () => {
         if (!JSON.parse(returned).ok) throw new Error(returned);
         expect(JSON.parse(returned).ok).toBe(true);
       }
-      expect(summaries).toBeGreaterThan(0);
       const childRequests = f.requests.filter(request => request.body.model === "child-model");
+      // Only the child model's own small context window makes the child compact.
+      expect(childRequests.some(request => JSON.stringify(request.body.messages).includes("<compacted_conversation>"))).toBe(true);
       expect(childRequests.every(request => request.body.max_tokens > 0 && request.body.max_tokens <= 512)).toBe(true);
       expect(f.requests.every(request => request.path === "/v1/chat/completions" && request.authorization === null)).toBe(true);
     } finally { f.close(); }
@@ -338,13 +465,14 @@ describe("configured providers", () => {
     } finally { f.close(); }
   }, 35000);
 
-  test.each(["clear", "caution", "missing", "refused", "truncated", "incomplete"])("custom review response recovery preserves %s outcome", async outcome => {
+  test.each(["clear", "caution", "missing", "malformed", "refused", "truncated", "incomplete"])("custom review response recovery preserves %s outcome", async outcome => {
     let marker = "";
     let reviews = 0;
     const f = fixture(body => {
       if (body.tools?.some((tool: any) => tool.function?.name === "permission_decision")) {
         reviews++;
         if (reviews === 1 || (outcome === "missing" && reviews === 2)) {
+          if (outcome === "malformed") return rawToolCalls(body.model, [{ id: "review-1", name: "permission_decision", arguments: "{\"decision\":\"clear\"" }]);
           if (outcome === "refused" || outcome === "truncated" || outcome === "incomplete") {
             const chunks = [
               { id: "review", model: body.model, choices: [{ index: 0, delta: outcome === "refused" ? { refusal: "Cannot review this." } : { content: "Incomplete review." }, finish_reason: null }] },
@@ -366,8 +494,8 @@ describe("configured providers", () => {
       f.save();
       const result = await runFx(["ask", "--json", "--no-save", "Run the local fixture once."], { cwd: f.workspace, env: f.env, timeoutMs: 15000 });
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
-      expect(readFileSync(marker, "utf8")).toBe(outcome === "clear" ? "one\n" : "");
-      expect(reviews).toBe(["clear", "caution", "missing"].includes(outcome) ? 2 : 1);
+      expect(readFileSync(marker, "utf8")).toBe(["clear", "malformed"].includes(outcome) ? "one\n" : "");
+      expect(reviews).toBe(["clear", "caution", "missing", "malformed"].includes(outcome) ? 2 : 1);
       const requests = f.requests.filter(request => request.body.tools?.some((tool: any) => tool.function?.name === "permission_decision"));
       if (reviews === 2) expect(requests[1].body).toEqual(requests[0].body);
       expect(f.requests.every(request => request.path === "/v1/chat/completions")).toBe(true);
@@ -462,6 +590,31 @@ describe("configured providers", () => {
       f.close();
     }
   }, 12000);
+
+  test("a connection without a saved model runs from --model or FX_MODEL and rejects a blank FX_MODEL", async () => {
+    const f = fixture();
+    try {
+      delete (f.settings.models as Record<string, string>).local;
+      f.save();
+      const chatModels = () => f.requests.filter(request => request.path === "/v1/chat/completions").map(request => request.body.model);
+
+      const flag = await runFx(["ask", "--json", "--no-save", "--model", "flag-model", "hello"], { cwd: f.workspace, env: f.env, timeoutMs: 10000 });
+      if (flag.code !== 0) throw new Error(flag.stdout + flag.stderr);
+      const env = await runFx(["ask", "--json", "--no-save", "hello"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "  env-model  " }, timeoutMs: 10000 });
+      if (env.code !== 0) throw new Error(env.stdout + env.stderr);
+      expect(chatModels()).toEqual(["flag-model", "env-model"]);
+
+      const status = await runFx(["status", "--json"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "env-model" } });
+      expect(status.code).toBe(0);
+      expect(JSON.parse(status.stdout)).toMatchObject({ model: "env-model", model_origin: "FX_MODEL", model_source: "local" });
+
+      const blank = await runFx(["status"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "   " } });
+      expect(blank.code).toBe(1);
+      expect(blank.stderr).toBe("fx: no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, or set a model for this run with --model or FX_MODEL\n");
+      expect(chatModels()).toHaveLength(2);
+      expect(JSON.parse(readFileSync(f.settingsPath, "utf8")).models.local).toBeUndefined();
+    } finally { f.close(); }
+  }, 25000);
 
   test("redirects cannot forward credentials to another connection", async () => {
     const target = fixture();

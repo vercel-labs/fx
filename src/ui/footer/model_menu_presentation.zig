@@ -205,7 +205,7 @@ const ProviderTabs = struct {
     fn build(items: []const model_cache_runtime.ModelMenuItem) ProviderTabs {
         var tabs: ProviderTabs = .{};
         for (0..model_cache_runtime.model_provider_filter_count) |index| {
-            const filter: model_cache_runtime.ModelProviderFilter = @enumFromInt(index);
+            const filter: model_cache_runtime.ModelProviderFilter = @fromBackingInt(@intCast(index));
             if (!model_cache_runtime.modelProviderFilterAvailable(items, filter)) continue;
             tabs.indices[tabs.len] = index;
             tabs.len += 1;
@@ -224,7 +224,7 @@ const ProviderTabs = struct {
 fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
     try row.appendSlice(alloc, ui_render.selected_completion_style);
     var buf: [48]u8 = undefined;
-    const title = std.fmt.bufPrint(&buf, "Models {d}", .{count}) catch "Models";
+    const title = std.mem.print(&buf, "Models {d}", .{count}) catch "Models";
     try row.appendSlice(alloc, title);
     try row.appendSlice(alloc, ui_render.reset_style);
 }
@@ -253,7 +253,7 @@ fn appendProviderOverflowMarker(alloc: Allocator, row: *std.ArrayList(u8)) !void
 }
 
 fn providerTabLabel(index: usize) []const u8 {
-    const filter: model_cache_runtime.ModelProviderFilter = @enumFromInt(index);
+    const filter: model_cache_runtime.ModelProviderFilter = @fromBackingInt(@intCast(index));
     return switch (filter) {
         .all => "All",
         .anthropic => "Anthropic",
@@ -339,8 +339,16 @@ fn appendCompactFacts(
 ) !void {
     if (capabilities.context_window) |tokens| try appendTokenFact(alloc, facts, tokens, "context");
     if (capabilities.max_output_tokens) |tokens| try appendTokenFact(alloc, facts, tokens, "output");
-    if (capabilities.supports_fast_mode) try appendMetadataFact(alloc, facts, "Fast");
+    if (capabilities.intrinsic_fast) try appendMetadataFact(alloc, facts, fast_fact);
+    if (capabilities.supports_fast_mode) try appendMetadataFact(alloc, facts, fast_mode_fact);
+    if (capabilities.supports_ultrafast_mode) try appendMetadataFact(alloc, facts, ultra_mode_fact);
 }
+
+// A `-fast` model always runs fast, so it reads "Fast". "Fast mode" and "Ultra mode"
+// name speed options the model offers, so they are not mistaken for a fast model.
+const fast_fact = "Fast";
+const fast_mode_fact = "Fast mode";
+const ultra_mode_fact = "Ultra mode";
 
 fn compactFactsWidth(capabilities: model_capabilities.Capabilities) usize {
     var width: usize = 0;
@@ -352,9 +360,17 @@ fn compactFactsWidth(capabilities: model_capabilities.Capabilities) usize {
         if (width > 0) width += display_width.visibleWidth(" · ");
         width += tokenFactWidth(tokens, "output");
     }
+    if (capabilities.intrinsic_fast) {
+        if (width > 0) width += display_width.visibleWidth(" · ");
+        width += display_width.visibleWidth(fast_fact);
+    }
     if (capabilities.supports_fast_mode) {
         if (width > 0) width += display_width.visibleWidth(" · ");
-        width += display_width.visibleWidth("Fast");
+        width += display_width.visibleWidth(fast_mode_fact);
+    }
+    if (capabilities.supports_ultrafast_mode) {
+        if (width > 0) width += display_width.visibleWidth(" · ");
+        width += display_width.visibleWidth(ultra_mode_fact);
     }
     return width;
 }
@@ -373,12 +389,12 @@ fn tokenFactWidth(tokens: u32, suffix: []const u8) usize {
 
 fn formatTokenFact(buf: *[48]u8, tokens: u32, suffix: []const u8) ![]const u8 {
     if (tokens >= 1_000_000 and tokens % 1_000_000 == 0) {
-        return try std.fmt.bufPrint(buf, "{d}M {s}", .{ tokens / 1_000_000, suffix });
+        return try std.mem.print(buf, "{d}M {s}", .{ tokens / 1_000_000, suffix });
     }
     if (tokens >= 1_000 and tokens % 1_000 == 0) {
-        return try std.fmt.bufPrint(buf, "{d}K {s}", .{ tokens / 1_000, suffix });
+        return try std.mem.print(buf, "{d}K {s}", .{ tokens / 1_000, suffix });
     }
-    return try std.fmt.bufPrint(buf, "{d} {s}", .{ tokens, suffix });
+    return try std.mem.print(buf, "{d} {s}", .{ tokens, suffix });
 }
 
 fn appendMetadataFact(alloc: Allocator, text: *std.ArrayList(u8), fact: []const u8) !void {
@@ -397,6 +413,7 @@ fn composeStateRow(alloc: Allocator, projection: ModelMenuProjection, width: u16
 
 fn loadedCatalogStatusText(state: model_cache_runtime.ModelMenuCatalogState) ?[]const u8 {
     if (retryableFailureText(state.failure)) |text| return text;
+    if (state.from_profile_settings) return "Models from profile settings; explicit model IDs do not require catalog discovery.";
     if (state.private_models_hidden) {
         const reason = state.public_only_reason orelse return "Using the public model catalog.";
         return switch (reason) {
@@ -430,9 +447,9 @@ fn retryableFailureText(failure: ?model_cache_runtime.ModelMenuCatalogState.Fail
     const value = failure orelse return null;
     if (!value.retryable) return null;
     return switch (value.category) {
-        .rate_limited => "AI Gateway rate limited model discovery; retry /model.",
-        .transport, .gateway_unavailable => "Could not reach AI Gateway; retry /model.",
-        else => "Could not refresh model catalog; retry /model.",
+        .rate_limited => "AI Gateway rate limited model discovery; fx retries automatically.",
+        .transport, .gateway_unavailable => "Could not reach AI Gateway; fx retries automatically.",
+        else => "Could not refresh model catalog; fx retries automatically.",
     };
 }
 
@@ -466,6 +483,7 @@ test "model menu renders provider tabs and compact model facts" {
                 .supports_file_input = true,
                 .supports_web_search = true,
                 .supports_fast_mode = true,
+                .supports_ultrafast_mode = true,
                 .context_window = 1_000_000,
                 .max_output_tokens = 128_000,
             },
@@ -495,7 +513,7 @@ test "model menu renders provider tabs and compact model facts" {
     try std.testing.expect(std.mem.find(u8, title.items, "anthropic/claude-opus-4.8") != null);
     try std.testing.expect(std.mem.find(u8, title.items, "●") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "○") == null);
-    try std.testing.expect(std.mem.find(u8, title.items, "1M context · 128K output · Fast") != null);
+    try std.testing.expect(std.mem.find(u8, title.items, "1M context · 128K output · Fast mode · Ultra mode") != null);
     try std.testing.expect(std.mem.find(u8, title.items, "Anthropic") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Current") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Reasoning") == null);
@@ -578,7 +596,7 @@ test "model menu states and navigation budget stay bounded" {
     const failed: ModelMenuProjection = .{ .active = true, .load_state = .failed, .catalog_state = .{ .failure = .{ .category = .transport, .retryable = true } } };
     var failed_state = try composeModelMenuRow(alloc, failed, 2, 80, menuRowCount(failed, 80, 10));
     defer failed_state.deinit(alloc);
-    try std.testing.expect(std.mem.find(u8, failed_state.items, "Could not reach AI Gateway; retry /model.") != null);
+    try std.testing.expect(std.mem.find(u8, failed_state.items, "Could not reach AI Gateway; fx retries automatically.") != null);
 
     const items = [_]model_cache_runtime.ModelMenuItem{
         .{ .id = @constCast("a/one"), .provider = "a", .capabilities = .{} },
@@ -678,6 +696,32 @@ test "model menu places catalog note after an item gap and preserves the heading
     try std.testing.expect(std.mem.find(u8, status.items, "Note: Gateway catalog is authenticated with an API key") != null);
 }
 
+test "configured model menu identifies profile settings without Gateway sign-in" {
+    const alloc = std.testing.allocator;
+    const items = [_]model_cache_runtime.ModelMenuItem{
+        .{ .id = @constCast("qwen2.5:0.5b"), .provider = "", .capabilities = .{} },
+    };
+    const projection: ModelMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .items = &items,
+        .catalog_state = .{
+            .access_level = .public_only,
+            .public_only_reason = .no_credential,
+            .private_models_hidden = true,
+            .from_profile_settings = true,
+        },
+    };
+    const rows = menuRowCount(projection, 120, 10);
+    try std.testing.expectEqual(@as(u16, 5), rows);
+
+    var status = try composeModelMenuRow(alloc, projection, rows - 1, 120, rows);
+    defer status.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, status.items, "Models from profile settings; explicit model IDs do not require catalog discovery.") != null);
+    try std.testing.expect(std.mem.find(u8, status.items, "public model catalog") == null);
+    try std.testing.expect(std.mem.find(u8, status.items, "sign in") == null);
+}
+
 test "model menu status follows provenance and retryable failure precedence" {
     try std.testing.expectEqualStrings(
         "Gateway catalog: authenticated with fx login.",
@@ -693,10 +737,12 @@ test "model menu status follows provenance and retryable failure precedence" {
         .{ .state = .{ .public_only_reason = .fx_login_refresh_required, .private_models_hidden = true }, .expected = "Vercel sign-in must refresh before team-private models can load." },
         .{ .state = .{ .public_only_reason = .credential_refresh_failed, .private_models_hidden = true }, .expected = "Vercel sign-in refresh failed; using the public model catalog." },
         .{ .state = .{ .public_only_reason = .authenticated_credential_rejected, .private_models_hidden = true }, .expected = "Your Gateway credential was rejected; using the public model catalog." },
-        .{ .state = .{ .failure = .{ .category = .transport, .retryable = true } }, .expected = "Could not reach AI Gateway; retry /model." },
-        .{ .state = .{ .access_level = .public_only, .public_only_reason = .no_credential, .private_models_hidden = true, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; retry /model." },
-        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; retry /model." },
-        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .runtime, .retryable = true } }, .expected = "Could not refresh model catalog; retry /model." },
+        .{ .state = .{ .public_only_reason = .chatgpt_subscription, .private_models_hidden = true }, .expected = "Codex models require an authenticated Codex catalog." },
+        .{ .state = .{ .public_only_reason = .grok_subscription, .private_models_hidden = true }, .expected = "Grok models require an authenticated Grok catalog." },
+        .{ .state = .{ .failure = .{ .category = .transport, .retryable = true } }, .expected = "Could not reach AI Gateway; fx retries automatically." },
+        .{ .state = .{ .access_level = .public_only, .public_only_reason = .no_credential, .private_models_hidden = true, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; fx retries automatically." },
+        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .rate_limited, .retryable = true } }, .expected = "AI Gateway rate limited model discovery; fx retries automatically." },
+        .{ .state = .{ .access_level = .authenticated, .failure = .{ .category = .runtime, .retryable = true } }, .expected = "Could not refresh model catalog; fx retries automatically." },
     };
 
     for (cases) |case| {
@@ -819,10 +865,61 @@ test "model menu keeps only compact facts beside the model" {
     var title = try composeModelMenuRow(alloc, projection, 2, 100, rows);
     defer title.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, title.items, "anthropic/claude-opus-4.8") != null);
-    try std.testing.expect(std.mem.find(u8, title.items, "1M context · 128K output · Fast") != null);
+    try std.testing.expect(std.mem.find(u8, title.items, "1M context · 128K output · Fast mode") != null);
     try std.testing.expect(std.mem.find(u8, title.items, "Anthropic") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Current") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Reasoning") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Vision") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Tools") == null);
+}
+
+test "model menu labels -fast models Fast and models that offer Fast mode as Fast mode" {
+    const alloc = std.testing.allocator;
+    const items = [_]model_cache_runtime.ModelMenuItem{
+        .{
+            .id = @constCast("anthropic/claude-opus-4.8"),
+            .provider = "anthropic",
+            .capabilities = model_capabilities.resolveCapabilities(
+                "anthropic/claude-opus-4.8",
+                .{ .supports_fast_mode = true, .context_window = 1_000_000 },
+            ),
+        },
+        .{
+            .id = @constCast("anthropic/claude-opus-4.8-fast"),
+            .provider = "anthropic",
+            .capabilities = model_capabilities.resolveCapabilities(
+                "anthropic/claude-opus-4.8-fast",
+                .{ .context_window = 1_000_000 },
+            ),
+        },
+        .{
+            .id = @constCast("xai/grok-4.7-fast"),
+            .provider = "xai",
+            .capabilities = model_capabilities.resolveCapabilities(
+                "xai/grok-4.7-fast",
+                .{ .supports_fast_mode = true, .context_window = 1_000_000 },
+            ),
+        },
+    };
+    const projection: ModelMenuProjection = .{
+        .active = true,
+        .load_state = .ready,
+        .items = &items,
+    };
+    const rows = menuRowCount(projection, 100, 20);
+
+    var regular = try composeModelMenuRow(alloc, projection, 2, 100, rows);
+    defer regular.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, regular.items, "1M context · Fast mode") != null);
+
+    var always_fast = try composeModelMenuRow(alloc, projection, 3, 100, rows);
+    defer always_fast.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, always_fast.items, "anthropic/claude-opus-4.8-fast") != null);
+    try std.testing.expect(std.mem.find(u8, always_fast.items, "1M context · Fast") != null);
+    try std.testing.expect(std.mem.find(u8, always_fast.items, "Fast mode") == null);
+
+    var fast_with_option = try composeModelMenuRow(alloc, projection, 4, 100, rows);
+    defer fast_with_option.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, fast_with_option.items, "xai/grok-4.7-fast") != null);
+    try std.testing.expect(std.mem.find(u8, fast_with_option.items, "1M context · Fast · Fast mode") != null);
 }

@@ -99,6 +99,7 @@ fn streamStatusVerb(stream: StreamState) []const u8 {
         .subagent => "delegating",
         .open => "opening",
         .ask => "asking",
+        .mcp => "calling",
     };
 }
 
@@ -231,7 +232,7 @@ fn buildThinkingLabelFull(buf: []u8, stream: StreamState) []const u8 {
     return out.buffered();
 }
 
-fn activityParts(stream: StreamState) [7]ActivityPart {
+fn activityParts(stream: StreamState) [8]ActivityPart {
     return .{
         .{ .count = stream.read_count, .singular = "file", .plural = "files", .verb = "read" },
         .{ .count = stream.list_count, .singular = "directory", .plural = "directories", .verb = "listed" },
@@ -240,6 +241,7 @@ fn activityParts(stream: StreamState) [7]ActivityPart {
         .{ .count = stream.command_count, .singular = "command", .plural = "commands", .verb = "started" },
         .{ .count = stream.subagent_count, .singular = "subagent", .plural = "subagents", .verb = "created" },
         .{ .count = stream.open_count, .singular = "file", .plural = "files", .verb = "opened" },
+        .{ .count = stream.mcp_count, .singular = "MCP call", .plural = "MCP calls", .verb = "made" },
     };
 }
 
@@ -257,14 +259,14 @@ fn writeActivityPart(writer: *std.Io.Writer, first: *bool, part: ActivityPart) !
 }
 
 pub fn formatTokenCountCompact(buf: []u8, tokens: u64) []const u8 {
-    if (tokens < 1000) return std.fmt.bufPrint(buf, "{d}", .{tokens}) catch "0";
+    if (tokens < 1000) return std.mem.print(buf, "{d}", .{tokens}) catch "0";
 
     const whole = tokens / 1000;
     const tenths = (tokens % 1000) / 100;
     if (whole < 10 and tenths > 0) {
-        return std.fmt.bufPrint(buf, "{d}.{d}k", .{ whole, tenths }) catch "1k";
+        return std.mem.print(buf, "{d}.{d}k", .{ whole, tenths }) catch "1k";
     }
-    return std.fmt.bufPrint(buf, "{d}k", .{whole}) catch "1k";
+    return std.mem.print(buf, "{d}k", .{whole}) catch "1k";
 }
 
 fn writeTokenProgress(writer: *std.Io.Writer, progress: types.TurnTokenProgress) !void {

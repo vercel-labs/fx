@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("testing_allocator.zig");
 
 pub fn serializedEqual(alloc: std.mem.Allocator, lhs: []const u8, rhs: []const u8) std.mem.Allocator.Error!bool {
     if (std.mem.eql(u8, lhs, rhs)) return true;
@@ -73,7 +74,7 @@ fn expectComparisonAllocations(alloc: std.mem.Allocator) !void {
 }
 
 test "serialized JSON equality releases comparison allocations on failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, expectComparisonAllocations, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, expectComparisonAllocations, .{});
     try std.testing.expect(try serializedEqual(std.testing.failing_allocator, "{}", "{}"));
 }
 

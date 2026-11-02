@@ -1,6 +1,7 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
-const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
+const agent_runtime = @import("../agent/agent_runtime.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const question_answer = @import("../agent/question_answer.zig");
@@ -11,6 +12,7 @@ const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const tool_admission = @import("../agent/runtime/tool_admission.zig");
 const tool_presentation = @import("../agent/runtime/tool_presentation.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
 const host_capability = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
@@ -29,9 +31,7 @@ const session_catalog = @import("../session/session_catalog.zig");
 const session_codec = @import("../session/session_codec.zig");
 const js_host_session_store = @import("../session/js_host_session_store.zig");
 const session_event = @import("../session/session_event.zig");
-const session_usage = @import("../session/session_usage.zig");
 const session_child_store = @import("../session/session_child_store.zig");
-const legacy_background_migration = @import("../session/legacy_background_migration.zig");
 const result_store = @import("../session/result_store.zig");
 const command_replay_store = @import("../session/command_replay_store.zig");
 const command_output_content = @import("../tooling/command_output_content.zig");
@@ -44,29 +44,34 @@ const captured_command = @import("../tooling/captured_command.zig");
 const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_title_generation = @import("../session/session_title_generation.zig");
-const session_log = @import("../session/session_log.zig");
+const session_adapter = @import("../session/session_adapter.zig");
 const session_store = @import("../session/session_store.zig");
 const session_catalog_cache = @import("../session/session_catalog_cache.zig");
 const session_summary_codec = @import("../session/session_summary_codec.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
+const subagent_child_state = @import("../subagent/child_state.zig");
 const subagent_authority = @import("../subagent/authority.zig");
-const subagent_resume_admission = @import("../subagent/resume_admission.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const builtin_tools = @import("../../builtins/tools.zig");
 const types = @import("../shared/types.zig");
+const history_range = @import("../shared/history_range.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
+const operation_control = @import("../mcp/operation_control.zig");
 const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const resume_projection = @import("../../ui/transcript/resume_projection.zig");
 const question_ui = @import("../../ui/footer/question_ui.zig");
+const render_input = @import("../../ui/footer/render_input.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
 const update_notes = @import("../upgrade/update_notes.zig");
 const update_target = @import("../upgrade/update_target.zig");
 
 const Allocator = std.mem.Allocator;
+const live_session_handoff_timeout_ms: u64 = 2_000;
+const live_session_worker_cancel_timeout_ms: u64 = 5_000;
 
 const BackgroundSessionPolicy = enum {
     carry_forward,
@@ -89,6 +94,20 @@ const LiveSessionTransitionDecision = struct {
     pending_policy: ?BackgroundSessionPolicy,
     action: LiveSessionTransitionAction,
 };
+
+const LiveSessionWait = union(enum) {
+    worker: u64,
+    geometry: u64,
+};
+
+const LiveSessionTimeout = enum { worker, geometry };
+
+fn liveSessionWaitTimeout(wait: LiveSessionWait, processing: bool, now_ms: u64) ?LiveSessionTimeout {
+    return switch (wait) {
+        .worker => |started| if (processing and now_ms -| started >= live_session_worker_cancel_timeout_ms) .worker else null,
+        .geometry => |started| if (!processing and now_ms -| started >= live_session_handoff_timeout_ms) .geometry else null,
+    };
+}
 
 fn decideLiveSessionTransition(
     cooperative: bool,
@@ -128,6 +147,15 @@ fn decideLiveSessionTransition(
                 .action = .none,
             },
     };
+}
+
+test "session wait deadlines distinguish worker cancellation from stalled geometry" {
+    try std.testing.expectEqual(@as(?LiveSessionTimeout, null), liveSessionWaitTimeout(.{ .worker = 1_000 }, true, 5_999));
+    try std.testing.expectEqual(@as(?LiveSessionTimeout, .worker), liveSessionWaitTimeout(.{ .worker = 1_000 }, true, 6_000));
+    try std.testing.expectEqual(@as(?LiveSessionTimeout, null), liveSessionWaitTimeout(.{ .worker = 1_000 }, false, 10_000));
+    try std.testing.expectEqual(@as(?LiveSessionTimeout, null), liveSessionWaitTimeout(.{ .geometry = 1_000 }, true, 10_000));
+    try std.testing.expectEqual(@as(?LiveSessionTimeout, null), liveSessionWaitTimeout(.{ .geometry = 1_000 }, false, 2_999));
+    try std.testing.expectEqual(@as(?LiveSessionTimeout, .geometry), liveSessionWaitTimeout(.{ .geometry = 1_000 }, false, 3_000));
 }
 
 test "live session transition decision defers only active cooperative requests" {
@@ -223,24 +251,31 @@ test "live session transition decision defers only active cooperative requests" 
     }
 }
 
-fn nextImageIdForResume(
-    alloc: Allocator,
-    history: []const types.HistoryTurn,
-    checkpoint: ?session_codec.RecoveryCheckpoint,
-) !usize {
+fn nextImageIdForResume(alloc: Allocator, history: []const types.HistoryTurn) !usize {
     const restored_catalog = try session_runtime.collect_image_catalog(
         alloc,
         history,
         &.{},
     );
     defer types.freeImageAttachmentSlice(alloc, restored_catalog);
-    if (checkpoint) |value| {
-        const merged = try session_runtime.merge_image_catalog_history_turn(alloc, restored_catalog, value.interruptedTurn());
-        defer types.freeImageAttachmentSlice(alloc, merged);
-        return (try image_attachments.calculate_next_image_id(merged)).next_id;
-    }
     return (try image_attachments.calculate_next_image_id(restored_catalog)).next_id;
 }
+
+/// Where the picker's next page starts: an owned copy of the listing's
+/// continuation.
+const PickerContinuation = struct {
+    updated_at_ms: i64,
+    id: []u8,
+
+    fn deinit(self: *PickerContinuation, alloc: Allocator) void {
+        alloc.free(self.id);
+        self.* = undefined;
+    }
+
+    fn view(self: PickerContinuation) session_store.ResumableSessionContinuation {
+        return .{ .updated_at_ms = self.updated_at_ms, .id = self.id };
+    }
+};
 
 pub const SessionPickerScope = session_catalog.Scope;
 
@@ -265,6 +300,8 @@ const UpgradeNotice = struct {
 const ResumeNotice = union(enum) {
     session,
     upgrade: UpgradeNotice,
+    /// The id of the session this one was forked from.
+    fork: []const u8,
 };
 
 fn writeUpgradeNoticeBody(writer: *std.Io.Writer, upgrade: UpgradeNotice) !void {
@@ -377,12 +414,14 @@ pub const SessionPreferencePatch = struct {
     model: ?[]const u8 = null,
     effort: ?types.ReasoningEffort = null,
     fast_mode: ?bool = null,
+    ultrafast_mode: ?bool = null,
 
     pub fn userSettingsPatch(self: SessionPreferencePatch) config_runtime.UserSettingsPatch {
         var patch = config_runtime.UserSettingsPatch{
             .provider = self.provider,
             .effort = self.effort,
             .fast_mode = self.fast_mode,
+            .ultrafast_mode = self.ultrafast_mode,
         };
         if (self.model) |model| patch.model_preference = .{
             .provider = self.provider orelse .gateway,
@@ -412,7 +451,7 @@ pub const SessionPicker = struct {
     has_more: bool = false,
     loading_more: bool = false,
     summaries: std.ArrayList(session_store.SessionSummary) = .empty,
-    continuation: ?subagent_resume_admission.ActionableContinuation = null,
+    continuation: ?PickerContinuation = null,
     selected: usize = 0,
     window_start: usize = 0,
     scope: SessionPickerScope = .current_workspace,
@@ -456,7 +495,7 @@ pub const SessionPicker = struct {
 
     pub fn setQuery(self: *SessionPicker, query_text: []const u8) void {
         const len = @min(query_text.len, self.query_buf.len);
-        if (len > 0) std.mem.copyForwards(u8, self.query_buf[0..len], query_text[0..len]);
+        if (len > 0) @memmove(self.query_buf[0..len], query_text[0..len]);
         self.query_len = len;
         self.selected = 0;
         self.window_start = 0;
@@ -530,11 +569,40 @@ pub const SessionPicker = struct {
     }
 };
 
+/// `/fork`'s menu: the open session's prompts, oldest first (D58).
+pub const ForkMenu = struct {
+    points: []const session_adapter.Session.ForkPoint = &.{},
+    selected: usize = 0,
+    /// The first menu line shown. It starts past the end, which shows the
+    /// newest prompts, and moves only as far as keeps the selection whole.
+    window_start: usize = std.math.maxInt(usize),
+
+    pub fn active(self: *const ForkMenu) bool {
+        return self.points.len > 0;
+    }
+
+    pub fn projection(self: *const ForkMenu) render_input.ForkMenuProjection {
+        return .{ .points = self.points, .selected = self.selected, .window_start = self.window_start };
+    }
+
+    /// Moves the selection, stopping at the oldest and the newest prompt.
+    pub fn move(self: *ForkMenu, delta: i32) void {
+        if (self.points.len == 0) return;
+        const next = @as(i64, @intCast(self.selected)) + delta;
+        self.selected = @intCast(std.math.clamp(next, 0, @as(i64, @intCast(self.points.len - 1))));
+    }
+
+    pub fn close(self: *ForkMenu, alloc: Allocator) void {
+        session_adapter.Session.freeForkPoints(alloc, self.points);
+        self.* = .{};
+    }
+};
+
 const SessionPickerCatalogCache = struct {
     ready: bool = false,
     loaded_at_ns: i128 = 0,
     active_id: ?[]u8 = null,
-    catalog: subagent_resume_admission.ActionableSessionCatalog = .{},
+    catalog: session_catalog_cache.ActionableSessionCatalog = .{},
 
     fn deinit(self: *SessionPickerCatalogCache) void {
         const alloc = std.heap.c_allocator;
@@ -558,8 +626,17 @@ const SessionPickerCatalogCache = struct {
 
     fn install(
         self: *SessionPickerCatalogCache,
-        source: *subagent_resume_admission.ActionableSessionCatalog,
+        source: *session_catalog_cache.ActionableSessionCatalog,
         active_id: ?[]const u8,
+    ) !void {
+        return self.installAt(source, active_id, io_mod.nanoTimestamp());
+    }
+
+    fn installAt(
+        self: *SessionPickerCatalogCache,
+        source: *session_catalog_cache.ActionableSessionCatalog,
+        active_id: ?[]const u8,
+        loaded_at_ns: i128,
     ) !void {
         const alloc = std.heap.c_allocator;
         const owned_active_id = if (active_id) |id| try alloc.dupe(u8, id) else null;
@@ -567,7 +644,7 @@ const SessionPickerCatalogCache = struct {
         self.deinit();
         self.* = .{
             .ready = true,
-            .loaded_at_ns = io_mod.nanoTimestamp(),
+            .loaded_at_ns = loaded_at_ns,
             .active_id = owned_active_id,
             .catalog = source.*,
         };
@@ -613,16 +690,18 @@ fn applySessionPickerCatalogPage(
     append: bool,
 ) !void {
     const workspace = if (picker.scope == .current_workspace) workspace_root else null;
+    // Pages hold only the sessions the search lists, so the search reaches
+    // the whole catalog and "Load more" appears only while matches remain.
+    const query = picker.query();
     var selected_index: ?usize = null;
     var page_limit = limit;
     if (!append) {
         page_limit = @max(page_limit, picker.summaries.items.len);
         if (picker.selectedId()) |selected_id| {
             var index: usize = 0;
-            for (cache.catalog.summaries.items) |summary| {
-                if (workspace) |root| {
-                    if (summary.workspace_root == null or !std.mem.eql(u8, summary.workspace_root.?, root)) continue;
-                }
+            const listed = session_catalog.pickerFilter(cache.catalog.summaries.items, workspace, query, .resumable);
+            for (cache.catalog.summaries.items, 0..) |summary, position| {
+                if (!listed.keeps(position)) continue;
                 if (std.mem.eql(u8, summary.id, selected_id)) {
                     selected_index = index;
                     page_limit = @max(page_limit, index + 1);
@@ -632,16 +711,16 @@ fn applySessionPickerCatalogPage(
             }
         }
     }
-    var page = try session_summary_codec.resumablePageFromSummaries(
+    var page = try session_catalog.resumablePage(
         alloc,
         cache.catalog.summaries.items,
         workspace,
-        null,
+        query,
         continuation,
         page_limit,
     );
     defer page.deinit(alloc);
-    var next: ?subagent_resume_admission.ActionableContinuation = if (page.has_more and page.summaries.items.len > 0) blk: {
+    var next: ?PickerContinuation = if (page.has_more and page.summaries.items.len > 0) blk: {
         const last = page.summaries.items[page.summaries.items.len - 1];
         break :blk .{
             .updated_at_ms = last.updated_at_ms,
@@ -664,12 +743,7 @@ fn applySessionPickerCatalogPage(
     picker.loading_more = false;
     picker.load_state = .ready;
     if (!append) {
-        if (selected_index) |index| {
-            picker.selected = session_catalog.filteredCount(
-                picker.summaries.items[0..index],
-                picker.query(),
-            );
-        }
+        if (selected_index) |index| picker.selected = index;
         picker.selected = @min(picker.selected, picker.filteredItemCount() -| 1);
         picker.window_start = @min(picker.window_start, picker.selected);
     } else if (selected_load_more) {
@@ -713,17 +787,19 @@ const SessionPickerLoad = struct {
         }
     };
 
+    /// Where a listing comes from (D26).
+    const Source = struct { store: *session_adapter.Store, workspace_root: []const u8 };
+
     const Task = struct {
         thread: ?std.Thread = null,
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         // Main-loop-owned; worker failures may also set cancel_requested.
         abandoned: bool = false,
-        home_dir: []u8,
-        workspace_root: []u8,
         request: PageRequest,
-        catalog: ?subagent_resume_admission.ActionableSessionCatalog = null,
-        cache_writer: ?session_catalog_cache.Writer = null,
+        catalog: ?session_catalog_cache.ActionableSessionCatalog = null,
+        /// Shared with the app, which joins this thread before freeing it.
+        store: *session_adapter.Store,
         failure: ?anyerror = null,
 
         fn requestStop(self: *Task) void {
@@ -742,10 +818,7 @@ const SessionPickerLoad = struct {
             self.requestStop();
             if (self.thread) |thread| thread.join();
             if (self.catalog) |*catalog| catalog.deinit(std.heap.c_allocator);
-            if (self.cache_writer) |*writer| writer.deinit();
             self.request.deinit();
-            std.heap.c_allocator.free(self.home_dir);
-            std.heap.c_allocator.free(self.workspace_root);
             std.heap.c_allocator.destroy(self);
         }
     };
@@ -782,14 +855,14 @@ const SessionPickerLoad = struct {
 
     fn schedule(
         self: *SessionPickerLoad,
-        store: *const session_store.Store,
+        source: Source,
         request: PageRequest,
     ) !void {
         if (self.task != null) {
             self.replacePending(request);
             return;
         }
-        try self.start(store, request);
+        try self.start(source, request);
     }
 
     fn replacePending(self: *SessionPickerLoad, request: PageRequest) void {
@@ -853,52 +926,30 @@ const SessionPickerLoad = struct {
         return null;
     }
 
-    fn startPending(self: *SessionPickerLoad, store: *const session_store.Store) !?u64 {
+    fn startPending(self: *SessionPickerLoad, source: Source) !?u64 {
         const request = self.pending orelse return null;
         self.pending = null;
         const generation = request.generation;
-        try self.start(store, request);
+        try self.start(source, request);
         return generation;
     }
 
     fn start(
         self: *SessionPickerLoad,
-        store: *const session_store.Store,
+        source: Source,
         request: PageRequest,
     ) !void {
         std.debug.assert(self.task == null);
 
         const alloc = std.heap.c_allocator;
         var owned_request = request;
-        const home_dir = alloc.dupe(u8, store.home_dir) catch |err| {
-            owned_request.deinit();
-            return err;
-        };
-        const workspace_root = alloc.dupe(u8, store.workspace_root) catch |err| {
-            alloc.free(home_dir);
-            owned_request.deinit();
-            return err;
-        };
         const task = alloc.create(Task) catch |err| {
-            alloc.free(workspace_root);
-            alloc.free(home_dir);
             owned_request.deinit();
             return err;
         };
-        task.* = .{
-            .home_dir = home_dir,
-            .workspace_root = workspace_root,
-            .request = owned_request,
-        };
-        task.cache_writer = session_catalog_cache.Writer.init(store.*) catch |err| blk: {
-            debug_trace.logf("core", "session catalog cache writer unavailable err={s}", .{@errorName(err)});
-            break :blk null;
-        };
+        task.* = .{ .request = owned_request, .store = source.store };
         task.thread = std.Thread.spawn(.{}, threadMain, .{task}) catch |err| {
-            if (task.cache_writer) |*writer| writer.deinit();
             task.request.deinit();
-            alloc.free(task.workspace_root);
-            alloc.free(task.home_dir);
             alloc.destroy(task);
             return err;
         };
@@ -915,28 +966,18 @@ const SessionPickerLoad = struct {
     fn threadMain(task: *Task) void {
         defer task.done.store(true, .release);
         const started = io_mod.nanoTimestamp();
-        var read_only = session_store.Store.initReadOnlyFromHome(
-            std.heap.c_allocator,
-            task.home_dir,
-            task.workspace_root,
-        ) catch |err| {
-            task.failure = err;
-            return;
-        };
-        defer read_only.deinit(std.heap.c_allocator);
-
-        task.catalog = subagent_resume_admission.listActionableCatalog(
-            read_only,
+        const summaries = session_adapter.listSummaries(
+            task.store,
             std.heap.c_allocator,
             task.request.active_id,
             &task.cancel_requested,
-            if (task.cache_writer) |*writer| writer else null,
         ) catch |err| {
-            debug_trace.logf("core", "session picker catalog stopped err={s} elapsed_us={d}", .{ @errorName(err), @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_us) });
+            debug_trace.logf("core", "session picker catalog stopped err={s}", .{@errorName(err)});
             task.failure = err;
             return;
         };
-        debug_trace.logf("core", "session picker catalog loaded sessions={d} elapsed_us={d}", .{ task.catalog.?.summaries.items.len, @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_us) });
+        task.catalog = .{ .summaries = summaries };
+        debug_trace.logf("core", "session picker catalog loaded sessions={d} elapsed_us={d}", .{ summaries.items.len, @divTrunc(io_mod.nanoTimestamp() - started, std.time.ns_per_us) });
     }
 };
 
@@ -1139,15 +1180,36 @@ const PendingCancelledCommand = struct {
     }
 };
 
+/// A request saved this long ago, or dated this far in the future, asks
+/// before it is sent again (`tests/tla/recovery/Resume.tla` OldAsks).
+const resume_max_age_ms: i64 = 24 * std.time.ms_per_hour;
+const resume_clock_slack_ms: i64 = 5 * std.time.ms_per_min;
+
+fn resumeIsStale(now_ms: i64, saved_ms: u64) bool {
+    const saved = std.math.cast(i64, saved_ms) orelse return true;
+    return now_ms -| saved > resume_max_age_ms or saved -| now_ms > resume_clock_slack_ms;
+}
+
+test "a resumed request older than a day, or dated ahead, asks first" {
+    const now: i64 = 10 * std.time.ms_per_day;
+    const now_u: u64 = @intCast(now);
+    try std.testing.expect(!resumeIsStale(now, now_u));
+    try std.testing.expect(!resumeIsStale(now, now_u - 23 * std.time.ms_per_hour));
+    try std.testing.expect(resumeIsStale(now, now_u - 25 * std.time.ms_per_hour));
+    // A clock a little ahead is noise; a record from the future is not.
+    try std.testing.expect(!resumeIsStale(now, now_u + std.time.ms_per_min));
+    try std.testing.expect(resumeIsStale(now, now_u + 10 * std.time.ms_per_min));
+    try std.testing.expect(resumeIsStale(now, std.math.maxInt(u64)));
+}
+
 pub const Persistence = struct {
     // Serializes event-log mutations with worker usage callbacks. Usage takes
     // its checkpoint mutex first, so callers must not checkpoint while held.
     // UI compaction publication takes worker_mutex before this mutex.
     write_mutex: std.Io.Mutex = .init,
-    store: ?session_store.Store = null,
-    writable: ?session_store.LoadedWritableSession = null,
-    remember_fresh_session: bool = false,
     subagent_host: ?*subagent_tool_host.Runtime = null,
+    /// The v2 session's children (D22), borrowed by `subagent_host`.
+    v2_children: ?*subagent_child_state.V2Children = null,
     workspace_preferences: ?session_codec.DurableSessionPreferences = null,
     session_preferences: ?session_codec.DurableSessionPreferences = null,
     fast_mode_model_bound: bool = false,
@@ -1157,31 +1219,42 @@ pub const Persistence = struct {
     process_model_override: ?[]u8 = null,
     process_effort_override: ?types.ReasoningEffort = null,
     process_fast_override: ?bool = null,
+    process_ultrafast_override: ?bool = null,
     session_picker: SessionPicker = .{},
     session_picker_load: SessionPickerLoad = .{},
     session_picker_cache: SessionPickerCatalogCache = .{},
+    fork_menu: ForkMenu = .{},
     title_generation: TitleGenerationLoad = .{},
     degraded_warning_emitted: bool = false,
     pending_cancelled_command: ?PendingCancelledCommand = null,
     image_snapshot_temp_dir: ?[]u8 = null,
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
+    pending_live_session_wait: ?LiveSessionWait = null,
+    /// The request the resumed session's newest turn left unfinished, which
+    /// `startPendingResume` sends again once the worker runs.
+    pending_request_resume: ?types.RecoveryResume = null,
+    /// Plain `fx` checks, once its first frame is on screen, whether the
+    /// session `fx -c` opens left a turn unfinished.
+    interrupted_turn_hint_pending: bool = false,
     shutdown_failure: ?anyerror = null,
+    /// On the heap, so the pointer every session keeps survives `App.init`
+    /// copying the app after it opens the store (`adoptStore`).
+    v2_store: ?*session_adapter.Store = null,
+    v2: ?*session_adapter.Session = null,
 
     /// Fieldwise initialization avoids retaining undefined optional payloads
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (std.meta.fields(Persistence).len != 24) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 29) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
         storage.* = undefined;
         storage.write_mutex = .init;
-        storage.store = null;
-        storage.writable = null;
-        storage.remember_fresh_session = false;
         storage.subagent_host = null;
+        storage.v2_children = null;
         storage.workspace_preferences = null;
         storage.session_preferences = null;
         storage.fast_mode_model_bound = false;
@@ -1191,19 +1264,39 @@ pub const Persistence = struct {
         storage.process_model_override = null;
         storage.process_effort_override = null;
         storage.process_fast_override = null;
+        storage.process_ultrafast_override = null;
         storage.session_picker = .{};
         storage.session_picker_load = .{};
         storage.session_picker_cache = .{};
+        storage.fork_menu = .{};
         storage.title_generation = .{};
         storage.degraded_warning_emitted = false;
         storage.pending_cancelled_command = null;
         storage.image_snapshot_temp_dir = null;
         storage.resume_handoff_intent = .none;
         storage.pending_live_session_policy = null;
+        storage.pending_live_session_wait = null;
+        storage.pending_request_resume = null;
+        storage.interrupted_turn_hint_pending = false;
         storage.shutdown_failure = null;
+        storage.v2_store = null;
+        storage.v2 = null;
     }
 
     pub fn deinit(self: *Persistence, alloc: Allocator) void {
+        self.deinitWithCatalog(alloc, .free);
+    }
+
+    /// Process exit leaves the session picker catalog to the exiting process;
+    /// freeing thousands of cached sessions one by one only delays exit.
+    pub fn deinitForProcessExit(self: *Persistence, alloc: Allocator) void {
+        self.deinitWithCatalog(alloc, .abandon);
+    }
+
+    fn deinitWithCatalog(self: *Persistence, alloc: Allocator, catalog: enum { free, abandon }) void {
+        if (self.pending_request_resume != null) {
+            debug_trace.logf("recovery", "event=resume_dropped reason=deinit", .{});
+        }
         if (self.pending_live_session_policy) |policy| {
             debug_trace.logf(
                 "session",
@@ -1217,57 +1310,49 @@ pub const Persistence = struct {
             alloc.free(path);
         }
         if (self.subagent_host) |host| host.deinit();
-        if (self.writable) |*loaded| loaded.deinit(alloc);
-        if (self.store) |*store| store.deinit(alloc);
+        if (self.v2_children) |children| {
+            children.deinit();
+            alloc.destroy(children);
+        }
+        if (self.v2) |v2| v2.close();
         if (self.workspace_preferences) |*preferences| preferences.deinit(alloc);
         if (self.session_preferences) |*preferences| preferences.deinit(alloc);
         if (self.js_host_session) |*owner| owner.deinit(alloc);
         if (self.process_model_override) |model| alloc.free(model);
         self.session_picker.deinit(alloc);
         self.session_picker_load.deinit();
-        self.session_picker_cache.deinit();
+        if (catalog == .free) self.session_picker_cache.deinit();
+        self.fork_menu.close(alloc);
         self.title_generation.deinit();
+        // After the picker thread, which lists through it, has joined.
+        if (self.v2_store) |store| {
+            store.deinit(alloc);
+            alloc.destroy(store);
+        }
         self.* = undefined;
     }
-};
 
-test "open session keeps exclusive writer ownership until close" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(alloc, &tmp);
-    defer alloc.free(paths.home);
-    defer alloc.free(paths.workspace);
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-    try configureTestPreferences(&app);
-    try Runtime(TestApp).initializePersistence(&app, true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app);
-    try Runtime(TestApp).appendHistoryTurn(&app, .{ .assistant = .{
-        .user = .{ .text = @constCast("original") },
-        .assistant = @constCast("original answer"),
-    } });
-    const id = try alloc.dupe(u8, app.session_persistence.writable.?.active_id);
-    defer alloc.free(id);
-    try app.input_runtime.edit_state.input.appendSlice(alloc, "local unfinished draft");
-    try std.testing.expectError(error.SessionBusy, Runtime(TestApp).loadResumeTargetForWrite(&app, .{ .id = id }, .{ .session_lock_deadline_ms = 1 }));
-    try std.testing.expectEqualStrings("local unfinished draft", app.input_runtime.edit_state.input.items);
-    Runtime(TestApp).finalizePersistence(&app);
-    var next = try Runtime(TestApp).loadResumeTargetForWrite(&app, .{ .id = id }, .{});
-    defer next.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), next.state.history.len);
-    try std.testing.expectEqualStrings("original answer", next.state.history[0].assistant.assistant);
-}
+    /// Takes `store` and keeps it at a stable address. Sessions point at
+    /// their store, and `App.init` copies the app after opening it.
+    pub fn adoptStore(self: *Persistence, alloc: Allocator, store: session_adapter.Store) !*session_adapter.Store {
+        var value = store;
+        const owned = alloc.create(session_adapter.Store) catch |err| {
+            value.deinit(alloc);
+            return err;
+        };
+        owned.* = value;
+        self.v2_store = owned;
+        return owned;
+    }
+};
 
 test "persistence in-place initialization preserves empty ownership" {
     var persistence: Persistence = undefined;
     Persistence.initInto(&persistence);
     defer persistence.deinit(std.testing.allocator);
 
-    try std.testing.expect(persistence.store == null);
-    try std.testing.expect(persistence.writable == null);
+    try std.testing.expect(persistence.v2_store == null);
+    try std.testing.expect(persistence.v2 == null);
     try std.testing.expect(persistence.subagent_host == null);
     try std.testing.expect(!persistence.fast_mode_model_bound);
     try std.testing.expect(!persistence.session_picker.active);
@@ -1289,23 +1374,14 @@ pub fn Runtime(comptime App: type) type {
                 attachment,
                 snapshot_dir,
             );
+            // A v2 session keeps the image inside the turn (D44).
+            if (app.session_persistence.v2 != null) try image_attachments.inlineCapturedSnapshot(app.alloc, attachment);
         }
 
         fn imageSnapshotStorageDir(app: *App) ![]u8 {
-            const sessions_dir = if (app.session_persistence.store) |*store|
-                store.sessions_dir
-            else
-                null;
-            const session_id = if (app.session_persistence.writable) |*writable|
-                writable.active_id
-            else
-                null;
-            return session_store.imageSnapshotStorageDir(
-                app.alloc,
-                sessions_dir,
-                session_id,
-                &app.session_persistence.image_snapshot_temp_dir,
-            );
+            // Captured into the process's temporary folder; the turn keeps
+            // the bytes (D44).
+            return session_store.imageSnapshotTempDir(app.alloc, &app.session_persistence.image_snapshot_temp_dir);
         }
 
         pub fn configureStartupPreferences(
@@ -1317,6 +1393,8 @@ pub fn Runtime(comptime App: type) type {
             effort: types.ReasoningEffort,
             fast_mode: bool,
             fast_mode_model_bound: bool,
+            configured_ultrafast_mode: bool,
+            ultrafast_process_override: ?bool,
             effort_process_override: ?types.ReasoningEffort,
             fast_process_override: ?bool,
             provider_process_override: ?model_provider.ProviderId,
@@ -1329,6 +1407,7 @@ pub fn Runtime(comptime App: type) type {
                     .model = @constCast(configured_model),
                     .effort = effort,
                     .fast_mode = fast_mode,
+                    .ultrafast_mode = configured_ultrafast_mode,
                 },
             );
             try replacePreferences(
@@ -1347,6 +1426,7 @@ pub fn Runtime(comptime App: type) type {
             }
             app.session_persistence.process_effort_override = effort_process_override;
             app.session_persistence.process_fast_override = fast_process_override;
+            app.session_persistence.process_ultrafast_override = ultrafast_process_override;
             app.session_persistence.process_provider_override = provider_process_override;
             // A provider override must pin the resolved model too, or a resume
             // would restore the session's model from a different provider.
@@ -1358,73 +1438,81 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        /// The v2 store's notice that converting a v1 session is slow, as a
+        /// dim line (D61).
+        fn conversionNotice(context: ?*anyopaque, text: []const u8) void {
+            if (comptime !@hasDecl(App, "writeDomainNotice")) return;
+            const app: *App = @ptrCast(@alignCast(context.?));
+            app.writeDomainNotice(.{ .topic = "session", .tone = .information, .body = text }, true) catch |err|
+                debug_trace.logf("convert", "action=NoticeDropped err={s}", .{@errorName(err)});
+        }
+
+        /// The reason a v1 session the startup resume refused with `err`
+        /// can't be converted (D61), for the launch's exit message, or null.
+        /// Caller owns it.
+        pub fn conversionRefusal(app: *App, alloc: Allocator, err: anyerror) ?[]u8 {
+            if (err != error.InvalidSessionFormat) return null;
+            const store = app.session_persistence.v2_store orelse return null;
+            const problem = store.conversionProblem() orelse return null;
+            return alloc.dupe(u8, problem) catch null;
+        }
+
+        /// Says in a notice why a session v1 holds can't be converted (D61),
+        /// on an in-app resume that `err` refused.
+        fn noteConversionProblem(app: *App, store: *const session_adapter.Store, err: anyerror) void {
+            if (comptime !@hasDecl(App, "writeDomainNotice")) return;
+            if (err != error.InvalidSessionFormat) return;
+            const problem = store.conversionProblem() orelse return;
+            var buffer: [640]u8 = undefined;
+            const body = std.mem.print(&buffer, "This session can't be converted (InvalidSessionFormat): {s}", .{problem}) catch problem;
+            app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch |write_err|
+                debug_trace.logf("convert", "action=NoticeDropped err={s}", .{@errorName(write_err)});
+        }
+
         pub fn initializePersistence(
             app: *App,
             required: bool,
         ) !void {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
-            var store = session_store.Store.init(
-                app.alloc,
-                app.workspace_root,
-            ) catch |err| {
+            const opened = session_adapter.Store.openFromEnv(app.alloc) catch |err| {
                 if (required) return err;
                 return;
             };
-            errdefer store.deinit(app.alloc);
-
-            app.session_persistence.store = store;
+            const store = try app.session_persistence.adoptStore(app.alloc, opened);
+            store.notice = .{ .context = app, .emit = conversionNotice };
         }
 
         pub fn enableSessionStores(app: *App) void {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
-            const loaded = if (app.session_persistence.writable) |*value| value else return;
-            const capability = loaded.childCapability() catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "interactive child capability unavailable session={s} err={s}",
-                    .{ loaded.active_id, @errorName(err) },
-                );
-                return;
-            };
-
-            configureWebFetchArtifacts(app, loaded);
-            enableSubagentHost(app, loaded);
-            if (comptime @hasField(App, "legacy_process_provider")) {
-                const migrated = legacy_background_migration.migrate(
-                    app.alloc,
-                    capability,
-                    app.legacy_process_provider,
-                ) catch |err| {
-                    debug_trace.logf(
-                        "session",
-                        "legacy process migration deferred session={s} err={s}",
-                        .{ loaded.active_id, @errorName(err) },
-                    );
-                    return;
-                };
-                if (migrated.records_removed != 0 or migrated.logs_removed != 0) {
-                    debug_trace.logf(
-                        "session",
-                        "legacy process migration committed session={s} records={d} logs={d} signaled={d} unavailable={d}",
-                        .{
-                            loaded.active_id,
-                            migrated.records_removed,
-                            migrated.logs_removed,
-                            migrated.processes_signaled,
-                            migrated.identities_unavailable,
-                        },
-                    );
+            const v2 = app.session_persistence.v2 orelse return;
+            if (comptime @hasDecl(@TypeOf(app.session), "configureWebFetchArtifactBlobs")) {
+                // A v2 session's downloads are its blobs (D44, D49).
+                if (v2.childCapability()) |capability| {
+                    app.session.configureWebFetchArtifactBlobs(app.alloc, capability, v2.id());
+                } else |err| {
+                    debug_trace.logf("session", "event=sessions_v2_web_fetch_store_unavailable session={s} err={s}", .{ v2.id(), @errorName(err) });
+                    app.session.clearWebFetchArtifacts();
                 }
             }
+            enableSubagentHostV2(app, v2);
         }
 
         pub fn beginFreshPersistedSession(app: *App) !void {
             closeWritableSession(app);
+            // A fresh session starts with no usage, whether or not it persists.
+            app.total_input_tokens = 0;
+            app.total_output_tokens = 0;
+            app.total_web_search_requests = 0;
             if (comptime runtime_profile.allows(App, .js_host_sessions)) {
                 try beginFreshJsHostSession(app);
             }
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
-            const store = app.session_persistence.store orelse return;
+            if (app.session_persistence.v2_store) |v2_store| try beginFreshV2Session(app, v2_store);
+        }
+
+        /// A v2 session starts in memory; its folder appears with the first
+        /// turn (D2), so a launch that never prompts leaves nothing behind.
+        fn beginFreshV2Session(app: *App, v2_store: *session_adapter.Store) !void {
             const preferences = app.session_persistence.workspace_preferences orelse
                 return error.SessionPreferencesUnavailable;
             try replacePreferences(
@@ -1432,21 +1520,17 @@ pub fn Runtime(comptime App: type) type {
                 &app.session_persistence.session_preferences,
                 preferences,
             );
-
-            var state = try freshState(app, preferences);
-            defer state.deinit(app.alloc);
-            app.session_persistence.writable = store.startWritableSession(
-                app.alloc,
-                state,
-            ) catch |err| {
+            var permission_state = try app.session.snapshotPermissionState(app.alloc);
+            defer permission_state.deinit(app.alloc);
+            app.session_persistence.v2 = session_adapter.Session.create(app.alloc, v2_store, app.workspace_root, .app, .{
+                .preferences = preferences,
+                .language = app.session.languageSnapshot(),
+                .permission_state = permission_state,
+            }) catch |err| {
                 try warnNonDurable(app, "session creation failed", err);
                 return;
             };
-            app.session_persistence.remember_fresh_session = true;
             app.session_persistence.degraded_warning_emitted = false;
-            app.total_input_tokens = 0;
-            app.total_output_tokens = 0;
-            app.total_web_search_requests = 0;
         }
 
         fn beginFreshJsHostSession(app: *App) !void {
@@ -1465,9 +1549,6 @@ pub fn Runtime(comptime App: type) type {
                 .revision = null,
             };
             state = undefined;
-            app.total_input_tokens = 0;
-            app.total_output_tokens = 0;
-            app.total_web_search_requests = 0;
         }
 
         pub fn clearSession(app: *App) !void {
@@ -1486,13 +1567,25 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             background_policy: BackgroundSessionPolicy,
         ) !void {
+            if (comptime @hasDecl(@TypeOf(app.worker), "holdSessionTransition")) {
+                app.worker.holdSessionTransition();
+            }
+            errdefer {
+                app.session_persistence.pending_live_session_wait = null;
+                releaseLiveSessionTransitionHold(app);
+            }
             const previous_policy = app.session_persistence.pending_live_session_policy;
+            const processing = app.worker.isProcessing();
             const decision = decideLiveSessionTransition(
                 runtime_profile.allows(App, .cooperative_agent),
-                app.worker.isProcessing(),
+                processing,
                 previous_policy,
                 .{ .request = background_policy },
             );
+            if (previous_policy == null) {
+                const now = operation_control.monotonicMillis(io_mod.getIo());
+                app.session_persistence.pending_live_session_wait = if (processing) .{ .worker = now } else .{ .geometry = now };
+            }
             if (previous_policy) |previous| {
                 if (decision.pending_policy) |next| {
                     if (previous != next) {
@@ -1506,24 +1599,136 @@ pub fn Runtime(comptime App: type) type {
             }
             app.session_persistence.pending_live_session_policy = decision.pending_policy;
             switch (decision.action) {
-                .apply_now => |policy| try applyLiveSessionTransition(app, policy),
-                .cancel_and_defer => beginLiveSessionCancellation(app),
-                .none => {},
+                .apply_now => |policy| {
+                    if (!freshSessionResizeReady(app)) {
+                        app.session_persistence.pending_live_session_policy = policy;
+                        if (processing) app.worker.requestCancel();
+                        debug_trace.logf("session", "event=live_session_transition_deferred reason=resize_pending", .{});
+                        return;
+                    }
+                    applyLiveSessionTransition(app, policy) catch |err| {
+                        if (handleScrollbackHandoffError(app, policy, err)) return;
+                        return err;
+                    };
+                },
+                .cancel_and_defer => app.worker.requestCancel(),
+                .none => if (decision.pending_policy == null) {
+                    app.session_persistence.pending_live_session_wait = null;
+                    releaseLiveSessionTransitionHold(app);
+                },
                 .apply_pending => unreachable,
             }
         }
 
+        fn freshSessionResizeReady(app: *App) bool {
+            if (comptime @hasField(@TypeOf(app.shell), "has_committed_frame")) {
+                if (!app.shell.has_committed_frame) return true;
+            }
+            if (comptime @hasDecl(App, "admitPendingResizeSignal")) {
+                _ = app.admitPendingResizeSignal("session_handoff");
+            }
+            if (!shell_runtime.resizeLifecycleIdle(&app.shell)) return false;
+            if (comptime !host_target.is_wasm and @hasField(App, "terminal")) {
+                const actual = app.terminal.queryLayout(app.shell.layout.rows -| app.shell.layout.content_bottom) catch return false;
+                if (actual.cols != app.shell.layout.cols or actual.rows != app.shell.layout.rows) return false;
+            }
+            return true;
+        }
+
+        fn handleScrollbackHandoffError(app: *App, policy: BackgroundSessionPolicy, err: anyerror) bool {
+            switch (err) {
+                error.SessionScrollbackHandoffUnavailable,
+                error.SessionScrollbackHandoffIncomplete,
+                => {
+                    app.session_persistence.pending_live_session_policy = policy;
+                    debug_trace.logf("session", "event=live_session_transition_deferred reason=scrollback_handoff err={s}", .{@errorName(err)});
+                    return true;
+                },
+                error.SessionScrollbackHandoffGeometryChanged => {
+                    app.session_persistence.pending_live_session_policy = null;
+                    app.session_persistence.pending_live_session_wait = null;
+                    app.shell.cancelSessionScrollbackHandoff();
+                    releaseLiveSessionTransitionHold(app);
+                    debug_trace.logf("session", "event=live_session_transition_cancelled reason=scrollback_handoff_geometry_changed", .{});
+                    if (comptime @hasDecl(App, "writeDomainNotice")) {
+                        app.writeDomainNotice(.{
+                            .topic = "session",
+                            .tone = .warning,
+                            .body = "Session change cancelled after a terminal resize. The old session was kept; an active turn may have been cancelled. Retry the command.",
+                        }, true) catch |notice_err| {
+                            debug_trace.logf("session", "event=transition_cancel_notice_dropped err={s}", .{@errorName(notice_err)});
+                        };
+                    }
+                    return true;
+                },
+                else => return false,
+            }
+        }
+
+        pub fn cancelPendingLiveSessionForInputLimit(app: *App) !void {
+            try cancelPendingLiveSessionForInput(app, "deferred_input_limit", "Session change cancelled because input arrived faster than it could finish. Your input is still being delivered to the old session; retry the command.");
+        }
+
+        pub fn cancelPendingLiveSessionForTimeout(app: *App) !void {
+            try cancelPendingLiveSessionForInput(app, "resize_timeout", "Session change cancelled because the terminal resize did not settle. Continuing in the old session; retry the command.");
+        }
+
+        fn cancelPendingLiveSessionForWorkerTimeout(app: *App) !void {
+            try cancelPendingLiveSessionForInput(app, "worker_timeout", "Session change cancelled because the active turn did not stop. Continuing in the old session; retry the command.");
+        }
+
+        fn cancelPendingLiveSessionForInput(app: *App, reason: []const u8, notice: []const u8) !void {
+            if (app.session_persistence.pending_live_session_policy == null) return;
+            app.session_persistence.pending_live_session_policy = null;
+            app.session_persistence.pending_live_session_wait = null;
+            app.shell.cancelSessionScrollbackHandoff();
+            releaseLiveSessionTransitionHold(app);
+            debug_trace.logf("session", "event=live_session_transition_cancelled reason={s}", .{reason});
+            try app.writeDomainNotice(.{ .topic = "session", .tone = .warning, .body = notice }, true);
+        }
+
         pub fn settlePendingLiveSessionTransition(app: *App) !void {
+            if (app.session_persistence.pending_live_session_policy == null) return;
+            const processing = app.worker.isProcessing();
+            const now = operation_control.monotonicMillis(io_mod.getIo());
+            var wait = app.session_persistence.pending_live_session_wait orelse if (processing) LiveSessionWait{ .worker = now } else LiveSessionWait{ .geometry = now };
+            if (wait == .worker and !processing) wait = .{ .geometry = now };
+            app.session_persistence.pending_live_session_wait = wait;
+            if (liveSessionWaitTimeout(wait, processing, now)) |timeout| {
+                switch (timeout) {
+                    .worker => try cancelPendingLiveSessionForWorkerTimeout(app),
+                    .geometry => try cancelPendingLiveSessionForTimeout(app),
+                }
+                return;
+            }
+            errdefer {
+                app.session_persistence.pending_live_session_wait = null;
+                releaseLiveSessionTransitionHold(app);
+            }
             const decision = decideLiveSessionTransition(
                 runtime_profile.allows(App, .cooperative_agent),
-                app.worker.isProcessing(),
+                processing,
                 app.session_persistence.pending_live_session_policy,
                 .settle,
             );
             app.session_persistence.pending_live_session_policy = decision.pending_policy;
             switch (decision.action) {
                 .apply_pending => |policy| {
-                    applyIdleLiveSessionTransition(app, policy);
+                    if (comptime @hasDecl(@TypeOf(app.shell), "sessionScrollbackHandoffPending")) {
+                        if (app.shell.sessionScrollbackHandoffPending()) {
+                            if (comptime @hasDecl(App, "admitPendingResizeSignal")) {
+                                _ = app.admitPendingResizeSignal("session_handoff");
+                            }
+                            if (!shell_runtime.resizeLifecycleIdle(&app.shell)) {
+                                _ = handleScrollbackHandoffError(app, policy, error.SessionScrollbackHandoffGeometryChanged);
+                                return;
+                            }
+                        }
+                    }
+                    applyIdleLiveSessionTransition(app, policy, true) catch |err| {
+                        if (handleScrollbackHandoffError(app, policy, err)) return;
+                        return err;
+                    };
                     try installFreshLiveSession(app);
                 },
                 .none => {},
@@ -1535,18 +1740,43 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             background_policy: BackgroundSessionPolicy,
         ) !void {
-            try prepareLiveSessionTransition(app, background_policy);
+            try prepareLiveSessionTransition(app, background_policy, true);
             try installFreshLiveSession(app);
         }
 
         fn installFreshLiveSession(app: *App) !void {
+            defer {
+                app.session_persistence.pending_live_session_wait = null;
+                releaseLiveSessionTransitionHold(app);
+            }
             try beginFreshPersistedSession(app);
             enableSessionStores(app);
             try finishLiveSessionTransition(app);
         }
 
+        fn releaseLiveSessionTransitionHold(app: *App) void {
+            if (comptime @hasField(App, "terminal_input_runtime")) {
+                if (comptime @hasDecl(@TypeOf(app.terminal_input_runtime), "hasDeferredSessionInput") and
+                    @hasDecl(@TypeOf(app.terminal_input_runtime), "allowCurrentDeferredSessionInputForReplay"))
+                {
+                    if (app.terminal_input_runtime.hasDeferredSessionInput()) {
+                        app.terminal_input_runtime.allowCurrentDeferredSessionInputForReplay();
+                        return;
+                    }
+                }
+            }
+            if (comptime @hasDecl(@TypeOf(app.worker), "releaseSessionTransitionHold")) {
+                app.worker.releaseSessionTransitionHold();
+            }
+        }
+
+        pub fn finishDeferredSessionInputReplay(app: *App) void {
+            if (app.session_persistence.pending_live_session_policy != null) return;
+            releaseLiveSessionTransitionHold(app);
+        }
+
         pub fn prepareLiveSessionResume(app: *App) !void {
-            try prepareLiveSessionTransition(app, .stop_forget);
+            try prepareLiveSessionTransition(app, .stop_forget, false);
         }
 
         pub fn finishLiveSessionResume(app: *App) !void {
@@ -1557,10 +1787,15 @@ pub fn Runtime(comptime App: type) type {
         fn prepareLiveSessionTransition(
             app: *App,
             background_policy: BackgroundSessionPolicy,
+            preserve_scrollback: bool,
         ) !void {
-            beginLiveSessionCancellation(app);
+            if (preserve_scrollback) {
+                app.worker.requestCancel();
+            } else {
+                beginLiveSessionCancellation(app);
+            }
             app.worker.waitUntilIdle();
-            applyIdleLiveSessionTransition(app, background_policy);
+            try applyIdleLiveSessionTransition(app, background_policy, preserve_scrollback);
         }
 
         fn beginLiveSessionCancellation(app: *App) void {
@@ -1587,7 +1822,18 @@ pub fn Runtime(comptime App: type) type {
         fn applyIdleLiveSessionTransition(
             app: *App,
             background_policy: BackgroundSessionPolicy,
-        ) void {
+            preserve_scrollback: bool,
+        ) !void {
+            if (preserve_scrollback) {
+                if (comptime @hasField(App, "terminal")) {
+                    if (comptime @hasField(@TypeOf(app.terminal), "alternate_screen_owner")) {
+                        if (app.terminal.alternate_screen_owner != .none) return error.SessionScrollbackHandoffUnavailable;
+                    }
+                }
+                if (!freshSessionResizeReady(app)) return error.SessionScrollbackHandoffUnavailable;
+                try app.shell.commitVisibleTranscriptBeforeFreshSession(app.alloc, &app.metrics);
+                beginLiveSessionCancellation(app);
+            }
             retireLiveSessionCompaction(app);
             clearCachedSessionTitle(app);
             app.worker.discardEvents(std.heap.c_allocator);
@@ -1616,6 +1862,7 @@ pub fn Runtime(comptime App: type) type {
             }
             app.question_prompt.discard(app.alloc, "session_reset");
             cancelSessionPicker(app);
+            app.session_persistence.fork_menu.close(app.alloc);
             invalidateSessionPickerCaches(app);
         }
 
@@ -1629,6 +1876,50 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn resumeRequestedSession(app: *App) !void {
             return resumeRequestedSessionWithNotice(app, .session);
+        }
+
+        /// The update's notice, in the fresh session an update relaunch
+        /// opens when the session it handed over had no turn to resume (D81).
+        pub fn writeUpgradeNotice(
+            app: *App,
+            version: []const u8,
+            channel: update_target.Channel,
+            previous_revision: []const u8,
+            revision: []const u8,
+        ) !void {
+            var body: std.Io.Writer.Allocating = .init(app.alloc);
+            defer body.deinit();
+            try writeUpgradeNoticeBody(&body.writer, .{
+                .version = version,
+                .channel = channel,
+                .previous_revision = previous_revision,
+                .revision = revision,
+            });
+            try app.writeDomainNotice(.{ .topic = "", .tone = .success, .body = body.written() }, true);
+        }
+
+        /// Plain `fx` points at a turn the session `fx -c` opens left
+        /// unfinished, whether or not `fx -c` would send it again on its own.
+        /// The check reads the session index, so it waits for the first frame
+        /// (`collectInterruptedTurnHint`).
+        pub fn queueInterruptedTurnHint(app: *App) void {
+            app.session_persistence.interrupted_turn_hint_pending = true;
+        }
+
+        pub fn collectInterruptedTurnHint(app: *App) void {
+            if (!app.session_persistence.interrupted_turn_hint_pending) return;
+            if (app.shell.render_requests.hasReason(.first_frame)) return;
+            app.session_persistence.interrupted_turn_hint_pending = false;
+            const v2_store = app.session_persistence.v2_store orelse return;
+            if (!session_adapter.hasInterruptedTurn(v2_store, app.alloc, app.workspace_root)) return;
+            debug_trace.logf("session", "event=interrupted_turn_hint", .{});
+            app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .neutral,
+                .body = "Interrupted turn · fx -c to continue",
+            }, true) catch |err| {
+                debug_trace.logf("session", "event=interrupted_turn_hint_failed err={s}", .{@errorName(err)});
+            };
         }
 
         pub fn resumeRequestedSessionAfterUpgrade(
@@ -1659,31 +1950,20 @@ pub fn Runtime(comptime App: type) type {
             app.requested_resume = null;
             defer target.deinit(app.alloc);
 
-            var remembered: ?[]u8 = null;
-            defer if (remembered) |id| app.alloc.free(id);
-            const resume_target: session_store.ResumeTarget = switch (target) {
-                // Nothing to load yet: the picker asks which session to open.
+            const v2_store = app.session_persistence.v2_store orelse return error.SessionStoreUnavailable;
+            const v2_target: session_adapter.Target = switch (target) {
                 .pick => return openSessionPicker(app),
                 .last => .last,
-                .remembered => blk: {
-                    const store = app.session_persistence.store orelse return error.SessionStoreUnavailable;
-                    remembered = store.readRememberedSessionId(app.alloc) catch |err| switch (err) {
-                        error.OutOfMemory => return err,
-                        else => return error.RememberedSessionUnavailable,
-                    };
-                    break :blk .{ .id = remembered orelse return error.NoRememberedSession };
-                },
+                // The manager records the session each host last opened.
+                .remembered => .last_opened,
                 .id => |session_id| .{ .id = session_id },
             };
-            var loaded = try loadResumeTargetForWrite(app, resume_target, .{});
-            var loaded_owned = true;
-            errdefer if (loaded_owned) loaded.deinit(app.alloc);
-
-            loaded_owned = false;
-            try installResumedSession(app, &loaded, notice);
+            // A refusal's reason is the launch's exit message
+            // (`conversionRefusal`).
+            const v2 = try session_adapter.Session.resumeSession(app.alloc, v2_store, v2_target, app.workspace_root, .app);
+            try installResumedV2Session(app, v2, notice);
             errdefer closeWritableSession(app);
             try app.commitStartupResumeReplayAnchor();
-            if (target != .remembered and notice == .session) rememberSelectedSession(app);
         }
 
         fn resumeRequestedJsHostSession(app: *App) !void {
@@ -1772,7 +2052,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             defer display.deinit(app.alloc);
-            hydrateResumedSession(app, loaded.state, display.title, notice) catch |err| {
+            hydrateResumedSession(app, loaded.state, &display, notice) catch |err| {
                 traceJsHostRestoreFailure("hydrate", session_id, err);
                 try continueWithFreshJsHostSession(app);
                 return;
@@ -1823,104 +2103,173 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        pub fn startResumedSessionReconciliation(app: *App) void {
+        pub fn startResumedSessionWarmup(app: *App) void {
             if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
-            if (comptime !@hasField(App, "auth") or !provider_runtime.supported(App)) return;
-            if (comptime !@hasDecl(@TypeOf(app.auth), "credentialSource") or
-                !@hasDecl(@TypeOf(app.auth), "accountId") or
-                !@hasDecl(@TypeOf(app.session.usage), "replaceProviderReconciliationCredential")) return;
-
-            const source = app.auth.credentialSource() orelse return;
-            if (!model_provider.authorizesCredential(provider_runtime.provider(app), source)) return;
-            const credential = app.auth.apiKey() orelse return;
-            app.session.usage.replaceProviderReconciliationCredential(
-                app.alloc,
-                provider_runtime.provider(app),
-                source,
-                app.auth.accountId(),
-                credential,
-            );
         }
 
         pub fn resumeSelectedSession(app: *App) !bool {
             const selected_id = app.session_persistence.session_picker.selectedId() orelse return false;
-            const log_options = session_log.Options{
-                .session_lock_deadline_ms = 0,
+            const v2_store = app.session_persistence.v2_store orelse return false;
+            // A session open in another fx shows as busy at once (D38).
+            const v2 = session_adapter.Session.resumeSessionWithoutWaiting(app.alloc, v2_store, .{ .id = selected_id }, app.workspace_root, .app) catch |err| {
+                noteConversionProblem(app, v2_store, err);
+                return err;
             };
-            var loaded = try loadResumeTargetForWrite(
-                app,
-                .{ .id = selected_id },
-                log_options,
-            );
-            var loaded_owned = true;
-            errdefer if (loaded_owned) loaded.deinit(app.alloc);
-
+            var v2_owned = true;
+            errdefer if (v2_owned) v2.close();
             try app.prepareLiveSessionResume();
-            loaded_owned = false;
-            try installResumedSession(app, &loaded, .session);
-            startResumedSessionReconciliation(app);
+            v2_owned = false;
+            try installResumedV2Session(app, v2, .session);
+            startResumedSessionWarmup(app);
             try app.finishLiveSessionResume();
-            rememberSelectedSession(app);
+            startPendingResume(app);
             return true;
         }
 
-        fn loadResumeTargetForWrite(
-            app: *App,
-            target: session_store.ResumeTarget,
-            log_options: session_log.Options,
-        ) !session_store.LoadedWritableSession {
-            const store = app.session_persistence.store orelse
-                return session_log.failLoadedWritableSession(error.SessionStoreUnavailable);
-            return subagent_resume_admission.resumeForExternalPrompt(
-                store,
-                app.alloc,
-                target,
-                app.workspace_root,
-                .{
-                    .seed_preferences = app.session_persistence.workspace_preferences,
-                    .log = log_options,
-                },
-            );
+        /// Opens `/fork`'s menu of the session's prompts, newest selected,
+        /// or says why it cannot (D58).
+        pub fn openForkMenu(app: *App) !void {
+            const v2 = app.session_persistence.v2 orelse return app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .warning,
+                .body = "/fork needs a saved session",
+            }, true);
+            if (app.stream.active) return app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .neutral,
+                .body = "/fork is available once the current turn finishes",
+            }, true);
+            const points = try v2.forkPoints(app.alloc);
+            if (points.len == 0) {
+                session_adapter.Session.freeForkPoints(app.alloc, points);
+                return app.writeDomainNotice(.{
+                    .topic = "session",
+                    .tone = .neutral,
+                    .body = "nothing to fork yet",
+                }, true);
+            }
+            const menu = &app.session_persistence.fork_menu;
+            menu.close(app.alloc);
+            menu.* = .{ .points = points, .selected = points.len - 1 };
+            app.shell.render_requests.request(.footer);
         }
 
-        fn installResumedSession(
-            app: *App,
-            loaded: *session_store.LoadedWritableSession,
-            notice: ResumeNotice,
-        ) !void {
-            var loaded_owned = true;
-            errdefer if (loaded_owned) loaded.deinit(app.alloc);
+        /// Forks the session before the fork menu's selected prompt and
+        /// switches to the fork, which opens before the source closes (D58).
+        /// Returns that prompt's text for the composer; caller owns it.
+        pub fn forkBeforeSelectedPrompt(app: *App) ![]u8 {
+            const menu = &app.session_persistence.fork_menu;
+            const points = menu.points;
+            const point = points[menu.selected];
+            menu.* = .{};
+            defer session_adapter.Session.freeForkPoints(app.alloc, points);
+            const source = app.session_persistence.v2 orelse return error.SessionStoreUnavailable;
+            const source_id = try app.alloc.dupe(u8, source.id());
+            defer app.alloc.free(source_id);
+            const prompt = try app.alloc.dupe(u8, point.prompt);
+            errdefer app.alloc.free(prompt);
+            const fork = try source.fork(app.alloc, .{
+                .before_turn = point.turn,
+                .workspace = app.workspace_root,
+                .host = .app,
+                .title = cachedSessionTitle(app),
+            });
+            var fork_owned = true;
+            errdefer if (fork_owned) fork.close();
+            try app.prepareLiveSessionResume();
+            fork_owned = false;
+            try installResumedV2Session(app, fork, .{ .fork = source_id });
+            startResumedSessionWarmup(app);
+            try app.finishLiveSessionResume();
+            return prompt;
+        }
 
-            var display = try readNativeResumeDisplay(app, loaded);
+        /// Makes `v2` the open session, taking ownership, and restores the app
+        /// from it through v1's state.
+        fn installResumedV2Session(app: *App, v2: *session_adapter.Session, notice: ResumeNotice) !void {
+            var v2_owned = true;
+            errdefer if (v2_owned) v2.close();
+            var resumed = try v2.durableState(app.alloc, app.workspace_root);
+            defer resumed.deinit(app.alloc);
+            var display: session_display_metadata.DisplayMetadata = if (resumed.title) |title|
+                .{ .present = true, .title = try app.alloc.dupe(u8, title) }
+            else
+                try session_display_metadata.deriveFromHistory(app.alloc, resumed.state.history);
             defer display.deinit(app.alloc);
 
             closeWritableSession(app);
-            app.session_persistence.writable = loaded.*;
-            loaded_owned = false;
-            loaded.* = undefined;
-            errdefer {
-                app.session_persistence.writable.?.deinit(app.alloc);
-                app.session_persistence.writable = null;
-            }
-            const active = &app.session_persistence.writable.?;
-            try hydrateResumedSession(app, active.state, display.title, notice);
-            active.releaseHydrationHistory(app.alloc);
+            app.session_persistence.v2 = v2;
+            v2_owned = false;
+            errdefer closeWritableSession(app);
+            try hydrateResumedSession(app, resumed.state, &display, notice);
             enableSessionStores(app);
+            // A fork is a new session: it continues nothing on its own.
+            if (notice != .fork) noteInterruptedRequest(app, v2);
+        }
+
+        /// Notes the request the newest turn left unfinished, if a crash or a
+        /// close ended it (`tests/tla/recovery/Resume.tla` AutoResumes).
+        fn noteInterruptedRequest(app: *App, v2: *session_adapter.Session) void {
+            app.session_persistence.pending_request_resume = null;
+            const found = (v2.interruptedRequest() catch |err| {
+                debug_trace.logf("recovery", "event=resume_check_failed err={s}", .{@errorName(err)});
+                return;
+            }) orelse return;
+            const now_ms = io_mod.milliTimestamp();
+            const stale = resumeIsStale(now_ms, found.saved_ms);
+            app.session_persistence.pending_request_resume = .{ .record = found.record, .stale = stale };
+            debug_trace.logf("recovery", "event=resume_pending record={} stale={} saved_ms={d} now_ms={d}", .{ found.record != null, stale, found.saved_ms, now_ms });
+        }
+
+        /// Sends the noted request again, as a turn whose prompt is fx's note
+        /// to the model. The recovery module decides whether it goes at once
+        /// or asks first.
+        pub fn startPendingResume(app: *App) void {
+            if (comptime !@hasDecl(App, "queueResumedRequest")) return;
+            const resumed = app.session_persistence.pending_request_resume orelse return;
+            app.session_persistence.pending_request_resume = null;
+            _ = app.queueResumedRequest(session_runtime.resumed_request_prompt, resumed) catch |err| {
+                debug_trace.logf("recovery", "event=resume_dropped reason=queue_failed err={s}", .{@errorName(err)});
+            };
+        }
+
+        /// `AgentRuntimeDeps.save_recovery_record` on v2.
+        pub fn saveRecoveryRecord(app: *App, record: types.RecoveryRecordWrite) !bool {
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = app.session_persistence.v2 orelse return false;
+            return v2.saveRecovery(record);
+        }
+
+        /// Record whether restored history references shell execution handles
+        /// this process does not own. Registry membership, not the resume
+        /// itself, decides staleness (see session_runtime.detectStaleShellHandles).
+        fn updateStaleShellHandles(app: *App, history: []const session_runtime.HistoryTurn) void {
+            if (comptime !@hasField(App, "managed_executions")) return;
+            app.session.has_stale_shell_handles = session_runtime.detectStaleShellHandles(
+                app.alloc,
+                history,
+                &app.managed_executions,
+            ) catch |err| blk: {
+                debug_trace.logf(
+                    "session",
+                    "event=stale_shell_handle_scan outcome=skipped err={s}",
+                    .{@errorName(err)},
+                );
+                break :blk false;
+            };
         }
 
         fn hydrateResumedSession(
             app: *App,
-            state: session_codec.DurableSessionState,
-            display_title: []const u8,
+            loaded_state: session_codec.DurableSessionState,
+            display: *const session_display_metadata.DisplayMetadata,
             notice: ResumeNotice,
         ) !void {
+            const state = loaded_state;
             const previous_provider = provider_runtime.provider(app);
             if (comptime @hasField(App, "next_image_id")) {
-                app.next_image_id = try nextImageIdForResume(
-                    app.alloc,
-                    state.history,
-                    state.recovery_checkpoint,
-                );
+                app.next_image_id = try nextImageIdForResume(app.alloc, state.history);
             }
             try app.session.restoreWithPermissionState(
                 app.alloc,
@@ -1928,15 +2277,7 @@ pub fn Runtime(comptime App: type) type {
                 state.history,
                 state.permission_state,
             );
-            if (state.usage) |usage| {
-                try app.session.usage.restore(
-                    app.alloc,
-                    usage,
-                    state.created_at_ms,
-                );
-            } else {
-                app.session.usage.restoreLegacyWallDuration(state.created_at_ms);
-            }
+            updateStaleShellHandles(app, state.history);
             try replacePreferences(
                 app.alloc,
                 &app.session_persistence.session_preferences,
@@ -1948,15 +2289,7 @@ pub fn Runtime(comptime App: type) type {
             app.total_output_tokens = state.total_output_tokens;
             app.total_web_search_requests = 0;
 
-            const resume_workspace_root = if (std.mem.eql(
-                u8,
-                state.origin_workspace_root,
-                state.workspace_root,
-            ))
-                state.workspace_root
-            else
-                "";
-            var historical_labels = HistoricalSessionLabels{ .workspace_root = resume_workspace_root };
+            var historical_labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
             defer historical_labels.deinit(app.alloc);
 
             if (comptime @hasDecl(App, "beginResumeProjection")) {
@@ -1966,12 +2299,10 @@ pub fn Runtime(comptime App: type) type {
                 var sink = DetachedHistorySink(@TypeOf(projection)){
                     .app = app,
                     .projection = &projection,
-                    .workspace_root = resume_workspace_root,
                     .labels = &historical_labels,
                 };
-                try writeResumeNotice(app, &sink, display_title, notice);
+                try writeResumeNotice(app, &sink, display, notice);
                 try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
-                try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels);
                 const projection_finished_ns = io_mod.nanoTimestamp();
                 try projection.finalize();
                 const finalization_finished_ns = io_mod.nanoTimestamp();
@@ -1989,13 +2320,25 @@ pub fn Runtime(comptime App: type) type {
                 );
             } else {
                 var sink = LiveHistorySink(App){ .app = app };
-                try writeResumeNotice(app, &sink, display_title, notice);
+                try writeResumeNotice(app, &sink, display, notice);
                 try replayResumedHistoryToSink(app, &sink, state.history, &historical_labels);
-                try writeRecoveryCheckpointToSink(app, &sink, state, &historical_labels);
             }
             if (comptime @hasDecl(App, "restoreSessionCredential")) {
                 try app.restoreSessionCredential(previous_provider);
             }
+        }
+
+        /// The picker lists from the backend this process runs on.
+        fn pickerSource(app: *App) ?SessionPickerLoad.Source {
+            if (app.session_persistence.v2_store) |store| {
+                return .{ .store = store, .workspace_root = app.workspace_root };
+            }
+            return null;
+        }
+
+        /// The open session, which the picker leaves out.
+        fn pickerActiveId(app: *App) ?[]const u8 {
+            return if (app.session_persistence.v2) |v2| v2.id() else null;
         }
 
         pub fn openSessionPicker(app: *App) !void {
@@ -2015,7 +2358,28 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
+            try listSessionPicker(app, scope);
+        }
 
+        /// Re-lists the open picker for the composer's current text, so the
+        /// search covers every saved session in scope, not only loaded pages.
+        pub fn searchSessionPicker(app: *App) !void {
+            const picker = &app.session_persistence.session_picker;
+            if (!picker.active) return;
+            // A listing still in flight applies the query when it lands.
+            if (picker.load_state != .ready) {
+                picker.setQuery(app.input_runtime.edit_state.input.items);
+                return;
+            }
+            listSessionPicker(app, picker.scope) catch |err| {
+                picker.load_state = .failed;
+                return err;
+            };
+        }
+
+        /// Lists the first page for `scope` and the composer's text from the
+        /// held catalog, refreshing a stale or missing catalog in the background.
+        fn listSessionPicker(app: *App, scope: SessionPickerScope) !void {
             var picker = &app.session_persistence.session_picker;
             const previous_generation = picker.generation;
             picker.deinit(app.alloc);
@@ -2023,18 +2387,13 @@ pub fn Runtime(comptime App: type) type {
             picker.load_state = .loading;
             picker.scope = scope;
             picker.setQuery(app.input_runtime.edit_state.input.items);
-            const store = if (app.session_persistence.store) |*value|
-                value
-            else {
+            const source = pickerSource(app) orelse {
                 picker.load_state = .failed;
                 try writeSessionPickerError(app, error.SessionStoreUnavailable);
                 app.shell.render_requests.request(.footer);
                 return;
             };
-            const active_id = if (app.session_persistence.writable) |*loaded|
-                loaded.active_id
-            else
-                null;
+            const active_id = pickerActiveId(app);
             const limit = if (comptime @hasField(App, "shell"))
                 resumePageLimitForRows(app.shell.layout.rows)
             else
@@ -2049,7 +2408,7 @@ pub fn Runtime(comptime App: type) type {
                     picker,
                     app.alloc,
                     cache,
-                    store.workspace_root,
+                    source.workspace_root,
                     null,
                     limit,
                     false,
@@ -2074,7 +2433,7 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             picker.generation = request.generation;
-            loader.schedule(store, request) catch |err| {
+            loader.schedule(source, request) catch |err| {
                 if (!cache_visible) picker.load_state = .failed;
                 try writeSessionPickerError(app, err);
                 return;
@@ -2098,8 +2457,8 @@ pub fn Runtime(comptime App: type) type {
             var task_owned = true;
             defer if (task_owned) task.deinit();
 
-            const active_id = if (app.session_persistence.writable) |*loaded| loaded.active_id else null;
-            const valid = app.session_persistence.store != null and
+            const active_id = pickerActiveId(app);
+            const valid = pickerSource(app) != null and
                 !task.abandoned and optionalStringEql(task.request.active_id, active_id);
             var cache_installed = false;
             if (valid and task.failure == null) {
@@ -2136,7 +2495,7 @@ pub fn Runtime(comptime App: type) type {
                     picker,
                     app.alloc,
                     cache,
-                    app.session_persistence.store.?.workspace_root,
+                    pickerSource(app).?.workspace_root,
                     null,
                     limit,
                     false,
@@ -2149,12 +2508,9 @@ pub fn Runtime(comptime App: type) type {
             task.deinit();
             task_owned = false;
 
-            const store = if (app.session_persistence.store) |*value|
-                value
-            else
-                return;
+            const source = pickerSource(app) orelse return;
             const pending_generation = loader.pendingGeneration();
-            _ = loader.startPending(store) catch |err| {
+            _ = loader.startPending(source) catch |err| {
                 if (pending_generation) |generation| {
                     if (picker.active and picker.generation == generation) {
                         if (picker.loading_more) {
@@ -2173,8 +2529,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn writeSessionPickerError(app: *App, err: anyerror) !void {
-            const notice = try std.fmt.allocPrint(
-                app.alloc,
+            const notice = try app.alloc.print(
                 "unable to list saved sessions: {s}",
                 .{@errorName(err)},
             );
@@ -2198,10 +2553,8 @@ pub fn Runtime(comptime App: type) type {
             const picker = &app.session_persistence.session_picker;
             const continuation = picker.continuation orelse
                 return error.SessionStoreUnavailable;
-            const active_id = if (app.session_persistence.writable) |*loaded|
-                loaded.active_id
-            else
-                null;
+            const source = pickerSource(app) orelse return error.SessionStoreUnavailable;
+            const active_id = pickerActiveId(app);
             const cache = &app.session_persistence.session_picker_cache;
             if (!cache.matches(active_id)) return error.SessionStoreUnavailable;
             const limit = if (comptime @hasField(App, "shell"))
@@ -2214,7 +2567,7 @@ pub fn Runtime(comptime App: type) type {
                 picker,
                 app.alloc,
                 cache,
-                app.session_persistence.store.?.workspace_root,
+                source.workspace_root,
                 continuation.view(),
                 limit,
                 true,
@@ -2257,7 +2610,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn cancelSessionPickerToComposer(app: *App) void {
             cancelSessionPicker(app);
             if (comptime !@hasField(App, "session")) return;
-            if (app.session_persistence.writable != null) return;
+            if (app.session_persistence.v2 != null) return;
             beginFreshPersistedSession(app) catch |err| {
                 debug_trace.logf(
                     "session",
@@ -2331,147 +2684,9 @@ pub fn Runtime(comptime App: type) type {
             _ = try appendHistoryTurnWithPendingPresentation(
                 app,
                 turn,
-                .strict,
+                .finished_prompt,
                 finished.snapshot_file_ownership,
             );
-        }
-
-        pub fn persistUsageCheckpoint(
-            app: *App,
-            snapshot: session_usage.Snapshot,
-        ) !void {
-            if (comptime !@hasField(App, "session_persistence")) {
-                return error.SessionPersistenceUnavailable;
-            }
-            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const store = if (app.session_persistence.store) |value|
-                value
-            else
-                return error.SessionPersistenceUnavailable;
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return error.SessionPersistenceUnavailable;
-            const recovery_checkpoint = try store.prepareUsageRecoveryCheckpoint(
-                app.alloc,
-                loaded,
-                snapshot,
-            );
-            _ = try loaded.appendEvent(
-                app.alloc,
-                .{ .usage_checkpointed = .{ .usage = snapshot } },
-                recovery_checkpoint.timestamp_ms,
-            );
-            try store.finishUsageRecoveryCheckpoint(
-                loaded.active_id,
-                recovery_checkpoint,
-            );
-        }
-
-        pub fn setRecoveryCheckpoint(
-            app: *App,
-            checkpoint: session_codec.RecoveryCheckpoint,
-        ) !void {
-            errdefer |err| if (err == error.SessionPersistenceUncertain) {
-                if (comptime @hasDecl(@TypeOf(app.worker), "preservePromptSnapshots")) {
-                    app.worker.preservePromptSnapshots(checkpoint.turn_id, checkpoint.user.images);
-                }
-            };
-            if (comptime !@hasField(App, "session_persistence")) {
-                return error.SessionPersistenceUnavailable;
-            }
-            var remember_failure: ?RememberFailure = null;
-            {
-                app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-                defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-                const loaded = if (app.session_persistence.writable) |*value|
-                    value
-                else
-                    return error.SessionPersistenceUnavailable;
-                const first_work = app.session_persistence.remember_fresh_session and !hasDurableUserWork(loaded);
-                const now_ms = io_mod.milliTimestamp();
-                _ = try loaded.appendEvent(
-                    app.alloc,
-                    .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
-                    now_ms,
-                );
-                if (first_work) {
-                    app.session_persistence.remember_fresh_session = false;
-                    remember_failure = rememberSession(app, loaded.active_id);
-                }
-            }
-            if (remember_failure) |failure| reportRememberFailure(app, failure, true);
-            if (comptime @hasDecl(@TypeOf(app.worker), "preservePromptSnapshots")) {
-                app.worker.preservePromptSnapshots(checkpoint.turn_id, checkpoint.user.images);
-            }
-        }
-
-        pub fn snapshotRecoveryCheckpoint(
-            app: *App,
-            alloc: Allocator,
-        ) !?session_codec.RecoveryCheckpoint {
-            if (comptime !@hasField(App, "session_persistence")) return null;
-            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const loaded = if (app.session_persistence.writable) |*value| value else return null;
-            const checkpoint = loaded.state.recovery_checkpoint orelse return null;
-            return try checkpoint.dupe(alloc);
-        }
-
-        pub fn continuePausedRecovery(app: *App) !bool {
-            var checkpoint = (try snapshotRecoveryCheckpoint(
-                app,
-                std.heap.c_allocator,
-            )) orelse return false;
-            defer checkpoint.deinit(std.heap.c_allocator);
-
-            app.session.setConversationLanguageFromUserMessage(checkpoint.user.text);
-            return app.queueRecoveryCheckpoint(&checkpoint);
-        }
-
-        pub fn snapshotFreshPromptBoundary(app: *App, alloc: Allocator) !?session_codec.RecoveryCheckpoint {
-            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const loaded = if (app.session_persistence.writable) |*value| value else return null;
-            if (!loaded.conversation_writer.turn_open) return null;
-            const value = loaded.state.recovery_checkpoint orelse return error.InvalidRecoveryCheckpoint;
-            return try value.dupe(alloc);
-        }
-
-        pub fn normalizeFreshPromptPreparation(app: *App, request: worker_runtime.FreshPromptPreparation) worker_runtime.FreshPromptPreparation {
-            if (comptime !@hasField(App, "session_persistence")) return request;
-            var current = request;
-            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            if (app.session_persistence.writable) |*loaded| {
-                if (!loaded.conversation_writer.turn_open and current.prior_turn != null) {
-                    debug_trace.logf("session", "event=fresh_prompt_prior_already_finished turn_id={d}; skipping interrupted closure", .{request.turn_id});
-                    current.prior_turn = null;
-                }
-            }
-            return current;
-        }
-
-        pub fn prepareFreshPrompt(app: *App, request: worker_runtime.FreshPromptPreparation) !worker_runtime.FreshPromptHistory {
-            const alloc = std.heap.c_allocator;
-            var source: std.ArrayList(types.HistoryTurn) = .empty;
-            defer source.deinit(alloc);
-            try source.appendSlice(alloc, app.session.agent.history.items);
-            if (request.prior_turn) |prior| try source.append(alloc, prior);
-            const history = try session_runtime.snapshotOwnedContextHistory(alloc, source.items, 0, 0);
-            errdefer types.freeHistoryTurnSlice(alloc, history);
-            const images = try session_runtime.collect_image_catalog(alloc, history, request.user.images);
-            errdefer types.freeImageAttachmentSlice(alloc, images);
-            const intent = try auto_classifier_context.buildCanonicalRootUserContext(alloc, request.user.text, history);
-            errdefer alloc.free(intent);
-            if (request.prior_turn) |prior| try appendHistoryTurn(app, prior);
-            return .{
-                .history = history,
-                .authorized_image_catalog = images,
-                .root_user_intent_context = intent,
-                .unversioned_history_count = app.session.unversionedHistoryEnd(),
-            };
         }
 
         pub fn appendHistoryTurnForVisualEpoch(
@@ -2501,6 +2716,10 @@ pub fn Runtime(comptime App: type) type {
         const AppendHistoryMode = enum {
             strict,
             visual_epoch,
+            /// A rendered, user-visible finished turn. A validation or commit
+            /// failure must not take the session down: commit in memory, warn,
+            /// and keep the process alive.
+            finished_prompt,
         };
 
         fn appendHistoryTurnWithPendingPresentation(
@@ -2625,7 +2844,9 @@ pub fn Runtime(comptime App: type) type {
             else
                 types.dupeHistoryTurn(app.alloc, turn)) catch |err| {
                 return switch (mode) {
-                    .strict => err,
+                    // In-memory preparation failure (out of memory) cannot be
+                    // degraded: the in-memory commit needs the prepared copy.
+                    .strict, .finished_prompt => err,
                     .visual_epoch => .uncommitted,
                 };
             };
@@ -2643,13 +2864,10 @@ pub fn Runtime(comptime App: type) type {
                 commitJsHostSnapshot(app, "history_turn");
                 return .committed;
             }
-            var remember_failure: ?RememberFailure = null;
-            defer if (remember_failure) |failure| reportRememberFailure(app, failure, false);
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else {
-                app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            if (app.session_persistence.v2) |v2| {
+                defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+                if (try commitV2HistoryTurn(app, v2, &prepared, mode)) |outcome| return outcome;
                 if (comptime @hasDecl(@TypeOf(app.session), "commitPreparedHistoryEntry")) {
                     app.session.commitPreparedHistoryEntry(app.alloc, prepared);
                     prepared_owned = false;
@@ -2658,42 +2876,9 @@ pub fn Runtime(comptime App: type) type {
                 }
                 if (snapshot_file_ownership) |ownership| ownership.transfer();
                 ensureCachedSessionTitle(app) catch {};
-                commitJsHostSnapshot(app, "history_turn");
                 return .committed;
-            };
-            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const first_work = app.session_persistence.remember_fresh_session and !hasDurableUserWork(loaded);
-            try loaded.prepareHistoryTurnForCommit(app.alloc, &prepared);
-            _ = loaded.appendEvent(
-                app.alloc,
-                .{ .history_turn_committed = .{
-                    .conversation_language = app.session.languageSnapshot(),
-                    .total_input_tokens = app.total_input_tokens,
-                    .total_output_tokens = app.total_output_tokens,
-                    .turn = prepared,
-                } },
-                io_mod.milliTimestamp(),
-            ) catch |err| {
-                if (err == error.SessionPersistenceUncertain) {
-                    if (snapshot_file_ownership) |ownership| ownership.transfer();
-                    return err;
-                }
-                return switch (mode) {
-                    .strict => err,
-                    .visual_epoch => blk: {
-                        debug_trace.logf(
-                            "session",
-                            "visual epoch history not committed err={s}",
-                            .{@errorName(err)},
-                        );
-                        break :blk .uncommitted;
-                    },
-                };
-            };
-            if (first_work) {
-                app.session_persistence.remember_fresh_session = false;
-                remember_failure = rememberSession(app, loaded.active_id);
             }
+            app.session_persistence.write_mutex.unlock(io_mod.getIo());
             if (comptime @hasDecl(@TypeOf(app.session), "commitPreparedHistoryEntry")) {
                 app.session.commitPreparedHistoryEntry(app.alloc, prepared);
                 prepared_owned = false;
@@ -2704,6 +2889,69 @@ pub fn Runtime(comptime App: type) type {
             ensureCachedSessionTitle(app) catch {};
             commitJsHostSnapshot(app, "history_turn");
             return .committed;
+        }
+
+        /// Saves a finished turn to v2 with v1's failure modes. Null means the
+        /// caller commits the turn in memory: it was saved, or its failure
+        /// was recorded and shown.
+        fn commitV2HistoryTurn(
+            app: *App,
+            v2: *session_adapter.Session,
+            prepared: *types.HistoryTurn,
+            mode: AppendHistoryMode,
+        ) !?HistoryAppendOutcome {
+            const failure: anyerror = saved: {
+                v2.prepareTurn(prepared) catch |err| break :saved err;
+                v2.commitTurn(prepared.*, app.session.languageSnapshot()) catch |err| break :saved err;
+                return null;
+            };
+            switch (mode) {
+                .strict => return failure,
+                .visual_epoch => {
+                    debug_trace.logf("session", "visual epoch history not committed err={s}", .{@errorName(failure)});
+                    return .uncommitted;
+                },
+                .finished_prompt => {
+                    recordShutdownFailure(app, failure);
+                    if (comptime @hasDecl(App, "writeDomainNotice")) {
+                        var plain_buf: [96]u8 = undefined;
+                        const body = try app.alloc.print(
+                            "Couldn't save this turn: {s}. It may be missing when you reopen this session.",
+                            .{types.plainErrorText(@errorName(failure), &plain_buf)},
+                        );
+                        defer app.alloc.free(body);
+                        app.writeDomainNotice(.{ .topic = "session", .tone = .@"error", .body = body }, true) catch {};
+                    }
+                    return null;
+                },
+            }
+        }
+
+        /// `AgentRuntimeDeps.append_turn_piece` on v2: the pieces finished so
+        /// far reach the log before the next request (D12).
+        pub fn appendTurnPiece(app: *App, progress: agent_runtime.TurnProgress) !void {
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = app.session_persistence.v2 orelse return;
+            try v2.appendProgressWithRecord(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }, progress.recovery_record);
+        }
+
+        /// `AgentRuntimeDeps.record_usage` on v2: each reply's usage
+        /// reaches the log as it arrives (D92).
+        pub fn recordUsage(app: *App, usage: types.Usage) !void {
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = app.session_persistence.v2 orelse return;
+            try v2.recordUsage(usage);
+        }
+
+        /// `AgentRuntimeDeps.save_prompt_images` on v2: the prompt's images
+        /// become the session's blobs before its first request (D89).
+        pub fn savePromptImages(app: *App, alloc: std.mem.Allocator, images: []types.ImageAttachment) !void {
+            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
+            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
+            const v2 = app.session_persistence.v2 orelse return;
+            try v2.savePromptImages(alloc, images);
         }
 
         pub fn commitRuntimePreferences(
@@ -2750,32 +2998,20 @@ pub fn Runtime(comptime App: type) type {
 
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
+            if (app.session_persistence.v2) |v2| {
+                if (result.session_error != null) return result;
+                const preferences = app.session_persistence.session_preferences orelse return result;
+                v2.setPreferences(preferences) catch |err| {
+                    result.session_error = err;
+                    warnDegraded(app, err) catch {};
+                };
                 return result;
-            if (result.session_error != null) return result;
-            _ = loaded.appendEvent(
-                app.alloc,
-                .{ .preferences_changed = .{
-                    .model = if (patch.model) |model|
-                        @constCast(model)
-                    else
-                        null,
-                    .provider = patch.provider,
-                    .effort = patch.effort,
-                    .fast_mode = patch.fast_mode,
-                } },
-                io_mod.milliTimestamp(),
-            ) catch |err| {
-                result.session_error = err;
-                warnDegraded(app, err) catch {};
-            };
+            }
             return result;
         }
 
         pub fn activeSessionId(app: *App) ?[]const u8 {
-            if (app.session_persistence.writable) |*loaded| return loaded.active_id;
+            if (app.session_persistence.v2) |v2| return v2.id();
             if (app.session_persistence.js_host_session) |*owner| return owner.state.id;
             return null;
         }
@@ -2832,13 +3068,13 @@ pub fn Runtime(comptime App: type) type {
                 return;
             }
             const basename = if (comptime @hasField(App, "workspace_root"))
-                std.fs.path.basename(app.workspace_root)
+                std.Io.Dir.path.basename(app.workspace_root)
             else
                 "";
             const folder = if (basename.len == 0) "workspace" else basename;
             const prefix = "fx v" ++ build_options.app_version ++ " | ";
-            var label_buffer: [prefix.len + std.fs.max_path_bytes]u8 = undefined;
-            const label = std.fmt.bufPrint(&label_buffer, "{s}{s}", .{ prefix, folder }) catch |err| {
+            var label_buffer: [prefix.len + std.Io.Dir.max_path_bytes]u8 = undefined;
+            const label = std.mem.print(&label_buffer, "{s}{s}", .{ prefix, folder }) catch |err| {
                 debug_trace.logf("session", "terminal title workspace omitted err={s}", .{@errorName(err)});
                 provider.set("fx v" ++ build_options.app_version);
                 return;
@@ -2948,13 +3184,8 @@ pub fn Runtime(comptime App: type) type {
             {
                 app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
                 defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-                if (app.session_persistence.writable) |*loaded| {
-                    installed = session_title_generation.installGeneratedTitle(
-                        app.alloc,
-                        loaded,
-                        app.session.agent.history.items,
-                        title,
-                    ) catch |err| {
+                if (app.session_persistence.v2) |v2| {
+                    installed = v2.installGeneratedTitle(app.session.agent.history.items, title) catch |err| {
                         debug_trace.logf(
                             "session",
                             "event=title_generation_apply result=failed session={s} err={s}",
@@ -3006,17 +3237,13 @@ pub fn Runtime(comptime App: type) type {
         pub fn renameActiveSession(app: *App, raw: []const u8) !void {
             const title = try validateSessionTitle(raw);
             if (comptime !@hasField(App, "session_persistence")) return error.NoActiveSession;
-            if (app.session_persistence.writable == null) return error.NoActiveSession;
+            const v2 = app.session_persistence.v2 orelse return error.NoActiveSession;
 
             try setCachedSessionTitle(app, title);
 
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-
-            const loaded = &app.session_persistence.writable.?;
-            if (!try loaded.renameConversation(app.alloc, title)) {
-                return error.UnsupportedSessionFormat;
-            }
+            try v2.rename(title);
             invalidateSessionPickerCaches(app);
         }
 
@@ -3024,24 +3251,19 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             alloc: Allocator,
         ) !?[]u8 {
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return null;
-            const store = app.session_persistence.store orelse return null;
-            return try session_store.sessionDirPath(
-                alloc,
-                store.sessions_dir,
-                loaded.active_id,
-            );
+            const v2 = app.session_persistence.v2 orelse return null;
+            return try v2.folderPath(alloc);
         }
 
         pub fn childCapability(app: *App) ?*session_child_store.SessionChildCapability {
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return null;
-            return loaded.childCapability() catch null;
+            if (app.session_persistence.v2 == null) return null;
+            return activeChildCapability(app) catch null;
+        }
+
+        /// The open session's side-file capability.
+        fn activeChildCapability(app: *App) !*session_child_store.SessionChildCapability {
+            const v2 = app.session_persistence.v2 orelse return error.SessionPersistenceUnavailable;
+            return v2.childCapability();
         }
 
         pub fn subagentHost(app: *App) ?*subagent_tool_host.Runtime {
@@ -3049,16 +3271,28 @@ pub fn Runtime(comptime App: type) type {
             return app.session_persistence.subagent_host;
         }
 
-        pub fn rebindSubagentHost(app: *App) void {
+        /// Points what holds the app back at it after `App.init` copies it:
+        /// the store's notice and the subagent host.
+        pub fn rebindAfterMove(app: *App) void {
+            if (app.session_persistence.v2_store) |store| {
+                if (store.notice != null) store.notice = .{ .context = app, .emit = conversionNotice };
+            }
             const host = app.session_persistence.subagent_host orelse return;
-            const store = if (app.session_persistence.store) |*value| value else return;
-            host.rebind(store, app, subagentAuthorityResolver(app));
+            host.rebindHost(app, subagentAuthorityResolver(app));
         }
 
+        /// Stops the subagent host, joining its child threads, before the
+        /// session they append to can close (`tests/tla/session_manager/Wiring.tla`
+        /// ParentOutlivesChildren).
         pub fn disableSubagentHost(app: *App) void {
             if (app.session_persistence.subagent_host) |host| {
                 host.deinit();
                 app.session_persistence.subagent_host = null;
+            }
+            if (app.session_persistence.v2_children) |children| {
+                children.deinit();
+                app.alloc.destroy(children);
+                app.session_persistence.v2_children = null;
             }
         }
 
@@ -3071,18 +3305,6 @@ pub fn Runtime(comptime App: type) type {
                 app.session_persistence.shutdown_failure = err;
             }
             debug_trace.logf("session", "shutdown finished prompt persistence failed err={s}", .{@errorName(err)});
-        }
-
-        pub fn recordFailedHistoryDelivery(app: *App, err: anyerror) void {
-            recordShutdownFailure(app, err);
-            app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
-            defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            if (app.session_persistence.writable) |*loaded| {
-                // A missing finished turn cannot be followed by another saved turn.
-                if (loaded.conversation_writer.failure == null) {
-                    loaded.conversation_writer.failure = error.SessionCommitFailed;
-                }
-            }
         }
 
         pub fn finalizePersistenceWithResumeHandoff(app: *App) ?ResumeHandoff {
@@ -3100,11 +3322,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn prepareResumeHandoff(app: *App) !void {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return error.SessionPersistenceUnavailable;
-            try settleDurableState(app, loaded);
+            if (app.session_persistence.v2 == null) return error.SessionPersistenceUnavailable;
         }
 
         pub fn suspendToJobControl(app: *App, footer_rows: u16) !void {
@@ -3119,6 +3337,11 @@ pub fn Runtime(comptime App: type) type {
         pub fn deinitPersistence(app: *App) void {
             closeWritableSession(app);
             app.session_persistence.deinit(app.alloc);
+        }
+
+        pub fn deinitPersistenceForProcessExit(app: *App) void {
+            closeWritableSession(app);
+            app.session_persistence.deinitForProcessExit(app.alloc);
         }
 
         pub fn requestPersistenceShutdown(app: *App) void {
@@ -3315,7 +3538,6 @@ pub fn Runtime(comptime App: type) type {
             return struct {
                 app: *App,
                 projection: *Projection,
-                workspace_root: []const u8,
                 labels: *const HistoricalSessionLabels,
 
                 const Self = @This();
@@ -3329,7 +3551,7 @@ pub fn Runtime(comptime App: type) type {
                 /// session label so resumed rows reclip to the live width.
                 fn attachSessionCommandDisplay(self: *Self, entry_id: u32, call: types.ToolCall) !void {
                     var scratch_state = std.heap.ArenaAllocator.init(self.projection.alloc);
-                    defer scratch_state.deinit();
+                    defer mem_utils.deinit_arena(scratch_state);
                     const scratch = scratch_state.allocator();
                     const label = tooling_presentation.terminalSessionCompletedActionLabel(
                         scratch,
@@ -3381,10 +3603,13 @@ pub fn Runtime(comptime App: type) type {
                         try self.attachSessionCommandDisplay(entry_id, call);
                         return;
                     }
+                    // Use the app's live workspace root: the replayed status
+                    // phrases are generated with that same root, so this keeps
+                    // both halves of the row consistent.
                     const display = (tooling_presentation.formatRunCommandDetailBounded(
                         self.projection.alloc,
                         command_value.string,
-                        self.workspace_root,
+                        self.app.workspace_root,
                         tooling_presentation.max_run_command_reflow_bytes,
                     ) catch |err| blk: {
                         debug_trace.logf(
@@ -3615,6 +3840,9 @@ pub fn Runtime(comptime App: type) type {
 
             workspace_root: []const u8,
             map: std.StringHashMapUnmanaged(Label) = .empty,
+            /// Calls whose saved output later `read_tool_result` rows read, so
+            /// those rows name them as the live session did.
+            saved_output_sources: tool_presentation.ReplayedSavedOutputSources = .{},
 
             fn deinit(self: *HistoricalSessionLabels, alloc: Allocator) void {
                 var it = self.map.iterator();
@@ -3624,6 +3852,7 @@ pub fn Runtime(comptime App: type) type {
                     if (entry.value_ptr.reflow) |value| alloc.free(value);
                 }
                 self.map.deinit(alloc);
+                self.saved_output_sources.deinit(alloc);
             }
         };
 
@@ -3716,7 +3945,7 @@ pub fn Runtime(comptime App: type) type {
             result: types.PersistedToolResult,
         ) Allocator.Error!void {
             var scratch_state = std.heap.ArenaAllocator.init(app.alloc);
-            defer scratch_state.deinit();
+            defer mem_utils.deinit_arena(scratch_state);
             const scratch = scratch_state.allocator();
             const args = tool_args.parseToolArgsObject(scratch, call.arguments_json) catch return;
             const command = tool_args.optionalStringArg(args, "command") orelse return;
@@ -3764,57 +3993,41 @@ pub fn Runtime(comptime App: type) type {
             labels: *HistoricalSessionLabels,
         ) !void {
             if (comptime runtime_profile.allows(App, .durable_sessions)) {
-                if (app.session_persistence.writable) |*loaded| {
-                    if (app.session_persistence.store) |store| {
-                        const Visitor = struct {
-                            app: *App,
-                            sink: @TypeOf(sink),
-                            labels: *HistoricalSessionLabels,
-                            has_prior_turns: bool = false,
+                // Every saved turn shows, not only those since the newest
+                // compaction.
+                if (app.session_persistence.v2) |v2| {
+                    const Visitor = struct {
+                        app: *App,
+                        sink: @TypeOf(sink),
+                        labels: *HistoricalSessionLabels,
+                        has_prior_turns: bool = false,
 
-                            pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
-                                return replayHistoryToSinkIncremental(
-                                    self.app,
-                                    self.sink,
-                                    &.{turn},
-                                    &self.has_prior_turns,
-                                    self.labels,
-                                );
-                            }
-                        };
-                        var visitor = Visitor{ .app = app, .sink = sink, .labels = labels };
-                        return store.visitConversationHistory(app.alloc, loaded.active_id, &visitor);
-                    }
+                        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+                            return replayHistoryToSinkIncremental(self.app, self.sink, &.{turn}, &self.has_prior_turns, self.labels);
+                        }
+                    };
+                    var visitor = Visitor{ .app = app, .sink = sink, .labels = labels };
+                    return v2.visitHistory(app.alloc, &visitor);
                 }
             }
             return replayHistoryToSink(app, sink, context_history, labels);
         }
 
-        fn readNativeResumeDisplay(
-            app: *App,
-            session: *session_store.LoadedWritableSession,
-        ) !session_display_metadata.DisplayMetadata {
-            if (try session.conversationTitle(app.alloc)) |title| {
-                return .{ .present = true, .title = title };
-            }
-            return session_display_metadata.deriveFromHistory(
-                app.alloc,
-                session.state.history,
-            );
-        }
-
         fn writeResumeNotice(
             app: *App,
             sink: anytype,
-            display_title: []const u8,
+            display: *const session_display_metadata.DisplayMetadata,
             notice: ResumeNotice,
         ) !void {
-            try setCachedSessionTitle(app, display_title);
+            // Only a real title enters the cache: the fallback placeholder must
+            // not count as an existing title, or background title generation
+            // would consider the session already named and never run.
+            if (display.present) try setCachedSessionTitle(app, display.title);
             switch (notice) {
                 .session => try sink.appendNotice(.{
                     .topic = "session resumed",
                     .tone = .neutral,
-                    .body = display_title,
+                    .body = display.title,
                 }),
                 .upgrade => |upgrade| {
                     var body: std.Io.Writer.Allocating = .init(app.alloc);
@@ -3828,57 +4041,27 @@ pub fn Runtime(comptime App: type) type {
                         .body = owned_body,
                     });
                 },
+                .fork => |source_id| {
+                    try sink.appendNotice(.{
+                        .topic = "session forked",
+                        .tone = .neutral,
+                        .body = display.title,
+                    });
+                    // A plain line, so the command copies as it is.
+                    const line = try app.alloc.print("original session fx --resume {s}\n", .{source_id});
+                    defer app.alloc.free(line);
+                    try sink.appendRaw(line);
+                },
             }
         }
 
-        fn writeRecoveryCheckpointToSink(
-            app: *App,
-            sink: anytype,
-            state: session_codec.DurableSessionState,
-            labels: *HistoricalSessionLabels,
-        ) !void {
-            const checkpoint = state.recovery_checkpoint orelse return;
-            var has_prior_turns = false;
-            for (state.history) |turn| switch (turn) {
-                .compacted_summary => {},
-                .assistant, .interrupted => {
-                    has_prior_turns = true;
-                    break;
-                },
-            };
-            try sink.appendUserTurn(checkpoint.user, has_prior_turns);
-            try writeExecutionHistoryToSink(app, sink, checkpoint.execution, labels);
-            if (checkpoint.assistant_source.len > 0) {
-                try writeAssistantHistoryMarkdownToSink(
-                    app,
-                    sink,
-                    checkpoint.assistant_source,
-                );
+        /// A turn that resumed an interrupted request replays as the line it
+        /// showed live, not as fx's note to the model.
+        fn appendHistoryUserTurn(sink: anytype, user: types.UserTurn, has_prior_turns: bool) !void {
+            if (std.mem.eql(u8, user.text, session_runtime.resumed_request_prompt)) {
+                return sink.appendNotice(session_runtime.resumed_request_notice);
             }
-            const recovery_notice = if (checkpoint.tool_state == .uncertain)
-                try std.fmt.allocPrint(
-                    app.alloc,
-                    "model response recovery is paused at attempt {d}/{d}; inspect the uncertain tool state before /continue",
-                    .{
-                        checkpoint.consumed_provider_attempts +| @intFromBool(checkpoint.outstanding_reservation),
-                        checkpoint.max_provider_attempts,
-                    },
-                )
-            else
-                try std.fmt.allocPrint(
-                    app.alloc,
-                    "model response recovery is paused at attempt {d}/{d}; run /continue to resume the preserved turn",
-                    .{
-                        checkpoint.consumed_provider_attempts +| @intFromBool(checkpoint.outstanding_reservation),
-                        checkpoint.max_provider_attempts,
-                    },
-                );
-            defer app.alloc.free(recovery_notice);
-            try sink.appendNotice(.{
-                .topic = "recovery",
-                .tone = .warning,
-                .body = recovery_notice,
-            });
+            return sink.appendUserTurn(user, has_prior_turns);
         }
 
         fn replayHistory(app: *App, history: []const types.HistoryTurn) !void {
@@ -3912,7 +4095,7 @@ pub fn Runtime(comptime App: type) type {
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.started_at_ms);
                         }
-                        try sink.appendUserTurn(entry.user, has_prior_turns.*);
+                        try appendHistoryUserTurn(sink, entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSink(app, sink, entry.execution, labels);
                         if (entry.execution.turn_summary) |summary| {
@@ -3929,7 +4112,7 @@ pub fn Runtime(comptime App: type) type {
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.started_at_ms);
                         }
-                        try sink.appendUserTurn(entry.user, has_prior_turns.*);
+                        try appendHistoryUserTurn(sink, entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSink(app, sink, entry.execution, labels);
                         if (entry.execution.turn_summary) |summary| {
@@ -3971,7 +4154,6 @@ pub fn Runtime(comptime App: type) type {
             var sink = DetachedHistorySink(@TypeOf(projection.*)){
                 .app = app,
                 .projection = projection,
-                .workspace_root = app.workspace_root,
                 .labels = &labels,
             };
             return replayHistoryToSinkIncremental(
@@ -3991,7 +4173,7 @@ pub fn Runtime(comptime App: type) type {
             labels: *HistoricalSessionLabels,
         ) !void {
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
-            defer action_arena.deinit();
+            defer mem_utils.deinit_arena(action_arena);
             const action = try app.describeToolActionDeniedWithAdvertised(
                 action_arena.allocator(),
                 call,
@@ -4123,6 +4305,13 @@ pub fn Runtime(comptime App: type) type {
             result: types.PersistedToolResult,
             labels: *HistoricalSessionLabels,
         ) !void {
+            try labels.saved_output_sources.record(
+                app.alloc,
+                app.toolAdvertisementSet().registry,
+                labels.workspace_root,
+                call,
+                result,
+            );
             if (try writeAnsweredQuestionResult(app, sink, call, result)) return;
             if (try writeCommittedFilePresentation(app, sink, call, result)) return;
 
@@ -4136,8 +4325,14 @@ pub fn Runtime(comptime App: type) type {
             const permission_denial_reason = tool_result_errors.toolPermissionDenialReason(result.output);
 
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
-            defer action_arena.deinit();
-            const session_target = historicalSessionTarget(action_arena.allocator(), labels, call);
+            defer mem_utils.deinit_arena(action_arena);
+            const action_target = historicalSessionTarget(action_arena.allocator(), labels, call) orelse
+                try tool_presentation.readToolResultDisplayTarget(
+                    action_arena.allocator(),
+                    app.toolAdvertisementSet().registry,
+                    call,
+                    &labels.saved_output_sources,
+                );
             const command_decision = if (is_command)
                 try tool_presentation.commandOutcomeDecision(
                     action_arena.allocator(),
@@ -4157,7 +4352,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.describeToolActionDeniedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    session_target,
+                    action_target,
                     if (context_deferred)
                         types.context_deferred_tool_status_label
                     else
@@ -4168,7 +4363,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.describeToolActionDeniedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    session_target,
+                    action_target,
                     tool_admission.permissionDeniedStatusLabel(reason),
                     &.{},
                 )
@@ -4176,7 +4371,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.describeToolActionDeniedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    session_target,
+                    action_target,
                     decision.label,
                     &.{},
                 )
@@ -4200,20 +4395,19 @@ pub fn Runtime(comptime App: type) type {
                 break :success try app.describeToolActionCompletedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    display_target orelse session_target,
+                    display_target orelse action_target,
                     &.{},
                 );
             } else try app.describeToolActionDeniedWithAdvertised(
                 action_arena.allocator(),
                 call,
-                session_target,
+                action_target,
                 try tooling_presentation.subagentFailureLabel(action_arena.allocator(), call, result.output),
                 &.{},
             );
             const formatted_action = if (outcome_decision) |decision|
                 if (decision.detail) |detail|
-                    try std.fmt.allocPrint(
-                        action_arena.allocator(),
+                    try action_arena.allocator().print(
                         "{s}: {s}",
                         .{ formatted_action_base, detail },
                     )
@@ -4304,11 +4498,8 @@ pub fn Runtime(comptime App: type) type {
                     return false;
                 },
             };
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return false;
-            const capability = loaded.childCapability() catch |err| {
+            if (app.session_persistence.v2 == null) return false;
+            const capability = activeChildCapability(app) catch |err| {
                 debug_trace.logf(
                     "session",
                     "resume command replay capability unavailable handle_bytes={d} err={s}",
@@ -4363,6 +4554,66 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Builds the full review of a resumed edit the first time it is
+        /// opened, from the spilled snapshots. Runs at most once per entry. A
+        /// missing or corrupt artifact leaves only the preview and never
+        /// fails; the full-diff expansion is simply absent. The built diff is
+        /// owned by `entry` and allocated with `std.heap.c_allocator`.
+        pub fn materializeDeferredDiff(
+            app: *App,
+            entry: *diff.DiffEntry,
+            styles: diff.FormatStyles,
+        ) void {
+            const deferred = entry.deferred orelse return;
+            entry.deferred = null;
+            defer deferred.deinit(std.heap.c_allocator);
+            const capability = childCapability(app) orelse {
+                debug_trace.logf(
+                    "session",
+                    "event=diff_content_unavailable call_id={s} reason=no_session",
+                    .{deferred.call_id},
+                );
+                return;
+            };
+            var pack = result_store.loadDiffContentManaged(
+                app.alloc,
+                capability,
+                deferred.call_id,
+                deferred.content_handle,
+            ) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=diff_content_unavailable call_id={s} err={s}; preview only",
+                    .{ deferred.call_id, @errorName(err) },
+                );
+                return;
+            };
+            defer pack.deinit(app.alloc);
+            const after = pack.after_content orelse return;
+            entry.full = diff.formatFileChangeFullDiff(
+                std.heap.c_allocator,
+                pack.previous_content,
+                .{ .after_content = after, .lifecycle_id = deferred.lifecycle_id },
+                styles,
+            ) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "event=diff_content_unavailable call_id={s} err={s}; preview only",
+                    .{ deferred.call_id, @errorName(err) },
+                );
+                return;
+            };
+            debug_trace.logf(
+                "session",
+                "event=diff_content_loaded call_id={s} previous_bytes={d} after_bytes={d}",
+                .{
+                    deferred.call_id,
+                    if (pack.previous_content) |content| content.len else 0,
+                    after.len,
+                },
+            );
+        }
+
         fn writeCommittedFilePresentation(
             app: *App,
             sink: anytype,
@@ -4376,7 +4627,24 @@ pub fn Runtime(comptime App: type) type {
                 !@hasDecl(App, "preparePersistedFileDiff") or
                 !@hasDecl(App, "registerAndEmitDiffBlock")) return false;
 
-            const payload = app.preparePersistedFileDiff(presentation) catch |err| {
+            // Spilled snapshots stay on disk: the transcript renders the inline
+            // preview, and the full review is built only when it is opened.
+            var deferred: ?diff.DeferredFullDiff = null;
+            if (presentation.content_handle) |handle| {
+                if (presentation.lifecycle_id) |lifecycle_id| {
+                    if (presentation.previous_content == null or presentation.after_content == null) {
+                        deferred = try diff.DeferredFullDiff.clone(
+                            std.heap.c_allocator,
+                            result.tool_call_id,
+                            handle,
+                            lifecycle_id,
+                        );
+                    }
+                }
+            }
+
+            var payload = app.preparePersistedFileDiff(presentation) catch |err| {
+                if (deferred) |value| value.deinit(std.heap.c_allocator);
                 debug_trace.logf(
                     "session",
                     "resume committed file presentation unavailable call_id={s} err={s}",
@@ -4384,11 +4652,12 @@ pub fn Runtime(comptime App: type) type {
                 );
                 return false;
             };
+            payload.deferred = deferred;
             var owns_payload = true;
             errdefer if (owns_payload) diff.freeDiffEntryPayload(std.heap.c_allocator, payload);
 
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
-            defer action_arena.deinit();
+            defer mem_utils.deinit_arena(action_arena);
             const base = try app.describeToolActionCompletedWithAdvertised(
                 action_arena.allocator(),
                 call,
@@ -4433,7 +4702,7 @@ pub fn Runtime(comptime App: type) type {
                 !@hasDecl(App, "writeHistoricalQuestionResolution")) return false;
 
             var answer_arena = std.heap.ArenaAllocator.init(app.alloc);
-            defer answer_arena.deinit();
+            defer mem_utils.deinit_arena(answer_arena);
             const answers = (try question_answer.decodeJson(
                 answer_arena.allocator(),
                 result.output,
@@ -4450,11 +4719,8 @@ pub fn Runtime(comptime App: type) type {
             result: types.PersistedToolResult,
         ) !bool {
             const handle = result.output_handle orelse return false;
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return false;
-            const capability = loaded.childCapability() catch |err| {
+            if (app.session_persistence.v2 == null) return false;
+            const capability = activeChildCapability(app) catch |err| {
                 debug_trace.logf(
                     "session",
                     "resume command replay could not open result handle={s} err={s}",
@@ -4484,8 +4750,7 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             call: types.ToolCall,
         ) !void {
-            const status = try std.fmt.allocPrint(
-                app.alloc,
+            const status = try app.alloc.print(
                 "● Tool completion was not reported: {s}",
                 .{call.name},
             );
@@ -4499,8 +4764,7 @@ pub fn Runtime(comptime App: type) type {
             sink: anytype,
             result: types.PersistedToolResult,
         ) !void {
-            const status = try std.fmt.allocPrint(
-                app.alloc,
+            const status = try app.alloc.print(
                 "● {s} tool result: {s}",
                 .{ @tagName(result.status), result.tool_name },
             );
@@ -4651,121 +4915,61 @@ pub fn Runtime(comptime App: type) type {
         fn closeWritableSessionWithResumeHandoff(app: *App) ?ResumeHandoff {
             const handoff_intent = app.session_persistence.resume_handoff_intent;
             app.session_persistence.resume_handoff_intent = .none;
-            if (comptime @hasField(@TypeOf(app.session), "usage")) {
-                app.session.usage.cancelReconciliation();
-                app.session.usage.finishProfilePublicationsBeforeShutdown();
-                app.session.usage.configureCheckpointSink(null);
-            }
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            app.session_persistence.remember_fresh_session = false;
             discardAnyPendingCancelledCommand(app, "writable_session_close");
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return null;
-            var resume_boundary_valid = false;
-            if (handoff_intent != .none) {
-                var settlement_failed = false;
-                settleDurableState(app, loaded) catch |err| {
-                    settlement_failed = true;
-                    recordShutdownFailure(app, err);
-                    debug_trace.logf(
-                        "session",
-                        "resume handoff boundary invalid session={s} err={s}",
-                        .{ loaded.active_id, @errorName(err) },
-                    );
-                };
-                resume_boundary_valid = !settlement_failed;
-            } else {
-                settleDurableState(app, loaded) catch |err| {
-                    recordShutdownFailure(app, err);
-                    debug_trace.logf(
-                        "session",
-                        "final persistence settlement failed session={s} err={s}",
-                        .{ loaded.active_id, @errorName(err) },
-                    );
-                };
-            }
-            const should_create_handoff = resume_boundary_valid and
-                shouldCreateResumeHandoff(.{
-                    .intent = handoff_intent,
-                    .has_writable_session = true,
-                    .is_pristine = session_store.isPristineStartedSession(loaded),
-                });
-            const handoff: ?ResumeHandoff = if (should_create_handoff) blk: {
-                const session_id = app.alloc.dupe(u8, loaded.active_id) catch |err| {
-                    debug_trace.logf(
-                        "session",
-                        "resume handoff unavailable session={s} err={s}",
-                        .{ loaded.active_id, @errorName(err) },
-                    );
+            if (app.session_persistence.v2) |v2| return closeV2Session(app, v2, handoff_intent);
+            return null;
+        }
+
+        /// Closes; the manager ends an open turn as `closed`, and a session
+        /// with no turn leaves nothing on disk (D2).
+        fn closeV2Session(app: *App, v2: *session_adapter.Session, handoff_intent: ResumeHandoffIntent) ?ResumeHandoff {
+            const create_handoff = shouldCreateResumeHandoff(.{
+                .intent = handoff_intent,
+                .has_writable_session = true,
+                .is_pristine = !v2.saved(),
+            });
+            const handoff: ?ResumeHandoff = if (create_handoff) blk: {
+                const session_id = app.alloc.dupe(u8, v2.id()) catch |err| {
+                    debug_trace.logf("session", "resume handoff unavailable session={s} err={s}", .{ v2.id(), @errorName(err) });
                     break :blk null;
                 };
                 break :blk .{ .session_id = session_id };
             } else null;
-            if (comptime @hasDecl(
-                @TypeOf(app.session),
-                "clearWebFetchArtifacts",
-            )) {
+            if (comptime @hasDecl(@TypeOf(app.session), "clearWebFetchArtifacts")) {
                 app.session.clearWebFetchArtifacts();
             }
             disableSubagentHost(app);
-            loaded.deinit(app.alloc);
-            app.session_persistence.writable = null;
+            v2.close();
+            app.session_persistence.v2 = null;
             return handoff;
         }
 
-        fn configureWebFetchArtifacts(
-            app: *App,
-            loaded: *session_store.LoadedWritableSession,
-        ) void {
-            if (comptime !@hasDecl(
-                @TypeOf(app.session),
-                "configureWebFetchArtifacts",
-            )) return;
-
-            const store = app.session_persistence.store orelse return;
-            const session_dir = session_store.sessionDirPath(
-                app.alloc,
-                store.sessions_dir,
-                loaded.active_id,
-            ) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "interactive web fetch artifact setup failed session={s} err={s}",
-                    .{ loaded.active_id, @errorName(err) },
-                );
-                app.session.clearWebFetchArtifacts();
+        /// Subagents on v2 keep their state in the session's log (D22). A
+        /// host that cannot start leaves them off and says why, as on v1.
+        fn enableSubagentHostV2(app: *App, v2: *session_adapter.Session) void {
+            disableSubagentHost(app);
+            const children = app.alloc.create(subagent_child_state.V2Children) catch |err| {
+                debug_trace.logf("session", "interactive subagent host unavailable session={s} err={s}", .{ v2.id(), @errorName(err) });
                 return;
             };
-            defer app.alloc.free(session_dir);
-            app.session.configureWebFetchArtifacts(app.alloc, session_dir);
-        }
-
-        fn enableSubagentHost(
-            app: *App,
-            loaded: *session_store.LoadedWritableSession,
-        ) void {
-            disableSubagentHost(app);
-            const store = if (app.session_persistence.store) |*value| value else return;
+            children.* = subagent_child_state.V2Children.init(app.alloc, v2, app.workspace_root);
             app.session_persistence.subagent_host = subagent_tool_host.Runtime.create(
                 app.alloc,
-                store,
-                loaded.active_id,
+                children,
                 subagentAuthorityResolver(app),
                 if (comptime @hasDecl(App, "runSubagentChild"))
                     .{ .context = app, .run_fn = App.runSubagentChild }
                 else
                     .{},
             ) catch |err| {
-                debug_trace.logf(
-                    "session",
-                    "interactive subagent host unavailable session={s} err={s}",
-                    .{ loaded.active_id, @errorName(err) },
-                );
+                debug_trace.logf("session", "interactive subagent host unavailable session={s} err={s}", .{ v2.id(), @errorName(err) });
+                children.deinit();
+                app.alloc.destroy(children);
                 return;
             };
+            app.session_persistence.v2_children = children;
         }
 
         fn subagentAuthorityResolver(app: *App) subagent_authority.HostResolver {
@@ -4784,8 +4988,8 @@ pub fn Runtime(comptime App: type) type {
             defer if (comptime @hasField(@TypeOf(app.permission_state), "authority_mutex")) {
                 app.permission_state.authority_mutex.unlock(io_mod.getIo());
             };
-            const writable = if (app.session_persistence.writable) |*value| value else return error.HostAuthorityUnavailable;
-            if (!std.mem.eql(u8, writable.active_id, root_id)) {
+            const active_id = if (app.session_persistence.v2) |v2| v2.id() else return error.HostAuthorityUnavailable;
+            if (!std.mem.eql(u8, active_id, root_id)) {
                 return error.HostAuthorityUnavailable;
             }
             const integrations = if (comptime @hasDecl(App, "snapshotMcpToolNames"))
@@ -4802,7 +5006,6 @@ pub fn Runtime(comptime App: type) type {
                     root_id,
                     root_id,
                     app.permission_engine.rules,
-                    !permissions.rulesDenyAllTargetsForTool(app.permission_engine.rules, "mcp_features"),
                 )
             else
                 null;
@@ -4826,47 +5029,20 @@ pub fn Runtime(comptime App: type) type {
             );
         }
 
-        fn settleDurableState(
-            app: *App,
-            loaded: *session_store.LoadedWritableSession,
-        ) !void {
-            try loaded.requireWritable();
-            const usage_dirty = if (comptime @hasField(@TypeOf(app.session), "usage"))
-                app.session.usage.isDirty()
-            else
-                false;
-            if (usage_dirty) {
-                var usage = try app.session.usage.snapshot(app.alloc);
-                defer usage.deinit(app.alloc);
-                _ = try loaded.appendEvent(
-                    app.alloc,
-                    .{ .usage_checkpointed = .{ .usage = usage } },
-                    io_mod.milliTimestamp(),
-                );
-                app.session.usage.markClean(usage);
-            }
-        }
-
         pub fn commitContextCompaction(
             app: *App,
             summary: types.CompactedSummaryHistoryTurn,
             active_prefix: ?types.AssistantHistoryTurn,
             retained_from: ?types.ContextHistoryCut,
         ) !void {
-            const prepared = try session_runtime.prepareCompactedHistory(app.alloc, app.session.agent.history.items, summary, retained_from orelse .{ .turns = session_runtime.rawHistoryTurnCount(app.session.agent.history.items) });
+            const prepared = try session_runtime.prepareCompactedHistory(app.alloc, app.session.agent.history.items, summary, retained_from orelse .{ .turns = history_range.rawHistoryTurnCount(app.session.agent.history.items) });
             var prepared_owned = true;
             defer if (prepared_owned) types.freeHistoryTurnSlice(app.alloc, prepared);
             if (comptime @hasField(App, "session_persistence")) {
                 app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
                 defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-                if (app.session_persistence.writable) |*loaded| {
-                    _ = try loaded.commitContextCompaction(
-                        app.alloc,
-                        summary,
-                        active_prefix,
-                        retained_from,
-                        io_mod.milliTimestamp(),
-                    );
+                if (app.session_persistence.v2) |v2| {
+                    try v2.commitCompaction(summary, active_prefix != null, retained_from);
                 } else if (app.session_persistence.js_host_session) |*owner| {
                     var next = try snapshotCurrentState(app, owner.state, io_mod.milliTimestamp());
                     var next_owned = true;
@@ -4881,7 +5057,6 @@ pub fn Runtime(comptime App: type) type {
                     owner.state = next;
                     owner.revision = revision;
                     next_owned = false;
-                    if (owner.state.usage) |usage| app.session.usage.markClean(usage);
                 }
             }
             app.session.commitCompactedHistory(app.alloc, prepared);
@@ -4894,15 +5069,8 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             app.session_persistence.write_mutex.lockUncancelable(io_mod.getIo());
             defer app.session_persistence.write_mutex.unlock(io_mod.getIo());
-            const loaded = if (app.session_persistence.writable) |*value|
-                value
-            else
-                return error.SessionPersistenceUnavailable;
-            try loaded.replacePermissionState(
-                app.alloc,
-                permission_state,
-                io_mod.milliTimestamp(),
-            );
+            const v2 = app.session_persistence.v2 orelse return error.SessionPersistenceUnavailable;
+            return v2.setPermissions(permission_state);
         }
 
         fn commitJsHostSnapshot(app: *App, boundary: []const u8) void {
@@ -4955,9 +5123,6 @@ pub fn Runtime(comptime App: type) type {
             owner.state = next;
             owner.revision = revision;
             next_owned = false;
-            if (comptime @hasField(@TypeOf(app.session), "usage")) {
-                if (owner.state.usage) |usage| app.session.usage.markClean(usage);
-            }
         }
 
         fn snapshotCurrentState(
@@ -4988,7 +5153,6 @@ pub fn Runtime(comptime App: type) type {
                 var value = permission_state;
                 value.deinit(app.alloc);
             }
-            const usage = try app.session.usage.snapshot(app.alloc);
             const recovery_checkpoint = if (base_state.recovery_checkpoint) |checkpoint|
                 try checkpoint.dupe(app.alloc)
             else
@@ -5006,7 +5170,6 @@ pub fn Runtime(comptime App: type) type {
                 .total_input_tokens = app.total_input_tokens,
                 .total_output_tokens = app.total_output_tokens,
                 .permission_state = permission_state,
-                .usage = usage,
                 .recovery_checkpoint = recovery_checkpoint,
             };
         }
@@ -5034,7 +5197,6 @@ pub fn Runtime(comptime App: type) type {
                 var value = permission_state;
                 value.deinit(app.alloc);
             }
-            const usage = try app.session.usage.snapshot(app.alloc);
             return .{
                 .id = id,
                 .origin_workspace_root = origin,
@@ -5047,7 +5209,6 @@ pub fn Runtime(comptime App: type) type {
                 .total_input_tokens = 0,
                 .total_output_tokens = 0,
                 .permission_state = permission_state,
-                .usage = usage,
             };
         }
 
@@ -5086,6 +5247,10 @@ pub fn Runtime(comptime App: type) type {
             // stored preferences for this launch, without rewriting them.
             const effective_effort = app.session_persistence.process_effort_override orelse preferences.effort;
             const effective_fast_mode = app.session_persistence.process_fast_override orelse preferences.fast_mode;
+            const effective_ultrafast_mode = resolveUltrafastMode(
+                preferences.ultrafast_mode,
+                app.session_persistence.process_ultrafast_override,
+            );
             app.effort = effective_effort;
             app.fast_mode = effective_fast_mode;
             app.session_persistence.fast_mode_model_bound = if (app.session_persistence.process_fast_override != null)
@@ -5094,6 +5259,7 @@ pub fn Runtime(comptime App: type) type {
                 fast_mode_model_bound;
             app.worker.syncQueuedPromptEffort(effective_effort);
             app.worker.syncQueuedPromptFastMode(effective_fast_mode);
+            app.worker.syncQueuedPromptUltrafastMode(effective_ultrafast_mode);
         }
 
         pub fn fastModeModelBound(app: *const App) bool {
@@ -5124,57 +5290,12 @@ pub fn Runtime(comptime App: type) type {
             try warnNonDurable(app, "session persistence degraded", err);
         }
 
-        const RememberFailure = struct {
-            id: [255]u8,
-            len: usize,
-            err: anyerror,
-        };
-
-        fn hasDurableUserWork(loaded: *const session_store.LoadedWritableSession) bool {
-            return loaded.conversation_writer.last_seq != 0 or loaded.state.recovery_checkpoint != null;
-        }
-
-        fn rememberSession(app: *App, id: []const u8) ?RememberFailure {
-            const store = app.session_persistence.store orelse return null;
-            store.rememberSessionId(app.alloc, id) catch |err| {
-                debug_trace.logf("session", "event=remember_session_failed id={s} err={s}", .{ id, @errorName(err) });
-                var failure = RememberFailure{ .id = undefined, .len = id.len, .err = err };
-                // Native loaded session IDs have already passed Store validation.
-                @memcpy(failure.id[0..id.len], id);
-                return failure;
-            };
-            return null;
-        }
-
-        fn rememberSelectedSession(app: *App) void {
-            if (app.session_persistence.writable) |*loaded| {
-                if (rememberSession(app, loaded.active_id)) |failure| reportRememberFailure(app, failure, false);
-            }
-        }
-
-        fn reportRememberFailure(app: *App, failure: RememberFailure, comptime from_worker: bool) void {
-            const alloc = std.heap.c_allocator;
-            const body = std.fmt.allocPrint(alloc, "Session saved, but could not remember it for -c ({s}). Resume with fx --resume {s}.", .{ @errorName(failure.err), failure.id[0..failure.len] }) catch return;
-            defer alloc.free(body);
-            const notice = types.SemanticNotice{ .topic = "session", .tone = .warning, .body = body };
-            if (comptime @hasDecl(@TypeOf(app.worker), "pushEvent") and (from_worker or !@hasDecl(App, "writeDomainNotice"))) {
-                app.worker.pushEvent(alloc, .{ .semantic_notice = notice }) catch |err| {
-                    debug_trace.logf("session", "event=remember_warning_dropped err={s}", .{@errorName(err)});
-                };
-            } else {
-                app.writeDomainNotice(notice, true) catch |err| {
-                    debug_trace.logf("session", "event=remember_warning_dropped err={s}", .{@errorName(err)});
-                };
-            }
-        }
-
         fn warnNonDurable(
             app: *App,
             label: []const u8,
             err: anyerror,
         ) !void {
-            const notice = try std.fmt.allocPrint(
-                app.alloc,
+            const notice = try app.alloc.print(
                 "{s}: {s}; continuing non-durably",
                 .{ label, @errorName(err) },
             );
@@ -5196,6 +5317,10 @@ fn replacePreferences(
     const replacement = try source.dupe(alloc);
     if (target.*) |*current| current.deinit(alloc);
     target.* = replacement;
+}
+
+fn resolveUltrafastMode(preference: bool, process_override: ?bool) bool {
+    return process_override orelse preference;
 }
 
 fn restoredFastModeModelBound(
@@ -5252,19 +5377,8 @@ fn applyPreferencePatch(
     }
     if (patch.effort) |effort| current.effort = effort;
     if (patch.fast_mode) |fast_mode| current.fast_mode = fast_mode;
+    if (patch.ultrafast_mode) |ultrafast_mode| current.ultrafast_mode = ultrafast_mode;
     target.* = current;
-}
-
-var stable_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableEmptyTestEnviron() !*const std.process.Environ.Map {
-    if (stable_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_test_environ = map;
-    return map;
 }
 
 const TestHome = struct {
@@ -5272,8 +5386,6 @@ const TestHome = struct {
     map: std.process.Environ.Map,
 
     fn install(alloc: Allocator, home: ?[]const u8) !*TestHome {
-        _ = try stableEmptyTestEnviron();
-
         const self = try alloc.create(TestHome);
         errdefer alloc.destroy(self);
 
@@ -5292,9 +5404,7 @@ const TestHome = struct {
     }
 
     fn deinit(self: *TestHome) void {
-        if (stable_test_environ) |map| {
-            io_mod.setEnvironMap(map);
-        }
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);
@@ -5366,7 +5476,7 @@ test "session transition retires queued and running compaction only after worker
             .history = try app.alloc.alloc(types.HistoryTurn, 0),
         });
         const next = app.worker.compactionActivitySnapshot();
-        try std.testing.expect(@intFromEnum(next.operation.?.id) > @intFromEnum(old.operation.?.id));
+        try std.testing.expect(@backingInt(next.operation.?.id) > @backingInt(old.operation.?.id));
         try std.testing.expect(next.revision > retired.revision);
         app.worker.settleCompactionActivity(old.operation.?.id, .{ .outcome = .failed });
         try std.testing.expect(!app.worker.dismissCompactionActivity(old.operation.?.id, terminal.revision));
@@ -5412,11 +5522,16 @@ const FakeWorker = struct {
     model: std.ArrayList(u8) = .empty,
     effort: types.ReasoningEffort = .auto,
     fast_mode: bool = false,
-    active_prompt_is_root_authority: bool = false,
+    ultrafast_mode: bool = false,
+    cancel_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn deinit(self: *FakeWorker, alloc: Allocator) void {
         self.model.deinit(alloc);
         self.* = .{};
+    }
+
+    pub fn isCancelRequested(self: *const FakeWorker) bool {
+        return self.cancel_requested.load(.seq_cst);
     }
 
     pub fn queuedPromptCount(self: *const FakeWorker) usize {
@@ -5442,6 +5557,10 @@ const FakeWorker = struct {
 
     fn syncQueuedPromptFastMode(self: *FakeWorker, fast_mode: bool) void {
         self.fast_mode = fast_mode;
+    }
+
+    fn syncQueuedPromptUltrafastMode(self: *FakeWorker, ultrafast_mode: bool) void {
+        self.ultrafast_mode = ultrafast_mode;
     }
 };
 
@@ -5575,7 +5694,7 @@ const TestApp = struct {
         );
     }
 
-    fn snapshotMcpToolNames(self: *TestApp, alloc: Allocator) ![][]u8 {
+    pub fn snapshotMcpToolNames(self: *TestApp, alloc: Allocator) ![][]u8 {
         const names = try alloc.alloc([]u8, self.mcp_tool_names.items.len);
         var initialized: usize = 0;
         errdefer {
@@ -5589,7 +5708,7 @@ const TestApp = struct {
         return names;
     }
 
-    fn terminalTitle(self: *TestApp) host_capability.TerminalTitle {
+    pub fn terminalTitle(self: *TestApp) host_capability.TerminalTitle {
         return .{
             .context = self,
             .set_fn = setTerminalTitleLabelForTest,
@@ -5656,25 +5775,24 @@ const TestApp = struct {
         self.* = undefined;
     }
 
-    fn writeDomainNotice(self: *TestApp, notice: types.SemanticNotice, _: bool) !void {
+    pub fn writeDomainNotice(self: *TestApp, notice: types.SemanticNotice, _: bool) !void {
         if (self.fail_system_notice) {
             self.writable_seen_during_notice_failure =
-                self.session_persistence.writable != null;
+                self.session_persistence.v2 != null;
             return error.TestSystemNoticeFailure;
         }
         try self.notices.append(self.alloc, if (notice.topic.len > 0)
-            try std.fmt.allocPrint(
-                self.alloc,
+            try self.alloc.print(
                 "{s} {s}: {s}",
                 .{ types.noticeGlyph(notice.tone), notice.topic, notice.body },
             )
         else
-            try std.fmt.allocPrint(self.alloc, "{s} {s}", .{ types.noticeGlyph(notice.tone), notice.body }));
+            try self.alloc.print("{s} {s}", .{ types.noticeGlyph(notice.tone), notice.body }));
     }
 
     fn commitStartupResumeReplayAnchor(self: *TestApp) !void {
         self.startup_resume_anchor_count += 1;
-        self.startup_resume_anchor_saw_writable = self.session_persistence.writable != null;
+        self.startup_resume_anchor_saw_writable = self.session_persistence.v2 != null;
         self.startup_resume_anchor_history_len = self.session.historyLen();
         self.startup_resume_anchor_notice_count = self.notices.items.len;
         if (self.fail_startup_resume_anchor) return error.TestStartupResumeAnchorFailure;
@@ -5724,13 +5842,13 @@ const TestApp = struct {
         const line = if (std.mem.endsWith(u8, text, "\n"))
             try self.alloc.dupe(u8, text)
         else
-            try std.fmt.allocPrint(self.alloc, "{s}\n", .{text});
+            try self.alloc.print("{s}\n", .{text});
         try self.completed_tool_statuses.append(self.alloc, line);
         try self.completed_tool_outcomes.append(self.alloc, kind);
         try self.replay_events.append(self.alloc, .completed_tool_status);
     }
 
-    fn writeCompletedToolStatusReturningEntryId(
+    pub fn writeCompletedToolStatusReturningEntryId(
         self: *TestApp,
         kind: types.ToolOutcomeKind,
         text: []const u8,
@@ -5740,7 +5858,7 @@ const TestApp = struct {
         return self.allocateTranscriptEntryId();
     }
 
-    fn writeHistoricalQuestionResolution(
+    pub fn writeHistoricalQuestionResolution(
         self: *TestApp,
         answers: []const types.QuestionAnswer,
     ) !u32 {
@@ -5750,7 +5868,7 @@ const TestApp = struct {
         return entry_id;
     }
 
-    fn attachHistoricalToolDetail(
+    pub fn attachHistoricalToolDetail(
         self: *TestApp,
         entry_id: u32,
         _: types.ToolCall,
@@ -5759,7 +5877,7 @@ const TestApp = struct {
         try self.historical_tool_detail_entry_ids.append(self.alloc, entry_id);
     }
 
-    fn attachHistoricalCancelledCommandDetail(
+    pub fn attachHistoricalCancelledCommandDetail(
         self: *TestApp,
         entry_id: u32,
         _: types.ToolCall,
@@ -5809,16 +5927,16 @@ const TestApp = struct {
             return arena.dupe(u8, "● Ran pwd");
         }
         if (display_target) |target| {
-            return std.fmt.allocPrint(arena, "● Completed {s} {s}", .{ call.name, target });
+            return arena.print("● Completed {s} {s}", .{ call.name, target });
         }
-        return std.fmt.allocPrint(arena, "● Completed {s}", .{call.name});
+        return arena.print("● Completed {s}", .{call.name});
     }
 
     fn describeToolActionDeniedWithAdvertised(self: *TestApp, arena: Allocator, call: types.ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
         if (self.action_description_allocates_scratch) {
             _ = try arena.dupe(u8, "temporary parsed arguments");
         }
-        return std.fmt.allocPrint(arena, "● {s} {s}", .{ label, call.name });
+        return arena.print("● {s} {s}", .{ label, call.name });
     }
 
     fn pacerEmit(ctx: *anyopaque, text: []const u8) anyerror!void {
@@ -5948,12 +6066,6 @@ fn makeJsHostTestState(
     errdefer alloc.free(workspace);
     const model = try alloc.dupe(u8, "restored/model");
     errdefer alloc.free(model);
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    const sequence = try usage.reserveInvocation();
-    usage.finishInvocation(sequence, 41, .unbilled);
-    var usage_snapshot = try usage.snapshot(alloc);
-    errdefer usage_snapshot.deinit(alloc);
     return .{
         .id = owned_id,
         .origin_workspace_root = origin,
@@ -5968,13 +6080,12 @@ fn makeJsHostTestState(
         },
         .history = history,
         .context_history_start = 0,
-        .usage = usage_snapshot,
         .total_input_tokens = 17,
         .total_output_tokens = 23,
     };
 }
 
-test "js-host resume restores transcript context preferences usage and revision" {
+test "js-host resume restores transcript context preferences and revision" {
     const alloc = std.testing.allocator;
     var fake = FakeJsHostSessionStore{
         .state = try makeJsHostTestState(
@@ -5997,6 +6108,8 @@ test "js-host resume restores transcript context preferences usage and revision"
         .auto,
         false,
         true,
+        false,
+        null,
         null,
         null,
         null,
@@ -6016,9 +6129,6 @@ test "js-host resume restores transcript context preferences usage and revision"
     try std.testing.expect(!Runtime(TestApp).fastModeModelBound(&app));
     try std.testing.expectEqual(@as(u64, 17), app.total_input_tokens);
     try std.testing.expectEqual(@as(u64, 23), app.total_output_tokens);
-    var restored_usage = try app.session.usage.snapshot(alloc);
-    defer restored_usage.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 41), restored_usage.api_duration_ms);
     try std.testing.expectEqualStrings(
         "restored-session",
         app.session_persistence.js_host_session.?.state.id,
@@ -6088,6 +6198,8 @@ test "js-host resume store failures and missing records fall back to fresh sessi
             .auto,
             false,
             true,
+            false,
+            null,
             null,
             null,
             null,
@@ -6121,6 +6233,8 @@ test "js-host picker request stays unsupported and starts fresh" {
         .auto,
         false,
         true,
+        false,
+        null,
         null,
         null,
         null,
@@ -6150,6 +6264,8 @@ test "js-host completed and interrupted turns propagate revisions preserve owner
         .auto,
         false,
         true,
+        false,
+        null,
         null,
         null,
         null,
@@ -6221,6 +6337,8 @@ test "js-host preference changes snapshot the updated session preferences" {
         .auto,
         false,
         true,
+        false,
+        null,
         null,
         null,
         null,
@@ -6256,7 +6374,7 @@ test "cold resume image id rebase rejects overflow before admission" {
 
     try std.testing.expectError(
         error.ImageIdOverflow,
-        nextImageIdForResume(std.testing.allocator, &history, null),
+        nextImageIdForResume(std.testing.allocator, &history),
     );
 }
 
@@ -6304,10 +6422,13 @@ test "session runtime owns temporary interactive image snapshot capture" {
 fn testPaths(alloc: Allocator, tmp: *std.testing.TmpDir) !struct { home: []u8, workspace: []u8 } {
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    return .{
-        .home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home"),
-        .workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace"),
-    };
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    errdefer alloc.free(home);
+    // fx keeps `.fx` private, and resuming a session verifies that.
+    const fx_dir = try std.Io.Dir.path.joinZ(alloc, &.{ home, ".fx" });
+    defer alloc.free(fx_dir);
+    if (std.c.chmod(fx_dir.ptr, 0o700) != 0) return error.TestChmodFailed;
+    return .{ .home = home, .workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace") };
 }
 
 fn configureTestPreferences(app: *TestApp) !void {
@@ -6320,51 +6441,57 @@ fn configureTestPreferences(app: *TestApp) !void {
         types.ReasoningEffort.literal("high"),
         true,
         true,
+        false,
+        null,
         null,
         null,
         null,
     );
 }
 
-fn writeSessionFixture(
-    alloc: Allocator,
-    store: session_store.Store,
-    id: []const u8,
-    history: []const types.HistoryTurn,
-    context_history_start: usize,
-) !void {
-    const owned_history = try alloc.alloc(types.HistoryTurn, history.len);
-    var copied: usize = 0;
-    errdefer {
-        for (owned_history[0..copied]) |turn| {
-            session_runtime.freeHistoryTurn(alloc, turn);
-        }
-        alloc.free(owned_history);
-    }
-    for (history, 0..) |turn, index| {
-        owned_history[index] = try session_runtime.dupeHistoryTurn(alloc, turn);
-        copied += 1;
-    }
-    var state = session_codec.DurableSessionState{
-        .id = try alloc.dupe(u8, id),
-        .origin_workspace_root = try alloc.dupe(u8, store.workspace_root),
-        .workspace_root = try alloc.dupe(u8, store.workspace_root),
-        .created_at_ms = 123,
-        .updated_at_ms = 456,
-        .conversation_language = session_runtime.ConversationLanguage.literal("en"),
-        .preferences = .{
-            .model = try alloc.dupe(u8, "saved/model"),
-            .effort = types.ReasoningEffort.literal("medium"),
-            .fast_mode = false,
-        },
-        .history = owned_history,
-        .context_history_start = context_history_start,
-        .total_input_tokens = 17,
-        .total_output_tokens = 23,
-    };
-    defer state.deinit(alloc);
-    var loaded = try store.startWritableSession(alloc, state);
-    loaded.deinit(alloc);
+/// Saves `history` as a new session in the app's store, as a run of
+/// prompts would, with the preferences of a session saved earlier, and
+/// returns its id. Caller frees.
+fn writeSessionFixture(app: *TestApp, history: []const types.HistoryTurn) ![]u8 {
+    try Runtime(TestApp).beginFreshPersistedSession(app);
+    const v2 = app.session_persistence.v2.?;
+    for (history) |turn| try v2.commitTurn(turn, session_runtime.ConversationLanguage.literal("en"));
+    var model = "saved/model".*;
+    try v2.setPreferences(.{ .model = &model, .effort = types.ReasoningEffort.literal("medium"), .fast_mode = false });
+    const id = try app.alloc.dupe(u8, v2.id());
+    Runtime(TestApp).closeWritableSession(app);
+    return id;
+}
+
+/// Begins a new session's first turn and stores `body` as one of its blobs
+/// (D44), returning the blob's name for the turn to name it by. Finish with
+/// `commitSessionFixture`.
+fn beginSessionWithBody(app: *TestApp, body: []const u8) !session_child_store.Blobs.Hash {
+    try Runtime(TestApp).beginFreshPersistedSession(app);
+    const v2 = app.session_persistence.v2.?;
+    try v2.beginTurn();
+    return (try v2.childCapability()).putBlob(body);
+}
+
+/// Commits `turn` to the session `beginSessionWithBody` began, closes it and
+/// returns its id. The caller frees it.
+fn commitSessionFixture(app: *TestApp, turn: types.HistoryTurn) ![]u8 {
+    const v2 = app.session_persistence.v2.?;
+    try v2.commitTurn(turn, session_runtime.ConversationLanguage.literal("en"));
+    const id = try app.alloc.dupe(u8, v2.id());
+    Runtime(TestApp).closeWritableSession(app);
+    return id;
+}
+
+/// Closes the app's session and restores what it saved, as a later fx
+/// would. The caller deinits the result.
+fn reopenSaved(app: anytype) !session_adapter.Restored {
+    const id = try app.alloc.dupe(u8, app.session_persistence.v2.?.id());
+    defer app.alloc.free(id);
+    Runtime(@TypeOf(app.*)).closeWritableSession(app);
+    const resumed = try session_adapter.Session.resumeSession(app.alloc, app.session_persistence.v2_store.?, .{ .id = id }, app.workspace_root, .app);
+    defer resumed.close();
+    return resumed.restore(app.alloc);
 }
 
 test "initializePersistence silently skips optional missing home and errors when required" {
@@ -6385,8 +6512,153 @@ test "initializePersistence silently skips optional missing home and errors when
     defer app.deinit();
 
     try Runtime(TestApp).initializePersistence(&app, false);
-    try std.testing.expect(app.session_persistence.store == null);
+    try std.testing.expect(app.session_persistence.v2_store == null);
     try std.testing.expectError(error.HomeNotSet, Runtime(TestApp).initializePersistence(&app, true));
+}
+
+test "a fresh session clears usage counters without a durable store" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+
+    const home = try TestHome.install(alloc, null);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+
+    try Runtime(TestApp).initializePersistence(&app, false);
+    try std.testing.expect(app.session_persistence.v2_store == null);
+
+    // The previous session's usage, which the footer shows as context used.
+    app.total_input_tokens = 43_000;
+    app.total_output_tokens = 1_200;
+    app.total_web_search_requests = 3;
+
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    try std.testing.expect(app.session_persistence.v2 == null);
+    try std.testing.expectEqual(@as(u64, 0), app.total_input_tokens);
+    try std.testing.expectEqual(@as(u64, 0), app.total_output_tokens);
+    try std.testing.expectEqual(@as(u64, 0), app.total_web_search_requests);
+}
+
+test "v2 ultrafast resume applies process overrides without persisting them" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    for ([_]bool{ false, true }) |baseline| {
+        var app = try TestApp.init(alloc, paths.workspace);
+        defer app.deinit();
+        try configureTestPreferences(&app);
+        app.session_persistence.workspace_preferences.?.ultrafast_mode = baseline;
+        app.session_persistence.process_ultrafast_override = !baseline;
+        try Runtime(TestApp).initializePersistence(&app, true);
+        try Runtime(TestApp).beginFreshPersistedSession(&app);
+        const v2 = app.session_persistence.v2.?;
+        try v2.commitTurn(.{ .assistant = .{
+            .user = .{ .text = @constCast("saved request") },
+            .assistant = @constCast("saved answer"),
+        } }, types.ConversationLanguage.default());
+        const id = try alloc.dupe(u8, v2.id());
+        defer alloc.free(id);
+        const store = app.session_persistence.v2_store.?;
+        Runtime(TestApp).closeWritableSession(&app);
+        const resumed = try session_adapter.Session.resumeSession(alloc, store, .{ .id = id }, paths.workspace, .app);
+        try Runtime(TestApp).installResumedV2Session(&app, resumed, .session);
+        try std.testing.expectEqual(!baseline, app.worker.ultrafast_mode);
+        try std.testing.expectEqual(baseline, app.session_persistence.session_preferences.?.ultrafast_mode);
+        var durable = try app.session_persistence.v2.?.currentPreferences(alloc);
+        defer durable.deinit(alloc);
+        try std.testing.expectEqual(baseline, durable.ultrafast_mode);
+    }
+}
+
+test "/fork waits for the turn and a prompt, then opens on the newest prompt (D58)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    try Runtime(TestApp).openForkMenu(&app);
+    try std.testing.expectEqualStrings("* session: nothing to fork yet", app.notices.last().?);
+
+    for ([_][]const u8{ "first", "second", "third" }) |prompt| {
+        try app.session_persistence.v2.?.commitTurn(.{ .assistant = .{
+            .user = .{ .text = @constCast(prompt) },
+            .assistant = @constCast("answer"),
+        } }, types.ConversationLanguage.default());
+    }
+    app.stream.active = true;
+    try Runtime(TestApp).openForkMenu(&app);
+    try std.testing.expectEqualStrings("* session: /fork is available once the current turn finishes", app.notices.last().?);
+    try std.testing.expect(!app.session_persistence.fork_menu.active());
+
+    app.stream.active = false;
+    try Runtime(TestApp).openForkMenu(&app);
+    const menu = &app.session_persistence.fork_menu;
+    try std.testing.expectEqual(@as(usize, 3), menu.points.len);
+    try std.testing.expectEqualStrings("first", menu.points[0].prompt);
+    try std.testing.expectEqualStrings("third", menu.points[menu.selected].prompt);
+}
+
+test "the startup session keeps its store, and the store's notice the app, after App.init copies the app" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    // As `App.init` does: open the store and start the session, then
+    // return the app by value.
+    const Launch = struct {
+        fn open(a: Allocator, workspace: []const u8) !TestApp {
+            var app = try TestApp.init(a, workspace);
+            errdefer app.deinit();
+            try configureTestPreferences(&app);
+            try Runtime(TestApp).initializePersistence(&app, true);
+            try Runtime(TestApp).beginFreshPersistedSession(&app);
+            return app;
+        }
+    };
+    var app = try Launch.open(alloc, paths.workspace);
+    defer app.deinit();
+    Runtime(TestApp).rebindAfterMove(&app);
+
+    const store = app.session_persistence.v2_store.?;
+    try std.testing.expect(app.session_persistence.v2.?.store == store);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(&app)), store.notice.?.context);
+    try app.session_persistence.v2.?.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("after the copy") },
+        .assistant = @constCast("saved"),
+    } }, types.ConversationLanguage.default());
 }
 
 test "beginFreshPersistedSession and enableSessionStores create per-session stores" {
@@ -6409,7 +6681,7 @@ test "beginFreshPersistedSession and enableSessionStores create per-session stor
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
-    try std.testing.expect(app.session_persistence.writable != null);
+    try std.testing.expect(app.session_persistence.v2 != null);
 
     Runtime(TestApp).enableSessionStores(&app);
     try std.testing.expect(app.session_persistence.subagent_host != null);
@@ -6417,7 +6689,7 @@ test "beginFreshPersistedSession and enableSessionStores create per-session stor
     var host_authority = try host.host_authority.resolve_fn(
         host.host_authority.context,
         alloc,
-        app.session_persistence.writable.?.active_id,
+        app.session_persistence.v2.?.id(),
     );
     defer host_authority.deinit(alloc);
     var found_subagent = false;
@@ -6427,7 +6699,7 @@ test "beginFreshPersistedSession and enableSessionStores create per-session stor
     try std.testing.expect(found_subagent);
 }
 
-test "resume handoff suppresses missing and pristine writable sessions" {
+test "resume handoff suppresses a missing session and one with no saved turn" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6451,40 +6723,17 @@ test "resume handoff suppresses missing and pristine writable sessions" {
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
+    const pristine_id = try alloc.dupe(u8, Runtime(TestApp).activeSessionId(&app).?);
+    defer alloc.free(pristine_id);
     Runtime(TestApp).requestResumeHandoff(&app);
 
     try std.testing.expect(Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app) == null);
-    try std.testing.expect(app.session_persistence.writable == null);
-}
-
-test "upgrade resume handoff owns a validated pristine session" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(alloc, &tmp);
-    defer {
-        alloc.free(paths.home);
-        alloc.free(paths.workspace);
-    }
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-    try configureTestPreferences(&app);
-    try Runtime(TestApp).initializePersistence(&app, true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app);
-    const expected_id = try alloc.dupe(
-        u8,
-        app.session_persistence.writable.?.active_id,
+    try std.testing.expect(app.session_persistence.v2 == null);
+    // Nothing durable happened, so closing leaves no empty session behind.
+    try std.testing.expectError(
+        error.SessionNotFound,
+        session_adapter.Session.resumeSession(alloc, app.session_persistence.v2_store.?, .{ .id = pristine_id }, paths.workspace, .app),
     );
-    defer alloc.free(expected_id);
-    Runtime(TestApp).requestUpgradeResumeHandoff(&app);
-
-    var handoff = Runtime(TestApp).finalizePersistenceWithResumeHandoff(&app) orelse
-        return error.TestExpectedResumeHandoff;
-    defer handoff.deinit(alloc);
-
-    try std.testing.expectEqualStrings(expected_id, handoff.session_id);
 }
 
 test "resume handoff owns the exact non-pristine session id" {
@@ -6508,7 +6757,7 @@ test "resume handoff owns the exact non-pristine session id" {
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
     const expected_id = try alloc.dupe(
         u8,
-        app.session_persistence.writable.?.active_id,
+        app.session_persistence.v2.?.id(),
     );
     defer alloc.free(expected_id);
     Runtime(TestApp).requestResumeHandoff(&app);
@@ -6518,50 +6767,11 @@ test "resume handoff owns the exact non-pristine session id" {
     defer handoff.deinit(alloc);
 
     try std.testing.expectEqualStrings(expected_id, handoff.session_id);
-    try std.testing.expect(app.session_persistence.writable == null);
-}
-
-test "resume handoff requires no derived cache write" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(alloc, &tmp);
-    defer {
-        alloc.free(paths.home);
-        alloc.free(paths.workspace);
-    }
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-    try configureTestPreferences(&app);
-    try Runtime(TestApp).initializePersistence(&app, true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app);
-    const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
-    defer session_runtime.freeHistoryTurn(alloc, turn);
-    try Runtime(TestApp).appendHistoryTurn(&app, turn);
-    const expected_id = try alloc.dupe(
-        u8,
-        app.session_persistence.writable.?.active_id,
-    );
-    defer alloc.free(expected_id);
-    const session_dir = (try Runtime(TestApp).activeSessionDisplayPath(&app, alloc)) orelse
-        return error.TestExpectedSessionDirectory;
-    defer alloc.free(session_dir);
-    const session_dir_z = try alloc.dupeZ(u8, session_dir);
-    defer alloc.free(session_dir_z);
-    if (std.c.chmod(session_dir_z.ptr, 0o500) != 0) return error.TestChmodFailed;
-    defer _ = std.c.chmod(session_dir_z.ptr, 0o700);
-    Runtime(TestApp).requestResumeHandoff(&app);
-    var handoff = Runtime(TestApp).closeWritableSessionWithResumeHandoff(&app) orelse
-        return error.TestExpectedResumeHandoff;
-    defer handoff.deinit(alloc);
-
-    try std.testing.expectEqualStrings(expected_id, handoff.session_id);
+    try std.testing.expect(app.session_persistence.v2 == null);
 }
 
 test "resume handoff suppresses session id allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try testPaths(alloc, &tmp);
@@ -6635,7 +6845,7 @@ test "interactive subagent host resolves current tools rules grants and integrat
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     Runtime(TestApp).enableSessionStores(&app);
     const host = app.session_persistence.subagent_host.?;
-    const root_id = app.session_persistence.writable.?.active_id;
+    const root_id = app.session_persistence.v2.?.id();
 
     var initial = try host.host_authority.resolve_fn(
         host.host_authority.context,
@@ -6960,6 +7170,86 @@ test "execution replay records session labels for tty-launched sessions" {
     );
 }
 
+test "execution replay names the call whose saved output a later read opens" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    const replay = "fx-command-replay-0123.bin";
+    const run_output = "{\"exit_code\":0,\"full_output_handle\":\"" ++ replay ++ "\"}";
+    const file_output = "<path>src/main.zig</path>";
+    var source_calls = [_]types.ToolCall{
+        .{ .id = "call_run", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"zig build test\"}" },
+        .{ .id = "call_file", .name = "read_file", .arguments_json = "{\"path\":\"src/main.zig\"}" },
+    };
+    var source_results = [_]types.PersistedToolResult{
+        .{
+            .tool_call_id = @constCast("call_run"),
+            .tool_name = @constCast("shell"),
+            .status = .success,
+            .output = @constCast(run_output),
+            .output_bytes = run_output.len,
+            .stored_output_bytes = run_output.len,
+            .command_output_replay = .{ .available = .{ .handle = replay, .framed_bytes = 64 } },
+        },
+        .{
+            .tool_call_id = @constCast("call_file"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast(file_output),
+            .output_handle = @constCast("result-read_file-1.txt"),
+            .output_bytes = file_output.len,
+            .stored_output_bytes = file_output.len,
+        },
+    };
+    var source_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = source_calls[0..],
+        .tool_results = source_results[0..],
+    }};
+    var read_calls = [_]types.ToolCall{
+        .{ .id = "page", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"" ++ replay ++ "\",\"start_byte\":9}}" },
+        .{ .id = "query", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"" ++ replay ++ "\",\"query\":\"error:\"}}" },
+        .{ .id = "file", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"result-read_file-1\"}}" },
+        .{ .id = "unknown", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"result-gone.txt\"}}" },
+    };
+    var read_results: [read_calls.len]types.PersistedToolResult = undefined;
+    for (&read_results, read_calls) |*result, call| {
+        result.* = .{
+            .tool_call_id = @constCast(call.id),
+            .tool_name = @constCast(call.name),
+            .status = .success,
+            .output = @constCast("page"),
+            .output_bytes = 4,
+            .stored_output_bytes = 4,
+        };
+    }
+    var read_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = read_calls[0..],
+        .tool_results = read_results[0..],
+    }};
+    const history = [_]types.HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("run the tests") },
+            .assistant = @constCast(""),
+            .execution = .{ .tool_steps = source_steps[0..] },
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("find the failure") },
+            .assistant = @constCast(""),
+            .execution = .{ .tool_steps = read_steps[0..] },
+        } },
+    };
+
+    try Runtime(TestApp).replayHistory(&app, &history);
+
+    const statuses = app.completed_tool_statuses.items;
+    try std.testing.expectEqual(@as(usize, 6), statuses.len);
+    try std.testing.expectEqualStrings("● Completed read_tool_result more output from zig build test\n", statuses[2]);
+    try std.testing.expectEqualStrings("● Completed read_tool_result zig build test output for \"error:\"\n", statuses[3]);
+    try std.testing.expectEqualStrings("● Completed read_tool_result more output from src/main.zig\n", statuses[4]);
+    try std.testing.expectEqualStrings("● Completed read_tool_result\n", statuses[5]);
+}
+
 test "resume projection stores reflow metadata for session action rows" {
     const alloc = std.testing.allocator;
     var app = try TestApp.init(alloc, "/workspace");
@@ -6974,16 +7264,15 @@ test "resume projection stores reflow metadata for session action rows" {
     var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
         .app = &app,
         .projection = &projection,
-        .workspace_root = app.workspace_root,
         .labels = &labels,
     };
 
-    const command = "bun run " ++ ("pipeline-stage-" ** 10);
+    const command = "bun run " ++ text_utils.repeat("pipeline-stage-", 10);
     const run_output = "{\"session_id\":\"shell-4\",\"state\":\"running\",\"backend\":\"captured\"}";
     var run_calls = [_]types.ToolCall{.{
         .id = "call_run",
         .name = "shell",
-        .arguments_json = try std.fmt.allocPrint(alloc, "{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
+        .arguments_json = try alloc.print("{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
     }};
     defer alloc.free(run_calls[0].arguments_json);
     var run_results = [_]types.PersistedToolResult{.{
@@ -7051,6 +7340,138 @@ test "resume projection stores reflow metadata for session action rows" {
         const display = detail.command_display orelse continue;
         try std.testing.expect(std.mem.find(u8, display, "shell-9") == null);
     }
+}
+
+test "resume projection restores session action rows with labels seeded from the live root" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    // Resume always seeds the labels root from the app's live workspace root;
+    // the origin root only records where the session was created.
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .labels = &labels,
+    };
+
+    const command = "cd /workspace/packages/cli && " ++ text_utils.repeat("printf relative-path ", 6);
+    const run_output = "{\"session_id\":\"shell-4\",\"state\":\"running\",\"backend\":\"captured\"}";
+    var run_calls = [_]types.ToolCall{.{
+        .id = "call_run",
+        .name = "shell",
+        .arguments_json = try alloc.print("{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
+    }};
+    defer alloc.free(run_calls[0].arguments_json);
+    var run_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_run"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast(run_output),
+        .output_bytes = run_output.len,
+        .stored_output_bytes = run_output.len,
+    }};
+    var first_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = run_calls[0..],
+        .tool_results = run_results[0..],
+    }};
+    var observe_calls = [_]types.ToolCall{.{
+        .id = "call_observe",
+        .name = "shell",
+        .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-4\",\"chars\":\"\"}",
+    }};
+    var observe_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_observe"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast(run_output),
+        .output_bytes = run_output.len,
+        .stored_output_bytes = run_output.len,
+    }};
+    var second_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = observe_calls[0..],
+        .tool_results = observe_results[0..],
+    }};
+
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, &sink, .{ .tool_steps = first_steps[0..] }, &labels);
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, &sink, .{ .tool_steps = second_steps[0..] }, &labels);
+
+    // The observe row resolves the recorded launch command through the live
+    // root instead of falling back to the raw session id.
+    var observed_metadata = false;
+    for (projection.runtime.tool_details.items) |*detail| {
+        const action = detail.command_action_label orelse continue;
+        if (std.mem.eql(u8, action, "Observed")) {
+            const display = detail.command_display.?;
+            try std.testing.expect(std.mem.startsWith(u8, display, "cd ./packages/cli && "));
+            try std.testing.expect(display.len > 120);
+            observed_metadata = true;
+        }
+    }
+    try std.testing.expect(observed_metadata);
+}
+
+test "resume projection stores reflow metadata after the session moved workspaces" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    var source_runtime: transcript_runtime.TranscriptRuntime = .{};
+    defer source_runtime.deinit(alloc);
+    var projection = try resume_projection.ResumeProjection.initEmpty(alloc, &source_runtime, 0, 1);
+    defer projection.deinit();
+    // Command reclip metadata resolves against the app's live root even when
+    // the sink labels root is empty: the replayed status phrases are
+    // generated with that same root, and withholding the metadata would
+    // freeze every absolute-path command row at the compact activity bound.
+    var labels = Runtime(TestApp).HistoricalSessionLabels{ .workspace_root = "" };
+    defer labels.deinit(app.alloc);
+    var sink = Runtime(TestApp).DetachedHistorySink(@TypeOf(projection)){
+        .app = &app,
+        .projection = &projection,
+        .labels = &labels,
+    };
+
+    const command = "cd /workspace/packages/cli && " ++ text_utils.repeat("printf relative-path ", 6);
+    var run_calls = [_]types.ToolCall{.{
+        .id = "call_run",
+        .name = "shell",
+        .arguments_json = try alloc.print("{{\"action\":\"run\",\"command\":{f}}}", .{std.json.fmt(command, .{})}),
+    }};
+    defer alloc.free(run_calls[0].arguments_json);
+    var run_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call_run"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast("done"),
+        .output_bytes = 4,
+        .stored_output_bytes = 4,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = run_calls[0..],
+        .tool_results = run_results[0..],
+    }};
+
+    try Runtime(TestApp).writeExecutionHistoryToSink(&app, &sink, .{ .tool_steps = steps[0..] }, &labels);
+
+    var stored = false;
+    for (projection.runtime.tool_details.items) |*detail| {
+        const display = detail.command_display orelse continue;
+        if (std.mem.eql(u8, detail.command_action_label orelse "", "Ran")) {
+            // Abbreviated against the live root, full length, never the
+            // compact-bound frozen form.
+            try std.testing.expect(std.mem.startsWith(u8, display, "cd ./packages/cli && "));
+            try std.testing.expect(display.len > 120);
+            stored = true;
+        }
+    }
+    try std.testing.expect(stored);
 }
 
 test "execution replay renders persisted permission feedback after its tool result" {
@@ -7276,29 +7697,11 @@ test "resume restores complete command output stored behind a result handle" {
         .assistant = @constCast(""),
         .execution = .{ .tool_steps = steps[0..] },
     } }};
-    try writeSessionFixture(
-        alloc,
-        app.session_persistence.store.?,
-        "stored-command-output",
-        &history,
-        0,
-    );
-
-    var fixture = try app.session_persistence.store.?.resumeForWrite(
-        alloc,
-        "stored-command-output",
-    );
-    const capability = try fixture.childCapability();
-    var entry = try capability.atomicReplace(
-        alloc,
-        .tool_results,
-        "saved-command-output.txt",
-        sidecar_output.items,
-    );
-    entry.deinit(alloc);
-    fixture.deinit(alloc);
-
-    app.requested_resume = .{ .id = try alloc.dupe(u8, "stored-command-output") };
+    const hash = try beginSessionWithBody(&app, sidecar_output.items);
+    const handle = try std.mem.concat(alloc, u8, &.{ "result-", &hash, ".txt" });
+    defer alloc.free(handle);
+    results[0].output_handle = handle;
+    app.requested_resume = .{ .id = try commitSessionFixture(&app, history[0]) };
     try Runtime(TestApp).resumeRequestedSession(&app);
 
     try std.testing.expect(std.mem.find(u8, app.command_stdout.items, "SIDECAR_STDOUT_MARKER") != null);
@@ -7332,7 +7735,7 @@ test "resume falls back to saved command output when replay contains an empty fr
         "exit_code=0\n<stdout>\nFALLBACK_STDOUT_MARKER\n</stdout>\n" ++
         "<stderr>\n</stderr>\n";
     const replay_handle = "fx-command-replay-empty-frame.bin";
-    var empty_replay = [_]u8{0} ** ("FXRPLY01".len + 9);
+    var empty_replay: ["FXRPLY01".len + 9]u8 = @splat(0);
     @memcpy(empty_replay[0.."FXRPLY01".len], "FXRPLY01");
 
     var calls = [_]types.ToolCall{.{
@@ -7362,29 +7765,11 @@ test "resume falls back to saved command output when replay contains an empty fr
         .assistant = @constCast(""),
         .execution = .{ .tool_steps = steps[0..] },
     } }};
-    try writeSessionFixture(
-        alloc,
-        app.session_persistence.store.?,
-        "empty-command-replay",
-        &history,
-        0,
-    );
-
-    var fixture = try app.session_persistence.store.?.resumeForWrite(
-        alloc,
-        "empty-command-replay",
-    );
-    const capability = try fixture.childCapability();
-    var entry = try capability.atomicReplace(
-        alloc,
-        .command_artifacts,
-        replay_handle,
-        &empty_replay,
-    );
-    entry.deinit(alloc);
-    fixture.deinit(alloc);
-
-    app.requested_resume = .{ .id = try alloc.dupe(u8, "empty-command-replay") };
+    const hash = try beginSessionWithBody(&app, &empty_replay);
+    const handle = try std.mem.concat(alloc, u8, &.{ "fx-command-replay-", &hash, ".bin" });
+    defer alloc.free(handle);
+    results[0].command_output_replay.?.available.handle = handle;
+    app.requested_resume = .{ .id = try commitSessionFixture(&app, history[0]) };
     try Runtime(TestApp).resumeRequestedSession(&app);
 
     try std.testing.expectEqualStrings("FALLBACK_STDOUT_MARKER", app.command_stdout.items);
@@ -7414,7 +7799,9 @@ test "historical command replay prefers tagged frames and preserves exit outcome
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
-    const capability = try app.session_persistence.writable.?.childCapability();
+    // A body is stored only while its session is on disk (D44).
+    try app.session_persistence.v2.?.beginTurn();
+    const capability = try app.session_persistence.v2.?.childCapability();
 
     var capture_arena = std.heap.ArenaAllocator.init(alloc);
     defer capture_arena.deinit();
@@ -7937,6 +8324,8 @@ test "upgrade resume restores active session with the installed version notice" 
         types.ReasoningEffort.literal("high"),
         true,
         false,
+        false,
+        null,
         null,
         null,
         null,
@@ -7962,21 +8351,9 @@ test "upgrade resume restores active session with the installed version notice" 
         .tool_calls = calls[0..],
         .tool_results = results[0..],
     }};
-    var resumed_images = [_]types.ImageAttachment{.{
-        .id = 41,
-        .path = @constCast("/tmp/resumed.png"),
-        .media_type = @constCast("image/png"),
-        .snapshot_path = @constCast("images/image-41-0123456789abcdef.bin"),
-        .snapshot_sha256 = @constCast("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
-    }};
     const history = [_]types.HistoryTurn{
-        .{ .compacted_summary = .{
-            .summary = @constCast("<context_handoff>older context</context_handoff>"),
-            .removed_turn_count = 2,
-            .compaction_count = 1,
-        } },
         .{ .assistant = .{
-            .user = .{ .text = @constCast("hello"), .images = &resumed_images },
+            .user = .{ .text = @constCast("hello") },
             .assistant = @constCast("hi"),
         } },
         .{ .assistant = .{
@@ -7990,14 +8367,9 @@ test "upgrade resume restores active session with the installed version notice" 
             .execution = .{ .tool_steps = steps[0..] },
         } },
     };
-    try writeSessionFixture(
-        alloc,
-        app.session_persistence.store.?,
-        "session-1",
-        &history,
-        2,
-    );
-    app.requested_resume = .{ .id = try alloc.dupe(u8, "session-1") };
+    const session_id = try writeSessionFixture(&app, &history);
+    defer alloc.free(session_id);
+    app.requested_resume = .{ .id = try alloc.dupe(u8, session_id) };
     app.total_web_search_requests = 99;
 
     try Runtime(TestApp).resumeRequestedSessionAfterUpgrade(
@@ -8013,13 +8385,9 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expect(app.startup_resume_anchor_saw_writable);
     try std.testing.expectEqual(@as(usize, 3), app.startup_resume_anchor_history_len);
     try std.testing.expectEqual(@as(usize, 1), app.startup_resume_anchor_notice_count);
-    try std.testing.expectEqualStrings(
-        "session-1",
-        app.session_persistence.writable.?.active_id,
-    );
+    try std.testing.expectEqualStrings(session_id, app.session_persistence.v2.?.id());
     try std.testing.expect(app.session_persistence.subagent_host != null);
     try std.testing.expectEqual(@as(usize, 3), app.session.historyLen());
-    try std.testing.expectEqual(@as(usize, 42), app.next_image_id);
     const context = try app.session.snapshotContextHistory(alloc);
     defer session_runtime.freeHistoryTurnSlice(alloc, context);
     try std.testing.expectEqual(@as(usize, 3), context.len);
@@ -8058,7 +8426,7 @@ test "upgrade resume restores active session with the installed version notice" 
     try std.testing.expect(!app.fast_mode);
 }
 
-test "resumed recovery checkpoint replays its unfinished turn once" {
+test "upgrade resume caches the derived title for a session with usable history" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8068,62 +8436,35 @@ test "resumed recovery checkpoint replays its unfinished turn once" {
         alloc.free(paths.home);
         alloc.free(paths.workspace);
     }
+
     const home = try TestHome.install(alloc, paths.home);
     defer home.deinit();
 
     var app = try TestApp.init(alloc, paths.workspace);
     defer app.deinit();
+
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
 
-    const history = [_]types.HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("completed prompt") },
-        .assistant = @constCast("completed answer"),
-    } }};
-    try writeSessionFixture(
-        alloc,
-        app.session_persistence.store.?,
-        "paused-recovery",
-        &history,
-        0,
-    );
-    {
-        var writable = try app.session_persistence.store.?.resumeForWrite(
-            alloc,
-            "paused-recovery",
-        );
-        defer writable.deinit(alloc);
-        const checkpoint = session_codec.RecoveryCheckpoint{
-            .turn_id = 41,
-            .user = .{ .text = @constCast("unfinished prompt") },
-            .assistant_source = @constCast("Partial output before EOF."),
-            .cause = .response_interrupted,
-            .action = .continuing_response,
-            .authority = .{ .provider = .gateway, .model = @constCast("saved/model") },
-            .requested_fast_mode = false,
-            .fast_mode = false,
-            .max_provider_attempts = 10,
-            .consumed_provider_attempts = 2,
-        };
-        _ = try writable.appendEvent(
-            alloc,
-            .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
-            789,
-        );
-    }
+    const history = [_]types.HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("hello") },
+            .assistant = @constCast("hi"),
+        } },
+    };
+    const session_hello_id = try writeSessionFixture(&app, &history);
+    defer alloc.free(session_hello_id);
+    app.requested_resume = .{ .id = try alloc.dupe(u8, session_hello_id) };
 
-    app.requested_resume = .{ .id = try alloc.dupe(u8, "paused-recovery") };
-    try Runtime(TestApp).resumeRequestedSession(&app);
-
-    try std.testing.expectEqual(@as(usize, 2), app.cards.items.len);
-    try std.testing.expectEqualStrings("completed prompt", app.cards.items[0].text);
-    try std.testing.expectEqualStrings("unfinished prompt", app.cards.items[1].text);
-    try std.testing.expectEqualStrings(
-        "completed answer\nPartial output before EOF.\n",
-        app.assistant_text.items,
+    try Runtime(TestApp).resumeRequestedSessionAfterUpgrade(
+        &app,
+        "9.9.9",
+        .stable,
+        "",
+        "",
     );
-    try std.testing.expectEqual(@as(usize, 2), app.notices.items.len);
-    try std.testing.expect(std.mem.find(u8, app.notices.items[1], "attempt 2/10") != null);
+
+    try std.testing.expectEqualStrings("hello", app.session_title.items);
 }
 
 test "resumeRequestedSession releases the writer when the startup replay anchor fails" {
@@ -8148,14 +8489,9 @@ test "resumeRequestedSession releases the writer when the startup replay anchor 
         .user = .{ .text = @constCast("saved prompt") },
         .assistant = @constCast("saved response"),
     } }};
-    try writeSessionFixture(
-        alloc,
-        app.session_persistence.store.?,
-        "anchor-failure",
-        &history,
-        0,
-    );
-    app.requested_resume = .{ .id = try alloc.dupe(u8, "anchor-failure") };
+    const anchor_failure_id = try writeSessionFixture(&app, &history);
+    defer alloc.free(anchor_failure_id);
+    app.requested_resume = .{ .id = try alloc.dupe(u8, anchor_failure_id) };
     app.fail_startup_resume_anchor = true;
 
     try std.testing.expectError(
@@ -8168,15 +8504,12 @@ test "resumeRequestedSession releases the writer when the startup replay anchor 
     try std.testing.expectEqual(@as(usize, 1), app.startup_resume_anchor_history_len);
     try std.testing.expectEqual(@as(usize, 1), app.startup_resume_anchor_notice_count);
     try std.testing.expect(app.requested_resume == null);
-    try std.testing.expect(app.session_persistence.writable == null);
+    try std.testing.expect(app.session_persistence.v2 == null);
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
 
-    var reopened = try app.session_persistence.store.?.resumeForWrite(
-        alloc,
-        "anchor-failure",
-    );
-    reopened.deinit(alloc);
+    // The session was let go: it opens again.
+    (try session_adapter.Session.resumeSession(alloc, app.session_persistence.v2_store.?, .{ .id = anchor_failure_id }, paths.workspace, .app)).close();
 }
 
 test "requested pick target opens the session picker instead of loading a session" {
@@ -8201,13 +8534,8 @@ test "requested pick target opens the session picker instead of loading a sessio
         .user = .{ .text = @constCast("saved prompt") },
         .assistant = @constCast("saved response"),
     } }};
-    try writeSessionFixture(
-        alloc,
-        app.session_persistence.store.?,
-        "saved-session",
-        &history,
-        0,
-    );
+    const saved_session_id = try writeSessionFixture(&app, &history);
+    defer alloc.free(saved_session_id);
 
     app.requested_resume = .pick;
     try Runtime(TestApp).resumeRequestedSession(&app);
@@ -8216,7 +8544,7 @@ test "requested pick target opens the session picker instead of loading a sessio
     try std.testing.expect(app.session_persistence.session_picker.active);
     try waitForSessionPickerLoad(&app);
     try std.testing.expectEqual(@as(usize, 0), app.session.historyLen());
-    try std.testing.expect(app.session_persistence.writable == null);
+    try std.testing.expect(app.session_persistence.v2 == null);
 }
 
 test "canceling a startup session picker starts a writable fresh session" {
@@ -8239,16 +8567,15 @@ test "canceling a startup session picker starts a writable fresh session" {
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).openSessionPicker(&app);
     try std.testing.expect(app.session_persistence.session_picker.active);
-    try std.testing.expect(app.session_persistence.writable == null);
+    try std.testing.expect(app.session_persistence.v2 == null);
 
     Runtime(TestApp).cancelSessionPickerToComposer(&app);
 
     try std.testing.expect(!app.session_persistence.session_picker.active);
-    try std.testing.expect(app.session_persistence.writable != null);
+    try std.testing.expect(app.session_persistence.v2 != null);
 }
 
-test "subagent host publication requires successful registry recovery" {
-    const subagent_child_state = @import("../subagent/child_state.zig");
+test "a resumed session's subagent host finds abandoned child work interrupted" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8264,8 +8591,13 @@ test "subagent host publication requires successful registry recovery" {
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
-    const parent_id = app.session_persistence.writable.?.active_id;
-    const state_store = subagent_child_state.Store{ .sessions = &app.session_persistence.store.?, .parent_id = parent_id };
+    const v2 = app.session_persistence.v2.?;
+    // Child lines need the parent on disk.
+    try v2.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("delegate") },
+        .assistant = @constCast("ok"),
+    } }, session_runtime.ConversationLanguage.literal("en"));
+    const parent_id = v2.id();
     var registry = try subagent_child_state.Registry.init(alloc, parent_id);
     defer registry.deinit(alloc);
     var active = subagent_child_state.ActiveWork{
@@ -8275,62 +8607,25 @@ test "subagent host publication requires successful registry recovery" {
     };
     defer active.deinit(alloc);
     try registry.appendOneOff(alloc, "child", active);
-    try state_store.save(alloc, registry);
-    Runtime(TestApp).enableSessionStores(&app);
+    {
+        // An earlier process started the work and exited before it finished.
+        var earlier = subagent_child_state.V2Children.init(alloc, v2, paths.workspace);
+        defer earlier.deinit();
+        try (subagent_child_state.Store{ .children = &earlier, .parent_id = parent_id }).save(alloc, registry);
+    }
+    const session_id = try alloc.dupe(u8, parent_id);
+    defer alloc.free(session_id);
+    Runtime(TestApp).closeWritableSession(&app);
+
+    // The reopen repair finishes the open work (D33) before the host loads it.
+    app.requested_resume = .{ .id = try alloc.dupe(u8, session_id) };
+    try Runtime(TestApp).resumeRequestedSession(&app);
     try std.testing.expect(app.session_persistence.subagent_host != null);
+    const state_store = subagent_child_state.Store{ .children = app.session_persistence.v2_children.?, .parent_id = session_id };
     var recovered = try state_store.load(alloc);
     defer recovered.deinit(alloc);
     try std.testing.expectEqual(subagent_child_state.Phase.interrupted, recovered.children[0].phase);
     try std.testing.expect(recovered.children[0].active == null);
-
-    registry.generation = recovered.generation + 1;
-    try state_store.save(alloc, registry);
-    Runtime(TestApp).rebindSubagentHost(&app);
-    var rebound = try state_store.load(alloc);
-    defer rebound.deinit(alloc);
-    try std.testing.expectEqual(registry.generation, rebound.generation);
-    try std.testing.expectEqual(subagent_child_state.Phase.running, rebound.children[0].phase);
-    const Faults = struct {
-        fn lock(_: ?*anyopaque, _: std.Io.File) anyerror!bool {
-            return error.InjectedLockFailure;
-        }
-        fn sync(_: ?*anyopaque, _: std.Io.File) anyerror!void {
-            return error.InjectedSyncFailure;
-        }
-    };
-    const host = app.session_persistence.subagent_host.?;
-    host.managed.state_store.options = .{ .lock_ops = .{ .try_lock = Faults.lock } };
-    try std.testing.expectError(error.SessionChildStoreFailed, host.managed.recoverInterrupted());
-    host.managed.state_store.options = .{ .replace_ops = .{ .sync_file = Faults.sync } };
-    try std.testing.expectError(error.SessionChildStoreFailed, host.managed.recoverInterrupted());
-    host.managed.state_store.options = .{};
-    var retained = try state_store.load(alloc);
-    defer retained.deinit(alloc);
-    try std.testing.expectEqual(registry.generation, retained.generation);
-    try std.testing.expectEqual(subagent_child_state.Phase.running, retained.children[0].phase);
-    Runtime(TestApp).disableSubagentHost(&app);
-    const capability = try app.session_persistence.writable.?.childCapability();
-    var entry = try capability.atomicReplace(alloc, .subagent_control, "children.json", "[]");
-    defer entry.deinit(alloc);
-    Runtime(TestApp).enableSessionStores(&app);
-    try std.testing.expect(app.session_persistence.subagent_host == null);
-    try std.testing.expect(app.session_persistence.writable != null);
-    const AllocationCheck = struct {
-        fn run(check_alloc: Allocator, store: *session_store.Store, id: []const u8) !void {
-            const created = subagent_tool_host.Runtime.create(check_alloc, store, id, .{ .resolve_fn = unavailable }, .{}) catch |err| {
-                if (err == error.OutOfMemory) return err;
-                try std.testing.expectEqual(error.InvalidState, err);
-                return;
-            };
-            created.deinit();
-            return error.TestExpectedError;
-        }
-
-        fn unavailable(_: ?*anyopaque, _: Allocator, _: []const u8) subagent_authority.HostResolveError!subagent_authority.HostAuthority {
-            return error.HostAuthorityUnavailable;
-        }
-    };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &app.session_persistence.store.?, parent_id });
 }
 
 test "interactive session resume uses the live transition and shared restore path" {
@@ -8355,13 +8650,8 @@ test "interactive session resume uses the live transition and shared restore pat
         .user = .{ .text = @constCast("saved prompt") },
         .assistant = @constCast("saved response"),
     } }};
-    try writeSessionFixture(
-        alloc,
-        app.session_persistence.store.?,
-        "saved-session",
-        &history,
-        0,
-    );
+    const saved_session_id = try writeSessionFixture(&app, &history);
+    defer alloc.free(saved_session_id);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     try Runtime(TestApp).openSessionPicker(&app);
     try std.testing.expect(app.session_persistence.session_picker.isLoading());
@@ -8371,8 +8661,8 @@ test "interactive session resume uses the live transition and shared restore pat
     try std.testing.expectEqual(@as(usize, 1), app.live_resume_prepare_count);
     try std.testing.expectEqual(@as(usize, 1), app.live_resume_finish_count);
     try std.testing.expectEqualStrings(
-        "saved-session",
-        app.session_persistence.writable.?.active_id,
+        saved_session_id,
+        app.session_persistence.v2.?.id(),
     );
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
@@ -8403,7 +8693,7 @@ test "interactive session resume preserves the current writer when the target is
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     const current_id = try alloc.dupe(
         u8,
-        app.session_persistence.writable.?.active_id,
+        app.session_persistence.v2.?.id(),
     );
     defer alloc.free(current_id);
 
@@ -8426,7 +8716,7 @@ test "interactive session resume preserves the current writer when the target is
     );
     try std.testing.expectEqualStrings(
         current_id,
-        app.session_persistence.writable.?.active_id,
+        app.session_persistence.v2.?.id(),
     );
     try std.testing.expect(picker.active);
     try std.testing.expectEqualStrings("missing-session", picker.selectedId().?);
@@ -8480,14 +8770,9 @@ test "resumeRequestedSession replays persisted model Markdown without parsing ge
             .completed_tool_names = completed_tool_names[0..],
         } },
     };
-    try writeSessionFixture(
-        alloc,
-        app.session_persistence.store.?,
-        "markdown-replay",
-        &history,
-        0,
-    );
-    app.requested_resume = .{ .id = try alloc.dupe(u8, "markdown-replay") };
+    const markdown_replay_id = try writeSessionFixture(&app, &history);
+    defer alloc.free(markdown_replay_id);
+    app.requested_resume = .{ .id = try alloc.dupe(u8, markdown_replay_id) };
 
     try Runtime(TestApp).resumeRequestedSession(&app);
 
@@ -8529,7 +8814,7 @@ test "resumeRequestedSession replays persisted model Markdown without parsing ge
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Cancelling") == null);
     try std.testing.expectEqual(
         transcript_runtime.RawEntryClass.turn_cancellation,
-        app.raw_transcript_classes.getLast(),
+        app.raw_transcript_classes.last().?,
     );
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
 }
@@ -8583,18 +8868,12 @@ test "resumeRequestedSession cleans final owner after post-transfer failure" {
 
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
-    try writeSessionFixture(
-        alloc,
-        app.session_persistence.store.?,
-        "session-1",
-        &.{.{ .compacted_summary = .{
-            .summary = @constCast("post-transfer failure"),
-            .removed_turn_count = 1,
-            .compaction_count = 1,
-        } }},
-        0,
-    );
-    app.requested_resume = .{ .id = try alloc.dupe(u8, "session-1") };
+    const session_id = try writeSessionFixture(&app, &.{.{ .assistant = .{
+        .user = .{ .text = @constCast("post-transfer failure") },
+        .assistant = @constCast("ok"),
+    } }});
+    defer alloc.free(session_id);
+    app.requested_resume = .{ .id = try alloc.dupe(u8, session_id) };
     app.fail_system_notice = true;
 
     try std.testing.expectError(
@@ -8603,14 +8882,12 @@ test "resumeRequestedSession cleans final owner after post-transfer failure" {
     );
     try std.testing.expect(app.writable_seen_during_notice_failure);
     try std.testing.expect(app.requested_resume == null);
-    try std.testing.expect(app.session_persistence.writable == null);
+    try std.testing.expect(app.session_persistence.v2 == null);
 
-    var reopened = try app.session_persistence.store.?.resumeForWrite(
-        alloc,
-        "session-1",
-    );
-    defer reopened.deinit(alloc);
-    try std.testing.expectEqualStrings("session-1", reopened.active_id);
+    // The failed resume let the session go: it opens again.
+    const reopened = try session_adapter.Session.resumeSession(alloc, app.session_persistence.v2_store.?, .{ .id = session_id }, paths.workspace, .app);
+    defer reopened.close();
+    try std.testing.expectEqualStrings(session_id, reopened.id());
 }
 
 test "resumeRequestedSession replays active-tool interruption with live cancellation notice" {
@@ -8642,14 +8919,9 @@ test "resumeRequestedSession replays active-tool interruption with live cancella
             },
         } },
     };
-    try writeSessionFixture(
-        alloc,
-        app.session_persistence.store.?,
-        "session-1",
-        &history,
-        0,
-    );
-    app.requested_resume = .{ .id = try alloc.dupe(u8, "session-1") };
+    const session_1_id = try writeSessionFixture(&app, &history);
+    defer alloc.free(session_1_id);
+    app.requested_resume = .{ .id = try alloc.dupe(u8, session_1_id) };
 
     try Runtime(TestApp).resumeRequestedSession(&app);
 
@@ -8690,14 +8962,9 @@ test "resumeRequestedSession preserves failed partial terminal reason" {
             .terminal_reason = .failed,
         } },
     };
-    try writeSessionFixture(
-        alloc,
-        app.session_persistence.store.?,
-        "session-1",
-        &history,
-        0,
-    );
-    app.requested_resume = .{ .id = try alloc.dupe(u8, "session-1") };
+    const session_1_id = try writeSessionFixture(&app, &history);
+    defer alloc.free(session_1_id);
+    app.requested_resume = .{ .id = try alloc.dupe(u8, session_1_id) };
 
     try Runtime(TestApp).resumeRequestedSession(&app);
 
@@ -8727,6 +8994,8 @@ test "cancelled command presentation survives a persisted session restart" {
         try configureTestPreferences(&app);
         try Runtime(TestApp).initializePersistence(&app, true);
         try Runtime(TestApp).beginFreshPersistedSession(&app);
+        // The turn is open on disk while its command runs (D44).
+        try app.session_persistence.v2.?.beginTurn();
         const capability = Runtime(TestApp).childCapability(&app) orelse
             return error.TestExpectedSessionCapability;
         const capture = try command_replay_store.Capture.create(alloc, 1, capability);
@@ -8765,7 +9034,7 @@ test "cancelled command presentation survives a persisted session restart" {
                 .output_replay = .{ .available = descriptor },
             },
         } });
-        session_id = try alloc.dupe(u8, app.session_persistence.writable.?.active_id);
+        session_id = try alloc.dupe(u8, app.session_persistence.v2.?.id());
         Runtime(TestApp).finalizePersistence(&app);
     }
 
@@ -8798,7 +9067,7 @@ test "cancelled command presentation survives a persisted session restart" {
 }
 
 test "cancelled command metadata allocation failure preserves core presentation" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var failing = std.testing.FailingAllocator.init(alloc, .{});
     const app_alloc = failing.allocator();
     var app = try TestApp.init(app_alloc, "/workspace");
@@ -8834,7 +9103,7 @@ test "cancelled command metadata allocation failure preserves core presentation"
     try std.testing.expect(presentation.output_replay == null);
 }
 
-fn expectAuthoritativeCancelledReplayIsSoleArtifact() !void {
+fn expectCancelledHistoryKeepsAuthoritativeReplay() !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8850,6 +9119,8 @@ fn expectAuthoritativeCancelledReplayIsSoleArtifact() !void {
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
+    // The turn is open on disk while its command runs (D44).
+    try app.session_persistence.v2.?.beginTurn();
     const capability = Runtime(TestApp).childCapability(&app) orelse
         return error.TestExpectedSessionCapability;
     const authoritative = try command_replay_store.Capture.create(
@@ -8925,13 +9196,10 @@ fn expectAuthoritativeCancelledReplayIsSoleArtifact() !void {
     try std.testing.expect(
         std.mem.find(u8, page, "SHARED-CANCELLED-OUTPUT") != null,
     );
-    var artifacts = try capability.iterate(alloc, .command_artifacts);
-    defer artifacts.deinit();
-    try std.testing.expectEqual(@as(usize, 1), artifacts.names.len);
 }
 
-test "authoritative cancelled replay is the sole output artifact" {
-    try expectAuthoritativeCancelledReplayIsSoleArtifact();
+test "a cancelled command's history keeps the authoritative replay" {
+    try expectCancelledHistoryKeepsAuthoritativeReplay();
 }
 
 test "cancelled command metadata does not create output replay" {
@@ -9111,7 +9379,7 @@ test "cancelled command replay rejects unsafe handles without partial output" {
     };
     for (unsafe_handles, 0..) |handle, index| {
         var call_id_buf: [32]u8 = undefined;
-        const call_id = try std.fmt.bufPrint(&call_id_buf, "unsafe-{d}", .{index});
+        const call_id = try std.mem.print(&call_id_buf, "unsafe-{d}", .{index});
         const history = [_]types.HistoryTurn{.{ .interrupted = .{
             .user = .{ .text = @constCast("cancel") },
             .tool_call = .{
@@ -9136,7 +9404,7 @@ test "cancelled command replay rejects unsafe handles without partial output" {
 }
 
 test "authoritative cancelled replay survives history insertion failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try testPaths(alloc, &tmp);
@@ -9151,6 +9419,8 @@ test "authoritative cancelled replay survives history insertion failure" {
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
+    // The turn is open on disk while its command runs (D44).
+    try app.session_persistence.v2.?.beginTurn();
     const capability = Runtime(TestApp).childCapability(&app).?;
     var capture_arena = std.heap.ArenaAllocator.init(alloc);
     defer capture_arena.deinit();
@@ -9186,7 +9456,6 @@ test "authoritative cancelled replay survives history insertion failure" {
             },
         } }),
     );
-    _ = try capability.stat(.command_artifacts, descriptor.handle);
     const page = try command_replay_store.readAgentPageManaged(
         alloc,
         capability,
@@ -9196,103 +9465,6 @@ test "authoritative cancelled replay survives history insertion failure" {
     );
     defer alloc.free(page);
     try std.testing.expect(std.mem.find(u8, page, "externally owned") != null);
-}
-
-test "appendHistoryTurn commits conversation without copying runtime counters" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const paths = try testPaths(alloc, &tmp);
-    defer {
-        alloc.free(paths.home);
-        alloc.free(paths.workspace);
-    }
-
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-
-    try configureTestPreferences(&app);
-    try Runtime(TestApp).initializePersistence(&app, true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app);
-    app.total_web_search_requests = 3;
-    app.total_input_tokens = 7;
-    app.total_output_tokens = 11;
-
-    const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
-    defer session_runtime.freeHistoryTurn(alloc, turn);
-
-    try Runtime(TestApp).appendHistoryTurn(&app, turn);
-
-    var loaded = try app.session_persistence.store.?.loadReadOnly(
-        alloc,
-        app.session_persistence.writable.?.active_id,
-    );
-    defer loaded.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), loaded.history.len);
-    try std.testing.expectEqualStrings("question", loaded.history[0].assistant.user.text);
-    try std.testing.expectEqualStrings("answer", loaded.history[0].assistant.assistant);
-    try std.testing.expectEqual(@as(u64, 0), loaded.total_input_tokens);
-    try std.testing.expectEqual(@as(u64, 0), loaded.total_output_tokens);
-}
-
-test "fresh TUI prompt preparation preserves equal user text as distinct turns" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(alloc, &tmp);
-    defer {
-        alloc.free(paths.home);
-        alloc.free(paths.workspace);
-    }
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-    try configureTestPreferences(&app);
-    try Runtime(TestApp).initializePersistence(&app, true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app);
-    try Runtime(TestApp).commitContextCompaction(&app, .{
-        .summary = @constCast("<context_handoff>unfinished request</context_handoff>"),
-        .removed_turn_count = 0,
-        .compaction_count = 1,
-    }, .{ .user = .{ .text = @constCast("same prompt") }, .assistant = @constCast("") }, null);
-    const checkpoint: session_codec.RecoveryCheckpoint = .{
-        .turn_id = 41,
-        .user = .{ .text = @constCast("same prompt") },
-        .assistant_source = @constCast("partial old response"),
-        .cause = .response_interrupted,
-        .action = .continuing_response,
-        .authority = .{ .provider = .gateway, .model = @constCast("saved/model") },
-        .requested_fast_mode = false,
-        .fast_mode = false,
-        .max_provider_attempts = 10,
-        .consumed_provider_attempts = 2,
-    };
-    try Runtime(TestApp).setRecoveryCheckpoint(&app, checkpoint);
-    var prepared = try Runtime(TestApp).prepareFreshPrompt(&app, .{
-        .user = .{ .text = @constCast("same prompt") },
-        .prior_turn = checkpoint.interruptedTurn(),
-    });
-    defer prepared.deinit(std.heap.c_allocator);
-    try std.testing.expectEqual(@as(usize, 2), prepared.history.len);
-    try std.testing.expect(!app.session_persistence.writable.?.conversation_writer.turn_open);
-    try std.testing.expect(app.session_persistence.writable.?.state.recovery_checkpoint == null);
-    try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
-    try Runtime(TestApp).appendHistoryTurn(&app, .{ .assistant = .{
-        .user = .{ .text = @constCast("same prompt") },
-        .assistant = @constCast("new answer"),
-    } });
-    var page = try app.session_persistence.store.?.loadHistoryPage(alloc, app.session_persistence.writable.?.active_id, null, 10);
-    defer page.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), page.turns.len);
-    try std.testing.expect(page.turns[0] == .interrupted);
-    try std.testing.expectEqualStrings("partial old response", page.turns[0].interrupted.assistant.?);
-    try std.testing.expectEqualStrings("same prompt", page.turns[1].assistant.user.text);
-    try std.testing.expectEqualStrings("new answer", page.turns[1].assistant.assistant);
 }
 
 test "context checkpoint persists before releasing summarized model memory" {
@@ -9311,7 +9483,6 @@ test "context checkpoint persists before releasing summarized model memory" {
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
-    const session_id = app.session_persistence.writable.?.active_id;
 
     const first = try session_runtime.makeAssistantTurn(alloc, "first", "one");
     defer session_runtime.freeHistoryTurn(alloc, first);
@@ -9324,36 +9495,13 @@ test "context checkpoint persists before releasing summarized model memory" {
         .removed_turn_count = 2,
         .compaction_count = 1,
     };
-    const writer = &app.session_persistence.writable.?.conversation_writer;
-    const saved_seq = writer.last_seq;
-    const saved_bytes = writer.committed_bytes;
-    writer.last_seq = std.math.maxInt(u64);
-    try std.testing.expectError(error.ConversationSequenceOverflow, Runtime(TestApp).commitContextCompaction(&app, summary, null, null));
-    writer.last_seq = saved_seq;
-    try std.testing.expectEqual(saved_bytes, writer.committed_bytes);
-    try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
     try Runtime(TestApp).commitContextCompaction(&app, summary, null, null);
 
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        app.session_persistence.writable.?.state.history.len,
-    );
-    var root = app.session_persistence.store.?.canonical_root;
-    var resumed = try root.loadReadOnly(alloc, session_id, .{});
-    defer resumed.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), resumed.history.len);
-    try std.testing.expect(resumed.history[0] == .compacted_summary);
-    var page = try app.session_persistence.store.?.loadHistoryPage(
-        alloc,
-        session_id,
-        null,
-        10,
-    );
-    defer page.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 2), page.turns.len);
-    try std.testing.expectEqualStrings("first", page.turns[0].assistant.user.text);
-    try std.testing.expectEqualStrings("second", page.turns[1].assistant.user.text);
+    var restored = try reopenSaved(&app);
+    defer restored.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), restored.history.len);
+    try std.testing.expect(restored.history[0] == .compacted_summary);
 }
 
 test "handle-free conversation result is externalized before live commit" {
@@ -9396,78 +9544,31 @@ test "handle-free conversation result is externalized before live commit" {
         .execution = .{ .tool_steps = &steps },
     } });
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        app.session_persistence.writable.?.state.history.len,
-    );
     const live_result = app.session.agent.history.items[0].assistant.execution
         .tool_steps[0].tool_results[0];
-    var reloaded = try app.session_persistence.store.?.loadReadOnly(
-        alloc,
-        app.session_persistence.writable.?.active_id,
-    );
-    defer reloaded.deinit(alloc);
-    const stored_result = reloaded.history[0].assistant.execution
-        .tool_steps[0].tool_results[0];
     try std.testing.expect(live_result.output_handle != null);
+    const session_id = try alloc.dupe(u8, app.session_persistence.v2.?.id());
+    defer alloc.free(session_id);
+    Runtime(TestApp).closeWritableSession(&app);
+    const resumed = try session_adapter.Session.resumeSession(alloc, app.session_persistence.v2_store.?, .{ .id = session_id }, paths.workspace, .app);
+    defer resumed.close();
+    var restored = try resumed.restore(alloc);
+    defer restored.deinit(alloc);
+    const stored_result = restored.history[0].assistant.execution
+        .tool_steps[0].tool_results[0];
     try std.testing.expectEqualStrings(
         live_result.output_handle.?,
         stored_result.output_handle.?,
     );
-    const capability = try app.session_persistence.writable.?.childCapability();
     const stored = try result_store.readByRangeManaged(
         alloc,
-        capability,
+        try resumed.childCapability(),
         live_result.output_handle.?,
         0,
         64,
     );
     defer alloc.free(stored);
     try std.testing.expect(std.mem.find(u8, stored, "done") != null);
-}
-
-test "completed conversation turn clears its recovery file" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(alloc, &tmp);
-    defer {
-        alloc.free(paths.home);
-        alloc.free(paths.workspace);
-    }
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-    try configureTestPreferences(&app);
-    try Runtime(TestApp).initializePersistence(&app, true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app);
-    try Runtime(TestApp).setRecoveryCheckpoint(&app, .{
-        .turn_id = 1,
-        .user = .{ .text = @constCast("prompt") },
-        .assistant_source = @constCast("partial"),
-        .cause = .network_interrupted,
-        .action = .retrying_request,
-        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
-        .requested_fast_mode = false,
-        .fast_mode = false,
-        .max_provider_attempts = 3,
-        .consumed_provider_attempts = 1,
-    });
-    try std.testing.expect(
-        app.session_persistence.writable.?.state.recovery_checkpoint != null,
-    );
-    const turn = try session_runtime.makeAssistantTurn(alloc, "prompt", "done");
-    defer session_runtime.freeHistoryTurn(alloc, turn);
-    try Runtime(TestApp).appendHistoryTurn(&app, turn);
-    try std.testing.expectError(
-        error.FileNotFound,
-        app.session_persistence.writable.?.log.dir.dir.statFile(
-            std.testing.io,
-            "recovery.json",
-            .{},
-        ),
-    );
 }
 
 const SnapshotOwnershipProbe = struct {
@@ -9526,7 +9627,7 @@ test "appendFinishedPrompt transfers snapshot ownership after history acceptance
 }
 
 test "appendFinishedPrompt does not transfer snapshot ownership when history insertion fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var app = try TestApp.init(alloc, "/tmp/workspace");
     defer app.deinit();
     var probe = SnapshotOwnershipProbe{};
@@ -9550,6 +9651,68 @@ test "appendFinishedPrompt does not transfer snapshot ownership when history ins
 
     try std.testing.expectEqual(@as(usize, 0), app.session.historyLen());
     try std.testing.expectEqual(@as(usize, 0), probe.transfers);
+}
+
+test "appendFinishedPrompt keeps the session alive when the turn cannot be saved" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+
+    try configureTestPreferences(&app);
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    // A finished turn whose file evidence carries an empty path: the
+    // conversation validator rejects the write with InvalidConversationEvent.
+    var evidence = [_]types.FileEvidence{.{
+        .path = @constCast(""),
+        .tool_call_id = @constCast("call_poison"),
+        .tool_name = @constCast("grep_files"),
+        .action = .search,
+        .status = .success,
+    }};
+    const poisoned = types.HistoryTurn{ .assistant = .{
+        .user = .{ .text = @constCast("search") },
+        .assistant = @constCast("done"),
+        .execution = .{ .files = evidence[0..] },
+    } };
+
+    try Runtime(TestApp).appendFinishedPrompt(&app, .{ .turn = poisoned });
+
+    // The turn stays in memory and the process keeps running.
+    try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
+    // The failure is latched for shutdown reporting.
+    try std.testing.expectEqual(
+        @as(?anyerror, error.InvalidConversationEvent),
+        app.session_persistence.shutdown_failure,
+    );
+    // The user sees a warning instead of a disappearing process.
+    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
+    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "Couldn't save this turn") != null);
+
+    // A later clean turn still persists; the writer is not latched shut.
+    const clean = try session_runtime.makeAssistantTurn(alloc, "next", "fine");
+    defer session_runtime.freeHistoryTurn(alloc, clean);
+    try Runtime(TestApp).appendFinishedPrompt(&app, .{ .turn = clean });
+
+    try std.testing.expectEqual(@as(usize, 2), app.session.historyLen());
+    // Only the clean turn is saved.
+    var restored = try reopenSaved(&app);
+    defer restored.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), restored.history.len);
+    try std.testing.expectEqualStrings("next", restored.history[0].assistant.user.text);
 }
 
 test "visual epoch history append reports committed without persistence" {
@@ -9601,57 +9764,11 @@ test "appendHistoryTurn preserves canonical turns above the context limit" {
         try Runtime(TestApp).appendHistoryTurn(&app, turn);
     }
 
-    var loaded = try app.session_persistence.store.?.loadReadOnly(
-        alloc,
-        app.session_persistence.writable.?.active_id,
-    );
+    var loaded = try reopenSaved(&app);
     defer loaded.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 3), loaded.history.len);
     try std.testing.expectEqualStrings("one", loaded.history[0].assistant.user.text);
     try std.testing.expectEqualStrings("three", loaded.history[2].assistant.user.text);
-}
-
-test "fresh interactive session retains one writable schema-v3 handle" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const paths = try testPaths(alloc, &tmp);
-    defer {
-        alloc.free(paths.home);
-        alloc.free(paths.workspace);
-    }
-
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-
-    try Runtime(TestApp).configureStartupPreferences(
-        &app,
-        .gateway,
-        "configured/model",
-        .user_workspace,
-        "configured/model",
-        types.ReasoningEffort.literal("high"),
-        true,
-        true,
-        null,
-        null,
-        null,
-    );
-    try Runtime(TestApp).initializePersistence(&app, true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app);
-
-    const loaded = app.session_persistence.writable orelse
-        return error.ExpectedWritableSession;
-    try std.testing.expectEqualStrings(
-        "configured/model",
-        loaded.state.preferences.model,
-    );
-    try std.testing.expectEqual(types.ReasoningEffort.literal("high"), loaded.state.preferences.effort);
-    try std.testing.expect(loaded.state.preferences.fast_mode);
 }
 
 test "session picker refuses activation while a response is active" {
@@ -9689,68 +9806,58 @@ test "session picker reopen keeps the loaded page visible while refreshing" {
         .user = .{ .text = @constCast("cached prompt") },
         .assistant = @constCast("cached response"),
     } }};
-    try writeSessionFixture(
-        alloc,
-        app.session_persistence.store.?,
-        "cached-session",
-        &history,
-        0,
-    );
+    const cached_session_id = try writeSessionFixture(&app, &history);
+    defer alloc.free(cached_session_id);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
 
     try Runtime(TestApp).openSessionPicker(&app);
     try waitForSessionPickerLoad(&app);
     try std.testing.expectEqual(.ready, app.session_persistence.session_picker.load_state);
     try std.testing.expectEqualStrings(
-        "cached-session",
+        cached_session_id,
         app.session_persistence.session_picker.selectedId().?,
     );
 
     Runtime(TestApp).cancelSessionPicker(&app);
-    try writeSessionFixture(
-        alloc,
-        app.session_persistence.store.?,
-        "external-session",
-        &history,
-        0,
-    );
+    // Another fx saves a session.
+    var other = try TestApp.init(alloc, paths.workspace);
+    defer other.deinit();
+    try configureTestPreferences(&other);
+    try Runtime(TestApp).initializePersistence(&other, true);
+    const external_session_id = try writeSessionFixture(&other, &history);
+    defer alloc.free(external_session_id);
     {
-        var renamed = try app.session_persistence.store.?.resumeForWrite(
-            alloc,
-            "cached-session",
-        );
-        defer renamed.deinit(alloc);
-        try std.testing.expect(try renamed.renameConversation(alloc, "renamed externally"));
+        // Another fx renames the session.
+        const renamed = try session_adapter.Session.resumeSession(alloc, app.session_persistence.v2_store.?, .{ .id = cached_session_id }, paths.workspace, .app);
+        defer renamed.close();
+        try renamed.rename("renamed externally");
     }
     app.session_persistence.session_picker_cache.loaded_at_ns = 0;
     try Runtime(TestApp).openSessionPicker(&app);
 
     try std.testing.expectEqual(.ready, app.session_persistence.session_picker.load_state);
     try std.testing.expectEqualStrings(
-        "cached-session",
+        cached_session_id,
         app.session_persistence.session_picker.selectedId().?,
     );
     try waitForSessionPickerPrewarm(&app);
     const picker = &app.session_persistence.session_picker;
     try std.testing.expectEqual(@as(usize, 2), picker.summaries.items.len);
-    try std.testing.expectEqualStrings("cached-session", picker.selectedId().?);
+    try std.testing.expectEqualStrings(cached_session_id, picker.selectedId().?);
     const renamed = session_catalog.summaryAt(picker.summaries.items, "renamed externally", 0);
     try std.testing.expect(renamed != null);
-    try std.testing.expectEqualStrings("cached-session", renamed.?.id);
+    try std.testing.expectEqualStrings(cached_session_id, renamed.?.id);
 
     Runtime(TestApp).cancelSessionPicker(&app);
     {
-        var removed = try app.session_persistence.store.?.resumeForWrite(
-            alloc,
-            "external-session",
-        );
-        _ = app.session_persistence.store.?.deleteCommittedSession(alloc, &removed);
+        // Another fx deletes the session.
+        try app.session_persistence.v2_store.?.manager.delete(external_session_id);
     }
     app.session_persistence.session_picker_cache.loaded_at_ns = 0;
     try Runtime(TestApp).openSessionPicker(&app);
     try waitForSessionPickerPrewarm(&app);
     try std.testing.expectEqual(@as(usize, 1), picker.summaries.items.len);
-    try std.testing.expectEqualStrings("cached-session", picker.selectedId().?);
+    try std.testing.expectEqualStrings(cached_session_id, picker.selectedId().?);
 }
 
 test "session picker refresh preserves selection and loaded pagination" {
@@ -9824,13 +9931,8 @@ test "session picker loads on demand and shares one catalog across workspace vie
         .user = .{ .text = @constCast("prewarmed prompt") },
         .assistant = @constCast("prewarmed response"),
     } }};
-    try writeSessionFixture(
-        alloc,
-        app.session_persistence.store.?,
-        "prewarmed-session",
-        &history,
-        0,
-    );
+    const prewarmed_session_id = try writeSessionFixture(&app, &history);
+    defer alloc.free(prewarmed_session_id);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
 
     try std.testing.expect(!app.session_persistence.session_picker_cache.ready);
@@ -9839,14 +9941,14 @@ test "session picker loads on demand and shares one catalog across workspace vie
     try waitForSessionPickerPrewarm(&app);
     try std.testing.expectEqual(.ready, app.session_persistence.session_picker.load_state);
     try std.testing.expectEqualStrings(
-        "prewarmed-session",
+        prewarmed_session_id,
         app.session_persistence.session_picker.selectedId().?,
     );
     try std.testing.expect(try Runtime(TestApp).toggleSessionPickerScope(&app));
     try std.testing.expectEqual(.ready, app.session_persistence.session_picker.load_state);
     try std.testing.expectEqual(SessionPickerScope.all_workspaces, app.session_persistence.session_picker.scope);
     try std.testing.expectEqualStrings(
-        "prewarmed-session",
+        prewarmed_session_id,
         app.session_persistence.session_picker.selectedId().?,
     );
 }
@@ -9876,16 +9978,18 @@ test "session picker reuses a held catalog after resize and workspace switch" {
         const generation = loader.allocateGeneration();
         const held = try createHeldSessionPickerTask(
             generation,
-            app.session_persistence.writable.?.active_id,
-            app.session_persistence.store.?,
+            app.session_persistence.v2.?.id(),
+            app.session_persistence.v2_store.?,
         );
         loader.task = held;
         held.catalog = .{};
         for (0..100) |index| {
             var id_buffer: [32]u8 = undefined;
-            const id = try std.fmt.bufPrint(&id_buffer, "saved-{d}", .{index});
+            const id = try std.mem.print(&id_buffer, "saved-{d}", .{index});
             var summary = try session_summary_codec.cloneSessionSummary(catalog_alloc, .{
                 .id = @constCast(id),
+                // The composer text "saved" searches the titles.
+                .title = @constCast(id),
                 .workspace_root = if (index % 2 == 0) paths.workspace else @constCast("/foreign-workspace"),
                 .created_at_ms = 1,
                 .updated_at_ms = @intCast(100 - index),
@@ -9942,7 +10046,7 @@ test "session picker keeps the visible scope when a stale catalog completes" {
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
 
-    var all_catalog: subagent_resume_admission.ActionableSessionCatalog = .{};
+    var all_catalog: session_catalog_cache.ActionableSessionCatalog = .{};
     defer all_catalog.deinit(catalog_alloc);
     try all_catalog.summaries.append(catalog_alloc, .{
         .id = try catalog_alloc.dupe(u8, "foreign-session"),
@@ -9953,7 +10057,7 @@ test "session picker keeps the visible scope when a stale catalog completes" {
         .history_len = 1,
     });
 
-    const active_id = app.session_persistence.writable.?.active_id;
+    const active_id = app.session_persistence.v2.?.id();
     try app.session_persistence.session_picker_cache.install(
         &all_catalog,
         active_id,
@@ -9967,7 +10071,7 @@ test "session picker keeps the visible scope when a stale catalog completes" {
     const stale = try createHeldSessionPickerTask(
         picker.generation,
         active_id,
-        app.session_persistence.store.?,
+        app.session_persistence.v2_store.?,
     );
     stale.catalog = .{};
     try stale.catalog.?.summaries.append(catalog_alloc, .{
@@ -10020,10 +10124,15 @@ test "session picker current mode filters workspace and all mode includes every 
         .user = .{ .text = @constCast("beta workspace prompt") },
         .assistant = @constCast("saved response"),
     } }};
-    try writeSessionFixture(alloc, app.session_persistence.store.?, "workspace-a-session", &history_a, 0);
-    var store_b = try session_store.Store.initFromHome(alloc, home_path, workspace_b);
-    defer store_b.deinit(alloc);
-    try writeSessionFixture(alloc, store_b, "workspace-b-session", &history_b, 0);
+    const workspace_a_session_id = try writeSessionFixture(&app, &history_a);
+    defer alloc.free(workspace_a_session_id);
+    {
+        var app_b = try TestApp.init(alloc, workspace_b);
+        defer app_b.deinit();
+        try configureTestPreferences(&app_b);
+        try Runtime(TestApp).initializePersistence(&app_b, true);
+        alloc.free(try writeSessionFixture(&app_b, &history_b));
+    }
 
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     try Runtime(TestApp).openSessionPicker(&app);
@@ -10031,7 +10140,7 @@ test "session picker current mode filters workspace and all mode includes every 
     const picker = &app.session_persistence.session_picker;
     try std.testing.expectEqual(SessionPickerScope.current_workspace, picker.scope);
     try std.testing.expectEqual(@as(usize, 1), picker.summaries.items.len);
-    try std.testing.expectEqualStrings("workspace-a-session", picker.summaries.items[0].id);
+    try std.testing.expectEqualStrings(workspace_a_session_id, picker.summaries.items[0].id);
 
     Runtime(TestApp).cancelSessionPicker(&app);
     try Runtime(TestApp).openAllSessionPicker(&app);
@@ -10152,7 +10261,7 @@ test "session picker clears selection feedback when the target context changes" 
 }
 
 test "session picker summary append releases ownership when cloning fails" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var summary = session_store.SessionSummary{
         .id = try alloc.dupe(u8, "allocation-failure"),
         .created_at_ms = 1,
@@ -10197,13 +10306,8 @@ test "session picker discards a held stale request after cancellation and reopen
         .user = .{ .text = @constCast("saved prompt") },
         .assistant = @constCast("saved response"),
     } }};
-    try writeSessionFixture(
-        alloc,
-        app.session_persistence.store.?,
-        "reopened-session",
-        &history,
-        0,
-    );
+    const reopened_session_id = try writeSessionFixture(&app, &history);
+    defer alloc.free(reopened_session_id);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
 
     var picker = &app.session_persistence.session_picker;
@@ -10221,8 +10325,8 @@ test "session picker discards a held stale request after cancellation and reopen
 
     const held = try createHeldSessionPickerTask(
         picker.generation,
-        app.session_persistence.writable.?.active_id,
-        app.session_persistence.store.?,
+        app.session_persistence.v2.?.id(),
+        app.session_persistence.v2_store.?,
     );
     held.failure = error.SessionStoreUnavailable;
     app.session_persistence.session_picker_load.task = held;
@@ -10233,9 +10337,9 @@ test "session picker discards a held stale request after cancellation and reopen
     try std.testing.expect(held.abandoned);
     try std.testing.expect(held.cancel_requested.load(.acquire));
     try std.testing.expect(app.session_persistence.session_picker_load.matchingInitialGeneration(
-        app.session_persistence.writable.?.active_id,
+        app.session_persistence.v2.?.id(),
     ) == null);
-    try std.testing.expectEqualStrings(app.session_persistence.writable.?.active_id, held.request.active_id.?);
+    try std.testing.expectEqualStrings(app.session_persistence.v2.?.id(), held.request.active_id.?);
 
     try Runtime(TestApp).openSessionPicker(&app);
     const reopened_generation = picker.generation;
@@ -10255,7 +10359,7 @@ test "session picker discards a held stale request after cancellation and reopen
 
     try std.testing.expect(picker.active);
     try std.testing.expectEqual(@as(usize, 1), picker.summaries.items.len);
-    try std.testing.expectEqualStrings("reopened-session", picker.summaries.items[0].id);
+    try std.testing.expectEqualStrings(reopened_session_id, picker.summaries.items[0].id);
     try std.testing.expectEqual(@as(usize, 0), app.notices.items.len);
 }
 
@@ -10277,8 +10381,8 @@ test "session picker source invalidation discards a finished catalog and pending
     try Runtime(TestApp).beginFreshPersistedSession(&app);
 
     const loader = &app.session_persistence.session_picker_load;
-    const active_id = app.session_persistence.writable.?.active_id;
-    const held = try createHeldSessionPickerTask(loader.allocateGeneration(), active_id, app.session_persistence.store.?);
+    const active_id = app.session_persistence.v2.?.id();
+    const held = try createHeldSessionPickerTask(loader.allocateGeneration(), active_id, app.session_persistence.v2_store.?);
     loader.task = held;
     held.catalog = .{};
     held.done.store(true, .release);
@@ -10312,8 +10416,8 @@ test "session picker reports worker failure when the shared stop flag is set" {
 
     const loader = &app.session_persistence.session_picker_load;
     const generation = loader.allocateGeneration();
-    const active_id = app.session_persistence.writable.?.active_id;
-    const held = try createHeldSessionPickerTask(generation, active_id, app.session_persistence.store.?);
+    const active_id = app.session_persistence.v2.?.id();
+    const held = try createHeldSessionPickerTask(generation, active_id, app.session_persistence.v2_store.?);
     loader.task = held;
     held.failure = error.OutOfMemory;
     held.cancel_requested.store(true, .release);
@@ -10391,7 +10495,7 @@ test "persistence shutdown cancels an active picker task before joining" {
     const task = try createHeldSessionPickerTask(
         1,
         "active-session",
-        app.session_persistence.store.?,
+        app.session_persistence.v2_store.?,
     );
     task.thread = try std.Thread.spawn(.{}, waitForPickerCancellation, .{task});
     app.session_persistence.session_picker_load.task = task;
@@ -10405,7 +10509,7 @@ test "persistence shutdown cancels an active picker task before joining" {
 fn createHeldSessionPickerTask(
     generation: u64,
     active_id: []const u8,
-    store: session_store.Store,
+    store: *session_adapter.Store,
 ) !*SessionPickerLoad.Task {
     const alloc = std.heap.c_allocator;
     var request = try SessionPickerLoad.PageRequest.init(
@@ -10413,17 +10517,8 @@ fn createHeldSessionPickerTask(
         active_id,
     );
     errdefer request.deinit();
-    const home_dir = try alloc.dupe(u8, store.home_dir);
-    errdefer alloc.free(home_dir);
-    const workspace_root = try alloc.dupe(u8, store.workspace_root);
-    errdefer alloc.free(workspace_root);
     const task = try alloc.create(SessionPickerLoad.Task);
-    errdefer alloc.destroy(task);
-    task.* = .{
-        .home_dir = home_dir,
-        .workspace_root = workspace_root,
-        .request = request,
-    };
+    task.* = .{ .request = request, .store = store };
     return task;
 }
 
@@ -10479,7 +10574,7 @@ test "new session releases the old writer and replaces the subagent host" {
 
     const old_id = try alloc.dupe(
         u8,
-        app.session_persistence.writable.?.active_id,
+        app.session_persistence.v2.?.id(),
     );
     defer alloc.free(old_id);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
@@ -10487,7 +10582,7 @@ test "new session releases the old writer and replaces the subagent host" {
     try std.testing.expect(!std.mem.eql(
         u8,
         old_id,
-        app.session_persistence.writable.?.active_id,
+        app.session_persistence.v2.?.id(),
     ));
 
     try std.testing.expect(app.session_persistence.subagent_host != null);
@@ -10501,7 +10596,7 @@ test "validateSessionTitle accepts printable text and rejects malformed input" {
     try std.testing.expectError(error.InvalidTitle, V("bad\ttitle"));
     try std.testing.expectError(error.InvalidTitle, V("bad\x07title"));
 
-    const long = "x" ** (session_display_metadata.max_title_bytes + 1);
+    const long = text_utils.repeat("x", session_display_metadata.max_title_bytes + 1);
     try std.testing.expectError(error.TitleTooLong, V(long));
 }
 
@@ -10527,7 +10622,7 @@ test "renameActiveSession requires an active session" {
     );
 }
 
-test "renameActiveSession persists the title only in session metadata" {
+test "renameActiveSession saves the title with the session" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10547,6 +10642,9 @@ test "renameActiveSession persists the title only in session metadata" {
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
     Runtime(TestApp).enableSessionStores(&app);
+    const turn = try session_runtime.makeAssistantTurn(alloc, "question", "answer");
+    defer session_runtime.freeHistoryTurn(alloc, turn);
+    try Runtime(TestApp).appendHistoryTurn(&app, turn);
 
     try Runtime(TestApp).renameActiveSession(&app, "  deploy pipeline fix  ");
 
@@ -10556,123 +10654,12 @@ test "renameActiveSession persists the title only in session metadata" {
         Runtime(TestApp).cachedSessionTitle(&app).?,
     );
 
-    // The tab shows the renamed title; the title itself lives in session.json.
+    // The tab shows the renamed title.
     try std.testing.expectEqualStrings("deploy pipeline fix", app.terminalTitleLabelText());
 
-    const loaded = &app.session_persistence.writable.?;
-    _ = try loaded.appendEvent(
-        alloc,
-        .{ .preferences_changed = .{ .fast_mode = true } },
-        loaded.state.updated_at_ms + 1,
-    );
-    var metadata_file = try loaded.log.dir.dir.openFile(
-        std.testing.io,
-        "session.json",
-        .{},
-    );
-    defer metadata_file.close(std.testing.io);
-    const metadata_bytes = try io_mod.readFileToEnd(
-        alloc,
-        &metadata_file,
-        session_codec.max_session_metadata_bytes,
-    );
-    defer alloc.free(metadata_bytes);
-    var metadata = try session_codec.decodeSessionMetadata(alloc, metadata_bytes);
-    defer metadata.deinit();
-    try std.testing.expectEqualStrings("deploy pipeline fix", metadata.value.title.?);
-    try std.testing.expectError(
-        error.FileNotFound,
-        loaded.log.dir.dir.statFile(std.testing.io, "display.json", .{}),
-    );
-    try std.testing.expectError(
-        error.FileNotFound,
-        app.session_persistence.store.?.canonical_root.sessions.?.dir.statFile(
-            std.testing.io,
-            "index.json",
-            .{},
-        ),
-    );
-}
-
-const ReconciliationOriginUsage = struct {
-    replaced_provider: ?model_provider.ProviderId = null,
-    replaced_source: ?types.CredentialSource = null,
-
-    fn replaceProviderReconciliationCredential(
-        self: *@This(),
-        _: Allocator,
-        provider: model_provider.ProviderId,
-        source: types.CredentialSource,
-        _: ?[]const u8,
-        _: []const u8,
-    ) void {
-        self.replaced_provider = provider;
-        self.replaced_source = source;
-    }
-};
-
-const ReconciliationOriginAuth = struct {
-    source: types.CredentialSource,
-
-    fn credentialSource(self: *const @This()) ?types.CredentialSource {
-        return self.source;
-    }
-
-    fn apiKey(_: *const @This()) ?[]const u8 {
-        return "origin-bound-token";
-    }
-
-    fn accountId(_: *const @This()) ?[]const u8 {
-        return null;
-    }
-
-    fn gatewayTeam(_: *const @This()) ?[]const u8 {
-        return null;
-    }
-};
-
-const ReconciliationOriginApp = struct {
-    alloc: Allocator = std.testing.allocator,
-    auth: ReconciliationOriginAuth,
-    session: struct { usage: ReconciliationOriginUsage = .{} } = .{},
-    selected_provider: model_provider.ProviderId,
-    selected_model: std.ArrayList(u8) = .empty,
-};
-
-test "resumed sessions install provider-scoped usage reconciliation authority" {
-    var chatgpt = ReconciliationOriginApp{
-        .auth = .{ .source = .chatgpt_subscription },
-        .selected_provider = .codex,
-    };
-    Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&chatgpt);
-    try std.testing.expectEqual(model_provider.ProviderId.codex, chatgpt.session.usage.replaced_provider.?);
-    try std.testing.expectEqual(types.CredentialSource.chatgpt_subscription, chatgpt.session.usage.replaced_source.?);
-
-    var gateway = ReconciliationOriginApp{
-        .auth = .{ .source = .ai_gateway_api_key },
-        .selected_provider = .gateway,
-    };
-    Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&gateway);
-    try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.session.usage.replaced_provider.?);
-    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, gateway.session.usage.replaced_source.?);
-}
-
-test "resumed usage reconciliation rejects the previous provider credential" {
-    const cases = .{
-        .{ model_provider.ProviderId.gateway, types.CredentialSource.chatgpt_subscription },
-        .{ model_provider.ProviderId.gateway, types.CredentialSource.grok_subscription },
-        .{ model_provider.ProviderId.codex, types.CredentialSource.fx_login },
-        .{ model_provider.ProviderId.grok, types.CredentialSource.fx_login },
-    };
-    inline for (cases) |case| {
-        var app = ReconciliationOriginApp{
-            .auth = .{ .source = case[1] },
-            .selected_provider = case[0],
-        };
-        Runtime(ReconciliationOriginApp).startResumedSessionReconciliation(&app);
-        try std.testing.expect(app.session.usage.replaced_provider == null);
-        try std.testing.expect(app.session.usage.replaced_source == null);
-    }
+    var saved = try reopenSaved(&app);
+    defer saved.deinit(alloc);
+    try std.testing.expectEqualStrings("deploy pipeline fix", saved.title.?);
 }
 
 test "ensureCachedSessionTitle derives from the first prompt and then freezes" {
@@ -10737,7 +10724,7 @@ const TitleGenerationFakeApp = struct {
             return .{ .api_key = "test-key", .gateway_team = null, .source = .ai_gateway_api_key };
         }
 
-        fn accountId(_: *const TitleTestAuth) ?[]const u8 {
+        pub fn accountId(_: *const TitleTestAuth) ?[]const u8 {
             return null;
         }
     };
@@ -10757,11 +10744,11 @@ const TitleGenerationFakeApp = struct {
         self.alloc.free(self.workspace_root);
     }
 
-    fn agentStreamProvider(self: *TitleGenerationFakeApp) @import("../agent/stream_provider.zig").Provider {
+    pub fn agentStreamProvider(self: *TitleGenerationFakeApp) @import("../agent/stream_provider.zig").Provider {
         return .{ .context = self, .stream_fn = titleStream };
     }
 
-    fn sessionTitleModel(_: *TitleGenerationFakeApp) ?[]const u8 {
+    pub fn sessionTitleModel(_: *TitleGenerationFakeApp) ?[]const u8 {
         return "test/title-model";
     }
 
@@ -10778,19 +10765,14 @@ const TitleGenerationFakeApp = struct {
     }
 };
 
+/// Opens a new session for the title tests, as a first prompt finds it.
 fn initTitleTestSession(app: *TitleGenerationFakeApp, alloc: Allocator, root: []const u8) !void {
-    app.session_persistence.store = try session_store.Store.initFromHome(alloc, root, root);
-    app.session_persistence.writable = try app.session_persistence.store.?.startWritableSession(alloc, .{
-        .id = @constCast("title-test"),
-        .origin_workspace_root = @constCast(root),
-        .workspace_root = @constCast(root),
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = .literal("en"),
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-        .preferences = .{ .model = @constCast("test-model"), .effort = .auto, .fast_mode = false },
+    _ = try app.session_persistence.adoptStore(alloc, try session_adapter.Store.openFromEnv(alloc));
+    var model = "test-model".*;
+    app.session_persistence.v2 = try session_adapter.Session.create(alloc, app.session_persistence.v2_store.?, root, .app, .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = .literal("en"),
+        .permission_state = .{},
     });
 }
 
@@ -10821,20 +10803,30 @@ test "session title generation installs the model title for a fresh session" {
 
     Runtime(TitleGenerationFakeApp).maybeStartSessionTitleGeneration(&app, "refactor the renderer loop");
     try std.testing.expect(app.session_persistence.title_generation.task != null);
+    // The first turn commits while the title is generated.
+    const first: types.HistoryTurn = .{ .assistant = .{
+        .user = .{ .text = @constCast("refactor the renderer loop") },
+        .assistant = @constCast("ok"),
+        .execution = .{},
+    } };
+    try app.session.appendHistoryEntry(alloc, first);
+    try app.session_persistence.v2.?.commitTurn(first, session_runtime.ConversationLanguage.literal("en"));
     try awaitTitleTask(&app);
 
     try std.testing.expectEqualStrings(
         "Refactor the renderer loop",
         Runtime(TitleGenerationFakeApp).cachedSessionTitle(&app).?,
     );
-    const persisted = try app.session_persistence.writable.?.conversationTitle(alloc);
-    defer if (persisted) |value| alloc.free(value);
-    try std.testing.expectEqualStrings("Refactor the renderer loop", persisted.?);
+    const session_id = try alloc.dupe(u8, app.session_persistence.v2.?.id());
+    defer alloc.free(session_id);
+    var saved = try reopenSaved(&app);
+    defer saved.deinit(alloc);
+    try std.testing.expectEqualStrings("Refactor the renderer loop", saved.title.?);
 
     const last = &app.session_persistence.title_generation.last;
     try std.testing.expectEqual(.installed, last.status);
     try std.testing.expectEqualStrings("test/title-model", last.model());
-    try std.testing.expectEqualStrings("title-test", last.sessionId());
+    try std.testing.expectEqualStrings(session_id, last.sessionId());
     try std.testing.expect(last.elapsed_ms >= 0);
 }
 
@@ -10857,17 +10849,19 @@ test "session title generation never overwrites a user-set title" {
     try std.testing.expect(app.session_persistence.title_generation.task != null);
 
     // The first turn commits and the user renames before the task lands.
-    try app.session.appendHistoryEntry(alloc, .{ .assistant = .{
+    const first: types.HistoryTurn = .{ .assistant = .{
         .user = .{ .text = @constCast("refactor the renderer loop") },
         .assistant = @constCast("ok"),
         .execution = .{},
-    } });
-    _ = try app.session_persistence.writable.?.renameConversation(alloc, "My custom title");
+    } };
+    try app.session.appendHistoryEntry(alloc, first);
+    try app.session_persistence.v2.?.commitTurn(first, session_runtime.ConversationLanguage.literal("en"));
+    try app.session_persistence.v2.?.rename("My custom title");
     try awaitTitleTask(&app);
 
-    const persisted = try app.session_persistence.writable.?.conversationTitle(alloc);
-    defer if (persisted) |value| alloc.free(value);
-    try std.testing.expectEqualStrings("My custom title", persisted.?);
+    var saved = try reopenSaved(&app);
+    defer saved.deinit(alloc);
+    try std.testing.expectEqualStrings("My custom title", saved.title.?);
     try std.testing.expect(Runtime(TitleGenerationFakeApp).cachedSessionTitle(&app) == null);
 }
 
@@ -10927,9 +10921,6 @@ test "session title generation keeps the derived title when the provider fails" 
     try awaitTitleTask(&app);
 
     try std.testing.expect(Runtime(TitleGenerationFakeApp).cachedSessionTitle(&app) == null);
-    const persisted = try app.session_persistence.writable.?.conversationTitle(alloc);
-    defer if (persisted) |value| alloc.free(value);
-    try std.testing.expect(persisted == null);
 
     const last = &app.session_persistence.title_generation.last;
     try std.testing.expectEqual(.failed, last.status);
@@ -10963,7 +10954,7 @@ test "session title generation retains a transport failure for diagnostics" {
     try std.testing.expectEqual(session_title_generation.FailureReason.transport_error, last.reason.?);
     try std.testing.expectEqualStrings("ConnectionRefused", last.detail);
     try std.testing.expectEqualStrings("test/title-model", last.model());
-    try std.testing.expectEqualStrings("title-test", last.sessionId());
+    try std.testing.expectEqualStrings(app.session_persistence.v2.?.id(), last.sessionId());
     try std.testing.expect(last.elapsed_ms >= 0);
 }
 
@@ -11066,7 +11057,7 @@ test "terminal title uses the workspace basename and handles unnamed roots" {
         defer app.deinit();
         Runtime(TestApp).syncTerminalTitle(&app);
         var expected_buffer: [128]u8 = undefined;
-        const expected = try std.fmt.bufPrint(&expected_buffer, "fx v{s} | {s}", .{ build_options.app_version, case.folder });
+        const expected = try std.mem.print(&expected_buffer, "fx v{s} | {s}", .{ build_options.app_version, case.folder });
         try std.testing.expectEqualStrings(expected, app.terminalTitleLabelText());
     }
 }
@@ -11084,15 +11075,15 @@ test "terminal title shows the session title once cached and keeps model context
     var app = try TestApp.init(alloc, paths.workspace);
     defer app.deinit();
 
-    try app.selected_model.appendSlice(alloc, "provider/" ++ ("model" ** 20));
-    try Runtime(TestApp).setCachedSessionTitle(&app, "session-" ++ ("title" ** 20));
+    try app.selected_model.appendSlice(alloc, "provider/" ++ text_utils.repeat("model", 20));
+    try Runtime(TestApp).setCachedSessionTitle(&app, "session-" ++ text_utils.repeat("title", 20));
 
-    const expected = "session-" ++ ("title" ** 20);
+    const expected = "session-" ++ text_utils.repeat("title", 20);
     try std.testing.expectEqualStrings(expected, app.terminalTitleLabelText());
     try std.testing.expect(std.mem.find(u8, app.terminalTitleLabelText(), "model") == null);
 }
 
-test "failed history delivery rejects the current writer without poisoning a fresh session" {
+test "a failed history delivery is kept for shutdown, and later turns still save" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -11106,176 +11097,13 @@ test "failed history delivery rejects the current writer without poisoning a fre
     try configureTestPreferences(&app);
     try Runtime(TestApp).initializePersistence(&app, true);
     try Runtime(TestApp).beginFreshPersistedSession(&app);
-    Runtime(TestApp).recordFailedHistoryDelivery(&app, error.InputOutput);
+    Runtime(TestApp).recordShutdownFailure(&app, error.InputOutput);
     const turn = try session_runtime.makeAssistantTurn(alloc, "request", "answer");
     defer session_runtime.freeHistoryTurn(alloc, turn);
-    try std.testing.expectError(error.SessionCommitFailed, Runtime(TestApp).appendHistoryTurn(&app, turn));
-    try std.testing.expectEqual(@as(usize, 0), app.session.historyLen());
-    Runtime(TestApp).closeWritableSession(&app);
-    try Runtime(TestApp).beginFreshPersistedSession(&app);
     try Runtime(TestApp).appendHistoryTurn(&app, turn);
     try std.testing.expectEqual(@as(usize, 1), app.session.historyLen());
     try std.testing.expectEqual(@as(?anyerror, error.InputOutput), app.session_persistence.shutdown_failure);
-}
-
-test "uncertain finished history preserves snapshot files and rejects later writes" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(alloc, &tmp);
-    defer alloc.free(paths.home);
-    defer alloc.free(paths.workspace);
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-    try configureTestPreferences(&app);
-    try Runtime(TestApp).initializePersistence(&app, true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app);
-    const Fault = struct {
-        fn sync(_: ?*anyopaque, _: std.Io.File) !void {
-            return error.InputOutput;
-        }
-    };
-    app.session_persistence.writable.?.conversation_writer.test_sync_ops = .{ .sync_file = Fault.sync };
-    var ownership = SnapshotOwnershipProbe{};
-    const turn = try session_runtime.makeAssistantTurn(alloc, "request", "answer");
-    defer session_runtime.freeHistoryTurn(alloc, turn);
-    try std.testing.expectError(error.SessionPersistenceUncertain, Runtime(TestApp).appendFinishedPrompt(&app, .{
-        .turn = turn,
-        .snapshot_file_ownership = ownership.handle(),
-    }));
-    try std.testing.expectEqual(@as(usize, 1), ownership.transfers);
-    try std.testing.expectEqual(@as(usize, 0), app.session.historyLen());
-    try std.testing.expectError(error.SessionPersistenceUncertain, Runtime(TestApp).appendHistoryTurn(&app, turn));
-}
-
-test "remembered session follows first durable work and ignores later activity" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(alloc, &tmp);
-    defer {
-        alloc.free(paths.home);
-        alloc.free(paths.workspace);
-    }
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-    try configureTestPreferences(&app);
-    try Runtime(TestApp).initializePersistence(&app, true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app);
-    const store = app.session_persistence.store.?;
-    try std.testing.expect((try store.readRememberedSessionId(alloc)) == null);
-    const checkpoint: session_codec.RecoveryCheckpoint = .{
-        .turn_id = 1,
-        .user = .{ .text = @constCast("pending prompt") },
-        .assistant_source = @constCast(""),
-        .cause = .network_interrupted,
-        .action = .retrying_request,
-        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
-        .requested_fast_mode = false,
-        .fast_mode = false,
-        .max_provider_attempts = 3,
-        .consumed_provider_attempts = 1,
-    };
-    _ = try app.session_persistence.writable.?.appendEvent(alloc, .{ .preferences_changed = .{ .fast_mode = true } }, io_mod.milliTimestamp());
-    try std.testing.expect(!app.session_persistence.writable.?.freshly_started);
-    try Runtime(TestApp).setRecoveryCheckpoint(&app, checkpoint);
-    const first = (try store.readRememberedSessionId(alloc)).?;
-    defer alloc.free(first);
-    try std.testing.expectEqualStrings(app.session_persistence.writable.?.active_id, first);
-    try store.rememberSessionId(alloc, "other-selection");
-    try Runtime(TestApp).setRecoveryCheckpoint(&app, checkpoint);
-    const turn = try session_runtime.makeAssistantTurn(alloc, "pending prompt", "done");
-    defer session_runtime.freeHistoryTurn(alloc, turn);
-    try Runtime(TestApp).appendHistoryTurn(&app, turn);
-    const retained = (try store.readRememberedSessionId(alloc)).?;
-    defer alloc.free(retained);
-    try std.testing.expectEqualStrings("other-selection", retained);
-    try Runtime(TestApp).beginFreshPersistedSession(&app);
-    const empty = (try store.readRememberedSessionId(alloc)).?;
-    defer alloc.free(empty);
-    try std.testing.expectEqualStrings("other-selection", empty);
-    _ = try app.session_persistence.writable.?.appendEvent(alloc, .{ .preferences_changed = .{ .fast_mode = true } }, io_mod.milliTimestamp());
-    try Runtime(TestApp).appendHistoryTurn(&app, turn);
-    const next = (try store.readRememberedSessionId(alloc)).?;
-    defer alloc.free(next);
-    try std.testing.expectEqualStrings(app.session_persistence.writable.?.active_id, next);
-}
-
-test "remembered continuation consumes selection without republishing and preserves busy admission" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(alloc, &tmp);
-    defer {
-        alloc.free(paths.home);
-        alloc.free(paths.workspace);
-    }
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-    try configureTestPreferences(&app);
-    try Runtime(TestApp).initializePersistence(&app, true);
-    app.requested_resume = .remembered;
-    try std.testing.expectError(error.NoRememberedSession, Runtime(TestApp).resumeRequestedSession(&app));
-    const history = [_]types.HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("saved prompt") },
-        .assistant = @constCast("saved response"),
-    } }};
-    const store = app.session_persistence.store.?;
-    try writeSessionFixture(alloc, store, "remembered", &history, 0);
-    try store.rememberSessionId(alloc, "remembered");
-    app.requested_resume = .remembered;
-    try Runtime(TestApp).resumeRequestedSession(&app);
-    try std.testing.expectEqualStrings("remembered", app.session_persistence.writable.?.active_id);
-    try std.testing.expectError(error.SessionBusy, store.resumeTargetForWrite(alloc, .{ .id = "remembered" }, paths.workspace, .{ .log = .{ .session_lock_deadline_ms = 0 } }));
-    try store.rememberSessionId(alloc, "newer-selection");
-    // Reading a remembered target is not another publication; exact selection still is.
-    const retained = (try store.readRememberedSessionId(alloc)).?;
-    defer alloc.free(retained);
-    try std.testing.expectEqualStrings("newer-selection", retained);
-    try std.testing.expect(!app.session_persistence.session_picker_cache.ready);
-    try std.testing.expect(app.session_persistence.session_picker_load.task == null);
-}
-
-test "remembered selection write failure leaves pending user work durable and warns" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const paths = try testPaths(alloc, &tmp);
-    defer {
-        alloc.free(paths.home);
-        alloc.free(paths.workspace);
-    }
-    const home = try TestHome.install(alloc, paths.home);
-    defer home.deinit();
-    var app = try TestApp.init(alloc, paths.workspace);
-    defer app.deinit();
-    try configureTestPreferences(&app);
-    try Runtime(TestApp).initializePersistence(&app, true);
-    try Runtime(TestApp).beginFreshPersistedSession(&app);
-    var obstruction = try tmp.dir.createFile(io_mod.getIo(), "home/.fx/continue", .{});
-    obstruction.close(io_mod.getIo());
-    try Runtime(TestApp).setRecoveryCheckpoint(&app, .{
-        .turn_id = 1,
-        .user = .{ .text = @constCast("saved pending request") },
-        .assistant_source = @constCast(""),
-        .cause = .network_interrupted,
-        .action = .retrying_request,
-        .authority = .{ .provider = .gateway, .model = @constCast("test/model") },
-        .requested_fast_mode = false,
-        .fast_mode = false,
-        .max_provider_attempts = 3,
-        .consumed_provider_attempts = 1,
-    });
-    const loaded = &app.session_persistence.writable.?;
-    try std.testing.expect(loaded.state.recovery_checkpoint != null);
-    try std.testing.expect(loaded.conversation_writer.failure == null);
-    try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
-    try std.testing.expect(std.mem.find(u8, app.notices.items[0], "Session saved, but could not remember") != null);
-    try std.testing.expect(std.mem.find(u8, app.notices.items[0], loaded.active_id) != null);
+    var restored = try reopenSaved(&app);
+    defer restored.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), restored.history.len);
 }

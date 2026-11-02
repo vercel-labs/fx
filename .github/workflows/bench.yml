@@ -3,6 +3,14 @@ name: Benchmarks
 on:
   workflow_dispatch:
     inputs:
+      long_turn_memory:
+        description: Run the long-turn memory benchmark
+        type: boolean
+        default: false
+      libfx_runtime:
+        description: Run the libfx runtime benchmark
+        type: boolean
+        default: false
       signed_run:
         description: Successful main Release validation run to compare (no signing credentials used)
         type: string
@@ -20,7 +28,7 @@ on:
   pull_request:
 
 concurrency:
-  group: bench-${{ github.ref }}${{ (inputs.pgso_control_artifact != '' || inputs.pgso_candidate_artifact != '') && '-pgso-artifacts' || '' }}
+  group: bench-${{ github.event_name == 'workflow_dispatch' && 'dispatch-' || '' }}${{ github.ref }}${{ (inputs.pgso_control_artifact != '' || inputs.pgso_candidate_artifact != '') && '-pgso-artifacts' || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -35,9 +43,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
-          version: "0.16.0"
+          version: "0.17.0"
+          cache-key: bench-ReleaseSafe
 
       - name: Build (ReleaseSafe)
         run: zig build -Doptimize=ReleaseSafe
@@ -77,17 +87,97 @@ jobs:
           path: ${{ runner.temp }}/tui-performance.json
           if-no-files-found: warn
 
-  libfx-ttft:
+      - name: Save Zig cache
+        uses: ./.github/actions/save-zig-cache
+        with:
+          cache-key: ${{ steps.zig.outputs.cache-key }}
+          cache-hit: ${{ steps.zig.outputs.cache-hit }}
+
+  long-turn-memory:
+    if: github.event_name == 'workflow_dispatch' && inputs.long_turn_memory && inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
+    name: Long-turn memory
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        id: zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.17.0"
+          cache-key: bench-ReleaseSafe
+
+      - name: Build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Run long-turn memory benchmark
+        run: python3 benchmarks/long_turn_memory.py --binary ./zig-out/bin/fx --output ${{ runner.temp }}/long-turn-memory --steps 500 --limit-mib 1024 --timeout 480
+
+      - name: Enforce memory budget
+        run: jq -e '.completed == true and (.peak_rss_kib < 524288)' ${{ runner.temp }}/long-turn-memory/measurements.json
+
+      - name: Upload long-turn memory evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: long-turn-memory-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/long-turn-memory/measurements.json
+            ${{ runner.temp }}/long-turn-memory/stderr.log
+            ${{ runner.temp }}/long-turn-memory/stdout.json
+          if-no-files-found: warn
+
+  shell-command-overhead:
     if: inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
+    name: Shell command overhead
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.17.0"
+          cache-key: bench-ReleaseSafe
+
+      - name: Build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Run shell command overhead benchmark
+        run: python3 benchmarks/shell_command_overhead.py --binary ./zig-out/bin/fx --output ${{ runner.temp }}/shell-command-overhead --calls 100 --timeout 480
+
+      # The 60 ms per-call median budget is provisional, set from local macOS
+      # runs. Linux runners use bash as the login shell, so this job measures bash.
+      - name: Enforce shell command overhead budget
+        run: jq -e '.completed == true and .rc_loads == 1 and .per_call_ms.median <= 60 and .total_ms <= (.rc_delay_ms + 100*60 + 1000)' ${{ runner.temp }}/shell-command-overhead/measurements.json
+
+      - name: Upload shell command overhead evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shell-command-overhead-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/shell-command-overhead/measurements.json
+            ${{ runner.temp }}/shell-command-overhead/stderr.log
+            ${{ runner.temp }}/shell-command-overhead/stdout.json
+            ${{ runner.temp }}/shell-command-overhead/home/rc-loads.log
+          if-no-files-found: warn
+
+  libfx-ttft:
+    if: github.event_name == 'workflow_dispatch' && inputs.libfx_runtime && inputs.signed_run == '' && inputs.pgso_control_artifact == '' && inputs.pgso_candidate_artifact == ''
     name: libfx Runtime
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        id: zig
+        uses: ./.github/actions/setup-zig
         with:
-          version: "0.16.0"
+          version: "0.17.0"
+          cache-key: bench-ReleaseSafe
 
       - name: Setup Node
         uses: actions/setup-node@v4

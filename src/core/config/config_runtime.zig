@@ -4,9 +4,11 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
+const compactor = @import("../compactor/compactor.zig");
 const types = @import("../shared/types.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const settings_store = @import("settings_store.zig");
+const settings_keys = @import("settings_keys.zig");
 const project_config = @import("../mcp/project_config.zig");
 const model_provider = @import("model_provider.zig");
 const model_preferences = @import("model_preferences.zig");
@@ -46,32 +48,56 @@ pub const Settings = struct {
     yolo_acknowledged: ?bool = null,
     max_agent_steps: ?usize = null,
     max_tool_result_bytes: ?usize = null,
+    /// Share of usable input, 10 to 80 percent, at which automatic
+    /// compaction starts. Profile-only.
+    auto_compact_percent: ?u8 = null,
     context_limits: context_limits.Overrides = .{},
     first_call_tool_choice: ?types.ToolChoice = null,
     context: ?bool = null,
     fast_mode: ?bool = null,
+    ultrafast_mode: ?bool = null,
     fast_mode_model_bound: ?bool = null,
+    /// Owned gateway provider slugs in preference order; null leaves routing
+    /// to the gateway. Freed in deinit.
+    provider_order: ?[][]const u8 = null,
+    provider_strict: ?bool = null,
     slash_menu_categories: ?bool = null,
     collapse_tool_calls: ?bool = null,
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
+    theme: ?[]const u8 = null,
     startup_scrollback: ?bool = null,
     prompt_history_enabled: ?bool = null,
     effort: ?types.ReasoningEffort = null,
+    /// Optional review-model override for automatic permission review. Owned by
+    /// this Settings; freed in deinit. Null keeps the provider's default.
+    review_model: ?[]const u8 = null,
     statusline_context: ?bool = null,
     statusline_session: ?bool = null,
     statusline_workspace: ?bool = null,
     session_titles: ?bool = null,
+    /// Ping a waiting Claude conversation's prompt cache so it stays alive.
+    cache_warming: ?bool = null,
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
     permission_rules: types.PermissionRuleSet = .{},
     has_permission_rules: bool = false,
+    /// Owned absolute directories whose contents symlinked skills may resolve
+    /// into. Profile-only; a later layer replaces the whole list. Freed in deinit.
+    skill_symlink_authorities: ?[][]u8 = null,
 
     pub fn deinit(self: *Settings, alloc: Allocator) void {
+        if (self.skill_symlink_authorities) |paths| freeStringSlice(alloc, paths);
         self.models.deinit(alloc);
         if (self.providers) |*providers| providers.deinit(alloc);
         self.permission_rules.deinit(alloc);
+        if (self.review_model) |value| alloc.free(value);
+        if (self.theme) |value| alloc.free(value);
+        if (self.provider_order) |order| {
+            for (order) |slug| alloc.free(@constCast(slug));
+            alloc.free(order);
+        }
         self.* = .{};
     }
 };
@@ -120,6 +146,7 @@ pub const ConfigSources = struct {
     permission_mode: ConfigSource = .compiled_default,
     effort: ConfigSource = .compiled_default,
     fast_mode: ConfigSource = .compiled_default,
+    ultrafast_mode: ConfigSource = .compiled_default,
     fast_mode_model_bound: ConfigSource = .compiled_default,
     slash_menu_categories: ConfigSource = .compiled_default,
     collapse_tool_calls: ConfigSource = .compiled_default,
@@ -128,6 +155,7 @@ pub const ConfigSources = struct {
     statusline_context: ConfigSource = .compiled_default,
     statusline_session: ConfigSource = .compiled_default,
     session_titles: ConfigSource = .compiled_default,
+    cache_warming: ConfigSource = .compiled_default,
     notification_turn_end: ConfigSource = .compiled_default,
     notification_attention_required: ConfigSource = .compiled_default,
     notification_max: ConfigSource = .compiled_default,
@@ -183,6 +211,7 @@ pub const ConfigDiagnosticCause = enum {
     settings_too_large,
     durable_path_unsafe,
     private_state_permissions_unsupported,
+    private_state_permissions_tightened,
     invalid_model_id,
     ignored_project_user_only_setting,
     legacy_workspace_preferences,
@@ -190,6 +219,8 @@ pub const ConfigDiagnosticCause = enum {
     retired_skill_match_fuzzy,
     invalid_context_limits,
     invalid_additional_directories,
+    invalid_skill_symlink_authorities,
+    invalid_ultrafast_mode_override,
 };
 
 pub const ConfigDiagnostic = struct {
@@ -199,7 +230,16 @@ pub const ConfigDiagnostic = struct {
     recovery_path: ?[]u8 = null,
 
     pub fn reportAtStartup(self: ConfigDiagnostic) bool {
-        return self.cause != .legacy_workspace_preferences;
+        return self.cause != .legacy_workspace_preferences and self.note() == null;
+    }
+
+    /// A one-line note for the user instead of a configuration issue.
+    pub fn note(self: ConfigDiagnostic) ?[]const u8 {
+        return switch (self.cause) {
+            .private_state_permissions_tightened => profile_paths.displayText("Other users could write to ~/.fx, so fx took that access away. " ++
+                "If you didn't write ~/.fx/settings.json yourself, check it."),
+            else => null,
+        };
     }
 
     pub fn deinit(self: *ConfigDiagnostic, alloc: Allocator) void {
@@ -224,13 +264,27 @@ pub fn writeDiagnosticMetadata(writer: *std.Io.Writer, diagnostic: ConfigDiagnos
             .{workspace_access.max_additional_directories},
         );
     }
+    if (diagnostic.cause == .invalid_skill_symlink_authorities) {
+        try writer.print(
+            "; skill_symlink_authorities must be an array of at most {d} absolute directory paths without .. components",
+            .{max_skill_symlink_authorities},
+        );
+    }
+    if (diagnostic.cause == .invalid_ultrafast_mode_override) {
+        try writer.writeAll("; FX_ULTRAFAST must be a boolean value");
+    }
 }
+
+/// Upper bound on profile `skill_symlink_authorities` entries.
+const max_skill_symlink_authorities: usize = 32;
 
 pub const DetailedSettings = struct {
     settings: Settings,
     diagnostics: []ConfigDiagnostic = &.{},
     model_source: ?ModelSource = null,
     sources: ConfigSources = .{},
+    /// Process-only override; null leaves the profile preference in effect.
+    ultrafast_mode_env_override: ?bool = null,
     permission_sources: PermissionSourceViews = .{},
     prompt_history_store_allowed: bool = true,
     additional_directories: ?[][]u8 = null,
@@ -250,7 +304,7 @@ pub const DetailedSettings = struct {
 };
 
 pub fn discoverPaths(alloc: Allocator, workspace_root: []const u8) !Paths {
-    return discoverPathsWithOptionalHome(alloc, io_mod.getenv("HOME"), workspace_root);
+    return discoverPathsWithOptionalHome(alloc, io_mod.homeDir(), workspace_root);
 }
 
 pub fn discoverPathsFromHome(alloc: Allocator, home_dir: []const u8, workspace_root: []const u8) !Paths {
@@ -261,6 +315,59 @@ pub fn providerEnvOverride() ?[]const u8 {
     const raw = io_mod.getenv("FX_PROVIDER") orelse return null;
     if (std.mem.trim(u8, raw, " \t\r\n").len == 0) return null;
     return raw;
+}
+
+/// Trimmed FX_MODEL, or null when unset or blank. Borrows process environment storage.
+pub fn modelEnvOverride() ?[]const u8 {
+    const raw = io_mod.getenv("FX_MODEL") orelse return null;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    return if (trimmed.len > 0) trimmed else null;
+}
+
+pub const ModelSelectionError = error{
+    CodexModelNotSelected,
+    GrokModelNotSelected,
+    ConfiguredModelNotSelected,
+};
+
+/// Chooses the provider and the model it persists as its preference. A saved
+/// model wins; Gateway falls back to `default_model`; providers without a
+/// built-in default accept `run_model` (--model or FX_MODEL) for this run.
+/// The result borrows from its arguments.
+pub fn selectProviderModel(
+    default_model: []const u8,
+    settings: *const Settings,
+    provider_override: ?model_provider.ProviderId,
+    run_model: ?[]const u8,
+) ModelSelectionError!model_provider.ProviderSelection {
+    const provider = provider_override orelse settings.provider orelse .gateway;
+    const model = settings.models.get(provider) orelse switch (provider) {
+        .gateway => default_model,
+        .codex => run_model orelse return error.CodexModelNotSelected,
+        .grok => run_model orelse return error.GrokModelNotSelected,
+        .configured => run_model orelse return error.ConfiguredModelNotSelected,
+    };
+    return .{ .provider = provider, .model = model };
+}
+
+/// What fx says about a provider name that isn't built in and isn't defined
+/// under "providers". `fx provider` and `fx ask --provider` both print it.
+pub fn unknownProviderMessage(alloc: Allocator, name: []const u8) ![]u8 {
+    return alloc.print(
+        "unknown provider {s}; expected gateway, codex, grok, or a name under \"providers\" in {s}",
+        .{ name, profile_paths.displayText("~/.fx/settings.json") },
+    );
+}
+
+/// User-facing guidance for a `ModelSelectionError`, or null for any other error.
+pub fn modelNotSelectedMessage(err: anyerror) ?[]const u8 {
+    const for_this_run = "or set a model for this run with --model or FX_MODEL";
+    return switch (err) {
+        error.CodexModelNotSelected => "no Codex model is selected; run `fx provider codex` to choose one, " ++ for_this_run,
+        error.GrokModelNotSelected => "no Grok model is selected; run `fx provider grok` to choose one, " ++ for_this_run,
+        error.ConfiguredModelNotSelected => profile_paths.displayText("no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, " ++ for_this_run),
+        else => null,
+    };
 }
 
 fn resolve_provider_selection(settings: *Settings) !void {
@@ -293,7 +400,7 @@ pub fn loadProjectMcpChoices(
     alloc: Allocator,
     workspace_root: []const u8,
 ) !ProjectMcpChoiceLoad {
-    const home = io_mod.getenv("HOME") orelse return .{};
+    const home = io_mod.homeDir() orelse return .{};
     return loadProjectMcpChoicesFromHome(alloc, home, workspace_root);
 }
 
@@ -345,7 +452,7 @@ pub fn loadMergedSettingsDetailedFromHome(
 }
 
 pub fn loadMergedSettingsDetailed(alloc: Allocator, workspace_root: []const u8) !DetailedSettings {
-    return loadMergedSettingsDetailedWithOptionalHome(alloc, io_mod.getenv("HOME"), workspace_root);
+    return loadMergedSettingsDetailedWithOptionalHome(alloc, io_mod.homeDir(), workspace_root);
 }
 
 fn loadMergedSettingsDetailedWithOptionalHome(
@@ -380,7 +487,7 @@ fn loadMergedSettingsDetailedWithOptionalHome(
     defer if (user_root) |*parsed| parsed.deinit();
 
     if (home_dir) |home| {
-        var store: ?settings_store.Store = settings_store.Store.initFromHome(alloc, home, .read_only) catch |err| blk: {
+        var store: ?settings_store.Store = settings_store.Store.initFromHomeTighteningReadOnly(alloc, home) catch |err| blk: {
             prompt_history_store_allowed = false;
             try diagnostics.append(alloc, .{
                 .layer = .user,
@@ -433,10 +540,13 @@ fn loadMergedSettingsDetailedWithOptionalHome(
                     }
                 },
             }
+            if (usable_store.tightened.any()) {
+                try diagnostics.append(alloc, .{ .layer = .user, .cause = .private_state_permissions_tightened });
+            }
         }
     }
 
-    const project_path = try std.fs.path.join(alloc, &.{ workspace_root, ".fx.json" });
+    const project_path = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".fx.json" });
     defer alloc.free(project_path);
     const project_text = readOptionalFile(alloc, project_path) catch |err| blk: {
         if (err == error.OutOfMemory) return err;
@@ -547,24 +657,32 @@ fn loadMergedSettingsDetailedWithOptionalHome(
 
     try resolve_provider_selection(&settings);
     if (providerEnvOverride() != null) sources.provider = .process_override;
-    if (io_mod.getenv("FX_MODEL")) |model_override| {
-        if (std.mem.trim(u8, model_override, " \t\r\n").len > 0) {
-            const override_provider = model_provider.NameKey.fromProvider(settings.provider orelse .gateway);
-            sources.models.set(override_provider, .process_override) catch |err| switch (err) {
-                error.TooManyModelPreferences => debug_trace.logf(
-                    "config",
-                    "dropping process model override provenance provider={s}: provenance table holds at most {d} provider names",
-                    .{ override_provider.label(), model_preferences.max_preferences },
-                ),
-            };
-        }
+    if (modelEnvOverride() != null) {
+        const override_provider = model_provider.NameKey.fromProvider(settings.provider orelse .gateway);
+        sources.models.set(override_provider, .process_override) catch |err| switch (err) {
+            error.TooManyModelPreferences => debug_trace.logf(
+                "config",
+                "dropping process model override provenance provider={s}: provenance table holds at most {d} provider names",
+                .{ override_provider.label(), model_preferences.max_preferences },
+            ),
+        };
     }
+    try applyEnvSettingOverrides(alloc, &settings);
+    const ultrafast_mode_env_override = ultrafastModeEnvOverride() catch |err| blk: {
+        try diagnostics.append(alloc, .{
+            .layer = .user,
+            .cause = .invalid_ultrafast_mode_override,
+        });
+        debug_trace.logf("config", "invalid FX_ULTRAFAST value err={s}", .{@errorName(err)});
+        break :blk null;
+    };
 
     return .{
         .settings = settings,
         .diagnostics = try diagnostics.toOwnedSlice(alloc),
         .model_source = sources.models.get(model_provider.NameKey.fromProvider(settings.provider orelse .gateway)),
         .sources = sources,
+        .ultrafast_mode_env_override = ultrafast_mode_env_override,
         .permission_sources = permission_sources,
         .prompt_history_store_allowed = prompt_history_store_allowed,
         .additional_directories = additional_directories,
@@ -576,6 +694,63 @@ const ParsedAdditionalDirectories = struct {
     canonical: [][]u8,
     sources: [][]u8,
 };
+
+pub const ProviderOrderParse = union(enum) {
+    /// Owned slice; null when the input held no slugs. Caller frees each slug
+    /// and the slice.
+    ok: ?[][]const u8,
+    invalid,
+};
+
+/// Parses a comma-separated gateway provider list ("azure, anthropic") into
+/// validated, deduplicated slugs. Caller owns the returned memory.
+pub fn parseProviderOrderList(alloc: Allocator, raw: []const u8) ProviderOrderParse {
+    const result = parseProviderOrderListInner(alloc, raw) catch return .invalid;
+    return .{ .ok = result };
+}
+
+fn parseProviderOrderListInner(alloc: Allocator, raw: []const u8) !?[][]const u8 {
+    var slugs: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (slugs.items) |slug| alloc.free(@constCast(slug));
+        slugs.deinit(alloc);
+    }
+    var tokenizer = std.mem.tokenizeScalar(u8, raw, ',');
+    while (tokenizer.next()) |token| {
+        const slug = std.mem.trim(u8, token, " \t\r\n");
+        if (slug.len == 0) continue;
+        if (!settings_store.validateProviderSlug(slug)) return error.InvalidProviderSlug;
+        if (slugs.items.len >= settings_store.max_provider_order_entries) return error.TooManyProviderSlugs;
+        for (slugs.items) |existing| {
+            if (std.mem.eql(u8, existing, slug)) return error.DuplicateProviderSlug;
+        }
+        const owned = try alloc.dupe(u8, slug);
+        errdefer alloc.free(@constCast(owned));
+        try slugs.append(alloc, owned);
+    }
+    if (slugs.items.len == 0) return null;
+    return try slugs.toOwnedSlice(alloc);
+}
+
+pub const UltrafastModeEnvError = error{InvalidUltrafastMode};
+
+/// Reads the process-only paid lane override using the repository's standard
+/// environment-boolean vocabulary. A malformed value cannot widen cost.
+pub fn ultrafastModeEnvOverride() UltrafastModeEnvError!?bool {
+    const raw = io_mod.getenv("FX_ULTRAFAST") orelse return null;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    return parseEnvBool(trimmed) orelse error.InvalidUltrafastMode;
+}
+
+/// The env-var booleans: `1`, `true`, `on`, or `yes`, and `0`, `false`, `off`,
+/// or `no`, in any case.
+pub fn parseEnvBool(raw: []const u8) ?bool {
+    if (std.ascii.eqlIgnoreCase(raw, "1") or std.ascii.eqlIgnoreCase(raw, "true") or
+        std.ascii.eqlIgnoreCase(raw, "on") or std.ascii.eqlIgnoreCase(raw, "yes")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "0") or std.ascii.eqlIgnoreCase(raw, "false") or
+        std.ascii.eqlIgnoreCase(raw, "off") or std.ascii.eqlIgnoreCase(raw, "no")) return false;
+    return null;
+}
 
 fn parseAdditionalDirectories(
     alloc: Allocator,
@@ -629,6 +804,7 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
             "model",
             "effort",
             "fast_mode",
+            "ultrafast_mode",
             "fast_mode_model_bound",
             "slash_menu_categories",
             "collapse_tool_calls",
@@ -639,48 +815,16 @@ fn hasLegacyWorkspacePreferences(root: std.json.Value) bool {
         if (workspace.get("prompt_history")) |value| {
             if (value == .object and value.object.contains("enabled")) return true;
         }
-        if (workspace.get("statusLine")) |value| {
-            if (value == .object and
-                (value.object.contains("context") or
-                    value.object.contains("session")))
-            {
-                return true;
+        for ([_]?std.json.Value{ workspace.get("statusLine"), workspace.get("status_line") }) |group| {
+            if (group) |value| {
+                if (value == .object and
+                    (value.object.contains("context") or
+                        value.object.contains("session")))
+                {
+                    return true;
+                }
             }
         }
-    }
-    return false;
-}
-
-fn isProfileOnlySettingKey(key: []const u8) bool {
-    inline for (&.{
-        "model",
-        "models",
-        "provider",
-        "providers",
-        "codex_model",
-        "grok_model",
-        "effort",
-        "fast_mode",
-        "fast_mode_model_bound",
-        "slash_menu_categories",
-        "collapse_tool_calls",
-        "session_titles",
-        "startup_scrollback",
-        "prompt_history",
-        "statusLine",
-        "notifications",
-        "context_limits",
-        "skill_match_fuzzy",
-        "first_call_tool_choice",
-        "auto_upgrade",
-        "update_channel",
-        "permission_mode",
-        "credential_source",
-        "yolo_acknowledged",
-        "permission",
-        "additional_directories",
-    }) |profile_key| {
-        if (std.mem.eql(u8, key, profile_key)) return true;
     }
     return false;
 }
@@ -693,7 +837,7 @@ fn appendIgnoredProjectProfileSettingDiagnostics(
     if (root != .object) return;
     var iterator = root.object.iterator();
     while (iterator.next()) |entry| {
-        if (!isProfileOnlySettingKey(entry.key_ptr.*)) continue;
+        if (!settings_keys.ignoredInProject(entry.key_ptr.*)) continue;
         try diagnostics.append(alloc, .{
             .layer = .project,
             .cause = .ignored_project_user_only_setting,
@@ -751,10 +895,12 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.permission_mode != null) sources.permission_mode = source;
     if (settings.effort != null) sources.effort = source;
     if (settings.fast_mode != null) sources.fast_mode = source;
+    if (settings.ultrafast_mode != null) sources.ultrafast_mode = source;
     if (settings.fast_mode_model_bound != null) sources.fast_mode_model_bound = source;
     if (settings.slash_menu_categories != null) sources.slash_menu_categories = source;
     if (settings.collapse_tool_calls != null) sources.collapse_tool_calls = source;
     if (settings.session_titles != null) sources.session_titles = source;
+    if (settings.cache_warming != null) sources.cache_warming = source;
     if (settings.startup_scrollback != null) sources.startup_scrollback = source;
     if (settings.prompt_history_enabled != null) sources.prompt_history_enabled = source;
     if (settings.statusline_context != null) sources.statusline_context = source;
@@ -845,6 +991,7 @@ fn diagnosticCauseForParseError(err: anyerror) ConfigDiagnosticCause {
         error.UnknownContextLimit,
         error.InvalidContextLimitValue,
         => .invalid_context_limits,
+        error.InvalidSkillSymlinkAuthorities => .invalid_skill_symlink_authorities,
         else => .malformed_settings,
     };
 }
@@ -902,7 +1049,7 @@ fn ensureAbsoluteDir(path_abs: []const u8) !void {
 }
 
 pub fn userSettingsPath(alloc: Allocator) !?[]u8 {
-    const home = io_mod.getenv("HOME") orelse return null;
+    const home = io_mod.homeDir() orelse return null;
     return try profile_paths.settingsPath(alloc, home);
 }
 
@@ -942,7 +1089,16 @@ pub fn attemptUserPreferences(
     alloc: Allocator,
     patch: UserSettingsPatch,
 ) CommitAttempt {
-    const home = io_mod.getenv("HOME") orelse return .{ .failure = .{ .err = error.HomeNotSet } };
+    const home = io_mod.homeDir() orelse return .{ .failure = .{ .err = error.HomeNotSet } };
+    return attemptUserPreferencesInHome(alloc, home, patch);
+}
+
+/// Like attemptUserPreferences, for hosts that run with their own home.
+pub fn attemptUserPreferencesInHome(
+    alloc: Allocator,
+    home: []const u8,
+    patch: UserSettingsPatch,
+) CommitAttempt {
     var store = settings_store.Store.initFromHome(alloc, home, .writable) catch |err| {
         return .{ .failure = .{ .err = err } };
     };
@@ -961,7 +1117,7 @@ pub fn attemptProjectMcpMutation(
     workspace_root: []const u8,
     action: project_config.ProjectMcpAction,
 ) CommitAttempt {
-    const home = io_mod.getenv("HOME") orelse return .{ .failure = .{ .err = error.HomeNotSet } };
+    const home = io_mod.homeDir() orelse return .{ .failure = .{ .err = error.HomeNotSet } };
     var store = settings_store.Store.initFromHome(alloc, home, .writable) catch |err| {
         return .{ .failure = .{ .err = err } };
     };
@@ -980,7 +1136,7 @@ pub fn setUserPreferences(
     alloc: Allocator,
     patch: UserSettingsPatch,
 ) !CommitOutcome {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var store = try settings_store.Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
     return store.applyUserPatch(alloc, patch);
@@ -990,7 +1146,7 @@ pub fn mutateWorkspaceDirectory(
     alloc: Allocator,
     mutation: WorkspaceDirectoryMutation,
 ) !CommitOutcome {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var store = try settings_store.Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
     return store.applyWorkspaceDirectoryPatch(alloc, mutation);
@@ -1000,7 +1156,7 @@ pub fn mutatePermission(
     alloc: Allocator,
     mutation: PermissionMutation,
 ) !CommitOutcome {
-    const home = io_mod.getenv("HOME") orelse return error.HomeNotSet;
+    const home = io_mod.homeDir() orelse return error.HomeNotSet;
     var store = try settings_store.Store.initFromHome(alloc, home, .writable);
     defer store.deinit(alloc);
     return store.applyPermissionPatch(alloc, mutation);
@@ -1079,7 +1235,7 @@ fn discoverPathsWithOptionalHome(alloc: Allocator, home_dir: ?[]const u8, worksp
         errdefer alloc.free(paths.sessions_dir.?);
     }
 
-    paths.workspace_settings = try std.fs.path.join(alloc, &.{ trimmed_workspace, ".fx.json" });
+    paths.workspace_settings = try std.Io.Dir.path.join(alloc, &.{ trimmed_workspace, ".fx.json" });
     errdefer alloc.free(paths.workspace_settings);
 
     return paths;
@@ -1231,6 +1387,90 @@ fn readOptionalFile(alloc: Allocator, path: []const u8) !?[]u8 {
     const stat = try file.stat(io_mod.getIo());
     if (stat.kind != .file or stat.size > max_settings_bytes) return error.StreamTooLong;
     return try io_mod.readFileToEnd(alloc, &file, max_settings_bytes + 1);
+}
+
+/// One `--config key=value` for a single run, with the value already checked
+/// and in settings-file form. The key is dotted, such as `statusLine.context`.
+pub const SettingOverride = struct {
+    key: []const u8,
+    value: std.json.Value,
+};
+
+/// Applies one run's `--config` values as the top settings layer, above every
+/// settings file. Flags and FX_* variables are resolved later, so they still
+/// win, as they do over the files. A later override for a key replaces an
+/// earlier one. Nothing is saved.
+/// The `FX_*` overrides the loader applies to merged settings:
+/// `FX_PROVIDER_ORDER`, `FX_PROVIDER_STRICT`, and `FX_REVIEW_MODEL`. They beat
+/// every settings layer, including `fx ask --config`, so
+/// `applySettingOverrides` runs them again after its merge.
+pub fn applyEnvSettingOverrides(alloc: Allocator, settings: *Settings) !void {
+    if (io_mod.getenv("FX_PROVIDER_ORDER")) |order_override| {
+        switch (parseProviderOrderList(alloc, order_override)) {
+            .ok => |maybe_order| {
+                if (maybe_order) |order| {
+                    if (settings.provider_order) |old| {
+                        for (old) |slug| alloc.free(@constCast(slug));
+                        alloc.free(old);
+                    }
+                    settings.provider_order = order;
+                }
+            },
+            .invalid => debug_trace.logf("config", "ignoring invalid FX_PROVIDER_ORDER value", .{}),
+        }
+    }
+    if (io_mod.getenv("FX_PROVIDER_STRICT")) |strict_override| {
+        const trimmed = std.mem.trim(u8, strict_override, " \t\r\n");
+        if (parseEnvBool(trimmed)) |strict| {
+            settings.provider_strict = strict;
+        } else if (trimmed.len > 0) {
+            debug_trace.logf("config", "ignoring invalid FX_PROVIDER_STRICT value", .{});
+        }
+    }
+    if (io_mod.getenv("FX_REVIEW_MODEL")) |review_override| {
+        const trimmed = std.mem.trim(u8, review_override, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (settings_store.validateModel(trimmed)) |_| {
+                if (settings.review_model) |old| alloc.free(old);
+                settings.review_model = try alloc.dupe(u8, trimmed);
+            } else |_| {
+                debug_trace.logf("config", "ignoring invalid FX_REVIEW_MODEL value", .{});
+            }
+        }
+    }
+}
+
+pub fn applySettingOverrides(alloc: Allocator, settings: *Settings, overrides: []const SettingOverride) !void {
+    if (overrides.len == 0) return;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    var root: std.json.ObjectMap = .empty;
+    for (overrides) |override| {
+        const dot = std.mem.findScalar(u8, override.key, '.') orelse {
+            try root.put(scratch, override.key, override.value);
+            continue;
+        };
+        const parent = try root.getOrPut(scratch, override.key[0..dot]);
+        if (!parent.found_existing or parent.value_ptr.* != .object) parent.value_ptr.* = .{ .object = .empty };
+        try parent.value_ptr.object.put(scratch, override.key[dot + 1 ..], override.value);
+    }
+
+    var incoming = try parseSettingsValueForLayer(alloc, .{ .object = root }, .profile, false, true);
+    defer incoming.deinit(alloc);
+    try mergeSettings(settings, &incoming, alloc);
+    // Like git's GIT_* variables over -c, an FX_* override still wins.
+    try applyEnvSettingOverrides(alloc, settings);
+}
+
+/// Reads and parses one settings file for inspection, such as `fx doctor`'s
+/// unknown-key check, with the same size limit as loading. Null when the file
+/// is absent. Caller deinits the result, which owns all of its strings.
+pub fn readSettingsFileJson(alloc: Allocator, path: []const u8) !?std.json.Parsed(std.json.Value) {
+    const bytes = try readOptionalFile(alloc, path) orelse return null;
+    defer alloc.free(bytes);
+    return try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .allocate = .alloc_always });
 }
 
 fn parseSettingsJson(alloc: Allocator, json_text: []const u8) !Settings {
@@ -1435,7 +1675,7 @@ fn parseSettingsValueForLayer(
         tolerate_non_object_user_containers,
         parse_workspace_statusline,
     );
-    try parseProjectSafeFields(&settings, root);
+    try parseProjectSafeFields(&settings, alloc, root);
 
     return settings;
 }
@@ -1448,6 +1688,11 @@ fn parseProfileOnlyFields(
     parse_workspace_statusline: bool,
 ) !void {
     if (root.object.contains("skill_match_fuzzy")) return error.RetiredSkillMatchFuzzy;
+    if (root.object.get("auto_compact_percent")) |value| {
+        if (value != .integer) return error.InvalidAutoCompactPercentType;
+        if (value.integer < 0 or !compactor.isValidPercent(@intCast(value.integer))) return error.InvalidAutoCompactPercentValue;
+        settings.auto_compact_percent = @intCast(value.integer);
+    }
     if (root.object.get("model")) |model_value| {
         const value = model_value;
         if (value != .string) return error.InvalidModelType;
@@ -1517,10 +1762,29 @@ fn parseProfileOnlyFields(
         }
     }
 
+    if (root.object.get("review_model")) |review_model_value| {
+        const value = review_model_value;
+        if (value != .string) return error.InvalidReviewModelType;
+        const trimmed = std.mem.trim(u8, value.string, " \t\r\n");
+        if (trimmed.len > 0) {
+            settings_store.validateModel(trimmed) catch {
+                debug_trace.logf("core", "ignoring invalid review_model value", .{});
+                return error.InvalidReviewModelValue;
+            };
+            settings.review_model = try alloc.dupe(u8, trimmed);
+        }
+    }
+
     if (root.object.get("fast_mode")) |fast_mode_value| {
         const value = fast_mode_value;
         if (value != .bool) return error.InvalidFastModeType;
         settings.fast_mode = value.bool;
+    }
+
+    if (root.object.get("ultrafast_mode")) |ultrafast_mode_value| {
+        const value = ultrafast_mode_value;
+        if (value != .bool) return error.InvalidUltrafastModeType;
+        settings.ultrafast_mode = value.bool;
     }
 
     if (root.object.get("fast_mode_model_bound")) |bound_value| {
@@ -1546,6 +1810,11 @@ fn parseProfileOnlyFields(
         settings.session_titles = value.bool;
     }
 
+    if (root.object.get("cache_warming")) |value| {
+        if (value != .bool) return error.InvalidCacheWarmingType;
+        settings.cache_warming = value.bool;
+    }
+
     if (root.object.get("auto_upgrade")) |auto_upgrade_value| {
         const value = auto_upgrade_value;
         if (value != .bool) return error.InvalidAutoUpgradeType;
@@ -1559,10 +1828,22 @@ fn parseProfileOnlyFields(
             return error.InvalidUpdateChannelValue;
     }
 
+    if (root.object.get("theme")) |theme_value| {
+        const value = theme_value;
+        if (value != .string) return error.InvalidThemeType;
+        if (value.string.len > 0) settings.theme = try alloc.dupe(u8, value.string);
+    }
+
     if (root.object.get("startup_scrollback")) |startup_scrollback_value| {
         const value = startup_scrollback_value;
         if (value != .bool) return error.InvalidStartupScrollbackType;
         settings.startup_scrollback = value.bool;
+    }
+
+    if (root.object.get("skill_symlink_authorities")) |value| {
+        const paths = try parseSkillSymlinkAuthorities(alloc, value);
+        if (settings.skill_symlink_authorities) |old| freeStringSlice(alloc, old);
+        settings.skill_symlink_authorities = paths;
     }
 
     if (root.object.get("prompt_history")) |prompt_history_value| {
@@ -1582,41 +1863,56 @@ fn parseProfileOnlyFields(
         }
     }
 
-    if (root.object.get("statusLine")) |statusline_value| {
-        const value = statusline_value;
-        if (value != .object) {
-            if (!tolerate_non_object_user_containers) return error.InvalidStatusLineType;
-        } else {
-            if (value.object.get("context")) |v| {
-                if (v != .bool) return error.InvalidStatusLineContextType;
-                settings.statusline_context = v.bool;
-            }
-            if (value.object.get("session")) |v| {
-                if (v != .bool) return error.InvalidStatusLineSessionType;
-                settings.statusline_session = v.bool;
-            }
-            if (parse_workspace_statusline) {
-                if (value.object.get("workspace")) |v| {
-                    if (v != .bool) return error.InvalidStatusLineWorkspaceType;
-                    settings.statusline_workspace = v.bool;
+    // `status_line` and `sound` were `statusLine` and `notifications`. The
+    // older name is read first, so the current one wins any value both set.
+    // The current names were unknown keys before, which startup ignores, so a
+    // value under one that isn't an object is still ignored.
+    for ([_]?std.json.Value{ root.object.get("statusLine"), root.object.get("status_line") }, 0..) |group, index| {
+        if (group) |value| {
+            if (value != .object) {
+                if (index == 1) {
+                    debug_trace.logf("config", "ignoring status_line: not an object", .{});
+                    continue;
+                }
+                if (!tolerate_non_object_user_containers) return error.InvalidStatusLineType;
+            } else {
+                if (value.object.get("context")) |v| {
+                    if (v != .bool) return error.InvalidStatusLineContextType;
+                    settings.statusline_context = v.bool;
+                }
+                if (value.object.get("session")) |v| {
+                    if (v != .bool) return error.InvalidStatusLineSessionType;
+                    settings.statusline_session = v.bool;
+                }
+                if (parse_workspace_statusline) {
+                    if (value.object.get("workspace")) |v| {
+                        if (v != .bool) return error.InvalidStatusLineWorkspaceType;
+                        settings.statusline_workspace = v.bool;
+                    }
                 }
             }
         }
     }
 
-    if (root.object.get("notifications")) |notifications_value| {
-        if (notifications_value != .object) return error.InvalidNotificationsType;
-        if (notifications_value.object.get("turn_end")) |value| {
-            if (value != .bool) return error.InvalidNotificationTurnEndType;
-            settings.notification_turn_end = value.bool;
-        }
-        if (notifications_value.object.get("attention_required")) |value| {
-            if (value != .bool) return error.InvalidNotificationAttentionRequiredType;
-            settings.notification_attention_required = value.bool;
-        }
-        if (notifications_value.object.get("max")) |value| {
-            if (value != .bool) return error.InvalidNotificationMaxType;
-            settings.notification_max = value.bool;
+    for ([_]?std.json.Value{ root.object.get("notifications"), root.object.get("sound") }, 0..) |group, index| {
+        if (group) |sound_value| {
+            if (sound_value != .object) {
+                if (index == 0) return error.InvalidNotificationsType;
+                debug_trace.logf("config", "ignoring sound: not an object", .{});
+                continue;
+            }
+            if (sound_value.object.get("turn_end")) |value| {
+                if (value != .bool) return error.InvalidNotificationTurnEndType;
+                settings.notification_turn_end = value.bool;
+            }
+            if (sound_value.object.get("attention_required")) |value| {
+                if (value != .bool) return error.InvalidNotificationAttentionRequiredType;
+                settings.notification_attention_required = value.bool;
+            }
+            if (sound_value.object.get("max")) |value| {
+                if (value != .bool) return error.InvalidNotificationMaxType;
+                settings.notification_max = value.bool;
+            }
         }
     }
 
@@ -1628,7 +1924,78 @@ fn parseProfileOnlyFields(
     }
 }
 
-fn parseProjectSafeFields(settings: *Settings, root: std.json.Value) !void {
+/// Parses `skill_symlink_authorities` into caller-owned path copies. Every
+/// entry must be an absolute path without `..` components so a typo cannot
+/// silently widen or narrow the directories skills may resolve into.
+fn parseSkillSymlinkAuthorities(alloc: Allocator, value: std.json.Value) ![][]u8 {
+    if (value != .array) return error.InvalidSkillSymlinkAuthorities;
+    const items = value.array.items;
+    if (items.len > max_skill_symlink_authorities) return error.InvalidSkillSymlinkAuthorities;
+    for (items) |item| {
+        if (item != .string or
+            !std.Io.Dir.path.isAbsolute(item.string) or
+            pathHasDotDotComponent(item.string))
+        {
+            return error.InvalidSkillSymlinkAuthorities;
+        }
+    }
+    const paths = try alloc.alloc([]u8, items.len);
+    var filled: usize = 0;
+    errdefer {
+        for (paths[0..filled]) |path| alloc.free(path);
+        alloc.free(paths);
+    }
+    for (items) |item| {
+        paths[filled] = try alloc.dupe(u8, item.string);
+        filled += 1;
+    }
+    return paths;
+}
+
+fn pathHasDotDotComponent(path: []const u8) bool {
+    var it = std.Io.Dir.path.componentIterator(path);
+    while (it.next()) |component| {
+        if (std.mem.eql(u8, component.name, "..")) return true;
+    }
+    return false;
+}
+
+fn parseProjectSafeFields(settings: *Settings, alloc: Allocator, root: std.json.Value) !void {
+    if (root.object.get("provider_order")) |order_value| {
+        if (order_value != .array) return error.InvalidProviderOrderType;
+        const items = order_value.array.items;
+        // An empty array explicitly clears an inherited routing list.
+        if (items.len > settings_store.max_provider_order_entries) {
+            return error.InvalidProviderOrderValue;
+        }
+        var order = try alloc.alloc([]const u8, items.len);
+        errdefer alloc.free(order);
+        var filled: usize = 0;
+        errdefer for (order[0..filled]) |slug| alloc.free(@constCast(slug));
+        for (items, 0..) |item, index| {
+            if (item != .string or !settings_store.validateProviderSlug(item.string)) {
+                return error.InvalidProviderOrderValue;
+            }
+            for (items[0..index]) |previous| {
+                if (previous == .string and std.mem.eql(u8, item.string, previous.string)) {
+                    return error.InvalidProviderOrderValue;
+                }
+            }
+            order[index] = try alloc.dupe(u8, item.string);
+            filled += 1;
+        }
+        if (settings.provider_order) |old| {
+            for (old) |slug| alloc.free(@constCast(slug));
+            alloc.free(old);
+        }
+        settings.provider_order = order;
+    }
+
+    if (root.object.get("provider_strict")) |strict_value| {
+        if (strict_value != .bool) return error.InvalidProviderStrictType;
+        settings.provider_strict = strict_value.bool;
+    }
+
     if (root.object.get("max_agent_steps")) |max_agent_steps_value| {
         const value = max_agent_steps_value;
         if (value != .integer) return error.InvalidMaxAgentStepsType;
@@ -1663,19 +2030,46 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.yolo_acknowledged) |value| target.yolo_acknowledged = value;
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;
     if (incoming.max_tool_result_bytes) |value| target.max_tool_result_bytes = value;
+    if (incoming.auto_compact_percent) |value| target.auto_compact_percent = value;
     target.context_limits.merge(incoming.context_limits);
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;
     if (incoming.context) |value| target.context = value;
     if (incoming.fast_mode) |value| target.fast_mode = value;
+    if (incoming.ultrafast_mode) |value| target.ultrafast_mode = value;
     if (incoming.fast_mode_model_bound) |value| target.fast_mode_model_bound = value;
+    if (incoming.provider_order) |value| {
+        if (target.provider_order) |old| {
+            for (old) |slug| alloc.free(@constCast(slug));
+            alloc.free(old);
+        }
+        target.provider_order = value;
+        incoming.provider_order = null;
+    }
+    if (incoming.provider_strict) |value| target.provider_strict = value;
     if (incoming.slash_menu_categories) |value| target.slash_menu_categories = value;
     if (incoming.collapse_tool_calls) |value| target.collapse_tool_calls = value;
     if (incoming.session_titles) |value| target.session_titles = value;
+    if (incoming.cache_warming) |value| target.cache_warming = value;
     if (incoming.auto_upgrade) |value| target.auto_upgrade = value;
     if (incoming.update_channel) |value| target.update_channel = value;
+    if (incoming.theme) |value| {
+        if (target.theme) |old| alloc.free(old);
+        target.theme = value;
+        incoming.theme = null;
+    }
     if (incoming.startup_scrollback) |value| target.startup_scrollback = value;
+    if (incoming.skill_symlink_authorities) |value| {
+        if (target.skill_symlink_authorities) |old| freeStringSlice(alloc, old);
+        target.skill_symlink_authorities = value;
+        incoming.skill_symlink_authorities = null;
+    }
     if (incoming.prompt_history_enabled) |value| target.prompt_history_enabled = value;
     if (incoming.effort) |value| target.effort = value;
+    if (incoming.review_model) |value| {
+        if (target.review_model) |old| alloc.free(old);
+        target.review_model = value;
+        incoming.review_model = null;
+    }
 
     if (incoming.statusline_context) |value| target.statusline_context = value;
     if (incoming.statusline_session) |value| target.statusline_session = value;
@@ -1819,25 +2213,11 @@ fn writeRepeatedByteAbsolute(path: []const u8, byte: u8, count: usize) !void {
     }
 }
 
-var stable_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableEmptyTestEnviron() !*const std.process.Environ.Map {
-    if (stable_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_test_environ = map;
-    return map;
-}
-
 const TestHome = struct {
     alloc: Allocator,
     map: std.process.Environ.Map,
 
     fn install(alloc: Allocator, home: ?[]const u8) !*TestHome {
-        _ = try stableEmptyTestEnviron();
-
         const self = try alloc.create(TestHome);
         errdefer alloc.destroy(self);
 
@@ -1856,9 +2236,7 @@ const TestHome = struct {
     }
 
     fn deinit(self: *TestHome) void {
-        if (stable_test_environ) |map| {
-            io_mod.setEnvironMap(map);
-        }
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);
@@ -2044,8 +2422,7 @@ test "loadMergedSettings merges project defaults before profile layers" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"model\":\"user-model\",\"permission_mode\":\"ask\",\"max_agent_steps\":8,\"workspaces\":{{\"{s}\":{{\"model\":\"override-model\",\"permission_mode\":\"auto\"}}}}}}",
         .{workspace_root},
     );
@@ -2062,6 +2439,156 @@ test "loadMergedSettings merges project defaults before profile layers" {
     try std.testing.expectEqual(@as(usize, 8), settings.max_agent_steps.?);
 }
 
+test "provider routing settings merge across layers with project defaults" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "project-only");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    const project_only_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "project-only");
+    defer std.testing.allocator.free(project_only_root);
+
+    const user_settings = try std.testing.allocator.print(
+        "{{\"provider_order\":[\"bedrock\",\"anthropic\"],\"provider_strict\":true,\"workspaces\":{{\"{s}\":{{\"provider_order\":[\"vertex\"],\"provider_strict\":false}}}}}}",
+        .{workspace_root},
+    );
+    defer std.testing.allocator.free(user_settings);
+
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"provider_order\":[\"azure\",\"openai\"]}");
+    try writeFixtureFile(tmp.dir, "project-only/.fx.json", "{\"provider_order\":[\"azure\",\"openai\"],\"provider_strict\":true}");
+
+    var settings = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
+    defer settings.deinit(std.testing.allocator);
+
+    const order = settings.provider_order.?;
+    try std.testing.expectEqual(@as(usize, 1), order.len);
+    try std.testing.expectEqualStrings("vertex", order[0]);
+    try std.testing.expectEqual(false, settings.provider_strict.?);
+
+    // Project defaults fill in only when neither the profile nor the workspace
+    // sets routing, so this case needs its own home without profile values.
+    var project_settings = try loadMergedSettingsFromHome(std.testing.allocator, home_root, project_only_root);
+    defer project_settings.deinit(std.testing.allocator);
+
+    const inherited_order = project_settings.provider_order.?;
+    try std.testing.expectEqual(@as(usize, 2), inherited_order.len);
+    try std.testing.expectEqualStrings("bedrock", inherited_order[0]);
+    try std.testing.expectEqual(true, project_settings.provider_strict.?);
+}
+
+test "provider routing project defaults apply when profile is silent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{}");
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"provider_order\":[\"azure\",\"openai\"],\"provider_strict\":true}");
+
+    var settings = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
+    defer settings.deinit(std.testing.allocator);
+
+    const order = settings.provider_order.?;
+    try std.testing.expectEqual(@as(usize, 2), order.len);
+    try std.testing.expectEqualStrings("azure", order[0]);
+    try std.testing.expectEqualStrings("openai", order[1]);
+    try std.testing.expectEqual(true, settings.provider_strict.?);
+}
+
+test "provider routing empty list clears an inherited order" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    const user_settings = try std.testing.allocator.print(
+        "{{\"provider_order\":[\"bedrock\"],\"workspaces\":{{\"{s}\":{{\"provider_order\":[]}}}}}}",
+        .{workspace_root},
+    );
+    defer std.testing.allocator.free(user_settings);
+
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
+
+    var settings = try loadMergedSettingsFromHome(std.testing.allocator, home_root, workspace_root);
+    defer settings.deinit(std.testing.allocator);
+
+    const order = settings.provider_order orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 0), order.len);
+}
+
+test "parseProviderOrderList validates trims and deduplicates slugs" {
+    const alloc = std.testing.allocator;
+
+    const parsed = parseProviderOrderList(alloc, " azure, anthropic ,bedrock");
+    const order = switch (parsed) {
+        .ok => |maybe| maybe orelse return error.TestExpectedEqual,
+        .invalid => return error.TestExpectedEqual,
+    };
+    defer {
+        for (order) |slug| alloc.free(@constCast(slug));
+        alloc.free(order);
+    }
+    try std.testing.expectEqual(@as(usize, 3), order.len);
+    try std.testing.expectEqualStrings("azure", order[0]);
+    try std.testing.expectEqualStrings("bedrock", order[2]);
+
+    // Mixed-case gateway slugs like vertexAnthropic are valid.
+    const mixed = parseProviderOrderList(alloc, "vertexAnthropic,claudeaws");
+    const mixed_order = switch (mixed) {
+        .ok => |maybe| maybe orelse return error.TestExpectedEqual,
+        .invalid => return error.TestExpectedEqual,
+    };
+    defer {
+        for (mixed_order) |slug| alloc.free(@constCast(slug));
+        alloc.free(mixed_order);
+    }
+    try std.testing.expectEqualStrings("vertexAnthropic", mixed_order[0]);
+
+    switch (parseProviderOrderList(alloc, "azure,Bad Slug")) {
+        .ok => |maybe| {
+            if (maybe) |value| {
+                for (value) |slug| alloc.free(@constCast(slug));
+                alloc.free(value);
+            }
+            return error.TestExpectedEqual;
+        },
+        .invalid => {},
+    }
+    try std.testing.expect(parseProviderOrderList(alloc, "azure,azure") == .invalid);
+    switch (parseProviderOrderList(alloc, "  ")) {
+        .ok => |maybe| try std.testing.expect(maybe == null),
+        .invalid => return error.TestExpectedEqual,
+    }
+}
+
+test "parseEnvBool accepts common boolean spellings" {
+    try std.testing.expectEqual(true, parseEnvBool("1"));
+    try std.testing.expectEqual(true, parseEnvBool("TRUE"));
+    try std.testing.expectEqual(false, parseEnvBool("0"));
+    try std.testing.expectEqual(false, parseEnvBool("off"));
+    try std.testing.expect(parseEnvBool("maybe") == null);
+    try std.testing.expect(parseEnvBool("") == null);
+}
+
 test "context limits resolve command line over workspace and global profile values" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2073,8 +2600,7 @@ test "context limits resolve command line over workspace and global profile valu
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"context_limits\":{{\"skill_chunk_bytes\":111,\"mcp_description_bytes\":\"off\"}},\"workspaces\":{{\"{s}\":{{\"context_limits\":{{\"skill_chunk_bytes\":222}}}}}}}}",
         .{workspace_root},
     );
@@ -2119,8 +2645,7 @@ test "loadStartupStatusSettings merges project defaults before profile layers" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"model\":\"user-model\",\"permission_mode\":\"ask\",\"max_agent_steps\":8,\"workspaces\":{{\"/other\":{{\"model\":\"wrong\"}},\"{s}\":{{\"model\":\"override-model\",\"permission_mode\":\"yolo\"}}}}}}",
         .{workspace_root},
     );
@@ -2149,14 +2674,13 @@ test "loadMergedSettings applies startup scrollback precedence with normalized w
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"startup_scrollback\":false,\"workspaces\":{{\"{s}\":{{\"startup_scrollback\":false}}}}}}",
         .{workspace_root},
     );
     defer std.testing.allocator.free(user_settings);
 
-    const workspace_with_slash = try std.fmt.allocPrint(std.testing.allocator, "{s}/", .{workspace_root});
+    const workspace_with_slash = try std.testing.allocator.print("{s}/", .{workspace_root});
     defer std.testing.allocator.free(workspace_with_slash);
 
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
@@ -2287,6 +2811,103 @@ test "startup_scrollback parses merges rejects invalid type and round trips" {
     try std.testing.expect(std.mem.find(u8, json, "\"startup_scrollback\":false") != null);
 }
 
+test "skill_symlink_authorities parses replaces on merge and rejects invalid entries" {
+    const alloc = std.testing.allocator;
+
+    var absent = try parseSettingsJson(alloc, "{}");
+    defer absent.deinit(alloc);
+    try std.testing.expect(absent.skill_symlink_authorities == null);
+
+    var first = try parseSettingsJson(alloc, "{\"skill_symlink_authorities\":[\"/Applications/Codiff.app/Contents/Resources/app/codex/skills\",\"/nix/store\"]}");
+    defer first.deinit(alloc);
+    const parsed_paths = first.skill_symlink_authorities.?;
+    try std.testing.expectEqual(@as(usize, 2), parsed_paths.len);
+    try std.testing.expectEqualStrings("/Applications/Codiff.app/Contents/Resources/app/codex/skills", parsed_paths[0]);
+    try std.testing.expectEqualStrings("/nix/store", parsed_paths[1]);
+
+    var second = try parseSettingsJson(alloc, "{\"skill_symlink_authorities\":[]}");
+    defer second.deinit(alloc);
+    try mergeSettings(&first, &second, alloc);
+    try std.testing.expectEqual(@as(usize, 0), first.skill_symlink_authorities.?.len);
+
+    inline for (&.{
+        "{\"skill_symlink_authorities\":\"/nix/store\"}",
+        "{\"skill_symlink_authorities\":[7]}",
+        "{\"skill_symlink_authorities\":[\"relative/skills\"]}",
+        "{\"skill_symlink_authorities\":[\"/opt/../etc\"]}",
+    }) |json| {
+        try std.testing.expectError(error.InvalidSkillSymlinkAuthorities, parseSettingsJson(alloc, json));
+    }
+}
+
+test "skill_symlink_authorities is profile-only and workspace overrides replace the global list" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "project-only");
+
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    const project_only_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "project-only");
+    defer alloc.free(project_only_root);
+
+    const user_settings = try alloc.print(
+        "{{\"skill_symlink_authorities\":[\"/opt/global-skills\"],\"workspaces\":{{\"{s}\":{{\"skill_symlink_authorities\":[\"/opt/workspace-skills\"]}}}}}}",
+        .{workspace_root},
+    );
+    defer alloc.free(user_settings);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"skill_symlink_authorities\":[\"/opt/project-skills\"]}");
+    try writeFixtureFile(tmp.dir, "project-only/.fx.json", "{\"skill_symlink_authorities\":[\"/opt/project-skills\"]}");
+
+    var workspace = try loadMergedSettingsFromHome(alloc, home_root, workspace_root);
+    defer workspace.deinit(alloc);
+    const workspace_paths = workspace.skill_symlink_authorities.?;
+    try std.testing.expectEqual(@as(usize, 1), workspace_paths.len);
+    try std.testing.expectEqualStrings("/opt/workspace-skills", workspace_paths[0]);
+
+    // A committed project file must never grant filesystem authority.
+    var project_only = try loadMergedSettingsFromHome(alloc, home_root, project_only_root);
+    defer project_only.deinit(alloc);
+    const project_only_paths = project_only.skill_symlink_authorities.?;
+    try std.testing.expectEqual(@as(usize, 1), project_only_paths.len);
+    try std.testing.expectEqualStrings("/opt/global-skills", project_only_paths[0]);
+}
+
+test "invalid skill_symlink_authorities reports a specific diagnostic" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"skill_symlink_authorities\":[\"relative/skills\"]}");
+
+    var detailed = try loadMergedSettingsDetailedFromHome(alloc, home_root, workspace_root);
+    defer detailed.deinit(alloc);
+    try std.testing.expect(detailed.settings.skill_symlink_authorities == null);
+    var found = false;
+    for (detailed.diagnostics) |diagnostic| {
+        if (diagnostic.layer != .user) continue;
+        if (diagnostic.cause != .invalid_skill_symlink_authorities) continue;
+        found = true;
+        var buffer: [512]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try writeDiagnosticMetadata(&writer, diagnostic);
+        try std.testing.expect(std.mem.find(u8, writer.buffered(), "skill_symlink_authorities must be an array") != null);
+    }
+    try std.testing.expect(found);
+}
+
 test "collapse tool calls parses merges and rejects invalid types" {
     var absent = try parseSettingsJson(std.testing.allocator, "{}");
     defer absent.deinit(std.testing.allocator);
@@ -2356,6 +2977,102 @@ test "first_call_tool_choice ignores unknown strings and rejects invalid types" 
     try std.testing.expectError(error.InvalidFirstCallToolChoiceType, parseSettingsJson(std.testing.allocator, "{\"first_call_tool_choice\":false}"));
 }
 
+test "review_model parses, merges, and yields to FX_REVIEW_MODEL" {
+    var absent = try parseSettingsJson(std.testing.allocator, "{}");
+    defer absent.deinit(std.testing.allocator);
+    try std.testing.expect(absent.review_model == null);
+
+    var base = try parseSettingsJson(std.testing.allocator, "{\"review_model\":\"base/review\"}");
+    defer base.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("base/review", base.review_model.?);
+
+    var over = try parseSettingsJson(std.testing.allocator, "{\"review_model\":\" layer/review \"}");
+    defer over.deinit(std.testing.allocator);
+    try mergeSettings(&base, &over, std.testing.allocator);
+    try std.testing.expectEqualStrings("layer/review", base.review_model.?);
+    try std.testing.expect(over.review_model == null);
+
+    try std.testing.expectError(error.InvalidReviewModelType, parseSettingsJson(std.testing.allocator, "{\"review_model\":false}"));
+    try std.testing.expectError(error.InvalidReviewModelValue, parseSettingsJson(std.testing.allocator, "{\"review_model\":\"bad\\u0001review\"}"));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"review_model\":\"profile/review\"}\n");
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    try home.map.put("FX_REVIEW_MODEL", "process/review");
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("process/review", result.settings.review_model.?);
+}
+
+test "renamed groups read either spelling and the current one wins" {
+    const alloc = std.testing.allocator;
+    var both = try parseSettingsJson(alloc,
+        \\{"status_line":{"context":true},"statusLine":{"context":false,"session":true},
+        \\ "sound":{"max":true},"notifications":{"max":false,"turn_end":true}}
+    );
+    defer both.deinit(alloc);
+    try std.testing.expect(both.statusline_context.? and both.statusline_session.?);
+    try std.testing.expect(both.notification_max.? and both.notification_turn_end.?);
+
+    var older = try parseSettingsJson(alloc, "{\"statusLine\":{\"session\":true},\"notifications\":{\"attention_required\":false}}");
+    defer older.deinit(alloc);
+    try std.testing.expect(older.statusline_session.?);
+    try std.testing.expect(!older.notification_attention_required.?);
+
+    // The current names were unknown keys before the rename, so a stray value
+    // of another type under one is ignored, not a startup failure.
+    var stray = try parseSettingsJson(alloc, "{\"sound\":false,\"status_line\":7,\"notifications\":{\"max\":true}}");
+    defer stray.deinit(alloc);
+    try std.testing.expect(stray.notification_max.?);
+    try std.testing.expect(stray.statusline_context == null);
+    try std.testing.expectError(error.InvalidNotificationsType, parseSettingsJson(alloc, "{\"notifications\":\"on\"}"));
+}
+
+test "an FX_* override beats a setting override for one run" {
+    const alloc = std.testing.allocator;
+    var env = try TestHome.install(alloc, null);
+    defer env.deinit();
+    try env.map.put("FX_PROVIDER_STRICT", "0");
+
+    var settings = try parseSettingsJson(alloc, "{\"provider_strict\":false}");
+    defer settings.deinit(alloc);
+    try applySettingOverrides(alloc, &settings, &.{.{ .key = "provider_strict", .value = .{ .bool = true } }});
+    try std.testing.expect(!settings.provider_strict.?);
+}
+
+test "setting overrides sit above the files, nest dotted keys, and keep the last value" {
+    const alloc = std.testing.allocator;
+    var settings = try parseSettingsJson(alloc, "{\"fast_mode\":false,\"effort\":\"low\",\"theme\":\"dark\",\"statusLine\":{\"session\":true}}");
+    defer settings.deinit(alloc);
+
+    try applySettingOverrides(alloc, &settings, &.{
+        .{ .key = "fast_mode", .value = .{ .bool = true } },
+        .{ .key = "effort", .value = .{ .string = "medium" } },
+        .{ .key = "effort", .value = .{ .string = "high" } },
+        .{ .key = "statusLine.context", .value = .{ .bool = true } },
+        .{ .key = "statusLine.workspace", .value = .{ .bool = true } },
+        .{ .key = "theme", .value = .{ .string = "light" } },
+    });
+    try std.testing.expect(settings.fast_mode.?);
+    try std.testing.expectEqualStrings("high", settings.effort.?.label());
+    try std.testing.expect(settings.statusline_context.? and settings.statusline_workspace.?);
+    try std.testing.expect(settings.statusline_session.?);
+    try std.testing.expectEqualStrings("light", settings.theme.?);
+
+    try applySettingOverrides(alloc, &settings, &.{});
+    try std.testing.expect(settings.fast_mode.?);
+}
+
 test "obsolete web_fetch worker model setting is ignored" {
     var parsed = try parseSettingsJson(std.testing.allocator, "{\"web_fetch_worker_model\":false,\"model\":\"provider/model\"}");
     defer parsed.deinit(std.testing.allocator);
@@ -2374,8 +3091,7 @@ test "workspace override can change effort from high to auto" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"effort\":\"high\",\"workspaces\":{{\"{s}\":{{\"effort\":\"auto\"}}}}}}",
         .{workspace_root},
     );
@@ -2398,8 +3114,7 @@ test "profile workspace settings effort null loads as auto" {
     defer std.testing.allocator.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"effort\":null}}}}}}\n",
         .{workspace_root},
     );
@@ -2442,7 +3157,7 @@ test "oversized user and workspace settings propagate StreamTooLong" {
 
     const user_settings = try profile_paths.settingsPath(std.testing.allocator, home_root);
     defer std.testing.allocator.free(user_settings);
-    const workspace_settings = try std.fs.path.join(std.testing.allocator, &.{ workspace_root, ".fx.json" });
+    const workspace_settings = try std.Io.Dir.path.join(std.testing.allocator, &.{ workspace_root, ".fx.json" });
     defer std.testing.allocator.free(workspace_settings);
 
     try writeRepeatedByteAbsolute(user_settings, 'a', max_settings_bytes + 1);
@@ -2465,8 +3180,7 @@ test "permission rules parse from workspace override" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"permission\":{{\"edit\":{{\"src/*\":\"allow\"}},\"bash\":{{\"rm -rf*\":\"deny\"}},\"open_url\":\"ask\"}}}}}}}}",
         .{workspace_root},
     );
@@ -2493,8 +3207,7 @@ test "later permission layers replace earlier rules" {
     defer std.testing.allocator.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"permission\":{{\"edit\":\"allow\"}},\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":\"deny\"}}}}}}}}\n",
         .{workspace_root},
     );
@@ -2521,8 +3234,7 @@ test "empty workspace override permission clears earlier rules" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"permission\":{{\"edit\":\"allow\"}},\"workspaces\":{{\"{s}\":{{\"permission\":{{}}}}}}}}",
         .{workspace_root},
     );
@@ -2669,8 +3381,7 @@ test "explicit user permission mutation writes top level and preserves local rul
     defer std.testing.allocator.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":{{\"local *\":\"allow\"}}}}}}}}}}\n",
         .{workspace_root},
     );
@@ -2816,8 +3527,7 @@ test "addPermissionRule preserves unrelated workspace override keys" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"model\":\"my-model\",\"permission_mode\":\"auto\"}}}}}}",
         .{workspace_root},
     );
@@ -2847,8 +3557,7 @@ test "addPermissionRule preserves non-object category under star" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":true}}}}}}}}",
         .{workspace_root},
     );
@@ -2911,8 +3620,7 @@ test "removePermissionRule missing rule returns false without rewrite" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"permission\":{{\"bash\":{{\"git *\":\"allow\"}}}}}}}}}}\n",
         .{workspace_root},
     );
@@ -2973,8 +3681,7 @@ test "user effort preference preserves unrelated workspace override keys" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"model\":\"my-model\",\"permission_mode\":\"auto\"}}}}}}",
         .{workspace_root},
     );
@@ -3015,8 +3722,7 @@ test "user fast mode preference writes bool and preserves unrelated keys" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"model\":\"my-model\",\"permission_mode\":\"auto\"}}}}}}",
         .{workspace_root},
     );
@@ -3057,8 +3763,7 @@ test "user startup scrollback preference writes bool and preserves unrelated key
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"workspaces\":{{\"{s}\":{{\"model\":\"my-model\",\"permission_mode\":\"auto\"}}}}}}",
         .{workspace_root},
     );
@@ -3096,12 +3801,12 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try writeFixtureFile(
         tmp.dir,
         "home/.fx/settings.json",
-        "{\"model\":\"profile/model\",\"permission_mode\":\"auto\",\"permission\":{\"bash\":{\"profile *\":\"allow\"}},\"prompt_history\":{\"enabled\":true},\"statusLine\":{\"sandbox\":true,\"context\":false},\"first_call_tool_choice\":\"none\",\"auto_upgrade\":false,\"update_channel\":\"dev\",\"fast_mode\":false,\"input_appearance\":\"tint\",\"maxxing_mode\":\"minimal\",\"slash_menu_categories\":false,\"effort\":\"high\",\"output_level\":\"quiet\",\"startup_scrollback\":false}\n",
+        "{\"model\":\"profile/model\",\"permission_mode\":\"auto\",\"permission\":{\"bash\":{\"profile *\":\"allow\"}},\"prompt_history\":{\"enabled\":true},\"statusLine\":{\"sandbox\":true,\"context\":false},\"first_call_tool_choice\":\"none\",\"review_model\":\"profile/review\",\"auto_upgrade\":false,\"update_channel\":\"dev\",\"fast_mode\":false,\"input_appearance\":\"tint\",\"maxxing_mode\":\"minimal\",\"slash_menu_categories\":false,\"effort\":\"high\",\"output_level\":\"quiet\",\"startup_scrollback\":false}\n",
     );
     try writeFixtureFile(
         tmp.dir,
         "workspace/.fx.json",
-        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"statusLine\":{\"sandbox\":false,\"context\":true},\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"auto_upgrade\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"startup_scrollback\":true,\"max_agent_steps\":17}\n",
+        "{\"model\":\"project/model\",\"permission_mode\":\"ask\",\"permission\":\"deny\",\"prompt_history\":{\"enabled\":false},\"statusLine\":{\"sandbox\":false,\"context\":true},\"skill_match_fuzzy\":true,\"first_call_tool_choice\":\"auto\",\"review_model\":\"project/review\",\"auto_upgrade\":true,\"update_channel\":\"stable\",\"fast_mode\":true,\"input_appearance\":\"lines\",\"maxxing_mode\":\"normal\",\"slash_menu_categories\":true,\"effort\":\"low\",\"output_level\":\"normal\",\"startup_scrollback\":true,\"max_agent_steps\":17}\n",
     );
 
     const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
@@ -3118,6 +3823,7 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try std.testing.expectEqual(true, result.settings.prompt_history_enabled.?);
     try std.testing.expectEqual(false, result.settings.statusline_context.?);
     try std.testing.expectEqual(types.ToolChoice.none, result.settings.first_call_tool_choice.?);
+    try std.testing.expectEqualStrings("profile/review", result.settings.review_model.?);
     try std.testing.expectEqual(false, result.settings.auto_upgrade.?);
     try std.testing.expectEqual(update_target.Channel.dev, result.settings.update_channel.?);
     try std.testing.expectEqual(false, result.settings.fast_mode.?);
@@ -3127,7 +3833,7 @@ test "project profile-only settings are ignored and diagnosed by key" {
     try std.testing.expectEqual(@as(usize, 1), result.settings.permission_rules.rules.len);
     try expectPermissionRule(result.settings.permission_rules.rules[0], "bash", "profile *", .allow);
 
-    try std.testing.expectEqual(@as(usize, 13), result.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 14), result.diagnostics.len);
     inline for (&.{
         "model",
         "permission_mode",
@@ -3136,6 +3842,7 @@ test "project profile-only settings are ignored and diagnosed by key" {
         "statusLine",
         "skill_match_fuzzy",
         "first_call_tool_choice",
+        "review_model",
         "auto_upgrade",
         "update_channel",
         "fast_mode",
@@ -3145,6 +3852,27 @@ test "project profile-only settings are ignored and diagnosed by key" {
     }) |key| {
         try expectIgnoredProjectKey(result.diagnostics, key);
     }
+}
+
+test "project auto_compact_percent is ignored with a diagnostic" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{}\n");
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"auto_compact_percent\":20}\n");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(?u8, null), result.settings.auto_compact_percent);
+    try std.testing.expectEqual(@as(usize, 1), result.diagnostics.len);
+    try expectIgnoredProjectKey(result.diagnostics, "auto_compact_percent");
 }
 
 test "malformed project profile-only settings are ignored before value parsing" {
@@ -3262,8 +3990,7 @@ test "workspace statusline is global only in ordinary and detailed loads" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"statusLine\":{{\"workspace\":true}},\"workspaces\":{{\"{s}\":{{\"statusLine\":{{\"workspace\":\"ignored\"}}}}}}}}\n",
         .{workspace_root},
     );
@@ -3291,8 +4018,7 @@ test "ordinary and detailed loads agree on workspace overrides with legacy statu
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"startup_scrollback\":true,\"workspaces\":{{\"{s}\":{{\"statusLine\":7,\"startup_scrollback\":false}}}}}}\n",
         .{workspace_root},
     );
@@ -3368,8 +4094,7 @@ test "notification settings merge global and workspace while project values are 
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"notifications\":{{\"turn_end\":true,\"attention_required\":false}},\"workspaces\":{{\"{s}\":{{\"notifications\":{{\"attention_required\":true}}}}}}}}",
         .{workspace_root},
     );
@@ -3412,8 +4137,7 @@ test "detailed settings diagnose legacy workspace preferences" {
         "workspace",
     );
     defer std.testing.allocator.free(workspace_root);
-    const fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const fixture = try std.testing.allocator.print(
         "{{\"model\":\"user/model\",\"workspaces\":{{\"{s}\":{{\"model\":\"legacy/model\",\"statusLine\":{{\"session\":true}}}}}}}}\n",
         .{workspace_root},
     );
@@ -3445,8 +4169,7 @@ test "detailed settings preserve model precedence and source" {
     defer std.testing.allocator.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
-    const user_fixture = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_fixture = try std.testing.allocator.print(
         "{{\"model\":\"user/model\",\"workspaces\":{{\"{s}\":{{\"model\":\"workspace/model\"}}}}}}\n",
         .{workspace_root},
     );
@@ -3471,8 +4194,7 @@ test "detailed settings expose target sources and permission views" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    const user_settings = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const user_settings = try std.testing.allocator.print(
         "{{\"model\":\"user/model\",\"permission_mode\":\"ask\",\"fast_mode\":true,\"input_appearance\":\"tint\",\"startup_scrollback\":false," ++
             "\"prompt_history\":{{\"enabled\":false}},\"statusLine\":{{\"sandbox\":true,\"context\":false,\"session\":true}}," ++
             "\"permission\":{{\"bash\":{{\"user *\":\"allow\"}}}},\"workspaces\":{{\"{s}\":{{" ++
@@ -3734,7 +4456,7 @@ test "invalid user model emits typed diagnostic and project model is ignored" {
     try std.testing.expect(!result.prompt_history_store_allowed);
 }
 
-test "detailed settings report unsafe user permissions distinctly" {
+test "detailed settings remove loose write access, load, and note it once" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
@@ -3753,14 +4475,25 @@ test "detailed settings report unsafe user permissions distinctly" {
     const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
     defer std.testing.allocator.free(workspace_root);
 
-    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
-    defer result.deinit(std.testing.allocator);
-    try std.testing.expect(result.settings.permission_mode == null);
-    try std.testing.expectEqual(
-        ConfigDiagnosticCause.private_state_permissions_unsupported,
-        result.diagnostics[0].cause,
-    );
-    try std.testing.expect(!result.prompt_history_store_allowed);
+    {
+        var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(result.settings.permission_mode == .auto);
+        try std.testing.expectEqual(@as(usize, 1), result.diagnostics.len);
+        const diagnostic = result.diagnostics[0];
+        try std.testing.expectEqual(ConfigDiagnosticCause.private_state_permissions_tightened, diagnostic.cause);
+        try std.testing.expect(!diagnostic.reportAtStartup());
+        try std.testing.expect(std.mem.indexOf(u8, diagnostic.note().?, "~/.fx/settings.json") != null);
+        try std.testing.expect(result.prompt_history_store_allowed);
+    }
+    const tightened = try root_dir.statFile(io_mod.getIo(), "settings.json", .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o644), tightened.permissions.toMode() & 0o777);
+
+    // Nothing is loose any more, so the next start says nothing.
+    var again = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer again.deinit(std.testing.allocator);
+    try std.testing.expect(again.settings.permission_mode == .auto);
+    try std.testing.expectEqual(@as(usize, 0), again.diagnostics.len);
 }
 
 test "detailed settings treat a missing home as read-only absence" {
@@ -3770,7 +4503,7 @@ test "detailed settings treat a missing home as read-only absence" {
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const home_root = try std.fs.path.join(alloc, &.{ root, "missing-home" });
+    const home_root = try std.Io.Dir.path.join(alloc, &.{ root, "missing-home" });
     defer alloc.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace_root);
@@ -3820,8 +4553,7 @@ test "update channel resolves only from the global user profile" {
     defer alloc.free(home_root);
     const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace_root);
-    const user_settings = try std.fmt.allocPrint(
-        alloc,
+    const user_settings = try alloc.print(
         "{{\"update_channel\":\"dev\",\"workspaces\":{{\"{s}\":{{\"update_channel\":\"stable\"}}}}}}",
         .{workspace_root},
     );
@@ -3873,16 +4605,14 @@ test "additional directories load only from the current profile workspace" {
     const project_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "project");
     defer alloc.free(project_root);
 
-    const settings_fixture = try std.fmt.allocPrint(
-        alloc,
+    const settings_fixture = try alloc.print(
         "{{\"additional_directories\":[\"{s}\"],\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
         .{ global_root, workspace_root, shared_root },
     );
     defer alloc.free(settings_fixture);
     try writeFixtureFile(tmp.dir, "home/.fx/settings.json", settings_fixture);
 
-    const project_fixture = try std.fmt.allocPrint(
-        alloc,
+    const project_fixture = try alloc.print(
         "{{\"additional_directories\":[\"{s}\"],\"max_agent_steps\":17}}\n",
         .{project_root},
     );
@@ -3924,10 +4654,9 @@ test "detailed settings retain raw additional directory sources beside canonical
     defer alloc.free(workspace_root);
     const shared_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "shared");
     defer alloc.free(shared_root);
-    const shared_source = try std.fs.path.resolve(alloc, &.{ workspace_root, "../shared-link" });
+    const shared_source = try std.Io.Dir.path.resolveAlloc(alloc, &.{ workspace_root, "../shared-link" });
     defer alloc.free(shared_source);
-    const fixture = try std.fmt.allocPrint(
-        alloc,
+    const fixture = try alloc.print(
         "{{\"workspaces\":{{\"{s}\":{{\"additional_directories\":[\"{s}\"]}}}}}}\n",
         .{ workspace_root, shared_source },
     );
@@ -3953,8 +4682,7 @@ test "malformed or duplicate additional directories do not discard sibling setti
     defer alloc.free(workspace_root);
     const invalid_values = [_][]const u8{ "\"invalid\"", "[\"/duplicate\",\"/duplicate\"]" };
     for (invalid_values) |value| {
-        const fixture = try std.fmt.allocPrint(
-            alloc,
+        const fixture = try alloc.print(
             "{{\"workspaces\":{{\"{s}\":{{\"model\":\"workspace/model\",\"additional_directories\":{s}}}}}}}\n",
             .{ workspace_root, value },
         );
@@ -3973,5 +4701,284 @@ test "malformed or duplicate additional directories do not discard sibling setti
             }
         }
         try std.testing.expect(found_diagnostic);
+    }
+}
+
+test "theme setting parses from profile settings and project theme is ignored" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"theme\":\"cursor-dark\"}\n");
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"theme\":\"project-theme\"}\n");
+
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+
+    var result = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("cursor-dark", result.settings.theme.?);
+    try expectIgnoredProjectKey(result.diagnostics, "theme");
+}
+
+test "theme setting rejects non-string values" {
+    try std.testing.expectError(
+        error.InvalidThemeType,
+        parseSettingsJson(std.testing.allocator, "{\"theme\":3}"),
+    );
+    var parsed = try parseSettingsJson(std.testing.allocator, "{\"theme\":\"cursor-light\"}");
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("cursor-light", parsed.theme.?);
+}
+
+test "auto compaction percent is a profile setting between 10 and 80" {
+    var global = try parseSettingsJson(std.testing.allocator, "{\"auto_compact_percent\":50}");
+    defer global.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u8, 50), global.auto_compact_percent);
+    try std.testing.expectError(error.InvalidAutoCompactPercentValue, parseSettingsJson(std.testing.allocator, "{\"auto_compact_percent\":90}"));
+    try std.testing.expectError(error.InvalidAutoCompactPercentValue, parseSettingsJson(std.testing.allocator, "{\"auto_compact_percent\":5}"));
+    try std.testing.expectError(error.InvalidAutoCompactPercentValue, parseSettingsJson(std.testing.allocator, "{\"auto_compact_percent\":-1}"));
+    try std.testing.expectError(error.InvalidAutoCompactPercentType, parseSettingsJson(std.testing.allocator, "{\"auto_compact_percent\":\"50\"}"));
+    var project = try parseSettingsJsonForLayer(std.testing.allocator, "{\"auto_compact_percent\":50}", .project);
+    defer project.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u8, null), project.auto_compact_percent);
+}
+
+test "selectProviderModel chooses only its provider-scoped model" {
+    var gateway_settings = Settings{ .provider = .gateway };
+    defer gateway_settings.deinit(std.testing.allocator);
+    try gateway_settings.models.putCopy(std.testing.allocator, .gateway, "gateway/model");
+    try gateway_settings.models.putCopy(std.testing.allocator, .codex, "gpt-model");
+    const gateway = try selectProviderModel("default/model", &gateway_settings, null, null);
+    try std.testing.expectEqual(model_provider.ProviderId.gateway, gateway.provider);
+    try std.testing.expectEqualStrings("gateway/model", gateway.model);
+
+    var codex_settings = Settings{ .provider = .codex };
+    defer codex_settings.deinit(std.testing.allocator);
+    try codex_settings.models.putCopy(std.testing.allocator, .gateway, "gateway/model");
+    try codex_settings.models.putCopy(std.testing.allocator, .codex, "gpt-model");
+    const codex = try selectProviderModel("default/model", &codex_settings, null, null);
+    try std.testing.expectEqual(model_provider.ProviderId.codex, codex.provider);
+    try std.testing.expectEqualStrings("gpt-model", codex.model);
+
+    const missing_codex = Settings{ .provider = .codex };
+    try std.testing.expectError(
+        error.CodexModelNotSelected,
+        selectProviderModel("default/model", &missing_codex, null, null),
+    );
+
+    var grok_settings = Settings{ .provider = .grok };
+    defer grok_settings.deinit(std.testing.allocator);
+    try grok_settings.models.putCopy(std.testing.allocator, .grok, "grok-model");
+    const grok = try selectProviderModel("default/model", &grok_settings, null, null);
+    try std.testing.expectEqual(model_provider.ProviderId.grok, grok.provider);
+    try std.testing.expectEqualStrings("grok-model", grok.model);
+
+    // A launch --provider override selects that provider and its saved model.
+    try gateway_settings.models.putCopy(std.testing.allocator, .grok, "grok-model");
+    const overridden = try selectProviderModel("default/model", &gateway_settings, .grok, null);
+    try std.testing.expectEqual(model_provider.ProviderId.grok, overridden.provider);
+    try std.testing.expectEqualStrings("grok-model", overridden.model);
+    try std.testing.expectError(
+        error.CodexModelNotSelected,
+        selectProviderModel("default/model", &grok_settings, .codex, null),
+    );
+    const overridden_gateway = try selectProviderModel("default/model", &codex_settings, .gateway, null);
+    try std.testing.expectEqualStrings("gateway/model", overridden_gateway.model);
+}
+
+test "selectProviderModel accepts the run model when the provider has none saved" {
+    // FX_PROVIDER=codex FX_MODEL=... in a profile that never saved a Codex model.
+    const missing_codex = Settings{ .provider = .codex };
+    const env_codex = try selectProviderModel("default/model", &missing_codex, null, "gpt-env");
+    try std.testing.expectEqual(model_provider.ProviderId.codex, env_codex.provider);
+    try std.testing.expectEqualStrings("gpt-env", env_codex.model);
+
+    const missing_grok = Settings{ .provider = .grok };
+    const env_grok = try selectProviderModel("default/model", &missing_grok, null, "grok-env");
+    try std.testing.expectEqualStrings("grok-env", env_grok.model);
+
+    // FX_PROVIDER=local names a custom connection, which has no default either.
+    const missing_local = Settings{ .provider = model_provider.parse("local").? };
+    try std.testing.expectError(error.ConfiguredModelNotSelected, selectProviderModel("default/model", &missing_local, null, null));
+    const env_local = try selectProviderModel("default/model", &missing_local, null, "local-env");
+    try std.testing.expectEqualStrings("local-env", env_local.model);
+
+    // --provider codex with FX_MODEL from a Gateway-only profile.
+    const gateway_only = Settings{ .provider = .gateway };
+    const launched = try selectProviderModel("default/model", &gateway_only, .codex, "gpt-env");
+    try std.testing.expectEqual(model_provider.ProviderId.codex, launched.provider);
+    try std.testing.expectEqualStrings("gpt-env", launched.model);
+
+    // A saved model remains the persisted preference; FX_MODEL applies on top of it later.
+    var saved_codex = Settings{ .provider = .codex };
+    defer saved_codex.deinit(std.testing.allocator);
+    try saved_codex.models.putCopy(std.testing.allocator, .codex, "gpt-saved");
+    const saved = try selectProviderModel("default/model", &saved_codex, null, "gpt-env");
+    try std.testing.expectEqualStrings("gpt-saved", saved.model);
+
+    // Gateway keeps its compiled default as the persisted preference.
+    const gateway = try selectProviderModel("default/model", &gateway_only, null, "gpt-env");
+    try std.testing.expectEqualStrings("default/model", gateway.model);
+}
+
+test "modelNotSelectedMessage names the provider and both ways to recover" {
+    const codex = modelNotSelectedMessage(error.CodexModelNotSelected).?;
+    try std.testing.expect(std.mem.find(u8, codex, "`fx provider codex`") != null);
+    try std.testing.expect(std.mem.find(u8, codex, "--model or FX_MODEL") != null);
+    try std.testing.expect(std.mem.find(u8, modelNotSelectedMessage(error.GrokModelNotSelected).?, "`fx provider grok`") != null);
+    try std.testing.expect(std.mem.find(u8, modelNotSelectedMessage(error.ConfiguredModelNotSelected).?, "\"models\" in ~/.fx/settings.json") != null);
+    try std.testing.expect(modelNotSelectedMessage(error.OutOfMemory) == null);
+}
+
+test "FX_ULTRAFAST overrides the profile and diagnoses malformed values" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
+    defer std.testing.allocator.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
+    defer std.testing.allocator.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"ultrafast_mode\":true}\n");
+
+    const home = try TestHome.install(std.testing.allocator, home_root);
+    defer home.deinit();
+    try home.map.put("FX_ULTRAFAST", "true");
+    var enabled = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer enabled.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?bool, true), enabled.ultrafast_mode_env_override);
+
+    try home.map.put("FX_ULTRAFAST", "1");
+    var numeric_enabled = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer numeric_enabled.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?bool, true), numeric_enabled.ultrafast_mode_env_override);
+
+    try home.map.put("FX_ULTRAFAST", "0");
+    var disabled = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer disabled.deinit(std.testing.allocator);
+    try std.testing.expect(disabled.settings.ultrafast_mode.?);
+    try std.testing.expectEqual(@as(?bool, false), disabled.ultrafast_mode_env_override);
+
+    try home.map.put("FX_ULTRAFAST", "paid");
+    var malformed = try loadMergedSettingsDetailedFromHome(std.testing.allocator, home_root, workspace_root);
+    defer malformed.deinit(std.testing.allocator);
+    try std.testing.expect(malformed.ultrafast_mode_env_override == null);
+    var diagnosed = false;
+    for (malformed.diagnostics) |diagnostic| {
+        if (diagnostic.cause == .invalid_ultrafast_mode_override) diagnosed = true;
+    }
+    try std.testing.expect(diagnosed);
+}
+
+/// Whether `parseSettingsValueForLayer` accepts `json` as a whole file.
+fn settingsTextAcceptedForTest(layer: SettingsLayer, json: []const u8) !bool {
+    const alloc = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    var settings = parseSettingsValueForLayer(alloc, parsed.value, layer, false, false) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return false;
+    };
+    settings.deinit(alloc);
+    return true;
+}
+
+fn expectSettingForTest(layer: SettingsLayer, name: []const u8, value_json: []const u8, accepted: bool) !void {
+    const json = try std.testing.allocator.print("{{\"{s}\": {s}}}", .{ name, value_json });
+    defer std.testing.allocator.free(json);
+    errdefer std.debug.print("settings {s} in layer {t}\n", .{ json, layer });
+    try std.testing.expectEqual(accepted, try settingsTextAcceptedForTest(layer, json));
+}
+
+test "the settings list gives the types, values, and bounds the settings parser accepts" {
+    const alloc = std.testing.allocator;
+    for (settings_keys.keys) |key| {
+        // fx reads these elsewhere or not at all: one workspace's own keys,
+        // the workspace map, retired keys, and `$schema`, which editors read.
+        if (key.workspace_only or key.kind == .workspaces or key.where == .retired or key.where == .editor) continue;
+        const layer: SettingsLayer = if (key.where == .project_safe) .project else .profile;
+        const wrong = switch (key.kind) {
+            .string, .string_or_null => try alloc.dupe(u8, "5"),
+            .switches => try alloc.print("{{\"{s}\": \"wrong\"}}", .{key.children[0]}),
+            .refused => try alloc.dupe(u8, "true"),
+            else => try alloc.dupe(u8, "\"wrong\""),
+        };
+        defer alloc.free(wrong);
+        try expectSettingForTest(layer, key.name, wrong, false);
+        // And a value of the listed kind is accepted, so a key listed as the
+        // wrong kind fails one of the two.
+        if (key.kind != .refused) {
+            const right = switch (key.kind) {
+                .boolean => try alloc.dupe(u8, "true"),
+                .integer => try alloc.print("{d}", .{key.minimum orelse 0}),
+                .string => try alloc.print("\"{s}\"", .{if (key.values.len > 0) key.values[0] else "dark"}),
+                .string_or_null => try alloc.dupe(u8, "\"auto\""),
+                .strings => try alloc.dupe(u8, "[]"),
+                .switches => try alloc.print("{{\"{s}\": true}}", .{key.children[0]}),
+                else => try alloc.dupe(u8, "{}"),
+            };
+            defer alloc.free(right);
+            try expectSettingForTest(layer, key.name, right, true);
+        }
+        // A project file that sets a profile key is ignored, not refused.
+        if (key.where == .profile) try expectSettingForTest(.project, key.name, wrong, true);
+
+        for (key.values) |value| {
+            const json = try alloc.print("\"{s}\"", .{value});
+            defer alloc.free(json);
+            try expectSettingForTest(layer, key.name, json, true);
+        }
+        if (key.minimum) |minimum| {
+            const at = try alloc.print("{d}", .{minimum});
+            defer alloc.free(at);
+            const below = try alloc.print("{d}", .{minimum - 1});
+            defer alloc.free(below);
+            try expectSettingForTest(layer, key.name, at, true);
+            try expectSettingForTest(layer, key.name, below, false);
+        }
+        if (key.maximum) |maximum| {
+            const at = try alloc.print("{d}", .{maximum});
+            defer alloc.free(at);
+            const above = try alloc.print("{d}", .{maximum + 1});
+            defer alloc.free(above);
+            try expectSettingForTest(layer, key.name, at, true);
+            try expectSettingForTest(layer, key.name, above, false);
+        }
+        if (key.max_items) |max_items| {
+            var items: std.Io.Writer.Allocating = .init(alloc);
+            defer items.deinit();
+            try items.writer.writeAll("[\"slug-0\"");
+            for (1..max_items) |index| try items.writer.print(", \"slug-{d}\"", .{index});
+            const full = try alloc.print("{s}]", .{items.written()});
+            defer alloc.free(full);
+            const over = try alloc.print("{s}, \"slug-{d}\"]", .{ items.written(), max_items });
+            defer alloc.free(over);
+            try expectSettingForTest(layer, key.name, full, true);
+            try expectSettingForTest(layer, key.name, over, false);
+        }
+    }
+    try expectSettingForTest(.profile, "effort", "null", true);
+}
+
+test "the settings list names every value the settings enums accept" {
+    const listed = struct {
+        fn has(name: []const u8, value: []const u8) bool {
+            for (settings_keys.find(name).?.values) |listed_value| {
+                if (std.mem.eql(u8, listed_value, value)) return true;
+            }
+            return false;
+        }
+    };
+    for (std.meta.tags(types.PermissionMode)) |mode| try std.testing.expect(listed.has("permission_mode", mode.label()));
+    for (std.meta.tags(update_target.Channel)) |channel| try std.testing.expect(listed.has("update_channel", channel.label()));
+    for (std.meta.tags(types.ToolChoice)) |choice| {
+        if (types.ToolChoice.parse(@tagName(choice)) != null) try std.testing.expect(listed.has("first_call_tool_choice", @tagName(choice)));
+    }
+    for (std.meta.tags(types.CredentialSource)) |source| {
+        if (types.parseCredentialSource(@tagName(source)) != null) try std.testing.expect(listed.has("credential_source", @tagName(source)));
     }
 }

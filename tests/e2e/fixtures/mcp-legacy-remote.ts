@@ -26,8 +26,11 @@ type StreamableMode =
   | "mixed_delimiters"
   | "unsafe_resume_id"
   | "resume"
+  | "oversized_resumable"
   | "poll"
   | "hold_open_call"
+  | "hold_initialize"
+  | "hold_initialized"
   | "stall_call"
   | "expire_session"
   | "elicitation_form"
@@ -246,6 +249,11 @@ export function startLegacyStreamableHttpFixture(
             { headers: { "content-type": "text/event-stream" } },
           );
         }
+        // Resuming the oversized answer's stream gets the same answer again.
+        if (mode === "oversized_resumable") {
+          if (headers["last-event-id"] === undefined) return new Response(null, { status: 405 });
+          return sseResponse([{ id: "call-event-2", data: oversizedCallResponse(resumableCallId!) }]);
+        }
         return sseResponse([
           {
             id: `resume-${resumeCalls}`,
@@ -292,6 +300,25 @@ export function startLegacyStreamableHttpFixture(
         return new Response(null, { status: 404 });
       }
       if (message!.method === "notifications/initialized") {
+        // A stream that stays connected but never ends: everything after
+        // initialized waits for its answer. The comments keep Bun from
+        // closing it after 10 s idle.
+        if (mode === "hold_initialized") {
+          let keepAlive: ReturnType<typeof setInterval> | undefined;
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                const comment = new TextEncoder().encode(": waiting\n\n");
+                controller.enqueue(comment);
+                keepAlive = setInterval(() => controller.enqueue(comment), 5_000);
+              },
+              cancel() {
+                clearInterval(keepAlive);
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }
         return new Response(null, { status: 202 });
       }
       if (message!.method === "notifications/cancelled") {
@@ -300,6 +327,24 @@ export function startLegacyStreamableHttpFixture(
       }
       if (message!.method === "initialize") {
         initializeCalls += 1;
+        // A stream that stays connected but never brings the answer. The
+        // comments keep Bun from closing it after 10 s idle.
+        if (mode === "hold_initialize") {
+          let keepAlive: ReturnType<typeof setInterval> | undefined;
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                const comment = new TextEncoder().encode(": waiting\n\n");
+                controller.enqueue(comment);
+                keepAlive = setInterval(() => controller.enqueue(comment), 3_000);
+              },
+              cancel() {
+                clearInterval(keepAlive);
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        }
         let sessionId: string | null = null;
         if (usesSession) {
           sessionId = mode === "expire_session"
@@ -542,6 +587,22 @@ export function startLegacyStreamableHttpFixture(
                 },
               },
             },
+          ]);
+        }
+        // An event id first, so the stream could be resumed, then an answer
+        // over fx's 16 MiB message limit.
+        if (mode === "oversized_resumable") {
+          resumableCallId = message!.id;
+          return sseResponse([
+            {
+              id: "call-event-1",
+              data: {
+                jsonrpc: "2.0",
+                method: "notifications/progress",
+                params: { progressToken: message!.id, progress: 1, total: 2 },
+              },
+            },
+            { id: "call-event-2", data: oversizedCallResponse(message!.id!) },
           ]);
         }
         if (mode === "poll") {
@@ -906,6 +967,11 @@ function toolCallResponse(id: number, text: string) {
       }],
     },
   };
+}
+
+/** A tools/call answer over fx's 16 MiB message limit. */
+function oversizedCallResponse(id: number) {
+  return toolCallResponse(id, "x".repeat(17 * 1024 * 1024));
 }
 
 function sseResponse(

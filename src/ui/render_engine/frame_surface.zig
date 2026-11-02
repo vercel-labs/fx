@@ -20,14 +20,6 @@ pub const FrameCell = struct {
     owner: paint_plan.CellOwner,
 };
 
-pub const SurfaceHyperlink = struct {
-    uri: []u8,
-
-    pub fn deinit(self: *SurfaceHyperlink, alloc: Allocator) void {
-        alloc.free(self.uri);
-    }
-};
-
 pub const OwnerWritePolicy = enum {
     same_owner,
     activity_over_transcript,
@@ -118,7 +110,7 @@ pub const FrameSurface = struct {
     rows: u16,
     cols: u16,
     cells: []FrameCell,
-    hyperlinks: std.ArrayList(SurfaceHyperlink) = .empty,
+    hyperlinks: std.ArrayList(vt_emulator.HyperlinkResource) = .empty,
     combining_suffixes: std.ArrayList([]u8) = .empty,
     plan: paint_plan.PaintPlan,
     cursor_target: ?paint_plan.FrameCursorTarget,
@@ -207,19 +199,25 @@ pub const FrameSurface = struct {
         return self.hyperlinks.items[id - 1].uri;
     }
 
+    pub fn hyperlinkParams(self: FrameSurface, id: u32) ?[]const u8 {
+        if (id == 0) return null;
+        if (id - 1 >= self.hyperlinks.items.len) return null;
+        return self.hyperlinks.items[id - 1].params;
+    }
+
     pub fn combiningSuffix(self: FrameSurface, id: u32) ?[]const u8 {
         if (id == 0) return null;
         if (id - 1 >= self.combining_suffixes.items.len) return null;
         return self.combining_suffixes.items[id - 1];
     }
 
-    pub fn internHyperlink(self: *FrameSurface, uri: []const u8) FrameSurfaceError!u32 {
+    fn internHyperlink(self: *FrameSurface, uri: []const u8, params: []const u8) FrameSurfaceError!u32 {
         for (self.hyperlinks.items, 0..) |link, idx| {
-            if (std.mem.eql(u8, link.uri, uri)) return @intCast(idx + 1);
+            if (link.eql(uri, params)) return @intCast(idx + 1);
         }
-        const dup = try self.alloc.dupe(u8, uri);
-        errdefer self.alloc.free(dup);
-        try self.hyperlinks.append(self.alloc, .{ .uri = dup });
+        const link = try vt_emulator.HyperlinkResource.init(self.alloc, uri, params);
+        errdefer link.deinit(self.alloc);
+        try self.hyperlinks.append(self.alloc, link);
         return @intCast(self.hyperlinks.items.len);
     }
 
@@ -320,8 +318,9 @@ pub const FrameSurface = struct {
 
         try target.hyperlink_pool.ensureTotalCapacity(alloc, self.hyperlinks.items.len);
         for (self.hyperlinks.items) |link| {
-            const dup = try alloc.dupe(u8, link.uri);
+            const dup = try link.clone(alloc);
             target.hyperlink_pool.appendAssumeCapacity(dup);
+            target.hyperlink_pool_bytes += dup.uri.len + dup.params.len;
         }
 
         try target.combining_suffix_pool.ensureTotalCapacity(alloc, self.combining_suffixes.items.len);
@@ -398,9 +397,9 @@ pub const FrameSurface = struct {
     fn importHyperlinkPool(self: *FrameSurface, grid: vt_emulator.Grid) FrameSurfaceError!void {
         std.debug.assert(self.hyperlinks.items.len == 0);
         try self.hyperlinks.ensureTotalCapacity(self.alloc, grid.hyperlink_pool.items.len);
-        for (grid.hyperlink_pool.items) |uri| {
-            const dup = try self.alloc.dupe(u8, uri);
-            self.hyperlinks.appendAssumeCapacity(.{ .uri = dup });
+        for (grid.hyperlink_pool.items) |link| {
+            const dup = try link.clone(self.alloc);
+            self.hyperlinks.appendAssumeCapacity(dup);
         }
     }
 
@@ -424,7 +423,13 @@ pub const FrameSurface = struct {
                 return error.MissingHyperlinkResource;
             const imported_uri = self.hyperlinkUrl(cell.style.hyperlink_id) orelse
                 return error.MissingHyperlinkResource;
-            if (!std.mem.eql(u8, source_uri, imported_uri)) {
+            const source_params = grid.hyperlinkParams(cell.style.hyperlink_id) orelse
+                return error.MissingHyperlinkResource;
+            const imported_params = self.hyperlinkParams(cell.style.hyperlink_id) orelse
+                return error.MissingHyperlinkResource;
+            if (!std.mem.eql(u8, source_uri, imported_uri) or
+                !std.mem.eql(u8, source_params, imported_params))
+            {
                 return error.MissingHyperlinkResource;
             }
         }
@@ -455,8 +460,9 @@ pub const FrameSurface = struct {
     fn remapStyleFromGrid(self: *FrameSurface, grid: vt_emulator.Grid, style: vt_emulator.Style) FrameSurfaceError!vt_emulator.Style {
         if (style.hyperlink_id == 0) return style;
         const uri = grid.hyperlinkUrl(style.hyperlink_id) orelse return error.MissingHyperlinkResource;
+        const params = grid.hyperlinkParams(style.hyperlink_id) orelse return error.MissingHyperlinkResource;
         var remapped = style;
-        remapped.hyperlink_id = try self.internHyperlink(uri);
+        remapped.hyperlink_id = try self.internHyperlink(uri, params);
         return remapped;
     }
 
@@ -782,7 +788,7 @@ test "frame surface traces owner violations without cell payloads" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -1015,6 +1021,31 @@ test "frame surface remaps OSC 8 hyperlink ids from temporary grid" {
     defer target.deinit();
     const target_cell = target.cellAt(2, 1).?;
     try std.testing.expectEqualStrings("https://example.com", target.hyperlinkUrl(target_cell.style.hyperlink_id).?);
+}
+
+test "frame surface retains one wrapped link identity and distinct same-URI links" {
+    const alloc = std.testing.allocator;
+    var shadow = try shadowGrid(alloc, 16, 6);
+    defer shadow.deinit();
+    var plan = testPlan(.transcript);
+    plan.layout.cols = 16;
+    var surface = try FrameSurface.initFromShadow(alloc, plan, shadow);
+    defer surface.deinit();
+
+    const first = "\x1b]8;id=fx-1;https://example.com\x1b\\";
+    const second = "\x1b]8;id=fx-2;https://example.com\x1b\\";
+    const close = "\x1b]8;;\x1b\\";
+    _ = try surface.writeAnsiBand(2, 2, first ++ "first" ++ close ++
+        "\x1b[2;1H" ++ first ++ "second" ++ close, .transcript, .same_owner);
+    _ = try surface.writeAnsiBand(4, 1, second ++ "third" ++ close, .transcript, .same_owner);
+
+    var target = try surface.copyToTargetGrid(alloc);
+    defer target.deinit();
+    const first_id = target.cellAt(2, 1).?.style.hyperlink_id;
+    try std.testing.expectEqual(first_id, target.cellAt(3, 1).?.style.hyperlink_id);
+    try std.testing.expect(first_id != target.cellAt(4, 1).?.style.hyperlink_id);
+    try std.testing.expectEqualStrings("id=fx-1", target.hyperlinkParams(first_id).?);
+    try std.testing.expectEqualStrings("id=fx-2", target.hyperlinkParams(target.cellAt(4, 1).?.style.hyperlink_id).?);
 }
 
 test "frame surface preserves authoritative hyperlink ids and unused pool slots" {

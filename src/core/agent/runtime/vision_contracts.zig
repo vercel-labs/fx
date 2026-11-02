@@ -1,9 +1,11 @@
 const std = @import("std");
+const testing_allocator = @import("../../shared/testing_allocator.zig");
 const stream_provider = @import("../stream_provider.zig");
 const model_provider = @import("../../config/model_provider.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
 const types = @import("../../shared/types.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
+const text_utils = @import("../../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -223,9 +225,10 @@ pub fn parse_vision_request(
 
     if (parsed.value != .object) return error.InvalidVisionRequest;
     const object = parsed.value.object;
-    const image_ids_value = object.get("image_ids");
-    const paths_value = object.get("paths");
-    if (object.count() != 2 or (image_ids_value == null) == (paths_value == null)) {
+    var image_ids_value = object.get("image_ids");
+    var paths_value = object.get("paths");
+    const unused_sources = dropUnusedSource(&image_ids_value, &paths_value);
+    if (object.count() - unused_sources != 2 or (image_ids_value == null) == (paths_value == null)) {
         return error.InvalidVisionRequest;
     }
 
@@ -252,7 +255,7 @@ pub fn parse_vision_request(
         for (value.array.items, 0..) |item, index| {
             if (item != .string or
                 std.mem.trim(u8, item.string, " \t\r\n").len == 0 or
-                item.string.len > std.fs.max_path_bytes)
+                item.string.len > std.Io.Dir.max_path_bytes)
             {
                 return error.InvalidImagePath;
             }
@@ -274,6 +277,31 @@ pub fn parse_vision_request(
     return .{
         .source = source,
         .focus = try alloc.dupe(u8, focus_value.string),
+    };
+}
+
+/// Models that fill every schema field send the unused source as null or [].
+/// Next to a real source it names nothing, so this reads it as absent and
+/// returns how many fields it dropped: 1 when it dropped one, otherwise 0.
+fn dropUnusedSource(image_ids: *?std.json.Value, paths: *?std.json.Value) usize {
+    const ids_value = image_ids.* orelse return 0;
+    const paths_value = paths.* orelse return 0;
+    if (isUnusedSource(ids_value)) {
+        image_ids.* = null;
+        return 1;
+    }
+    if (isUnusedSource(paths_value)) {
+        paths.* = null;
+        return 1;
+    }
+    return 0;
+}
+
+fn isUnusedSource(value: std.json.Value) bool {
+    return switch (value) {
+        .null => true,
+        .array => |items| items.items.len == 0,
+        else => false,
     };
 }
 
@@ -481,7 +509,7 @@ pub noinline fn project_text_only_messages(
     projected[current_user_message_index].content = if (content.len == 0)
         try alloc.dupe(u8, references)
     else
-        try std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ content, references });
+        try alloc.print("{s}\n\n{s}", .{ content, references });
     return projected;
 }
 
@@ -1015,11 +1043,11 @@ fn fuzz_vision_json(_: void, smith: *std.testing.Smith) !void {
 
 test "Vision JSON parsers tolerate arbitrary bounded bytes" {
     try std.testing.fuzz({}, fuzz_vision_json, .{
-        .corpus = &.{
+        .corpus = &(@import("fuzz_seed").slices(.{
             "{\"image_ids\":[1],\"focus\":\"inspect\"}",
             "{\"images\":[{\"image_id\":1,\"status\":\"failed\",\"error\":\"vision_unavailable\"}]}",
             "{",
-        },
+        }) ++ @import("fuzz_corpus").vision_json.*),
     });
 }
 
@@ -1080,7 +1108,7 @@ test "Vision request parsing enforces nonempty ids and focus bounds" {
         error.FocusTooLong,
         parse_vision_request(
             std.testing.allocator,
-            "{\"image_ids\":[1],\"focus\":\"" ++ ("x" ** (max_focus_bytes + 1)) ++ "\"}",
+            "{\"image_ids\":[1],\"focus\":\"" ++ text_utils.repeat("x", max_focus_bytes + 1) ++ "\"}",
         ),
     );
 }
@@ -1101,6 +1129,27 @@ test "Vision request parsing requires exactly one nonempty source" {
     try std.testing.expectError(
         error.InvalidVisionRequest,
         parse_vision_request(std.testing.allocator, "{\"image_ids\":[1],\"paths\":[\"a.png\"],\"focus\":\"inspect\"}"),
+    );
+}
+
+test "Vision request parsing reads an empty unused source as absent" {
+    for ([_][]const u8{
+        "{\"image_ids\":[],\"paths\":[\"a.png\"],\"focus\":\"inspect\"}",
+        "{\"image_ids\":null,\"paths\":[\"a.png\"],\"focus\":\"inspect\"}",
+    }) |json| {
+        const request = try parse_vision_request(std.testing.allocator, json);
+        defer request.deinit(std.testing.allocator);
+        const paths = request.paths().?;
+        try std.testing.expectEqual(@as(usize, 1), paths.len);
+        try std.testing.expectEqualStrings("a.png", paths[0]);
+    }
+    const ids = try parse_vision_request(std.testing.allocator, "{\"image_ids\":[2],\"paths\":[],\"focus\":\"inspect\"}");
+    defer ids.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(usize, &.{2}, ids.image_ids().?);
+    // With no real source, the empty one still reports itself.
+    try std.testing.expectError(
+        error.EmptyPaths,
+        parse_vision_request(std.testing.allocator, "{\"image_ids\":[],\"paths\":[],\"focus\":\"inspect\"}"),
     );
 }
 
@@ -1160,7 +1209,7 @@ test "Vision provider parsing accepts forty evidence items within the total byte
 test "Vision provider parsing accepts one long evidence string within the total byte limit" {
     const provider_json =
         "{\"images\":[{\"image_id\":3,\"status\":\"ok\",\"summary\":\"long text\",\"visible_text\":[\"" ++
-        ("x" ** 5000) ++
+        text_utils.repeat("x", 5000) ++
         "\"],\"details\":[]}]}";
     const parsed = try parse_vision_provider_result(
         std.testing.allocator,
@@ -1319,17 +1368,17 @@ test "Vision provider parsing has no hidden twenty kibibyte ceiling" {
     const evidence_chunk_bytes = 4096;
     const large_provider_json =
         "{\"images\":[{\"image_id\":3,\"status\":\"ok\",\"summary\":\"ok\",\"visible_text\":[\"" ++
-        ("x" ** evidence_chunk_bytes) ++
+        text_utils.repeat("x", evidence_chunk_bytes) ++
         "\",\"" ++
-        ("x" ** evidence_chunk_bytes) ++
+        text_utils.repeat("x", evidence_chunk_bytes) ++
         "\",\"" ++
-        ("x" ** evidence_chunk_bytes) ++
+        text_utils.repeat("x", evidence_chunk_bytes) ++
         "\",\"" ++
-        ("x" ** evidence_chunk_bytes) ++
+        text_utils.repeat("x", evidence_chunk_bytes) ++
         "\",\"" ++
-        ("x" ** evidence_chunk_bytes) ++
+        text_utils.repeat("x", evidence_chunk_bytes) ++
         "\",\"" ++
-        ("x" ** evidence_chunk_bytes) ++
+        text_utils.repeat("x", evidence_chunk_bytes) ++
         "\"],\"details\":[]}]}";
     try std.testing.expect(large_provider_json.len > 20 * 1024);
 
@@ -1755,7 +1804,7 @@ fn check_native_replay_projection_allocations(alloc: Allocator) !void {
 
 test "native message projection preserves selected replay and releases failed allocations" {
     try check_native_replay_projection_allocations(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_native_replay_projection_allocations, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_native_replay_projection_allocations, .{});
 }
 
 test "native message projection leaves mismatched replay to the provider adapter" {
@@ -1849,12 +1898,12 @@ test "Vision owned parsing and merge clean up every allocation failure" {
         "{\"image_ids\":[1,2],\"focus\":\"compare both images\"}",
         "{\"paths\":[\"first.png\",\"second.png\"],\"focus\":\"compare both images\"}",
     }) |request_json| {
-        var request_probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var request_probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
         const probed_request = try parse_vision_request(request_probe.allocator(), request_json);
         probed_request.deinit(request_probe.allocator());
         for (0..request_probe.alloc_index) |fail_index| {
             var failing = std.testing.FailingAllocator.init(
-                std.testing.allocator,
+                testing_allocator.no_resize,
                 .{ .fail_index = fail_index },
             );
             try std.testing.expectError(
@@ -1866,7 +1915,7 @@ test "Vision owned parsing and merge clean up every allocation failure" {
 
     const provider_json =
         "{\"images\":[{\"image_id\":1,\"status\":\"ok\",\"summary\":\"summary\",\"visible_text\":[\"visible\"],\"details\":[\"detail\"]}]}";
-    var provider_probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var provider_probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const probed_provider = try parse_vision_provider_result(
         provider_probe.allocator(),
         provider_json,
@@ -1875,7 +1924,7 @@ test "Vision owned parsing and merge clean up every allocation failure" {
     probed_provider.deinit(provider_probe.allocator());
     for (0..provider_probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
         try std.testing.expectError(
@@ -1889,7 +1938,7 @@ test "Vision owned parsing and merge clean up every allocation failure" {
     }
 
     const provider_records = [_]VisionImageResult{ test_ok_result(2), test_ok_result(1) };
-    var merge_probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var merge_probe = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const probed_merge = try merge_vision_results(
         merge_probe.allocator(),
         &.{ 1, 2 },
@@ -1898,7 +1947,7 @@ test "Vision owned parsing and merge clean up every allocation failure" {
     probed_merge.deinit(merge_probe.allocator());
     for (0..merge_probe.alloc_index) |fail_index| {
         var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
+            testing_allocator.no_resize,
             .{ .fail_index = fail_index },
         );
         try std.testing.expectError(

@@ -131,7 +131,7 @@ async function waitFor(expression, sessionId, timeoutMs = 10000) {
   let diagnostic;
   try {
     diagnostic = await command("Runtime.evaluate", {
-      expression: "window.__fxBrowserTerminalTest || null",
+      expression: "window.__fxCoreTest || window.__fxBrowserTerminalTest || null",
       returnByValue: true,
     }, sessionId);
   } catch {}
@@ -181,12 +181,22 @@ try {
     expect(modelChunks.filter((chunk) => chunk.trim()).length >= 2, "browser stream was buffered");
     expect(result.fetchCalls === 1, `expected one prompt fetch, got ${result.fetchCalls}`);
     expect(result.model === "sdk/chrome-model", `unexpected model ${result.model}`);
-    expect(JSON.stringify(result.api) === JSON.stringify(["checkpoint", "close", "prompt"]), `unexpected public API ${JSON.stringify(result.api)}`);
+    expect(JSON.stringify(result.api) === JSON.stringify(["checkpoint", "close", "followUp", "prompt", "resume", "sessionId"]), `unexpected public API ${JSON.stringify(result.api)}`);
+  });
+  await runCase("Blob prompt", "transport=mock&autorun=describe&model=sdk%2Fchrome-model&blob-prompt=1", (result) => {
+    expect(result.stopReason === "end_turn", `unexpected stop reason ${result.stopReason}`);
+    expect(result.blobSent === true, "browser Blob image was not sent as a validated file part");
+    expect(result.fetchCalls === 1, `expected one prompt fetch, got ${result.fetchCalls}`);
+  });
+  await runCase("iframe File prompt", "transport=mock&autorun=describe&model=sdk%2Fchrome-model&blob-prompt=1&blob-iframe=1", (result) => {
+    expect(result.crossRealm === true, "test File was not created in another realm");
+    expect(result.stopReason === "end_turn", `unexpected stop reason ${result.stopReason}`);
+    expect(result.blobSent === true, "iframe File was not sent as a validated file part");
   });
   await runCase("stalled cancellation", "transport=stall&autorun=wait&cancel-after=50", (result) => {
     expect(result.stopReason === "cancelled", `unexpected stop reason ${result.stopReason}`);
     expect(result.fetchAborted, "browser fetch did not receive abort");
-    expect(JSON.stringify(result.api) === JSON.stringify(["checkpoint", "close", "prompt"]), `unexpected public API ${JSON.stringify(result.api)}`);
+    expect(JSON.stringify(result.api) === JSON.stringify(["checkpoint", "close", "followUp", "prompt", "resume", "sessionId"]), `unexpected public API ${JSON.stringify(result.api)}`);
   });
   await runCase("host tool and skill", "transport=mock&autorun=use%20the%20tool&host-tool=1&host-skill=1&model=sdk%2Fchrome-model", (result) => {
     expect(result.stopReason === "end_turn", `unexpected stop reason ${result.stopReason}`);
@@ -200,6 +210,102 @@ try {
   await runCase("unsupported UI", "force-unsupported=1", (result) => {
     expect(result.state === "unsupported", `unexpected state ${result.state}`);
   });
+
+  // Exercise the public browser SDK without starting the demo's live transport.
+  {
+    const { targetId } = await command("Target.createTarget", { url: "about:blank" });
+    try {
+      const { sessionId } = await command("Target.attachToTarget", { targetId, flatten: true });
+      await command("Runtime.enable", {}, sessionId);
+      await command("Page.enable", {}, sessionId);
+      await command("Page.navigate", { url: `http://127.0.0.1:${port}/sdk/index.html?force-unsupported=1` }, sessionId);
+      await waitFor("window.__fxCoreTest?.state === 'unsupported'", sessionId);
+      const evaluated = await withTimeout(command("Runtime.evaluate", {
+        awaitPromise: true,
+        returnByValue: true,
+        expression: `(async () => {
+          const expect = ${expect.toString()};
+          const { createFxEngine } = await import('/sdk/browser.js');
+          const response = await fetch('/zig-out/bin/fx-core.wasm', { cache: 'no-store' });
+          expect(response.ok, 'local core WASM fetch failed: ' + response.status);
+          const wasm = await response.arrayBuffer();
+          const astra = 'openai/gpt-6-astra';
+          const sol = 'openai/gpt-5.6-sol';
+          const pricing = { input_cache_read: '0.000001', service_tiers: {
+            ultrafast: { input: '0.00006', output: '0.0003', input_cache_read: '0.000006' },
+          } };
+          const cases = [
+            { name: 'priced Sol true', model: sol, ultrafast: true },
+            { name: 'Astra false', model: astra, ultrafast: false },
+            { name: 'unpriced Sol rejection', model: sol, ultrafast: true, reject: true },
+          ];
+          const passed = [];
+          for (const scenario of cases) {
+            let agent;
+            let catalogFetches = 0;
+            const requests = [];
+            const fakeFetch = async (_url, init = {}) => {
+              const method = String(init.method ?? 'GET').toUpperCase();
+              if (method === 'GET') {
+                catalogFetches++;
+                return Response.json({ object: 'list', data: [
+                  { id: astra, type: 'language', owned_by: 'openai', pricing },
+                  { id: sol, type: 'language', owned_by: 'openai', ...(scenario.reject ? {} : { pricing }) },
+                ] });
+              }
+              expect(method === 'POST', scenario.name + ': unexpected method ' + method);
+              requests.push({ body: JSON.parse(new TextDecoder().decode(init.body)),
+                model: new Headers(init.headers).get('ai-language-model-id') });
+              const frames = [
+                { type: 'text-delta', delta: 'ok' },
+                { type: 'finish', finishReason: { unified: 'stop', raw: 'stop' },
+                  usage: { inputTokens: { total: 3 }, outputTokens: { total: 2 } },
+                  providerMetadata: { gateway: { serviceTier: 'ultrafast', cost: '0.00036' } } },
+              ];
+              return new Response(frames.map(frame => 'data: ' + JSON.stringify(frame) + '\\n\\n').join('') + 'data: [DONE]\\n\\n',
+                { headers: { 'content-type': 'text/event-stream' } });
+            };
+            try {
+              try {
+                agent = await createFxEngine({ wasm, apiKey: 'browser-ultrafast-test-key',
+                  model: { id: scenario.model, ultrafast: scenario.ultrafast }, fetch: fakeFetch });
+              } catch (error) {
+                if (!scenario.reject) throw error;
+                expect(error.code === 'LIBFX_MODEL_UNSUPPORTED_ULTRAFAST', 'unexpected rejection code: ' + error.code);
+                expect(error.model === sol && error.capability === 'ultrafast', 'rejection omitted Sol capability');
+                expect(/Ultrafast mode is not available/.test(error.message), 'unexpected rejection: ' + error.message);
+                expect(catalogFetches === 1 && requests.length === 0, 'unpriced Sol sent a completion POST');
+                passed.push(scenario.name);
+                continue;
+              }
+              expect(!scenario.reject, 'unpriced Sol creation unexpectedly succeeded');
+              expect(catalogFetches === (scenario.ultrafast ? 1 : 0), scenario.name + ': wrong creation fetch count');
+              const turn = agent.prompt('say ok');
+              let text = '';
+              for await (const event of turn) if (event.type === 'text_delta') text += event.delta;
+              expect((await turn.result).stopReason === 'end_turn' && text === 'ok', scenario.name + ': unexpected reply ' + text);
+              expect(requests.length === 1 && requests[0].model === scenario.model, scenario.name + ': wrong completion model/count');
+              const options = requests[0].body.providerOptions;
+              expect(options?.openai?.serviceTier === (scenario.ultrafast ? 'ultrafast' : undefined), scenario.name + ': wrong service tier');
+              expect(JSON.stringify(options?.gateway?.only) === (scenario.ultrafast ? '["openai"]' : undefined), scenario.name + ': wrong provider route');
+              expect(options?.gateway?.speed === undefined && options?.gateway?.fast === undefined, scenario.name + ': Fast leaked');
+              passed.push(scenario.name);
+            } finally {
+              await agent?.close();
+            }
+          }
+          return passed;
+        })()`,
+      }, sessionId), "browser Ultrafast case timed out", 15000);
+      expect(!evaluated.exceptionDetails, evaluated.result?.description || evaluated.exceptionDetails?.text || "browser Ultrafast exception");
+      expect(JSON.stringify(evaluated.result.value) === JSON.stringify([
+        "priced Sol true", "Astra false", "unpriced Sol rejection",
+      ]), `unexpected browser Ultrafast cases ${JSON.stringify(evaluated.result.value)}`);
+      console.log("browser core ultrafast routing and eligibility passed");
+    } finally {
+      await command("Target.closeTarget", { targetId });
+    }
+  }
 
   const { targetId } = await command("Target.createTarget", { url: "about:blank" });
   const { sessionId } = await command("Target.attachToTarget", { targetId, flatten: true });

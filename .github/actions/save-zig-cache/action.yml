@@ -1,0 +1,23 @@
+name: Save Zig cache
+description: >-
+  Save the Zig cache restored by the setup-zig action. Saves only on main and
+  only when the exact key was missing, so the cache gets a new entry when the
+  Zig version or build files change instead of on every run.
+
+inputs:
+  cache-key:
+    description: The cache-key output of the setup-zig action
+    required: true
+  cache-hit:
+    description: The cache-hit output of the setup-zig action
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Save Zig cache
+      if: github.ref == 'refs/heads/main' && inputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ github.workspace }}/.zig-cache
+        key: ${{ inputs.cache-key }}

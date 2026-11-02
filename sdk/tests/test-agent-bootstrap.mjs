@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../node.js";
+import { createFxEngine } from "../node.js";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
@@ -41,7 +41,7 @@ if (!child) {
 
   for (let index = 0; index < attempts; index++) {
     await assert.rejects(
-      createFxAgent({ ...options, checkpoint: new Uint8Array([1, 2, 3]) }),
+      createFxEngine({ ...options, checkpoint: new Uint8Array([1, 2, 3]) }),
       (error) => {
         assert.match(error.message, /Invalid or non-fresh libfx checkpoint/);
         return true;
@@ -49,7 +49,7 @@ if (!child) {
     );
   }
 
-  const agent = await createFxAgent(options);
+  const agent = await createFxEngine(options);
   await agent.close();
   console.log(`${backend} failed bootstrap cleanup passed`);
 }

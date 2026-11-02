@@ -37,7 +37,9 @@ def main():
     home, workspace = root / "home", root / "workspace"
     (home / ".fx").mkdir(parents=True, mode=0o700)
     workspace.mkdir()
-    (home / ".fx/settings.json").write_text(json.dumps({"provider": "gateway", "model": "openai/gpt-5.5", "max_agent_steps": 0}))
+    # Background title generation would consume one fixture response and shift
+    # the step accounting, so the fixture profile keeps titles off.
+    (home / ".fx/settings.json").write_text(json.dumps({"provider": "gateway", "model": "openai/gpt-5.5", "max_agent_steps": 0, "session_titles": False}))
     count = 0
     request_bytes = 0
 
@@ -78,7 +80,7 @@ def main():
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     env = {k: v for k, v in os.environ.items() if not k.startswith(("FX_", "OPENAI_", "GROK_", "XAI_", "AI_GATEWAY_", "VERCEL_"))}
     base_url = f"http://127.0.0.1:{server.server_port}"
-    env.update(HOME=str(home), AI_GATEWAY_API_KEY="fixture-key", FX_GATEWAY_BASE_URL=base_url, FX_E2E_GATEWAY_CHAT_URL=base_url + "/chat", FX_E2E_GATEWAY_MODELS_URL=base_url + "/coding-agent/v1/models", FX_MODEL="openai/gpt-5.5", FX_MAX_AGENT_STEPS="0")
+    env.update(HOME=str(home), AI_GATEWAY_API_KEY="fixture-key", FX_GATEWAY_BASE_URL=base_url, FX_TEST_GATEWAY_CHAT_URL=base_url + "/chat", FX_TEST_GATEWAY_MODELS_URL=base_url + "/coding-agent/v1/models", FX_MODEL="openai/gpt-5.5", FX_MAX_AGENT_STEPS="0")
 
     def limits():
         resource.setrlimit(resource.RLIMIT_AS, (args.limit_mib * 1024**2,) * 2)
@@ -102,35 +104,17 @@ def main():
             time.sleep(0.1)
         code = proc.wait()
     server.shutdown()
-    retained = {"execution_json_bytes": 0, "tool_output_bytes": 0, "tool_steps": 0, "conversation_json_bytes": 0}
-
-    def measure(value):
-        if isinstance(value, dict):
-            if isinstance(value.get("tool_steps"), list):
-                size = len(json.dumps(value, separators=(",", ":")).encode())
-                if size > retained["execution_json_bytes"]:
-                    retained.update(execution_json_bytes=size, tool_steps=len(value["tool_steps"]), tool_output_bytes=sum(result.get("output_bytes", 0) for step in value["tool_steps"] for result in step.get("tool_results", [])))
-            for child in value.values():
-                measure(child)
-        elif isinstance(value, list):
-            for child in value:
-                measure(child)
-
-    for checkpoint in list((home / ".fx/sessions").glob("*/checkpoint.json")) + list((home / ".fx/sessions").glob("*/recovery.json")):
-        measure(json.loads(checkpoint.read_text()))
-    for event_log in (home / ".fx/sessions").glob("*/events.jsonl"):
-        retained["conversation_json_bytes"] += event_log.stat().st_size
+    # What the session kept: its log and blobs, and each step's tool result.
+    retained = {"session_bytes": 0, "tool_output_bytes": 0, "tool_steps": 0}
+    for log in (home / ".fx/sessions/v2").glob("*/log.jsonl"):
+        retained["session_bytes"] += sum(path.stat().st_size for path in log.parent.rglob("*") if path.is_file())
         result_count = 0
         output_bytes = 0
-        for line in event_log.open():
+        for line in log.open():
             value = json.loads(line)
-            measure(value)
-            result = value.get("event", {}).get("tool_result")
-            if isinstance(result, dict):
+            if value.get("kind") == "item" and value.get("type") == "tool_result":
                 result_count += 1
-                output_bytes += result.get("output_bytes", 0)
-        # This workload has one read per step. Completed v4 turns use normalized
-        # conversation events instead of an embedded execution snapshot.
+                output_bytes += value["data"].get("output_bytes", 0)
         if result_count > retained["tool_steps"]:
             retained.update(tool_steps=result_count, tool_output_bytes=output_bytes)
     try:

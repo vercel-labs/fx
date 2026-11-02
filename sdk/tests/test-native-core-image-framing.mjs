@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../node.js";
+import { createFxEngine } from "../node.js";
 
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const addon = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/lib/libfx.node"));
@@ -26,7 +26,7 @@ const sse = (...events) => new Response(
 );
 
 try {
-  agent = await createFxAgent({
+  agent = await createFxEngine({
     backend: "native",
     nativeAddon: addon,
     home,
@@ -51,15 +51,32 @@ try {
         { type: "tool-call", toolCallId: "images1", toolName: "screenshots", input: {} },
         { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
       );
+      if (requests === 3) {
+        // The bridge carries at most 8 MiB, so this request left out the
+        // older image instead of failing, with a note, and kept the newer.
+        assert.ok(init.body.length <= 8 * 1024 * 1024 - 144 * 1024);
+        const body = Buffer.from(init.body).toString("utf8");
+        assert.equal(body.split(data).length - 1, 1, "only the newer image stays");
+        assert.match(body, /not sent to keep the request under the provider's size limit/);
+        return sse(
+          { type: "text-delta", delta: "read the text" },
+          { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
+        );
+      }
       assert.equal(requests, 2);
       assert.ok(init.body.length < 8 * 1024 * 1024);
       assert.ok(Buffer.from(init.body).toString("base64").length > 8 * 1024 * 1024);
       const payload = JSON.parse(Buffer.from(init.body).toString("utf8"));
-      const received = payload.prompt.flatMap((message) => message.content ?? [])
+      const resultValues = payload.prompt.flatMap((message) => message.content ?? [])
         .filter((part) => part.type === "tool-result")
-        .flatMap((part) => part.output.value ?? [])
-        .filter((part) => part.type === "image-data");
-      assert.deepEqual(received, images.map(() => ({ type: "image-data", data, mediaType: "image/png" })));
+        .flatMap((part) => part.output.value ?? []);
+      assert.ok(resultValues.length > 0);
+      assert.ok(resultValues.every((part) => part.type === "text"));
+      const received = payload.prompt
+        .filter((message) => message.role === "user" && Array.isArray(message.content))
+        .flatMap((message) => message.content)
+        .filter((part) => part.type === "file");
+      assert.deepEqual(received, images.map(() => ({ type: "file", mediaType: "image/png", data: { type: "data", data } })));
       return sse(
         { type: "text-delta", delta: "received images" },
         { type: "finish", finishReason: { unified: "stop", raw: "stop" } },
@@ -71,10 +88,14 @@ try {
   assert.equal(toolCalls, 1);
   assert.equal(requests, 2);
 
-  // The retained images plus this prompt exceed the unchanged raw request budget.
-  await assert.rejects(agent.prompt("x".repeat(2 * 1024 * 1024)).result, /HostStreamBackpressure/);
-  assert.equal(requests, 2, "an oversized raw request must not reach host fetch");
-  console.log("native image framing passed: accepted images survive base64 framing; oversized raw requests stay bounded");
+  // The retained images plus this prompt exceed what the bridge carries: the
+  // oldest images leave the request, which reaches host fetch within it.
+  assert.equal((await agent.prompt("x".repeat(2 * 1024 * 1024)).result).stopReason, "end_turn");
+  assert.equal(requests, 3);
+  // A request past the bridge even without its images stays bounded.
+  await assert.rejects(agent.prompt("z".repeat(6.5 * 1024 * 1024)).result, /HostStreamBackpressure/);
+  assert.equal(requests, 3, "an oversized request must not reach host fetch");
+  console.log("native image framing passed: accepted images survive base64 framing; requests past the bridge leave out their oldest images");
 } finally {
   clearTimeout(timer);
   await agent?.close();

@@ -17,11 +17,11 @@ export const REPO_ROOT = resolve(import.meta.dirname, "../..");
 
 export function providerVersionTestEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
   const result = { ...env };
-  if (env.FX_E2E_OPENAI_CODEX_MODELS_URL && !env.FX_E2E_CODEX_VERSION_URL && !env.FX_E2E_CODEX_CLIENT_VERSION) {
-    result.FX_E2E_CODEX_CLIENT_VERSION = "0.153.0";
+  if (env.FX_TEST_OPENAI_CODEX_MODELS_URL && !env.FX_TEST_CODEX_VERSION_URL && !env.FX_TEST_CODEX_CLIENT_VERSION) {
+    result.FX_TEST_CODEX_CLIENT_VERSION = "0.153.0";
   }
-  if ((env.FX_E2E_XAI_GROK_MODELS_URL || env.FX_E2E_XAI_GROK_RESPONSES_URL) && !env.FX_E2E_GROK_VERSION_URL && !env.FX_E2E_GROK_CLIENT_VERSION) {
-    result.FX_E2E_GROK_CLIENT_VERSION = "1.0.6";
+  if ((env.FX_TEST_XAI_GROK_MODELS_URL || env.FX_TEST_XAI_GROK_RESPONSES_URL) && !env.FX_TEST_GROK_VERSION_URL && !env.FX_TEST_GROK_CLIENT_VERSION) {
+    result.FX_TEST_GROK_CLIENT_VERSION = "1.0.6";
   }
   return result;
 }
@@ -104,6 +104,10 @@ export interface EvalResult {
 }
 
 export interface EvalOptions {
+  /**
+   * Wall-clock budget for the whole run. fx is stopped when it runs out, and
+   * the same value is fx's default limit for shell commands.
+   */
   timeoutSec?: number;
   cwd?: string;
   model?: string;
@@ -168,6 +172,19 @@ export function buildEvalProcessEnv(
   };
 }
 
+export function buildEvalArgs(prompt: string, timeoutSec: number): string[] {
+  // fx reads --timeout in seconds.
+  return [
+    "ask",
+    "--auto",
+    "--json",
+    "--no-save",
+    "--timeout",
+    String(timeoutSec),
+    prompt,
+  ];
+}
+
 export async function runEval(
   prompt: string,
   opts: EvalOptions = {},
@@ -188,20 +205,13 @@ export async function runEval(
       );
     }
 
-    const args = [
-      "ask",
-      "--auto",
-      "--json",
-      "--no-save",
-      "--timeout",
-      String(timeoutSec * 1000),
-      prompt,
-    ];
+    const args = buildEvalArgs(prompt, timeoutSec);
 
     const result = await new Promise<{
       stdout: string;
       stderr: string;
       code: number | null;
+      timedOut: boolean;
     }>((resolvePromise) => {
       const env = buildEvalProcessEnv(home, model);
       const child = nodeSpawn(FX_BIN, args, {
@@ -216,14 +226,31 @@ export async function runEval(
       child.stderr.on("data", (d: Buffer) => stderrBufs.push(d));
       child.stdin.end();
 
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        // fx may have exited already with its close event still pending.
+        timedOut =
+          child.exitCode === null &&
+          child.signalCode === null &&
+          child.kill("SIGKILL");
+      }, timeoutSec * 1000);
+
       child.on("close", (code: number | null) => {
+        clearTimeout(timer);
         resolvePromise({
           stdout: Buffer.concat(stdoutBufs).toString(),
           stderr: Buffer.concat(stderrBufs).toString(),
           code,
+          timedOut,
         });
       });
     });
+
+    if (result.timedOut) {
+      throw new Error(
+        `fx ask did not finish within ${timeoutSec}s\nstderr: ${result.stderr.slice(-1000)}`,
+      );
+    }
 
     let json: HeadlessResult;
     try {

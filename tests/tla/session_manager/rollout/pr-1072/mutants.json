@@ -1,0 +1,16 @@
+[
+  {
+    "module": "PR1072Ask",
+    "description": "A no-save turn appends a session piece",
+    "old": "/\\ phase = \"turn\" /\\ saving /\\ Len(disk) < MaxPieces",
+    "new": "/\\ phase = \"turn\" /\\ Len(disk) < MaxPieces",
+    "invariant": "NoSaveNoDisk"
+  },
+  {
+    "module": "PR1072Ask",
+    "description": "Charge before a usage marker",
+    "old": "/\\ phase = \"turn\" /\\ marker /\\ charged < MaxPieces",
+    "new": "/\\ phase = \"turn\" /\\ charged < MaxPieces",
+    "invariant": "NoSilentUsageGap"
+  }
+]

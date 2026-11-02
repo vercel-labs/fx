@@ -1,6 +1,7 @@
 const std = @import("std");
 const config_runtime = @import("../config/config_runtime.zig");
 const io_mod = @import("../shared/io.zig");
+const artifact_digest = @import("artifact_digest.zig");
 
 const Allocator = std.mem.Allocator;
 const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
@@ -17,6 +18,9 @@ pub const ManagedChildKind = enum {
     subagent_control,
     terminal_state,
     terminal_proofs,
+    /// Session-scoped context supplied by the client that created it, such as
+    /// an ACP client system prompt.
+    client_context,
 };
 
 pub const Mode = enum {
@@ -52,6 +56,59 @@ pub const AdvisoryLockError = error{
 pub const ManagedStat = struct {
     size: u64,
     modified_at_ns: i128,
+};
+
+/// What a v2 session's blobs can fail with (D44).
+pub const BlobError = error{
+    OutOfMemory,
+    /// This session holds no body under that name.
+    BlobNotFound,
+    /// The blob's bytes no longer match its name.
+    BlobDamaged,
+    BlobTooLarge,
+    /// The session has closed, so nothing more can be stored.
+    BlobStoreClosed,
+    SessionChildReadOnly,
+    BlobStoreFailed,
+    NoSpaceLeft,
+    AccessDenied,
+    ReadOnlyFileSystem,
+    FileTooBig,
+};
+
+/// The large bodies of a v2 session, each a blob of that session named by
+/// its hash (D44). The session adapter implements it; every capability
+/// that holds it keeps it alive through `retain` and `release`, so a copy
+/// may outlive the session, which then refuses only new bodies.
+pub const Blobs = struct {
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    pub const Hash = [artifact_digest.blob_hex_bytes]u8;
+
+    pub const VTable = struct {
+        put: *const fn (ctx: *anyopaque, bytes: []const u8) BlobError!Hash,
+        /// The first `len` bytes of an open file outside the session.
+        put_file: *const fn (ctx: *anyopaque, file: std.Io.File, len: u64) BlobError!Hash,
+        /// Keeps `bytes` as the compactor record `name`, replacing any record
+        /// of that name (D50).
+        put_record: *const fn (ctx: *anyopaque, name: []const u8, bytes: []const u8) BlobError!void,
+        /// Every compactor record's name, with a moved session's old
+        /// tool-results names (D50). `arena` owns the list.
+        record_names: *const fn (ctx: *anyopaque, arena: Allocator) BlobError![]const []const u8,
+        /// The blob a handle of `kind` refers to: the one it names, a
+        /// compactor record's (D50), or in a session moved off the side
+        /// folder, the one its old name maps to (D47).
+        resolve: *const fn (ctx: *anyopaque, kind: ManagedChildKind, name: []const u8) BlobError!Hash,
+        /// A blob's bytes, at most `max_bytes`, checked against its name.
+        /// Caller owns.
+        get: *const fn (ctx: *anyopaque, alloc: Allocator, hash: []const u8, max_bytes: usize) BlobError![]u8,
+        /// The read-only file of a blob, for readers that page through a
+        /// large body and tools that open files by path (D49). Caller owns.
+        path: *const fn (ctx: *anyopaque, alloc: Allocator, hash: []const u8) BlobError![]u8,
+        retain: *const fn (ctx: *anyopaque) void,
+        release: *const fn (ctx: *anyopaque) void,
+    };
 };
 
 pub const ManagedEntry = struct {
@@ -168,10 +225,16 @@ pub const ManagedFile = struct {
 const CapabilityImpl = struct {
     alloc: Allocator,
     mode: Mode,
-    session_dir: io_mod.VerifiedDir,
+    /// Null for a v2 session's capability, which holds its bodies as blobs
+    /// and has no side folder (D48).
+    session_dir: ?io_mod.VerifiedDir,
+    blobs: ?Blobs = null,
+    /// A v2 session's terminal folder, `~/.fx/terminal/{id}` (D45), where
+    /// its terminal kinds route; opened on first use and made only by a
+    /// write. `display_session_path` is its path.
+    terminal_dir: ?io_mod.VerifiedDir = null,
     display_session_path: []u8,
     legacy_direct_kind: ?ManagedChildKind = null,
-    legacy_background_root: bool = false,
     legacy_display_route: ?[]u8 = null,
     replace_ops: io_mod.DurableOps,
     lock_ops: io_mod.LockOps,
@@ -187,8 +250,9 @@ const CapabilityImpl = struct {
     terminal_parent: ?io_mod.VerifiedDir = null,
     terminal_state: ?io_mod.VerifiedDir = null,
     terminal_proofs: ?io_mod.VerifiedDir = null,
-    indeterminate_names: [@typeInfo(ManagedChildKind).@"enum".fields.len]?[]u8 =
-        [_]?[]u8{null} ** @typeInfo(ManagedChildKind).@"enum".fields.len,
+    client_context: ?io_mod.VerifiedDir = null,
+    indeterminate_names: [@typeInfo(ManagedChildKind).@"enum".field_names.len]?[]u8 =
+        @splat(null),
 
     fn deinit(self: *CapabilityImpl) void {
         closeOptionalDir(&self.background_logs);
@@ -202,7 +266,10 @@ const CapabilityImpl = struct {
         closeOptionalDir(&self.terminal_state);
         closeOptionalDir(&self.terminal_proofs);
         closeOptionalDir(&self.terminal_parent);
-        self.session_dir.close();
+        closeOptionalDir(&self.client_context);
+        closeOptionalDir(&self.session_dir);
+        closeOptionalDir(&self.terminal_dir);
+        if (self.blobs) |blobs| blobs.vtable.release(blobs.ctx);
         self.alloc.free(self.display_session_path);
         if (self.legacy_display_route) |path| self.alloc.free(path);
         for (&self.indeterminate_names) |*name| {
@@ -223,19 +290,15 @@ const CapabilityImpl = struct {
             if (kind != direct_kind) return error.SessionChildStoreFailed;
             return self.directRoute(kind);
         }
-        if (self.legacy_background_root) {
-            return switch (kind) {
-                .background_records => &self.background_records.?,
-                .background_logs => if (self.background_logs) |*managed_route|
-                    managed_route
-                else
-                    null,
-                else => error.SessionChildStoreFailed,
-            };
-        }
+        // A v2 capability has no side folder: its bodies are blobs (D48),
+        // and its terminal state lives in its terminal folder (D45).
+        const session_dir = if (self.session_dir) |*dir| dir else switch (kind) {
+            .terminal_state, .terminal_proofs => try self.terminalDir(create_if_missing) orelse return null,
+            else => return if (create_if_missing) error.SessionChildStoreFailed else null,
+        };
         return switch (kind) {
             .background_records => self.ensureComponent(
-                &self.session_dir,
+                session_dir,
                 &self.background_records,
                 "background",
                 create_if_missing,
@@ -254,7 +317,7 @@ const CapabilityImpl = struct {
             },
             .command_artifacts => blk: {
                 const parent = try self.ensureComponent(
-                    &self.session_dir,
+                    session_dir,
                     &self.logs_parent,
                     "logs",
                     create_if_missing,
@@ -268,7 +331,7 @@ const CapabilityImpl = struct {
             },
             .browser_artifacts => blk: {
                 const parent = try self.ensureComponent(
-                    &self.session_dir,
+                    session_dir,
                     &self.artifacts_parent,
                     "artifacts",
                     create_if_missing,
@@ -281,20 +344,26 @@ const CapabilityImpl = struct {
                 );
             },
             .tool_results => self.ensureComponent(
-                &self.session_dir,
+                session_dir,
                 &self.tool_results,
                 "tool-results",
                 create_if_missing,
             ),
             .subagent_control => self.ensureComponent(
-                &self.session_dir,
+                session_dir,
                 &self.subagent_control,
                 "subagent",
                 create_if_missing,
             ),
+            .client_context => self.ensureComponent(
+                session_dir,
+                &self.client_context,
+                "client",
+                create_if_missing,
+            ),
             .terminal_state, .terminal_proofs => blk: {
                 const parent = try self.ensureComponent(
-                    &self.session_dir,
+                    session_dir,
                     &self.terminal_parent,
                     "terminal",
                     create_if_missing,
@@ -318,6 +387,38 @@ const CapabilityImpl = struct {
         };
     }
 
+    /// A v2 capability's terminal folder (D45), opened once. Missing, it is
+    /// made only for a write (`create`); a read finds nothing.
+    fn terminalDir(self: *CapabilityImpl, create: bool) !?*io_mod.VerifiedDir {
+        if (self.terminal_dir) |*dir| return dir;
+        const owner_path = self.display_session_path;
+        if (self.blobs == null or owner_path.len == 0) return if (create) error.SessionChildStoreFailed else null;
+        if (create and self.mode != .writable) return error.SessionChildReadOnly;
+        const root_path = std.Io.Dir.path.dirname(owner_path) orelse return error.SessionPathUnsafe;
+        const fx_path = std.Io.Dir.path.dirname(root_path) orelse return error.SessionPathUnsafe;
+        var fx = io_mod.VerifiedDir{ .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), fx_path, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return if (create) error.SessionChildStoreFailed else null,
+            error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
+            else => return error.SessionChildStoreFailed,
+        } };
+        defer fx.close();
+        const root_name = std.Io.Dir.path.basename(root_path);
+        var root = if (create)
+            try io_mod.openOrCreateVerifiedPrivateDir(&fx, root_name)
+        else
+            (try io_mod.openVerifiedPrivateDirIfPresent(&fx, root_name)) orelse return null;
+        defer root.close();
+        const id = std.Io.Dir.path.basename(owner_path);
+        self.terminal_dir = if (create)
+            try io_mod.openOrCreateVerifiedPrivateDir(&root, id)
+        else
+            (try io_mod.openVerifiedPrivateDirIfPresent(&root, id)) orelse return null;
+        return &self.terminal_dir.?;
+    }
+
     fn directRoute(
         self: *CapabilityImpl,
         kind: ManagedChildKind,
@@ -331,6 +432,7 @@ const CapabilityImpl = struct {
             .subagent_control => &self.subagent_control.?,
             .terminal_state => &self.terminal_state.?,
             .terminal_proofs => &self.terminal_proofs.?,
+            .client_context => &self.client_context.?,
         };
     }
 
@@ -400,7 +502,7 @@ const CapabilityImpl = struct {
     ) ![]u8 {
         const route_path = try self.displayRoutePath(alloc, kind);
         defer alloc.free(route_path);
-        return std.fs.path.join(alloc, &.{ route_path, name });
+        return std.Io.Dir.path.join(alloc, &.{ route_path, name });
     }
 
     fn displayRoutePath(
@@ -411,51 +513,42 @@ const CapabilityImpl = struct {
         if (self.legacy_direct_kind == kind) {
             return alloc.dupe(u8, self.legacy_display_route.?);
         }
-        if (self.legacy_background_root) {
-            return switch (kind) {
-                .background_records => alloc.dupe(
-                    u8,
-                    self.legacy_display_route.?,
-                ),
-                .background_logs => std.fs.path.join(
-                    alloc,
-                    &.{ self.legacy_display_route.?, "logs" },
-                ),
-                else => error.SessionChildStoreFailed,
-            };
-        }
         return switch (kind) {
-            .background_records => std.fs.path.join(
+            .background_records => std.Io.Dir.path.join(
                 alloc,
                 &.{ self.display_session_path, "background" },
             ),
-            .background_logs => std.fs.path.join(
+            .background_logs => std.Io.Dir.path.join(
                 alloc,
                 &.{ self.display_session_path, "background", "logs" },
             ),
-            .command_artifacts => std.fs.path.join(
+            .command_artifacts => std.Io.Dir.path.join(
                 alloc,
                 &.{ self.display_session_path, "logs", "commands" },
             ),
-            .browser_artifacts => std.fs.path.join(
+            .browser_artifacts => std.Io.Dir.path.join(
                 alloc,
                 &.{ self.display_session_path, "artifacts", "browser" },
             ),
-            .tool_results => std.fs.path.join(
+            .tool_results => std.Io.Dir.path.join(
                 alloc,
                 &.{ self.display_session_path, "tool-results" },
             ),
-            .subagent_control => std.fs.path.join(
+            .subagent_control => std.Io.Dir.path.join(
                 alloc,
                 &.{ self.display_session_path, "subagent" },
             ),
-            .terminal_state => std.fs.path.join(
+            .terminal_state => std.Io.Dir.path.join(
                 alloc,
                 &.{ self.display_session_path, "terminal", "state" },
             ),
-            .terminal_proofs => std.fs.path.join(
+            .terminal_proofs => std.Io.Dir.path.join(
                 alloc,
                 &.{ self.display_session_path, "terminal", "proofs" },
+            ),
+            .client_context => std.Io.Dir.path.join(
+                alloc,
+                &.{ self.display_session_path, "client" },
             ),
         };
     }
@@ -474,19 +567,19 @@ const CapabilityImpl = struct {
         kind: ManagedChildKind,
         replacement: []u8,
     ) void {
-        const index = @intFromEnum(kind);
+        const index = @backingInt(kind);
         if (self.indeterminate_names[index]) |old| self.alloc.free(old);
         self.indeterminate_names[index] = replacement;
     }
 
     fn clearIndeterminate(self: *CapabilityImpl, kind: ManagedChildKind) void {
-        const index = @intFromEnum(kind);
+        const index = @backingInt(kind);
         if (self.indeterminate_names[index]) |name| self.alloc.free(name);
         self.indeterminate_names[index] = null;
     }
 
     fn resolveIndeterminate(self: *CapabilityImpl, kind: ManagedChildKind) !void {
-        const name = self.indeterminate_names[@intFromEnum(kind)] orelse return;
+        const name = self.indeterminate_names[@backingInt(kind)] orelse return;
         const route_dir = try self.route(kind, false) orelse
             return error.FileNotFound;
         var file = try openPrivateFile(route_dir, name, .read_only, self.mode);
@@ -499,6 +592,170 @@ const CapabilityImpl = struct {
     }
 };
 
+/// Blobs held in memory, for the stores' tests: bodies by hash, with the
+/// adapter's rules for names and limits, compactor records by name, and no
+/// moved map. Given a folder, each body is also written there read-only, so
+/// `path` has a file.
+pub const MemoryBlobsForTesting = struct {
+    alloc: Allocator,
+    dir: ?[]const u8 = null,
+    mutex: std.Io.Mutex = .init,
+    bodies: std.StringHashMapUnmanaged([]u8) = .empty,
+    records: std.array_hash_map.String(Blobs.Hash) = .empty,
+    refs: usize = 0,
+    closed: bool = false,
+    puts: usize = 0,
+
+    const vtable: Blobs.VTable = .{
+        .put = put,
+        .put_file = putFile,
+        .put_record = putRecord,
+        .record_names = recordNames,
+        .resolve = resolve,
+        .get = get,
+        .path = path,
+        .retain = retain,
+        .release = release,
+    };
+
+    pub fn init(alloc: Allocator) MemoryBlobsForTesting {
+        return .{ .alloc = alloc };
+    }
+
+    /// As `init`, also writing each body to `dir`, which must outlive it.
+    pub fn initWithFiles(alloc: Allocator, dir: []const u8) MemoryBlobsForTesting {
+        return .{ .alloc = alloc, .dir = dir };
+    }
+
+    pub fn deinit(self: *MemoryBlobsForTesting) void {
+        std.debug.assert(self.refs == 0);
+        var it = self.bodies.iterator();
+        while (it.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            self.alloc.free(entry.value_ptr.*);
+        }
+        self.bodies.deinit(self.alloc);
+        for (self.records.keys()) |name| self.alloc.free(name);
+        self.records.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn blobs(self: *MemoryBlobsForTesting) Blobs {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    pub fn count(self: *MemoryBlobsForTesting) usize {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.bodies.count();
+    }
+
+    fn from(ctx: *anyopaque) *MemoryBlobsForTesting {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn put(ctx: *anyopaque, bytes: []const u8) BlobError!Blobs.Hash {
+        const self = from(ctx);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        const hash = std.fmt.bytesToHex(digest, .lower);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.closed) return error.BlobStoreClosed;
+        self.puts += 1;
+        if (self.bodies.contains(&hash)) return hash;
+        const key = try self.alloc.dupe(u8, &hash);
+        errdefer self.alloc.free(key);
+        const body = try self.alloc.dupe(u8, bytes);
+        errdefer self.alloc.free(body);
+        if (self.dir) |dir| {
+            const file_path = try std.Io.Dir.path.join(self.alloc, &.{ dir, &hash });
+            defer self.alloc.free(file_path);
+            var file = std.Io.Dir.createFileAbsolute(io_mod.getIo(), file_path, .{
+                .exclusive = true,
+                .permissions = std.Io.File.Permissions.fromMode(0o400),
+            }) catch return error.BlobStoreFailed;
+            defer file.close(io_mod.getIo());
+            file.writeStreamingAll(io_mod.getIo(), bytes) catch return error.BlobStoreFailed;
+        }
+        try self.bodies.put(self.alloc, key, body);
+        return hash;
+    }
+
+    fn putFile(ctx: *anyopaque, file: std.Io.File, len: u64) BlobError!Blobs.Hash {
+        const self = from(ctx);
+        const bytes = try self.alloc.alloc(u8, std.math.cast(usize, len) orelse return error.BlobTooLarge);
+        defer self.alloc.free(bytes);
+        const got = file.readPositionalAll(io_mod.getIo(), bytes, 0) catch return error.BlobStoreFailed;
+        if (got != bytes.len) return error.BlobStoreFailed;
+        return put(ctx, bytes);
+    }
+
+    fn putRecord(ctx: *anyopaque, name: []const u8, bytes: []const u8) BlobError!void {
+        const self = from(ctx);
+        const hash = try put(ctx, bytes);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.records.getPtr(name)) |known| {
+            known.* = hash;
+            return;
+        }
+        const key = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(key);
+        try self.records.put(self.alloc, key, hash);
+    }
+
+    fn recordNames(ctx: *anyopaque, arena: Allocator) BlobError![]const []const u8 {
+        const self = from(ctx);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const names = try arena.alloc([]const u8, self.records.count());
+        for (self.records.keys(), names) |name, *out| out.* = try arena.dupe(u8, name);
+        return names;
+    }
+
+    fn resolve(ctx: *anyopaque, kind: ManagedChildKind, name: []const u8) BlobError!Blobs.Hash {
+        const self = from(ctx);
+        if (artifact_digest.blobHash(name)) |hash| return hash[0..artifact_digest.blob_hex_bytes].*;
+        if (kind != .tool_results) return error.BlobNotFound;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return self.records.get(name) orelse error.BlobNotFound;
+    }
+
+    fn get(ctx: *anyopaque, alloc: Allocator, hash: []const u8, max_bytes: usize) BlobError![]u8 {
+        const self = from(ctx);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const body = self.bodies.get(hash) orelse return error.BlobNotFound;
+        if (body.len > max_bytes) return error.BlobTooLarge;
+        return alloc.dupe(u8, body);
+    }
+
+    fn path(ctx: *anyopaque, alloc: Allocator, hash: []const u8) BlobError![]u8 {
+        const self = from(ctx);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (!self.bodies.contains(hash)) return error.BlobNotFound;
+        const dir = self.dir orelse return error.BlobStoreFailed;
+        return std.Io.Dir.path.join(alloc, &.{ dir, hash });
+    }
+
+    fn retain(ctx: *anyopaque) void {
+        const self = from(ctx);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.refs += 1;
+    }
+
+    fn release(ctx: *anyopaque) void {
+        const self = from(ctx);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.refs -= 1;
+    }
+};
+
 pub const SessionChildCapability = struct {
     impl: *CapabilityImpl,
 
@@ -506,13 +763,105 @@ pub const SessionChildCapability = struct {
         self: *const SessionChildCapability,
         alloc: Allocator,
     ) !SessionChildCapability {
+        if (self.impl.blobs) |blobs| return initBlobs(alloc, blobs, self.impl.display_session_path, self.impl.mode);
         return initWithOptions(
             alloc,
-            self.impl.session_dir.dir,
+            self.impl.session_dir.?.dir,
             self.impl.display_session_path,
             self.impl.mode,
             .{},
         );
+    }
+
+    /// A v2 session's capability: its bodies are that session's blobs, its
+    /// terminal kinds route to `terminal_path`, its `~/.fx/terminal/{id}`
+    /// (D45), and it has no side folder, so every other kind is absent
+    /// (D44, D48). An empty `terminal_path` gives no terminal kinds.
+    pub fn initBlobs(alloc: Allocator, blobs: Blobs, terminal_path: []const u8, mode: Mode) !SessionChildCapability {
+        if (mode == .writable) io_mod.e2eFailIfDurableMutationAttempted();
+        const display = try alloc.dupe(u8, terminal_path);
+        errdefer alloc.free(display);
+        const impl = try alloc.create(CapabilityImpl);
+        impl.* = .{
+            .alloc = alloc,
+            .mode = mode,
+            .session_dir = null,
+            .blobs = blobs,
+            .display_session_path = display,
+            .replace_ops = .{},
+            .lock_ops = .{},
+        };
+        blobs.vtable.retain(blobs.ctx);
+        return .{ .impl = impl };
+    }
+
+    /// Whether bodies are blobs of a v2 session rather than files (D44).
+    pub fn holdsBlobs(self: *const SessionChildCapability) bool {
+        return self.impl.blobs != null;
+    }
+
+    /// Stores a body as a blob and returns its hash; `holdsBlobs` only.
+    pub fn putBlob(self: *SessionChildCapability, bytes: []const u8) BlobError!Blobs.Hash {
+        const blobs = try self.writableBlobs();
+        return blobs.vtable.put(blobs.ctx, bytes);
+    }
+
+    /// As `putBlob`, for the first `len` bytes of an open file.
+    pub fn putBlobFile(self: *SessionChildCapability, file: std.Io.File, len: u64) BlobError!Blobs.Hash {
+        const blobs = try self.writableBlobs();
+        return blobs.vtable.put_file(blobs.ctx, file, len);
+    }
+
+    /// Keeps `bytes` as the compactor record `name`, replacing any of that
+    /// name; `holdsBlobs` only (D50). `readBlob` and `openBlobFile` read it
+    /// back under `.tool_results`.
+    pub fn putRecord(self: *SessionChildCapability, name: []const u8, bytes: []const u8) BlobError!void {
+        const blobs = try self.writableBlobs();
+        return blobs.vtable.put_record(blobs.ctx, name, bytes);
+    }
+
+    /// Every compactor record's name; `holdsBlobs` only (D50). `arena` owns
+    /// the list.
+    pub fn recordNames(self: *SessionChildCapability, arena: Allocator) BlobError![]const []const u8 {
+        const blobs = self.impl.blobs orelse return error.BlobStoreFailed;
+        return blobs.vtable.record_names(blobs.ctx, arena);
+    }
+
+    /// The body a handle of `kind` refers to, at most `max_bytes` and
+    /// checked against its blob's name; caller owns. `holdsBlobs` only.
+    pub fn readBlob(self: *SessionChildCapability, alloc: Allocator, kind: ManagedChildKind, name: []const u8, max_bytes: usize) BlobError![]u8 {
+        const blobs = self.impl.blobs orelse return error.BlobStoreFailed;
+        const hash = try blobs.vtable.resolve(blobs.ctx, kind, name);
+        return blobs.vtable.get(blobs.ctx, alloc, &hash, max_bytes);
+    }
+
+    /// Opens the read-only file of the blob a handle of `kind` refers to,
+    /// for a reader that pages through it (D49). Its bytes are not checked
+    /// against the name, as a side file's never were. Caller closes it.
+    pub fn openBlobFile(self: *SessionChildCapability, alloc: Allocator, kind: ManagedChildKind, name: []const u8) BlobError!std.Io.File {
+        const blobs = self.impl.blobs orelse return error.BlobStoreFailed;
+        const hash = try blobs.vtable.resolve(blobs.ctx, kind, name);
+        const file_path = try blobs.vtable.path(blobs.ctx, alloc, &hash);
+        defer alloc.free(file_path);
+        return std.Io.Dir.openFileAbsolute(io_mod.getIo(), file_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => error.BlobNotFound,
+            error.AccessDenied, error.PermissionDenied => error.AccessDenied,
+            else => error.BlobStoreFailed,
+        };
+    }
+
+    /// The read-only file of the blob a handle of `kind` refers to, for a
+    /// tool that opens files by path (D49); caller owns.
+    pub fn blobPath(self: *SessionChildCapability, alloc: Allocator, kind: ManagedChildKind, name: []const u8) BlobError![]u8 {
+        const blobs = self.impl.blobs orelse return error.BlobStoreFailed;
+        const hash = try blobs.vtable.resolve(blobs.ctx, kind, name);
+        return blobs.vtable.path(blobs.ctx, alloc, &hash);
+    }
+
+    fn writableBlobs(self: *SessionChildCapability) BlobError!Blobs {
+        const blobs = self.impl.blobs orelse return error.BlobStoreFailed;
+        if (self.impl.mode != .writable) return error.SessionChildReadOnly;
+        return blobs;
     }
 
     pub fn init(
@@ -570,7 +919,7 @@ pub const SessionChildCapability = struct {
             else => return err,
         };
         errdefer route.close(io_mod.getIo());
-        const display = try std.fs.path.join(alloc, &.{ display_session_path, "subagent" });
+        const display = try std.Io.Dir.path.join(alloc, &.{ display_session_path, "subagent" });
         defer alloc.free(display);
         return try initOpenedLegacyRoute(alloc, route, display, .subagent_control, .read_only);
     }
@@ -613,96 +962,8 @@ pub const SessionChildCapability = struct {
             .subagent_control => impl.subagent_control = .{ .dir = route },
             .terminal_state => impl.terminal_state = .{ .dir = route },
             .terminal_proofs => impl.terminal_proofs = .{ .dir = route },
+            .client_context => impl.client_context = .{ .dir = route },
         }
-        return .{ .impl = impl };
-    }
-
-    pub fn initLegacyBackgroundRoutes(
-        alloc: Allocator,
-        background_path: []const u8,
-        mode: Mode,
-    ) !SessionChildCapability {
-        if (mode == .writable) io_mod.e2eFailIfDurableMutationAttempted();
-        if (mode == .writable) {
-            try config_runtime.makeAbsolutePath(background_path);
-        }
-        var records = std.Io.Dir.openDirAbsolute(
-            io_mod.getIo(),
-            background_path,
-            .{ .iterate = true, .follow_symlinks = false },
-        ) catch |err| switch (err) {
-            error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
-            else => return err,
-        };
-        errdefer records.close(io_mod.getIo());
-        if (mode == .writable) {
-            records.setPermissions(
-                io_mod.getIo(),
-                private_dir_permissions,
-            ) catch return error.PrivateStatePermissionsUnsupported;
-        }
-        try verifyPrivateDirectory(records);
-
-        if (mode == .writable) {
-            records.createDir(
-                io_mod.getIo(),
-                "logs",
-                private_dir_permissions,
-            ) catch |err| switch (err) {
-                error.PathAlreadyExists => {},
-                error.NotDir, error.SymLinkLoop => {
-                    return error.SessionPathUnsafe;
-                },
-                else => return error.SessionChildStoreFailed,
-            };
-        }
-        const logs: ?std.Io.Dir = records.openDir(io_mod.getIo(), "logs", .{
-            .iterate = true,
-            .follow_symlinks = false,
-        }) catch |err| switch (err) {
-            error.FileNotFound => if (mode == .read_only)
-                null
-            else
-                return error.SessionChildStoreFailed,
-            error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
-            else => return err,
-        };
-        errdefer if (logs) |route| route.close(io_mod.getIo());
-        if (logs) |route| {
-            if (mode == .writable) {
-                route.setPermissions(
-                    io_mod.getIo(),
-                    private_dir_permissions,
-                ) catch return error.PrivateStatePermissionsUnsupported;
-            }
-            try verifyPrivateDirectory(route);
-        }
-
-        var retained = try records.openDir(io_mod.getIo(), ".", .{
-            .iterate = true,
-            .follow_symlinks = false,
-        });
-        errdefer retained.close(io_mod.getIo());
-        const display = try alloc.dupe(u8, background_path);
-        errdefer alloc.free(display);
-        const direct_display = try alloc.dupe(u8, background_path);
-        errdefer alloc.free(direct_display);
-        const impl = try alloc.create(CapabilityImpl);
-        impl.* = .{
-            .alloc = alloc,
-            .mode = mode,
-            .session_dir = .{ .dir = retained },
-            .display_session_path = display,
-            .legacy_background_root = true,
-            .legacy_display_route = direct_display,
-            .replace_ops = .{},
-            .lock_ops = .{},
-            .background_records = .{ .dir = records },
-            .background_logs = if (logs) |route|
-                .{ .dir = route }
-            else
-                null,
-        };
         return .{ .impl = impl };
     }
 
@@ -748,31 +1009,6 @@ pub const SessionChildCapability = struct {
             .lock_ops = options.lock_ops,
         };
         return .{ .impl = impl };
-    }
-
-    /// Opens a capability restricted to the subagent control route. This does
-    /// not acquire or imply authority over the session transcript.
-    pub fn initSubagentControl(
-        alloc: Allocator,
-        session_dir: std.Io.Dir,
-        display_session_path: []const u8,
-        mode: Mode,
-        options: Options,
-    ) SubagentControlInitError!SessionChildCapability {
-        var capability = initWithOptions(
-            alloc,
-            session_dir,
-            display_session_path,
-            mode,
-            options,
-        ) catch |err| return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.SessionPathUnsafe => error.SessionPathUnsafe,
-            error.PrivateStatePermissionsUnsupported => error.PrivateStatePermissionsUnsupported,
-            else => error.SessionChildStoreFailed,
-        };
-        capability.impl.allowed_kind = .subagent_control;
-        return capability;
     }
 
     /// Opens a capability restricted to host-owned terminal records and
@@ -836,18 +1072,17 @@ pub const SessionChildCapability = struct {
         self: *const SessionChildCapability,
         alloc: Allocator,
     ) !SessionChildCapability {
-        if (self.impl.legacy_direct_kind != null or
-            self.impl.legacy_background_root)
-        {
-            return error.SessionChildStoreFailed;
-        }
-        var cloned = try initWithOptions(
-            alloc,
-            self.impl.session_dir.dir,
-            self.impl.display_session_path,
-            .read_only,
-            .{},
-        );
+        if (self.impl.legacy_direct_kind != null) return error.SessionChildStoreFailed;
+        var cloned = if (self.impl.blobs) |blobs|
+            try initBlobs(alloc, blobs, self.impl.display_session_path, .read_only)
+        else
+            try initWithOptions(
+                alloc,
+                self.impl.session_dir.?.dir,
+                self.impl.display_session_path,
+                .read_only,
+                .{},
+            );
         cloned.impl.allowed_kind = self.impl.allowed_kind;
         return cloned;
     }
@@ -1166,7 +1401,7 @@ pub const SessionChildCapability = struct {
         kind: ManagedChildKind,
         name: []const u8,
     ) bool {
-        const pending = self.impl.indeterminate_names[@intFromEnum(kind)] orelse
+        const pending = self.impl.indeterminate_names[@backingInt(kind)] orelse
             return false;
         return std.mem.eql(u8, pending, name);
     }
@@ -1187,7 +1422,7 @@ pub const SessionChildCapability = struct {
         self: SessionChildCapability,
         kind: ManagedChildKind,
     ) ?[]const u8 {
-        return self.impl.indeterminate_names[@intFromEnum(kind)];
+        return self.impl.indeterminate_names[@backingInt(kind)];
     }
 
     /// Returns non-authoritative metadata for compatibility rendering only.
@@ -1348,8 +1583,8 @@ fn countEntries(dir: std.Io.Dir) !usize {
 }
 
 test "private read-only file remains valid after atomic replacement unlinks it" {
-    if (comptime @import("builtin").os.tag == .windows or
-        @import("builtin").os.tag == .wasi)
+    if (comptime @import("builtin").target.os.tag == .windows or
+        @import("builtin").target.os.tag == .wasi)
     {
         return error.SkipZigTest;
     }
@@ -1419,9 +1654,9 @@ test "managed child capability rejects invalid names and unsafe routes" {
     var linked = try capability.createExclusiveFile(alloc, .tool_results, "linked.txt");
     linked.deinit();
     var source_buf: [128]u8 = undefined;
-    const source = try std.fmt.bufPrintZ(&source_buf, "tool-results/linked.txt", .{});
+    const source = try std.mem.printSentinel(&source_buf, "tool-results/linked.txt", .{}, 0);
     var target_buf: [128]u8 = undefined;
-    const target = try std.fmt.bufPrintZ(&target_buf, "tool-results/linked-again.txt", .{});
+    const target = try std.mem.printSentinel(&target_buf, "tool-results/linked-again.txt", .{}, 0);
     try std.testing.expectEqual(
         @as(c_int, 0),
         std.c.linkat(session.dir.handle, source, session.dir.handle, target, 0),
@@ -1625,86 +1860,6 @@ test "read only capability leaves every missing fixed route absent" {
     try std.testing.expectEqual(@as(usize, 0), try countEntries(session.dir));
 }
 
-test "subagent control capability is route restricted and rejects symlinks" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var session = try openTestSession(alloc, &tmp);
-    defer session.dir.close(io_mod.getIo());
-    defer alloc.free(session.display_path);
-    var capability = try SessionChildCapability.initSubagentControl(
-        alloc,
-        session.dir,
-        session.display_path,
-        .writable,
-        .{},
-    );
-    defer capability.deinit();
-
-    try std.testing.expectError(
-        error.SessionChildStoreFailed,
-        capability.createExclusiveFile(alloc, .background_records, "wrong-route.json"),
-    );
-    var entry = try capability.atomicReplace(
-        alloc,
-        .subagent_control,
-        "control.json",
-        "{}",
-    );
-    entry.deinit(alloc);
-    var lock = try capability.acquireTimedAdvisoryLock(
-        .subagent_control,
-        "subagent-control.lock",
-        10,
-    );
-    lock.release();
-
-    try session.dir.symLink(
-        io_mod.getIo(),
-        "../outside-control",
-        "subagent/linked.json",
-        .{},
-    );
-    try std.testing.expectError(
-        error.SessionPathUnsafe,
-        capability.openFileReadOnly(alloc, .subagent_control, "linked.json"),
-    );
-}
-
-test "subagent control capability rejects a symlinked route" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var session = try openTestSession(alloc, &tmp);
-    defer session.dir.close(io_mod.getIo());
-    defer alloc.free(session.display_path);
-    try tmp.dir.createDir(
-        io_mod.getIo(),
-        "outside",
-        std.Io.File.Permissions.fromMode(0o700),
-    );
-    try session.dir.symLink(
-        io_mod.getIo(),
-        "../outside",
-        "subagent",
-        .{ .is_directory = true },
-    );
-    var capability = try SessionChildCapability.initSubagentControl(
-        alloc,
-        session.dir,
-        session.display_path,
-        .writable,
-        .{},
-    );
-    defer capability.deinit();
-    try std.testing.expectError(
-        error.SessionPathUnsafe,
-        capability.iterate(alloc, .subagent_control),
-    );
-}
-
 test "terminal capabilities are private route restricted and reject symlinks" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1791,6 +1946,52 @@ const FailFirstParentSync = struct {
         if (self.calls == 1) return error.InjectedParentSyncFailure;
     }
 };
+
+test "a v2 capability keeps terminal kinds in the terminal folder, made only by a write (D45)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io_mod.getIo(), "fx", private_dir_permissions);
+    const fx_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "fx");
+    defer alloc.free(fx_path);
+    const terminal_path = try std.Io.Dir.path.join(alloc, &.{ fx_path, "terminal", "kYIGy8ik0H3K" });
+    defer alloc.free(terminal_path);
+
+    var memory = MemoryBlobsForTesting.init(alloc);
+    defer memory.deinit();
+    var capability = try SessionChildCapability.initBlobs(alloc, memory.blobs(), terminal_path, .writable);
+    defer capability.deinit();
+
+    // A read finds nothing and makes nothing.
+    try std.testing.expectError(error.FileNotFound, capability.openFileReadOnly(alloc, .terminal_state, "record.json"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io_mod.getIo(), "fx/terminal", .{ .follow_symlinks = false }));
+
+    var entry = try capability.atomicReplace(alloc, .terminal_state, "record.json", "{}");
+    entry.deinit(alloc);
+    for ([_][]const u8{ "fx/terminal", "fx/terminal/kYIGy8ik0H3K" }) |sub_path| {
+        const stat = try tmp.dir.statFile(io_mod.getIo(), sub_path, .{ .follow_symlinks = false });
+        try std.testing.expectEqual(std.Io.File.Kind.directory, stat.kind);
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o700), stat.permissions.toMode() & 0o777);
+    }
+
+    // A read-only clone reads it back; side-folder kinds stay absent.
+    var reader = try capability.cloneReadOnly(alloc);
+    defer reader.deinit();
+    var file = try reader.openFileReadOnly(alloc, .terminal_state, "record.json");
+    defer file.deinit();
+    const bytes = try file.readToEnd(alloc, 16);
+    defer alloc.free(bytes);
+    try std.testing.expectEqualStrings("{}", bytes);
+    try std.testing.expectError(error.SessionChildStoreFailed, capability.atomicReplace(alloc, .background_records, "record.json", "{}"));
+
+    // A read-only capability never makes the folder.
+    const other_path = try std.Io.Dir.path.join(alloc, &.{ fx_path, "terminal", "otherSession1" });
+    defer alloc.free(other_path);
+    var read_only = try SessionChildCapability.initBlobs(alloc, memory.blobs(), other_path, .read_only);
+    defer read_only.deinit();
+    try std.testing.expectError(error.FileNotFound, read_only.openFileReadOnly(alloc, .terminal_state, "record.json"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io_mod.getIo(), "fx/terminal/otherSession1", .{ .follow_symlinks = false }));
+}
 
 test "post rename parent sync failure is indeterminate and next write reopens" {
     const alloc = std.testing.allocator;

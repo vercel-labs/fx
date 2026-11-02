@@ -13,7 +13,7 @@ const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 
 const Allocator = std.mem.Allocator;
 const endpoint = "https://chatgpt.com/backend-api/codex/responses";
-const e2e_endpoint_env = "FX_E2E_OPENAI_CODEX_RESPONSES_URL";
+const e2e_endpoint_env = "FX_TEST_OPENAI_CODEX_RESPONSES_URL";
 const max_error_body_bytes: usize = 1024 * 1024;
 const max_sse_line_bytes: usize = 32 * 1024 * 1024;
 const max_sse_aggregate_bytes: usize = 64 * 1024 * 1024;
@@ -151,9 +151,7 @@ fn streamCompletion(
     request: stream_provider.ModelRequest,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
-    if (request.credential.credentialSource() != .chatgpt_subscription and
-        request.credential.credentialSource() != .host_managed)
-    {
+    if (!acceptsCredential(request.credential)) {
         return stream_provider.failResult(error.CodexSubscriptionCredentialRequired);
     }
     try validateModel(request.model);
@@ -191,22 +189,68 @@ const PreparedStreamOperation = struct {
     }
 };
 
-const RequestAuthHeaders = struct {
+/// True for the credentials a Codex request may use: a ChatGPT subscription,
+/// or a host that authorizes the request itself.
+pub fn acceptsCredential(lease: stream_provider.CredentialLease) bool {
+    const source = lease.credentialSource() orelse return false;
+    return source == .chatgpt_subscription or source == .host_managed;
+}
+
+/// The Responses endpoint, or a loopback test endpoint from the environment.
+/// Borrowed; static or environment-owned.
+pub fn responsesEndpoint() error{InvalidE2EOpenAICodexEndpoint}![]const u8 {
+    const override = io_mod.getenv(e2e_endpoint_env) orelse return endpoint;
+    if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EOpenAICodexEndpoint;
+    return override;
+}
+
+pub const max_extra_headers = 6;
+
+/// Writes the Codex headers other than authorization and content type into
+/// `buf` and returns the used prefix. Values are borrowed from the arguments.
+pub fn extraHeaders(
+    buf: *[max_extra_headers]std.http.Header,
+    account_id: ?[]const u8,
+    session_id: ?[]const u8,
+) []std.http.Header {
+    var count: usize = 0;
+    if (account_id) |value| {
+        buf[count] = .{ .name = "chatgpt-account-id", .value = value };
+        count += 1;
+    }
+    buf[count] = .{ .name = "originator", .value = "fx" };
+    count += 1;
+    buf[count] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };
+    count += 1;
+    buf[count] = .{ .name = "accept", .value = "text/event-stream" };
+    count += 1;
+    if (session_id) |value| if (value.len > 0) {
+        buf[count] = .{ .name = "session-id", .value = value };
+        count += 1;
+        buf[count] = .{ .name = "x-client-request-id", .value = value };
+        count += 1;
+    };
+    return buf[0..count];
+}
+
+pub const RequestAuthHeaders = struct {
     authorization: ?[]u8 = null,
     account_id: ?[]u8 = null,
 
-    fn deinit(self: *RequestAuthHeaders, alloc: Allocator) void {
+    pub fn deinit(self: *RequestAuthHeaders, alloc: Allocator) void {
         if (self.authorization) |value| secret.zeroAndFree(alloc, value);
         if (self.account_id) |value| alloc.free(value);
         self.* = .{};
     }
 };
 
-fn requestAuthHeaders(alloc: Allocator, auth: stream_provider.CredentialLease) !RequestAuthHeaders {
+/// Authorization for a direct ChatGPT credential; empty for a host-managed one,
+/// whose host adds its own. The caller owns the result.
+pub fn requestAuthHeaders(alloc: Allocator, auth: stream_provider.CredentialLease) !RequestAuthHeaders {
     return switch (auth) {
         .host_managed => .{},
         .direct => |direct| blk: {
-            const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{direct.secret_bytes});
+            const authorization = try alloc.print("Bearer {s}", .{direct.secret_bytes});
             errdefer secret.zeroAndFree(alloc, authorization);
             const account_id = if (direct.account_id) |account|
                 try alloc.dupe(u8, account)
@@ -232,32 +276,11 @@ pub fn streamPrepared(
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     var auth_headers = try requestAuthHeaders(alloc, request.credential);
     defer auth_headers.deinit(alloc);
-    const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
-        if (!gateway_client.isLoopbackHttpUrl(override)) {
-            return stream_provider.failResult(error.InvalidE2EOpenAICodexEndpoint);
-        }
-        break :endpoint override;
-    } else endpoint;
+    const request_endpoint = responsesEndpoint() catch |err| return stream_provider.failResult(err);
     const uri = try std.Uri.parse(request_endpoint);
 
-    var extra_headers_buf: [7]std.http.Header = undefined;
-    var extra_count: usize = 0;
-    if (auth_headers.account_id) |account_id| {
-        extra_headers_buf[extra_count] = .{ .name = "chatgpt-account-id", .value = account_id };
-        extra_count += 1;
-    }
-    extra_headers_buf[extra_count] = .{ .name = "originator", .value = "fx" };
-    extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };
-    extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "accept", .value = "text/event-stream" };
-    extra_count += 1;
-    if (request.session_id) |session_id| if (session_id.len > 0) {
-        extra_headers_buf[extra_count] = .{ .name = "session-id", .value = session_id };
-        extra_count += 1;
-        extra_headers_buf[extra_count] = .{ .name = "x-client-request-id", .value = session_id };
-        extra_count += 1;
-    };
+    var extra_headers_buf: [max_extra_headers]std.http.Header = undefined;
+    const extra_headers = extraHeaders(&extra_headers_buf, auth_headers.account_id, request.session_id);
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
@@ -265,7 +288,7 @@ pub fn streamPrepared(
         .client = &client,
         .uri = uri,
         .authorization = auth_headers.authorization,
-        .extra_headers = extra_headers_buf[0..extra_count],
+        .extra_headers = extra_headers,
     };
     const connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
@@ -280,10 +303,13 @@ pub fn streamPrepared(
     );
     var http_request = opened.take();
     defer http_request.deinit();
-    var cancel_watch: gateway_client.CancelWatch = .{};
-    defer cancel_watch.stop();
+    var watch: gateway_client.ConnectionWatch = .init(.{
+        .patient = true,
+        .stall_timeout_ms = gateway_client.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
+    });
+    defer watch.stop();
     if (http_request.connection) |connection|
-        try cancel_watch.start(request.cancel_flag, null, connection.stream_writer.stream);
+        try watch.start(request.cancel_flag, null, connection.stream_writer.stream);
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     http_request.transfer_encoding = .{ .content_length = payload.len };
@@ -295,7 +321,9 @@ pub fn streamPrepared(
     if (http_request.connection) |connection| try connection.flush();
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
-    var response = try http_request.receiveHead(&.{});
+    if (watch.armHead()) |err| return err;
+    var response = http_request.receiveHead(&.{}) catch |err| return watch.failure(err);
+    if (watch.commitHead()) |err| return err;
     if (response.head.status != .ok) {
         var transfer: [16 * 1024]u8 = undefined;
         const reader = response.reader(&transfer);
@@ -304,26 +332,42 @@ pub fn streamPrepared(
             else => return err,
         };
         return .{ .failed = .{
-            .kind = failureKind(response.head.status),
+            .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(response.head.status), body),
             .detail = body,
             .ownership = .owned,
         } };
     }
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
+    var result = completeFromStream(alloc, request, response.reader(&transfer_buffer), watch.progress()) catch |err| return watch.failure(err);
+    if (watch.finish()) |err| {
+        result.deinit(alloc);
+        return err;
+    }
+    return result;
+}
+
+/// Parses one successful Codex event stream into a completion with its
+/// subscription usage. The result owns the completion.
+pub fn completeFromStream(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    reader: *std.Io.Reader,
+    progress: ?sse_stream.Progress,
+) !stream_provider.Result {
     var events = request.events;
-    var completion = try consumeSse(
+    const completion = try consumeSse(
         alloc,
         reader,
         &events,
-        EventBridge.content,
-        EventBridge.toolStart,
-        EventBridge.reasoning,
-        EventBridge.toolInput,
+        stream_provider.EventSink.onContentChunk,
+        stream_provider.EventSink.onToolStart,
+        stream_provider.EventSink.onReasoningChunk,
+        stream_provider.EventSink.onToolInputChunk,
         request.cancel_flag,
         request.content_capture_limit,
         .{},
+        progress,
     );
     errdefer {
         var owned = stream_provider.Result{ .completed = .{
@@ -332,61 +376,10 @@ pub fn streamPrepared(
         } };
         owned.deinit(alloc);
     }
-    const usage_outcome: stream_provider.UsageOutcome = usage: {
-        if (completion.generation_id == null) {
-            break :usage .{ .unavailable = .possibly_billed };
-        }
-        completion.billing = try responses_protocol.buildSubscriptionBilling(
-            alloc,
-            .codex,
-            request.model,
-            @max(io_mod.milliTimestamp(), 0),
-            completion.usage,
-        ) orelse break :usage .{ .unavailable = .possibly_billed };
-        break :usage .{ .exact = .codex };
-    };
     return .{ .completed = .{
         .completion = completion,
-        .usage = usage_outcome,
         .ownership = .owned,
     } };
-}
-
-const EventBridge = struct {
-    fn sink(raw: *anyopaque) *stream_provider.EventSink {
-        return @ptrCast(@alignCast(raw));
-    }
-
-    fn content(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .content_delta = chunk });
-    }
-
-    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .reasoning_delta = chunk });
-    }
-
-    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .tool_input_delta = chunk });
-    }
-
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
-    }
-};
-
-fn failureKind(status: std.http.Status) stream_provider.FailureKind {
-    return switch (status) {
-        .bad_request => .invalid_request,
-        .unauthorized => .unauthorized,
-        .forbidden => .forbidden,
-        .payload_too_large => .request_too_large,
-        .too_many_requests => .rate_limited,
-        .internal_server_error => .server_error,
-        .bad_gateway => .bad_gateway,
-        .service_unavailable => .unavailable,
-        .gateway_timeout => .gateway_timeout,
-        else => .provider_error,
-    };
 }
 
 fn consumeSse(
@@ -400,10 +393,11 @@ fn consumeSse(
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
     limits: CodexLimits,
+    progress: ?sse_stream.Progress,
 ) !types.ModelCompletion {
     var reducer = responses_protocol.Reducer.init(alloc);
     defer reducer.deinit(alloc);
-    var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes };
+    var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes, .progress = progress };
     defer sse.deinit(alloc);
     const callbacks = responses_protocol.StreamCallbacks{
         .context = callback_ctx,
@@ -680,14 +674,20 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
         content: std.ArrayList(u8) = .empty,
         reasoning: std.ArrayList(u8) = .empty,
         saw_read_file: bool = false,
+        /// A chunk that could not be kept; the test reports it.
+        append_error: ?std.mem.Allocator.Error = null,
 
         fn contentChunk(raw: *anyopaque, chunk: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.content.appendSlice(std.testing.allocator, chunk) catch unreachable;
+            self.content.appendSlice(std.testing.allocator, chunk) catch |err| {
+                self.append_error = err;
+            };
         }
         fn reasoningChunk(raw: *anyopaque, chunk: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.reasoning.appendSlice(std.testing.allocator, chunk) catch unreachable;
+            self.reasoning.appendSlice(std.testing.allocator, chunk) catch |err| {
+                self.append_error = err;
+            };
         }
         fn toolStart(raw: *anyopaque, _: []const u8, name: []const u8, _: ?[]const u8, _: ?[]const u8) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -708,12 +708,14 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
         &cancelled,
         null,
         .{},
+        null,
     );
     defer {
         if (completion.content) |value| std.testing.allocator.free(@constCast(value));
         types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
         if (completion.provider_state_json) |value| std.testing.allocator.free(@constCast(value));
     }
+    if (capture.append_error) |err| return err;
     try std.testing.expectEqualStrings("hello", capture.content.items);
     try std.testing.expectEqualStrings("thinking", capture.reasoning.items);
     try std.testing.expect(capture.saw_read_file);
@@ -743,6 +745,7 @@ fn consumeOpenAICodexTestSse(sse_text: []const u8, limits: CodexLimits) !types.M
         &cancelled,
         null,
         limits,
+        null,
     );
 }
 
@@ -869,4 +872,79 @@ test "OpenAI Codex rejects a 129th streamed tool call" {
     } else |err| {
         try std.testing.expectEqual(error.OpenAICodexToolCallLimitExceeded, err);
     }
+}
+
+const stream_fuzz = @import("stream_fuzz_testing.zig");
+
+fn fuzzResponsesChunkedStream(_: void, smith: *std.testing.Smith) !void {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var reasoning: stream_fuzz.Text = .{};
+    try reasoning.generate(arena, smith, "", "", false);
+    var content: stream_fuzz.Text = .{};
+    try content.generate(arena, smith, "", "", false);
+    const with_tool = smith.boolWeighted(1, 1);
+    var arguments: stream_fuzz.Text = .{};
+    try arguments.generate(arena, smith, "{\"path\":\"", "\"}", true);
+
+    // Each output item has its own index. Its closing `output_item.done`
+    // event is optional, and when sent it repeats the complete text.
+    var wire_buffer: std.Io.Writer.Allocating = .init(arena);
+    const wire = &wire_buffer.writer;
+    var index: usize = 0;
+    if (reasoning.text.items.len > 0) {
+        try wire.print("data: {{\"type\":\"response.output_item.added\",\"output_index\":{d},\"item\":{{\"type\":\"reasoning\"}}}}\n\n", .{index});
+        for (try reasoning.pieces(arena)) |piece| {
+            try wire.print("data: {{\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":{d},\"delta\":{f}}}\n\n", .{ index, std.json.fmt(piece, .{}) });
+        }
+        if (smith.boolWeighted(1, 1)) {
+            try wire.print("data: {{\"type\":\"response.output_item.done\",\"output_index\":{d},\"item\":{{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}}}}\n\n", .{index});
+        }
+        index += 1;
+    }
+    if (content.text.items.len > 0) {
+        try wire.print("data: {{\"type\":\"response.output_item.added\",\"output_index\":{d},\"item\":{{\"type\":\"message\"}}}}\n\n", .{index});
+        for (try content.pieces(arena)) |piece| {
+            if (smith.boolWeighted(1, 7)) try wire.writeAll(": ping\n\n");
+            try wire.print("data: {{\"type\":\"response.output_text.delta\",\"output_index\":{d},\"delta\":{f}}}\n\n", .{ index, std.json.fmt(piece, .{}) });
+        }
+        if (smith.boolWeighted(1, 1)) {
+            try wire.print("data: {{\"type\":\"response.output_item.done\",\"output_index\":{d},\"item\":{{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":{f}}}]}}}}\n\n", .{ index, std.json.fmt(content.text.items, .{}) });
+        }
+        index += 1;
+    }
+    if (with_tool) {
+        try wire.print("data: {{\"type\":\"response.output_item.added\",\"output_index\":{d},\"item\":{{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\"}}}}\n\n", .{index});
+        for (try arguments.pieces(arena)) |piece| {
+            try wire.print("data: {{\"type\":\"response.function_call_arguments.delta\",\"output_index\":{d},\"delta\":{f}}}\n\n", .{ index, std.json.fmt(piece, .{}) });
+        }
+        if (smith.boolWeighted(1, 1)) {
+            try wire.print("data: {{\"type\":\"response.output_item.done\",\"output_index\":{d},\"item\":{{\"id\":\"fc_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":{f}}}}}\n\n", .{ index, std.json.fmt(arguments.text.items, .{}) });
+        }
+    }
+    try wire.writeAll("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}}\n\n");
+
+    const read_buffer = try stream_fuzz.readBuffer(arena, smith);
+    var fixed = std.Io.Reader.fixed(wire_buffer.written());
+    var source = fixed.limited(.unlimited, read_buffer);
+    var deltas: stream_fuzz.Deltas = .{ .alloc = arena };
+    var cancelled = std.atomic.Value(bool).init(false);
+    const completion = try consumeSse(std.testing.allocator, &source.interface, &deltas, stream_fuzz.Deltas.onContent, null, stream_fuzz.Deltas.onReasoning, null, &cancelled, null, .{}, null);
+    defer {
+        if (completion.content) |value| std.testing.allocator.free(@constCast(value));
+        types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
+        if (completion.provider_state_json) |value| std.testing.allocator.free(@constCast(value));
+    }
+
+    try std.testing.expectEqualStrings(content.text.items, completion.content orelse "");
+    try deltas.expectEqual(content.text.items, reasoning.text.items);
+    try stream_fuzz.expectToolCall(completion.tool_calls, with_tool, "call_1", arguments.text.items);
+}
+
+test "Responses streams give the same result however they are cut into events and reads" {
+    try std.testing.fuzz({}, fuzzResponsesChunkedStream, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").responses_stream.*),
+    });
 }

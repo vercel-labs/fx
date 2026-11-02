@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 const session_event = @import("session_event.zig");
 const session_log = @import("session_log.zig");
@@ -62,20 +61,6 @@ pub fn classifyAuthority(
     }
     if (try isPreparedCreationOrphan(alloc, session_dir, session_id)) {
         return error.SessionNotFound;
-    }
-    return .legacy;
-}
-
-/// Like `classifyAuthority` but treats a marker-less directory as legacy without
-/// the creation-orphan check, so an oversized legacy snapshot can still be
-/// migrated under an explicit `allow_large` request.
-pub fn classifyAuthorityAllowingLargeLegacy(
-    alloc: Allocator,
-    session_dir: *io_mod.VerifiedDir,
-    session_id: []const u8,
-) !AuthorityClassification {
-    if (try classifyMarker(alloc, session_dir, session_id)) |classification| {
-        return classification;
     }
     return .legacy;
 }
@@ -220,56 +205,45 @@ pub fn readOptionalSessionFile(
 }
 
 /// Opens an in-session file with symlink/escape protections, rejecting
-/// non-regular or hard-linked targets as `error.SessionPathUnsafe`.
+/// non-regular or hard-linked targets as `error.SessionPathUnsafe` without
+/// waiting on a special file such as a FIFO. A read-only open accepts a file
+/// that atomic replacement unlinks after the open: the descriptor remains a
+/// safe, immutable snapshot. `name` is a single path component.
 pub fn openSessionFile(
     session_dir: *io_mod.VerifiedDir,
     name: []const u8,
     mode: session_log.OpenMode,
 ) !std.Io.File {
-    const file = session_dir.dir.openFile(io_mod.getIo(), name, .{
-        .mode = if (mode == .writable) .read_write else .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| switch (err) {
-        error.SymLinkLoop, error.IsDir, error.NotDir => return error.SessionPathUnsafe,
+    std.debug.assert(std.mem.findScalar(u8, name, '/') == null);
+    return io_mod.openExistingRegularFile(
+        session_dir.dir,
+        name,
+        if (mode == .writable) .read_write else .read_only,
+    ) catch |err| switch (err) {
+        error.DurablePathUnsafe, error.SymLinkLoop, error.IsDir, error.NotDir => return error.SessionPathUnsafe,
         else => return err,
     };
-    errdefer file.close(io_mod.getIo());
-    try verifyOpenedSessionFile(try file.stat(io_mod.getIo()), mode);
-    return file;
 }
 
-fn verifyOpenedSessionFile(
-    stat: std.Io.File.Stat,
-    mode: session_log.OpenMode,
-) !void {
-    if (stat.kind != .file or stat.nlink > 1) {
-        return error.SessionPathUnsafe;
+test "session files open without waiting on a FIFO" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.mem.printSentinel(&path_buf, "{s}/events.jsonl", .{root}, 0);
+    if (mkfifo(path, 0o600) != 0) return error.SkipZigTest;
+    var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .follow_symlinks = false }) };
+    defer dir.close();
+    // A blocking open of a FIFO waits for a writer that never comes.
+    for ([_]session_log.OpenMode{ .read_only, .writable }) |mode| {
+        try std.testing.expectError(error.SessionPathUnsafe, openSessionFile(&dir, "events.jsonl", mode));
     }
-    // Atomic replacement can unlink the old inode after a read-only open but
-    // before fstat. The descriptor remains a safe, immutable snapshot.
-    if (mode == .writable and stat.nlink != 1) {
-        return error.SessionPathUnsafe;
-    }
+    try std.testing.expectEqual(@as(?[]u8, null), try readOptionalSessionFile(alloc, &dir, "missing.json", 16));
 }
 
-test "read-only session files accept an atomically unlinked descriptor" {
-    var stat = std.mem.zeroes(std.Io.File.Stat);
-    stat.kind = .file;
-    stat.nlink = 0;
-    try verifyOpenedSessionFile(stat, .read_only);
-    try std.testing.expectError(
-        error.SessionPathUnsafe,
-        verifyOpenedSessionFile(stat, .writable),
-    );
-
-    stat.nlink = 2;
-    try std.testing.expectError(
-        error.SessionPathUnsafe,
-        verifyOpenedSessionFile(stat, .read_only),
-    );
-}
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
 /// Reports whether `name` exists directly under the session dir, mapping
 /// unsafe link/dir shapes to `error.SessionPathUnsafe`.
@@ -287,65 +261,13 @@ pub fn entryExistsRelative(
     return true;
 }
 
-/// Resolves the containing device id for `name`, which the projection layer
-/// folds into its stat fingerprint. The OS-specific syscall path (Linux
-/// `statx`, Apple `fstatat`, 0 elsewhere) is isolated here so `eventFileStat`
-/// stays platform-agnostic. Syscall failures map to `error.InvalidSessionFormat`.
-fn statFileDevice(session_dir: *io_mod.VerifiedDir, name: []const u8) !u64 {
-    var path_buffer: [std.c.PATH_MAX]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&path_buffer, "{s}", .{name}) catch
-        return error.InvalidSessionFormat;
-    return switch (builtin.os.tag) {
-        .linux => blk: {
-            const linux = std.os.linux;
-            while (true) {
-                var statx = std.mem.zeroes(linux.Statx);
-                switch (linux.errno(linux.statx(
-                    session_dir.dir.handle,
-                    path_z,
-                    linux.AT.SYMLINK_NOFOLLOW,
-                    linux.STATX.BASIC_STATS,
-                    &statx,
-                ))) {
-                    .SUCCESS => {
-                        const major: u64 = statx.dev_major;
-                        const minor: u64 = statx.dev_minor;
-                        break :blk (minor & 0xff) |
-                            ((major & 0xfff) << 8) |
-                            ((minor & ~@as(u64, 0xff)) << 12) |
-                            ((major & ~@as(u64, 0xfff)) << 32);
-                    },
-                    .INTR => continue,
-                    else => return error.InvalidSessionFormat,
-                }
-            }
-        },
-        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => blk: {
-            var native_stat = std.mem.zeroes(std.c.Stat);
-            while (true) {
-                switch (std.c.errno(std.c.fstatat(
-                    session_dir.dir.handle,
-                    path_z,
-                    &native_stat,
-                    std.c.AT.SYMLINK_NOFOLLOW,
-                ))) {
-                    .SUCCESS => break :blk @intCast(native_stat.dev),
-                    .INTR => continue,
-                    else => return error.InvalidSessionFormat,
-                }
-            }
-        },
-        else => 0,
-    };
-}
-
-/// Stats a session's event log into the `EventFileStat` fingerprint the
-/// projection layer compares against. Rejects non-regular or hard-linked files
-/// as `error.SessionPathUnsafe`; a missing log is `error.InvalidSessionFormat`.
-pub fn eventFileStat(
+/// Returns the size of a session's event log, the input to the projection
+/// staleness check. Rejects non-regular or hard-linked files as
+/// `error.SessionPathUnsafe`; a missing log is `error.InvalidSessionFormat`.
+pub fn eventLogSize(
     session_dir: *io_mod.VerifiedDir,
     name: []const u8,
-) !session_projection.EventFileStat {
+) !u64 {
     const stat = session_dir.dir.statFile(io_mod.getIo(), name, .{
         .follow_symlinks = false,
     }) catch |err| switch (err) {
@@ -354,17 +276,7 @@ pub fn eventFileStat(
         else => return err,
     };
     if (stat.kind != .file or stat.nlink != 1) return error.SessionPathUnsafe;
-    const device = try statFileDevice(session_dir, name);
-    return .{
-        .device = device,
-        .inode = @intCast(stat.inode),
-        .kind = .regular,
-        .mode = stat.permissions.toMode(),
-        .link_count = @intCast(stat.nlink),
-        .size = stat.size,
-        .mtime_ns = stat.mtime.nanoseconds,
-        .ctime_ns = stat.ctime.nanoseconds,
-    };
+    return stat.size;
 }
 
 /// Parses the top-level `schema_version` from manifest/snapshot bytes.
@@ -408,15 +320,6 @@ pub fn parseIdentifier(raw: []const u8) error{InvalidSessionFormat}!session_even
     const canonical = std.fmt.bytesToHex(result, .lower);
     if (!std.mem.eql(u8, &canonical, raw)) return error.InvalidSessionFormat;
     return result;
-}
-
-/// Deletes one obsolete legacy-session file and syncs the directory.
-pub fn deleteSessionEntry(
-    session_dir: *io_mod.VerifiedDir,
-    name: []const u8,
-) !void {
-    try session_dir.dir.deleteFile(io_mod.getIo(), name);
-    try io_mod.syncVerifiedDir(session_dir.dir);
 }
 
 /// Reads exactly `size` bytes (+1 guard) of a legacy file into an owned slice.

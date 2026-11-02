@@ -1,6 +1,8 @@
 const std = @import("std");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const settings_catalog = @import("../config/settings_catalog.zig");
+const effort_menu = @import("effort_menu.zig");
+const info_panel = @import("info_panel.zig");
 const usage_menu = @import("../session/usage_menu.zig");
 const workspace_menu = @import("../workspace/workspace_menu.zig");
 const composer_deletion = @import("composer_deletion.zig");
@@ -38,6 +40,8 @@ pub const Runtime = struct {
     help_menu: command_specs.HelpMenu = .{},
     settings_menu: settings_catalog.Menu = .{},
     statusline_menu: settings_catalog.StatuslineMenu = .{},
+    info_panel: info_panel.State = .{},
+    effort_menu: effort_menu.State = .{},
     usage_menu: usage_menu.State = .{},
     workspace_menu: workspace_menu.State = .{},
     composer_history: composer_history.State = .{},
@@ -49,14 +53,26 @@ pub const Runtime = struct {
     kill_ring: kill_ring.State = .{},
     edit_history: edit_history.State = .{},
     vertical_navigation: vertical_navigation.State = .{},
-    /// Set while the Ctrl+P model picker borrows the composer as its query
-    /// box. Holds the draft the composer is restored to when the picker closes.
+    /// Set while the Ctrl+P model picker borrows the composer: first as the
+    /// catalog's query box, then for its inline effort and fast stages. Holds
+    /// the draft the composer is restored to when that flow ends.
     model_picker_draft: ?composer_stash.State = null,
+
+    pub fn initInto(self: *Runtime) void {
+        const runtime_info = @typeInfo(Runtime).@"struct";
+        inline for (runtime_info.field_names, runtime_info.field_types, runtime_info.field_attrs) |field_name, field_type, field_attrs| {
+            if (comptime std.mem.eql(u8, field_name, "picker")) continue;
+            @field(self.*, field_name) = field_attrs.defaultValue(field_type).?;
+        }
+        self.picker.initInto();
+    }
 
     pub fn deinit(self: *Runtime, alloc: Allocator) void {
         input_reset.resetPendingTextScalarWithTrace(&self.text_scalar, "shutdown");
         self.paste.deinit(alloc);
-        self.usage_menu.close(alloc);
+        self.info_panel.close();
+        self.effort_menu.close(alloc);
+        self.usage_menu.close();
         self.edit_state.deinit(alloc);
         self.picker.deinit(alloc);
         self.composer_history.deinit(alloc);
@@ -201,4 +217,16 @@ test "runtime owns product input state without terminal mechanics" {
     try std.testing.expectEqualStrings("draft", runtime.edit_state.input.items);
     try std.testing.expect(!@hasField(Runtime, "terminal_action_decoder"));
     try std.testing.expect(!@hasField(Runtime, "terminal_cursor_probe"));
+}
+
+test "runtime initInto preserves defaults without copying file picker scratch buffers" {
+    var actual: Runtime = undefined;
+    @memset(std.mem.asBytes(&actual), 0xa5);
+    actual.initInto();
+
+    var expected: Runtime = .{};
+    @memset(expected.picker.file_completion.raw_query[0..], 0xa5);
+    @memset(expected.picker.file_completion.lookup_query[0..], 0xa5);
+
+    try std.testing.expectEqualDeep(expected, actual);
 }

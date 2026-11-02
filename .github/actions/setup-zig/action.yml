@@ -1,0 +1,60 @@
+name: Setup Zig
+description: >-
+  Install Zig and restore the job's Zig cache. Only runs on main save the cache,
+  through save-zig-cache, so pull requests reuse main's cache without adding
+  entries of their own. The key changes only with the Zig version and the build
+  files: fx itself recompiles on every change, so the cache pays off through the
+  dependencies, compiler_rt, and libc it keeps.
+
+inputs:
+  version:
+    description: Zig version to install
+    required: true
+  cache-key:
+    description: Cache name for the job, unique per build configuration
+    required: true
+
+outputs:
+  cache-key:
+    description: Exact cache key for save-zig-cache
+    value: ${{ steps.key.outputs.key }}
+  cache-hit:
+    description: Whether the exact cache key was restored
+    value: ${{ steps.restore.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install Zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: ${{ inputs.version }}
+        use-cache: false
+
+    # mlugg/setup-zig points both Zig cache directories at the workspace's
+    # .zig-cache, which the cache steps below save and restore.
+    - name: Compute Zig cache key
+      id: key
+      shell: bash
+      env:
+        PREFIX: zig-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ inputs.cache-key }}-
+        BUILD_HASH: ${{ hashFiles('build.zig', 'build.zig.zon') }}
+      run: |
+        for dir in "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"; do
+          if [ "$dir" != "$GITHUB_WORKSPACE/.zig-cache" ]; then
+            printf '::error::Zig cache is %s, not %s; update the cache path.\n' "$dir" "$GITHUB_WORKSPACE/.zig-cache"
+            exit 1
+          fi
+        done
+        printf 'prefix=%s\n' "$PREFIX" >> "$GITHUB_OUTPUT"
+        printf 'key=%s%s\n' "$PREFIX" "$BUILD_HASH" >> "$GITHUB_OUTPUT"
+
+    # Main starts from an empty cache when the key misses, so each saved
+    # snapshot holds one build instead of growing with every build change.
+    - name: Restore Zig cache
+      id: restore
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ github.workspace }}/.zig-cache
+        key: ${{ steps.key.outputs.key }}
+        restore-keys: ${{ github.ref != 'refs/heads/main' && steps.key.outputs.prefix || '' }}

@@ -48,19 +48,23 @@ pub const ResetReason = union(enum) {
     input_limit: Owner,
     invalid_utf8,
     new_paste_stale_state,
-    unsafe_suffix,
 };
 
 pub const BoundaryState = enum {
     capturing,
     end_candidate,
-    unsafe,
 };
 
-pub const Settlement = enum {
+pub const Settlement = union(enum) {
     none,
-    finish,
-    reject,
+    finish: Finish,
+};
+
+/// A paste that ended in this delivery epoch. Bytes that followed its end
+/// marker in the same epoch are never input: they may be clipboard content
+/// after an end marker embedded in the paste, so they are only counted.
+const Finish = struct {
+    dropped_suffix_bytes: usize,
 };
 
 pub const State = struct {
@@ -98,11 +102,6 @@ pub const State = struct {
         switch (self.boundary) {
             .capturing => {},
             .end_candidate => {
-                self.boundary = .unsafe;
-                self.unsafe_suffix_bytes +|= 1;
-                return;
-            },
-            .unsafe => {
                 self.unsafe_suffix_bytes +|= 1;
                 return;
             },
@@ -161,8 +160,7 @@ pub const State = struct {
         if (!self.active()) return .none;
         return switch (self.boundary) {
             .capturing => .none,
-            .end_candidate => .finish,
-            .unsafe => if (self.confirmedOverflowBytes() > 0) .finish else .reject,
+            .end_candidate => .{ .finish = .{ .dropped_suffix_bytes = self.unsafe_suffix_bytes } },
         };
     }
 
@@ -176,17 +174,6 @@ pub const State = struct {
 
     pub fn attemptedBytes(self: *const State) usize {
         return self.buffer.items.len +| self.overflow_bytes;
-    }
-
-    pub fn observedBytes(self: *const State) usize {
-        return self.attemptedBytes() +|
-            self.decision_bytes +|
-            self.unsafe_suffix_bytes;
-    }
-
-    pub fn confirmedOverflowBytes(self: *const State) usize {
-        if (self.end_match_len > 0) return self.end_candidate_overflow_bytes;
-        return self.overflow_bytes;
     }
 
     /// Ends framing while retaining captured bytes for synchronous handling.
@@ -269,11 +256,6 @@ pub const State = struct {
                     );
                 }
             },
-            .unsafe_suffix => debug_trace.logf(
-                "input",
-                "{s} paste dropped bytes={d} reason=unsafe_suffix",
-                .{ ownerLabel(self.owner), self.observedBytes() },
-            ),
             .decision_prompt_active, .session_reset, .shutdown => {
                 switch (self.owner) {
                     .decision_prompt => debug_trace.logf(
@@ -339,7 +321,6 @@ fn resetReasonName(reason: ResetReason) []const u8 {
         .input_limit => "input_limit",
         .invalid_utf8 => "invalid_utf8",
         .new_paste_stale_state => "new_paste_stale_state",
-        .unsafe_suffix => "unsafe_suffix",
     };
 }
 
@@ -386,7 +367,7 @@ test "decision paste counts content bytes and exact end marker only" {
     try std.testing.expectEqual(@as(usize, 3), state.decision_bytes);
     try std.testing.expectEqual(Owner.decision_prompt, state.owner);
     try std.testing.expectEqual(BoundaryState.end_candidate, state.boundary);
-    try std.testing.expectEqual(Settlement.finish, state.settleDeliveryEpoch());
+    try std.testing.expectEqual(Settlement{ .finish = .{ .dropped_suffix_bytes = 0 } }, state.settleDeliveryEpoch());
 }
 
 test "decision paste treats incomplete and parameterized end candidates as content" {
@@ -402,7 +383,7 @@ test "decision paste treats incomplete and parameterized end candidates as conte
         try state.consumeByte(std.testing.allocator, byte);
     }
     try std.testing.expectEqual(payload.len, state.decision_bytes);
-    try std.testing.expectEqual(Settlement.finish, state.settleDeliveryEpoch());
+    try std.testing.expectEqual(Settlement{ .finish = .{ .dropped_suffix_bytes = 0 } }, state.settleDeliveryEpoch());
 }
 
 test "composer paste preserves safe bytes and tracks bounded overflow" {
@@ -427,12 +408,10 @@ test "composer overflow excludes a possible exact end marker" {
     exact.begin(.composer, 1);
 
     try exact.consumeByte(std.testing.allocator, 'x');
-    for (paste_end_marker[0 .. paste_end_marker.len - 1]) |byte| {
+    for (paste_end_marker) |byte| {
         try exact.consumeByte(std.testing.allocator, byte);
-        try std.testing.expectEqual(@as(usize, 0), exact.confirmedOverflowBytes());
     }
-    try exact.consumeByte(std.testing.allocator, paste_end_marker[paste_end_marker.len - 1]);
-    try std.testing.expectEqual(@as(usize, 0), exact.confirmedOverflowBytes());
+    try std.testing.expectEqual(@as(usize, 0), exact.overflow_bytes);
 
     var mismatch: State = .{};
     defer mismatch.deinit(std.testing.allocator);
@@ -442,10 +421,10 @@ test "composer overflow excludes a possible exact end marker" {
     for ("\x1b[20x") |byte| {
         try mismatch.consumeByte(std.testing.allocator, byte);
     }
-    try std.testing.expect(mismatch.confirmedOverflowBytes() > 0);
+    try std.testing.expect(mismatch.overflow_bytes > 0);
 }
 
-test "composer overflow rejection takes precedence over an unsafe suffix" {
+test "composer overflow survives an ignored suffix" {
     var state: State = .{};
     defer state.deinit(std.testing.allocator);
     state.begin(.composer, 1);
@@ -458,9 +437,9 @@ test "composer overflow rejection takes precedence over an unsafe suffix" {
     }
     try state.consumeByte(std.testing.allocator, 'z');
 
-    try std.testing.expectEqual(BoundaryState.unsafe, state.boundary);
-    try std.testing.expect(state.confirmedOverflowBytes() > 0);
-    try std.testing.expectEqual(Settlement.finish, state.settleDeliveryEpoch());
+    try std.testing.expectEqual(BoundaryState.end_candidate, state.boundary);
+    try std.testing.expect(state.overflow_bytes > 0);
+    try std.testing.expectEqual(Settlement{ .finish = .{ .dropped_suffix_bytes = 1 } }, state.settleDeliveryEpoch());
 }
 
 test "discarding remainder preserves buffered bytes and end-marker progress" {
@@ -475,7 +454,7 @@ test "discarding remainder preserves buffered bytes and end-marker progress" {
         try state.consumeByte(std.testing.allocator, byte);
     }
 
-    try std.testing.expectEqual(Settlement.finish, state.settleDeliveryEpoch());
+    try std.testing.expectEqual(Settlement{ .finish = .{ .dropped_suffix_bytes = 0 } }, state.settleDeliveryEpoch());
     try std.testing.expectEqualStrings("x", state.buffer.items);
     try std.testing.expectEqual(@as(usize, 0), state.decision_bytes);
 }
@@ -542,10 +521,10 @@ test "end candidate stays paste owned until delivery epoch settlement" {
     try std.testing.expect(state.active());
     try std.testing.expectEqualStrings("safe", state.buffer.items);
     try std.testing.expectEqual(BoundaryState.end_candidate, state.boundary);
-    try std.testing.expectEqual(Settlement.finish, state.settleDeliveryEpoch());
+    try std.testing.expectEqual(Settlement{ .finish = .{ .dropped_suffix_bytes = 0 } }, state.settleDeliveryEpoch());
 }
 
-test "any same-epoch suffix makes the candidate sticky unsafe" {
+test "a same-epoch suffix is counted and never captured" {
     var state: State = .{};
     defer state.deinit(std.testing.allocator);
     state.begin(.composer, std.math.maxInt(usize));
@@ -559,9 +538,11 @@ test "any same-epoch suffix makes the candidate sticky unsafe" {
 
     try std.testing.expect(state.active());
     try std.testing.expectEqualStrings("safe", state.buffer.items);
-    try std.testing.expectEqual(BoundaryState.unsafe, state.boundary);
-    try std.testing.expectEqual(@as(usize, 1 + paste_end_marker.len), state.unsafe_suffix_bytes);
-    try std.testing.expectEqual(Settlement.reject, state.settleDeliveryEpoch());
+    try std.testing.expectEqual(BoundaryState.end_candidate, state.boundary);
+    try std.testing.expectEqual(
+        Settlement{ .finish = .{ .dropped_suffix_bytes = 1 + paste_end_marker.len } },
+        state.settleDeliveryEpoch(),
+    );
 }
 
 test "traced reset reports dropped captures and clears only paste state" {
@@ -570,7 +551,7 @@ test "traced reset reports dropped captures and clears only paste state" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "paste-reset.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "paste-reset.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -618,7 +599,7 @@ test "deinit traces an active capture once" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "paste-deinit.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "paste-deinit.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();

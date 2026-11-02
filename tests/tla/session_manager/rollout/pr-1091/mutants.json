@@ -1,0 +1,16 @@
+[
+  {
+    "module": "PR1091Harness",
+    "description": "Pane inherits a stale tmux server environment",
+    "old": "pane' = requested",
+    "new": "pane' = server",
+    "invariant": "PaneGetsCallerEnvironment"
+  },
+  {
+    "module": "PR1091Harness",
+    "description": "Coverage records a cell without incrementing its count",
+    "old": "count' = count + 1",
+    "new": "count' = count",
+    "invariant": "NoDuplicateCoverage"
+  }
+]

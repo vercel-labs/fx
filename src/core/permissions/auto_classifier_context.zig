@@ -620,13 +620,13 @@ fn writeHeadTail(writer: *std.Io.Writer, text: []const u8, max_content_bytes: us
 test "root user context keeps first latest and newest recent turns with visible omission" {
     const turns = [_][]const u8{
         "first-root-authorization",
-        "oldest-middle " ++ ("a" ** 280),
-        "older-middle " ++ ("b" ** 280),
-        "middle-three " ++ ("d" ** 280),
-        "middle-four " ++ ("e" ** 280),
-        "middle-five " ++ ("f" ** 280),
-        "middle-six " ++ ("g" ** 280),
-        "recent-middle " ++ ("c" ** 280),
+        "oldest-middle " ++ text_utils.repeat("a", 280),
+        "older-middle " ++ text_utils.repeat("b", 280),
+        "middle-three " ++ text_utils.repeat("d", 280),
+        "middle-four " ++ text_utils.repeat("e", 280),
+        "middle-five " ++ text_utils.repeat("f", 280),
+        "middle-six " ++ text_utils.repeat("g", 280),
+        "recent-middle " ++ text_utils.repeat("c", 280),
         "newest-recent-root-request",
         "latest-root-request",
     };
@@ -643,12 +643,12 @@ test "root user context keeps first latest and newest recent turns with visible 
 
 test "root user context reserves capacity for every required oversized anchor" {
     const turns = [_][]const u8{
-        "first-required-marker " ++ ("a" ** 4096),
-        "older-middle-one-marker " ++ ("b" ** 4096),
-        "older-middle-two-marker " ++ ("c" ** 4096),
-        "older-middle-three-marker " ++ ("d" ** 4096),
-        "newest-recent-required-marker " ++ ("e" ** 4096),
-        "current-required-marker " ++ ("f" ** 4096),
+        "first-required-marker " ++ text_utils.repeat("a", 4096),
+        "older-middle-one-marker " ++ text_utils.repeat("b", 4096),
+        "older-middle-two-marker " ++ text_utils.repeat("c", 4096),
+        "older-middle-three-marker " ++ text_utils.repeat("d", 4096),
+        "newest-recent-required-marker " ++ text_utils.repeat("e", 4096),
+        "current-required-marker " ++ text_utils.repeat("f", 4096),
     };
     const context = try buildRootUserContextBounded(
         std.testing.allocator,
@@ -675,8 +675,8 @@ test "root user context reserves capacity for every required oversized anchor" {
 
 test "root user context redistributes unused required anchor capacity" {
     const turns = [_][]const u8{
-        "first-required-marker " ++ ("a" ** 4096),
-        "newest-recent-required-marker " ++ ("b" ** 4096),
+        "first-required-marker " ++ text_utils.repeat("a", 4096),
+        "newest-recent-required-marker " ++ text_utils.repeat("b", 4096),
         "current",
     };
     const context = try buildRootUserContextBounded(
@@ -796,7 +796,7 @@ test "persisted root user context accepts only the bounded canonical format" {
             "first_root_user_request: two\n",
     ));
     try std.testing.expect(!isCanonicalRootUserContext(
-        "current_request: " ++ ("x" ** max_root_user_bytes) ++ "\n",
+        "current_request: " ++ text_utils.repeat("x", max_root_user_bytes) ++ "\n",
     ));
 }
 
@@ -897,9 +897,9 @@ test "tool execution context keeps omitted feedback after newly appended feedbac
 test "tool execution context bounds structured root fields before appending feedback" {
     const alloc = std.testing.allocator;
     const root =
-        "current_request: " ++ ("a" ** 380) ++ "\n" ++
+        "current_request: " ++ text_utils.repeat("a", 380) ++ "\n" ++
         "first_root_user_request: b\n" ++
-        "recent_root_user_request: " ++ ("c" ** 380) ++ "\n" ++
+        "recent_root_user_request: " ++ text_utils.repeat("c", 380) ++ "\n" ++
         "omitted_proven_root_user_turns: 2\n" ++
         "trusted_user_permission_feedback: preserve the existing amendment\n" ++
         "omitted_trusted_user_permission_feedback: 2\n";

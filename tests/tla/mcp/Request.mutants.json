@@ -1,0 +1,56 @@
+[
+ {
+  "description": "A late or duplicate response is delivered to the caller again",
+  "old": "IF req[id] = \"inflight\" THEN Accept(id, kind)",
+  "new": "IF req[id] # \"unused\" THEN Accept(id, kind)",
+  "invariant": "AtMostOneOutcome"
+ },
+ {
+  "description": "A finished request id is sent again",
+  "old": "/\\ req[id] = \"unused\"",
+  "new": "/\\ req[id] \\in {\"unused\", \"done\"}",
+  "invariant": "IdsNeverReused"
+ },
+ {
+  "description": "A timeout is reported as an error from the server",
+  "old": "Finish(id, \"timed_out\")",
+  "new": "Finish(id, \"error\")",
+  "invariant": "PeerOutcomesFromPeer"
+ },
+ {
+  "description": "A server's cancel ends a listen as if the client cancelled it",
+  "old": "    THEN /\\ Finish(id, \"ended\")",
+  "new": "    THEN /\\ Finish(id, \"cancelled\")",
+  "invariant": "CancelledByClientOnly"
+ },
+ {
+  "description": "The caller can cancel initialize",
+  "old": "/\\ id \\notin InitIds",
+  "new": "/\\ TRUE",
+  "invariant": "NeverCancelInitialize"
+ },
+ {
+  "description": "Progress is accepted for a request that is not in flight",
+  "old": "IF req[id] = \"inflight\" /\\ p > progress[id]",
+  "new": "IF p > progress[id]",
+  "invariant": "ProgressScoped"
+ },
+ {
+  "description": "No hard timeout, so a request the server never answers stays in flight forever",
+  "old": "Finish(id, \"timed_out\")",
+  "new": "FALSE /\\ Finish(id, \"timed_out\")",
+  "property": "EveryRequestEnds"
+ },
+ {
+  "description": "A listen times out like any request",
+  "old": "    /\\ req[id] = \"inflight\"\n    /\\ id \\notin ListenIds",
+  "new": "    /\\ req[id] = \"inflight\"",
+  "invariant": "ListenNeverTimesOut"
+ },
+ {
+  "description": "A server's cancel ends any request, not only a listen (REQ-05)",
+  "old": "IF id \\in ListenIds /\\ req[id] = \"inflight\"",
+  "new": "IF req[id] = \"inflight\"",
+  "invariant": "EndedOnlyListen"
+ }
+]

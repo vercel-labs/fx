@@ -1,0 +1,68 @@
+[
+  {
+    "description": "A re-issued attempt reuses the broken attempt's id",
+    "old": "    /\\ currentId' = nextId\n",
+    "new": "    /\\ currentId' = IF currentId = 0 THEN nextId ELSE currentId\n",
+    "invariant": "ReissueNewId"
+  },
+  {
+    "description": "A tools/call is re-sent after a broken stream",
+    "old": "    /\\ IF kind = \"idempotent\" /\\ attempts < MaxAttempts",
+    "new": "    /\\ IF attempts < MaxAttempts",
+    "invariant": "NoCallResent"
+  },
+  {
+    "description": "Broken streams are re-issued past the attempt limit",
+    "old": "    /\\ IF kind = \"idempotent\" /\\ attempts < MaxAttempts",
+    "new": "    /\\ IF kind = \"idempotent\" /\\ attempts <= MaxAttempts",
+    "invariant": "TypeOK"
+  },
+  {
+    "description": "-32020 is retried more than once",
+    "old": "    /\\ IF a = \"mismatch\" /\\ kind = \"call\" /\\ headerRetries = 0\n          THEN /\\ phase' = \"relisting\"\n               /\\ headerRetries' = 1",
+    "new": "    /\\ IF a = \"mismatch\" /\\ kind = \"call\" /\\ headerRetries <= 1\n          THEN /\\ phase' = \"relisting\"\n               /\\ headerRetries' = headerRetries + 1",
+    "invariant": "TypeOK"
+  },
+  {
+    "description": "Cancelling sends notifications/cancelled",
+    "old": "                   cancelNote>>",
+    "new": "                   kind>> /\\ cancelNote' = TRUE",
+    "invariant": "CancelByClose"
+  },
+  {
+    "description": "Cancelling leaves the stream open",
+    "old": "    /\\ closed' = TRUE\n",
+    "new": "    /\\ closed' = FALSE\n",
+    "invariant": "CancelByClose"
+  },
+  {
+    "description": "An answer that arrives after a cancel is delivered",
+    "old": "Answer(a) ==\n    /\\ phase = \"posted\"",
+    "new": "Answer(a) ==\n    /\\ phase \\in {\"posted\", \"cancelled\"}",
+    "invariant": "AtMostOneOutcome"
+  },
+  {
+    "description": "Every lost request is flagged as maybe run",
+    "old": "               /\\ maybeRan' = (kind = \"call\")",
+    "new": "               /\\ maybeRan' = TRUE",
+    "invariant": "MaybeRanOnlyForLostCalls"
+  },
+  {
+    "description": "A re-list after -32020 never ends",
+    "old": "Relisted(ok) ==\n    /\\ phase = \"relisting\"",
+    "new": "Relisted(ok) ==\n    /\\ FALSE",
+    "property": "EveryRequestEnds"
+  },
+  {
+    "description": "An answered attempt's stream is left open",
+    "old": "    /\\ closed' = TRUE    \\* nothing more comes for the answered attempt\n",
+    "new": "    /\\ UNCHANGED closed\n",
+    "invariant": "AnsweredStreamClosed"
+  },
+  {
+    "description": "A listing whose answer was over the message limit is re-issued like a broken stream",
+    "old": "    /\\ phase' = \"lost\"\n    /\\ maybeRan' = (kind = \"call\")\n    /\\ Deliver(\"lost\")\n    /\\ UNCHANGED <<kind, attempts, headerRetries, currentId, nextId, closed, usedIds, reused, cancelNote>>",
+    "new": "    /\\ IF kind = \"idempotent\" /\\ attempts < MaxAttempts\n          THEN /\\ attempts' = attempts + 1\n               /\\ Post\n               /\\ UNCHANGED <<outcome, maybeRan, delivered>>\n          ELSE /\\ phase' = \"lost\"\n               /\\ maybeRan' = (kind = \"call\")\n               /\\ Deliver(\"lost\")\n               /\\ UNCHANGED <<attempts, currentId, nextId, closed, usedIds, reused>>\n    /\\ UNCHANGED <<kind, headerRetries, cancelNote>>",
+    "property": "TooLargeEnds"
+  }
+]

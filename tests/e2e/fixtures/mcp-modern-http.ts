@@ -71,7 +71,9 @@ export function startModernMcpHttpFixture(
   const requests: ModernHttpRequest[] = [];
   const toolPageResponses: ToolPageResponse[] = [];
   const httpMethods: string[] = [];
+  // Request streams the client dropped; a dropped listen counts separately.
   let cancelledCalls = 0;
+  let cancelledListens = 0;
   let discoverCalls = 0;
   let toolsListCalls = 0;
   let resourcesListCalls = 0;
@@ -332,10 +334,10 @@ export function startModernMcpHttpFixture(
                 })}\n\n`));
                 return;
               }
-              if (mode === "cache_partial_ack" ||
-                  mode === "cache_unexpected_ack" ||
-                  mode === "cache_invalidate_before_send" ||
-                  mode === "cache_auth_subscription") return;
+              // Only the storm and failed-refresh modes change the list; in
+              // every other mode the listen stays quiet, so it can't race the
+              // test's own timing.
+              if (mode !== "cache_subscription" && mode !== "cache_failed_refresh") return;
               setTimeout(() => {
                 if (!active) return;
                 if (mode === "cache_subscription") currentToolName = "fresh";
@@ -356,7 +358,7 @@ export function startModernMcpHttpFixture(
               active = false;
               subscriptionController = null;
               subscriptionId = null;
-              cancelledCalls += 1;
+              cancelledListens += 1;
             },
           }),
           { headers: { "content-type": "text/event-stream" } },
@@ -629,7 +631,7 @@ export function startModernMcpHttpFixture(
                 },
               },
             },
-            requestState: { transport: "http", opaque: true },
+            requestState: "http-opaque",
           },
         };
       }
@@ -800,6 +802,9 @@ export function startModernMcpHttpFixture(
     httpMethods,
     get cancelledCalls() {
       return cancelledCalls;
+    },
+    get cancelledListens() {
+      return cancelledListens;
     },
     get toolsListCalls() {
       return toolsListCalls;

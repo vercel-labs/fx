@@ -11,7 +11,7 @@ const wasmPath = resolve(process.argv[2] || resolve(scriptDir, "../../zig-out/bi
 if (!supportsJspi()) process.exit(2);
 
 const terminal = new Terminal({ cols: 100, rows: 34, allowProposedApi: true, scrollback: 3000 });
-const config = new Map([["model", "test/workspace-model"], ["mode", "code"]]);
+const config = new Map([["model", "test/workspace-model"], ["mode", "auto"]]);
 const encoder = new TextEncoder();
 const requestDecoder = new TextDecoder();
 const stderrDecoder = new TextDecoder();

@@ -41,7 +41,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: "0.16.0"
+          version: "0.17.0"
 
       - name: Build dev binary
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dupdate-channel=dev
@@ -77,7 +77,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: "0.16.0"
+          version: "0.17.0"
 
       - name: Build terminal WASM
         run: zig build -Doptimize=ReleaseSafe -Dwasm-surface=term
@@ -86,10 +86,12 @@ jobs:
         run: |
           cp sdk/fx-sdk.js fx-sdk.js
           cp sdk/core-output.js core-output.js
+          cp sdk/tool-observation.js tool-observation.js
           cp sdk/wasm-module.js wasm-module.js
           cp zig-out/bin/fx-term.wasm fx-term.wasm
           sha256sum fx-sdk.js > fx-sdk.js.sha256
           sha256sum core-output.js > core-output.js.sha256
+          sha256sum tool-observation.js > tool-observation.js.sha256
           sha256sum wasm-module.js > wasm-module.js.sha256
           sha256sum fx-term.wasm > fx-term.wasm.sha256
 
@@ -102,6 +104,8 @@ jobs:
             fx-sdk.js.sha256
             core-output.js
             core-output.js.sha256
+            tool-observation.js
+            tool-observation.js.sha256
             wasm-module.js
             wasm-module.js.sha256
             fx-term.wasm
@@ -155,10 +159,11 @@ jobs:
 
           sha256sum --check fx-sdk.js.sha256
           sha256sum --check core-output.js.sha256
+          sha256sum --check tool-observation.js.sha256
           sha256sum --check wasm-module.js.sha256
           sha256sum --check fx-term.wasm.sha256
 
-          for FILE in fx-sdk.js fx-sdk.js.sha256 core-output.js core-output.js.sha256 wasm-module.js wasm-module.js.sha256 fx-term.wasm fx-term.wasm.sha256; do
+          for FILE in fx-sdk.js fx-sdk.js.sha256 core-output.js core-output.js.sha256 tool-observation.js tool-observation.js.sha256 wasm-module.js wasm-module.js.sha256 fx-term.wasm fx-term.wasm.sha256; do
             CONTENT_TYPE="application/octet-stream"
             [[ "$FILE" == *.js ]] && CONTENT_TYPE="text/javascript"
             [[ "$FILE" == *.wasm ]] && CONTENT_TYPE="application/wasm"

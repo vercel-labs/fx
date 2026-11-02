@@ -70,8 +70,7 @@ fn formatPermissionCommandIdentity(
     shell_path: []const u8,
     command: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         permission_identity_prefix ++ "{s}:{d}:{s}::{s}",
         .{ profile, shell_path.len, shell_path, command },
     );
@@ -108,23 +107,19 @@ pub fn formatApprovalCommand(
     command: []const u8,
 ) ![]u8 {
     return switch (environment) {
-        .legacy => std.fmt.allocPrint(
-            alloc,
+        .legacy => alloc.print(
             "# shell.run profile=omitted (legacy)\n{s}",
             .{command},
         ),
-        .workspace_clean => std.fmt.allocPrint(
-            alloc,
+        .workspace_clean => alloc.print(
             "# shell.run profile=clean workspace=root-fixed\n{s}",
             .{command},
         ),
-        .clean => |path| std.fmt.allocPrint(
-            alloc,
+        .clean => |path| alloc.print(
             "# shell.run profile=clean shell={s}\n{s}",
             .{ path, command },
         ),
-        .user => |path| std.fmt.allocPrint(
-            alloc,
+        .user => |path| alloc.print(
             "# shell.run profile=user shell={s}\n{s}",
             .{ path, command },
         ),

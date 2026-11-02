@@ -1,7 +1,12 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
+
+/// Most questions one `ask_user_question` call may ask. The tool schema, the
+/// argument parser, and saved-result decoding all share this bound.
+pub const max_questions: u32 = 20;
 
 const EncodeError = Allocator.Error || std.Io.Writer.Error || error{
     AnswerCountMismatch,
@@ -51,7 +56,7 @@ pub fn decodeJson(
 
     if (root != .array) return null;
     const items = root.array.items;
-    if (items.len < 1 or items.len > 4) return null;
+    if (items.len < 1 or items.len > max_questions) return null;
 
     const answers = try arena.alloc(types.QuestionAnswer, items.len);
     for (items, 0..) |item, index| {
@@ -105,6 +110,36 @@ test "question answer decoding rejects non-result payloads" {
     try std.testing.expect((try decodeJson(arena, "[{\"question\":\"Q\",\"answer\":\"A\"}] trailing")) == null);
 }
 
+test "question answers round-trip a full batch and reject one more" {
+    const alloc = std.testing.allocator;
+    const count = max_questions + 1;
+    var question_bufs: [count][24]u8 = undefined;
+    var answer_bufs: [count][24]u8 = undefined;
+    var entries: [count]types.QuestionBatchEntry = undefined;
+    var answers: [count][]const u8 = undefined;
+    for (&entries, &answers, &question_bufs, &answer_bufs, 0..) |*entry, *answer, *question_buf, *answer_buf, index| {
+        entry.* = .{ .question = try std.mem.print(question_buf, "Question {d}?", .{index + 1}), .options = &.{} };
+        answer.* = try std.mem.print(answer_buf, "Answer {d}", .{index + 1});
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const full = try encodeJson(alloc, entries[0..max_questions], answers[0..max_questions]);
+    defer alloc.free(full);
+    const decoded = (try decodeJson(arena, full)).?;
+    try std.testing.expectEqual(@as(usize, max_questions), decoded.len);
+    for (decoded, entries[0..max_questions], answers[0..max_questions]) |pair, entry, answer| {
+        try std.testing.expectEqualStrings(entry.question, pair.question);
+        try std.testing.expectEqualStrings(answer, pair.answer);
+    }
+
+    const oversized = try encodeJson(alloc, &entries, &answers);
+    defer alloc.free(oversized);
+    try std.testing.expect((try decodeJson(arena, oversized)) == null);
+}
+
 test "question answer codec exposes structural and allocation failures" {
     const entries = [_]types.QuestionBatchEntry{
         .{ .question = "Continue?", .options = &.{} },
@@ -115,7 +150,7 @@ test "question answer codec exposes structural and allocation failures" {
     );
 
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     try std.testing.expectError(

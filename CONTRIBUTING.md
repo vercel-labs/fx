@@ -1,530 +1,309 @@
-# Contributing
+# Contributing to fx
 
-## Scope
+fx is open source and developed in public at [vercel-labs/fx](https://github.com/vercel-labs/fx). The fx team at Vercel maintains it and makes most changes, and pull requests from outside contributors are welcome and go through the same CI checks. Only maintainers can push branches to the repository, add labels, or start optional CI runs. Outside contributors work from a fork, and a maintainer handles those steps for them.
 
-`fx` is a CLI-first coding agent written in Zig.
+Code conventions live in [AGENTS.md](AGENTS.md): which module owns which behavior, how fx uses Zig 0.17, how permissions and tests are structured, and the rules coding agents follow. Read it before you change code, whether you write the change yourself or with a coding agent.
 
-Contributions should preserve that direction:
+## Report a problem
 
-* CLI-first over terminal-IDE behavior
+Run `/feedback` inside fx to open the feedback form, or [open an issue](https://github.com/vercel-labs/fx/issues/new/choose) with the bug report template. Describe what you did, what you expected, and what happened instead. If something looks wrong in your terminal, `/trace` copies a private diagnostic trace that you can attach. Issues are public, so review the trace and remove secrets before you post it.
 
-* explicit contracts over ad hoc strings and branches
+Report security vulnerabilities through the [contact page](https://fx.sh/contact), not in a public issue.
 
-* permission-first security model
+## Set up a checkout
 
-* small, reviewable changes
+You need:
 
-* honest docs and status reporting
+- [Zig 0.17.0](https://ziglang.org/download/), the version CI builds with. Check `zig version` before you build, because an older Zig fails inside `build.zig` with errors such as `no field or member function named 'poisonCache'` that don't mention the version.
+- [Bun](https://bun.sh) and [tmux](https://github.com/tmux/tmux) for the end-to-end tests.
+- [hyperfine](https://github.com/sharkdp/hyperfine), if you want to run the startup benchmark locally.
 
-## Setup
+The unit tests and most end-to-end tests don't call a model. To try a change that does, sign in as the [README](README.md#quick-start) describes or set `AI_GATEWAY_API_KEY`.
 
-Requirements:
+Clone the repository, or your fork if you're an outside contributor, and build fx:
 
-* Zig `0.16.0+`
+```bash
+git clone https://github.com/vercel-labs/fx.git
+cd fx
+zig build
+./zig-out/bin/fx
+```
 
-* interactive terminal for manual shell testing
+Test your changes with `./zig-out/bin/fx` from your checkout. A bare `fx` runs whichever copy comes first on your `PATH`, which is usually an installed release that doesn't include your change.
 
-* a model connection for model-backed flows. [Custom model connections](README.md#custom-model-connections) support local and remote endpoints. Vercel OAuth via `fx login`, macOS Keychain API keys via `fx setup`, `AI_GATEWAY_API_KEY`, and `VERCEL_OIDC_TOKEN` are also supported
+fx keeps its settings and sessions in `~/.fx`, and on macOS it stores API keys and OAuth credentials in your Keychain. To try a change against an empty profile without touching your own, give fx a temporary home directory and turn off Keychain storage:
 
-Common commands:
+```bash
+HOME="$(mktemp -d)" FX_DISABLE_KEYCHAIN=1 ./zig-out/bin/fx
+```
+
+## Make a change
+
+Start each change from the latest `main`, and keep each pull request to one change. Put unrelated formatting, renames, and cleanup in their own pull requests, so each one can be reviewed and reverted on its own.
+
+Before you build a feature, answer the questions in the [Adding a Feature](AGENTS.md#adding-a-feature) section of AGENTS.md. They ask which module owns the behavior, what its typed contract is, whether it needs persistence or JSON output, which docs and tests land with it, and how its end-to-end tests are classified for PGSO. If you can't answer them yet, settle the design before you write code. Outside contributors can propose a design in an issue first.
+
+These rules apply to every change:
+
+- `src/main.zig` only wires runtimes together. Feature logic and state belong to the module that owns them.
+- Sensitive tool behavior goes through the permission system in `src/core/permissions/permissions.zig`. Don't add a path around it.
+- fx has no dependencies outside the Zig standard library. Talk to the maintainers before you add one.
+- Don't commit generated state from `.fx/`, `.zig-cache/`, or `zig-out/`.
+- Don't commit home-directory paths, real team IDs, or personal project slugs. `scripts/check-public-surface.sh` rejects them in CI, so use `/Users/example/` in fixtures.
+- Don't document behavior that doesn't exist yet.
+
+If a coding agent helps with your change, point it at AGENTS.md. Any prose the agent writes for your contribution, including pull request titles and descriptions, commit messages, documentation, and issues, must follow the `technical-writer` skill in `.fx/skills/technical-writer/`.
+
+## Test your change
+
+Run the tests that cover your change, build fx, and then use `./zig-out/bin/fx` to exercise the change yourself. Tests don't always start the full runtime, attach a terminal, or spawn background threads, so a passing suite can still miss a startup crash or a rendering regression. Confirm that fx didn't abort, that stderr is clean, and that the behavior matches what you'll describe in the pull request.
 
 ```bash
 zig fmt src/
 zig build
 zig build test
-zig build run
+cd tests/e2e
+bun install
+bun test cli.test.ts
 ```
 
-## Verification Workflow
+Zig unit tests sit in `test` blocks inside the source file they cover, and `zig build test` runs all of them. CI checks formatting with `zig fmt --check src/`. The end-to-end tests run the binary at `zig-out/bin/fx`, so build before you run them. Run only the end-to-end files that cover your change, because CI runs the whole suite on every push. The `tui-*` files drive fx inside tmux.
 
-Keep the local development loop focused: run the narrowest test that covers the changed path, build fx, and exercise the change using `./zig-out/bin/fx`. The installed `fx` on `PATH` is not valid development evidence.
+### Add an end-to-end test file
 
-Once the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. The **Full CI** workflow runs the complete deterministic suite on native Linux x86_64, Linux aarch64, macOS x86_64, and macOS aarch64 runners. The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting and the public-surface audit run in those ReleaseSafe jobs. Four duration-balanced, isolated ReleaseSafe E2E shards per platform use checked-in weights to assign every Bun test file once; files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after tmux is reset.
+Every root `tests/e2e/*.test.ts` file needs an entry in the first two files below, and in the third only when it branches on the platform. CI fails when a required entry is missing or stale:
 
-Standard PR CI reports ReleaseSafe Build & Test and deterministic E2E results. Do not mark the draft PR ready until all four Full CI jobs and the final ship gate have succeeded for the exact current commit. Each platform aggregate requires its ReleaseSafe native check and all four ReleaseSafe E2E shards. A result from an older commit does not count. Live model evals are separate from this gate because they require credentials and are not deterministic.
+| File | Entry |
+| --- | --- |
+| `scripts/pgso/corpus.json` | Exactly one classification: training, verification-only, or intentional exclusion |
+| `tests/e2e/ci-shard-weights.json` | A weight that balances the four CI shards |
+| `tests/e2e/macos-platform-tests.json` | Needed only when the file branches on `process.platform` or `platform()` being `darwin` or `linux` |
 
-Changes to `build.zig` or `scripts/pgso/` also run the native macOS arm64 PGSO candidate workflow. That lane produces retained size, behavior, and performance evidence but does not alter any release artifact or update channel. Its pinned toolchain, local reproduction command, corpus exclusions, and failure rules are documented in [`scripts/pgso/README.md`](scripts/pgso/README.md).
+The corpus drives the macOS arm64 PGSO build, which profiles fx on the training files, optimizes the code they exercise for speed, and compiles the functions they show to be cold for size. Classify a file as training when it covers common or performance-sensitive behavior. Use verification-only for correctness, recovery, security, or rare behavior that the build must pass without treating it as hot. Use an intentional exclusion only for coverage that is nondeterministic, needs the network or credentials, involves sound, or tests the harness itself, and record the reason. A test added to an existing file inherits that file's classification, and removing a file means removing its entries.
 
-Every pull request also receives informational ReleaseSafe binary-size
-comparisons for Linux x86_64, Linux arm64, macOS x86_64, and macOS arm64. Each
-comparison builds the pull request merge commit and base commit on the same
-native runner, reports exact file and ELF or Mach-O section deltas, and emits a
-warning at increases of 52,429 bytes (0.050000 MiB) or more. The warning requests
-investigation but does not replace the full PGSO release gate or reject a valid
-feature solely for adding code.
+### Reproduce a rendering bug
 
-## Pull Requests
+fx prints into your terminal's scrollback instead of taking over the screen, so many rendering bugs appear only at certain sizes or after a resize. Reproduce a bug at the lowest layer that catches it:
 
-Every PR must carry exactly one label that describes its primary intent:
+1. A Zig unit test in `src/ui/resize_tests.zig` drives the transcript renderer against an in-process virtual terminal, with no TTY or signals. These tests are the fastest and run in `zig build test`.
+2. A tmux test in `tests/e2e/tui-resize.test.ts` covers bugs that need a real terminal and a real `SIGWINCH`. `tests/e2e/tmux-helpers.ts` provides `resizeWindow`, `capturePaneGrid`, and `capturePaneEscapes`.
+3. A recorded tape captures a session someone has already seen go wrong. Run fx with `FX_RECORD=/tmp/bug.fxtape`, or with `FX_DEBUG_RECORD=1` to write a private tape under `~/.fx/recordings/`, then replay it without a terminal:
 
-* `type: bug`: fixes incorrect behavior
+   ```bash
+   ./zig-out/bin/fx replay /tmp/bug.fxtape
+   ./zig-out/bin/fx replay /tmp/bug.fxtape --golden /tmp/bug.txt
+   ```
 
-* `type: feature`: adds a new user-facing capability
+   `--golden` writes the final screen to a file that you can check in as the expected result.
 
-* `type: improvement`: improves existing user-facing behavior
+When a tmux test or a tape exposes a bug, reproduce it as a Zig unit test before you fix it, so the fix lands with its regression test.
 
-* `type: docs`: changes documentation only
+### Fuzz a parser
 
-* `type: maintenance`: changes internal tooling, dependencies, CI, or implementation structure without a user-facing behavior change
-
-* `type: release`: prepares or repairs a release
-
-* `type: security`: fixes or hardens a security boundary
-
-If you cannot manage labels, a maintainer or repository agent will apply the label before review. For a mixed PR, choose the label that best describes why the PR exists. Keep the title as a clean imperative sentence and do not add bracketed type prefixes such as `[bug]` or `[improvement]`.
-
-## Repo Shape
-
-* `src/main.zig`: composition root only
-
-* `src/core/`: contracts, runtimes, config, sessions, permissions, MCP, skills
-
-* `src/tools/`: built-in tool implementations
-
-* `src/ui/`: terminal rendering, event loop, input, transcript
-
-* `src/gateway/`: AI Gateway client transport
-
-* `.fx/skills/`: optional fx-native workspace-level skill root
-
-* `skills/`: optional shared workspace-level skill root
-
-## Collaboration Rules
-
-Before adding a new feature, answer these first:
-
-1. Which module owns the behavior?
-2. What is the typed contract?
-3. Does it need persistence?
-4. Does it need both text and JSON output?
-5. What docs and tests land with it?
-6. How is its deterministic E2E owner classified for macOS arm64 PGSO?
-
-If that is unclear, stop and define it first.
-
-### PGSO corpus ownership
-
-Classify every root `tests/e2e/*.test.ts` file in
-`scripts/pgso/corpus.json`. Put common or performance-sensitive behavior in
-training. Put important correctness, recovery, security, and rare behavior in
-verification-only. Exclude only nondeterministic, live-network, credentialed,
-sound-related, or harness-only coverage, and record the reason.
-
-Tests added to an existing file inherit its classification. Reconsider that
-classification when a feature changes the file's product role, and remove stale
-entries when deleting a feature or E2E owner. Normal PR CI rejects missing,
-duplicate, stale, and unclassified files without running the full PGSO gate.
-
-## Configuration and State
-
-Config precedence (highest wins):
-
-1. Environment variables such as `FX_PROVIDER`, `FX_MODEL`, `FX_PERMISSION_MODE`, and `FX_MAX_AGENT_STEPS`
-2. `~/.fx/settings.json` → `workspaces["<workspace_path>"]` (profile workspace overrides)
-3. `~/.fx/settings.json` top-level (profile global settings)
-4. `<workspace>/.fx.json` (committed project defaults)
-5. Built-in defaults
-
-Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `update_channel`, `permission_mode`, and `permission` are ignored from project config before their values are parsed.
-
-Runtime state lives under `~/.fx/`:
-
-* `~/.fx/sessions/<session-id>/session.json`
-
-* `~/.fx/sessions/<session-id>/background/`
-
-* `~/.fx/sessions/<session-id>/subagent/`
-
-* `~/.fx/sessions/<session-id>/logs/`
-
-Sessions are global and portable across workspaces. Each session tracks a `workspace_root` that updates when resumed from a different directory.
-
-Subagent children are internal ordinary sessions with their own `~/.fx/sessions/<child-id>/` directory and history. The parent owns one bounded `subagent/children.json` registry; each child carries only an immutable owner marker. Child sessions are hidden from ordinary session discovery and cannot be resumed directly. A first `subagent.message` creates a named persistent child for that parent; later messages continue it, and optional instructions replace only its child-specific system overlay.
-
-## Skills
-
-There are two distinct skill categories in `fx`:
-
-* `fx` roots that belong to the product itself: `.fx/skills`, `skills/`, `~/.fx/skills`
-
-* compatibility roots discovered for other agent installs: `.opencode/skills`, `.codex/skills`, `.claude/skills`, `.agents/skills`, `.claw/skills`, plus their global equivalents
-
-`/skills list` should make that distinction visible to the user.
-
-`/skills add` and `/skills install` install full skill directories into the profile-owned `~/.fx/skills` managed root, not just `SKILL.md`. Workspace `.fx/skills` and `skills/` remain discoverable project-local instructions, not managed install targets.
-
-The interactive agent can also install skills via the `install_skill` tool when the user asks to install one in conversation, including pasted `npx skills add ...` syntax.
-
-## MCP
-
-Native fx connections use MCP v1 initialization by default over stdio,
-Streamable HTTP, and deprecated `2024-11-05` HTTP+SSE. Servers using the newer
-`2026-07-28` discovery lifecycle opt in with
-`FX_MCP_PROTOCOL_VERSION=2026-07-28` in their configured `environment` map.
-The SDK's host-owned client controls its own protocol negotiation. Native
-sessions load trusted MCP configuration from the profile:
-
-* `~/.fx/mcp.json`
-
-They also read Claude-compatible workspace configuration from:
-
-* `<workspace>/.mcp.json`
-
-Project `.fx.json` does not define runnable MCP commands, URLs, env, or secrets.
-The profile file reads top-level `mcp` and accepts `mcpServers` as a
-compatibility alias; `mcp` wins when both exist, and every write uses `mcp`.
-Suspicious server-like unsupported keys produce a bounded warning and block
-profile mutation instead of being overwritten. The workspace file reads only
-top-level `mcpServers`, accepts `command` plus `args`, and is opened as a
-bounded no-follow regular file. Profile entries win native name collisions;
-ACP request entries win ACP name collisions without deduplicating the request
-array. Workspace entries are always optional and never load stored credentials.
-Approved workspace `command`, `args`, `env`, and HTTP header values expand
-`${VAR}` and `${VAR:-default}` from the fx process environment. Pending and
-rejected entries do not read environment values. Missing required variables
-leave an approved server unloaded and appear in `/mcp list` without exposing
-values.
-
-Interactive sessions keep pending workspace servers disconnected and request
-project trust before any project-defined process or network effect. Pending
-resource, prompt, completion, and authentication commands require explicit
-`/mcp trust approve <name>` and a retry. Rejected servers remain disconnected.
-Choices live only in profile `settings.json` under the canonical workspace key,
-using `enabledMcpjsonServers`, `disabledMcpjsonServers`, and
-`enableAllProjectMcpServers`. Repository files cannot persist their own
-approval. `fx ask` and ACP skip pending workspace servers. Noninteractive users
-approve them first with `fx mcp trust approve <name>`; rejected servers remain
-disabled.
-
-The core feature surface is Tools, Resources and Resource Templates, Prompts,
-Completion, pagination, cache-aware discovery, subscriptions, progress,
-cancellation, and form or URL elicitation. Keep modern and legacy protocol
-behavior in their existing version-scoped modules.
-
-fx bounds schema size and structure before publication. It accepts schemas
-without `$schema`, the canonical JSON Schema 2020-12 declaration, and the
-canonical Draft 7 declaration used by legacy SDKs; other declared dialects are
-rejected. fx does not resolve network references or evaluate semantic schema
-assertions. Servers validate their tool arguments and results.
-
-The interactive surface supports:
-
-* `/mcp list`
-
-* `/mcp resource list <server>`
-
-* `/mcp resource templates <server>`
-
-* `/mcp resource read <server> <uri>`
-
-* `/mcp resource complete <server> <uri-template> <variable> [value]`
-
-* `/mcp prompt list <server>`
-
-* `/mcp prompt get <server> <name> [arguments-json]`
-
-* `/mcp prompt complete <server> <name> <argument> [value]`
-
-* `/mcp add <name> <command> [args...]`
-
-* `/mcp add --transport http <name> <url>`
-
-* `/mcp remove <name>`
-
-* `/mcp reload`
-
-* `/mcp auth <name> --open`
-
-* `/mcp logout <name>`
-
-* `/mcp trust approve <name>`
-
-* `/mcp trust reject <name>`
-
-* `/mcp trust approve-all`
-
-* `/mcp trust reset`
-
-* `/mcp path`
-
-The noninteractive MCP surface supports:
-
-* `fx mcp add <name> <command> [args...]`
-
-* `fx mcp add --transport http <name> <url>`
-
-* `fx mcp auth <name>`
-
-* `fx mcp list`
-
-* `fx mcp logout <name>`
-
-* `fx mcp path`
-
-* `fx mcp remove <name>`
-
-* `fx mcp trust approve <name>`
-
-* `fx mcp trust reject <name>`
-
-* `fx mcp trust approve-all`
-
-* `fx mcp trust reset`
-
-The local form saves a stdio command. The HTTP form saves a remote Streamable
-HTTP endpoint. List reads effective profile and workspace configuration plus
-stored authentication state without connecting servers. Path prints the profile
-configuration path. Remove uses the same locked canonical profile writer as
-add. Trust updates the canonical workspace entry in profile settings. Auth and
-logout run the existing remote credential lifecycle. None of these commands
-constructs the TUI or contacts the Gateway.
-
-The default MCP startup timeout is 30 seconds and remains overridable per
-server with `startup_timeout_ms`. Exact direct `docker run` stdio commands
-without `--cidfile` receive a private cidfile so fx can remove the container
-after shutdown or startup failure. An explicit cidfile remains user-owned.
-
-MongoDB Atlas Managed MCP configuration service accounts use the OAuth
-client-credentials grant. fx does not implement that grant directly. Use
-MongoDB's `mongodb-atlas-mcp-remote` stdio wrapper with inherited
-`MDB_MCP_API_CLIENT_ID` and `MDB_MCP_API_CLIENT_SECRET` environment variables.
-The Atlas App Connection browser flow is user-delegated access and must not be
-treated as equivalent to configuration service-account credentials.
-
-Remote authentication supports configured bearer tokens and OAuth credential
-discovery, persistence, refresh, scope challenges, and logout. Credential and
-private-cache identity changes invalidate prior private state. macOS persists
-OAuth credentials in Keychain and migrates the private profile credential file
-only after verified publication. If the user account has no default Keychain,
-macOS falls back to the same `0600` credential file used on other platforms
-under the `0700` profile directory. `FX_DISABLE_KEYCHAIN=1` selects that portable
-backend explicitly for deterministic tests and local troubleshooting.
-
-Servers are optional by default. Required startup failures block the first TUI
-or `fx ask` model request; optional failures publish a reduced, degraded
-capability set. Terminal `fx ask` completes admitted MCP discovery before its
-first model request. JSON and other headless asks start required servers first
-and defer optional servers until the turn performs an MCP operation or delegates
-MCP capability to a child. Server-filtered searches, selected tools, and feature
-operations activate only their target; a broad search activates the broader
-catalog. Each server owns its startup and recovery progress. Connection deadlines
-cover discovery, fallback, and restarts together. Interactive authentication and
-logout change only the affected connection. `/mcp list` renders a bounded, secret-free health
-snapshot. The interactive menu refreshes that view while it is open.
-
-Search and explicit selection share bounded schema publication. Definitions are
-checked against their runtime, connection, catalog, and credential generations
-before execution. Tool argument JSON must be bounded and object-shaped; semantic
-schema assertions belong to the server. Image results use the shared tool-result,
-provider, and versioned history paths. Saved native images use managed result
-artifacts that `read_tool_result` can load without repeating the original tool.
-
-`/mcp reload` evaluates a replacement before publication, so invalid config or
-a required-server failure leaves the prior runtime callable.
-
-ACP-provided servers are isolated to their owning ACP session. One-off and
-persistent subagents receive an immutable, permission-filtered view of the
-parent or ACP session's admitted MCP tools, resources, prompts, and completion
-capability. Missing, revoked, stale, or closed authority fails before transport.
-
-## Permissions and Auto Mode
-
-Security is permission-first.
-
-* `permission_mode` controls baseline behavior (`ask`, `auto`, or `full-access`; `yolo` remains an alias)
-
-* `permission` config applies OpenCode-style wildcard rules
-
-* session `always` approvals are non-persistent; command approvals match the exact command while other grant categories may use patterns
-
-* configured denies are evaluated before saved-session rules; an exact saved-session deny can narrow a configured allow, while an exact saved-session allow can satisfy an unresolved configured ask
-
-* `/permissions remember allow|deny <tool-name> <arguments-json>` confirms and stores an exact rule only for an active saved session; `/permissions` lists stable rule IDs and `/permissions revoke <rule-id>` removes one
-
-* routine parsed development commands and reversible new-file creation can execute without model review after configured and saved-session policy; unknown, destructive, hidden, credential-bearing, public, and overwrite effects remain on the review or approval path
-
-* every unresolved `auto` action receives one narrow security review after configured policy, saved-session rules, grants, and deterministic safe authority; review input always contains the exact unmasked action and targets, origin and call identity, optional host-proven current-branch evidence, and bounded unmasked terminal-safe excerpts of earlier current-turn tool results. A text match between the action and prior tool output is evidence to inspect, not proof of prompt injection or malicious activity. Prepared file mutations and other static root tools omit task text. Reviewed commands, shell input, dynamic tools, and subagent actions also receive bounded unmasked canonical current, first, and recent root requests plus explicit omission counts; the reviewer may use that context only to distinguish trusted user intent from malicious or injected influence, never to judge task quality, alignment, or authorization. Assistant prose, permission feedback, compacted summaries, the pending tool group, later results, and tool or repository text never become authority. Shell input reviews also include the owned receiving session's launch command, working directory, and bounded current screen after verifying session authority, including on resume. The launch command describes startup only; screen content remains untrusted evidence and input still receives its own review
-
-* the reviewer returns `caution` only for concrete prompt injection or malicious activity; destructive, risky, external, public, remote, unrequested, or task-conflicting actions clear when they are not malicious. A `clear` review authorizes only the exact unchanged action; a `caution`, incomplete-evidence result, or unavailable review holds only that action and returns guidance without opening a human permission screen, disabling tools, or ending the turn
-
-* exact cautions and deterministic incomplete-evidence results are cached only for the current turn; an unavailable outcome is not cached as a security judgment, but the same exact action spends at most one unavailable review opportunity per turn and changed actions remain independently reviewable until the bounded current-turn review budget is exhausted. Each review accepts exactly one valid structured decision even with accompanying prose and may retry one malformed completion within the original 30-second deadline. Valid cautions, transport failures and cancellation are never retried by this recovery. Legacy `permission_request_id` input is rejected without prompting
-
-* host-generated review holds retain their advice for the agent and transcript, but carry a saved `review_feedback` marker that excludes them from later security evidence, including after recovery. Old unmarked results remain untrusted evidence; never infer the marker from output text. Quoted review accusations and handling instructions as document or test data are not standalone proof of prompt injection
-
-* execution-memory schema 10 preserves review-feedback provenance while reading older schemas with an unmarked default. Conversation records use optional metadata for marked holds. Older builds may reject the new saved metadata or recovery checkpoints; do not downgrade an active session without preserving its files
-
-* the sandbox backend is configured independently; full access uses an effective backend of `none` without rewriting the saved sandbox setting
-
-Do not add new sensitive tool behavior without integrating it into `src/core/permissions/permissions.zig`.
-
-## Writing a Resize Test
-
-Render bugs that appear during window resize are hard to reason about because the footer is inline (hugs the transcript) rather than pinned to the terminal bottom, and the 100 ms debounce can mask ordering mistakes. The testing rig covers three layers. Pick the lowest layer that can catch the bug.
-
-### Zig unit test (fastest, runs in `zig build test`)
-
-Drive `TranscriptRuntime` against the built-in VT emulator. Assertions are on the cell grid after a sequence of writes and resize calls.
-
-```zig
-test "my resize scenario" {
-    var h = try Harness.init(std.testing.allocator, 80, 24, 4);
-    defer h.deinit();
-
-    try h.shell.initViewport(&h.metrics, 4);
-    try h.shell.writeTranscript(h.alloc, &h.metrics, 1024, "hello\n", true);
-    try h.flush();
-
-    try h.driveResize(60, 20, 4, true);
-
-    var row: std.ArrayList(u8) = .empty;
-    defer row.deinit(h.alloc);
-    try h.vt.rowText(1, &row);
-    try std.testing.expectEqualStrings("hello               ", row.items);
-}
-```
-
-Add it to `src/ui/resize_tests.zig`. See the file header for what each Harness method does.
-
-### tmux end-to-end test (real SIGWINCH, seconds per test)
-
-For bugs that only show up with a real terminal and a real signal (timing, input integration, terminal-emulator quirks), add a scenario to `tests/e2e/tui-resize.test.ts` using the helpers in `tmux-helpers.ts`:
-
-```typescript
-test("my scenario", async () => {
-    session = await TmuxSession.create({ width: 120, height: 40 });
-    await session.waitForText(">", 10_000);
-    await session.resizeWindow(80, 30);
-    const grid = await session.capturePaneGrid();
-    expect(findFooter(grid)).not.toBeNull();
-}, 30_000);
-```
-
-### Tape-based test (replay a real capture)
-
-For bugs reported by a user, have them run the built binary with an exact
-`FX_RECORD=<path>`, or use `FX_DEBUG_RECORD=1` for an automatic private tape.
-`FX_DEBUG_RECORD_SILENT_BANNER=1` hides the developer-only startup notice from
-the inline transcript without disabling capture; Ctrl+O still shows it. Drop
-the tape in `tests/e2e/tapes/<name>.fxtape` and assert against the built replay
-command:
+A fuzz test is a `test` block that calls `std.testing.fuzz`. `tests/fuzz/targets.json` lists each one as a target, with its exact test name and the module that holds it. `zig build test` runs every fuzz test once on its inline seeds and on each file in `tests/fuzz/corpus/<target>/`. `zig build fuzz` builds only the fuzz tests, and with `--fuzz` Zig searches for new inputs that fail:
 
 ```bash
-./zig-out/bin/fx replay tests/e2e/tapes/my-bug.fxtape --golden tests/e2e/tapes/my-bug.txt
+zig build fuzz -Dfuzz-target=sse_framing               # replay the saved inputs
+zig build fuzz -Dfuzz-target=sse_framing --fuzz=200K   # try 200,000 new inputs
 ```
 
-Check in the golden file and wire a regression test that re-runs `fx replay` in CI and diffs.
+When the search finds a failure, Zig 0.17 prints `error: test '...'` but still exits with status 0, so read the output. Without a limit, `--fuzz` runs until you stop it and opens Zig's web interface.
 
-## What Not To Do
+The Fuzz workflow fuzzes each target on `main` every night for about 20 minutes, and for two minutes on a pull request that changes the fuzzing setup. When the nightly run finds a failure, it uploads the failing input as an artifact and opens an issue titled `Nightly fuzz failure: <target>`, or comments on that issue if it is already open. To fix the failure, copy the input into `tests/fuzz/corpus/<target>/` and run `zig build fuzz -Dfuzz-target=<target>` to reproduce it. That build uses Debug by default, which adds allocation stack traces to leak reports. Keep the input file in the fix's pull request, so `zig build test` replays it on every pull request after that.
 
-* Do not grow `main.zig` with leaf feature logic
+A saved input holds the values the test reads from its `std.testing.Smith`, in order. For example, a test that calls `smith.slice` reads a 4-byte little-endian length and then that many bytes. Inputs that the fuzzer saves are already in this form. Inline seeds go through `@import("fuzz_seed").slices`, which writes each one in this form for a test whose first read is `smith.slice`. A seed written as a plain string would lose its first four bytes to the length.
 
-* Do not add hidden product state that only exists in the shell
+To add a target, write the fuzz test in the file it covers and add an entry to `tests/fuzz/targets.json`. For a target outside the session manager, also import its file in `src/fuzz_targets.zig`. Pass the seeds and saved inputs to the test with `.corpus = &(@import("fuzz_seed").slices(.{ <seeds> }) ++ @import("fuzz_corpus").<target>.*)`. The session manager imports nothing from fx, so its targets keep their seeds as files in `tests/fuzz/corpus/<target>/` and pass `.corpus = &(.{""} ++ @import("build_options").fuzz_corpus_<target>.*)`. Set `iterations` so that one round of `--fuzz` takes about 30 seconds on a developer machine. `scripts/tests/test_fuzz_nightly.py` fails when an entry names a test that doesn't exist or that `zig build fuzz` can't reach. The MCP engine in `src/mcp/` imports only the standard library, so its targets live in `src/core/mcp_host/wire_tests.zig`. A file that holds only tests, like that one, is also imported from the test block in `src/main.zig`.
 
-* Do not add a second execution path for the same feature without a clear reason
+### Find data races
 
-* Do not document intended behavior as if it already exists
+`-Dsanitize-thread=true` builds fx and its tests with ThreadSanitizer, which reports two threads touching the same memory without synchronization. The build is slow and large, so install it to its own prefix:
 
-* Do not commit generated state from `.fx/`, `.zig-cache/`, or `zig-out/`
+```bash
+TSAN_OPTIONS=halt_on_error=0:abort_on_error=0 zig build test -Dsanitize-thread=true -p /tmp/fx-tsan
+```
 
-* Do not add a general alternate-screen (`\x1b[?1049h/l`) render path. fx is inline by design except for the three exclusive owner classes represented by `AlternateScreenOwner`: interactive tool-approval review, the full-transcript screen, and catalog menus. Every owner must leave or explicitly hand off the alternate buffer and restore the main grid, composer, cursor, paste, mouse, focus, and keyboard modes before resolving, cancelling, or shutting down
+Without those options, the sanitizer aborts a test binary once it has reported a race, so that binary's later tests don't run. The Thread Sanitizer workflow runs the unit tests this way on `main` every night and lists each race in its job summary. It reports races without failing. A sanitized suite runs slower, so a few tests that depend on timing fail in it, such as the `command_runner` tests of output read after a command exits. Those failures aren't races.
+
+### Check startup performance
+
+The `Startup Latency` check fails a pull request when any benchmarked command takes longer than 2 ms on the Linux CI runner. To measure before you push, run:
+
+```bash
+./benchmarks/startup.sh --quick
+```
+
+The script builds a ReleaseSafe binary and needs hyperfine. On macOS, process and dynamic-loader overhead alone can exceed 2 ms, so compare local numbers between builds instead of against the budget. To measure an interactive launch up to its first frame, `benchmarks/first_frame.py` runs several binaries under the same machine load. In this example, `/tmp/fx-before` is a build of `main`:
+
+```bash
+python3 benchmarks/first_frame.py --binary /tmp/fx-before --binary ./zig-out/bin/fx
+```
+
+### Check a TLA+ model
+
+`tests/tla/` holds TLA+ models of fx, such as the session manager, the MCP engine and host, ACP, `/usage`, the shell tool, the workspace indexer, and libfx. Most come with Bun drivers that run the real binary and have TLC check what it did. CI runs the libfx and MCP models on `main` and on pull requests that change the code they cover; run the matching checker yourself when you change behavior that one of the others describes. You need Java and `tla2tools.jar`, and `tests/tla/README.md` lists every model and covers setup.
+
+```bash
+tests/tla/session_manager/check.sh SessionLog
+tests/tla/mcp/check.sh --model Engine
+bun test ./tests/tla/drivers/shell_command/
+```
+
+### Run the model evals
+
+The evals in `tests/evals/` drive the agent through `fx ask --json` against real models and need `AI_GATEWAY_API_KEY`. They make billed model calls and their results vary between runs, so they aren't part of the pull request checks.
+
+```bash
+cd tests/evals
+bun install
+bun test
+```
+
+`prompt-cache-ab.test.ts` compares how two fx builds keep the provider's prompt cache through mid-session changes: a branch switch, a permission change, folder rules, a restart, and a named skill. A recording proxy keeps every request, and for each run it reports the requests that break the cached prefix, the new and cached input tokens, and whether the answers are right. It runs only when the variables name two builds and the models to try:
+
+```bash
+cd tests/evals
+FX_CACHE_AB_BASELINE_BIN=/abs/path/to/base/fx FX_CACHE_AB_CANDIDATE_BIN=/abs/path/to/zig-out/bin/fx \
+  FX_CACHE_AB_MODELS=anthropic/claude-haiku-5.5,openai/gpt-6.1-sol bun test prompt-cache-ab.test.ts
+```
+
+`FX_CACHE_AB_SCENARIOS` picks scenarios by name, and `FX_CACHE_AB_OUTPUT_DIR` keeps each run's requests and summary. One run per scenario varies, so compare several.
+
+## Open a pull request
+
+1. Sign every commit before you push it. `main` accepts only commits with verified signatures, and squash merging is turned off, so a single unsigned commit blocks the merge. GitHub explains how to set up [commit signature verification](https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification) with an SSH or GPG key.
+2. Push your branch. Maintainers push to `vercel-labs/fx`. Outside contributors push to their fork and open the pull request against `main`.
+3. Open the pull request as a draft once your focused checks pass, so CI starts on it.
+4. Write the title as a plain imperative sentence, such as `Restore feedback report file clipboard`. Leave out bracketed prefixes like `[bug]`, because the type goes in a label.
+5. In the description, say what changes for users or callers, why it changes, and how you verified it, including what you ran with `./zig-out/bin/fx`.
+
+### Choose a label
+
+Every pull request needs exactly one `type:` label before it merges. Choose the label that matches the main reason the pull request exists:
+
+| Label | Use it when the pull request |
+| --- | --- |
+| `type: bug` | Fixes incorrect behavior |
+| `type: feature` | Adds a new user-facing capability |
+| `type: improvement` | Improves existing user-facing behavior |
+| `type: docs` | Changes documentation only |
+| `type: maintenance` | Changes internal tooling, dependencies, CI, or code structure without changing user-facing behavior |
+| `type: release` | Prepares or repairs a release |
+| `type: security` | Fixes or hardens a security boundary |
+
+Only maintainers can add labels. Maintainers add the label when they open the pull request and update it if the scope changes. When a pull request mixes kinds of change, the label follows its main purpose. Outside contributors leave the label off, and a maintainer adds it during review. A missing label never holds a pull request in draft.
+
+## CI checks
+
+CI runs on every push to a pull request, including drafts. Linux x86_64 gates every change, because most fx behavior is the same on every platform. A result counts only for the exact commit it ran on, so each new push needs a new passing run.
+
+These five checks must pass before a pull request merges:
+
+| Check | What it runs |
+| --- | --- |
+| `Build & Test` | Formatting, the PGSO corpus, the public-surface, compactor-boundary, and indexer-boundary checks, the ReleaseSafe unit tests, and the SDK package jobs, including the libfx durable-session model check when the change needs it |
+| `E2E (deterministic)` | Every end-to-end file, split across four weighted shards, plus the MCP conformance baseline |
+| `Shellcheck` | `bash -n` and `shellcheck` on the scripts listed in the job, such as `benchmarks/startup.sh` and `scripts/detect-macos-need.sh` |
+| `Startup Latency` | The benchmarked CLI commands on a ReleaseSafe build, each held to 2 ms, plus the interactive performance test in `tests/e2e/tui-performance.test.ts` |
+| `macOS arm64` | The macOS checks when the change needs them, and otherwise a pass without starting a macOS runner |
+
+CI retries a failed end-to-end file once. A file that passes only on the retry gets a warning annotation, and you should investigate it as a possible race.
+
+`scripts/detect-macos-need.sh` decides whether a change needs macOS. It runs the macOS checks when the change touches:
+
+- A Zig file with a macOS, BSD, or Linux code path
+- `build.zig`
+- The macOS signing script
+- The native SDK addon
+- An end-to-end file listed in `tests/e2e/macos-platform-tests.json`
+- A shared end-to-end helper that reads the platform
+
+When the detector can't read the change, the `macOS arm64` check fails instead of passing.
+
+`scripts/detect-ci-need.sh` decides whether a pull request runs CI's two long model checks. The libfx durable-session model check takes about 40 minutes and runs when the change touches:
+
+- `sdk/`
+- The SDK models in `tests/tla/sdk/` or their drivers in `tests/tla/drivers/*.mjs`
+- The Node-API or WebAssembly core entry point
+- `src/acp/`, `src/core/hosts/`, or `src/core/session_manager/`
+
+The `TLA+ MCP models and drivers` job takes about 20 minutes and runs its checks when the change touches:
+
+- `src/mcp/`, `src/core/mcp_host/`, or `src/core/mcp/`
+- The models in `tests/tla/mcp/` or `tests/tla/mcp_host/`, or their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, or `tests/tla/drivers/lib/`
+- The `tests/e2e/fixtures/mcp-*` servers, or the helpers those drivers load: `tests/e2e/tmux-helpers.ts`, `tests/evals/eval-helpers.ts`, and `tests/e2e/render-lab/tape.ts`
+
+Both run when the change touches `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`, and on every push to `main`. When the detector can't read the change, `Build & Test` fails instead of passing.
+
+Other workflows and benchmark jobs also report on pull requests, such as the `Examples` workflow when `examples/` changes and the `Shell command overhead` benchmark. Only the five checks above are required to merge, but look into any check that fails. Two of the others need more explanation:
+
+- The binary size workflow builds each release target for the pull request and its base commit on native runners, reports the size change, and smoke-tests every target's binary. Growth of 52,429 bytes (0.05 MiB) or more on a platform adds a warning. Investigate growth you can't explain.
+- The macOS arm64 PGSO workflow runs on a pull request only when the PGSO pipeline itself changes: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or `.github/workflows/pgso-macos-arm64.yml`. Stable releases always run it. [scripts/pgso/README.md](scripts/pgso/README.md) explains the pipeline and its acceptance gates.
+- The Linux arm64 PGSO workflow runs on the same pull request paths, with `.github/workflows/pgso-linux-arm64.yml` in place of the macOS workflow file. It qualifies a Linux candidate in one job, which takes several hours. The stable release always runs it and ships its candidate as the Linux arm64 binary. `.github/workflows/pgso-linux-x86_64.yml` qualifies a Linux x86_64 candidate the same way, and the stable release ships it as the Linux x86_64 binary.
+
+Other runs start only on request:
+
+| Run | Command |
+| --- | --- |
+| macOS checks | `gh workflow run macos.yml --ref your-branch`, or add the `ci:macos` label |
+| libfx durable-session and MCP model checks | `gh workflow run ci.yml --ref your-branch` |
+| PGSO qualification | `gh workflow run pgso-macos-arm64.yml --ref your-branch` |
+| Linux PGSO qualification | `gh workflow run pgso-linux-arm64.yml --ref your-branch` or `pgso-linux-x86_64.yml` |
+| Live ACP suite | `gh workflow run ci.yml --ref your-branch -f acp_live=true` |
+| Long-turn memory benchmark | `gh workflow run bench.yml --ref your-branch -f long_turn_memory=true` |
+| libfx runtime benchmark | `gh workflow run bench.yml --ref your-branch -f libfx_runtime=true` |
+| Fuzzing of one target | `gh workflow run fuzz.yml --ref your-branch -f target=<target>` |
+| Unit tests with ThreadSanitizer | `gh workflow run tsan.yml --ref your-branch` |
+
+Only maintainers can start these runs or add the `ci:macos` label. If you're an outside contributor and your change needs one of them, ask in the pull request and a maintainer will start it. If CI doesn't start at all on your first pull request, a maintainer may need to approve the workflow run.
+
+## Mark it ready for review
+
+Mark the pull request ready when all of these hold for its current commit:
+
+1. All five required checks passed. A queued, cancelled, skipped, or failed run doesn't count, and neither does a run on an earlier commit.
+2. You ran `./zig-out/bin/fx` through the changed behavior.
+3. The diff against `main` contains only the files this change needs.
+4. The documentation that describes the behavior is up to date.
+
+If CI fails, push the smallest fix to the same pull request and wait for a passing run on the new commit.
+
+## Update the docs
+
+Update the documentation in the same pull request as the behavior it describes:
+
+- The `--help` output comes from the command specs in `src/builtins/commands.zig`.
+- `sdk/README.md` documents libfx. Update it when libfx's public behavior or setup changes, as [sdk/AGENTS.md](sdk/AGENTS.md) describes.
+- Update this file when build steps, development setup, or collaboration rules change.
+
+Change `README.md` only when one of its statements becomes false, or when a change adds a capability as broad as the ones in its feature list. A new option, command, or environment variable belongs in `--help` and the manual.
+
+Don't edit `CHANGELOG.md` or the version in `src/main.zig`. Maintainers write the changelog when they prepare a release.
+
+### Changes to the manual
+
+The user manual at [fx.sh/docs](https://fx.sh/docs) is built from a private repository, so outside contributors can't edit it. When your change makes a manual page wrong or incomplete:
+
+- Maintainers update the page in a companion pull request and link it from theirs.
+- Outside contributors add a `## Docs` section to the pull request description with the exact change each affected page needs: the page URL, the section, and the text to add, replace, or remove. A maintainer makes the change in the manual.
+
+For example:
+
+```md
+## Docs
+
+- https://fx.sh/docs/configure-fx/permissions, "Change the mode": replace "<current text>" with "<new text>".
+- https://fx.sh/docs/using-fx/sessions: add "<new paragraph>" after the first paragraph.
+```
 
 ## Releases
 
-Releases are triggered automatically when the version in `src/main.zig` changes on `main`:
+Maintainers prepare each release in a pull request that bumps `pub const version` in `src/main.zig` and adds the new entry to `CHANGELOG.md`. When that pull request merges, the release workflow finds no tag for the new version, builds the binaries for every platform, creates the tag, and publishes the GitHub Release along with the binaries that the install script and `fx upgrade` download. Never create a version tag by hand. The [Releasing](AGENTS.md#releasing) section of AGENTS.md describes the changelog format and release markers.
 
-1. Edit `pub const version = "X.Y.Z";` in `src/main.zig`
-2. Merge to `main`
-3. The release workflow checks if `vX.Y.Z` tag exists; if not, it builds four platform binaries, creates the git tag, and publishes a GitHub Release with the binaries attached
+To check release artifacts without publishing anything, run **Actions > Release** on `main` with `validate_only` enabled. The run builds every target, runs the PGSO qualification, and notarizes the macOS binaries. It creates no tag or GitHub Release, uploads nothing to the CDN, and changes no update channel.
 
-The install script and `fx upgrade` fetch binaries from `releases.fx.sh`, backed by the public Vercel Blob CDN. No authentication or external CLI tools are required. The release workflow also publishes binaries to the CDN and updates `latest.txt` automatically.
+After CI passes on `main`, the dev release workflow publishes binaries for that commit. Run `fx upgrade --channel dev` to follow those builds, and `fx upgrade --channel stable` to go back to tagged releases.
 
-After CI passes for a push to `main`, the dev release workflow publishes commit-addressed binaries and then updates `dev.json`. Dogfooders opt in with `fx upgrade --channel dev`; the choice is stored in their user settings and applies to manual upgrades, automatic upgrades, and the `ctrl+g` handoff. `fx upgrade --channel stable` returns to tagged releases. Dev publishing does not create tags or GitHub Releases.
+## License
 
-Release notes are public product copy. Describe user-visible behavior, always spell the product `fx`, and omit contributor attribution, tracker references, repository or website work, delivery infrastructure, CI and test details, branch history, and implementation-only refactors. Use commits and pull requests as research evidence only. Changelog formatting and release-marker rules live in `AGENTS.md`.
-
-Do not create tags manually. The workflow owns tag creation.
-
-### Validate release artifacts without publishing
-
-Run **Actions > Release** on `main` with `validate_only` enabled. This builds
-all four release targets, runs macOS arm64 PGSO qualification, and uses the
-existing `apple-signing` approval to notarize both macOS targets. It does not
-create a tag, publish a GitHub Release, upload to the CDN, or change a channel.
-
-The arm64 validation retains both 4 KiB and 16 KiB signature variants of the
-same PGSO payload for comparison. Intel retains 4 KiB signatures. Download the
-workflow artifacts for matched signed-binary performance checks; notarization
-and smoke checks alone do not establish performance equivalence. Normal release
-runs keep the existing signing default.
-
-To compare the retained signatures on an isolated runner, run **Actions >
-Benchmarks** with `signed_run` set to the successful main validation run ID.
-This mode downloads already-notarized binaries and does not access Apple
-credentials. It records two alternating startup cohorts, an identical-control
-status calibration, and a separate native image-flow memory screen. Review the
-retained measurements before changing release signing defaults; successful
-measurement is not performance approval.
-
-## Benchmarks
-
-Startup latency benchmarks run automatically on every PR and push to `main` via `.github/workflows/bench.yml`.
-
-The workflow builds a ReleaseSafe binary, then uses [hyperfine](https://github.com/sharkdp/hyperfine) to measure wall-clock time for six paths:
-
-| Command                | Budget | What it measures                                   |
-| ---------------------- | ------ | -------------------------------------------------- |
-| `fx` (startup)         | 2ms    | Binary launch through CLI dispatch (no TTY needed) |
-| `fx help`              | 2ms    | Minimal startup, pure text output                  |
-| `fx status --json`     | 2ms    | Config read + JSON serialization                   |
-| `fx background --json` | 2ms    | Background record read                             |
-| `fx doctor --json`     | 2ms    | System checks, subprocess spawns                   |
-| `fx sessions --json`   | 2ms    | Session directory read                             |
-
-On PRs the check **fails** if any command exceeds its budget.
-
-The table is the authoritative Linux CI contract. Non-Linux local runs report
-raw means for comparison but do not assign a substitute product budget because
-the host process and dynamic-loader floor can independently exceed 2ms. The
-process baseline is diagnostic only and is never subtracted.
-
-The startup benchmark uses `FX_BENCH=1`, which runs through CLI dispatch and exits before TTY initialization.
-
-To run locally:
-
-```bash
-brew install hyperfine             # macOS (one-time)
-./benchmarks/startup.sh            # full run (100 iterations, builds ReleaseSafe)
-./benchmarks/startup.sh --quick    # quick run (20 iterations)
-```
-
-CI uses `--runs 100` with a reduced warmup and skips the build step because the
-workflow builds ReleaseSafe first. Results are written to
-`benchmarks/results/` (gitignored).
-
-The libfx runtime job measures cold startup, warm prompts, host-tool calls,
-stream throughput, and Agent cleanup. Its direct Pi comparison uses an external
-Zig HTTP server, Pi 0.84.4, and three alternating 100-sample rounds. On Bun,
-native libfx must match or beat Pi p50 and stay within 0.25 ms of Pi p95.
-The Node comparison is report-only because Node's bundled fetch client and
-Pi's dispatcher have different warm-request overhead. Both runtimes still
-require valid measurements, 300 samples, and exactly one inference request per
-prompt. Native/Wasm latency, host-tool, and resource gates remain blocking.
-Live model latency and bulk-stream throughput remain informational.
-
-```sh
-zig build-exe benchmarks/libfx/fake-inference-server.zig -O ReleaseSafe -femit-bin=/tmp/libfx-bench-server
-node benchmarks/libfx/bench-competitive.mjs --server /tmp/libfx-bench-server --pi-root /tmp/libfx-pi --out benchmarks/results/libfx
-```
-
-Build the SDK artifacts and install the pinned Pi package first, as shown in
-`.github/workflows/bench.yml`. Raw per-prompt samples remain in the output directory.
-
-## Before Marking a PR Ready
-
-Minimum checklist:
-
-1. Run `zig fmt --check src/` and the focused tests for the changed path.
-2. Run `zig build`, then exercise the change with `./zig-out/bin/fx`.
-3. Push the feature branch and open a draft PR immediately.
-4. Require all four **Full CI** jobs and the final ship gate to pass for the exact current commit before marking the PR ready.
-5. Update `README.md` if user-facing behavior changed.
+fx is licensed under [Apache-2.0](LICENSE). Unless you state otherwise, a contribution you submit for inclusion in fx is licensed under the same terms, as section 5 of the license describes.

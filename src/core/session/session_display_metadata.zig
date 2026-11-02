@@ -3,10 +3,11 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const session = @import("session.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const sidecar_file = "display.json";
+const sidecar_file = "display.json";
 pub const max_sidecar_bytes: usize = 16 * 1024;
 const max_title_words: usize = 8;
 pub const max_title_bytes: usize = 240;
@@ -249,14 +250,10 @@ pub fn readSidecarOrFallback(
     alloc: Allocator,
     session_dir: *io_mod.VerifiedDir,
 ) !DisplayMetadata {
-    var file = session_dir.dir.openFile(io_mod.getIo(), sidecar_file, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch |err| switch (err) {
+    // A special file, such as a FIFO, is never opened, so it cannot block.
+    var file = io_mod.openExistingReadOnlyRegularFile(session_dir.dir, sidecar_file, .no_follow) catch |err| switch (err) {
         error.FileNotFound => return missingFallback(alloc),
-        error.NotDir, error.SymLinkLoop, error.IsDir => return missingFallback(alloc),
+        error.DurablePathUnsafe, error.NotDir, error.SymLinkLoop, error.IsDir => return missingFallback(alloc),
         else => return err,
     };
     defer file.close(io_mod.getIo());
@@ -310,7 +307,7 @@ test "display metadata derives capped title from first prompt line and bounded p
 
 test "display metadata byte-caps a single-token title" {
     const alloc = std.testing.allocator;
-    const long_token = "x" ** 512;
+    const long_token = text_utils.repeat("x", 512);
     const history = [_]session.HistoryTurn{makeAssistantTurn(long_token)};
 
     var metadata = try deriveFromHistory(alloc, &history);

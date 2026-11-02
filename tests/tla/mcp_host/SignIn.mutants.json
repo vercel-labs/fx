@@ -1,0 +1,69 @@
+[
+  {
+    "description": "The callback's state isn't compared with the live flow's",
+    "old": "           ok == flow[h] # 0 /\\ got[k] = flow[h]",
+    "new": "           ok == flow[h] # 0",
+    "invariant": "RedeemOnlyLiveState"
+  },
+  {
+    "description": "The loopback listener takes any request, an icon's too, as the browser's return",
+    "old": "Takes(kind) == IF Bridge THEN kind = \"form_ours\" ELSE kind = \"get\"",
+    "new": "Takes(kind) == IF Bridge THEN kind = \"form_ours\" ELSE kind \\in {\"get\", \"other\"}",
+    "invariant": "ListenerTakesOnlyItsOwn"
+  },
+  {
+    "description": "A bridged listener takes a form from any origin",
+    "config": "SignIn.stress.cfg",
+    "old": "Takes(kind) == IF Bridge THEN kind = \"form_ours\" ELSE kind = \"get\"",
+    "new": "Takes(kind) == IF Bridge THEN kind \\in {\"form_ours\", \"form_foreign\"} ELSE kind = \"get\"",
+    "invariant": "ListenerTakesOnlyItsOwn"
+  },
+  {
+    "description": "A destroyed host leaves its login listening",
+    "old": "          /\\ phase' = IF free THEN Gone(cur, phase) ELSE phase",
+    "new": "          /\\ phase' = phase",
+    "invariant": "NoListenerWithoutHost"
+  },
+  {
+    "description": "A second login while one is under way starts another beside it",
+    "old": "    /\\ ~SigningIn(cur)\n",
+    "new": "",
+    "invariant": "OneSignInPerHost"
+  },
+  {
+    "description": "A second login ends the one under way and starts its own, which the engine ignores (startLogin before it reused the login)",
+    "old": "    /\\ ~SigningIn(cur)\n    /\\ LET k == next\n       IN /\\ phase' = [phase EXCEPT ![k] = \"open\"]",
+    "new": "    /\\ LET k == next\n       IN /\\ phase' = [(IF live[cur] # 0 THEN Ended(live[cur]) ELSE phase) EXCEPT ![k] = \"open\"]",
+    "invariant": "FlowHasListener"
+  },
+  {
+    "description": "A login the browser never comes back to never expires",
+    "old": "    /\\ Open(k) /\\ alive[hostOf[k]] /\\ live[hostOf[k]] = k",
+    "new": "    /\\ phase[k] = \"redeeming\" /\\ alive[hostOf[k]] /\\ live[hostOf[k]] = k",
+    "property": "EveryLoginEnds"
+  },
+  {
+    "description": "A host's end closes its sign-in without a notice",
+    "old": "GoneIndicator(h) == IF SignsIn(h) THEN FALSE ELSE indicator",
+    "new": "GoneIndicator(h) == indicator",
+    "invariant": "IndicatorImpliesListener"
+  },
+  {
+    "description": "A new host starts a sign-in while an old one still signs in",
+    "old": "    /\\ \\A h \\in Hosts : alive[h] => h = cur\n    /\\ ~SigningIn(cur)\n",
+    "new": "    /\\ ~SigningIn(cur)\n",
+    "invariant": "OneSignInPerServer"
+  },
+  {
+    "description": "The listener takes a return carrying any state, so a stray one ends the sign-in",
+    "old": "    /\\ IF Takes(kind) /\\ s = k\n",
+    "new": "    /\\ IF Takes(kind)\n",
+    "invariant": "ListenerTakesOnlyItsOwn"
+  },
+  {
+    "description": "An in-place reload that leaves the server alone ends its sign-in (the host swap before the in-place reload did)",
+    "old": "ReloadKeeps == alive[cur] /\\ UNCHANGED vars",
+    "new": "ReloadKeeps == ReloadDrops",
+    "property": "KeptSignInGoesOn"
+  }
+]

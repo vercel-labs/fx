@@ -1,11 +1,13 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync, realpathSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { logLines, rootSessionIds, storeRoot } from "./saved-sessions";
 import {
   fakeGatewayFinalText,
   startDynamicFakeGateway,
+  startUpgradeServer,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -46,28 +48,24 @@ function baseEnv(root: FixtureRoot, gateway: { baseUrl: string; chatUrl: string 
     FX_E2E_DISABLE_DOTENV: "1",
     FX_AUTO_UPGRADE: "0",
     FX_SOUND: "0",
-    FX_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_ONBOARDING: "1",
     FX_MODEL: MAIN_MODEL,
     FX_PERMISSION_MODE: "full-access",
     FX_MAX_AGENT_STEPS: "2",
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
   };
 }
 
+/// Each saved session's title: its log's newest title setting.
 function sessionTitles(root: FixtureRoot): string[] {
-  const sessionsDir = join(root.home, ".fx", "sessions");
-  if (!existsSync(sessionsDir)) return [];
-  const titles: string[] = [];
-  for (const id of readdirSync(sessionsDir)) {
-    const manifest = join(sessionsDir, id, "session.json");
-    if (!existsSync(manifest)) continue;
-    const value = JSON.parse(readFileSync(manifest, "utf8"));
-    if (typeof value.title === "string") titles.push(value.title);
-  }
-  return titles;
+  if (!existsSync(storeRoot(root.home))) return [];
+  return rootSessionIds(root.home).flatMap((id) => {
+    const title = (logLines(root.home, id) as any[]).filter((line) => line.kind === "set" && line.key === "title").at(-1)?.value;
+    return typeof title === "string" ? [title] : [];
+  });
 }
 
 function titleRequests(gateway: ReturnType<typeof startTitleAwareGateway>) {
@@ -267,3 +265,54 @@ test.skipIf(SKIP_TMUX)("tui shows the generated session title", async () => {
     gateway.stop();
   }
 }, 60_000);
+
+test.skipIf(SKIP_TMUX)("tui generates a title in the fresh session an upgrade relaunch opens for a session that saved nothing", async () => {
+  const root = createFixtureRoot("tui-upgrade-title", JSON.stringify({ statusLine: { session: true } }));
+  const installDir = join(root.root, "install");
+  mkdirSync(installDir);
+  const installedFx = join(installDir, "fx");
+  copyFileSync(FX_BIN, installedFx);
+  chmodSync(installedFx, 0o755);
+  const argvLogPath = join(root.root, "upgrade-argv.log");
+  const release = startUpgradeServer(root.root, argvLogPath);
+  const gateway = startTitleAwareGateway();
+  let tui: TmuxSession | undefined;
+  try {
+    tui = await TmuxSession.create({
+      cmd: JSON.stringify(installedFx),
+      cwd: root.workspace,
+      isolated: true,
+      remainOnExit: true,
+      env: {
+        ...baseEnv(root, gateway),
+        FX_AUTO_UPGRADE: "1",
+        FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+      },
+    });
+    await tui.waitForStableComposer(15000);
+    // No prompt before the relaunch: the session stays pristine and untitled.
+    await tui.waitForText("update ready: ctrl+g to reload", 60_000);
+    await tui.sendHexBytes(["07"]);
+    await tui.waitForStableComposer(15000);
+
+    // The relaunch hands over the session, which saved nothing without a
+    // turn (D2), so the new build opens a fresh session with the update's
+    // notice instead (D81).
+    const handed = readFileSync(argvLogPath, "utf8").trim().split("\n")
+      .map(line => line.split("\t"))
+      .find(args => args[0] === installedFx && args[1] === "resume" && args[3] === "--upgrade-relaunch");
+    expect(handed).toBeDefined();
+    await tui.waitForText("fx has been updated to ", 15000);
+
+    await tui.sendText("refactor the renderer loop to fix the crash");
+    await tui.waitForText("MAIN_ANSWER_OK", 20000);
+    await tui.waitForText(GENERATED_TITLE, 15000);
+    expect(sessionTitles(root)).toContain(GENERATED_TITLE);
+    expect(rootSessionIds(root.home)).not.toContain(handed![2]);
+    expect(titleRequests(gateway).length).toBe(1);
+  } finally {
+    await tui?.kill();
+    gateway.stop();
+    release.stop();
+  }
+}, 120_000);

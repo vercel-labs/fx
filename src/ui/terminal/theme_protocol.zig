@@ -8,6 +8,46 @@ pub const Background = struct {
     rgb: Rgb,
 };
 
+pub const ResponseStatus = enum { invalid, pending, complete };
+
+const primary_device_attributes_prefix = "\x1b[?";
+
+/// Classifies a primary device attributes reply (`ESC [ ? Ps ; ... c`). Every
+/// terminal answers that query, so fx sends it as a fence after a query the
+/// terminal may ignore.
+pub fn classifyPrimaryDeviceAttributes(bytes: []const u8) ResponseStatus {
+    if (std.mem.startsWith(u8, primary_device_attributes_prefix, bytes)) return .pending;
+    if (!std.mem.startsWith(u8, bytes, primary_device_attributes_prefix)) return .invalid;
+
+    const parameters = bytes[primary_device_attributes_prefix.len..];
+    var expect_digit = true;
+    for (parameters, 0..) |byte, index| {
+        if (std.ascii.isDigit(byte)) {
+            expect_digit = false;
+            continue;
+        }
+        if (byte == ';' and !expect_digit) {
+            expect_digit = true;
+            continue;
+        }
+        if (byte == 'c') {
+            return if (!expect_digit and index + 1 == parameters.len)
+                .complete
+            else
+                .invalid;
+        }
+        return .invalid;
+    }
+    return .pending;
+}
+
+/// Returns where a complete primary device attributes reply starts when
+/// `bytes` ends with one.
+pub fn trailingPrimaryDeviceAttributes(bytes: []const u8) ?usize {
+    const start = std.mem.findLast(u8, bytes, primary_device_attributes_prefix) orelse return null;
+    return if (classifyPrimaryDeviceAttributes(bytes[start..]) == .complete) start else null;
+}
+
 pub fn parseOsc11Response(bytes: []const u8) ?Background {
     const prefix = "\x1b]11;rgb:";
     if (!std.mem.startsWith(u8, bytes, prefix)) return null;

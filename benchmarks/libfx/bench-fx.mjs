@@ -38,7 +38,7 @@ async function runChild() {
   if (!gatewayUrl || !diagnosticsPath) throw new Error("benchmark child environment is incomplete");
 
   const startedAt = performance.now();
-  const { createFxAgent } = await import(new URL("../../sdk/node.js", import.meta.url));
+  const { createFxEngine } = await import(new URL("../../sdk/node.js", import.meta.url));
   const importedAt = performance.now();
   let fetchAt = null;
   let firstBodyAt = null;
@@ -80,7 +80,7 @@ async function runChild() {
     });
   };
 
-  const agent = await createFxAgent({
+  const agent = await createFxEngine({
     backend,
     nativeAddon: resolve(repoRoot, "zig-out/lib/libfx.node"),
     wasm: resolve(repoRoot, "zig-out/bin/fx-core.wasm"),

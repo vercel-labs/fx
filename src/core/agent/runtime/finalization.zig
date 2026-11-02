@@ -41,6 +41,10 @@ pub const TurnFinalizationGuard = struct {
     state: State = .open,
     outcome: ?types.TurnPresentationOutcome = null,
     compacted_execution: execution_memory.CompactedExecutionBoundary = .{},
+    /// The runtime context this turn captured for the session, if it did.
+    /// Every save of the turn carries it, so a streamed turn keeps one prefix
+    /// (D94). Borrowed from the turn's arena.
+    captured_runtime_context: ?[][]u8 = null,
     lease_allocator: Allocator = std.heap.c_allocator,
     agent_terminal_leases: std.ArrayList([]u8) = .empty,
 
@@ -55,6 +59,15 @@ pub const TurnFinalizationGuard = struct {
             .turn_id = turn_id,
             .lifecycle = lifecycle_context,
         };
+    }
+
+    /// The execution memory a save of this turn records: the part after any
+    /// in-turn compaction cut, with the runtime context the turn captured.
+    /// Borrows `execution` and the captured texts.
+    pub fn persistedExecution(self: *const TurnFinalizationGuard, arena: Allocator, execution: types.ExecutionMemory) !types.ExecutionMemory {
+        var projected = try self.compacted_execution.project(arena, execution);
+        projected.runtime_context = self.captured_runtime_context;
+        return projected;
     }
 
     pub fn deinit(self: *TurnFinalizationGuard) void {
@@ -183,7 +196,7 @@ pub fn finishAssistantTerminalWithExecution(
 ) !void {
     var projection_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer projection_arena.deinit();
-    const context_execution = try finalization.compacted_execution.project(projection_arena.allocator(), execution);
+    const context_execution = try finalization.persistedExecution(projection_arena.allocator(), execution);
     const completed_summary = summary.finish();
     var turn: HistoryTurn = .{ .assistant = .{
         .user = .{ .text = job.prompt, .images = job.images },

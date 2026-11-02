@@ -1,12 +1,15 @@
 const std = @import("std");
+const profile_paths = @import("../shared/profile_paths.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
+const settings_keys = @import("../config/settings_keys.zig");
+const settings_messages = @import("settings_messages.zig");
 const host = @import("../hosts/host.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
-const session_store = @import("../session/session_store.zig");
+const session_adapter = @import("../session/session_adapter.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
 
@@ -51,11 +54,6 @@ pub const Snapshot = struct {
     }
 };
 
-const ResolvedModel = struct {
-    value: []const u8,
-    owned: ?[]u8 = null,
-};
-
 pub fn collect(
     alloc: Allocator,
     secret_store: host.SecretStore,
@@ -85,7 +83,7 @@ pub fn collect(
         snapshot.auth.deinit(alloc);
     }
 
-    const workspace_detail = try std.fmt.allocPrint(alloc, "using workspace {s}", .{snapshot.workspace_root});
+    const workspace_detail = try alloc.print("using workspace {s}", .{snapshot.workspace_root});
     try appendCheckOwned(&checks, alloc, "workspace", .ok, workspace_detail);
 
     const paths = try config_runtime.discoverPaths(alloc, snapshot.workspace_root);
@@ -101,7 +99,7 @@ pub fn collect(
         try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
         try appendAuthCheck(&checks, alloc, snapshot.auth);
         try appendConfigLoadFailureCheck(&checks, alloc, "startup", "failed to resolve startup settings", err);
-        try appendStateChecks(&checks, alloc, snapshot.workspace_root);
+        try appendStateChecks(&checks, alloc);
         try appendGitCheck(&checks, alloc, snapshot.workspace_root);
         try appendGhCheck(&checks, alloc);
 
@@ -120,14 +118,20 @@ pub fn collect(
 
     try appendConfigCheck(&checks, alloc, paths, detailed.diagnostics);
     try appendConfigDiagnosticChecks(&checks, alloc, detailed.diagnostics);
+    try appendUnknownSettingChecks(&checks, alloc, paths);
     try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
     try appendAuthCheck(&checks, alloc, snapshot.auth);
-    try appendResolvedStartupCheck(&snapshot, &checks, alloc, .{
-        .model = if (detailed.settings.models.get(snapshot.provider)) |model| @constCast(model) else null,
+    const selection = config_runtime.selectProviderModel(
+        default_model,
+        &detailed.settings,
+        null,
+        config_runtime.modelEnvOverride(),
+    );
+    try appendResolvedStartupCheck(&snapshot, &checks, alloc, selection, .{
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,
-    }, default_model, default_agent_step_limit);
-    try appendStateChecks(&checks, alloc, snapshot.workspace_root);
+    }, default_agent_step_limit);
+    try appendStateChecks(&checks, alloc);
     try appendGitCheck(&checks, alloc, snapshot.workspace_root);
     try appendGhCheck(&checks, alloc);
 
@@ -151,6 +155,60 @@ fn appendConfigDiagnosticChecks(
         const detail = try detail_writer.toOwnedSlice();
         try appendCheckOwned(checks, alloc, "config", .warn, detail);
     }
+}
+
+/// Warns about each key fx doesn't know in the profile and project settings
+/// files, with the closest known key. Startup ignores these keys silently.
+fn appendUnknownSettingChecks(
+    checks: *std.ArrayList(Check),
+    alloc: Allocator,
+    paths: config_runtime.Paths,
+) !void {
+    if (paths.user_settings) |path| try appendUnknownSettingChecksFor(checks, alloc, path, profile_paths.displayText("~/.fx/settings.json"), .profile);
+    try appendUnknownSettingChecksFor(checks, alloc, paths.workspace_settings, ".fx.json", .project);
+}
+
+fn appendUnknownSettingChecksFor(
+    checks: *std.ArrayList(Check),
+    alloc: Allocator,
+    path: []const u8,
+    display_path: []const u8,
+    file: settings_keys.File,
+) !void {
+    // An unreadable or malformed file is already reported by the config check.
+    const loaded = config_runtime.readSettingsFileJson(alloc, path) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    var parsed = loaded orelse return;
+    defer parsed.deinit();
+    const unknown = try settings_keys.findUnknown(alloc, parsed.value, file);
+    defer alloc.free(unknown);
+    for (unknown) |key| {
+        try appendCheckOwned(checks, alloc, "config", .warn, try settings_messages.formatUnknownSetting(alloc, key, display_path));
+    }
+    const older = try settings_keys.findOlderNames(alloc, parsed.value, file);
+    defer alloc.free(older);
+    for (older) |entry| {
+        try appendCheckOwned(checks, alloc, "config", .warn, try settings_messages.formatOlderName(alloc, entry, display_path));
+    }
+    if (parsed.value != .object) return;
+    try appendOldYolo(checks, alloc, parsed.value.object, null, display_path);
+    if (file != .profile) return;
+    const workspaces = parsed.value.object.get("workspaces") orelse return;
+    if (workspaces != .object) return;
+    var iterator = workspaces.object.iterator();
+    while (iterator.next()) |entry| {
+        if (entry.value_ptr.* == .object) try appendOldYolo(checks, alloc, entry.value_ptr.object, entry.key_ptr.*, display_path);
+    }
+}
+
+/// Warns about a saved `permission_mode: "yolo"`, the older name for
+/// `full-access`.
+fn appendOldYolo(checks: *std.ArrayList(Check), alloc: Allocator, object: std.json.ObjectMap, workspace: ?[]const u8, display_path: []const u8) !void {
+    const mode = object.get("permission_mode") orelse return;
+    if (mode != .string or !std.mem.eql(u8, mode.string, "yolo")) return;
+    try appendCheckOwned(checks, alloc, "config", .warn, try settings_messages.formatOldYolo(alloc, workspace, display_path));
 }
 
 fn appendConfigCheck(
@@ -189,11 +247,14 @@ fn configLayerRejected(
             .invalid_model_id,
             .retired_skill_match_fuzzy,
             .invalid_context_limits,
+            .invalid_ultrafast_mode_override,
+            .invalid_skill_symlink_authorities,
             => return true,
             .invalid_additional_directories,
             .ignored_project_user_only_setting,
             .legacy_workspace_preferences,
             .manual_backup_available,
+            .private_state_permissions_tightened,
             => {},
         }
     }
@@ -214,19 +275,25 @@ fn appendResolvedStartupCheck(
     snapshot: *Snapshot,
     checks: *std.ArrayList(Check),
     alloc: Allocator,
+    selection: config_runtime.ModelSelectionError!model_provider.ProviderSelection,
     settings: config_runtime.StartupStatusSettings,
-    default_model: []const u8,
     default_agent_step_limit: usize,
 ) !void {
-    const next_model = try resolveModel(alloc, default_model, settings.model);
-    if (snapshot.owned_model) |model| alloc.free(model);
-    snapshot.model = next_model.value;
-    snapshot.owned_model = next_model.owned;
     snapshot.permission_mode = try resolvePermissionMode(settings.permission_mode);
     snapshot.agent_step_limit = try resolveAgentStepLimit(default_agent_step_limit, settings.max_agent_steps);
+    if (snapshot.owned_model) |model| alloc.free(model);
+    snapshot.owned_model = null;
+    const selected = selection catch |err| {
+        // Startup refuses this provider, so no model would run.
+        snapshot.model = "";
+        try appendCheck(checks, alloc, "startup", .fail, config_runtime.modelNotSelectedMessage(err) orelse @errorName(err));
+        return;
+    };
+    const model = try alloc.dupe(u8, config_runtime.modelEnvOverride() orelse selected.model);
+    snapshot.model = model;
+    snapshot.owned_model = model;
 
-    const detail = try std.fmt.allocPrint(
-        alloc,
+    const detail = try alloc.print(
         "resolved model={s}, permission_mode={s}, agent_step_limit={d}",
         .{ snapshot.model, permissionModeLabel(snapshot.permission_mode), snapshot.agent_step_limit },
     );
@@ -239,53 +306,75 @@ fn appendConfigLoadFailureCheck(checks: *std.ArrayList(Check), alloc: Allocator,
 }
 
 fn formatConfigLoadFailure(alloc: Allocator, prefix: []const u8, err: anyerror) ![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}: {s}", .{ prefix, @errorName(err) });
+    return alloc.print("{s}: {s}", .{ prefix, @errorName(err) });
 }
 
-fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, workspace_root: []const u8) !void {
-    var store = session_store.Store.initReadOnly(alloc, workspace_root) catch |err| {
+/// Reports damaged sessions and removes side folders whose session is gone
+/// (D36). Rebuilds nothing.
+fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator) !void {
+    var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
         const status: CheckStatus = if (err == error.HomeNotSet) .warn else .fail;
-        const detail = try std.fmt.allocPrint(alloc, "failed to inspect workspace state: {s}", .{@errorName(err)});
+        const detail = try alloc.print("failed to inspect sessions: {s}", .{@errorName(err)});
         try appendCheckOwned(checks, alloc, "state", status, detail);
         return;
     };
     defer store.deinit(alloc);
-
-    if (store.canonical_root.sessions == null) {
-        try appendCheck(checks, alloc, "state", .warn, "durable state is not initialized");
-        try appendCheck(checks, alloc, "sessions", .warn, "no saved sessions yet");
-        return;
-    }
-
-    const state_detail = try std.fmt.allocPrint(alloc, "state dir ready at {s} (per-session managed state created on demand)", .{store.sessions_dir});
-    try appendCheckOwned(checks, alloc, "state", .ok, state_detail);
-
-    var inspection = try store.inspectForDoctorBounded(alloc, default_session_diagnostics_limit);
-    defer inspection.deinit(alloc);
-    try appendSessionDiagnosticChecks(
-        checks,
-        alloc,
-        &store,
-        inspection.diagnostics.items,
-    );
-    if (inspection.truncated) {
-        try appendSessionDiagnosticsTruncatedCheck(checks, alloc, inspection.inspected_count);
-    }
-
-    var summaries = store.list(alloc) catch {
-        try appendSessionsCountUnavailableCheck(checks, alloc);
+    var report = session_adapter.doctor(&store, alloc, default_session_diagnostics_limit, io_mod.milliTimestamp()) catch |err| {
+        const detail = try alloc.print("failed to inspect sessions: {s}", .{@errorName(err)});
+        try appendCheckOwned(checks, alloc, "state", .fail, detail);
         return;
     };
-    defer {
-        for (summaries.items) |*summary| summary.deinit(alloc);
-        summaries.deinit(alloc);
+    defer report.deinit(alloc);
+    try appendCheck(checks, alloc, "state", .ok, "sessions ready");
+    for (report.damaged.items) |id| {
+        const detail = try alloc.print("session {s} has a damaged log; `fx session recover {s}` copies its good turns", .{ id, id });
+        try appendCheckOwned(checks, alloc, "session", .warn, detail);
     }
-    try appendSessionsCountCheck(
-        checks,
-        alloc,
-        summaries.items.len,
-        if (summaries.items.len > 0) summaries.items[0].id else "",
-    );
+    for (report.stuck.items) |stuck| try appendStuckCheck(checks, alloc, stuck);
+    for (report.kept_children) |kept| {
+        const detail = try alloc.print("session {s}, a subagent an older fx saved, is kept as it is: {s}", .{ kept.id, kept.reason });
+        try appendCheckOwned(checks, alloc, "session", .ok, detail);
+    }
+    // The limit covers v1's unconverted sessions too (D73).
+    if (report.checked < report.sessions + report.unconverted) try appendSessionDiagnosticsTruncatedCheck(checks, alloc, report.checked);
+    if (report.removed > 0) {
+        const detail = try alloc.print("removed {d} terminal or side folder(s) whose session is gone", .{report.removed});
+        try appendCheckOwned(checks, alloc, "session", .ok, detail);
+    }
+    if (report.kept > 0) {
+        const detail = try alloc.print("{d} terminal or side folder(s) whose session is gone could not be removed", .{report.kept});
+        try appendCheckOwned(checks, alloc, "session", .warn, detail);
+    }
+    if (report.keeps_left_out > 0) {
+        const detail = try alloc.print("{d} earlier session folder(s) under ~/.fx/sessions keep files their conversion left out", .{report.keeps_left_out});
+        try appendCheckOwned(checks, alloc, "sessions", .ok, detail);
+    }
+    const convertible = report.unconverted - report.stuck.items.len;
+    if (convertible > 0) {
+        const detail = try alloc.print("{d} session(s) saved by an older fx will be converted when first opened", .{convertible});
+        try appendCheckOwned(checks, alloc, "sessions", .ok, detail);
+    }
+    try appendSessionsCountCheck(checks, alloc, report.sessions, report.latest orelse "", report.unconverted > 0);
+}
+
+/// A session an older fx saved that can't be converted, with what
+/// `fx session recover` copies of it (D73). Its v1 folder is kept.
+fn appendStuckCheck(checks: *std.ArrayList(Check), alloc: Allocator, stuck: session_adapter.Doctor.Stuck) !void {
+    const detail = switch (stuck.recover) {
+        .without_rules => try alloc.print(
+            "session {s} saved by an older fx can't be converted: {s}; `fx session recover {s}` copies its conversation without its saved permission rules",
+            .{ stuck.id, stuck.reason, stuck.id },
+        ),
+        .good_turns => try alloc.print(
+            "session {s} saved by an older fx can't be converted: {s}; `fx session recover {s}` copies its good turns",
+            .{ stuck.id, stuck.reason, stuck.id },
+        ),
+        .nothing => try alloc.print(
+            "session {s} saved by an older fx can't be converted: {s}; nothing in it can be copied, so it is kept as it is",
+            .{ stuck.id, stuck.reason },
+        ),
+    };
+    try appendCheckOwned(checks, alloc, "session", .warn, detail);
 }
 
 fn appendSessionDiagnosticsTruncatedCheck(
@@ -293,25 +382,11 @@ fn appendSessionDiagnosticsTruncatedCheck(
     alloc: Allocator,
     inspected_count: usize,
 ) !void {
-    const detail = try std.fmt.allocPrint(
-        alloc,
+    const detail = try alloc.print(
         "session diagnostics truncated after {d} session director{s} to keep doctor bounded",
         .{ inspected_count, if (inspected_count == 1) "y" else "ies" },
     );
     try appendCheckOwned(checks, alloc, "session", .warn, detail);
-}
-
-fn appendSessionsCountUnavailableCheck(
-    checks: *std.ArrayList(Check),
-    alloc: Allocator,
-) !void {
-    try appendCheck(
-        checks,
-        alloc,
-        "sessions",
-        .warn,
-        "exact saved-session count unavailable without a full session scan",
-    );
 }
 
 fn appendSessionsCountCheck(
@@ -319,174 +394,16 @@ fn appendSessionsCountCheck(
     alloc: Allocator,
     count: usize,
     latest_id: []const u8,
+    older_saved: bool,
 ) !void {
     if (count == 0) {
-        try appendCheck(checks, alloc, "sessions", .warn, "no saved sessions yet");
+        // Sessions only an older fx saved are not "no sessions" (D73).
+        if (!older_saved) try appendCheck(checks, alloc, "sessions", .warn, "no saved sessions yet");
         return;
     }
 
-    const detail = try std.fmt.allocPrint(alloc, "{d} saved session(s); latest={s}", .{ count, latest_id });
+    const detail = try alloc.print("{d} saved session(s); latest={s}", .{ count, latest_id });
     try appendCheckOwned(checks, alloc, "sessions", .ok, detail);
-}
-
-fn appendSessionDiagnosticChecks(
-    checks: *std.ArrayList(Check),
-    alloc: Allocator,
-    read_store: *const session_store.Store,
-    diagnostics: []const session_store.DoctorDiagnostic,
-) !void {
-    for (diagnostics) |diagnostic| {
-        if (diagnostic.kind == .cleanup_candidate) {
-            const cleanup = read_store.cleanupForDoctor(
-                alloc,
-                diagnostic.session_id,
-            ) catch |err| {
-                const detail = try std.fmt.allocPrint(
-                    alloc,
-                    "session {s}: cleanup_candidate report_only=true error={s}",
-                    .{ diagnostic.session_id, @errorName(err) },
-                );
-                try appendCheckOwned(checks, alloc, "session", .warn, detail);
-                continue;
-            };
-            const detail = try std.fmt.allocPrint(
-                alloc,
-                "session {s}: cleanup_candidate cleanup_removed={d} report_only={d} ignored={d}",
-                .{
-                    diagnostic.session_id,
-                    cleanup.removed,
-                    cleanup.report_only,
-                    cleanup.ignored,
-                },
-            );
-            try appendCheckOwned(
-                checks,
-                alloc,
-                "session",
-                if (cleanup.removed > 0) .ok else .warn,
-                detail,
-            );
-            continue;
-        }
-
-        const status: CheckStatus = switch (diagnostic.kind) {
-            .authority_less_creation_orphan,
-            .authority_transition_pending,
-            .commit_intent_pending,
-            .oversized_legacy_snapshot,
-            .projection_missing,
-            .projection_stale,
-            .canonical_log_large,
-            .canonical_log_compaction_overdue,
-            .canonical_log_compaction_failed,
-            .cleanup_candidate,
-            => .warn,
-            .invalid_authority_transition,
-            .missing_authority,
-            .invalid_authority,
-            .invalid_commit_intent,
-            .projection_invalid,
-            .commit_watermark_missing,
-            .commit_watermark_invalid,
-            .commit_watermark_mismatched,
-            .canonical_state_invalid,
-            .unsafe_path,
-            => .fail,
-        };
-
-        var recovery_buffer: [512]u8 = undefined;
-        const recovery = try recoveryActionForSessionDiagnostic(
-            diagnostic.kind,
-            diagnostic.session_id,
-            &recovery_buffer,
-        );
-        const detail = if (diagnostic.growth_bytes) |growth_bytes|
-            try std.fmt.allocPrint(
-                alloc,
-                "session {s}: {s} bytes={d} growth_bytes={d} growth_frames={d}; recovery={s}",
-                .{
-                    diagnostic.session_id,
-                    @tagName(diagnostic.kind),
-                    diagnostic.bytes.?,
-                    growth_bytes,
-                    diagnostic.growth_frames.?,
-                    recovery,
-                },
-            )
-        else if (diagnostic.bytes) |bytes|
-            try std.fmt.allocPrint(
-                alloc,
-                "session {s}: {s} bytes={d}; recovery={s}",
-                .{ diagnostic.session_id, @tagName(diagnostic.kind), bytes, recovery },
-            )
-        else
-            try std.fmt.allocPrint(
-                alloc,
-                "session {s}: {s}{s}; recovery={s}",
-                .{
-                    diagnostic.session_id,
-                    @tagName(diagnostic.kind),
-                    if (diagnostic.kind == .authority_transition_pending)
-                        " report_only=true"
-                    else
-                        "",
-                    recovery,
-                },
-            );
-        try appendCheckOwned(checks, alloc, "session", status, detail);
-    }
-}
-
-fn recoveryActionForSessionDiagnostic(
-    kind: session_store.DoctorIssueKind,
-    session_id: []const u8,
-    buffer: []u8,
-) ![]const u8 {
-    return switch (kind) {
-        .authority_less_creation_orphan,
-        .authority_transition_pending,
-        .commit_intent_pending,
-        .cleanup_candidate,
-        => "rerun fx doctor after active writers exit; cleanup is guarded",
-
-        .canonical_log_large,
-        .canonical_log_compaction_overdue,
-        => "resume or update the session to trigger compaction",
-
-        .canonical_log_compaction_failed,
-        => "inspect the failed compaction artifact; keep it until no writer is active",
-
-        .oversized_legacy_snapshot,
-        => "rerun migration with --allow-large only after verifying the legacy snapshot",
-
-        .projection_missing,
-        .projection_stale,
-        => "open the session detail or resume it to rebuild projections",
-
-        .commit_watermark_missing,
-        .commit_watermark_invalid,
-        .commit_watermark_mismatched,
-        => std.fmt.bufPrint(
-            buffer,
-            "run fx session recover {s}; it creates a separate resumable copy and leaves the source unchanged",
-            .{session_id},
-        ),
-
-        .projection_invalid,
-        .canonical_state_invalid,
-        .invalid_commit_intent,
-        => std.fmt.bufPrint(
-            buffer,
-            "back up ~/.fx/sessions, then inspect this session with fx session {s} --json",
-            .{session_id},
-        ),
-
-        .missing_authority,
-        .invalid_authority,
-        .invalid_authority_transition,
-        .unsafe_path,
-        => "back up ~/.fx/sessions and avoid opening this session until the path is repaired",
-    };
 }
 
 fn appendGitCheck(checks: *std.ArrayList(Check), alloc: Allocator, workspace_root: []const u8) !void {
@@ -503,20 +420,6 @@ fn appendGhCheck(checks: *std.ArrayList(Check), alloc: Allocator) !void {
         return;
     }
     try appendCheck(checks, alloc, "gh", .warn, "GitHub CLI not found in PATH; publish workflows unavailable");
-}
-
-fn resolveModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) !ResolvedModel {
-    if (io_mod.getenv("FX_MODEL")) |model| {
-        const trimmed = std.mem.trim(u8, model, " \t\r\n");
-        if (trimmed.len > 0) return .{ .value = trimmed };
-    }
-
-    if (configured) |model| {
-        const owned = try alloc.dupe(u8, model);
-        return .{ .value = owned, .owned = owned };
-    }
-
-    return .{ .value = default_model };
 }
 
 fn resolvePermissionMode(configured: ?types.PermissionMode) !types.PermissionMode {
@@ -562,8 +465,8 @@ fn appendMcpConfigCheck(
             var out: std.Io.Writer.Allocating = .init(alloc);
             defer out.deinit();
             try out.writer.print(
-                "~/.fx/mcp.json warning: {s}",
-                .{@tagName(warning.cause)},
+                "{s}/mcp.json warning: {s}",
+                .{ profile_paths.displayRoot(), @tagName(warning.cause) },
             );
             if (warning.key()) |key| try out.writer.print(" key={s}", .{key});
             try out.writer.print(
@@ -580,10 +483,9 @@ fn appendMcpConfigCheck(
             return;
         },
         .failed => |err| {
-            const detail = try std.fmt.allocPrint(
-                alloc,
-                "failed to load ~/.fx/mcp.json: {s}",
-                .{@errorName(err)},
+            const detail = try alloc.print(
+                "failed to load {s}/mcp.json: {s}",
+                .{ profile_paths.displayRoot(), @errorName(err) },
             );
             try appendCheckOwned(checks, alloc, "mcp_config", .fail, detail);
             return;
@@ -600,7 +502,7 @@ fn formatConfigPresence(alloc: Allocator, user_exists: bool, repo_exists: bool) 
     if (user_exists) {
         if (!first) try out.writer.writeAll(", ");
         first = false;
-        try out.writer.writeAll("~/.fx/settings.json");
+        try out.writer.writeAll(profile_paths.displayText("~/.fx/settings.json"));
     }
     if (repo_exists) {
         if (!first) try out.writer.writeAll(", ");
@@ -610,7 +512,7 @@ fn formatConfigPresence(alloc: Allocator, user_exists: bool, repo_exists: bool) 
 }
 
 fn fileExists(path: []const u8) !bool {
-    if (comptime @import("builtin").os.tag != .windows) {
+    if (comptime @import("builtin").target.os.tag != .windows) {
         return accessPath(path);
     }
     std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch |err| switch (err) {
@@ -621,9 +523,9 @@ fn fileExists(path: []const u8) !bool {
 }
 
 fn hasGitMetadata(alloc: Allocator, workspace_root: []const u8) !bool {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const git_path = std.fmt.bufPrint(&path_buf, "{s}" ++ std.fs.path.sep_str ++ ".git", .{workspace_root}) catch {
-        const owned = try std.fs.path.join(alloc, &.{ workspace_root, ".git" });
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const git_path = std.mem.print(&path_buf, "{s}" ++ std.Io.Dir.path.sep_str ++ ".git", .{workspace_root}) catch {
+        const owned = try std.Io.Dir.path.join(alloc, &.{ workspace_root, ".git" });
         defer alloc.free(owned);
         return try fileExists(owned);
     };
@@ -637,13 +539,13 @@ fn commandInPath(alloc: Allocator, command_name: []const u8) !bool {
 }
 
 fn commandInPathValue(alloc: Allocator, command_name: []const u8, path_env: []const u8) !bool {
-    var it = std.mem.splitScalar(u8, path_env, std.fs.path.delimiter);
+    var it = std.mem.splitScalar(u8, path_env, std.Io.Dir.path.delimiter);
     while (it.next()) |entry| {
         if (entry.len == 0) continue;
 
-        var candidate_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const candidate = std.fmt.bufPrint(&candidate_buf, "{s}" ++ std.fs.path.sep_str ++ "{s}", .{ entry, command_name }) catch {
-            const owned = try std.fs.path.join(alloc, &.{ entry, command_name });
+        var candidate_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const candidate = std.mem.print(&candidate_buf, "{s}" ++ std.Io.Dir.path.sep_str ++ "{s}", .{ entry, command_name }) catch {
+            const owned = try std.Io.Dir.path.join(alloc, &.{ entry, command_name });
             defer alloc.free(owned);
             if (pathExists(owned)) return true;
             continue;
@@ -658,11 +560,11 @@ fn commandInPathValue(alloc: Allocator, command_name: []const u8, path_env: []co
 }
 
 fn pathExists(path: []const u8) bool {
-    if (comptime @import("builtin").os.tag != .windows) {
+    if (comptime @import("builtin").target.os.tag != .windows) {
         return accessPath(path) catch false;
     }
 
-    if (std.fs.path.isAbsolute(path)) {
+    if (std.Io.Dir.path.isAbsolute(path)) {
         std.Io.Dir.accessAbsolute(io_mod.getIo(), path, .{}) catch return false;
         return true;
     }
@@ -672,8 +574,8 @@ fn pathExists(path: []const u8) bool {
 }
 
 fn accessPath(path: []const u8) !bool {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return false;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_z = std.mem.printSentinel(&path_buf, "{s}", .{path}, 0) catch return false;
     const rc = std.c.access(path_z.ptr, std.c.F_OK);
     if (rc == 0) return true;
     return switch (std.posix.errno(rc)) {
@@ -799,8 +701,10 @@ test "session count check preserves empty and latest details" {
         checks.deinit(alloc);
     }
 
-    try appendSessionsCountCheck(&checks, alloc, 0, "");
-    try appendSessionsCountCheck(&checks, alloc, 2, "session-2");
+    try appendSessionsCountCheck(&checks, alloc, 0, "", false);
+    try appendSessionsCountCheck(&checks, alloc, 2, "session-2", false);
+    // Sessions only an older fx saved are not "no sessions" (D73).
+    try appendSessionsCountCheck(&checks, alloc, 0, "", true);
 
     try std.testing.expectEqual(@as(usize, 2), checks.items.len);
     try std.testing.expectEqualStrings("sessions", checks.items[0].name);
@@ -809,6 +713,33 @@ test "session count check preserves empty and latest details" {
     try std.testing.expectEqualStrings("sessions", checks.items[1].name);
     try std.testing.expectEqual(CheckStatus.ok, checks.items[1].status);
     try std.testing.expectEqualStrings("2 saved session(s); latest=session-2", checks.items[1].detail);
+}
+
+test "doctor startup check fails when the provider has no model to run" {
+    const alloc = std.testing.allocator;
+    var checks: std.ArrayList(Check) = .empty;
+    defer {
+        for (checks.items) |*entry| entry.deinit(alloc);
+        checks.deinit(alloc);
+    }
+    var snapshot = Snapshot{
+        .workspace_root = "",
+        .model = "default/model",
+        .permission_mode = config_runtime.default_permission_mode,
+        .agent_step_limit = 25,
+        .checks = &.{},
+    };
+
+    try appendResolvedStartupCheck(&snapshot, &checks, alloc, error.CodexModelNotSelected, .{ .max_agent_steps = 7 }, 25);
+    try std.testing.expectEqualStrings("", snapshot.model);
+    try std.testing.expectEqual(@as(usize, 7), snapshot.agent_step_limit);
+    try std.testing.expectEqual(CheckStatus.fail, checks.items[0].status);
+    try std.testing.expect(std.mem.startsWith(u8, checks.items[0].detail, "no Codex model is selected;"));
+
+    try appendResolvedStartupCheck(&snapshot, &checks, alloc, .{ .provider = .codex, .model = "gpt-saved" }, .{}, 25);
+    defer if (snapshot.owned_model) |model| alloc.free(model);
+    try std.testing.expectEqualStrings("gpt-saved", snapshot.model);
+    try std.testing.expectEqual(CheckStatus.ok, checks.items[1].status);
 }
 
 test "bounded doctor warnings use existing check stream" {
@@ -820,71 +751,14 @@ test "bounded doctor warnings use existing check stream" {
     }
 
     try appendSessionDiagnosticsTruncatedCheck(&checks, alloc, 64);
-    try appendSessionsCountUnavailableCheck(&checks, alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), checks.items.len);
+    try std.testing.expectEqual(@as(usize, 1), checks.items.len);
     try std.testing.expectEqualStrings("session", checks.items[0].name);
     try std.testing.expectEqual(CheckStatus.warn, checks.items[0].status);
     try std.testing.expect(std.mem.find(
         u8,
         checks.items[0].detail,
         "truncated after 64 session directories",
-    ) != null);
-    try std.testing.expectEqualStrings("sessions", checks.items[1].name);
-    try std.testing.expectEqual(CheckStatus.warn, checks.items[1].status);
-    try std.testing.expect(std.mem.find(
-        u8,
-        checks.items[1].detail,
-        "unavailable without a full session scan",
-    ) != null);
-}
-
-test "session doctor renders precise watermark and compaction diagnostics" {
-    const alloc = std.testing.allocator;
-    var checks: std.ArrayList(Check) = .empty;
-    defer {
-        for (checks.items) |*entry| entry.deinit(alloc);
-        checks.deinit(alloc);
-    }
-    var unused_store: session_store.Store = undefined;
-    const diagnostics = [_]session_store.DoctorDiagnostic{
-        .{
-            .session_id = @constCast("missing-watermark"),
-            .kind = .commit_watermark_missing,
-        },
-        .{
-            .session_id = @constCast("failed-compaction"),
-            .kind = .canonical_log_compaction_failed,
-            .bytes = 1024,
-            .growth_bytes = 512,
-            .growth_frames = 9,
-        },
-    };
-
-    try appendSessionDiagnosticChecks(
-        &checks,
-        alloc,
-        &unused_store,
-        &diagnostics,
-    );
-
-    try std.testing.expectEqual(@as(usize, 2), checks.items.len);
-    try std.testing.expectEqual(CheckStatus.fail, checks.items[0].status);
-    try std.testing.expect(std.mem.find(
-        u8,
-        checks.items[0].detail,
-        "commit_watermark_missing",
-    ) != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        checks.items[0].detail,
-        "fx session recover missing-watermark",
-    ) != null);
-    try std.testing.expectEqual(CheckStatus.warn, checks.items[1].status);
-    try std.testing.expect(std.mem.find(
-        u8,
-        checks.items[1].detail,
-        "growth_bytes=512 growth_frames=9",
     ) != null);
 }
 
@@ -916,7 +790,7 @@ test "command in path checks explicit path entries" {
     const bin_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "bin");
     defer std.testing.allocator.free(bin_root);
 
-    const path_env = try std.fmt.allocPrint(std.testing.allocator, "{s}", .{bin_root});
+    const path_env = try std.testing.allocator.print("{s}", .{bin_root});
     defer std.testing.allocator.free(path_env);
 
     try std.testing.expect(try commandInPathValue(std.testing.allocator, "gh", path_env));

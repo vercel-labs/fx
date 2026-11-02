@@ -23,8 +23,10 @@ const model_menu_presentation = @import("model_menu_presentation.zig");
 const skills_menu_presentation = @import("skills_menu_presentation.zig");
 const help_menu_presentation = @import("help_menu_presentation.zig");
 const settings_menu_presentation = @import("settings_menu_presentation.zig");
-const mcp_menu_presentation = @import("mcp_menu_presentation.zig");
+const mcp_host_menu_presentation = @import("mcp_host_menu_presentation.zig");
 const resume_menu_presentation = @import("resume_menu_presentation.zig");
+const effort_menu_presentation = @import("effort_menu_presentation.zig");
+const fork_menu_presentation = @import("fork_menu_presentation.zig");
 const question_ui = @import("question_ui.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
@@ -735,12 +737,12 @@ pub fn composeFooterFrame(
                 );
                 try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
             }
-        } else if (input.picker_kind == .mcp and ctx.mcp_menu.state.active) {
+        } else if (input.picker_kind == .mcp and ctx.mcp_host_menu.active()) {
             var menu_row_index: u16 = 0;
             while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
-                var menu_row = try mcp_menu_presentation.composeMcpMenuRow(
+                var menu_row = try mcp_host_menu_presentation.composeRow(
                     alloc,
-                    ctx.mcp_menu,
+                    ctx.mcp_host_menu,
                     menu_row_index,
                     shell.layout.cols,
                     input.picker_rows,
@@ -771,12 +773,36 @@ pub fn composeFooterFrame(
                 );
                 try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
             }
+        } else if (input.picker_kind == .fork and ctx.fork_menu.active()) {
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
+                var menu_row = try fork_menu_presentation.composeForkMenuRow(
+                    alloc,
+                    ctx.fork_menu,
+                    menu_row_index,
+                    shell.layout.cols,
+                    input.picker_rows,
+                );
+                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
         } else if (input.picker_kind == .models and ctx.model_menu.active) {
             var menu_row_index: u16 = 0;
             while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
                 var menu_row = try model_menu_presentation.composeModelMenuRow(
                     alloc,
                     ctx.model_menu,
+                    menu_row_index,
+                    shell.layout.cols,
+                    input.picker_rows,
+                );
+                try pushFooterBandRow(alloc, &frame, plan, rows.picker_start + menu_row_index, &menu_row);
+            }
+        } else if (input.picker_kind == .effort and ctx.effort_menu.active) {
+            var menu_row_index: u16 = 0;
+            while (menu_row_index < input.picker_rows) : (menu_row_index += 1) {
+                var menu_row = try effort_menu_presentation.composeEffortMenuRow(
+                    alloc,
+                    ctx.effort_menu,
                     menu_row_index,
                     shell.layout.cols,
                     input.picker_rows,
@@ -899,14 +925,14 @@ pub fn composeFooterFrame(
         } else if (input.picker_kind == .file and input.file_picker_items.len > 0) {
             const selected = input.picker_selection_index % input.file_picker_items.len;
             var row = rows.picker_start;
-            const status_rows: u16 = @intFromBool(ctx.file_completion_status != null and input.picker_rows > 1);
+            const visible_rows = picker_presentation.filePickerItemRows(input.picker_rows, ctx.file_completion_status != null);
+            const status_rows = input.picker_rows - visible_rows;
             if (status_rows > 0) {
                 const status = ctx.file_completion_status.?;
                 var status_row = try picker_presentation.composePickerOptionRow(alloc, .file, input.picker_start_col, status, false, shell.layout.cols);
                 try pushFooterBandRow(alloc, &frame, plan, row, &status_row);
                 row += 1;
             }
-            const visible_rows = input.picker_rows -| status_rows;
             const window_start = picker_presentation.updateEdgeScrollPickerWindowStart(input.picker_window_start, input.file_picker_items.len, selected, visible_rows);
             const window = picker_presentation.edgeScrollPickerWindowFromStart(input.file_picker_items.len, window_start, visible_rows);
             for (input.file_picker_items[window.start..window.end], window.start..) |item, i| {
@@ -954,19 +980,23 @@ pub fn composeFooterFrame(
         try input_presentation.composeSkillsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .settings)
         try input_presentation.composeSettingsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
-    else if (input.show_picker and input.picker_kind == .mcp)
-        try input_presentation.composeMcpMenuHintRow(
+    else if (input.show_picker and input.picker_kind == .mcp and ctx.mcp_host_menu.active())
+        try input_presentation.composeVariantHintRow(
             alloc,
             shell.layout.cols,
             ctx.ctrl_c_pending,
-            ctx.mcp_menu,
+            mcp_host_menu_presentation.hintVariants(ctx.mcp_host_menu),
         )
     else if (input.show_picker and input.picker_kind == .help)
         try input_presentation.composeHelpMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .sessions)
         try input_presentation.composeResumeMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .fork)
+        try input_presentation.composeForkMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .models)
         try input_presentation.composeModelsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
+    else if (input.show_picker and input.picker_kind == .effort)
+        try input_presentation.composeEffortMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .slash and input.slash_menu_layout != null)
         try input_presentation.composeSlashMenuHintRow(alloc, shell.layout.cols)
     else blk: {

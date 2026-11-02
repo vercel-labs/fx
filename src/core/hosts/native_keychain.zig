@@ -3,7 +3,9 @@ const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("host.zig");
 const io_mod = @import("../shared/io.zig");
+const select_watch = @import("../shared/select_watch.zig");
 const secret = @import("../auth/secret.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 const err_sec_success: i32 = 0;
 const err_sec_item_not_found: i32 = -25300;
@@ -21,7 +23,10 @@ const FindGenericPasswordFn = *const fn (
 ) callconv(.c) i32;
 
 pub const service_name = "FX_AI_GATEWAY_API_KEY";
-const mcp_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V1";
+/// The sign-in credentials the MCP engine hands fx to keep, a different format.
+/// Not `FX_MCP_OAUTH_CREDENTIALS_V2`: fx builds that still run read and
+/// rewrite that item (`mcp_host/credentials.zig` says why).
+pub const mcp_host_credentials_service_name = "FX_MCP_OAUTH_CREDENTIALS_V3";
 pub const oauth_session_service_name = "FX_OAUTH_SESSION_V1";
 
 /// Backing store for a resolved account name. Must outlive any argv built from it.
@@ -48,7 +53,7 @@ pub const Error = error{
 };
 
 pub fn isAvailable() bool {
-    return builtin.os.tag == .macos;
+    return builtin.target.os.tag == .macos;
 }
 
 pub fn isDisabled() bool {
@@ -128,7 +133,7 @@ fn accountName(buf: *AccountBuffer) Error![]const u8 {
 }
 
 fn osAccountName(buf: *AccountBuffer) ?[]const u8 {
-    if (comptime builtin.os.tag == .macos) return posixAccountName(buf);
+    if (comptime builtin.target.os.tag == .macos) return posixAccountName(buf);
     return null;
 }
 
@@ -161,7 +166,7 @@ pub fn oauthSessionPresence() Error!host.SecretStorePresence {
 }
 
 fn containsService(service: []const u8) Error!host.SecretStorePresence {
-    if (comptime builtin.os.tag != .macos) return .missing;
+    if (comptime builtin.target.os.tag != .macos) return .missing;
     var account_buf: AccountBuffer = undefined;
     const account = try accountName(&account_buf);
     const service_len = std.math.cast(u32, service.len) orelse
@@ -196,23 +201,8 @@ fn containsService(service: []const u8) Error!host.SecretStorePresence {
     return error.KeychainReadFailed;
 }
 
-pub fn loadMcpCredentials(alloc: std.mem.Allocator) !?[]u8 {
-    return loadMcpValueMacControlled(alloc, mcp_credentials_service_name, null);
-}
-
 pub fn loadOAuthSession(alloc: std.mem.Allocator) !?[]u8 {
     return loadMcpValueMacControlled(alloc, oauth_session_service_name, null);
-}
-
-pub fn loadMcpCredentialsCancellable(
-    alloc: std.mem.Allocator,
-    cancel_flag: *const std.atomic.Value(bool),
-) !?[]u8 {
-    return loadMcpValueMacControlled(
-        alloc,
-        mcp_credentials_service_name,
-        cancel_flag,
-    );
 }
 
 fn loadFromService(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
@@ -229,7 +219,7 @@ fn loadFromService(alloc: std.mem.Allocator, service: []const u8) !?[]u8 {
     defer alloc.free(result.stderr);
     if (result.term != .exited or result.term.exited != 0) {
         secret.zeroAndFree(alloc, result.stdout);
-        if (std.mem.indexOf(u8, result.stderr, "could not be found") != null) {
+        if (std.mem.find(u8, result.stderr, "could not be found") != null) {
             debug_trace.logf("keychain", "load failed step=lookup err=KeychainItemNotFound", .{});
             return error.KeychainItemNotFound;
         }
@@ -371,12 +361,8 @@ pub fn storeValue(value: []const u8) Error!void {
     if (!isAvailable()) return error.UnsupportedPlatform;
     if (value.len == 0) return error.KeychainWriteFailed;
 
-    if (comptime builtin.os.tag == .macos) return storeValueMac(service_name, value);
+    if (comptime builtin.target.os.tag == .macos) return storeValueMac(service_name, value);
     return error.UnsupportedPlatform;
-}
-
-pub fn storeMcpCredentials(value: []const u8) Error!void {
-    return storeMcpCredentialsControlled(value, null);
 }
 
 pub fn storeOAuthSession(value: []const u8) Error!void {
@@ -387,38 +373,24 @@ pub fn storeOAuthSession(value: []const u8) Error!void {
     return storeMcpValueMac(oauth_session_service_name, value);
 }
 
-pub fn storeMcpCredentialsCancellable(
-    value: []const u8,
-    cancel_flag: *const std.atomic.Value(bool),
-) Error!void {
-    return storeMcpCredentialsControlled(value, cancel_flag);
+pub fn deleteOAuthSession(alloc: std.mem.Allocator) Error!bool {
+    return deleteMcpValueMac(alloc, oauth_session_service_name);
 }
 
-fn storeMcpCredentialsControlled(
-    value: []const u8,
-    cancel_flag: ?*const std.atomic.Value(bool),
-) Error!void {
-    if (!isAvailable()) return error.UnsupportedPlatform;
-    if (value.len == 0 or value.len > max_mcp_credentials_bytes) {
-        return error.KeychainWriteFailed;
-    }
+/// Returns error.KeychainItemNotFound when nothing was stored yet.
+pub fn loadMcpHostCredentials(alloc: std.mem.Allocator) Error!?[]u8 {
+    return loadMcpValueMacControlled(alloc, mcp_host_credentials_service_name, null);
+}
 
-    if (comptime builtin.os.tag == .macos) {
-        return storeMcpValueMacControlled(
-            mcp_credentials_service_name,
-            value,
-            cancel_flag,
-        );
-    }
+pub fn storeMcpHostCredentials(value: []const u8) Error!void {
+    if (!isAvailable()) return error.UnsupportedPlatform;
+    if (value.len == 0 or value.len > max_mcp_credentials_bytes) return error.KeychainWriteFailed;
+    if (comptime builtin.target.os.tag == .macos) return storeMcpValueMac(mcp_host_credentials_service_name, value);
     return error.UnsupportedPlatform;
 }
 
-pub fn deleteMcpCredentials(alloc: std.mem.Allocator) Error!bool {
-    return deleteMcpValueMac(alloc, mcp_credentials_service_name);
-}
-
-pub fn deleteOAuthSession(alloc: std.mem.Allocator) Error!bool {
-    return deleteMcpValueMac(alloc, oauth_session_service_name);
+pub fn deleteMcpHostCredentials(alloc: std.mem.Allocator) Error!bool {
+    return deleteMcpValueMac(alloc, mcp_host_credentials_service_name);
 }
 
 fn writeFailed(step: []const u8, err: anyerror) Error {
@@ -449,7 +421,7 @@ fn storeValueMac(service: []const u8, value: []const u8) Error!void {
     defer if (input_open) input.close(io_mod.getIo());
 
     var header_buffer: [96]u8 = undefined;
-    const header = std.fmt.bufPrint(
+    const header = std.mem.print(
         &header_buffer,
         "{d}\n{d}\n{d}\n",
         .{ account.len, service.len, value.len },
@@ -534,7 +506,7 @@ const McpKeychainRunContext = struct {
 
 const McpKeychainRunEvent = union(enum) {
     process: anyerror!std.process.RunResult,
-    cancelled: anyerror!void,
+    watch: std.Io.Cancelable!select_watch.Outcome,
 };
 
 fn runMcpKeychainChild(
@@ -548,12 +520,42 @@ fn runMcpKeychainChild(
     });
 }
 
-fn waitForMcpKeychainCancellation(
-    cancel_flag: *const std.atomic.Value(bool),
-) anyerror!void {
-    while (!cancel_flag.load(.acquire)) {
-        try io_mod.getIo().sleep(.fromMilliseconds(5), .awake);
+/// Ends a keychain call's watch when its cancel flag is set or, with a deadline,
+/// when that passes. See `select_watch` for why the caller stops the watch
+/// instead of cancelling it.
+const KeychainCondition = struct {
+    cancel_flag: ?*const std.atomic.Value(bool),
+    deadline: ?std.Io.Clock.Timestamp = null,
+
+    pub fn cancelled(condition: KeychainCondition) bool {
+        const flag = condition.cancel_flag orelse return false;
+        return flag.load(.acquire);
     }
+
+    pub fn expired(condition: KeychainCondition, io: std.Io) bool {
+        const limit = condition.deadline orelse return false;
+        const now = std.Io.Clock.Timestamp.now(io, .awake);
+        return !std.Io.Clock.Timestamp.compare(now, .lt, limit);
+    }
+};
+
+const KeychainWatch = select_watch.Watch(KeychainCondition);
+
+/// Cancels a keychain read that is still running. A result that arrives anyway
+/// can hold credentials, so its output is zeroed before it is freed.
+fn abandonMcpKeychainRun(
+    alloc: std.mem.Allocator,
+    select: *std.Io.Select(McpKeychainRunEvent),
+    watch: *KeychainWatch,
+) void {
+    watch.stop(select.io);
+    while (select.cancel()) |item| switch (item) {
+        .process => |result| if (result) |late| {
+            secret.zeroAndFree(alloc, late.stdout);
+            alloc.free(late.stderr);
+        } else |_| {},
+        .watch => {},
+    };
 }
 
 fn runMcpKeychainProcess(
@@ -572,36 +574,33 @@ fn runMcpKeychainProcess(
         .argv = argv,
         .stdout_limit = stdout_limit,
     };
+    var watch: KeychainWatch = .{};
     var select_buffer: [2]McpKeychainRunEvent = undefined;
     var select: std.Io.Select(McpKeychainRunEvent) = .init(
         io_mod.getIo(),
         &select_buffer,
     );
-    select.concurrent(.process, runMcpKeychainChild, .{&context}) catch |err|
-        return err;
-    select.concurrent(
-        .cancelled,
-        waitForMcpKeychainCancellation,
-        .{flag},
-    ) catch |err| {
-        select.cancelDiscard();
+    select.concurrent(.watch, KeychainWatch.run, .{
+        &watch,
+        select.io,
+        KeychainCondition{ .cancel_flag = flag },
+    }) catch |err| return err;
+    select.concurrent(.process, runMcpKeychainChild, .{&context}) catch |err| {
+        watch.finish(&select);
         return err;
     };
     const event = select.await() catch |err| {
-        select.cancelDiscard();
+        abandonMcpKeychainRun(alloc, &select, &watch);
         return err;
     };
     return switch (event) {
         .process => |result| blk: {
-            select.cancelDiscard();
+            watch.finish(&select);
             break :blk result catch |err| return err;
         },
-        .cancelled => |result| {
-            result catch |err| {
-                select.cancelDiscard();
-                return err;
-            };
-            select.cancelDiscard();
+        .watch => |result| {
+            abandonMcpKeychainRun(alloc, &select, &watch);
+            _ = try result;
             return error.Cancelled;
         },
     };
@@ -609,63 +608,69 @@ fn runMcpKeychainProcess(
 
 const McpStoreEvent = union(enum) {
     wait: anyerror!std.process.Child.Term,
-    timeout: anyerror!void,
-    cancelled: anyerror!void,
+    watch: std.Io.Cancelable!select_watch.Outcome,
 };
 
 fn waitForMcpStoreChild(child: *std.process.Child) anyerror!std.process.Child.Term {
     return child.wait(io_mod.getIo());
 }
 
-fn waitForMcpStoreTimeout() anyerror!void {
-    return std.Io.Timeout.sleep(keychain_process_timeout, io_mod.getIo());
+/// Cancels the store's wait, then kills and reaps the child unless that wait
+/// already reaped it. A cancelled `child.wait` clears `child.id` without
+/// reaping, so the caller's deferred `child.kill` would leave it running. The
+/// pid cannot have been reused, because nothing has reaped it.
+fn abandonMcpStore(
+    select: *std.Io.Select(McpStoreEvent),
+    watch: *KeychainWatch,
+    pid: std.posix.pid_t,
+) void {
+    watch.stop(select.io);
+    var reaped = false;
+    while (select.cancel()) |item| switch (item) {
+        .wait => |result| reaped = if (result) |_| true else |_| false,
+        .watch => {},
+    };
+    if (reaped) return;
+    std.posix.kill(pid, .KILL) catch |err| {
+        debug_trace.logf("keychain", "store abandon kill failed err={s}", .{@errorName(err)});
+    };
+    while (std.c.waitpid(pid, null, 0) == -1) {
+        if (std.posix.errno(-1) != .INTR) break;
+    }
 }
 
 fn waitForMcpStore(
     child: *std.process.Child,
     cancel_flag: ?*const std.atomic.Value(bool),
 ) Error!std.process.Child.Term {
-    var select_buffer: [3]McpStoreEvent = undefined;
-    var select: std.Io.Select(McpStoreEvent) = .init(io_mod.getIo(), &select_buffer);
-    select.concurrent(.wait, waitForMcpStoreChild, .{child}) catch |err|
+    const pid = child.id orelse return writeFailed("native_wait_start", error.ProcessNotFound);
+    const io = io_mod.getIo();
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, keychain_process_timeout.duration);
+    var watch: KeychainWatch = .{};
+    var select_buffer: [2]McpStoreEvent = undefined;
+    var select: std.Io.Select(McpStoreEvent) = .init(io, &select_buffer);
+    select.concurrent(.watch, KeychainWatch.run, .{
+        &watch,
+        select.io,
+        KeychainCondition{ .cancel_flag = cancel_flag, .deadline = deadline },
+    }) catch |err| return writeFailed("native_timeout_start", err);
+    select.concurrent(.wait, waitForMcpStoreChild, .{child}) catch |err| {
+        watch.finish(&select);
         return writeFailed("native_wait_start", err);
-    select.concurrent(.timeout, waitForMcpStoreTimeout, .{}) catch |err| {
-        select.cancelDiscard();
-        return writeFailed("native_timeout_start", err);
     };
-    if (cancel_flag) |flag| {
-        select.concurrent(
-            .cancelled,
-            waitForMcpKeychainCancellation,
-            .{flag},
-        ) catch |err| {
-            select.cancelDiscard();
-            return writeFailed("native_cancel_start", err);
-        };
-    }
     const event = select.await() catch |err| {
-        select.cancelDiscard();
+        abandonMcpStore(&select, &watch, pid);
         return writeFailed("native_wait", err);
     };
     switch (event) {
         .wait => |result| {
-            select.cancelDiscard();
+            watch.finish(&select);
             return result catch |err| writeFailed("native_wait", err);
         },
-        .timeout => |result| {
-            result catch |err| {
-                select.cancelDiscard();
-                return writeFailed("native_timeout", err);
-            };
-            select.cancelDiscard();
-            return writeFailed("native_wait", error.Timeout);
-        },
-        .cancelled => |result| {
-            result catch |err| {
-                select.cancelDiscard();
-                return writeFailed("native_cancel", err);
-            };
-            select.cancelDiscard();
+        .watch => |result| {
+            abandonMcpStore(&select, &watch, pid);
+            const outcome = result catch |err| return writeFailed("native_timeout", err);
+            if (outcome == .deadline) return writeFailed("native_wait", error.Timeout);
             return error.Cancelled;
         },
     }
@@ -772,7 +777,7 @@ fn deleteTestServiceItem(alloc: std.mem.Allocator) void {
 }
 
 test "account name resolves from the operating system when USER is unset" {
-    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .macos) return error.SkipZigTest;
     try std.testing.expect(io_mod.getenv("USER") == null);
 
     var buf: AccountBuffer = undefined;
@@ -782,7 +787,7 @@ test "account name resolves from the operating system when USER is unset" {
 }
 
 test "stored key round-trips byte-identically with USER unset" {
-    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .macos) return error.SkipZigTest;
     if (isDisabled()) return error.SkipZigTest;
     try std.testing.expect(io_mod.getenv("USER") == null);
 
@@ -804,12 +809,12 @@ test "stored key round-trips byte-identically with USER unset" {
 }
 
 test "MCP Keychain storage round-trips values beyond the security prompt limit" {
-    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .macos) return error.SkipZigTest;
     if (isDisabled()) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     const test_mcp_service = "FX_TEST_MCP_OAUTH_CREDENTIALS_V1";
-    const written = "mcp-credential-section-" ** 32;
+    const written = text_utils.repeat("mcp-credential-section-", 32);
 
     storeMcpValueMac(test_mcp_service, written) catch return error.SkipZigTest;
     defer _ = deleteMcpValueMac(alloc, test_mcp_service) catch false;
@@ -834,7 +839,7 @@ test "Keychain store command has no secret argument" {
 }
 
 test "cancellable MCP Keychain runner interrupts and reaps a stalled child" {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     const Canceller = struct {
@@ -864,7 +869,7 @@ test "cancellable MCP Keychain runner interrupts and reaps a stalled child" {
 }
 
 test "default Keychain availability probe is cancellable" {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     const Canceller = struct {
@@ -893,7 +898,7 @@ test "default Keychain availability probe is cancellable" {
 }
 
 test "cancellable MCP Keychain store wait interrupts a stalled child" {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     const Canceller = struct {
@@ -912,6 +917,7 @@ test "cancellable MCP Keychain store wait interrupts a stalled child" {
         .stderr = .ignore,
     });
     defer child.kill(std.testing.io);
+    const pid = child.id orelse return error.TestUnexpectedResult;
     var cancel = std.atomic.Value(bool).init(false);
     var canceller = Canceller{ .flag = &cancel };
     const thread = try std.Thread.spawn(.{}, Canceller.run, .{&canceller});
@@ -922,12 +928,15 @@ test "cancellable MCP Keychain store wait interrupts a stalled child" {
     );
     thread.join();
     try std.testing.expect(io_mod.milliTimestamp() - started_ms < 1_000);
+    // The cancelled wait clears child.id, so the deferred kill does nothing.
+    // The store must have killed and reaped the child itself.
+    try std.testing.expectEqual(@as(std.c.pid_t, -1), std.c.waitpid(pid, null, std.c.W.NOHANG));
 }
 
 test "Keychain value store uses a bounded PTY bridge without a secret argument" {
     const argv = storeValueArgv();
     try std.testing.expectEqualStrings("/usr/bin/expect", argv[0]);
-    try std.testing.expect(std.mem.indexOf(u8, argv[2], "set timeout 10") != null);
+    try std.testing.expect(std.mem.find(u8, argv[2], "set timeout 10") != null);
     for (argv) |arg| {
         try std.testing.expect(!std.mem.eql(u8, arg, "vca_secret_value"));
     }

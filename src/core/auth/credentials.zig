@@ -242,7 +242,7 @@ pub fn catalogAccessForCredentialAndAccount(
 
 /// Current native product copy. Store mechanics and availability come from the
 /// injected host port; Core retains the stable user-facing source name.
-pub const stored_key_backend_label = if (builtin.os.tag == .macos) "macOS Keychain" else "profile file";
+pub const stored_key_backend_label = if (builtin.target.os.tag == .macos) "macOS Keychain" else "profile file";
 
 /// Both modes resolve the same source set; the mode selects only whether an expired
 /// fx login session is refreshed first.
@@ -250,7 +250,7 @@ pub const LoadMode = enum { stored, refresh_if_needed };
 
 const FxLoginRefreshMode = enum { if_needed, force };
 
-pub const missing_credential_message = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.";
+pub const missing_credential_message = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_interactive_credential_message = "fx needs access to Vercel AI Gateway. Run /login to sign in, /provider to use an API key, or set AI_GATEWAY_API_KEY.";
 pub const missing_chatgpt_credential_message = "fx needs a Codex subscription login for this model. Run fx login codex.";
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login, open Connections, then choose Codex subscription.";
@@ -815,7 +815,7 @@ pub fn refreshFxSession(
         try retire_fx_session(alloc, mutation);
         return error.NoRefreshToken;
     };
-    const expires_at_ms = oauth.expiry_timestamp_ms(
+    const expires_at_ms = oauth.expiryTimestampMs(
         io_mod.milliTimestamp(),
         refreshed.expires_in,
     ) catch |err| {
@@ -931,11 +931,12 @@ test "stored key label discloses the backend that answered" {
 
 test "missing credential messages use surface commands in preferred order" {
     const cli_login = std.mem.find(u8, missing_credential_message, "fx login").?;
-    const cli_setup = std.mem.find(u8, missing_credential_message, "fx setup").?;
+    const cli_api_key = std.mem.find(u8, missing_credential_message, "fx login vercel --api-key").?;
     const cli_env = std.mem.find(u8, missing_credential_message, "AI_GATEWAY_API_KEY").?;
 
-    try std.testing.expect(cli_login < cli_setup);
-    try std.testing.expect(cli_setup < cli_env);
+    try std.testing.expect(cli_login < cli_api_key);
+    try std.testing.expect(cli_api_key < cli_env);
+    try std.testing.expect(std.mem.find(u8, missing_credential_message, "fx setup") == null);
 
     const tui_login = std.mem.find(u8, missing_interactive_credential_message, "/login").?;
     const tui_setup = std.mem.find(u8, missing_interactive_credential_message, "/provider").?;
@@ -1107,18 +1108,6 @@ test "credential clone owns every secret and authority field independently" {
     try std.testing.expectEqual(original.refresh_after_ms, cloned.refresh_after_ms);
 }
 
-var stable_credential_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableCredentialTestEnviron() !*const std.process.Environ.Map {
-    if (stable_credential_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_credential_test_environ = map;
-    return map;
-}
-
 const CredentialTestEnv = struct {
     alloc: std.mem.Allocator,
     map: std.process.Environ.Map,
@@ -1130,8 +1119,6 @@ const CredentialTestEnv = struct {
     /// migrates into the developer's real `FX_OAUTH_SESSION_V1` item and
     /// destroys their fx login.
     fn install(alloc: std.mem.Allocator, entries: []const [2][]const u8) !*CredentialTestEnv {
-        _ = try stableCredentialTestEnviron();
-
         const self = try alloc.create(CredentialTestEnv);
         errdefer alloc.destroy(self);
         self.* = .{
@@ -1147,7 +1134,7 @@ const CredentialTestEnv = struct {
     }
 
     fn deinit(self: *CredentialTestEnv) void {
-        if (stable_credential_test_environ) |map| io_mod.setEnvironMap(map);
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);
@@ -1372,8 +1359,8 @@ test "credential source presence reads metadata without parsing session secrets"
         .{ .source = .grok_subscription, .file_name = profile_paths.grok_auth_file_name },
     };
     for (cases) |case| {
-        var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const relative_path = try std.fmt.bufPrint(
+        var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const relative_path = try std.mem.print(
             &path_buffer,
             ".fx/{s}",
             .{case.file_name},
@@ -1477,7 +1464,7 @@ const ExpiredFxLoginFixture = struct {
         errdefer alloc.free(home);
 
         try tmp.dir.createDirPath(io_mod.getIo(), ".fx");
-        const auth_path = try std.fs.path.join(alloc, &.{ home, ".fx", "auth.json" });
+        const auth_path = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "auth.json" });
         defer alloc.free(auth_path);
         var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), auth_path, .{
             .truncate = true,
@@ -1619,7 +1606,7 @@ test "an fx login refresh retires the consumed token when durable replacement fa
     const alloc = std.testing.allocator;
     var fixture = try ExpiredFxLoginFixture.install(alloc);
     defer fixture.deinit();
-    const auth_path = try std.fs.path.join(alloc, &.{ fixture.home, ".fx", "auth.json" });
+    const auth_path = try std.Io.Dir.path.join(alloc, &.{ fixture.home, ".fx", "auth.json" });
     defer alloc.free(auth_path);
     var refresh = FxLoginRefreshProbe{
         .token_disposition = .accepted,

@@ -1,4 +1,6 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
+const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("workspace_access.zig");
@@ -57,6 +59,7 @@ pub const OmissionReason = enum {
     non_regular,
     symlink,
     selection_cap,
+    host_unreadable,
 
     pub fn label(self: OmissionReason) []const u8 {
         return switch (self) {
@@ -68,7 +71,86 @@ pub const OmissionReason = enum {
             .non_regular => "non-regular rule file",
             .symlink => "symlinked rule file",
             .selection_cap => "selection cap",
+            .host_unreadable => "host cannot read instruction files",
         };
+    }
+};
+
+/// One project instruction file read through a host. `bytes` is owned by the
+/// allocator passed to `InstructionFileReader.read` and holds the first
+/// `@min(total_bytes, max_bytes)` bytes.
+pub const InstructionFile = struct {
+    bytes: []u8,
+    total_bytes: u64,
+};
+
+pub const InstructionFileError = Allocator.Error || error{
+    /// The host has no instruction file access.
+    HostUnreadable,
+    /// The host failed, timed out, or returned malformed or non-UTF-8 content.
+    Unreadable,
+    /// The path is outside what the host allows fx to read.
+    UnsafePath,
+};
+
+/// Reads project instruction files (AGENTS.md) through an embedding host.
+pub const InstructionFileReader = struct {
+    read_fn: *const fn (Allocator, path: []const u8, max_bytes: usize) InstructionFileError!?InstructionFile,
+    /// Largest prefix one read copies; callers never request more.
+    max_read_bytes: usize,
+
+    /// Returns null when the file does not exist. The read may block on the host.
+    pub fn read(self: InstructionFileReader, alloc: Allocator, path: []const u8, max_bytes: usize) InstructionFileError!?InstructionFile {
+        return self.read_fn(alloc, path, max_bytes);
+    }
+};
+
+/// Where the default provider finds project instruction files.
+pub const InstructionFiles = union(enum) {
+    /// The local filesystem, with HOME taken from the environment.
+    filesystem,
+    /// A host workspace. `home` is an absolute host path borrowed from the
+    /// composing host for the lifetime of the registry that carries it.
+    host: struct {
+        home: []const u8,
+        reader: InstructionFileReader,
+    },
+    /// A host workspace exists but cannot read instruction files. The provider
+    /// reports the omission instead of silently skipping AGENTS.md.
+    host_unreadable,
+    /// No workspace exists, so there are no instruction files to read.
+    none,
+
+    /// A stamp of the instruction file at `path` as this source reads it, so
+    /// a later turn can tell whether the file changed since a context note
+    /// delivered it (D93). A local file is stamped by the metadata of the file
+    /// the rules come from, through a symlink too, as the indexer stamps its
+    /// sources: inode, size, and modification and change times. A host file
+    /// has no metadata here, so it is stamped by the bytes the host returns.
+    /// Never 0; returns 0 when the file cannot be read.
+    pub fn sourceStamp(self: InstructionFiles, alloc: Allocator, path: []const u8) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        switch (self) {
+            .filesystem => {
+                const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = true }) catch return 0;
+                const fields = [_]u64{
+                    stat.size,
+                    @bitCast(@as(i64, @truncate(stat.mtime.nanoseconds))),
+                    @bitCast(@as(i64, @truncate(stat.ctime.nanoseconds))),
+                    @intCast(stat.inode),
+                };
+                hasher.update(std.mem.sliceAsBytes(&fields));
+            },
+            .host => |host_files| {
+                const file = (host_files.reader.read(alloc, path, host_files.reader.max_read_bytes) catch return 0) orelse return 0;
+                defer alloc.free(file.bytes);
+                hasher.update(std.mem.asBytes(&file.total_bytes));
+                hasher.update(file.bytes);
+            },
+            .host_unreadable, .none => return 0,
+        }
+        // 53 bits stay exact for any JSON reader of the saved session.
+        return (hasher.final() & ((@as(u64, 1) << 53) - 1)) | 1;
     }
 };
 
@@ -79,20 +161,20 @@ pub const ContextOmissionInput = struct {
 
 pub const ContextOmissionSummary = struct {
     omitted_count: usize,
-    reason_counts: [std.meta.fields(OmissionReason).len]usize,
+    reason_counts: [@typeInfo(OmissionReason).@"enum".field_names.len]usize,
     digest: [std.crypto.hash.sha2.Sha256.digest_length]u8,
 };
 
 pub const ContextOmissionSummaryBuilder = struct {
     omitted_count: usize = 0,
-    reason_counts: [std.meta.fields(OmissionReason).len]usize = @splat(0),
+    reason_counts: [@typeInfo(OmissionReason).@"enum".field_names.len]usize = @splat(0),
     hasher: std.crypto.hash.sha2.Sha256 = std.crypto.hash.sha2.Sha256.init(.{}),
 
     pub fn add(self: *ContextOmissionSummaryBuilder, source: []const u8, reason: OmissionReason) void {
         self.omitted_count += 1;
-        self.reason_counts[@intFromEnum(reason)] += 1;
+        self.reason_counts[@backingInt(reason)] += 1;
         self.hasher.update("fx.context.omission-record\x00");
-        self.hasher.update(&.{@intFromEnum(reason)});
+        self.hasher.update(&.{@backingInt(reason)});
         hashUsize(&self.hasher, source.len);
         self.hasher.update(source);
     }
@@ -130,9 +212,9 @@ pub const InitialContextInput = struct {
     targets: []const ApplicableTarget = &.{},
     omissions: []const ContextOmissionInput = &.{},
     omission_summary: ?ContextOmissionSummary = null,
-    /// Internal request reconstruction only; ordinary gathers retain their work limits.
-    bounded_reconstruction: bool = false,
     context_limits: context_limits.Values = .{},
+    /// Assigned by `Registry` from its composition when routed through it.
+    instruction_files: InstructionFiles = .filesystem,
 };
 
 pub const LaterContextInput = struct {
@@ -141,7 +223,12 @@ pub const LaterContextInput = struct {
     targets: []const ApplicableTarget,
     delivered_sources: []const []const u8,
     evaluated_endpoints: []const []const u8,
+    /// Delivered sources that may get a reminder when a target reaches them:
+    /// rules an earlier turn's note delivered and this turn has not reminded.
+    remind_sources: []const []const u8 = &.{},
     context_limits: context_limits.Values = .{},
+    /// Assigned by `Registry` from its composition when routed through it.
+    instruction_files: InstructionFiles = .filesystem,
 };
 
 /// Owns provider-produced context bytes and delivery-state additions. The
@@ -151,14 +238,22 @@ pub const ProviderContext = struct {
     delivered_sources: [][]u8 = &.{},
     evaluated_endpoints: [][]u8 = &.{},
     notices: [][]u8 = &.{},
+    /// One reminder line per `reminded_sources` entry: the targets reached
+    /// rules from `LaterContextInput.remind_sources` again.
+    reminders: ?[]u8 = null,
+    reminded_sources: [][]u8 = &.{},
 
     pub fn deinit(self: *ProviderContext, alloc: Allocator) void {
         if (self.content) |content| {
             if (content.len > 0) alloc.free(content);
         }
+        if (self.reminders) |reminders| {
+            if (reminders.len > 0) alloc.free(reminders);
+        }
         freeOwnedStrings(alloc, self.delivered_sources);
         freeOwnedStrings(alloc, self.evaluated_endpoints);
         freeOwnedStrings(alloc, self.notices);
+        freeOwnedStrings(alloc, self.reminded_sources);
         self.* = .{};
     }
 
@@ -299,6 +394,9 @@ pub fn selectNoApplicableProjectContext(_: Allocator, _: LaterContextInput) Prov
 
 pub const Registry = struct {
     default_provider: Provider,
+    /// Every gather and selection routed through this registry reads project
+    /// instruction files from this source, so later context matches startup.
+    instruction_files: InstructionFiles = .filesystem,
 
     pub fn defaultProvider(self: Registry) Provider {
         return self.default_provider;
@@ -306,7 +404,9 @@ pub const Registry = struct {
 
     pub fn gatherDefaultSnapshot(self: Registry, alloc: Allocator, input: InitialContextInput) ProviderError!GatheredContextSnapshot {
         const provider = self.defaultProvider();
-        var gathered = try provider.gatherProjectContext(alloc, input);
+        var routed = input;
+        routed.instruction_files = self.instruction_files;
+        var gathered = try provider.gatherProjectContext(alloc, routed);
         errdefer gathered.deinit(alloc);
 
         var snapshot: GatheredContextSnapshot = .{
@@ -336,7 +436,9 @@ pub const Registry = struct {
     }
 
     pub fn selectDefaultApplicableContext(self: Registry, alloc: Allocator, input: LaterContextInput) ProviderError!ProviderContext {
-        return self.defaultProvider().selectApplicableProjectContext(alloc, input);
+        var routed = input;
+        routed.instruction_files = self.instruction_files;
+        return self.defaultProvider().selectApplicableProjectContext(alloc, routed);
     }
 
     pub fn appendDefaultStatic(self: Registry, input: StaticContextInput, alloc: Allocator, messages: *std.ArrayList(types.ChatMessage)) ProviderError!void {
@@ -746,7 +848,7 @@ test "entrypoint model-visible layout snapshot covers major entrypoints" {
 test "context registry routes the default provider" {
     const Fixture = struct {
         fn gather(alloc: Allocator, input: InitialContextInput) ProviderError!ProviderContext {
-            return .{ .content = try std.fmt.allocPrint(alloc, "project:{s}", .{input.workspace_root}) };
+            return .{ .content = try alloc.print("project:{s}", .{input.workspace_root}) };
         }
 
         fn appendStatic(input: StaticContextInput, alloc: Allocator, messages: *std.ArrayList(types.ChatMessage)) ProviderError!void {
@@ -754,7 +856,7 @@ test "context registry routes the default provider" {
         }
 
         fn appendTransient(input: TransientContextInput, alloc: Allocator, messages: *std.ArrayList(types.ChatMessage)) ProviderError!void {
-            const content = try std.fmt.allocPrint(alloc, "runtime:{s}", .{input.workspace_root});
+            const content = try alloc.print("runtime:{s}", .{input.workspace_root});
             try messages.append(alloc, .{ .role = .system, .content = content });
         }
     };
@@ -789,6 +891,51 @@ test "context registry routes the default provider" {
     try std.testing.expectEqualStrings("test.default_context", contribution.provider_id);
     try std.testing.expectEqualStrings("project:/workspace", messages.items[0].content.?);
     try std.testing.expectEqualStrings("runtime:/workspace", messages.items[1].content.?);
+}
+
+test "registry routes its instruction file source to gathers and later selections" {
+    const Fixture = struct {
+        var gathered: ?std.meta.Tag(InstructionFiles) = null;
+        var selected: ?std.meta.Tag(InstructionFiles) = null;
+
+        fn gather(_: Allocator, input: InitialContextInput) ProviderError!ProviderContext {
+            gathered = std.meta.activeTag(input.instruction_files);
+            return .{};
+        }
+
+        fn select(_: Allocator, input: LaterContextInput) ProviderError!ProviderContext {
+            selected = std.meta.activeTag(input.instruction_files);
+            return .{};
+        }
+
+        fn appendStatic(_: StaticContextInput, _: Allocator, _: *std.ArrayList(types.ChatMessage)) ProviderError!void {}
+
+        fn appendTransient(_: TransientContextInput, _: Allocator, _: *std.ArrayList(types.ChatMessage)) ProviderError!void {}
+    };
+
+    const registry = Registry{
+        .default_provider = .{
+            .id = "test.instruction_files",
+            .gather_project_context_fn = Fixture.gather,
+            .select_applicable_project_context_fn = Fixture.select,
+            .append_static_fn = Fixture.appendStatic,
+            .append_transient_fn = Fixture.appendTransient,
+        },
+        .instruction_files = .host_unreadable,
+    };
+    const alloc = std.testing.allocator;
+    var snapshot = try registry.gatherDefaultSnapshot(alloc, .{ .workspace_root = "/workspace", .instruction_files = .filesystem });
+    defer snapshot.deinit(alloc);
+    var later = try registry.selectDefaultApplicableContext(alloc, .{
+        .workspace_root = "/workspace",
+        .targets = &.{},
+        .delivered_sources = &.{},
+        .evaluated_endpoints = &.{},
+    });
+    defer later.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?std.meta.Tag(InstructionFiles), .host_unreadable), Fixture.gathered);
+    try std.testing.expectEqual(@as(?std.meta.Tag(InstructionFiles), .host_unreadable), Fixture.selected);
 }
 
 test "gathered context snapshot duplicates provenance and content ownership" {
@@ -858,7 +1005,7 @@ test "delivery state copies snapshot seeds and atomically takes selection identi
 }
 
 test "delivery state commit leaves selection identities owned on reserve failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var selected: ProviderContext = .{
         .delivered_sources = try dupeOwnedStrings(alloc, &.{"/workspace/src/AGENTS.md"}),
         .evaluated_endpoints = try dupeOwnedStrings(alloc, &.{"/workspace/src/nested"}),
@@ -899,7 +1046,7 @@ test "gathered context snapshot cleans partial allocation failures" {
         .append_static_fn = Fixture.appendStatic,
         .append_transient_fn = Fixture.appendTransient,
     } };
-    const backing = std.testing.allocator;
+    const backing = testing_allocator.no_resize;
 
     var gather_probe = std.testing.FailingAllocator.init(backing, .{});
     var gathered = try registry.gatherDefaultSnapshot(gather_probe.allocator(), .{ .workspace_root = "/workspace" });
@@ -937,4 +1084,52 @@ test "gathered context snapshot cleans partial allocation failures" {
         try std.testing.expect(failing.has_induced_failure);
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
+}
+
+test "an instruction file's stamp follows a symlink to its rules and reads a host's bytes (D93)" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "CLAUDE.md", .data = "V1" });
+    tmp.dir.symLink(std.testing.io, "CLAUDE.md", "AGENTS.md", .{ .is_directory = false }) catch |err| {
+        if (err == error.AccessDenied or err == error.FileSystem) return error.SkipZigTest;
+        return err;
+    };
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const link = try std.Io.Dir.path.join(alloc, &.{ root, "AGENTS.md" });
+    defer alloc.free(link);
+    const missing = try std.Io.Dir.path.join(alloc, &.{ root, "missing", "AGENTS.md" });
+    defer alloc.free(missing);
+
+    const local: InstructionFiles = .filesystem;
+    const first = local.sourceStamp(alloc, link);
+    try std.testing.expect(first != 0);
+    try std.testing.expectEqual(first, local.sourceStamp(alloc, link));
+    // Editing the file the link names changes the stamp, though the link
+    // itself is untouched.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "CLAUDE.md", .data = "V2 edited" });
+    try std.testing.expect(local.sourceStamp(alloc, link) != first);
+    try std.testing.expectEqual(@as(u64, 0), local.sourceStamp(alloc, missing));
+
+    // A host path need not exist on this disk: the host's bytes stamp it.
+    const Host = struct {
+        var text: []const u8 = "H1";
+        fn read(read_alloc: Allocator, path: []const u8, max_bytes: usize) InstructionFileError!?InstructionFile {
+            if (!std.mem.eql(u8, path, "/host/work/AGENTS.md")) return null;
+            return .{ .bytes = try read_alloc.dupe(u8, text[0..@min(text.len, max_bytes)]), .total_bytes = text.len };
+        }
+    };
+    const host: InstructionFiles = .{ .host = .{
+        .home = "/host",
+        .reader = .{ .read_fn = Host.read, .max_read_bytes = 1024 },
+    } };
+    const host_first = host.sourceStamp(alloc, "/host/work/AGENTS.md");
+    try std.testing.expect(host_first != 0);
+    try std.testing.expectEqual(host_first, host.sourceStamp(alloc, "/host/work/AGENTS.md"));
+    Host.text = "H2";
+    try std.testing.expect(host.sourceStamp(alloc, "/host/work/AGENTS.md") != host_first);
+    try std.testing.expectEqual(@as(u64, 0), host.sourceStamp(alloc, "/host/work/sub/AGENTS.md"));
+    try std.testing.expectEqual(@as(u64, 0), (InstructionFiles{ .host_unreadable = {} }).sourceStamp(alloc, link));
 }

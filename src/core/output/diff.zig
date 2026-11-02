@@ -25,9 +25,52 @@ const trailing_newline_removed_marker = "(trailing newline removed)";
 pub const DiffEntry = struct {
     id: u32,
     full: ?FullDiff = null,
+    /// Set instead of `full` for resumed history: the full review is built
+    /// from the saved snapshots only when someone asks to see it.
+    deferred: ?DeferredFullDiff = null,
 
     pub fn deinit(self: *DiffEntry, alloc: Allocator) void {
         if (self.full) |full| full.deinit(alloc);
+        if (self.deferred) |deferred| deferred.deinit(alloc);
+    }
+};
+
+/// A saved edit whose full before/after review has not been built yet. The
+/// strings name the session artifact holding both snapshots and the tool call
+/// that artifact is bound to. All strings are owned by the holder.
+pub const DeferredFullDiff = struct {
+    call_id: []u8,
+    content_handle: []u8,
+    lifecycle_id: types.ToolLifecycleId,
+
+    /// Copies every borrowed string. Caller owns the result.
+    pub fn clone(
+        alloc: Allocator,
+        call_id: []const u8,
+        content_handle: []const u8,
+        lifecycle_id: types.ToolLifecycleId,
+    ) !DeferredFullDiff {
+        const owned_call = try alloc.dupe(u8, call_id);
+        errdefer alloc.free(owned_call);
+        const owned_handle = try alloc.dupe(u8, content_handle);
+        errdefer alloc.free(owned_handle);
+        const lifecycle_call = try alloc.dupe(u8, lifecycle_id.call_id);
+        return .{
+            .call_id = owned_call,
+            .content_handle = owned_handle,
+            .lifecycle_id = .{ .turn_id = lifecycle_id.turn_id, .call_id = lifecycle_call },
+        };
+    }
+
+    pub fn deinit(self: DeferredFullDiff, alloc: Allocator) void {
+        alloc.free(self.call_id);
+        alloc.free(self.content_handle);
+        alloc.free(@constCast(self.lifecycle_id.call_id));
+    }
+
+    pub fn matches(self: DeferredFullDiff, lifecycle_id: types.ToolLifecycleId) bool {
+        return self.lifecycle_id.turn_id == lifecycle_id.turn_id and
+            std.mem.eql(u8, self.lifecycle_id.call_id, lifecycle_id.call_id);
     }
 };
 
@@ -46,11 +89,13 @@ pub const DiffEntryPayload = struct {
     additions: u32 = 0,
     deletions: u32 = 0,
     full: ?FullDiff = null,
+    deferred: ?DeferredFullDiff = null,
 };
 
 pub fn freeDiffEntryPayload(alloc: Allocator, payload: DiffEntryPayload) void {
     alloc.free(payload.preview);
     if (payload.full) |full| full.deinit(alloc);
+    if (payload.deferred) |deferred| deferred.deinit(alloc);
 }
 
 test "diff entry payload has one canonical preview" {
@@ -65,7 +110,7 @@ pub fn wrapWithMarkers(alloc: Allocator, id: u32, content: []const u8) ![]u8 {
     errdefer out.deinit(alloc);
 
     var id_buf: [16]u8 = undefined;
-    const id_str = try std.fmt.bufPrint(&id_buf, "{d}", .{id});
+    const id_str = try std.mem.print(&id_buf, "{d}", .{id});
 
     try out.appendSlice(alloc, diff_block_start_prefix);
     try out.appendSlice(alloc, id_str);
@@ -80,13 +125,13 @@ pub fn wrapWithMarkers(alloc: Allocator, id: u32, content: []const u8) ![]u8 {
 pub fn markedDiffBlockId(bytes: []const u8) ?u32 {
     if (!std.mem.startsWith(u8, bytes, diff_block_start_prefix)) return null;
     const id_start = diff_block_start_prefix.len;
-    const bell_pos = std.mem.indexOfScalarPos(u8, bytes, id_start, osc_bell) orelse
+    const bell_pos = std.mem.findScalarPos(u8, bytes, id_start, osc_bell) orelse
         return null;
     const id_digits = bytes[id_start..bell_pos];
     const id = std.fmt.parseInt(u32, id_digits, 10) catch return null;
 
     var end_marker: [32]u8 = undefined;
-    const end = std.fmt.bufPrint(
+    const end = std.mem.print(
         &end_marker,
         "{s}{s}{c}",
         .{ diff_block_end_prefix, id_digits, osc_bell },
@@ -884,22 +929,8 @@ pub fn formatPersistedFileChangePayload(
     presentation: types.CommittedFilePresentation,
     styles: FormatStyles,
 ) !DiffEntryPayload {
-    const lines = try alloc.alloc(PreviewLine, presentation.lines.len);
+    const lines = try previewLinesForPresentation(alloc, presentation.lines);
     defer alloc.free(lines);
-    for (presentation.lines, 0..) |line, index| {
-        lines[index] = .{
-            .op = switch (line.kind) {
-                .context => .context,
-                .addition => .addition,
-                .deletion => .deletion,
-                .elision => .elision,
-                .notice => .notice,
-            },
-            .old_line = line.old_line,
-            .new_line = line.new_line,
-            .text = line.text,
-        };
-    }
     const full_view = if (presentation.after_content) |after_content| if (presentation.lifecycle_id) |lifecycle_id|
         FileChangeFullView{
             .after_content = after_content,
@@ -907,7 +938,7 @@ pub fn formatPersistedFileChangePayload(
         }
     else
         null else null;
-    return formatFileChangePayload(
+    var payload = try formatFileChangePayload(
         alloc,
         alloc,
         .{
@@ -921,6 +952,29 @@ pub fn formatPersistedFileChangePayload(
         full_view,
         styles,
     );
+    // Captured rows and inline snapshots never coexist, so this never
+    // replaces a full diff built above.
+    if (payload.full == null) payload.full = capturedFullDiff(alloc, presentation, styles);
+    return payload;
+}
+
+/// The full diff a presentation's captured rows restore, or null when it has
+/// none or they cannot be formatted, which leaves the preview.
+fn capturedFullDiff(
+    alloc: Allocator,
+    presentation: types.CommittedFilePresentation,
+    styles: FormatStyles,
+) ?FullDiff {
+    const rows = presentation.review_lines orelse return null;
+    const lifecycle_id = presentation.lifecycle_id orelse return null;
+    return formatCapturedFullDiff(alloc, rows, lifecycle_id, styles) catch |err| {
+        debug_trace.logf(
+            "tool",
+            "persisted file full diff formatting unavailable err={s}",
+            .{@errorName(err)},
+        );
+        return null;
+    };
 }
 
 pub fn formatFileChangeFullDiff(
@@ -968,9 +1022,9 @@ fn formatFileChangeReviewLines(
     const gutter_width = decimalDigits(max_line_number);
 
     for (lines) |line| {
-        var elision_text: [64]u8 = undefined;
+        var elision_text: ElisionText = undefined;
         const text = if (line.op == .elision)
-            try std.fmt.bufPrint(&elision_text, "{d} unchanged lines ⋯", .{line.elision_count})
+            reviewElisionText(&elision_text, line.elision_count)
         else
             line.text;
         try appendDiffRenderLine(alloc, &out, .{
@@ -984,22 +1038,197 @@ fn formatFileChangeReviewLines(
     return out.toOwnedSlice(alloc);
 }
 
+/// Holds the longest elision text, a 20-digit count and its label.
+const ElisionText = [64]u8;
+
+fn reviewElisionText(buffer: *ElisionText, count: usize) []const u8 {
+    return std.mem.print(buffer, "{d} unchanged lines ⋯", .{count}) catch unreachable;
+}
+
+/// The rows of a committed edit's full diff, kept so a resumed session shows
+/// the same full diff without the file snapshots it was built from.
+const CapturedReview = struct {
+    /// Owned by the caller. Elision rows carry their rendered text. When rows
+    /// were left out, the last row is a notice that says how many.
+    rows: []types.CommittedFilePresentationLine,
+    /// Rows of the full diff left out because the text budget ran out.
+    omitted_rows: usize,
+};
+
+/// Captures the rows `formatFileChangeFullDiff` shows for the same contents.
+/// Every row's text, plus one byte per row, counts against `max_text_bytes`;
+/// once the next row would exceed it, the remaining rows are replaced by one
+/// notice row. Borrows both contents only for the duration of the call.
+pub fn captureReviewLines(
+    alloc: Allocator,
+    previous_content: ?[]const u8,
+    after_content: []const u8,
+    max_text_bytes: usize,
+) FileReviewError!CapturedReview {
+    var review = try FileReview.init(alloc, previous_content orelse "", after_content);
+    defer review.deinit(alloc);
+
+    var capture = ReviewCapture{ .alloc = alloc, .max_text_bytes = max_text_bytes };
+    errdefer capture.deinit();
+    if (review.additions == 0 and review.deletions == 0) {
+        capture.append(.{ .op = .notice, .text = "No content changes" });
+    } else switch (review.mode) {
+        .computed => |source| visitComputedReviewRows(source, &capture),
+        .fallback => |fallback| {
+            const row_count = review.rowCount();
+            var ordinal: usize = 0;
+            while (ordinal < row_count and !capture.isFull()) : (ordinal += 1) {
+                capture.append(fallbackReviewLineAt(fallback, ordinal));
+            }
+        },
+    }
+    if (capture.failed) return error.OutOfMemory;
+
+    const omitted_rows = review.rowCount() - capture.rows.items.len;
+    if (omitted_rows > 0) {
+        const notice = try alloc.print("{d} more rows not saved ⋯", .{omitted_rows});
+        errdefer alloc.free(notice);
+        try capture.rows.append(alloc, .{ .kind = .notice, .text = notice });
+    }
+    return .{
+        .rows = try capture.rows.toOwnedSlice(alloc),
+        .omitted_rows = omitted_rows,
+    };
+}
+
+/// Review-row visitor that copies rows until their text reaches the budget.
+/// Visitors cannot return errors, so an allocation failure ends the walk
+/// and is reported through `failed`.
+const ReviewCapture = struct {
+    alloc: Allocator,
+    max_text_bytes: usize,
+    rows: std.ArrayList(types.CommittedFilePresentationLine) = .empty,
+    text_bytes: usize = 0,
+    budget_reached: bool = false,
+    failed: bool = false,
+
+    fn deinit(self: *ReviewCapture) void {
+        for (self.rows.items) |row| self.alloc.free(@constCast(row.text));
+        self.rows.deinit(self.alloc);
+    }
+
+    fn append(self: *ReviewCapture, line: ReviewLine) void {
+        if (self.isFull()) return;
+        var elision_text: ElisionText = undefined;
+        const text = if (line.op == .elision)
+            reviewElisionText(&elision_text, line.elision_count)
+        else
+            line.text;
+        // Saved text must be valid UTF-8, so invalid bytes are kept as the
+        // escapes the renderer shows for them.
+        const owned_text = text_utils.dupeValidUtf8(self.alloc, text) catch {
+            self.failed = true;
+            return;
+        };
+        const charge = owned_text.len +| 1;
+        if (self.text_bytes +| charge > self.max_text_bytes) {
+            self.alloc.free(owned_text);
+            self.budget_reached = true;
+            return;
+        }
+        self.rows.append(self.alloc, .{
+            .kind = presentationLineKind(line.op),
+            .old_line = line.old_line,
+            .new_line = line.new_line,
+            .text = owned_text,
+        }) catch {
+            self.alloc.free(owned_text);
+            self.failed = true;
+            return;
+        };
+        self.text_bytes += charge;
+    }
+
+    fn isFull(self: ReviewCapture) bool {
+        return self.budget_reached or self.failed;
+    }
+};
+
+pub fn presentationLineKind(op: PreviewOp) types.CommittedFilePresentationLineKind {
+    return switch (op) {
+        .context => .context,
+        .addition => .addition,
+        .deletion => .deletion,
+        .elision => .elision,
+        .notice => .notice,
+    };
+}
+
+fn previewOpForPresentationLine(kind: types.CommittedFilePresentationLineKind) PreviewOp {
+    return switch (kind) {
+        .context => .context,
+        .addition => .addition,
+        .deletion => .deletion,
+        .elision => .elision,
+        .notice => .notice,
+    };
+}
+
+/// Borrows each line's text. Caller frees only the returned slice.
+fn previewLinesForPresentation(
+    alloc: Allocator,
+    lines: []const types.CommittedFilePresentationLine,
+) ![]PreviewLine {
+    const preview_lines = try alloc.alloc(PreviewLine, lines.len);
+    for (lines, preview_lines) |line, *preview_line| {
+        preview_line.* = .{
+            .op = previewOpForPresentationLine(line.kind),
+            .old_line = line.old_line,
+            .new_line = line.new_line,
+            .text = line.text,
+        };
+    }
+    return preview_lines;
+}
+
+/// Renders captured review rows exactly as `formatFileChangeFullDiff` renders
+/// the review they came from.
+fn formatCapturedFullDiff(
+    alloc: Allocator,
+    rows: []const types.CommittedFilePresentationLine,
+    lifecycle_id: types.ToolLifecycleId,
+    styles: FormatStyles,
+) !FullDiff {
+    const lines = try previewLinesForPresentation(alloc, rows);
+    defer alloc.free(lines);
+    const content = try formatPreviewLines(alloc, lines, styles);
+    errdefer alloc.free(content);
+    const call_id = try alloc.dupe(u8, lifecycle_id.call_id);
+    return .{
+        .content = content,
+        .lifecycle_id = .{ .turn_id = lifecycle_id.turn_id, .call_id = call_id },
+    };
+}
+
 pub fn formatFileChangePreview(
     alloc: Allocator,
     preview: FileChangePreview,
+    styles: FormatStyles,
+) ![]u8 {
+    return formatPreviewLines(alloc, preview.lines, styles);
+}
+
+fn formatPreviewLines(
+    alloc: Allocator,
+    lines: []const PreviewLine,
     styles: FormatStyles,
 ) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
 
     var max_line_number: u32 = 1;
-    for (preview.lines) |line| {
+    for (lines) |line| {
         const line_number = line.new_line orelse line.old_line orelse continue;
         max_line_number = @max(max_line_number, line_number);
     }
     const gutter_width = decimalDigits(max_line_number);
 
-    for (preview.lines) |line| {
+    for (lines) |line| {
         try appendDiffRenderLine(alloc, &out, .{
             .op = line.op,
             .line_number = line.new_line orelse line.old_line,
@@ -1038,7 +1267,10 @@ fn appendDiffRenderLine(
     try out.append(alloc, previewLineSign(line.op));
     if (accent) try out.appendSlice(alloc, line_style);
     try out.append(alloc, ' ');
-    try out.appendSlice(alloc, line.text);
+    // A row's text comes from a file and can hold escape sequences, C1
+    // controls, or invalid UTF-8, which the frame's emulator or the user's
+    // terminal would act on if written raw.
+    try text_utils.appendTerminalSafeLine(alloc, out, line.text);
     try out.appendSlice(alloc, styles.reset);
     try out.append(alloc, '\n');
 }
@@ -1089,7 +1321,7 @@ fn appendDiffLineNumber(
 ) !void {
     var number_buffer: [10]u8 = undefined;
     const number = if (line_number) |value|
-        try std.fmt.bufPrint(&number_buffer, "{d}", .{value})
+        try std.mem.print(&number_buffer, "{d}", .{value})
     else
         "";
     try out.appendNTimes(alloc, ' ', width - number.len);
@@ -1222,7 +1454,7 @@ const ForwardLineIterator = struct {
         if (self.cursor >= self.text.len) return null;
 
         const start = self.cursor;
-        const newline = std.mem.indexOfScalarPos(u8, self.text, start, '\n');
+        const newline = std.mem.findScalarPos(u8, self.text, start, '\n');
         const end = newline orelse self.text.len;
         self.cursor = if (newline) |index| index + 1 else self.text.len;
 
@@ -1722,7 +1954,7 @@ fn indexLineStarts(alloc: Allocator, text: []const u8) Allocator.Error![]usize {
     var cursor: usize = 0;
     for (starts) |*start| {
         start.* = cursor;
-        cursor = if (std.mem.indexOfScalarPos(u8, text, cursor, '\n')) |newline|
+        cursor = if (std.mem.findScalarPos(u8, text, cursor, '\n')) |newline|
             newline + 1
         else
             text.len;
@@ -1952,7 +2184,7 @@ test "formatUnified: gutter width fits largest line number" {
 
     var index: u32 = 1;
     while (index <= 12) : (index += 1) {
-        const line = try std.fmt.allocPrint(alloc, "line{d}\n", .{index});
+        const line = try alloc.print("line{d}\n", .{index});
         defer alloc.free(line);
         try old_buf.appendSlice(alloc, line);
         try new_buf.appendSlice(alloc, line);
@@ -2085,6 +2317,227 @@ test "persisted edit emits one canonical preview without a full snapshot" {
     try std.testing.expectEqual(@as(u32, 1), payload.additions);
     try std.testing.expectEqual(@as(u32, 0), payload.deletions);
     try std.testing.expect(payload.full == null);
+}
+
+fn expectCapturedReviewMatchesLive(previous: ?[]const u8, after: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const lifecycle_id: types.ToolLifecycleId = .{ .turn_id = 3, .call_id = "edit_1" };
+    const live = (try formatFileChangeFullDiff(
+        alloc,
+        previous,
+        .{ .after_content = after, .lifecycle_id = lifecycle_id },
+        .{},
+    )).?;
+    defer live.deinit(alloc);
+
+    const captured = try captureReviewLines(alloc, previous, after, std.math.maxInt(usize));
+    defer types.freeCommittedFilePresentationLines(alloc, captured.rows);
+    try std.testing.expectEqual(@as(usize, 0), captured.omitted_rows);
+    const restored = try formatCapturedFullDiff(alloc, captured.rows, lifecycle_id, .{});
+    defer restored.deinit(alloc);
+
+    try std.testing.expectEqualStrings(live.content, restored.content);
+    try std.testing.expectEqual(live.lifecycle_id.turn_id, restored.lifecycle_id.turn_id);
+    try std.testing.expectEqualStrings(live.lifecycle_id.call_id, restored.lifecycle_id.call_id);
+}
+
+fn numberedLines(alloc: Allocator, count: usize, changed: ?usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (0..count) |index| {
+        if (changed == index) {
+            try out.print(alloc, "changed line {d}\n", .{index});
+        } else {
+            try out.print(alloc, "line {d}\n", .{index});
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+test "captured review rows render the same full diff as the live review" {
+    const alloc = std.testing.allocator;
+    // Small files use the computed diff; one change leaves elisions on both sides.
+    const small_before = try numberedLines(alloc, 40, null);
+    defer alloc.free(small_before);
+    const small_after = try numberedLines(alloc, 40, 20);
+    defer alloc.free(small_after);
+    try expectCapturedReviewMatchesLive(small_before, small_after);
+
+    // Past the indexed-line ceiling the review falls back to prefix and suffix.
+    const large_before = try numberedLines(alloc, 20_000, null);
+    defer alloc.free(large_before);
+    const large_after = try numberedLines(alloc, 20_000, 10_000);
+    defer alloc.free(large_after);
+    try expectCapturedReviewMatchesLive(large_before, large_after);
+
+    try expectCapturedReviewMatchesLive("a\nb", "a\nb\n");
+    try expectCapturedReviewMatchesLive(null, "new\nfile\n");
+    try expectCapturedReviewMatchesLive("same\n", "same\n");
+    try expectCapturedReviewMatchesLive(hostile_before, hostile_after);
+}
+
+/// A file with its own terminal sequences, a C1 control, a tab, CRLF line
+/// endings, and invalid UTF-8 around a one-line edit.
+const hostile_before = "keep\tx\r\n\x1b[2J\x1b[Hclear\r\n\u{9b}31mcsi\n\xff\xfe\x00\xc3(\nold\ntail\n";
+const hostile_after = "keep\tx\r\n\x1b[2J\x1b[Hclear\r\n\u{9b}31mcsi\n\xff\xfe\x00\xc3(\nnew \x1b]0;title\x07\ntail\n";
+
+const plain_styles: FormatStyles = .{ .added_fg = "", .removed_fg = "", .context_fg = "", .reset = "" };
+
+/// Every line of `content` is printable terminal text, apart from tabs,
+/// which only move along the row.
+fn expectTerminalSafeLines(content: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        var parts = std.mem.splitScalar(u8, line, '\t');
+        while (parts.next()) |part| try std.testing.expect(text_utils.isTerminalSafe(part));
+    }
+}
+
+test "diff rows show a file's control bytes as text, never as terminal sequences" {
+    const alloc = std.testing.allocator;
+    const live = (try formatFileChangeFullDiff(
+        alloc,
+        hostile_before,
+        .{ .after_content = hostile_after, .lifecycle_id = .{ .turn_id = 1, .call_id = "edit_1" } },
+        plain_styles,
+    )).?;
+    defer live.deinit(alloc);
+    try expectTerminalSafeLines(live.content);
+    try std.testing.expect(std.mem.find(u8, live.content, "keep\tx") != null);
+    try std.testing.expect(std.mem.find(u8, live.content, "\\x1b[2J\\x1b[Hclear") != null);
+    try std.testing.expect(std.mem.find(u8, live.content, "\\u{009b}31mcsi") != null);
+    try std.testing.expect(std.mem.find(u8, live.content, "\\xff\\xfe\\x00\\xc3(") != null);
+    try std.testing.expect(std.mem.find(u8, live.content, "new \\x1b]0;title\\x07") != null);
+
+    // The inline preview draws its rows through the same renderer.
+    const preview_lines = [_]PreviewLine{
+        .{ .op = .context, .old_line = 2, .new_line = 2, .text = "\x1b[2J\x1b[Hclear" },
+        .{ .op = .addition, .new_line = 5, .text = "new \u{9b}31m" },
+    };
+    const preview = try formatFileChangePreview(alloc, .{
+        .path = "a.txt",
+        .lines = &preview_lines,
+        .additions = 1,
+        .deletions = 0,
+        .truncated = false,
+    }, plain_styles);
+    defer alloc.free(preview);
+    try expectTerminalSafeLines(preview);
+
+    // Saved rows are text the session store accepts.
+    const captured = try captureReviewLines(alloc, hostile_before, hostile_after, std.math.maxInt(usize));
+    defer types.freeCommittedFilePresentationLines(alloc, captured.rows);
+    for (captured.rows) |row| try std.testing.expect(std.unicode.utf8ValidateSlice(row.text));
+}
+
+test "diff rows stay terminal-safe and saveable on fuzzed file text" {
+    try std.testing.fuzz({}, fuzzDiffRows, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "keep\nold\n" ++ "keep\nnew\n",
+            "\x1b[2J\x1b[Hold\n\u{9b}31m\xff\tx\r\n" ++ "\x1b[2J\x1b[Hnew\n\u{9b}31m\xff\tx\r\n",
+            "a\xed\xa0\x80\r\rb\x00\n" ++ "a\xc3(\x1b]52;c;eA==\x07\n",
+        }) ++ @import("fuzz_corpus").diff_rows.*),
+    });
+}
+
+/// The input's first half is a file before an edit and its second half the
+/// file after it. Whatever the bytes, the saved rows must be valid UTF-8,
+/// both renderings must be terminal-safe, and the resumed full diff must
+/// match the live one.
+fn fuzzDiffRows(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [4096]u8 = undefined;
+    const len: usize = @intCast(smith.slice(&buffer));
+    const previous = buffer[0 .. len / 2];
+    const after = buffer[len / 2 .. len];
+    const alloc = std.testing.allocator;
+    const lifecycle_id: types.ToolLifecycleId = .{ .turn_id = 1, .call_id = "fuzz" };
+
+    const captured = captureReviewLines(alloc, previous, after, std.math.maxInt(usize)) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    defer types.freeCommittedFilePresentationLines(alloc, captured.rows);
+    for (captured.rows) |row| try std.testing.expect(std.unicode.utf8ValidateSlice(row.text));
+
+    const restored = try formatCapturedFullDiff(alloc, captured.rows, lifecycle_id, plain_styles);
+    defer restored.deinit(alloc);
+    try expectTerminalSafeLines(restored.content);
+
+    const live = (try formatFileChangeFullDiff(
+        alloc,
+        previous,
+        .{ .after_content = after, .lifecycle_id = lifecycle_id },
+        plain_styles,
+    )) orelse return;
+    defer live.deinit(alloc);
+    try std.testing.expectEqualStrings(live.content, restored.content);
+}
+
+test "captured review rows stop at the text budget with one notice row" {
+    const alloc = std.testing.allocator;
+    const before = "old-0\nold-1\nold-2\nold-3\nold-4\nold-5\nold-6\nold-7\n";
+    const after = "new-0\nnew-1\nnew-2\nnew-3\nnew-4\nnew-5\nnew-6\nnew-7\n";
+    var review = try FileReview.init(alloc, before, after);
+    defer review.deinit(alloc);
+    const total_rows = review.rowCount();
+
+    // Each row costs its 5-byte text plus one byte, so 20 bytes keeps 3 rows.
+    const captured = try captureReviewLines(alloc, before, after, 20);
+    defer types.freeCommittedFilePresentationLines(alloc, captured.rows);
+
+    try std.testing.expectEqual(@as(usize, 4), captured.rows.len);
+    try std.testing.expectEqual(total_rows - 3, captured.omitted_rows);
+    for (captured.rows[0..3]) |row| try std.testing.expect(row.kind != .notice);
+    const notice = captured.rows[3];
+    try std.testing.expectEqual(types.CommittedFilePresentationLineKind.notice, notice.kind);
+    const expected = try alloc.print("{d} more rows not saved ⋯", .{total_rows - 3});
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, notice.text);
+}
+
+test "persisted presentation with captured review rows restores the full diff" {
+    const alloc = std.testing.allocator;
+    const before = try numberedLines(alloc, 40, null);
+    defer alloc.free(before);
+    const after = try numberedLines(alloc, 40, 20);
+    defer alloc.free(after);
+    const captured = try captureReviewLines(alloc, before, after, std.math.maxInt(usize));
+    defer types.freeCommittedFilePresentationLines(alloc, captured.rows);
+    const lifecycle_id: types.ToolLifecycleId = .{ .turn_id = 9, .call_id = "edit_9" };
+    const preview_lines = [_]types.CommittedFilePresentationLine{
+        .{ .kind = .deletion, .old_line = 21, .text = "line 20" },
+        .{ .kind = .addition, .new_line = 21, .text = "changed line 20" },
+    };
+    const presentation: types.CommittedFilePresentation = .{
+        .path = "numbers.txt",
+        .kind = .edited,
+        .lines = &preview_lines,
+        .additions = 1,
+        .deletions = 1,
+        .truncated = false,
+        .lifecycle_id = lifecycle_id,
+        .review_lines = captured.rows,
+    };
+    try std.testing.expect(types.committedFilePresentationContentSourceValid(presentation));
+
+    const payload = try formatPersistedFileChangePayload(alloc, presentation, .{});
+    defer freeDiffEntryPayload(alloc, payload);
+    const live = (try formatFileChangeFullDiff(
+        alloc,
+        before,
+        .{ .after_content = after, .lifecycle_id = lifecycle_id },
+        .{},
+    )).?;
+    defer live.deinit(alloc);
+
+    try std.testing.expect(payload.deferred == null);
+    try std.testing.expectEqualStrings(live.content, payload.full.?.content);
+    try std.testing.expectEqualStrings("edit_9", payload.full.?.lifecycle_id.call_id);
+
+    var with_snapshot = presentation;
+    with_snapshot.after_content = after;
+    try std.testing.expect(!types.committedFilePresentationContentSourceValid(with_snapshot));
 }
 
 test "wrapWithMarkers surrounds content with start/end OSC markers" {
@@ -2293,8 +2746,7 @@ test "buildBoundedPreview bounds selected rows with explicit elision" {
             retained_additions += @intFromBool(retained.op == .addition);
             retained_deletions += @intFromBool(retained.op == .deletion);
         }
-        const expected = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const expected = try std.testing.allocator.print(
             "⋯ +{d} -{d} omitted",
             .{
                 preview.additions - retained_additions,
@@ -2315,7 +2767,7 @@ test "file review exposes every changed line beyond the bounded preview cap" {
         var line: [32]u8 = undefined;
         try after.appendSlice(
             alloc,
-            try std.fmt.bufPrint(&line, "line {d}\n", .{line_number}),
+            try std.mem.print(&line, "line {d}\n", .{line_number}),
         );
     }
 
@@ -2344,11 +2796,11 @@ test "fallback file review seeks to replacement boundaries" {
         var line: [32]u8 = undefined;
         try before.appendSlice(
             alloc,
-            try std.fmt.bufPrint(&line, "old-{d:0>4}\n", .{line_number}),
+            try std.mem.print(&line, "old-{d:0>4}\n", .{line_number}),
         );
         try after.appendSlice(
             alloc,
-            try std.fmt.bufPrint(&line, "new-{d:0>4}\n", .{line_number}),
+            try std.mem.print(&line, "new-{d:0>4}\n", .{line_number}),
         );
     }
 
@@ -2437,7 +2889,7 @@ test "file review projects only proven fallback context with exact elisions" {
 
     for (1..1001) |line_number| {
         var line: [16]u8 = undefined;
-        const formatted = try std.fmt.bufPrint(&line, "line-{d:0>4}\n", .{line_number});
+        const formatted = try std.mem.print(&line, "line-{d:0>4}\n", .{line_number});
         try before.appendSlice(alloc, formatted);
         try after.appendSlice(alloc, formatted);
         if (line_number == 500) {
@@ -2674,12 +3126,12 @@ test "buildBoundedPreview bounds rows and escapes terminal controls" {
     var encoded_bytes: usize = 0;
     for (preview.lines) |line| {
         try std.testing.expect(line.text.len <= 4096);
-        try std.testing.expect(std.mem.indexOfScalar(u8, line.text, 0x1b) == null);
-        try std.testing.expect(std.mem.indexOfScalar(u8, line.text, '\n') == null);
+        try std.testing.expect(std.mem.findScalar(u8, line.text, 0x1b) == null);
+        try std.testing.expect(std.mem.findScalar(u8, line.text, '\n') == null);
         encoded_bytes += line.text.len;
     }
     try std.testing.expect(encoded_bytes <= max_encoded_preview_bytes);
-    try std.testing.expect(std.mem.indexOf(u8, preview.lines[0].text, "\\x1b") != null);
+    try std.testing.expect(std.mem.find(u8, preview.lines[0].text, "\\x1b") != null);
 }
 
 test "buildBoundedPreview enforces per-line and aggregate encoded budgets" {

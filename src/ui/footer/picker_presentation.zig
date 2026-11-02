@@ -6,6 +6,7 @@ const picker_state = @import("../../core/input/picker_state.zig");
 const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const list_window = @import("../../core/shared/list_window.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const file_index = @import("../../core/workspace/file_index.zig");
 const ui_render = @import("../render.zig");
@@ -108,12 +109,7 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
             .action => |action| switch (action) {
                 .connections => if (view.available_sources.count() > 0) "connected" else "not connected",
                 .switch_provider => view.choiceLabel(.{ .provider = view.active_provider }),
-                .change_team => if (!view.fx_login_session_available)
-                    "sign in to manage"
-                else if (view.current_team != null)
-                    "selected"
-                else
-                    "choose a team",
+                .change_team => changeTeamSetupValue(view),
                 .switch_credential => if (view.active_source != null)
                     view.activeSourceLabel()
                 else
@@ -140,6 +136,12 @@ fn setupChoiceValue(view: auth_runtime.PickerView, choice: auth_runtime.Choice) 
         .provider, .change_team, .switch_credential => view.choiceDescription(choice),
         .sign_in, .api_key => "",
     };
+}
+
+fn changeTeamSetupValue(view: auth_runtime.PickerView) []const u8 {
+    if (view.team_list_loading) return auth_runtime.team_list_loading_label;
+    if (!view.fx_login_session_available) return "sign in to manage";
+    return if (view.current_team != null) "selected" else "choose a team";
 }
 
 fn detailValueColumn(width: u16) usize {
@@ -392,7 +394,7 @@ fn composeOnboardingPickerRow(
         const selected = view.choiceIsSelected(choice);
         try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
         var label_buf: [96]u8 = undefined;
-        const label = std.fmt.bufPrint(
+        const label = std.mem.print(
             &label_buf,
             "{s}{s}",
             .{ if (selected) "   › " else "     ", view.choiceLabel(choice) },
@@ -409,7 +411,7 @@ fn composeOnboardingPickerRow(
         2 => "   fx can access AI models with an account, subscription, or API key.",
         3 => "   Choose a sign-in option below, or add your own API key.",
         4 => "",
-        5 => "   You can change this anytime with /setup.",
+        5 => "   You can change this anytime with /provider.",
         6 => "",
         7 => "   Get started",
         12 => if (display_width.visibleWidthIgnoringAnsi(onboarding_note_link) <= width) onboarding_note_link else onboarding_note,
@@ -421,6 +423,18 @@ fn composeOnboardingPickerRow(
     try row_text.appendClipped(alloc, &row, label, width);
     try row.appendSlice(alloc, ui_render.reset_style);
     return row;
+}
+
+/// The device page as a link, the way Codex and Grok open theirs; null when
+/// the address can't be a link target or the row is too narrow for it.
+fn vercelOpenLabel(buf: []u8, url: []const u8, width: u16) ?[]const u8 {
+    if (!text_utils.isLinkTarget(url)) return null;
+    const label = std.mem.print(
+        buf,
+        "   Open   \x1b]8;id=fx-vercel-auth;{s}\x1b\\\x1b[4mAuthorize with Vercel\x1b[24m\x1b]8;;\x1b\\",
+        .{url},
+    ) catch return null;
+    return if (display_width.visibleWidthIgnoringAnsi(label) <= width) label else null;
 }
 
 fn composeSignInPickerRow(
@@ -554,7 +568,7 @@ fn composeSignInPickerRow(
         else
             "   Sign in with Vercel",
         1, 4 => "",
-        2 => std.fmt.bufPrint(
+        2 => if (snapshot.preparing) "" else vercelOpenLabel(&label_buf, snapshot.verification_uri, width) orelse std.mem.print(
             &label_buf,
             "   Open   {s}",
             .{snapshot.verification_uri},
@@ -567,12 +581,12 @@ fn composeSignInPickerRow(
         3 => if (snapshot.user_code.len == 0)
             ""
         else
-            std.fmt.bufPrint(
+            std.mem.print(
                 &label_buf,
                 "   Code   {s}",
                 .{snapshot.user_code},
             ) catch "   Code unavailable",
-        5 => switch (snapshot.state) {
+        5 => if (snapshot.preparing) "   Preparing sign-in…" else switch (snapshot.state) {
             .idle => "   Preparing sign-in…",
             .polling => "   Waiting for authorization…",
             .succeeded => "   Authorization complete",
@@ -618,7 +632,7 @@ fn composeApiKeyPickerRow(
         2 => try row_text.appendClipped(alloc, &row, "   enter saves · esc cancels", width),
         3 => {
             var label_buf: [128]u8 = undefined;
-            const label = std.fmt.bufPrint(
+            const label = std.mem.print(
                 &label_buf,
                 "   Saves to {s}",
                 .{credentials.stored_key_backend_label},
@@ -636,6 +650,26 @@ pub fn activeListPickerReservedRows(terminal_rows: u16, input_extra: u16, banner
     const available_rows = terminal_rows -| fixed_rows;
     if (available_rows == 0) return 1;
     return @min(input_presentation.max_model_picker_rows, available_rows);
+}
+
+/// The @ file picker grows past the list picker's six rows when the terminal
+/// has room, because the file a user wants is often just below row 6.
+const max_file_picker_rows: u16 = 10;
+
+/// The @ file picker keeps the list picker's height, and grows up to
+/// `max_file_picker_rows` while at least five transcript rows stay visible
+/// above it.
+pub fn filePickerReservedRows(terminal_rows: u16, input_extra: u16, banner_rows: u16) u16 {
+    const fixed_rows: u16 = 5 +| input_extra +| banner_rows;
+    const minimum_transcript_rows: u16 = 5;
+    const grown = @min(max_file_picker_rows, (terminal_rows -| fixed_rows) -| minimum_transcript_rows);
+    return @max(activeListPickerReservedRows(terminal_rows, input_extra, banner_rows), grown);
+}
+
+/// File rows in a file picker of `picker_rows` rows; a status line, when
+/// shown, takes the first row.
+pub fn filePickerItemRows(picker_rows: u16, has_status: bool) u16 {
+    return picker_rows -| @intFromBool(has_status and picker_rows > 1);
 }
 
 pub fn authPickerReservedRows(view: auth_runtime.PickerView, terminal_rows: u16, input_extra: u16, banner_rows: u16) u16 {
@@ -796,11 +830,11 @@ pub noinline fn composePickerOptionRowAnnotated(
     if (width_usize == 0 or start_col == 0 or start_col > width) return row;
 
     if (start_col > 1) try row_text.appendAbsoluteColumn(alloc, &row, start_col);
-    // Model, provider, and model-catalog pickers signal selection by
+    // Model, provider, model-catalog, and effort pickers signal selection by
     // brightness alone, like the question panel; other pickers keep the filled row.
     const selected_style = switch (kind) {
-        .model_stage, .provider_stage, .models => ui_render.selected_completion_style,
-        .file, .slash, .skills, .help, .settings, .sessions, .mcp, .auth => ui_render.approval_button_inactive_style,
+        .model_stage, .provider_stage, .models, .effort => ui_render.selected_completion_style,
+        .file, .slash, .skills, .help, .settings, .sessions, .fork, .mcp, .auth => ui_render.approval_button_inactive_style,
     };
     const base_style = if (selected) selected_style else ui_render.dim_style;
     const available = width_usize - @as(usize, start_col - 1);
@@ -892,11 +926,12 @@ pub fn composePickerStatusRowWithProvider(
         .provider_stage => switch (provider_stage) {
             .provider => "no matching providers",
             .method => "no matching sign-in methods",
-            .team => if (loading) "loading teams..." else if (failed) "unable to load teams" else "no matching teams",
+            .team => if (loading) auth_runtime.team_list_loading_label else if (failed) "unable to load teams" else "no matching teams",
             .key_source => "no matching key sources",
             .api_key => "",
         },
         .models => "no models available",
+        .effort => "no reasoning effort levels",
         .file => if (loading)
             "indexing files..."
         else if (failed)
@@ -908,6 +943,7 @@ pub fn composePickerStatusRowWithProvider(
         .help => "no matching commands",
         .settings => "no matching settings",
         .sessions => "no matching sessions",
+        .fork => "nothing to fork yet",
         .mcp => "no MCP items available",
         .auth => "authentication actions unavailable",
     };
@@ -933,9 +969,9 @@ fn appendFilePickerLabel(
         return;
     }
 
-    const basename = std.fs.path.basename(path);
+    const basename = std.Io.Dir.path.basename(path);
     const basename_start = @intFromPtr(basename.ptr) - @intFromPtr(path.ptr);
-    const dirname = std.fs.path.dirname(path) orelse {
+    const dirname = std.Io.Dir.path.dirname(path) orelse {
         try appendBasenameProjection(alloc, row, item, basename_start, width_usize, base_style);
         return;
     };
@@ -1204,13 +1240,13 @@ pub fn composeSlashMenuHeaderRow(
     const noun = if (layout.command_count == layout.result_count) "Commands" else "Results";
     var left_buf: [96]u8 = undefined;
     const left = if (std.mem.eql(u8, prefix, "/"))
-        std.fmt.bufPrint(&left_buf, "{s} {d} · type to filter", .{ noun, layout.result_count }) catch noun
+        std.mem.print(&left_buf, "{s} {d} · type to filter", .{ noun, layout.result_count }) catch noun
     else
-        std.fmt.bufPrint(&left_buf, "{s} {d}", .{ noun, layout.result_count }) catch noun;
+        std.mem.print(&left_buf, "{s} {d}", .{ noun, layout.result_count }) catch noun;
 
     var range_buf: [48]u8 = undefined;
     const range = if (layout.result_count > layout.selectable_rows)
-        std.fmt.bufPrint(&range_buf, "{d}–{d}", .{ layout.window.start + 1, layout.window.end }) catch ""
+        std.mem.print(&range_buf, "{d}–{d}", .{ layout.window.start + 1, layout.window.end }) catch ""
     else
         "";
 
@@ -1548,6 +1584,17 @@ test "slash menu layout keeps six selectable rows below its header" {
     const scrolled = slashMenuLayout(picker_test_slash_registry, "/", &.{}, 6, 0, 24, 0, 0).?;
     try std.testing.expectEqual(@as(usize, 1), scrolled.window.start);
     try std.testing.expectEqual(@as(usize, 7), scrolled.window.end);
+}
+
+test "file picker grows to ten rows while five transcript rows stay visible" {
+    try std.testing.expectEqual(@as(u16, 10), filePickerReservedRows(40, 0, 0));
+    try std.testing.expectEqual(@as(u16, 10), filePickerReservedRows(24, 0, 0));
+    try std.testing.expectEqual(@as(u16, 8), filePickerReservedRows(18, 0, 0));
+    // Short terminals keep the list picker's height.
+    try std.testing.expectEqual(@as(u16, 6), filePickerReservedRows(16, 0, 0));
+    try std.testing.expectEqual(@as(u16, 6), filePickerReservedRows(12, 0, 0));
+    try std.testing.expectEqual(@as(u16, 1), filePickerReservedRows(6, 0, 0));
+    try std.testing.expectEqual(@as(u16, 6), filePickerReservedRows(20, 2, 4));
 }
 
 test "inline picker row budget preserves six roomy choices and shrinks with height" {
@@ -2147,7 +2194,7 @@ test "auth onboarding composes the welcome copy and setup choices" {
 
     try std.testing.expect(std.mem.find(u8, screen.items, "Welcome to fx") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "fx can access AI models with an account, subscription, or API key") != null);
-    try std.testing.expect(std.mem.find(u8, screen.items, "You can change this anytime with /setup.") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "You can change this anytime with /provider.") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "⚠︎ Note: fx is experimental and defaults to auto mode. \x1b]8;id=fx-onboarding;https://fx.sh/docs/stability\x1b\\\x1b[4mLearn more\x1b[24m\x1b]8;;\x1b\\") != null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Learn more: https://") == null);
     try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") != null);
@@ -2473,13 +2520,48 @@ test "sign-in stage renders the complete device authorization screen" {
     }
     for ([_][]const u8{
         "Sign in with Vercel",
-        "Open   https://vercel.test/verify",
+        // The device page is a link, not its address printed out.
+        "Open   \x1b]8;id=fx-vercel-auth;https://vercel.test/verify\x1b\\\x1b[4mAuthorize with Vercel\x1b[24m\x1b]8;;\x1b\\",
         "Code   TEST-CODE",
         "Waiting for authorization",
         "enter reopens browser · esc cancels",
     }) |expected| {
         try std.testing.expect(std.mem.find(u8, screen.items, expected) != null);
     }
+    try std.testing.expect(std.mem.find(u8, screen.items, "Open   https://") == null);
+
+    // Too narrow for the link: the address, clipped, and no link left open.
+    var narrow = try composeAuthPickerRow(alloc, view, 2, 7, 24);
+    defer narrow.deinit(alloc);
+    try std.testing.expect(std.mem.find(u8, narrow.items, "Open   https://") != null);
+    try std.testing.expect(std.mem.find(u8, narrow.items, "\x1b]8;") == null);
+}
+
+test "sign-in stage shows a preparing flow without an empty device link" {
+    const alloc = std.testing.allocator;
+    const view = auth_runtime.PickerView{
+        .active = true,
+        .available_sources = .empty,
+        .selected_choice = null,
+        .active_source = null,
+        .include_skip = false,
+        .stage = .sign_in,
+        .sign_in = .{ .state = .polling, .preparing = true },
+    };
+
+    var screen: std.ArrayList(u8) = .empty;
+    defer screen.deinit(alloc);
+    for (0..authPickerRowCount(view)) |row_index| {
+        var row = try composeAuthPickerRow(alloc, view, @intCast(row_index), 7, 100);
+        defer row.deinit(alloc);
+        try screen.appendSlice(alloc, row.items);
+        try screen.append(alloc, '\n');
+    }
+    try std.testing.expect(std.mem.find(u8, screen.items, "Sign in with Vercel") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Preparing sign-in…") != null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Waiting for authorization") == null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Open") == null);
+    try std.testing.expect(std.mem.find(u8, screen.items, "Code") == null);
 }
 
 test "Codex sign-in stage renders a bounded clickable authorization action" {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const display_width = @import("../shared/display_width.zig");
 const unicode_letter = @import("json_schema_unicode_letter.zig");
 
 const Allocator = std.mem.Allocator;
@@ -416,7 +417,7 @@ const Parser = struct {
         const width = std.unicode.utf8ByteSequenceLength(self.source[self.index]) catch
             return error.InvalidUtf8;
         if (width > self.source.len - self.index) return error.InvalidUtf8;
-        const codepoint = std.unicode.utf8Decode(self.source[self.index..][0..width]) catch
+        const codepoint = display_width.decodeUtf8Sequence(self.source[self.index..][0..width]) catch
             return error.InvalidUtf8;
         self.index += width;
         return codepoint;
@@ -621,11 +622,11 @@ pub fn matches(
     const start = try compiler.compile(root);
 
     const instructions = compiler.instructions.items;
-    var current = try std.DynamicBitSetUnmanaged.initEmpty(alloc, instructions.len);
+    var current = try std.bit_set.Dynamic.initEmpty(alloc, instructions.len);
     defer current.deinit(alloc);
-    var next = try std.DynamicBitSetUnmanaged.initEmpty(alloc, instructions.len);
+    var next = try std.bit_set.Dynamic.initEmpty(alloc, instructions.len);
     defer next.deinit(alloc);
-    var visited = try std.DynamicBitSetUnmanaged.initEmpty(alloc, instructions.len);
+    var visited = try std.bit_set.Dynamic.initEmpty(alloc, instructions.len);
     defer visited.deinit(alloc);
     var stack: std.ArrayList(usize) = .empty;
     defer stack.deinit(alloc);
@@ -651,7 +652,7 @@ pub fn matches(
         const width = std.unicode.utf8ByteSequenceLength(text[byte_index]) catch
             return error.InvalidUtf8;
         if (width > text.len - byte_index) return error.InvalidUtf8;
-        const codepoint = std.unicode.utf8Decode(text[byte_index..][0..width]) catch
+        const codepoint = display_width.decodeUtf8Sequence(text[byte_index..][0..width]) catch
             return error.InvalidUtf8;
         const next_byte_index = byte_index + width;
         next.unsetAll();
@@ -681,7 +682,7 @@ pub fn matches(
                 steps,
             );
         }
-        std.mem.swap(std.DynamicBitSetUnmanaged, &current, &next);
+        std.mem.swap(std.bit_set.Dynamic, &current, &next);
         byte_index = next_byte_index;
     }
 }
@@ -689,8 +690,8 @@ pub fn matches(
 fn addClosure(
     alloc: Allocator,
     instructions: []const Instruction,
-    states: *std.DynamicBitSetUnmanaged,
-    visited: *std.DynamicBitSetUnmanaged,
+    states: *std.bit_set.Dynamic,
+    visited: *std.bit_set.Dynamic,
     stack: *std.ArrayList(usize),
     start: usize,
     byte_index: usize,
@@ -719,7 +720,7 @@ fn addClosure(
     }
 }
 
-fn containsAccept(instructions: []const Instruction, states: *const std.DynamicBitSetUnmanaged) bool {
+fn containsAccept(instructions: []const Instruction, states: *const std.bit_set.Dynamic) bool {
     var iterator = states.iterator(.{});
     while (iterator.next()) |index| if (instructions[index].op == .accept) return true;
     return false;

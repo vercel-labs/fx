@@ -4,14 +4,15 @@ const agent_stream_provider = @import("../../stream_provider.zig");
 const command_admission = @import("../../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../../permissions/auto_classifier.zig");
 const types = @import("../../../shared/types.zig");
+const cache_warmer = @import("../cache_warmer.zig");
 const permissions = @import("../../../permissions/permissions.zig");
 const worker_runtime = @import("../../worker_runtime.zig");
 const builtin_context = @import("../../../../builtins/context.zig");
 const builtin_gateway = @import("../../../../builtins/gateway.zig");
+const gateway_client = @import("../../../../gateway/client.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
 const session_runtime = @import("../../../session/session.zig");
 const session_codec = @import("../../../session/session_codec.zig");
-const session_usage = @import("../../../session/session_usage.zig");
 const model_provider = @import("../../../config/model_provider.zig");
 const command_replay_store = @import("../../../session/command_replay_store.zig");
 const session_child_store = @import("../../../session/session_child_store.zig");
@@ -39,7 +40,6 @@ const runtime_config = @import("../config.zig");
 const runtime_deps = @import("../deps.zig");
 const runtime_lifecycle = @import("../lifecycle.zig");
 const runtime_agent = @import("../agent.zig");
-const model_response_recovery = @import("../model_response_recovery.zig");
 const runtime_orchestrator = @import("../orchestrator.zig");
 const runtime_tool_contracts = @import("../tool_contracts.zig");
 
@@ -179,7 +179,7 @@ fn testExecutionAuthority(call: ToolCall) command_admission.ToolExecutionAuthori
         .fingerprint = .{
             .command = call.arguments_json,
             .resolved_cwd = "",
-            .target_os = builtin.os.tag,
+            .target_os = builtin.target.os.tag,
         },
         .source = .interactive_once,
     } } };
@@ -209,14 +209,33 @@ pub const FakeCompletion = struct {
     omit_finish: bool = false,
     usage: types.Usage = .{},
     generation_id: ?[]const u8 = null,
-    billing: ?types.ProviderBilling = null,
-    exact_usage_provider: ?model_provider.ProviderId = null,
     delivery_ambiguous: bool = false,
-    pause_before_output: bool = false,
     cancel_before_output: bool = false,
     cancel_after_chunks: bool = false,
     cancel_during_tool_stream: bool = false,
 };
+
+/// Fails a model request whose prompt ends on an assistant message, and one the
+/// runtime had to continue unless the test expects that repair.
+pub fn expectReplyablePromptTail(alloc: Allocator, payload: []const u8, allow_continuation: bool) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const prompt = parsed.value.object.get("prompt") orelse return;
+    if (prompt != .array or prompt.array.items.len == 0) return;
+    const tail = prompt.array.items[prompt.array.items.len - 1];
+    if (tail != .object) return;
+    const role = tail.object.get("role") orelse return;
+    if (role != .string) return;
+    if (std.mem.eql(u8, role.string, "assistant")) return error.TestAssistantPrefillRequest;
+    if (allow_continuation or !std.mem.eql(u8, role.string, "user")) return;
+    const content = tail.object.get("content") orelse return;
+    if (content != .array or content.array.items.len != 1 or content.array.items[0] != .object) return;
+    const text = content.array.items[0].object.get("text") orelse return;
+    if (text == .string and std.mem.eql(u8, text.string, runtime_orchestrator.assistant_tail_continuation_prompt)) {
+        return error.TestAssistantTailContinued;
+    }
+}
 
 pub const FakeGateway = struct {
     alloc: Allocator,
@@ -227,8 +246,10 @@ pub const FakeGateway = struct {
     request_api_keys: std.ArrayList([]u8) = .empty,
     request_session_ids: std.ArrayList(?[]u8) = .empty,
     admitted_requests: usize = 0,
-    recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     observe_request: ?*const fn (agent_stream_provider.ModelRequest) anyerror!void = null,
+    /// A continued tail means history projection ended on an assistant
+    /// message. Only tests of that repair may accept it.
+    allow_assistant_tail_continuation: bool = false,
 
     pub fn init(alloc: Allocator, completions: []const FakeCompletion) FakeGateway {
         return .{ .alloc = alloc, .completions = completions };
@@ -263,6 +284,7 @@ pub const FakeGateway = struct {
         const payload = request.prepared_request_body orelse
             try builtin_gateway.buildAgentRequest(alloc, request.data());
         defer if (request.prepared_request_body == null) alloc.free(payload);
+        try expectReplyablePromptTail(alloc, payload, self.allow_assistant_tail_continuation);
         try self.request_bodies.append(self.alloc, try self.alloc.dupe(u8, payload));
         try self.request_models.append(self.alloc, try self.alloc.dupe(u8, request.model));
         try self.request_api_keys.append(self.alloc, try self.alloc.dupe(u8, request.credential.secret() orelse ""));
@@ -287,11 +309,6 @@ pub const FakeGateway = struct {
             return err;
         }
 
-        if (completion.pause_before_output) {
-            if (self.recovery_pause_flag) |flag| flag.store(true, .seq_cst);
-            request.cancel_flag.store(true, .seq_cst);
-            return error.Cancelled;
-        }
         if (completion.cancel_before_output) {
             request.cancel_flag.store(true, .seq_cst);
             return .{ .completed = .{} };
@@ -324,7 +341,7 @@ pub const FakeGateway = struct {
             errdefer if (failure_schema) |value| alloc.free(value);
             const failure_request_shape = if (completion.failure_request_shape) |value| try alloc.dupe(u8, value) else null;
             return .{ .failed = .{
-                .kind = failureKind(completion.status),
+                .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(completion.status), err_body),
                 .detail = err_body,
                 .retry_after_seconds = completion.retry_after_seconds,
                 .diagnostics = .{
@@ -350,62 +367,20 @@ pub const FakeGateway = struct {
                     completion.finish_reason orelse if (completion.tool_calls.len > 0) .tool_calls else .stop,
                 .usage = completion.usage,
                 .generation_id = completion.generation_id,
-                .billing = completion.billing,
             },
-            .usage = if (completion.exact_usage_provider) |provider_id|
-                .{ .exact = provider_id }
-            else
-                .{ .unavailable = .possibly_billed },
         } };
     }
 
+    /// The production classification, recorded as `src/builtins/gateway.zig`
+    /// records it for the real gateway.
     fn recordNetworkFailureEvidence(
         request: agent_stream_provider.ModelRequest,
         err: anyerror,
     ) void {
-        const cause: agent_stream_provider.NetworkFailureCause = if (err == error.SystemResumed)
-            .system_resumed
-        else if (err == error.TlsInitializationFailed or
-            err == error.ConnectionSetupTimedOut or
-            err == error.UnknownHostName or
-            err == error.NameServerFailure or
-            err == error.NoAddressReturned or
-            err == error.DetectingNetworkConfigurationFailed or
-            err == error.AddressUnavailable or
-            err == error.ConnectionPending or
-            err == error.ConnectionRefused or
-            err == error.HostUnreachable or
-            err == error.NetworkUnreachable or
-            err == error.NetworkDown or
-            err == error.WouldBlock or
-            err == error.WriteFailed or
-            err == error.ReadFailed or
-            err == error.HttpConnectionClosing or
-            err == error.ConnectionResetByPeer or
-            err == error.ConnectionTimedOut or
-            err == error.Timeout)
-            .transport_interrupted
-        else
-            return;
-        request.attempt_evidence.network_failure = .{
-            .cause = cause,
-            .delivery = request.delivery.load(),
-        };
-    }
-
-    fn failureKind(status: std.http.Status) agent_stream_provider.FailureKind {
-        return switch (status) {
-            .bad_request => .invalid_request,
-            .unauthorized => .unauthorized,
-            .forbidden => .forbidden,
-            .payload_too_large => .request_too_large,
-            .too_many_requests => .rate_limited,
-            .internal_server_error => .server_error,
-            .bad_gateway => .bad_gateway,
-            .service_unavailable => .unavailable,
-            .gateway_timeout => .gateway_timeout,
-            else => .provider_error,
-        };
+        request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(
+            err,
+            request.delivery.load(),
+        );
     }
 };
 
@@ -481,6 +456,10 @@ pub const FakeAgentRuntimeDeps = struct {
     context_registry: ?context_contract.Registry = null,
     context_enabled: bool = false,
     root_permission_mode: ?PermissionMode = null,
+    cache_warmer: ?*cache_warmer.Warmer = null,
+    /// Records each usage the agent loop saves, as a saved session would.
+    record_usages: bool = false,
+    recorded_usages: std.ArrayList(types.Usage) = .empty,
     validation_mcp_runtime_generation: ?u64 = null,
     validation_mcp_tool_name: ?[]const u8 = null,
     execute_mutex: std.Io.Mutex = .init,
@@ -503,6 +482,7 @@ pub const FakeAgentRuntimeDeps = struct {
     executed_names: std.ArrayList([]u8) = .empty,
     executed_call_ids: std.ArrayList([]u8) = .empty,
     rejected_names: std.ArrayList([]u8) = .empty,
+    failed_names: std.ArrayList([]u8) = .empty,
     inner_usage_names: std.ArrayList([]u8) = .empty,
     inner_usages: std.ArrayList(types.ToolUsage) = .empty,
     validated_names: std.ArrayList([]u8) = .empty,
@@ -574,6 +554,7 @@ pub const FakeAgentRuntimeDeps = struct {
     last_execute_grant_count: usize = 0,
     command_complete_count: usize = 0,
     route_recovery_clear_count: usize = 0,
+    full_detail_records: std.ArrayList(types.SemanticNotice) = .empty,
     finish_event_count: usize = 0,
     finish_event_attempt_count: usize = 0,
     finish_event_error: ?anyerror = null,
@@ -611,6 +592,12 @@ pub const FakeAgentRuntimeDeps = struct {
     cancel_on_text_match: ?[]const u8 = null,
     cancel_on_auto_retry_status: ?*std.atomic.Value(bool) = null,
     cancel_on_auto_retry_attempt: ?usize = null,
+    /// Presses Enter (sets the flag) when a request waits for the user.
+    continue_on_need_user: ?*std.atomic.Value(bool) = null,
+    /// Presses Esc (sets the flag) when a request waits for the user.
+    cancel_on_need_user: ?*std.atomic.Value(bool) = null,
+    /// Records prompts handed back to the composer.
+    record_restored_prompt: bool = false,
     cancel_on_permission: ?*std.atomic.Value(bool) = null,
     cancel_on_permission_name: ?[]const u8 = null,
     cancel_on_execute: ?*std.atomic.Value(bool) = null,
@@ -619,7 +606,6 @@ pub const FakeAgentRuntimeDeps = struct {
     cancel_on_execute_delay_ms: u64 = 0,
     ordinary_cancel_on_execute_name: ?[]const u8 = null,
     session_context: ?*session_runtime.SessionRuntime = null,
-    usage: ?*session_usage.Usage = null,
     validation_not_registered_names: []const []const u8 = &.{},
     validation_failure_names: []const []const u8 = &.{},
     validation_results: []const ?[]const u8 = &.{},
@@ -636,14 +622,10 @@ pub const FakeAgentRuntimeDeps = struct {
     command_replay_output: ?[]const u8 = null,
     command_replay_capability: ?*session_child_store.SessionChildCapability = null,
     last_file_request_allocators_distinct: bool = false,
-    route_recovery_decisions: []const runtime_deps.RouteRecoveryDecision = &.{},
-    enable_route_recovery: bool = true,
-    route_recovery_index: usize = 0,
-    route_recovery_count: usize = 0,
-    last_route_recovery_replay_safe: bool = false,
-    last_route_recovery_fast_mode: bool = false,
-    last_route_recovery_finish_reason: ?types.ProviderFinishReason = null,
-    last_route_recovery_unsafe_reason: ?types.RouteRecoveryUnsafeReason = null,
+    /// Answers to the out-of-credits picker, in order; past the end it cancels.
+    out_of_credits_choices: []const runtime_deps.OutOfCreditsChoice = &.{},
+    out_of_credits_index: usize = 0,
+    out_of_credits_count: usize = 0,
     default_model_capabilities: model_capabilities.Capabilities = .{
         .image_input_support = .non_native,
         .context_window = 1_000_000,
@@ -658,16 +640,32 @@ pub const FakeAgentRuntimeDeps = struct {
     credential_refresh_sources: std.ArrayList(types.CredentialSource) = .empty,
     credential_refresh_modes: std.ArrayList(runtime_deps.CredentialRefreshMode) = .empty,
     credential_refresh_error: ?anyerror = null,
+    /// A forced refresh finds nothing, as when the refresh token is rejected.
+    credential_refresh_fail_force: bool = false,
     last_credential_refresh_expected_account: ?[]u8 = null,
     enable_interactive_notices: bool = false,
     enable_recovery_checkpoint: bool = false,
+    /// Keeps the recovery module's record, as a host that resumes requests
+    /// does.
+    enable_recovery_record: bool = false,
+    /// The newest record the hook saved; null once cleared.
+    recovery_record: ?[32]u8 = null,
+    recovery_record_writes: usize = 0,
+    recovery_record_clears: usize = 0,
+    /// The turn has pieces on disk, so a save between sends lands.
+    recovery_turn_written: bool = true,
+    /// Returned by every session writer check; null confirms the writer.
+    session_writer_error: ?anyerror = null,
+    session_writer_checks: usize = 0,
     recovery_checkpoints: std.ArrayList(session_codec.RecoveryCheckpoint) = .empty,
     recovery_checkpoint_error: ?anyerror = null,
     recovery_checkpoint_error_at: ?usize = null,
     recovery_checkpoint_calls: usize = 0,
+    recovery_checkpoint_clears: usize = 0,
+    /// Records each prompt the runtime hands back to the composer.
+    capture_restored_prompts: bool = false,
+    restored_prompts: std.ArrayList([]u8) = .empty,
     cancel_on_recovery_reservation: ?*std.atomic.Value(bool) = null,
-    pause_on_auto_retry_status: bool = false,
-    recovery_pause_flag: ?*std.atomic.Value(bool) = null,
     route_recovery_status_error_attempt: ?usize = null,
     steering_messages: []const []const u8 = &.{},
     steering_take_at: usize = 1,
@@ -675,18 +673,26 @@ pub const FakeAgentRuntimeDeps = struct {
     immediate_steering_messages: []const []const u8 = &.{},
     immediate_steering_cancel_flag: ?*std.atomic.Value(bool) = null,
     immediate_steering_take_count: usize = 0,
+    /// A real worker wired as the app wires it: the turn takes its steering
+    /// from it and publishes its events and tool lifecycle to it. Its queue,
+    /// events, and taken steering use `alloc`.
+    steering_worker: ?*worker_runtime.WorkerRuntime = null,
 
     pub fn init(alloc: Allocator) FakeAgentRuntimeDeps {
         return .{ .alloc = alloc };
     }
 
     pub fn deinit(self: *FakeAgentRuntimeDeps) void {
+        self.recorded_usages.deinit(self.alloc);
         freeStringList(self.alloc, &self.log);
         freeStringList(self.alloc, &self.texts);
         freeStringList(self.alloc, &self.assistant_sources);
         freeStringList(self.alloc, &self.system_notices);
+        freeStringList(self.alloc, &self.restored_prompts);
         for (self.interactive_notices.items) |notice| types.freeSemanticNotice(self.alloc, notice);
         self.interactive_notices.deinit(self.alloc);
+        for (self.full_detail_records.items) |notice| types.freeSemanticNotice(self.alloc, notice);
+        self.full_detail_records.deinit(self.alloc);
         freeStringList(self.alloc, &self.context_notices);
         self.route_recovery_statuses.deinit(self.alloc);
         freeStringList(self.alloc, &self.permission_names);
@@ -701,6 +707,7 @@ pub const FakeAgentRuntimeDeps = struct {
         freeStringList(self.alloc, &self.executed_names);
         freeStringList(self.alloc, &self.executed_call_ids);
         freeStringList(self.alloc, &self.rejected_names);
+        freeStringList(self.alloc, &self.failed_names);
         freeStringList(self.alloc, &self.inner_usage_names);
         self.inner_usages.deinit(self.alloc);
         freeStringList(self.alloc, &self.validated_names);
@@ -778,7 +785,10 @@ pub const FakeAgentRuntimeDeps = struct {
             .commit_context_compaction = .{ .commit = commitCompaction },
             .recovery_checkpoint = if (self.enable_recovery_checkpoint) .{
                 .set = setRecoveryCheckpoint,
+                .clear = clearRecoveryCheckpoint,
             } else null,
+            .restore_failed_prompt = if (self.capture_restored_prompts or self.record_restored_prompt) restoreFailedPrompt else null,
+            .confirm_session_writer = confirmSessionWriter,
             .propagate_grant = @This().propagateGrant,
             .push_event = pushEvent,
             .push_text = pushText,
@@ -791,21 +801,45 @@ pub const FakeAgentRuntimeDeps = struct {
             .push_command_output_complete = commandOutputComplete,
             .push_http_error = httpError,
             .refresh_gateway_credential = refreshGatewayCredential,
-            .request_route_recovery = if (self.enable_route_recovery) requestRouteRecovery else null,
+            .ask_out_of_credits = askOutOfCredits,
+            .save_recovery_record = if (self.enable_recovery_record) saveRecoveryRecord else null,
             .available_model_capabilities = availableModelCapabilities,
             .resolve_model_capabilities = resolveModelCapabilities,
             .model_catalog_unavailable = catalogUnavailable,
-            .take_steering_boundary = if (self.steering_messages.len > 0 or
+            .take_steering_boundary = if (self.steering_worker != null)
+                takeWorkerSteeringBoundary
+            else if (self.steering_messages.len > 0 or
                 self.immediate_steering_messages.len > 0)
                 takeSteeringBoundary
             else
                 null,
             .format_tool_execution_error = formatError,
             .record_tool_call_rejected = recordRejected,
+            .record_tool_call_failed = recordFailed,
             .report_inner_tool_usage = reportCapturedInnerToolUsage,
-            .usage = self.usage,
-            .usage_allocator = self.alloc,
+            .cache_warmer = self.cache_warmer,
+            .record_usage = if (self.record_usages) recordUsage else null,
         };
+    }
+
+    fn confirmSessionWriter(raw: *anyopaque) anyerror!void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.session_writer_checks += 1;
+        if (self.session_writer_error) |err| return err;
+    }
+
+    fn clearRecoveryCheckpoint(raw: *anyopaque) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.recovery_checkpoint_clears += 1;
+    }
+
+    fn restoreFailedPrompt(raw: *anyopaque, prompt: []const u8) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (self.record_restored_prompt) try self.record("restore_failed_prompt:{s}", .{prompt});
+        if (!self.capture_restored_prompts) return;
+        const owned = try self.alloc.dupe(u8, prompt);
+        errdefer self.alloc.free(owned);
+        try self.restored_prompts.append(self.alloc, owned);
     }
 
     fn setRecoveryCheckpoint(
@@ -879,6 +913,7 @@ pub const FakeAgentRuntimeDeps = struct {
         else
             null;
         if (self.credential_refresh_error) |err| return err;
+        if (self.credential_refresh_fail_force and mode == .force) return null;
         if (self.credential_refresh_index >= self.credential_refresh_tokens.len) return null;
         const token = self.credential_refresh_tokens[self.credential_refresh_index];
         self.credential_refresh_index += 1;
@@ -911,17 +946,56 @@ pub const FakeAgentRuntimeDeps = struct {
         return .{ .continue_turn = messages };
     }
 
-    fn requestRouteRecovery(raw: *anyopaque, _: Allocator, request: runtime_deps.RouteRecoveryRequest) !runtime_deps.RouteRecoveryDecision {
+    /// Takes steering from `steering_worker` and copies it into the turn's
+    /// arena, as the app's callback does.
+    fn takeWorkerSteeringBoundary(
+        raw: *anyopaque,
+        arena: Allocator,
+        turn_id: u64,
+        kind: worker_runtime.SteeringBoundaryKind,
+    ) !worker_runtime.SteeringBoundaryResult {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        self.route_recovery_count += 1;
-        self.last_route_recovery_replay_safe = request.replay_safe;
-        self.last_route_recovery_fast_mode = request.fast_mode;
-        self.last_route_recovery_finish_reason = request.finish_reason;
-        self.last_route_recovery_unsafe_reason = request.unsafe_no_retry_reason;
-        if (self.route_recovery_index < self.route_recovery_decisions.len) {
-            const decision = self.route_recovery_decisions[self.route_recovery_index];
-            self.route_recovery_index += 1;
-            return decision;
+        const result = try self.steering_worker.?.takeSteeringBoundary(self.alloc, turn_id, kind);
+        return switch (result) {
+            .continue_turn => |owned| blk: {
+                defer {
+                    for (owned) |text| self.alloc.free(text);
+                    self.alloc.free(owned);
+                }
+                const messages = try arena.alloc([]u8, owned.len);
+                for (owned, messages) |text, *copy| copy.* = try arena.dupe(u8, text);
+                break :blk .{ .continue_turn = messages };
+            },
+            .none => .none,
+            .handoff => .handoff,
+            .interrupt => .interrupt,
+        };
+    }
+
+    fn saveRecoveryRecord(raw: *anyopaque, write: types.RecoveryRecordWrite) !bool {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (!self.recovery_turn_written) return false;
+        switch (write) {
+            .keep => return false,
+            .save => |bytes| {
+                self.recovery_record = bytes;
+                self.recovery_record_writes += 1;
+            },
+            .clear => {
+                self.recovery_record = null;
+                self.recovery_record_clears += 1;
+            },
+        }
+        return true;
+    }
+
+    fn askOutOfCredits(raw: *anyopaque) !runtime_deps.OutOfCreditsChoice {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        self.out_of_credits_count += 1;
+        if (self.out_of_credits_index < self.out_of_credits_choices.len) {
+            const choice = self.out_of_credits_choices[self.out_of_credits_index];
+            self.out_of_credits_index += 1;
+            return choice;
         }
         return .cancel;
     }
@@ -949,15 +1023,15 @@ pub const FakeAgentRuntimeDeps = struct {
         }
     }
 
-    fn appendStaticContext(raw: *anyopaque, arena: Allocator, project_context: ?[]const u8, messages: *std.ArrayList(ChatMessage)) !void {
+    fn appendStaticContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        if (project_context orelse self.static_context_text) |text| {
+        if (self.static_context_text) |text| {
             try messages.append(arena, .{ .role = .system, .content = try arena.dupe(u8, text) });
         }
     }
 
     fn record(self: *FakeAgentRuntimeDeps, comptime fmt: []const u8, args: anytype) !void {
-        try self.log.append(self.alloc, try std.fmt.allocPrint(self.alloc, fmt, args));
+        try self.log.append(self.alloc, try self.alloc.print(fmt, args));
     }
 
     fn prepareParentTurnContext(raw: *anyopaque, arena: Allocator) !?runtime_deps.PreparedParentTurnContext {
@@ -1037,7 +1111,7 @@ pub const FakeAgentRuntimeDeps = struct {
         }
         for (self.validation_failure_names) |name| {
             if (std.mem.eql(u8, name, call.name)) {
-                return .{ .failure = try std.fmt.allocPrint(arena, "{s} arguments failed registered-tool validation", .{call.name}) };
+                return .{ .failure = try arena.print("{s} arguments failed registered-tool validation", .{call.name}) };
             }
         }
         const mcp_runtime_generation = if (self.validation_mcp_tool_name) |name|
@@ -1358,20 +1432,20 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn describeAction(_: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
         return if (display_target) |target|
-            std.fmt.allocPrint(arena, "start {s} {s}", .{ call.name, target })
+            arena.print("start {s} {s}", .{ call.name, target })
         else
-            std.fmt.allocPrint(arena, "start {s}", .{call.name});
+            arena.print("start {s}", .{call.name});
     }
 
     fn describeCompleted(_: *anyopaque, arena: Allocator, call: ToolCall, display_target: ?[]const u8, _: []const []const u8) ![]const u8 {
         return if (display_target) |target|
-            std.fmt.allocPrint(arena, "done {s} {s}", .{ call.name, target })
+            arena.print("done {s} {s}", .{ call.name, target })
         else
-            std.fmt.allocPrint(arena, "done {s}", .{call.name});
+            arena.print("done {s}", .{call.name});
     }
 
     fn describeDenied(_: *anyopaque, arena: Allocator, call: ToolCall, _: ?[]const u8, label: []const u8, _: []const []const u8) ![]const u8 {
-        return std.fmt.allocPrint(arena, "{s} {s}", .{ label, call.name });
+        return arena.print("{s} {s}", .{ label, call.name });
     }
 
     fn permissionTarget(raw: *anyopaque, arena: Allocator, call: ToolCall, _: []const []const u8) ![]const u8 {
@@ -1579,10 +1653,21 @@ pub const FakeAgentRuntimeDeps = struct {
         self.inner_usages.append(self.alloc, usage) catch return;
     }
 
+    fn recordUsage(ctx: *anyopaque, usage: types.Usage) anyerror!void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(ctx));
+        try self.recorded_usages.append(self.alloc, usage);
+    }
+
     fn recordRejected(raw: *anyopaque, _: Allocator, call: ToolCall, _: []const u8, _: ?[]const u8) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         try self.rejected_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
         try self.record("rejected:{s}", .{call.name});
+    }
+
+    fn recordFailed(raw: *anyopaque, _: Allocator, call: ToolCall, _: []const u8, _: ?[]const u8) !void {
+        const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        try self.failed_names.append(self.alloc, try self.alloc.dupe(u8, call.name));
+        try self.record("failed:{s}", .{call.name});
     }
 
     fn commitCompaction(raw: *anyopaque, summary: types.CompactedSummaryHistoryTurn, active_prefix: ?types.AssistantHistoryTurn, _: ?types.ContextHistoryCut) !void {
@@ -1631,7 +1716,15 @@ pub const FakeAgentRuntimeDeps = struct {
     fn pushEvent(raw: *anyopaque, event: WorkerEvent) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
         defer worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
+        if (self.steering_worker) |worker| try worker.pushEvent(self.alloc, event);
         switch (event) {
+            .full_detail_record => |notice| {
+                const owned = try types.dupeSemanticNotice(self.alloc, notice);
+                errdefer types.freeSemanticNotice(self.alloc, owned);
+                try self.full_detail_records.append(self.alloc, owned);
+                try self.record("full_detail_record:{s}:{s}", .{ notice.topic, notice.body });
+            },
+            .open_model_picker => try self.record("event:open_model_picker", .{}),
             .clear_route_recovery_status => {
                 self.route_recovery_clear_count += 1;
                 try self.record("event:clear_route_recovery_status", .{});
@@ -1713,6 +1806,7 @@ pub const FakeAgentRuntimeDeps = struct {
         event: types.ToolLifecycleEvent,
     ) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
+        if (self.steering_worker) |worker| try worker.pushEvent(self.alloc, .{ .tool_lifecycle = event });
         switch (event) {
             .provisional, .authoritative_started => try self.record("status:started", .{}),
             .terminal => |terminal| {
@@ -1756,30 +1850,29 @@ pub const FakeAgentRuntimeDeps = struct {
 
     fn routeRecoveryStatus(raw: *anyopaque, status: types.RouteRecoveryStatus) !void {
         const self: *FakeAgentRuntimeDeps = @ptrCast(@alignCast(raw));
-        if (status.kind == .auto_retry and
-            status.retry_deadline == null and
-            self.route_recovery_status_error_attempt == status.failed_attempt)
+        // Fails publishing the retrying status of one resend.
+        if (status.kind == .retrying and
+            self.route_recovery_status_error_attempt == status.attempt)
         {
             return error.TestRouteRecoveryPublicationFailed;
         }
         try self.route_recovery_statuses.append(self.alloc, status);
-        if (status.kind == .auto_retry and status.retry_deadline != null) {
+        if (status.kind == .need_user) {
+            if (self.continue_on_need_user) |flag| flag.store(true, .seq_cst);
+            if (self.cancel_on_need_user) |flag| flag.store(true, .seq_cst);
+        }
+        // Presses Esc while the request waits after the matching attempt.
+        if (status.kind == .waiting) {
             if (self.cancel_on_auto_retry_status) |flag| {
                 if (self.cancel_on_auto_retry_attempt == null or
-                    self.cancel_on_auto_retry_attempt.? == status.failed_attempt)
+                    self.cancel_on_auto_retry_attempt.? == status.attempt)
                 {
                     flag.store(true, .seq_cst);
                 }
             }
         }
-        if (self.pause_on_auto_retry_status and
-            status.kind == .auto_retry and
-            status.retry_deadline != null)
-        {
-            if (self.recovery_pause_flag) |flag| flag.store(true, .seq_cst);
-        }
         var label_buf: [types.RouteRecoveryStatus.label_max_bytes]u8 = undefined;
-        try self.record("route_recovery_status:{s}", .{status.label(&label_buf)});
+        try self.record("route_recovery_status:{s}:{s}", .{ @tagName(status.kind), status.label(&label_buf) });
     }
 
     fn commandOutputComplete(raw: *anyopaque, lifecycle_id: ?types.ToolLifecycleId) !void {
@@ -1802,7 +1895,7 @@ pub const FakeAgentRuntimeDeps = struct {
     }
 
     fn formatError(_: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) ![]const u8 {
-        return std.fmt.allocPrint(arena, "Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
+        return arena.print("Tool {s} failed: {s}", .{ tool_name, @errorName(err) });
     }
 };
 
@@ -1830,7 +1923,6 @@ pub const PromptFixture = struct {
         return .{
             .system_prompt = "system",
             .gateway_retry_count = 1,
-            .max_provider_attempts = model_response_recovery.default_max_provider_attempts,
             .gateway_chat_url = "https://example.invalid",
             .agent_step_limit = 8,
             .cancel_flag = &self.cancel_flag,
@@ -2089,7 +2181,7 @@ pub fn expectBodyContainsInOrder(gateway: *const FakeGateway, index: usize, need
     const body = gateway.request_bodies.items[index];
     var cursor: usize = 0;
     for (needles) |needle| {
-        const found = std.mem.indexOfPos(u8, body, cursor, needle) orelse return error.TestExpectedBodyNeedleMissing;
+        const found = std.mem.findPos(u8, body, cursor, needle) orelse return error.TestExpectedBodyNeedleMissing;
         cursor = found + needle.len;
     }
 }
@@ -2156,7 +2248,7 @@ pub fn countText(hooks: *const FakeAgentRuntimeDeps, needle: []const u8) usize {
 pub fn countNeedle(haystack: []const u8, needle: []const u8) usize {
     var count: usize = 0;
     var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, pos, needle)) |found| {
+    while (std.mem.findPos(u8, haystack, pos, needle)) |found| {
         count += 1;
         pos = found + needle.len;
     }

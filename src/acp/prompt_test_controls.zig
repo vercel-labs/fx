@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const io_mod = @import("../core/shared/io.zig");
 
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
@@ -9,7 +10,10 @@ const Controls = struct {
     release_path: []const u8,
 };
 
+// Only the fx binary's ACP tests set these controls
+// (`tests/e2e/acp.test.ts`), so the libfx artifacts leave them out.
 pub fn pauseAfterTerminalWrite() void {
+    if (comptime build_options.libfx) return;
     const control = controls() orelse return;
     writeMarker(control.terminal_ready_path, "terminal_response_written") catch return;
     while (!pathExists(control.release_path)) {
@@ -18,15 +22,16 @@ pub fn pauseAfterTerminalWrite() void {
 }
 
 pub fn noteReapBeforeJoin() void {
+    if (comptime build_options.libfx) return;
     const control = controls() orelse return;
     writeMarker(control.reap_ready_path, "reap_before_join") catch {};
 }
 
 fn controls() ?Controls {
     return controlsFromPaths(
-        io_mod.getenv("FX_E2E_ACP_PROMPT_TERMINAL_READY"),
-        io_mod.getenv("FX_E2E_ACP_PROMPT_REAP_READY"),
-        io_mod.getenv("FX_E2E_ACP_PROMPT_RELEASE"),
+        io_mod.getenv("FX_TEST_ACP_PROMPT_TERMINAL_READY"),
+        io_mod.getenv("FX_TEST_ACP_PROMPT_REAP_READY"),
+        io_mod.getenv("FX_TEST_ACP_PROMPT_RELEASE"),
     );
 }
 

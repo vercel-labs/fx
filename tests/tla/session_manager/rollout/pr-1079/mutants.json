@@ -1,0 +1,16 @@
+[
+  {
+    "module": "PR1079ACP",
+    "description": "Load replays only post-compaction context",
+    "old": "replay' = full",
+    "new": "replay' = context",
+    "invariant": "ReplayWholeHistory"
+  },
+  {
+    "module": "PR1079ACP",
+    "description": "Load fails to update the indexed workspace",
+    "old": "workspace' = w /\\ savedWorkspace' = w",
+    "new": "workspace' = w /\\ savedWorkspace' = savedWorkspace",
+    "invariant": "WorkspaceImmediatelyIndexed"
+  }
+]

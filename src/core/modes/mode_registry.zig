@@ -7,6 +7,7 @@ const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 
 pub const ModeSpec = mode_contract.ModeSpec;
+const PermissionMode = @FieldType(ModeSpec, "permission_mode");
 
 pub const Registry = struct {
     default_mode_id: []const u8,
@@ -17,6 +18,26 @@ pub const Registry = struct {
             if (std.mem.eql(u8, mode.id, id)) return mode;
         }
         return null;
+    }
+
+    /// The registered mode that applies `permission_mode`: the default mode
+    /// when it does, otherwise the first that does, or null when none does.
+    /// Sessions use it to start in the saved permission mode.
+    pub fn forPermission(self: Registry, permission_mode: PermissionMode) ?*const ModeSpec {
+        if (self.lookup(self.default_mode_id)) |mode| {
+            if (mode.permission_mode == permission_mode) return mode;
+        }
+        for (self.modes) |*mode| {
+            if (mode.permission_mode == permission_mode) return mode;
+        }
+        return null;
+    }
+
+    /// The mode a new session starts in under `permission_mode`: the mode
+    /// that applies it, or the default mode when none does.
+    pub fn startingModeId(self: Registry, permission_mode: PermissionMode) []const u8 {
+        const mode = self.forPermission(permission_mode) orelse return self.default_mode_id;
+        return mode.id;
     }
 
     pub fn buildModelToolProjection(
@@ -82,6 +103,24 @@ test "mode registry looks up modes by id" {
     try std.testing.expectEqualStrings("Code", found.name);
     try std.testing.expectEqual(@as(@TypeOf(found.permission_mode), .auto), found.permission_mode);
     try std.testing.expect(registry.lookup("missing") == null);
+}
+
+test "mode registry finds the mode for a permission mode, preferring the default" {
+    const modes = [_]ModeSpec{
+        .{ .id = "inspect", .name = "Inspect", .permission_mode = .ask },
+        .{ .id = "ask", .name = "Ask", .permission_mode = .ask },
+        .{ .id = "apply", .name = "Apply", .permission_mode = .auto },
+    };
+    const apply_default = Registry{ .default_mode_id = "apply", .modes = modes[0..] };
+    try std.testing.expectEqualStrings("inspect", apply_default.forPermission(.ask).?.id);
+    try std.testing.expectEqualStrings("apply", apply_default.forPermission(.auto).?.id);
+    try std.testing.expect(apply_default.forPermission(.yolo) == null);
+
+    const ask_default = Registry{ .default_mode_id = "ask", .modes = modes[0..] };
+    try std.testing.expectEqualStrings("ask", ask_default.forPermission(.ask).?.id);
+
+    try std.testing.expectEqualStrings("inspect", apply_default.startingModeId(.ask));
+    try std.testing.expectEqualStrings("apply", apply_default.startingModeId(.yolo));
 }
 
 test "mode registry applies tool policy to the supplied tool set" {

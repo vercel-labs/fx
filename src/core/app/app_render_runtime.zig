@@ -32,6 +32,7 @@ const surface_invalidation = @import("../../ui/footer/surface_invalidation.zig")
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
 const render_input = @import("../../ui/footer/render_input.zig");
+const picker_presentation = @import("../../ui/footer/picker_presentation.zig");
 const input_presentation = @import("../../ui/footer/input_presentation.zig");
 const footer_viewport = @import("../../ui/footer/viewport.zig");
 const render_request = @import("../../ui/render_request.zig");
@@ -52,6 +53,7 @@ const command_output_runtime = @import("../../ui/transcript/command_output_runti
 const resume_projection = @import("../../ui/transcript/resume_projection.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
+const shared_theme = @import("../shared/theme.zig");
 const assistant_pacer = @import("../../ui/assistant/pacer.zig");
 const user_message_card = @import("../../ui/assistant/user_message_card.zig");
 
@@ -153,6 +155,10 @@ const PendingCardProjection = struct {
     paint_row_count: u16,
     leading_advance_rows: u16,
 
+    fn overlaps_flow_endpoint(self: PendingCardProjection, cursor_col: u16) bool {
+        return self.leading_advance_rows == 0 and cursor_col > 1;
+    }
+
     fn deinit(self: *PendingCardProjection, alloc: std.mem.Allocator) void {
         alloc.free(self.bytes);
         self.* = undefined;
@@ -200,17 +206,15 @@ const PendingCardPaintContext = struct {
     }
 };
 
-fn pendingCardLeadingAdvanceRows(
-    cursor_row: u16,
-    cursor_col: u16,
-    content_bottom: u16,
-) u16 {
-    if (cursor_col == 1 or cursor_row >= content_bottom) return 0;
-    const canonical_rows = render_engine.transcript_blocks.blockSeparatorNewlineCount(
+// A mid-line flow endpoint always takes the canonical user-turn separator,
+// even at the content bottom: the frame scrolls to reserve the card rows, so
+// the preview starts on a fresh row instead of overwriting the endpoint.
+fn pendingCardLeadingAdvanceRows(cursor_col: u16) u16 {
+    if (cursor_col == 1) return 0;
+    return render_engine.transcript_blocks.blockSeparatorNewlineCount(
         .unknown_raw,
         .user_turn,
     );
-    return @min(canonical_rows, content_bottom - cursor_row);
 }
 
 fn buildPendingCardProjection(
@@ -247,11 +251,7 @@ fn buildPendingCardProjection(
         @max(presentation_shell.cursor_row, 1),
         presentation_shell.layout.content_bottom,
     );
-    const leading_advance_rows = pendingCardLeadingAdvanceRows(
-        cursor_row,
-        presentation_shell.cursor_col,
-        presentation_shell.layout.content_bottom,
-    );
+    const leading_advance_rows = pendingCardLeadingAdvanceRows(presentation_shell.cursor_col);
     const available_rows = presentation_shell.layout.content_bottom - cursor_row + 1 -| leading_advance_rows;
     const card = try user_message_card.buildUserPromptCardTailForTerminalPresentationInterruptible(
         app.alloc,
@@ -328,11 +328,7 @@ fn buildPendingSteeringCardProjection(
         row_count += @as(u16, @intCast(std.mem.count(u8, card, "\n"))) + gap;
     }
     if (row_count == 0) return null;
-    const leading_rows = pendingCardLeadingAdvanceRows(
-        @min(@max(shell.cursor_row, 1), shell.layout.content_bottom),
-        shell.cursor_col,
-        shell.layout.content_bottom,
-    );
+    const leading_rows = pendingCardLeadingAdvanceRows(shell.cursor_col);
     return .{
         .bytes = try pendingCardTerminalWireBytes(alloc, card_bytes.items),
         .row_count = row_count +| leading_rows,
@@ -486,13 +482,30 @@ pub fn Runtime(comptime App: type) type {
         pub fn applyThemeUpdate(app: *App, light: bool, rgb: ?ui_render.TerminalRgb) !void {
             if (!ui_render.themeNeedsUpdate(light, rgb)) return;
 
-            const prior_light = ui_render.is_light;
-            app.shell.retintEntriesForTheme(app.alloc, prior_light, light) catch |err| {
+            // Resolve the target first so the retint rewrites the old theme's
+            // escapes into the new theme's, custom pairs included.
+            const prior_theme = shared_theme.current();
+            var resolved_target: ?shared_theme.Theme = null;
+            if (shared_theme.sourceName() orelse ui_render.explicitThemeName()) |name| {
+                // Custom themes re-resolve on live flips: sibling swap or
+                // builtin fallback, same rule as startup.
+                resolved_target = shared_theme.resolveNamed(app.alloc, name, light, .{ .truecolor = ui_render.truecolorIsEnabled() }) catch |err| blk: {
+                    debug_trace.logf("theme", "live_theme_resolve_failed name={s} err={s}", .{ name, @errorName(err) });
+                    break :blk null;
+                };
+            }
+            const target = resolved_target orelse shared_theme.builtin(light);
+
+            app.shell.retintEntriesForTheme(app.alloc, prior_theme, target) catch |err| {
                 debug_trace.logf("theme", "theme_transcript_retint_failed err={s}", .{@errorName(err)});
                 return;
             };
             app.pacer.rethemeInlineCode(light);
-            ui_render.initTheme(light, rgb);
+            if (resolved_target) |resolved| {
+                ui_render.applyTheme(resolved, rgb);
+            } else {
+                ui_render.initTheme(light, rgb);
+            }
             app.shell.setCommandOutputRenderPolicy(shellStyles());
             try app.shell.requestTerminalReset(&app.metrics);
             app.shell.render_requests.request(.transcript);
@@ -517,7 +530,7 @@ pub fn Runtime(comptime App: type) type {
         var model_completions_buf: [32][]const u8 = undefined;
         var effort_picker_values_buf: [types.ReasoningEffort.max_options + 1]types.ReasoningEffort = undefined;
         var effort_picker_labels_buf: [types.ReasoningEffort.max_options + 1][]const u8 = undefined;
-        var fast_picker_labels_buf: [2][]const u8 = undefined;
+        var fast_picker_labels_buf: [3][]const u8 = undefined;
         var provider_picker_column: provider_picker_runtime.ColumnBuffer = .{};
         noinline fn footerContext(
             app: *App,
@@ -526,7 +539,17 @@ pub fn Runtime(comptime App: type) type {
             steering: *const SteeringProjection,
         ) render_input.RenderContext {
             const model_query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state);
-            const pending_model = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else null;
+            // `/effort ` lists the current model's levels, whatever a `/model`
+            // flow left pending.
+            const effort_command = if (model_query) |query| query.command == .effort else false;
+            const pending_model = if (!effort_command and app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else null;
+            // The level the `/effort ` column highlights, which the status line
+            // shows until the column applies or closes.
+            var effort_command_preview: ?types.ReasoningEffort = null;
+            // A model with no levels, or none loaded yet, shows no `/effort `
+            // column, as `/model` skips its effort column; Enter runs the
+            // command, which says why.
+            var effort_command_without_levels = false;
             var model_picker_stage: picker_state.ModelPickerStage = .model;
             var picker_items: []const []const u8 = &.{};
             var picker_index: usize = 0;
@@ -544,9 +567,10 @@ pub fn Runtime(comptime App: type) type {
                         picker_window_start = input_completion_runtime.CompletionRuntime(App).modelPickerWindowStart(app, count, picker_index);
                     },
                     .effort => {
-                        const target = if (app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else provider_runtime.model(app);
+                        const target = pending_model orelse provider_runtime.model(app);
                         const capabilities = model_capabilities.resolveForApp(App, app, target);
                         const effort_count = model_capabilities.reasoningEffortOptionCount(capabilities);
+                        effort_command_without_levels = effort_command and effort_count == 0;
                         for (0..effort_count) |i| {
                             effort_picker_values_buf[i] = model_capabilities.reasoningEffortAtIndex(capabilities, i);
                             effort_picker_labels_buf[i] = effort_picker_values_buf[i].displayLabel();
@@ -555,12 +579,21 @@ pub fn Runtime(comptime App: type) type {
                         picker_items = effort_picker_labels_buf[0..count];
                         picker_index = app.input_runtime.picker.model_picker_effort_index;
                         picker_window_start = app.input_runtime.picker.model_picker_effort_window_start;
+                        if (effort_command and count > 0) {
+                            effort_command_preview = types.ReasoningEffort.parseDisplayLabel(picker_items[picker_index % count]);
+                        }
                     },
                     .fast => {
-                        for (picker_state.model_picker_fast_options, 0..) |option, i| fast_picker_labels_buf[i] = option;
-                        const count = picker_state.filterCompletionLabels(picker_query.query, fast_picker_labels_buf[0..], fast_picker_labels_buf[0..]);
+                        const count = input_completion_runtime.CompletionRuntime(App).speedPickerLabels(
+                            app,
+                            picker_query.query,
+                            &fast_picker_labels_buf,
+                        );
                         picker_items = fast_picker_labels_buf[0..count];
-                        picker_index = app.input_runtime.picker.model_picker_fast_index;
+                        picker_index = input_completion_runtime.CompletionRuntime(App).speedPickerIndex(
+                            app,
+                            picker_items,
+                        );
                         picker_window_start = app.input_runtime.picker.model_picker_fast_window_start;
                     },
                 }
@@ -628,7 +661,9 @@ pub fn Runtime(comptime App: type) type {
             const model_supports_fast = visible_capabilities.supports_fast_mode;
             const model_supports_effort = visible_capabilities.reasoning_efforts.len > 0 or
                 (active_capabilities_pending and !app.effort.isDefault());
-            const visible_effort = if (pending_model != null and model_supports_effort)
+            const visible_effort = if (effort_command_preview) |effort|
+                effort
+            else if (pending_model != null and model_supports_effort)
                 pendingPickerEffort(app, visible_model, model_query, app.input_runtime.picker.model_picker_effort_index)
             else if (active_capabilities_pending or model_capabilities.reasoningEffortSupported(visible_capabilities, app.effort))
                 app.effort
@@ -680,6 +715,14 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
+            var statusline = buildStatuslineItems(app, visible_model);
+            statusline.ultrafast_indicator_active = if (pending_model != null)
+                visible_capabilities.supports_ultrafast_mode and std.mem.eql(u8, pendingPickerSpeed(model_query, app.input_runtime.picker.model_picker_fast_index), "ultrafast")
+            else if (comptime @hasField(@TypeOf(app.worker), "agent_turn_settings"))
+                app.worker.agent_turn_settings.ultrafast_mode
+            else
+                false;
+
             return .{
                 .slash_registry = app.slashRegistry(),
                 .stream = visible_stream,
@@ -687,7 +730,9 @@ pub fn Runtime(comptime App: type) type {
                 .pending_prompt_activity = pendingPromptActivityVisible(app),
                 .completed_assistant_presentation_tail = app.pacer.hasCompletedAssistantPresentationTail(),
                 .writing_response = app.pacer.hasPending(),
-                .has_api_key = app.auth.credentialSource() != null,
+                // A launch credential still loading must not flash "run /login".
+                .has_api_key = app.auth.credentialSource() != null or
+                    (if (comptime @hasDecl(@TypeOf(app.auth), "startupCredentialPending")) app.auth.startupCredentialPending() else false),
                 .model = visible_model,
                 .pending_images = app.pending_images.items,
                 .permission_mode = if (comptime @hasField(App, "permission_engine"))
@@ -702,7 +747,7 @@ pub fn Runtime(comptime App: type) type {
                 .ctrl_c_pending = app.input_runtime.gestures.ctrlCExitArmed(),
                 .shimmer_pos = shimmer_pos,
                 .now_ms = now_ms,
-                .model_query_active = model_query != null,
+                .model_query_active = model_query != null and !effort_command_without_levels,
                 .model_picker_stage = model_picker_stage,
                 .model_completions_loading = if (model_query != null and model_picker_stage == .model) app.isModelCacheLoading() else false,
                 .model_completions_failed = if (model_query != null and model_picker_stage == .model) app.isModelCacheFailed() else false,
@@ -731,29 +776,21 @@ pub fn Runtime(comptime App: type) type {
                 else
                     "",
                 .auth_picker = app.auth.pickerView(),
+                .auth_picker_during_turn = if (comptime @hasDecl(@TypeOf(app.shell), "worker_status_state"))
+                    app.shell.worker_status_state().waitsForSignIn()
+                else
+                    false,
                 .skills_menu = if (comptime @hasField(App, "skills"))
                     render_input.skillsMenuProjection(&app.skills)
                 else
                     .{},
-                .mcp_menu = if (comptime @hasField(App, "mcp")) blk: {
-                    const view = app.mcp.menuView();
-                    break :blk .{
-                        .state = view.state,
-                        .servers = if (view.health) |health| health.servers else &.{},
-                        .tools = view.tools,
-                        .resources = if (view.resources) |catalog| catalog.resources.items else &.{},
-                        .resource_templates = if (view.resources) |catalog| catalog.templates.items else &.{},
-                        .prompts = if (view.prompts) |catalog| catalog.items else &.{},
-                        .configuration_issue_count = if (view.health) |health| health.configuration_issues.len else 0,
-                        .preview = view.preview,
-                        .feedback = view.feedback,
-                        .add_name = view.add_form.name.items,
-                        .add_target = view.add_form.target.items,
-                        .add_arguments = view.add_form.arguments.items,
-                        .add_draft = app.input_runtime.edit_state.input.items,
-                        .arguments = view.argument_fields,
-                        .argument_draft = app.input_runtime.edit_state.input.items,
-                    };
+                .mcp_host_menu = if (comptime @hasField(App, "mcp")) .{
+                    .state = app.mcp.host_menu,
+                    .rows = app.mcp.host_menu_rows,
+                    .filter = app.input_runtime.edit_state.input.items,
+                    .tools = app.mcp.host_menu_tools,
+                    .notes = app.mcp.host_menu_notes,
+                    .sign_in_url = app.mcp.hostMenuSignInUrl(),
                 } else .{},
                 .help_menu = render_input.helpMenuProjection(
                     &app.input_runtime.help_menu,
@@ -788,9 +825,19 @@ pub fn Runtime(comptime App: type) type {
                     .now_ms = now_ms,
                     .selection_failure = app.session_persistence.session_picker.selection_failure,
                 } else .{},
+                .fork_menu = if (comptime @hasField(App, "session_persistence"))
+                    app.session_persistence.fork_menu.projection()
+                else
+                    .{},
+                .effort_menu = render_input.effortMenuProjection(&app.input_runtime.effort_menu),
                 .statusline_menu = render_input.statuslineMenuProjection(
                     &app.input_runtime.statusline_menu,
                     settings_snapshot,
+                ),
+                .info_panel = render_input.infoPanelProjection(
+                    &app.input_runtime.info_panel,
+                    app.shell.layout.cols,
+                    app.shell.layout.rows,
                 ),
                 .usage_menu = render_input.usageMenuProjection(
                     &app.input_runtime.usage_menu,
@@ -804,6 +851,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     .{},
                 .upgrade_status = upgrade_label,
+                .mcp_status = if (comptime @hasField(App, "mcp")) app.mcp.hostStatusText() else "",
                 .danger_status = if (yolo_warning_active)
                     app_permission_runtime.yolo_warning_text
                 else
@@ -815,10 +863,7 @@ pub fn Runtime(comptime App: type) type {
                 .esc_clear_armed = app.input_runtime.gestures.escapeClearArmed(),
                 .esc_interrupt_armed = app.input_runtime.gestures.escapeInterruptArmed(),
                 .question = app.question_prompt.projection(),
-                .statusline = buildStatuslineItems(
-                    app,
-                    visible_model,
-                ),
+                .statusline = statusline,
                 .activity = activityProjection(app),
                 .input = &app.input_runtime,
             };
@@ -864,18 +909,26 @@ pub fn Runtime(comptime App: type) type {
             return items;
         }
 
-        fn pendingPickerFastMode(query: ?picker_state.ModelPickerQuery, fast_index: usize) bool {
+        fn pendingPickerSpeed(query: ?picker_state.ModelPickerQuery, speed_index: usize) []const u8 {
             if (query) |picker_query| {
                 if (picker_query.stage == .fast) {
                     const typed = std.mem.trim(u8, picker_query.query, " \t");
-                    if (std.ascii.eqlIgnoreCase(typed, picker_state.model_picker_fast_options[0])) return false;
-                    if (std.ascii.eqlIgnoreCase(typed, picker_state.model_picker_fast_options[1])) return true;
+                    for (picker_state.model_picker_speed_options) |speed| {
+                        if (std.ascii.eqlIgnoreCase(typed, speed)) return speed;
+                    }
                 }
             }
-            return fast_index % picker_state.model_picker_fast_options.len == 1;
+            return picker_state.model_picker_speed_options[speed_index % picker_state.model_picker_speed_options.len];
+        }
+
+        fn pendingPickerFastMode(query: ?picker_state.ModelPickerQuery, speed_index: usize) bool {
+            return std.mem.eql(u8, pendingPickerSpeed(query, speed_index), "fast");
         }
 
         pub fn flushRequestedFrame(app: *App) !void {
+            if (comptime @hasDecl(@TypeOf(app.shell), "sessionScrollbackHandoffPending")) {
+                if (app.shell.sessionScrollbackHandoffPending()) return;
+            }
             if (app.shell.terminal_dimensions_invalid or app.shell.layout.rows == 0 or app.shell.layout.cols == 0) return;
             const has_resize_lifecycle =
                 @hasField(@TypeOf(app.shell), "pending_resize_observation");
@@ -900,7 +953,17 @@ pub fn Runtime(comptime App: type) type {
                     render_requests.animation_next_deadline_ms,
                 },
             );
-            errdefer |err| {
+            defer attempt.deinit();
+
+            const resize_commit = if (comptime has_resize_lifecycle)
+                shell_runtime.pendingResizeFrameCommit(
+                    &app.shell,
+                    snapshot.reasons.contains(.resize),
+                )
+            else
+                shell_runtime.ResizeFrameCommit.none;
+            const attempted = attemptRequestedFrame(app, snapshot) catch |err| {
+                attempt.restore();
                 if (comptime @hasField(App, "terminal")) {
                     _ = app_lifecycle.closeFullTranscriptIfActive(
                         app.alloc,
@@ -922,17 +985,9 @@ pub fn Runtime(comptime App: type) type {
                         render_requests.animation_next_deadline_ms,
                     },
                 );
-            }
-            defer attempt.deinit();
-
-            const resize_commit = if (comptime has_resize_lifecycle)
-                shell_runtime.pendingResizeFrameCommit(
-                    &app.shell,
-                    snapshot.reasons.contains(.resize),
-                )
-            else
-                shell_runtime.ResizeFrameCommit.none;
-            const result = (try attemptRequestedFrame(app, snapshot)) orelse {
+                return err;
+            };
+            const result = attempted orelse {
                 attempt.restore();
                 render_requests.noteInputPendingAbort();
                 debug_trace.logf(
@@ -983,6 +1038,10 @@ pub fn Runtime(comptime App: type) type {
                 if (snapshot.reasons.contains(.first_frame)) {
                     App.startPromptCredentialPrewarm(app);
                 }
+            }
+            // MCP servers start once the first frame is on screen, never before.
+            if (comptime @hasDecl(App, "startMcpHostServers")) {
+                if (snapshot.reasons.contains(.first_frame)) App.startMcpHostServers(app);
             }
             if (comptime @hasDecl(App, "notePendingFrameCommitted")) {
                 if (result.pending_prompt_presented) {
@@ -1138,7 +1197,7 @@ pub fn Runtime(comptime App: type) type {
                     if (!question_active and approval == null and
                         (settingsMenuActive(app) or helpMenuActive(app) or
                             skillsMenuActive(app) or modelMenuActive(app) or
-                            sessionMenuActive(app)))
+                            sessionMenuActive(app) or forkMenuActive(app) or effortMenuActive(app)))
                     {
                         app.shell.render_requests.request(.footer);
                     }
@@ -1148,7 +1207,7 @@ pub fn Runtime(comptime App: type) type {
                 },
             }
 
-            if (!question_active and approval == null and (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app))) {
+            if (!question_active and approval == null and (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app) or forkMenuActive(app) or effortMenuActive(app))) {
                 if (try app_lifecycle.closeFullTranscriptIfActive(
                     app.alloc,
                     &app.terminal,
@@ -1603,6 +1662,7 @@ pub fn Runtime(comptime App: type) type {
                     .tool_slot => |slot| if (slot.thinking_label != null) .thinking else .tool_marker,
                     .turn_thinking => |thinking| switch (thinking.tone) {
                         .thinking => .thinking,
+                        .live => .live,
                         .neutral => .neutral,
                         .warning => .warning,
                         .success => .success,
@@ -1621,7 +1681,11 @@ pub fn Runtime(comptime App: type) type {
                     .paint => .paint,
                     .retain_committed => |retained| .{ .retain = retained },
                 } else .paint;
-            var pending_paint_ctx = if (pending_card) |card|
+            const pending_preview_overlaps_flow = pending_submission_card and if (prepared_transcript) |prepared|
+                pending_card.?.overlaps_flow_endpoint(prepared.cursor.cursor_col)
+            else
+                false;
+            var pending_paint_ctx = if (pending_preview_overlaps_flow) null else if (pending_card) |card|
                 PendingCardPaintContext.init(
                     card,
                     footer_frame.paint.transcript_band,
@@ -1630,6 +1694,10 @@ pub fn Runtime(comptime App: type) type {
                 )
             else
                 null;
+            // A band too short for the preview below the flow endpoint defers it
+            // the same way: adoption writes the real card.
+            const pending_preview_deferred = pending_submission_card and
+                prepared_transcript != null and pending_paint_ctx == null;
             if (pending_paint_ctx) |paint_ctx| switch (transcript_body) {
                 .paint => {},
                 .retain => |retained_source| {
@@ -1785,11 +1853,13 @@ pub fn Runtime(comptime App: type) type {
                 .animation_visible = frame_ctx.activity_result.painted,
                 .yolo_warning_visible = !render_reconciliation.alternate_screen_owns_rendering and
                     footer_frame.composed.danger_status_visible,
-                .pending_prompt_presented = pending_submission_card and pending_paint_ctx != null,
+                // The committed pending UI permits adoption even when its preview
+                // would overwrite the flow endpoint. Adoption writes the real card.
+                .pending_prompt_presented = pending_submission_card and (pending_paint_ctx != null or pending_preview_deferred),
                 .file_picker_receipt = if (result.is_committed() and presentation_commits_transcript and
                     footer_measurement != null and footer_measurement.?.show_picker and
                     footer_measurement.?.picker_kind == .file and footer_measurement.?.picker_rows > 0)
-                    file_picker_receipt
+                    paintedFilePickerReceipt(file_picker_receipt, footer_measurement.?.picker_rows, footer_ctx.file_completion_status != null)
                 else
                     null,
             };
@@ -1948,8 +2018,18 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
+        fn forkMenuActive(app: *const App) bool {
+            if (comptime @hasField(App, "session_persistence")) return app.session_persistence.fork_menu.active();
+            return false;
+        }
+
         fn helpMenuActive(app: *const App) bool {
             if (comptime @hasField(App, "input_runtime")) return app.input_runtime.help_menu.active;
+            return false;
+        }
+
+        fn effortMenuActive(app: *const App) bool {
+            if (comptime @hasField(App, "input_runtime")) return app.input_runtime.effort_menu.active;
             return false;
         }
 
@@ -2051,13 +2131,6 @@ fn FixedPointTranscriptContext(comptime App: type) type {
                 candidate.transcript_area,
                 self.pending_tail_rows,
             );
-            if (canonical_area.isEmpty()) return .{
-                .inline_advance_rows = 0,
-                .occupied_transcript_rows = @min(
-                    self.pending_tail_rows,
-                    candidate.transcript_area.height(),
-                ),
-            };
 
             self.prepared_transcript.* = try self.presentation_shell.prepareTranscriptSurfacePaintFromSourceForFrame(
                 self.app.alloc,
@@ -2096,15 +2169,6 @@ fn FixedPointTranscriptContext(comptime App: type) type {
             const candidate_rows = candidate.transcript_area.height();
             if (!self.prepare_transcript or candidate.transcript_area.isEmpty()) {
                 return .{ .occupied_transcript_rows = candidate_rows };
-            }
-            if (transcriptAreaBeforePendingTail(
-                candidate.transcript_area,
-                self.pending_tail_rows,
-            ).isEmpty()) {
-                return .{ .occupied_transcript_rows = @min(
-                    self.pending_tail_rows,
-                    candidate_rows,
-                ) };
             }
             const source = self.source orelse return error.MissingTranscriptPreparationSource;
             const prepared = if (self.prepared_transcript.*) |*value| value else return error.MissingTranscriptPaint;
@@ -2173,8 +2237,11 @@ fn transcriptAreaBeforePendingTail(
     tail_rows: u16,
 ) render_engine.frame_layout.FrameRect {
     if (area.isEmpty() or tail_rows == 0) return area;
-    if (tail_rows >= area.height()) return .empty();
-    return .{ .top = area.top, .bottom = area.bottom - tail_rows };
+    // A tail taller than the band still leaves the flow endpoint row. Without
+    // it the frame seals no transcript transition, and adoption would rebase
+    // onto rows that never reached scrollback.
+    const canonical_rows = @max(area.height() -| tail_rows, 1);
+    return .{ .top = area.top, .bottom = area.top + canonical_rows - 1 };
 }
 
 fn FramePaintContext(comptime App: type) type {
@@ -2288,6 +2355,14 @@ fn promptTurnReservation(
         return .{ .transcript_rows = canonical_rows, .activity = future_activity };
     }
     return .{};
+}
+
+/// Records how many file rows the frame painted, so keyboard navigation
+/// scrolls the same window the user sees.
+fn paintedFilePickerReceipt(receipt: ?input_completion_runtime.FilePickerReceipt, picker_rows: u16, has_status: bool) ?input_completion_runtime.FilePickerReceipt {
+    var painted = receipt orelse return null;
+    painted.visible_rows = picker_presentation.filePickerItemRows(picker_rows, has_status);
+    return painted;
 }
 
 fn footerMeasurementFromRows(rows: render_engine.footer_layout.FooterRows) render_engine.frame_layout.FooterMeasurement {
@@ -2546,23 +2621,374 @@ test "pending steering cards preserve feedback order and tool waiting placement"
     }
 }
 
+test "pending prompt at an occupied band bottom preserves the summary through adoption" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "pending-paste.log", .{ .read = true });
+    defer file.close(std.testing.io);
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = file, .layout = .{ .cols = 168, .rows = 75, .content_bottom = 71, .divider_top_row = 72, .input_row = 73, .divider_bottom_row = 74, .hint_row = 75 } },
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "test-model");
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    var physical = try vt_emulator.Grid.init(alloc, 168, 75);
+    defer physical.deinit();
+    physical.defer_sync_updates = false;
+    var history: std.ArrayList(u8) = .empty;
+    defer history.deinit(alloc);
+    var offset: u64 = 0;
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, text_utils.repeat("previous answer\n", 235), .unknown_raw);
+    const summary = "  10m 31s (↑177 ↓21k)";
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, summary, .turn_summary);
+    app.shell.render_requests.request(.first_frame);
+    app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    const first = try readCoordinatorFrameBytes(alloc, file, &offset);
+    defer alloc.free(first);
+    try feedRewritePublicationFrame(alloc, &physical, &history, first);
+    for (0..3) |_| _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expect(app.shell.cursor_col > 1);
+    try std.testing.expect(app.shell.cursor_row >= app.shell.layout.content_bottom);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, history.items, "↑177"));
+    const initial = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(initial);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, initial, summary));
+
+    const last_line = "- evidence gaps that could still change the design.";
+    const prompt = text_utils.repeat("PASTE_BODY\n", 383) ++ last_line;
+    app.submission.pending = .{ .draft = .{
+        .turn_id = 1,
+        .prompt = try alloc.dupe(u8, prompt),
+        .images = &.{},
+        .skill_display_spans = &.{},
+    } };
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    const preview = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(preview);
+    const preview_summary_count = std.mem.count(u8, preview, summary);
+    const preview_card_count = std.mem.count(u8, preview, last_line);
+    const preview_row = app.shell.transcript_commit_state.stable.cursor_row;
+    const preview_col = app.shell.transcript_commit_state.stable.cursor_col;
+    try std.testing.expectEqual(@as(usize, 1), app.pending_frame_commits);
+
+    app.submission.pending.?.phase = .adopted;
+    _ = try app.shell.writeUserPromptCard(alloc, &app.metrics, .{ .text = app.submission.pending.?.draft.prompt }, true, &.{});
+    const scroll = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    const adopted = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(adopted);
+    errdefer std.debug.print("pending paste preview cursor={d},{d} summary={d} card_tail={d}; adoption scroll={d} summary={d} tail_prefix={d} full_tail={d}\n", .{
+        preview_row,                           preview_col, preview_summary_count, preview_card_count, scroll,
+        std.mem.count(u8, adopted, summary),
+        std.mem.count(u8, adopted, "┃ - evidence gaps"),
+        std.mem.count(u8, adopted, last_line),
+    });
+    try std.testing.expect(scroll > preview_row);
+    try std.testing.expectEqual(@as(usize, 1), preview_summary_count);
+    try std.testing.expectEqual(@as(usize, 1), preview_card_count);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, history.items, summary));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, summary));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, "┃ - evidence gaps"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, last_line));
+    try std.testing.expectEqual(@as(usize, 0), publicationLineCount(adopted, "┃ - evidence gaps tha"));
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, text_utils.repeat("FOLLOWUP\n", 80), .unknown_raw);
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, history.items, summary));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, history.items, last_line));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, history.items, "┃ - evidence gaps"));
+    const finished = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(finished);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, finished, last_line));
+    try std.testing.expect(std.mem.find(u8, finished, summary).? < std.mem.find(u8, finished, last_line).?);
+    try std.testing.expectEqual(@as(u32, 0), try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset));
+    const quiet = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(quiet);
+    try std.testing.expectEqualStrings(finished, quiet);
+}
+
+fn currentCompactSource(shell: *transcript_runtime.TranscriptRuntime) ?*transcript_runtime.TranscriptPreparationSource {
+    for (&shell.compact_transcript_source_cache.entries) |*entry| {
+        if (entry.*) |*cached| {
+            if (cached.content_revision == shell.full_transcript_content_revision and
+                cached.cols == shell.layout.cols and
+                cached.has_committed_frame == shell.has_committed_frame)
+            {
+                return &cached.source;
+            }
+        }
+    }
+    return null;
+}
+
+const compact_source_cache_capacity = @typeInfo(@FieldType(
+    @FieldType(transcript_runtime.TranscriptRuntime, "compact_transcript_source_cache"),
+    "entries",
+)).array.len;
+
+fn compactSourceCacheSlots(shell: *const transcript_runtime.TranscriptRuntime) [compact_source_cache_capacity]?[*]const u8 {
+    var slots: [compact_source_cache_capacity]?[*]const u8 = undefined;
+    for (shell.compact_transcript_source_cache.entries, &slots) |entry, *slot| {
+        slot.* = if (entry) |cached| cached.source.bytes.ptr else null;
+    }
+    return slots;
+}
+
+fn findGridRow(alloc: std.mem.Allocator, physical: *vt_emulator.Grid, needle: []const u8) !?u16 {
+    var row_text: std.ArrayList(u8) = .empty;
+    defer row_text.deinit(alloc);
+    for (1..physical.rows + 1) |row| {
+        row_text.clearRetainingCapacity();
+        try physical.rowTextTrimmed(@intCast(row), &row_text);
+        if (std.mem.find(u8, row_text.items, needle) != null) return @intCast(row);
+    }
+    return null;
+}
+
+test "pending prompt on a full screen is visible before adoption and keeps its row" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "pending-full-screen.log", .{ .read = true });
+    defer file.close(std.testing.io);
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = file, .layout = .{ .cols = 80, .rows = 24, .content_bottom = 20, .divider_top_row = 21, .input_row = 22, .divider_bottom_row = 23, .hint_row = 24 } },
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "test-model");
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    var physical = try vt_emulator.Grid.init(alloc, 80, 24);
+    defer physical.deinit();
+    physical.defer_sync_updates = false;
+    var history: std.ArrayList(u8) = .empty;
+    defer history.deinit(alloc);
+    var offset: u64 = 0;
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, text_utils.repeat("previous answer\n", 60), .unknown_raw);
+    const summary = "  6m 25s (↑14 ↓30k)";
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, summary, .turn_summary);
+    app.shell.render_requests.request(.first_frame);
+    app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    const first = try readCoordinatorFrameBytes(alloc, file, &offset);
+    defer alloc.free(first);
+    try feedRewritePublicationFrame(alloc, &physical, &history, first);
+    for (0..3) |_| _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    // The flow endpoint sits mid-line at the content bottom, as after any
+    // finished turn in a long session.
+    try std.testing.expect(app.shell.cursor_col > 1);
+    try std.testing.expect(app.shell.cursor_row >= app.shell.layout.content_bottom);
+
+    const prompt = "FULL_SCREEN_PROMPT";
+    app.submission.pending = .{ .draft = .{
+        .turn_id = 1,
+        .prompt = try alloc.dupe(u8, prompt),
+        .images = &.{},
+        .skill_display_spans = &.{},
+    } };
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_frame_commits);
+    const preview_row = (try findGridRow(alloc, &physical, prompt)) orelse return error.PendingPreviewNotPainted;
+    const summary_row = (try findGridRow(alloc, &physical, "6m 25s")) orelse return error.SummaryMissing;
+    try std.testing.expect(preview_row <= app.shell.layout.content_bottom);
+    try std.testing.expectEqual(summary_row + 2, preview_row);
+    const preview = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(preview);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview, summary));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview, prompt));
+
+    app.submission.pending.?.phase = .adopted;
+    _ = try app.shell.writeUserPromptCard(alloc, &app.metrics, .{ .text = app.submission.pending.?.draft.prompt }, true, &.{});
+    const seeded = currentCompactSource(&app.shell) orelse return error.CommittedSourceNotCached;
+    const slots_before = compactSourceCacheSlots(&app.shell);
+    // A cache hit refreshes the cursor from the shell, so clearing this
+    // column proves the frame read the commit's source instead of rebuilding.
+    const poisoned_col = std.math.maxInt(@TypeOf(seeded.preview.cursor_col));
+    seeded.preview.cursor_col = poisoned_col;
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expectEqual(slots_before, compactSourceCacheSlots(&app.shell));
+    try std.testing.expect(seeded.preview.cursor_col != poisoned_col);
+    try std.testing.expectEqual(preview_row, (try findGridRow(alloc, &physical, prompt)) orelse return error.AdoptedCardMissing);
+    const adopted = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(adopted);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, summary));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, prompt));
+    try std.testing.expectEqual(@as(u32, 0), try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset));
+    const quiet = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(quiet);
+    try std.testing.expectEqualStrings(adopted, quiet);
+}
+
+test "pending steering on a full screen paints below the summary and leaves no fragment" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "pending-steering-full-screen.log", .{ .read = true });
+    defer file.close(std.testing.io);
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = file, .layout = .{ .cols = 80, .rows = 24, .content_bottom = 20, .divider_top_row = 21, .input_row = 22, .divider_bottom_row = 23, .hint_row = 24 } },
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "test-model");
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    var physical = try vt_emulator.Grid.init(alloc, 80, 24);
+    defer physical.deinit();
+    physical.defer_sync_updates = false;
+    var history: std.ArrayList(u8) = .empty;
+    defer history.deinit(alloc);
+    var offset: u64 = 0;
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, text_utils.repeat("previous answer\n", 60), .unknown_raw);
+    const summary = "  6m 25s (↑14 ↓30k)";
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, summary, .turn_summary);
+    app.shell.render_requests.request(.first_frame);
+    app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    const first = try readCoordinatorFrameBytes(alloc, file, &offset);
+    defer alloc.free(first);
+    try feedRewritePublicationFrame(alloc, &physical, &history, first);
+    for (0..3) |_| _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expect(app.shell.cursor_col > 1);
+    try std.testing.expect(app.shell.cursor_row >= app.shell.layout.content_bottom);
+
+    const steering = "FULL_SCREEN_STEERING";
+    app.worker.steering_messages = &.{steering};
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    const steering_row = (try findGridRow(alloc, &physical, steering)) orelse return error.SteeringPreviewNotPainted;
+    const summary_row = (try findGridRow(alloc, &physical, "6m 25s")) orelse return error.SummaryMissing;
+    try std.testing.expectEqual(summary_row + 2, steering_row);
+    try std.testing.expect(steering_row <= app.shell.layout.content_bottom);
+    const preview = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(preview);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview, summary));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview, steering));
+
+    app.worker.steering_messages = &.{};
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    const cleared = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(cleared);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, cleared, summary));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, cleared, steering));
+}
+
+test "pending prompt taller than a near-empty transcript reaches scrollback through adoption" {
+    // The short terminal leaves the preview no row below the flow endpoint.
+    for ([_]struct { rows: u16, preview_tail: usize }{
+        .{ .rows = 24, .preview_tail = 1 },
+        .{ .rows = 7, .preview_tail = 0 },
+    }) |case| try expectTallPendingPromptReachesScrollback(case.rows, case.preview_tail);
+}
+
+fn expectTallPendingPromptReachesScrollback(rows: u16, preview_tail: usize) !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var file = try tmp.dir.createFile(std.testing.io, "pending-banner-paste.log", .{ .read = true });
+    defer file.close(std.testing.io);
+    var app = CoordinatorTestApp{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = file, .layout = .{ .cols = 80, .rows = rows, .content_bottom = rows - 4, .divider_top_row = rows - 3, .input_row = rows - 2, .divider_bottom_row = rows - 1, .hint_row = rows } },
+    };
+    defer app.deinit();
+    try app.selected_model.appendSlice(alloc, "test-model");
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    var physical = try vt_emulator.Grid.init(alloc, 80, rows);
+    defer physical.deinit();
+    physical.defer_sync_updates = false;
+    var history: std.ArrayList(u8) = .empty;
+    defer history.deinit(alloc);
+    var offset: u64 = 0;
+    const banner = "BANNER_ROW · Run /help for commands";
+    _ = try app.shell.appendRawTranscriptEntryClassified(alloc, banner, .unknown_raw);
+    app.shell.render_requests.request(.first_frame);
+    app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
+    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
+    const first = try readCoordinatorFrameBytes(alloc, file, &offset);
+    defer alloc.free(first);
+    try feedRewritePublicationFrame(alloc, &physical, &history, first);
+    try std.testing.expectEqual(@as(u16, 1), app.shell.cursor_row);
+    try std.testing.expect(app.shell.cursor_col > 1);
+
+    const first_line = "FIRST_PROMPT_LINE";
+    const last_line = "LAST_PROMPT_LINE";
+    const prompt = first_line ++ "\n" ++ text_utils.repeat("PASTE_BODY\n", 60) ++ last_line;
+    app.submission.pending = .{ .draft = .{
+        .turn_id = 1,
+        .prompt = try alloc.dupe(u8, prompt),
+        .images = &.{},
+        .skill_display_spans = &.{},
+    } };
+    _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_frame_commits);
+    try std.testing.expect(app.shell.transcript_commit_state == .stable);
+    const preview = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(preview);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, preview, banner));
+    try std.testing.expectEqual(preview_tail, std.mem.count(u8, preview, last_line));
+
+    app.submission.pending.?.phase = .adopted;
+    _ = try app.shell.writeUserPromptCard(alloc, &app.metrics, .{ .text = app.submission.pending.?.draft.prompt }, true, &.{});
+    try std.testing.expect(try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset) > 0);
+    const adopted = try rewritePublicationText(alloc, &physical, history.items);
+    defer alloc.free(adopted);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, banner));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, first_line));
+    try std.testing.expectEqual(@as(usize, 60), std.mem.count(u8, adopted, "PASTE_BODY"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, adopted, last_line));
+    try std.testing.expect(std.mem.find(u8, adopted, banner).? < std.mem.find(u8, adopted, first_line).?);
+}
+
+test "pending prompt preview preserves blank bottom rows and canonical leading space" {
+    const alloc = std.testing.allocator;
+    const TestApp = struct {
+        alloc: std.mem.Allocator,
+        submission: @import("input_submit_runtime.zig").State,
+    };
+    var app = TestApp{
+        .alloc = alloc,
+        .submission = .{ .pending = .{ .draft = .{
+            .turn_id = 1,
+            .prompt = try alloc.dupe(u8, text_utils.repeat("line\n", 30)),
+            .images = &.{},
+            .skill_display_spans = &.{},
+        } } },
+    };
+    defer app.submission.pending.?.deinit(alloc);
+    // Rows at or near the content bottom keep the canonical separator; the
+    // frame scrolls to reserve it, so only unscrolled rows check the paint row.
+    const cases = [_]struct { row: u16, col: u16, advance: u16, unscrolled: bool }{
+        .{ .row = 20, .col = 1, .advance = 0, .unscrolled = true },
+        .{ .row = 8, .col = 47, .advance = 2, .unscrolled = true },
+        .{ .row = 19, .col = 47, .advance = 2, .unscrolled = false },
+        .{ .row = 20, .col = 47, .advance = 2, .unscrolled = false },
+        .{ .row = 24, .col = 47, .advance = 2, .unscrolled = false },
+    };
+    for (cases) |case| {
+        var shell = transcript_runtime.TranscriptRuntime{
+            .layout = .{ .cols = 80, .rows = 24, .content_bottom = 20, .divider_top_row = 21, .input_row = 22, .divider_bottom_row = 23, .hint_row = 24 },
+            .cursor_row = case.row,
+            .cursor_col = case.col,
+        };
+        defer shell.deinit(alloc);
+        var card = (try buildPendingCardProjection(TestApp, &app, &shell, null)).?;
+        defer card.deinit(alloc);
+        try std.testing.expectEqual(case.advance, card.leading_advance_rows);
+        try std.testing.expect(!card.overlaps_flow_endpoint(case.col));
+        if (!case.unscrolled) continue;
+        const context = PendingCardPaintContext.init(card, .{ .top = 1, .bottom = 20, .owner = .transcript }, case.row, false).?;
+        try std.testing.expectEqual(case.row + case.advance, context.row);
+        try std.testing.expect(context.max_rows > 0);
+    }
+}
+
 test "pending prompt uses the canonical user turn boundary" {
-    try std.testing.expectEqual(
-        @as(u16, 2),
-        pendingCardLeadingAdvanceRows(8, 47, 20),
-    );
-    try std.testing.expectEqual(
-        @as(u16, 0),
-        pendingCardLeadingAdvanceRows(8, 1, 20),
-    );
-    try std.testing.expectEqual(
-        @as(u16, 0),
-        pendingCardLeadingAdvanceRows(20, 47, 20),
-    );
-    try std.testing.expectEqual(
-        @as(u16, 1),
-        pendingCardLeadingAdvanceRows(19, 47, 20),
-    );
+    try std.testing.expectEqual(@as(u16, 2), pendingCardLeadingAdvanceRows(47));
+    try std.testing.expectEqual(@as(u16, 0), pendingCardLeadingAdvanceRows(1));
 }
 
 test "pending prompt painting fits the solved transcript band" {
@@ -2620,7 +3046,7 @@ test "assistant tail writability changes remain traceable" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "assistant-tail.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "assistant-tail.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -2871,11 +3297,11 @@ const CoordinatorFaultTestApp = struct {
     file_picker_receipt: ?input_completion_runtime.FilePickerReceipt = null,
     last_snapshot: ?render_request.AttemptSnapshot = null,
 
-    fn flushNotifications(self: *CoordinatorFaultTestApp) void {
+    pub fn flushNotifications(self: *CoordinatorFaultTestApp) void {
         self.notification_flushes += 1;
     }
 
-    fn renderFrameAttemptForTest(
+    pub fn renderFrameAttemptForTest(
         self: *CoordinatorFaultTestApp,
         snapshot: render_request.AttemptSnapshot,
     ) !FrameAttemptResult {
@@ -3290,6 +3716,22 @@ const CoordinatorTestWorker = struct {
     submitted_permission: ?types.ToolPermissionDecision = null,
     cancel_requested: bool = false,
     cancel_continues_turn: bool = false,
+    steering_messages: []const []const u8 = &.{},
+
+    pub fn snapshotSteeringPresentation(
+        self: *const @This(),
+        alloc: std.mem.Allocator,
+    ) !@import("../agent/worker_runtime.zig").SteeringPresentationSnapshot {
+        var snapshot: @import("../agent/worker_runtime.zig").SteeringPresentationSnapshot = .{};
+        errdefer snapshot.deinit(alloc);
+        if (self.steering_messages.len == 0) return snapshot;
+        snapshot.messages = try alloc.alloc([]u8, self.steering_messages.len);
+        for (snapshot.messages) |*message| message.* = &.{};
+        for (self.steering_messages, 0..) |message, index| {
+            snapshot.messages[index] = try alloc.dupe(u8, message);
+        }
+        return snapshot;
+    }
 
     pub fn isCancelRequested(self: *const @This()) bool {
         return self.cancel_requested;
@@ -3410,12 +3852,19 @@ const CoordinatorTestApp = struct {
     terminal_client: CoordinatorTestTerminalClient = .{},
     file_completion_values: []const file_index.SearchResult = &.{},
     file_completion_calls: usize = 0,
+    submission: @import("input_submit_runtime.zig").State = .{},
+    pending_frame_commits: usize = 0,
+
+    pub fn notePendingFrameCommitted(self: *CoordinatorTestApp) void {
+        self.pending_frame_commits += 1;
+    }
 
     pub fn slashRegistry(_: *const CoordinatorTestApp) command_specs.SlashRegistry {
         return coordinator_test_slash_registry;
     }
 
     fn deinit(self: *CoordinatorTestApp) void {
+        if (self.submission.pending) |*pending| pending.deinit(self.alloc);
         self.shell.deinit(self.alloc);
         self.input_runtime.deinit(self.alloc);
         self.terminal_input_runtime.deinit(self.alloc);
@@ -4081,7 +4530,7 @@ test "core.app_render_runtime consolidation rebases before publishing followup r
     var ids: [18]u32 = undefined;
     for (&ids, 0..) |*id, index| {
         var line: [48]u8 = undefined;
-        id.* = try app.shell.appendRawTranscriptEntry(alloc, try std.fmt.bufPrint(&line, "CONSOLIDATION_OUTPUT_{d:0>2}\n", .{index}));
+        id.* = try app.shell.appendRawTranscriptEntry(alloc, try std.mem.print(&line, "CONSOLIDATION_OUTPUT_{d:0>2}\n", .{index}));
         _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
     }
     var old_text: std.Io.Writer.Allocating = .init(alloc);
@@ -4122,7 +4571,7 @@ test "core.app_render_runtime consolidation rebases before publishing followup r
     var previous = std.mem.find(u8, text, "CONSOLIDATION_PROMPT").?;
     for (0..18) |index| {
         var label_buffer: [48]u8 = undefined;
-        const label = try std.fmt.bufPrint(&label_buffer, "CONSOLIDATION_OUTPUT_{d:0>2}", .{index});
+        const label = try std.mem.print(&label_buffer, "CONSOLIDATION_OUTPUT_{d:0>2}", .{index});
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, label));
         const at = std.mem.find(u8, text, label).?;
         try std.testing.expect(at > previous);
@@ -4130,7 +4579,7 @@ test "core.app_render_runtime consolidation rebases before publishing followup r
     }
     for (0..84) |index| {
         var label_buffer: [48]u8 = undefined;
-        const label = try std.fmt.bufPrint(&label_buffer, "{s}_TABLE_{d:0>2}", .{ if (index < 24) "OLD" else "FOLLOWUP", if (index < 24) index else index - 24 });
+        const label = try std.mem.print(&label_buffer, "{s}_TABLE_{d:0>2}", .{ if (index < 24) "OLD" else "FOLLOWUP", if (index < 24) index else index - 24 });
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, label));
         const at = std.mem.find(u8, text, label).?;
         try std.testing.expect(at > previous);
@@ -4233,7 +4682,7 @@ fn checkRebasedNoticePublication(cols: u16, rows: u16) !void {
     if (cols == 24) try app.input_runtime.textReplacementState().replace(alloc, "draft one\ndraft two\ndraft three\ndraft four");
     for (0..4) |index| {
         var line: [48]u8 = undefined;
-        _ = try app.shell.appendRawTranscriptEntry(alloc, try std.fmt.bufPrint(&line, "NOTICE_HISTORY_{d:0>2}\n", .{index}));
+        _ = try app.shell.appendRawTranscriptEntry(alloc, try std.mem.print(&line, "NOTICE_HISTORY_{d:0>2}\n", .{index}));
         _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
     }
     _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
@@ -4244,7 +4693,7 @@ fn checkRebasedNoticePublication(cols: u16, rows: u16) !void {
     });
     for (0..6) |index| {
         var line: [48]u8 = undefined;
-        _ = try app.shell.appendRawTranscriptEntry(alloc, try std.fmt.bufPrint(&line, "NOTICE_LATER_{d:0>2}\n", .{index}));
+        _ = try app.shell.appendRawTranscriptEntry(alloc, try std.mem.print(&line, "NOTICE_LATER_{d:0>2}\n", .{index}));
     }
     _ = try flushRebasedPublicationFrame(&app, file, &physical, &history, &offset);
     const held = app.shell.transcriptCommitDiagnostic().history_visual_offset;
@@ -4279,7 +4728,7 @@ fn checkRebasedNoticePublication(cols: u16, rows: u16) !void {
     var previous: usize = 0;
     for (0..10) |index| {
         var label_buffer: [48]u8 = undefined;
-        const label = try std.fmt.bufPrint(&label_buffer, "NOTICE_{s}_{d:0>2}", .{ if (index < 4) "HISTORY" else "LATER", if (index < 4) index else index - 4 });
+        const label = try std.mem.print(&label_buffer, "NOTICE_{s}_{d:0>2}", .{ if (index < 4) "HISTORY" else "LATER", if (index < 4) index else index - 4 });
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, label));
         const at = std.mem.find(u8, text, label).?;
         try std.testing.expect(at >= previous);
@@ -4353,9 +4802,9 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
     try app.selected_model.appendSlice(alloc, "test-model");
     try app.shell.initBacking(alloc);
     try app.shell.enableShadowVt(alloc);
-    const prefix_id = try app.shell.appendRawTranscriptEntryClassified(alloc, ("\x1b[0m" ** 256) ++ ("prefix padding\n" ** 2), .subagent_status);
+    const prefix_id = try app.shell.appendRawTranscriptEntryClassified(alloc, text_utils.repeat("\x1b[0m", 256) ++ text_utils.repeat("prefix padding\n", 2), .subagent_status);
     const text = "1. earlier context\n2. earlier context\n3. earlier context\n4. earlier context\n5. RW_OLD_00\n6. RW_OLD_01\n7. RW_OLD_02\n8. RW_OLD_03\n9. RW_OLD_04\n10. RW_OLD_05\n\n";
-    const assistant_id = try app.shell.streamAssistantChunk(alloc, &app.metrics, if (retry.utf8) text ++ ("界é" ** 48) ++ "\n\nRW_ARTIFACTS\n" else text ++ "RW_ARTIFACTS\n");
+    const assistant_id = try app.shell.streamAssistantChunk(alloc, &app.metrics, if (retry.utf8) text ++ text_utils.repeat("界é", 48) ++ "\n\nRW_ARTIFACTS\n" else text ++ "RW_ARTIFACTS\n");
     const status_id = if (retry.cancel) blk: {
         const id: types.ToolLifecycleId = .{ .turn_id = 41, .call_id = "publication-cancel" };
         _ = try app.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{ .id = id, .reconciles_provisional_call_id = null, .tool_name = "run_command", .activity_kind = .command } });
@@ -4381,7 +4830,7 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
     try physical.snapshot(&initial_screen);
     for (0..6) |index| {
         var label_buffer: [32]u8 = undefined;
-        const label = try std.fmt.bufPrint(&label_buffer, "RW_OLD_{d:0>2}", .{index});
+        const label = try std.mem.print(&label_buffer, "RW_OLD_{d:0>2}", .{index});
         const initial_count = std.mem.count(u8, exported.items, label) + std.mem.count(u8, initial_screen.items, label);
         if (initial_count != 1) std.debug.print("initial {s} {s} count={d}\nexported:\n{s}\nscreen:\n{s}\n", .{ @tagName(case), label, initial_count, exported.items, initial_screen.items });
         try std.testing.expectEqual(@as(usize, 1), initial_count);
@@ -4556,7 +5005,7 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
         @memset(seen, false);
         for (0..retry.drain_frames) |index| {
             var buffer: [32]u8 = undefined;
-            const line = try std.fmt.bufPrint(&buffer, "N{d}\n", .{index});
+            const line = try std.mem.print(&buffer, "N{d}\n", .{index});
             _ = try store.writeRecordedTranscriptClassifiedAtomic(&app.shell, alloc, &app.metrics, line, .unknown_raw);
             app.shell.render_requests.consecutive_input_pending_aborts = render_request.max_consecutive_input_pending_aborts;
             try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
@@ -4567,7 +5016,7 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
             defer alloc.free(visible);
             for (0..index + 1) |prior| {
                 var label_buffer: [32]u8 = undefined;
-                const label = try std.fmt.bufPrint(&label_buffer, "N{d}", .{prior});
+                const label = try std.mem.print(&label_buffer, "N{d}", .{prior});
                 const count = publicationLineCount(visible, label);
                 if (seen[prior] or count > 0) {
                     try std.testing.expectEqual(@as(usize, 1), count);
@@ -4587,7 +5036,7 @@ fn checkRewritePublicationRetry(case: RewritePublicationCase, retry: Publication
     try physical.snapshot(&screen);
     for (0..6) |index| {
         var label_buffer: [32]u8 = undefined;
-        const label = try std.fmt.bufPrint(&label_buffer, "RW_OLD_{d:0>2}", .{index});
+        const label = try std.mem.print(&label_buffer, "RW_OLD_{d:0>2}", .{index});
         const count = std.mem.count(u8, exported.items, label) + std.mem.count(u8, screen.items, label);
         if (count != 1) std.debug.print("rewrite publication {s}: {s} count={d} cut={?d} resize={?d}\nexported:\n{s}\nscreen:\n{s}\n", .{ @tagName(case), label, count, retry.accepted_bytes, retry.resize_cols, exported.items, screen.items });
         try std.testing.expectEqual(@as(usize, 1), count);
@@ -4694,7 +5143,7 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         defer flow.deinit(alloc);
         for (0..case.rows) |i| {
             var buf: [32]u8 = undefined;
-            try flow.appendSlice(alloc, try std.fmt.bufPrint(
+            try flow.appendSlice(alloc, try std.mem.print(
                 &buf,
                 "{s}ORIGIN_ROW_{d:0>3}",
                 .{ if (i == 0) "" else "\n", i },
@@ -4727,7 +5176,7 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         defer physical.deinit();
         if (case.rows > 9) {
             var origin_buf: [32]u8 = undefined;
-            const origin = try std.fmt.bufPrint(&origin_buf, "\x1b[{d};1H", .{case.origin});
+            const origin = try std.mem.print(&origin_buf, "\x1b[{d};1H", .{case.origin});
             try std.testing.expect(std.mem.find(u8, first[0..document_start], origin) != null);
         }
         var first_stats: vt_emulator.FeedStats = .{};
@@ -4748,7 +5197,7 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         defer row.deinit(alloc);
         try physical.rowTextTrimmed(case.post_top, &row);
         var expected_buf: [32]u8 = undefined;
-        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{first_history}), row.items);
+        try std.testing.expectEqualStrings(try std.mem.print(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{first_history}), row.items);
 
         if (history_rows > 64) {
             try std.testing.expectEqual(.recovering, diagnostic.state);
@@ -4762,14 +5211,14 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
             try std.testing.expect(std.mem.find(u8, next, "ORIGIN_ROW_000") == null);
             const suffix_start = std.mem.find(u8, next, "ORIGIN_ROW_") orelse return error.MissingResumeSuffix;
             var receipt_cursor_buf: [32]u8 = undefined;
-            const receipt_cursor = try std.fmt.bufPrint(&receipt_cursor_buf, "\x1b[{d};{d}H", .{ receipt.cursor_row, receipt.cursor_col });
+            const receipt_cursor = try std.mem.print(&receipt_cursor_buf, "\x1b[{d};{d}H", .{ receipt.cursor_row, receipt.cursor_col });
             try std.testing.expect(std.mem.find(u8, next[0..suffix_start], receipt_cursor) != null);
             var next_stats: vt_emulator.FeedStats = .{};
             try physical.feedWithStats(next, &next_stats);
             physical_scroll_rows += next_stats.scroll_rows;
             row.clearRetainingCapacity();
             try physical.rowTextTrimmed(case.post_top, &row);
-            try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{history_rows}), row.items);
+            try std.testing.expectEqualStrings(try std.mem.print(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{history_rows}), row.items);
             try std.testing.expectEqual(@as(u32, 0), app.shell.transcriptCommitDiagnostic().remaining_inline_rows);
         }
         for (0..3) |_| {
@@ -4780,7 +5229,7 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         try std.testing.expectEqual(history_rows, app.shell.transcriptCommitDiagnostic().history_visual_offset);
         try std.testing.expectEqual(history_rows + case.origin - case.post_top, physical_scroll_rows);
         try std.testing.expect(app.shell.pending_resume_source == null);
-        try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, try std.fmt.bufPrint(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{case.rows - 1})));
+        try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, try std.mem.print(&expected_buf, "ORIGIN_ROW_{d:0>3}", .{case.rows - 1})));
 
         const anchor = app.shell.transcript_commit_state.stable;
         read_offset = try file.length(std.testing.io);
@@ -4791,7 +5240,7 @@ test "core.app_render_runtime resume publication preserves the pre-scroll origin
         const appended = try readCoordinatorFrameBytes(alloc, file, &read_offset);
         defer alloc.free(appended);
         var cursor_buf: [32]u8 = undefined;
-        const append_cursor = try std.fmt.bufPrint(&cursor_buf, "\x1b[{d};{d}H", .{ anchor.cursor_row, anchor.cursor_col });
+        const append_cursor = try std.mem.print(&cursor_buf, "\x1b[{d};{d}H", .{ anchor.cursor_row, anchor.cursor_col });
         if (history_rows > 0) {
             const suffix_start = std.mem.find(u8, appended, "AFTER_RESUME") orelse return error.MissingAppend;
             try std.testing.expect(std.mem.find(u8, appended[0..suffix_start], append_cursor) != null);
@@ -5958,7 +6407,7 @@ test "core.app_render_runtime lifecycle rewrite recovers normal buffer after fil
     try app.shell.writeTranscript(
         alloc,
         &app.metrics,
-        "retained assistant history\n" ** 64,
+        text_utils.repeat("retained assistant history\n", 64),
         true,
     );
     app.shell.render_requests.request(.first_frame);
@@ -6062,7 +6511,7 @@ test "core.app_render_runtime full transcript defers repaint until its page is r
     try app.shell.writeTranscript(
         alloc,
         &app.metrics,
-        ("historical transcript row\n" ** 512) ++ "FULL_ASYNC_SENTINEL\n",
+        text_utils.repeat("historical transcript row\n", 512) ++ "FULL_ASYNC_SENTINEL\n",
         true,
     );
     app.shell.render_requests.request(.first_frame);
@@ -6126,7 +6575,7 @@ test "core.app_render_runtime full transcript resize defers history reset until 
     try app.shell.writeTranscript(
         alloc,
         &app.metrics,
-        "old primary history\n" ** 256,
+        text_utils.repeat("old primary history\n", 256),
         true,
     );
     app.shell.render_requests.request(.first_frame);

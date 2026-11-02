@@ -5,7 +5,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
   statSync,
@@ -28,6 +27,7 @@ import {
 } from "./tmux-helpers";
 import { findActiveFileApprovalBlock } from "./tui-render-assertions";
 import { stdoutFrames } from "./render-lab/tape";
+import { onlySessionId, savedText } from "./saved-sessions";
 
 const TIMEOUT = 30_000;
 const MAXIMUM_WRITE_TIMEOUT = 120_000;
@@ -188,12 +188,7 @@ function expectAtomicApprovalExit(tapePath: string, frameStart: number) {
 }
 
 function sessionIdFromHome(root: IsolatedRoot): string {
-  const sessionsRoot = join(root.home, ".fx", "sessions");
-  const sessionIds = readdirSync(sessionsRoot, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && entry.name !== "latest")
-    .map((entry) => entry.name);
-  expect(sessionIds).toHaveLength(1);
-  return sessionIds[0]!;
+  return onlySessionId(root.home);
 }
 
 type ApprovalIntent = "apply" | "reveal";
@@ -934,10 +929,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       activeSession = null;
 
       const sessionId = sessionIdFromHome(root);
-      const events = readFileSync(
-        join(root.home, ".fx", "sessions", sessionId, "events.jsonl"),
-        "utf8",
-      );
+      const events = savedText(root.home, sessionId);
       expect(events).toContain('"permission_feedback"');
       expect(events).toContain(feedback);
 
@@ -946,7 +938,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         [
           "ask",
           "--auto",
-          "--resume-id",
+          "--resume",
           sessionId,
           "Continue the amended review session.",
         ],
@@ -1168,7 +1160,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
         },
         {
           name: "cancelled",
-          outcome: "■ Cancelled",
+          outcome: "▪ Cancelled",
           resolve: async (session: TmuxSession) => {
             await session.sendKeys("Escape");
           },
@@ -1377,6 +1369,68 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
 
   test(
+    "diff counts are monochrome until a theme is explicitly selected",
+    async () => {
+      for (const selection of ["default", "pinned", "named"] as const) {
+        const root = createIsolatedRoot();
+        const target = join(root.workspace, "marker.txt");
+        writeFileSync(target, "before\n");
+        if (selection === "named") {
+          mkdirSync(join(root.home, ".fx", "themes"), { recursive: true });
+          writeFileSync(join(root.home, ".fx", "themes", "marker-dark.json"), JSON.stringify({
+            name: "Marker Dark",
+            type: "dark",
+            colors: { diff_added_marker: "#30A46C", diff_removed_marker: "#E5484D" },
+          }));
+          writeFileSync(join(root.home, ".fx", "settings.json"), JSON.stringify({
+            sandbox: "none",
+            permission_mode: "ask",
+            permission: {},
+            theme: "marker-dark",
+          }));
+        }
+        const gateway = startFakeGateway([
+          toolCall(`${selection}_marker`, "edit_file", {
+            path: "marker.txt",
+            old_string: "before\n",
+            new_string: "after\n",
+          }),
+          finalText(`${selection} marker complete`),
+        ]);
+        const { session, stderrPath } = await launch(root, gateway, {}, {
+          FX_THEME: selection === "pinned" ? "dark" : undefined,
+          NO_COLOR: undefined,
+          COLORTERM: undefined,
+          TERM_PROGRAM: "Apple_Terminal",
+          COLORFGBG: "15;0",
+        });
+
+        await session.sendText("Edit the marker fixture.");
+        await waitForFileApproval(session, { required: ["marker.txt", "after"] });
+        await decide(session, 1);
+        await session.waitForText(`${selection} marker complete`, TIMEOUT);
+        expect(readFileSync(target, "utf8")).toBe("after\n");
+        const scrollback = await session.captureFullScrollbackEscapes();
+        const row = scrollback.split("\n").find((line) =>
+          line.includes("Edited marker.txt") && line.includes("+1") && line.includes("-1")
+        );
+        expect(row).toBeDefined();
+        if (selection === "default") {
+          expect(row).not.toContain("\x1b[38;5;71m");
+          expect(row).not.toContain("\x1b[38;5;167m");
+        } else {
+          expect(row).toContain("\x1b[38;5;71m+1");
+          expect(row).toContain("\x1b[38;5;167m-1");
+        }
+        expectCleanStderr(stderrPath);
+        await session.kill();
+        activeSession = null;
+      }
+    },
+    90_000,
+  );
+
+  test(
     "file session grant reuses the canonical target without a second prompt",
     async () => {
       const root = createIsolatedRoot();
@@ -1490,26 +1544,31 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
 
       await session.sendKeys("C-o");
       await session.waitForText("full detail · ctrl+o close", TIMEOUT);
-      for (let page = 0; page < 20; page += 1) {
+      // Page to the tail of the second diff; the page count varies with
+      // session and network record height at the top of the transcript.
+      let fullSecond = await session.capturePane();
+      for (let page = 0; page < 24 && !fullSecond.includes("CTRL_O_SECOND_060"); page += 1) {
         await session.sendHexBytes(["1b", "5b", "36", "7e"]);
+        await Bun.sleep(50);
+        fullSecond = await session.capturePane();
       }
-      await session.waitForText("CTRL_O_SECOND_060", TIMEOUT);
-      const fullSecond = await session.capturePane();
       expect(fullSecond).toContain("CTRL_O_SECOND_060");
       expect(fullSecond).not.toContain("omitted");
       expect(fullSecond).not.toContain('"content":"CTRL_O_SECOND');
-
-      for (let page = 0; page < 2; page += 1) {
+      let fullFirst = await session.capturePane();
+      for (let page = 0; page < 20 && !fullFirst.includes("CTRL_O_FIRST_120"); page += 1) {
         await session.sendHexBytes(["1b", "5b", "35", "7e"]);
+        await Bun.sleep(50);
+        fullFirst = await session.capturePane();
       }
-      await session.waitForText("CTRL_O_FIRST_120", TIMEOUT);
-      const fullFirst = await session.capturePane();
       expect(fullFirst).toContain("CTRL_O_FIRST_120");
       expect(fullFirst).not.toContain("omitted");
       expect(fullFirst).not.toContain('"content":"CTRL_O_FIRST');
-
-      for (let page = 0; page < 20; page += 1) {
+      let fullHead = await session.capturePane();
+      for (let page = 0; page < 20 && !fullHead.includes("CTRL_O_FIRST_001"); page += 1) {
         await session.sendHexBytes(["1b", "5b", "35", "7e"]);
+        await Bun.sleep(50);
+        fullHead = await session.capturePane();
       }
       await session.waitForText("CTRL_O_FIRST_001", TIMEOUT);
 
@@ -1655,7 +1714,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       const scrollback = await session.captureFullScrollback();
 
       expect(scrollback).toContain(
-        "Permission target resolution failed for grep_files: FileNotFound",
+        "Path not found: missing-map/behavior-index",
       );
       expect(scrollback).not.toContain("preflight failed");
       expect(settled).not.toContain(APPLY_QUESTION);
@@ -1864,8 +1923,8 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(settled).not.toContain(APPLY_QUESTION);
       expect(existsSync(target)).toBe(false);
       expect(gateway.requests).toHaveLength(3);
-      expect(gateway.requests[1]!.body).toContain("Tool write_file (failure)");
-      expect(gateway.requests[2]!.body).toContain("context_handoff");
+      expect(gateway.requests[1]!.body).toContain("[Tool result T1: write_file]");
+      expect(gateway.requests[2]!.body).toContain("compacted_conversation");
       expectCleanStderr(stderrPath);
     },
     90_000,

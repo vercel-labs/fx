@@ -5,7 +5,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -14,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { findFooterBlocks, readTrace } from "./tui-render-assertions";
+import { savedSessionIds, sessionDir, storeRoot } from "./saved-sessions";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -26,6 +26,8 @@ import {
 } from "./tmux-helpers";
 
 const SKIP = !tmuxAvailable();
+// The persistence fault comes from a library the loader preloads into fx.
+const PRELOADS_LIBRARIES = loadsPreloadedLibraries(FX_BIN);
 const TIMEOUT = 30_000;
 const TRACE_SCOPES = "agent,worker,gateway,history,interrupt,prompt";
 const PARTIAL_CHUNKS = [
@@ -50,6 +52,22 @@ let session: TmuxSession | null = null;
 let gateway: GatewayHandle | null = null;
 let root: string | null = null;
 
+// A static Linux binary has no ELF interpreter, so nothing acts on
+// LD_PRELOAD. macOS binaries always load through dyld.
+function loadsPreloadedLibraries(binary: string): boolean {
+  if (process.platform !== "linux" || !existsSync(binary)) return true;
+  const elf = readFileSync(binary);
+  const PT_INTERP = 3;
+  if (elf.readUInt32BE(0) !== 0x7f454c46 || elf[4] !== 2 || elf[5] !== 1) return true;
+  const offset = Number(elf.readBigUInt64LE(0x20));
+  const size = elf.readUInt16LE(0x36);
+  const count = elf.readUInt16LE(0x38);
+  for (let i = 0; i < count; i++) {
+    if (elf.readUInt32LE(offset + i * size) === PT_INTERP) return true;
+  }
+  return false;
+}
+
 afterEach(async () => {
   if (session) {
     await session.kill();
@@ -64,7 +82,7 @@ afterEach(async () => {
 });
 
 describe.skipIf(SKIP)("tui: interrupt recovery", () => {
-  for (const inject of [false, true]) test(`quit reports final history persistence failure with fault=${inject}`, async () => {
+  for (const inject of [false, true]) test.skipIf(inject && !PRELOADS_LIBRARIES)(`quit reports final history persistence failure with fault=${inject}`, async () => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "fx-shutdown-save-")));
     const home = join(root, "home"), workspace = join(root, "workspace");
     mkdirSync(home); mkdirSync(workspace);
@@ -82,14 +100,14 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       fakeGatewayFinalText("SHUTDOWN_RESUMED_281"),
     ]);
     const env = { HOME: home, AI_GATEWAY_API_KEY: "fake-shutdown-save", VERCEL_OIDC_TOKEN: undefined,
-      FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0",
+      FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0",
       FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-      FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models` };
+      FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models` };
     try {
       const seeded = await runFx(["ask", "--json", "Save the first fact."], { cwd: workspace, env, timeoutMs: TIMEOUT });
       expect(seeded.code).toBe(0); expect(seeded.stderr).toBe("");
       const id = JSON.parse(seeded.stdout).session_id;
-      const eventPath = join(home, ".fx", "sessions", id, "events.jsonl");
+      const eventPath = join(sessionDir(home, id), "log.jsonl");
       const saved = readFileSync(eventPath);
       const stderrPath = join(root, "stderr.log"), tracePath = join(root, "trace.log");
       const arm = join(root, "armed"), receipt = join(root, "injected.txt");
@@ -113,10 +131,10 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         expect(readFileSync(receipt, "utf8")).toContain(`target=${eventPath}`);
         expect(readFileSync(tracePath, "utf8")).toContain("shutdown finished prompt persistence failed");
         expect(session.paneStatus().status).toBe(1);
-        expect(output + stderr).toMatch(/save.*fail|fail.*sav|could not.*sav|unable to.*sav/i);
+        expect(output + stderr).toMatch(/save.*fail|fail.*sav|could not.*sav|couldn.t.*sav|unable to.*sav/i);
       } else { expect(session.paneStatus().status).toBe(0); expect(stderr).toBe(""); }
       expect(readFileSync(eventPath).subarray(0, saved.length).equals(saved)).toBe(true);
-      const resumed = await runFx(["ask", "--json", "--resume-id", id, "Continue without repeating work."], {
+      const resumed = await runFx(["ask", "--json", "--resume", id, "Continue without repeating work."], {
         cwd: workspace, env, timeoutMs: TIMEOUT });
       expect(resumed.code).toBe(0); expect(resumed.stderr).toBe("");
       expect(JSON.parse(resumed.stdout).session_id).toBe(id);
@@ -153,7 +171,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: `${TRACE_SCOPES},input`,
           FX_TRACE_LOG: tracePath,
@@ -232,7 +250,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: `${TRACE_SCOPES},input`,
           FX_TRACE_LOG: tracePath,
@@ -322,7 +340,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: TRACE_SCOPES,
           FX_TRACE_LOG: tracePath,
@@ -369,17 +387,16 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(session.isAlive()).toBe(true);
       expect(session.isPaneAlive()).toBe(true);
 
-      const sessionRoot = join(home, ".fx", "sessions");
       let eventsPath: string | undefined;
       await waitForCondition(() => {
-        eventsPath = readdirSync(sessionRoot, { withFileTypes: true })
-          .filter((entry) => entry.isDirectory())
-          .map((entry) => join(sessionRoot, entry.name, "events.jsonl"))
+        if (!existsSync(storeRoot(home))) return false;
+        eventsPath = savedSessionIds(home)
+          .map((id) => join(sessionDir(home, id), "log.jsonl"))
           .find((path) => existsSync(path) && readFileSync(path, "utf8").includes(steeringText));
         return eventsPath !== undefined;
       }, "steering history persistence");
       const events = readFileSync(eventsPath!, "utf8");
-      expect(events).not.toContain('"kind":"interrupted"');
+      expect(events).not.toContain('"kind":"turn_interrupted"');
       expect(events).toContain(steeringText);
       const scrollback = await session.captureFullScrollback();
       expect(countOccurrences(scrollback, steeringText)).toBe(1);
@@ -428,7 +445,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
           FX_PERMISSION_MODE: "yolo",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: TRACE_SCOPES,
           FX_TRACE_LOG: tracePath,
@@ -512,8 +529,8 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_TRACE_SCOPES: TRACE_SCOPES,
           FX_TRACE_LOG: tracePath,
         },
@@ -533,7 +550,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       await session.waitForText("What can fx do differently?", TIMEOUT);
       const cancelledGrid = await session.capturePaneGrid();
       const footer = findFooterBlocks(cancelledGrid).at(-1);
-      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("■ Cancelled"));
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
       expect(footer).toBeDefined();
       expect(cancelledRow).toBeGreaterThanOrEqual(0);
       expect(cancelledRow).toBeLessThan(footer!.topDivider);
@@ -613,27 +630,17 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       expect(finalScrollback).not.toContain("HTTP 400");
 
-      const sessionRoot = join(home, ".fx", "sessions");
-      const sessionIds = readdirSync(sessionRoot, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => entry.name)
-        .filter((id) => {
-          const path = join(sessionRoot, id, "events.jsonl");
-          return existsSync(path) && readFileSync(path, "utf8").includes(
-            "Stream a response that I will interrupt.",
-          );
-        });
-      expect(sessionIds).toHaveLength(1);
-      const events = readFileSync(
-        join(sessionRoot, sessionIds[0]!, "events.jsonl"),
-        "utf8",
+      const sessionIds = savedSessionIds(home).filter((id) =>
+        readFileSync(join(sessionDir(home, id), "log.jsonl"), "utf8").includes("Stream a response that I will interrupt.")
       );
+      expect(sessionIds).toHaveLength(1);
+      const events = readFileSync(join(sessionDir(home, sessionIds[0]!), "log.jsonl"), "utf8");
       const interruptedEvents = events
         .trim()
         .split("\n")
         .filter(Boolean)
-        .map((line) => JSON.parse(line) as { event: Record<string, unknown> })
-        .filter((record) => record.event.interrupted !== undefined);
+        .map((line) => JSON.parse(line))
+        .filter((line) => line.kind === "turn_interrupted");
       expect(interruptedEvents).toHaveLength(1);
       for (const chunk of PARTIAL_CHUNKS) {
         expect(events).toContain(chunk.trim());
@@ -700,7 +707,7 @@ while :; do sleep 1; done
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: `${TRACE_SCOPES},core`,
           FX_TRACE_LOG: tracePath,
@@ -736,7 +743,7 @@ while :; do sleep 1; done
         TIMEOUT,
       );
       expect(Date.now() - cancelStartedAt).toBeLessThan(500);
-      expect(immediateCancellation).toContain("■ Cancelled");
+      expect(immediateCancellation).toContain("▪ Cancelled");
       expect(immediateCancellation).not.toContain("system: cancelled");
       expect(immediateCancellation).not.toContain("Cancelling");
       await waitForTrace(
@@ -785,6 +792,77 @@ while :; do sleep 1; done
   );
 
   test(
+    "double Ctrl-C during a running command exits cleanly and kills the command",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-exit-running-command-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      const workspaceRoot = realpathSync(workspace);
+      const pidPath = join(workspaceRoot, "held-command.pid");
+      const scriptPath = join(workspaceRoot, "hold-exit.sh");
+      // Ignoring TERM keeps a cooperative stop inside its grace window, so
+      // exit has to force-kill the command rather than wait it out.
+      writeFileSync(
+        scriptPath,
+        `#!/bin/sh
+trap '' TERM
+echo $$ > held-command.pid
+while :; do sleep 1; done
+`,
+      );
+      chmodSync(scriptPath, 0o755);
+
+      gateway = startFakeGateway([
+        fakeShellRun("exit-hold", "./hold-exit.sh", { timeout_ms: 600_000 }),
+      ]);
+      session = await TmuxSession.create({
+        cwd: workspaceRoot,
+        stderrPath,
+        isolated: true,
+        remainOnExit: true,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-exit-running-command-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_PERMISSION_MODE: "full-access",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_TRACE_SCOPES: `${TRACE_SCOPES},core,shutdown`,
+          FX_TRACE_LOG: tracePath,
+        },
+      });
+      await session.waitForComposer(TIMEOUT);
+
+      await session.sendText("Run the held exit command.");
+      await waitForCondition(
+        () => existsSync(pidPath) && readFileSync(pidPath, "utf8").trim().length > 0,
+        "held command start",
+      );
+      const commandPid = Number.parseInt(readFileSync(pidPath, "utf8").trim(), 10);
+
+      // One burst, so exit lands while the first press is still cancelling
+      // the command and both paths join the same command thread.
+      session.sendKeysImmediate(["C-c", "C-c"]);
+      await session.waitForPane(() => session!.paneStatus().dead, TIMEOUT);
+
+      expect(session.paneStatus().status).toBe(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(readTrace(tracePath)).toContain("stage name=complete");
+      await waitForCondition(() => !processExists(commandPid), "held command termination");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "late successful tool settlement stays truthful after Escape",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-late-tool-success-")));
@@ -793,16 +871,14 @@ while :; do sleep 1; done
       const corpus = join(workspace, "corpus");
       const stderrPath = join(root, "stderr.log");
       const tracePath = join(root, "trace.log");
+      const releasePath = join(root, "grep-release");
       const pattern = "LATE_SUCCESS_NEEDLE";
       const callId = "late_success_grep";
       mkdirSync(join(home, ".fx"), { recursive: true });
       mkdirSync(corpus, { recursive: true });
       writeFileSync(join(home, ".fx", "settings.json"), "{}");
-      for (let index = 0; index < 30_000; index += 1) {
-        writeFileSync(
-          join(corpus, `candidate-${String(index).padStart(5, "0")}.txt`),
-          "ordinary corpus text\n",
-        );
+      for (let index = 0; index < 3; index += 1) {
+        writeFileSync(join(corpus, `candidate-${index}.txt`), "ordinary corpus text\n");
       }
 
       gateway = startFakeGateway([
@@ -824,10 +900,13 @@ while :; do sleep 1; done
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: `${TRACE_SCOPES},tool,ui_activity`,
           FX_TRACE_LOG: tracePath,
+          // The search holds its result until this file exists, so it is
+          // still running when the turn is cancelled.
+          FX_TEST_GREP_RELEASE: releasePath,
         },
       });
       await session.waitForComposer(TIMEOUT);
@@ -845,17 +924,25 @@ while :; do sleep 1; done
       await session.sendKeys("Escape");
       await session.waitForText("What can fx do differently?", TIMEOUT);
       expect(Date.now() - cancelStartedAt).toBeLessThan(500);
+      expect(readTrace(tracePath)).not.toContain(
+        `event=after_tool_execution call_id=${callId}`,
+      );
+      writeFileSync(releasePath, "");
       await waitForTrace(tracePath, `event=after_tool_execution`, TIMEOUT);
       await waitForTrace(tracePath, "finish processing queued=0", TIMEOUT);
 
       const trace = readTrace(tracePath);
-      const completedTool = trace.split("\n").find((line) =>
+      const traceLines = trace.split("\n");
+      const completedToolIndex = traceLines.findIndex((line) =>
         line.includes("event=after_tool_execution") &&
         line.includes(`call_id=${callId}`) &&
         line.includes("name=grep_files") &&
         line.includes("result_kind=model_output")
       );
-      expect(completedTool).toBeDefined();
+      expect(completedToolIndex).toBeGreaterThanOrEqual(0);
+      const cancelIndex = traceLines.findIndex((line) => line.includes("event=cancel_requested"));
+      expect(cancelIndex).toBeGreaterThanOrEqual(0);
+      expect(cancelIndex).toBeLessThan(completedToolIndex);
       await session.waitForText(`Searched ${pattern}`, TIMEOUT);
       const scrollback = await session.captureFullScrollback();
       expect(scrollback).toContain(`Searched ${pattern}`);
@@ -868,6 +955,68 @@ while :; do sleep 1; done
     },
     TIMEOUT * 2,
   );
+
+  test(
+    "follow-up sent while a cancellation finalizes is never rejected",
+    async () => {
+      root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cancel-send-window-")));
+      const home = join(root, "home");
+      const workspace = join(root, "workspace");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      mkdirSync(join(home, ".fx"), { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(join(home, ".fx", "settings.json"), "{}");
+
+      const held: HoldState = {
+        started: false,
+        cancelled: false,
+        cancelCount: 0,
+        released: false,
+      };
+      gateway = startFakeGateway([
+        () => heldPartialResponse(held),
+        fakeGatewayFinalText("SEND_AFTER_CANCEL_ACCEPTED"),
+      ]);
+      session = await TmuxSession.create({
+        cwd: realpathSync(workspace),
+        stderrPath,
+        width: 120,
+        height: 40,
+        env: {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "fake-cancel-send-window-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_AUTO_UPGRADE: "0",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_TRACE_SCOPES: TRACE_SCOPES,
+          FX_TRACE_LOG: tracePath,
+        },
+      });
+      await session.waitForComposer(TIMEOUT);
+
+      await session.sendText("Start the first response.");
+      await waitForCondition(() => held.started, "first response start");
+      await session.sendKeys("C-c");
+      await waitForCondition(() => held.cancelled, "first response cancellation");
+      // Race the finalization window on purpose: the follow-up must be
+      // accepted even if the interrupted turn has not finished closing.
+      await session.sendText("Send this right after the cancel.");
+      await session.waitForText("SEND_AFTER_CANCEL_ACCEPTED", TIMEOUT);
+
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).not.toContain("InvalidRecoveryCheckpoint");
+      expect(scrollback).not.toContain("request failed");
+      expect(gateway.requests).toHaveLength(2);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(session.isPaneAlive()).toBe(true);
+    },
+    TIMEOUT * 2,
+  );
+
 });
 
 function heldPartialResponse(state: HoldState): Response {
@@ -978,4 +1127,13 @@ async function waitForCondition(
 
 function countOccurrences(text: string, needle: string): number {
   return text.split(needle).length - 1;
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }

@@ -36,6 +36,7 @@ passing, so any conformance change requires an intentional baseline update.
 
 `client.ts` uses the runner's scenario/context variables to select the fake
 Gateway tool calls and requested protocol. It opts into the newer discovery
-lifecycle for the `2026-07-28` suite; the legacy scenarios use MCP v1. It then
-launches `./zig-out/bin/fx` without implementing MCP messages or transport
-behavior.
+lifecycle for the `2026-07-28` suite. For the `2025-11-25` scenarios it puts a
+proxy in front of the test server that answers fx's `server/discover` probe with
+404, as a 2025 server does, so fx falls back to `initialize`. It then launches
+`./zig-out/bin/fx` without implementing MCP messages or transport behavior.

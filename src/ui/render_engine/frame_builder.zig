@@ -791,10 +791,10 @@ test "buildAndFlushFrame neutral presentation keeps repaint controls without sty
     });
 
     try std.testing.expect(result.is_committed());
-    try std.testing.expect(std.mem.indexOf(u8, sink.bytes.items, "\x1b[?2026h") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sink.bytes.items, "\x1b[") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sink.bytes.items, "\x1b[31m") == null);
-    try std.testing.expect(std.mem.indexOf(u8, sink.bytes.items, "\x1b]8;") == null);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "\x1b[?2026h") != null);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "\x1b[") != null);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "\x1b[31m") == null);
+    try std.testing.expect(std.mem.find(u8, sink.bytes.items, "\x1b]8;") == null);
     try std.testing.expectEqual(@as(u21, 'B'), shell.shadow.cellAt(2, 1).?.codepoint);
     try std.testing.expect(shell.shadow.cellAt(2, 1).?.style.eql(.{}));
 }

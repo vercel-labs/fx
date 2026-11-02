@@ -16,6 +16,7 @@ const secret = @import("../core/auth/secret.zig");
 const types = @import("../core/shared/types.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const sse = @import("sse.zig");
 const Allocator = std.mem.Allocator;
 
 /// Every callback borrows the immutable definition from the owning profile runtime.
@@ -23,10 +24,17 @@ pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
     const context: *anyopaque = @ptrCast(@constCast(definition));
     return .{
         .agent_stream = .{ .context = context, .stream_fn = stream, .build_request_fn = build, .project_replay_fn = project_replay },
-        .model_catalog = .{ .context = context, .fetch_fn = fetch_catalog, .lookup_capabilities_fn = lookup_capabilities, .provider_id = bound_identity(definition) },
+        .model_catalog = model_catalog_provider(definition),
         .cli_model_catalog = .{ .context = context, .fetch_fn = fetch_cli_catalog },
         .permission_reviewer = .{ .context = context, .review_fn = review },
     };
+}
+
+/// The models the definition declares; there is no network request. Borrows
+/// the definition, which must outlive the provider.
+pub fn model_catalog_provider(definition: *const definitions.Definition) catalog.Provider {
+    const context: *anyopaque = @ptrCast(@constCast(definition));
+    return .{ .context = context, .fetch_fn = fetch_catalog, .lookup_capabilities_fn = lookup_capabilities, .provider_id = bound_identity(definition) };
 }
 
 fn definition_at(raw: ?*anyopaque) *const definitions.Definition {
@@ -40,7 +48,12 @@ fn bound_identity(definition: *const definitions.Definition) model_provider.Prov
 }
 
 fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8 {
-    const definition = definition_at(raw);
+    return build_for(definition_at(raw), alloc, request);
+}
+
+/// The request body for `definition`, omitting replay parts recorded for
+/// another endpoint. Caller owns the result.
+pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, request: streams.RequestData) ![]u8 {
     const identity = bound_identity(definition);
     for (request.messages) |message| if (message.provider_replay) |replay| {
         if (!replay.matches(.{ .provider = identity, .model = request.model })) {
@@ -51,7 +64,7 @@ fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) ![]u8
     return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .provider = &identity });
 }
 
-fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
+pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
     const selected = try codec.project_replay(alloc, replay, calls, text, reasoning);
     if (replay != null and selected == null) debug_trace.logf("gateway", "provider_replay_omitted reason={s}", .{if (reasoning) "associated_calls_removed" else "reasoning_removed"});
     return selected;
@@ -129,7 +142,7 @@ fn phase_deadline(milliseconds: i64, caller: ?std.Io.Clock.Timestamp) std.Io.Clo
 fn post(alloc: Allocator, definition: *const definitions.Definition, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8) !streams.Result {
     const url = try definition.chat_url(alloc);
     defer alloc.free(url);
-    const authorization = if (token) |value| try std.fmt.allocPrint(alloc, "Bearer {s}", .{value}) else null;
+    const authorization = if (token) |value| try alloc.print("Bearer {s}", .{value}) else null;
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
     var client: std.http.Client = .{ .allocator = alloc, .io = io.getIo() };
     defer client.deinit();
@@ -145,10 +158,14 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     var opened = try client_mod.openBoundedPost(alloc, request.cancel_flag, phase_deadline(30_000, request.deadline), &operation);
     defer opened.deinit(alloc);
     const http = &opened.request.?;
-    var watch: client_mod.CancelWatch = .{};
+    var watch: client_mod.ConnectionWatch = .init(.{
+        .timeout_ms = 120_000,
+        .stall_timeout_ms = client_mod.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
+    });
     defer watch.stop();
-    const head_deadline = phase_deadline(120_000, request.deadline);
-    if (http.connection) |connection| try watch.start(request.cancel_flag, head_deadline, connection.stream_writer.stream);
+    if (http.connection) |connection| try watch.start(request.cancel_flag, request.deadline, connection.stream_writer.stream);
+    // The 120 s head wait also bounds sending the request.
+    if (watch.armHead()) |err| return err;
     http.transfer_encoding = .{ .content_length = payload.len };
     var buffer: [8192]u8 = undefined;
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
@@ -157,12 +174,14 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
     try body.writer.writeAll(payload);
     try body.end();
     if (http.connection) |connection| try connection.flush();
-    var response = http.receiveHead(&.{}) catch |err| {
-        if (expired(head_deadline)) return error.Timeout;
-        return err;
-    };
-    watch.stop();
-    if (http.connection) |connection| try watch.start(request.cancel_flag, if (response.head.status == .ok) request.deadline else phase_deadline(30_000, request.deadline), connection.stream_writer.stream);
+    var response = http.receiveHead(&.{}) catch |err| return watch.failure(err);
+    if (watch.commitHead()) |err| return err;
+    if (response.head.status != .ok) {
+        // An error body is read under its own 30 s bound.
+        watch.stop();
+        watch = .init(.{ .patient = true, .stall_timeout_ms = std.math.maxInt(i64) });
+        if (http.connection) |connection| try watch.start(request.cancel_flag, phase_deadline(30_000, request.deadline), connection.stream_writer.stream);
+    }
     var retry_after: ?u64 = null;
     var headers = response.head.iterateHeaders();
     while (headers.next()) |header| if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
@@ -183,30 +202,35 @@ fn post(alloc: Allocator, definition: *const definitions.Definition, request: st
             detail = redacted;
         }
 
-        return .{ .failed = .{ .kind = switch (response.head.status) {
-            .bad_request => .invalid_request,
-            .unauthorized => .unauthorized,
-            .forbidden => .forbidden,
-            .payload_too_large => .request_too_large,
-            .too_many_requests => .rate_limited,
-            .internal_server_error => .server_error,
-            .bad_gateway => .bad_gateway,
-            .service_unavailable => .unavailable,
-            .gateway_timeout => .gateway_timeout,
-            else => .provider_error,
-        }, .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
+        return .{ .failed = .{ .kind = client_mod.httpFailureKind(alloc, .fromHttpStatus(response.head.status), detail), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
+    var result = consume(alloc, reader, request, watch.progress()) catch |err| return watch.failure(err);
+    if (watch.finish()) |err| {
+        result.deinit(alloc);
+        return err;
+    }
+    return result;
+}
+
+/// Parses a successful streamed reply from `reader`, telling `progress` about
+/// each event when it is set.
+pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress) !streams.Result {
     var limits: codec.Limits = .{};
     if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
-    return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag);
+    return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress);
 }
 
 /// The returned entry borrows its strings; fetch_catalog replaces them with owned copies.
 fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry {
+    const vision = metadata.supports_vision orelse false;
     return .{
         .id = @constCast(metadata.id),
         .model_type = @constCast("language"),
         .has_tool_use = metadata.supports_tool_use orelse false,
+        // Chat completions sends images as inline base64 content parts, so
+        // vision support implies file input through the same path.
+        .has_vision = vision,
+        .has_file_input = vision,
         .context_window = metadata.context_window orelse 0,
         .max_tokens = metadata.max_output_tokens orelse 0,
     };
@@ -245,8 +269,12 @@ test "configured capability lookup matches catalog projection and preserves unkn
     for (fetched.catalog.items) |entry| {
         const actual = provider.lookupCapabilities(entry.id).?;
         try std.testing.expectEqualDeep(model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(entry)), actual);
-        try std.testing.expectEqual(model_capabilities.ImageInputSupport.non_native, actual.image_input_support);
-        try std.testing.expect(!actual.supports_vision);
+        const declared_vision = std.mem.eql(u8, entry.id, "small");
+        try std.testing.expectEqual(declared_vision, actual.supports_vision);
+        try std.testing.expectEqual(
+            if (declared_vision) model_capabilities.ImageInputSupport.native else model_capabilities.ImageInputSupport.non_native,
+            actual.image_input_support,
+        );
     }
     try std.testing.expectEqual(@as(?u32, 512), provider.lookupCapabilities("small").?.max_output_tokens);
     try std.testing.expectEqual(@as(?u32, 1024), provider.lookupCapabilities("large").?.max_output_tokens);
@@ -309,7 +337,7 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
         .attempt_evidence = &evidence,
         .events = .{ .context = &event_context, .emit_fn = ignore_event },
         .cancel_flag = cancel,
-    }, state.input.usage, state.input.usage_allocator) catch |err| switch (err) {
+    }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Cancelled => return .cancelled,
         error.Timeout => return .timed_out,
@@ -317,7 +345,10 @@ fn send_review(raw: *anyopaque, alloc: Allocator, model: []const u8, payload: []
         else => return .permanent_failure,
     };
     errdefer result.deinit(alloc);
-    if (result == .failed) {
+    // A review the output limit cut off holds no decision, and the same
+    // review would be cut off again, so it stays unavailable.
+    const cut_off = result == .completed and result.completed.completion.finish_reason == .length;
+    if (result == .failed or cut_off) {
         result.deinit(alloc);
         return .permanent_failure;
     }

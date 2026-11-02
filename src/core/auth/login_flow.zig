@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const credentials = @import("credentials.zig");
 const chatgpt_session = @import("chatgpt_session.zig");
@@ -19,6 +20,9 @@ else
 
 const Allocator = std.mem.Allocator;
 const teams_endpoint = "https://api.vercel.com/v2/teams";
+/// A team list returns full team objects, so it can far exceed the OAuth
+/// transport's default response limit.
+const teams_response_max_bytes: usize = 4 * 1024 * 1024;
 const poll_wait_slice_ms: u64 = 100;
 pub const poll_request_timeout_ms: i64 = 15_000;
 const max_poll_interval_ms = std.math.maxInt(u64) / std.time.ns_per_ms;
@@ -190,6 +194,8 @@ pub const SignInState = enum {
 
 pub const SignInSnapshot = struct {
     state: SignInState = .idle,
+    /// The flow is polling but its device code is still being requested.
+    preparing: bool = false,
     verification_uri: []const u8 = "",
     verification_uri_complete: ?[]const u8 = null,
     user_code: []const u8 = "",
@@ -239,9 +245,61 @@ pub const PreparedLogin = struct {
     }
 };
 
+pub const BrowserPreparedOptions = struct {
+    issuer: []const u8,
+    authorization_endpoint_suffix: []const u8,
+    /// Ownership transfers to the returned login on success.
+    token_endpoint: []u8,
+    /// Ownership transfers to the returned login on success.
+    verification_uri: []u8,
+    client_id: []const u8,
+    expires_in: i64,
+};
+
+/// Builds the device-shaped storage used by browser OAuth flows. On failure,
+/// caller-owned option fields remain owned by the caller.
+pub fn prepareBrowserLogin(
+    alloc: Allocator,
+    options: BrowserPreparedOptions,
+) !PreparedLogin {
+    const issuer = try alloc.dupe(u8, options.issuer);
+    errdefer alloc.free(issuer);
+    const authorization_endpoint = try alloc.print(
+        "{s}{s}",
+        .{
+            std.mem.trimEnd(u8, options.issuer, "/"),
+            options.authorization_endpoint_suffix,
+        },
+    );
+    errdefer alloc.free(authorization_endpoint);
+    const device_code = try alloc.dupe(u8, "");
+    errdefer secret.zeroAndFree(alloc, device_code);
+    const user_code = try alloc.dupe(u8, "");
+    errdefer alloc.free(user_code);
+    const client_id = try alloc.dupe(u8, options.client_id);
+    errdefer alloc.free(client_id);
+
+    return .{
+        .metadata = .{
+            .issuer = issuer,
+            .device_authorization_endpoint = authorization_endpoint,
+            .token_endpoint = options.token_endpoint,
+        },
+        .device = .{
+            .device_code = device_code,
+            .user_code = user_code,
+            .verification_uri = options.verification_uri,
+            .expires_in = options.expires_in,
+            .interval = 1,
+        },
+        .client_id = client_id,
+    };
+}
+
 pub const CompleteSignInFn = *const fn (
     ?*anyopaque,
     Allocator,
+    oauth_transport.Provider,
     []const u8,
     []const u8,
     *oauth.TokenSet,
@@ -274,16 +332,34 @@ pub const SignInRuntime = struct {
     failure: ?anyerror = null,
     poll_state: ?LoginPollState = null,
     deps: SignInRuntimeDeps = .{},
+    /// Set once when a device code requested on the worker becomes ready, so
+    /// the input loop can open the browser for it.
+    browser_pending: bool = false,
 
+    /// Starts an fx login sign-in. On native hosts the issuer discovery and
+    /// device-code request run on the sign-in worker, so the input loop never
+    /// waits on them; `snapshot().preparing` holds until the code arrives.
     pub fn start(
         self: *Self,
         alloc: Allocator,
         transport: oauth_transport.Provider,
     ) !bool {
-        const prepared = try prepareLogin(alloc, transport);
-        return self.startPrepared(alloc, prepared, .{
-            .oauth_transport = transport,
-        });
+        if (comptime host_target.is_wasm) {
+            const prepared = try prepareLogin(alloc, transport);
+            return self.startPrepared(alloc, prepared, .{
+                .oauth_transport = transport,
+            });
+        }
+        return self.startPreparedWithMode(alloc, null, .{ .oauth_transport = transport }, false);
+    }
+
+    /// Returns true once after the worker publishes a device code.
+    pub fn takeBrowserPending(self: *Self) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        const pending = self.browser_pending;
+        self.browser_pending = false;
+        return pending;
     }
 
     pub fn startPrepared(
@@ -304,33 +380,34 @@ pub const SignInRuntime = struct {
         return self.startPreparedWithMode(alloc, prepared, deps, true);
     }
 
+    /// Without `prepared`, the worker requests the device code before it
+    /// polls; cooperative hosts have no worker and must pass one.
     fn startPreparedWithMode(
         self: *Self,
         alloc: Allocator,
-        prepared: PreparedLogin,
+        prepared: ?PreparedLogin,
         deps: SignInRuntimeDeps,
         comptime cooperative: bool,
     ) !bool {
-        const poll_state = if (cooperative)
-            LoginPollState.init(deps.poll, prepared.device) catch |err| {
-                var rejected = prepared;
-                rejected.deinit(alloc);
+        const poll_state = if (cooperative) poll: {
+            const device = if (prepared) |value| value.device else return error.LoginFlowMissing;
+            break :poll LoginPollState.init(deps.poll, device) catch |err| {
+                releasePrepared(alloc, prepared);
                 if (deps.deinit_ctx) |deinit_ctx| deinit_ctx(deps.ctx, alloc);
                 return err;
-            }
-        else
-            null;
+            };
+        } else null;
         self.mutex.lockUncancelable(io_mod.getIo());
         if (self.thread != null or self.state == .polling or self.completion != null) {
             self.mutex.unlock(io_mod.getIo());
-            var rejected = prepared;
-            rejected.deinit(alloc);
+            releasePrepared(alloc, prepared);
             if (deps.deinit_ctx) |deinit_ctx| deinit_ctx(deps.ctx, alloc);
             return false;
         }
         self.state = .polling;
         self.failure = null;
         self.flow = prepared;
+        self.browser_pending = false;
         self.poll_state = poll_state;
         self.deps = deps;
         self.deps.poll.cancel_flag = &self.cancel_requested;
@@ -376,7 +453,10 @@ pub const SignInRuntime = struct {
         const mutable = @constCast(self);
         mutable.mutex.lockUncancelable(io_mod.getIo());
         defer mutable.mutex.unlock(io_mod.getIo());
-        const flow = self.flow orelse return .{ .state = self.state };
+        const flow = self.flow orelse return .{
+            .state = self.state,
+            .preparing = self.state == .polling,
+        };
         return .{
             .state = self.state,
             .verification_uri = flow.device.verification_uri,
@@ -439,8 +519,31 @@ pub const SignInRuntime = struct {
         };
     }
 
+    /// Requests the device code for a flow started without one, through a
+    /// transport `cancel` can stop. Returns whether the flow can poll.
+    fn prepareFlow(self: *Self, alloc: Allocator) bool {
+        var transport: oauth_transport.Cancellable = .{ .inner = self.deps.oauth_transport, .cancel_flag = &self.cancel_requested };
+        const prepared = prepareLogin(alloc, transport.provider()) catch |err| {
+            self.publishFailure(err);
+            return false;
+        };
+        self.mutex.lockUncancelable(io_mod.getIo());
+        if (self.state != .polling or self.cancel_requested.load(.seq_cst)) {
+            self.mutex.unlock(io_mod.getIo());
+            debug_trace.logf("auth", "sign-in dropped prepared device code reason=cancelled", .{});
+            var discarded = prepared;
+            discarded.deinit(alloc);
+            return false;
+        }
+        self.flow = prepared;
+        self.browser_pending = true;
+        self.mutex.unlock(io_mod.getIo());
+        return true;
+    }
+
     fn workerMain(self: *Self, alloc: Allocator) void {
         defer self.finishAttempt(alloc);
+        if (self.flow == null and !self.prepareFlow(alloc)) return;
         const flow = if (self.flow) |*prepared| prepared else return;
         var prompt = BrowserOpenPrompt{ .url = flow.device.verification_uri };
         var token = pollForTokenWithDeps(
@@ -504,9 +607,11 @@ pub const SignInRuntime = struct {
             debug_trace.logf("auth", "sign-in discarded token after cancel", .{});
             return;
         }
+        var transport: oauth_transport.Cancellable = .{ .inner = self.deps.oauth_transport, .cancel_flag = &self.cancel_requested };
         var completion = self.deps.complete(
             self.deps.ctx,
             alloc,
+            transport.provider(),
             flow.metadata.issuer,
             flow.client_id,
             token,
@@ -559,6 +664,7 @@ pub const SignInRuntime = struct {
         self.flow = null;
         self.poll_state = null;
         self.deps = .{};
+        self.browser_pending = false;
         self.mutex.unlock(io_mod.getIo());
         if (flow) |*prepared| prepared.deinit(alloc);
         if (deps.deinit_ctx) |deinit_ctx| deinit_ctx(deps.ctx, alloc);
@@ -580,6 +686,11 @@ pub const SignInRuntime = struct {
         if (finish) |notify| notify(ctx, alloc, saved);
     }
 };
+
+fn releasePrepared(alloc: Allocator, prepared: ?PreparedLogin) void {
+    var owned = prepared orelse return;
+    owned.deinit(alloc);
+}
 
 fn prepareLogin(
     alloc: Allocator,
@@ -611,11 +722,12 @@ fn prepareLogin(
 fn completeSignIn(
     _: ?*anyopaque,
     alloc: Allocator,
+    transport: oauth_transport.Provider,
     issuer_url: []const u8,
     client_id: []const u8,
     token: *oauth.TokenSet,
 ) !SignInCompletion {
-    var teams = fetchTeams(alloc, token.access_token, issuer_url) catch std.ArrayList(Team).empty;
+    var teams = fetchTeams(alloc, transport, token.access_token, issuer_url) catch std.ArrayList(Team).empty;
     errdefer freeTeams(alloc, &teams);
     const now_ms = io_mod.milliTimestamp();
     const session = try take_login_session(alloc, issuer_url, client_id, token, null, now_ms);
@@ -666,7 +778,7 @@ pub fn runLogin(
     );
     defer token.deinit(alloc);
 
-    var teams = fetchTeams(alloc, token.access_token, prepared.metadata.issuer) catch std.ArrayList(Team).empty;
+    var teams = fetchTeams(alloc, transport, token.access_token, prepared.metadata.issuer) catch std.ArrayList(Team).empty;
     defer freeTeams(alloc, &teams);
     const selected_team_index = try selectTeam(alloc, teams.items, null);
     const selected_team = if (selected_team_index) |index| &teams.items[index] else null;
@@ -697,7 +809,7 @@ fn take_login_session(
     now_ms: i64,
 ) !oauth_session.Session {
     const refresh_token = token.refresh_token orelse return LoginError.NoRefreshToken;
-    const expires_at_ms = try oauth.expiry_timestamp_ms(now_ms, token.expires_in);
+    const expires_at_ms = try oauth.expiryTimestampMs(now_ms, token.expires_in);
     const owned_issuer = try alloc.dupe(u8, issuer_url);
     errdefer alloc.free(owned_issuer);
     const owned_client_id = try alloc.dupe(u8, client_id);
@@ -765,7 +877,7 @@ pub fn loadTeamSelection(
     };
     errdefer session.deinit(alloc);
 
-    const teams = try fetchTeams(alloc, session.access_token, session.issuer);
+    const teams = try fetchTeams(alloc, transport, session.access_token, session.issuer);
     return .{
         .session = session,
         .teams = teams,
@@ -786,9 +898,31 @@ pub fn logout(
     alloc: Allocator,
     transport: oauth_transport.Provider,
 ) !LogoutResult {
+    var local = try logoutLocally(alloc);
+    defer if (local.session) |*session| session.deinit(alloc);
+    var result = local.result;
+    if (local.session) |session| {
+        revokeLoggedOutSession(alloc, transport, session) catch {
+            result.remote_revocation_failed = true;
+        };
+    }
+    return result;
+}
+
+/// The outcome of deleting the saved fx login session, with the deleted
+/// session kept so its tokens can still be revoked.
+pub const LocalLogout = struct {
+    result: LogoutResult = .{},
+    /// Owned by the caller when set; release it with `Session.deinit` using
+    /// the allocator passed to `logoutLocally`.
+    session: ?oauth_session.Session = null,
+};
+
+/// Deletes the saved fx login session without contacting the issuer. Revoke
+/// the returned session with `revokeLoggedOutSession`, then release it.
+pub fn logoutLocally(alloc: Allocator) LogoutError!LocalLogout {
     var session: ?oauth_session.Session = null;
     var session_load_failed = false;
-    defer if (session) |*loaded| loaded.deinit(alloc);
     const delete_result = blk: {
         var mutation = (oauth_session.beginExistingMutation() catch {
             return LogoutError.SessionDeleteFailed;
@@ -805,23 +939,18 @@ pub fn logout(
             .local_cleanup_failed = true,
         };
     };
-
-    var remote_revocation_failed = session_load_failed;
-    if (session != null) {
-        const loaded = session.?;
-        revokeLogoutSession(alloc, transport, loaded) catch {
-            remote_revocation_failed = true;
-        };
-    }
-
     return .{
-        .session_deleted = delete_result.session_deleted,
-        .local_durability_failed = delete_result.local_cleanup_failed,
-        .remote_revocation_failed = remote_revocation_failed,
+        .result = .{
+            .session_deleted = delete_result.session_deleted,
+            .local_durability_failed = delete_result.local_cleanup_failed,
+            .remote_revocation_failed = session_load_failed,
+        },
+        .session = session,
     };
 }
 
-fn revokeLogoutSession(
+/// Revokes a signed-out session's refresh and access tokens at its issuer.
+pub fn revokeLoggedOutSession(
     alloc: Allocator,
     transport: oauth_transport.Provider,
     session: oauth_session.Session,
@@ -896,7 +1025,7 @@ const LoginPollState = struct {
     fn init(deps: LoginPollDeps, device: oauth.DeviceAuthorization) !LoginPollState {
         const now_ms = deps.now_ms(deps.ctx);
         return .{
-            .expires_at_ms = try oauth.expiry_timestamp_ms(now_ms, device.expires_in),
+            .expires_at_ms = try oauth.expiryTimestampMs(now_ms, device.expires_in),
             .interval_ms = try poll_interval_ms(device.interval),
             .next_poll_at_ms = now_ms,
         };
@@ -1115,38 +1244,34 @@ fn discardStdinLine() void {
     }
 }
 
-fn fetchTeams(alloc: Allocator, access_token: []const u8, issuer_url: []const u8) !std.ArrayList(Team) {
+/// Lists the account's teams through `transport`, which bounds the request
+/// with a deadline and the caller's cancel flag.
+fn fetchTeams(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    access_token: []const u8,
+    issuer_url: []const u8,
+) !std.ArrayList(Team) {
     if (comptime host_target.is_wasm) return fetchTeamsFromJsHost(alloc, access_token, issuer_url);
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-    defer client.deinit();
-
     const e2e_endpoint = if (oauth_session.isLoopbackE2EIssuer(issuer_url))
-        try std.fmt.allocPrint(alloc, "{s}/v2/teams", .{issuer_url})
+        try alloc.print("{s}/v2/teams", .{issuer_url})
     else
         null;
     defer if (e2e_endpoint) |endpoint| alloc.free(endpoint);
     const endpoint = e2e_endpoint orelse teams_endpoint;
 
-    const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});
+    const auth_header = try alloc.print("Bearer {s}", .{access_token});
     defer secret.zeroAndFree(alloc, auth_header);
 
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-
-    const result = try client.fetch(.{
-        .location = .{ .url = endpoint },
-        .method = .GET,
-        .headers = .{
-            .authorization = .{ .override = auth_header },
-            .accept_encoding = .omit,
-        },
-        .response_writer = &out.writer,
-        .redirect_behavior = .unhandled,
+    var response = try transport.execute(alloc, .{
+        .method = .get,
+        .url = endpoint,
+        .authorization = auth_header,
+        .max_response_bytes = teams_response_max_bytes,
     });
-    if (result.status != .ok) return error.TeamRequestFailed;
-    const body = try out.toOwnedSlice();
-    defer alloc.free(body);
-    return parseTeams(alloc, body);
+    defer response.deinit(alloc);
+    if (response.disposition != .accepted) return error.TeamRequestFailed;
+    return parseTeams(alloc, response.body);
 }
 
 fn fetchTeamsFromJsHost(
@@ -1155,7 +1280,7 @@ fn fetchTeamsFromJsHost(
     issuer_url: []const u8,
 ) !std.ArrayList(Team) {
     const e2e_endpoint = if (oauth_session.isLoopbackE2EIssuer(issuer_url))
-        try std.fmt.allocPrint(alloc, "{s}/v2/teams", .{issuer_url})
+        try alloc.print("{s}/v2/teams", .{issuer_url})
     else
         null;
     defer if (e2e_endpoint) |endpoint| alloc.free(endpoint);
@@ -1288,7 +1413,7 @@ fn renderTeamPicker(
     first_render: *bool,
 ) !void {
     if (!first_render.*) {
-        const move_up = try std.fmt.allocPrint(alloc, "\x1b[{d}A\r", .{teams.len});
+        const move_up = try alloc.print("\x1b[{d}A\r", .{teams.len});
         defer alloc.free(move_up);
         try writeStdout(move_up);
     }
@@ -1374,7 +1499,7 @@ const TeamPickerRawMode = struct {
         }
 
         var self = TeamPickerRawMode{};
-        self.original = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
+        self.original = try io_mod.tcgetattr(std.posix.STDIN_FILENO);
         var raw = self.original;
 
         raw.iflag.BRKINT = false;
@@ -1398,20 +1523,20 @@ const TeamPickerRawMode = struct {
             raw.cc[vtime_idx] = 0;
         }
 
-        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
+        try io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
         self.active = true;
         return self;
     }
 
     fn disable(self: *TeamPickerRawMode) void {
         if (!self.active) return;
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
+        io_mod.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, self.original) catch {};
         self.active = false;
     }
 };
 
 fn vminIndex() usize {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .linux => 6,
         .macos, .ios, .tvos, .watchos, .visionos => 16,
         .freebsd, .netbsd, .dragonfly, .openbsd => 16,
@@ -1420,7 +1545,7 @@ fn vminIndex() usize {
 }
 
 fn vtimeIndex() usize {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .linux => 5,
         .macos, .ios, .tvos, .watchos, .visionos => 17,
         .freebsd, .netbsd, .dragonfly, .openbsd => 17,
@@ -1490,8 +1615,47 @@ fn freeTeams(alloc: Allocator, teams: *std.ArrayList(Team)) void {
     teams.deinit(alloc);
 }
 
+fn checkBrowserPreparedAllocationFailures(alloc: Allocator) !void {
+    const token_endpoint = try alloc.dupe(u8, "https://issuer.test/token");
+    var token_endpoint_owned = true;
+    errdefer if (token_endpoint_owned) alloc.free(token_endpoint);
+    const verification_uri = try alloc.dupe(u8, "https://issuer.test/authorize?state=state");
+    var verification_uri_owned = true;
+    errdefer if (verification_uri_owned) alloc.free(verification_uri);
+
+    var prepared = try prepareBrowserLogin(alloc, .{
+        .issuer = "https://issuer.test",
+        .authorization_endpoint_suffix = "/authorize",
+        .token_endpoint = token_endpoint,
+        .verification_uri = verification_uri,
+        .client_id = "client",
+        .expires_in = 300,
+    });
+    token_endpoint_owned = false;
+    verification_uri_owned = false;
+    defer prepared.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "https://issuer.test/authorize",
+        prepared.metadata.device_authorization_endpoint,
+    );
+    try std.testing.expectEqualStrings(
+        "https://issuer.test/authorize?state=state",
+        prepared.device.verification_uri,
+    );
+    try std.testing.expectEqualStrings("client", prepared.client_id);
+}
+
+test "browser login preparation cleans up allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        testing_allocator.no_resize,
+        checkBrowserPreparedAllocationFailures,
+        .{},
+    );
+}
+
 test "team parsing cleans up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_parse_teams_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_parse_teams_allocation_failures, .{});
 }
 
 test "single team selection does not allocate" {
@@ -1503,7 +1667,7 @@ test "single team selection does not allocate" {
         .slug = &slug,
         .name = &name,
     }};
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
 
     try std.testing.expect((try selectTeam(failing.allocator(), &teams, null)) != null);
 }
@@ -1574,7 +1738,7 @@ test "team validation failure prevents the durable selection commit" {
 }
 
 test "login session transfer cleans up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_take_login_session_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, check_take_login_session_allocation_failures, .{});
 }
 
 fn readLine(alloc: Allocator) ![]u8 {
@@ -1590,7 +1754,7 @@ fn writeStdout(text: []const u8) !void {
 
 fn writeStdoutFmt(comptime fmt: []const u8, args: anytype) !void {
     var buf: [512]u8 = undefined;
-    const text = try std.fmt.bufPrint(&buf, fmt, args);
+    const text = try std.mem.print(&buf, fmt, args);
     try writeStdout(text);
 }
 
@@ -1624,6 +1788,8 @@ const LoginPollTestState = struct {
     open_available: bool = true,
     open_error: bool = false,
     now_ms: i64 = 0,
+    /// A sleep or wait that could not be recorded; the next poll reports it.
+    record_error: ?Allocator.Error = null,
 
     fn init(alloc: Allocator, results: []const ScriptedPollResult) LoginPollTestState {
         return .{ .alloc = alloc, .results = results };
@@ -1664,6 +1830,7 @@ const LoginPollTestState = struct {
         _: std.Io.Clock.Timestamp,
     ) !oauth.PollResult {
         const self = testState(raw);
+        if (self.record_error) |err| return err;
         if (self.poll_index >= self.results.len) return error.TestUnexpectedDevicePoll;
         const result = self.results[self.poll_index];
         self.poll_index += 1;
@@ -1676,13 +1843,17 @@ const LoginPollTestState = struct {
 
     fn testSleepMs(raw: ?*anyopaque, ms: u64) void {
         const self = testState(raw);
-        self.sleep_calls.append(self.alloc, ms) catch unreachable;
+        self.sleep_calls.append(self.alloc, ms) catch |err| {
+            self.record_error = err;
+        };
         self.now_ms += @intCast(ms);
     }
 
     fn testWaitForEnter(raw: ?*anyopaque, timeout_ms: u64) bool {
         const self = testState(raw);
-        self.wait_calls.append(self.alloc, timeout_ms) catch unreachable;
+        self.wait_calls.append(self.alloc, timeout_ms) catch |err| {
+            self.record_error = err;
+        };
         self.now_ms += @intCast(timeout_ms);
         return if (self.enter_on_wait) |index| self.wait_calls.items.len == index else false;
     }
@@ -1783,6 +1954,7 @@ const SignInTestState = struct {
     fn complete(
         raw: ?*anyopaque,
         alloc: Allocator,
+        _: oauth_transport.Provider,
         issuer_url: []const u8,
         client_id: []const u8,
         token: *oauth.TokenSet,
@@ -1841,6 +2013,7 @@ const CooperativeSignInTestState = struct {
     fn complete(
         raw: ?*anyopaque,
         alloc: Allocator,
+        _: oauth_transport.Provider,
         issuer_url: []const u8,
         client_id: []const u8,
         token: *oauth.TokenSet,
@@ -1985,6 +2158,26 @@ test "sign-in runtime releases an owned provider context exactly once" {
     try std.testing.expectEqual(@as(usize, 1), cleanup_count);
 }
 
+test "sign-in snapshot reports preparing only until the device code exists" {
+    const alloc = std.testing.allocator;
+    var runtime: SignInRuntime = .{};
+    try std.testing.expect(!runtime.snapshot().preparing);
+
+    // `start` on a native host polls before its worker has the device code.
+    runtime.state = .polling;
+    try std.testing.expect(runtime.snapshot().preparing);
+    try std.testing.expect(!runtime.takeBrowserPending());
+    runtime.state = .idle;
+
+    try std.testing.expect(try runtime.startPreparedCooperative(alloc, try makeTestPreparedLogin(alloc), .{}));
+    const prepared = runtime.snapshot();
+    try std.testing.expectEqual(SignInState.polling, prepared.state);
+    try std.testing.expect(!prepared.preparing);
+    try std.testing.expect(prepared.verification_uri.len > 0);
+    try std.testing.expect(runtime.cancel(alloc));
+    runtime.deinit(alloc);
+}
+
 const WithholdingTokenFixture = struct {
     io_backend: std.Io.Threaded = .init_single_threaded,
     server: std.Io.net.Server,
@@ -2021,7 +2214,7 @@ const WithholdingTokenFixture = struct {
     }
 
     fn tokenEndpoint(self: *@This(), alloc: Allocator) ![]u8 {
-        return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/oauth/token", .{
+        return alloc.print("http://127.0.0.1:{d}/oauth/token", .{
             self.server.socket.address.getPort(),
         });
     }
@@ -2058,9 +2251,9 @@ const WithholdingTokenFixture = struct {
 };
 
 fn makeLoopbackPreparedLogin(alloc: Allocator, token_endpoint: []const u8) !PreparedLogin {
-    const issuer = try alloc.dupe(u8, token_endpoint[0..std.mem.lastIndexOfScalar(u8, token_endpoint, '/').?]);
+    const issuer = try alloc.dupe(u8, token_endpoint[0..std.mem.findScalarLast(u8, token_endpoint, '/').?]);
     errdefer alloc.free(issuer);
-    const device_endpoint = try std.fmt.allocPrint(alloc, "{s}/device", .{issuer});
+    const device_endpoint = try alloc.print("{s}/device", .{issuer});
     errdefer alloc.free(device_endpoint);
     const owned_token_endpoint = try alloc.dupe(u8, token_endpoint);
     errdefer alloc.free(owned_token_endpoint);
@@ -2167,7 +2360,7 @@ test "cooperative sign-in store failure is traced and becomes a recoverable tran
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "sign-in-store-failure.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "sign-in-store-failure.log" });
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
     defer debug_trace.resetForTest();

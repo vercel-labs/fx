@@ -19,7 +19,7 @@ fn openUrlForHost(_: ?*anyopaque, alloc: Allocator, url: []const u8) host.UrlOpe
 }
 
 fn openUrl(alloc: Allocator, url: []const u8) Allocator.Error!bool {
-    return launchUrl(alloc, url, builtin.os.tag, .{}) == .opened;
+    return launchUrl(alloc, url, builtin.target.os.tag, .{}) == .opened;
 }
 
 const LaunchResult = struct {
@@ -76,8 +76,8 @@ fn launchUrl(
 fn logUnsuccessfulTerm(term: std.process.Child.Term) void {
     switch (term) {
         .exited => |code| debug_trace.logf("core", "url opener unsuccessful term=exited exit_code={d}", .{code}),
-        .signal => |sig| debug_trace.logf("core", "url opener unsuccessful term=signal signal={d}", .{@intFromEnum(sig)}),
-        .stopped => |sig| debug_trace.logf("core", "url opener unsuccessful term=stopped signal={d}", .{@intFromEnum(sig)}),
+        .signal => |sig| debug_trace.logf("core", "url opener unsuccessful term=signal signal={d}", .{@backingInt(sig)}),
+        .stopped => |sig| debug_trace.logf("core", "url opener unsuccessful term=stopped signal={d}", .{@backingInt(sig)}),
         .unknown => |code| debug_trace.logf("core", "url opener unsuccessful term=unknown status={d}", .{code}),
     }
 }
@@ -133,7 +133,7 @@ test "url opener treats nonzero exit, bad terms, and launch errors as failed" {
     defer nonzero.deinit(alloc);
     try std.testing.expectEqual(LaunchOutcome.failed, launchUrl(alloc, "http://x", .macos, nonzero.launcher()));
 
-    var signaled = MockLauncher{ .result = .{ .term = .{ .signal = @enumFromInt(2) } } };
+    var signaled = MockLauncher{ .result = .{ .term = .{ .signal = @fromBackingInt(@intCast(2)) } } };
     defer signaled.deinit(alloc);
     try std.testing.expectEqual(LaunchOutcome.failed, launchUrl(alloc, "http://x", .macos, signaled.launcher()));
 

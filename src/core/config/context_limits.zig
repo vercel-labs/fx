@@ -32,8 +32,9 @@ pub const Name = enum {
     }
 
     pub fn parse(raw: []const u8) ?Name {
-        inline for (std.meta.fields(Name)) |field| {
-            if (std.mem.eql(u8, raw, field.name)) return @enumFromInt(field.value);
+        const name_info = @typeInfo(Name).@"enum";
+        inline for (name_info.field_names, name_info.field_values) |field_name, field_value| {
+            if (std.mem.eql(u8, raw, field_name)) return @fromBackingInt(@intCast(field_value));
         }
         return null;
     }
@@ -105,9 +106,10 @@ pub const Values = struct {
     }
 
     pub fn apply(self: *Values, overrides: Overrides) void {
-        inline for (std.meta.fields(Name)) |field| {
-            const name: Name = @enumFromInt(field.value);
-            if (overrides.get(name)) |value| @field(self, field.name) = value;
+        const name_info = @typeInfo(Name).@"enum";
+        inline for (name_info.field_names, name_info.field_values) |field_name, field_value| {
+            const name: Name = @fromBackingInt(@intCast(field_value));
+            if (overrides.get(name)) |value| @field(self, field_name) = value;
         }
     }
 
@@ -150,20 +152,20 @@ pub const Overrides = struct {
     }
 
     pub fn retag(self: *Overrides, source: Source) void {
-        inline for (std.meta.fields(Name)) |field| {
-            if (@field(self, field.name)) |*value| value.source = source;
+        inline for (@typeInfo(Name).@"enum".field_names) |field_name| {
+            if (@field(self, field_name)) |*value| value.source = source;
         }
     }
 
     pub fn merge(self: *Overrides, incoming: Overrides) void {
-        inline for (std.meta.fields(Name)) |field| {
-            if (@field(incoming, field.name)) |value| @field(self, field.name) = value;
+        inline for (@typeInfo(Name).@"enum".field_names) |field_name| {
+            if (@field(incoming, field_name)) |value| @field(self, field_name) = value;
         }
     }
 };
 
 pub fn parseOverride(raw: []const u8) !Override {
-    const separator = std.mem.indexOfScalar(u8, raw, '=') orelse return error.InvalidContextLimitOverride;
+    const separator = std.mem.findScalar(u8, raw, '=') orelse return error.InvalidContextLimitOverride;
     const raw_name = std.mem.trim(u8, raw[0..separator], " \t\r\n");
     const raw_value = std.mem.trim(u8, raw[separator + 1 ..], " \t\r\n");
     if (raw_name.len == 0 or raw_value.len == 0) return error.InvalidContextLimitOverride;
@@ -217,14 +219,14 @@ pub fn utf8PrefixLength(bytes: []const u8, max_bytes: usize) usize {
 pub fn lineSafePrefixLength(bytes: []const u8, max_bytes: usize) usize {
     const utf8_end = utf8PrefixLength(bytes, max_bytes);
     if (utf8_end == bytes.len) return utf8_end;
-    if (std.mem.lastIndexOfScalar(u8, bytes[0..utf8_end], '\n')) |newline| return newline + 1;
+    if (std.mem.findScalarLast(u8, bytes[0..utf8_end], '\n')) |newline| return newline + 1;
     return utf8_end;
 }
 
 test "defaults match the public context limit contract" {
     const values = Values{};
-    inline for (std.meta.fields(Name)) |field| {
-        const name: Name = @enumFromInt(field.value);
+    inline for (@typeInfo(Name).@"enum".field_values) |field_value| {
+        const name: Name = @fromBackingInt(@intCast(field_value));
         try std.testing.expectEqual(name.defaultBytes(), values.get(name).effectiveBytes());
         try std.testing.expectEqual(Source.compiled_default, values.get(name).source);
     }

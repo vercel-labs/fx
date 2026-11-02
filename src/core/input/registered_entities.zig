@@ -489,8 +489,7 @@ pub const State = struct {
         );
         const retained_len = editor.input.items.len - (replace_end - replace_start);
         const final_len = try std.math.add(usize, retained_len, inserted_len);
-        const raw = try std.fmt.allocPrint(
-            alloc,
+        const raw = try alloc.print(
             "${s}{s}",
             .{ name, if (append_separator) " " else "" },
         );

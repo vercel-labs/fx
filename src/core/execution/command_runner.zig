@@ -5,6 +5,7 @@ const command_contract = @import("command_contract.zig");
 const command_environment = @import("command_environment.zig");
 const process_tree = @import("process_tree.zig");
 const io_mod = @import("../shared/io.zig");
+const mem_utils = @import("../shared/mem_utils.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const session_child_store = @import("../session/session_child_store.zig");
@@ -12,6 +13,7 @@ const artifact_digest = @import("../session/artifact_digest.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const shell_resolver = @import("../terminal/shell_resolver.zig");
+const shell_snapshot = @import("../terminal/shell_snapshot.zig");
 const darwin_process_spawn = @import("../shared/darwin_process_spawn.zig");
 
 const Allocator = std.mem.Allocator;
@@ -35,7 +37,17 @@ pub const Config = struct {
     timeout_started_ms: ?i64 = null,
     command_artifact_capability: ?*session_child_store.SessionChildCapability = null,
     command_artifact_dir: ?[]const u8 = null,
+    /// Shell snapshot epoch of the remembered grant that admitted a `user`
+    /// profile command, or null when it was not admitted by a grant.
+    shell_grant_epoch: ?u64 = null,
 };
+
+const ai_agent_env = "AI_AGENT";
+const ai_agent_name = "fx";
+
+pub fn applyAgentEnvironment(environment: *std.process.Environ.Map) !void {
+    try environment.put(ai_agent_env, ai_agent_name);
+}
 
 pub const CallbackProjection = enum {
     model_safe,
@@ -48,20 +60,43 @@ const command_artifact_log_suffix = ".log";
 const command_artifact_stdout_suffix = ".stdout.log";
 const command_artifact_stderr_suffix = ".stderr.log";
 const pending_output_flush_bytes: usize = 4096;
-const command_output_poll_ms: i64 = 100;
+/// Idle wait between stop checks while capturing output. Reads return as soon
+/// as output arrives, so this bounds only how long a silent command takes to
+/// observe a cancel or force-kill request.
+const capture_stop_poll_ms: i64 = 20;
+/// After a command finishes on its own, capture keeps reading its leftover
+/// output until it has waited this long in total for more. Leftover output is
+/// already in the pipes and reads without waiting, so time spent delivering it
+/// never ends the drain. Only a detached daemon that kept a pipe open can keep
+/// the pipes from reaching end of file, and this bounds waiting on it.
+const natural_completion_wait_ms: i64 = 1_000;
+/// Live delivery of drained output ends this long after a natural completion,
+/// so a reader too slow to keep up with a detached writer cannot hold the
+/// call. Capture keeps reading and collecting the output after that.
+const natural_completion_live_ms: i64 = 10_000;
+/// Most output capture reads after a natural completion. A finished command
+/// leaves at most one pipe buffer per stream behind, and Linux lets a pipe
+/// buffer grow to 1 MiB by default, so reading this much means the command's
+/// own output is done and a detached process is still writing.
+const natural_completion_drain_max_bytes: usize = 2 * 1024 * 1024;
 pub const termination_settle_timeout_ms: i64 = 5_000;
-const supports_foreground_session = builtin.link_libc and
+pub const supports_foreground_session = builtin.link_libc and
     std.process.can_spawn and
     std.process.can_replace and
-    builtin.os.tag != .windows and
-    builtin.os.tag != .wasi;
+    builtin.target.os.tag != .windows and
+    builtin.target.os.tag != .wasi;
 const foreground_session_token = "__fx_foreground_session__";
 const foreground_session_ready_byte: u8 = 0x1e;
 const foreground_session_release_byte: u8 = 0x06;
 const foreground_session_setup_timeout_ms: i64 = 5000;
 const foreground_target_termination_grace_ms: i64 = 700;
 const foreground_target_cleanup_wait_ms: i64 = 250;
-const foreground_supervisor_handoff_ms: i64 = command_output_poll_ms * 2;
+/// How long `finishDetachedSession` waits after closing the lifeline. The
+/// supervisor's own cleanup ends within its termination grace and cleanup
+/// wait; the rest is margin.
+const detached_session_exit_wait_ms: i64 =
+    foreground_target_termination_grace_ms + foreground_target_cleanup_wait_ms + 1000;
+const foreground_supervisor_handoff_ms: i64 = 200;
 const foreground_session_replace_failure_exit_code: u8 = 125;
 const foreground_session_failure_nonce_bytes: usize = 16;
 const foreground_session_failure_nonce_hex_bytes: usize = foreground_session_failure_nonce_bytes * 2;
@@ -81,11 +116,11 @@ const ForegroundSessionTerminationRequest = enum(std.c.sig_atomic_t) {
     force,
 };
 var foreground_session_termination_request: std.c.sig_atomic_t =
-    @intFromEnum(ForegroundSessionTerminationRequest.none);
+    @backingInt(ForegroundSessionTerminationRequest.none);
 const foreground_session_replace_error_name_bytes = blk: {
     var max_len: usize = 0;
-    for (std.meta.fields(std.process.ReplaceError)) |field| {
-        max_len = @max(max_len, field.name.len);
+    for (@typeInfo(std.process.ReplaceError).error_set.error_names.?) |error_name| {
+        max_len = @max(max_len, error_name.len);
     }
     break :blk max_len;
 };
@@ -127,7 +162,8 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     else
         std.fmt.parseInt(i64, args[1], 10) catch
             return error.InvalidForegroundSessionInvocation;
-    if (std.c.setsid() == -1) return error.ForegroundSessionSetupFailed;
+    const command_session = std.c.setsid();
+    if (command_session == -1) return error.ForegroundSessionSetupFailed;
 
     const zio = io_mod.getIo();
     try std.Io.File.stderr().writeStreamingAll(
@@ -163,7 +199,7 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     };
 
     @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request).* =
-        @intFromEnum(ForegroundSessionTerminationRequest.none);
+        @backingInt(ForegroundSessionTerminationRequest.none);
     const supervisor_action: std.posix.Sigaction = .{
         .handler = .{ .handler = recordForegroundSessionTermination },
         .mask = foregroundSupervisorSignalMask(),
@@ -171,11 +207,11 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
     };
     std.posix.sigaction(std.posix.SIG.TERM, &supervisor_action, null);
     std.posix.sigaction(foreground_session_force_signal, &supervisor_action, null);
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.target.os.tag == .linux) {
         _ = try std.posix.prctl(.SET_CHILD_SUBREAPER, .{@as(usize, 1)});
     }
     var process_witness: ?process_tree.DarwinProcessWitness =
-        if (comptime builtin.os.tag == .macos)
+        if (comptime builtin.target.os.tag == .macos)
             try .init()
         else
             null;
@@ -185,9 +221,9 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         .stdin = .pipe,
         .stdout = .inherit,
         .stderr = .inherit,
-        .start_suspended = builtin.os.tag == .macos,
+        .start_suspended = builtin.target.os.tag == .macos,
     };
-    var target = (if (comptime builtin.os.tag == .macos)
+    var target = (if (comptime builtin.target.os.tag == .macos)
         darwin_process_spawn.spawn_inheriting_fd(
             zio,
             spawn_options,
@@ -208,29 +244,69 @@ pub fn runForegroundSessionBootstrap(args: []const [:0]const u8) !void {
         std.process.exit(foreground_session_replace_failure_exit_code);
     };
     target.stdin = null;
-    target_input.writeStreamingAll(zio, script) catch |err| {
+    var script_writer: ?std.Thread = null;
+    if (script.len <= foreground_session_inline_script_bytes) {
+        target_input.writeStreamingAll(zio, script) catch |err| {
+            target_input.close(zio);
+            target.kill(zio);
+            writeForegroundSessionReplaceFailure(failure_nonce, err);
+            std.process.exit(foreground_session_replace_failure_exit_code);
+        };
         target_input.close(zio);
-        target.kill(zio);
-        writeForegroundSessionReplaceFailure(failure_nonce, err);
-        std.process.exit(foreground_session_replace_failure_exit_code);
-    };
-    target_input.close(zio);
+    } else {
+        // A large script can exceed the pipe buffer, and on macOS the target
+        // stays suspended until waitForForegroundTarget resumes it, so it is
+        // written while the target runs. The target already exec'd with the
+        // default SIGPIPE disposition; ignoring it here only keeps a target
+        // that stops reading from killing the supervisor.
+        const ignore_action: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.IGN },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.PIPE, &ignore_action, null);
+        script_writer = std.Thread.spawn(
+            .{},
+            writeForegroundTargetScript,
+            .{ target_input, script },
+        ) catch |err| {
+            target_input.close(zio);
+            target.kill(zio);
+            writeForegroundSessionReplaceFailure(failure_nonce, err);
+            std.process.exit(foreground_session_replace_failure_exit_code);
+        };
+    }
     const term = waitForForegroundTarget(
         &target,
         if (process_witness) |*witness| witness else null,
         deadline_ms,
+        command_session,
     ) catch |err| {
         target.kill(zio);
         writeForegroundSessionReplaceFailure(failure_nonce, err);
         std.process.exit(foreground_session_replace_failure_exit_code);
     };
+    // The target has exited, so the writer finished or saw a broken pipe.
+    if (script_writer) |writer| writer.join();
     exitForegroundSessionSupervisor(term);
+}
+
+/// Scripts up to this size fit in any pipe buffer, so they are written before
+/// the target is resumed.
+const foreground_session_inline_script_bytes: usize = 4096;
+
+fn writeForegroundTargetScript(target_input: std.Io.File, script: []const u8) void {
+    const zio = io_mod.getIo();
+    target_input.writeStreamingAll(zio, script) catch |err| {
+        debug_trace.logf("core", "foreground session script write stopped err={s}", .{@errorName(err)});
+    };
+    target_input.close(zio);
 }
 
 fn recordForegroundSessionTermination(signal: std.posix.SIG) callconv(.c) void {
     const request = @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request);
-    request.* = @intFromEnum(mergeForegroundSessionTerminationRequest(
-        @enumFromInt(request.*),
+    request.* = @backingInt(mergeForegroundSessionTerminationRequest(
+        @fromBackingInt(@intCast(request.*)),
         signal,
     ));
 }
@@ -252,9 +328,9 @@ fn mergeForegroundSessionTerminationRequest(
 }
 
 fn foregroundSessionTerminationRequest() ForegroundSessionTerminationRequest {
-    return @enumFromInt(
+    return @fromBackingInt(@intCast(
         @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request).*,
-    );
+    ));
 }
 
 const ForegroundTerminationAction = enum {
@@ -306,6 +382,8 @@ const ChildWaiter = struct {
     io: std.Io,
     ready: std.atomic.Value(bool) = .init(false),
     result: std.process.Child.WaitError!std.process.Child.Term = undefined,
+    /// When the wait returned. Valid once `ready` is observed.
+    completed_ms: i64 = 0,
     future: ?std.Io.Future(void) = null,
 
     fn init(child: *std.process.Child) ChildWaiter {
@@ -325,6 +403,7 @@ const ChildWaiter = struct {
 
     fn waitMain(self: *ChildWaiter) void {
         self.result = self.child.wait(self.io);
+        self.completed_ms = io_mod.milliTimestamp();
         self.ready.store(true, .release);
     }
 
@@ -358,6 +437,7 @@ fn waitForForegroundTarget(
     target: *std.process.Child,
     process_witness: ?*const process_tree.DarwinProcessWitness,
     deadline_ms: ?i64,
+    command_session: std.posix.pid_t,
 ) !std.process.Child.Term {
     const target_pid = target.id orelse return error.ForegroundTargetMissing;
     var descendants = try process_tree.Tracker.init(std.heap.page_allocator);
@@ -365,7 +445,7 @@ fn waitForForegroundTarget(
     if (process_witness) |witness| {
         descendants.bindProcessWitness(witness);
     }
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime builtin.target.os.tag == .macos) {
         try descendants.refresh(target_pid);
         try std.posix.kill(target_pid, std.posix.SIG.CONT);
     }
@@ -395,7 +475,7 @@ fn waitForForegroundTarget(
         );
         if (request == .force) {
             @as(*volatile std.c.sig_atomic_t, &foreground_session_termination_request).* =
-                @intFromEnum(ForegroundSessionTerminationRequest.force);
+                @backingInt(ForegroundSessionTerminationRequest.force);
         }
         try refreshForegroundTargetTree(&descendants, target_pid);
         advanceForegroundTargetTermination(
@@ -426,15 +506,20 @@ fn waitForForegroundTarget(
                 );
                 return term;
             }
-            const count = try cleanupCompletedForegroundTarget(
+            const cleanup = try cleanupCompletedForegroundTarget(
                 &descendants,
                 target_pid,
+                command_session,
             );
-            if (count > 0) {
+            if (cleanup.terminated > 0 or cleanup.kept_detached > 0 or cleanup.incomplete) {
                 debug_trace.logf(
                     "core",
-                    "captured command target completed; tracked descendants terminated count={d}",
-                    .{count},
+                    "captured command target completed; tracked descendants terminated count={d} detached daemons kept count={d} incomplete={s}",
+                    .{
+                        cleanup.terminated,
+                        cleanup.kept_detached,
+                        if (cleanup.incomplete) "true" else "false",
+                    },
                 );
             }
             return term;
@@ -443,29 +528,47 @@ fn waitForForegroundTarget(
     }
 }
 
+const CompletedTargetCleanup = struct {
+    terminated: usize = 0,
+    kept_detached: usize = 0,
+    /// The latest pass could not inspect or signal every tracked process.
+    incomplete: bool = false,
+
+    fn record(self: *CompletedTargetCleanup, delivery: process_tree.CompletionDelivery) void {
+        self.terminated += delivery.delivery.delivered;
+        self.kept_detached = delivery.kept_detached;
+        self.incomplete = delivery.delivery.incomplete;
+    }
+};
+
+/// Stops what a naturally completed command left in its session. Daemons
+/// that moved to their own session keep running, so background servers that
+/// tools start survive between calls. Cancellation, timeout, and owner loss
+/// still stop them.
 fn cleanupCompletedForegroundTarget(
     descendants: *process_tree.Tracker,
     target_pid: std.posix.pid_t,
-) !usize {
+    command_session: std.posix.pid_t,
+) !CompletedTargetCleanup {
     const started_ms = io_mod.milliTimestamp();
-    var signaled: usize = 0;
+    var cleanup: CompletedTargetCleanup = .{};
     var empty_scans: u8 = 0;
     while (io_mod.milliTimestamp() - started_ms <
         foreground_target_cleanup_wait_ms)
     {
         try refreshForegroundTargetTree(descendants, target_pid);
-        signaled += descendants.signalAll(std.posix.SIG.KILL);
-        if (descendants.anyAlive()) {
+        cleanup.record(descendants.signalAttached(std.posix.SIG.KILL, command_session));
+        if (descendants.anyAttachedAlive(command_session)) {
             empty_scans = 0;
         } else {
             empty_scans += 1;
-            if (empty_scans >= 2) return signaled;
+            if (empty_scans >= 2) return cleanup;
         }
         io_mod.sleep(std.time.ns_per_ms);
     }
     try refreshForegroundTargetTree(descendants, target_pid);
-    signaled += descendants.signalAll(std.posix.SIG.KILL);
-    return signaled;
+    cleanup.record(descendants.signalAttached(std.posix.SIG.KILL, command_session));
+    return cleanup;
 }
 
 fn refreshForegroundTargetTree(
@@ -473,10 +576,10 @@ fn refreshForegroundTargetTree(
     target_pid: std.posix.pid_t,
 ) !void {
     try descendants.refresh(target_pid);
-    if (comptime builtin.os.tag == .linux) {
+    if (comptime builtin.target.os.tag == .linux) {
         try descendants.refreshAdditionalRoot(std.c.getpid());
     }
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime builtin.target.os.tag == .macos) {
         if (foregroundSessionTerminationRequest() != .none) {
             try descendants.refreshLineageProcesses();
         }
@@ -568,7 +671,7 @@ fn writeForegroundSessionReplaceFailure(
     err: anyerror,
 ) void {
     var buffer: [256]u8 = undefined;
-    const message = std.fmt.bufPrint(
+    const message = std.mem.print(
         &buffer,
         foreground_session_replace_failure_prefix ++ "{s}:{s}\n",
         .{ nonce, @errorName(err) },
@@ -592,7 +695,7 @@ fn exitForegroundSessionSupervisor(term: std.process.Child.Term) noreturn {
             std.posix.sigaddset(&signal_mask, signal);
             std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &signal_mask, null);
             std.posix.raise(signal) catch {};
-            std.process.exit(128 + @as(u8, @truncate(@intFromEnum(signal))));
+            std.process.exit(128 + @as(u8, @truncate(@backingInt(signal))));
         },
         .stopped, .unknown => std.process.exit(127),
     }
@@ -606,7 +709,7 @@ pub fn executeCommand(
     cwd: []const u8,
 ) !command_contract.RunCommandResult {
     var scratch_state = std.heap.ArenaAllocator.init(arena);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     var effective_cfg = cfg;
@@ -629,12 +732,20 @@ pub fn executeCommandInEnvironment(
     }
 
     var scratch_state = std.heap.ArenaAllocator.init(arena);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     var effective_cfg = cfg;
     if (effective_cfg.timeout_started_ms == null) effective_cfg.timeout_started_ms = io_mod.milliTimestamp();
     try ExecutionControl.init(effective_cfg).check();
+    switch (environment) {
+        .user => |shell_path| if (snapshotEligible(shell_path, command)) {
+            if (try executeWithSnapshot(arena, scratch, effective_cfg, command, cwd, shell_path)) |result| {
+                return result;
+            }
+        },
+        else => {},
+    }
     const invocation = try shell_resolver.capturedInvocation(scratch, environment, command);
     debug_trace.logf(
         "core",
@@ -650,6 +761,253 @@ pub fn executeCommandInEnvironment(
         &invocation,
     );
 }
+
+fn snapshotEligible(shell_path: []const u8, command: []const u8) bool {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return false;
+    // A NUL cannot travel through the stdin script; keep today's argv path,
+    // which rejects it at spawn.
+    return shell_resolver.shellKind(shell_path) != null and
+        std.mem.findScalar(u8, command, 0) == null;
+}
+
+/// The result for a command whose remembered approval predates a shell
+/// refresh. Nothing ran; requesting the command again asks for approval.
+fn approvalResetResult(
+    arena: Allocator,
+    command: []const u8,
+    cwd: []const u8,
+) !command_contract.RunCommandResult {
+    debug_trace.logf("core", "command runner rejected stale shell approval", .{});
+    return formatOutputWithStatus(
+        arena,
+        command,
+        cwd,
+        .{ .exit_code = 126 },
+        "",
+        "fx did not run this command: the shell startup files changed after it was approved. Request it again to ask for approval.\n",
+        null,
+        false,
+    );
+}
+
+/// Runs a `user` profile command in a clean shell restored from the process
+/// snapshot. Returns null when the command must use full startup instead:
+/// no snapshot is available, or its replay failed before the command started.
+fn executeWithSnapshot(
+    arena: Allocator,
+    scratch: Allocator,
+    cfg: Config,
+    command: []const u8,
+    cwd: []const u8,
+    shell_path: []const u8,
+) !?command_contract.RunCommandResult {
+    const owner = shell_snapshot.processOwner();
+    const acquired = owner.acquire(shell_path, cwd, .{
+        .cancel_flag = cfg.cancel_flag,
+        .deadline_ms = ExecutionControl.init(cfg).deadlineMs(),
+    }) catch |err| return switch (err) {
+        error.Cancelled => error.CancelledBeforeExecution,
+        error.TimeoutExpired => error.TimeoutExpired,
+    };
+    const lease = switch (acquired) {
+        .snapshot => |value| value,
+        .full_startup => {
+            if (cfg.shell_grant_epoch) |epoch| {
+                if (epoch != owner.approvalEpoch()) return try approvalResetResult(arena, command, cwd);
+            }
+            return null;
+        },
+    };
+    defer lease.release();
+    const generation = lease.generation;
+    if (cfg.shell_grant_epoch) |epoch| {
+        if (epoch != generation.epoch) return try approvalResetResult(arena, command, cwd);
+    }
+
+    var nonce_raw: [foreground_session_failure_nonce_bytes]u8 = undefined;
+    io_mod.getIo().random(&nonce_raw);
+    const nonce = std.fmt.bytesToHex(nonce_raw, .lower);
+    const failure_marker = try std.mem.concat(scratch, u8, &.{
+        shell_resolver.snapshot_replay_failure_prefix,
+        &nonce,
+    });
+    const invocation = try shell_resolver.snapshotInvocation(scratch, generation.shell_path, failure_marker);
+    const kind = shell_resolver.shellKind(generation.shell_path) orelse return error.UnsupportedShell;
+    const script = try shell_resolver.snapshotScript(scratch, kind, generation.replay, command);
+    debug_trace.logf(
+        "core",
+        "command runner snapshot generation={d} shell={s} replay_bytes={d}",
+        .{ generation.id, generation.shell_path, generation.replay.len },
+    );
+    var snapshot_cfg = cfg;
+    var presented: ?ReplayMarkerFilter = null;
+    var accepted: ?ReplayMarkerFilter = null;
+    ReplayMarkerFilter.install(
+        &presented,
+        failure_marker,
+        &snapshot_cfg.output_chunk_ctx,
+        &snapshot_cfg.on_output_chunk,
+    );
+    ReplayMarkerFilter.install(
+        &accepted,
+        failure_marker,
+        &snapshot_cfg.accepted_output_chunk_ctx,
+        &snapshot_cfg.on_accepted_output_chunk,
+    );
+    const result = executeProcessWithScript(
+        scratch,
+        snapshot_cfg,
+        invocation.argv(),
+        cwd,
+        script,
+        &generation.environ,
+    ) catch |err| {
+        // A run that timed out or was cancelled still reports the output it
+        // produced, including any bytes held as a possible marker.
+        if (presented) |*filter| filter.finishOrLog();
+        if (accepted) |*filter| filter.finishOrLog();
+        return err;
+    };
+    if (snapshotReplayFailed(result, failure_marker)) {
+        // The replay stopped before the command started, so the command has
+        // not run. Fail this snapshot and let the caller run it once with
+        // full startup.
+        debug_trace.logf(
+            "core",
+            "command runner snapshot replay failed generation={d}; dropped its failure marker from the live output; rerunning with full startup",
+            .{generation.id},
+        );
+        owner.markReplayFailed(generation);
+        return null;
+    }
+    if (presented) |*filter| filter.finishOrLog();
+    if (accepted) |*filter| try filter.finish();
+    return try formatCollectedOutput(arena, command, cwd, result);
+}
+
+/// Passes a snapshot run's output on to one of the caller's callbacks without
+/// the replay failure marker. A run whose replay failed is discarded and the
+/// command reruns with full startup, so the marker must reach neither the live
+/// view nor the output the model reads. Stderr bytes that could begin the
+/// marker wait for the next chunk, or for `finish` when the run is kept.
+const ReplayMarkerFilter = struct {
+    const marker_bytes = shell_resolver.snapshot_replay_failure_prefix.len + foreground_session_failure_nonce_hex_bytes;
+
+    marker: []const u8,
+    ctx: *anyopaque,
+    callback: CommandOutputCallback,
+    lifecycle_id: ?types.ToolLifecycleId = null,
+    held: [marker_bytes]u8 = undefined,
+    held_len: usize = 0,
+
+    /// Puts a filter in `slot` in front of the callback the two fields name,
+    /// and points the fields at it. Leaves `slot` null when there is no
+    /// callback. `slot` must outlive the run.
+    fn install(
+        slot: *?ReplayMarkerFilter,
+        marker: []const u8,
+        ctx_field: *?*anyopaque,
+        callback_field: *?CommandOutputCallback,
+    ) void {
+        std.debug.assert(marker.len == marker_bytes);
+        const ctx = ctx_field.* orelse return;
+        const callback = callback_field.* orelse return;
+        slot.* = .{ .marker = marker, .ctx = ctx, .callback = callback };
+        ctx_field.* = &slot.*.?;
+        callback_field.* = onChunk;
+    }
+
+    fn onChunk(
+        raw: *anyopaque,
+        lifecycle_id: ?types.ToolLifecycleId,
+        stream: CommandOutputStream,
+        chunk: []const u8,
+    ) anyerror!void {
+        const self: *ReplayMarkerFilter = @ptrCast(@alignCast(raw));
+        if (stream == .stdout) return self.callback(self.ctx, lifecycle_id, stream, chunk);
+        self.lifecycle_id = lifecycle_id;
+        var rest = chunk;
+        if (self.held_len > 0) rest = try self.resolveHeld(chunk) orelse return;
+        while (std.mem.find(u8, rest, self.marker)) |index| {
+            try self.forward(rest[0..index]);
+            rest = rest[index + self.marker.len ..];
+        }
+        const keep = markerPrefixAtEnd(rest, self.marker);
+        try self.forward(rest[0 .. rest.len - keep]);
+        @memcpy(self.held[0..keep], rest[rest.len - keep ..]);
+        self.held_len = keep;
+    }
+
+    /// Delivers the bytes still held when a kept run ends.
+    fn finish(self: *ReplayMarkerFilter) !void {
+        const held_len = self.held_len;
+        self.held_len = 0;
+        try self.forward(self.held[0..held_len]);
+    }
+
+    /// `finish` for a path that cannot return the callback's error.
+    fn finishOrLog(self: *ReplayMarkerFilter) void {
+        const held_len = self.held_len;
+        self.finish() catch |err| debug_trace.logf(
+            "core",
+            "command output dropped {d} held stderr bytes err={s}",
+            .{ held_len, @errorName(err) },
+        );
+    }
+
+    /// Decides the held bytes against the start of `chunk`: forwards the ones
+    /// that cannot begin the marker and drops a completed marker. Returns the
+    /// part of `chunk` still to scan, or null when all of it is held.
+    fn resolveHeld(self: *ReplayMarkerFilter, chunk: []const u8) !?[]const u8 {
+        var window: [2 * marker_bytes]u8 = undefined;
+        const held_len = self.held_len;
+        const take = @min(chunk.len, self.marker.len);
+        @memcpy(window[0..held_len], self.held[0..held_len]);
+        @memcpy(window[held_len..][0..take], chunk[0..take]);
+        const joined = window[0 .. held_len + take];
+        self.held_len = 0;
+
+        var start: usize = 0;
+        while (start < held_len) : (start += 1) {
+            const candidate = joined[start..];
+            const compared = @min(candidate.len, self.marker.len);
+            if (std.mem.eql(u8, candidate[0..compared], self.marker[0..compared])) break;
+        }
+        try self.forward(joined[0..start]);
+        if (start == held_len) return chunk;
+        const candidate = joined[start..];
+        if (candidate.len >= self.marker.len) return chunk[start + self.marker.len - held_len ..];
+        // Still a partial marker, which means `take` consumed the whole chunk.
+        std.debug.assert(take == chunk.len);
+        @memcpy(self.held[0..candidate.len], candidate);
+        self.held_len = candidate.len;
+        return null;
+    }
+
+    fn forward(self: *ReplayMarkerFilter, bytes: []const u8) !void {
+        if (bytes.len == 0) return;
+        try self.callback(self.ctx, self.lifecycle_id, .stderr, bytes);
+    }
+
+    /// Length of the longest proper prefix of `marker` that `bytes` ends with.
+    fn markerPrefixAtEnd(bytes: []const u8, marker: []const u8) usize {
+        var keep = @min(bytes.len, marker.len - 1);
+        while (keep > 0) : (keep -= 1) {
+            if (std.mem.eql(u8, bytes[bytes.len - keep ..], marker[0..keep])) return keep;
+        }
+        return 0;
+    }
+};
+
+fn snapshotReplayFailed(result: CollectedProcess, failure_marker: []const u8) bool {
+    return switch (result.status) {
+        .exit_code => |code| code == shell_snapshot_replay_failure_exit_code and
+            std.mem.find(u8, result.stderr, failure_marker) != null,
+        else => false,
+    };
+}
+
+const shell_snapshot_replay_failure_exit_code: i64 = 125;
 
 const ExecutionControl = struct {
     cancel_flag: ?*std.atomic.Value(bool),
@@ -771,7 +1129,7 @@ const StreamPreview = struct {
         if (self.tail.items.len + bytes.len > self.tail_limit) {
             const drop = self.tail.items.len + bytes.len - self.tail_limit;
             const keep = self.tail.items.len - drop;
-            std.mem.copyForwards(u8, self.tail.items[0..keep], self.tail.items[drop..]);
+            @memmove(self.tail.items[0..keep], self.tail.items[drop..]);
             self.tail.items.len = keep;
         }
         try self.tail.appendSlice(alloc, bytes);
@@ -854,7 +1212,7 @@ const CommandArtifact = struct {
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         var hasher = self.output_hasher;
         hasher.final(&digest);
-        const source_handle = std.fs.path.basename(self.output_file);
+        const source_handle = std.Io.Dir.path.basename(self.output_file);
         const target_handle = try artifact_digest.contentAddressedHandle(
             alloc,
             source_handle,
@@ -862,9 +1220,9 @@ const CommandArtifact = struct {
             digest,
         );
         defer alloc.free(target_handle);
-        const parent = std.fs.path.dirname(self.output_file) orelse
+        const parent = std.Io.Dir.path.dirname(self.output_file) orelse
             return error.InvalidCommandArtifactPath;
-        const target_path = try std.fs.path.join(
+        const target_path = try std.Io.Dir.path.join(
             alloc,
             &.{ parent, target_handle },
         );
@@ -1060,13 +1418,17 @@ fn executeProcessWithInput(
     isolate_process_group: bool,
 ) !CollectedProcess {
     const started_ms = io_mod.milliTimestamp();
+    var environment = try io_mod.cloneEnvironMap(scratch);
+    defer environment.deinit();
+    try applyAgentEnvironment(&environment);
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
         .stdin = if (closed_input) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = .{ .path = cwd },
-        .pgid = if (isolate_process_group and builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+        .environ_map = &environment,
+        .pgid = if (isolate_process_group and builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) 0 else null,
     });
     if (child.stdin) |input| {
         input.close(io_mod.getIo());
@@ -1080,7 +1442,7 @@ fn executeProcessWithInput(
     errdefer if (child_needs_cleanup) cleanupChild(&child);
 
     const process_group_id = if (isolate_process_group and
-        builtin.os.tag != .windows and builtin.os.tag != .wasi)
+        builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi)
         child.id
     else
         null;
@@ -1106,13 +1468,21 @@ fn executeProcessWithInput(
     );
 }
 
+/// `environ_map` replaces the inherited environment for the command when set.
 fn executeProcessWithScript(
     scratch: Allocator,
     cfg: Config,
     argv: []const []const u8,
     cwd: []const u8,
     script: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
 ) !CollectedProcess {
+    var environment = if (environ_map) |map|
+        try map.clone(scratch)
+    else
+        try io_mod.cloneEnvironMap(scratch);
+    defer environment.deinit();
+    try applyAgentEnvironment(&environment);
     if (comptime supports_foreground_session) {
         return executeProcessWithDetachedSession(
             scratch,
@@ -1120,6 +1490,7 @@ fn executeProcessWithScript(
             argv,
             cwd,
             script,
+            &environment,
         );
     }
     return executeProcessWithScriptUnisolated(
@@ -1128,6 +1499,7 @@ fn executeProcessWithScript(
         argv,
         cwd,
         script,
+        &environment,
     );
 }
 
@@ -1142,6 +1514,7 @@ fn executeProcessWithDetachedSession(
     argv: []const []const u8,
     cwd: []const u8,
     script: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
 ) !CollectedProcess {
     const executable = try foregroundSessionExecutable(scratch);
     var nonce_bytes: [foreground_session_failure_nonce_bytes]u8 = undefined;
@@ -1164,19 +1537,21 @@ fn executeProcessWithDetachedSession(
     const deadline_ms = ExecutionControl.init(cfg).deadlineMs();
     const supervisor_deadline_ms = foreground_supervisor_fallback_deadline_ms(deadline_ms);
     const deadline_text = if (supervisor_deadline_ms) |value|
-        try std.fmt.allocPrint(scratch, "{d}", .{value})
+        try scratch.print("{d}", .{value})
     else
         "none";
     try helper_argv.append(scratch, deadline_text);
     try helper_argv.appendSlice(scratch, argv);
 
     const started_ms = io_mod.milliTimestamp();
+    // The supervisor passes its environment through to the target shell.
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = helper_argv.items,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = .{ .path = cwd },
+        .environ_map = environ_map,
     });
 
     var output = OutputCollector.init(scratch, cfg);
@@ -1218,10 +1593,11 @@ fn executeProcessWithDetachedSession(
         process_group_id,
         .foreground_supervisor,
     );
+    // Judge the deadline at the supervisor's exit, not after the output drain.
     collected.source = reconcileForegroundTerminationSource(
         collected.source,
         deadline_ms,
-        io_mod.milliTimestamp(),
+        collected.natural_completion_ms orelse io_mod.milliTimestamp(),
     );
     const duration_ms = elapsedMs(started_ms, io_mod.milliTimestamp());
 
@@ -1239,12 +1615,109 @@ fn executeProcessWithDetachedSession(
     );
 }
 
-fn foregroundSessionExecutable(scratch: Allocator) ![]const u8 {
-    if (comptime builtin.is_test) {
-        const path_z = std.c.getenv("FX_TEST_PRODUCT_EXE") orelse
-            return error.TestProductExecutableMissing;
-        return std.mem.sliceTo(path_z, 0);
+/// Starts `argv` in a new session through the foreground supervisor, so it
+/// has no controlling terminal: an interactive login shell can neither stop
+/// on nor draw over the terminal fx runs in. The target's stdin is empty;
+/// stdout and stderr are pipes. `child.stdin` stays open as the supervisor's
+/// lifeline: closing it ends the session. The caller owns the child and ends
+/// the session with `finishDetachedSession`.
+pub fn spawnDetachedSession(
+    scratch: Allocator,
+    argv: []const []const u8,
+    cwd: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+) !std.process.Child {
+    if (comptime !supports_foreground_session) return error.OperationUnsupported;
+    const executable = try foregroundSessionExecutable(scratch);
+    var helper_argv: std.ArrayList([]const u8) = .empty;
+    try helper_argv.appendSlice(scratch, &.{ executable, foreground_session_token, "none" });
+    try helper_argv.appendSlice(scratch, argv);
+    const started_ms = io_mod.milliTimestamp();
+    var child = try std.process.spawn(io_mod.getIo(), .{
+        .argv = helper_argv.items,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .cwd = .{ .path = cwd },
+        .environ_map = environ_map,
+    });
+    debug_trace.logf("core", "detached session supervisor spawned pid={?d} elapsed_ms={d}", .{
+        child.id,
+        io_mod.milliTimestamp() - started_ms,
+    });
+    var phase: ForegroundSessionPhase = .pre_ready;
+    errdefer cleanupForegroundSessionChild(&child, phase);
+    try waitForForegroundSessionReady(&child, .{ .max_command_output_bytes = 0 });
+    phase = .group_ready;
+    debug_trace.logf("core", "detached session supervisor ready pid={?d} elapsed_ms={d}", .{
+        child.id,
+        io_mod.milliTimestamp() - started_ms,
+    });
+
+    const input = child.stdin orelse return error.SpawnFailed;
+    var nonce_bytes: [foreground_session_failure_nonce_bytes]u8 = undefined;
+    io_mod.getIo().random(&nonce_bytes);
+    const nonce = std.fmt.bytesToHex(nonce_bytes, .lower);
+    var control: [foreground_session_control_bytes]u8 = undefined;
+    @memcpy(control[0..nonce.len], &nonce);
+    control[foreground_session_release_index] = foreground_session_release_byte;
+    std.mem.writeInt(
+        u64,
+        control[foreground_session_script_length_index..][0..foreground_session_script_length_bytes],
+        0,
+        .little,
+    );
+    try input.writeStreamingAll(io_mod.getIo(), &control);
+    debug_trace.logf("core", "detached session released pid={?d} elapsed_ms={d}", .{
+        child.id,
+        io_mod.milliTimestamp() - started_ms,
+    });
+    return child;
+}
+
+/// Ends a live session from `spawnDetachedSession` and returns how its
+/// supervisor exited. Closing the lifeline makes the supervisor stop the
+/// target and every descendant it tracks, then exit on its own. fx does not
+/// signal the supervisor first: it is a child subreaper, and on gVisor
+/// killing a subreaper that still has children ends the whole sandbox. Its
+/// process group is killed only if it is still running after
+/// `detached_session_exit_wait_ms`.
+pub fn finishDetachedSession(
+    child: *std.process.Child,
+) std.process.Child.WaitError!std.process.Child.Term {
+    const io = io_mod.getIo();
+    const pid = child.id.?;
+    if (child.stdin) |lifeline| {
+        lifeline.close(io);
+        child.stdin = null;
     }
+    debug_trace.logf("core", "detached session lifeline closed pid={d}", .{pid});
+    var waiter = ChildWaiter.init(child);
+    waiter.start() catch |err| {
+        // The supervisor still exits on its own, so wait for it here.
+        debug_trace.logf("core", "detached session exit watch unavailable pid={d} err={s}", .{ pid, @errorName(err) });
+        return child.wait(io);
+    };
+    const deadline_ms = io_mod.milliTimestamp() + detached_session_exit_wait_ms;
+    while (!waiter.isReady()) {
+        if (io_mod.milliTimestamp() >= deadline_ms) {
+            debug_trace.logf(
+                "core",
+                "detached session supervisor still running after {d} ms; killing its process group pid={d}",
+                .{ detached_session_exit_wait_ms, pid },
+            );
+            signalProcessGroup(pid, std.posix.SIG.KILL) catch |err| {
+                debug_trace.logf("core", "detached session process group kill failed pid={d} err={s}", .{ pid, @errorName(err) });
+            };
+            break;
+        }
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    waiter.awaitDiscard();
+    return waiter.result;
+}
+
+fn foregroundSessionExecutable(scratch: Allocator) ![]const u8 {
     return self_exe.pathForReexec(scratch);
 }
 
@@ -1340,6 +1813,7 @@ fn executeProcessWithScriptUnisolated(
     argv: []const []const u8,
     cwd: []const u8,
     script: []const u8,
+    environ_map: ?*const std.process.Environ.Map,
 ) !CollectedProcess {
     const started_ms = io_mod.milliTimestamp();
     var child = try std.process.spawn(io_mod.getIo(), .{
@@ -1348,7 +1822,8 @@ fn executeProcessWithScriptUnisolated(
         .stdout = .pipe,
         .stderr = .pipe,
         .cwd = .{ .path = cwd },
-        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+        .pgid = if (builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) 0 else null,
+        .environ_map = environ_map,
     });
 
     var output = OutputCollector.init(scratch, cfg);
@@ -1418,8 +1893,7 @@ fn createManagedCommandArtifact(
     alloc: Allocator,
     capability: *session_child_store.SessionChildCapability,
 ) !CommandArtifact {
-    const stem = try std.fmt.allocPrint(
-        alloc,
+    const stem = try alloc.print(
         "{s}{d}-{d}",
         .{
             command_artifact_file_prefix,
@@ -1495,8 +1969,7 @@ fn createManagedCommandArtifact(
 fn createCommandArtifactInDir(alloc: Allocator, dir: []const u8) !CommandArtifact {
     try config_runtime.makeAbsolutePath(dir);
 
-    const stem = try std.fmt.allocPrint(
-        alloc,
+    const stem = try alloc.print(
         "{s}{d}-{d}",
         .{ command_artifact_file_prefix, io_mod.milliTimestamp(), io_mod.nanoTimestamp() },
     );
@@ -1532,20 +2005,20 @@ fn artifactName(
     stem: []const u8,
     suffix: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}{s}", .{ stem, suffix });
+    return alloc.print("{s}{s}", .{ stem, suffix });
 }
 
 fn artifactPath(alloc: Allocator, dir: []const u8, stem: []const u8, suffix: []const u8) ![]u8 {
-    const name = try std.fmt.allocPrint(alloc, "{s}{s}", .{ stem, suffix });
+    const name = try alloc.print("{s}{s}", .{ stem, suffix });
     defer alloc.free(name);
-    return std.fs.path.join(alloc, &.{ dir, name });
+    return std.Io.Dir.path.join(alloc, &.{ dir, name });
 }
 
 fn fallbackCommandArtifactDir(alloc: Allocator) ![]u8 {
     const temp_root = io_mod.getenv("TMPDIR") orelse "/tmp";
-    const pid_text = try std.fmt.allocPrint(alloc, "{d}", .{currentProcessId()});
+    const pid_text = try alloc.print("{d}", .{currentProcessId()});
     defer alloc.free(pid_text);
-    return std.fs.path.join(alloc, &.{ temp_root, command_artifact_fallback_dir_name, pid_text });
+    return std.Io.Dir.path.join(alloc, &.{ temp_root, command_artifact_fallback_dir_name, pid_text });
 }
 
 fn currentProcessId() u64 {
@@ -1581,7 +2054,7 @@ fn executeRawBashWithResultCommand(
     result_command: []const u8,
     cwd: []const u8,
 ) !command_contract.RunCommandResult {
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         const argv = [_][]const u8{ "cmd", "/C", execution_command };
         const result = try executeProcess(scratch, cfg, &argv, cwd);
         return formatCollectedOutput(alloc, result_command, cwd, result);
@@ -1598,6 +2071,7 @@ fn executeRawBashWithResultCommand(
         &argv,
         cwd,
         execution_command,
+        null,
     );
     return formatCollectedOutput(alloc, result_command, cwd, result);
 }
@@ -1610,7 +2084,7 @@ fn executeRawInvocation(
     cwd: []const u8,
     invocation: *const shell_resolver.Invocation,
 ) !command_contract.RunCommandResult {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         return error.InvalidCommandEnvironment;
     }
     const result = try executeProcessWithScript(
@@ -1619,12 +2093,13 @@ fn executeRawInvocation(
         invocation.argv(),
         cwd,
         "",
+        null,
     );
     return formatCollectedOutput(alloc, command, cwd, result);
 }
 
 test "explicit captured profiles execute exact shells without synthetic stderr" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
     std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
         return error.SkipZigTest;
     const shell_path = "/bin/bash";
@@ -1674,7 +2149,7 @@ test "explicit captured profiles execute exact shells without synthetic stderr" 
 }
 
 test "zsh user profile reports natural SIGTERM after alias-safe startup" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
     std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
         return error.SkipZigTest;
 
@@ -1691,8 +2166,8 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
     const home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home");
     const workspace = try io_mod.dirRealpathAlloc(arena, tmp.dir, "workspace");
     const wrapper_dir = try io_mod.dirRealpathAlloc(arena, tmp.dir, "wrapper");
-    const wrapper_path = try std.fs.path.join(arena, &.{ wrapper_dir, "zsh" });
-    const debug_log = try std.fs.path.join(arena, &.{ workspace, "debug.log" });
+    const wrapper_path = try std.Io.Dir.path.join(arena, &.{ wrapper_dir, "zsh" });
+    const debug_log = try std.Io.Dir.path.join(arena, &.{ workspace, "debug.log" });
     const quoted_home = try shellQuote(arena, home);
     const quoted_debug_log = try shellQuote(arena, debug_log);
 
@@ -1716,8 +2191,7 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
             .{ .truncate = true },
         );
         defer wrapper.close(io_mod.getIo());
-        const source = try std.fmt.allocPrint(
-            arena,
+        const source = try arena.print(
             "#!/bin/sh\nexport HOME={s}\nexport ZDOTDIR={s}\nexport FX_SIGTERM_DEBUG_LOG={s}\nexec /bin/zsh \"$@\"\n",
             .{ quoted_home, quoted_home, quoted_debug_log },
         );
@@ -1739,11 +2213,17 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
     try std.testing.expect(std.mem.startsWith(u8, signaled.output, "signal=15\n"));
     const foreground = signaled.command_result.?;
     try std.testing.expectEqual(@as(?i64, null), foreground.exit_code);
-    try std.testing.expectEqual(@as(?u32, @intFromEnum(std.posix.SIG.TERM)), foreground.signal);
+    try std.testing.expectEqual(@as(?u32, @backingInt(std.posix.SIG.TERM)), foreground.signal);
 
-    const debug_output = try readAbsoluteFile(arena, debug_log, 4096);
-    try std.testing.expect(std.mem.find(u8, debug_output, "builtin trap - TERM") != null);
+    // The startup files ran once into the snapshot. The aliased `builtin`
+    // could not intercept the alias-safe `\builtin eval` that runs the
+    // command, and the replayed TRAPDEBUG still observed it. The log holds a
+    // line for each command TRAPDEBUG saw, and Debian's and Ubuntu's global
+    // compinit defines hundreds of functions, so it can pass 64 KiB.
+    const debug_output = try readAbsoluteFile(arena, debug_log, 4 * 1024 * 1024);
+    try std.testing.expect(std.mem.find(u8, debug_output, "builtin eval") != null);
     try std.testing.expect(std.mem.find(u8, debug_output, "kill -TERM $$") != null);
+    try std.testing.expect(std.mem.find(u8, signaled.output, "INTERCEPTED") == null);
 
     const trapped = try executeCommandInEnvironment(
         config,
@@ -1754,6 +2234,462 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
     );
     try std.testing.expectEqual(@as(?i64, 42), trapped.command_result.?.exit_code);
     try std.testing.expectEqual(@as(?u32, null), trapped.command_result.?.signal);
+}
+
+const SnapshotTestShell = struct { home: []const u8, workspace: []const u8, shell: []const u8 };
+
+fn writeSnapshotTestShell(
+    arena: Allocator,
+    tmp: *std.testing.TmpDir,
+    zshrc: []const u8,
+) !SnapshotTestShell {
+    return writeSnapshotTestShellFor(arena, tmp, "zsh", ".zshrc", zshrc);
+}
+
+/// Writes a wrapper named after the shell that pins HOME (and ZDOTDIR) to a
+/// temporary home holding `rc_name`.
+fn writeSnapshotTestShellFor(
+    arena: Allocator,
+    tmp: *std.testing.TmpDir,
+    shell_name: []const u8,
+    rc_name: []const u8,
+    rc: []const u8,
+) !SnapshotTestShell {
+    try tmp.dir.createDirPath(io_mod.getIo(), "home");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "wrapper");
+    const home = try io_mod.dirRealpathAlloc(arena, tmp.dir, "home");
+    const workspace = try io_mod.dirRealpathAlloc(arena, tmp.dir, "workspace");
+    const wrapper_dir = try io_mod.dirRealpathAlloc(arena, tmp.dir, "wrapper");
+    const rc_path = try std.Io.Dir.path.join(arena, &.{ "home", rc_name });
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = rc_path, .data = rc });
+    const source = try arena.print(
+        "#!/bin/sh\nexport HOME={s}\nexport ZDOTDIR={s}\nexec /bin/{s} \"$@\"\n",
+        .{ try shellQuote(arena, home), try shellQuote(arena, home), shell_name },
+    );
+    const wrapper_path = try std.Io.Dir.path.join(arena, &.{ "wrapper", shell_name });
+    var wrapper = try tmp.dir.createFile(io_mod.getIo(), wrapper_path, .{ .truncate = true });
+    defer wrapper.close(io_mod.getIo());
+    try wrapper.writeStreamingAll(io_mod.getIo(), source);
+    try wrapper.setPermissions(io_mod.getIo(), std.Io.File.Permissions.fromMode(0o700));
+    return .{
+        .home = home,
+        .workspace = workspace,
+        .shell = try std.Io.Dir.path.join(arena, &.{ wrapper_dir, shell_name }),
+    };
+}
+
+test "bash user profile commands reuse one startup-file snapshot" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShellFor(
+        arena,
+        &tmp,
+        "bash",
+        ".bash_profile",
+        "printf 'loaded\\n' >> \"$HOME/rc-loads.log\"\n" ++
+            "alias fxsnap_alias='printf alias-ok'\n" ++
+            "fxsnap_fn() { printf function-ok; }\n" ++
+            "export PATH=\"$HOME/marker-bin:$PATH\"\n" ++
+            "export FXSNAP_EXPORT=exported\n",
+    );
+
+    const config = Config{ .max_command_output_bytes = 64 * 1024 };
+    const first = try executeCommandInEnvironment(
+        config,
+        arena,
+        "trap 'echo trap-ok >&2' EXIT; echo stderr-ok >&2; " ++
+            "fxsnap_alias; echo; fxsnap_fn; echo; echo $FXSNAP_EXPORT; " ++
+            "case :$PATH: in *:$HOME/marker-bin:*) echo path-ok;; esac; cat; echo stdin-closed",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    // The command and its exit trap write to stderr after the replay hid it.
+    inline for (.{ "alias-ok", "function-ok", "exported", "path-ok", "stdin-closed", "stderr-ok", "trap-ok" }) |expected| {
+        try std.testing.expect(std.mem.find(u8, first.output, expected) != null);
+    }
+    try std.testing.expect(std.mem.startsWith(u8, first.output, "exit_code=0\n"));
+
+    _ = try executeCommandInEnvironment(config, arena, "cd /; export FXSNAP_LEAK=1", paths.workspace, .{ .user = paths.shell });
+    const third = try executeCommandInEnvironment(
+        config,
+        arena,
+        "echo \"pwd=$PWD leak=${FXSNAP_LEAK-unset}\"; exit 7",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    const expected_pwd = try arena.print("pwd={s} leak=unset", .{paths.workspace});
+    try std.testing.expect(std.mem.find(u8, third.output, expected_pwd) != null);
+    try std.testing.expectEqual(@as(?i64, 7), third.command_result.?.exit_code);
+
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+}
+
+test "user profile commands reuse one startup-file snapshot" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Thousands of functions push the replay past the pipe buffer, so the
+    // supervisor must stream it while the shell reads.
+    const paths = try writeSnapshotTestShell(
+        arena,
+        &tmp,
+        "print -r -- loaded >> \"$HOME/rc-loads.log\"\n" ++
+            "alias fxsnap_alias='print -r -- alias-ok'\n" ++
+            "fxsnap_fn() { print -r -- function-ok; }\n" ++
+            "export PATH=\"$HOME/marker-bin:$PATH\"\n" ++
+            "export FXSNAP_EXPORT=exported\n" ++
+            "for i in {1..3000}; do eval \"fxsnap_bulk_$i() { print -r -- bulk-$i; }\"; done\n",
+    );
+
+    const config = Config{ .max_command_output_bytes = 64 * 1024 };
+    const first = try executeCommandInEnvironment(
+        config,
+        arena,
+        "trap 'print -r -- trap-ok >&2' EXIT; print -r -- stderr-ok >&2; " ++
+            "fxsnap_alias; fxsnap_fn; print -r -- $FXSNAP_EXPORT; " ++
+            "case :$PATH: in *:$HOME/marker-bin:*) print -r -- path-ok;; esac; " ++
+            "fxsnap_bulk_2999; cat; print -r -- stdin-closed",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    // The command and its exit trap write to stderr after the replay hid it.
+    inline for (.{ "alias-ok", "function-ok", "exported", "path-ok", "bulk-2999", "stdin-closed", "stderr-ok", "trap-ok" }) |expected| {
+        try std.testing.expect(std.mem.find(u8, first.output, expected) != null);
+    }
+    try std.testing.expect(std.mem.startsWith(u8, first.output, "exit_code=0\n"));
+
+    _ = try executeCommandInEnvironment(
+        config,
+        arena,
+        "cd /; export FXSNAP_LEAK=1; alias fxsnap_new='print leaked'",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    const third = try executeCommandInEnvironment(
+        config,
+        arena,
+        "print -r -- \"pwd=$PWD leak=${FXSNAP_LEAK-unset}\"; " ++
+            "alias fxsnap_new >/dev/null 2>&1 || print -r -- alias-unset; exit 7",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    const expected_pwd = try arena.print("pwd={s} leak=unset", .{paths.workspace});
+    try std.testing.expect(std.mem.find(u8, third.output, expected_pwd) != null);
+    try std.testing.expect(std.mem.find(u8, third.output, "alias-unset") != null);
+    try std.testing.expectEqual(@as(?i64, 7), third.command_result.?.exit_code);
+
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    const loads = try readAbsoluteFile(arena, loads_path, 4096);
+    try std.testing.expectEqualStrings("loaded\n", loads);
+}
+
+test "zsh user profile snapshot restores a function that replaces a default alias" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // zsh starts with a `run-help` alias, and Debian's and Ubuntu's global
+    // zshrc replace it with a function, as this startup file does.
+    const paths = try writeSnapshotTestShell(
+        arena,
+        &tmp,
+        "print -r -- loaded >> \"$HOME/rc-loads.log\"\n" ++
+            "unalias run-help\n" ++
+            "run-help() { print -r -- run-help-function; }\n",
+    );
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+    for (0..2) |_| {
+        const result = try executeCommandInEnvironment(config, arena, "run-help", paths.workspace, .{ .user = paths.shell });
+        try std.testing.expectEqualStrings("exit_code=0\n<stdout>\nrun-help-function\n</stdout>\n", result.output);
+    }
+    // Both commands ran from the snapshot, so startup ran only for its capture.
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+}
+
+test "user profile command with an approval from an earlier shell epoch does not run" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShell(arena, &tmp, "alias fxsnap_alias='print -r -- alias-ok'\n");
+    const marker_path = try std.Io.Dir.path.join(arena, &.{ paths.workspace, "ran.log" });
+    const command = try arena.print("print -r -- ran >> {s}", .{try shellQuote(arena, marker_path)});
+
+    // The grant was checked under epoch 0; a refresh moved the shell to 1.
+    shell_snapshot.processOwner().markDirty(.user_reload);
+    const stale = try executeCommandInEnvironment(
+        .{ .max_command_output_bytes = 16 * 1024, .shell_grant_epoch = 0 },
+        arena,
+        command,
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    try std.testing.expectEqual(@as(?i64, 126), stale.command_result.?.exit_code);
+    try std.testing.expect(std.mem.find(u8, stale.output, "changed after it was approved") != null);
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), marker_path, .{}) catch |err| {
+        try std.testing.expectEqual(error.FileNotFound, err);
+    };
+
+    const current = try executeCommandInEnvironment(
+        .{ .max_command_output_bytes = 16 * 1024, .shell_grant_epoch = shell_snapshot.processOwner().approvalEpoch() },
+        arena,
+        command,
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+    try std.testing.expectEqual(@as(?i64, 0), current.command_result.?.exit_code);
+    try std.testing.expectEqualStrings("ran\n", try readAbsoluteFile(arena, marker_path, 4096));
+}
+
+fn brokenReplayCapture(request: shell_snapshot.CaptureRequest) shell_snapshot.CaptureOutcome {
+    const generation = shell_snapshot.Generation.create() catch return .{ .failed = .out_of_memory };
+    const alloc = generation.arena.allocator();
+    generation.shell_path = alloc.dupe(u8, request.shell_path) catch {
+        generation.destroy();
+        return .{ .failed = .out_of_memory };
+    };
+    generation.replay = "fxsnap_broken() {\n";
+    generation.environ.put("PATH", "/usr/bin:/bin") catch {};
+    return .{ .ready = generation };
+}
+
+/// Runs `command` once with both output callbacks captured, through a replay
+/// that fails, and checks that only the full-startup rerun's stdout `done\n`
+/// reached either callback: no replay error and no failure marker.
+fn expectFailedReplayHidden(
+    arena: Allocator,
+    command: []const u8,
+    paths: SnapshotTestShell,
+) !void {
+    var presented: StreamCapture = .{ .alloc = arena };
+    var accepted: StreamCapture = .{ .alloc = arena };
+    const config = Config{
+        .max_command_output_bytes = 16 * 1024,
+        .output_chunk_ctx = &presented,
+        .on_output_chunk = StreamCapture.onChunk,
+        .accepted_output_chunk_ctx = &accepted,
+        .on_accepted_output_chunk = StreamCapture.onChunk,
+    };
+    const result = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+    for ([_]*const StreamCapture{ &presented, &accepted }) |capture| {
+        var streamed: std.ArrayList(u8) = .empty;
+        for (capture.streams.items, capture.chunks.items) |stream, chunk| {
+            try std.testing.expectEqual(CommandOutputStream.stdout, stream);
+            try streamed.appendSlice(arena, chunk);
+        }
+        try std.testing.expectEqualStrings("done\n", streamed.items);
+    }
+    try std.testing.expect(std.mem.startsWith(u8, result.output, "exit_code=0\n"));
+    try std.testing.expect(std.mem.find(u8, result.output, "done") != null);
+    try std.testing.expect(std.mem.find(u8, result.output, shell_resolver.snapshot_replay_failure_prefix) == null);
+}
+
+test "user profile command reruns once with full startup after a failed replay" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(brokenReplayCapture);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShell(
+        arena,
+        &tmp,
+        "print -r -- loaded >> \"$HOME/rc-loads.log\"\n",
+    );
+    const marker_path = try std.Io.Dir.path.join(arena, &.{ paths.workspace, "runs.log" });
+    const command = try arena.print("print -r -- ran >> {s}; print -r -- done", .{try shellQuote(arena, marker_path)});
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+
+    try expectFailedReplayHidden(arena, command, paths);
+    try std.testing.expectEqualStrings("ran\n", try readAbsoluteFile(arena, marker_path, 4096));
+
+    // Later commands fall back to full startup without retrying the replay.
+    _ = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+    try std.testing.expectEqualStrings("ran\nran\n", try readAbsoluteFile(arena, marker_path, 4096));
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\nloaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+    var notice_buffer: [256]u8 = undefined;
+    const notice = shell_snapshot.processOwner().takeUiNotice(&notice_buffer).?;
+    try std.testing.expect(std.mem.find(u8, notice, "could not be restored") != null);
+}
+
+test "bash user profile command hides a failed replay from its output" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/bash", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(brokenReplayCapture);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShellFor(arena, &tmp, "bash", ".bash_profile", "");
+    try expectFailedReplayHidden(arena, "echo done", paths);
+}
+
+test "timed-out user profile command keeps stderr that could begin the replay marker" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShell(arena, &tmp, "");
+    // Capture the snapshot first so the timeout covers only the command.
+    _ = try executeCommandInEnvironment(
+        .{ .max_command_output_bytes = 1024 },
+        arena,
+        "true",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+
+    // The trailing `f` could begin the marker, so the filter holds it until
+    // the run ends, which here is a timeout.
+    var accepted: StreamCapture = .{ .alloc = arena };
+    try std.testing.expectError(error.TimeoutExpired, executeCommandInEnvironment(.{
+        .max_command_output_bytes = 1024,
+        .accepted_output_chunk_ctx = &accepted,
+        .on_accepted_output_chunk = StreamCapture.onChunk,
+        .timeout_ms = 1000,
+    }, arena, "printf 'waiting f' >&2; sleep 30", paths.workspace, .{ .user = paths.shell }));
+    var streamed: std.ArrayList(u8) = .empty;
+    for (accepted.streams.items, accepted.chunks.items) |stream, chunk| {
+        try std.testing.expectEqual(CommandOutputStream.stderr, stream);
+        try streamed.appendSlice(arena, chunk);
+    }
+    try std.testing.expectEqualStrings("waiting f", streamed.items);
+}
+
+test "replay marker filter drops the marker however chunks split it" {
+    const marker = shell_resolver.snapshot_replay_failure_prefix ++ "0123456789abcdef0123456789abcdef";
+    const Sink = struct {
+        alloc: Allocator,
+        stdout: std.ArrayList(u8) = .empty,
+        stderr: std.ArrayList(u8) = .empty,
+
+        fn onChunk(ctx: *anyopaque, _: ?types.ToolLifecycleId, stream: CommandOutputStream, chunk: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const list = switch (stream) {
+                .stdout => &self.stdout,
+                .stderr => &self.stderr,
+            };
+            try list.appendSlice(self.alloc, chunk);
+        }
+    };
+    const cases = [_]struct { input: []const u8, expected: []const u8 }{
+        .{ .input = marker, .expected = "" },
+        .{ .input = "warning\n" ++ marker, .expected = "warning\n" },
+        .{ .input = "ff" ++ marker ++ "f", .expected = "fff" },
+        // Partial markers that never complete pass through unchanged.
+        .{ .input = "err\nfx-shell-snapshot\nfx-done\n", .expected = "err\nfx-shell-snapshot\nfx-done\n" },
+        .{ .input = "ends with fx-shell-snap", .expected = "ends with fx-shell-snap" },
+    };
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for (cases) |case| {
+        // Every cut into two chunks, then one byte per chunk.
+        for (0..case.input.len + 2) |cut| {
+            var sink: Sink = .{ .alloc = arena };
+            var slot: ?ReplayMarkerFilter = null;
+            var ctx: ?*anyopaque = &sink;
+            var callback: ?CommandOutputCallback = Sink.onChunk;
+            ReplayMarkerFilter.install(&slot, marker, &ctx, &callback);
+            if (cut <= case.input.len) {
+                try callback.?(ctx.?, null, .stderr, case.input[0..cut]);
+                // Stdout is never filtered.
+                try callback.?(ctx.?, null, .stdout, marker);
+                try callback.?(ctx.?, null, .stderr, case.input[cut..]);
+            } else {
+                for (case.input, 0..) |_, index| {
+                    try callback.?(ctx.?, null, .stderr, case.input[index..][0..1]);
+                }
+                try callback.?(ctx.?, null, .stdout, marker);
+            }
+            try slot.?.finish();
+            try std.testing.expectEqualStrings(case.expected, sink.stderr.items);
+            try std.testing.expectEqualStrings(marker, sink.stdout.items);
+        }
+    }
+}
+
+test "zsh commands keep words that start with = literal in every captured profile" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Startup files that turn the option on explicitly do not reach the command.
+    const paths = try writeSnapshotTestShell(
+        arena,
+        &tmp,
+        "print -r -- loaded >> \"$HOME/rc-loads.log\"\nsetopt equals\n",
+    );
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    const command = "echo before; echo ======; [ x == x ] && echo same; echo after";
+    const expected = "exit_code=0\n<stdout>\nbefore\n======\nsame\nafter\n</stdout>\n";
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+
+    const clean = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .clean = "/bin/zsh" });
+    try std.testing.expectEqualStrings(expected, clean.output);
+
+    const snapshot = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+    try std.testing.expectEqualStrings(expected, snapshot.output);
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+
+    shell_snapshot.resetProcessOwnerForTest(brokenReplayCapture);
+    const full_startup = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+    try std.testing.expectEqualStrings(expected, full_startup.output);
+    try std.testing.expectEqualStrings("loaded\nloaded\n", try readAbsoluteFile(arena, loads_path, 4096));
 }
 
 fn formatOutput(alloc: Allocator, command: []const u8, cwd: []const u8, term: std.process.Child.Term, stdout_raw: []const u8, stderr_raw: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {
@@ -1795,7 +2731,7 @@ fn formatOutputWithStatus(
 fn commandStatusFromTerm(term: std.process.Child.Term) command_contract.CommandStatus {
     return switch (term) {
         .exited => |code| .{ .exit_code = @intCast(code) },
-        .signal => |sig| .{ .signal = @intFromEnum(sig) },
+        .signal => |sig| .{ .signal = @backingInt(sig) },
         .stopped, .unknown => .indeterminate,
     };
 }
@@ -1861,7 +2797,7 @@ fn writePreviewEnvelope(alloc: Allocator, writer: *std.Io.Writer, label: []const
 
     try writer.print("<{s}>\n", .{label});
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
+    defer mem_utils.deinit_arena(scratch_state);
     const scratch = scratch_state.allocator();
 
     if (preview.total_bytes <= preview.max_bytes) {
@@ -1904,6 +2840,8 @@ const TerminationSource = enum {
 const CollectedOutput = struct {
     source: TerminationSource,
     output_incomplete: bool = false,
+    /// When the leader was seen exiting on its own, before any output drain.
+    natural_completion_ms: ?i64 = null,
 };
 
 fn reconcileForegroundTerminationSource(
@@ -1973,6 +2911,9 @@ const OutputChunkEmitter = struct {
     stdout_pending: std.ArrayList(u8) = .empty,
     stderr_pending: std.ArrayList(u8) = .empty,
     presentation_suppressed: bool = false,
+    /// Set during the drain after a natural completion. Live delivery ends at
+    /// this time or on a cancel, while the output is still collected.
+    live_until_ms: ?i64 = null,
 
     fn deinit(self: *@This(), arena: Allocator) void {
         self.stdout_pending.deinit(arena);
@@ -2021,16 +2962,29 @@ const OutputChunkEmitter = struct {
             return;
         };
 
-        while (std.mem.findScalar(u8, pending.items, '\n')) |newline_index| {
-            const line = pending.items[0 .. newline_index + 1];
+        var line_start: usize = 0;
+        while (std.mem.findScalarPos(u8, pending.items, line_start, '\n')) |newline_index| {
+            if (self.liveDeliveryEnded(cfg)) {
+                self.suppressPresentation(error.OutputDrainInterrupted);
+                return;
+            }
+            const line = pending.items[line_start .. newline_index + 1];
             emitOutputChunk(ctx, callback, cfg.output_chunk_lifecycle_id, stream, line, cfg.callback_projection) catch |err| {
                 self.suppressPresentation(err);
                 return;
             };
-
-            const remaining = pending.items.len - (newline_index + 1);
-            std.mem.copyForwards(u8, pending.items[0..remaining], pending.items[newline_index + 1 ..]);
+            line_start = newline_index + 1;
+        }
+        if (line_start > 0) {
+            const remaining = pending.items.len - line_start;
+            @memmove(pending.items[0..remaining], pending.items[line_start..]);
             pending.items.len = remaining;
+        }
+        // The final flush always delivers the last partial line. It is one
+        // callback, so it cannot stretch the drain.
+        if (!flush_remainder and pending.items.len > 0 and self.liveDeliveryEnded(cfg)) {
+            self.suppressPresentation(error.OutputDrainInterrupted);
+            return;
         }
 
         if (!flush_remainder and pending.items.len >= pending_output_flush_bytes) {
@@ -2048,6 +3002,11 @@ const OutputChunkEmitter = struct {
             };
             pending.clearRetainingCapacity();
         }
+    }
+
+    fn liveDeliveryEnded(self: *const @This(), cfg: Config) bool {
+        const until_ms = self.live_until_ms orelse return false;
+        return cancelRequested(cfg.cancel_flag) or io_mod.milliTimestamp() >= until_ms;
     }
 
     fn suppressPresentation(self: *@This(), err: anyerror) void {
@@ -2182,9 +3141,9 @@ const ForegroundLaunchFailureProbe = struct {
 };
 
 fn parseReplaceError(name: []const u8) ?std.process.ReplaceError {
-    inline for (std.meta.fields(std.process.ReplaceError)) |field| {
-        if (std.mem.eql(u8, name, field.name)) {
-            return @field(std.process.ReplaceError, field.name);
+    inline for (comptime @typeInfo(std.process.ReplaceError).error_set.error_names.?) |error_name| {
+        if (std.mem.eql(u8, name, error_name)) {
+            return @field(std.process.ReplaceError, error_name);
         }
     }
     return null;
@@ -2201,8 +3160,8 @@ const ProcessObserver = struct {
         const process_id = child.id orelse return error.SpawnFailed;
         const stdout = child.stdout orelse return error.SpawnFailed;
         const stderr = child.stderr orelse return error.SpawnFailed;
-        const detached_pipes = comptime builtin.os.tag != .windows and
-            builtin.os.tag != .wasi;
+        const detached_pipes = comptime builtin.target.os.tag != .windows and
+            builtin.target.os.tag != .wasi;
         if (detached_pipes) {
             child.stdout = null;
             child.stderr = null;
@@ -2225,12 +3184,12 @@ const ProcessObserver = struct {
     }
 
     fn start(self: *ProcessObserver) !void {
-        if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+        if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
         try self.waiter.start();
     }
 
     fn observe(self: *ProcessObserver) ?command_contract.CommandStatus {
-        if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
+        if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return null;
         if (!self.waiter.isReady()) return null;
         const term = self.waiter.awaitReady() catch |err| {
             return indeterminateStatus(err);
@@ -2242,7 +3201,7 @@ const ProcessObserver = struct {
         self: *ProcessObserver,
         source: TerminationSource,
     ) !command_contract.CommandStatus {
-        if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (comptime builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
             self.waiter.awaitDiscard();
             return self.observe().?;
         }
@@ -2265,7 +3224,7 @@ const ProcessObserver = struct {
     fn statusFromTerm(
         term: std.process.Child.Term,
     ) command_contract.CommandStatus {
-        if (io_mod.getenv("FX_COMMAND_TEST_INDETERMINATE_AFTER_EXIT") != null) {
+        if (io_mod.getenv("FX_TEST_COMMAND_INDETERMINATE_AFTER_EXIT") != null) {
             debug_trace.logf(
                 "core",
                 "command termination became indeterminate reason=injected_after_exit",
@@ -2302,7 +3261,7 @@ const ProcessObserver = struct {
         protocol: TerminationProtocol,
         intent: TerminationIntent,
     ) !void {
-        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
             self.waiter.child.kill(self.waiter.io);
             return;
         }
@@ -2315,7 +3274,7 @@ const ProcessObserver = struct {
     }
 
     fn abort(self: *ProcessObserver, process_group_id: ?std.posix.pid_t) void {
-        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
             cleanupChild(self.waiter.child);
             return;
         }
@@ -2369,26 +3328,26 @@ fn collectOutput(
     var emitter: OutputChunkEmitter = .{};
     defer emitter.deinit(arena);
 
-    const started_ms = ExecutionControl.init(cfg).started_ms;
+    const control = ExecutionControl.init(cfg);
+    const started_ms = control.started_ms;
+    const deadline_ms = control.deadlineMs();
     var signal_started_ms: ?i64 = null;
     var force_kill_sent = false;
     var streams_finished = false;
     var output_incomplete = false;
+    var natural_drain: ?NaturalDrain = null;
 
     while (true) {
-        try updateTerminationSignal(
-            observer,
-            process_group_id,
-            termination_protocol,
-            cfg,
-            started_ms,
-            source,
-            &signal_started_ms,
-            &force_kill_sent,
-        );
+        // Observe the leader before any deadline or cancel so a command that
+        // already exited on its own is never signaled or reclassified.
         if (leader_status.* == null) {
             if (observer.observe()) |status| {
                 leader_status.* = status;
+                if (source.* == .natural) {
+                    const drain: NaturalDrain = .{ .completed_ms = observer.waiter.completed_ms };
+                    emitter.live_until_ms = drain.liveUntilMs(deadline_ms);
+                    natural_drain = drain;
+                }
                 if (process_group_id) |pid| {
                     if (source.* == .natural) {
                         terminateRemainingProcessGroup(pid);
@@ -2406,6 +3365,18 @@ fn collectOutput(
                     }
                 }
             }
+        }
+        if (natural_drain == null) {
+            try updateTerminationSignal(
+                observer,
+                process_group_id,
+                termination_protocol,
+                cfg,
+                started_ms,
+                source,
+                &signal_started_ms,
+                &force_kill_sent,
+            );
         }
 
         const now_ms = io_mod.milliTimestamp();
@@ -2429,6 +3400,39 @@ fn collectOutput(
             );
             break;
         }
+        if (natural_drain) |*drain| drain_stop: {
+            if (streams_finished) break :drain_stop;
+            const reason = drain.stop(
+                now_ms,
+                cancelRequested(cfg.cancel_flag),
+                deadline_ms,
+            ) orelse break :drain_stop;
+            const cuts_output = drain.cutsCommandOutput(reason);
+            if (cuts_output and !drain.confirming) {
+                // One more read shows whether the command's own output is
+                // still waiting or has all been read.
+                drain.confirming = true;
+                break :drain_stop;
+            }
+            debug_trace.logf(
+                "core",
+                "captured command output drain stopped after natural completion reason={s} bytes={d} waited_ms={d} output_cut={s}",
+                .{
+                    @tagName(reason),
+                    drain.bytes,
+                    @divTrunc(drain.waited_ns, std.time.ns_per_ms),
+                    if (cuts_output) "true" else "false",
+                },
+            );
+            if (cuts_output) {
+                recordOutputDrainFailure(
+                    &output_incomplete,
+                    @tagName(reason),
+                    error.OutputDrainInterrupted,
+                );
+            }
+            break;
+        }
 
         if (streams_finished) {
             if (source.* == .natural or
@@ -2442,13 +3446,22 @@ fn collectOutput(
             continue;
         }
 
-        const keep_reading = if (multi_reader.fill(4096, .{ .duration = .{ .raw = .{ .nanoseconds = command_output_poll_ms * std.time.ns_per_ms }, .clock = .awake } }))
+        const fill_started_ns = io_mod.nanoTimestamp();
+        var fill_timed_out = false;
+        const keep_reading = if (multi_reader.fill(4096, .{ .duration = .{ .raw = .{ .nanoseconds = capture_stop_poll_ms * std.time.ns_per_ms }, .clock = .awake } }))
             true
         else |err| switch (err) {
             error.EndOfStream => false,
-            error.Timeout => true,
+            error.Timeout => blk: {
+                fill_timed_out = true;
+                break :blk true;
+            },
             else => |e| blk: {
-                if (source.* != .natural or cancelRequested(cfg.cancel_flag)) return e;
+                if (source.* != .natural or
+                    (natural_drain == null and cancelRequested(cfg.cancel_flag)))
+                {
+                    return e;
+                }
                 recordOutputDrainFailure(
                     &output_incomplete,
                     "reader_coordination",
@@ -2460,6 +3473,13 @@ fn collectOutput(
 
         const stdout_buf = stdout_r.buffered();
         const stderr_buf = stderr_r.buffered();
+        if (natural_drain) |*drain| {
+            drain.record(
+                stdout_buf.len + stderr_buf.len,
+                fill_timed_out,
+                io_mod.nanoTimestamp() - fill_started_ns,
+            );
+        }
         if (stdout_buf.len > 0) {
             try emitter.append(arena, output, .stdout, stdout_buf, cfg);
             stdout_r.tossBuffered();
@@ -2472,7 +3492,9 @@ fn collectOutput(
             }
             stderr_r.tossBuffered();
         }
-        if (emitter.presentation_suppressed and cancelRequested(cfg.cancel_flag)) {
+        if (natural_drain == null and emitter.presentation_suppressed and
+            cancelRequested(cfg.cancel_flag))
+        {
             return error.Cancelled;
         }
         if (source.* == .natural) {
@@ -2502,8 +3524,73 @@ fn collectOutput(
     return .{
         .source = source.*,
         .output_incomplete = output_incomplete,
+        .natural_completion_ms = if (natural_drain) |drain| drain.completed_ms else null,
     };
 }
+
+/// Leftover-output drain after a command finishes on its own.
+const NaturalDrain = struct {
+    completed_ms: i64,
+    waited_ns: i128 = 0,
+    bytes: usize = 0,
+    /// A read that found nothing for a whole poll shows the command's own
+    /// leftover output has all been read. Later output is a daemon's.
+    leftover_read: bool = false,
+    /// One more read is confirming whether a stop would cut command output.
+    confirming: bool = false,
+
+    const Stop = enum {
+        wait_limit,
+        cancelled,
+        deadline,
+        byte_limit,
+    };
+
+    /// Records one read. Every wait counts, because leftover output reads
+    /// without waiting and only a detached writer makes capture wait.
+    fn record(self: *NaturalDrain, read_len: usize, timed_out: bool, waited_ns: i128) void {
+        self.bytes +|= read_len;
+        self.waited_ns +|= @max(waited_ns, 0);
+        if (timed_out) self.leftover_read = true;
+        // A read that returns nothing without timing out ended one stream,
+        // which settles nothing about the other, so confirmation starts over.
+        if (read_len == 0) self.confirming = false;
+    }
+
+    /// Reading ends at end of file, at the wait limit, on a cancel, at the
+    /// deadline, or once the byte budget shows a detached writer.
+    fn stop(
+        self: NaturalDrain,
+        now_ms: i64,
+        cancel_requested: bool,
+        deadline_ms: ?i64,
+    ) ?Stop {
+        if (cancel_requested) return .cancelled;
+        if (deadline_ms) |deadline| {
+            if (now_ms >= deadline) return .deadline;
+        }
+        if (self.bytes >= natural_completion_drain_max_bytes) return .byte_limit;
+        if (self.waited_ns >= natural_completion_wait_ms * std.time.ns_per_ms) return .wait_limit;
+        return null;
+    }
+
+    /// Whether stopping now can drop the command's own output. The wait limit
+    /// and the byte budget are reached only after that output was read.
+    fn cutsCommandOutput(self: NaturalDrain, reason: Stop) bool {
+        return switch (reason) {
+            .cancelled, .deadline => !self.leftover_read,
+            .wait_limit, .byte_limit => false,
+        };
+    }
+
+    /// When live delivery of drained output ends, so a slow reader cannot
+    /// hold the drain past its deadline or live limit.
+    fn liveUntilMs(self: NaturalDrain, deadline_ms: ?i64) i64 {
+        const limit_ms = self.completed_ms + natural_completion_live_ms;
+        const deadline = deadline_ms orelse return limit_ms;
+        return @min(deadline, limit_ms);
+    }
+};
 
 fn recordMultiReaderFailure(
     multi_reader: *const std.Io.File.MultiReader,
@@ -2560,7 +3647,7 @@ fn waitForCollectedProcess(
     leader_status: ?command_contract.CommandStatus,
 ) !command_contract.CommandStatus {
     if (leader_status) |status| {
-        if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        if (comptime builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) {
             observer.waiter.awaitDiscard();
         }
         return status;
@@ -2576,6 +3663,7 @@ const CollectedTermination = struct {
     source: TerminationSource,
     status: command_contract.CommandStatus,
     output_incomplete: bool = false,
+    natural_completion_ms: ?i64 = null,
 };
 
 fn collectSpawnedProcess(
@@ -2641,7 +3729,7 @@ fn collectSpawnedProcess(
     );
     wait_pending = false;
     var output_incomplete = collected_output.output_incomplete;
-    if (io_mod.getenv("FX_COMMAND_TEST_OUTPUT_INCOMPLETE_AFTER_EXIT") != null) {
+    if (io_mod.getenv("FX_TEST_COMMAND_OUTPUT_INCOMPLETE_AFTER_EXIT") != null) {
         recordOutputDrainFailure(
             &output_incomplete,
             "injected_after_exit",
@@ -2652,6 +3740,7 @@ fn collectSpawnedProcess(
         .source = collected_output.source,
         .status = status,
         .output_incomplete = output_incomplete,
+        .natural_completion_ms = collected_output.natural_completion_ms,
     };
 }
 
@@ -2728,10 +3817,19 @@ fn updateTerminationSignal(
     }
 
     if (signal_started_ms.*) |sent_ms| {
-        if (!force_kill_sent.* and now_ms - sent_ms >= 800) {
-            try observer.signal(process_group_id, termination_protocol, .force);
-            debug_trace.logf("core", "command force-killed after termination grace expired", .{});
-            force_kill_sent.* = true;
+        if (!force_kill_sent.*) {
+            // A force request (process exit) escalates a cooperative stop
+            // that is still inside its grace window.
+            const grace_expired = now_ms - sent_ms >= 800;
+            if (grace_expired or cancelRequested(cfg.force_cancel_flag)) {
+                try observer.signal(process_group_id, termination_protocol, .force);
+                debug_trace.logf(
+                    "core",
+                    "command force-killed reason={s}",
+                    .{if (grace_expired) "termination_grace_expired" else "force_cancel"},
+                );
+                force_kill_sent.* = true;
+            }
         }
     }
 }
@@ -2771,9 +3869,9 @@ fn terminateRemainingProcessGroup(pid: std.posix.pid_t) void {
 }
 
 fn remainingProcessGroupAlive(process_group_id: ?std.posix.pid_t) bool {
-    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return false;
+    if (comptime builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return false;
     const pid = process_group_id orelse return false;
-    std.posix.kill(-pid, @enumFromInt(0)) catch |err| return switch (err) {
+    std.posix.kill(-pid, @fromBackingInt(@intCast(0))) catch |err| return switch (err) {
         error.ProcessNotFound => false,
         else => true,
     };
@@ -2785,7 +3883,7 @@ fn cleanupChild(child: *std.process.Child) void {
         closeChildPipes(child);
         return;
     }
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) {
         child.kill(io_mod.getIo());
         return;
     }
@@ -2872,17 +3970,57 @@ test "raw process execution returns foreground output" {
     try std.testing.expect(!command_result.truncated);
 }
 
+test "commands receive fx agent environment" {
+    const result = try executeCommand(
+        .{ .max_command_output_bytes = 4096 },
+        std.testing.allocator,
+        "printf '%s' \"$AI_AGENT\"",
+        "/tmp",
+    );
+    defer std.testing.allocator.free(result.output);
+
+    try std.testing.expect(std.mem.find(
+        u8,
+        result.output,
+        "<stdout>\nfx\n</stdout>",
+    ) != null);
+}
+
+test "agent environment preserves the supplied environment without mutating it" {
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
+
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("AI_AGENT", "other-agent");
+    try environment.put("FX_AGENT_FIXTURE", "retained");
+
+    var scratch_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch_state.deinit();
+    const result = try executeProcessWithScript(
+        scratch_state.allocator(),
+        .{ .max_command_output_bytes = 4096 },
+        &.{ "/bin/sh", "-c", "printf '%s:%s' \"$AI_AGENT\" \"$FX_AGENT_FIXTURE\"" },
+        "/tmp",
+        "",
+        &environment,
+    );
+
+    try std.testing.expectEqualStrings("fx:retained", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+    try std.testing.expectEqualStrings("other-agent", environment.get("AI_AGENT").?);
+}
+
 test "authorized command executes exactly once" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cwd = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(cwd);
-    const marker = try std.fs.path.join(alloc, &.{ cwd, "attempts" });
+    const marker = try std.Io.Dir.path.join(alloc, &.{ cwd, "attempts" });
     defer alloc.free(marker);
     const quoted_marker = try shellQuote(alloc, marker);
     defer alloc.free(quoted_marker);
-    const command = try std.fmt.allocPrint(alloc, "printf x >> {s}", .{quoted_marker});
+    const command = try alloc.print("printf x >> {s}", .{quoted_marker});
     defer alloc.free(command);
 
     const result = try executeCommand(.{
@@ -2900,6 +4038,7 @@ fn spawnForegroundSessionBootstrapForTest(
     target_script: []const u8,
 ) !std.process.Child {
     const product_path = try foregroundSessionExecutable(std.testing.allocator);
+    defer std.testing.allocator.free(product_path);
     const argv = [_][]const u8{
         product_path,
         foreground_session_token,
@@ -2952,11 +4091,11 @@ fn expectRejectedForegroundSessionReleaseForTest(release: ?u8) !void {
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const marker_path = try std.fs.path.join(alloc, &.{ workspace, "rejected-release-target.txt" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "rejected-release-target.txt" });
     defer alloc.free(marker_path);
     const quoted_marker = try shellQuote(alloc, marker_path);
     defer alloc.free(quoted_marker);
-    const target_script = try std.fmt.allocPrint(alloc, "printf unexpected > {s}", .{quoted_marker});
+    const target_script = try alloc.print("printf unexpected > {s}", .{quoted_marker});
     defer alloc.free(target_script);
 
     var child = try spawnForegroundSessionBootstrapForTest(workspace, target_script);
@@ -2985,13 +4124,13 @@ fn spawnUnreadyForegroundSessionChildForTest(argv: []const []const u8) !std.proc
 
 fn expectReapedChildForTest(child: *std.process.Child, pid: std.posix.pid_t) !void {
     try std.testing.expect(child.id == null);
-    try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, @enumFromInt(0)));
+    try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, @fromBackingInt(@intCast(0))));
 }
 
 fn expectProcessGoneWithinForTest(pid: std.posix.pid_t, timeout_ms: i64) !void {
     const deadline_ms = io_mod.milliTimestamp() + timeout_ms;
     while (io_mod.milliTimestamp() < deadline_ms) {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+        std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
             error.ProcessNotFound => return,
             else => return err,
         };
@@ -3001,7 +4140,7 @@ fn expectProcessGoneWithinForTest(pid: std.posix.pid_t, timeout_ms: i64) !void {
 }
 
 test "captured foreground command runs beneath a detached session supervisor" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const command =
         "exec python3 -c 'import os,sys; " ++
@@ -3024,11 +4163,11 @@ test "foreground session bootstrap waits for release before executing target" {
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const marker_path = try std.fs.path.join(alloc, &.{ workspace, "released-target.txt" });
+    const marker_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "released-target.txt" });
     defer alloc.free(marker_path);
     const quoted_marker = try shellQuote(alloc, marker_path);
     defer alloc.free(quoted_marker);
-    const target_script = try std.fmt.allocPrint(alloc, "printf released > {s}", .{quoted_marker});
+    const target_script = try alloc.print("printf released > {s}", .{quoted_marker});
     defer alloc.free(target_script);
     var child = try spawnForegroundSessionBootstrapForTest(workspace, target_script);
     defer child.kill(io_mod.getIo());
@@ -3059,17 +4198,16 @@ test "foreground session owner loss kills the target and descendant before delay
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pids_path = try std.fs.path.join(alloc, &.{ workspace, "owner-loss.pids" });
+    const pids_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "owner-loss.pids" });
     defer alloc.free(pids_path);
-    const effect_path = try std.fs.path.join(alloc, &.{ workspace, "owner-loss.finished" });
+    const effect_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "owner-loss.finished" });
     defer alloc.free(effect_path);
     const quoted_pids = try shellQuote(alloc, pids_path);
     defer alloc.free(quoted_pids);
     const quoted_effect = try shellQuote(alloc, effect_path);
     defer alloc.free(quoted_effect);
     // Keep a write window open, but publish readiness only after the PID record is complete.
-    const target_script = try std.fmt.allocPrint(
-        alloc,
+    const target_script = try alloc.print(
         "sleep 30 & child=$!; (sleep 0.05; printf '%s %s' \"$$\" \"$child\") > {s}.pending && mv {s}.pending {s}; sleep 3; printf FINISHED > {s}",
         .{ quoted_pids, quoted_pids, quoted_pids, quoted_effect },
     );
@@ -3114,6 +4252,58 @@ test "foreground session owner loss kills the target and descendant before delay
     try expectProcessGoneWithinForTest(target_pid, 2_000);
     try expectProcessGoneWithinForTest(descendant_pid, 2_000);
     try std.testing.expect(!absoluteFileExists(effect_path));
+}
+
+test "finishing a detached session leaves cleanup to its supervisor" {
+    if (comptime !supports_foreground_session) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "grouped.pid" });
+    defer alloc.free(pid_path);
+    const quoted_pid = try shellQuote(alloc, pid_path);
+    defer alloc.free(quoted_pid);
+    // The descendant leaves the supervisor's process group before it records
+    // its PID, so killing that group cannot stop it. Only the supervisor's
+    // own cleanup can.
+    const script = try alloc.print(
+        "python3 -c 'import os,sys,time; os.setpgid(0,0); p=sys.argv[1]; " ++
+            "open(p+\".pending\",\"w\").write(str(os.getpid())); os.rename(p+\".pending\",p); " ++
+            "time.sleep(30)' {s} & wait",
+        .{quoted_pid},
+    );
+    defer alloc.free(script);
+
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    var child = try spawnDetachedSession(
+        scratch_state.allocator(),
+        &.{ "/bin/sh", "-c", script },
+        workspace,
+        null,
+    );
+    var finished = false;
+    defer if (!finished) {
+        _ = finishDetachedSession(&child) catch {};
+    };
+
+    const marker_deadline_ms = io_mod.milliTimestamp() + 2_000;
+    while (!absoluteFileExists(pid_path) and
+        io_mod.milliTimestamp() < marker_deadline_ms)
+    {
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+    const pid_text = try readAbsoluteFile(alloc, pid_path, 32);
+    defer alloc.free(pid_text);
+    const descendant_pid = try std.fmt.parseInt(std.posix.pid_t, pid_text, 10);
+    defer signalProcess(descendant_pid, std.posix.SIG.KILL) catch {};
+
+    finished = true;
+    _ = try finishDetachedSession(&child);
+    try expectProcessGoneWithinForTest(descendant_pid, 2_000);
 }
 
 test "foreground session bootstrap EOF executes no target" {
@@ -3163,14 +4353,13 @@ test "target replacement marker prefix remains ordinary stderr" {
 }
 
 test "target cannot recover replacement nonce from supervisor" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
-    const token_probe = if (builtin.os.tag == .linux)
+    const token_probe = if (builtin.target.os.tag == .linux)
         "tr '\\000' '\\n' < /proc/$PPID/cmdline | grep -E '^[0-9a-f]{32}$' | head -1"
     else
         "ps -ww -p $PPID -o command= | grep -Eo '[0-9a-f]{32}' | head -1";
-    const command = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const command = try std.testing.allocator.print(
         "token=$({s}); printf '\\000FX_FOREGROUND_EXEC_FAILED:%s:FileNotFound\\n' \"$token\" >&2; exit 125",
         .{token_probe},
     );
@@ -3322,12 +4511,13 @@ test "detached session preserves replacement failure with a zero output budget" 
             &argv,
             "/tmp",
             "",
+            null,
         ),
     );
 }
 
 test "raw process execution transports long scripts without exposing stdin" {
-    if (builtin.os.tag == .windows) return;
+    if (builtin.target.os.tag == .windows) return;
 
     const alloc = std.testing.allocator;
     var script: std.ArrayList(u8) = .empty;
@@ -3460,7 +4650,7 @@ test "managed command artifact confirms an indeterminate rename target" {
         "session",
     );
     defer alloc.free(session_path);
-    const commands = try std.fs.path.join(
+    const commands = try std.Io.Dir.path.join(
         alloc,
         &.{ session_path, "logs", "commands" },
     );
@@ -3500,7 +4690,7 @@ test "managed command artifact confirms an indeterminate rename target" {
     try std.testing.expectEqual(@as(usize, 3), entries.names.len);
     const output_path = metadataField(result.output, "output_file=").?;
     try std.testing.expect(std.mem.startsWith(u8, output_path, commands));
-    const output_handle = std.fs.path.basename(output_path);
+    const output_handle = std.Io.Dir.path.basename(output_path);
     try std.testing.expect(!capability.hasIndeterminateEntry(
         .command_artifacts,
         output_handle,
@@ -3707,7 +4897,7 @@ test "line buffered streaming preserves stderr stream and tail" {
 }
 
 test "multi-reader stream failure marks output incomplete" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const failed_pipe = try std.Io.Threaded.pipe2(.{});
     const clean_pipe = try std.Io.Threaded.pipe2(.{});
@@ -3750,7 +4940,7 @@ test "multi-reader stream failure marks output incomplete" {
 }
 
 test "presentation failure preserves the complete command result" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     var trigger = FailOutput{};
     const result = try executeCommand(.{
@@ -3766,7 +4956,7 @@ test "presentation failure preserves the complete command result" {
 }
 
 test "raw callback projection preserves bytes without changing command result" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     var safe_capture = StreamCapture{ .alloc = std.testing.allocator };
     defer safe_capture.deinit();
@@ -3828,7 +5018,7 @@ test "accepted callbacks preserve repeated newline-free stream order" {
 }
 
 test "cancellation requested by a failing output callback dominates its error" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     var cancel = std.atomic.Value(bool).init(false);
     var trigger = FailOutput{ .cancel_flag = &cancel };
@@ -3843,7 +5033,7 @@ test "cancellation requested by a failing output callback dominates its error" {
 }
 
 test "cancellation preserves the termination grace beneath the session supervisor" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     var cancel = std.atomic.Value(bool).init(false);
     var trigger = CancelAfterOutput{
@@ -3865,7 +5055,7 @@ test "cancellation preserves the termination grace beneath the session superviso
 }
 
 test "cancellation preserves the termination grace in an invoked script" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3913,7 +5103,7 @@ test "cancellation preserves the termination grace in an invoked script" {
 }
 
 test "cap-crossing cancellation returns a synchronized bounded result" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3956,7 +5146,7 @@ test "cap-crossing cancellation returns a synchronized bounded result" {
 }
 
 test "cancelled managed command confirms an indeterminate artifact target" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4022,7 +5212,7 @@ test "cancelled managed command confirms an indeterminate artifact target" {
     const foreground = result.command_result.?;
     const output_path = foreground.output_file orelse
         return error.TestExpectedEqual;
-    const output_handle = std.fs.path.basename(output_path);
+    const output_handle = std.Io.Dir.path.basename(output_path);
     try std.testing.expect(!capability.hasIndeterminateEntry(
         .command_artifacts,
         output_handle,
@@ -4053,7 +5243,7 @@ test "cancelled managed command confirms an indeterminate artifact target" {
 }
 
 test "below-cap cancellation retains complete artifact and non-truncated metadata" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4107,12 +5297,11 @@ test "zero-output cancellation remains a bare error" {
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const ready_path = try std.fs.path.join(alloc, &.{ workspace, "zero-output-ready" });
+    const ready_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "zero-output-ready" });
     defer alloc.free(ready_path);
     const quoted_ready = try shellQuote(alloc, ready_path);
     defer alloc.free(quoted_ready);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         ": > {s}; exec sleep 5",
         .{quoted_ready},
     );
@@ -4153,19 +5342,18 @@ test "zero-output cancellation remains a bare error" {
 }
 
 test "artifact write failure after cancellation remains a bare error" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const ready_path = try std.fs.path.join(alloc, &.{ workspace, "cancel-ready" });
+    const ready_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "cancel-ready" });
     defer alloc.free(ready_path);
     const quoted_ready = try shellQuote(alloc, ready_path);
     defer alloc.free(quoted_ready);
-    const script = try std.fmt.allocPrint(
-        alloc,
+    const script = try alloc.print(
         "trap 'printf \"CANCEL-TAIL\\n\"; exit 0' TERM; : > {s}; while :; do :; done",
         .{quoted_ready},
     );
@@ -4375,9 +5563,14 @@ test "pending termination source makes supervisor fallback timeout dominant" {
 }
 
 test "timeout prevents captured user shell from evaluating trailing statements" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
     std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
         return error.SkipZigTest;
+    // The timeout can expire while the process owner is still capturing the
+    // user's zsh. Resetting the owner on the way out joins that capture, so
+    // the capture never outlives this test or its allocator.
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4385,14 +5578,13 @@ test "timeout prevents captured user shell from evaluating trailing statements" 
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const effect_path = try std.fs.path.join(alloc, &.{ workspace, "post-timeout-effect.txt" });
+    const effect_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "post-timeout-effect.txt" });
     defer alloc.free(effect_path);
     const quoted_effect = try shellQuote(alloc, effect_path);
     defer alloc.free(quoted_effect);
     var capture = StreamCapture{ .alloc = alloc };
     defer capture.deinit();
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "sleep 2; printf 'SHOULD-NOT-RUN\\n'; printf 'SHOULD-NOT-RUN' > {s}",
         .{quoted_effect},
     );
@@ -4406,6 +5598,19 @@ test "timeout prevents captured user shell from evaluating trailing statements" 
     }, alloc, command, workspace, .{ .user = "/bin/zsh" }));
     try std.testing.expect(!capture.contains(.stdout, "SHOULD-NOT-RUN\n"));
     try std.testing.expect(!absoluteFileExists(effect_path));
+}
+
+test "child commands inherit the test runner environment" {
+    // A test fixture that installs its own environment resets it on teardown.
+    // One that leaves even an empty map behind gives the child processes of
+    // every later test no environment, so a login shell whose startup files
+    // read `$HOME` fails.
+    var expected = try std.process.Environ.createMap(std.testing.environ, std.testing.allocator);
+    defer expected.deinit();
+    const home = expected.get("HOME") orelse return error.SkipZigTest;
+    var inherited = try io_mod.cloneEnvironMap(std.testing.allocator);
+    defer inherited.deinit();
+    try std.testing.expectEqualStrings(home, inherited.get("HOME") orelse "");
 }
 
 test "timeout remains dominant when its output callback fails" {
@@ -4426,7 +5631,7 @@ test "timeout remains dominant when its output callback fails" {
 }
 
 test "timeout terminates foreground process group descendants" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4434,12 +5639,11 @@ test "timeout terminates foreground process group descendants" {
     try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
     defer alloc.free(workspace);
-    const ready_path = try std.fs.path.join(alloc, &.{ workspace, "timeout-ready.txt" });
+    const ready_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "timeout-ready.txt" });
     defer alloc.free(ready_path);
     const quoted_ready = try shellQuote(alloc, ready_path);
     defer alloc.free(quoted_ready);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "sleep 30 & child=$!; printf '%s' \"$child\" > {s}; wait",
         .{quoted_ready},
     );
@@ -4460,7 +5664,7 @@ test "timeout terminates foreground process group descendants" {
 
     const started_ms = io_mod.milliTimestamp();
     while (true) {
-        std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
+        std.posix.kill(pid, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
             error.ProcessNotFound => break,
             else => return err,
         };
@@ -4473,17 +5677,16 @@ test "timeout terminates foreground process group descendants" {
 }
 
 test "timeout terminates redirected descendant after setsid" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-timeout.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "escaped-timeout.pid" });
     defer alloc.free(pid_path);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "pid=os.fork()\n" ++
             "if pid == 0:\n" ++
@@ -4514,17 +5717,16 @@ test "timeout terminates redirected descendant after setsid" {
 }
 
 test "timeout terminates double-forked descendant after setsid" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "double-fork-timeout.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "double-fork-timeout.pid" });
     defer alloc.free(pid_path);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "pid=os.fork()\n" ++
             "if pid == 0:\n" ++
@@ -4557,17 +5759,16 @@ test "timeout terminates double-forked descendant after setsid" {
 }
 
 test "timeout terminates environment-sanitized double-fork descendants" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "env-clear-timeout.pids" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "env-clear-timeout.pids" });
     defer alloc.free(pid_path);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "/usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -c 'import os,time\n" ++
             "for index in range(16):\n" ++
             " pid=os.fork()\n" ++
@@ -4617,19 +5818,18 @@ fn expectProcessGone(pid: std.posix.pid_t) !void {
 }
 
 test "natural command completion terminates background child inheriting pipes" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "inherited-child.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "inherited-child.pid" });
     defer alloc.free(pid_path);
     const quoted_pid_path = try shellQuote(alloc, pid_path);
     defer alloc.free(quoted_pid_path);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "sleep 30 & child=$!; printf '%s' \"$child\" > {s}",
         .{quoted_pid_path},
     );
@@ -4653,19 +5853,18 @@ test "natural command completion terminates background child inheriting pipes" {
 }
 
 test "natural command completion terminates background child with redirected streams" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "redirected-child.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "redirected-child.pid" });
     defer alloc.free(pid_path);
     const quoted_pid_path = try shellQuote(alloc, pid_path);
     defer alloc.free(quoted_pid_path);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "sleep 30 >/dev/null 2>&1 & child=$!; printf '%s' \"$child\" > {s}",
         .{quoted_pid_path},
     );
@@ -4688,20 +5887,19 @@ test "natural command completion terminates background child with redirected str
     try expectProcessGone(pid);
 }
 
-test "natural command completion terminates redirected descendant after setsid" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+test "natural command completion keeps a daemon that detached after setsid" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-child.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "escaped-child.pid" });
     defer alloc.free(pid_path);
-    // Natural cleanup may kill the child before it publishes its PID unless
-    // the parent waits for readiness after setsid and stream redirection.
-    const command = try std.fmt.allocPrint(
-        alloc,
+    // Natural cleanup stops the child while it is still in the command
+    // session, so the parent waits for readiness after setsid and redirection.
+    const command = try alloc.print(
         "python3 -c 'import os,time\n" ++
             "ready_r,ready_w=os.pipe()\n" ++
             "pid=os.fork()\n" ++
@@ -4728,30 +5926,655 @@ test "natural command completion terminates redirected descendant after setsid" 
     defer alloc.free(result.output);
     try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
 
-    const pid_text = try readAbsoluteFile(alloc, pid_path, 64);
-    defer alloc.free(pid_text);
-    const pid = try std.fmt.parseInt(
-        std.posix.pid_t,
-        std.mem.trim(u8, pid_text, " \t\r\n"),
-        10,
-    );
-    try expectProcessGone(pid);
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 1), pids.len);
+    try std.testing.expect(try process_tree.processIsAlive(alloc, pids[0]));
 }
 
-test "cancellation preserves grace and removes an escaped descendant" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+test "natural command completion keeps a double-forked daemon and its children" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const pid_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-cancel.pid" });
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "daemon.pids" });
     defer alloc.free(pid_path);
-    const term_path = try std.fs.path.join(alloc, &.{ workspace, "escaped-cancel.term" });
+    // The daemon keeps every inherited descriptor except the output streams,
+    // like CLIs that spawn a detached background server and a browser child.
+    const command = try alloc.print(
+        "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " if os.fork() > 0: os._exit(0)\n" ++
+            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
+            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            " worker=os.fork()\n" ++
+            " if worker == 0:\n" ++
+            "  time.sleep(30)\n" ++
+            "  os._exit(0)\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid())+\" \"+str(worker))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "print(\"DAEMON-STARTED\")'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+    try std.testing.expect(std.mem.find(u8, result.output, "DAEMON-STARTED") != null);
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 2), pids.len);
+    for (pids) |pid| {
+        try std.testing.expect(try process_tree.processIsAlive(alloc, pid));
+    }
+}
+
+test "natural command completion returns while a detached daemon keeps command output" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "output-holder.pid" });
+    defer alloc.free(pid_path);
+    // The daemon keeps a duplicate of the output pipe on a high descriptor,
+    // so end of file never arrives while it runs.
+    const command = try alloc.print(
+        "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " kept=os.dup(1)\n" ++
+            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
+            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "print(\"BEFORE-EXIT\", flush=True)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    const started_ms = io_mod.milliTimestamp();
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+    try std.testing.expect(std.mem.find(u8, result.output, "BEFORE-EXIT") != null);
+    try std.testing.expect(elapsed_ms >= natural_completion_wait_ms);
+    try std.testing.expect(elapsed_ms < 5_000);
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 1), pids.len);
+    try std.testing.expect(try process_tree.processIsAlive(alloc, pids[0]));
+}
+
+test "natural command completion keeps a detached daemon that hides its descriptors" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "hidden-daemon.pid" });
+    defer alloc.free(pid_path);
+    // Like ssh-agent, the daemon turns off Linux process inspection, then it
+    // closes every descriptor. Neither may decide whether it survives.
+    const command = try alloc.print(
+        "python3 -c 'import ctypes,os,sys,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " if sys.platform.startswith(\"linux\"): ctypes.CDLL(None).prctl(4,0,0,0,0)\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\")\n" ++
+            " os.closerange(0,65536)\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "time.sleep(0.1)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 1), pids.len);
+    try std.testing.expect(try process_tree.processIsAlive(alloc, pids[0]));
+}
+
+test "natural completion drain counts every wait and cuts output only before the leftover is read" {
+    const wait_limit_ns: i128 = natural_completion_wait_ms * std.time.ns_per_ms;
+    var drain: NaturalDrain = .{ .completed_ms = 1_000 };
+    // Leftover output reads without waiting, however slowly it is delivered.
+    drain.record(4096, false, 0);
+    try std.testing.expectEqual(@as(?NaturalDrain.Stop, null), drain.stop(9_000, false, null));
+    try std.testing.expect(drain.cutsCommandOutput(.cancelled));
+    try std.testing.expect(drain.cutsCommandOutput(.deadline));
+    try std.testing.expect(!drain.cutsCommandOutput(.wait_limit));
+    try std.testing.expect(!drain.cutsCommandOutput(.byte_limit));
+
+    // Waits count even when a detached writer's output ends them.
+    drain.record(16, false, wait_limit_ns - 1);
+    try std.testing.expectEqual(@as(?NaturalDrain.Stop, null), drain.stop(9_000, false, null));
+    drain.record(16, false, 1);
+    try std.testing.expectEqual(@as(?NaturalDrain.Stop, .wait_limit), drain.stop(9_000, false, null));
+
+    // A stream reaching end of file restarts a confirmation but proves
+    // nothing about the other stream.
+    drain.confirming = true;
+    drain.record(0, false, 0);
+    try std.testing.expect(!drain.confirming);
+    try std.testing.expect(drain.cutsCommandOutput(.cancelled));
+
+    // A read that finds nothing for a whole poll shows the command's own
+    // output is done.
+    drain.record(0, true, 0);
+    try std.testing.expect(!drain.cutsCommandOutput(.cancelled));
+    try std.testing.expect(!drain.cutsCommandOutput(.deadline));
+
+    var busy: NaturalDrain = .{ .completed_ms = 1_000 };
+    busy.record(0, false, -5);
+    try std.testing.expectEqual(@as(i128, 0), busy.waited_ns);
+    try std.testing.expectEqual(@as(?NaturalDrain.Stop, .cancelled), busy.stop(1_001, true, null));
+    try std.testing.expectEqual(@as(?NaturalDrain.Stop, .deadline), busy.stop(1_500, false, 1_500));
+    try std.testing.expectEqual(@as(?NaturalDrain.Stop, null), busy.stop(1_499, false, 1_500));
+    // The live limit ends only delivery. Reading continues past it.
+    const limit_ms = busy.completed_ms + natural_completion_live_ms;
+    try std.testing.expectEqual(@as(?NaturalDrain.Stop, null), busy.stop(limit_ms + 1, false, null));
+    try std.testing.expectEqual(limit_ms, busy.liveUntilMs(null));
+    try std.testing.expectEqual(@as(i64, 1_500), busy.liveUntilMs(1_500));
+    try std.testing.expectEqual(limit_ms, busy.liveUntilMs(limit_ms + 1));
+    busy.record(natural_completion_drain_max_bytes, false, 0);
+    try std.testing.expectEqual(@as(?NaturalDrain.Stop, .byte_limit), busy.stop(1_499, false, null));
+}
+
+const SlowOutputConsumer = struct {
+    delay_ms: u64,
+    lines: usize = 0,
+
+    fn onChunk(ctx: *anyopaque, _: ?types.ToolLifecycleId, _: CommandOutputStream, bytes: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lines += std.mem.countScalar(u8, bytes, '\n');
+        io_mod.sleep(self.delay_ms * std.time.ns_per_ms);
+    }
+};
+
+test "natural completion delivers all leftover output to a slow consumer" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    // The command exits with its last lines still in the pipe, and delivery
+    // takes 10 ms per line, so draining them takes well over one second.
+    var consumer = SlowOutputConsumer{ .delay_ms = 10 };
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 30_000,
+        .output_chunk_ctx = @ptrCast(&consumer),
+        .on_output_chunk = SlowOutputConsumer.onChunk,
+    }, alloc, "python3 -c 'import sys; sys.stdout.write((\"y\"*99+\"\\n\")*200)'", workspace);
+    defer alloc.free(result.output);
+    const command_result = result.command_result.?;
+    try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
+    try std.testing.expectEqual(@as(usize, 20_000), command_result.stdout_bytes);
+    try std.testing.expect(!command_result.output_incomplete);
+}
+
+test "natural command completion stops a same-session process that left the process group" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "own-group.pid" });
+    defer alloc.free(pid_path);
+    // A process group kill cannot reach this child, so only the session
+    // rule stops it.
+    const command = try alloc.print(
+        "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setpgid(0,0)\n" ++
+            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
+            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 1), pids.len);
+    try expectProcessGone(pids[0]);
+}
+
+test "natural completion keeps its exit when the deadline passes during the output drain" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "drain-deadline.pid" });
+    defer alloc.free(pid_path);
+    const timeout_ms: usize = 3_000;
+    // The command exits about 800 ms before its deadline while a detached
+    // daemon keeps the output open, so the deadline lands inside the drain.
+    // Its last line has no newline, so only the final flush delivers it live.
+    const command = try alloc.print(
+        "python3 -c 'import os,sys,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " kept=os.dup(1)\n" ++
+            " null=os.open(\"/dev/null\",os.O_RDWR)\n" ++
+            " os.dup2(null,0); os.dup2(null,1); os.dup2(null,2)\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "time.sleep(2.2)\n" ++
+            "sys.stdout.write(\"FINISHED-BEFORE-DEADLINE\"); sys.stdout.flush()'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    var recorder = LiveOutputRecorder{};
+    defer recorder.delivered.deinit(std.testing.allocator);
+    const started_ms = io_mod.milliTimestamp();
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = timeout_ms,
+        .output_chunk_ctx = @ptrCast(&recorder),
+        .on_output_chunk = LiveOutputRecorder.onChunk,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    try std.testing.expectEqual(@as(?i64, 0), result.command_result.?.exit_code);
+    try std.testing.expect(
+        std.mem.find(u8, result.output, "FINISHED-BEFORE-DEADLINE") != null,
+    );
+    try std.testing.expect(elapsed_ms < @as(i64, timeout_ms) + 1_000);
+    try std.testing.expect(!result.command_result.?.output_incomplete);
+    try std.testing.expect(std.mem.endsWith(u8, recorder.delivered.items, "FINISHED-BEFORE-DEADLINE"));
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    try std.testing.expectEqual(@as(usize, 1), pids.len);
+    try std.testing.expect(try process_tree.processIsAlive(alloc, pids[0]));
+}
+
+test "natural completion stops waiting on a detached daemon that keeps writing" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "chatty-daemon.pid" });
+    defer alloc.free(pid_path);
+    // The daemon writes to the command's output every 5 ms, so the pipes
+    // never reach end of file and no read waits a whole poll.
+    const command = try alloc.print(
+        "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " end=time.time()+30\n" ++
+            " while time.time() < end:\n" ++
+            "  os.write(1,b\"tick\\n\")\n" ++
+            "  time.sleep(0.005)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "print(\"COMMAND-DONE\", flush=True)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    const started_ms = io_mod.milliTimestamp();
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    const command_result = result.command_result.?;
+    try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
+    try std.testing.expect(!command_result.output_incomplete);
+    try std.testing.expect(elapsed_ms < 5_000);
+}
+
+const CancelOnOutput = struct {
+    cancel: *std.atomic.Value(bool),
+    needle: []const u8,
+    /// Matching chunks to receive before cancelling.
+    cancel_after: usize = 1,
+    /// Time each matching chunk takes to deliver.
+    delay_ms: u64 = 0,
+    seen: usize = 0,
+
+    fn onChunk(ctx: *anyopaque, _: ?types.ToolLifecycleId, _: CommandOutputStream, bytes: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (std.mem.find(u8, bytes, self.needle) == null) return;
+        self.seen += 1;
+        io_mod.sleep(self.delay_ms * std.time.ns_per_ms);
+        if (self.seen >= self.cancel_after) self.cancel.store(true, .release);
+    }
+};
+
+test "natural completion ends live delivery of drained output at a cancel" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "burst-daemon.pid" });
+    defer alloc.free(pid_path);
+    // After the command exits, the daemon writes 200 lines at once, and the
+    // reader takes 20 ms per line and cancels at the 20th.
+    const command = try alloc.print(
+        "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " time.sleep(0.3)\n" ++
+            " os.write(1,b\"\".join(b\"DAEMON-LINE-%03d\\n\" % i for i in range(200)))\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "print(\"COMMAND-DONE\", flush=True)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var trigger = CancelOnOutput{
+        .cancel = &cancel,
+        .needle = "DAEMON-LINE",
+        .cancel_after = 20,
+        .delay_ms = 20,
+    };
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+        .cancel_flag = &cancel,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = CancelOnOutput.onChunk,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    const command_result = result.command_result.?;
+    try std.testing.expectEqual(@as(usize, 20), trigger.seen);
+    try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
+    try std.testing.expect(!command_result.output_incomplete);
+}
+
+test "natural completion keeps complete output when a cancel follows the command's last line" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    // Delivering the last line takes long enough for the command to exit
+    // and both pipes to reach end of file before the cancel lands.
+    var cancel = std.atomic.Value(bool).init(false);
+    var trigger = CancelOnOutput{ .cancel = &cancel, .needle = "FINAL-LINE", .delay_ms = 300 };
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+        .cancel_flag = &cancel,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = CancelOnOutput.onChunk,
+    }, alloc, "printf 'FINAL-LINE\\n'", workspace);
+    defer alloc.free(result.output);
+    const command_result = result.command_result.?;
+    try std.testing.expect(cancel.load(.acquire));
+    try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
+    try std.testing.expectEqual(@as(?u32, null), command_result.signal);
+    try std.testing.expect(!command_result.output_incomplete);
+    try std.testing.expect(std.mem.find(u8, result.output, "FINAL-LINE") != null);
+}
+
+test "natural completion keeps complete output when a cancel follows only daemon output" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "late-daemon.pid" });
+    defer alloc.free(pid_path);
+    // The daemon writes once after the command exits, and that output
+    // triggers the cancel, so only daemon output is left unread.
+    const command = try alloc.print(
+        "python3 -c 'import os,time\n" ++
+            "ready_r,ready_w=os.pipe()\n" ++
+            "if os.fork() == 0:\n" ++
+            " os.close(ready_r)\n" ++
+            " os.setsid()\n" ++
+            " with open(\"{s}\",\"w\") as f: f.write(str(os.getpid()))\n" ++
+            " os.write(ready_w,b\"R\"); os.close(ready_w)\n" ++
+            " time.sleep(0.6)\n" ++
+            " os.write(1,b\"LATE-DAEMON-OUTPUT\\n\")\n" ++
+            " time.sleep(30)\n" ++
+            " os._exit(0)\n" ++
+            "os.close(ready_w)\n" ++
+            "if os.read(ready_r,1) != b\"R\": raise SystemExit(1)\n" ++
+            "print(\"COMMAND-DONE\", flush=True)'",
+        .{pid_path},
+    );
+    defer alloc.free(command);
+
+    var cancel = std.atomic.Value(bool).init(false);
+    var trigger = CancelOnOutput{ .cancel = &cancel, .needle = "LATE-DAEMON-OUTPUT" };
+    const started_ms = io_mod.milliTimestamp();
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 10_000,
+        .cancel_flag = &cancel,
+        .output_chunk_ctx = @ptrCast(&trigger),
+        .on_output_chunk = CancelOnOutput.onChunk,
+    }, alloc, command, workspace);
+    defer alloc.free(result.output);
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+
+    const pids = try readPidsForTest(alloc, pid_path);
+    defer alloc.free(pids);
+    defer stopProcessesForTest(pids);
+    const command_result = result.command_result.?;
+    try std.testing.expect(cancel.load(.acquire));
+    try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
+    try std.testing.expectEqual(@as(?u32, null), command_result.signal);
+    try std.testing.expect(!command_result.output_incomplete);
+    try std.testing.expect(std.mem.find(u8, result.output, "COMMAND-DONE") != null);
+    try std.testing.expect(elapsed_ms < 3_000);
+}
+
+const LiveOutputRecorder = struct {
+    delivered: std.ArrayList(u8) = .empty,
+    calls: usize = 0,
+
+    fn onChunk(ctx: *anyopaque, _: ?types.ToolLifecycleId, _: CommandOutputStream, bytes: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        try self.delivered.appendSlice(std.testing.allocator, bytes);
+    }
+};
+
+test "output emitter delivers each line once and flushes the last partial line after live delivery ends" {
+    const alloc = std.testing.allocator;
+    var recorder = LiveOutputRecorder{};
+    defer recorder.delivered.deinit(alloc);
+    const cfg: Config = .{
+        .max_command_output_bytes = 1024,
+        .output_chunk_ctx = @ptrCast(&recorder),
+        .on_output_chunk = LiveOutputRecorder.onChunk,
+    };
+
+    var emitter: OutputChunkEmitter = .{};
+    defer emitter.deinit(alloc);
+    emitter.emitPending(alloc, &emitter.stdout_pending, .stdout, "one\ntw", cfg, false);
+    emitter.emitPending(alloc, &emitter.stdout_pending, .stdout, "o\nthree\nfour", cfg, false);
+    try std.testing.expectEqualStrings("one\ntwo\nthree\n", recorder.delivered.items);
+    try std.testing.expectEqual(@as(usize, 3), recorder.calls);
+
+    // Once live delivery has ended, the final flush still delivers the last
+    // partial line.
+    emitter.live_until_ms = 0;
+    emitter.flush(alloc, cfg);
+    try std.testing.expectEqualStrings("one\ntwo\nthree\nfour", recorder.delivered.items);
+    try std.testing.expectEqual(@as(usize, 4), recorder.calls);
+
+    // Later lines are collected by the caller but no longer delivered live.
+    var ended: OutputChunkEmitter = .{ .live_until_ms = 0 };
+    defer ended.deinit(alloc);
+    ended.emitPending(alloc, &ended.stdout_pending, .stdout, "late\n", cfg, false);
+    try std.testing.expect(ended.presentation_suppressed);
+    try std.testing.expectEqual(@as(usize, 4), recorder.calls);
+}
+
+test "natural completion marks output incomplete when the deadline cuts leftover output" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    // The command exits at once, but delivering its 200 lines takes about
+    // four seconds, so the deadline lands while its output is still unread.
+    var consumer = SlowOutputConsumer{ .delay_ms = 20 };
+    const result = try executeCommand(.{
+        .max_command_output_bytes = 1024,
+        .timeout_ms = 1_000,
+        .output_chunk_ctx = @ptrCast(&consumer),
+        .on_output_chunk = SlowOutputConsumer.onChunk,
+    }, alloc, "python3 -c 'import sys; sys.stdout.write((\"y\"*99+\"\\n\")*200)'", workspace);
+    defer alloc.free(result.output);
+    const command_result = result.command_result.?;
+    try std.testing.expectEqual(@as(?i64, 0), command_result.exit_code);
+    try std.testing.expect(!command_result.timed_out);
+    try std.testing.expect(command_result.output_incomplete);
+    // Live delivery ends at the deadline, so the confirming read is not
+    // delivered line by line.
+    try std.testing.expect(consumer.lines < 100);
+}
+
+/// Reads whitespace-separated PIDs. The caller owns the returned slice.
+fn readPidsForTest(alloc: Allocator, path: []const u8) ![]std.posix.pid_t {
+    const text = try readAbsoluteFile(alloc, path, 256);
+    defer alloc.free(text);
+    var pids: std.ArrayList(std.posix.pid_t) = .empty;
+    errdefer pids.deinit(alloc);
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    while (tokens.next()) |token| {
+        try pids.append(alloc, try std.fmt.parseInt(std.posix.pid_t, token, 10));
+    }
+    return pids.toOwnedSlice(alloc);
+}
+
+fn stopProcessesForTest(pids: []const std.posix.pid_t) void {
+    for (pids) |pid| std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+}
+
+test "cancellation preserves grace and removes an escaped descendant" {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    const pid_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "escaped-cancel.pid" });
+    defer alloc.free(pid_path);
+    const term_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "escaped-cancel.term" });
     defer alloc.free(term_path);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "python3 -c 'import os,signal,time\n" ++
             "pid=os.fork()\n" ++
             "if pid == 0:\n" ++
@@ -4836,7 +6659,7 @@ test "cancel and timeout tie chooses cancellation" {
 }
 
 test "runtime cancellation observed at the timeout deadline stays graceful" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     for (0..10) |_| {
         const alloc = std.testing.allocator;
@@ -4844,12 +6667,11 @@ test "runtime cancellation observed at the timeout deadline stays graceful" {
         defer tmp.cleanup();
         const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
         defer alloc.free(workspace);
-        const term_path = try std.fs.path.join(alloc, &.{ workspace, "tie.term" });
+        const term_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "tie.term" });
         defer alloc.free(term_path);
         const quoted_term = try shellQuote(alloc, term_path);
         defer alloc.free(quoted_term);
-        const command = try std.fmt.allocPrint(
-            alloc,
+        const command = try alloc.print(
             "trap 'printf TERM > {s}; sleep 3; exit 130' TERM; printf 'TIE-READY\n'; while :; do sleep 1; done",
             .{quoted_term},
         );
@@ -4902,7 +6724,7 @@ test "runtime cancellation observed at the timeout deadline stays graceful" {
 }
 
 test "accepted short timeout matrix returns timeout errors" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     for ([_]usize{ 1, 2, 5, 10, 25, 50 }) |timeout_ms| {
         try std.testing.expectError(error.TimeoutExpired, executeCommand(.{
@@ -4913,19 +6735,18 @@ test "accepted short timeout matrix returns timeout errors" {
 }
 
 test "supervisor handoff does not extend the parent timeout deadline" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const effect_path = try std.fs.path.join(alloc, &.{ workspace, "handoff-effect" });
+    const effect_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "handoff-effect" });
     defer alloc.free(effect_path);
     const quoted_effect = try shellQuote(alloc, effect_path);
     defer alloc.free(quoted_effect);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "sleep 0.6; printf trailing > {s}",
         .{quoted_effect},
     );
@@ -4939,19 +6760,18 @@ test "supervisor handoff does not extend the parent timeout deadline" {
 }
 
 test "supervisor fallback force remains timeout dominant" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .wasi) return;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(workspace);
-    const term_path = try std.fs.path.join(alloc, &.{ workspace, "fallback.term" });
+    const term_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "fallback.term" });
     defer alloc.free(term_path);
     const quoted_term = try shellQuote(alloc, term_path);
     defer alloc.free(quoted_term);
-    const command = try std.fmt.allocPrint(
-        alloc,
+    const command = try alloc.print(
         "trap 'printf TERM > {s}; exit 130' TERM; printf 'FALLBACK-BLOCK\n'; while :; do sleep 1; done",
         .{quoted_term},
     );

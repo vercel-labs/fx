@@ -3,7 +3,7 @@ import { strict as assert } from "node:assert";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../node.js";
+import { createFxEngine } from "../node.js";
 
 const events = [];
 const unicodeText = "\u{1f600}界".repeat(200_000);
@@ -66,7 +66,7 @@ try {
   let catalogCalls = 0;
   let firstAbortResolve;
   const firstAbort = new Promise((resolveAbort) => { firstAbortResolve = resolveAbort; });
-  agent = await createFxAgent({
+  agent = await createFxEngine({
     nativeAddon: addon,
     backend: "native",
     async fetch(input, init) {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const message = @import("../shared/message.zig");
@@ -180,6 +181,15 @@ fn dupeCommittedFilePresentation(
         .call_id = try durableIdentifier(alloc, id.call_id),
     } else null;
     errdefer if (lifecycle_id) |id| alloc.free(@constCast(id.call_id));
+    const content_handle = if (presentation.content_handle) |handle|
+        try alloc.dupe(u8, handle)
+    else
+        null;
+    errdefer if (content_handle) |handle| alloc.free(handle);
+    const review_lines = if (presentation.review_lines) |rows|
+        try types.dupeCommittedFilePresentationLines(alloc, rows)
+    else
+        null;
     return .{
         .path = path,
         .kind = presentation.kind,
@@ -190,6 +200,8 @@ fn dupeCommittedFilePresentation(
         .previous_content = previous_content,
         .after_content = after_content,
         .lifecycle_id = lifecycle_id,
+        .content_handle = content_handle,
+        .review_lines = review_lines,
     };
 }
 
@@ -209,9 +221,12 @@ pub fn appendFileEvidenceForTool(
     const object = parsed.value.object;
 
     const path = switch (action) {
-        .search => stringField(object, "path") orelse stringField(object, "directory") orelse stringField(object, "query"),
-        else => stringField(object, "path"),
-    } orelse return;
+        .search => non_empty_string_field(object, "path") orelse
+            non_empty_string_field(object, "directory") orelse
+            non_empty_string_field(object, "query") orelse
+            ".",
+        else => non_empty_string_field(object, "path") orelse return,
+    };
 
     const evidence = try makeFileEvidence(
         alloc,
@@ -273,6 +288,10 @@ const ChatMessageAdapter = struct {
         return value.role == .user and value.permission_feedback;
     }
 
+    fn isContextNote(value: Message) bool {
+        return value.role == .system and value.context_note;
+    }
+
     fn toolCalls(value: Message) []const ToolCall {
         return value.tool_calls;
     }
@@ -291,6 +310,10 @@ const ChatMessageAdapter = struct {
 
     fn toolResultMemory(value: Message) ?types.ToolResultMemory {
         return value.tool_result_memory;
+    }
+
+    fn toolResultCreatedAtMs(value: Message) ?i64 {
+        return value.tool_result_created_at_ms;
     }
 
     fn content(value: Message) ?[]const u8 {
@@ -324,6 +347,11 @@ const MessageAdapter = struct {
         return value.role == .user and value.permission_feedback;
     }
 
+    /// This message type carries no context notes.
+    fn isContextNote(_: Message) bool {
+        return false;
+    }
+
     fn toolCalls(value: Message) []const ToolCall {
         return value.tool_calls;
     }
@@ -342,6 +370,10 @@ const MessageAdapter = struct {
 
     fn toolResultMemory(value: Message) ?types.ToolResultMemory {
         return value.tool_result_memory;
+    }
+
+    fn toolResultCreatedAtMs(_: Message) ?i64 {
+        return null;
     }
 
     fn content(value: Message) ?[]const u8 {
@@ -401,15 +433,18 @@ fn buildNormalExecutionMemory(
 
         var j = i + 1;
         var last_result_index: ?usize = null;
-        while (j < messages.len and Adapter.isTool(messages[j])) : (j += 1) {
+        // A context note sits between steps; it never ends a step's results
+        // or feedback, and `buildExecutionMemory` records it (D93).
+        while (j < messages.len and (Adapter.isTool(messages[j]) or Adapter.isContextNote(messages[j]))) : (j += 1) {
             const result_msg = messages[j];
+            if (Adapter.isContextNote(result_msg)) continue;
             const tool_call_id = Adapter.toolCallId(result_msg) orelse continue;
             const call = findToolCallById(tool_calls, tool_call_id) orelse continue;
             const output = Adapter.content(result_msg) orelse "";
             const status = Adapter.toolResultStatus(result_msg) orelse
                 return error.MissingToolResultStatus;
             const result_memory = Adapter.toolResultMemory(result_msg);
-            const record = try makePersistedToolResult(
+            var record = try makePersistedToolResult(
                 alloc,
                 tool_call_id,
                 Adapter.toolName(result_msg) orelse call.name,
@@ -417,6 +452,11 @@ fn buildNormalExecutionMemory(
                 output,
                 result_memory,
             );
+            // The result keeps the time it was made, so every rebuild of the
+            // turn records it alike.
+            if (Adapter.toolResultCreatedAtMs(result_msg)) |stamp| {
+                if (stamp > 0) record.created_at_ms = stamp;
+            }
             var owns_record = true;
             errdefer if (owns_record) {
                 freeTransientPersistedToolResult(alloc, record);
@@ -434,7 +474,7 @@ fn buildNormalExecutionMemory(
             );
         }
 
-        while (j < messages.len and Adapter.isUser(messages[j])) : (j += 1) {
+        while (j < messages.len and (Adapter.isUser(messages[j]) or Adapter.isContextNote(messages[j]))) : (j += 1) {
             const feedback_msg = messages[j];
             if (!Adapter.isPermissionFeedback(feedback_msg)) continue;
             const text = Adapter.content(feedback_msg) orelse
@@ -786,9 +826,9 @@ fn fileEvidenceActionForTool(tool_name: []const u8) types.FileEvidenceAction {
     return .unknown;
 }
 
-fn stringField(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
+fn non_empty_string_field(object: std.json.ObjectMap, name: []const u8) ?[]const u8 {
     const value = object.get(name) orelse return null;
-    if (value != .string) return null;
+    if (value != .string or value.string.len == 0) return null;
     return value.string;
 }
 
@@ -809,7 +849,7 @@ fn durableIdentifier(alloc: Allocator, value: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(value, &digest, .{});
     const hex = std.fmt.bytesToHex(digest[0..12].*, .lower);
-    return std.fmt.allocPrint(alloc, "redacted-{s}", .{&hex});
+    return alloc.print("redacted-{s}", .{&hex});
 }
 
 test "execution memory persists secret-bearing arguments results and provider output verbatim" {
@@ -1093,8 +1133,65 @@ test "durable execution memory preserves committed file presentation verbatim an
     try std.testing.expectEqualStrings(result.tool_call_id, memory.files[0].tool_call_id);
 }
 
+test "durable execution memory keeps a committed edit's captured review rows" {
+    const alloc = std.testing.allocator;
+    const call_id = "call_edit_rows";
+    const preview_lines = [_]types.CommittedFilePresentationLine{
+        .{ .kind = .deletion, .old_line = 9, .text = "old" },
+        .{ .kind = .addition, .new_line = 9, .text = "new" },
+    };
+    const review_rows = [_]types.CommittedFilePresentationLine{
+        .{ .kind = .elision, .text = "8 unchanged lines ⋯" },
+        .{ .kind = .deletion, .old_line = 9, .text = "old" },
+        .{ .kind = .addition, .new_line = 9, .text = "new" },
+    };
+    const calls = [_]ToolCall{.{
+        .id = call_id,
+        .name = "edit_file",
+        .arguments_json = "{\"path\":\"lock.yaml\",\"old_string\":\"old\",\"new_string\":\"new\"}",
+    }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .assistant, .tool_calls = calls[0..] },
+        .{
+            .role = .tool,
+            .content = "edited lock.yaml",
+            .tool_call_id = call_id,
+            .tool_name = "edit_file",
+            .tool_result_status = .success,
+            .tool_result_memory = .{
+                .committed_file_presentation = .{
+                    .path = "lock.yaml",
+                    .kind = .edited,
+                    .lines = &preview_lines,
+                    .additions = 1,
+                    .deletions = 1,
+                    .truncated = false,
+                    .lifecycle_id = .{ .turn_id = 2, .call_id = call_id },
+                    .review_lines = &review_rows,
+                },
+            },
+        },
+    };
+
+    const memory = try buildNormalChatExecutionMemory(alloc, &messages);
+    defer types.freeExecutionMemory(alloc, memory);
+    const presentation = memory.tool_steps[0].tool_results[0].committed_file_presentation orelse
+        return error.TestExpectedPresentation;
+
+    const rows = presentation.review_lines orelse return error.TestExpectedReviewRows;
+    try std.testing.expectEqual(review_rows.len, rows.len);
+    for (review_rows, rows) |expected, actual| {
+        try std.testing.expectEqual(expected.kind, actual.kind);
+        try std.testing.expectEqual(expected.old_line, actual.old_line);
+        try std.testing.expectEqual(expected.new_line, actual.new_line);
+        try std.testing.expectEqualStrings(expected.text, actual.text);
+    }
+    try std.testing.expect(presentation.after_content == null);
+    try std.testing.expectEqualStrings(call_id, presentation.lifecycle_id.?.call_id);
+}
+
 test "file evidence does not parse unknown tool arguments" {
-    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var failing_allocator = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{});
     const alloc = failing_allocator.allocator();
     var files: std.ArrayList(types.FileEvidence) = .empty;
     defer files.deinit(alloc);
@@ -1105,7 +1202,7 @@ test "file evidence does not parse unknown tool arguments" {
         .{
             .id = "large_command",
             .name = "run_command",
-            .arguments_json = "{\"command\":\"" ++ ("x\\n" ** 20_000) ++ "\"}",
+            .arguments_json = "{\"command\":\"" ++ text_utils.repeat("x\\n", 20_000) ++ "\"}",
         },
         .success,
         null,
@@ -1113,6 +1210,35 @@ test "file evidence does not parse unknown tool arguments" {
 
     try std.testing.expectEqual(@as(usize, 0), failing_allocator.alloc_index);
     try std.testing.expectEqual(@as(usize, 0), files.items.len);
+}
+
+test "search file evidence normalizes missing and empty roots" {
+    const alloc = std.testing.allocator;
+    var files: std.ArrayList(types.FileEvidence) = .empty;
+    defer {
+        for (files.items) |file| freeTransientFileEvidence(alloc, file);
+        files.deinit(alloc);
+    }
+
+    const calls = [_]ToolCall{
+        .{
+            .id = "call_empty_root",
+            .name = "grep_files",
+            .arguments_json = "{\"pattern\":\"needle\",\"path\":\"\"}",
+        },
+        .{
+            .id = "call_default_root",
+            .name = "glob_files",
+            .arguments_json = "{\"pattern\":\"*.zig\"}",
+        },
+    };
+    for (calls) |call| {
+        try appendFileEvidenceForTool(alloc, &files, call, .success, null);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), files.items.len);
+    try std.testing.expectEqualStrings(".", files.items[0].path);
+    try std.testing.expectEqualStrings(".", files.items[1].path);
 }
 
 test "read evidence trusts typed model coverage instead of output text" {
@@ -1571,12 +1697,12 @@ test "normal execution-memory builders clean every allocation failure" {
     };
 
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         ChatCheck.run,
         .{},
     );
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         MessageCheck.run,
         .{},
     );
@@ -1594,11 +1720,11 @@ test "normal execution-memory builders skip non-tool messages without allocation
         message.Message.assistantBorrowed("ignored", &.{}),
     };
     var chat_failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     var message_failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
 

@@ -41,9 +41,35 @@ function seedGitRepo(dir: string, remote: string): void {
   });
 }
 
+/** Commits one change per subject and sets origin/main to the result, like an up-to-date clone. */
+function commitHistory(dir: string, subjects: string[]): void {
+  subjects.forEach((subject, index) => {
+    writeFileSync(join(dir, "HISTORY.log"), subjects.slice(0, index + 1).join("\n") + "\n");
+    execSync(`git add -A && git commit -q -m ${JSON.stringify(subject)}`, { cwd: dir, stdio: "pipe" });
+  });
+  execSync("git update-ref refs/remotes/origin/main HEAD && git branch -q --set-upstream-to=origin/main main", {
+    cwd: dir,
+    stdio: "pipe",
+  });
+}
+
 function seedV0ChangelogRepo(dir: string): void {
   seedGitRepo(dir, "https://github.com/vercel/v0.git");
   mkdirSync(join(dir, "apps", "www"), { recursive: true });
+  mkdirSync(join(dir, "scripts"), { recursive: true });
+  mkdirSync(join(dir, "docs"), { recursive: true });
+  writeFileSync(
+    join(dir, "package.json"),
+    JSON.stringify({ name: "v0", private: true, scripts: { release: "node scripts/release.mjs" } }, null, 2) + "\n",
+  );
+  writeFileSync(
+    join(dir, "scripts", "release.mjs"),
+    "// Moves the Unreleased section of CHANGELOG.md under the new version, then tags the release.\n",
+  );
+  writeFileSync(
+    join(dir, "docs", "changelog.md"),
+    "# Writing changelog entries\n\nAdd one line per user-facing change under Unreleased in CHANGELOG.md.\n",
+  );
   writeFileSync(
     join(dir, "CHANGELOG.md"),
     [
@@ -59,13 +85,18 @@ function seedV0ChangelogRepo(dir: string): void {
     join(dir, "apps", "www", "release-notes.ts"),
     "export const changelogPath = '../../CHANGELOG.md';\n",
   );
-  execSync("git add . && git commit -m initial", { cwd: dir, stdio: "pipe" });
+  commitHistory(dir, [
+    "Set up the v0 web app",
+    "Add the release notes page",
+    "Generate the changelog during release",
+    "Document how changelog entries are written",
+    "Release 1.0.0",
+  ]);
 }
 
 function seedFxHistoryRepo(dir: string): void {
-  seedGitRepo(dir, "https://github.com/vercel-labs/fx.git");
-  writeFileSync(join(dir, "README.md"), "# fx\n");
-  execSync("git add . && git commit -m initial", { cwd: dir, stdio: "pipe" });
+  // A shallow clone of the real repository: its history and origin/main agree with GitHub.
+  execSync("git clone -q --depth 20 --single-branch https://github.com/vercel-labs/fx.git .", { cwd: dir, stdio: "pipe" });
 }
 
 function assertNoWebSearchOrHandleQuestion(result: EvalResult): void {
@@ -73,12 +104,26 @@ function assertNoWebSearchOrHandleQuestion(result: EvalResult): void {
   assertNoAskUserQuestionMatching(result, /GitHub handle/i);
 }
 
+/** A shell command that reaches the network: gh, curl, wget, or a git command that talks to a remote. */
+function isRemoteCommand(command: string): boolean {
+  return /(^|[;&|(]\s*)(gh|curl|wget)\s/.test(command.trim()) || /\bgit\s+(clone|fetch|pull|ls-remote)\b/.test(command);
+}
+
 function assertFirstActionIsLocal(result: EvalResult): void {
   assertFirstToolIn(result, LOCAL_FIRST_TOOLS);
   const first = result.json.tool_calls[0];
+  // Any command that stays on this machine is a local first step, such as ls or git log.
   if (first?.name === "shell") {
-    expect(/^git\s+/.test(first.command_result?.command ?? "")).toBe(true);
+    expect(isRemoteCommand(first.command_result?.command ?? "")).toBe(false);
   }
+}
+
+function assertFirstRemoteActionIsGh(result: EvalResult): void {
+  const remote = result.json.tool_calls.find(
+    (call) => call.name === "web_fetch" || (call.name === "shell" && isRemoteCommand(call.command_result?.command ?? "")),
+  );
+  expect(remote?.name).toBe("shell");
+  expect(/(^|[;&|(]\s*)gh\s/.test(remote?.command_result?.command?.trim() ?? "")).toBe(true);
 }
 
 describe("eval: GitHub and repo routing", () => {
@@ -133,15 +178,15 @@ describe("eval: GitHub and repo routing", () => {
       seedGitRepo(workDir, "https://github.com/vercel-labs/fx.git");
 
       const result = await runEval(
-        "For https://github.com/vercel/v0, use GitHub metadata to tell me how many open pull requests it currently has. Do not answer from the URL alone.",
+        "For https://github.com/vercel/next.js, use GitHub metadata to tell me how many open pull requests it currently has. Do not answer from the URL alone.",
         {
           cwd: workDir,
           timeoutSec: 180,
         },
       );
 
-      assertTerminalExecMatches(result, /^gh\s+/);
-      assertNoWebSearchOrHandleQuestion(result);
+      assertFirstRemoteActionIsGh(result);
+      assertNoAskUserQuestionMatching(result, /GitHub handle/i);
       expect(result.json.exit_code).toBe(0);
     },
     TIMEOUT,

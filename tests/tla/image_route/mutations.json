@@ -1,0 +1,322 @@
+{
+  "about": "Planted bugs. Each one breaks one guard, and the named property must fail. Spec mutations edit spec/ImageRoute.tla and run TLC on MCImageRoute.cfg. Code mutations edit a copy of src/core/images/image_route.zig, rebuild the harness from it, and run both driver directions. Each find string must occur exactly once.",
+  "spec": [
+    {
+      "id": "S1",
+      "breaks": "Image support requires file-input as well as vision: the reported bug.",
+      "find": "(IF v.vision THEN \"native\" ELSE \"non_native\")",
+      "replace": "(IF v.vision /\\ v.file_input THEN \"native\" ELSE \"non_native\")",
+      "expect": "VisionImpliesNative"
+    },
+    {
+      "id": "S2",
+      "breaks": "A reply's decision reads the support from before the reply.",
+      "find": "/\\ out' = DecideOut(s, Head(pending), notified)",
+      "replace": "/\\ out' = DecideOut(support, Head(pending), notified)",
+      "expect": "OneSnapshot"
+    },
+    {
+      "id": "S3",
+      "breaks": "A turn asks for capabilities again after it already asked.",
+      "find": "NeedsResolve(r) == support = \"unknown\" /\\ ~resolved /\\ HasImages(r)",
+      "replace": "NeedsResolve(r) == support = \"unknown\" /\\ HasImages(r)",
+      "expect": "ResolveOncePerTurn"
+    },
+    {
+      "id": "S4",
+      "breaks": "The catalog-down notice repeats within a turn.",
+      "find": "/\\ r.catalog_down /\\ ~n",
+      "replace": "/\\ r.catalog_down",
+      "expect": "NotifyOncePerTurn"
+    },
+    {
+      "id": "S5",
+      "breaks": "Tool images go inline while support is unknown.",
+      "find": "[] s = \"unknown\" -> \"withheld_unknown\"",
+      "replace": "[] s = \"unknown\" -> \"attached\"",
+      "expect": "UnknownNeverInline"
+    },
+    {
+      "id": "S6",
+      "breaks": "A request delivered twice asks for capabilities twice.",
+      "find": "THEN pending' = <<r>> /\\ out' = <<>> /\\ UNCHANGED <<support, resolved, notified>>",
+      "replace": "THEN pending' = <<r>> /\\ out' = <<[kind |-> \"resolve\"]>> /\\ UNCHANGED <<support, resolved, notified>>",
+      "expect": "DuplicateRequestIsQuiet"
+    },
+    {
+      "id": "S7",
+      "breaks": "A stale reply overwrites the turn's support.",
+      "find": "THEN out' = <<>> /\\ UNCHANGED <<support, resolved, notified, pending>>",
+      "replace": "THEN out' = <<>> /\\ support' = Derive(v) /\\ UNCHANGED <<resolved, notified, pending>>",
+      "expect": "StaleReplyIsQuiet"
+    },
+    {
+      "id": "S8",
+      "breaks": "User images without a route are sent anyway.",
+      "find": "Unroutable(s, r) == r.user_images /\\ Decide(s, r).route = \"unavailable\"",
+      "replace": "Unroutable(s, r) == FALSE",
+      "expect": "FailExactlyWhenUnroutable"
+    },
+    {
+      "id": "S9",
+      "breaks": "A new turn keeps the previous turn's notice flag.",
+      "find": "/\\ notified' = FALSE   \\* a new turn may tell the user again",
+      "replace": "/\\ notified' = notified",
+      "expect": "TurnResets"
+    },
+    {
+      "id": "S10",
+      "breaks": "The vision tool is optional even while user images wait.",
+      "find": "ELSE IF r.pending_images THEN \"required\" ELSE \"optional\"",
+      "replace": "ELSE \"optional\"",
+      "expect": "RequiredWhenPending"
+    },
+    {
+      "id": "S11",
+      "breaks": "A reply leaves its request waiting.",
+      "find": "/\\ support' = s\n            /\\ pending' = <<>>",
+      "replace": "/\\ support' = s\n            /\\ pending' = pending",
+      "expect": "Answered"
+    },
+    {
+      "id": "S12",
+      "breaks": "The catalog-down notice comes after the answer.",
+      "find": "ELSE IF Notifies(s, r, n) THEN <<[kind |-> \"notify\"], Decide(s, r)>>",
+      "replace": "ELSE IF Notifies(s, r, n) THEN <<Decide(s, r), [kind |-> \"notify\"]>>",
+      "expect": "Bounded"
+    },
+    {
+      "id": "S13",
+      "breaks": "A request delivered while a reply is owed is decided at once.",
+      "find": "THEN pending' = <<r>> /\\ out' = <<>> /\\ UNCHANGED <<support, resolved, notified>>",
+      "replace": "THEN pending' = <<r>> /\\ out' = DecideOut(support, r, notified) /\\ UNCHANGED <<support, resolved, notified>>",
+      "expect": "DecideOnlyWhenReady"
+    },
+    {
+      "id": "S14",
+      "breaks": "Asking for capabilities does not mark the turn as having asked.",
+      "find": "THEN /\\ resolved' = TRUE",
+      "replace": "THEN /\\ resolved' = resolved",
+      "expect": "PendingWaitsForReply"
+    },
+    {
+      "id": "S15",
+      "breaks": "The core asks for capabilities for a request without images.",
+      "find": "NeedsResolve(r) == support = \"unknown\" /\\ ~resolved /\\ HasImages(r)",
+      "replace": "NeedsResolve(r) == support = \"unknown\" /\\ ~resolved",
+      "expect": "ResolveOnlyWhenNeeded"
+    },
+    {
+      "id": "S16",
+      "breaks": "The catalog-down notice appears when the catalog is up.",
+      "find": "/\\ r.catalog_down /\\ ~n",
+      "replace": "/\\ ~n",
+      "expect": "NotifyOnlyWhenDown"
+    },
+    {
+      "id": "S17",
+      "breaks": "Tool images vanish without a notice while support is unknown.",
+      "find": "[] s = \"unknown\" -> \"withheld_unknown\"",
+      "replace": "[] s = \"unknown\" -> \"none\"",
+      "expect": "NoSilentWithhold"
+    },
+    {
+      "id": "S18",
+      "breaks": "The vision tool is offered off the fallback route.",
+      "find": "mode == IF route # \"fallback\" THEN \"unavailable\"",
+      "replace": "mode == IF route # \"fallback\" THEN \"optional\"",
+      "expect": "RouteModeCoherent"
+    },
+    {
+      "id": "S19",
+      "breaks": "A native image model is routed through the vision tool.",
+      "find": "LET route == CASE s = \"native\" -> \"native\"",
+      "replace": "LET route == CASE s = \"native\" -> (IF r.fallback THEN \"fallback\" ELSE \"native\")",
+      "expect": "NativeExcludesFallback"
+    },
+    {
+      "id": "S20",
+      "breaks": "An earlier image fails the request like one attached now: the reported bug.",
+      "find": "Unroutable(s, r) == r.user_images /\\ Decide(s, r).route = \"unavailable\"",
+      "replace": "Unroutable(s, r) == (r.user_images \\/ r.earlier_images) /\\ Decide(s, r).route = \"unavailable\"",
+      "expect": "FailExactlyWhenUnroutable"
+    },
+    {
+      "id": "S21",
+      "breaks": "Earlier images go inline whatever the support.",
+      "find": "earlier == IF ~r.earlier_images THEN \"none\" ELSE Held(s, route)",
+      "replace": "earlier == IF ~r.earlier_images THEN \"none\" ELSE \"attached\"",
+      "expect": "UnknownNeverInline"
+    },
+    {
+      "id": "S22",
+      "breaks": "Earlier images vanish from the request without a notice.",
+      "find": "earlier == IF ~r.earlier_images THEN \"none\" ELSE Held(s, route)",
+      "replace": "earlier == \"none\"",
+      "expect": "NoSilentWithhold"
+    },
+    {
+      "id": "S23",
+      "breaks": "Earlier images are withheld as unconfirmed without the turn asking the catalog.",
+      "find": "HasImages(r) == r.user_images \\/ r.earlier_images \\/ r.tool_images",
+      "replace": "HasImages(r) == r.user_images \\/ r.tool_images",
+      "expect": "AskedBeforeUnknown"
+    }
+  ],
+  "code": [
+    {
+      "id": "C1",
+      "breaks": "Image support requires file-input as well as vision: the reported bug.",
+      "find": ".listed => |tags| if (tags.vision) .native else .non_native,",
+      "replace": ".listed => |tags| if (tags.vision and tags.file_input) .native else .non_native,",
+      "expect": "VisionImpliesNative"
+    },
+    {
+      "id": "C2",
+      "breaks": "A turn asks for capabilities again after it already asked.",
+      "find": "if (state.support == .unknown and !state.resolved and hasImages(request)) {",
+      "replace": "if (state.support == .unknown and hasImages(request)) {",
+      "expect": "ResolveOncePerTurn"
+    },
+    {
+      "id": "C3",
+      "breaks": "The catalog-down notice repeats within a turn.",
+      "find": "if (withholdsUnknown(chosen) and request.catalog_down and !state.notified) {",
+      "replace": "if (withholdsUnknown(chosen) and request.catalog_down) {",
+      "expect": "NotifyOncePerTurn"
+    },
+    {
+      "id": "C4",
+      "breaks": "Tool images go inline while support is unknown.",
+      "find": ".unknown => .withheld_unknown,",
+      "replace": ".unknown => .attached,",
+      "expect": "UnknownNeverInline"
+    },
+    {
+      "id": "C5",
+      "breaks": "A request delivered twice asks for capabilities twice.",
+      "find": "next.pending = request;\n        return .{ .state = next };",
+      "replace": "next.pending = request;\n        return withEffects(next, &.{.resolve_capabilities});",
+      "expect": "DuplicateRequestIsQuiet"
+    },
+    {
+      "id": "C6",
+      "breaks": "A stale reply overwrites the turn's support.",
+      "find": "const request = state.pending orelse return .{ .state = state };",
+      "replace": "const request = state.pending orelse return .{ .state = .{ .support = support, .resolved = state.resolved, .notified = state.notified } };",
+      "expect": "StaleReplyIsQuiet"
+    },
+    {
+      "id": "C7",
+      "breaks": "A reply's decision reads the support from before the reply: the old orchestrator order.",
+      "find": "next.support = support;\n    next.pending = null;\n    return decide(next, request);",
+      "replace": "next.pending = null;\n    var stale = decide(next, request);\n    stale.state.support = support;\n    return stale;",
+      "expect": "OneSnapshot"
+    },
+    {
+      "id": "C8",
+      "breaks": "A new turn keeps the previous turn's notice flag.",
+      "find": ".turn_started => |support| .{ .state = .{ .support = support } },",
+      "replace": ".turn_started => |support| .{ .state = .{ .support = support, .notified = state.notified } },",
+      "expect": "TurnResets"
+    },
+    {
+      "id": "C9",
+      "breaks": "User images without a route are sent anyway.",
+      "find": "if (request.user_images and chosen.route == .unavailable) {",
+      "replace": "if (request.user_images and chosen.route == .unavailable and false) {",
+      "expect": "FailExactlyWhenUnroutable"
+    },
+    {
+      "id": "C10",
+      "breaks": "The vision tool is optional even while user images wait.",
+      "find": "else if (request.pending_images)\n        .required",
+      "replace": "else if (false)\n        .required",
+      "expect": "RequiredWhenPending"
+    },
+    {
+      "id": "C11",
+      "breaks": "The catalog-down notice comes after the answer.",
+      "find": "return withEffects(next, &.{ .notify_catalog_down, .{ .send = chosen } });",
+      "replace": "return withEffects(next, &.{ .{ .send = chosen }, .notify_catalog_down });",
+      "expect": "Bounded"
+    },
+    {
+      "id": "C12",
+      "breaks": "A request delivered while a reply is owed is decided at once.",
+      "find": "next.pending = request;\n        return .{ .state = next };",
+      "replace": "next.pending = request;\n        return decide(next, request);",
+      "expect": "DecideOnlyWhenReady"
+    },
+    {
+      "id": "C13",
+      "breaks": "Asking for capabilities does not mark the turn as having asked.",
+      "find": "next.resolved = true;\n        next.pending = request;",
+      "replace": "next.pending = request;",
+      "expect": "PendingWaitsForReply"
+    },
+    {
+      "id": "C14",
+      "breaks": "The core asks for capabilities for a request without images.",
+      "find": "if (state.support == .unknown and !state.resolved and hasImages(request)) {",
+      "replace": "if (state.support == .unknown and !state.resolved) {",
+      "expect": "ResolveOnlyWhenNeeded"
+    },
+    {
+      "id": "C15",
+      "breaks": "The catalog-down notice appears when the catalog is up.",
+      "find": "if (withholdsUnknown(chosen) and request.catalog_down and !state.notified) {",
+      "replace": "if (withholdsUnknown(chosen) and !state.notified) {",
+      "expect": "NotifyOnlyWhenDown"
+    },
+    {
+      "id": "C16",
+      "breaks": "Tool images vanish without a notice while support is unknown.",
+      "find": ".unknown => .withheld_unknown,",
+      "replace": ".unknown => .none,",
+      "expect": "NoSilentWithhold"
+    },
+    {
+      "id": "C17",
+      "breaks": "The vision tool is offered off the fallback route.",
+      "find": "const mode: VisionMode = if (route != .fallback)\n        .unavailable",
+      "replace": "const mode: VisionMode = if (route != .fallback)\n        .optional",
+      "expect": "RouteModeCoherent"
+    },
+    {
+      "id": "C18",
+      "breaks": "A native image model is routed through the vision tool.",
+      "find": ".native => .native,",
+      "replace": ".native => if (request.fallback) .fallback else .native,",
+      "expect": "NativeExcludesFallback"
+    },
+    {
+      "id": "C19",
+      "breaks": "An earlier image fails the request like one attached now: the reported bug.",
+      "find": "if (request.user_images and chosen.route == .unavailable) {",
+      "replace": "if ((request.user_images or request.earlier_images) and chosen.route == .unavailable) {",
+      "expect": "FailExactlyWhenUnroutable"
+    },
+    {
+      "id": "C20",
+      "breaks": "Earlier images go inline whatever the support.",
+      "find": ".earlier_images = held(request.earlier_images, support, route),",
+      "replace": ".earlier_images = if (request.earlier_images) .attached else .none,",
+      "expect": "UnknownNeverInline"
+    },
+    {
+      "id": "C21",
+      "breaks": "Earlier images vanish from the request without a notice.",
+      "find": ".earlier_images = held(request.earlier_images, support, route),",
+      "replace": ".earlier_images = .none,",
+      "expect": "NoSilentWithhold"
+    },
+    {
+      "id": "C22",
+      "breaks": "Earlier images are withheld as unconfirmed without the turn asking the catalog.",
+      "find": "return request.user_images or request.earlier_images or request.tool_images;",
+      "replace": "return request.user_images or request.tool_images;",
+      "expect": "AskedBeforeUnknown"
+    }
+  ]
+}

@@ -19,6 +19,7 @@ pub const PreparedCommand = union(enum) {
         command_ctx: command_admission.CommandContext,
         reason: command_effect.ApprovalReason,
         source: command_admission.ShellAuthorizationSource,
+        grant_epoch: ?u64 = null,
     },
 
     pub fn deinit(self: *PreparedCommand, alloc: std.mem.Allocator) void {
@@ -48,6 +49,12 @@ pub fn foregroundResultComparisonLimit(
     };
 }
 
+fn shellConfig(cfg: command_runner.Config, grant_epoch: ?u64) command_runner.Config {
+    var bound = cfg;
+    bound.shell_grant_epoch = grant_epoch;
+    return bound;
+}
+
 /// Executes a prepared foreground command without taking ownership of it.
 pub fn executePreparedCommand(
     cfg: command_runner.Config,
@@ -62,7 +69,7 @@ pub fn executePreparedCommand(
         .approved_shell => |shell| .{
             .route = .approved_shell,
             .result = try command_runner.executeCommandInEnvironment(
-                cfg,
+                shellConfig(cfg, shell.grant_epoch),
                 alloc,
                 shell.command_ctx.command,
                 shell.command_ctx.resolved_cwd,
@@ -87,7 +94,7 @@ test "local executor keeps route-specific foreground result limits" {
         .command_ctx = .{
             .command = "",
             .resolved_cwd = "",
-            .target_os = @import("builtin").os.tag,
+            .target_os = @import("builtin").target.os.tag,
         },
         .reason = .process_or_system,
         .source = .interactive_once,
@@ -107,7 +114,7 @@ test "local executor runs an approved shell command with its admitted context" {
         .command_ctx = .{
             .command = "printf local-executor",
             .resolved_cwd = "/tmp",
-            .target_os = @import("builtin").os.tag,
+            .target_os = @import("builtin").target.os.tag,
         },
         .reason = .process_or_system,
         .source = .interactive_once,

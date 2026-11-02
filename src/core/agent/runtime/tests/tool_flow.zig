@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const builtin_context = @import("../../../../builtins/context.zig");
 const builtin_tools = @import("../../../../builtins/tools.zig");
@@ -35,6 +36,7 @@ const permission_auto_classifier = @import("../../../permissions/auto_classifier
 const auto_classifier_context = @import("../../../permissions/auto_classifier_context.zig");
 
 const test_support = @import("support.zig");
+const text_utils = @import("../../../shared/text_utils.zig");
 
 const ChatMessage = types.ChatMessage;
 const PermissionGrant = types.PermissionGrant;
@@ -100,7 +102,7 @@ fn makeOwnedVisionCatalog(
     errdefer types.freeImageAttachment(alloc, catalog[0]);
     const root = try io_mod.dirRealpathAlloc(alloc, dir, ".");
     defer alloc.free(root);
-    const snapshot_dir = try std.fs.path.join(alloc, &.{ root, "snapshots" });
+    const snapshot_dir = try std.Io.Dir.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshot_dir);
     try image_attachments.captureImageSnapshot(alloc, &catalog[0], snapshot_dir);
     return catalog;
@@ -438,6 +440,12 @@ const FreshnessApplicableContext = struct {
 };
 
 fn expectPermissionDeniedToolResult(gateway: *const FakeGateway, index: usize, tool_name: []const u8, reason: types.ToolPermissionDenialReason) !void {
+    return expectPermissionDeniedToolResultAs(gateway, index, tool_name, tool_name, reason);
+}
+
+/// `history_tool_name` is the result's tool in the replayed request, which can
+/// differ from the denied tool when legacy history is projected onto shell.
+fn expectPermissionDeniedToolResultAs(gateway: *const FakeGateway, index: usize, history_tool_name: []const u8, tool_name: []const u8, reason: types.ToolPermissionDenialReason) !void {
     const alloc = std.testing.allocator;
     try std.testing.expect(index < gateway.request_bodies.items.len);
 
@@ -454,7 +462,7 @@ fn expectPermissionDeniedToolResult(gateway: *const FakeGateway, index: usize, t
         for (content.array.items) |part| {
             if (part != .object) continue;
             const part_tool_name = part.object.get("toolName") orelse continue;
-            if (part_tool_name != .string or !std.mem.eql(u8, part_tool_name.string, tool_name)) continue;
+            if (part_tool_name != .string or !std.mem.eql(u8, part_tool_name.string, history_tool_name)) continue;
             const output = part.object.get("output") orelse continue;
             if (output != .object) continue;
             const output_type = output.object.get("type") orelse continue;
@@ -700,17 +708,15 @@ test "parallel skill admission binds identities preserves denies and isolates fa
                 const selected = request.call.resolved_skill orelse return error.MissingSkillBinding;
                 try std.testing.expectEqualStrings("allowed-name", selected.skill.name);
             }
-            var detail: ?[]u8 = null;
             const result = try tool_dispatch.dispatchAuthorizedToolCall(.{
                 .allocator = request.result_allocator,
                 .workspace_root = self.workspace_root,
                 .execution_authority = request.authority,
                 .resolved_skill = request.call.resolved_skill,
-            }, self.registry, request.call, &detail);
+            }, self.registry, request.call);
             return .{
                 .status = if (result.status == .success) .success else .failure,
                 .model_output = result.body,
-                .status_detail = detail,
             };
         }
     };
@@ -1117,7 +1123,7 @@ test "processQueuedPrompt malformed parallel fallback emits one terminal and rej
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "parallel-fallback-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "parallel-fallback-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -2064,7 +2070,7 @@ fn expectRejectedPrompt(completion: FakeCompletion, expected_error: anyerror) !v
 }
 
 test "processQueuedPrompt rejects unstorable tool batches before permissions or execution" {
-    const oversized = [_]u8{'i'} ** 257;
+    const oversized: [257]u8 = @splat('i');
     const invalid = [_]ToolCall{
         .{ .id = "bad", .name = "", .arguments_json = "{}" },
         .{ .id = &oversized, .name = "read_file", .arguments_json = "{}" },
@@ -2139,7 +2145,7 @@ test "processQueuedPrompt length-limited calls bypass malformed local tool ident
     try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "Partial answer") != null);
-    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "did not execute") != null);
+    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "did not run them") != null);
 }
 
 test "local tool emits authoritative progress and terminal lifecycle by default" {
@@ -2266,7 +2272,7 @@ test "vision uses generic lifecycle execution memory persistence and reprojectio
 }
 
 test "vision OOM propagates through assembled orchestrator without a tool result" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const calls = [_]ToolCall{toolCall(
         "call_vision_oom",
         "vision",
@@ -2717,6 +2723,519 @@ test "modern directory glob executes while nested project instructions load" {
     );
 }
 
+/// The leading system messages of a Gateway request body: the instructions.
+fn leadingSystemContents(alloc: std.mem.Allocator, body: []const u8) !std.ArrayList([]const u8) {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, body, .{});
+    var contents: std.ArrayList([]const u8) = .empty;
+    for (parsed.object.get("prompt").?.array.items) |message| {
+        if (!std.mem.eql(u8, message.object.get("role").?.string, "system")) break;
+        try contents.append(alloc, message.object.get("content").?.string);
+    }
+    return contents;
+}
+
+fn expectSameInstructions(alloc: std.mem.Allocator, a: []const u8, b: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const first = try leadingSystemContents(arena_state.allocator(), a);
+    const second = try leadingSystemContents(arena_state.allocator(), b);
+    try std.testing.expectEqual(first.items.len, second.items.len);
+    for (first.items, second.items) |x, y| try std.testing.expectEqualStrings(x, y);
+}
+
+/// The request ends with a tool result whose text ends with a rules block
+/// holding `rule`, and no system message follows the instructions (D93).
+fn expectRulesOnLastToolResult(alloc: std.mem.Allocator, body: []const u8, rule: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), body, .{});
+    const prompt = parsed.object.get("prompt").?.array.items;
+    var in_conversation = false;
+    for (prompt) |message| {
+        const is_system = std.mem.eql(u8, message.object.get("role").?.string, "system");
+        if (!is_system) in_conversation = true;
+        try std.testing.expect(!(is_system and in_conversation));
+    }
+    const last = prompt[prompt.len - 1].object;
+    try std.testing.expectEqualStrings("tool", last.get("role").?.string);
+    const parts = last.get("content").?.array.items;
+    const output = parts[parts.len - 1].object.get("output").?.object.get("value").?.string;
+    try std.testing.expect(std.mem.find(u8, output, rule) != null);
+    try std.testing.expect(std.mem.endsWith(u8, output, "</scoped-rules>"));
+}
+
+/// The request ends with a tool result whose text ends with the reminder
+/// line for `rules` in `scope`, and no system message follows the
+/// instructions.
+fn expectReminderOnLastToolResult(alloc: std.mem.Allocator, body: []const u8, rules: []const u8, scope: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+    const prompt = parsed.object.get("prompt").?.array.items;
+    var in_conversation = false;
+    for (prompt) |message| {
+        const is_system = std.mem.eql(u8, message.object.get("role").?.string, "system");
+        if (!is_system) in_conversation = true;
+        try std.testing.expect(!(is_system and in_conversation));
+    }
+    const last = prompt[prompt.len - 1].object;
+    try std.testing.expectEqualStrings("tool", last.get("role").?.string);
+    const parts = last.get("content").?.array.items;
+    const output = parts[parts.len - 1].object.get("output").?.object.get("value").?.string;
+    const line = try arena.print("<scoped-rules-reminder from=\"{s}\" scope=\"{s}\">The rules fx added earlier for this folder still apply.</scoped-rules-reminder>", .{ rules, scope });
+    try std.testing.expect(std.mem.endsWith(u8, output, line));
+}
+
+test "rules a tool call reaches ride on the step's tool result and stay out of the instructions, for every model (D93)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/nested");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/AGENTS.md", .data = "NOTE_SCOPE_RULE" });
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const rules_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "nested", "AGENTS.md" });
+    defer alloc.free(rules_path);
+    const registry = context_contract.Registry{ .default_provider = builtin_context.provider };
+    const calls = [_]ToolCall{toolCall("note_glob", "glob_files", "{\"pattern\":\"*\",\"path\":\"nested\"}")};
+    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Final" } };
+    var fixture = PromptFixture{ .workspace_root = workspace };
+
+    // Turn 1: the rules end the step's tool result; the instructions stay as
+    // the first request sent them.
+    var first_gateway = FakeGateway.init(alloc, &completions);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    first_hooks.context_enabled = true;
+    first_hooks.context_registry = registry;
+    var job = fixture.job();
+    job.model = @constCast("anthropic/claude-sonnet-5.5");
+    job.permission_mode = .auto;
+    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), job);
+    try std.testing.expectEqual(@as(usize, 2), first_gateway.request_bodies.items.len);
+    try expectBodyNotContains(&first_gateway, 0, "NOTE_SCOPE_RULE");
+    try expectRulesOnLastToolResult(alloc, first_gateway.request_bodies.items[1], "NOTE_SCOPE_RULE");
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], first_gateway.request_bodies.items[1]);
+    // The saved turn keeps the note at its boundary, with the file it delivered.
+    try std.testing.expectEqual(@as(usize, 1), first_hooks.history_turns.items.len);
+    const saved = first_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes.len);
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes[0].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes[0].sources.len);
+    try std.testing.expectEqualStrings(rules_path, saved.context_notes[0].sources[0].path);
+    try std.testing.expect(saved.context_notes[0].sources[0].stamp != 0);
+    // The note is only the rules; the instructions say how such a block works.
+    try std.testing.expect(std.mem.startsWith(u8, saved.context_notes[0].text, "<scoped-rules from=\""));
+
+    // Turn 2: the instructions do not rebuild the rules from the saved call,
+    // and a call that reaches the folder again does not deliver them again:
+    // its tool result ends with a reminder line instead. A later step that
+    // reaches the folder from another directory gets no second line.
+    try tmp.dir.createDirPath(std.testing.io, "workspace/nested/deeper");
+    const again = [_]ToolCall{toolCall("note_glob_again", "glob_files", "{\"pattern\":\"*\",\"path\":\"nested\"}")};
+    const deeper = [_]ToolCall{toolCall("note_glob_deeper", "glob_files", "{\"pattern\":\"*\",\"path\":\"nested/deeper\"}")};
+    const second_completions = [_]FakeCompletion{ .{ .tool_calls = &again }, .{ .tool_calls = &deeper }, .{ .content = "Final" } };
+    var second_gateway = FakeGateway.init(alloc, &second_completions);
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    second_hooks.context_enabled = true;
+    second_hooks.context_registry = registry;
+    job.history = first_hooks.history_turns.items;
+    try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), job);
+    try std.testing.expectEqual(@as(usize, 3), second_gateway.request_bodies.items.len);
+    for (second_gateway.request_bodies.items) |body| {
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "NOTE_SCOPE_RULE"));
+    }
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, second_gateway.request_bodies.items[0], "<scoped-rules-reminder"));
+    try expectReminderOnLastToolResult(alloc, second_gateway.request_bodies.items[1], "nested/AGENTS.md", "nested");
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, second_gateway.request_bodies.items[2], "<scoped-rules-reminder"));
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], second_gateway.request_bodies.items[0]);
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], second_gateway.request_bodies.items[2]);
+    // The reminder is saved at its boundary without sources, so it never
+    // counts as delivering the file.
+    const second_saved = second_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), second_saved.context_notes.len);
+    try std.testing.expectEqual(@as(usize, 1), second_saved.context_notes[0].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 0), second_saved.context_notes[0].sources.len);
+    try std.testing.expect(std.mem.startsWith(u8, second_saved.context_notes[0].text, "<scoped-rules-reminder from=\"nested/AGENTS.md\" scope=\"nested\">"));
+
+    // Turn 3: after the file changes, the next call that reaches it delivers
+    // the current rules in a new note that replaces the earlier copy.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/AGENTS.md", .data = "NOTE_SCOPE_RULE_EDITED" });
+    var both_turns: std.ArrayList(types.HistoryTurn) = .empty;
+    defer both_turns.deinit(alloc);
+    try both_turns.appendSlice(alloc, first_hooks.history_turns.items);
+    try both_turns.appendSlice(alloc, second_hooks.history_turns.items);
+    // Its second step reaches the folder again: rules this turn delivered
+    // get no reminder.
+    const deeper_again = [_]ToolCall{toolCall("note_glob_deeper_again", "glob_files", "{\"pattern\":\"*\",\"path\":\"nested/deeper\"}")};
+    const third_completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .tool_calls = &deeper_again }, .{ .content = "Final" } };
+    var third_gateway = FakeGateway.init(alloc, &third_completions);
+    defer third_gateway.deinit();
+    var third_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer third_hooks.deinit();
+    third_hooks.context_enabled = true;
+    third_hooks.context_registry = registry;
+    job.history = both_turns.items;
+    try runFakePrompt(&third_gateway, &third_hooks, fixture.config(), job);
+    try std.testing.expectEqual(@as(usize, 3), third_gateway.request_bodies.items.len);
+    try expectBodyNotContains(&third_gateway, 0, "NOTE_SCOPE_RULE_EDITED");
+    // The saved reminder rides on the same tool result again; the changed
+    // file is delivered in full, with no reminder for its old copy.
+    for (third_gateway.request_bodies.items) |body| {
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "<scoped-rules-reminder"));
+    }
+    try expectRulesOnLastToolResult(alloc, third_gateway.request_bodies.items[1], "NOTE_SCOPE_RULE_EDITED");
+    try expectRulesOnLastToolResult(alloc, third_gateway.request_bodies.items[1], "The rules below replace the earlier copy from the same file.");
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], third_gateway.request_bodies.items[1]);
+
+    // A model no live probe covered gets the rules the same way.
+    var plain_gateway = FakeGateway.init(alloc, &completions);
+    defer plain_gateway.deinit();
+    var plain_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer plain_hooks.deinit();
+    plain_hooks.context_enabled = true;
+    plain_hooks.context_registry = registry;
+    var plain_job = fixture.job();
+    plain_job.model = @constCast("meta/llama-4-maverick");
+    plain_job.permission_mode = .auto;
+    try runFakePrompt(&plain_gateway, &plain_hooks, fixture.config(), plain_job);
+    try std.testing.expectEqual(@as(usize, 2), plain_gateway.request_bodies.items.len);
+    try expectRulesOnLastToolResult(alloc, plain_gateway.request_bodies.items[1], "NOTE_SCOPE_RULE");
+    try expectSameInstructions(alloc, plain_gateway.request_bodies.items[0], plain_gateway.request_bodies.items[1]);
+    try std.testing.expectEqual(@as(usize, 1), plain_hooks.history_turns.items[0].assistant.execution.context_notes.len);
+}
+
+test "an edit to the file a symlinked AGENTS.md names is delivered on a later turn (D93)" {
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace/nested");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/CLAUDE.md", .data = "LINKED_RULE_V1" });
+    tmp.dir.symLink(std.testing.io, "CLAUDE.md", "workspace/nested/AGENTS.md", .{ .is_directory = false }) catch |err| {
+        if (err == error.AccessDenied or err == error.FileSystem) return error.SkipZigTest;
+        return err;
+    };
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const registry = context_contract.Registry{ .default_provider = builtin_context.provider };
+    const calls = [_]ToolCall{toolCall("link_glob", "glob_files", "{\"pattern\":\"*\",\"path\":\"nested\"}")};
+    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Final" } };
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var job = fixture.job();
+    job.model = @constCast("anthropic/claude-sonnet-5.5");
+    job.permission_mode = .auto;
+
+    var first_gateway = FakeGateway.init(alloc, &completions);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    first_hooks.context_enabled = true;
+    first_hooks.context_registry = registry;
+    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), job);
+    try expectRulesOnLastToolResult(alloc, first_gateway.request_bodies.items[1], "LINKED_RULE_V1");
+
+    // The link stays as it was; only the file it names changes.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "workspace/nested/CLAUDE.md", .data = "LINKED_RULE_V2" });
+    var second_gateway = FakeGateway.init(alloc, &completions);
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    second_hooks.context_enabled = true;
+    second_hooks.context_registry = registry;
+    job.history = first_hooks.history_turns.items;
+    try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), job);
+    try std.testing.expectEqual(@as(usize, 2), second_gateway.request_bodies.items.len);
+    try expectRulesOnLastToolResult(alloc, second_gateway.request_bodies.items[1], "LINKED_RULE_V2");
+    try expectRulesOnLastToolResult(alloc, second_gateway.request_bodies.items[1], "The rules below replace the earlier copy from the same file.");
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, second_gateway.request_bodies.items[1], "<scoped-rules-reminder"));
+}
+
+/// The text of each user message in a Gateway request body, in order.
+fn userMessageTexts(alloc: std.mem.Allocator, body: []const u8) !std.ArrayList([]const u8) {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, alloc, body, .{});
+    var texts: std.ArrayList([]const u8) = .empty;
+    for (parsed.object.get("prompt").?.array.items) |message| {
+        if (!std.mem.eql(u8, message.object.get("role").?.string, "user")) continue;
+        const content = message.object.get("content").?;
+        var text: std.ArrayList(u8) = .empty;
+        switch (content) {
+            .string => |value| try text.appendSlice(alloc, value),
+            .array => |parts| for (parts.items) |part| {
+                if (part.object.get("text")) |value| try text.appendSlice(alloc, value.string);
+            },
+            else => {},
+        }
+        try texts.append(alloc, text.items);
+    }
+    return texts;
+}
+
+test "a resumed turn carries the stale shell handles note on its own message, not in the instructions (D93)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const note = session_runtime.stale_shell_handles_note;
+    const prompt = "Check the build again.";
+    const calls = [_]ToolCall{toolCall("resume_glob", "glob_files", "{\"pattern\":\"*\"}")};
+    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Final" } };
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The first turn after the resume: every request's turn message ends with
+    // the note, and the instructions never carry it.
+    var first_gateway = FakeGateway.init(alloc, &completions);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    var job = fixture.job();
+    job.prompt = @constCast(prompt);
+    job.permission_mode = .auto;
+    job.stale_shell_handles = true;
+    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), job);
+    try std.testing.expectEqual(@as(usize, 2), first_gateway.request_bodies.items.len);
+    const carried = prompt ++ "\n\n" ++ note;
+    for (first_gateway.request_bodies.items) |body| {
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, note));
+        const users = try userMessageTexts(arena, body);
+        try std.testing.expectEqual(@as(usize, 1), users.items.len);
+        try std.testing.expectEqualStrings(carried, users.items[0]);
+        for ((try leadingSystemContents(arena, body)).items) |instruction| {
+            try std.testing.expect(std.mem.find(u8, instruction, "fx restarted since this session") == null);
+        }
+    }
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], first_gateway.request_bodies.items[1]);
+    // It is saved at the start of the turn, without sources.
+    const saved = first_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes.len);
+    try std.testing.expectEqual(@as(usize, 0), saved.context_notes[0].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 0), saved.context_notes[0].sources.len);
+    try std.testing.expectEqualStrings(note, saved.context_notes[0].text);
+
+    // The next turn rebuilds it from the saved turn on the same message, once,
+    // and adds no other copy.
+    var second_gateway = FakeGateway.init(alloc, &completions);
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    var next = fixture.job();
+    next.permission_mode = .auto;
+    next.history = first_hooks.history_turns.items;
+    try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), next);
+    for (second_gateway.request_bodies.items) |body| {
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, note));
+        const users = try userMessageTexts(arena, body);
+        try std.testing.expectEqualStrings(carried, users.items[0]);
+    }
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], second_gateway.request_bodies.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), second_hooks.history_turns.items[0].assistant.execution.context_notes.len);
+}
+
+test "a session keeps its first runtime context ahead of the history and notes a later change on the turn's message (D94)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const before = "Runtime context: permission mode is ask. branch main";
+    const after = "Runtime context: permission mode is auto. branch feature";
+    const completions = [_]FakeCompletion{.{ .content = "Final" }};
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var history: std.ArrayList(types.HistoryTurn) = .empty;
+    defer history.deinit(alloc);
+
+    // The first turn captures the runtime context and saves it.
+    var first_gateway = FakeGateway.init(alloc, &completions);
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    first_hooks.runtime_context_text = before;
+    var first = fixture.job();
+    first.prompt = @constCast("First.");
+    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), first);
+    const first_saved = first_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqualStrings(before, first_saved.runtime_context.?[0]);
+    try std.testing.expectEqual(@as(usize, 0), first_saved.context_notes.len);
+    try history.append(alloc, first_hooks.history_turns.items[0]);
+
+    // The mode and branch change before the next turn: the instructions stay
+    // as the first turn sent them, and the update joins this turn's message.
+    var second_gateway = FakeGateway.init(alloc, &completions);
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    second_hooks.runtime_context_text = after;
+    var second = fixture.job();
+    second.prompt = @constCast("Second.");
+    second.history = history.items;
+    try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), second);
+    const second_body = second_gateway.request_bodies.items[0];
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], second_body);
+    for ((try leadingSystemContents(arena, second_body)).items) |instruction| {
+        try std.testing.expect(std.mem.find(u8, instruction, after) == null);
+    }
+    const second_users = try userMessageTexts(arena, second_body);
+    try std.testing.expectEqual(@as(usize, 2), second_users.items.len);
+    try std.testing.expectEqualStrings("First.", second_users.items[0]);
+    try std.testing.expect(std.mem.startsWith(u8, second_users.items[1], "Second.\n\n<fx-context-update>\n"));
+    try std.testing.expect(std.mem.endsWith(u8, second_users.items[1], "\n" ++ after ++ "\n</fx-context-update>"));
+    const second_saved = second_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expect(second_saved.runtime_context == null);
+    try std.testing.expectEqual(@as(usize, 1), second_saved.context_notes.len);
+    try std.testing.expectEqual(@as(usize, 0), second_saved.context_notes[0].after_tool_step_count);
+    try std.testing.expectEqual(@as(usize, 0), second_saved.context_notes[0].sources.len);
+    try history.append(alloc, second_hooks.history_turns.items[0]);
+
+    // Nothing changes again: the next turn sends the same instructions,
+    // replays the update on the second turn's message, and adds none.
+    var third_gateway = FakeGateway.init(alloc, &completions);
+    defer third_gateway.deinit();
+    var third_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer third_hooks.deinit();
+    third_hooks.runtime_context_text = after;
+    var third = fixture.job();
+    third.prompt = @constCast("Third.");
+    third.history = history.items;
+    try runFakePrompt(&third_gateway, &third_hooks, fixture.config(), third);
+    const third_body = third_gateway.request_bodies.items[0];
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], third_body);
+    const third_users = try userMessageTexts(arena, third_body);
+    try std.testing.expectEqual(@as(usize, 3), third_users.items.len);
+    try std.testing.expectEqualStrings(second_users.items[1], third_users.items[1]);
+    try std.testing.expectEqualStrings("Third.", third_users.items[2]);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, third_body, "<fx-context-update>"));
+    const third_saved = third_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expect(third_saved.runtime_context == null);
+    try std.testing.expectEqual(@as(usize, 0), third_saved.context_notes.len);
+}
+
+test "a named skill's text rides on its turn's message and the turn saves a short note in its place (D95)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "workspace");
+    try tmp.dir.createDirPath(std.testing.io, "requested-workflow");
+    var file = try tmp.dir.createFile(std.testing.io, "requested-workflow/SKILL.md", .{});
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "---\nname: requested-workflow\ndescription: Requested workflow\n---\nREQUESTED_SKILL_CONTENT\n");
+    const skill_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "requested-workflow");
+    defer alloc.free(skill_path);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace);
+    const skills = [_]@import("../../../skills/skill_runtime.zig").Skill{.{
+        .name = "requested-workflow",
+        .description = "Requested workflow",
+        .path = skill_path,
+        .source = .workspace_shared,
+    }};
+    const calls = [_]ToolCall{toolCall("skill_glob", "glob_files", "{\"pattern\":\"*\"}")};
+    var fixture = PromptFixture{ .workspace_root = workspace };
+    var config = fixture.config();
+    config.skill_catalog = .{ .skills = &skills };
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The naming turn: each request's turn message ends with the skill's
+    // text, and the instructions never carry it.
+    var first_gateway = FakeGateway.init(alloc, &.{ .{ .tool_calls = &calls }, .{ .content = "Done" } });
+    defer first_gateway.deinit();
+    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer first_hooks.deinit();
+    first_hooks.enable_recovery_checkpoint = true;
+    var first = fixture.job();
+    first.prompt = @constCast("Use $requested-workflow.");
+    try runFakePrompt(&first_gateway, &first_hooks, config, first);
+    try std.testing.expectEqual(@as(usize, 2), first_gateway.request_bodies.items.len);
+    for (first_gateway.request_bodies.items) |body| {
+        const users = try userMessageTexts(arena, body);
+        try std.testing.expectEqual(@as(usize, 1), users.items.len);
+        try std.testing.expect(std.mem.startsWith(u8, users.items[0], "Use $requested-workflow.\n\nExplicitly invoked skill content for this query:\n"));
+        try std.testing.expect(std.mem.find(u8, users.items[0], "REQUESTED_SKILL_CONTENT") != null);
+        for ((try leadingSystemContents(arena, body)).items) |instruction| {
+            try std.testing.expect(std.mem.find(u8, instruction, "REQUESTED_SKILL_CONTENT") == null);
+        }
+    }
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], first_gateway.request_bodies.items[1]);
+    // The turn saves only the short note, at its start.
+    const saved = first_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), saved.context_notes.len);
+    try std.testing.expectEqual(@as(usize, 0), saved.context_notes[0].after_tool_step_count);
+    try std.testing.expectEqualStrings(
+        "<fx-skill-used>\nFor that turn the user named the skill requested-workflow, and fx sent its full text with that message. If it still applies, load it again with the skill tool, using its location from the skill catalog.\n</fx-skill-used>",
+        saved.context_notes[0].text,
+    );
+
+    // The next turn sends the same instructions and the short note in the
+    // text's place, never the text again.
+    var second_gateway = FakeGateway.init(alloc, &.{.{ .content = "Ok" }});
+    defer second_gateway.deinit();
+    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer second_hooks.deinit();
+    var second = fixture.job();
+    second.prompt = @constCast("Thanks.");
+    second.history = first_hooks.history_turns.items;
+    try runFakePrompt(&second_gateway, &second_hooks, config, second);
+    const body = second_gateway.request_bodies.items[0];
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], body);
+    try std.testing.expect(std.mem.find(u8, body, "REQUESTED_SKILL_CONTENT") == null);
+    // The first turn's message, its saved file evidence, then this turn's.
+    const users = try userMessageTexts(arena, body);
+    try std.testing.expectEqual(@as(usize, 3), users.items.len);
+    try std.testing.expect(std.mem.startsWith(u8, users.items[1], "Session file evidence from previous tool execution."));
+    try std.testing.expectEqualStrings("Use $requested-workflow.\n\n" ++ "<fx-skill-used>\nFor that turn the user named the skill requested-workflow, and fx sent its full text with that message. If it still applies, load it again with the skill tool, using its location from the skill catalog.\n</fx-skill-used>", users.items[0]);
+    try std.testing.expectEqualStrings("Thanks.", users.items[2]);
+    try std.testing.expectEqual(@as(usize, 0), second_hooks.history_turns.items[0].assistant.execution.context_notes.len);
+
+    // A turn recovered from the checkpoint set right after its tool step
+    // sends the full text again in place of the short note the checkpoint
+    // saved.
+    const checkpoint = checkpoint: {
+        for (first_hooks.recovery_checkpoints.items) |*item| {
+            if (item.execution.tool_steps.len == 1) break :checkpoint item;
+        }
+        return error.TestExpectedCheckpoint;
+    };
+    try std.testing.expectEqualStrings("", checkpoint.assistant_source);
+    try std.testing.expectEqual(@as(usize, 1), checkpoint.execution.context_notes.len);
+    try std.testing.expect(std.mem.startsWith(u8, checkpoint.execution.context_notes[0].text, "<fx-skill-used>"));
+    var restored = try checkpoint.dupe(alloc);
+    defer restored.deinit(alloc);
+    var recovered_gateway = FakeGateway.init(alloc, &.{.{ .content = "Done" }});
+    defer recovered_gateway.deinit();
+    var recovered_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer recovered_hooks.deinit();
+    var recovered = fixture.job();
+    recovered.prompt = @constCast("Use $requested-workflow.");
+    recovered.recovery_checkpoint = restored;
+    try runFakePrompt(&recovered_gateway, &recovered_hooks, config, recovered);
+    try std.testing.expectEqual(@as(usize, 1), recovered_gateway.request_bodies.items.len);
+    const recovered_body = recovered_gateway.request_bodies.items[0];
+    const recovered_users = try userMessageTexts(arena, recovered_body);
+    try std.testing.expect(recovered_users.items.len >= 1);
+    try std.testing.expect(std.mem.startsWith(u8, recovered_users.items[0], "Use $requested-workflow.\n\nExplicitly invoked skill content for this query:\n"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, recovered_body, "REQUESTED_SKILL_CONTENT"));
+    try std.testing.expect(std.mem.find(u8, recovered_body, "<fx-skill-used>") == null);
+    try expectSameInstructions(alloc, first_gateway.request_bodies.items[0], recovered_body);
+    try std.testing.expectEqual(@as(usize, 1), recovered_hooks.history_turns.items.len);
+    const recovered_saved = recovered_hooks.history_turns.items[0].assistant.execution;
+    try std.testing.expectEqual(@as(usize, 1), recovered_saved.context_notes.len);
+    try std.testing.expectEqualStrings(saved.context_notes[0].text, recovered_saved.context_notes[0].text);
+}
+
 test "modern parallel preparation validates and checks availability once" {
     const alloc = std.testing.allocator;
     defer EmptyApplicableContext.reset();
@@ -2801,7 +3320,7 @@ test "same-batch retarget defers stale scoped call before permission and reloads
     defer alloc.free(new_target);
     const new_directory = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/new");
     defer alloc.free(new_directory);
-    const link_path = try std.fs.path.join(alloc, &.{ workspace, "link" });
+    const link_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "link" });
     defer alloc.free(link_path);
 
     const first_calls = [_]ToolCall{
@@ -2907,11 +3426,11 @@ test "same-batch file mutation retarget stops before permission and execution" {
     defer alloc.free(workspace);
     const new_directory = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/new");
     defer alloc.free(new_directory);
-    const link_path = try std.fs.path.join(alloc, &.{ workspace, "link" });
+    const link_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "link" });
     defer alloc.free(link_path);
-    const old_output = try std.fs.path.join(alloc, &.{ workspace, "old/proof.txt" });
+    const old_output = try std.Io.Dir.path.join(alloc, &.{ workspace, "old/proof.txt" });
     defer alloc.free(old_output);
-    const new_output = try std.fs.path.join(alloc, &.{ workspace, "new/proof.txt" });
+    const new_output = try std.Io.Dir.path.join(alloc, &.{ workspace, "new/proof.txt" });
     defer alloc.free(new_output);
 
     const calls = [_]ToolCall{
@@ -2979,7 +3498,7 @@ test "same-batch missing target defers newly resolvable scope until reissue" {
     defer alloc.free(new_target);
     const new_directory = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace/new");
     defer alloc.free(new_directory);
-    const link_path = try std.fs.path.join(alloc, &.{ workspace, "link" });
+    const link_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "link" });
     defer alloc.free(link_path);
 
     const first_calls = [_]ToolCall{
@@ -3094,7 +3613,10 @@ test "modern mixed batch materializes unsupported terminal before admission" {
     try std.testing.expectEqualStrings("read_file", hooks.permission_names.items[0]);
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
-    try std.testing.expectEqual(@as(usize, 0), hooks.rejected_names.items.len);
+    // Hosts finish their own record of a refused call (ACP's final update,
+    // the `fx ask --json` tool_calls entry) through the rejection hook.
+    try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
+    try std.testing.expectEqualStrings("missing_tool", hooks.rejected_names.items[0]);
     try expectLifecycleCallIds(
         hooks.lifecycle_events.items,
         &.{
@@ -3183,39 +3705,6 @@ test "modern cancellation during later context selection stops before context or
     try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
 }
 
-test "retained project context cancellation preserves an interrupted turn" {
-    const alloc = std.testing.allocator;
-    defer ApplicableContextDelta.reset("", null);
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    const calls = [_]ToolCall{toolCall("prior_read", "read_file", "{\"path\":\"prior.txt\"}")};
-    const steps = [_]types.ToolExecutionStep{.{ .tool_calls = @constCast(&calls) }};
-    const history = [_]types.HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("prior") },
-        .assistant = @constCast("prior result"),
-        .execution = .{ .tool_steps = @constCast(&steps) },
-    } }};
-    var gateway = FakeGateway.init(alloc, &.{});
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.context_enabled = true;
-    hooks.context_registry = ApplicableContextDelta.registry;
-    var fixture = PromptFixture{ .workspace_root = workspace };
-    var job = fixture.job();
-    job.history = @constCast(&history);
-    ApplicableContextDelta.reset("", &fixture.cancel_flag);
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
-    try std.testing.expect(fixture.cancel_flag.load(.seq_cst));
-    try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);
-    try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, hooks.finalized_outcome.?);
-    try std.testing.expectEqual(@as(usize, 1), hooks.history_turns.items.len);
-    try std.testing.expect(hooks.history_turns.items[0] == .interrupted);
-}
-
 test "retained project context leaves empty history host context unchanged" {
     const alloc = std.testing.allocator;
     const completions = [_]FakeCompletion{.{ .content = "Final" }};
@@ -3228,92 +3717,6 @@ test "retained project context leaves empty history host context unchanged" {
     var fixture = PromptFixture{};
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
     try expectBodyContains(&gateway, 0, "HOST_ONLY_CONTEXT");
-}
-
-test "retained project context refreshes queued rules before a repeated shell call" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "nested");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "nested/AGENTS.md", .data = "RETAINED_OLD_RULE" });
-    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(workspace);
-    const nested = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "nested");
-    defer alloc.free(nested);
-    const registry = context_contract.Registry{ .default_provider = builtin_context.provider };
-    const calls = [_]ToolCall{toolCall("scoped_shell", "shell", "{\"action\":\"run\",\"command\":\"pwd\",\"cwd\":\"nested\"}")};
-    const completions = [_]FakeCompletion{ .{ .tool_calls = &calls }, .{ .content = "Final" } };
-    var first_gateway = FakeGateway.init(alloc, &completions);
-    defer first_gateway.deinit();
-    var first_hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer first_hooks.deinit();
-    first_hooks.context_enabled = true;
-    first_hooks.context_registry = registry;
-    var fixture = PromptFixture{ .workspace_root = workspace };
-    try runFakePrompt(&first_gateway, &first_hooks, fixture.config(), fixture.job());
-    try std.testing.expectEqual(@as(usize, 0), first_hooks.executed_names.items.len);
-    try expectBodyContains(&first_gateway, 1, types.context_deferred_tool_result_output);
-
-    var queued_snapshot = try registry.gatherDefaultSnapshot(alloc, .{
-        .workspace_root = workspace,
-        .targets = &.{.{ .path = nested, .kind = .directory }},
-    });
-    defer queued_snapshot.deinit(alloc);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "nested/AGENTS.md", .data = "RETAINED_CURRENT_RULE" });
-    var job = fixture.job();
-    job.history = first_hooks.history_turns.items;
-    job.context_snapshot = queued_snapshot;
-    var second_gateway = FakeGateway.init(alloc, &completions);
-    defer second_gateway.deinit();
-    var second_hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer second_hooks.deinit();
-    second_hooks.context_enabled = true;
-    second_hooks.context_registry = registry;
-    second_hooks.static_context_text = queued_snapshot.modelVisibleBytes();
-    try runFakePrompt(&second_gateway, &second_hooks, fixture.config(), job);
-    try expectBodyContains(&second_gateway, 0, "RETAINED_CURRENT_RULE");
-    try expectBodyNotContains(&second_gateway, 0, "RETAINED_OLD_RULE");
-    try std.testing.expectEqual(@as(usize, 1), second_hooks.executed_names.items.len);
-    try std.testing.expectEqual(@as(usize, 1), second_hooks.permission_names.items.len);
-    try std.testing.expectEqual(@as(usize, 2), second_gateway.request_bodies.items.len);
-
-    const bare_final = [_]FakeCompletion{.{ .content = "Core context delivered" }};
-    var bare_gateway = FakeGateway.init(alloc, &bare_final);
-    defer bare_gateway.deinit();
-    var bare_hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer bare_hooks.deinit();
-    bare_hooks.context_enabled = true;
-    bare_hooks.context_registry = registry;
-    var bare_deps = bare_hooks.deps();
-    bare_deps.append_static_context = null;
-    bare_deps.agent_stream_provider = bare_gateway.provider();
-    var agent: @import("../agent.zig").Agent = .{};
-    defer agent.deinit(alloc);
-    try agent.restoreHistory(alloc, job.history);
-    try runtime_orchestrator.processAgentPrompt(&agent, &bare_deps, null, testLifecycleContext(lifecycle_hooks.RuntimeView.empty(), alloc, workspace), fixture.config(), job);
-    try expectBodyContains(&bare_gateway, 0, "RETAINED_CURRENT_RULE");
-
-    try tmp.dir.deleteFile(std.testing.io, "nested/AGENTS.md");
-    const final = [_]FakeCompletion{.{ .content = "No stale rule" }};
-    var deleted_gateway = FakeGateway.init(alloc, &final);
-    defer deleted_gateway.deinit();
-    var deleted_hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer deleted_hooks.deinit();
-    deleted_hooks.context_enabled = true;
-    deleted_hooks.context_registry = registry;
-    deleted_hooks.static_context_text = queued_snapshot.modelVisibleBytes();
-    try runFakePrompt(&deleted_gateway, &deleted_hooks, fixture.config(), job);
-    try expectBodyNotContains(&deleted_gateway, 0, "RETAINED_OLD_RULE");
-    try expectBodyNotContains(&deleted_gateway, 0, "RETAINED_CURRENT_RULE");
-
-    var disabled_gateway = FakeGateway.init(alloc, &final);
-    defer disabled_gateway.deinit();
-    var disabled_hooks = FakeAgentRuntimeDeps.init(alloc);
-    defer disabled_hooks.deinit();
-    disabled_hooks.static_context_text = "HOST_CONTEXT_UNCHANGED";
-    try runFakePrompt(&disabled_gateway, &disabled_hooks, fixture.config(), job);
-    try expectBodyContains(&disabled_gateway, 0, "HOST_CONTEXT_UNCHANGED");
-    try expectBodyNotContains(&disabled_gateway, 0, "RETAINED_OLD_RULE");
 }
 
 test "modern context delta defers effectful call exactly once" {
@@ -3740,7 +4143,7 @@ test "processQueuedPrompt length-limited calls bypass malformed provider result 
     try std.testing.expectEqual(@as(usize, 1), hooks.system_notices.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
     try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "Partial provider answer") != null);
-    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "did not execute") != null);
+    try std.testing.expect(std.mem.find(u8, hooks.finish_assistant_text.?, "did not run them") != null);
 }
 
 test "processQueuedPrompt rejects duplicate authoritative tool ids before effects" {
@@ -4315,6 +4718,84 @@ test "committed file result is appended before degraded secondary publication" {
     try std.testing.expect(persisted.output_handle != null);
 }
 
+// A result without a stamp is stamped again on every rebuild, so each step
+// would parse every earlier result again before streaming the turn
+// (tests/tla/session/TurnStream.tla `NoReparseOfStamped`).
+test "tool results are stamped as they enter the turn, and later requests and the saved turn keep each time" {
+    const Seen = struct {
+        const ModelRequest = @import("../../stream_provider.zig").ModelRequest;
+        var stamps: [2]?i64 = @splat(null);
+        var requests: usize = 0;
+
+        fn observe(request: ModelRequest) !void {
+            requests += 1;
+            var position: usize = 0;
+            for (request.messages) |message| {
+                if (message.role != .tool) continue;
+                const stamp = message.tool_result_created_at_ms orelse return error.TestExpectedStampedToolResult;
+                if (position >= stamps.len) return error.TestUnexpectedToolResult;
+                if (stamps[position]) |first| {
+                    try std.testing.expectEqual(first, stamp);
+                } else stamps[position] = stamp;
+                position += 1;
+            }
+        }
+    };
+    Seen.stamps = @splat(null);
+    Seen.requests = 0;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const result_dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(result_dir);
+    const preview_lines = [_]diff.PreviewLine{.{ .op = .addition, .new_line = 1, .text = "x" }};
+    const handoff = file_mutation.CommittedFileHandoff.init(
+        .{ .path = "safe.txt", .lines = &preview_lines, .additions = 1, .deletions = 0, .truncated = false },
+        .{ .kind = .write, .raw_path = "/tmp/workspace/safe.txt", .previous_content = null, .committed_at_ms = 42 },
+    );
+    const write_output = "wrote safe.txt (1 bytes)";
+    const read_calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"a.txt\"}")};
+    const write_calls = [_]ToolCall{toolCall("call_write", "write_file", "{\"path\":\"safe.txt\",\"content\":\"x\"}")};
+    const completions = [_]FakeCompletion{
+        .{ .tool_calls = &read_calls },
+        .{ .tool_calls = &write_calls },
+        .{ .content = "Done" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    gateway.observe_request = Seen.observe;
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    // The read result enters through appendToolResultContent, the committed
+    // write through processCommittedFileResult.
+    hooks.exec_plans = &.{
+        .{ .result = .{ .model_output = "a" } },
+        .{ .result = .{
+            .status = .success,
+            .model_output = write_output,
+            .tool_result_memory = .{ .output_bytes = write_output.len, .stored_output_bytes = write_output.len },
+            .tool_result_memory_prepared = true,
+            .committed_file_handoff = handoff,
+        } },
+    };
+    var fixture = PromptFixture{};
+    var config = fixture.config();
+    config.tool_result_dir = result_dir;
+
+    const before = io_mod.milliTimestamp();
+    try runFakePrompt(&gateway, &hooks, config, fixture.job());
+    const after = io_mod.milliTimestamp();
+
+    try std.testing.expectEqual(@as(usize, 3), Seen.requests);
+    const read_stamp = Seen.stamps[0] orelse return error.TestExpectedStampedToolResult;
+    const write_stamp = Seen.stamps[1] orelse return error.TestExpectedStampedToolResult;
+    try std.testing.expect(before <= read_stamp and read_stamp <= write_stamp and write_stamp <= after);
+    const steps = hooks.history_turns.items[0].assistant.execution.tool_steps;
+    try std.testing.expectEqual(@as(usize, 2), steps.len);
+    try std.testing.expectEqual(read_stamp, steps[0].tool_results[0].created_at_ms);
+    try std.testing.expectEqual(write_stamp, steps[1].tool_results[0].created_at_ms);
+}
+
 test "terminal publication failure deletes retained command replay" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4462,7 +4943,8 @@ test "processQueuedPrompt denied registered run command compatibility never reac
     try std.testing.expectEqual(@as(usize, 1), hooks.permission_names.items.len);
     try std.testing.expectEqualStrings("terminal", hooks.permission_names.items[0]);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
-    try expectPermissionDeniedToolResult(&gateway, 1, "terminal", .user_denied);
+    // History replays the legacy exec as the shell run it maps to.
+    try expectPermissionDeniedToolResultAs(&gateway, 1, "shell", "terminal", .user_denied);
 }
 
 test "processQueuedPrompt legacy auto denial retains lifecycle source" {
@@ -4935,7 +5417,7 @@ test "initial session grants follow active registry metadata" {
 }
 
 test "processQueuedPrompt once permission binds external mutation grants before prompt returns" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4960,9 +5442,9 @@ test "processQueuedPrompt once permission binds external mutation grants before 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const link_path = try std.fs.path.join(arena, &.{ workspace, "link" });
-    const requested = try std.fs.path.join(arena, &.{ link_path, "created.txt" });
-    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{requested});
+    const link_path = try std.Io.Dir.path.join(arena, &.{ workspace, "link" });
+    const requested = try std.Io.Dir.path.join(arena, &.{ link_path, "created.txt" });
+    const args = try arena.print("{{\"path\":\"{s}\",\"content\":\"x\"}}", .{requested});
     const calls = [_]ToolCall{toolCall("call_1", "write_file", args)};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
@@ -5001,7 +5483,7 @@ test "processQueuedPrompt once permission binds external mutation grants before 
 }
 
 test "processQueuedPrompt always permission retains external mutation session grants from approved targets" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5026,9 +5508,9 @@ test "processQueuedPrompt always permission retains external mutation session gr
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const link_path = try std.fs.path.join(arena, &.{ workspace, "link" });
-    const requested = try std.fs.path.join(arena, &.{ link_path, "created.txt" });
-    const args = try std.fmt.allocPrint(arena, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{requested});
+    const link_path = try std.Io.Dir.path.join(arena, &.{ workspace, "link" });
+    const requested = try std.Io.Dir.path.join(arena, &.{ link_path, "created.txt" });
+    const args = try arena.print("{{\"path\":\"{s}\",\"content\":\"x\"}}", .{requested});
     const calls = [_]ToolCall{toolCall("call_1", "write_file", args)};
     const completions = [_]FakeCompletion{
         .{ .tool_calls = &calls },
@@ -5316,7 +5798,7 @@ test "processQueuedPrompt caps chatty grep_files model output" {
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.exec_plans = &.{.{ .result = .{
-        .model_output = "match\n" ++ ("x" ** 2048),
+        .model_output = "match\n" ++ text_utils.repeat("x", 2048),
     } }};
     defer hooks.deinit();
     var fixture = PromptFixture{};
@@ -5340,7 +5822,7 @@ test "processQueuedPrompt caps chatty terminal exec result with explicit marker"
     defer gateway.deinit();
     var hooks = FakeAgentRuntimeDeps.init(alloc);
     hooks.exec_plans = &.{.{ .result = .{
-        .model_output = "{\"truncated\":true,\"stdout\":\"" ++ ("x" ** 2048) ++ "\",\"stderr\":\"\",\"stdout_bytes\":2048}",
+        .model_output = "{\"truncated\":true,\"stdout\":\"" ++ text_utils.repeat("x", 2048) ++ "\",\"stderr\":\"\",\"stdout_bytes\":2048}",
     } }};
     defer hooks.deinit();
     var fixture = PromptFixture{};
@@ -5383,7 +5865,7 @@ test "processQueuedPrompt forwards diff payload instead of display text" {
     try std.testing.expectEqualStrings("diff preview", hooks.diff_preview.?);
 }
 
-test "processQueuedPrompt records permission preflight failures as denied tool calls" {
+test "processQueuedPrompt records permission preflight failures as failed tool calls" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_1", "read_file", "{\"path\":\"a\"}")};
     const completions = [_]FakeCompletion{
@@ -5399,8 +5881,10 @@ test "processQueuedPrompt records permission preflight failures as denied tool c
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
-    try std.testing.expectEqualStrings("read_file", hooks.rejected_names.items[0]);
+    // A preflight content failure is a tool failure, not a rejection.
+    try std.testing.expectEqual(@as(usize, 0), hooks.rejected_names.items.len);
+    try std.testing.expectEqual(@as(usize, 1), hooks.failed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.failed_names.items[0]);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
 }
 
@@ -5426,7 +5910,12 @@ test "parallel permission preflight failure terminalizes its started lifecycle" 
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
-    try std.testing.expectEqual(@as(usize, 2), hooks.rejected_names.items.len);
+    // The denied web_search stays rejected; the read_file preflight failure
+    // is a tool failure.
+    try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
+    try std.testing.expectEqualStrings("web_search", hooks.rejected_names.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), hooks.failed_names.items.len);
+    try std.testing.expectEqualStrings("read_file", hooks.failed_names.items[0]);
     try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
     try expectLifecycleCallIds(hooks.lifecycle_events.items, &.{
         "call_search",
@@ -5454,7 +5943,7 @@ test "web_search denial trace records redacted query without api keys or result 
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "web-search-denied-trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "web-search-denied-trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -5539,7 +6028,7 @@ test "PreToolUse rewrite is authoritative for validation permission execution hi
 }
 
 test "PreToolUse allocation failure escapes before history validation permission or execution" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     const calls = [_]ToolCall{
         toolCall("call_read", "read_file", "{\"path\":\"src/main.zig\"}"),
     };
@@ -5913,7 +6402,7 @@ test "owner cancellation wins over PreToolUse outcome allocation failure" {
         }
     };
 
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var cancel_flag = std.atomic.Value(bool).init(false);
     var handler = CancelRewriteHandler{ .cancel_flag = &cancel_flag };
     var lifecycle_runtime = lifecycle_hooks.Runtime.init(alloc);
@@ -6120,13 +6609,13 @@ test "processQueuedPrompt interruption persists staged feedback from a completed
     );
 }
 
-test "processQueuedPrompt pauses retryable failures and preserves execution on terminal failure" {
+test "processQueuedPrompt preserves execution when Esc ends a retry or a failure ends the turn" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{
         toolCall("call_completed", "read_file", "{\"path\":\"README.md\"}"),
     };
     const Expected = enum {
-        paused,
+        interrupted,
         transport_error,
     };
     const Case = struct {
@@ -6139,15 +6628,15 @@ test "processQueuedPrompt pauses retryable failures and preserves execution on t
                 .status = .bad_gateway,
                 .err_body = "gateway unavailable",
             },
-            .expected = .paused,
+            .expected = .interrupted,
         },
         .{
             .completion = .{ .finish_reason = .provider_error },
-            .expected = .paused,
+            .expected = .interrupted,
         },
         .{
             .completion = .{ .omit_finish = true },
-            .expected = .paused,
+            .expected = .interrupted,
         },
         .{
             .completion = .{ .stream_error = error.TestTransportFailure },
@@ -6164,14 +6653,14 @@ test "processQueuedPrompt pauses retryable failures and preserves execution on t
         var gateway = FakeGateway.init(alloc, &completions);
         defer gateway.deinit();
         var deps = FakeAgentRuntimeDeps.init(alloc);
-        if (case.completion.finish_reason == .provider_error) deps.enable_route_recovery = false;
         defer deps.deinit();
         var fixture = PromptFixture{};
 
-        var config = fixture.config();
-        config.max_provider_attempts = 2;
+        const config = fixture.config();
+        // Esc while the request waits to retry ends the turn.
+        deps.cancel_on_auto_retry_status = config.cancel_flag;
         switch (case.expected) {
-            .paused => try runFakePrompt(
+            .interrupted => try runFakePrompt(
                 &gateway,
                 &deps,
                 config,
@@ -6184,10 +6673,17 @@ test "processQueuedPrompt pauses retryable failures and preserves execution on t
         }
 
         try std.testing.expectEqual(@as(usize, 1), deps.executed_names.items.len);
-        if (case.expected == .paused) {
-            try std.testing.expectEqual(@as(usize, 0), deps.history_turns.items.len);
-            try std.testing.expectEqual(@as(usize, 0), deps.finish_event_count);
-            try std.testing.expectEqual(types.TurnPresentationOutcome.paused, deps.finalized_outcome.?);
+        if (case.expected == .interrupted) {
+            // The interrupted turn keeps the tool step that already ran.
+            try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items.len);
+            const interrupted = deps.history_turns.items[0].interrupted;
+            try std.testing.expectEqual(@as(usize, 1), interrupted.execution.tool_steps.len);
+            try std.testing.expectEqualStrings(
+                "call_completed",
+                interrupted.execution.tool_steps[0].tool_calls[0].id,
+            );
+            try std.testing.expectEqual(@as(usize, 1), deps.finish_event_count);
+            try std.testing.expectEqual(types.TurnPresentationOutcome.interrupted, deps.finalized_outcome.?);
             continue;
         }
         try std.testing.expectEqual(@as(usize, 1), deps.history_turns.items.len);
@@ -6601,7 +7097,10 @@ test "child target failures settle the batch before and after permission without
         try std.testing.expectEqualStrings("good-neighbor", probe.hooks.executed_call_ids.items[0]);
         try std.testing.expectEqual(@as(usize, if (case.after_permission) 2 else 1), probe.hooks.permission_names.items.len);
         try std.testing.expectEqual(types.TurnPresentationOutcome.completed, probe.hooks.finalized_outcome.?);
-        try std.testing.expectEqual(@as(usize, 1), probe.hooks.rejected_names.items.len);
+        // Target-resolution failures arrive through the permission tool_failure
+        // channel and record as tool failures, not rejections.
+        try std.testing.expectEqual(@as(usize, 1), probe.hooks.failed_names.items.len);
+        try std.testing.expectEqual(@as(usize, 0), probe.hooks.rejected_names.items.len);
     }
 }
 

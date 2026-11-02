@@ -311,6 +311,46 @@ function outerQuestionBatchCall() {
   ]);
 }
 
+const FULL_QUESTION_BATCH = 20;
+const QUESTION_COUNT_REJECTION =
+  `(ask_user_question: provide 1 to ${FULL_QUESTION_BATCH} questions)`;
+
+function batchQuestionText(index: number) {
+  return `Batch decision ${String(index + 1).padStart(2, "0")}?`;
+}
+
+function batchQuestions(count: number) {
+  return Array.from({ length: count }, (_, index) => ({
+    question: batchQuestionText(index),
+    options: [
+      { label: `Keep ${index + 1}`, description: "Leave this setting as it is." },
+      { label: `Change ${index + 1}`, description: "Apply the proposed change." },
+    ],
+  }));
+}
+
+function outerBatchQuestionCall(id: string, count: number) {
+  return outerToolCalls([
+    { id, name: "ask_user_question", input: { questions: batchQuestions(count) } },
+  ]);
+}
+
+function toolResultText(body: string, callId: string): string {
+  const prompt = (JSON.parse(body) as { prompt: Array<{ content: unknown }> }).prompt;
+  for (const message of prompt) {
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content as Array<Record<string, unknown>>) {
+      if (part.type !== "tool-result" || part.toolCallId !== callId) continue;
+      const output = part.output as { value?: unknown } | undefined;
+      if (typeof output?.value !== "string") {
+        throw new Error(`Tool result ${callId} has no text output`);
+      }
+      return output.value;
+    }
+  }
+  throw new Error(`Missing tool result for ${callId}`);
+}
+
 function outerLongQuestionAnswerCall() {
   return outerToolCalls([
     {
@@ -700,13 +740,47 @@ function hasSelection(pane: string, ordinal: number, selectedLabel: string) {
   return visibleText(pane).includes(visibleText(`› ${ordinal}. ${selectedLabel}`));
 }
 
-// The selected option is the only row carrying the white (255) style; match
-// the ordinal/label on that row after stripping the interleaved escapes.
+// The selected option is bold. Sessions here run with NO_COLOR, which keeps
+// emphasis but drops color, so bold is the cue a user can still see. tmux
+// carries SGR state from row to row, so bold is tracked across the whole pane
+// and checked at the first visible character of the selected label.
+function boldAfterSgr(bold: boolean, params: string): boolean {
+  const values = params.split(";");
+  for (let i = 0; i < values.length; i++) {
+    const value = values[i] === "" ? "0" : values[i];
+    if (value === "38" || value === "48" || value === "58") {
+      i += values[i + 1] === "2" ? 4 : 2;
+    } else if (value === "0" || value === "22") {
+      bold = false;
+    } else if (value === "1") {
+      bold = true;
+    }
+  }
+  return bold;
+}
+
 function hasQuestionSelection(paneEscapes: string, ordinal: number, selectedLabel: string) {
-  const needle = visibleText(`${ordinal}) ${selectedLabel}`);
-  return paneEscapes.split(/\r?\n/).some((line) =>
-    line.includes("38;5;255") && visibleText(stripAnsi(line)).includes(needle)
-  );
+  const needle = Array.from(visibleText(`${ordinal}) ${selectedLabel}`));
+  let bold = false;
+  for (const line of paneEscapes.split(/\r?\n/)) {
+    const chars: string[] = [];
+    const flags: boolean[] = [];
+    for (const part of line.split(/(\x1b\[[0-9;]*m)/)) {
+      const sgr = /^\x1b\[([0-9;]*)m$/.exec(part);
+      if (sgr) {
+        bold = boldAfterSgr(bold, sgr[1]!);
+        continue;
+      }
+      for (const ch of Array.from(visibleText(stripAnsi(part)))) {
+        chars.push(ch);
+        flags.push(bold);
+      }
+    }
+    for (let at = 0; at + needle.length <= chars.length; at++) {
+      if (flags[at] && needle.every((ch, k) => chars[at + k] === ch)) return true;
+    }
+  }
+  return false;
 }
 
 function hasApprovalSelection(pane: string, ordinal: number, selectedLabel: string) {
@@ -1240,6 +1314,42 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
+    "approval reports program status until the turn is done and clears it on exit",
+    async () => {
+      const tapeRoot = process.env.FX_RECORD
+        ? null
+        : mkdtempSync(join(tmpdir(), "fx-program-status-"));
+      if (tapeRoot) roots.push(tapeRoot);
+      const tapePath = process.env.FX_RECORD ?? join(tapeRoot!, "approval.fxtape");
+      const ctx = await openApprovalPrompt("program status approval", {
+        FX_RECORD: tapePath,
+      });
+      await ctx.session.sendLiteralText("1");
+      await ctx.session.waitForText("program status approval handled", TIMEOUT);
+      await ctx.session.sendText("/quit");
+      expect(await ctx.session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      expect(readFileSync(ctx.stderrPath, "utf8")).toBe("");
+
+      const stdout = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload))
+        .toString("latin1");
+      const reports = [...stdout.matchAll(/\x1b\]7501;([^\x1b]*)\x1b\\/g)]
+        .map((match) => match[1]!);
+      expect(reports.map((report) => report.replace(/:msg=.*$/, ""))).toEqual([
+        "state=idle:app=fx",
+        "state=working:app=fx",
+        "state=blocked:kind=permission:app=fx",
+        "state=working:app=fx",
+        "state=done:app=fx",
+        "state=clear",
+      ]);
+      const encodedMessage = reports[2]!.split(":msg=")[1] ?? "";
+      expect(Buffer.from(encodedMessage, "base64").toString("utf8"))
+        .toContain("touch generic-preview-accepted.txt");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "long command approval renders the complete command before a decision",
     async () => {
       const tapeRoot = process.env.FX_RECORD
@@ -1417,7 +1527,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       await ctx.session.waitForText("Permission needed", TIMEOUT);
 
       await ctx.session.sendKeys("Escape");
-      const cancelled = await ctx.session.waitForText("■ Cancelled", TIMEOUT);
+      const cancelled = await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
       expect(cancelled).not.toContain(APPROVAL_PROMPT);
 
       await ctx.session.resizeWindow(72, 20);
@@ -2452,19 +2562,111 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   );
 
   test(
+    "a full 20-question batch opens as one prompt, survives navigation and resize, and returns every answer in order",
+    async () => {
+      const finalMarker = "full question batch handled";
+      const ctx = await launchScenario([
+        outerBatchQuestionCall("question_batch_oversized", FULL_QUESTION_BATCH + 1),
+        outerBatchQuestionCall("question_batch_full", FULL_QUESTION_BATCH),
+        outerText(finalMarker),
+      ]);
+      const waitForPage = (page: number) =>
+        waitForPaneState(
+          ctx.session,
+          `full batch page ${page} of ${FULL_QUESTION_BATCH}`,
+          (value) =>
+            value.includes(batchQuestionText(page - 1)) &&
+            value.includes(`Question ${page} of ${FULL_QUESTION_BATCH}`),
+          TIMEOUT,
+        );
+
+      await ctx.session.sendText("Ask every setup decision at once.");
+      await waitForPage(1);
+
+      // The model is offered the full batch size, and one more question is
+      // rejected without opening a prompt.
+      const tools = (JSON.parse(ctx.gateway.requests[0]!.body) as {
+        tools: Array<{ name: string; description: string; inputSchema: any }>;
+      }).tools;
+      const askTool = tools.find((tool) => tool.name === "ask_user_question");
+      expect(askTool?.inputSchema.properties.questions.maxItems).toBe(FULL_QUESTION_BATCH);
+      expect(askTool?.description).toStartWith(`Ask the user 1-${FULL_QUESTION_BATCH} `);
+      expect(ctx.gateway.requests).toHaveLength(2);
+      expect(toolResultText(ctx.gateway.requests[1]!.body, "question_batch_oversized"))
+        .toBe(QUESTION_COUNT_REJECTION);
+
+      // Bursts of tab keys land on the right page and wrap past the last one.
+      await ctx.session.sendKeys(Array(13).fill("Tab").join(" "));
+      await waitForPage(14);
+      await ctx.session.sendKeys(Array(FULL_QUESTION_BATCH - 13).fill("Tab").join(" "));
+      await waitForPage(1);
+      await ctx.session.sendKeys(Array(13).fill("Tab").join(" "));
+      await waitForPage(14);
+
+      // A narrow terminal keeps the current page, and the counter returns
+      // once the hint row has room again.
+      await ctx.session.resizeWindow(48, 24);
+      await waitForPaneState(
+        ctx.session,
+        "narrow full batch page",
+        (value) => value.includes(batchQuestionText(13)) && value.includes("Change 14"),
+        TIMEOUT,
+      );
+      await ctx.session.resizeWindow(120, 40);
+      await waitForPage(14);
+      await ctx.session.sendKeys(Array(FULL_QUESTION_BATCH - 13).fill("Tab").join(" "));
+      await waitForPage(1);
+
+      // One burst answers every page: even pages keep, odd pages change.
+      const choices = Array.from({ length: FULL_QUESTION_BATCH }, (_, index) =>
+        index % 2 === 0 ? "1" : "2"
+      );
+      await ctx.session.sendLiteralText(choices.join(""));
+      await ctx.session.waitForText(finalMarker, TIMEOUT);
+
+      expect(ctx.gateway.requests).toHaveLength(3);
+      const answers = JSON.parse(
+        toolResultText(ctx.gateway.requests[2]!.body, "question_batch_full"),
+      ) as Array<{ question: string; answer: string }>;
+      expect(answers).toEqual(
+        Array.from({ length: FULL_QUESTION_BATCH }, (_, index) => ({
+          question: batchQuestionText(index),
+          answer: `${index % 2 === 0 ? "Keep" : "Change"} ${index + 1}`,
+        })),
+      );
+
+      // The transcript lists every answer once, hanging under its numbered
+      // question even after the number grows to two digits.
+      const scrollback = await ctx.session.captureFullScrollback();
+      expect(scrollback).not.toContain(`of ${FULL_QUESTION_BATCH + 1}`);
+      const lines = scrollback.split("\n").map((line) => line.trimEnd());
+      for (let index = 0; index < FULL_QUESTION_BATCH; index += 1) {
+        const prefix = `  ${index + 1}) `;
+        const resolution = `${prefix}${batchQuestionText(index)}`;
+        expect(lines.filter((line) => line === resolution)).toHaveLength(1);
+        expect(lines[lines.indexOf(resolution) + 1]).toBe(
+          `${" ".repeat(prefix.length)}${answers[index]!.answer}`,
+        );
+      }
+      await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "raw Escape cancels a question turn before a new prompt",
     async () => {
       const nextPrompt = "Start a new turn after raw question cancellation.";
       const ctx = await openQuestionPrompt("raw question cancellation completed");
 
       await ctx.session.sendKeys("Escape");
-      const cancelled = await ctx.session.waitForText("■ Cancelled", TIMEOUT);
-      expect(countOccurrences(cancelled, "■ Cancelled")).toBe(1);
+      const cancelled = await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
+      expect(countOccurrences(cancelled, "▪ Cancelled")).toBe(1);
       expect(cancelled).not.toContain(QUESTION_PROMPT);
       expect(cancelled).not.toContain("raw question cancellation completed");
       const cancelledGrid = await ctx.session.capturePaneGrid();
       const footer = findFooterBlocks(cancelledGrid).at(-1);
-      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("■ Cancelled"));
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
       expect(footer).toBeDefined();
       expect(cancelledRow).toBeGreaterThanOrEqual(0);
       expect(cancelledRow).toBeLessThan(footer!.topDivider);
@@ -2518,13 +2720,13 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
         (grid) => {
           const footer = findFooterBlocks(grid).at(-1);
           return (
-            grid.some((row) => row.includes("■ Cancelled")) &&
+            grid.some((row) => row.includes("▪ Cancelled")) &&
             footer?.bottomDivider === grid.length - 2
           );
         },
       );
       const cancelledFooter = findFooterBlocks(cancelledGrid).at(-1);
-      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("■ Cancelled"));
+      const cancelledRow = cancelledGrid.findIndex((row) => row.includes("▪ Cancelled"));
       expect(cancelledFooter).toBeDefined();
       expect(cancelledRow).toBeGreaterThanOrEqual(0);
       expect(cancelledRow).toBeLessThan(cancelledFooter!.topDivider);
@@ -2548,7 +2750,7 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       );
       const editedFooter = findFooterBlocks(editedGrid).at(-1);
       expect(editedFooter).toEqual(cancelledFooter);
-      expect(countOccurrences(editedGrid.join("\n"), "■ Cancelled")).toBe(1);
+      expect(countOccurrences(editedGrid.join("\n"), "▪ Cancelled")).toBe(1);
       expect(editedGrid.join("\n")).not.toContain(QUESTION_PROMPT);
       expect(ctx.gateway.requests).toHaveLength(2);
       await assertProcessAliveAndClean(ctx);
@@ -2563,8 +2765,8 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       const ctx = await openQuestionPrompt("kitty question cancellation completed");
 
       await ctx.session.sendHexBytes(CSI_U_ESCAPE);
-      const cancelled = await ctx.session.waitForText("■ Cancelled", TIMEOUT);
-      expect(countOccurrences(cancelled, "■ Cancelled")).toBe(1);
+      const cancelled = await ctx.session.waitForText("▪ Cancelled", TIMEOUT);
+      expect(countOccurrences(cancelled, "▪ Cancelled")).toBe(1);
       expect(cancelled).not.toContain(QUESTION_PROMPT);
       expect(cancelled).not.toContain("kitty question cancellation completed");
 
@@ -2593,6 +2795,39 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
       expect(scrollback).toContain(visibleText(`1) ${QUESTION_PROMPT}`));
       expect(scrollback).toContain(visibleText("Run tests"));
       await assertProcessAliveAndClean(ctx);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "question freeform rejects blank answers and accepts text afterward",
+    async () => {
+      const ctx = await openQuestionPrompt("question blank freeform");
+
+      await ctx.session.sendKeys("Up");
+      await waitForQuestionPane(ctx.session, "question blank freeform selected", (value) =>
+        hasQuestionSelection(value, 3, ""),
+      );
+      await ctx.session.sendKeys("Enter");
+      await ctx.session.sendLiteralText("   ");
+      await ctx.session.sendKeys("Enter");
+
+      const answer = "verify the focused tests";
+      await ctx.session.sendHexBytes(["15"]);
+      await ctx.session.sendLiteralText(answer);
+      await waitForQuestionPane(ctx.session, "question remains editable after blank Enter", (value) =>
+        hasQuestionSelection(value, 3, answer),
+      );
+      expect(ctx.gateway.requests).toHaveLength(1);
+
+      await ctx.session.sendKeys("Enter");
+      await ctx.session.waitForText("question blank freeform handled", TIMEOUT);
+      expect(ctx.gateway.requests).toHaveLength(2);
+      expect(requestContainsExactString(ctx.gateway.requests[1]!.body, answer)).toBe(true);
+      await assertProcessAliveAndClean(ctx);
+      await ctx.session.sendText("/quit");
+      expect(await ctx.session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      expect(readFileSync(ctx.stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
   );

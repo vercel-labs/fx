@@ -58,6 +58,52 @@ pub fn terminalActionFieldCorrectionJson(
     return try out.toOwnedSlice();
 }
 
+/// Code of the shell failure for a terminal that ended with the fx process
+/// that started it. Such terminals are never reattached.
+pub const terminal_ended_error_code = "TerminalEnded";
+
+pub fn isTerminalEndedFailure(
+    alloc: Allocator,
+    output: []const u8,
+) Allocator.Error!bool {
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        output,
+        .{},
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => false,
+    };
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return false,
+    };
+    const error_value = switch (root.get("error") orelse return false) {
+        .object => |value| value,
+        else => return false,
+    };
+    const code = switch (error_value.get("code") orelse return false) {
+        .string => |value| value,
+        else => return false,
+    };
+    return std.mem.eql(u8, code, terminal_ended_error_code);
+}
+
+test "terminal ended failures are recognized only by their exact code" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try isTerminalEndedFailure(
+        alloc,
+        "{\"error\":{\"tool\":\"shell\",\"code\":\"TerminalEnded\"}}",
+    ));
+    try std.testing.expect(!try isTerminalEndedFailure(
+        alloc,
+        "{\"error\":{\"tool\":\"shell\",\"code\":\"TerminalSessionLost\"}}",
+    ));
+    try std.testing.expect(!try isTerminalEndedFailure(alloc, "TerminalEnded"));
+}
+
 pub fn inspectTerminalActionFieldCorrection(
     alloc: Allocator,
     output: []const u8,
@@ -356,17 +402,49 @@ pub fn filesystemAccessDeniedJson(
 }
 
 fn filesystemAccessDeniedSuggestion() []const u8 {
-    if (builtin.os.tag == .macos) {
+    if (builtin.target.os.tag == .macos) {
         return "Do not retry this path unchanged or propose a symlink. fx permissions cannot override the operating system. If the path is in a protected folder such as Desktop, Documents, or Downloads, ask the user to grant the terminal app Files and Folders or Full Disk Access. Otherwise, ask the user to correct OS filesystem permissions or move/copy the project to an accessible location.";
     }
     return "Do not retry this path unchanged or propose a symlink. fx permissions cannot override the operating system. Ask the user to correct OS filesystem permissions or move/copy the project to an accessible location.";
 }
 
-pub fn malformedToolArgumentsJson(alloc: Allocator, tool_name: []const u8) Allocator.Error![]u8 {
-    return toolExecutionFailureJson(alloc, .{
+/// Builds the model-facing result for arguments fx could not parse. The
+/// conversation replays such a call with `{}`, so a diagnostic, when present,
+/// reports how much input arrived and where parsing stopped. Rejected
+/// argument bytes are never quoted.
+pub fn malformedToolArgumentsJson(
+    alloc: Allocator,
+    tool_name: []const u8,
+    diagnostic: ?types.ToolArgumentDiagnostic,
+) Allocator.Error![]u8 {
+    const found = diagnostic orelse return toolExecutionFailureJson(alloc, .{
         .tool_name = tool_name,
         .message = "Tool arguments were not valid JSON.",
         .suggestion = "Reissue the tool call with complete valid JSON arguments matching the tool schema.",
+    });
+    var details: [3]Detail = .{
+        .{ .name = "failure", .value = .{ .string = @tagName(found.failure) } },
+        .{ .name = "received_bytes", .value = .{ .unsigned = found.input_bytes } },
+        undefined,
+    };
+    var count: usize = 2;
+    if (found.error_offset) |offset| {
+        details[count] = .{ .name = "error_offset", .value = .{ .unsigned = offset } };
+        count += 1;
+    }
+    return toolExecutionFailureJson(alloc, .{
+        .tool_name = tool_name,
+        .message = switch (found.failure) {
+            .truncated => "Tool arguments ended before the JSON was complete, so fx did not run the call. The conversation shows its arguments as {}.",
+            .syntax_error => "Tool arguments were not valid JSON, so fx did not run the call. The conversation shows its arguments as {}.",
+            .rejected_value => "Tool arguments repeated an object key or held a value fx cannot accept, so fx did not run the call. The conversation shows its arguments as {}.",
+        },
+        .details = details[0..count],
+        .suggestion = switch (found.failure) {
+            .truncated => "Reissue the complete call. Your arguments stopped after received_bytes; keep long arguments concise or split the work into smaller calls.",
+            .syntax_error => "Reissue the call with valid JSON. Parsing failed at error_offset; escape quotes, backslashes, and newlines inside strings.",
+            .rejected_value => "Reissue the call with each object key used once and values matching the tool schema.",
+        },
     });
 }
 
@@ -707,7 +785,7 @@ test "filesystem access denial JSON preserves recovery details" {
         try std.testing.expect(std.mem.find(u8, suggestion, "Do not retry") != null);
         try std.testing.expect(std.mem.find(u8, suggestion, "symlink") != null);
         try std.testing.expect(std.mem.find(u8, suggestion, "fx permissions") != null);
-        if (builtin.os.tag == .macos) {
+        if (builtin.target.os.tag == .macos) {
             try std.testing.expect(std.mem.find(u8, suggestion, "If the path is in a protected folder") != null);
             try std.testing.expect(std.mem.find(u8, suggestion, "Files and Folders") != null);
         }
@@ -779,7 +857,7 @@ test "tool output classification preserves structured and legacy categories" {
 
 test "malformed tool arguments JSON requests a schema-valid retry" {
     const alloc = std.testing.allocator;
-    const payload = try malformedToolArgumentsJson(alloc, "ask_user_question");
+    const payload = try malformedToolArgumentsJson(alloc, "ask_user_question", null);
     defer alloc.free(payload);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
@@ -790,4 +868,33 @@ test "malformed tool arguments JSON requests a schema-valid retry" {
     try std.testing.expectEqualStrings("ask_user_question", error_obj.get("tool_name").?.string);
     try std.testing.expect(std.mem.find(u8, error_obj.get("message").?.string, "valid JSON") != null);
     try std.testing.expect(std.mem.find(u8, error_obj.get("suggestion").?.string, "tool schema") != null);
+    try std.testing.expect(error_obj.get("details") == null);
+}
+
+test "malformed tool arguments JSON reports the diagnosis without source bytes" {
+    const alloc = std.testing.allocator;
+    const raw = "{\"request\":{\"task\":\"FX_REJECTED_SOURCE_SENTINEL and more";
+    const diagnostic = try types.ToolArgumentDiagnostic.diagnose(alloc, raw);
+    const payload = try malformedToolArgumentsJson(alloc, "subagent", diagnostic);
+    defer alloc.free(payload);
+    try std.testing.expect(std.mem.find(u8, payload, "FX_REJECTED_SOURCE_SENTINEL") == null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+    const error_obj = parsed.value.object.get("error").?.object;
+    try std.testing.expect(std.mem.find(u8, error_obj.get("message").?.string, "ended before the JSON was complete") != null);
+    try std.testing.expect(std.mem.find(u8, error_obj.get("message").?.string, "{}") != null);
+    const details = error_obj.get("details").?.object;
+    try std.testing.expectEqualStrings("truncated", details.get("failure").?.string);
+    try std.testing.expectEqual(@as(i64, @intCast(raw.len)), details.get("received_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, @intCast(raw.len)), details.get("error_offset").?.integer);
+
+    const rejected = try types.ToolArgumentDiagnostic.diagnose(alloc, "{\"a\":1,\"a\":2}");
+    const rejected_payload = try malformedToolArgumentsJson(alloc, "read_file", rejected);
+    defer alloc.free(rejected_payload);
+    var rejected_parsed = try std.json.parseFromSlice(std.json.Value, alloc, rejected_payload, .{});
+    defer rejected_parsed.deinit();
+    const rejected_details = rejected_parsed.value.object.get("error").?.object.get("details").?.object;
+    try std.testing.expectEqualStrings("rejected_value", rejected_details.get("failure").?.string);
+    try std.testing.expect(rejected_details.get("error_offset") == null);
 }

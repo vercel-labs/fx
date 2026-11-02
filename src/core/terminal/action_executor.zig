@@ -42,28 +42,17 @@ pub fn execute(
         if (ctx.runtime.takeCompletionFor(correlation_id)) |completion_value| {
             var completion = completion_value;
             defer completion.deinit();
-            if (completion.frame) |*frame| {
-                return switch (frame.message().payload) {
-                    .response => |response| contracts.OwnedResult.init(
-                        ctx.alloc,
-                        response,
-                    ),
-                    else => failure(ctx, request, .protocol_incompatible, false),
-                };
+            if (completion.response) |*response| {
+                return contracts.OwnedResult.init(ctx.alloc, response.value.view());
             }
             return failure(
                 ctx,
                 request,
                 switch (completion.kind) {
                     .cancelled => .cancelled,
-                    .unavailable => if (completion.is_missing_capability(
-                        contracts.protocol_capability_complete_process_tree_signals,
-                    ))
-                        .unsupported_host
-                    else
-                        .protocol_incompatible,
+                    .unavailable => .unsupported_host,
                     .disconnected => .session_lost,
-                    .response => .protocol_incompatible,
+                    .response => .invalid_request,
                 },
                 completion.kind == .disconnected and
                     disconnectedActionIsRetryable(request.action()),
@@ -102,12 +91,13 @@ fn failure(
     } });
 }
 
-fn mapAdmissionError(err: anyerror) contracts.StructuredErrorCode {
+fn mapAdmissionError(err: client.AdmissionError) contracts.StructuredErrorCode {
     return switch (err) {
         error.QueueFull => .capacity_exceeded,
-        error.TerminalUnavailable, error.Unsupported => .unsupported_host,
-        error.Cancelled => .cancelled,
-        else => .protocol_incompatible,
+        error.TerminalUnavailable => .unsupported_host,
+        // The owning fx process is exiting and has ended its terminals.
+        error.RuntimeStopping => .cancelled,
+        else => .invalid_request,
     };
 }
 

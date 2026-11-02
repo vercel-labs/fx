@@ -56,7 +56,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn prepareDirectoryCompletion(app: *App) void {
             if (comptime !runtime_profile.allows(App, .file_index)) return;
-            app.workspace.directory_completion.schedule(std.heap.c_allocator, app.alloc, &app.input_runtime.picker.file_completion, app.workspace_root, io_mod.getenv("HOME"));
+            app.workspace.directory_completion.schedule(std.heap.c_allocator, app.alloc, &app.input_runtime.picker.file_completion, app.workspace_root, io_mod.homeDir());
             app.shell.render_requests.request(.footer);
         }
 

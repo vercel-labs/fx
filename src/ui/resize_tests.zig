@@ -2,14 +2,16 @@
 //! `vt_emulator.Grid` without a TTY or signals.
 
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 
 const question_prompt = @import("../core/agent/question_prompt.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const display_width = @import("../core/shared/display_width.zig");
 const diff_mod = @import("../core/output/diff.zig");
 const io_mod = @import("../core/shared/io.zig");
+const shared_theme = @import("../core/shared/theme.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
-const usage_report = @import("../core/session/usage_report.zig");
+const usage = @import("../usage/usage.zig");
 const workspace_access = @import("../core/workspace/workspace_access.zig");
 const types = @import("../core/shared/types.zig");
 const assistant_presentation = @import("../core/agent/assistant_presentation.zig");
@@ -32,6 +34,7 @@ const transcript_painter = @import("transcript/painter.zig");
 const transcript_runtime = @import("transcript/runtime.zig");
 const full_transcript_screen = @import("full_transcript_screen.zig");
 const vt_emulator = @import("../core/terminal/engine.zig");
+const text_utils = @import("../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Layout = types.Layout;
@@ -159,7 +162,7 @@ pub const Harness = struct {
             self.shell.layout.content_bottom;
         if (requested_start_row > max_start_row) {
             var cursor_buf: [32]u8 = undefined;
-            const cursor = try std.fmt.bufPrint(&cursor_buf, "\x1b[{d};1H", .{self.shell.layout.rows});
+            const cursor = try std.mem.print(&cursor_buf, "\x1b[{d};1H", .{self.shell.layout.rows});
             try self.file.writeStreamingAll(io_mod.getIo(), cursor);
             var row: u16 = 0;
             while (row < requested_start_row - max_start_row) : (row += 1) {
@@ -991,41 +994,34 @@ fn expectGridContains(h: *Harness, needle: []const u8) !void {
 
 test "responsive compact menus stay inline across the VT width matrix" {
     const alloc = std.testing.allocator;
-    var models: [25]usage_report.ModelUsage = undefined;
+    var models: [25]usage.report.ModelRow = undefined;
     for (&models) |*model| {
         model.* = .{
-            .model = @constCast("provider/model"),
-            .totals = .{
-                .total_tokens = 1,
-                .input_tokens = 1,
-                .output_tokens = 0,
-                .cache_read_tokens = 0,
-                .cache_write_tokens = 0,
-                .reasoning_tokens = null,
-                .request_count = 1,
-                .total_cost = 0.0001,
-            },
+            .model = "provider/model",
+            .totals = .{ .request_count = 1, .input_tokens = 1, .total_cost = 0.0001 },
         };
     }
-    const usage_snapshot = usage_report.Snapshot{
-        .scope = .days_30,
-        .snapshot_time_ms = 100,
-        .window_start_ms = 0,
-        .coverage_started_at_ms = 0,
-        .coverage = .full,
-        .completeness = .complete,
-        .totals = .{
-            .total_tokens = 25,
-            .input_tokens = 25,
-            .output_tokens = 0,
-            .cache_read_tokens = 0,
-            .cache_write_tokens = 0,
-            .reasoning_tokens = null,
-            .request_count = 25,
-            .total_cost = 0.0025,
-        },
-        .models = &models,
+    var usage_views: [usage.Period.all.len]usage.View = undefined;
+    for (&usage_views, usage.Period.all) |*v, period| {
+        v.* = .{
+            .arena = std.heap.ArenaAllocator.init(alloc),
+            .period = period,
+            .models = &models,
+            .totals = .{ .request_count = 25, .input_tokens = 25, .total_cost = 0.0025 },
+            .today_current = true,
+            .finished_current = true,
+            .fetched_at_ms = 0,
+            .budget = null,
+        };
+    }
+    var usage_snapshot: usage.Snapshot = .{
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .views = usage_views,
+        .status = .ready,
+        .label = "team (fx login)",
+        .now_ms = 0,
     };
+    defer usage_snapshot.deinit();
     var entries = [_]workspace_access.Entry{.{
         .path = @constCast("/workspace/long-additional-directory"),
         .saved = true,
@@ -1068,7 +1064,7 @@ test "responsive compact menus stay inline across the VT width matrix" {
         ctx.statusline_menu = .{};
         ctx.usage_menu = .{
             .active = true,
-            .scope = .days_30,
+            .period = .month,
             .selected_model = models.len - 1,
             .model_window_start = models.len - 1,
             .snapshot = &usage_snapshot,
@@ -1076,9 +1072,9 @@ test "responsive compact menus stay inline across the VT width matrix" {
         h.frame_redraw = true;
         try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
         try h.flush();
-        try expectGridContains(&h, "[30 days]");
+        try expectGridContains(&h, "model (month)");
         try std.testing.expectEqual(
-            @as(usize, 20),
+            @as(usize, 10),
             try countGridOccurrences(&h, "provider/model"),
         );
 
@@ -1098,73 +1094,6 @@ test "responsive compact menus stay inline across the VT width matrix" {
             @as(usize, 0),
             try countGridOccurrences(&h, "provider/model"),
         );
-    }
-}
-
-test "MCP menu stays inline across the VT width matrix and restores the composer" {
-    const alloc = std.testing.allocator;
-    const tools = [_][]const u8{
-        "mcp_fixture_echo",
-        "mcp_fixture_read_resource",
-    };
-
-    for ([_]u16{ 50, 80, 120 }) |width| {
-        var h = try Harness.init(alloc, width, 28, 4);
-        defer h.deinit();
-        var input = InputRuntime{};
-        defer input.deinit(alloc);
-        var approval = approval_prompt.ApprovalPrompt{};
-        defer approval.deinit(alloc);
-        try h.shell.initViewport(&h.metrics, 1);
-        try h.shell.writeTranscript(
-            alloc,
-            &h.metrics,
-            "MCP menu transcript remains visible\n",
-            true,
-        );
-
-        var ctx = defaultFooterContext(&input);
-        ctx.mcp_menu = .{
-            .state = .{
-                .active = true,
-                .section = .tools,
-                .selected_index = 1,
-                .load_state = .ready,
-            },
-            .tools = &tools,
-        };
-        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
-        try h.flush();
-        try expectGridContains(&h, "MCP menu transcript remains visible");
-        try expectGridContains(&h, "MCP 0");
-        try expectGridContains(&h, "[Tools]");
-        try expectGridContains(&h, "mcp_fixture_read_resource");
-        try expectGridContains(&h, "tab");
-        try expectGridContains(&h, "esc");
-
-        ctx.mcp_menu = .{
-            .state = .{
-                .active = true,
-                .section = .resources,
-                .screen = .preview,
-                .load_state = .ready,
-            },
-            .preview = "MCP resource · untrusted content\n\nRESOURCE_TEXT: preview remains wrapped and scrollable",
-        };
-        h.frame_redraw = true;
-        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
-        try h.flush();
-        try expectGridContains(&h, "untrusted content");
-        try expectGridContains(&h, "RESOURCE_TEXT:");
-        try expectGridContains(&h, "i insert");
-
-        ctx.mcp_menu = .{};
-        h.frame_redraw = true;
-        try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
-        try h.flush();
-        try expectGridContains(&h, "MCP menu transcript remains visible");
-        try expectGridNotContains(&h, "[Resources]");
-        try expectGridNotContains(&h, "i insert");
     }
 }
 
@@ -1434,7 +1363,7 @@ test "active hard-newline footer survives every valid tiny height" {
 }
 
 test "active soft-wrapped footer survives every valid tiny height" {
-    const input = "FX_SOFT_START " ++ ("filler " ** 16) ++ "FX_SOFT_END";
+    const input = "FX_SOFT_START " ++ text_utils.repeat("filler ", 16) ++ "FX_SOFT_END";
     for ([_]u16{ 5, 6, 7, 8 }) |target_height| {
         try expectActiveInputSurvivesResize(input, target_height, 1);
     }
@@ -1722,8 +1651,8 @@ test "streamed markdown lists reflow through shrink and grow" {
     const ordered_initial = try findRowContaining(&h, "second-");
     const nested_initial = try findRowContaining(&h, "third-");
     try std.testing.expect(first_initial < ordered_initial and ordered_initial < nested_initial);
-    try expectRowPrefix(&h, ordered_initial, "  1. second-");
-    try expectRowPrefix(&h, ordered_initial + 1, "     ");
+    try expectRowPrefix(&h, ordered_initial, "    1. second-");
+    try expectRowPrefix(&h, ordered_initial + 1, "       ");
     try expectRowPrefix(&h, nested_initial, "    • third-");
     try expectRowPrefix(&h, nested_initial + 1, "      ");
 
@@ -1734,7 +1663,7 @@ test "streamed markdown lists reflow through shrink and grow" {
     const nested_narrow = try findRowContaining(&h, "third-");
     try std.testing.expect(first_narrow < ordered_narrow and ordered_narrow < nested_narrow);
     try expectRowPrefix(&h, first_narrow + 1, "    ");
-    try expectRowPrefix(&h, ordered_narrow + 1, "     ");
+    try expectRowPrefix(&h, ordered_narrow + 1, "       ");
     try expectRowPrefix(&h, nested_narrow + 1, "      ");
 
     try h.driveResize(26, 40, 4, true);
@@ -1744,8 +1673,69 @@ test "streamed markdown lists reflow through shrink and grow" {
     const nested_wide = try findRowContaining(&h, "third-");
     try std.testing.expect(first_wide < ordered_wide and ordered_wide < nested_wide);
     try expectRowPrefix(&h, first_wide + 1, "    ");
-    try expectRowPrefix(&h, ordered_wide + 1, "     ");
+    try expectRowPrefix(&h, ordered_wide + 1, "       ");
     try expectRowPrefix(&h, nested_wide + 1, "      ");
+}
+
+test "streamed ordered list markers stay aligned through shrink and grow" {
+    var h = try Harness.init(std.testing.allocator, 24, 40, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+
+    var processor = assistant_presentation.MarkdownProcessor{};
+    defer processor.deinit(h.alloc);
+    var formatted: std.ArrayList(u8) = .empty;
+    defer formatted.deinit(h.alloc);
+    try processor.push(
+        h.alloc,
+        "8. eight\n" ++
+            "9. nine-abcdefghijklmnopqrstuvwxyz\n" ++
+            "   - child-abcdefghijklmnopqrstuvwxyz\n" ++
+            "10. ten-abcdefghijklmnopqrstuvwxyz\n" ++
+            "100. hundred\n",
+        &formatted,
+    );
+    try processor.flush(h.alloc, &formatted);
+
+    _ = try h.shell.streamAssistantChunk(h.alloc, &h.metrics, formatted.items);
+    try h.renderTranscriptFrame();
+    try h.flush();
+    try expectAlignedOrderedList(&h);
+
+    try h.driveResize(17, 40, 4, true);
+    try expectAlignedOrderedList(&h);
+
+    try h.driveResize(30, 40, 4, true);
+    try expectAlignedOrderedList(&h);
+}
+
+/// Checks the list from "streamed ordered list markers stay aligned through
+/// shrink and grow": every marker ends in the same column, and each wrapped
+/// row starts where its item's text starts.
+fn expectAlignedOrderedList(h: *Harness) !void {
+    const eight = try findRowContaining(h, "eight");
+    const nine = try findRowContaining(h, "nine-");
+    const child = try findRowContaining(h, "child-");
+    const ten = try findRowContaining(h, "ten-");
+    const hundred = try findRowContaining(h, "hundred");
+    try std.testing.expect(eight < nine and nine < child and child < ten and ten < hundred);
+    try expectRowPrefix(h, eight, "    8. eight");
+    try expectRowPrefix(h, nine, "    9. nine-");
+    try expectRowPrefix(h, child, "       \xe2\x80\xa2 child-");
+    try expectRowPrefix(h, ten, "   10. ten-");
+    try expectRowPrefix(h, hundred, "  100. hundred");
+
+    for ([_][3]u16{ .{ nine, child, 7 }, .{ child, ten, 9 }, .{ ten, hundred, 7 } }) |item| {
+        try std.testing.expect(item[1] - item[0] > 1);
+        var row = item[0] + 1;
+        while (row < item[1]) : (row += 1) {
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(h.alloc);
+            try h.vt.rowText(row, &text);
+            const indent = text.items.len - std.mem.trimStart(u8, text.items, " ").len;
+            try std.testing.expectEqual(@as(usize, item[2]), indent);
+        }
+    }
 }
 
 test "streamed longer code fence keeps inner fences inside the block" {
@@ -1835,14 +1825,14 @@ test "streamed plus and paren list markers wrap under their text" {
     try expectGridNotContains(&h, "+ plus");
 
     const paren_row = try findRowContaining(&h, "paren-");
-    try expectRowPrefix(&h, paren_row, "  1) paren-");
-    try expectRowPrefix(&h, paren_row + 1, "     ");
+    try expectRowPrefix(&h, paren_row, "    1) paren-");
+    try expectRowPrefix(&h, paren_row + 1, "       ");
 
     try h.driveResize(14, 40, 4, true);
     const plus_narrow = try findRowContaining(&h, "plus-");
     const paren_narrow = try findRowContaining(&h, "paren-");
     try expectRowPrefix(&h, plus_narrow + 1, "    ");
-    try expectRowPrefix(&h, paren_narrow + 1, "     ");
+    try expectRowPrefix(&h, paren_narrow + 1, "       ");
 }
 
 test "streamed blockquote keeps heading and bullet styling inside the quote" {
@@ -2016,50 +2006,50 @@ test "streamed markdown task lists reflow through shrink and grow" {
     try h.renderTranscriptFrame();
     try h.flush();
 
-    const completed_initial = try findRowContaining(&h, "complete");
+    const completed_initial = try findRowContaining(&h, "1. \xe2\x9c\x93");
     const nested_initial = try findRowContaining(&h, "nested-");
     try std.testing.expect(first_initial < completed_initial and completed_initial < nested_initial);
-    try expectRowPrefix(&h, completed_initial + 1, "       ");
+    try expectRowPrefix(&h, completed_initial + 1, "         ");
     try expectRowPrefix(&h, nested_initial + 1, "      ");
     try expectGridNotContains(&h, "[ ]");
     try expectGridNotContains(&h, "[x]");
     try expectGridNotContains(&h, "[X]");
 
-    const completed_marker = h.vt.cellAt(completed_initial, 6) orelse return error.TestMissingTaskMarker;
+    const completed_marker = h.vt.cellAt(completed_initial, 8) orelse return error.TestMissingTaskMarker;
     try std.testing.expectEqual(@as(u21, '\u{2713}'), completed_marker.codepoint);
     try std.testing.expect(completed_marker.style.fg.eql(.{ .indexed = 252 }));
-    const completed_body = h.vt.cellAt(completed_initial, 8) orelse return error.TestMissingTaskBody;
+    const completed_body = h.vt.cellAt(completed_initial, 10) orelse return error.TestMissingTaskBody;
     try std.testing.expectEqual(@as(u21, 'c'), completed_body.codepoint);
     try std.testing.expect(completed_body.style.fg.eql(.default));
 
     try h.driveResize(15, 40, 4, true);
 
     const first_narrow = try findRowContaining(&h, "first-");
-    const completed_narrow = try findRowContaining(&h, "complete");
+    const completed_narrow = try findRowContaining(&h, "1. \xe2\x9c\x93");
     const nested_narrow = try findRowContaining(&h, "nested-");
     try std.testing.expect(first_narrow < completed_narrow and completed_narrow < nested_narrow);
     try expectRowPrefix(&h, first_narrow + 1, "    ");
-    try expectRowPrefix(&h, completed_narrow + 1, "       ");
+    try expectRowPrefix(&h, completed_narrow + 1, "         ");
     try expectRowPrefix(&h, nested_narrow + 1, "      ");
 
-    const completed_narrow_marker = h.vt.cellAt(completed_narrow, 6) orelse return error.TestMissingTaskMarker;
+    const completed_narrow_marker = h.vt.cellAt(completed_narrow, 8) orelse return error.TestMissingTaskMarker;
     try std.testing.expect(completed_narrow_marker.style.fg.eql(.{ .indexed = 252 }));
-    const completed_narrow_body = h.vt.cellAt(completed_narrow, 8) orelse return error.TestMissingTaskBody;
+    const completed_narrow_body = h.vt.cellAt(completed_narrow, 10) orelse return error.TestMissingTaskBody;
     try std.testing.expect(completed_narrow_body.style.fg.eql(.default));
 
     try h.driveResize(26, 40, 4, true);
 
     const first_wide = try findRowContaining(&h, "first-");
-    const completed_wide = try findRowContaining(&h, "complete");
+    const completed_wide = try findRowContaining(&h, "1. \xe2\x9c\x93");
     const nested_wide = try findRowContaining(&h, "nested-");
     try std.testing.expect(first_wide < completed_wide and completed_wide < nested_wide);
     try expectRowPrefix(&h, first_wide + 1, "    ");
-    try expectRowPrefix(&h, completed_wide + 1, "       ");
+    try expectRowPrefix(&h, completed_wide + 1, "         ");
     try expectRowPrefix(&h, nested_wide + 1, "      ");
 
-    const completed_wide_marker = h.vt.cellAt(completed_wide, 6) orelse return error.TestMissingTaskMarker;
+    const completed_wide_marker = h.vt.cellAt(completed_wide, 8) orelse return error.TestMissingTaskMarker;
     try std.testing.expect(completed_wide_marker.style.fg.eql(.{ .indexed = 252 }));
-    const completed_wide_body = h.vt.cellAt(completed_wide, 8) orelse return error.TestMissingTaskBody;
+    const completed_wide_body = h.vt.cellAt(completed_wide, 10) orelse return error.TestMissingTaskBody;
     try std.testing.expect(completed_wide_body.style.fg.eql(.default));
 }
 
@@ -2211,9 +2201,9 @@ test "streamed double backtick span and entities render as plain characters" {
     const row = try findRowContaining(&h, "Use ");
     try expectRowTrimmedEquals(&h, row, "  Use a ` b for <x> & y");
     const code_cell = h.vt.cellAt(row, 7) orelse return error.TestMissingInlineCodeCell;
-    try std.testing.expect(code_cell.style.fg.eql(.{ .indexed = 245 }));
+    try std.testing.expect(code_cell.style.fg.eql(.{ .indexed = 255 }));
     const inner_tick = h.vt.cellAt(row, 9) orelse return error.TestMissingInlineCodeCell;
-    try std.testing.expect(inner_tick.style.fg.eql(.{ .indexed = 245 }));
+    try std.testing.expect(inner_tick.style.fg.eql(.{ .indexed = 255 }));
     const prose_cell = h.vt.cellAt(row, 17) orelse return error.TestMissingProseCell;
     try std.testing.expect(prose_cell.style.fg.eql(.default));
     try expectGridNotContains(&h, "``");
@@ -2295,7 +2285,7 @@ test "streamed nested and mixed emphasis pairs resolve on the grid" {
     const a_cell = h.vt.cellAt(under_row, 7) orelse return error.TestMissingCell;
     try std.testing.expect(a_cell.codepoint == 'a' and a_cell.style.flags.italic);
     const tick_cell = h.vt.cellAt(under_row, 10) orelse return error.TestMissingCell;
-    try std.testing.expect(tick_cell.codepoint == '`' and tick_cell.style.fg.eql(.{ .indexed = 245 }));
+    try std.testing.expect(tick_cell.codepoint == '`' and tick_cell.style.fg.eql(.{ .indexed = 255 }));
     const d_cell = h.vt.cellAt(under_row, 13) orelse return error.TestMissingCell;
     try std.testing.expect(d_cell.codepoint == 'd' and d_cell.style.flags.italic);
     const end_cell = h.vt.cellAt(under_row, 15) orelse return error.TestMissingCell;
@@ -2320,8 +2310,8 @@ test "streamed nested and mixed emphasis pairs resolve on the grid" {
 
 test "streamed inline code color survives shrink and grow" {
     const cases = [_]struct { light: bool, fg: u8 }{
-        .{ .light = false, .fg = 245 },
-        .{ .light = true, .fg = 247 },
+        .{ .light = false, .fg = 255 },
+        .{ .light = true, .fg = 235 },
     };
     defer assistant_presentation.setInlineCodeTheme(false);
 
@@ -3083,7 +3073,7 @@ test "thinking shimmer appears after bottom assistant text ending mid-row" {
     defer body.deinit(h.alloc);
     var i: usize = 0;
     while (i < 10) : (i += 1) {
-        const line = try std.fmt.allocPrint(h.alloc, "filler line {d}\n", .{i});
+        const line = try h.alloc.print("filler line {d}\n", .{i});
         defer h.alloc.free(line);
         try body.appendSlice(h.alloc, line);
     }
@@ -3272,7 +3262,7 @@ test "image badge stays inside user card block without extra gap" {
 }
 
 fn appendImageTurn(h: *Harness, id: usize, path: []const u8, label: []const u8) !void {
-    const text = try std.fmt.allocPrint(h.alloc, "[Image #{d}] {s}", .{ id, label });
+    const text = try h.alloc.print("[Image #{d}] {s}", .{ id, label });
     errdefer h.alloc.free(text);
     const images = try h.alloc.alloc(types.ImageAttachment, 1);
     errdefer h.alloc.free(images);
@@ -3655,7 +3645,7 @@ test "resized question cancellation keeps the idle footer bottom anchored" {
     _ = try h.shell.appendReplaceableTranscriptLineClassified(
         alloc,
         &h.metrics,
-        "\x1b[2m■ Cancelled\x1b[0m\n",
+        "\x1b[2m▪ Cancelled\x1b[0m\n",
         .question_resolution,
     );
     question.discard(alloc, "test_cleanup");
@@ -3673,7 +3663,7 @@ test "resized question cancellation keeps the idle footer bottom anchored" {
     try renderTestFooterWithContext(&h, &approval, &h.frame_redraw, ctx);
     try h.flush();
 
-    const cancelled_row = try findRowContaining(&h, "■ Cancelled");
+    const cancelled_row = try findRowContaining(&h, "▪ Cancelled");
     const footer_row = try findFirstDividerRowAfter(&h, cancelled_row);
     try expectExactlyOneBlankRowBetween(&h, cancelled_row, footer_row);
     try std.testing.expectEqual(
@@ -3735,7 +3725,7 @@ test "structured command-output rewrite materializes committed transcript scroll
 
     for (0..18) |index| {
         var line: [48]u8 = undefined;
-        const text = try std.fmt.bufPrint(&line, "SYSTEM OUTPUT {d:0>2}\\n", .{index + 1});
+        const text = try std.mem.print(&line, "SYSTEM OUTPUT {d:0>2}\\n", .{index + 1});
         const bytes = try h.alloc.dupe(u8, text);
         _ = try h.shell.appendRawBytesEntryClassified(
             h.alloc,
@@ -3749,7 +3739,7 @@ test "structured command-output rewrite materializes committed transcript scroll
         return error.TestExpectedAssistantSegments;
     for (0..24) |index| {
         var line: [48]u8 = undefined;
-        const text = try std.fmt.bufPrint(&line, "assistant table row {d}\n", .{index + 1});
+        const text = try std.mem.print(&line, "assistant table row {d}\n", .{index + 1});
         try first_assistant.text.appendSlice(h.alloc, text);
     }
     // Assistant content is complete before each frame; report producer
@@ -3767,7 +3757,7 @@ test "structured command-output rewrite materializes committed transcript scroll
     var observed_old: [24]bool = undefined;
     for (&observed_old, 1..) |*observed, index| {
         var buffer: [48]u8 = undefined;
-        const marker = try std.fmt.bufPrint(&buffer, "assistant table row {d}\n", .{index});
+        const marker = try std.mem.print(&buffer, "assistant table row {d}\n", .{index});
         const count = std.mem.count(u8, observed_before, marker);
         try std.testing.expect(count <= 1);
         observed.* = count == 1;
@@ -3817,7 +3807,7 @@ test "structured command-output rewrite materializes committed transcript scroll
     try std.testing.expectEqual(bytes_before_mutation, try h.file.length(std.testing.io));
     try std.testing.expectEqualStrings("", probe.history.items);
 
-    var seen_follow_up = [_]bool{false} ** 60;
+    var seen_follow_up: [60]bool = @splat(false);
     var accepted_rows: usize = 0;
     for (0..8) |_| {
         // Settlement may translate coordinates only for rows already exported.
@@ -3842,7 +3832,7 @@ test "structured command-output rewrite materializes committed transcript scroll
         var old_position: usize = 0;
         for (observed_old, 1..) |observed, index| {
             var buffer: [48]u8 = undefined;
-            const marker = try std.fmt.bufPrint(&buffer, "assistant table row {d}\n", .{index});
+            const marker = try std.mem.print(&buffer, "assistant table row {d}\n", .{index});
             try std.testing.expectEqual(@as(usize, @intFromBool(observed)), std.mem.count(u8, frame_text, marker));
             if (observed) {
                 const position = std.mem.find(u8, frame_text, marker).?;
@@ -3857,7 +3847,7 @@ test "structured command-output rewrite materializes committed transcript scroll
         };
         for (&seen_follow_up, 1..) |*seen, index| {
             var buffer: [48]u8 = undefined;
-            const marker = try std.fmt.bufPrint(&buffer, "follow-up retained row {d}\n", .{index});
+            const marker = try std.mem.print(&buffer, "follow-up retained row {d}\n", .{index});
             const count = std.mem.count(u8, frame_text, marker);
             try std.testing.expect(count <= 1);
             if (seen.* or std.mem.find(u8, published_prefix, marker) != null) try std.testing.expectEqual(@as(usize, 1), count);
@@ -3882,7 +3872,7 @@ test "structured command-output rewrite materializes committed transcript scroll
     previous = boundary;
     for (1..61) |index| {
         var buffer: [48]u8 = undefined;
-        const marker = try std.fmt.bufPrint(&buffer, "follow-up retained row {d}\n", .{index});
+        const marker = try std.mem.print(&buffer, "follow-up retained row {d}\n", .{index});
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, physical, marker));
         const position = std.mem.find(u8, physical, marker).?;
         try std.testing.expect(position > previous);
@@ -3892,8 +3882,8 @@ test "structured command-output rewrite materializes committed transcript scroll
     for (18..25) |index| {
         var first: [48]u8 = undefined;
         var second: [48]u8 = undefined;
-        const prior_marker = try std.fmt.bufPrint(&first, "assistant table row {d}\n", .{index - 1});
-        const marker = try std.fmt.bufPrint(&second, "assistant table row {d}\n", .{index});
+        const prior_marker = try std.mem.print(&first, "assistant table row {d}\n", .{index - 1});
+        const marker = try std.mem.print(&second, "assistant table row {d}\n", .{index});
         const old_start = std.mem.find(u8, observed_before, prior_marker).? + prior_marker.len;
         const old_end = std.mem.find(u8, observed_before, marker).?;
         const start = std.mem.find(u8, physical, prior_marker).? + prior_marker.len;
@@ -3947,7 +3937,7 @@ test "closed tool group finality flows through fixed point resolution and sealin
     try h.shell.initViewport(&h.metrics, 8);
     for (0..4) |index| {
         var line: [32]u8 = undefined;
-        const text = try std.fmt.bufPrint(&line, "startup row {d}\n", .{index});
+        const text = try std.mem.print(&line, "startup row {d}\n", .{index});
         _ = try h.shell.appendRawTranscriptEntry(alloc, text);
     }
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
@@ -3956,7 +3946,7 @@ test "closed tool group finality flows through fixed point resolution and sealin
     const group_a = types.ToolPresentationGroupId{ .turn_id = 92, .anchor_step_id = 1 };
     var group_a_call_ids: [18][20]u8 = undefined;
     for (0..group_a_call_ids.len) |index| {
-        const call_id = try std.fmt.bufPrint(
+        const call_id = try std.mem.print(
             &group_a_call_ids[index],
             "fixed-a-{d:0>2}",
             .{index},
@@ -4006,7 +3996,7 @@ test "completed tool group lets streamed assistant hard lines enter history" {
     try h.shell.initViewport(&h.metrics, 8);
     for (0..4) |index| {
         var line: [32]u8 = undefined;
-        const text = try std.fmt.bufPrint(&line, "startup row {d}\n", .{index});
+        const text = try std.mem.print(&line, "startup row {d}\n", .{index});
         _ = try h.shell.appendRawTranscriptEntry(alloc, text);
     }
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
@@ -4015,14 +4005,14 @@ test "completed tool group lets streamed assistant hard lines enter history" {
     const group = types.ToolPresentationGroupId{ .turn_id = 93, .anchor_step_id = 1 };
     var call_ids: [18][20]u8 = undefined;
     for (0..call_ids.len - 1) |index| {
-        const call_id = try std.fmt.bufPrint(
+        const call_id = try std.mem.print(
             &call_ids[index],
             "answer-a-{d:0>2}",
             .{index},
         );
         try applyCompletedReadForGroupFinalityResizeTest(&h, 93, call_id, group);
     }
-    const active_call_id = try std.fmt.bufPrint(
+    const active_call_id = try std.mem.print(
         &call_ids[call_ids.len - 1],
         "answer-a-{d:0>2}",
         .{call_ids.len - 1},
@@ -4236,7 +4226,7 @@ test "long live command output keeps running tool visible with stable footer" {
 
     var line_index: usize = 1;
     while (line_index <= 18) : (line_index += 1) {
-        const line = try std.fmt.allocPrint(h.alloc, "line-{d}\n", .{line_index});
+        const line = try h.alloc.print("line-{d}\n", .{line_index});
         defer h.alloc.free(line);
         try h.shell.writeCommandOutputChunk(h.alloc, &h.metrics, commandOutputAnsiStyles(), .stdout, line, true);
     }
@@ -4256,7 +4246,7 @@ test "long live command output keeps running tool visible with stable footer" {
     const footer_after_first_batch = try findFirstDividerRowAfter(&h, 1);
 
     while (line_index <= 30) : (line_index += 1) {
-        const line = try std.fmt.allocPrint(h.alloc, "line-{d}\n", .{line_index});
+        const line = try h.alloc.print("line-{d}\n", .{line_index});
         defer h.alloc.free(line);
         try h.shell.writeCommandOutputChunk(h.alloc, &h.metrics, commandOutputAnsiStyles(), .stdout, line, true);
     }
@@ -4286,7 +4276,7 @@ test "resize keeps transcript-owned active command above output and thinking" {
     const status_id = try appendCompletedToolStatus(&h, "Resize activity active");
     var line_index: usize = 1;
     while (line_index <= 18) : (line_index += 1) {
-        const line = try std.fmt.allocPrint(h.alloc, "resize-line-{d}\n", .{line_index});
+        const line = try h.alloc.print("resize-line-{d}\n", .{line_index});
         defer h.alloc.free(line);
         try h.shell.writeCommandOutputChunk(
             h.alloc,
@@ -4379,7 +4369,7 @@ test "bottom assistant line ending mid-row keeps one blank row before footer" {
     defer body.deinit(h.alloc);
     var i: usize = 0;
     while (i < 12) : (i += 1) {
-        const line = try std.fmt.allocPrint(h.alloc, "filler line {d}\n", .{i});
+        const line = try h.alloc.print("filler line {d}\n", .{i});
         defer h.alloc.free(line);
         try body.appendSlice(h.alloc, line);
     }
@@ -4408,7 +4398,7 @@ test "approval banner keeps one blank row after bottom assistant line" {
     defer body.deinit(h.alloc);
     var i: usize = 0;
     while (i < 14) : (i += 1) {
-        const line = try std.fmt.allocPrint(h.alloc, "filler line {d}\n", .{i});
+        const line = try h.alloc.print("filler line {d}\n", .{i});
         defer h.alloc.free(line);
         try body.appendSlice(h.alloc, line);
     }
@@ -4439,7 +4429,7 @@ test "approval banner frames prompt after completed tool status" {
     defer body.deinit(h.alloc);
     var i: usize = 0;
     while (i < 10) : (i += 1) {
-        const line = try std.fmt.allocPrint(h.alloc, "filler line {d}\n", .{i});
+        const line = try h.alloc.print("filler line {d}\n", .{i});
         defer h.alloc.free(line);
         try body.appendSlice(h.alloc, line);
     }
@@ -4482,7 +4472,7 @@ test "welcome logo stays pinned while middle transcript rows overflow" {
     defer body.deinit(h.alloc);
     var i: usize = 0;
     while (i < 45) : (i += 1) {
-        const line = try std.fmt.allocPrint(h.alloc, "content line {d}\n", .{i});
+        const line = try h.alloc.print("content line {d}\n", .{i});
         defer h.alloc.free(line);
         try body.appendSlice(h.alloc, line);
     }
@@ -4510,7 +4500,7 @@ test "welcome logo stays pinned during footer-reserved overflow" {
     defer body.deinit(h.alloc);
     var i: usize = 0;
     while (i < 45) : (i += 1) {
-        const line = try std.fmt.allocPrint(h.alloc, "content line {d}\n", .{i});
+        const line = try h.alloc.print("content line {d}\n", .{i});
         defer h.alloc.free(line);
         try body.appendSlice(h.alloc, line);
     }
@@ -4548,7 +4538,7 @@ test "welcome pinning does not hide submitted user prompt" {
     defer body.deinit(h.alloc);
     var i: usize = 0;
     while (i < 28) : (i += 1) {
-        const line = try std.fmt.allocPrint(h.alloc, "assistant tail line {d}\n", .{i});
+        const line = try h.alloc.print("assistant tail line {d}\n", .{i});
         defer h.alloc.free(line);
         try body.appendSlice(h.alloc, line);
     }
@@ -4633,7 +4623,7 @@ test "render engine preserves transcript footer activity behavior" {
     defer filler.deinit(alloc);
     var filler_line: usize = 0;
     while (filler_line < 45) : (filler_line += 1) {
-        const line = try std.fmt.allocPrint(alloc, "overflow filler line {d}\n", .{filler_line});
+        const line = try alloc.print("overflow filler line {d}\n", .{filler_line});
         defer alloc.free(line);
         try filler.appendSlice(alloc, line);
     }
@@ -4807,7 +4797,7 @@ fn checkNextPromptAdmissionPreservesCommittedHistory(resize_before_cancel: bool)
         "SCROLLBACK_LINE_19\nSCROLLBACK_LINE_20\nSCROLLBACK_LINE_21\n" ++
         "SCROLLBACK_LINE_22\nSCROLLBACK_LINE_23\n" ++
         "\x1b[1mSCROLLBACK_LINE_24";
-    const draft = "unsent composer draft " ** 8;
+    const draft = text_utils.repeat("unsent composer draft ", 8);
 
     try h.shell.initViewport(&h.metrics, 1);
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, response);
@@ -4902,7 +4892,7 @@ test "long context notice survives full transcript growth and later compact resi
     defer approval.deinit(alloc);
 
     try h.shell.initViewport(&h.metrics, 1);
-    const notice_body = ("x" ** 377) ++ "\n";
+    const notice_body = text_utils.repeat("x", 377) ++ "\n";
     h.shell.setCommandOutputRenderPolicy(commandOutputAnsiStyles());
     _ = try h.shell.appendSemanticNotice(alloc, .{
         .topic = "context",
@@ -4954,7 +4944,7 @@ test "long context notice survives full transcript growth and later compact resi
         return error.TestExpectedAssistantSegments;
     for (0..25) |index| {
         var line: [48]u8 = undefined;
-        const text = try std.fmt.bufPrint(&line, "later response row {d}\n", .{index + 1});
+        const text = try std.mem.print(&line, "later response row {d}\n", .{index + 1});
         try assistant.text.appendSlice(alloc, text);
     }
     var ctx = defaultFooterContext(&input);
@@ -5163,7 +5153,7 @@ test "entry-bound shimmer resolves inside pinned welcome tail selection" {
     defer body.deinit(h.alloc);
     var i: usize = 0;
     while (i < 28) : (i += 1) {
-        const line = try std.fmt.allocPrint(h.alloc, "content line {d}\n", .{i});
+        const line = try h.alloc.print("content line {d}\n", .{i});
         defer h.alloc.free(line);
         try body.appendSlice(h.alloc, line);
     }
@@ -5198,7 +5188,7 @@ test "long transcript overflow does not start or end on orphan gap rows" {
     try h.shell.initViewport(&h.metrics, 1);
     var i: usize = 0;
     while (i < 12) : (i += 1) {
-        const line = try std.fmt.allocPrint(h.alloc, "block-{d}\n", .{i});
+        const line = try h.alloc.print("block-{d}\n", .{i});
         defer h.alloc.free(line);
         _ = try h.shell.appendSemanticNotice(h.alloc, .{
             .topic = "system",
@@ -5409,7 +5399,7 @@ test "clean footer frame does not spam trace on idle ticks" {
 
     const root = try io_mod.dirRealpathAlloc(h.alloc, h.tmp.dir, ".");
     defer h.alloc.free(root);
-    const trace_path = try std.fs.path.join(h.alloc, &.{ root, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(h.alloc, &.{ root, "trace.log" });
     defer h.alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -5847,7 +5837,7 @@ test "slash picker dismissal resolves transcript extent before layout convergenc
     defer transcript.deinit(alloc);
     for (0..82) |line_number| {
         var line_buf: [128]u8 = undefined;
-        const line = try std.fmt.bufPrint(
+        const line = try std.mem.print(
             &line_buf,
             "ATOMIC_RENDER_LINE_{d:0>3} carries deterministic resumed transcript geometry.",
             .{line_number},
@@ -6114,7 +6104,7 @@ test "short notice after picker selection keeps footer compact" {
     defer transcript.deinit(alloc);
     for (1..71) |line_number| {
         var line_buf: [24]u8 = undefined;
-        const line = try std.fmt.bufPrint(&line_buf, "history line {d}\n", .{line_number});
+        const line = try std.mem.print(&line_buf, "history line {d}\n", .{line_number});
         try transcript.appendSlice(alloc, line);
     }
 
@@ -6247,7 +6237,7 @@ test "picker growth advances history while shrink and dismissal do not" {
     defer transcript.deinit(alloc);
     for (1..71) |line_number| {
         var line_buf: [16]u8 = undefined;
-        const line = try std.fmt.bufPrint(&line_buf, "{d}.\n", .{line_number});
+        const line = try std.mem.print(&line_buf, "{d}.\n", .{line_number});
         try transcript.appendSlice(alloc, line);
     }
 
@@ -6328,7 +6318,7 @@ test "slash main page renders header categories selection range and contextual c
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 35 · type to filter");
+    try expectGridContains(&h, "Commands 37 · type to filter");
     try expectGridContains(&h, "1–6");
     try expectGridContains(&h, "/help");
     try expectGridContains(&h, "General");
@@ -6349,7 +6339,7 @@ test "slash main page renders header categories selection range and contextual c
 
     try expectGridContains(&h, "ask");
     try expectGridContains(&h, "test-model");
-    try expectGridNotContains(&h, "Commands 35");
+    try expectGridNotContains(&h, "Commands 37");
     try expectGridNotContains(&h, "↑↓ navigate");
 }
 
@@ -6614,7 +6604,7 @@ test "compact command completion keeps restored history footer stable" {
     defer approval.deinit(alloc);
 
     try h.shell.initViewport(&h.metrics, 1);
-    _ = try h.shell.appendRawTranscriptEntry(alloc, "history\n" ** 30);
+    _ = try h.shell.appendRawTranscriptEntry(alloc, text_utils.repeat("history\n", 30));
     const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "command" };
     _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
         .id = id,
@@ -7275,7 +7265,7 @@ test "rapid settled resizes retain the four-skill transcript" {
     );
     for (0..4) |index| {
         var marker_buf: [32]u8 = undefined;
-        const skill_marker = try std.fmt.bufPrint(
+        const skill_marker = try std.mem.print(
             &marker_buf,
             "skill-{d:0>3}:",
             .{index},
@@ -7527,10 +7517,10 @@ test "large tabbed user turn keeps frame scroll plan aligned" {
 
     const raw_prompt =
         "\tTAB_START_0001\tquoted=\"value 1\"\tansi_like=\\x1b[32mgreen\\x1b[0m\n" ++
-        "LONGTOKEN_" ++ ("X" ** 220) ++ "_0003\n" ++
+        "LONGTOKEN_" ++ text_utils.repeat("X", 220) ++ "_0003\n" ++
         "    indented code block tok0 tok1 tok2 tok3 tok4 tok5 tok6 tok7 tok8 tok9 tok10 tok11\n" ++
         "Pathish ~/tmp/example/nested/nested/nested/nested/nested/nested/nested/nested/file_12.txt\n" ++
-        "MARKER_0013 " ++ ("word " ** 24) ++ "word\n" ++
+        "MARKER_0013 " ++ text_utils.repeat("word ", 24) ++ "word\n" ++
         "\tTAB_START_0015\tquoted=\"value 15\"\tansi_like=\\x1b[32mgreen\\x1b[0m\n" ++
         "\tTAB_START_0029\tquoted=\"value 29\"\tansi_like=\\x1b[32mgreen\\x1b[0m\n" ++
         "\tTAB_START_0043\tquoted=\"value 43\"\tansi_like=\\x1b[32mgreen\\x1b[0m\n" ++
@@ -7608,7 +7598,7 @@ test "paint regenerates assistant text with wraps at current cols" {
 
     const assistant_id = try h.shell.appendAssistantTurnEntry(alloc);
     const segs = h.shell.lookupAssistantSegments(assistant_id) orelse unreachable;
-    const body = "abcdefghijklmnopqrstuvwxyz0123456789" ** 4;
+    const body = text_utils.repeat("abcdefghijklmnopqrstuvwxyz0123456789", 4);
     try segs.text.appendSlice(alloc, body[0..120]);
 
     try h.renderTranscriptFrame();
@@ -7717,14 +7707,14 @@ test "theme reset retints fx entries and replays the retained transcript once" {
     );
     const assistant_id = try h.shell.appendAssistantTurnEntry(alloc);
     const assistant = h.shell.lookupAssistantSegments(assistant_id) orelse unreachable;
-    try assistant.text.appendSlice(alloc, "\x1b[38;5;245mFX THEME INLINE CODE\x1b[39m\n");
+    try assistant.text.appendSlice(alloc, "\x1b[38;5;255mFX THEME INLINE CODE\x1b[39m\n");
 
     try h.renderTranscriptFrame();
     try h.flush();
     const min_visible_rows = h.shell.min_visible_viewport_rows;
     const before = try h.file.length(io_mod.getIo());
 
-    try h.shell.retintEntriesForTheme(alloc, false, true);
+    try h.shell.retintEntriesForTheme(alloc, shared_theme.fx_dark, shared_theme.fx_light);
     try h.shell.requestTerminalReset(&h.metrics);
     try std.testing.expect(h.shell.terminal_reset_pending);
     try std.testing.expectEqual(min_visible_rows, h.shell.min_visible_viewport_rows);
@@ -7734,7 +7724,7 @@ test "theme reset retints fx entries and replays the retained transcript once" {
     const emitted = try readEmittedSince(&h, before);
     defer alloc.free(emitted);
 
-    try std.testing.expect(std.mem.indexOf(u8, emitted, "\x1b[3J") != null);
+    try std.testing.expect(std.mem.find(u8, emitted, "\x1b[3J") != null);
     try std.testing.expect(!h.shell.terminal_reset_pending);
     try std.testing.expectEqual(@as(u16, 1), h.shell.viewport_top_row);
     try std.testing.expectEqual(min_visible_rows, h.shell.min_visible_viewport_rows);
@@ -7747,7 +7737,7 @@ test "theme reset retints fx entries and replays the retained transcript once" {
         h.shell.entries.items[2].raw_bytes.bytes,
     );
     try std.testing.expectEqualStrings(
-        "\x1b[38;5;247mFX THEME INLINE CODE\x1b[39m\n",
+        "\x1b[38;5;235mFX THEME INLINE CODE\x1b[39m\n",
         h.shell.lookupAssistantSegments(assistant_id).?.text.items,
     );
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, h.shell.transcript.items, "FX THEME HEADER"));
@@ -7801,7 +7791,7 @@ pub fn testReconstructiveFullTranscriptReplay() !void {
     const middle_marker = "REPLAY-MARKER-030";
     const final_marker = "REPLAY-MARKER-059";
     const reset_idx = std.mem.find(u8, emitted, "\x1b[3J") orelse return error.TestMissingTerminalReset;
-    const replay_origin_idx = std.mem.indexOfPos(
+    const replay_origin_idx = std.mem.findPos(
         u8,
         emitted,
         reset_idx,
@@ -7891,7 +7881,7 @@ test "partial-tail emission fills top rows when an entry overflows the band" {
 
     const assistant_id = try h.shell.appendAssistantTurnEntry(alloc);
     const segs = h.shell.lookupAssistantSegments(assistant_id) orelse unreachable;
-    const body = "abcdefghijklmnopqrstuvwxyz0123456789" ** 6;
+    const body = text_utils.repeat("abcdefghijklmnopqrstuvwxyz0123456789", 6);
     try segs.text.appendSlice(alloc, body[0..200]);
 
     try h.renderTranscriptFrame();
@@ -7915,7 +7905,7 @@ test "partial-tail emission drops SGR state from the oldest-visible line" {
 
     try h.shell.initViewport(&h.metrics, 1);
 
-    const line = "\x1b[1m" ++ ("X" ** 200) ++ "\x1b[0m\n";
+    const line = "\x1b[1m" ++ text_utils.repeat("X", 200) ++ "\x1b[0m\n";
     try h.shell.writeTranscript(alloc, &h.metrics, line, true);
     try h.flush();
 
@@ -7970,9 +7960,9 @@ test "narrow-drag resize pins overflowing content to content_bottom" {
     defer h.deinit();
     try h.shell.initViewport(&h.metrics, 1);
 
-    try h.shell.writeTranscript(alloc, &h.metrics, ("A" ** 3000) ++ "\n", true);
-    try h.shell.writeTranscript(alloc, &h.metrics, ("B" ** 3000) ++ "\n", true);
-    try h.shell.writeTranscript(alloc, &h.metrics, ("C" ** 3000) ++ "\n", true);
+    try h.shell.writeTranscript(alloc, &h.metrics, text_utils.repeat("A", 3000) ++ "\n", true);
+    try h.shell.writeTranscript(alloc, &h.metrics, text_utils.repeat("B", 3000) ++ "\n", true);
+    try h.shell.writeTranscript(alloc, &h.metrics, text_utils.repeat("C", 3000) ++ "\n", true);
     try h.flush();
 
     try h.driveResize(30, 40, 4, true);
@@ -8085,7 +8075,7 @@ fn assertCapacityInvariantUnderWrites(path: CapacityWritePath) !void {
     try std.testing.expect(h.shell.transcript.capacity >= cap);
     const initial_capacity = h.shell.transcript.capacity;
 
-    const chunk = "x" ** 512 ++ "\n";
+    const chunk = text_utils.repeat("x", 512) ++ "\n";
     var i: usize = 0;
     while (i < cap * 10 / chunk.len) : (i += 1) {
         switch (path) {
@@ -8242,6 +8232,195 @@ test "orphan command output does not leak into current compact rows" {
     try expectGridOccurrenceCount(&h, "dedupe-command-row", 0);
 }
 
+test "fresh session publishes the last visible transcript rows before clearing" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 60, 12, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(60, 12);
+    defer probe.deinit();
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(
+        alloc,
+        &h.metrics,
+        "old 01\nold 02\nold 03\nold 04\nold 05\nold 06\n" ++
+            "old 07\nold 08\nold 09\nold 10\nold 11\n" ++
+            "workspace=/tmp/fx\nhistory_turns=0\nagent_step_limit=0\n",
+        true,
+    );
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try capturePhysicalFrame(&h, &probe);
+    try input.textReplacementState().replace(alloc, "/new");
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try capturePhysicalFrame(&h, &probe);
+    try expectGridContains(&h, "agent_step_limit=0");
+    try std.testing.expect(std.mem.find(u8, probe.history.items, "agent_step_limit=0") == null);
+
+    try h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics);
+    try capturePhysicalFrame(&h, &probe);
+    try std.testing.expect(std.mem.find(u8, probe.history.items, "agent_step_limit=0") != null);
+    try std.testing.expect(std.mem.find(u8, probe.history.items, "Commands 1") == null);
+
+    h.shell.clearTranscript(alloc);
+    input.inputResetState().clearCurrent(alloc);
+    try h.shell.writeTranscript(alloc, &h.metrics, "new session header\n", true);
+    try shell_runtime.requestRedraw(&h.shell, &h.metrics, .replay_viewport);
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try capturePhysicalFrame(&h, &probe);
+    try expectGridContains(&h, "new session header");
+    try expectGridOccurrenceCount(&h, "agent_step_limit=0", 0);
+}
+
+test "fresh session scrollback handoff releases pre-fx rows before the transcript" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 40, 12, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(40, 12);
+    defer probe.deinit();
+
+    const pre_fx = "\x1b[1;1Hpre-fx first\r\npre-fx second";
+    try h.vt.feed(pre_fx);
+    try h.shell.shadow_vt.?.feed(pre_fx);
+    try probe.feed(pre_fx);
+    try h.shell.initViewport(&h.metrics, 5);
+    try h.shell.writeTranscript(alloc, &h.metrics, "owned first\nowned second\nowned last\n", true);
+    try h.renderTranscriptFrame();
+    try capturePhysicalFrame(&h, &probe);
+    try expectGridContains(&h, "pre-fx first");
+    try expectGridContains(&h, "owned last");
+
+    try h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics);
+    try capturePhysicalFrame(&h, &probe);
+    try std.testing.expect(std.mem.find(u8, probe.history.items, "pre-fx first") != null);
+    try std.testing.expect(std.mem.find(u8, probe.history.items, "owned last") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.history.items, "owned last"));
+}
+
+test "fresh session handoff waits for an admitted resize" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 40, 12, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(alloc, &h.metrics, "old session visible\n", true);
+    try h.renderTranscriptFrame();
+    try h.flush();
+    const before = try h.file.length(io_mod.getIo());
+
+    h.shell.render_requests.observeResizeSignal(100, 100);
+    try std.testing.expectError(
+        error.SessionScrollbackHandoffUnavailable,
+        h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics),
+    );
+    try std.testing.expectEqual(before, try h.file.length(io_mod.getIo()));
+    try std.testing.expect(std.mem.find(u8, h.shell.transcript.items, "old session visible") != null);
+}
+
+test "partial fresh session scrollback handoff does not duplicate committed rows" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 40, 12, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(40, 12);
+    defer probe.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(alloc, &h.metrics, "old first\nold second\nold third\n", true);
+    try h.renderTranscriptFrame();
+    try capturePhysicalFrame(&h, &probe);
+
+    const PartialSink = struct {
+        file: std.Io.File,
+        writes: usize = 0,
+
+        fn write(ctx: *anyopaque, _: *Metrics, bytes: []const u8) render_engine.terminal_diff.FrameSinkWriteResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.writes += 1;
+            const accepted = if (self.writes == 1)
+                (std.mem.findScalar(u8, bytes, '\n') orelse return .{ .partial = .{ .accepted_bytes = 0, .err = error.TestMissingScroll } }) + 1
+            else
+                bytes.len;
+            self.file.writeStreamingAll(io_mod.getIo(), bytes[0..accepted]) catch |err| {
+                return .{ .partial = .{ .accepted_bytes = 0, .err = err } };
+            };
+            return if (self.writes == 1)
+                .{ .partial = .{ .accepted_bytes = accepted, .err = error.TestPartialFrame } }
+            else
+                .complete;
+        }
+    };
+    var sink = PartialSink{ .file = h.file };
+    h.shell.test_frame_sink = .{ .ctx = &sink, .write_frame = PartialSink.write };
+    try std.testing.expectError(
+        error.SessionScrollbackHandoffIncomplete,
+        h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics),
+    );
+    try capturePhysicalFrame(&h, &probe);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.history.items, "old first"));
+    try std.testing.expect(std.mem.find(u8, h.shell.transcript.items, "old third") != null);
+
+    try std.testing.expect(h.shell.sessionScrollbackHandoffPending());
+    h.shell.test_frame_sink = null;
+    try h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics);
+    try capturePhysicalFrame(&h, &probe);
+    try std.testing.expect(!h.shell.sessionScrollbackHandoffPending());
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.history.items, "old first"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.history.items, "old third"));
+}
+
+test "resizing after a partial session handoff cancels without clearing transcript" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 40, 12, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(alloc, &h.metrics, "old session retained\n", true);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    h.shell.pending_session_scrollback_handoff = .{
+        .remaining_rows = 1,
+        .total_rows = 2,
+        .terminal_cols = 40,
+        .terminal_rows = 12,
+    };
+    h.shell.layout.cols = 39;
+    try std.testing.expectError(
+        error.SessionScrollbackHandoffGeometryChanged,
+        h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics),
+    );
+    h.shell.cancelSessionScrollbackHandoff();
+    try std.testing.expect(!h.shell.sessionScrollbackHandoffPending());
+    try std.testing.expect(std.mem.find(u8, h.shell.transcript.items, "old session retained") != null);
+    try std.testing.expect(h.shell.render_requests.hasReason(.footer));
+}
+
+test "failed fresh session scrollback handoff keeps the old transcript" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 40, 12, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(alloc, &h.metrics, "old transcript still owned\n", true);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    const FailSink = struct {
+        fn write(_: *anyopaque, _: *Metrics, _: []const u8) render_engine.terminal_diff.FrameSinkWriteResult {
+            return .{ .partial = .{ .accepted_bytes = 0, .err = error.TestWriteFailure } };
+        }
+    };
+    var sink_context: u8 = 0;
+    h.shell.test_frame_sink = .{ .ctx = &sink_context, .write_frame = FailSink.write };
+    try std.testing.expectError(
+        error.TerminalSyncRecoveryFailed,
+        h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics),
+    );
+    try std.testing.expect(std.mem.find(u8, h.shell.transcript.items, "old transcript still owned") != null);
+    try std.testing.expectEqual(@as(usize, 1), h.shell.entries.items.len);
+}
+
 /// Test-only physical eviction observer, including automatic wraps.
 pub const PhysicalHistoryProbe = struct {
     grid: Grid,
@@ -8335,7 +8514,7 @@ test "append pending wrap repeated recorded continuations retain every old margi
     try h.shell.writeTranscriptBytes(h.alloc, &h.metrics, "A\nB\nC\n12345678", true);
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
-    const expected = "A\nB\nC\n12345678\n" ++ ("X\nY\nZ\n12345678\n" ** 3);
+    const expected = "A\nB\nC\n12345678\n" ++ text_utils.repeat("X\nY\nZ\n12345678\n", 3);
     for (0..4) |i| {
         try h.shell.writeTranscriptBytes(h.alloc, &h.metrics, "X\nY\nZ\n12345678", true);
         try h.renderTranscriptFrame();
@@ -8358,7 +8537,7 @@ test "append pending wrap bounded resume publishes each soft wrapped row once" {
     defer expected.deinit(alloc);
     for (0..300) |i| {
         var row: [8]u8 = undefined;
-        const text = try std.fmt.bufPrint(&row, "{d:0>8}", .{i});
+        const text = try std.mem.print(&row, "{d:0>8}", .{i});
         try flow.appendSlice(alloc, text);
         if (i < 296) {
             try expected.appendSlice(alloc, text);
@@ -8406,7 +8585,7 @@ test "recorded tool rows enter physical history when the viewport advances" {
     var committed_rows: usize = 0;
     for (0..16) |i| {
         var buf: [48]u8 = undefined;
-        _ = try h.shell.appendRawTranscriptEntry(alloc, try std.fmt.bufPrint(&buf, "Continuation row {d}\n", .{i}));
+        _ = try h.shell.appendRawTranscriptEntry(alloc, try std.mem.print(&buf, "Continuation row {d}\n", .{i}));
         try h.renderTranscriptFrame();
         try h.flush();
         committed_rows += h.last_frame.committed_scroll_rows;
@@ -8443,7 +8622,7 @@ fn expectRetentionRows(self: *PhysicalHistoryProbe, h: *Harness, count: usize) !
     var previous: usize = 0;
     for (0..count) |id| {
         var buffer: [32]u8 = undefined;
-        const marker = try std.fmt.bufPrint(&buffer, "ROW_{d:0>4}", .{id});
+        const marker = try std.mem.print(&buffer, "ROW_{d:0>4}", .{id});
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, full, marker));
         const position = std.mem.find(u8, full, marker).?;
         try std.testing.expect(position >= previous);
@@ -8458,7 +8637,7 @@ fn paintRetentionFrame(h: *Harness, probe: *PhysicalHistoryProbe, input: *InputR
 }
 
 fn retentionRow(alloc: Allocator, id: usize) ![]u8 {
-    return std.fmt.allocPrint(alloc, "ROW_{d:0>4} immutable sentinel\n", .{id});
+    return alloc.print("ROW_{d:0>4} immutable sentinel\n", .{id});
 }
 
 fn expectAssistantRetentionPreservesHistory(retention: bool) !void {
@@ -8547,7 +8726,7 @@ fn expectUnpaintedRetentionIdentity(reflow: bool) !void {
     var probe = try PhysicalHistoryProbe.init(cols, 12);
     defer probe.deinit();
     try h.shell.initViewport(&h.metrics, 1);
-    _ = try h.shell.appendRawTranscriptEntry(alloc, "old\n" ** 20);
+    _ = try h.shell.appendRawTranscriptEntry(alloc, text_utils.repeat("old\n", 20));
     _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, if (reflow) "alpha beta gamma delta" else "alpha beta gamma");
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
@@ -8595,7 +8774,7 @@ test "assistant retention deleted soft wrapped entry preserves the next physical
     var probe = try PhysicalHistoryProbe.init(12, 12);
     defer probe.deinit();
     try h.shell.initViewport(&h.metrics, 1);
-    const retired_id = try h.shell.appendRawTranscriptEntry(alloc, "abcdefghijkl" ** 10);
+    const retired_id = try h.shell.appendRawTranscriptEntry(alloc, text_utils.repeat("abcdefghijkl", 10));
     _ = try h.shell.appendRawTranscriptEntry(alloc, "KEEP00000001KEEP00000002KEEP00000003");
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
@@ -8614,7 +8793,7 @@ test "assistant retention deleted soft wrapped entry preserves the next physical
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
     h.shell.max_retained_transcript_bytes = std.math.maxInt(usize);
-    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, "next\n" ** 12);
+    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, text_utils.repeat("next\n", 12));
     for (0..3) |_| {
         try h.renderTranscriptFrame();
         try capturePhysicalFrame(&h, &probe);
@@ -8639,7 +8818,7 @@ test "assistant retention partial compact group preserves surviving physical chi
     try h.shell.initViewport(&h.metrics, 1);
     h.shell.collapse_tool_calls = false;
     for (0..16) |index| {
-        const text = try std.fmt.allocPrint(alloc, "● CHILD_{d:0>4}\n", .{index});
+        const text = try alloc.print("● CHILD_{d:0>4}\n", .{index});
         defer alloc.free(text);
         _ = try h.shell.appendRawTranscriptEntryClassified(alloc, text, .tool_status);
         try h.renderTranscriptFrame();
@@ -8652,7 +8831,7 @@ test "assistant retention partial compact group preserves surviving physical chi
     const initial_full = try std.mem.concat(alloc, u8, &.{ probe.history.items, initial_grid });
     defer alloc.free(initial_full);
     for (0..16) |index| {
-        const marker = try std.fmt.allocPrint(alloc, "CHILD_{d:0>4}", .{index});
+        const marker = try alloc.print("CHILD_{d:0>4}", .{index});
         defer alloc.free(marker);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, initial_full, marker));
     }
@@ -8666,7 +8845,7 @@ test "assistant retention partial compact group preserves surviving physical chi
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
     h.shell.max_retained_transcript_bytes = std.math.maxInt(usize);
-    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, "later\n" ** 16);
+    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, text_utils.repeat("later\n", 16));
     for (0..3) |_| {
         try h.renderTranscriptFrame();
         try capturePhysicalFrame(&h, &probe);
@@ -8677,7 +8856,7 @@ test "assistant retention partial compact group preserves surviving physical chi
     defer alloc.free(full);
     var last: usize = 0;
     for (0..16) |index| {
-        const marker = try std.fmt.allocPrint(alloc, "CHILD_{d:0>4}", .{index});
+        const marker = try alloc.print("CHILD_{d:0>4}", .{index});
         defer alloc.free(marker);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, full, marker));
         const position = std.mem.find(u8, full, marker).?;
@@ -8694,7 +8873,7 @@ fn expectAssistantRetentionPreservesToolProjection(collapsed: bool) !void {
     defer probe.deinit();
     try h.shell.initViewport(&h.metrics, 1);
     h.shell.collapse_tool_calls = collapsed;
-    const prefix_id = try h.shell.appendRawTranscriptEntry(alloc, "PRUNE\n" ** 20);
+    const prefix_id = try h.shell.appendRawTranscriptEntry(alloc, text_utils.repeat("PRUNE\n", 20));
     try h.renderTranscriptFrame();
     try capturePhysicalFrame(&h, &probe);
     for ([_][]const u8{ "● CHILD_ONE\n", "● CHILD_TWO\n", "● CHILD_THREE\n" }) |text| {
@@ -8752,7 +8931,7 @@ fn checkAssistantRetentionAllocationFailure(operation_alloc: Allocator) !void {
     var h = try Harness.init(alloc, 60, 12, 4);
     defer h.deinit();
     try h.shell.initViewport(&h.metrics, 1);
-    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, "before\n" ** 24);
+    _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, text_utils.repeat("before\n", 24));
     try h.renderTranscriptFrame();
     try h.flush();
     var before = try h.shell.prepareTranscriptSource(alloc, null);
@@ -8773,11 +8952,11 @@ fn checkAssistantRetentionAllocationFailure(operation_alloc: Allocator) !void {
 }
 
 test "assistant retention allocation failures leave source and boundaries unchanged" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAssistantRetentionAllocationFailure, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkAssistantRetentionAllocationFailure, .{});
 }
 
 fn wrappedRetentionRow(alloc: Allocator, id: usize) ![]u8 {
-    return std.fmt.allocPrint(alloc, "ROW_{d:0>4} 界 café repeated words repeated words repeated words repeated words repeated words\n", .{id});
+    return alloc.print("ROW_{d:0>4} 界 café repeated words repeated words repeated words repeated words repeated words\n", .{id});
 }
 
 test "assistant retention preserves physical rows inside a protected wrapped entry" {
@@ -8822,5 +9001,234 @@ test "assistant retention preserves physical rows inside a protected wrapped ent
         }
         try paintRetentionFrame(&h, &probe, &input, &approval);
         try expectRetentionRows(&probe, &h, 123);
+    }
+}
+
+test "command tool rows reclip to live width across lifecycle states" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 200, 30, 4);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    try h.shell.initViewport(&h.metrics, 1);
+
+    // A 152-byte command: past the 120-byte compact activity bound, so its
+    // status phrases carry the frozen "..." marker at generation time.
+    const command = "printf '" ++ text_utils.repeat("x", 60) ++ "' && sleep 1 && printf '" ++ text_utils.repeat("y", 60) ++ "'";
+    const frozen_command = command[0..117] ++ "...";
+    const full_tail = text_utils.repeat("y", 60);
+
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "cmd-live" };
+    const args_json = try alloc.print("{{\"command\":{f}}}", .{std.json.fmt(command, .{})});
+    defer alloc.free(args_json);
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+        .arguments_json = args_json,
+    } });
+    // Start-time metadata store, mirroring the worker callback: the full
+    // reflow-bound command plus the predicted completed label.
+    try h.shell.setToolCommandMetadata(alloc, id, command, "Ran");
+    // The active status phrase is generated at the compact bound.
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .progress = .{
+        .id = id,
+        .text = "● Running " ++ frozen_command,
+    } });
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    // The active row reclips to the live width and keeps its own label.
+    try expectGridContains(&h, "Running " ++ command);
+    try expectGridNotContains(&h, frozen_command);
+
+    // Settled success: the frozen "Ran" phrase reclips the same way.
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Ran " ++ frozen_command },
+    } });
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    try expectGridContains(&h, "Ran " ++ command);
+    try expectGridNotContains(&h, frozen_command);
+
+    // Settled with a nonzero exit: the settled label carries the exit code,
+    // which the start-time predicted label ("Ran") cannot know.
+    const failed_id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "cmd-failed" };
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = failed_id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+        .arguments_json = args_json,
+    } });
+    try h.shell.setToolCommandMetadata(alloc, failed_id, command, "Ran");
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = failed_id,
+        .outcome = .{ .kind = .completed, .summary = "Exited 1 " ++ frozen_command },
+    } });
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    try expectGridContains(&h, "Exited 1 " ++ command);
+    try expectGridNotContains(&h, frozen_command);
+
+    // Reclipped rows still respect the live width: narrow them and the row
+    // folds to the width with the single-cell clip marker, not the frozen
+    // generation marker.
+    try h.driveResize(90, 30, 4, true);
+    try expectGridNotContains(&h, full_tail);
+    try h.driveResize(200, 30, 4, true);
+    try expectGridContains(&h, "Exited 1 " ++ command);
+}
+
+test "full transcript shows terminal session launch commands in full across widths" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 100, 30, 4);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    try h.shell.initViewport(&h.metrics, 1);
+
+    // `interact` has no command argument: the session's launch command is
+    // known only through the stored command display, and the status phrase
+    // was frozen at the compact activity bound.
+    const launch = "cd . && python3 - <<'PYEOF' import pathlib led = pathlib.Path(\"docs/workflows/ledger.md\"); " ++
+        "s = led.read_text() old = \"Fixed in draft (b226cd28e,\" assert old in s LAUNCH_COMMAND_TAIL";
+    const frozen = launch[0..100] ++ "...";
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "observe-session" };
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+        .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-922\"}",
+    } });
+    try h.shell.setToolCommandMetadata(alloc, id, launch, "Observed");
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Observed " ++ frozen },
+    } });
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    // The main view still trails a row that does not fit.
+    try expectGridContains(&h, "Observed cd . && python3");
+    try expectGridNotContains(&h, "LAUNCH_COMMAND_TAIL");
+
+    // Ctrl+O shows the whole launch command at every width.
+    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .full));
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    try expectGridContains(&h, "Observed cd . && python3");
+    try expectGridContains(&h, "LAUNCH_COMMAND_TAIL");
+    try expectGridContains(&h, "session_id: shell-922");
+    try expectGridNotContains(&h, "…");
+    try h.driveResize(60, 30, 4, true);
+    try expectGridContains(&h, "LAUNCH_COMMAND_TAIL");
+    try expectGridNotContains(&h, "…");
+    try h.driveResize(140, 30, 4, true);
+    try expectGridContains(&h, "LAUNCH_COMMAND_TAIL");
+
+    // Leaving Ctrl+O restores the trailing main view.
+    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .inline_mode));
+    try h.driveResize(100, 30, 4, true);
+    try expectGridContains(&h, "Observed cd . && python3");
+    try expectGridNotContains(&h, "LAUNCH_COMMAND_TAIL");
+}
+
+test "transcript painting keeps the shadow terminal in step with the screen" {
+    try std.testing.fuzz({}, fuzzTranscriptPaint, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").transcript_paint.*),
+    });
+}
+
+const fuzz_transcript_pieces = [_][]const u8{
+    "word",   " ",       "\n",         "\n\n",  "\u{754c}", "e\u{301}", "\u{2600}\u{fe0f}",                           "**bold**",
+    "`code`", "- item ", "# heading ", "```\n", "\t",       "|a|b|\n",  "an-unbroken-token-longer-than-a-narrow-row",
+};
+
+fn appendFuzzTranscriptText(alloc: Allocator, smith: *std.testing.Smith, out: *std.ArrayList(u8)) !void {
+    for (0..smith.valueRangeAtMost(u8, 0, 24)) |_| {
+        try out.appendSlice(alloc, fuzz_transcript_pieces[smith.index(fuzz_transcript_pieces.len)]);
+    }
+}
+
+fn fuzzTranscriptPaint(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var cols = smith.valueRangeAtMost(u16, 10, 80);
+    var rows = smith.valueRangeAtMost(u16, 6, 24);
+    // The test layout always draws a four-row footer.
+    const footer_rows = 4;
+    var h = try Harness.init(alloc, cols, rows, footer_rows);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.flush();
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(alloc);
+    for (0..smith.valueRangeAtMost(u8, 0, 24)) |_| {
+        text.clearRetainingCapacity();
+        switch (smith.valueRangeAtMost(u8, 0, 4)) {
+            0, 1 => {
+                try appendFuzzTranscriptText(alloc, smith, &text);
+                _ = try h.shell.streamAssistantChunk(alloc, &h.metrics, text.items);
+            },
+            2 => {
+                try appendFuzzTranscriptText(alloc, smith, &text);
+                try h.shell.writeTranscript(alloc, &h.metrics, text.items, true);
+            },
+            else => {
+                cols = smith.valueRangeAtMost(u16, 10, 80);
+                rows = smith.valueRangeAtMost(u16, 6, 24);
+                // fx applies a resize it is still debouncing as unsettled,
+                // then applies it again settled before more output lands.
+                const debounced = smith.value(bool);
+                if (debounced) try h.driveResize(cols, rows, footer_rows, false);
+                try h.driveResize(cols, rows, footer_rows, true);
+            },
+        }
+        try h.renderTranscriptFrameIfDirty();
+        try h.flush();
+        try expectFuzzShadowMatchesScreen(&h);
+    }
+}
+
+/// The transcript runtime's model of the terminal must show what the bytes
+/// it wrote actually drew: the same rows and the same cursor.
+fn expectFuzzShadowMatchesScreen(h: *Harness) !void {
+    const shadow = h.shell.shadow_vt orelse return error.TestMissingShadowTerminal;
+    var screen_row: std.ArrayList(u8) = .empty;
+    defer screen_row.deinit(h.alloc);
+    var shadow_row: std.ArrayList(u8) = .empty;
+    defer shadow_row.deinit(h.alloc);
+    var mismatch = false;
+    if (shadow.cols != h.vt.cols or shadow.rows != h.vt.rows) mismatch = true;
+    var row: u16 = 1;
+    while (row <= @min(h.vt.rows, shadow.rows)) : (row += 1) {
+        screen_row.clearRetainingCapacity();
+        shadow_row.clearRetainingCapacity();
+        try h.vt.rowTextTrimmed(row, &screen_row);
+        try shadow.rowTextTrimmed(row, &shadow_row);
+        if (!std.mem.eql(u8, screen_row.items, shadow_row.items)) {
+            mismatch = true;
+            std.debug.print("transcript_paint row {d}: screen=[{s}] shadow=[{s}]\n", .{ row, screen_row.items, shadow_row.items });
+        }
+    }
+    if (shadow.cursor_row != h.vt.cursor_row or shadow.cursor_col != h.vt.cursor_col) mismatch = true;
+    if (mismatch) {
+        std.debug.print("transcript_paint: screen {d}x{d} at {d},{d}; shadow {d}x{d} at {d},{d}\n", .{ h.vt.cols, h.vt.rows, h.vt.cursor_row, h.vt.cursor_col, shadow.cols, shadow.rows, shadow.cursor_row, shadow.cursor_col });
+        return error.TestShadowTerminalDiverged;
     }
 }

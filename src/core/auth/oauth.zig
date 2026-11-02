@@ -1,4 +1,7 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
+const browser_callback = @import("browser_callback.zig");
+const io_mod = @import("../shared/io.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 
@@ -83,22 +86,103 @@ pub const TokenSet = struct {
     }
 };
 
+pub const BrowserTokenSet = struct {
+    access_token: []u8,
+    refresh_token: []u8,
+    expires_in: i64,
+
+    pub fn deinit(self: *BrowserTokenSet, alloc: Allocator) void {
+        secret.zeroAndFree(alloc, self.access_token);
+        secret.zeroAndFree(alloc, self.refresh_token);
+        self.* = undefined;
+    }
+};
+
 pub const PollResult = union(enum) {
     pending,
     slow_down,
     success: TokenSet,
 };
 
+pub fn takeBrowserPollResult(
+    alloc: Allocator,
+    token: *BrowserTokenSet,
+) !PollResult {
+    const scope = try alloc.dupe(u8, "");
+    errdefer if (scope.len > 0) alloc.free(scope);
+    const token_type = try alloc.dupe(u8, "Bearer");
+    errdefer alloc.free(token_type);
+    const access_token = token.access_token;
+    token.access_token = &.{};
+    const refresh_token = token.refresh_token;
+    token.refresh_token = &.{};
+    return .{ .success = .{
+        .access_token = access_token,
+        .refresh_token = refresh_token,
+        .expires_in = token.expires_in,
+        .scope = scope,
+        .token_type = token_type,
+    } };
+}
+
 pub const TokenTypeHint = enum {
     access_token,
     refresh_token,
 };
 
-pub fn expiry_timestamp_ms(now_ms: i64, expires_in_seconds: i64) OAuthError!i64 {
+pub fn expiryTimestampMs(now_ms: i64, expires_in_seconds: i64) OAuthError!i64 {
     if (expires_in_seconds <= 0) return OAuthError.InvalidOAuthResponse;
     const duration_ms = std.math.mul(i64, expires_in_seconds, std.time.ms_per_s) catch
         return OAuthError.InvalidOAuthResponse;
     return std.math.add(i64, now_ms, duration_ms) catch OAuthError.InvalidOAuthResponse;
+}
+
+pub fn randomUrlSafeSecret(alloc: Allocator) ![]u8 {
+    var entropy: [32]u8 = undefined;
+    try io_mod.getIo().randomSecure(&entropy);
+    const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(entropy.len);
+    const encoded = try alloc.alloc(u8, encoded_len);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, &entropy);
+    return encoded;
+}
+
+pub fn pkceChallengeAlloc(alloc: Allocator, verifier: []const u8) ![]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(verifier, &digest, .{});
+    const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(digest.len);
+    const encoded = try alloc.alloc(u8, encoded_len);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, &digest);
+    return encoded;
+}
+
+pub fn isLoopbackHttpUrl(url: []const u8) bool {
+    const uri = std.Uri.parse(url) catch return false;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") or
+        uri.user != null or
+        uri.password != null or
+        uri.port == null)
+    {
+        return false;
+    }
+    const host_component = uri.host orelse return false;
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host_name = host_component.toRaw(&host_buf) catch return false;
+    return std.mem.eql(u8, host_name, "127.0.0.1") or
+        std.ascii.eqlIgnoreCase(host_name, "localhost") or
+        std.mem.eql(u8, host_name, "[::1]");
+}
+
+pub fn configuredEndpoint(
+    alloc: Allocator,
+    env_name: []const u8,
+    default_url: []const u8,
+) ![]u8 {
+    const configured = io_mod.getenv(env_name);
+    const candidate = configured orelse default_url;
+    if (configured != null and !isLoopbackHttpUrl(candidate)) {
+        return error.InvalidE2EOAuthEndpoint;
+    }
+    return alloc.dupe(u8, candidate);
 }
 
 pub fn discover(
@@ -106,7 +190,7 @@ pub fn discover(
     transport: oauth_transport.Provider,
     issuer_url: []const u8,
 ) !Metadata {
-    const url = try std.fmt.allocPrint(alloc, "{s}/.well-known/openid-configuration", .{issuer_url});
+    const url = try alloc.print("{s}/.well-known/openid-configuration", .{issuer_url});
     defer alloc.free(url);
     const bytes = try fetchJson(alloc, transport, .get, url, null, .{});
     defer alloc.free(bytes);
@@ -295,6 +379,26 @@ pub fn parseTokenSet(alloc: Allocator, bytes: []const u8) !TokenSet {
     };
 }
 
+pub fn parseBrowserTokenSet(
+    alloc: Allocator,
+    bytes: []const u8,
+) !BrowserTokenSet {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return OAuthError.InvalidOAuthResponse;
+    const object = parsed.value.object;
+    const access_token = try dupeRequiredString(alloc, object, "access_token");
+    errdefer secret.zeroAndFree(alloc, access_token);
+    const refresh_token = try dupeRequiredString(alloc, object, "refresh_token");
+    errdefer secret.zeroAndFree(alloc, refresh_token);
+    const expires_in = try requiredPositiveInteger(object, "expires_in");
+    return .{
+        .access_token = access_token,
+        .refresh_token = refresh_token,
+        .expires_in = expires_in,
+    };
+}
+
 fn fetchJson(
     alloc: Allocator,
     transport: oauth_transport.Provider,
@@ -336,19 +440,19 @@ fn mapOAuthHttpError(alloc: Allocator, body: []const u8) !void {
     return OAuthError.OAuthRequestFailed;
 }
 
-const FormBody = struct {
+pub const FormBody = struct {
     first: bool = true,
 
-    fn append(self: *FormBody, writer: *std.Io.Writer, key: []const u8, value: []const u8) !void {
-        if (!self.first) try writer.writeAll("&");
+    pub fn append(self: *FormBody, writer: *std.Io.Writer, key: []const u8, value: []const u8) !void {
+        if (!self.first) try writer.writeByte('&');
         self.first = false;
         try percentEncode(writer, key);
-        try writer.writeAll("=");
+        try writer.writeByte('=');
         try percentEncode(writer, value);
     }
 };
 
-fn percentEncode(writer: *std.Io.Writer, value: []const u8) !void {
+pub fn percentEncode(writer: *std.Io.Writer, value: []const u8) !void {
     const hex = "0123456789ABCDEF";
     for (value) |byte| {
         const safe = std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '~';
@@ -360,6 +464,180 @@ fn percentEncode(writer: *std.Io.Writer, value: []const u8) !void {
             try writer.writeByte(hex[byte & 0x0f]);
         }
     }
+}
+
+pub const QueryError = std.mem.Allocator.Error || error{
+    MissingQueryParameter,
+    InvalidPercentEncoding,
+    EmptyQueryValue,
+};
+
+/// Returns an owned decoded value for the first matching form/query key.
+pub fn queryValueAlloc(
+    alloc: Allocator,
+    query: []const u8,
+    key: []const u8,
+) QueryError![]u8 {
+    var pairs = std.mem.splitScalar(u8, query, '&');
+    while (pairs.next()) |pair| {
+        const equals = std.mem.findScalar(u8, pair, '=') orelse continue;
+        if (!std.mem.eql(u8, pair[0..equals], key)) continue;
+        return percentDecodeAlloc(alloc, pair[equals + 1 ..]);
+    }
+    return error.MissingQueryParameter;
+}
+
+/// Returns an owned non-empty decoded value for the first matching key.
+pub fn queryValueNonEmptyAlloc(
+    alloc: Allocator,
+    query: []const u8,
+    key: []const u8,
+) QueryError![]u8 {
+    const value = try queryValueAlloc(alloc, query, key);
+    errdefer alloc.free(value);
+    if (value.len == 0) return error.EmptyQueryValue;
+    return value;
+}
+
+pub fn percentDecodeAlloc(alloc: Allocator, value: []const u8) QueryError![]u8 {
+    return percentDecodeAllocDetailed(alloc, value) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidPercentEncoding,
+    };
+}
+
+const PercentDecodeDetailedError = std.mem.Allocator.Error || error{
+    TruncatedPercentEncoding,
+    InvalidPercentDigit,
+};
+
+fn percentDecodeAllocDetailed(alloc: Allocator, value: []const u8) PercentDecodeDetailedError![]u8 {
+    var out = try alloc.alloc(u8, value.len);
+    errdefer alloc.free(out);
+    var read_index: usize = 0;
+    var write_index: usize = 0;
+    while (read_index < value.len) {
+        if (value[read_index] == '%') {
+            if (read_index + 2 >= value.len) return error.TruncatedPercentEncoding;
+            const high = std.fmt.charToDigit(value[read_index + 1], 16) catch
+                return error.InvalidPercentDigit;
+            const low = std.fmt.charToDigit(value[read_index + 2], 16) catch
+                return error.InvalidPercentDigit;
+            out[write_index] = @intCast(high * 16 + low);
+            read_index += 3;
+        } else {
+            out[write_index] = if (value[read_index] == '+') ' ' else value[read_index];
+            read_index += 1;
+        }
+        write_index += 1;
+    }
+    return alloc.realloc(out, write_index);
+}
+
+pub const FormCallback = struct {
+    state: []u8,
+    code: ?[]u8,
+    issuer: ?[]u8,
+    denied: bool,
+
+    pub fn deinit(self: *FormCallback, alloc: Allocator) void {
+        secret.zeroAndFree(alloc, self.state);
+        if (self.code) |value| secret.zeroAndFree(alloc, value);
+        if (self.issuer) |value| secret.zeroAndFree(alloc, value);
+        self.* = undefined;
+    }
+};
+
+pub const FormCallbackContext = struct {
+    expected_state: []const u8,
+    invalid_error: anyerror,
+    allow_issuer: bool = false,
+    require_visible_ascii: bool = false,
+    max_value_bytes: usize,
+    code_max_bytes: usize = 2048,
+    consumed: bool = false,
+};
+
+pub fn parseFormCallback(
+    raw: ?*anyopaque,
+    alloc: Allocator,
+    body: []const u8,
+) browser_callback.ParseResult(FormCallback) {
+    const context: *FormCallbackContext = @ptrCast(@alignCast(raw.?));
+    if (context.consumed) return .unrelated;
+    const callback = parseFormCallbackBody(alloc, body, context) catch |err| {
+        if (err == error.OAuthFormStateMismatch) return .unrelated;
+        return .{ .failed = err };
+    };
+    context.consumed = true;
+    return .{ .accepted = callback };
+}
+
+fn decodeFormCallbackComponent(
+    alloc: Allocator,
+    value: []const u8,
+    context: *const FormCallbackContext,
+) ![]u8 {
+    const decoded = percentDecodeAllocDetailed(alloc, value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.TruncatedPercentEncoding => return if (context.require_visible_ascii)
+            context.invalid_error
+        else
+            error.InvalidPercentEncoding,
+        error.InvalidPercentDigit => return if (context.require_visible_ascii)
+            error.InvalidCharacter
+        else
+            error.InvalidPercentEncoding,
+    };
+    errdefer alloc.free(decoded);
+    if (context.require_visible_ascii) {
+        for (decoded) |byte| if (byte < 0x21 or byte > 0x7e) return context.invalid_error;
+    }
+    return decoded;
+}
+
+fn parseFormCallbackBody(
+    alloc: Allocator,
+    body: []const u8,
+    context: *const FormCallbackContext,
+) !FormCallback {
+    var values: [4]?[]u8 = @splat(null);
+    defer for (values) |value| if (value) |bytes| secret.zeroAndFree(alloc, bytes);
+    var fields = std.mem.splitScalar(u8, body, '&');
+    while (fields.next()) |field| {
+        const equals = std.mem.findScalar(u8, field, '=') orelse return context.invalid_error;
+        const name = try decodeFormCallbackComponent(alloc, field[0..equals], context);
+        defer alloc.free(name);
+        const index: usize = if (std.mem.eql(u8, name, "state"))
+            0
+        else if (std.mem.eql(u8, name, "code"))
+            1
+        else if (std.mem.eql(u8, name, "error"))
+            2
+        else if (context.allow_issuer and std.mem.eql(u8, name, "iss"))
+            3
+        else
+            return context.invalid_error;
+        if (values[index] != null) return context.invalid_error;
+        const value = try decodeFormCallbackComponent(alloc, field[equals + 1 ..], context);
+        values[index] = value;
+        if (value.len == 0 or value.len > context.max_value_bytes) return context.invalid_error;
+        if (index == 1 and value.len > context.code_max_bytes) return context.invalid_error;
+    }
+    if (!std.mem.eql(u8, values[0] orelse return error.OAuthFormStateMismatch, context.expected_state)) {
+        return error.OAuthFormStateMismatch;
+    }
+    if ((values[1] == null) == (values[2] == null)) return context.invalid_error;
+    const result: FormCallback = .{
+        .state = values[0].?,
+        .code = values[1],
+        .issuer = values[3],
+        .denied = values[2] != null,
+    };
+    values[0] = null;
+    values[1] = null;
+    values[3] = null;
+    return result;
 }
 
 fn dupeRequiredString(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) ![]u8 {
@@ -381,7 +659,92 @@ fn requiredInteger(object: std.json.ObjectMap, key: []const u8) !i64 {
     return value.integer;
 }
 
-fn check_metadata_allocation_failures(alloc: Allocator) !void {
+fn requiredPositiveInteger(object: std.json.ObjectMap, key: []const u8) !i64 {
+    const value = try requiredInteger(object, key);
+    if (value <= 0) return OAuthError.InvalidOAuthResponse;
+    return value;
+}
+
+test "OAuth form codec preserves encoding and first-value query semantics" {
+    const alloc = std.testing.allocator;
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    var form: FormBody = .{};
+    try form.append(&encoded.writer, "first key", "one+two");
+    try form.append(&encoded.writer, "empty", "");
+    try std.testing.expectEqualStrings(
+        "first%20key=one%2Btwo&empty=",
+        encoded.written(),
+    );
+
+    const first = try queryValueNonEmptyAlloc(
+        alloc,
+        "ignored&value=first+result&value=second",
+        "value",
+    );
+    defer alloc.free(first);
+    try std.testing.expectEqualStrings("first result", first);
+
+    const empty = try queryValueAlloc(alloc, "value=", "value");
+    defer alloc.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    try std.testing.expectError(
+        error.EmptyQueryValue,
+        queryValueNonEmptyAlloc(alloc, "value=", "value"),
+    );
+    try std.testing.expectError(
+        error.MissingQueryParameter,
+        queryValueAlloc(alloc, "other=value", "value"),
+    );
+    try std.testing.expectError(
+        error.InvalidPercentEncoding,
+        queryValueAlloc(alloc, "value=%zz", "value"),
+    );
+}
+
+fn checkQueryValueAllocationFailures(alloc: Allocator) !void {
+    const value = try queryValueNonEmptyAlloc(
+        alloc,
+        "value=encoded%20result",
+        "value",
+    );
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("encoded result", value);
+}
+
+test "OAuth query decoding cleans up allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        testing_allocator.no_resize,
+        checkQueryValueAllocationFailures,
+        .{},
+    );
+}
+
+fn checkBrowserTokenAllocationFailures(alloc: Allocator) !void {
+    var token = try parseBrowserTokenSet(
+        alloc,
+        "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_in\":3600}",
+    );
+    defer token.deinit(alloc);
+    var result = try takeBrowserPollResult(alloc, &token);
+    defer switch (result) {
+        .success => |*value| value.deinit(alloc),
+        .pending, .slow_down => {},
+    };
+    try std.testing.expectEqualStrings("access", result.success.access_token);
+    try std.testing.expectEqualStrings("refresh", result.success.refresh_token.?);
+    try std.testing.expectEqual(@as(i64, 3600), result.success.expires_in);
+}
+
+test "browser token parsing and transfer clean up allocation failures" {
+    try std.testing.checkAllAllocationFailures(
+        testing_allocator.no_resize,
+        checkBrowserTokenAllocationFailures,
+        .{},
+    );
+}
+
+fn checkMetadataAllocationFailures(alloc: Allocator) !void {
     var metadata = try parseMetadata(
         alloc,
         "{\"issuer\":\"https://vercel.com\",\"device_authorization_endpoint\":\"https://vercel.com/device\",\"token_endpoint\":\"https://vercel.com/token\",\"revocation_endpoint\":\"https://vercel.com/revoke\"}",
@@ -389,7 +752,7 @@ fn check_metadata_allocation_failures(alloc: Allocator) !void {
     defer metadata.deinit(alloc);
 }
 
-fn check_device_authorization_allocation_failures(alloc: Allocator) !void {
+fn checkDeviceAuthorizationAllocationFailures(alloc: Allocator) !void {
     var device = try parseDeviceAuthorization(
         alloc,
         "{\"device_code\":\"device\",\"user_code\":\"user\",\"verification_uri\":\"https://vercel.com/verify\",\"verification_uri_complete\":\"https://vercel.com/verify?code=user\",\"expires_in\":600,\"interval\":5}",
@@ -397,7 +760,7 @@ fn check_device_authorization_allocation_failures(alloc: Allocator) !void {
     defer device.deinit(alloc);
 }
 
-fn check_token_set_allocation_failures(alloc: Allocator) !void {
+fn checkTokenSetAllocationFailures(alloc: Allocator) !void {
     var token = try parseTokenSet(
         alloc,
         "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_in\":3600,\"scope\":\"openid offline_access\",\"token_type\":\"Bearer\"}",
@@ -568,17 +931,17 @@ test "oauth parses token set" {
 }
 
 test "oauth parsers clean up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_metadata_allocation_failures, .{});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_device_authorization_allocation_failures, .{});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_token_set_allocation_failures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkMetadataAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkDeviceAuthorizationAllocationFailures, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkTokenSetAllocationFailures, .{});
 }
 
 test "oauth expiry timestamps reject invalid durations" {
-    try std.testing.expectEqual(@as(i64, 11_000), try expiry_timestamp_ms(1_000, 10));
-    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiry_timestamp_ms(1_000, 0));
-    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiry_timestamp_ms(1_000, -1));
-    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiry_timestamp_ms(1_000, std.math.maxInt(i64)));
-    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiry_timestamp_ms(std.math.maxInt(i64), 1));
+    try std.testing.expectEqual(@as(i64, 11_000), try expiryTimestampMs(1_000, 10));
+    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiryTimestampMs(1_000, 0));
+    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiryTimestampMs(1_000, -1));
+    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiryTimestampMs(1_000, std.math.maxInt(i64)));
+    try std.testing.expectError(OAuthError.InvalidOAuthResponse, expiryTimestampMs(std.math.maxInt(i64), 1));
 }
 
 test "oauth parsers reject non-object JSON" {

@@ -1,10 +1,14 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const glob_pattern = @import("../../core/workspace/glob_pattern.zig");
 const grep_search = @import("../../core/workspace/grep_search.zig");
+const tool_files = @import("../../core/workspace/tool_files.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 
 const Allocator = std.mem.Allocator;
@@ -49,47 +53,40 @@ pub const Input = struct {
 
 /// Decodes grep_files JSON into an owned Input released by ToolInput.deinit.
 pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return .{ .failure = try ctx.allocator.dupe(u8, "grep_files arguments must be valid JSON") };
-    };
+    var args: tool_args.ArgsDecoder = .{ .alloc = ctx.allocator, .tool = "grep_files" };
+    var parsed = args.parse(args_json) catch |err| return .{ .failure = try args.takeFailure(err) };
     defer parsed.deinit();
-
-    if (parsed.value != .object) {
-        return .{ .failure = try ctx.allocator.dupe(u8, "grep_files arguments must be an object") };
-    }
-
-    const pattern_value = parsed.value.object.get("pattern") orelse {
-        return .{ .failure = try ctx.allocator.dupe(u8, "grep_files requires string field \"pattern\"") };
-    };
-    if (pattern_value != .string) {
-        return .{ .failure = try ctx.allocator.dupe(u8, "grep_files field \"pattern\" must be a string") };
-    }
-
-    const path_string = optionalStringField(parsed.value.object, "path");
-    const include_string = optionalStringField(parsed.value.object, "include");
-    const case_insensitive = if (parsed.value.object.get("case_insensitive")) |value| switch (value) {
+    const object = parsed.value.object;
+    const pattern = args.requiredString(object, "pattern") catch |err| return .{ .failure = try args.takeFailure(err) };
+    const path_string = args.optionalString(object, "path") catch |err| return .{ .failure = try args.takeFailure(err) };
+    const include_string = args.optionalString(object, "include") catch |err| return .{ .failure = try args.takeFailure(err) };
+    const case_insensitive = if (object.get("case_insensitive")) |value| switch (value) {
+        .null => false,
         .bool => |enabled| enabled,
-        else => false,
+        else => return .{ .failure = try ctx.allocator.dupe(u8, "grep_files field \"case_insensitive\" must be a boolean") },
     } else false;
-    const mode = parseOutputMode(parsed.value.object);
+    const raw_mode = args.optionalString(object, "mode") catch |err| return .{ .failure = try args.takeFailure(err) };
+    const mode: OutputMode = if (raw_mode) |raw| std.meta.stringToEnum(OutputMode, raw) orelse {
+        return .{ .failure = try ctx.allocator.dupe(u8, "grep_files field \"mode\" must be one of matches, files_with_matches, count") };
+    } else .matches;
 
-    const head_limit = switch (try parseOptionalInteger(ctx.allocator, parsed.value.object, "head_limit", 1, "positive")) {
+    const head_limit = switch (try parseOptionalInteger(ctx.allocator, object, "head_limit", 1, "positive")) {
         .missing => output_cap,
         .value => |value| @min(value, output_cap),
         .failure => |body| return .{ .failure = body },
     };
-    const offset = switch (try parseOptionalInteger(ctx.allocator, parsed.value.object, "offset", 0, "non-negative")) {
+    const offset = switch (try parseOptionalInteger(ctx.allocator, object, "offset", 0, "non-negative")) {
         .missing => 0,
         .value => |value| value,
         .failure => |body| return .{ .failure = body },
     };
-    const context_lines = switch (try parseOptionalInteger(ctx.allocator, parsed.value.object, "context_lines", 0, "non-negative")) {
+    const context_lines = switch (try parseOptionalInteger(ctx.allocator, object, "context_lines", 0, "non-negative")) {
         .missing => 0,
         .value => |value| @min(value, context_lines_cap),
         .failure => |body| return .{ .failure = body },
     };
 
-    const owned_pattern = try ctx.allocator.dupe(u8, pattern_value.string);
+    const owned_pattern = try ctx.allocator.dupe(u8, pattern);
     errdefer ctx.allocator.free(owned_pattern);
     const effective_path = if (path_string) |path|
         if (path.len == 0) "." else path
@@ -122,21 +119,6 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
     alloc.destroy(input);
 }
 
-fn optionalStringField(object: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const value = object.get(key) orelse return null;
-    return switch (value) {
-        .string => |text| text,
-        else => null,
-    };
-}
-
-fn parseOutputMode(object: std.json.ObjectMap) OutputMode {
-    const raw = optionalStringField(object, "mode") orelse return .matches;
-    if (std.mem.eql(u8, raw, "count")) return .count;
-    if (std.mem.eql(u8, raw, "files_with_matches")) return .files_with_matches;
-    return .matches;
-}
-
 const OptionalIntegerParse = union(enum) {
     missing,
     value: usize,
@@ -152,7 +134,7 @@ fn parseOptionalInteger(
 ) tool_dispatch.DispatchError!OptionalIntegerParse {
     const value = object.get(key) orelse return .missing;
     if (value != .integer or value.integer < min_value) {
-        return .{ .failure = try std.fmt.allocPrint(alloc, "grep_files field \"{s}\" must be a {s} integer", .{ key, description }) };
+        return .{ .failure = try alloc.print("grep_files field \"{s}\" must be a {s} integer", .{ key, description }) };
     }
     return .{ .value = @intCast(value.integer) };
 }
@@ -163,11 +145,27 @@ pub fn validate(_: tool_dispatch.DispatchContext, _: tool_dispatch.ToolInput) to
 
 /// Searches the resolved root and returns an owned tool result body.
 pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
-    return callWithOps(ctx, erased, .{});
+    const result = try callWithOps(ctx, erased, .{});
+    holdForTest();
+    return result;
+}
+
+// Only `tests/e2e/tui-interrupt-recovery.test.ts` sets
+// `FX_TEST_GREP_RELEASE`: a finished search then waits until the file it
+// names exists, so the test can cancel the turn while the tool is still
+// running. The libfx artifacts leave it out.
+fn holdForTest() void {
+    if (comptime build_options.libfx) return;
+    const release_path = io_mod.getenv("FX_TEST_GREP_RELEASE") orelse return;
+    while (true) : (io_mod.sleep(std.time.ns_per_ms)) {
+        std.Io.Dir.accessAbsolute(io_mod.getIo(), release_path, .{}) catch continue;
+        return;
+    }
 }
 
 const StatRootFn = *const fn ([]const u8) anyerror!std.Io.File.Stat;
 const CollectDirectoryFn = *const fn (
+    Allocator,
     Allocator,
     []const u8,
     []const u8,
@@ -185,6 +183,7 @@ const CollectFileFn = *const fn (
     ?glob_pattern.Pattern,
 ) anyerror!grep_search.Result;
 const CountDirectoryFn = *const fn (
+    Allocator,
     Allocator,
     []const u8,
     []const u8,
@@ -219,8 +218,11 @@ const SearchOutcome = union(enum) {
 fn callWithOps(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput, ops: CallOps) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(Input);
 
-    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena_state.deinit();
+    // The scan and the per-call work use the scratch allocator, so each search
+    // returns its memory when it ends; only the result body comes from
+    // `ctx.allocator`.
+    var arena_state = std.heap.ArenaAllocator.init(ctx.scratch_allocator);
+    defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
 
     const absolute_root = pathing.resolveWorkspaceOrExternalPath(arena, ctx.workspace_root, input.path) catch |err| {
@@ -228,14 +230,14 @@ fn callWithOps(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInp
         if (tool_result_errors.isFilesystemAccessDenied(err)) {
             return .{ .failure = try tool_result_errors.filesystemAccessDeniedJson(ctx.allocator, "grep_files", input.path, err) };
         }
-        return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "Unable to resolve grep search root: {s} ({s})", .{ input.path, @errorName(err) }) };
+        return .{ .failure = try ctx.allocator.print("Unable to resolve grep search root: {s} ({s})", .{ input.path, @errorName(err) }) };
     };
 
     var include_pattern: ?glob_pattern.Pattern = null;
     if (input.include) |include| {
         include_pattern = glob_pattern.Pattern.compile(arena, include) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.PatternTooLong => return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "grep_files field \"include\" must be at most {d} bytes", .{glob_pattern.max_pattern_bytes}) },
+            error.PatternTooLong => return .{ .failure = try ctx.allocator.print("grep_files field \"include\" must be at most {d} bytes", .{glob_pattern.max_pattern_bytes}) },
         };
     }
 
@@ -243,7 +245,7 @@ fn callWithOps(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInp
         if (tool_result_errors.isFilesystemAccessDenied(err)) {
             return .{ .failure = try tool_result_errors.filesystemAccessDeniedJson(ctx.allocator, "grep_files", absolute_root, err) };
         }
-        return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "Unable to stat grep search root: {s} ({s})", .{ absolute_root, @errorName(err) }) };
+        return .{ .failure = try ctx.allocator.print("Unable to stat grep search root: {s} ({s})", .{ absolute_root, @errorName(err) }) };
     };
 
     return switch (try searchGrepRoot(ctx, arena, input, absolute_root, root_stat, include_pattern, ops)) {
@@ -268,10 +270,10 @@ fn searchGrepRoot(
 ) tool_dispatch.DispatchError!SearchOutcome {
     return switch (root_stat.kind) {
         .directory => switch (input.mode) {
-            .count => .{ .count = ops.count_directory(arena, ctx.workspace_root, absolute_root, input.pattern, input.case_insensitive, ctx.ignored_list_entries, include_pattern) catch |err| {
+            .count => .{ .count = ops.count_directory(ctx.scratch_allocator, arena, ctx.workspace_root, absolute_root, input.pattern, input.case_insensitive, ctx.ignored_list_entries, include_pattern) catch |err| {
                 return searchFailure(ctx.allocator, absolute_root, "walk grep search root", err);
             } },
-            .matches, .files_with_matches => .{ .matches = ops.collect_directory(arena, ctx.workspace_root, absolute_root, input.pattern, input.case_insensitive, ctx.ignored_list_entries, include_pattern) catch |err| {
+            .matches, .files_with_matches => .{ .matches = ops.collect_directory(ctx.scratch_allocator, arena, ctx.workspace_root, absolute_root, input.pattern, input.case_insensitive, ctx.ignored_list_entries, include_pattern) catch |err| {
                 return searchFailure(ctx.allocator, absolute_root, "walk grep search root", err);
             } },
         },
@@ -283,7 +285,7 @@ fn searchGrepRoot(
                 return searchFailure(ctx.allocator, absolute_root, "scan grep file root", err);
             } },
         },
-        else => .{ .failure = try std.fmt.allocPrint(ctx.allocator, "Not a regular file or directory: {s}", .{absolute_root}) },
+        else => .{ .failure = try ctx.allocator.print("Not a regular file or directory: {s}", .{absolute_root}) },
     };
 }
 
@@ -297,7 +299,7 @@ fn searchFailure(
     if (tool_result_errors.isFilesystemAccessDenied(err)) {
         return .{ .failure = try tool_result_errors.filesystemAccessDeniedJson(alloc, "grep_files", absolute_root, err) };
     }
-    return .{ .failure = try std.fmt.allocPrint(alloc, "Unable to {s}: {s} ({s})", .{ action, absolute_root, @errorName(err) }) };
+    return .{ .failure = try alloc.print("Unable to {s}: {s} ({s})", .{ action, absolute_root, @errorName(err) }) };
 }
 
 fn statRoot(absolute_root: []const u8) anyerror!std.Io.File.Stat {
@@ -495,26 +497,17 @@ fn writeGrepResultNotes(
             .collection_cap => writer.print("... match collection cap reached at {d} matches before all candidate files were scanned\n", .{grep_search.collection_cap}) catch return error.OutOfMemory,
         }
     }
-    try writeCandidateNotes(
-        writer,
-        result.candidate_incomplete,
-        result.candidate_cap,
-        result.skipped_overlong,
-    );
+    try candidateCompleteness(result).writeNotes(writer);
 }
 
-fn writeCandidateNotes(
-    writer: *std.Io.Writer,
-    candidate_incomplete: bool,
-    candidate_cap: usize,
-    skipped_overlong: usize,
-) error{OutOfMemory}!void {
-    if (candidate_incomplete) {
-        writer.print("... candidate list may be incomplete; candidate cap {d} reached before all files were discovered\n", .{candidate_cap}) catch return error.OutOfMemory;
-    }
-    if (skipped_overlong > 0) {
-        writer.print("... skipped {d} overlong candidate path{s}\n", .{ skipped_overlong, if (skipped_overlong == 1) "" else "s" }) catch return error.OutOfMemory;
-    }
+/// The candidate fields of a `grep_search.Result` or `CountResult`.
+fn candidateCompleteness(result: anytype) tool_files.Completeness {
+    return .{
+        .incomplete = result.candidate_incomplete,
+        .cap_reached = result.candidate_cap_reached,
+        .candidate_cap = result.candidate_cap,
+        .skipped_overlong = result.skipped_overlong,
+    };
 }
 
 fn formatCount(
@@ -526,12 +519,7 @@ fn formatCount(
     defer out.deinit();
 
     out.writer.print("[grep] count {d} matching lines in {d} files for {s}\n", .{ result.matching_lines, result.matching_files, pattern }) catch return error.OutOfMemory;
-    try writeCandidateNotes(
-        &out.writer,
-        result.candidate_incomplete,
-        result.candidate_cap,
-        result.skipped_overlong,
-    );
+    try candidateCompleteness(result).writeNotes(&out.writer);
     return try out.toOwnedSlice();
 }
 
@@ -677,6 +665,7 @@ fn dispatchGrepFilesRaw(alloc: Allocator, workspace_root: []const u8, args_json:
     const registry = tool_dispatch.Registry{ .tools = &.{grep_files_dispatch_tool} };
     return tool_dispatch.dispatchToolCall(.{
         .allocator = alloc,
+        .scratch_allocator = alloc,
         .permission_mode = .auto,
         .workspace_root = workspace_root,
     }, registry, .{
@@ -686,8 +675,43 @@ fn dispatchGrepFilesRaw(alloc: Allocator, workspace_root: []const u8, args_json:
     });
 }
 
+test "grep_files keeps only its result in the turn's allocator" {
+    // fx passes the turn's arena as `allocator`, so a scan left there stays
+    // until the turn ends and every search adds another.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), "many");
+    for (0..2050) |i| {
+        var name_buf: [64]u8 = undefined;
+        const name = try std.mem.print(&name_buf, "many/file-{d:0>4}.txt", .{i});
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = if (i == 1) "needle\n" else "x\n" });
+    }
+    const args = try grepArgsJson(alloc, "needle", null, null, null, null, null);
+    defer alloc.free(args);
+
+    var turn_state = std.heap.ArenaAllocator.init(alloc);
+    defer turn_state.deinit();
+    const registry = tool_dispatch.Registry{ .tools = &.{grep_files_dispatch_tool} };
+    for (0..2) |_| {
+        const before = turn_state.queryCapacity();
+        const result = try tool_dispatch.dispatchToolCall(.{
+            .allocator = turn_state.allocator(),
+            .scratch_allocator = alloc,
+            .permission_mode = .auto,
+            .workspace_root = workspace,
+        }, registry, .{ .id = "call_1", .name = "grep_files", .arguments_json = args });
+        try std.testing.expectEqual(.success, result.status);
+        try std.testing.expect(std.mem.find(u8, result.body, "many/file-0001.txt") != null);
+        // Searching 2,050 files takes far more than this; the result does not.
+        try std.testing.expect(turn_state.queryCapacity() - before < 64 * 1024);
+    }
+}
+
 fn writeTempFile(alloc: Allocator, tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) ![]u8 {
-    if (std.fs.path.dirname(sub_path)) |parent| {
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| {
         try tmp.dir.createDirPath(io_mod.getIo(), parent);
     }
     var file = try tmp.dir.createFile(std.testing.io, sub_path, .{});
@@ -738,7 +762,7 @@ fn grepFilesFailureWithOps(
     };
     defer input.deinit(alloc);
 
-    const result = try callWithOps(.{ .allocator = alloc, .workspace_root = workspace_root }, .{ .ptr = &input, .deinit_fn = noopInputDeinit }, ops);
+    const result = try callWithOps(.{ .allocator = alloc, .scratch_allocator = alloc, .workspace_root = workspace_root }, .{ .ptr = &input, .deinit_fn = noopInputDeinit }, ops);
     switch (result) {
         .rich => return error.TestUnexpectedRichResult,
         .failure => |body| return body,
@@ -785,6 +809,7 @@ fn namedPipeStatRoot(_: []const u8) anyerror!std.Io.File.Stat {
 
 fn failingCollectDirectory(
     _: Allocator,
+    _: Allocator,
     _: []const u8,
     _: []const u8,
     _: []const u8,
@@ -811,6 +836,11 @@ test "grep_files decodes invalid argument shapes as failures" {
     try expectDecodeFailure("[]", "grep_files arguments must be an object");
     try expectDecodeFailure("{\"path\":\".\"}", "grep_files requires string field \"pattern\"");
     try expectDecodeFailure("{\"pattern\":1}", "grep_files field \"pattern\" must be a string");
+    try expectDecodeFailure("{\"pattern\":\"needle\",\"path\":1}", "grep_files field \"path\" must be a string");
+    try expectDecodeFailure("{\"pattern\":\"needle\",\"include\":[\"*.zig\"]}", "grep_files field \"include\" must be a string");
+    try expectDecodeFailure("{\"pattern\":\"needle\",\"case_insensitive\":\"true\"}", "grep_files field \"case_insensitive\" must be a boolean");
+    try expectDecodeFailure("{\"pattern\":\"needle\",\"mode\":\"files\"}", "grep_files field \"mode\" must be one of matches, files_with_matches, count");
+    try expectDecodeFailure("{\"pattern\":\"needle\",\"mode\":2}", "grep_files field \"mode\" must be a string");
 }
 
 test "grep_files validate preserves active raw pattern and path values" {
@@ -841,7 +871,7 @@ test "grep_files decodes defaults and all fields" {
         5,
         2,
     );
-    try expectDecodeInput("{\"pattern\":\"needle\",\"path\":1,\"include\":1,\"case_insensitive\":\"yes\"}", "needle", ".", null, false, output_cap, 0);
+    try expectDecodeInput("{\"pattern\":\"needle\",\"path\":null,\"include\":null,\"case_insensitive\":null,\"mode\":null}", "needle", ".", null, false, output_cap, 0);
 }
 
 test "grep_files decodes context_lines above cap as bounded" {
@@ -907,7 +937,7 @@ test "grep_files reports overlong include patterns before scanning" {
     var result = try dispatchGrepFiles(alloc, workspace, "needle", path, include, null, null, null);
     defer result.deinit(alloc);
 
-    const expected = try std.fmt.allocPrint(alloc, "grep_files field \"include\" must be at most {d} bytes", .{glob_pattern.max_pattern_bytes});
+    const expected = try alloc.print("grep_files field \"include\" must be at most {d} bytes", .{glob_pattern.max_pattern_bytes});
     defer alloc.free(expected);
     try std.testing.expectEqual(.failure, result.status);
     try std.testing.expectEqualStrings(expected, result.body);
@@ -931,13 +961,13 @@ test "grep_files reports stat failures after root resolution" {
 
 test "grep_files access denial returns structured recovery" {
     const alloc = std.testing.allocator;
-    const root = try std.fmt.allocPrint(alloc, "/tmp/fx-grep-files-access-{d}", .{io_mod.nanoTimestamp()});
+    const root = try alloc.print("/tmp/fx-grep-files-access-{d}", .{io_mod.nanoTimestamp()});
     defer alloc.free(root);
     defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), root) catch {};
     try std.Io.Dir.cwd().createDirPath(io_mod.getIo(), root);
     const workspace = try io_mod.realpathAlloc(alloc, root);
     defer alloc.free(workspace);
-    const path = try std.fs.path.join(alloc, &.{ workspace, "file.txt" });
+    const path = try std.Io.Dir.path.join(alloc, &.{ workspace, "file.txt" });
     defer alloc.free(path);
     {
         var file = try std.Io.Dir.createFileAbsolute(io_mod.getIo(), path, .{});
@@ -1057,7 +1087,7 @@ test "grep_files single-file search returns matching lines" {
     try std.testing.expectEqualStrings("[grep] 1 matches for needle\n - single.txt:2: needle here\n", result.body);
 }
 
-test "grep_files single-file include applies to basename" {
+test "grep_files single-file include matches the base name or the workspace path" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1071,7 +1101,14 @@ test "grep_files single-file include applies to basename" {
     try std.testing.expectEqual(.success, basename_match.status);
     try std.testing.expectEqualStrings("[grep] 1 matches for needle\n - src/single.zig:1: needle\n", basename_match.body);
 
-    var path_pattern_miss = try dispatchGrepFiles(alloc, workspace, "needle", file_path, "src/*.zig", null, null, null);
+    // A pattern with a slash matches the path relative to the workspace, as in
+    // a search of the whole workspace.
+    var path_pattern_match = try dispatchGrepFiles(alloc, workspace, "needle", file_path, "src/*.zig", null, null, null);
+    defer path_pattern_match.deinit(alloc);
+    try std.testing.expectEqual(.success, path_pattern_match.status);
+    try std.testing.expectEqualStrings("[grep] 1 matches for needle\n - src/single.zig:1: needle\n", path_pattern_match.body);
+
+    var path_pattern_miss = try dispatchGrepFiles(alloc, workspace, "needle", file_path, "lib/*.zig", null, null, null);
     defer path_pattern_miss.deinit(alloc);
     try std.testing.expectEqual(.success, path_pattern_miss.status);
     try std.testing.expectEqualStrings("[grep] no matches for needle\n", path_pattern_miss.body);
@@ -1110,7 +1147,7 @@ test "grep_files finds match beyond former traversal cap" {
     var i: usize = 0;
     while (i < 2050) : (i += 1) {
         var name_buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "many/file-{d:0>4}.txt", .{i});
+        const name = try std.mem.print(&name_buf, "many/file-{d:0>4}.txt", .{i});
         const path = try writeTempFile(alloc, &tmp, name, "not here\n");
         alloc.free(path);
     }
@@ -1420,11 +1457,22 @@ test "grep_files formatter reports candidate cap without output truncation wordi
     const body = try formatMatches(alloc, alloc, "", "needle", .{
         .matches = &.{},
         .candidate_incomplete = true,
+        .candidate_cap_reached = true,
         .candidate_cap = 2,
     }, output_cap, 0, 0, tool_dispatch.default_max_list_entries, 2000);
     defer alloc.free(body);
 
     try std.testing.expectEqualStrings("[grep] no matches for needle\n... candidate list may be incomplete; candidate cap 2 reached before all files were discovered\n", body);
+
+    // A listing left incomplete by unreadable folders or git files says so,
+    // not that the cap was reached.
+    const unreadable = try formatMatches(alloc, alloc, "", "needle", .{
+        .matches = &.{},
+        .candidate_incomplete = true,
+        .candidate_cap = 100000,
+    }, output_cap, 0, 0, tool_dispatch.default_max_list_entries, 2000);
+    defer alloc.free(unreadable);
+    try std.testing.expectEqualStrings("[grep] no matches for needle\n... candidate list may be incomplete; some folders or git files could not be read\n", unreadable);
 }
 
 test "grep_files classifiers are read-only and reversible" {

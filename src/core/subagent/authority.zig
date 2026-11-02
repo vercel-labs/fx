@@ -3,7 +3,6 @@ const child_state = @import("child_state.zig");
 const domain = @import("domain.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
 const permissions = @import("../permissions/permissions.zig");
-const session_child_store = @import("../session/session_child_store.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const session_store = @import("../session/session_store.zig");
 const types = @import("../shared/types.zig");
@@ -191,10 +190,9 @@ pub const Snapshot = struct {
 };
 
 pub const Resolver = struct {
-    sessions: *session_store.Store,
+    children: *child_state.V2Children,
     root_id: []const u8 = "",
     host: HostResolver,
-    child_store_options: session_child_store.Options = .{},
 
     pub fn resolve(
         self: *Resolver,
@@ -203,16 +201,9 @@ pub const Resolver = struct {
     ) Error!Snapshot {
         domain.validateId(child_id) catch return error.ChildNotAttached;
         domain.validateId(self.root_id) catch return error.ChildNotAttached;
-        var store = child_state.Store{
-            .sessions = self.sessions,
-            .parent_id = self.root_id,
-            .options = self.child_store_options,
-        };
+        const store = child_state.Store{ .children = self.children, .parent_id = self.root_id };
         const work_generation = blk: {
-            var lock = store.acquireLock(alloc) catch |err| return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.StoreUnavailable,
-            };
+            var lock = store.acquireLock();
             defer lock.release();
             var registry = store.load(alloc) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
@@ -229,10 +220,7 @@ pub const Resolver = struct {
         defer host.deinit(alloc);
 
         const current = blk: {
-            var lock = store.acquireLock(alloc) catch |err| return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.StoreUnavailable,
-            };
+            var lock = store.acquireLock();
             defer lock.release();
             var registry = store.load(alloc) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
@@ -484,7 +472,6 @@ test "tool authority excludes nested subagents and preserves rules" {
 }
 
 test "authority capture permits registry access and rejects changed work" {
-    const io_mod = @import("../shared/io.zig");
     const Fixture = struct {
         const Change = enum { none, finish, replace, permission, sibling, host_failure };
         store: child_state.Store,
@@ -494,7 +481,7 @@ test "authority capture permits registry access and rejects changed work" {
         fn resolve(raw: ?*anyopaque, alloc: Allocator, _: []const u8) HostResolveError!HostAuthority {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.calls += 1;
-            var lock = self.store.acquireLock(alloc) catch return error.HostAuthorityUnavailable;
+            var lock = self.store.acquireLock();
             defer lock.release();
             var registry = self.store.load(alloc) catch return error.HostAuthorityUnavailable;
             defer registry.deinit(alloc);
@@ -537,35 +524,13 @@ test "authority capture permits registry access and rejects changed work" {
     };
 
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-    var sessions = try session_store.Store.initFromHome(alloc, home, home);
-    defer sessions.deinit(alloc);
-    var state: @import("../session/session_codec.zig").DurableSessionState = .{
-        .id = try alloc.dupe(u8, "authority-parent"),
-        .origin_workspace_root = try alloc.dupe(u8, home),
-        .workspace_root = try alloc.dupe(u8, home),
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = @import("../session/session.zig").ConversationLanguage.literal("en"),
-        .preferences = .{
-            .model = try alloc.dupe(u8, "test/model"),
-            .effort = types.ReasoningEffort.literal("low"),
-            .fast_mode = false,
-        },
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    };
-    defer state.deinit(alloc);
-    var parent = try sessions.startWritableSession(alloc, state);
-    defer parent.deinit(alloc);
-    const store = child_state.Store{ .sessions = &sessions, .parent_id = state.id };
-
     for (std.enums.values(Fixture.Change)) |change| {
-        var registry = try child_state.Registry.init(alloc, state.id);
+        // A parent for each change: v2 children are never removed (D22).
+        var parent: child_state.TestParent = undefined;
+        try parent.init(alloc);
+        defer parent.deinit();
+        const store = parent.stateStore();
+        var registry = try child_state.Registry.init(alloc, parent.parent.id());
         defer registry.deinit(alloc);
         var work = child_state.ActiveWork{
             .id = try alloc.dupe(u8, "work-one"),
@@ -578,8 +543,8 @@ test "authority capture permits registry access and rejects changed work" {
         try store.save(alloc, registry);
         var fixture = Fixture{ .store = store, .change = change };
         var resolver = Resolver{
-            .sessions = &sessions,
-            .root_id = state.id,
+            .children = &parent.children,
+            .root_id = parent.parent.id(),
             .host = .{ .context = &fixture, .resolve_fn = Fixture.resolve },
         };
         try std.testing.expectError(error.ChildNotAttached, resolver.resolve(alloc, "missing-child"));
@@ -607,7 +572,7 @@ test "authority capture permits registry access and rejects changed work" {
                 var host = try HostAuthority.capture(alloc, &.{ "read_file", "subagent" }, &.{}, .{}, &.{});
                 defer host.deinit(alloc);
                 try std.testing.expectEqual(
-                    authorityGeneration("authority-child", state.id, current.generation, host.generation),
+                    authorityGeneration("authority-child", parent.parent.id(), current.generation, host.generation),
                     snapshot.generation,
                 );
             },

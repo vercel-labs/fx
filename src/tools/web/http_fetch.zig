@@ -1,6 +1,7 @@
 const std = @import("std");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const select_watch = @import("../../core/shared/select_watch.zig");
 const url_policy = @import("url_policy.zig");
 
 const Allocator = std.mem.Allocator;
@@ -316,13 +317,13 @@ fn cloneUrl(alloc: Allocator, source: url_policy.ValidatedUrl) !url_policy.Valid
 fn hostHeader(alloc: Allocator, target: url_policy.ValidatedUrl) ![]u8 {
     const host = try hostForHeader(alloc, target.canonical_host);
     defer alloc.free(host);
-    if (target.explicit_port) |port| return std.fmt.allocPrint(alloc, "{s}:{d}", .{ host, port });
+    if (target.explicit_port) |port| return alloc.print("{s}:{d}", .{ host, port });
     return alloc.dupe(u8, host);
 }
 
 fn hostForHeader(alloc: Allocator, canonical_host: []const u8) ![]u8 {
     if (std.mem.findScalar(u8, canonical_host, ':') == null) return alloc.dupe(u8, canonical_host);
-    return std.fmt.allocPrint(alloc, "[{s}]", .{canonical_host});
+    return alloc.print("[{s}]", .{canonical_host});
 }
 
 fn isRedirectStatus(status: std.http.Status) bool {
@@ -342,26 +343,52 @@ fn resolveDefault(_: *anyopaque, alloc: Allocator, host: []const u8, port: u16, 
 
 const ResolveSelect = union(enum) {
     lookup: anyerror![]IpAddress,
-    timeout: anyerror!void,
+    watch: std.Io.Cancelable!select_watch.Outcome,
 };
+
+/// Ends a DNS lookup's watch when the hop deadline passes. Cancellation is
+/// checked by the lookup itself. See `select_watch` for why the resolver stops
+/// the watch instead of cancelling it.
+const ResolveCondition = struct {
+    deadline: Deadline,
+
+    pub fn cancelled(_: ResolveCondition) bool {
+        return false;
+    }
+
+    pub fn expired(condition: ResolveCondition, _: std.Io) bool {
+        return monotonicMillis() >= condition.deadline.deadline_ms;
+    }
+};
+
+const ResolveWatch = select_watch.Watch(ResolveCondition);
 
 fn resolveWithDeadline(alloc: Allocator, host_name: std.Io.net.HostName, port: u16, deadline: Deadline, options: FetchOptions) anyerror![]IpAddress {
     const zio = io_mod.getIo();
+    var watch: ResolveWatch = .{};
     var select_buffer: [2]ResolveSelect = undefined;
     var select: std.Io.Select(ResolveSelect) = .init(zio, &select_buffer);
 
-    try select.concurrent(.lookup, collectLookup, .{ alloc, host_name, port, options });
-    try select.concurrent(.timeout, waitForDeadline, .{deadline});
+    try select.concurrent(.watch, ResolveWatch.run, .{ &watch, zio, ResolveCondition{ .deadline = deadline } });
+    select.concurrent(.lookup, collectLookup, .{ alloc, host_name, port, options }) catch |err| {
+        watch.finish(&select);
+        return err;
+    };
 
-    const result = try select.await();
+    const result = select.await() catch |err| {
+        watch.stop(zio);
+        cancelResolveSelect(alloc, &select);
+        return err;
+    };
     switch (result) {
         .lookup => |lookup_result| {
-            select.cancelDiscard();
+            watch.finish(&select);
             return lookup_result;
         },
-        .timeout => |timeout_result| {
+        // getaddrinfo cannot be stopped any other way, so the lookup is cancelled.
+        .watch => |watch_result| {
             cancelResolveSelect(alloc, &select);
-            try timeout_result;
+            _ = try watch_result;
             return error.Timeout;
         },
     }
@@ -390,22 +417,13 @@ fn collectLookup(alloc: Allocator, host_name: std.Io.net.HostName, port: u16, op
     return addresses.toOwnedSlice(alloc);
 }
 
-fn waitForDeadline(deadline: Deadline) anyerror!void {
-    const timestamp: std.Io.Clock.Timestamp = .{
-        .clock = .awake,
-        .raw = std.Io.Timestamp.fromNanoseconds(@as(i96, deadline.deadline_ms) * std.time.ns_per_ms),
-    };
-    try timestamp.wait(io_mod.getIo());
-    return error.Timeout;
-}
-
 fn cancelResolveSelect(alloc: Allocator, select: *std.Io.Select(ResolveSelect)) void {
     while (select.cancel()) |item| switch (item) {
         .lookup => |lookup_result| {
             const addresses = lookup_result catch continue;
             alloc.free(addresses);
         },
-        .timeout => {},
+        .watch => {},
     };
 }
 
@@ -614,7 +632,7 @@ fn readResponse(
 
         const head_end = complete_head_end.?;
         var parsed = try parseHead(alloc, received.items[0 .. head_end - "\r\n\r\n".len]);
-        const status_code = @intFromEnum(parsed.status);
+        const status_code = @backingInt(parsed.status);
         if (status_code >= 100 and status_code < 200) {
             if (status_code == 101) {
                 parsed.deinit(alloc);
@@ -629,7 +647,7 @@ fn readResponse(
             parsed.deinit(alloc);
 
             const pending_len = received.items.len - head_end;
-            std.mem.copyForwards(u8, received.items[0..pending_len], received.items[head_end..]);
+            @memmove(received.items[0..pending_len], received.items[head_end..]);
             received.items.len = pending_len;
             continue;
         }
@@ -867,7 +885,7 @@ fn responseBodyFraming(status: StatusLine, framing: ResponseFramingState) !BodyF
     if (status.version == .http_1_0 and transfer_coding.present)
         return error.InvalidHttpResponse;
 
-    const status_code = @intFromEnum(status.status);
+    const status_code = @backingInt(status.status);
     return if (status_code == 204 or status_code == 304)
         .no_body
     else if (transfer_coding.present and framing.content_length_present)
@@ -904,7 +922,7 @@ fn parseStatusLine(line: []const u8) !StatusLine {
     }
     return .{
         .version = version,
-        .status = @enumFromInt(code),
+        .status = @fromBackingInt(@intCast(code)),
     };
 }
 
@@ -1341,7 +1359,7 @@ fn checkSocketError(fd: posix.fd_t) !void {
     var len: std.c.socklen_t = @sizeOf(c_int);
     if (std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, &value, &len) != 0) return error.ConnectionFailed;
     if (value == 0) return;
-    const socket_error: posix.E = @enumFromInt(value);
+    const socket_error: posix.E = @fromBackingInt(@intCast(value));
     return classifyConnectErrno(socket_error);
 }
 
@@ -1671,7 +1689,7 @@ fn pollSocketError(fd: posix.fd_t) !void {
     if (std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, &value, &len) != 0)
         return error.UnexpectedClose;
     if (value == 0) return error.UnexpectedClose;
-    const socket_error: posix.E = @enumFromInt(value);
+    const socket_error: posix.E = @fromBackingInt(@intCast(value));
     return switch (socket_error) {
         .CONNREFUSED => error.ConnectionRefused,
         .CONNRESET => error.ConnectionResetByPeer,
@@ -1766,7 +1784,7 @@ fn expectResponseBody(payload: []const u8, expected_status: u16, expected_body: 
     var response = try readResponse(alloc, &reader, max_body_bytes, .{}, &failure_stage);
     defer response.deinit(alloc);
 
-    try std.testing.expectEqual(expected_status, @intFromEnum(response.status));
+    try std.testing.expectEqual(expected_status, @backingInt(response.status));
     try std.testing.expectEqualStrings(expected_body, response.body);
 }
 
@@ -1914,8 +1932,7 @@ test "web_fetch response parser consumes informational heads before final respon
         "103 Early Hints",
     };
     for (informational) |status_line| {
-        const payload = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const payload = try std.testing.allocator.print(
             "HTTP/1.1 {s}\r\nX-Interim: yes\r\n\r\n" ++
                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
             .{status_line},
@@ -2685,7 +2702,7 @@ const FakeResolver = struct {
     calls: usize = 0,
     last_host: ?[]u8 = null,
     last_port: ?u16 = null,
-    deadlines: [fake_recorded_calls]?i64 = [_]?i64{null} ** fake_recorded_calls,
+    deadlines: [fake_recorded_calls]?i64 = @splat(null),
 
     fn resolver(self: *@This()) Resolver {
         return .{ .ctx = @ptrCast(self), .resolve = resolve };
@@ -2722,7 +2739,7 @@ const FakeConnector = struct {
     last_first_admitted_address: ?IpAddress = null,
     last_max_body_bytes: ?usize = null,
     last_deadline_ms: ?i64 = null,
-    deadlines: [fake_recorded_calls]?i64 = [_]?i64{null} ** fake_recorded_calls,
+    deadlines: [fake_recorded_calls]?i64 = @splat(null),
     sleep_after_first_call_ms: u64 = 0,
 
     fn connector(self: *@This()) Connector {
@@ -3376,7 +3393,7 @@ test "web_fetch transport traces stable stages and redact sensitive values" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "web-fetch-transport.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "web-fetch-transport.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -3455,7 +3472,7 @@ const ScriptedDialer = struct {
     errors: []const ?anyerror,
     returned_fds: []const posix.fd_t,
     attempts: [4]IpAddress = undefined,
-    deadlines: [4]?i64 = [_]?i64{null} ** 4,
+    deadlines: [4]?i64 = @splat(null),
     calls: usize = 0,
     cancel_after_call: ?usize = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
@@ -3880,4 +3897,137 @@ test "web_fetch closed peer write returns a cause without terminating process" {
         return;
     };
     return error.TestExpectedError;
+}
+
+test "web_fetch response parser reads a response the same however it is split" {
+    try std.testing.fuzz({}, fuzzResponseParser, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").http_response.*),
+    });
+}
+
+const fuzz_response_pieces = [_][]const u8{
+    "HTTP/1.1 ",        "HTTP/1.0 ",                  "200",          "301",           "100", " OK", "\r\n", "\r\n\r\n",
+    "Content-Length:",  "Transfer-Encoding: chunked", "Location: /a", "Content-Type:", " ",   "0",   "5",    "a",
+    "ffffffffffffffff", ";x=1",                       ";q=\"v\"",     "hello",         "\n",  ":",   "gzip", ",",
+};
+
+const fuzz_statuses = [_]struct { code: u16, text: []const u8 }{
+    .{ .code = 200, .text = "OK" },    .{ .code = 201, .text = "Created" },   .{ .code = 301, .text = "Moved Permanently" },
+    .{ .code = 302, .text = "Found" }, .{ .code = 404, .text = "Not Found" }, .{ .code = 500, .text = "" },
+};
+
+/// Appends a well-formed response and returns its body.
+fn appendFuzzResponse(alloc: Allocator, smith: *std.testing.Smith, wire: *std.ArrayList(u8), body: *std.ArrayList(u8)) !u16 {
+    for (0..smith.valueRangeAtMost(u8, 0, 2)) |_| try wire.appendSlice(alloc, "HTTP/1.1 100 Continue\r\n\r\n");
+    const status = fuzz_statuses[smith.index(fuzz_statuses.len)];
+    try wire.print(alloc, "HTTP/1.1 {d} {s}\r\n", .{ status.code, status.text });
+    if (smith.value(bool)) try wire.appendSlice(alloc, "Content-Type: text/plain; charset=utf-8\r\n");
+    if (status.code == 301 or status.code == 302) try wire.appendSlice(alloc, "Location: /next?q=1\r\n");
+    if (smith.value(bool)) try wire.appendSlice(alloc, "X-Extra:  value with spaces \r\n");
+
+    for (0..smith.valueRangeAtMost(u16, 0, 320)) |_| try body.append(alloc, smith.value(u8));
+    switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => {
+            const name = if (smith.value(bool)) "Content-Length" else "content-length";
+            try wire.print(alloc, "{s}: {d}\r\n\r\n", .{ name, body.items.len });
+            try wire.appendSlice(alloc, body.items);
+        },
+        1 => {
+            try wire.appendSlice(alloc, "Transfer-Encoding: chunked\r\n\r\n");
+            var sent: usize = 0;
+            while (sent < body.items.len) {
+                const size = @min(body.items.len - sent, @as(usize, smith.valueRangeAtMost(u16, 1, 80)));
+                if (smith.value(bool)) try wire.print(alloc, "{X}", .{size}) else try wire.print(alloc, "{x}", .{size});
+                if (smith.valueRangeAtMost(u8, 0, 3) == 0) try wire.appendSlice(alloc, ";ext=\"a b\"");
+                try wire.appendSlice(alloc, "\r\n");
+                try wire.appendSlice(alloc, body.items[sent .. sent + size]);
+                try wire.appendSlice(alloc, "\r\n");
+                sent += size;
+            }
+            try wire.appendSlice(alloc, "0\r\n");
+            if (smith.value(bool)) try wire.appendSlice(alloc, "X-Trailer: ignored\r\n");
+            try wire.appendSlice(alloc, "\r\n");
+        },
+        else => {
+            // Without a length the body runs to the end of the connection.
+            try wire.appendSlice(alloc, "Connection: close\r\n\r\n");
+            try wire.appendSlice(alloc, body.items);
+        },
+    }
+    return status.code;
+}
+
+fn fuzzResponseParser(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(alloc);
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(alloc);
+    const well_formed = smith.valueRangeAtMost(u8, 0, 3) != 0;
+    var status: u16 = 0;
+    if (well_formed) {
+        status = try appendFuzzResponse(alloc, smith, &wire, &body);
+    } else {
+        for (0..smith.valueRangeAtMost(u8, 0, 24)) |_| {
+            if (smith.valueRangeAtMost(u8, 0, 5) == 0) {
+                try wire.append(alloc, smith.value(u8));
+            } else {
+                try wire.appendSlice(alloc, fuzz_response_pieces[smith.index(fuzz_response_pieces.len)]);
+            }
+        }
+    }
+    const cap = @as(usize, smith.valueRangeAtMost(u16, 0, 400));
+
+    var splits: std.ArrayList(usize) = .empty;
+    defer splits.deinit(alloc);
+    var at: usize = 0;
+    while (at < wire.items.len) {
+        at = @min(wire.items.len, at + @as(usize, smith.valueRangeAtMost(u16, 1, 64)));
+        try splits.append(alloc, at);
+    }
+
+    const whole_splits = [_]usize{wire.items.len};
+    var whole = readFuzzResponse(alloc, wire.items, &whole_splits, cap);
+    defer if (whole) |*response| response.deinit(alloc) else |_| {};
+    var pieces = readFuzzResponse(alloc, wire.items, splits.items, cap);
+    defer if (pieces) |*response| response.deinit(alloc) else |_| {};
+
+    if (whole) |response| {
+        const other = try pieces;
+        try std.testing.expectEqual(response.status, other.status);
+        try std.testing.expectEqualStrings(response.body, other.body);
+        try expectEqualOptionalStrings(response.location, other.location);
+        try expectEqualOptionalStrings(response.content_type, other.content_type);
+        try expectEqualOptionalStrings(response.content_encoding, other.content_encoding);
+        try std.testing.expect(response.body.len <= cap);
+        if (well_formed) {
+            try std.testing.expectEqual(status, @backingInt(response.status));
+            try std.testing.expectEqualStrings(body.items, response.body);
+        }
+    } else |err| {
+        try std.testing.expectError(err, pieces);
+        if (well_formed) {
+            try std.testing.expect(body.items.len > cap);
+            try std.testing.expectEqual(error.BodyTooLarge, err);
+        }
+    }
+}
+
+fn readFuzzResponse(alloc: Allocator, wire: []const u8, splits: []const usize, cap: usize) anyerror!ConnectorResponse {
+    const calls = try alloc.alloc(std.testing.Reader.Call, splits.len);
+    defer alloc.free(calls);
+    var start: usize = 0;
+    for (splits, calls) |end, *call| {
+        call.* = .{ .buffer = wire[start..end] };
+        start = end;
+    }
+    var buffer: [64]u8 = undefined;
+    var reader: std.testing.Reader = .init(&buffer, calls);
+    var failure_stage: FailureStage = .response_head;
+    return readResponse(alloc, &reader.interface, cap, .{}, &failure_stage);
+}
+
+fn expectEqualOptionalStrings(expected: ?[]const u8, actual: ?[]const u8) !void {
+    if (expected) |value| return std.testing.expectEqualStrings(value, actual orelse return error.TestExpectedEqual);
+    try std.testing.expect(actual == null);
 }

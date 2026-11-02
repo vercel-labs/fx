@@ -1,0 +1,1 @@
+CONV_CLIENT_PROMPT: you run inside Mini.

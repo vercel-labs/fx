@@ -5,10 +5,12 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -126,6 +128,16 @@ function processRssKb(pid: number): number {
     throw new Error(`invalid RSS for pid ${pid}: ${JSON.stringify(output)}`);
   }
   return rss;
+}
+
+// The @ menu rows: the lines between the two rules below the composer.
+function pickerRows(grid: string[]): string[] {
+  const composer = grid.findIndex(isComposerLine);
+  const rules = grid.flatMap((line, index) =>
+    index > composer && /^─+$/.test(line.trim()) ? [index] : []
+  );
+  if (composer < 0 || rules.length < 2) return [];
+  return grid.slice(rules[0]! + 1, rules[1]!).map((line) => line.trim()).filter(Boolean);
 }
 
 function composerTextFromPane(pane: string): string {
@@ -359,7 +371,7 @@ function expectFileDiscoveryOffMainThread(trace: string): void {
   );
   const discoveryThreads = traceThreadIds(
     trace,
-    /workspace file discovery process spawning thread=(\d+)/g,
+    /file index root (?:scanned|reused) root=\d+ .*thread=(\d+)/g,
   );
   const mainThreads = new Set(callerThreads);
 
@@ -427,6 +439,147 @@ async function replayTape(current: Fixture): Promise<void> {
 }
 
 describe("@ file picker", () => {
+  tmuxTest(
+    "Tab opens a folder that lists itself first, and Enter selects a folder",
+    async () => {
+      const current = createFixture("fx-file-picker-folder-");
+      mkdirSync(join(current.workspace, "notes", "drafts"), { recursive: true });
+      writeFileSync(join(current.workspace, "notes", "todo.md"), "todo");
+      writeFileSync(join(current.workspace, "notes", "drafts", "idea.md"), "idea");
+      const active = await startMockFx(current, [], 1000);
+
+      await active.sendLiteral("Review @notes");
+      await active.waitForText("notes/", TIMEOUT);
+      await active.sendKeys("Tab");
+      await active.waitForText("notes/todo.md", TIMEOUT);
+      expect(await composerPlainText(active)).toBe("Review @notes/");
+      expect(pickerRows(await active.capturePaneGrid())).toEqual(["notes/", "notes/drafts/", "notes/todo.md"]);
+
+      // Enter on the first row selects the opened folder itself.
+      await active.sendKeys("Enter");
+      await active.sendLiteral("please");
+      await active.waitForPane((pane) => composerTextFromPane(pane) === "Review @notes/ please", TIMEOUT);
+      expect(pickerRows(await active.capturePaneGrid())).toEqual([]);
+
+      // Enter on a listed child folder selects that folder.
+      await clearComposer(active);
+      await active.sendLiteral("@notes/");
+      await active.waitForText("notes/drafts/", TIMEOUT);
+      await active.sendKeys("Down");
+      await active.sendKeys("Enter");
+      await active.sendLiteral("x");
+      await active.waitForPane((pane) => composerTextFromPane(pane) === "@notes/drafts/ x", TIMEOUT);
+      expect(gateway?.requests ?? []).toHaveLength(0);
+      expectCleanRuntime(current, active);
+      await clearComposer(active);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TIMEOUT,
+  );
+
+  tmuxTest(
+    "shows ten rows when the terminal has room and scrolls the rows it shows",
+    async () => {
+      const current = createFixture("fx-file-picker-rows-");
+      const names = Array.from({ length: 30 }, (_, i) => `item-${String(i).padStart(2, "0")}.txt`);
+      for (const name of names) writeFileSync(join(current.workspace, name), "x");
+      gateway = startFakeGateway([]);
+      session = await TmuxSession.create({
+        cmd: FX_BIN, cwd: current.workspace, env: mockFxEnvironment(current, gateway),
+        isolated: true, width: 112, height: 40, stderrPath: current.stderrPath,
+      });
+      const active = session;
+      await active.waitForComposer(TIMEOUT);
+      await active.sendLiteral("@item-");
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === names.slice(0, 10).join("|"), TIMEOUT);
+
+      // A short terminal keeps six rows, and navigation scrolls those six:
+      // moving back up leaves the window in place until the selection passes
+      // its top row.
+      await active.resizeWindow(112, 16);
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === names.slice(0, 6).join("|"), TIMEOUT);
+      for (let i = 0; i < 7; i++) await active.sendKeys("Down");
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === names.slice(2, 8).join("|"), TIMEOUT);
+      for (let i = 0; i < 6; i++) await active.sendKeys("Up");
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === names.slice(1, 7).join("|"), TIMEOUT);
+      await active.sendKeys("Tab");
+      await active.waitForPane((pane) => composerTextFromPane(pane) === "@item-01.txt", TIMEOUT);
+      expect(gateway.requests).toHaveLength(0);
+      expectCleanRuntime(current, active);
+      await clearComposer(active);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TIMEOUT,
+  );
+
+  tmuxTest(
+    "paints a folder's rows with the keystroke instead of a loading frame",
+    async () => {
+      const current = createFixture("fx-file-picker-folder-frame-");
+      mkdirSync(join(current.workspace, "tree", "inner"), { recursive: true });
+      writeFileSync(join(current.workspace, "tree", "top.txt"), "top");
+      writeFileSync(join(current.workspace, "tree", "inner", "leaf-a.txt"), "a");
+      writeFileSync(join(current.workspace, "tree", "inner", "leaf-b.txt"), "b");
+      const active = await startMockFx(current, [], 1000);
+
+      await active.sendLiteral("@./tree/");
+      await active.waitForText("./tree/top.txt", TIMEOUT);
+      await active.sendKeys("Down");
+      await active.sendKeys("Tab");
+      await active.waitForText("./tree/inner/leaf-a.txt", TIMEOUT);
+      await active.sendLiteral("leaf-b");
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === "./tree/inner/leaf-b.txt", TIMEOUT);
+      expectCleanRuntime(current, active);
+      await clearComposer(active);
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+
+      // Every frame fx wrote, interleaved with the keystrokes that caused them.
+      const framesDir = join(current.root, "frames");
+      const replay = await runFx(["replay", current.tapePath, "--frames-dir", framesDir], {
+        cwd: current.workspace, env: { HOME: current.home }, timeoutMs: TIMEOUT,
+      });
+      expect(replay.code).toBe(0);
+      const frames = readdirSync(join(framesDir, "frames"))
+        .filter((name) => name.endsWith(".json"))
+        .map((name) => JSON.parse(readFileSync(join(framesDir, "frames", name), "utf8")) as {
+          index: number;
+          elapsed_ms: number;
+          kind: string;
+        })
+        .sort((a, b) => a.index - b.index);
+      let lastInputMs = Number.NEGATIVE_INFINITY;
+      let folderRowsPainted = false;
+      for (const frame of frames) {
+        if (frame.kind === "stdin") {
+          lastInputMs = frame.elapsed_ms;
+          continue;
+        }
+        if (frame.kind !== "stdout") continue;
+        // Grid files frame each terminal row as |row|.
+        const grid = readFileSync(
+          join(framesDir, "frames", `${String(frame.index).padStart(4, "0")}.grid.txt`),
+          "utf8",
+        ).split("\n").map((line) => line.replace(/^\|(.*)\|$/, "$1"));
+        if (!composerTextFromPane(grid.join("\n")).startsWith("@./tree/")) continue;
+        if (pickerRows(grid).includes("./tree/inner/leaf-a.txt")) folderRowsPainted = true;
+        // A folder that lists within one 8 ms tick paints together with its
+        // keystroke. A loading frame is allowed only once that wait has run
+        // out; 7 allows for millisecond rounding between the tape and the wait.
+        if (grid.some((line) => line.includes("indexing files..."))) {
+          expect(frame.elapsed_ms - lastInputMs).toBeGreaterThanOrEqual(7);
+        }
+      }
+      expect(folderRowsPainted).toBe(true);
+    },
+    TIMEOUT,
+  );
+
   tmuxTest(
     "opens and selects a file while a turn is in flight",
     async () => {
@@ -679,7 +832,14 @@ describe("@ file picker", () => {
         }
       })();
 
+      // A refresh of an unchanged tree reuses the saved listing in a few
+      // milliseconds. Touching the git index, as `git add` would, makes each
+      // refresh rescan every file without changing the result, so frames can
+      // observe a replacement in flight.
+      const gitIndexPath = join(current.workspace, ".git", "index");
       const injectCycle = () => {
+        const now = new Date();
+        utimesSync(gitIndexPath, now, now);
         active.sendKeysImmediate(["Escape", "C-u"]);
         active.sendLiteralImmediate(`${LIFECYCLE_QUERY.slice(0, -1)}`);
         active.sendLiteralImmediate(LIFECYCLE_QUERY.slice(-1));
@@ -838,8 +998,15 @@ describe("@ file picker", () => {
       for (const snapshot of activeQueryFrames) {
         expect(snapshot.pane).not.toContain("indexing files...");
       }
+      // A replacement finishes in tens of milliseconds, close to one frame
+      // capture, so a frame inside it is luck. What must hold is that
+      // replacements began while the query was on screen and every frame
+      // around them kept the completed result.
       expect(
-        activeQueryFrames.some((snapshot) => replacementIncomplete(snapshot.trace)),
+        activeQueryFrames.some((snapshot) =>
+          traceGenerationNumbers(snapshot.trace, "file index generation started")
+            .some((generation) => generation >= firstReplacementGeneration)
+        ),
       ).toBe(true);
 
       let acceptedFilePrompt = "";
@@ -968,7 +1135,7 @@ describe("@ file picker", () => {
 
       const finalTrace = await waitForFileText(
         current.tracePath,
-        "file index shutdown complete",
+        "file index shutdown requested",
       );
       const replacementStart = finalTrace.indexOf(
         `file index generation started generation=${replacementGeneration}`,
@@ -983,7 +1150,6 @@ describe("@ file picker", () => {
       expect(replacementReady).toBeGreaterThan(replacementStart);
       expect(replacementAdopted).toBeGreaterThan(replacementReady);
       expect(finalTrace).toContain("file index refresh coalesced");
-      expect(finalTrace).toContain("file index shutdown requested");
       expectFileDiscoveryOffMainThread(finalTrace);
 
       if (artifactDir) {
@@ -1637,7 +1803,8 @@ describe("@ file picker", () => {
       expect(await composerPlainText(active)).toBe("@./second/");
       expect(starts()).toBe(2);
       expect(gateway.requests).toHaveLength(0);
-      await active.sendKeys("Tab");
+      // The first row is the opened folder itself; its file follows.
+      await active.sendKeys("Down Tab");
       expect(await composerPlainText(active)).toBe("@./second/beta.txt");
       await clearComposer(active);
       const scrollback = await active.captureFullScrollbackEscapes();
@@ -1708,7 +1875,8 @@ describe("@ file picker", () => {
       await active.waitForText("Selection unavailable", TIMEOUT);
       expect(await composerPlainText(active)).toBe("@./retry/");
       expect(gateway?.requests).toHaveLength(0);
-      await active.sendKeys("Down Enter");
+      // The rows are now the folder and b.txt; move from the stale slot to b.txt.
+      await active.sendKeys("Down Down Enter");
       expect(await composerPlainText(active)).toBe("@./retry/b.txt");
 
       await clearComposer(active);
@@ -1722,7 +1890,8 @@ describe("@ file picker", () => {
       await active.sendKeys("Tab");
       await active.waitForText("./missing/recovered.txt", TIMEOUT);
       expect(await composerPlainText(active)).toBe("@./missing/");
-      await active.sendKeys("Tab");
+      // The recovered folder lists itself first; its file follows.
+      await active.sendKeys("Down Tab");
       expect(await composerPlainText(active)).toBe("@./missing/recovered.txt");
       await active.sendLiteral(" Reply with the words PRESENTED, PICKER, and OK joined by underscores.");
       await active.sendKeys("Enter");
@@ -1849,7 +2018,8 @@ describe("@ file picker", () => {
       await clearComposer(active);
       await active.sendLiteral("@~");
       await active.waitForText("~/home-target.txt", TIMEOUT);
-      await active.sendKeys("Down Enter");
+      // Rows: the home folder itself, ~/.fx/, then ~/home-target.txt.
+      await active.sendKeys("Down Down Enter");
       expect(await composerPlainText(active)).toBe("@~/home-target.txt");
       expect(gateway?.requests).toHaveLength(0);
       await active.sendLiteral(" Reply with the words SHORTCUT, FLOW, and OK joined by underscores.");
@@ -1920,6 +2090,9 @@ describe("@ file picker", () => {
       await active.waitForText("empty-workspace/", TIMEOUT);
       await active.sendKeys("Tab");
       expect(await composerPlainText(active)).toBe("@empty-workspace/");
+      // An opened empty folder still lists itself, so it can be selected.
+      await active.waitForPane((pane) => pickerRows(pane.split("\n")).join("|") === "empty-workspace/", TIMEOUT);
+      await active.sendLiteral("zzz");
       await active.waitForText("no matching files", TIMEOUT);
       await active.sendKeys("Escape");
       await active.waitForPane((pane) => !pane.includes("no matching files"), TIMEOUT);
@@ -2125,7 +2298,7 @@ describe("@ file picker", () => {
         writeFileSync(current.stderrPath, "");
         const activeGateway = gateway!;
         session = await TmuxSession.create({
-          cmd: `${FX_BIN} --resume-last`,
+          cmd: `${FX_BIN} --resume last`,
           cwd: current.workspace,
           env: mockFxEnvironment(current, activeGateway, {
             FX_RECORD: join(current.root, `resume-${cycle}.fxtape`),

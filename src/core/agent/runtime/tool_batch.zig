@@ -1,6 +1,8 @@
 const std = @import("std");
+const observation = @import("observation.zig");
 const types = @import("../../shared/types.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
+const io_mod = @import("../../shared/io.zig");
 const diff = @import("../../output/diff.zig");
 const tool_dispatch = @import("../../tooling/tool_dispatch.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
@@ -23,10 +25,14 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const ToolExecutionResult = runtime_tool_contracts.ToolExecutionResult;
 
 pub const StepBatchState = struct {
+    observer: ?*observation.Observer = null,
     step_error_count: usize = 0,
     step_total_count: usize = 0,
     step_had_writes: bool = false,
     pending_user_suffix: std.ArrayList(ChatMessage) = .empty,
+    /// Turn-scoped identical-failure tracker owned by the orchestrator step
+    /// loop. Null disables escalation (tests and non-turn callers).
+    identical_failure_escalation: ?*runtime_tool_admission.IdenticalFailureEscalationState = null,
 
     pub fn allToolResultsFailed(self: StepBatchState) bool {
         return self.step_total_count > 0 and self.step_error_count == self.step_total_count;
@@ -69,18 +75,39 @@ pub fn appendToolResultContent(
     if (accounting.increment_total) batch.step_total_count += 1;
     if (accounting.increment_error) batch.step_error_count += 1;
     if (accounting.mark_write) batch.step_had_writes = true;
+    var content = model_output;
+    // Only well-formed calls escalate: malformed-argument rejections never
+    // execute and already have their own hard-stop path.
+    if (tool_call.argument_integrity == .valid) {
+        if (batch.identical_failure_escalation) |escalation| {
+            const failure_count = try escalation.observe(arena, tool_call, accounting.increment_error);
+            if (failure_count >= 2) {
+                content = try runtime_tool_admission.appendIdenticalFailureEscalation(
+                    arena,
+                    model_output,
+                    failure_count,
+                );
+            }
+        }
+    }
     try within_turn_suffix.append(arena, .{
         .role = .tool,
-        .content = model_output,
+        .content = content,
         .tool_call_id = tool_call.id,
         .tool_name = tool_call.name,
         .tool_result_status = accounting.status orelse
             if (accounting.increment_error) .failure else .success,
         .tool_result_memory = memory,
+        .tool_result_created_at_ms = io_mod.milliTimestamp(),
     });
     if (accounting.record_completion) {
         try runtime_interruption.recordCompletedToolName(arena, completed_tool_names, tool_call.name);
     }
+    if (batch.observer) |observer| observer.emit(.{ .tool_result = .{
+        .call = tool_call,
+        .output = content,
+        .status = accounting.status orelse if (accounting.increment_error) .failure else .success,
+    } });
 }
 
 pub fn appendPermissionFeedback(
@@ -169,6 +196,12 @@ pub fn assembleParallelToolResults(
             &prepared.memory,
             execution.tool_result_memory,
         );
+        // The parallel run's attempts are deinitialized when this scope exits,
+        // but history keeps prepared.memory. ArenaAllocator.free genuinely
+        // reclaims most-recent and dedicated-chunk allocations, so the
+        // attempt-owned slices must be transferred into the history arena
+        // before that deinit runs.
+        prepared.memory = try types.dupeToolResultMemory(arena, prepared.memory);
         try runtime_execution_memory.retainToolImages(arena, config, original_call, &prepared);
         const safe_tool_output = prepared.model_output;
         if (precomputed == null) {
@@ -302,24 +335,6 @@ pub fn processCommittedFileResult(
         return error.InvalidCommittedFileExecutionResult;
     }
     const handoff = execution.committed_file_handoff orelse unreachable;
-    if (hooks.usage) |usage| {
-        usage.recordCommittedLines(
-            handoff.preview.additions,
-            handoff.preview.deletions,
-        ) catch |err| {
-            debug_trace.logf(
-                "session",
-                "usage code accounting failed additions={d} deletions={d} reason={s}",
-                .{
-                    handoff.preview.additions,
-                    handoff.preview.deletions,
-                    @errorName(err),
-                },
-            );
-            usage.markCodeIncomplete();
-        };
-        if (!usage.persistCheckpoint()) usage.markCodeIncomplete();
-    }
     const committed_contract_degraded =
         execution.status != .success or
         !execution.tool_result_memory_prepared or
@@ -369,7 +384,13 @@ pub fn processCommittedFileResult(
             model_output,
         ),
         .tool_result_memory = prepared_memory,
+        .tool_result_created_at_ms = io_mod.milliTimestamp(),
     });
+    if (batch.observer) |observer| observer.emit(.{ .tool_result = .{
+        .call = tool_call,
+        .output = model_output,
+        .status = runtime_execution_memory.persistedStatusForCurrentFxLocalResult(execution.status, model_output),
+    } });
     debug_trace.eventf(
         "tool",
         "committed_result_appended",
@@ -598,4 +619,124 @@ test "drained batch feedback follows all tool results and keeps its source call"
     try std.testing.expectEqual(.user, suffix.items[3].role);
     try std.testing.expectEqualStrings("call_first", suffix.items[3].tool_call_id.?);
     try std.testing.expect(suffix.items[3].permission_feedback);
+}
+
+test "repeated identical failures escalate from the second failure on" {
+    const backing = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(backing);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    var completed_tool_names: std.ArrayList([]u8) = .empty;
+    const call: ToolCall = .{
+        .id = "edit-1",
+        .name = "edit_file",
+        .arguments_json = "{\"path\":\"strategy.ts\",\"old_string\":\"  trajectory?: Trajectory;\\n}\",\"new_string\":\"}\"}",
+    };
+    const failure_output = "edit_file failed: old_string not found in file";
+
+    var escalation: runtime_tool_admission.IdenticalFailureEscalationState = .{};
+
+    var step: usize = 0;
+    while (step < 3) : (step += 1) {
+        var batch: StepBatchState = .{
+            .identical_failure_escalation = &escalation,
+        };
+        try appendToolResultContent(
+            alloc,
+            &suffix,
+            &completed_tool_names,
+            &batch,
+            call,
+            failure_output,
+            null,
+            .{ .increment_error = true },
+        );
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), suffix.items.len);
+    // The first failure is delivered plain; the second and third carry the
+    // running count, and every delivery preserves the original failure text.
+    try std.testing.expectEqualStrings(failure_output, suffix.items[0].content.?);
+    try std.testing.expect(std.mem.find(u8, suffix.items[1].content.?, "already failed 2 times this turn") != null);
+    try std.testing.expect(std.mem.find(u8, suffix.items[2].content.?, "already failed 3 times this turn") != null);
+    for (suffix.items) |message| {
+        try std.testing.expect(std.mem.find(u8, message.content.?, failure_output) != null);
+    }
+}
+
+test "identical failures stay plain when no escalation tracker is attached" {
+    const backing = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(backing);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    var completed_tool_names: std.ArrayList([]u8) = .empty;
+    const call: ToolCall = .{
+        .id = "edit-1",
+        .name = "edit_file",
+        .arguments_json = "{\"path\":\"strategy.ts\"}",
+    };
+
+    var step: usize = 0;
+    while (step < 2) : (step += 1) {
+        var batch: StepBatchState = .{};
+        try appendToolResultContent(
+            alloc,
+            &suffix,
+            &completed_tool_names,
+            &batch,
+            call,
+            "edit_file failed: old_string not found in file",
+            null,
+            .{ .increment_error = true },
+        );
+    }
+
+    for (suffix.items) |message| {
+        try std.testing.expectEqualStrings(
+            "edit_file failed: old_string not found in file",
+            message.content.?,
+        );
+    }
+}
+
+test "malformed argument rejections never escalate through the identical failure tracker" {
+    const backing = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(backing);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    var completed_tool_names: std.ArrayList([]u8) = .empty;
+    const malformed: ToolCall = .{
+        .id = "call-1",
+        .name = "read_file",
+        .arguments_json = "{}",
+        .argument_integrity = .malformed_json,
+    };
+    const rejected_output = "Tool execution failed: malformed arguments";
+
+    var escalation: runtime_tool_admission.IdenticalFailureEscalationState = .{};
+
+    var step: usize = 0;
+    while (step < 2) : (step += 1) {
+        var batch: StepBatchState = .{
+            .identical_failure_escalation = &escalation,
+        };
+        try appendToolResultContent(
+            alloc,
+            &suffix,
+            &completed_tool_names,
+            &batch,
+            malformed,
+            rejected_output,
+            null,
+            .{ .increment_error = true },
+        );
+    }
+
+    for (suffix.items) |message| {
+        try std.testing.expectEqualStrings(rejected_output, message.content.?);
+    }
+    try std.testing.expectEqual(@as(usize, 0), escalation.counts.items.len);
 }

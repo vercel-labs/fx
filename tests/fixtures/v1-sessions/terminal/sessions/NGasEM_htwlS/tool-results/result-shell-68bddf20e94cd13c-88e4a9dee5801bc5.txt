@@ -1,0 +1,1 @@
+{"session_id":"shell-P1Rx7ZvNXwWFA8DxO1uT2w","state":"running","backend":"tty","persistence":"session","output_truncated":false,"output_incomplete":false,"output_terminal_safe":true,"full_output_handle":null,"exit_code":null,"signal":null,"termination_indeterminate":false,"duration_ms":null,"accepted_bytes":null,"error":null,"retry_guidance":null,"output_delta":""}

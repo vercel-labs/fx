@@ -15,7 +15,7 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 
 from scripts.pgso.model import PgsoError, sha256_file
-from scripts.pgso.pipeline import merge_profile_batch
+from scripts.pgso.pipeline import keep_startup_profile, merge_profile_batch
 from scripts.pgso.runner import CommandResult, hermetic_environment, run_checked
 
 
@@ -502,7 +502,8 @@ def _prepare_runtime_home(
         "set-option -g history-limit 100000\n",
         encoding="utf-8",
     )
-    if allow_keychain:
+    # Only macOS has a Keychain; on Linux fx keeps keys in its profile file.
+    if allow_keychain and sys.platform == "darwin":
         source = pathlib.Path.home() / "Library" / "Keychains"
         if not source.is_dir():
             raise PgsoError(f"host Keychains directory does not exist: {source}")
@@ -724,7 +725,20 @@ def run_corpus(
     bun: pathlib.Path | str = "bun",
     command_runner: Callable[..., CommandResult] = run_checked,
     profile_merger: Callable[..., int] = merge_profile_batch,
+    startup_scenarios: Sequence[str] = (),
+    startup_profile_dir: pathlib.Path | None = None,
+    startup_profile_keeper: Callable[..., None] = keep_startup_profile,
 ) -> CorpusResult:
+    """Train on every scenario and merge its raw profiles into `merged_profile`.
+
+    Each of `startup_scenarios` also keeps its own merged profile in
+    `startup_profile_dir`, which the startup exemption reads.
+    """
+    missing = set(startup_scenarios) - {scenario.name for scenario in corpus.scenarios}
+    if missing:
+        raise PgsoError(f"startup scenarios are missing from the corpus: {sorted(missing)}")
+    if startup_scenarios and startup_profile_dir is None:
+        raise PgsoError("startup scenarios need a startup profile directory")
     profile_dir.mkdir(parents=True, exist_ok=True)
     log_dir = profile_dir.parent.parent / "logs" / "corpus"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -750,6 +764,14 @@ def run_corpus(
             for profile in generated
         ):
             raise PgsoError("produced no raw profile")
+        if scenario.name in startup_scenarios:
+            assert startup_profile_dir is not None
+            startup_profile_keeper(
+                toolchain,
+                generated,
+                startup_profile_dir / f"{scenario.name}.profdata",
+                log_dir / f"{scenario.name}-startup-merge.json",
+            )
         try:
             return profile_merger(
                 toolchain,

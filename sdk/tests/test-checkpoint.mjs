@@ -4,16 +4,18 @@ import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../node.js";
+import { createFxEngine } from "../node.js";
 
 const sourceBackend = process.argv[2] || "native";
 const targetBackend = process.argv[3] || "wasm";
 const scriptDir = fileURLToPath(new URL(".", import.meta.url));
 const addon = resolve(scriptDir, "../../zig-out/lib/libfx.node");
 const wasm = await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm"));
-for (const shape of ["plain", "reasoning-text", "reasoning-only", "provider-terminal"]) {
+const pngData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+for (const shape of ["plain", "reasoning-text", "reasoning-only", "provider-terminal", "image"]) {
   let modelRequests = 0;
   const remembered = shape === "reasoning-only" ? "Done." : "remembered value";
+  const model = shape === "image" ? "checkpoint/vision-model" : "checkpoint/model";
   const server = createServer((request, response) => {
     let body = "";
     request.setEncoding("utf8");
@@ -21,7 +23,10 @@ for (const shape of ["plain", "reasoning-text", "reasoning-only", "provider-term
     request.on("end", () => {
       if (request.method === "GET") {
         response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({ object: "list", data: [{ id: "checkpoint/model", type: "language" }] }));
+        response.end(JSON.stringify({ object: "list", data: [
+          { id: "checkpoint/model", type: "language" },
+          { id: "checkpoint/vision-model", type: "language", tags: ["vision", "file-input"] },
+        ] }));
         return;
       }
       modelRequests += 1;
@@ -44,6 +49,13 @@ for (const shape of ["plain", "reasoning-text", "reasoning-only", "provider-term
       }
       assert.equal(modelRequests, 2, "unexpected extra model request");
       assert.ok(body.includes("store this context"), "restored request omitted the prior user turn");
+      if (shape === "image") {
+        const files = JSON.parse(body).prompt
+          .filter((message) => message.role === "user" && Array.isArray(message.content))
+          .flatMap((message) => message.content)
+          .filter((part) => part.type === "file");
+        assert.deepEqual(files, [{ type: "file", mediaType: "image/png", data: { type: "data", data: pngData } }], "restored request omitted the prior image");
+      }
       const parts = JSON.parse(body).prompt.flatMap((message) => Array.isArray(message.content) ? message.content : []);
       assert.equal(parts.filter((part) => part.type === "text" && part.text === remembered).length, 1, "restored answer must appear exactly once");
       if (shape !== "plain") {
@@ -71,22 +83,36 @@ for (const shape of ["plain", "reasoning-text", "reasoning-only", "provider-term
   await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));
   const { port } = server.address();
 
+  // The kernel fetches the model catalog from the canonical gateway origin
+  // through the host fetch; redirect those GETs to the loopback server so
+  // capability resolution sees the fixture catalog on both backends.
+  const loopbackFetch = (input, init) => {
+    const url = new URL(String(input?.url ?? input));
+    const method = String(init?.method ?? input?.method ?? "GET").toUpperCase();
+    if (url.hostname === "ai-gateway.vercel.sh" && method === "GET") {
+      return fetch(`http://127.0.0.1:${port}${url.pathname}${url.search}`, init);
+    }
+    return fetch(input, init);
+  };
+
   const options = (backend, checkpoint) => ({
     backend,
     nativeAddon: addon,
     ...(backend === "wasm" ? { wasm } : {}),
     ...(checkpoint ? { checkpoint } : {}),
-    fetch,
+    fetch: loopbackFetch,
     apiKey: "checkpoint-key",
     gatewayChatUrl: `http://127.0.0.1:${port}/chat`,
-    model: "checkpoint/model",
+    model,
   });
 
   let source;
   let target;
   try {
-    source = await createFxAgent(options(sourceBackend));
-    const first = source.prompt("store this context");
+    source = await createFxEngine(options(sourceBackend));
+    const first = source.prompt(shape === "image"
+      ? [{ type: "text", text: "store this context" }, { type: "image", data: pngData, mimeType: "image/png" }]
+      : "store this context");
     for await (const _ of first) {}
     assert.equal((await first.result).stopReason, "end_turn");
     const checkpoint = await source.checkpoint();
@@ -94,7 +120,7 @@ for (const shape of ["plain", "reasoning-text", "reasoning-only", "provider-term
     assert.equal(await source.close(), undefined);
     source = null;
 
-    target = await createFxAgent(options(targetBackend, checkpoint));
+    target = await createFxEngine(options(targetBackend, checkpoint));
     const second = target.prompt("continue");
     let text = "";
     for await (const update of second) {

@@ -1,0 +1,16 @@
+[
+  {
+    "module": "PR1099FIFO",
+    "description": "Reader closes before its writer joins",
+    "old": "/\\ reader /\\ joined /\\ reader' = FALSE",
+    "new": "/\\ reader /\\ reader' = FALSE",
+    "invariant": "ReaderHeldUntilJoin"
+  },
+  {
+    "module": "PR1099FIFO",
+    "description": "Join claims completion while the writer is blocked",
+    "old": "/\\ writer = \"finished\" /\\ ~joined /\\ joined' = TRUE",
+    "new": "/\\ ~joined /\\ joined' = TRUE",
+    "invariant": "JoinAfterFinish"
+  }
+]

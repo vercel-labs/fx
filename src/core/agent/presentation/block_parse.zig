@@ -44,7 +44,7 @@ fn isCodeFence(line: []const u8) bool {
 pub fn codeFenceLanguage(line: []const u8) []const u8 {
     const fence = parseCodeFence(line) orelse return "";
     const info = std.mem.trim(u8, line[fence.indent + fence.run ..], " \t");
-    const end = std.mem.indexOfAny(u8, info, " \t") orelse info.len;
+    const end = std.mem.findAny(u8, info, " \t") orelse info.len;
     return info[0..end];
 }
 
@@ -136,7 +136,7 @@ pub const ParsedFootnoteDefinition = struct {
 
 pub fn parseFootnoteDefinition(line: []const u8) ?ParsedFootnoteDefinition {
     if (line.len < 6 or line[0] != '[' or line[1] != '^') return null;
-    const close = std.mem.indexOfScalarPos(u8, line, 2, ']') orelse return null;
+    const close = std.mem.findScalarPos(u8, line, 2, ']') orelse return null;
     if (close == 2 or close + 1 >= line.len or line[close + 1] != ':') return null;
 
     var body_start = close + 2;
@@ -307,7 +307,7 @@ pub fn isValidTable(buf: []const u8) bool {
     var saw_separator = false;
     var start: usize = 0;
     while (start < buf.len) {
-        const end = std.mem.indexOfScalarPos(u8, buf, start, '\n') orelse buf.len;
+        const end = std.mem.findScalarPos(u8, buf, start, '\n') orelse buf.len;
         const line = buf[start..end];
         if (line_count == 1 and isSeparatorLine(line)) saw_separator = true;
         line_count += 1;

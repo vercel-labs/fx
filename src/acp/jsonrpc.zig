@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
 
@@ -25,6 +26,23 @@ pub fn writeJsonStr(s: []const u8, w: *std.Io.Writer) !void {
         }
     }
     try w.writeByte('"');
+}
+
+/// Writes JSON a caller built into a frame. Frames are newline-delimited, and
+/// valid JSON holds a raw CR or LF only as whitespace between tokens, so each
+/// one is written as a space. A host tool call's input, for example, is the
+/// model's own text and may be pretty-printed.
+fn writeOneLine(w: *std.Io.Writer, json: []const u8) !void {
+    if (std.mem.findScalar(u8, json, '\n') == null and std.mem.findScalar(u8, json, '\r') == null) {
+        return w.writeAll(json);
+    }
+    var rest = json;
+    while (std.mem.findAny(u8, rest, "\r\n")) |index| {
+        try w.writeAll(rest[0..index]);
+        try w.writeByte(' ');
+        rest = rest[index + 1 ..];
+    }
+    try w.writeAll(rest);
 }
 
 pub const ErrorCode = struct {
@@ -58,6 +76,11 @@ pub const Message = struct {
 pub const RpcError = struct {
     code: i64,
     message: []const u8,
+    data: ?struct {
+        code: []const u8,
+        model: []const u8,
+        capability: []const u8,
+    } = null,
 };
 
 pub fn parseMessage(alloc: Allocator, line: []const u8) !Message {
@@ -162,7 +185,7 @@ pub const Writer = struct {
                     try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
                     try writeId(w, response.id);
                     try w.writeAll(",\"result\":");
-                    try w.writeAll(response.result_json);
+                    try writeOneLine(w, response.result_json);
                     try w.writeAll("}\n");
                 },
                 .error_response => |response| {
@@ -172,13 +195,22 @@ pub const Writer = struct {
                     try w.print("{d}", .{response.err.code});
                     try w.writeAll(",\"message\":");
                     try writeJsonStr(response.err.message, w);
+                    if (response.err.data) |data| {
+                        try w.writeAll(",\"data\":{\"code\":");
+                        try writeJsonStr(data.code, w);
+                        try w.writeAll(",\"model\":");
+                        try writeJsonStr(data.model, w);
+                        try w.writeAll(",\"capability\":");
+                        try writeJsonStr(data.capability, w);
+                        try w.writeByte('}');
+                    }
                     try w.writeAll("}}\n");
                 },
                 .notification => |notification| {
                     try w.writeAll("{\"jsonrpc\":\"2.0\",\"method\":");
                     try writeJsonStr(notification.method, w);
                     try w.writeAll(",\"params\":");
-                    try w.writeAll(notification.params_json);
+                    try writeOneLine(w, notification.params_json);
                     try w.writeAll("}\n");
                 },
                 .request => |request| {
@@ -187,7 +219,7 @@ pub const Writer = struct {
                     try w.writeAll(",\"method\":");
                     try writeJsonStr(request.method, w);
                     try w.writeAll(",\"params\":");
-                    try w.writeAll(request.params_json);
+                    try writeOneLine(w, request.params_json);
                     try w.writeAll("}\n");
                 },
             }
@@ -256,7 +288,7 @@ pub const Writer = struct {
         }
     }
 
-    fn writeId(w: *std.Io.Writer, id: ?RequestId) !void {
+    pub fn writeId(w: *std.Io.Writer, id: ?RequestId) !void {
         if (id) |rid| {
             switch (rid) {
                 .integer => |n| try w.print("{d}", .{n}),
@@ -454,7 +486,7 @@ test "Reader propagates allocation failure without publishing a partial frame" {
     };
     var reader = Reader.initForTesting(&source, ChunkedTestSource.read);
     var failing = std.testing.FailingAllocator.init(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         .{ .fail_index = 0 },
     );
     try std.testing.expectError(
@@ -559,6 +591,27 @@ test "Writer Frame formats protocol lines" {
     {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
+        try (Writer.Frame{ .error_response = .{
+            .id = .{ .integer = 7 },
+            .err = .{
+                .code = ErrorCode.invalid_params,
+                .message = "Unsupported fast mode",
+                .data = .{
+                    .code = "LIBFX_MODEL_UNSUPPORTED_FAST",
+                    .model = "provider/quoted\"model",
+                    .capability = "fast",
+                },
+            },
+        } }).write(&out.writer);
+        try std.testing.expectEqualStrings(
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32602,\"message\":\"Unsupported fast mode\",\"data\":{\"code\":\"LIBFX_MODEL_UNSUPPORTED_FAST\",\"model\":\"provider/quoted\\\"model\",\"capability\":\"fast\"}}}\n",
+            out.writer.buffered(),
+        );
+    }
+
+    {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
         try (Writer.Frame{ .notification = .{
             .method = "session/update",
             .params_json = "{\"ok\":true}",
@@ -641,5 +694,223 @@ test "Writer writeId handles all id types" {
         defer out.deinit();
         try Writer.writeId(&out.writer, null);
         try std.testing.expectEqualStrings("null", out.writer.buffered());
+    }
+}
+
+test "Writer keeps each frame on one line when caller JSON has line breaks" {
+    const alloc = std.testing.allocator;
+    const Capture = struct {
+        bytes: std.ArrayList(u8) = .empty,
+
+        fn write(raw: ?*anyopaque, frame: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.bytes.appendSlice(std.testing.allocator, frame);
+        }
+    };
+    // A model's tool input as some models send it: pretty-printed with LF and
+    // CRLF line breaks, holding an escaped newline that must survive.
+    const input = "{\n  \"items\": [\r\n\t{\"text\": \"a\\nb\"}\n  ]\n}";
+    var capture: Capture = .{};
+    defer capture.bytes.deinit(alloc);
+    var writer = Writer.initCallback(&capture, Capture.write);
+    try writer.writeRequest(alloc, .{ .integer = 1 }, "libfx/tool_call", "{\"name\":\"todo\",\"input\":" ++ input ++ "}");
+    try writer.writeNotification(alloc, "session/update", input);
+    try writer.writeResponse(alloc, .{ .integer = 2 }, input);
+
+    const frames = capture.bytes.items;
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, frames, "\n"));
+    try std.testing.expect(std.mem.endsWith(u8, frames, "\n"));
+    try std.testing.expect(std.mem.findScalar(u8, frames, '\r') == null);
+
+    const expected = try std.json.parseFromSlice(std.json.Value, alloc, input, .{});
+    defer expected.deinit();
+    const expected_json = try std.json.Stringify.valueAlloc(alloc, expected.value, .{});
+    defer alloc.free(expected_json);
+    var lines = std.mem.splitScalar(u8, frames[0 .. frames.len - 1], '\n');
+    for ([_][]const u8{ "params", "params", "result" }, 0..) |field, index| {
+        const frame = try std.json.parseFromSlice(std.json.Value, alloc, lines.next().?, .{});
+        defer frame.deinit();
+        var value = frame.value.object.get(field).?;
+        if (index == 0) value = value.object.get("input").?;
+        const actual_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
+        defer alloc.free(actual_json);
+        try std.testing.expectEqualStrings(expected_json, actual_json);
+    }
+}
+
+test "ACP frames stay one parseable line and read the same however they are split" {
+    try std.testing.fuzz({}, fuzzAcpFrames, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").acp_jsonrpc.*),
+    });
+}
+
+const fuzz_text_pieces = [_][]const u8{
+    "a",      "Z",        " ",         "\"",       "\\", "\n", "\r", "\t", "\x00", "\x08", "\x1f", "\x7f", "/", "{", "]",
+    "\u{e9}", "\u{754c}", "\u{1f600}", "\u{2028}",
+};
+
+const FuzzFrameSink = struct {
+    alloc: Allocator,
+    out: std.ArrayList(u8) = .empty,
+
+    fn write(raw: ?*anyopaque, bytes: []const u8) anyerror!void {
+        const self: *FuzzFrameSink = @ptrCast(@alignCast(raw.?));
+        try self.out.appendSlice(self.alloc, bytes);
+    }
+};
+
+fn appendFuzzText(smith: *std.testing.Smith, w: *std.Io.Writer) !void {
+    for (0..smith.valueRangeAtMost(u8, 0, 12)) |_| try w.writeAll(fuzz_text_pieces[smith.index(fuzz_text_pieces.len)]);
+}
+
+/// Writes a JSON value, sometimes pretty-printed across lines as a model's
+/// tool input can be.
+fn appendFuzzJson(alloc: Allocator, smith: *std.testing.Smith, w: *std.Io.Writer, depth: u8) !void {
+    const spaces = [_][]const u8{ "", " ", "\n", "\r\n", "\t" };
+    try w.writeAll(spaces[smith.index(spaces.len)]);
+    switch (smith.valueRangeAtMost(u8, 0, if (depth >= 3) 4 else 6)) {
+        0 => try w.writeAll("null"),
+        1 => try w.writeAll(if (smith.value(bool)) "true" else "false"),
+        2 => try w.print("{d}", .{smith.value(i32)}),
+        3, 4 => {
+            var text: std.Io.Writer.Allocating = .init(alloc);
+            defer text.deinit();
+            try appendFuzzText(smith, &text.writer);
+            try writeJsonStr(text.written(), w);
+        },
+        5 => {
+            try w.writeByte('[');
+            for (0..smith.valueRangeAtMost(u8, 0, 3)) |index| {
+                if (index > 0) try w.writeByte(',');
+                try appendFuzzJson(alloc, smith, w, depth + 1);
+            }
+            try w.writeByte(']');
+        },
+        else => {
+            try w.writeByte('{');
+            for (0..smith.valueRangeAtMost(u8, 0, 3)) |index| {
+                if (index > 0) try w.writeByte(',');
+                try w.print("\"k{d}\":", .{index});
+                try appendFuzzJson(alloc, smith, w, depth + 1);
+            }
+            try w.writeByte('}');
+        },
+    }
+    try w.writeAll(spaces[smith.index(spaces.len)]);
+}
+
+fn fuzzAcpFrames(_: void, smith: *std.testing.Smith) !void {
+    const alloc = std.testing.allocator;
+    try expectFuzzFrame(alloc, smith);
+    try expectFuzzLines(alloc, smith);
+}
+
+fn expectFuzzFrame(alloc: Allocator, smith: *std.testing.Smith) !void {
+    var text: std.Io.Writer.Allocating = .init(alloc);
+    defer text.deinit();
+    try appendFuzzText(smith, &text.writer);
+    var json: std.Io.Writer.Allocating = .init(alloc);
+    defer json.deinit();
+    try appendFuzzJson(alloc, smith, &json.writer, 0);
+    var id_text: std.Io.Writer.Allocating = .init(alloc);
+    defer id_text.deinit();
+    try appendFuzzText(smith, &id_text.writer);
+    const id: RequestId = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => .{ .integer = smith.value(i64) },
+        1 => .{ .string = id_text.written() },
+        else => .null,
+    };
+
+    var sink: FuzzFrameSink = .{ .alloc = alloc };
+    defer sink.out.deinit(alloc);
+    var writer = Writer.initCallback(&sink, FuzzFrameSink.write);
+    const kind = smith.valueRangeAtMost(u8, 0, 3);
+    switch (kind) {
+        0 => try writer.writeRequest(alloc, id, text.written(), json.written()),
+        1 => try writer.writeNotification(alloc, text.written(), json.written()),
+        2 => try writer.writeResponse(alloc, id, json.written()),
+        else => try writer.writeError(alloc, id, .{ .code = ErrorCode.invalid_params, .message = text.written() }),
+    }
+
+    // One frame is one line of JSON.
+    const frame = sink.out.items;
+    try std.testing.expect(frame.len > 0 and frame[frame.len - 1] == '\n');
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, frame, "\n"));
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, frame[0 .. frame.len - 1], .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("2.0", object.get("jsonrpc").?.string);
+
+    // It carries what the caller wrote.
+    if (kind != 1) try expectFuzzId(id, object.get("id").?);
+    if (kind <= 1) try std.testing.expectEqualStrings(text.written(), object.get("method").?.string);
+    if (kind == 3) try std.testing.expectEqualStrings(text.written(), object.get("error").?.object.get("message").?.string);
+    if (kind <= 2) {
+        const field = if (kind == 2) "result" else "params";
+        const expected = try std.json.parseFromSlice(std.json.Value, alloc, json.written(), .{});
+        defer expected.deinit();
+        const expected_text = try stringifyValueAlloc(alloc, expected.value);
+        defer alloc.free(expected_text);
+        const actual_text = try stringifyValueAlloc(alloc, object.get(field).?);
+        defer alloc.free(actual_text);
+        try std.testing.expectEqualStrings(expected_text, actual_text);
+    }
+
+    // The server's own parser reads it back.
+    if (kind >= 2 or text.written().len > 0) {
+        var message = try parseMessage(alloc, frame[0 .. frame.len - 1]);
+        defer freeMessage(alloc, &message);
+        if (kind <= 1) try std.testing.expectEqualStrings(text.written(), message.method);
+        if (kind >= 2) try std.testing.expect(message.isResponse());
+    }
+}
+
+fn expectFuzzId(expected: RequestId, actual: std.json.Value) !void {
+    switch (expected) {
+        .integer => |n| try std.testing.expectEqual(n, actual.integer),
+        .string => |s| try std.testing.expectEqualStrings(s, actual.string),
+        .null => try std.testing.expect(actual == .null),
+    }
+}
+
+fn expectFuzzLines(alloc: Allocator, smith: *std.testing.Smith) !void {
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(alloc);
+    for (0..smith.valueRangeAtMost(u8, 0, 16)) |_| {
+        if (smith.valueRangeAtMost(u8, 0, 3) == 0) {
+            try stream.append(alloc, '\n');
+        } else {
+            for (0..smith.valueRangeAtMost(u8, 0, 40)) |_| try stream.append(alloc, 'a' + smith.valueRangeAtMost(u8, 0, 25));
+        }
+    }
+    const limit: usize = smith.valueRangeAtMost(u16, 1, 48);
+
+    // A line ends at a newline. An empty line is skipped, a line over the
+    // limit is reported once as an overflow, and a final line without a
+    // newline is dropped unless it is over the limit.
+    var expected: std.ArrayList(?[]const u8) = .empty;
+    defer expected.deinit(alloc);
+    var rest: []const u8 = stream.items;
+    while (std.mem.findScalar(u8, rest, '\n')) |end| {
+        const line = rest[0..end];
+        if (line.len > limit) try expected.append(alloc, null) else if (line.len > 0) try expected.append(alloc, line);
+        rest = rest[end + 1 ..];
+    }
+    if (rest.len > limit) try expected.append(alloc, null);
+
+    for ([_]usize{ stream.items.len + 1, smith.valueRangeAtMost(u16, 1, 64) }) |max_chunk| {
+        var source = ChunkedTestSource{ .bytes = stream.items, .max_chunk = max_chunk };
+        var reader = Reader.initForTesting(&source, ChunkedTestSource.read);
+        for (expected.items) |want| {
+            const got = (try reader.readLineWithLimit(alloc, limit)) orelse return error.TestExpectedLine;
+            switch (got) {
+                .line => |line| {
+                    defer alloc.free(line);
+                    try std.testing.expectEqualStrings(want orelse return error.TestExpectedOverflow, line);
+                },
+                .overflow => try std.testing.expect(want == null),
+            }
+        }
+        try std.testing.expect((try reader.readLineWithLimit(alloc, limit)) == null);
     }
 }

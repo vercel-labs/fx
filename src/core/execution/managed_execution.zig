@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const command_admission = @import("../permissions/command_admission.zig");
 const command_contract = @import("command_contract.zig");
@@ -198,6 +199,8 @@ const Entry = struct {
     force_cancel: std.atomic.Value(bool) = .init(false),
     start_gate: std.Io.Event = .unset,
     thread: ?std.Thread = null,
+    /// Serializes joins of `thread`; see `Runtime.joinEntry`.
+    join_mutex: std.Io.Mutex = .init,
     published_running: bool = false,
     tombstone_sequence: std.atomic.Value(u32) = .init(0),
     active_operations: usize = 0,
@@ -224,7 +227,7 @@ const Entry = struct {
         const command_ctx = command_admission.CommandContext{
             .command = command,
             .resolved_cwd = cwd,
-            .target_os = builtin.os.tag,
+            .target_os = builtin.target.os.tag,
             .environment = environment,
         };
         const authority = rebindAuthority(input.authority, command_ctx);
@@ -531,7 +534,7 @@ pub const Runtime = struct {
         const value = self.next_generated_id;
         self.next_generated_id +%= 1;
         if (self.next_generated_id == 0) self.next_generated_id = 1;
-        return std.fmt.bufPrint(buffer, "shell-{d}", .{value});
+        return std.mem.print(buffer, "shell-{d}", .{value});
     }
 
     pub fn replayStore(
@@ -929,7 +932,9 @@ pub const Runtime = struct {
             const next = contract.transition(entry.state, entry.barrier, .stop_requested);
             entry.state = next.state;
             entry.barrier = next.barrier;
-            entry.force_cancel.store(force, .seq_cst);
+            // Force only escalates: a later cooperative stop must not undo a
+            // force-kill already requested, such as the one at process exit.
+            if (force) entry.force_cancel.store(true, .seq_cst);
             entry.cancel.store(true, .seq_cst);
             if (entry.active_waiter) |waiter_id| {
                 entry.preempted_waiter = waiter_id;
@@ -1023,8 +1028,7 @@ pub const Runtime = struct {
             return error.InvalidOutputRange;
         }
         if (delivered != 0) {
-            std.mem.copyForwards(
-                u8,
+            @memmove(
                 entry.output.items[0 .. entry.output.items.len - delivered],
                 entry.output.items[delivered..],
             );
@@ -1081,6 +1085,19 @@ pub const Runtime = struct {
     }
 
     pub fn shutdown(self: *Runtime) void {
+        self.stopAllAndJoin(.cooperative);
+    }
+
+    /// Process exit: force-kill every live command's process group instead of
+    /// granting the cooperative termination grace, then wait only for each
+    /// worker thread to observe the kill so no command outlives fx.
+    pub fn terminateForProcessExit(self: *Runtime) void {
+        self.stopAllAndJoin(.force);
+    }
+
+    const StopMode = enum { cooperative, force };
+
+    fn stopAllAndJoin(self: *Runtime, mode: StopMode) void {
         const zio = io_mod.getIo();
         self.mutex.lockUncancelable(zio);
         if (self.shutting_down) {
@@ -1094,6 +1111,7 @@ pub const Runtime = struct {
             const entry = candidate orelse continue;
             entry.mutex.lockUncancelable(zio);
             if (!entry.isTerminal()) {
+                if (mode == .force) entry.force_cancel.store(true, .seq_cst);
                 entry.cancel.store(true, .seq_cst);
                 entry.start_gate.set(zio);
                 live[live_len] = entry;
@@ -1347,7 +1365,14 @@ pub const Runtime = struct {
         );
     }
 
+    /// Joins the entry's worker thread exactly once. A cancelled foreground
+    /// wait and runtime shutdown can both reach this concurrently; the second
+    /// caller blocks until the first join finishes, so every caller returns
+    /// only after the thread has exited.
     fn joinEntry(_: *Runtime, entry: *Entry) void {
+        const zio = io_mod.getIo();
+        entry.join_mutex.lockUncancelable(zio);
+        defer entry.join_mutex.unlock(zio);
         if (entry.thread) |thread| {
             thread.join();
             entry.thread = null;
@@ -1500,6 +1525,7 @@ fn rebindAuthority(
         .shell_allowed => |shell| .{ .shell_allowed = .{
             .fingerprint = .init(command_ctx),
             .source = shell.source,
+            .grant_epoch = shell.grant_epoch,
         } },
     };
 }
@@ -1575,7 +1601,7 @@ fn testAuthority(input: StartCapturedInput) command_admission.CommandExecutionAu
     const ctx = command_admission.CommandContext{
         .command = input.command,
         .resolved_cwd = input.cwd,
-        .target_os = builtin.os.tag,
+        .target_os = builtin.target.os.tag,
         .environment = input.environment,
     };
     return .{ .shell_allowed = .{
@@ -1585,8 +1611,8 @@ fn testAuthority(input: StartCapturedInput) command_admission.CommandExecutionAu
 }
 
 test "captured managed execution yields one handle and delivers ordered output once" {
-    if (comptime builtin.os.tag == .wasi) return;
-    const alloc = std.testing.allocator;
+    if (comptime builtin.target.os.tag == .wasi) return;
+    const alloc = testing_allocator.no_resize;
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
     var input = StartCapturedInput{
@@ -1634,8 +1660,64 @@ test "captured managed execution yields one handle and delivers ordered output o
     try std.testing.expect(runtime.isTombstone(input.execution_id));
 }
 
+test "process-exit termination joins a command a cancelled foreground wait is already joining" {
+    if (comptime builtin.target.os.tag == .wasi or builtin.target.os.tag == .windows) return;
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+    var cancel = std.atomic.Value(bool).init(false);
+    var input = StartCapturedInput{
+        .execution_id = "exit-while-cancelling",
+        // Ignoring TERM keeps the cancelled foreground wait inside its join
+        // for the whole cooperative termination grace.
+        .command = "trap '' TERM; while :; do sleep 1; done",
+        .cwd = "/tmp",
+        .environment = .legacy,
+        .authority = undefined,
+        .max_output_bytes = 4096,
+        .timeout_ms = 30_000,
+        .command_artifact_dir = null,
+        .yield_time_ms = 30_000,
+        .cancel_flag = &cancel,
+    };
+    input.authority = testAuthority(input);
+
+    const Foreground = struct {
+        fn run(rt: *Runtime, start_input: StartCapturedInput) void {
+            var prepared = rt.startCaptured(std.testing.allocator, start_input) catch return;
+            prepared.deinit(std.testing.allocator);
+        }
+    };
+    const foreground = try std.Thread.spawn(.{}, Foreground.run, .{ &runtime, input });
+
+    const admitted_deadline_ms = io_mod.milliTimestamp() + 2_000;
+    while (true) {
+        if (try runtime.captured_command_alloc(alloc, input.execution_id)) |command| {
+            alloc.free(command);
+            break;
+        }
+        if (io_mod.milliTimestamp() > admitted_deadline_ms) return error.TestUnexpectedResult;
+        io_mod.sleep(5 * std.time.ns_per_ms);
+    }
+    // Let the shell install its trap, then cancel the foreground wait so it
+    // parks in joinEntry behind the ignored TERM. Process-exit termination
+    // then joins the same thread; unserialized, glibc rejects the second
+    // pthread_join with EINVAL, and a join that races the first one's
+    // completion reuses a released handle.
+    io_mod.sleep(200 * std.time.ns_per_ms);
+    cancel.store(true, .seq_cst);
+    io_mod.sleep(100 * std.time.ns_per_ms);
+
+    const started_ms = io_mod.milliTimestamp();
+    runtime.terminateForProcessExit();
+    const elapsed_ms = io_mod.milliTimestamp() - started_ms;
+    foreground.join();
+    // Force escalation lands well inside the 800 ms cooperative grace.
+    try std.testing.expect(elapsed_ms < 500);
+}
+
 test "captured stop returns lost when its worker cannot settle" {
-    if (comptime builtin.os.tag == .wasi) return;
+    if (comptime builtin.target.os.tag == .wasi) return;
     const alloc = std.testing.allocator;
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
@@ -1729,7 +1811,7 @@ test "captured stop returns lost when its worker cannot settle" {
 }
 
 test "generated captured execution identities do not depend on provider call ids" {
-    if (comptime builtin.os.tag == .wasi) return;
+    if (comptime builtin.target.os.tag == .wasi) return;
     const alloc = std.testing.allocator;
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
@@ -1765,7 +1847,7 @@ test "generated captured execution identities do not depend on provider call ids
 }
 
 test "captured managed execution capacity rejects before spawn" {
-    if (comptime builtin.os.tag == .wasi) return;
+    if (comptime builtin.target.os.tag == .wasi) return;
     const alloc = std.testing.allocator;
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
@@ -1797,7 +1879,7 @@ test "captured managed execution capacity rejects before spawn" {
 }
 
 test "captured managed execution exposes full output only by opaque replay handle" {
-    if (comptime builtin.os.tag == .wasi) return;
+    if (comptime builtin.target.os.tag == .wasi) return;
     const alloc = std.testing.allocator;
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
@@ -1820,7 +1902,7 @@ test "captured managed execution exposes full output only by opaque replay handl
     defer completed.deinit(alloc);
     try std.testing.expect(completed.snapshot.output_truncated);
     const handle = completed.snapshot.output_file orelse return error.TestExpectedEqual;
-    try std.testing.expect(std.fs.path.dirname(handle) == null);
+    try std.testing.expect(std.Io.Dir.path.dirname(handle) == null);
     try runtime.commitDelivery(completed.snapshot.execution_id, completed.reservation_id);
 
     var reader = try command_replay_store.Reader.openEphemeralHandle(
@@ -1845,7 +1927,7 @@ test "managed execution retains thirty two authority free terminal snapshots" {
     var ids: [contract.max_tombstones + 1][32]u8 = undefined;
     var id_lengths: [ids.len]usize = undefined;
     for (0..ids.len) |index| {
-        const id = try std.fmt.bufPrint(&ids[index], "tty-tombstone-{d}", .{index});
+        const id = try std.mem.print(&ids[index], "tty-tombstone-{d}", .{index});
         id_lengths[index] = id.len;
         var prepared = try runtime.registerTty(alloc, .{
             .execution_id = id,
@@ -1883,7 +1965,7 @@ test "delivery reservation pins a tombstone across capacity eviction" {
     var ids: [contract.max_tombstones + 1][32]u8 = undefined;
     var lengths: [ids.len]usize = undefined;
     for (0..contract.max_tombstones) |index| {
-        const id = try std.fmt.bufPrint(&ids[index], "tty-pinned-{d}", .{index});
+        const id = try std.mem.print(&ids[index], "tty-pinned-{d}", .{index});
         lengths[index] = id.len;
         var prepared = try runtime.registerTty(alloc, .{
             .execution_id = id,
@@ -1909,7 +1991,7 @@ test "delivery reservation pins a tombstone across capacity eviction" {
     ) orelse return error.TestExpectedEqual;
     defer runtime.releaseEntry(pinned);
 
-    const replacement_id = try std.fmt.bufPrint(
+    const replacement_id = try std.mem.print(
         &ids[contract.max_tombstones],
         "tty-pinned-{d}",
         .{contract.max_tombstones},

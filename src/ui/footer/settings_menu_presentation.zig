@@ -10,7 +10,7 @@ const vt_emulator = @import("../../core/terminal/engine.zig");
 const Allocator = std.mem.Allocator;
 const SettingsMenuProjection = render_input.SettingsMenuProjection;
 const roomy_header_rows: u16 = 2;
-pub const max_inline_rows: u16 = roomy_header_rows + std.meta.fields(settings_catalog.SettingId).len;
+pub const max_inline_rows: u16 = roomy_header_rows + @typeInfo(settings_catalog.SettingId).@"enum".field_names.len;
 
 fn inlineModelRowCount(projection: SettingsMenuProjection) u16 {
     if (!projection.models.active) return 0;
@@ -186,8 +186,8 @@ fn composeBrowseHeader(alloc: Allocator, projection: SettingsMenuProjection, wid
     var wide: std.ArrayList(u8) = .empty;
     defer wide.deinit(alloc);
     try appendHeaderTitle(alloc, &wide, projection.filteredItemCount());
-    inline for (std.meta.fields(settings_catalog.Category)) |field| {
-        const category: settings_catalog.Category = @enumFromInt(field.value);
+    inline for (@typeInfo(settings_catalog.Category).@"enum".field_values) |field_value| {
+        const category: settings_catalog.Category = @fromBackingInt(@intCast(field_value));
         try wide.appendSlice(alloc, "  ");
         try appendCategoryTab(alloc, &wide, category, category == projection.category);
     }
@@ -212,7 +212,7 @@ fn composeBrowseHeader(alloc: Allocator, projection: SettingsMenuProjection, wid
 fn appendHeaderTitle(alloc: Allocator, row: *std.ArrayList(u8), count: usize) !void {
     try row.appendSlice(alloc, ui_render.selected_completion_style);
     var buf: [48]u8 = undefined;
-    const title = std.fmt.bufPrint(&buf, "Settings {d}", .{count}) catch "Settings";
+    const title = std.mem.print(&buf, "Settings {d}", .{count}) catch "Settings";
     try row.appendSlice(alloc, title);
     try row.appendSlice(alloc, ui_render.reset_style);
 }
@@ -361,7 +361,7 @@ test "settings menu renders each setting on one row at wide and narrow widths" {
         .snapshot = test_snapshot,
     };
     const wide_rows = menuRowCount(projection, 100, 40);
-    try std.testing.expectEqual(@as(u16, 15), wide_rows);
+    try std.testing.expectEqual(@as(u16, 16), wide_rows);
 
     var header = try composeSettingsMenuRow(alloc, projection, 0, 100, wide_rows);
     defer header.deinit(alloc);
@@ -382,7 +382,7 @@ test "settings menu renders each setting on one row at wide and narrow widths" {
     try std.testing.expect(std.mem.find(u8, compact_item.items, "on") != null);
 
     const narrow_rows = menuRowCount(projection, 24, 40);
-    try std.testing.expectEqual(@as(u16, 15), narrow_rows);
+    try std.testing.expectEqual(@as(u16, 16), narrow_rows);
     var narrow_item = try composeSettingsMenuRow(alloc, projection, 2, 24, narrow_rows);
     defer narrow_item.deinit(alloc);
     try std.testing.expect(std.mem.find(u8, narrow_item.items, "Status line") != null);
@@ -468,7 +468,7 @@ test "settings menu renders category tabs and a flat full list through the VT" {
         .active = true,
         .snapshot = test_snapshot,
     };
-    const row_budget: u16 = 15;
+    const row_budget: u16 = 16;
     const rows = menuRowCount(projection, width, row_budget);
     try std.testing.expectEqual(row_budget, rows);
 
@@ -479,7 +479,7 @@ test "settings menu renders category tabs and a flat full list through the VT" {
         var row = try composeSettingsMenuRow(alloc, projection, row_index, width, rows);
         defer row.deinit(alloc);
         var cursor_buf: [32]u8 = undefined;
-        const cursor = try std.fmt.bufPrint(&cursor_buf, "\x1b[{d};1H", .{row_index + 1});
+        const cursor = try std.mem.print(&cursor_buf, "\x1b[{d};1H", .{row_index + 1});
         try grid.feed(cursor);
         try grid.feed(row.items);
     }
@@ -487,7 +487,7 @@ test "settings menu renders category tabs and a flat full list through the VT" {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(alloc);
     try grid.rowTextTrimmed(1, &text);
-    try std.testing.expect(std.mem.find(u8, text.items, "Settings 13") != null);
+    try std.testing.expect(std.mem.find(u8, text.items, "Settings 14") != null);
     try std.testing.expect(std.mem.find(u8, text.items, "[All]") != null);
     try std.testing.expect(std.mem.find(u8, text.items, "Interface") != null);
     text.clearRetainingCapacity();
@@ -495,6 +495,6 @@ test "settings menu renders category tabs and a flat full list through the VT" {
     try std.testing.expect(std.mem.find(u8, text.items, "Status line context") != null);
     try std.testing.expect(std.mem.find(u8, text.items, "Interface") == null);
     text.clearRetainingCapacity();
-    try grid.rowTextTrimmed(15, &text);
+    try grid.rowTextTrimmed(16, &text);
     try std.testing.expect(std.mem.find(u8, text.items, "Prompt history") != null);
 }

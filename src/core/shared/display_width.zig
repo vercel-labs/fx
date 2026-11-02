@@ -1,6 +1,41 @@
 const std = @import("std");
 const unicode_data = @import("unicode_display_data.zig");
 
+const PackedRange = packed struct(u32) {
+    first: u18,
+    span: u14,
+};
+
+fn packedRangeCount(comptime source: []const unicode_data.Range) comptime_int {
+    const max_span: u21 = std.math.maxInt(u14);
+    var count: usize = 0;
+    for (source) |range| {
+        count += @as(usize, @intCast((range.last - range.first) / (max_span + 1))) + 1;
+    }
+    return count;
+}
+
+fn packRanges(comptime source: []const unicode_data.Range) [packedRangeCount(source)]PackedRange {
+    const max_span: u21 = std.math.maxInt(u14);
+    var encoded: [packedRangeCount(source)]PackedRange = undefined;
+    var index: usize = 0;
+    for (source) |range| {
+        var first = range.first;
+        while (first <= range.last) {
+            const span: u14 = @intCast(@min(range.last - first, max_span));
+            encoded[index] = .{ .first = @intCast(first), .span = span };
+            index += 1;
+            first += @as(u21, span) + 1;
+        }
+    }
+    return encoded;
+}
+
+const wide_ranges = packRanges(&unicode_data.wide_ranges);
+const emoji_presentation_ranges = packRanges(&unicode_data.emoji_presentation_ranges);
+const emoji_modifier_ranges = packRanges(&unicode_data.emoji_modifier_ranges);
+const variation_bases = packRanges(&unicode_data.variation_bases);
+
 const RgiNode = packed struct(u32) {
     edge_start: u13,
     edge_len: u8,
@@ -213,10 +248,10 @@ pub noinline fn displayUnitAt(text: []const u8, index: usize) DisplayUnit {
 
     const first = decodeNextRune(text, index);
     const next_index = index + first.len;
-    if (next_index < text.len and isInRanges(first.codepoint, unicode_data.variation_bases[0..])) {
+    if (next_index < text.len and isInRanges(first.codepoint, &variation_bases)) {
         const selector = decodeNextRune(text, next_index);
         if (selector.codepoint == 0xfe0e) {
-            const cell_width: usize = if (isInRanges(first.codepoint, unicode_data.wide_ranges[0..])) 2 else 1;
+            const cell_width: usize = if (isInRanges(first.codepoint, &wide_ranges)) 2 else 1;
             return .{ .byte_len = first.len + selector.len, .cell_width = cell_width };
         }
         if (selector.codepoint == 0xfe0f) {
@@ -241,8 +276,8 @@ noinline fn runeWidth(codepoint: u21) usize {
     if (codepoint == 0) return 0;
     if (codepoint < 32 or (codepoint >= 0x7f and codepoint < 0xa0)) return 0;
     if (isZeroWidthContinuation(codepoint)) return 0;
-    if (isInRanges(codepoint, unicode_data.wide_ranges[0..]) or
-        isInRanges(codepoint, unicode_data.emoji_presentation_ranges[0..])) return 2;
+    if (isInRanges(codepoint, &wide_ranges) or
+        isInRanges(codepoint, &emoji_presentation_ranges)) return 2;
     return 1;
 }
 
@@ -264,6 +299,24 @@ pub fn nextTabStopColumn(col: u16, cols: u16) u16 {
     return @intCast(@min(next_stop, @as(u32, cols)));
 }
 
+/// Decodes `sequence` as exactly one UTF-8 scalar value. Unlike the
+/// deprecated `std.unicode.utf8Decode`, any input that is not one complete
+/// well-formed sequence returns `error.InvalidUtf8`: a lone non-ASCII byte
+/// no longer decodes as itself, and a lead byte that disagrees with the
+/// slice length no longer reaches the fixed-length decoders' assertions.
+pub fn decodeUtf8Sequence(sequence: []const u8) error{InvalidUtf8}!u21 {
+    if (sequence.len == 0) return error.InvalidUtf8;
+    const len = std.unicode.utf8ByteSequenceLength(sequence[0]) catch return error.InvalidUtf8;
+    if (len != sequence.len) return error.InvalidUtf8;
+    return switch (len) {
+        1 => sequence[0],
+        2 => std.unicode.utf8Decode2(sequence[0..2].*) catch error.InvalidUtf8,
+        3 => std.unicode.utf8Decode3(sequence[0..3].*) catch error.InvalidUtf8,
+        4 => std.unicode.utf8Decode4(sequence[0..4].*) catch error.InvalidUtf8,
+        else => unreachable,
+    };
+}
+
 pub noinline fn decodeNextRune(text: []const u8, index: usize) DecodedRune {
     if (index >= text.len) return .{ .len = 0, .codepoint = 0 };
     const first = text[index];
@@ -272,7 +325,7 @@ pub noinline fn decodeNextRune(text: []const u8, index: usize) DecodedRune {
     const len = std.unicode.utf8ByteSequenceLength(first) catch return .{ .len = 1, .codepoint = 0xfffd };
     if (index + len > text.len) return .{ .len = 1, .codepoint = 0xfffd };
 
-    const codepoint = std.unicode.utf8Decode(text[index .. index + len]) catch return .{ .len = 1, .codepoint = 0xfffd };
+    const codepoint = decodeUtf8Sequence(text[index .. index + len]) catch return .{ .len = 1, .codepoint = 0xfffd };
     return .{ .len = len, .codepoint = codepoint };
 }
 
@@ -323,6 +376,11 @@ pub noinline fn wrapCutIgnoringAnsi(text: []const u8, max_width: usize) []const 
     var last_space: ?usize = null;
     var index: usize = 0;
     while (index < prefix.len) {
+        // A space inside an escape, such as an OSC 8 URL, is not a break.
+        if (prefix[index] == 0x1b) {
+            index = ansiSequenceEnd(prefix, index);
+            continue;
+        }
         const unit = displayUnitAt(prefix, index);
         if (prefix[index] == ' ' or prefix[index] == '\t') last_space = index;
         index += unit.byte_len;
@@ -350,7 +408,7 @@ fn isCombining(codepoint: u21) bool {
 
 fn isZeroWidthContinuation(codepoint: u21) bool {
     return isCombining(codepoint) or
-        isInRanges(codepoint, unicode_data.emoji_modifier_ranges[0..]) or
+        isInRanges(codepoint, &emoji_modifier_ranges) or
         codepoint == 0x200c or
         codepoint == 0x200d or
         (codepoint >= 0x200b and codepoint <= 0x200f) or
@@ -361,7 +419,24 @@ fn isZeroWidthContinuation(codepoint: u21) bool {
         (codepoint >= 0xe0100 and codepoint <= 0xe01ef);
 }
 
-fn isInRanges(codepoint: u21, ranges: []const unicode_data.Range) bool {
+fn isInRanges(codepoint: u21, ranges: []const PackedRange) bool {
+    var low: usize = 0;
+    var high = ranges.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const range = ranges[middle];
+        if (codepoint < range.first) {
+            high = middle;
+        } else if (codepoint > @as(u21, range.first) + range.span) {
+            low = middle + 1;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn isInSourceRanges(codepoint: u21, ranges: []const unicode_data.Range) bool {
     var low: usize = 0;
     var high = ranges.len;
     while (low < high) {
@@ -416,6 +491,35 @@ fn findTrieChild(node_index: u32, codepoint: u21) ?u32 {
 
 test "RGI runtime lookup data stays within the measured size budget" {
     try std.testing.expect(@sizeOf(RgiData) <= 22_272);
+}
+
+test "packed display ranges preserve every scalar classification" {
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(PackedRange));
+    for (0..0x110000) |raw| {
+        const codepoint: u21 = @intCast(raw);
+        try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.wide_ranges), isInRanges(codepoint, &wide_ranges));
+        try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.emoji_presentation_ranges), isInRanges(codepoint, &emoji_presentation_ranges));
+        try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.emoji_modifier_ranges), isInRanges(codepoint, &emoji_modifier_ranges));
+        try std.testing.expectEqual(isInSourceRanges(codepoint, &unicode_data.variation_bases), isInRanges(codepoint, &variation_bases));
+    }
+}
+
+test "decodeUtf8Sequence decodes one sequence and rejects malformed input" {
+    try std.testing.expectEqual(@as(u21, 'a'), try decodeUtf8Sequence("a"));
+    try std.testing.expectEqual(@as(u21, 0xe9), try decodeUtf8Sequence("é"));
+    try std.testing.expectEqual(@as(u21, 0x4e16), try decodeUtf8Sequence("世"));
+    try std.testing.expectEqual(@as(u21, 0x1f600), try decodeUtf8Sequence("😀"));
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence(""));
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\x80"));
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\xc3"));
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\xc3\x28"));
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\xc0\x80"));
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\xed\xa0\x80"));
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("😀a"));
+    // A lead byte that disagrees with the slice length, as when a caller
+    // walks back over continuation bytes in malformed text.
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\xe4\x80"));
+    try std.testing.expectError(error.InvalidUtf8, decodeUtf8Sequence("\x80\x80\x80\x80"));
 }
 
 test "prefixByWidth avoids cutting emoji bytes" {
@@ -589,6 +693,10 @@ test "wrapCutIgnoringAnsi prefers the last space inside the budget" {
     try std.testing.expectEqualStrings(" a", wrapCutIgnoringAnsi(" abcd", 2));
     try std.testing.expectEqualStrings("aaaa bbbb cccc", wrapCutIgnoringAnsi("aaaa bbbb cccc", 20));
     try std.testing.expectEqualStrings("\x1b[31maaaa", wrapCutIgnoringAnsi("\x1b[31maaaa bbbb\x1b[0m", 6));
+    try std.testing.expectEqualStrings(
+        "see",
+        wrapCutIgnoringAnsi("see \x1b]8;id=1;https://x.io/a b\x1b\\docs more", 8),
+    );
 }
 
 test "trimBreakWhitespace strips leading spaces and tabs" {
@@ -720,14 +828,14 @@ test "display unit clipping preserves sequence boundaries" {
 
 test "fuzz display unit boundaries" {
     try std.testing.fuzz({}, fuzzDisplayUnitBoundaries, .{
-        .corpus = &.{
+        .corpus = &(@import("fuzz_seed").slices(.{
             "",
             "plain text",
             "\xff\xf0\x28\x8c\x28",
             "\u{2600}\u{FE0E}\u{2600}\u{FE0F}",
             "\u{1F44D}\u{1F3FD}\u{1F1FA}\u{1F1F8}",
             "#\u{FE0F}\u{20E3}\u{1F469}\u{200D}\u{1F4BB}",
-        },
+        }) ++ @import("fuzz_corpus").display_width.*),
     });
 }
 

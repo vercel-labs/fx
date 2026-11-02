@@ -80,6 +80,8 @@ export interface AbConfig {
 export interface AbRunOptions {
   env?: Record<string, string | undefined>;
   score?: (result: HeadlessResult) => AbScore;
+  /** Prepares the fresh trial HOME before fx starts; it is removed after the trial. */
+  setupHome?: (home: string) => void | Promise<void>;
 }
 
 export function createTrialOrder(trialIndex: number): [AbSide, AbSide] {
@@ -298,6 +300,7 @@ export async function runAbTrial(
   };
 
   try {
+    await options.setupHome?.(trialHome);
     const versionOutput = await versionFor(binaryPath, env);
     const result = await runProcess(
       binaryPath,

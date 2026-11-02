@@ -15,15 +15,15 @@ pub fn Value(comptime T: type) type {
             return .{ .raw = value };
         }
 
-        pub fn load(self: *const Self, comptime _: std.builtin.AtomicOrder) T {
+        pub fn load(self: *const Self, comptime _: std.lang.AtomicOrder) T {
             return self.raw;
         }
 
-        pub fn store(self: *Self, value: T, comptime _: std.builtin.AtomicOrder) void {
+        pub fn store(self: *Self, value: T, comptime _: std.lang.AtomicOrder) void {
             self.raw = value;
         }
 
-        pub fn fetchAdd(self: *Self, operand: T, comptime _: std.builtin.AtomicOrder) T {
+        pub fn fetchAdd(self: *Self, operand: T, comptime _: std.lang.AtomicOrder) T {
             const previous = self.raw;
             self.raw +%= operand;
             return previous;
@@ -33,8 +33,8 @@ pub fn Value(comptime T: type) type {
             self: *Self,
             expected: T,
             new: T,
-            comptime _: std.builtin.AtomicOrder,
-            comptime _: std.builtin.AtomicOrder,
+            comptime _: std.lang.AtomicOrder,
+            comptime _: std.lang.AtomicOrder,
         ) ?T {
             if (self.raw != expected) return self.raw;
             self.raw = new;

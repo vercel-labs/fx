@@ -198,7 +198,7 @@ test "bounded insertion rejects before applying the successful transition" {
 
     var picker: picker_state.State = .{};
     defer picker.deinit(alloc);
-    try picker.beginModelPickerFlow(alloc, "openai/gpt-5", 2, false, .effort);
+    try picker.beginModelPickerFlow(alloc, "openai/gpt-5", 2, false, false, .effort);
     picker.file_completion_index = 3;
     picker.file_completion_window_start = 1;
 

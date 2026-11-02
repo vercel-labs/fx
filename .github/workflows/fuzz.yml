@@ -1,0 +1,111 @@
+name: Fuzz
+
+# Nightly coverage-guided fuzzing. Each target in tests/fuzz/targets.json gets
+# its own job and about 20 minutes of fuzzing. A failure uploads the recovered
+# input and opens or updates the target's issue, titled
+# "Nightly fuzz failure: <target>". scripts/fuzz_nightly.py does the work.
+# A pull request that changes the fuzzing setup fuzzes every target for two
+# minutes, so a change that breaks the nightly run fails before it merges.
+
+on:
+  schedule:
+    - cron: "23 7 * * *"
+  pull_request:
+    paths:
+      - .github/workflows/fuzz.yml
+      - scripts/fuzz_nightly.py
+      - src/fuzz_targets.zig
+      - tests/fuzz/**
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Fuzz only this target (leave empty for every target)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  targets:
+    name: List fuzz targets
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: List targets
+        id: list
+        env:
+          ONLY: ${{ inputs.target }}
+        run: python3 -m scripts.fuzz_nightly matrix --only "$ONLY" >> "$GITHUB_OUTPUT"
+
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    needs: targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.targets.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Restores main's unit-test cache for the dependencies, compiler_rt, and
+      # libc it keeps. This job never saves a cache.
+      - name: Setup Zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: "0.17.0"
+          cache-key: ci-unit-ReleaseSafe
+
+      # shell_parity compares fx's parse with sh, dash, bash, and zsh.
+      - name: Install zsh
+        if: matrix.target == 'shell_parity'
+        run: command -v zsh >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zsh; }
+
+      - name: Fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+          # Ubuntu has sh, dash, and bash, and the step above adds zsh, so
+          # shell_parity fails here if any of them is missing.
+          FX_TEST_SHELL_PARITY_ALL_SHELLS: "1"
+          BUDGET_SECONDS: ${{ github.event_name == 'pull_request' && '120' || '1200' }}
+        run: >-
+          python3 -m scripts.fuzz_nightly run
+          --target "$TARGET"
+          --out fuzz-output
+          --budget-seconds "$BUDGET_SECONDS"
+
+      - name: Upload failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: fuzz-output/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # Only main reports, so a dispatch on a branch cannot open issues.
+      - name: Report failure
+        if: failure() && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: >-
+          python3 -m scripts.fuzz_nightly report
+          --target "$TARGET"
+          --out fuzz-output
+          --repo "$GITHUB_REPOSITORY"
+          --run-url "$RUN_URL"
+          --commit "$GITHUB_SHA"

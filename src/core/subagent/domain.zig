@@ -47,6 +47,7 @@ pub const AdmissionSnapshot = struct {
     model: []u8,
     provider: model_provider.ProviderId = .gateway,
     effort: types.ReasoningEffort,
+    ultrafast_mode: bool = false,
     permission_mode: types.PermissionMode = .yolo,
     tool_names: [][]u8,
     rules: types.PermissionRuleSet,
@@ -76,6 +77,7 @@ pub const AdmissionInput = struct {
     model: []const u8,
     provider: model_provider.ProviderId = .gateway,
     effort: types.ReasoningEffort,
+    ultrafast_mode: bool = false,
     permission_mode: types.PermissionMode = .yolo,
     tool_names: []const []const u8 = &.{},
     rules: types.PermissionRuleSet = .{},
@@ -100,10 +102,11 @@ pub fn captureAdmission(
     validateId(input.parent_id) catch return error.InvalidAdmissionItem;
     validateId(input.source_id) catch return error.InvalidAdmissionItem;
     validateBoundedText(input.model, max_model_bytes) catch return error.InvalidModel;
+    // Integration names mirror the parent's MCP catalog, which is already
+    // bounded per server by the MCP tool limits, so they carry no count cap.
     if (input.tool_names.len > max_admission_items or
         input.rules.rules.len > max_admission_items or
-        input.grants.len > max_admission_items or
-        input.integration_names.len > max_admission_items)
+        input.grants.len > max_admission_items)
     {
         return error.TooManyAdmissionItems;
     }
@@ -152,6 +155,7 @@ pub fn captureAdmission(
         .model = model,
         .provider = input.provider,
         .effort = input.effort,
+        .ultrafast_mode = input.ultrafast_mode,
         .permission_mode = input.permission_mode,
         .tool_names = tool_names,
         .rules = rules,
@@ -241,4 +245,41 @@ test "captured admission owns independent authority slices" {
     });
     defer snapshot.deinit(alloc);
     try std.testing.expectEqualStrings("read_file", snapshot.tool_names[0]);
+}
+
+test "admission accepts more integration names than the admission item cap" {
+    const alloc = std.testing.allocator;
+    var names: [max_admission_items + 1][]const u8 = undefined;
+    for (&names) |*name| name.* = "mcp_fixture_tool";
+    var snapshot = try captureAdmission(alloc, .{
+        .parent_id = "01J00000000000000000000000",
+        .source_id = "01J00000000000000000000000",
+        .model = "test/model",
+        .effort = .auto,
+        .integration_names = &names,
+    });
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(names.len, snapshot.integration_names.len);
+}
+
+test "admission still validates each integration name" {
+    try std.testing.expectError(error.InvalidAdmissionItem, captureAdmission(std.testing.allocator, .{
+        .parent_id = "01J00000000000000000000000",
+        .source_id = "01J00000000000000000000000",
+        .model = "test/model",
+        .effort = .auto,
+        .integration_names = &.{""},
+    }));
+}
+
+test "admission keeps the item cap for tool names" {
+    var names: [max_admission_items + 1][]const u8 = undefined;
+    for (&names) |*name| name.* = "read_file";
+    try std.testing.expectError(error.TooManyAdmissionItems, captureAdmission(std.testing.allocator, .{
+        .parent_id = "01J00000000000000000000000",
+        .source_id = "01J00000000000000000000000",
+        .model = "test/model",
+        .effort = .auto,
+        .tool_names = &names,
+    }));
 }

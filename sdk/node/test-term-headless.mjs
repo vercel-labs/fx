@@ -75,7 +75,7 @@ while (!(events.some((event) => event.type === "config.changed" && event.configI
 runtime.write("/permissions auto\r");
 const modeDeadline = performance.now() + 5000;
 while (!(events.some((event) => event.type === "config.changed" && event.configId === "mode") &&
-  config.get("mode") === "code")) {
+  config.get("mode") === "auto")) {
   if (performance.now() >= modeDeadline) throw new Error(`timed out waiting for mode change:\n${readGrid()}`);
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
@@ -104,8 +104,8 @@ if (terminal.buffer.active.baseY !== 0 || terminal.buffer.active.viewportY !== 0
 if (!events.some((event) => event.type === "terminal.size" && event.cols === 96 && event.rows === 30)) throw new Error("terminal.size event did not report headless xterm geometry");
 if (config.get("model") !== "sdk/accepted-model") throw new Error("accepted terminal model was not persisted through configStore");
 if (!events.some((event) => event.type === "config.changed" && event.configId === "model" && event.value === "sdk/accepted-model" && event.source === "terminal")) throw new Error("terminal model command did not emit config.changed");
-if (config.get("mode") !== "code") throw new Error("accepted terminal mode was not persisted through configStore");
-if (!events.some((event) => event.type === "config.changed" && event.configId === "mode" && event.value === "code" && event.source === "terminal")) throw new Error("terminal mode command did not emit config.changed");
+if (config.get("mode") !== "auto") throw new Error("accepted terminal mode was not persisted through configStore");
+if (!events.some((event) => event.type === "config.changed" && event.configId === "mode" && event.value === "auto" && event.source === "terminal")) throw new Error("terminal mode command did not emit config.changed");
 if (!grid.includes("streamed response")) throw new Error(`terminal prompt did not render streamed gateway text:\n${grid}`);
 if (requestedModel !== "sdk/accepted-model") throw new Error(`terminal prompt used unexpected accepted model: ${requestedModel}`);
 if (!(firstChunkAt >= startedAt)) throw new Error("terminal fetch did not produce a first stream chunk");

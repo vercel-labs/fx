@@ -5,13 +5,13 @@ const auth_runtime = @import("../../core/auth/auth_runtime.zig");
 const activity_status = @import("../../core/output/activity_status.zig");
 const model_cache_runtime = @import("../../core/app/model_cache_runtime.zig");
 const app_mcp_runtime = @import("../../core/app/app_mcp_runtime.zig");
-const mcp_health = @import("../../core/mcp/health.zig");
-const mcp_menu_state = @import("../../core/mcp/menu_state.zig");
-const mcp_runtime = @import("../../core/mcp/mcp_runtime.zig");
+const mcp_host_menu_presentation = @import("mcp_host_menu_presentation.zig");
 const picker_state = @import("../../core/input/picker_state.zig");
+const session_adapter = @import("../../core/session/session_adapter.zig");
 const session_catalog = @import("../../core/session/session_catalog.zig");
 const session_store = @import("../../core/session/session_store.zig");
-const usage_report = @import("../../core/session/usage_report.zig");
+const info_panel_presentation = @import("info_panel_presentation.zig");
+const usage_presentation = @import("usage_presentation.zig");
 const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const settings_catalog = @import("../../core/config/settings_catalog.zig");
 const skill_runtime = @import("../../core/skills/skill_runtime.zig");
@@ -23,6 +23,8 @@ const file_index = @import("../../core/workspace/file_index.zig");
 const workspace_menu = @import("../../core/workspace/workspace_menu.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
 const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
+const effort_menu = @import("../../core/input/effort_menu.zig");
+const info_panel = @import("../../core/input/info_panel.zig");
 const usage_menu = @import("../../core/session/usage_menu.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
 const ui_render = @import("../render.zig");
@@ -87,7 +89,7 @@ pub const ModelMenuProjection = struct {
     query: []const u8 = "",
 
     pub fn providerFilter(self: ModelMenuProjection) model_cache_runtime.ModelProviderFilter {
-        return @enumFromInt(@min(self.provider_index, model_cache_runtime.model_provider_filter_count - 1));
+        return @fromBackingInt(@intCast(@min(self.provider_index, model_cache_runtime.model_provider_filter_count - 1)));
     }
 
     pub fn filteredItemCount(self: ModelMenuProjection) usize {
@@ -98,120 +100,6 @@ pub const ModelMenuProjection = struct {
         return model_cache_runtime.modelMenuItemAt(self.items, self.providerFilter(), self.query, display_index);
     }
 };
-
-pub const McpMenuProjection = struct {
-    state: mcp_menu_state.State = .{},
-    servers: []const mcp_health.ServerSnapshot = &.{},
-    tools: []const []const u8 = &.{},
-    resources: []const mcp_runtime.ResourceSummary = &.{},
-    resource_templates: []const mcp_runtime.ResourceSummary = &.{},
-    prompts: []const mcp_runtime.PromptSummary = &.{},
-    configuration_issue_count: usize = 0,
-    preview: ?[]const u8 = null,
-    feedback: ?[]const u8 = null,
-    add_name: []const u8 = "",
-    add_target: []const u8 = "",
-    add_arguments: []const u8 = "",
-    add_draft: []const u8 = "",
-    arguments: []const app_mcp_runtime.MenuArgumentField = &.{},
-    argument_draft: []const u8 = "",
-
-    pub fn itemCount(self: McpMenuProjection) usize {
-        return switch (self.state.section) {
-            .servers => self.servers.len,
-            .tools => countMatchingTools(self.tools, self.state.queryText()),
-            .resources => countMatchingResources(
-                self.resources,
-                self.resource_templates,
-                self.state.queryText(),
-            ),
-            .prompts => countMatchingPrompts(self.prompts, self.state.queryText()),
-        };
-    }
-
-    pub fn selectedServer(self: McpMenuProjection) ?*const mcp_health.ServerSnapshot {
-        if (self.state.selected_server_index >= self.servers.len) return null;
-        return &self.servers[self.state.selected_server_index];
-    }
-
-    pub fn resourceAt(self: McpMenuProjection, index: usize) ?*const mcp_runtime.ResourceSummary {
-        var matched: usize = 0;
-        const query = self.state.queryText();
-        for (self.resources) |*item| {
-            if (!resourceMatches(item.*, query)) continue;
-            if (matched == index) return item;
-            matched += 1;
-        }
-        for (self.resource_templates) |*item| {
-            if (!resourceMatches(item.*, query)) continue;
-            if (matched == index) return item;
-            matched += 1;
-        }
-        return null;
-    }
-
-    pub fn toolAt(self: McpMenuProjection, index: usize) ?[]const u8 {
-        var matched: usize = 0;
-        const query = self.state.queryText();
-        for (self.tools) |item| {
-            if (!matches(item, query)) continue;
-            if (matched == index) return item;
-            matched += 1;
-        }
-        return null;
-    }
-
-    pub fn promptAt(self: McpMenuProjection, index: usize) ?*const mcp_runtime.PromptSummary {
-        var matched: usize = 0;
-        const query = self.state.queryText();
-        for (self.prompts) |*item| {
-            if (!promptMatches(item.*, query)) continue;
-            if (matched == index) return item;
-            matched += 1;
-        }
-        return null;
-    }
-};
-
-fn matches(text: []const u8, query: []const u8) bool {
-    return mcp_menu_state.textMatchesQuery(text, query);
-}
-
-fn countMatchingTools(items: []const []const u8, query: []const u8) usize {
-    var count: usize = 0;
-    for (items) |item| count += @intFromBool(matches(item, query));
-    return count;
-}
-
-fn resourceMatches(item: mcp_runtime.ResourceSummary, query: []const u8) bool {
-    return matches(item.uri, query) or
-        matches(item.name, query) or
-        (item.title != null and matches(item.title.?, query)) or
-        (item.description != null and matches(item.description.?, query));
-}
-
-fn countMatchingResources(
-    resources: []const mcp_runtime.ResourceSummary,
-    templates: []const mcp_runtime.ResourceSummary,
-    query: []const u8,
-) usize {
-    var count: usize = 0;
-    for (resources) |item| count += @intFromBool(resourceMatches(item, query));
-    for (templates) |item| count += @intFromBool(resourceMatches(item, query));
-    return count;
-}
-
-fn promptMatches(item: mcp_runtime.PromptSummary, query: []const u8) bool {
-    return matches(item.name, query) or
-        (item.title != null and matches(item.title.?, query)) or
-        (item.description != null and matches(item.description.?, query));
-}
-
-fn countMatchingPrompts(items: []const mcp_runtime.PromptSummary, query: []const u8) usize {
-    var count: usize = 0;
-    for (items) |item| count += @intFromBool(promptMatches(item, query));
-    return count;
-}
 
 pub const SessionMenuProjection = struct {
     active: bool = false,
@@ -242,6 +130,41 @@ pub const SessionMenuProjection = struct {
         return session_catalog.summaryAt(self.summaries, self.query, display_index);
     }
 };
+
+pub const ForkMenuProjection = struct {
+    /// The session's prompts, oldest first.
+    points: []const session_adapter.Session.ForkPoint = &.{},
+    selected: usize = 0,
+    window_start: usize = 0,
+
+    pub fn active(self: ForkMenuProjection) bool {
+        return self.points.len > 0;
+    }
+};
+
+/// What the `/effort` menu shows: the current model's reasoning effort
+/// levels, the one in use, and the one highlighted.
+pub const EffortMenuProjection = struct {
+    active: bool = false,
+    model: []const u8 = "",
+    /// `default`, then the model's levels.
+    levels: []const types.ReasoningEffort = &.{},
+    current: usize = 0,
+    selected: usize = 0,
+    window_start: usize = 0,
+};
+
+pub fn effortMenuProjection(menu: *const effort_menu.State) EffortMenuProjection {
+    if (!menu.active) return .{};
+    return .{
+        .active = true,
+        .model = menu.model.items,
+        .levels = menu.levels(),
+        .current = menu.current,
+        .selected = menu.selected,
+        .window_start = menu.window_start,
+    };
+}
 
 pub const HelpMenuProjection = struct {
     active: bool = false,
@@ -295,27 +218,21 @@ pub fn statuslineMenuProjection(
     };
 }
 
-pub const UsageMenuProjection = struct {
-    active: bool = false,
-    scope: usage_report.Scope = .days_30,
-    selected_model: usize = 0,
-    expanded_model: ?usize = null,
-    model_window_start: usize = 0,
-    snapshot: ?*const usage_report.Snapshot = null,
-    refresh_error: ?[]const u8 = null,
-};
+pub const UsageMenuProjection = usage_presentation.Projection;
+pub const usageShowsTables = usage_presentation.showsTables;
+pub const usageIsPlan = usage_presentation.isPlan;
+pub const usageCodexHasPeriods = usage_presentation.codexHasPeriods;
 
 pub fn usageMenuProjection(
     menu: *const usage_menu.State,
 ) UsageMenuProjection {
     return .{
         .active = menu.active,
-        .scope = menu.scope(),
+        .period = menu.period,
         .selected_model = menu.selected_model,
-        .expanded_model = menu.expanded_model,
         .model_window_start = menu.model_window_start,
+        .detail = menu.detail,
         .snapshot = if (menu.snapshot) |*snapshot| snapshot else null,
-        .refresh_error = menu.refresh_error,
     };
 }
 
@@ -341,8 +258,30 @@ pub fn workspaceMenuProjection(
     };
 }
 
+/// A read-only panel such as `/status` opens: its title, its rows, how far
+/// they are scrolled, and whether they do not all fit, so its hint offers ↑↓.
+pub const InfoPanelProjection = struct {
+    active: bool = false,
+    title: []const u8 = "",
+    rows: []const info_panel.Row = &.{},
+    scroll: usize = 0,
+    overflows: bool = false,
+};
+
+pub fn infoPanelProjection(panel: *const info_panel.State, cols: u16, terminal_rows: u16) InfoPanelProjection {
+    var projection: InfoPanelProjection = .{
+        .active = panel.active,
+        .title = panel.title(),
+        .rows = panel.rows(),
+        .scroll = panel.scroll,
+    };
+    projection.overflows = info_panel_presentation.overflows(projection, cols, terminal_rows);
+    return projection;
+}
+
 pub const CompactCommandMenuProjection = union(enum) {
     statusline: StatuslineMenuProjection,
+    info_panel: InfoPanelProjection,
     usage: UsageMenuProjection,
     workspace: WorkspaceMenuProjection,
 };
@@ -452,6 +391,9 @@ pub const RenderContext = struct {
     file_completions_loading: bool = false,
     file_completions_failed: bool = false,
     inline_completion_suffix: []const u8 = "",
+    /// A request waits for the sign-in fx opened for it, so the auth picker
+    /// shows while the turn is active.
+    auth_picker_during_turn: bool = false,
     auth_picker: auth_runtime.PickerView = .{
         .active = false,
         .available_sources = .empty,
@@ -460,15 +402,20 @@ pub const RenderContext = struct {
         .include_skip = false,
     },
     skills_menu: SkillsMenuProjection = .{},
-    mcp_menu: McpMenuProjection = .{},
+    mcp_host_menu: mcp_host_menu_presentation.Projection = .{},
     help_menu: HelpMenuProjection = .{},
     settings_menu: SettingsMenuProjection = .{},
     model_menu: ModelMenuProjection = .{},
     session_menu: SessionMenuProjection = .{},
+    fork_menu: ForkMenuProjection = .{},
+    effort_menu: EffortMenuProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},
+    info_panel: InfoPanelProjection = .{},
     usage_menu: UsageMenuProjection = .{},
     workspace_menu: WorkspaceMenuProjection = .{},
     upgrade_status: []const u8 = "",
+    /// What MCP has to say, after everything else on the right.
+    mcp_status: []const u8 = "",
     danger_status: []const u8 = "",
     danger_status_compact: []const u8 = "",
     esc_clear_armed: bool = false,
@@ -482,6 +429,7 @@ pub const RenderContext = struct {
 
 pub fn activeCompactCommandMenu(ctx: RenderContext) ?CompactCommandMenuProjection {
     if (ctx.statusline_menu.active) return .{ .statusline = ctx.statusline_menu };
+    if (ctx.info_panel.active) return .{ .info_panel = ctx.info_panel };
     if (ctx.usage_menu.active) return .{ .usage = ctx.usage_menu };
     if (ctx.workspace_menu.active) return .{ .workspace = ctx.workspace_menu };
     return null;
@@ -489,9 +437,12 @@ pub fn activeCompactCommandMenu(ctx: RenderContext) ?CompactCommandMenuProjectio
 
 pub const steering_composer_gap_rows: u16 = 1;
 pub const max_steering_message_rows: u16 = 2;
+/// Rows a message layout holds: steering previews show two, fork menu
+/// prompts three.
+pub const max_message_layout_rows: u16 = 3;
 
-const SteeringMessageLayout = struct {
-    rows: [max_steering_message_rows][]const u8 = @splat(""),
+pub const SteeringMessageLayout = struct {
+    rows: [max_message_layout_rows][]const u8 = @splat(""),
     row_count: u16 = 0,
     content_width: u16,
     truncated: bool = false,
@@ -524,7 +475,7 @@ pub fn steering_message_layout(
     var layout: SteeringMessageLayout = .{
         .content_width = if (waits_for_boundary) width -| 2 else width,
     };
-    const limit = @min(row_limit, max_steering_message_rows);
+    const limit = @min(row_limit, max_message_layout_rows);
     var offset: usize = 0;
     while (layout.row_count < limit) {
         const start = offset;
@@ -710,12 +661,40 @@ pub fn frameOwnedActivityProjection(
     switch (ctx.activity) {
         .tool_slot => {},
         .turn_thinking => |thinking| {
-            if (thinking.tone != .thinking) return ctx.activity;
+            if (thinking.tone != .thinking) return fitStatusLabel(thinking, shell.layout.cols);
         },
         .none => {},
     }
     if (compaction != .none) return compaction;
     return turnActivityProjection(buf, shell, ctx);
+}
+
+/// A status with a short form shows it when the full label is wider than the
+/// row, so the action at the end of a "needs you" line is never clipped.
+fn fitStatusLabel(thinking: ActivityProjection.TurnThinking, cols: u16) ActivityProjection {
+    const short = thinking.short_label orelse return .{ .turn_thinking = thinking };
+    if (cols == 0 or display_width.visibleWidthIgnoringAnsi(thinking.label) <= cols) {
+        return .{ .turn_thinking = thinking };
+    }
+    return .{ .turn_thinking = .{ .label = short, .tone = thinking.tone } };
+}
+
+test "a status shows its short form only when the row is narrower than its text" {
+    const thinking: ActivityProjection.TurnThinking = .{
+        .label = "⚠ Blocked by the content filter · press Esc and rephrase",
+        .short_label = "⚠ Blocked by content filter · Esc, then rephrase",
+        .tone = .danger,
+    };
+    try std.testing.expectEqualStrings(thinking.label, fitStatusLabel(thinking, 80).turn_thinking.label);
+    const width: u16 = @intCast(display_width.visibleWidthIgnoringAnsi(thinking.label));
+    try std.testing.expectEqualStrings(thinking.label, fitStatusLabel(thinking, width).turn_thinking.label);
+    const narrow = fitStatusLabel(thinking, width - 1).turn_thinking;
+    try std.testing.expectEqualStrings(thinking.short_label.?, narrow.label);
+    try std.testing.expectEqual(ActivityProjection.Tone.danger, narrow.tone);
+
+    var no_short = thinking;
+    no_short.short_label = null;
+    try std.testing.expectEqualStrings(thinking.label, fitStatusLabel(no_short, 20).turn_thinking.label);
 }
 
 pub fn frameActivityBlink(ctx: RenderContext) ?bool {
@@ -781,7 +760,8 @@ fn appendConnectedToolLabel(
     var connected: std.ArrayList(u8) = .empty;
     defer connected.deinit(alloc);
     try connected.appendSlice(alloc, ui_render.statusline_style);
-    if (std.mem.eql(u8, marker_bytes, "●") or std.mem.eql(u8, marker_bytes, "■")) {
+    // `■` is the cancelled marker older sessions recorded before `▪`.
+    if (std.mem.eql(u8, marker_bytes, "●") or std.mem.eql(u8, marker_bytes, "▪") or std.mem.eql(u8, marker_bytes, "■")) {
         try connected.appendSlice(alloc, "└");
         try appendWithoutAnsi(alloc, &connected, label[marker_end .. marker_end + line_end]);
     } else {
@@ -1139,6 +1119,32 @@ test "minimal connected tool label clips with an ellipsis" {
     try std.testing.expect(std.mem.find(u8, label.items, "…") != null);
     try std.testing.expect(std.mem.findScalar(u8, label.items, '\n') == null);
     try std.testing.expect(display_width.visibleWidthIgnoringAnsi(label.items) <= 24);
+}
+
+test "frame-owned activity keeps a live retrying status in place of the thinking row" {
+    var input = InputRuntime{};
+    defer input.deinit(std.testing.allocator);
+    var shell = TranscriptRuntime{};
+    defer shell.deinit(std.testing.allocator);
+    const ctx: RenderContext = .{
+        .stream = .{ .active = true },
+        .has_api_key = true,
+        .model = "gpt-5.1",
+        .activity = .{ .turn_thinking = .{
+            .label = "• Gateway error · retrying · attempt 4 · 1m 20s",
+            .tone = .live,
+        } },
+        .input = &input,
+    };
+
+    var active_buf: [256]u8 = undefined;
+    switch (frameOwnedActivityProjection(&active_buf, &shell, ctx, null)) {
+        .turn_thinking => |thinking| {
+            try std.testing.expectEqual(ActivityProjection.Tone.live, thinking.tone);
+            try std.testing.expectEqualStrings("• Gateway error · retrying · attempt 4 · 1m 20s", thinking.label);
+        },
+        .none, .tool_slot => return error.TestUnexpectedResult,
+    }
 }
 
 test "frame-owned activity preserves route recovery status tone" {

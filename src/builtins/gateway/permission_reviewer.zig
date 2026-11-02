@@ -1,12 +1,12 @@
 const std = @import("std");
 const gateway_client = @import("../../gateway/client.zig");
 const permission_auto_classifier = @import("../../core/permissions/auto_classifier.zig");
-const session_usage = @import("../../core/session/session_usage.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const types = @import("../../core/shared/types.zig");
 const stream_provider = @import("../../core/agent/stream_provider.zig");
-const credential_authority = @import("../../core/auth/credential_authority.zig");
 const vercel_protocol = @import("../../gateway/vercel_protocol.zig");
+const vercel_model_policy = @import("../../gateway/vercel_model_policy.zig");
+const typesafe_permission_reviewer = @import("typesafe_permission_reviewer.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -35,8 +35,6 @@ const GatewayConfig = struct {
     team: ?[]const u8 = null,
     chat_url: []const u8,
     cancel_flag: ?*std.atomic.Value(bool) = null,
-    usage: ?*session_usage.Usage = null,
-    usage_allocator: Allocator = std.heap.c_allocator,
     stream_ctx: *anyopaque = @ptrCast(&default_stream_ctx),
     stream_fn: StreamFn = streamGatewayReviewer,
 };
@@ -49,21 +47,30 @@ fn reviewGateway(
     input: permission_auto_classifier.ProviderInput,
     request: permission_auto_classifier.ReviewRequest,
 ) anyerror!permission_auto_classifier.ParseOutcome {
+    // The review_model setting (or FX_REVIEW_MODEL) overrides the reviewer
+    // model. typesafeai/jev selects the TypeSafe System One reviewer; any
+    // other value stays on this gateway chat path with that model id. Every
+    // composition site selects this provider, so the override covers
+    // interactive, ask, and subagent reviews uniformly.
+    const selected = if (input.reviewer_model.len > 0) input.reviewer_model else reviewer_model;
+    if (typesafe_permission_reviewer.isJevModelId(selected)) {
+        debug_trace.logf("permission", "event=auto_review_provider_selected provider={s}", .{typesafe_permission_reviewer.review_model_id});
+        return typesafe_permission_reviewer.review(null, alloc, input, request);
+    }
     return reviewGatewayConfig(.{
         .api_key = if (input.credential_source == .host_managed) null else input.credential,
         .credential_source = input.credential_source,
         .team = input.tenant,
         .chat_url = input.endpoint,
         .cancel_flag = input.cancel_flag,
-        .usage = input.usage,
-        .usage_allocator = input.usage_allocator,
-    }, alloc, request);
+    }, alloc, request, selected);
 }
 
 fn reviewGatewayConfig(
     config: GatewayConfig,
     alloc: Allocator,
     request: permission_auto_classifier.ReviewRequest,
+    model: []const u8,
 ) !permission_auto_classifier.ParseOutcome {
     var local = config;
     return permission_auto_classifier.Reviewer.withTransportModel(
@@ -74,14 +81,14 @@ fn reviewGatewayConfig(
         },
         local.cancel_flag,
         permission_auto_classifier.Reviewer.default_timeout_ms,
-        reviewer_model,
+        model,
     ).review(alloc, request);
 }
 
 fn buildGatewayReview(
     _: *anyopaque,
     alloc: Allocator,
-    _: []const u8,
+    model: []const u8,
     tools_json: []const u8,
     instructions: []const types.ChatMessage,
     messages: []const types.ChatMessage,
@@ -89,13 +96,18 @@ fn buildGatewayReview(
     deadline: std.Io.Clock.Timestamp,
     cancel_flag: *std.atomic.Value(bool),
 ) ![]u8 {
+    // No later request shares a review's prefix: the review data sits inside
+    // the policy instructions. A cache write would only add its premium.
     return vercel_protocol.buildGatewayPendingToolReviewRequestBodyWithMaxOutputTokens(
         alloc,
         tools_json,
         instructions,
         messages,
         target_call_id,
-        .{},
+        .{
+            .skip_cache_writes = vercel_model_policy.takesPromptCacheOptions(model),
+            .single_system_message = vercel_model_policy.singleSystemMessage(model),
+        },
         2048,
         deadline,
         cancel_flag,
@@ -132,14 +144,6 @@ fn sendGatewayReview(
         return .permanent_failure;
     }
 
-    const usage_observation = session_usage.InvocationObservation.begin(config.usage) catch |err| {
-        debug_trace.logf(
-            "permission",
-            "event=auto_review_usage result=permanent_failure phase=begin reason={s}",
-            .{@errorName(err)},
-        );
-        return .permanent_failure;
-    };
     var delivery = gateway_client.DeliveryCertainty.init();
     var stream = config.stream_fn(
         config.stream_ctx,
@@ -153,52 +157,9 @@ fn sendGatewayReview(
         deadline,
         &delivery,
         cancel_flag,
-    ) catch |err| {
-        usage_observation.fail(if (delivery.load() == .possibly_sent)
-            .ambiguous_delivery
-        else
-            .unbilled) catch |usage_err| {
-            debug_trace.logf(
-                "permission",
-                "event=auto_review_usage result=permanent_failure phase=transport_failure reason={s}",
-                .{@errorName(usage_err)},
-            );
-            return .permanent_failure;
-        };
-        return mapTransportError(err, cancel_flag);
-    };
+    ) catch |err| return mapTransportError(err, cancel_flag);
     var stream_owned = true;
     defer if (stream_owned) stream.deinit(alloc);
-    const usage_outcome = usageOutcome(config, stream.completion);
-    (if (stream.status == .ok)
-        usage_observation.complete(
-            config.usage_allocator,
-            stream.completion,
-            usage_outcome,
-        )
-    else
-        usage_observation.fail(.unbilled)) catch |err| {
-        debug_trace.logf(
-            "permission",
-            "event=auto_review_usage result=permanent_failure phase=completion reason={s}",
-            .{@errorName(err)},
-        );
-        return .permanent_failure;
-    };
-    if (stream.status == .ok and std.meta.activeTag(usage_outcome) == .deferred) if (config.usage) |ledger| {
-        if (config.api_key) |api_key| {
-            ledger.startDeferredReconciliation(
-                config.usage_allocator,
-                usage_outcome.deferred,
-                api_key,
-            );
-        } else if (config.credential_source == .host_managed) {
-            ledger.startHostManagedDeferredReconciliation(
-                config.usage_allocator,
-                usage_outcome.deferred,
-            );
-        }
-    };
 
     if (cancel_flag.load(.seq_cst)) {
         return .cancelled;
@@ -208,7 +169,7 @@ fn sendGatewayReview(
         debug_trace.logf(
             "permission",
             "event=auto_review_transport result={s} http_status={d}",
-            .{ @tagName(std.meta.activeTag(outcome)), @intFromEnum(stream.status) },
+            .{ @tagName(std.meta.activeTag(outcome)), @backingInt(stream.status) },
         );
         return outcome;
     }
@@ -251,30 +212,6 @@ fn sendGatewayReview(
     } };
 }
 
-fn usageOutcome(
-    config: *const GatewayConfig,
-    completion: types.ModelCompletion,
-) stream_provider.UsageOutcome {
-    const generation_id = completion.generation_id orelse
-        return .{ .unavailable = .possibly_billed };
-    const source = config.credential_source orelse .ai_gateway_api_key;
-    const reference = stream_provider.DeferredUsageReference{
-        .provider = .gateway,
-        .generation_id = generation_id,
-        .scope = gateway_client.generationBaseUrl(),
-        .tenant = config.team,
-        .credential_source = source,
-        .credential_identity = credential_authority.derive(
-            source,
-            null,
-        ),
-    };
-    return if (completion.billing != null)
-        .{ .exact = .gateway }
-    else
-        .{ .deferred = reference };
-}
-
 fn mapTransportError(
     err: anyerror,
     cancel_flag: *std.atomic.Value(bool),
@@ -298,7 +235,7 @@ fn mapTransportError(
 }
 
 fn mapHttpStatus(status: std.http.Status) permission_auto_classifier.TransportOutcome {
-    const code: u16 = @intFromEnum(status);
+    const code: u16 = @backingInt(status);
     if (code == 408 or code == 425 or code == 429 or code >= 500) {
         return .transient_failure;
     }
@@ -349,6 +286,7 @@ const FakeOutcome = enum {
 const FakeStream = struct {
     outcomes: []const FakeOutcome,
     calls: usize = 0,
+    expected_model: []const u8 = reviewer_model,
     saw_single_attempt_only: bool = true,
     saw_expected_model_only: bool = true,
     saw_required_tool_payload: bool = true,
@@ -370,7 +308,7 @@ const FakeStream = struct {
         const self: *FakeStream = @ptrCast(@alignCast(raw_ctx));
         if (self.calls < self.deadlines.len) self.deadlines[self.calls] = deadline;
         self.saw_single_attempt_only = self.saw_single_attempt_only and retry_count == 1;
-        self.saw_expected_model_only = self.saw_expected_model_only and std.mem.eql(u8, model, reviewer_model);
+        self.saw_expected_model_only = self.saw_expected_model_only and std.mem.eql(u8, model, self.expected_model);
         self.saw_required_tool_payload = self.saw_required_tool_payload and
             std.mem.find(u8, payload, "permission_decision") != null;
         const outcome = self.outcomes[@min(self.calls, self.outcomes.len - 1)];
@@ -386,8 +324,8 @@ const FakeStream = struct {
             },
             .timeout => error.Timeout,
             .cancelled => error.Cancelled,
-            .transient_http => .{ .status = @enumFromInt(429) },
-            .permanent_http => .{ .status = @enumFromInt(400) },
+            .transient_http => .{ .status = @fromBackingInt(@intCast(429)) },
+            .permanent_http => .{ .status = @fromBackingInt(@intCast(400)) },
         };
     }
 };
@@ -466,10 +404,76 @@ fn testConfig(fake: *FakeStream, cancel_flag: ?*std.atomic.Value(bool)) GatewayC
     };
 }
 
+test "gateway review asks GPT-5.6 and later to skip cache writes" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(1000),
+    });
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = "Review the pending call." }};
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "review_context_kind: normal\n" },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "call", .name = "shell", .arguments_json = "{}" }} },
+    };
+    for ([_]struct { model: []const u8, skip: bool }{
+        .{ .model = reviewer_model, .skip = true },
+        .{ .model = "openai/gpt-6.1-sol", .skip = true },
+        .{ .model = "openai/gpt-5", .skip = false },
+        .{ .model = "anthropic/claude-haiku-5.5", .skip = false },
+    }) |case| {
+        var unused: u8 = 0;
+        const body = try buildGatewayReview(@ptrCast(&unused), std.testing.allocator, case.model, "[]", &instructions, &messages, "call", deadline, &cancel);
+        defer std.testing.allocator.free(body);
+        try std.testing.expectEqual(case.skip, std.mem.find(u8, body, "\"promptCacheOptions\":{\"mode\":\"explicit\"}") != null);
+        // A review never asks the Gateway to cache.
+        try std.testing.expect(std.mem.find(u8, body, "\"caching\"") == null);
+    }
+}
+
+test "gateway review sends Qwen its instructions as one system message" {
+    var cancel = std.atomic.Value(bool).init(false);
+    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(1000),
+    });
+    const instructions = [_]types.ChatMessage{
+        .{ .role = .system, .content = "Review the pending call." },
+        .{ .role = .system, .content = "Review policy details." },
+    };
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "review_context_kind: normal\n" },
+        .{ .role = .assistant, .tool_calls = &.{.{ .id = "call", .name = "shell", .arguments_json = "{}" }} },
+    };
+    for ([_]struct { model: []const u8, systems: usize }{
+        .{ .model = "alibaba/qwen3.8-max", .systems = 1 },
+        .{ .model = "zai/glm-5.3", .systems = 2 },
+    }) |case| {
+        var unused: u8 = 0;
+        const body = try buildGatewayReview(@ptrCast(&unused), std.testing.allocator, case.model, "[]", &instructions, &messages, "call", deadline, &cancel);
+        defer std.testing.allocator.free(body);
+        try std.testing.expectEqual(case.systems, std.mem.count(u8, body, "{\"role\":\"system\""));
+    }
+}
+
+test "gateway reviewer transport carries the resolved review-model override" {
+    var fake = FakeStream{ .outcomes = &.{.valid}, .expected_model = "openai/gpt-5-alt" };
+    const config = testConfig(&fake, null);
+    var outcome = try reviewGatewayConfig(config, std.testing.allocator, testRequest(), "openai/gpt-5-alt");
+    defer outcome.deinit(std.testing.allocator);
+
+    switch (outcome) {
+        .valid => |result| try std.testing.expectEqual(permission_auto_classifier.Decision.clear, result.decision),
+        .evidence_incomplete, .invalid => return error.TestExpectedEqual,
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expect(fake.saw_expected_model_only);
+    try std.testing.expect(fake.saw_required_tool_payload);
+}
+
 test "gateway automatic reviewer transport is single-attempt" {
     var fake = FakeStream{ .outcomes = &.{.valid} };
     const config = testConfig(&fake, null);
-    var outcome = try reviewGatewayConfig(config, std.testing.allocator, testRequest());
+    var outcome = try reviewGatewayConfig(config, std.testing.allocator, testRequest(), reviewer_model);
     defer outcome.deinit(std.testing.allocator);
 
     switch (outcome) {
@@ -482,152 +486,42 @@ test "gateway automatic reviewer transport is single-attempt" {
     try std.testing.expect(fake.saw_required_tool_payload);
 }
 
-test "gateway automatic reviewer records its generation in session usage" {
-    const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    var fake = FakeStream{ .outcomes = &.{.valid} };
-    const config = GatewayConfig{
-        .api_key = "test-key",
-        .chat_url = "https://example.test/chat",
-        .usage = &usage,
-        .usage_allocator = alloc,
-        .stream_ctx = @ptrCast(&fake),
-        .stream_fn = FakeStream.execute,
-    };
-
-    var outcome = try reviewGatewayConfig(config, alloc, testRequest());
-    defer outcome.deinit(alloc);
-    var snapshot = try usage.snapshot(alloc);
-    defer snapshot.deinit(alloc);
-
-    try std.testing.expectEqual(session_usage.Availability.pending, snapshot.billing);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.pending.len);
-    try std.testing.expectEqualStrings(
-        "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        snapshot.pending[0].id,
-    );
-}
-
-test "pre-send automatic reviewer failure stays unbilled" {
-    const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    var fake = FakeStream{ .outcomes = &.{.permanent_error} };
-    const config = GatewayConfig{
-        .api_key = "test-key",
-        .chat_url = "https://example.test/chat",
-        .usage = &usage,
-        .usage_allocator = alloc,
-        .stream_ctx = @ptrCast(&fake),
-        .stream_fn = FakeStream.execute,
-    };
-
-    var outcome = try reviewGatewayConfig(config, alloc, testRequest());
-    defer outcome.deinit(alloc);
-    var snapshot = try usage.snapshot(alloc);
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.complete, snapshot.billing);
-    try std.testing.expect(snapshot.api_duration_complete);
-    try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
-}
-
-test "possibly sent automatic reviewer failure marks billing incomplete" {
-    const alloc = std.testing.allocator;
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    var fake = FakeStream{ .outcomes = &.{.ambiguous_error} };
-    const config = GatewayConfig{
-        .api_key = "test-key",
-        .chat_url = "https://example.test/chat",
-        .usage = &usage,
-        .usage_allocator = alloc,
-        .stream_ctx = @ptrCast(&fake),
-        .stream_fn = FakeStream.execute,
-    };
-
-    var outcome = try reviewGatewayConfig(config, alloc, testRequest());
-    defer outcome.deinit(alloc);
-    var snapshot = try usage.snapshot(alloc);
-    defer snapshot.deinit(alloc);
-    try std.testing.expectEqual(session_usage.Availability.incomplete, snapshot.billing);
-    try std.testing.expect(snapshot.api_duration_complete);
-    try std.testing.expectEqual(@as(u64, 1), snapshot.settled_through_sequence);
-}
-
-test "terminal checkpoint failure releases automatic reviewer stream" {
-    const Checkpoint = struct {
-        calls: usize = 0,
-
-        fn persist(raw_ctx: *anyopaque, _: session_usage.Snapshot) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw_ctx));
-            self.calls += 1;
-            if (self.calls == 2) return error.CheckpointRejected;
-        }
-    };
-
-    const alloc = std.testing.allocator;
-    var checkpoint = Checkpoint{};
-    var usage = session_usage.Usage.initFresh();
-    defer usage.deinit(alloc);
-    usage.configureCheckpointSink(.{
-        .context = &checkpoint,
-        .allocator = alloc,
-        .persist = Checkpoint.persist,
-    });
-    var fake = FakeStream{ .outcomes = &.{.valid} };
-    const config = GatewayConfig{
-        .api_key = "test-key",
-        .chat_url = "https://example.test/chat",
-        .usage = &usage,
-        .usage_allocator = alloc,
-        .stream_ctx = @ptrCast(&fake),
-        .stream_fn = FakeStream.execute,
-    };
-
-    var outcome = try reviewGatewayConfig(config, alloc, testRequest());
-    defer outcome.deinit(alloc);
-    try std.testing.expectEqual(
-        std.meta.Tag(permission_auto_classifier.ParseOutcome).valid,
-        std.meta.activeTag(outcome),
-    );
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
-    try std.testing.expectEqual(@as(usize, 2), checkpoint.calls);
-}
-
-test "permission reviewer owns a single-send budget" {
+test "permission reviewer retries one transport failure with a fresh deadline" {
     var fake = FakeStream{ .outcomes = &.{ .transient_error, .malformed } };
     const config = testConfig(&fake, null);
-    const outcome = try reviewGatewayConfig(config, std.testing.allocator, testRequest());
+    const outcome = try reviewGatewayConfig(config, std.testing.allocator, testRequest(), reviewer_model);
 
     try std.testing.expectEqual(
         std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
         std.meta.activeTag(outcome),
     );
-    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    // One transport retry, then one malformed-completion retry.
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
     try std.testing.expect(fake.saw_single_attempt_only);
     try std.testing.expect(fake.deadlines[0] != null);
-    try std.testing.expect(fake.deadlines[1] == null);
+    try std.testing.expect(fake.deadlines[1] != null);
+    try std.testing.expect(fake.deadlines[1].?.raw.nanoseconds > fake.deadlines[0].?.raw.nanoseconds);
 }
 
 test "gateway automatic reviewer distinguishes transient and permanent HTTP failures" {
     var transient_fake = FakeStream{ .outcomes = &.{ .transient_http, .valid } };
     const transient_config = testConfig(&transient_fake, null);
-    var transient = try reviewGatewayConfig(transient_config, std.testing.allocator, testRequest());
+    var transient = try reviewGatewayConfig(transient_config, std.testing.allocator, testRequest(), reviewer_model);
     defer transient.deinit(std.testing.allocator);
+    // Transient failures retry once and can recover.
     try std.testing.expectEqual(
-        std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
+        std.meta.Tag(permission_auto_classifier.ParseOutcome).valid,
         std.meta.activeTag(transient),
     );
     try std.testing.expectEqual(
-        permission_auto_classifier.InvalidReason.transport_transient,
-        transient.invalid,
+        permission_auto_classifier.Decision.clear,
+        transient.valid.decision,
     );
-    try std.testing.expectEqual(@as(usize, 1), transient_fake.calls);
+    try std.testing.expectEqual(@as(usize, 2), transient_fake.calls);
 
     var permanent_fake = FakeStream{ .outcomes = &.{ .permanent_http, .valid } };
     const permanent_config = testConfig(&permanent_fake, null);
-    const permanent = try reviewGatewayConfig(permanent_config, std.testing.allocator, testRequest());
+    const permanent = try reviewGatewayConfig(permanent_config, std.testing.allocator, testRequest(), reviewer_model);
     try std.testing.expectEqual(
         std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
         std.meta.activeTag(permanent),
@@ -680,7 +574,7 @@ test "gateway transport preserves cancellation timeout transient and permanent o
 test "gateway automatic reviewer distinguishes timeout permanent failure and cancellation" {
     var timeout_fake = FakeStream{ .outcomes = &.{.timeout} };
     const timeout_config = testConfig(&timeout_fake, null);
-    const timed_out = try reviewGatewayConfig(timeout_config, std.testing.allocator, testRequest());
+    const timed_out = try reviewGatewayConfig(timeout_config, std.testing.allocator, testRequest(), reviewer_model);
     try std.testing.expectEqual(
         std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
         std.meta.activeTag(timed_out),
@@ -689,11 +583,12 @@ test "gateway automatic reviewer distinguishes timeout permanent failure and can
         permission_auto_classifier.InvalidReason.transport_timed_out,
         timed_out.invalid,
     );
-    try std.testing.expectEqual(@as(usize, 1), timeout_fake.calls);
+    // The timeout is retried once before the review is declared unavailable.
+    try std.testing.expectEqual(@as(usize, 2), timeout_fake.calls);
 
     var permanent_fake = FakeStream{ .outcomes = &.{ .permanent_error, .valid } };
     const permanent_config = testConfig(&permanent_fake, null);
-    const permanent = try reviewGatewayConfig(permanent_config, std.testing.allocator, testRequest());
+    const permanent = try reviewGatewayConfig(permanent_config, std.testing.allocator, testRequest(), reviewer_model);
     try std.testing.expectEqual(
         std.meta.Tag(permission_auto_classifier.ParseOutcome).invalid,
         std.meta.activeTag(permanent),
@@ -708,7 +603,7 @@ test "gateway automatic reviewer distinguishes timeout permanent failure and can
     const cancelled_config = testConfig(&cancelled_fake, null);
     try std.testing.expectError(
         error.Cancelled,
-        reviewGatewayConfig(cancelled_config, std.testing.allocator, testRequest()),
+        reviewGatewayConfig(cancelled_config, std.testing.allocator, testRequest(), reviewer_model),
     );
     try std.testing.expectEqual(@as(usize, 1), cancelled_fake.calls);
 
@@ -717,7 +612,7 @@ test "gateway automatic reviewer distinguishes timeout permanent failure and can
     const pre_cancelled_config = testConfig(&pre_cancelled_fake, &cancel_flag);
     try std.testing.expectError(
         error.Cancelled,
-        reviewGatewayConfig(pre_cancelled_config, std.testing.allocator, testRequest()),
+        reviewGatewayConfig(pre_cancelled_config, std.testing.allocator, testRequest(), reviewer_model),
     );
     try std.testing.expectEqual(@as(usize, 0), pre_cancelled_fake.calls);
 }

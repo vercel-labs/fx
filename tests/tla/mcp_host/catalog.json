@@ -1,0 +1,67 @@
+[
+  {
+    "module": "HostLifecycle",
+    "smoke": "HostLifecycle.cfg",
+    "stress": "HostLifecycle.stress.cfg",
+    "findings": [],
+    "repair": []
+  },
+  {
+    "module": "Credentials",
+    "smoke": "Credentials.cfg",
+    "stress": "Credentials.stress.cfg",
+    "findings": [],
+    "repair": []
+  },
+  {
+    "module": "SignIn",
+    "smoke": "SignIn.cfg",
+    "stress": "SignIn.stress.cfg",
+    "findings": [],
+    "repair": []
+  },
+  {
+    "module": "ElicitationRouting",
+    "smoke": "ElicitationRouting.cfg",
+    "stress": "ElicitationRouting.stress.cfg",
+    "findings": [
+      {
+        "config": "ElicitationRouting.findings.cfg",
+        "invariant": "AnswerReachesSeenQuestion"
+      }
+    ],
+    "repair": [
+      "ElicitationRouting.repair.cfg"
+    ]
+  },
+  {
+    "module": "SharedLogins",
+    "smoke": "SharedLogins.cfg",
+    "stress": "SharedLogins.stress.cfg",
+    "findings": [],
+    "repair": []
+  },
+  {
+    "module": "SubagentAccess",
+    "smoke": "SubagentAccess.cfg",
+    "stress": "SubagentAccess.stress.cfg",
+    "findings": [],
+    "repair": []
+  },
+  {
+    "module": "UrlRetry",
+    "smoke": "UrlRetry.cfg",
+    "stress": "UrlRetry.stress.cfg",
+    "findings": [
+      { "config": "UrlRetry.findings.cfg", "invariant": "EndsByUserOrServer" }
+    ],
+    "repair": []
+  },
+  {
+    "module": "MixedBuilds",
+    "smoke": "MixedBuilds.cfg",
+    "stress": "MixedBuilds.stress.cfg",
+    "findings": [],
+    "repair": []
+  }
+]

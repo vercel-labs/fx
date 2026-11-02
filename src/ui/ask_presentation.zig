@@ -5,6 +5,7 @@ const types = @import("../core/shared/types.zig");
 const io_mod = @import("../core/shared/io.zig");
 const render_engine = @import("render_engine.zig");
 const render_request = @import("render_request.zig");
+const shared_theme = @import("../core/shared/theme.zig");
 const shell_runtime = @import("shell_runtime.zig");
 const transcript_painter = @import("transcript/painter.zig");
 const transcript_runtime = @import("transcript/runtime.zig");
@@ -115,18 +116,16 @@ pub const Runtime = struct {
 
     pub fn pushText(self: *Runtime, text: []const u8) !void {
         try self.checkPendingError();
-        errdefer |err| self.rememberFailure(err);
-        _ = try self.shell.streamAssistantChunk(self.alloc, &self.metrics, text);
-        try self.render();
+        _ = self.shell.streamAssistantChunk(self.alloc, &self.metrics, text) catch |err| return self.failWith(err);
+        self.render() catch |err| return self.failWith(err);
     }
 
     pub fn pushToolLifecycle(self: *Runtime, event: types.ToolLifecycleEvent) !void {
         try self.checkPendingError();
-        errdefer |err| self.rememberFailure(err);
-        _ = try self.shell.applyToolLifecycle(self.alloc, event);
-        try self.render();
+        _ = self.shell.applyToolLifecycle(self.alloc, event) catch |err| return self.failWith(err);
+        self.render() catch |err| return self.failWith(err);
         switch (event) {
-            .turn_finished => try self.shell.finishLifecycleBatch(self.alloc),
+            .turn_finished => self.shell.finishLifecycleBatch(self.alloc) catch |err| return self.failWith(err),
             else => {},
         }
     }
@@ -134,20 +133,18 @@ pub const Runtime = struct {
     pub fn pushDiffBlock(self: *Runtime, payload: diff_mod.DiffEntryPayload) !void {
         defer diff_mod.freeDiffEntryPayload(std.heap.c_allocator, payload);
         try self.checkPendingError();
-        errdefer |err| self.rememberFailure(err);
-        _ = try self.shell.appendRawTranscriptEntryClassified(
+        _ = self.shell.appendRawTranscriptEntryClassified(
             self.alloc,
             payload.preview,
             .diff_block,
-        );
-        try self.render();
+        ) catch |err| return self.failWith(err);
+        self.render() catch |err| return self.failWith(err);
     }
 
     pub fn pushNotice(self: *Runtime, notice: types.SemanticNotice) !void {
         try self.checkPendingError();
-        errdefer |err| self.rememberFailure(err);
-        _ = try self.shell.appendSemanticNotice(self.alloc, notice);
-        try self.render();
+        _ = self.shell.appendSemanticNotice(self.alloc, notice) catch |err| return self.failWith(err);
+        self.render() catch |err| return self.failWith(err);
     }
 
     pub fn finish(self: *Runtime) !void {
@@ -161,8 +158,7 @@ pub const Runtime = struct {
     fn pushTable(raw: *anyopaque, table: assistant_presentation.TablePayload) !void {
         const self: *Runtime = @ptrCast(@alignCast(raw));
         try self.checkPendingError();
-        errdefer |err| self.rememberFailure(err);
-        _ = try self.shell.appendAssistantTableOwned(self.alloc, table);
+        _ = self.shell.appendAssistantTableOwned(self.alloc, table) catch |err| return self.failWith(err);
         self.render() catch |err| {
             self.rememberFailure(err);
         };
@@ -171,8 +167,7 @@ pub const Runtime = struct {
     fn pushCodeBlock(raw: *anyopaque, block: assistant_presentation.CodeBlockPayload) !void {
         const self: *Runtime = @ptrCast(@alignCast(raw));
         try self.checkPendingError();
-        errdefer |err| self.rememberFailure(err);
-        _ = try self.shell.appendAssistantCodeBlockOwned(self.alloc, block);
+        _ = self.shell.appendAssistantCodeBlockOwned(self.alloc, block) catch |err| return self.failWith(err);
         self.render() catch |err| {
             self.rememberFailure(err);
         };
@@ -181,9 +176,8 @@ pub const Runtime = struct {
     fn pushThematicRule(raw: *anyopaque) !void {
         const self: *Runtime = @ptrCast(@alignCast(raw));
         try self.checkPendingError();
-        errdefer |err| self.rememberFailure(err);
-        _ = try self.shell.appendAssistantThematicRule(self.alloc);
-        try self.render();
+        _ = self.shell.appendAssistantThematicRule(self.alloc) catch |err| return self.failWith(err);
+        self.render() catch |err| return self.failWith(err);
     }
 
     fn checkPendingError(self: *Runtime) !void {
@@ -192,6 +186,12 @@ pub const Runtime = struct {
 
     fn rememberFailure(self: *Runtime, err: anyerror) void {
         if (self.pending_error == null) self.pending_error = err;
+    }
+
+    /// Records `err` as the pending failure and returns it unchanged.
+    fn failWith(self: *Runtime, err: anytype) @TypeOf(err) {
+        self.rememberFailure(err);
+        return err;
     }
 
     fn refreshGeometry(self: *Runtime) !void {
@@ -398,16 +398,31 @@ fn probeTerminal(
     no_color: bool,
 ) shell_runtime.CursorPosition {
     const fallback = shell_runtime.CursorPosition{ .row = layout.rows, .col = 1 };
-    const fallback_light = if (no_color) false else ui_render.explicitThemeOverride() orelse false;
-    ui_render.initTheme(fallback_light, null);
+    // A light/dark pin was applied before presentation setup; leave it alone.
+    const theme_locked = ui_render.themeInputLocked();
+    if (!theme_locked) {
+        const fallback_light = if (no_color) false else ui_render.explicitThemeOverride() orelse false;
+        ui_render.initTheme(fallback_light, null);
+    }
     if (std.c.isatty(std.posix.STDIN_FILENO) == 0) return fallback;
     terminal.captureOriginalTermios() catch return fallback;
     terminal.enableRawMode() catch return fallback;
     defer terminal.disableRawMode();
 
-    if (!no_color) {
+    if (!no_color and !theme_locked) {
         const theme = ui_render.detectTheme(std.heap.c_allocator, terminal);
-        ui_render.initTheme(theme.light, theme.rgb);
+        if (shared_theme.sourceName()) |name| {
+            // Custom themes resolve after detection picks the variant, same
+            // rule as the interactive shell.
+            const custom = shared_theme.resolveNamed(std.heap.c_allocator, name, theme.light, .{ .truecolor = ui_render.truecolorIsEnabled() }) catch null;
+            if (custom) |resolved| {
+                ui_render.applyTheme(resolved, theme.rgb);
+            } else {
+                ui_render.initTheme(theme.light, theme.rgb);
+            }
+        } else {
+            ui_render.initTheme(theme.light, theme.rgb);
+        }
     }
     return terminal.queryCursorPosition() catch fallback;
 }

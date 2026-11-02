@@ -1,0 +1,86 @@
+[
+  {
+    "description": "A POST is sent again after its stream broke without an event id",
+    "old": "                                 ELSE End(r, \"lost\")]",
+    "new": "                                 ELSE [@ EXCEPT !.st = \"queued\", !.stream = FALSE]]",
+    "invariant": "NoReplayOfLostPost"
+  },
+  {
+    "description": "A request that got a 404 a second time is sent a third time",
+    "old": "    /\\ req' = [req EXCEPT ![r] = IF req[r].st = \"resuming\" \\/ req[r].after404",
+    "new": "    /\\ req' = [req EXCEPT ![r] = IF req[r].st = \"resuming\"",
+    "invariant": "NoReplayOfLostPost"
+  },
+  {
+    "description": "A stream is resumed though it carried no event id",
+    "old": "    /\\ req' = [req EXCEPT ![r] = IF req[r].ev /\\ req[r].resumes < MaxResumes",
+    "new": "    /\\ req' = [req EXCEPT ![r] = IF req[r].resumes < MaxResumes",
+    "invariant": "ResumeAfterEventId"
+  },
+  {
+    "description": "A stream is resumed in a newer session than it started in",
+    "old": "    /\\ IF phase = \"ready\" /\\ req[r].sid = sid\n       THEN /\\ req' = [req EXCEPT ![r] = [@ EXCEPT !.st = \"resuming\", !.resumes = @ + 1, !.stream = TRUE]]",
+    "new": "    /\\ IF phase = \"ready\"\n       THEN /\\ req' = [req EXCEPT ![r] = [@ EXCEPT !.st = \"resuming\", !.resumes = @ + 1, !.stream = TRUE]]",
+    "invariant": "ResumeSameSession"
+  },
+  {
+    "description": "A 404 for an older session starts another new session",
+    "old": "    /\\ IF s = sid /\\ phase = \"ready\"",
+    "new": "    /\\ IF phase = \"ready\"",
+    "invariant": "OneInitPerEnd"
+  },
+  {
+    "description": "A failed initialize is sent again",
+    "old": "    /\\ phase' = \"failed\"\n    /\\ req' = EndAll(\"failed\")\n    /\\ listen' = IF listen = \"none\" THEN \"none\" ELSE \"off\"\n    /\\ UNCHANGED <<sid, nextSid, seenEnd, nextEvent, deleted, ghosts>>",
+    "new": "    /\\ phase' = \"initializing\"\n    /\\ inits' = inits + 1\n    /\\ UNCHANGED <<req, listen>>\n    /\\ UNCHANGED <<sid, nextSid, seenEnd, nextEvent, deleted, serverEnded, sentClosed, refused405, listenAfter405, crossResume>>",
+    "invariant": "OneInitPerEnd"
+  },
+  {
+    "description": "Close sends a DELETE while a new session is starting, naming the ended one",
+    "old": "    /\\ deleted' = (phase = \"ready\" /\\ sid # 0)",
+    "new": "    /\\ deleted' = (phase \\in {\"ready\", \"initializing\"} /\\ sid # 0)",
+    "invariant": "DeleteOnlyLive"
+  },
+  {
+    "description": "A request is sent after close",
+    "old": "    /\\ phase = \"ready\"\n    /\\ req[r].st \\in {\"idle\", \"queued\"}",
+    "new": "    /\\ phase \\in {\"ready\", \"closed\"}\n    /\\ req[r].st \\in {\"idle\", \"queued\"}",
+    "invariant": "NothingAfterClose"
+  },
+  {
+    "description": "The listening stream is opened again after a 405",
+    "old": "    /\\ listen' = \"none\"\n    /\\ refused405' = TRUE",
+    "new": "    /\\ listen' = \"off\"\n    /\\ refused405' = TRUE",
+    "invariant": "ListenRespects405"
+  },
+  {
+    "description": "Requests that got a 404, or waited for the session, are never sent",
+    "old": "    /\\ req[r].st \\in {\"idle\", \"queued\"}\n    /\\ req' = [req EXCEPT ![r] = [@ EXCEPT !.st = \"posted\"",
+    "new": "    /\\ req[r].st = \"idle\"\n    /\\ req' = [req EXCEPT ![r] = [@ EXCEPT !.st = \"posted\"",
+    "property": "EveryRequestEnds"
+  },
+  {
+    "description": "A 404 for the current session doesn't start a new one, so close DELETEs the ended session",
+    "old": "       THEN /\\ phase' = \"initializing\"\n            /\\ inits' = inits + 1",
+    "new": "       THEN UNCHANGED <<phase, inits>>",
+    "invariant": "DeleteOnlyLive"
+  },
+  {
+    "description": "The server never answers a new session's initialize (proves ExpiryReinits is checked)",
+    "old": "    /\\ WF_vars(InitAnswered(TRUE) \\/ InitAnswered(FALSE) \\/ InitFailed)\n",
+    "new": "    \\* (no fairness for the initialize answer)\n",
+    "property": "ExpiryReinits"
+  },
+  {
+    "description": "An answered request's stream is left open",
+    "old": "    /\\ req' = [req EXCEPT ![r] = End(r, \"result\")]\n",
+    "new": "    /\\ req' = [req EXCEPT ![r] = [End(r, \"result\") EXCEPT !.stream = TRUE]]\n",
+    "invariant": "StreamOnlyWhileOpen"
+  },
+  {
+    "description": "An answer over the message limit is resumed like a broken stream",
+    "old": "    /\\ req' = [req EXCEPT ![r] = End(r, \"lost\")]\n    /\\ UNCHANGED <<session, nextEvent, listen, deleted, ghosts>>\n\n\\* A status without",
+    "new": "    /\\ req' = [req EXCEPT ![r] = IF req[r].ev /\\ req[r].resumes < MaxResumes\n                                 THEN [@ EXCEPT !.st = \"broken\", !.stream = FALSE]\n                                 ELSE End(r, \"lost\")]\n    /\\ UNCHANGED <<session, nextEvent, listen, deleted, ghosts>>\n\n\\* A status without",
+    "property": "TooLargeEnds"
+  }
+]

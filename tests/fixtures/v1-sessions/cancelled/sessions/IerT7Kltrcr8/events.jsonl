@@ -1,0 +1,5 @@
+{"schema_version":3,"seq":1,"timestamp_ms":1792257546150,"event":{"user":{"text":"CONV_FIRST","images":[],"work_id":null}}}
+{"schema_version":3,"seq":2,"timestamp_ms":1792257546150,"event":{"assistant":{"text":"CONV_FIRST_ANSWER","provider_replay":null,"standalone_response":false}}}
+{"schema_version":3,"seq":3,"timestamp_ms":1792257546150,"event":{"turn_completed":{"files":[],"turn_summary":{"started_at_ms":1792257546123,"completed_at_ms":1792257546150,"thinking_duration_ms":1,"turn_duration_ms":27,"token_progress":{"input_tokens":3,"output_tokens":5,"input_exact":false,"output_exact":true}}}}}
+{"schema_version":3,"seq":4,"timestamp_ms":1792257547587,"event":{"user":{"text":"CONV_MORE","images":[],"work_id":null}}}
+{"schema_version":3,"seq":5,"timestamp_ms":1792257547587,"event":{"interrupted":{"reason":"cancelled","partial_text":"CONV_PARTIAL","command_replay_ref":null,"command_replay_bytes":null,"command_artifact_ref":null,"files":[],"turn_summary":null}}}

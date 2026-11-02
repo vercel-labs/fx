@@ -1,0 +1,46 @@
+[
+  {
+    "description": "A delivered answer leaves its question waiting, so it can be answered again",
+    "old": "                  /\\ pending' = [pending EXCEPT ![target] = FALSE]",
+    "new": "                  /\\ pending' = pending",
+    "invariant": "AnsweredOnce"
+  },
+  {
+    "description": "A question fx dismisses because the call already holds one replaces it on the call",
+    "old": "          /\\ offered' = IF take THEN q ELSE offered",
+    "new": "          /\\ offered' = IF calling THEN q ELSE offered",
+    "invariant": "DismissedNeverShown"
+  },
+  {
+    "description": "askWaiting shows the question but leaves it on the call",
+    "old": "    /\\ offered' = None /\\ offerKey' = 0\n    /\\ shown'",
+    "new": "    /\\ offered' = offered /\\ offerKey' = offerKey\n    /\\ shown'",
+    "invariant": "OneOnScreen"
+  },
+  {
+    "description": "A 2026 answer goes to the latest round instead of its own call's",
+    "old": "LET target == IF version = \"2025\" THEN holder[posted.key] ELSE posted.key",
+    "new": "LET target == IF version = \"2025\" THEN holder[posted.key] ELSE nextQ - 1",
+    "invariant": "AnswerReachesSeen2026"
+  },
+  {
+    "description": "The owner never handles a 2025 answer",
+    "old": "    /\\ posted.q # None\n    /\\ LET target",
+    "new": "    /\\ posted.q # None /\\ version = \"2026\"\n    /\\ LET target",
+    "property": "ShownIsAnswered"
+  },
+  {
+    "description": "Repair witness broken: the owner doesn't check the slot still holds the answered question",
+    "config": "ElicitationRouting.repair.cfg",
+    "old": "(Guard => target = posted.q)",
+    "new": "TRUE",
+    "invariant": "AnswerReachesSeenQuestion"
+  },
+  {
+    "description": "Repair witness broken: a withdrawn question the call hasn't shown stays on the call",
+    "config": "ElicitationRouting.repair.cfg",
+    "invariant": "OfferedStillWaits",
+    "old": "    /\\ IF Guard /\\ offered = q",
+    "new": "    /\\ IF FALSE /\\ offered = q"
+  }
+]

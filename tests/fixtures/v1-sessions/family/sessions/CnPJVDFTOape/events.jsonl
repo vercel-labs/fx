@@ -1,0 +1,3 @@
+{"schema_version":3,"seq":1,"timestamp_ms":1792257547862,"event":{"user":{"text":"Report the second marker.","images":[],"work_id":"fxop:2:m:345178029540156039:33e3b43a49c728ed941f0f968de5a9a39f7eb019bae5b121957594b99d11b3bc"}}}
+{"schema_version":3,"seq":2,"timestamp_ms":1792257547862,"event":{"assistant":{"text":"CONV_CHILD_ANSWER_2","provider_replay":null,"standalone_response":false}}}
+{"schema_version":3,"seq":3,"timestamp_ms":1792257547862,"event":{"turn_completed":{"files":[],"turn_summary":{"started_at_ms":1792257547849,"completed_at_ms":1792257547862,"thinking_duration_ms":0,"turn_duration_ms":13,"token_progress":{"input_tokens":0,"output_tokens":5,"input_exact":true,"output_exact":true}}}}}

@@ -1,0 +1,146 @@
+[
+  {
+    "source": "2025-11-25_basic_lifecycle block 1",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 1,   \"method\": \"initialize\",   \"params\": {     \"protocolVersion\": \"2025-11-25\",     \"capabilities\": {       \"roots\": {         \"listChanged\": true       },       \"sampling\": {},       \"elicitation\": {         \"form\": {},         \"url\": {}       },       \"tasks\": {         \"requests\": {           \"elicitation\": {             \"create\": {}           },           \"sampling\": {             \"createMessage\": {}           }         }       }     },     \"clientInfo\": {       \"name\": \"ExampleClient\",       \"title\": \"Example Client Display Name\",       \"version\": \"1.0.0\",       \"description\": \"An example MCP client application\",       \"icons\": [         {           \"src\": \"https://example.com/icon.png\",           \"mimeType\": \"image/png\",           \"sizes\": [\"48x48\"]         }       ],       \"websiteUrl\": \"https://example.com\"     }   } }"
+  },
+  {
+    "source": "2025-11-25_basic_lifecycle block 2",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 1,   \"result\": {     \"protocolVersion\": \"2025-11-25\",     \"capabilities\": {       \"logging\": {},       \"prompts\": {         \"listChanged\": true       },       \"resources\": {         \"subscribe\": true,         \"listChanged\": true       },       \"tools\": {         \"listChanged\": true       },       \"tasks\": {         \"list\": {},         \"cancel\": {},         \"requests\": {           \"tools\": {             \"call\": {}           }         }       }     },     \"serverInfo\": {       \"name\": \"ExampleServer\",       \"title\": \"Example Server Display Name\",       \"version\": \"1.0.0\",       \"description\": \"An example MCP server providing tools and resources\",       \"icons\": [         {           \"src\": \"https://example.com/server-icon.svg\",           \"mimeType\": \"image/svg+xml\",           \"sizes\": [\"any\"]         }       ],       \"websiteUrl\": \"https://example.com/server\"     },     \"instructions\": \"Optional instructions for the client\"   } }"
+  },
+  {
+    "source": "2025-11-25_basic_lifecycle block 3",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"method\": \"notifications/initialized\" }"
+  },
+  {
+    "source": "2025-11-25_basic_lifecycle block 4",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 1,   \"error\": {     \"code\": -32602,     \"message\": \"Unsupported protocol version\",     \"data\": {       \"supported\": [\"2024-11-05\"],       \"requested\": \"1.0.0\"     }   } }"
+  },
+  {
+    "source": "2025-11-25_basic_utilities_cancellation block 1",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"method\": \"notifications/cancelled\",   \"params\": {     \"requestId\": \"123\",     \"reason\": \"User requested cancellation\"   } }"
+  },
+  {
+    "source": "2025-11-25_client_elicitation block 9",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 1,   \"method\": \"elicitation/create\",   \"params\": {     \"mode\": \"form\",     \"message\": \"Please provide your GitHub username\",     \"requestedSchema\": {       \"type\": \"object\",       \"properties\": {         \"name\": {           \"type\": \"string\"         }       },       \"required\": [\"name\"]     }   } }"
+  },
+  {
+    "source": "2025-11-25_client_elicitation block 10",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 1,   \"result\": {     \"action\": \"accept\",     \"content\": {       \"name\": \"octocat\"     }   } }"
+  },
+  {
+    "source": "2025-11-25_client_elicitation block 11",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 2,   \"method\": \"elicitation/create\",   \"params\": {     \"mode\": \"form\",     \"message\": \"Please provide your contact information\",     \"requestedSchema\": {       \"type\": \"object\",       \"properties\": {         \"name\": {           \"type\": \"string\",           \"description\": \"Your full name\"         },         \"email\": {           \"type\": \"string\",           \"format\": \"email\",           \"description\": \"Your email address\"         },         \"age\": {           \"type\": \"number\",           \"minimum\": 18,           \"description\": \"Your age\"         }       },       \"required\": [\"name\", \"email\"]     }   } }"
+  },
+  {
+    "source": "2025-11-25_client_elicitation block 12",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 2,   \"result\": {     \"action\": \"accept\",     \"content\": {       \"name\": \"Monalisa Octocat\",       \"email\": \"octocat@github.com\",       \"age\": 30     }   } }"
+  },
+  {
+    "source": "2025-11-25_client_elicitation block 13",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 3,   \"method\": \"elicitation/create\",   \"params\": {     \"mode\": \"url\",     \"elicitationId\": \"550e8400-e29b-41d4-a716-446655440000\",     \"url\": \"https://mcp.example.com/ui/set_api_key\",     \"message\": \"Please provide your API key to continue.\"   } }"
+  },
+  {
+    "source": "2025-11-25_client_elicitation block 14",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 3,   \"result\": {     \"action\": \"accept\"   } }"
+  },
+  {
+    "source": "2025-11-25_client_elicitation block 15",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"method\": \"notifications/elicitation/complete\",   \"params\": {     \"elicitationId\": \"550e8400-e29b-41d4-a716-446655440000\"   } }"
+  },
+  {
+    "source": "2026-07-28_basic_index block 3",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 2,   \"method\": \"tools/call\",   \"params\": {     \"name\": \"get_weather\",     \"arguments\": {       \"location\": \"New York\"     },     \"_meta\": {       \"traceparent\": \"00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01\"     }   } }"
+  },
+  {
+    "source": "2026-07-28_basic_patterns_cancellation block 1",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"method\": \"notifications/cancelled\",   \"params\": {     \"requestId\": \"123\",     \"reason\": \"User requested cancellation\"   } }"
+  },
+  {
+    "source": "2026-07-28_basic_patterns_progress block 1",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 1,   \"method\": \"some_method\",   \"params\": {     \"_meta\": {       \"progressToken\": \"abc123\"     }   } }"
+  },
+  {
+    "source": "2026-07-28_basic_patterns_progress block 2",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"method\": \"notifications/progress\",   \"params\": {     \"progressToken\": \"abc123\",     \"progress\": 50,     \"total\": 100,     \"message\": \"Reticulating splines...\"   } }"
+  },
+  {
+    "source": "2026-07-28_basic_patterns_subscriptions block 1",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 1,   \"method\": \"subscriptions/listen\",   \"params\": {     \"_meta\": {       \"io.modelcontextprotocol/protocolVersion\": \"2026-07-28\",       \"io.modelcontextprotocol/clientInfo\": {         \"name\": \"ExampleClient\",         \"version\": \"1.0.0\"       },       \"io.modelcontextprotocol/clientCapabilities\": {}     },     \"notifications\": {       \"toolsListChanged\": true,       \"resourceSubscriptions\": [\"file:///project/config.json\"]     }   } }"
+  },
+  {
+    "source": "2026-07-28_basic_patterns_subscriptions block 2",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"method\": \"notifications/subscriptions/acknowledged\",   \"params\": {     \"_meta\": {       \"io.modelcontextprotocol/subscriptionId\": 1     },     \"notifications\": {       \"toolsListChanged\": true,       \"resourceSubscriptions\": [\"file:///project/config.json\"]     }   } }"
+  },
+  {
+    "source": "2026-07-28_basic_patterns_subscriptions block 3",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"method\": \"notifications/resources/updated\",   \"params\": {     \"_meta\": {       \"io.modelcontextprotocol/subscriptionId\": 1     },     \"uri\": \"file:///project/config.json\"   } }"
+  },
+  {
+    "source": "2026-07-28_basic_patterns_subscriptions block 4",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 1,   \"result\": {     \"resultType\": \"complete\",     \"_meta\": {       \"io.modelcontextprotocol/subscriptionId\": 1     }   } }"
+  },
+  {
+    "source": "2026-07-28_basic_transports_streamable-http block 2",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 1,   \"error\": {     \"code\": -32020,     \"message\": \"Header mismatch: Mcp-Name header value 'foo' does not match body value 'bar'\"   } }"
+  },
+  {
+    "source": "2026-07-28_basic_versioning block 1",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 1,   \"error\": {     \"code\": -32022,     \"message\": \"Unsupported protocol version\",     \"data\": {       \"supported\": [\"2026-07-28\", \"2025-11-25\"],       \"requested\": \"1900-01-01\"     }   } }"
+  },
+  {
+    "source": "2026-07-28_server_discover block 1",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": \"discover-1\",   \"method\": \"server/discover\",   \"params\": {     \"_meta\": {       \"io.modelcontextprotocol/protocolVersion\": \"2026-07-28\",       \"io.modelcontextprotocol/clientInfo\": {         \"name\": \"ExampleClient\",         \"version\": \"1.0.0\"       },       \"io.modelcontextprotocol/clientCapabilities\": {}     }   } }"
+  },
+  {
+    "source": "2026-07-28_server_discover block 2",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": \"discover-1\",   \"result\": {     \"resultType\": \"complete\",     \"supportedVersions\": [\"2026-07-28\"],     \"capabilities\": {       \"tools\": {},       \"resources\": {}     },     \"_meta\": {       \"io.modelcontextprotocol/serverInfo\": {         \"name\": \"ExampleServer\",         \"version\": \"1.0.0\"       }     },     \"instructions\": \"This server provides weather and resource utilities.\",     \"ttlMs\": 3600000,     \"cacheScope\": \"public\"   } }"
+  },
+  {
+    "source": "2026-07-28_server_tools block 2",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 1,   \"method\": \"tools/list\",   \"params\": {     \"cursor\": \"optional-cursor-value\"   } }"
+  },
+  {
+    "source": "2026-07-28_server_tools block 3",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 1,   \"result\": {     \"resultType\": \"complete\",     \"tools\": [       {         \"name\": \"get_weather\",         \"title\": \"Weather Information Provider\",         \"description\": \"Get current weather information for a location\",         \"inputSchema\": {           \"type\": \"object\",           \"properties\": {             \"location\": {               \"type\": \"string\",               \"description\": \"City name or zip code\"             }           },           \"required\": [\"location\"]         },         \"icons\": [           {             \"src\": \"https://example.com/weather-icon.png\",             \"mimeType\": \"image/png\",             \"sizes\": [\"48x48\"]           }         ]       }     ],     \"nextCursor\": \"next-page-cursor\",     \"ttlMs\": 300000,     \"cacheScope\": \"public\"   } }"
+  },
+  {
+    "source": "2026-07-28_server_tools block 4",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 2,   \"method\": \"tools/call\",   \"params\": {     \"name\": \"get_weather\",     \"arguments\": {       \"location\": \"New York\"     }   } }"
+  },
+  {
+    "source": "2026-07-28_server_tools block 5",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 2,   \"result\": {     \"resultType\": \"complete\",     \"content\": [       {         \"type\": \"text\",         \"text\": \"Current weather in New York:\\nTemperature: 72°F\\nConditions: Partly cloudy\"       }     ],     \"isError\": false   } }"
+  },
+  {
+    "source": "2026-07-28_server_tools block 6",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 2,   \"result\": {     \"resultType\": \"input_required\",     \"inputRequests\": {       \"github_login\": {         \"method\": \"elicitation/create\",         \"params\": {           \"mode\": \"form\",           \"message\": \"Please provide your GitHub username\",           \"requestedSchema\": {             \"type\": \"object\",             \"properties\": {               \"name\": { \"type\": \"string\" }             },             \"required\": [\"name\"]           }         }       }     },     \"requestState\": \"eyJsb2NhdGlvbiI6Ik5ldyBZb3JrIn0...\"   } }"
+  },
+  {
+    "source": "2026-07-28_server_tools block 7",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 3,   \"method\": \"tools/call\",   \"params\": {     \"name\": \"get_weather\",     \"arguments\": {       \"location\": \"New York\"     },     \"inputResponses\": {       \"github_login\": {         \"action\": \"accept\",         \"content\": {           \"name\": \"octocat\"         }       }     },     \"requestState\": \"eyJsb2NhdGlvbiI6Ik5ldyBZb3JrIn0...\"   } }"
+  },
+  {
+    "source": "2026-07-28_server_tools block 8",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"method\": \"notifications/tools/list_changed\" }"
+  },
+  {
+    "source": "2026-07-28_server_tools block 16",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 5,   \"result\": {     \"resultType\": \"complete\",     \"content\": [       {         \"type\": \"text\",         \"text\": \"{\\\"temperature\\\": 22.5, \\\"conditions\\\": \\\"Partly cloudy\\\", \\\"humidity\\\": 65}\"       }     ],     \"structuredContent\": {       \"temperature\": 22.5,       \"conditions\": \"Partly cloudy\",       \"humidity\": 65     }   } }"
+  },
+  {
+    "source": "2026-07-28_server_tools block 18",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": 6,   \"result\": {     \"resultType\": \"complete\",     \"content\": [       {         \"type\": \"text\",         \"text\": \"Found 2 users: Alice (alice@example.com) and Bob (bob@example.com).\"       }     ],     \"structuredContent\": [       { \"id\": \"1\", \"name\": \"Alice\", \"email\": \"alice@example.com\" },       { \"id\": \"2\", \"name\": \"Bob\", \"email\": \"bob@example.com\" }     ]   } }"
+  },
+  {
+    "source": "2026-07-28_server_tools block 22",
+    "input": "{      \"jsonrpc\": \"2.0\",      \"id\": 3,      \"error\": {        \"code\": -32602,        \"message\": \"Unknown tool: invalid_tool_name\"      }    }"
+  },
+  {
+    "source": "2026-07-28_server_tools block 23",
+    "input": "{      \"jsonrpc\": \"2.0\",      \"id\": 4,      \"result\": {        \"resultType\": \"complete\",        \"content\": [          {            \"type\": \"text\",            \"text\": \"Invalid departure date: must be in the future. Current date is 08/08/2025.\"          }        ],        \"isError\": true      }    }"
+  },
+  {
+    "source": "2026-07-28_server_utilities_pagination block 2",
+    "input": "{   \"jsonrpc\": \"2.0\",   \"id\": \"124\",   \"method\": \"resources/list\",   \"params\": {     \"cursor\": \"eyJwYWdlIjogMn0=\"   } }"
+  }
+]

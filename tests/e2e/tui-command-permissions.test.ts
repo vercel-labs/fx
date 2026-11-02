@@ -19,6 +19,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { commandReplays, onlySessionId, savedSessionIds, savedText, storeRoot } from "./saved-sessions";
 import {
   canonicalSubagentIdForStore,
   fakeGatewayPermissionDecision,
@@ -213,12 +214,7 @@ function twoEffectfulCommandBatch(first: string, second: string) {
 }
 
 function sessionIdFromHome(root: IsolatedRoot): string {
-  const sessions = join(root.home, ".fx", "sessions");
-  const ids = readdirSync(sessions, { withFileTypes: true })
-    .filter((entry) => entry.name !== "latest" && entry.isDirectory())
-    .map((entry) => entry.name);
-  expect(ids).toHaveLength(1);
-  return ids[0]!;
+  return onlySessionId(root.home);
 }
 
 function latestTraceReportPath(root: IsolatedRoot): string {
@@ -259,11 +255,9 @@ function expectOrdinaryToolResults(body: string, callIds: string[]) {
   for (const result of results) {
     const output = result.output as Record<string, unknown> | undefined;
     expect(output?.type).toBe("text");
-    expect(JSON.parse(output?.value as string)).toMatchObject({
-      state: "completed",
-      exit_code: 0,
-      error: null,
-    });
+    const snapshot = JSON.parse(output?.value as string);
+    expect(snapshot).toMatchObject({ state: "completed", exit_code: 0 });
+    expect(snapshot).not.toHaveProperty("error");
   }
   expect(JSON.stringify(results)).not.toContain("Repeated identical tool call blocked");
 }
@@ -709,7 +703,7 @@ async function launchPermissionResumeHarness(initialResponses: Response[]) {
 
       const gateway = startFakeGateway(responses);
       const session = await TmuxSession.create({
-        cmd: `${FX_BIN} resume last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: root.workspace,
         env: gatewayEnv(root, gateway, { FX_PERMISSION_MODE: undefined }),
         stderrPath: resumedStderrPath,
@@ -728,7 +722,8 @@ function expectUserProfileTrace(tracePath: string) {
     "shell.run authority=shell_allowed source=yolo " +
       "route=approved_shell environment=user",
   );
-  expect(trace).toContain("command runner explicit environment=user shell=");
+  // The user profile runs through the process's captured startup files.
+  expect(trace).toContain("command runner snapshot generation=");
   expect(trace).not.toContain("authority=direct_only route=direct_read_only");
 }
 
@@ -739,21 +734,15 @@ function expectNoCommandArtifacts(root: IsolatedRoot) {
     stdout: "pipe",
     stderr: "pipe",
   }).stdout.toString().trim().split("\n").filter(Boolean);
-  const legacyArtifacts = files.filter((path) =>
-    path.includes("/logs/commands/") && path.endsWith(".log")
-  );
-  expect(legacyArtifacts).toEqual([]);
+  // A command's own log files stay outside the session store (D44).
+  expect(files.filter((path) => path.endsWith(".log"))).toEqual([]);
 }
 
+/// The command replays the saved sessions keep: each is a blob, named by its
+/// handle wherever a result refers to it (D44).
 function commandReplayFiles(root: IsolatedRoot): string[] {
-  const sessions = join(root.home, ".fx", "sessions");
-  if (!existsSync(sessions)) return [];
-  const result = Bun.spawnSync(
-    ["find", sessions, "-type", "f", "-name", "fx-command-replay-*"],
-    { stdout: "pipe", stderr: "pipe" },
-  );
-  expect(result.exitCode).toBe(0);
-  return result.stdout.toString().trim().split("\n").filter(Boolean);
+  if (!existsSync(storeRoot(root.home))) return [];
+  return savedSessionIds(root.home).flatMap((id) => commandReplays(root.home, id).map((replay) => replay.name));
 }
 
 function expectNoHostileExecutables(root: IsolatedRoot) {
@@ -892,10 +881,7 @@ describe("effect-aware command permissions", () => {
       activeSession = null;
 
       const sessionId = sessionIdFromHome(root);
-      const events = readFileSync(
-        join(root.home, ".fx", "sessions", sessionId, "events.jsonl"),
-        "utf8",
-      );
+      const events = savedText(root.home, sessionId);
       expect(events).toContain(feedback);
 
       const cliResumeGateway = startFakeGateway([
@@ -1040,6 +1026,38 @@ describe("effect-aware command permissions", () => {
       expect(existsSync(root.profileMarker)).toBe(true);
       expectNoHostileExecutables(root);
       expectNoCommandArtifacts(root);
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
+    "TUI --ask launch flag overrides FX_PERMISSION_MODE without saving it",
+    async () => {
+      const root = createIsolatedRoot();
+      const gateway = startFakeGateway([
+        toolCall("touch launch-flag-ask.txt"),
+        finalText("launch flag complete"),
+      ]);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+      const settingsPath = join(root.home, ".fx", "settings.json");
+      const settingsBefore = readFileSync(settingsPath, "utf8");
+
+      activeSession = await TmuxSession.create({
+        cmd: `${FX_BIN} --ask`,
+        cwd: root.workspace,
+        env: gatewayEnv(root, gateway, { FX_PERMISSION_MODE: "yolo" }),
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await activeSession.waitForComposer(TIMEOUT);
+      await activeSession.sendText("Create the launch flag marker.");
+      await activeSession.waitForText(COMMAND_APPROVAL_PROMPT, TIMEOUT);
+
+      expect(existsSync(join(root.workspace, "launch-flag-ask.txt"))).toBe(false);
+      expect(readFileSync(settingsPath, "utf8")).toBe(settingsBefore);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
     },
     TIMEOUT,
   );
@@ -1246,7 +1264,7 @@ describe("effect-aware command permissions", () => {
       await activeSession.kill();
       activeSession = null;
       activeSession = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: root.workspace,
         env: gatewayEnv(root, gateway, {
           FX_PERMISSION_MODE: "auto",
@@ -1499,7 +1517,7 @@ describe("effect-aware command permissions", () => {
 
       const resumedGateway = startFakeGateway([]);
       activeSession = await TmuxSession.create({
-        cmd: `${FX_BIN} --resume-last`,
+        cmd: `${FX_BIN} --resume last`,
         cwd: root.workspace,
         env: gatewayEnv(root, resumedGateway),
         stderrPath: resumedStderrPath,
@@ -1673,7 +1691,7 @@ describe("effect-aware command permissions", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
-    "TUI trace distinguishes rejected edits from failed commands",
+    "TUI trace distinguishes failed edits from failed commands",
     async () => {
       const root = createIsolatedRoot();
       const fixturePath = join(root.workspace, "duplicate.txt");
@@ -1691,7 +1709,7 @@ describe("effect-aware command permissions", () => {
           path: "duplicate.txt",
           old_string: "same",
           new_string: "new",
-        }, "trace_edit_rejected"),
+        }, "trace_edit_failed"),
         toolCall("exit 7", {}, "trace_command_failed"),
         finalText("diagnostic fixture complete"),
       ]);
@@ -1727,15 +1745,15 @@ describe("effect-aware command permissions", () => {
 
       expect(gateway.requests).toHaveLength(6);
       expect(report).toContain(
-        "last=4 succeeded=2 rejected=1 command_failed=1 tool_failed=0 runtime_failed=0",
+        "last=4 succeeded=2 rejected=0 command_failed=1 tool_failed=1 runtime_failed=0",
       );
       const localCalls = report.split("## Tool Calls\n### Local\n")[1]?.split("### Web Search")[0];
       expect(localCalls).toBeDefined();
       expect(localCalls).toMatch(/name=shell outcome=succeeded duration=\d+ms source=subagent#1\n/);
       expect(localCalls).toMatch(/name=subagent outcome=succeeded duration=\d+ms source=parent\n/);
       expect(localCalls).toMatch(/name=shell outcome=command_failed duration=\d+ms source=parent\n/);
-      expect(localCalls).toMatch(/name=edit_file outcome=rejected duration=\d+ms source=parent\n/);
-      expect(report).toContain("name=edit_file outcome=rejected");
+      expect(localCalls).toMatch(/name=edit_file outcome=tool_failed duration=\d+ms source=parent\n/);
+      expect(report).toContain("name=edit_file outcome=tool_failed");
       expect(report).toContain("name=shell outcome=command_failed");
       expect(report).not.toContain("name=edit_file outcome=runtime_failed");
       expect(report).not.toContain("name=shell outcome=runtime_failed");
@@ -2259,12 +2277,10 @@ describe("effect-aware command permissions", () => {
           "terminal_session_command",
         );
         const commandSnapshot = JSON.parse(commandResult);
-        expect(commandSnapshot).toMatchObject({
-          state: "completed",
-          backend: "captured",
-          persistence: "process",
-          exit_code: 0,
-        });
+        expect(commandSnapshot).toMatchObject({ state: "completed", exit_code: 0 });
+        // A finished command that was not kept as a session reports no
+        // backend: it ran captured, without the terminal.
+        expect(commandSnapshot).not.toHaveProperty("backend");
         expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDOUT_BEGIN");
         expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDOUT_END");
         expect(commandSnapshot.output_delta).toContain("TTY_SESSION_STDERR");
@@ -2308,7 +2324,7 @@ describe("effect-aware command permissions", () => {
           "shell.run authority=shell_allowed source=auto_classifier " +
             "route=approved_shell environment=user",
         );
-        expect(trace).toContain("command runner explicit environment=user shell=");
+        expect(trace).toContain("command runner snapshot generation=");
         expect(trace).not.toContain("authority=direct_only route=direct_read_only");
         expectTraceOrder(trace, [
           "event=permission_decision turn_id=1 step_id=1 call_id=terminal_session_command",
@@ -2412,7 +2428,7 @@ describe("effect-aware command permissions", () => {
         { force: true },
       );
       activeSession = await TmuxSession.create({
-        cmd: `${FX_BIN} resume ${sessionId}`,
+        cmd: `${FX_BIN} --resume ${sessionId}`,
         cwd: root.workspace,
         env: gatewayEnv(root, gateway, { TMPDIR: root.root }),
         stderrPath,
@@ -3140,6 +3156,43 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
+    "fx ask forwards agent identity to clean, user, and TTY commands",
+    async () => {
+      for (const options of [{ profile: "clean" }, { profile: "user" }, { tty: true }]) {
+        const root = createIsolatedRoot();
+        const tracePath = join(root.root, "trace.log");
+        const gateway = startFakeGateway([
+          toolCall(`printf 'agent=%s' "$AI_AGENT"`, options),
+          finalText("agent environment complete"),
+        ]);
+        const result = await runFx(
+          ["ask", "--yolo", "--quiet", "--json", "Report the agent environment."],
+          {
+            cwd: root.workspace,
+            env: gatewayEnv(root, gateway, {
+              AI_AGENT: "other-agent",
+              FX_TRACE_LOG: tracePath,
+              FX_TRACE_SCOPES: "core",
+            }),
+            timeoutMs: TIMEOUT,
+          },
+        );
+
+        expect(result.code).toBe(0);
+        expect(result.stderr.toLowerCase()).not.toContain("error");
+        JSON.parse(result.stdout.trim());
+        const toolResult = JSON.parse(toolResultText(gateway.requests[1].body, "command_1"));
+        expect(toolResult).toMatchObject({ state: "completed", exit_code: 0 });
+        expect(toolResult.output_delta).toContain("agent=fx");
+        if (options.profile === "user") {
+          expect(readFileSync(tracePath, "utf8")).toContain("command runner snapshot generation=");
+        }
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx ask yolo executes pwd through the default user profile with process-scoped replay",
     async () => {
       const root = createIsolatedRoot();
@@ -3444,7 +3497,7 @@ describe("effect-aware command permissions", () => {
         ],
         {
           classifierResponses: Array.from(
-            { length: 1 },
+            { length: 2 },
             () => new Response("provider unavailable", { status: 502 }),
           ),
         },
@@ -3467,9 +3520,10 @@ describe("effect-aware command permissions", () => {
       expect(result.stdout).toContain("provider failure handled");
       expect(existsSync(marker)).toBe(false);
       expect(gateway.requests).toHaveLength(2);
-      expect(gateway.classifierRequests).toHaveLength(1);
+      expect(gateway.classifierRequests).toHaveLength(2);
       const trace = readFileSync(tracePath, "utf8");
-      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(1);
+      expect(trace.match(/event=auto_review_transport_start/g)).toHaveLength(2);
+      expect(trace.match(/event=auto_review_transport_retry/g)).toHaveLength(1);
       expect(trace.match(/event=auto_review_result/g)).toHaveLength(1);
       expect(trace).toContain("decision=unavailable");
       expect(trace).toContain(
@@ -3709,7 +3763,7 @@ describe("effect-aware command permissions", () => {
         finalText("large ACP complete"),
       ]);
       activeClient = AcpClient.create(acpRoot.workspace, gatewayEnv(acpRoot, acpGateway));
-      await startAcpSession(activeClient, "code");
+      await startAcpSession(activeClient, "auto");
       const acpMessages = await runAcpPrompt(activeClient, "Run the large ACP fixture.");
       await activeClient.close();
       activeClient = null;
@@ -4074,7 +4128,7 @@ class AcpClient {
   }
 }
 
-async function startAcpSession(client: AcpClient, modeId: "ask" | "code" = "ask") {
+async function startAcpSession(client: AcpClient, modeId: "ask" | "auto" = "ask") {
   await client.request("initialize", { protocolVersion: 1 }, 1);
   await client.request("session/new", { mcpServers: [] }, 2);
   await client.readLine();

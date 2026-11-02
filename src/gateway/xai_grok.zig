@@ -15,7 +15,7 @@ const Allocator = std.mem.Allocator;
 const endpoint = "https://cli-chat-proxy.grok.com/v1/responses";
 // The proxy gates this as Grok wire compatibility; fx identifies itself separately below.
 const version_lookup = @import("provider_versions.zig");
-const e2e_endpoint_env = "FX_E2E_XAI_GROK_RESPONSES_URL";
+const e2e_endpoint_env = "FX_TEST_XAI_GROK_RESPONSES_URL";
 const max_error_body_bytes: usize = 256 * 1024;
 const max_sse_line_bytes: usize = 1024 * 1024;
 const max_sse_aggregate_bytes: usize = 64 * 1024 * 1024;
@@ -33,7 +33,8 @@ pub const agent_stream_provider = stream_provider.Provider{
     .project_replay_fn = responses_protocol.selectReplayParts,
 };
 
-fn validateModel(model: []const u8) !void {
+/// Rejects a model id that could not travel in a request header.
+pub fn validateModel(model: []const u8) !void {
     if (model.len == 0 or model.len > 256) return error.InvalidXaiGrokModel;
     for (model) |byte| {
         if (byte <= 0x20 or byte == 0x7f) return error.InvalidXaiGrokModel;
@@ -144,9 +145,7 @@ fn streamCompletion(
     request: stream_provider.ModelRequest,
 ) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
-    if (request.credential.credentialSource() != .grok_subscription and
-        request.credential.credentialSource() != .host_managed)
-    {
+    if (!acceptsCredential(request.credential)) {
         return stream_provider.failResult(error.GrokSubscriptionCredentialRequired);
     }
     if (request.credential.credentialSource() != .host_managed) {
@@ -179,6 +178,64 @@ fn requestDeadlineExpired(request: stream_provider.ModelRequest) bool {
     return !std.Io.Clock.Timestamp.compare(now, .lt, deadline);
 }
 
+/// True for the credentials a Grok request may use: a Grok subscription, or a
+/// host that authorizes the request itself.
+pub fn acceptsCredential(lease: stream_provider.CredentialLease) bool {
+    const source = lease.credentialSource() orelse return false;
+    return source == .grok_subscription or source == .host_managed;
+}
+
+/// The Responses endpoint, or a loopback test endpoint from the environment.
+/// Borrowed; static or environment-owned.
+pub fn responsesEndpoint() error{InvalidE2EXaiGrokEndpoint}![]const u8 {
+    const override = io_mod.getenv(e2e_endpoint_env) orelse return endpoint;
+    if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EXaiGrokEndpoint;
+    return override;
+}
+
+pub const max_extra_headers = 8;
+
+pub const HeaderOptions = struct {
+    /// Sends the subscription proxy's token-auth headers.
+    subscription: bool,
+    client_version: ?[]const u8 = null,
+    /// Omitted when the host adds the account along with its credentials.
+    account_id: ?[]const u8 = null,
+    model: []const u8,
+    session_id: ?[]const u8 = null,
+};
+
+/// Writes the Grok headers other than authorization and content type into
+/// `buf` and returns the used prefix. Values are borrowed from `options`.
+pub fn extraHeaders(buf: *[max_extra_headers]std.http.Header, options: HeaderOptions) []std.http.Header {
+    var count: usize = 0;
+    buf[count] = .{ .name = "accept", .value = "text/event-stream" };
+    count += 1;
+    if (options.subscription) {
+        buf[count] = .{ .name = "X-XAI-Token-Auth", .value = "xai-grok-cli" };
+        count += 1;
+        buf[count] = .{ .name = "x-authenticateresponse", .value = "authenticate-response" };
+        count += 1;
+    }
+    if (options.client_version) |version| {
+        buf[count] = .{ .name = "x-grok-client-version", .value = version };
+        count += 1;
+    }
+    buf[count] = .{ .name = "x-grok-client-identifier", .value = "fx" };
+    count += 1;
+    buf[count] = .{ .name = "x-grok-model-override", .value = options.model };
+    count += 1;
+    if (options.account_id) |account_id| {
+        buf[count] = .{ .name = "x-grok-user-id", .value = account_id };
+        count += 1;
+    }
+    if (options.session_id) |session_id| if (session_id.len > 0) {
+        buf[count] = .{ .name = "x-grok-conv-id", .value = session_id };
+        count += 1;
+    };
+    return buf[0..count];
+}
+
 const RequestAuthHeaders = struct {
     authorization: ?[]u8 = null,
     account_id: ?[]const u8 = null,
@@ -194,7 +251,7 @@ fn requestAuthHeaders(alloc: Allocator, auth: stream_provider.CredentialLease) !
     return switch (auth) {
         .host_managed => .{},
         .direct => |direct| .{
-            .authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{direct.secret_bytes}),
+            .authorization = try alloc.print("Bearer {s}", .{direct.secret_bytes}),
             .account_id = direct.account_id,
             .include_subscription_headers = true,
         },
@@ -209,44 +266,21 @@ pub fn streamPrepared(
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     var auth_headers = try requestAuthHeaders(alloc, request.credential);
     defer auth_headers.deinit(alloc);
-    const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
-        if (!gateway_client.isLoopbackHttpUrl(override)) {
-            return stream_provider.failResult(error.InvalidE2EXaiGrokEndpoint);
-        }
-        break :endpoint override;
-    } else endpoint;
+    const request_endpoint = responsesEndpoint() catch |err| return stream_provider.failResult(err);
     const uri = try std.Uri.parse(request_endpoint);
     const compatibility = if (auth_headers.include_subscription_headers)
         try version_lookup.resolve(alloc, .grok, request.cancel_flag, request.deadline)
     else
         null;
 
-    var extra_headers_buf: [8]std.http.Header = undefined;
-    var extra_count: usize = 0;
-    extra_headers_buf[extra_count] = .{ .name = "accept", .value = "text/event-stream" };
-    extra_count += 1;
-    if (auth_headers.include_subscription_headers) {
-        extra_headers_buf[extra_count] = .{ .name = "X-XAI-Token-Auth", .value = "xai-grok-cli" };
-        extra_count += 1;
-        extra_headers_buf[extra_count] = .{ .name = "x-authenticateresponse", .value = "authenticate-response" };
-        extra_count += 1;
-    }
-    if (compatibility) |*version| {
-        extra_headers_buf[extra_count] = .{ .name = "x-grok-client-version", .value = version.slice() };
-        extra_count += 1;
-    }
-    extra_headers_buf[extra_count] = .{ .name = "x-grok-client-identifier", .value = "fx" };
-    extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "x-grok-model-override", .value = request.model };
-    extra_count += 1;
-    if (auth_headers.account_id) |account_id| {
-        extra_headers_buf[extra_count] = .{ .name = "x-grok-user-id", .value = account_id };
-        extra_count += 1;
-    }
-    if (request.session_id) |session_id| if (session_id.len > 0) {
-        extra_headers_buf[extra_count] = .{ .name = "x-grok-conv-id", .value = session_id };
-        extra_count += 1;
-    };
+    var extra_headers_buf: [max_extra_headers]std.http.Header = undefined;
+    const extra_headers = extraHeaders(&extra_headers_buf, .{
+        .subscription = auth_headers.include_subscription_headers,
+        .client_version = if (compatibility) |*version| version.slice() else null,
+        .account_id = auth_headers.account_id,
+        .model = request.model,
+        .session_id = request.session_id,
+    });
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
@@ -254,7 +288,7 @@ pub fn streamPrepared(
         .client = &client,
         .uri = uri,
         .authorization = auth_headers.authorization,
-        .extra_headers = extra_headers_buf[0..extra_count],
+        .extra_headers = extra_headers,
     };
     var connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
@@ -274,10 +308,13 @@ pub fn streamPrepared(
     );
     var http_request = opened.take();
     defer http_request.deinit();
-    var cancel_watch: gateway_client.CancelWatch = .{};
-    defer cancel_watch.stop();
+    var watch: gateway_client.ConnectionWatch = .init(.{
+        .patient = true,
+        .stall_timeout_ms = gateway_client.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
+    });
+    defer watch.stop();
     if (http_request.connection) |connection|
-        try cancel_watch.start(request.cancel_flag, request.deadline, connection.stream_writer.stream);
+        try watch.start(request.cancel_flag, request.deadline, connection.stream_writer.stream);
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     http_request.transfer_encoding = .{ .content_length = payload.len };
@@ -289,7 +326,9 @@ pub fn streamPrepared(
     if (http_request.connection) |connection| try connection.flush();
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
 
-    var response = try http_request.receiveHead(&.{});
+    if (watch.armHead()) |err| return err;
+    var response = http_request.receiveHead(&.{}) catch |err| return watch.failure(err);
+    if (watch.commitHead()) |err| return err;
     if (response.head.status != .ok) {
         var transfer: [16 * 1024]u8 = undefined;
         const reader = response.reader(&transfer);
@@ -302,25 +341,41 @@ pub fn streamPrepared(
             break :body try alloc.dupe(u8, "xAI Grok error response exceeded the local limit");
         } else bounded_body;
         return .{ .failed = .{
-            .kind = failureKind(response.head.status),
+            .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(response.head.status), body),
             .detail = body,
             .ownership = .owned,
         } };
     }
 
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
+    var result = completeFromStream(alloc, request, response.reader(&transfer_buffer), watch.progress()) catch |err| return watch.failure(err);
+    if (watch.finish()) |err| {
+        result.deinit(alloc);
+        return err;
+    }
+    return result;
+}
+
+/// Parses one successful Grok event stream into a completion with its
+/// subscription usage. The result owns the completion.
+pub fn completeFromStream(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    reader: *std.Io.Reader,
+    progress: ?sse_stream.Progress,
+) !stream_provider.Result {
     var events = request.events;
-    var completion = try consumeSse(
+    const completion = try consumeSse(
         alloc,
         reader,
         &events,
-        EventBridge.content,
-        EventBridge.toolStart,
-        EventBridge.reasoning,
-        EventBridge.toolInput,
+        stream_provider.EventSink.onContentChunk,
+        stream_provider.EventSink.onToolStart,
+        stream_provider.EventSink.onReasoningChunk,
+        stream_provider.EventSink.onToolInputChunk,
         request.cancel_flag,
         request.content_capture_limit,
+        progress,
     );
     errdefer {
         var owned = stream_provider.Result{ .completed = .{
@@ -329,61 +384,10 @@ pub fn streamPrepared(
         } };
         owned.deinit(alloc);
     }
-    const usage_outcome: stream_provider.UsageOutcome = usage: {
-        if (completion.generation_id == null) {
-            break :usage .{ .unavailable = .possibly_billed };
-        }
-        completion.billing = try responses_protocol.buildSubscriptionBilling(
-            alloc,
-            .grok,
-            request.model,
-            @max(io_mod.milliTimestamp(), 0),
-            completion.usage,
-        ) orelse break :usage .{ .unavailable = .possibly_billed };
-        break :usage .{ .exact = .grok };
-    };
     return .{ .completed = .{
         .completion = completion,
-        .usage = usage_outcome,
         .ownership = .owned,
     } };
-}
-
-const EventBridge = struct {
-    fn sink(raw: *anyopaque) *stream_provider.EventSink {
-        return @ptrCast(@alignCast(raw));
-    }
-
-    fn content(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .content_delta = chunk });
-    }
-
-    fn reasoning(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .reasoning_delta = chunk });
-    }
-
-    fn toolInput(raw: *anyopaque, chunk: []const u8) void {
-        sink(raw).emit(.{ .tool_input_delta = chunk });
-    }
-
-    fn toolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, arguments_json: ?[]const u8) void {
-        sink(raw).emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = arguments_json } });
-    }
-};
-
-fn failureKind(status: std.http.Status) stream_provider.FailureKind {
-    return switch (status) {
-        .bad_request => .invalid_request,
-        .unauthorized => .unauthorized,
-        .forbidden => .forbidden,
-        .payload_too_large => .request_too_large,
-        .too_many_requests => .rate_limited,
-        .internal_server_error => .server_error,
-        .bad_gateway => .bad_gateway,
-        .service_unavailable => .unavailable,
-        .gateway_timeout => .gateway_timeout,
-        else => .provider_error,
-    };
 }
 
 fn consumeSse(
@@ -396,10 +400,11 @@ fn consumeSse(
     on_tool_input_chunk: ?stream_provider.StreamCallback,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
+    progress: ?sse_stream.Progress,
 ) !types.ModelCompletion {
     var reducer = responses_protocol.Reducer.init(alloc);
     defer reducer.deinit(alloc);
-    var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes, .max_total_bytes = max_sse_aggregate_bytes };
+    var sse: sse_stream.Reader = .{ .max_event_bytes = max_sse_line_bytes, .max_total_bytes = max_sse_aggregate_bytes, .progress = progress };
     defer sse.deinit(alloc);
     const callbacks = responses_protocol.StreamCallbacks{
         .context = callback_ctx,
@@ -622,14 +627,20 @@ test "xAI Grok SSE maps text reasoning tools and usage" {
         content: std.ArrayList(u8) = .empty,
         reasoning: std.ArrayList(u8) = .empty,
         saw_read_file: bool = false,
+        /// A chunk that could not be kept; the test reports it.
+        append_error: ?std.mem.Allocator.Error = null,
 
         fn contentChunk(raw: *anyopaque, chunk: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.content.appendSlice(std.testing.allocator, chunk) catch unreachable;
+            self.content.appendSlice(std.testing.allocator, chunk) catch |err| {
+                self.append_error = err;
+            };
         }
         fn reasoningChunk(raw: *anyopaque, chunk: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.reasoning.appendSlice(std.testing.allocator, chunk) catch unreachable;
+            self.reasoning.appendSlice(std.testing.allocator, chunk) catch |err| {
+                self.append_error = err;
+            };
         }
         fn toolStart(raw: *anyopaque, _: []const u8, name: []const u8, _: ?[]const u8, _: ?[]const u8) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -649,12 +660,14 @@ test "xAI Grok SSE maps text reasoning tools and usage" {
         null,
         &cancelled,
         null,
+        null,
     );
     defer {
         if (completion.content) |value| std.testing.allocator.free(@constCast(value));
         types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
         if (completion.provider_state_json) |value| std.testing.allocator.free(@constCast(value));
     }
+    if (capture.append_error) |err| return err;
     try std.testing.expectEqualStrings("hello", capture.content.items);
     try std.testing.expectEqualStrings("thinking", capture.reasoning.items);
     try std.testing.expect(capture.saw_read_file);
@@ -806,23 +819,11 @@ fn writeTestErrorResponse(zio: std.Io, stream: std.Io.net.Stream, body_bytes: us
     try writer.interface.flush();
 }
 
-var stable_xai_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableXaiTestEnviron() !*const std.process.Environ.Map {
-    if (stable_xai_test_environ) |map| return map;
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_xai_test_environ = map;
-    return map;
-}
-
 const XaiTestEnvironment = struct {
     alloc: Allocator,
     map: std.process.Environ.Map,
 
     fn install(alloc: Allocator, responses_url: []const u8) !*@This() {
-        _ = try stableXaiTestEnviron();
         const self = try alloc.create(@This());
         errdefer alloc.destroy(self);
         self.* = .{
@@ -831,13 +832,13 @@ const XaiTestEnvironment = struct {
         };
         errdefer self.map.deinit();
         try self.map.put(e2e_endpoint_env, responses_url);
-        try self.map.put("FX_E2E_GROK_CLIENT_VERSION", "1.0.6");
+        try self.map.put("FX_TEST_GROK_CLIENT_VERSION", "1.0.6");
         io_mod.setEnvironMap(&self.map);
         return self;
     }
 
     fn deinit(self: *@This()) void {
-        if (stable_xai_test_environ) |map| io_mod.setEnvironMap(map);
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);
@@ -868,8 +869,7 @@ test "xAI Grok request deadline closes slow headers and stalled SSE" {
         var fixture = try TestResponseFixture.init(mode);
         defer fixture.deinit();
         try fixture.start();
-        const url = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const url = try std.testing.allocator.print(
             "http://127.0.0.1:{d}/responses",
             .{fixture.port()},
         );
@@ -894,6 +894,37 @@ test "xAI Grok request deadline closes slow headers and stalled SSE" {
     }
 }
 
+test "xAI Grok agent stream closes a silent body as stalled so recovery restarts it" {
+    gateway_client.test_body_stall_timeout_ms = 80;
+    defer gateway_client.test_body_stall_timeout_ms = null;
+    var fixture = try TestResponseFixture.init(.stalled_sse);
+    defer fixture.deinit();
+    try fixture.start();
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/responses", .{fixture.port()});
+    defer std.testing.allocator.free(url);
+    const environment = try XaiTestEnvironment.install(std.testing.allocator, url);
+    defer environment.deinit();
+
+    var delivery = stream_provider.DeliveryCertainty.init();
+    var evidence: stream_provider.AttemptEvidence = .{};
+    var cancelled = std.atomic.Value(bool).init(false);
+    var callback_context: u8 = 0;
+    var request = testModelRequest("grok-test-token", .grok_subscription, "acct_grok_test", &delivery, &evidence, &cancelled, &callback_context);
+    request.content_capture_limit = 1024;
+    // An agent stream has no caller deadline.
+    request.deadline = null;
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const result = agent_stream_provider.stream(std.testing.allocator, request);
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds();
+    fixture.deinit();
+
+    try std.testing.expectError(error.StreamStalled, result);
+    if (fixture.failure) |err| return err;
+    try std.testing.expect(fixture.reached_stage.load(.seq_cst));
+    try std.testing.expect(elapsed_ms >= 70 and elapsed_ms < 2_000);
+    try std.testing.expectEqual(stream_provider.NetworkFailureCause.stream_stalled, evidence.network_failure.?.cause);
+}
+
 fn ignoreTestChunk(_: *anyopaque, _: []const u8) void {}
 fn ignoreTestEvent(_: *anyopaque, _: stream_provider.Event) void {}
 fn admitTestRequest(_: *anyopaque) !void {}
@@ -912,8 +943,7 @@ test "xAI Grok error-body reader accepts the exact bound and replaces one beyond
         var fixture = try TestResponseFixture.init(mode);
         defer fixture.deinit();
         try fixture.start();
-        const url = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const url = try std.testing.allocator.print(
             "http://127.0.0.1:{d}/responses",
             .{fixture.port()},
         );
@@ -958,6 +988,7 @@ fn consumeTestSse(bytes: []const u8) !types.ModelCompletion {
         null,
         null,
         &cancelled,
+        null,
         null,
     );
 }

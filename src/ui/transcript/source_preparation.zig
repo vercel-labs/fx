@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const command_output_runtime = @import("command_output_runtime.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
@@ -10,6 +11,7 @@ const render_engine = @import("../render_engine.zig");
 const user_message_card = @import("../assistant/user_message_card.zig");
 const ui_render = @import("../render.zig");
 const types = @import("../../core/shared/types.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const transcript_blocks = render_engine.transcript_blocks;
@@ -768,7 +770,7 @@ test "rewrite publication prefix receipts exclude unpainted raw and assistant te
 }
 
 test "rewrite publication projection preserves preview and finality across allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPublicationProjectionAllocation, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, checkPublicationProjectionAllocation, .{});
 }
 
 /// Maps boundaries through the producer's retained version of the same source.
@@ -982,9 +984,9 @@ test "retention rebase deleted soft wrapped entry does not transfer partial rows
 
 test "retention rebase indexes a large removed entry run once" {
     const alloc = std.testing.allocator;
-    var before = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "x\n" ** 20_000), 80, null);
+    var before = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, text_utils.repeat("x\n", 20_000)), 80, null);
     defer before.deinit(alloc);
-    var after = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, "x\n" ** 10_000), 80, null);
+    var after = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, text_utils.repeat("x\n", 10_000)), 80, null);
     defer after.deinit(alloc);
     const old_lines = try alloc.alloc(transcript_blocks.LineProvenance, 20_000);
     before.line_provenance = old_lines;
@@ -1005,7 +1007,7 @@ test "retention rebase maps raw soft wraps and byte endpoints" {
     defer before.deinit(alloc);
     var after = try prepareIndexedFullTranscriptWindowSourceInterruptible(alloc, try alloc.dupe(u8, text[2..]), 3, null);
     defer after.deinit(alloc);
-    const provenance = [_]transcript_blocks.LineProvenance{.{ .entry = .{ .entry_id = 1, .entry_class = .unknown_raw } }} ** 2;
+    const provenance: [2]transcript_blocks.LineProvenance = @splat(.{ .entry = .{ .entry_id = 1, .entry_class = .unknown_raw } });
     before.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &provenance);
     after.line_provenance = try alloc.dupe(transcript_blocks.LineProvenance, &provenance);
     const entries = [_]RetentionEntryRows{.{

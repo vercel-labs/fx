@@ -24,6 +24,30 @@ fn normalizeApprovalAmendmentPasteInPlace(bytes: []u8) []u8 {
     return normalized;
 }
 
+fn isBareImageSlashPrefix(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t");
+    return std.mem.eql(u8, trimmed, "/image") or std.mem.eql(u8, trimmed, "/img");
+}
+
+fn pastedImageSlashPrefixLen(text: []const u8) ?usize {
+    const trimmed = std.mem.trimStart(u8, text, " \t");
+    for ([_][]const u8{ "/image", "/img" }) |command| {
+        if (!std.mem.startsWith(u8, trimmed, command)) continue;
+        var index = text.len - trimmed.len + command.len;
+        if (index >= text.len or (text[index] != ' ' and text[index] != '\t')) continue;
+        while (index < text.len and (text[index] == ' ' or text[index] == '\t')) : (index += 1) {}
+        return index;
+    }
+    return null;
+}
+
+test "bare image slash prefix excludes image paths and other commands" {
+    try std.testing.expect(isBareImageSlashPrefix("/image "));
+    try std.testing.expect(isBareImageSlashPrefix("  /img\t"));
+    try std.testing.expect(!isBareImageSlashPrefix("/image photo.png"));
+    try std.testing.expect(!isBareImageSlashPrefix("/images clear"));
+}
+
 const ImagePasteStage = struct {
     replacement: std.ArrayList(u8) = .empty,
     images: std.ArrayList(types.ImageAttachment) = .empty,
@@ -38,6 +62,37 @@ const ImagePasteStage = struct {
         self.tokens.deinit(alloc);
     }
 };
+
+fn stripPastedImageSlashPrefix(stage: *ImagePasteStage) bool {
+    const prefix_len = pastedImageSlashPrefixLen(stage.replacement.items) orelse return false;
+    if (stage.tokens.items.len == 0 or stage.tokens.items[0].span.raw_start != prefix_len) return false;
+
+    const remaining = stage.replacement.items.len - prefix_len;
+    @memmove(stage.replacement.items[0..remaining], stage.replacement.items[prefix_len..]);
+    stage.replacement.items.len = remaining;
+    for (stage.tokens.items) |*token| {
+        token.span.raw_start -= prefix_len;
+        token.span.raw_end -= prefix_len;
+    }
+    return true;
+}
+
+test "pasted image slash removes only a prefix before a captured path" {
+    const alloc = std.testing.allocator;
+    var stage: ImagePasteStage = .{};
+    defer stage.deinit(alloc);
+    try stage.replacement.appendSlice(alloc, "/image [Image #1] Describe");
+    try stage.tokens.append(alloc, .{ .id = 1, .span = .{ .raw_start = 7, .raw_end = 17 } });
+    try std.testing.expect(stripPastedImageSlashPrefix(&stage));
+    try std.testing.expectEqualStrings("[Image #1] Describe", stage.replacement.items);
+    try std.testing.expectEqual(entity_spans.Span{ .raw_start = 0, .raw_end = 10 }, stage.tokens.items[0].span);
+
+    stage.replacement.clearRetainingCapacity();
+    stage.tokens.clearRetainingCapacity();
+    try stage.replacement.appendSlice(alloc, "/image missing.png");
+    try std.testing.expect(!stripPastedImageSlashPrefix(&stage));
+    try std.testing.expectEqualStrings("/image missing.png", stage.replacement.items);
+}
 
 pub fn PasteEditRuntime(comptime App: type) type {
     return struct {
@@ -111,33 +166,44 @@ pub fn PasteEditRuntime(comptime App: type) type {
         }
 
         pub fn settlePasteDeliveryEpoch(app: *App, max_input_len: usize) !bool {
-            switch (app.input_runtime.paste.settleDeliveryEpoch()) {
+            const finish = switch (app.input_runtime.paste.settleDeliveryEpoch()) {
                 .none => return false,
-                .finish => {
-                    debug_trace.logf(
-                        "input",
-                        "paste end owner={s} bytes={d}",
-                        .{ @tagName(app.input_runtime.paste.owner), app.input_runtime.paste.byteCount() },
-                    );
-                    try finishPaste(app, max_input_len);
-                },
-                .reject => {
-                    const owner = app.input_runtime.paste.owner;
-                    const render_reason: render_request.Reason = switch (owner) {
-                        .composer => .footer,
-                        .decision_prompt, .question_freeform, .approval_amendment => .modal,
-                        .none, .auth_code => .footer,
-                    };
-                    app.input_runtime.paste.resetWithTrace(.unsafe_suffix);
-                    app.shell.render_requests.request(render_reason);
-                    try app.writeDomainNotice(.{
-                        .topic = "input",
-                        .tone = .@"error",
-                        .body = "Paste was not applied because extra input followed its end marker.",
-                    }, true);
-                },
+                .finish => |finish| finish,
+            };
+            const owner = app.input_runtime.paste.owner;
+            debug_trace.logf(
+                "input",
+                "paste end owner={s} bytes={d}",
+                .{ @tagName(owner), app.input_runtime.paste.byteCount() },
+            );
+            // The paste is kept, but input that followed its end marker in the
+            // same delivery never runs: it may be clipboard content after an
+            // end marker embedded in the paste.
+            if (finish.dropped_suffix_bytes > 0) {
+                debug_trace.logf(
+                    "input",
+                    "paste suffix dropped owner={s} bytes={d} reason=same_delivery_as_end_marker",
+                    .{ @tagName(owner), finish.dropped_suffix_bytes },
+                );
+            }
+            try finishPaste(app, max_input_len);
+            if (finish.dropped_suffix_bytes > 0) {
+                try app.writeDomainNotice(.{
+                    .topic = "input",
+                    .tone = .warning,
+                    .body = "Input that arrived right after the paste was ignored.",
+                }, true);
             }
             return true;
+        }
+
+        /// Resets the paste after `owner` failed to take it and returns `err`.
+        fn failPaste(app: *App, owner: paste_framing.Owner, err: anytype) @TypeOf(err) {
+            app.input_runtime.paste.resetWithTrace(.{ .finalize_failed = .{
+                .owner = owner,
+                .error_name = @errorName(err),
+            } });
+            return err;
         }
 
         pub fn finishPaste(app: *App, max_input_len: usize) !void {
@@ -204,15 +270,12 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 .decision_prompt => app.input_runtime.paste.resetWithTrace(.decision_prompt_active),
                 .question_freeform => {
                     if (comptime @hasField(App, "question_prompt")) {
-                        errdefer |err| app.input_runtime.paste.resetWithTrace(.{ .finalize_failed = .{
-                            .owner = .question_freeform,
-                            .error_name = @errorName(err),
-                        } });
-                        switch (try app.question_prompt.insertFreeformSlice(
+                        const outcome = app.question_prompt.insertFreeformSlice(
                             app.alloc,
                             app.input_runtime.paste.buffer.items,
                             max_input_len,
-                        )) {
+                        ) catch |err| return failPaste(app, .question_freeform, err);
+                        switch (outcome) {
                             .inserted => {
                                 app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
                                 app.input_runtime.paste.finishHandled();
@@ -222,7 +285,8 @@ pub fn PasteEditRuntime(comptime App: type) type {
                             .limit_exceeded => {
                                 const attempted_bytes = app.input_runtime.paste.buffer.items.len;
                                 app.input_runtime.paste.resetWithTrace(.{ .input_limit = .question_freeform });
-                                try input_limit_feedback.report(App, app, .question_freeform, attempted_bytes);
+                                input_limit_feedback.report(App, app, .question_freeform, attempted_bytes) catch |err|
+                                    return failPaste(app, .question_freeform, err);
                             },
                         }
                     } else {
@@ -243,15 +307,12 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 },
                 .approval_amendment => {
                     if (comptime @hasField(App, "approval_prompt")) {
-                        errdefer |err| app.input_runtime.paste.resetWithTrace(.{ .finalize_failed = .{
-                            .owner = .approval_amendment,
-                            .error_name = @errorName(err),
-                        } });
-                        switch (try app.approval_prompt.decision.insertAmendmentSlice(
+                        const outcome = app.approval_prompt.decision.insertAmendmentSlice(
                             app.alloc,
                             app.input_runtime.paste.buffer.items,
                             max_input_len,
-                        )) {
+                        ) catch |err| return failPaste(app, .approval_amendment, err);
+                        switch (outcome) {
                             .inserted => app.input_runtime.input_limit_rejection = input_limit_rejection.clear(),
                             .inactive => {
                                 app.input_runtime.paste.resetWithTrace(.session_reset);
@@ -260,7 +321,8 @@ pub fn PasteEditRuntime(comptime App: type) type {
                             .limit_exceeded => {
                                 const attempted_bytes = app.input_runtime.paste.buffer.items.len;
                                 app.input_runtime.paste.resetWithTrace(.{ .input_limit = .approval_amendment });
-                                try input_limit_feedback.report(App, app, .approval_amendment, attempted_bytes);
+                                input_limit_feedback.report(App, app, .approval_amendment, attempted_bytes) catch |err|
+                                    return failPaste(app, .approval_amendment, err);
                                 return;
                             },
                         }
@@ -297,14 +359,28 @@ pub fn PasteEditRuntime(comptime App: type) type {
             }
         }
 
+        /// The model picker lends the composer out as its query box: the
+        /// catalog, then a Ctrl+P flow's inline stages. An image attached
+        /// there would outlive the query, so image input stays out of it.
+        pub fn modelPickerBorrowsComposer(app: *const App) bool {
+            if (comptime @hasField(@TypeOf(app.input_runtime), "model_picker_draft")) {
+                if (app.input_runtime.model_picker_draft != null) return true;
+            }
+            if (comptime !@hasField(App, "model_cache")) return false;
+            return app.model_cache.menu.active;
+        }
+
         pub fn finalizePastedBlock(app: *App, max_input_len: usize) !void {
             if (app.input_runtime.paste.buffer.items.len == 0) return;
 
             // Inline image paths create pending attachments, not pasted-text blocks.
             if (image_attachments.hasImagePathToken(app.input_runtime.paste.buffer.items)) {
-                try handlePastedBytes(app, app.input_runtime.paste.buffer.items, max_input_len);
-                app.input_runtime.paste.buffer.clearRetainingCapacity();
-                return;
+                if (!modelPickerBorrowsComposer(app)) {
+                    try handlePastedBytes(app, app.input_runtime.paste.buffer.items, max_input_len);
+                    app.input_runtime.paste.buffer.clearRetainingCapacity();
+                    return;
+                }
+                debug_trace.logf("input", "image path paste kept as text reason=model_picker_borrows_composer", .{});
             }
 
             const text = try app.alloc.dupe(u8, app.input_runtime.paste.buffer.items);
@@ -437,6 +513,12 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 }
             }
             try stage.replacement.appendSlice(app.alloc, bytes[prev..]);
+            if (app.input_runtime.edit_state.input.items.len == 0 and
+                app.pending_images.items.len == 0 and
+                stripPastedImageSlashPrefix(&stage))
+            {
+                debug_trace.logf("input", "event=image_slash_prefix_consumed reason=pasted_slash_command", .{});
+            }
 
             const image_count = stage.images.items.len;
             const start = if (app.input_runtime.edit_state.selectionRange()) |selection|
@@ -495,7 +577,15 @@ pub fn PasteEditRuntime(comptime App: type) type {
                 );
             }
 
-            const structured_start = start;
+            const consume_image_slash = app.pending_images.items.len == 0 and
+                app.input_runtime.edit_state.selectionRange() == null and
+                start == app.input_runtime.edit_state.input.items.len and
+                isBareImageSlashPrefix(app.input_runtime.edit_state.input.items);
+            if (consume_image_slash) {
+                debug_trace.logf("input", "event=image_slash_prefix_consumed reason=pasted_image_attachment", .{});
+                app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            }
+            const structured_start: usize = if (consume_image_slash) 0 else start;
             std.debug.assert(try replacement.replaceSelectionOrInsertSliceBounded(
                 app.alloc,
                 stage.replacement.items,
