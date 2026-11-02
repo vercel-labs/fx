@@ -236,6 +236,7 @@ pub const StartupState = struct {
     session_title_generation: bool = true,
     /// Resolved `cache_warming` preference.
     cache_warming: bool = true,
+    rtk: bool = false,
     notification_turn_end: bool = false,
     notification_attention_required: bool = false,
     notification_max: bool = false,
@@ -909,6 +910,7 @@ pub fn resolveSettings(alloc: Allocator, state: *StartupState, detailed: *const 
     state.statusline_workspace = settings.statusline_workspace orelse false;
     state.session_title_generation = settings.session_titles orelse true;
     state.cache_warming = settings.cache_warming orelse true;
+    state.rtk = settings.rtk orelse false;
     const sound_override = soundEnvOverride();
     const sound_on_override: ?bool = if (sound_override) |level| level != .off else null;
     const max_override: ?bool = if (sound_override) |level| level == .max else null;

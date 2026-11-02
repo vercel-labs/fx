@@ -124,6 +124,7 @@ pub const UserSettingsPatch = struct {
     auto_compact_percent: ?u8 = null,
     provider_strict: ?bool = null,
     context: ?bool = null,
+    rtk: ?bool = null,
     /// Removes a plain setting, such as `fast_mode` or `statusLine.context`,
     /// so it falls back to its default. Distinct from the fields above, where
     /// null means "leave unchanged".
@@ -156,6 +157,7 @@ pub const UserSettingsPatch = struct {
             self.auto_compact_percent == null and
             self.provider_strict == null and
             self.context == null and
+            self.rtk == null and
             self.remove == null;
     }
 };
@@ -1301,6 +1303,7 @@ fn applyUserPatchToRoot(
     if (patch.auto_compact_percent) |value| application.changed = try putInteger(arena, &root.object, "auto_compact_percent", value) or application.changed;
     if (patch.provider_strict) |value| application.changed = try putBool(arena, &root.object, "provider_strict", value) or application.changed;
     if (patch.context) |value| application.changed = try putBool(arena, &root.object, "context", value) or application.changed;
+    if (patch.rtk) |value| application.changed = try putBool(arena, &root.object, "rtk", value) or application.changed;
     if (patch.remove) |path| application.changed = removePath(&root.object, path) or application.changed;
     try cleanupLegacyWorkspacePreferences(arena, root, patch, &application);
     return application;
@@ -1473,7 +1476,7 @@ fn cleanupLegacyWorkspacePreferences(
 
 /// The settings paths a patch from `fx config set` or `unset` writes that the
 /// `/settings` cleanup above doesn't already cover.
-fn configWrittenPaths(patch: UserSettingsPatch) [8]?[]const u8 {
+fn configWrittenPaths(patch: UserSettingsPatch) [9]?[]const u8 {
     return .{
         if (patch.theme != null) "theme" else null,
         if (patch.auto_upgrade != null) "auto_upgrade" else null,
@@ -1482,6 +1485,7 @@ fn configWrittenPaths(patch: UserSettingsPatch) [8]?[]const u8 {
         if (patch.auto_compact_percent != null) "auto_compact_percent" else null,
         if (patch.provider_strict != null) "provider_strict" else null,
         if (patch.context != null) "context" else null,
+        if (patch.rtk != null) "rtk" else null,
         patch.remove,
     };
 }

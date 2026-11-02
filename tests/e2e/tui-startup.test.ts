@@ -15,11 +15,13 @@ import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeShellRun,
   hasEmptyComposer,
   startDynamicFakeGateway,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { createRtkFixture, toolResultText } from "./fixtures/rtk";
 
 const SKIP = !tmuxAvailable() || !HAS_API_KEY;
 const SKIP_TMUX = !tmuxAvailable();
@@ -71,6 +73,49 @@ describe.skipIf(SKIP)("tui: startup and exit", () => {
 });
 
 describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
+  test("rtk reduces model requests while the terminal retains the original command output", async () => {
+    const fixture = createRtkFixture(true);
+    const stderrPath = join(fixture.home, "stderr.log");
+    const requests: any[] = [];
+    const gateway = startDynamicFakeGateway((raw) => {
+      requests.push(JSON.parse(raw));
+      return requests.length === 1
+        ? fakeShellRun("rtk-tui-run", "./cargo test")
+        : fakeGatewayFinalText("RTK_TUI_COMPLETE");
+    });
+    try {
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        env: {
+          HOME: fixture.home, AI_GATEWAY_API_KEY: "rtk-fixture-key", VERCEL_OIDC_TOKEN: undefined,
+          FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1",
+        }, stderrPath,
+      });
+      await session.waitForComposer(10_000);
+      await session.sendText("Run the fixture tests.");
+      await session.waitForText("RTK_TUI_COMPLETE", 10_000);
+      const reduced = JSON.parse(toolResultText(requests[1], "rtk-tui-run"));
+      expect(reduced.output_delta).toContain("80 passing test lines omitted");
+      expect(reduced.output_delta).toContain("RTK_DIAGNOSTIC: retain this warning");
+      const scrollback = await session.captureFullScrollback();
+      expect(scrollback).not.toContain("[rtk:");
+      await session.resizeWindow(120, 140);
+      await session.sendKeys("C-o");
+      const full = await session.waitForText("rtk_pass_0", 5_000);
+      expect(full).toContain("rtk_pass_79");
+      expect(full).not.toContain("[rtk:");
+      await session.sendKeys("C-o");
+      expect(readFileSync(join(fixture.workspace, "runs"), "utf8")).toBe("run\n");
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(5_000)).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      if (session) { await session.kill(); session = null; }
+      gateway.stop(); fixture.cleanup();
+    }
+  }, TIMEOUT);
+
   test(
     "statusline hides the workspace identity by default",
     async () => {

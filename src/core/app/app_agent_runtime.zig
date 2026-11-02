@@ -228,6 +228,7 @@ pub fn Runtime(comptime App: type) type {
                 .max_command_output_bytes = max_command_output_bytes,
                 .max_tool_result_bytes = agent_settings.max_tool_result_bytes,
                 .auto_compact_percent = agent_settings.auto_compact_percent,
+                .rtk = agent_settings.rtk,
                 .api_key = app.auth.apiKey() orelse "",
                 .agent_stream_provider = if (comptime @hasDecl(App, "agentStreamProvider"))
                     app.agentStreamProvider()
@@ -1232,6 +1233,7 @@ pub fn Runtime(comptime App: type) type {
                 .agent_step_limit = app.agent_step_limit,
                 .max_tool_result_bytes = job.agent_settings.max_tool_result_bytes,
                 .auto_compact_percent = job.agent_settings.auto_compact_percent,
+                .rtk = job.agent_settings.rtk,
                 .cancel_flag = &app.worker.worker_cancel_requested,
                 .recovery_continue_flag = &app.worker.recovery_continue_requested,
                 .review_enabled = false,
