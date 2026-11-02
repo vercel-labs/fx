@@ -164,6 +164,7 @@ const subagent_properties = [_]model_tool_schema.Property{
     .{ .name = "instructions", .json_type = .string, .description = "For message: system instructions for this child." },
     .{ .name = "model", .json_type = .string, .description = "Model ID for a new child. Defaults to yours." },
     .{ .name = "effort", .json_type = .string, .description = "Reasoning effort for a new child." },
+    .{ .name = "profile", .json_type = .string, .description = "Agent profile for a new child, from the subagent guidance. Without one, it gets yours." },
 };
 const vision_description =
     "Look at images and return what is visible. Pass exactly one source, image_ids for images the user attached or paths for image files the user named, plus focus.";
@@ -901,9 +902,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "e90a2960fe42b9c28ca6ce5abd7d18600ef79eac654c03ddaeaccec5d566bcde"
+            "c54a5c290ce21a163dd3558a2563c1362a222b0be617dd9ab391933533c3d043"
         else
-            "3cfbe58765e1d905c392cc6861b8558d520811239faba54e22f0ad21bdeef53f",
+            "213a5b826c4832d71f49e0c4dcb8ecd8ace3cf0157adaecb72ae0504324668ce",
         &actual_hex,
     );
 }
