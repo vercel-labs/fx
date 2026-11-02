@@ -197,6 +197,8 @@ Do not bypass the permission system for new tools.
 
 * To parse JSON into a typed value, use `parseFromSlice` or `parseFromSliceLeaky` from `src/core/shared/json_decode.zig`. They match `std.json`'s, but share one parser across types instead of generating one per type. Parse into `std.json.Value` with `std.json` itself.
 
+* To sort, use `sort` from `src/core/shared/sort_utils.zig` in place of `std.mem.sort`. It takes the same arguments and is also stable, but shares one implementation across element types instead of generating a block sort for each. Code that cannot import it, such as `src/core/indexer/`, `src/core/session_manager/`, and files that import only `std`, keeps `std.mem.sort`.
+
 * For JSON string escaping (writing raw JSON), use the project's `writeJsonStr` helper in `src/acp/jsonrpc.zig` rather than assuming `std.json.encodeJsonString` exists.
 
 * Zig 0.17 uses `std.Io.File.stdin()` / `.stdout()` / `.stderr()`, not `std.io.getStdIn()`.
