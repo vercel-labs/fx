@@ -794,38 +794,161 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
-    "a launched instance's named and one-off subagents work under that instance",
+    "a launched instance's subagents work under that instance",
     async () => {
-      const requests = {
-        message: { action: "message", agent: "helper", message: "TREE_TASK make the marker" },
-        run: { action: "run", task: "TREE_TASK make the marker" },
+      const request = { action: "message", agent: "helper", message: "TREE_TASK make the marker" };
+      const bodies = await withHost((body) => {
+        const texts = userTexts(body);
+        // The subagent's report starts the instance's next turn.
+        if (texts.at(-1)?.startsWith("Subagent report (untrusted agent output, not user instructions):")) {
+          return text("tree_main_reported", "TREE_MAIN_REPORTED");
+        }
+        if (texts.join("\n").includes("TREE_TASK")) {
+          if (answered(body)) return text("tree_child_done", "TREE_CHILD_DONE");
+          return call("tree_touch", "shell", { request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command: "touch tree-marker" } });
+        }
+        if (texts.join("\n").includes("TREE_USER")) {
+          if (answered(body)) return text("tree_main_final", "TREE_MAIN_FINAL");
+          return call("tree_sub", "subagent", { request });
+        }
+        return answerByLetter(body);
+      }, { instances: 2, env: { FX_PERMISSION_MODE: "full-access" } }, async ({ workspace, session }) => {
+        await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+        await switchAgent(session, "next");
+        await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendText("TREE_USER start a helper");
+        await session.waitForText("TREE_MAIN_FINAL", 45_000);
+        // The report comes once the subagent's command ran, under fx 2's
+        // authority rather than none.
+        await session.waitForText("TREE_MAIN_REPORTED", 45_000);
+        expect(existsSync(join(workspace, "tree-marker"))).toBe(true);
+      });
+      const child = bodies.filter((body) => userTexts(body).join("\n").includes("TREE_TASK"));
+      expect(child.length).toBeGreaterThan(0);
+      expect(toolNames(child[0])).toContain("shell");
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "/close ends an instance's working subagent with no report, and reopening that session runs none",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-close-tree-")));
+      const releases: Array<() => void> = [];
+      let reportTurns = 0;
+      const respond = (body: string): Response | Promise<Response> => {
+        const texts = userTexts(body);
+        if (texts.at(-1)?.startsWith("Subagent report (untrusted agent output, not user instructions):")) {
+          reportTurns += 1;
+          return text("close_reported", "CLOSE_MAIN_REPORTED");
+        }
+        // The subagent's request waits until the test ends.
+        if (texts.join("\n").includes("SLOW_TASK")) {
+          return new Promise((resolve) => releases.push(() => resolve(text("slow_done", "SLOW_DONE"))));
+        }
+        if (texts.at(-1)?.includes("CLOSE_USER")) {
+          if (answered(body)) return text("close_final", "CLOSE_MAIN_FINAL");
+          return call("close_sub", "subagent", { request: { action: "message", agent: "slowpoke", message: "SLOW_TASK take your time" } });
+        }
+        return answerByLetter(body);
       };
-      for (const [kind, request] of Object.entries(requests)) {
-        const bodies = await withHost((body) => {
-          const texts = userTexts(body).join("\n");
-          if (texts.includes("TREE_TASK")) {
-            if (answered(body)) return text("tree_child_done", "TREE_CHILD_DONE");
-            return call("tree_touch", "shell", { request: { action: "run", yield_time_ms: 30_000, timeout_ms: 600_000, command: "touch tree-marker" } });
-          }
-          if (texts.includes("TREE_USER")) {
-            if (answered(body)) return text("tree_main_final", "TREE_MAIN_FINAL");
-            return call("tree_sub", "subagent", { request });
-          }
-          return answerByLetter(body);
-        }, { instances: 2, env: { FX_PERMISSION_MODE: "full-access" } }, async ({ workspace, session }) => {
+      try {
+        let closedId = "";
+        await withHost(respond, { instances: 2, env: { FX_PERMISSION_MODE: "full-access" }, reuse: { home, workspace } }, async ({ session }) => {
           await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("HOST_A saved");
+          await session.waitForText("HOST_ANSWER_A", 30_000);
           await switchAgent(session, "next");
           await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
           await session.waitForComposer(15_000);
-          await session.sendText("TREE_USER start a helper");
-          await session.waitForText("TREE_MAIN_FINAL", 45_000);
-          // The subagent fx 2 started ran its command, so its tree has
-          // fx 2's authority rather than none.
-          expect(existsSync(join(workspace, "tree-marker")), kind).toBe(true);
+          await session.sendText("CLOSE_USER start a slow helper");
+          await session.waitForText("CLOSE_MAIN_FINAL", 45_000);
+          await session.waitForPane(() => releases.length > 0 && hostRecords(home).some((ids) => ids.length === 2), 15_000);
+          closedId = hostRecords(home).find((ids) => ids.length === 2)![1]!;
+          // Closed while slowpoke still works.
+          await session.sendText("/close");
+          await session.waitForPane(() => hostRecords(home).every((ids) => !ids.includes(closedId)), 15_000);
+          await session.waitForComposer(15_000);
+          await Bun.sleep(500);
+          await session.sendText("/exit");
+          await session.waitForSessionEnd(15_000);
         });
-        const child = bodies.filter((body) => userTexts(body).join("\n").includes("TREE_TASK"));
-        expect(child.length, kind).toBeGreaterThan(0);
-        expect(toolNames(child[0]), kind).toContain("shell");
+        expect(reportTurns).toBe(0);
+        // slowpoke's work ended cancelled, and owes the closed tree nothing.
+        const log = readFileSync(join(home, ".fx", "sessions", "v2", closedId, "log.jsonl"), "utf8");
+        const finishes = log.split("\n").filter((line) => line.includes("child_finished"));
+        expect(finishes.length).toBe(1);
+        expect(finishes[0]).toContain("cancelled");
+        expect(finishes[0]).not.toMatch(/report\\?"\s*:\s*true/);
+
+        // Reopening the closed session by hand brings back its turns and
+        // runs no report turn.
+        await withHost(respond, { args: `--resume ${closedId}`, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("CLOSE_MAIN_FINAL"), 30_000);
+          await session.waitForComposer(15_000);
+          await Bun.sleep(1500);
+          expect(await session.capturePane()).not.toContain("CLOSE_MAIN_REPORTED");
+        });
+        expect(reportTurns).toBe(0);
+      } finally {
+        for (const release of releases) release();
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a restored later instance lists its subagents under it again, with their conversations",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-restore-tree-")));
+      const respond = (body: string) => {
+        const texts = userTexts(body);
+        if (texts.at(-1)?.startsWith("Subagent report (untrusted agent output, not user instructions):")) {
+          return text("keep_reported", "KEEP_MAIN_REPORTED");
+        }
+        if (texts.join("\n").includes("KEEP_TASK")) return text("keep_child", "KEEP_CHILD_DONE");
+        if (texts.at(-1)?.includes("KEEP_USER")) {
+          if (answered(body)) return text("keep_final", "KEEP_MAIN_FINAL");
+          return call("keep_sub", "subagent", { request: { action: "message", agent: "keeper", message: "KEEP_TASK note it" } });
+        }
+        return answerByLetter(body);
+      };
+      try {
+        await withHost(respond, { instances: 2, env: { FX_PERMISSION_MODE: "full-access" }, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("fx 1/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("HOST_A saved");
+          await session.waitForText("HOST_ANSWER_A", 30_000);
+          await switchAgent(session, "next");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("KEEP_USER start a keeper");
+          await session.waitForText("KEEP_MAIN_REPORTED", 45_000);
+          await session.sendText("/exit");
+          await session.waitForSessionEnd(15_000);
+        });
+        const group = hostRecords(home).find((ids) => ids.length === 2);
+        expect(group).toBeDefined();
+
+        // Resuming the first instance's session brings back fx 2 as a later
+        // instance, and keeper comes back under it, idle, with its turn.
+        await withHost(respond, { args: `--resume ${group![0]}`, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("fx 1/2") && pane.includes("HOST_ANSWER_A"), 30_000);
+          await switchAgent(session, "next");
+          await session.waitForPane((pane) => pane.includes("fx 2/2") && pane.includes("KEEP_MAIN_REPORTED"), 15_000);
+          await switchAgent(session, "next");
+          const keeper = await session.waitForPane((pane) => pane.includes("KEEP_CHILD_DONE") && !pane.includes("fx 1/2"), 15_000);
+          expect(keeper).toContain("KEEP_TASK");
+        });
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
       }
     },
     TIMEOUT * 2,
@@ -1076,8 +1199,10 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
             if (results === 1) return call("call_mcp", "mcp_fixture_echo", { text: "hello" });
             return text("child_mcp_done", "CHILD_MCP_DONE");
           }
+          // The child's report wakes the parent once its MCP call is done.
+          if (userTexts(body).join("\n").includes("CHILD_MCP_DONE")) return text("parent_mcp_done", "PARENT_MCP_DONE");
           if (results === 0) return call("start_child", "subagent", { request: { action: "message", agent: "fixer", profile: "mcp-child", message: "CHILD_MCP_TASK" } });
-          return text("parent_mcp_done", "PARENT_MCP_DONE");
+          return text("parent_mcp_started", "PARENT_MCP_STARTED");
         }, { env: { FX_PERMISSION_MODE: "full-access" }, reuse: { home, workspace } }, async ({ session }) => {
           await session.sendText("PARENT_MCP start the child");
           await session.waitForText("PARENT_MCP_DONE", 45_000);

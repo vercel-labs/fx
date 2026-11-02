@@ -130,14 +130,19 @@ pub fn Runtime(comptime App: type) type {
             return modeOf(app, agents.screenAgentOf(app));
         }
 
-        /// `agent`'s permission mode: an instance's own, or a
-        /// subagent's own: the one chosen on its screen, else the one
-        /// its run was admitted with, else its root instance's.
+        /// `agent`'s permission mode: an instance's own, or a subagent's as
+        /// its tool calls resolve it: the one chosen on its screen, else
+        /// its profile's, else its parent's current one. A subagent whose
+        /// run can't resolve it shows the mode the run was admitted with,
+        /// and one with no run its root instance's. Never call it for a
+        /// subagent while holding the authority lock, which resolving a
+        /// subagent's mode takes; an instance's takes no lock.
         pub fn modeOf(app: anytype, agent: anytype) types.PermissionMode {
             if (comptime !@hasField(App, "permission_engine")) return .ask;
             if (comptime own_mode_supported) if (isSubagent(app, agent)) {
                 if (agent.permission_mode) |own| return own;
-                if (agent.child_run) |*run| return run.admission.permission_mode;
+                if (agent.child_run) |*run| return run.authority_resolver.currentMode(app.alloc, run.child_id) catch
+                    run.admission.permission_mode;
             };
             return instanceMode(app, permissionOwner(app, agent));
         }

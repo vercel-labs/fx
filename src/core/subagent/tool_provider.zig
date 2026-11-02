@@ -70,8 +70,9 @@ test "provider forwards the validated managed request and invocation identity" {
     };
 
     var fixture = Fixture{};
-    var request = model_contract.Request{ .run = .{
-        .task = @constCast("review this"),
+    var request = model_contract.Request{ .message = .{
+        .agent = @constCast("reviewer"),
+        .message = @constCast("review this"),
     } };
     const provider = Provider{
         .context = &fixture,

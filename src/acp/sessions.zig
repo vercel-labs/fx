@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const agent_frame = @import("../core/shared/agent_frame.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 const jsonrpc = @import("jsonrpc.zig");
@@ -1603,6 +1604,12 @@ fn sendUserHistoryTurn(
     if (std.mem.eql(u8, user.text, session_runtime.resumed_request_prompt)) {
         return sendAgentHistoryChunk(state, alloc, session_id, session_runtime.resumed_request_notice.body);
     }
+    // A turn a subagent's report or message started is not the user's
+    // words, so it never replays as theirs; the agent's reply still does.
+    if (user.author != .user) {
+        debug_trace.logf("acp", "history replay skipped non-user prompt author={s} bytes={d}", .{ @tagName(user.author), user.text.len });
+        return;
+    }
     var message_id: acp_types.MessageIdBuffer = undefined;
     const stable_message_id = acp_types.generateMessageId(&message_id);
     if (user.text.len > 0) {
@@ -1688,7 +1695,15 @@ fn sendExecutionHistory(
     for (frames) |frame| {
         switch (frame) {
             .assistant_text => |text| try sendAgentHistoryChunk(state, alloc, session_id, text),
-            .steering_text => |text| try sendSteeringHistoryChunk(state, alloc, session_id, text),
+            .steering_text => |text| {
+                // A subagent's report a boundary took is not the user's
+                // message, so it isn't replayed as one.
+                if (agent_frame.isFrame(text)) {
+                    debug_trace.logf("acp", "event=history_steering_skipped reason=subagent_frame bytes={d}", .{text.len});
+                    continue;
+                }
+                try sendSteeringHistoryChunk(state, alloc, session_id, text);
+            },
             .tool_call => |call| try sendHistoryToolCall(state, alloc, session_id, call),
         }
     }
