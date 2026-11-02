@@ -1,4 +1,4 @@
-import { afterEach, describe, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
   mkdtempSync,
   readFileSync,
@@ -7,7 +7,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { FX_BIN } from "../evals/eval-helpers";
+import {
+  cleanupIsolatedTestHome,
+  createIsolatedTestHome,
+  FX_BIN,
+} from "../evals/eval-helpers";
 import {
   assertSingleFooter,
   findFooterBlocks,
@@ -55,12 +59,17 @@ const routes = [
 ] as const;
 
 let session: TmuxSession | null = null;
+let testHome: string | null = null;
 const workDirs: string[] = [];
 
 afterEach(async () => {
   if (session) {
     await session.kill();
     session = null;
+  }
+  if (testHome) {
+    cleanupIsolatedTestHome(testHome);
+    testHome = null;
   }
   for (const dir of workDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
@@ -135,9 +144,12 @@ describe.skipIf(SKIP)("tui: logical-line deletion", () => {
         const stderrPath = join(workDir, "stderr.log");
         writeFileSync(stderrPath, "");
 
+        testHome = createIsolatedTestHome();
         session = await TmuxSession.create({
-          cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_TEST_SKIP_ONBOARDING=1 ${FX_BIN} 2>${stderrPath}`,
+          cmd: FX_BIN,
           cwd: workDir,
+          env: { HOME: testHome },
+          stderrPath,
           width: 120,
           height: 40,
         });
@@ -196,8 +208,61 @@ describe.skipIf(SKIP)("tui: logical-line deletion", () => {
 
         await session.kill();
         session = null;
+        cleanupIsolatedTestHome(testHome);
+        testHome = null;
       }
     },
     TIMEOUT,
   );
+});
+
+describe.skipIf(SKIP)("tui: backward word deletion", () => {
+  const wordRoutes = [
+    { label: "Kitty Ctrl+Backspace", sequence: "\x1b[127;5u", expected: "left  right" },
+    { label: "Kitty Ctrl+Backspace repeat", sequence: "\x1b[127;5:2u", expected: "left  right" },
+    { label: "modifyOtherKeys Ctrl+Backspace", sequence: "\x1b[27;5;127~", expected: "left  right" },
+    { label: "Option+Backspace", sequence: "\x1b[127;3u", expected: "left  right" },
+    { label: "Backspace", sequence: "\x7f", expected: "left caf right" },
+    { label: "Ctrl+H", sequence: "\x08", expected: "left caf right" },
+  ];
+
+  for (const route of wordRoutes) {
+    test(route.label, async () => {
+      testHome = createIsolatedTestHome();
+      const stderrPath = join(testHome, "stderr.log");
+      writeFileSync(stderrPath, "");
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: testHome,
+        env: { HOME: testHome },
+        stderrPath,
+        width: 120,
+        height: 40,
+      });
+      await session.waitForComposer(10_000);
+      await session.sendLiteralText("alpha");
+      await session.sendHexBytes(["0a"]);
+      await session.sendLiteralText("left café right");
+      await session.sendHexBytes(["0a"]);
+      await session.sendLiteralText("gamma");
+      await waitForLatestFooterState(
+        route.label, session, stderrPath, "alpha\nleft café right\ngamma", null,
+      );
+      await session.sendKeys(Array(12).fill("Left").join(" "));
+      await session.sendHexBytes(Array.from(Buffer.from(route.sequence), (byte) =>
+        byte.toString(16).padStart(2, "0")
+      ));
+      const finalGrid = await waitForLatestFooterState(
+        route.label, session, stderrPath, `alpha\n${route.expected}\ngamma`, "left café right",
+      );
+      const failures: string[] = [];
+      const footer = assertSingleFooter(finalGrid, failures, route.label);
+      if (footer) {
+        assertFooterLogicalRows(finalGrid, footer, ["alpha", route.expected, "gamma"], failures, route.label);
+      }
+      expect(failures).toEqual([]);
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    }, TIMEOUT);
+  }
 });
