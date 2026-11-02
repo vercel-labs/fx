@@ -1047,7 +1047,7 @@ pub fn Runtime(comptime App: type) type {
             app.writeDomainNotice(.{
                 .topic = "session",
                 .tone = .neutral,
-                .body = "Interrupted turn · fx -c to continue",
+                .body = "Interrupted turn · /resume to continue",
             }, true) catch |err| {
                 debug_trace.logf("session", "event=interrupted_turn_hint_failed err={s}", .{@errorName(err)});
             };
