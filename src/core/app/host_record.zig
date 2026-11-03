@@ -10,6 +10,7 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const sort_utils = @import("../shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -240,7 +241,7 @@ pub fn staleGroups(alloc: Allocator, records: []const Record, keep: usize, keep_
     const order = try alloc.alloc(usize, records.len);
     defer alloc.free(order);
     for (order, 0..) |*slot, index| slot.* = index;
-    std.mem.sort(usize, order, records, struct {
+    sort_utils.sort(usize, order, records, struct {
         fn lessThan(list: []const Record, a: usize, b: usize) bool {
             return newer(list[a], list[b]);
         }
