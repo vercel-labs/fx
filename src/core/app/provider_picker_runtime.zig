@@ -11,6 +11,7 @@
 //! provider switching, OAuth, API key entry, and team selection.
 
 const std = @import("std");
+const agents = @import("../agents/agents.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
@@ -52,6 +53,7 @@ pub fn supported(comptime App: type) bool {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
         /// Fills one column with its options and their `current` annotations,
         /// then narrows both to what the typed query matches.
         pub fn columnOptions(
@@ -326,7 +328,7 @@ pub fn Runtime(comptime App: type) type {
                         app.input_runtime.picker.provider_picker_pending_provider.items,
                     ) orelse .gateway;
                     if (provider_picker_catalog.keySourceCredential(key_source)) |credential| {
-                        try commitSource(app, credential, pending_provider);
+                        try commitSource(app, agents.screenAgentOf(app), credential, pending_provider);
                     } else {
                         try openKeyStage(app, query.prefix, .api_key);
                     }
@@ -340,7 +342,7 @@ pub fn Runtime(comptime App: type) type {
                     const provider = provider_catalog.parse(
                         app.input_runtime.picker.provider_picker_pending_provider.items,
                     ) orelse .gateway;
-                    try commitTeam(app, index, provider);
+                    try commitTeam(app, agents.screenAgentOf(app), index, provider);
                     return true;
                 },
             }
@@ -429,7 +431,7 @@ pub fn Runtime(comptime App: type) type {
             // picker were still waiting for input.
             app.input_runtime.picker.clearProviderPickerFlow();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
-            try app_auth_runtime.Runtime(App).applyPickerChoice(app, choice);
+            try app_auth_runtime.Runtime(App).applyPickerChoice(app, agents.screenAgentOf(app), choice);
             app.shell.render_requests.request(.footer);
         }
 
@@ -478,13 +480,13 @@ pub fn Runtime(comptime App: type) type {
                     // round trip; switch to it instead of forcing a sign-in it
                     // does not need.
                     if (ambientOauthSource(app)) |source| {
-                        try commitSource(app, source, provider);
+                        try commitSource(app, agents.screenAgentOf(app), source, provider);
                         return;
                     }
                     if (teams == .blocked) return;
                     app.input_runtime.picker.clearProviderPickerFlow();
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                    try app_auth_runtime.Runtime(App).beginSignInForProviderPicker(app);
+                    try app_auth_runtime.Runtime(App).beginSignInForProviderPicker(app, agents.screenAgentOf(app));
                     app.shell.render_requests.request(.footer);
                     return;
                 },
@@ -492,7 +494,7 @@ pub fn Runtime(comptime App: type) type {
                 // last column the choice has: the login is still the
                 // credential the user asked for, teams or not.
                 .unavailable => {
-                    try commitSource(app, .fx_login, provider);
+                    try commitSource(app, agents.screenAgentOf(app), .fx_login, provider);
                     return;
                 },
             }
@@ -512,16 +514,16 @@ pub fn Runtime(comptime App: type) type {
 
         /// Switching to a detected credential is a complete leaf: apply the
         /// source, then the provider it authenticates.
-        fn commitSource(app: *App, source: credentials.Source, provider: model_provider.ProviderId) !void {
+        fn commitSource(app: *App, agent: *AppAgent, source: credentials.Source, provider: model_provider.ProviderId) !void {
             app.input_runtime.picker.clearProviderPickerFlow();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             const auth_rt = app_auth_runtime.Runtime(App);
             // The provider only follows a credential that actually applied;
             // switching after a failed selection would strand the provider
             // without the credential the user just asked it to use.
-            if (try auth_rt.applySourceChoice(app, source)) {
-                if (!provider_runtime.provider(app).eql(provider)) {
-                    try auth_rt.applyPickerChoice(app, .{ .provider = provider });
+            if (try auth_rt.applySourceChoice(app, agent, source)) {
+                if (!provider_runtime.providerOf(app, agent).eql(provider)) {
+                    try auth_rt.applyPickerChoice(app, agent, .{ .provider = provider });
                 }
             }
             app.shell.render_requests.request(.footer);
@@ -529,13 +531,13 @@ pub fn Runtime(comptime App: type) type {
 
         /// The team is the last column, so this is where the whole path
         /// (provider, method, team) finally takes effect.
-        fn commitTeam(app: *App, index: usize, provider: model_provider.ProviderId) !void {
+        fn commitTeam(app: *App, agent: *AppAgent, index: usize, provider: model_provider.ProviderId) !void {
             app.input_runtime.picker.clearProviderPickerFlow();
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             const auth_rt = app_auth_runtime.Runtime(App);
-            if (try auth_rt.applyTeamChoice(app, index)) {
-                if (!provider_runtime.provider(app).eql(provider)) {
-                    try auth_rt.applyPickerChoice(app, .{ .provider = provider });
+            if (try auth_rt.applyTeamChoice(app, agent, index)) {
+                if (!provider_runtime.providerOf(app, agent).eql(provider)) {
+                    try auth_rt.applyPickerChoice(app, agent, .{ .provider = provider });
                 }
             }
             app.shell.render_requests.request(.footer);

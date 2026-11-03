@@ -252,6 +252,9 @@ pub const Context = struct {
     /// that require a live user (like `ask_user_question`) short-circuit
     /// in that case.
     interactive: bool = true,
+    /// Lets a turn that is not interactive still ask the user questions: a
+    /// subagent's, whose questions show on its own screen and on main's.
+    ask_user_questions: bool = false,
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     lifecycle_scope: hooks.Scope = .{
         .kind = .interactive,
@@ -1540,8 +1543,8 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .output_chunk_ctx = ctx.output_chunk_ctx,
         .on_output_chunk = ctx.on_output_chunk,
         .command_timeout_ms = ctx.command_timeout_ms,
-        .ask_question_ctx = if (ctx.interactive) ctx.worker else null,
-        .ask_question_batch = if (ctx.interactive) requestQuestionBatchWithWorker else null,
+        .ask_question_ctx = if (ctx.interactive or ctx.ask_user_questions) ctx.worker else null,
+        .ask_question_batch = if (ctx.interactive or ctx.ask_user_questions) requestQuestionBatchWithWorker else null,
         .web_fetch_runtime = ctx.web_fetch_runtime,
         .web_fetch_artifact_store = ctx.web_fetch_artifact_store,
         .web_fetch_artifact_error = ctx.web_fetch_artifact_error,
@@ -2465,7 +2468,7 @@ test "subagent progress publishes a complete two-line lifecycle row" {
     defer if (capture.text) |text| std.testing.allocator.free(text);
     var bridge = SubagentProgressBridge{
         .alloc = std.testing.allocator,
-        .call = .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}" },
+        .call = .{ .id = "child", .name = "subagent", .arguments_json = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"inspect auth\"}" },
         .renderer = .{ .ctx = &capture, .render_fn = Capture.render },
         .progress_ctx = &capture,
         .progress_fn = Capture.publish,
@@ -2478,13 +2481,12 @@ test "subagent progress publishes a complete two-line lifecycle row" {
         .context_window = 100_000,
     });
 
-    try std.testing.expectEqualStrings("● Subagent working · inspect auth\n  openai/gpt-5.5 · high · Subagent · 12k", capture.text.?);
+    try std.testing.expectEqualStrings("● reviewer working · inspect auth\n  openai/gpt-5.5 · high · reviewer · 12k", capture.text.?);
 }
 
 test "subagent session title is derived only from the current request identity" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { arguments_json: []const u8, expected: []const u8 }{
-        .{ .arguments_json = "{\"action\":\"run\",\"task\":\"inspect auth\"}", .expected = "Subagent" },
         .{ .arguments_json = "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"inspect auth\"}", .expected = "reviewer" },
     };
     for (cases) |case| {
@@ -2496,11 +2498,13 @@ test "subagent session title is derived only from the current request identity" 
         defer alloc.free(title);
         try std.testing.expectEqualStrings(case.expected, title);
     }
-    try std.testing.expect((try requestDerivedSubagentSessionTitle(alloc, .{
-        .id = "child",
-        .name = "subagent",
-        .arguments_json = "{}",
-    })) == null);
+    for ([_][]const u8{ "{}", "{\"action\":\"run\",\"task\":\"inspect auth\"}" }) |arguments_json| {
+        try std.testing.expect((try requestDerivedSubagentSessionTitle(alloc, .{
+            .id = "child",
+            .name = "subagent",
+            .arguments_json = arguments_json,
+        })) == null);
+    }
 }
 
 fn subagentProviderFailure(
@@ -2548,7 +2552,7 @@ fn executeSubagentProvider(
         .timestamp_ms = io_mod.milliTimestamp(),
         .identity_epoch = identity_epoch,
         .cancel_flag = runtimeCancelFlag(ctx),
-        .steering_worker = if (ctx.interactive) ctx.worker else null,
+        .caller_worker = ctx.worker,
         .progress = if (progress_bridge) |*bridge| bridge.sink() else null,
         .model_capability_resolver = ctx.model_capability_resolver,
         .model_override_resolver = ctx.model_override_resolver,
