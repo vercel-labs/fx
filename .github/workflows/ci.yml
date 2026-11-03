@@ -106,7 +106,7 @@ jobs:
         run: |
           started_at=$SECONDS
           trap 'printf "Unit tests elapsed: %ss\n" "$((SECONDS - started_at))"' EXIT
-          timeout "${TEST_TIMEOUT_SECONDS}s" zig build test -Doptimize=${{ matrix.optimize }}
+          timeout "${TEST_TIMEOUT_SECONDS}s" zig build test -Doptimize=${{ matrix.optimize }} --summary all
 
       - name: Save Zig cache
         uses: ./.github/actions/save-zig-cache
