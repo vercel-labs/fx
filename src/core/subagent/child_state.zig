@@ -72,6 +72,9 @@ pub const ActiveWork = struct {
     root_user_evidence_complete: bool = false,
     permission_mode: types.PermissionMode = .yolo,
     created_at_ms: i64,
+    /// Who started the work: its parent's message, or a turn the user typed
+    /// on the child's screen or its own child's report woke.
+    started_by: reports.StartedBy = .parent,
 
     pub fn deinit(self: *ActiveWork, alloc: Allocator) void {
         alloc.free(self.id);
@@ -99,6 +102,7 @@ pub const ActiveWork = struct {
             .root_user_evidence_complete = self.root_user_evidence_complete,
             .permission_mode = self.permission_mode,
             .created_at_ms = self.created_at_ms,
+            .started_by = self.started_by,
         };
     }
 
@@ -673,18 +677,34 @@ const SpawnData = struct {
     /// fx and converted v1 sessions never write it; a name this fx does not
     /// know reads as `final`.
     report: ?[]const u8 = null,
+    /// Who started a work its parent didn't: `user` or `child`. Crash
+    /// repair's finish carries no fx data, so its report reads this.
+    by: ?[]const u8 = null,
 };
 
 /// A spawn line's data. `rule` is null only for a converted v1 session,
 /// whose works owe no report, and then the line is written as before
 /// report rules existed.
-fn spawnData(arena: Allocator, agent: ?[]const u8, fingerprint: []const u8, profile: ?[]const u8, rule: ?reports.Rule) ![]const u8 {
+fn spawnData(arena: Allocator, agent: ?[]const u8, fingerprint: []const u8, profile: ?[]const u8, rule: ?reports.Rule, by: reports.StartedBy) ![]const u8 {
     return stringifyAlloc(arena, SpawnData{
         .agent = agent,
         .fingerprint = fingerprint,
         .profile = profile,
         .report = if (rule) |value| @tagName(value) else null,
+        .by = if (by == .parent) null else @tagName(by),
     });
+}
+
+/// Pure: who started the work a `child_spawned` line's `data` opens. A
+/// line without `by`, or one this fx can't read, is the parent's.
+pub fn spawnStartedBy(data: ?[]const u8) reports.StartedBy {
+    const bytes = data orelse return .parent;
+    var buf: [256]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const Wire = struct { by: ?[]const u8 = null };
+    const wire = std.json.parseFromSliceLeaky(Wire, fba.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return .parent;
+    const name = wire.by orelse return .parent;
+    return std.meta.stringToEnum(reports.StartedBy, name) orelse .parent;
 }
 
 /// Whether a `child_spawned` line's data names a report rule: the work was
@@ -774,6 +794,21 @@ test "a finish that owes a report saves who started its work and why it was canc
     try std.testing.expectEqual(EndFacts{}, finishEndFacts("{\"report\":true}"));
     try std.testing.expectEqual(EndFacts{}, finishEndFacts("{\"report\":true,\"by\":\"robot\",\"cause\":\"meteor\"}"));
     try std.testing.expectEqual(EndFacts{}, finishEndFacts(null));
+}
+
+test "a spawn saves who started a work its parent didn't" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_]reports.StartedBy{ .user, .child, .parent }) |by| {
+        try std.testing.expectEqual(by, spawnStartedBy(try spawnData(arena, "reviewer", "ab", null, .final, by)));
+    }
+    // The parent's own work names no one in `by`.
+    try std.testing.expect(std.mem.find(u8, try spawnData(arena, "reviewer", "ab", null, .final, .parent), "\"by\":\"") == null);
+    // An older fx's line, a value this fx doesn't know, and no data read as the parent's.
+    try std.testing.expectEqual(reports.StartedBy.parent, spawnStartedBy("{\"fingerprint\":\"ab\",\"report\":\"final\"}"));
+    try std.testing.expectEqual(reports.StartedBy.parent, spawnStartedBy("{\"by\":\"robot\"}"));
+    try std.testing.expectEqual(reports.StartedBy.parent, spawnStartedBy(null));
 }
 
 /// Pure: the registry a v2 parent's folded children describe. The
@@ -884,7 +919,7 @@ fn planLines(arena: Allocator, old: Registry, next: Registry) ![]session_adapter
                 try lines.append(arena, .{ .spawned = .{
                     .child = after.id,
                     .work_id = work_id,
-                    .data = try spawnData(arena, after.agentName(), &fingerprint, after.profile, after.report_rule),
+                    .data = try spawnData(arena, after.agentName(), &fingerprint, after.profile, after.report_rule, after.active.?.started_by),
                 } });
             }
         }
@@ -918,7 +953,7 @@ pub fn v1ImportLines(arena: Allocator, registry: Registry, has_log: []const bool
         try lines.append(arena, .{ .spawned = .{
             .child = child.id,
             .work_id = work_id,
-            .data = try spawnData(arena, child.agentName(), fingerprint, null, null),
+            .data = try spawnData(arena, child.agentName(), fingerprint, null, null, .parent),
         } });
         try lines.append(arena, .{ .finished = .{
             .child = child.id,
