@@ -154,6 +154,7 @@ fn recordProviderResultMetric(
         .{
             .schema = if (failure) |value| value.diagnostics.schema orelse "" else "",
             .request_shape = if (failure) |value| value.diagnostics.request_shape orelse "" else "",
+            .provider_stop_reason = completion.finish_reason_raw.slice(),
         },
     );
 }

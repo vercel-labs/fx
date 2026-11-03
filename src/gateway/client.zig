@@ -4143,6 +4143,7 @@ fn traceSseTermination(trace: ?ResolvedModelTrace, cause: []const u8, finish_rea
 
 const SseFinishEvent = struct {
     finish_reason: types.ProviderFinishReason,
+    raw: types.ProviderFinishRaw = .{},
     usage: types.Usage = .{},
 };
 
@@ -4162,8 +4163,21 @@ fn parseSseFinishEvent(
     }
     return .{
         .finish_reason = finish_reason,
+        .raw = parseSseFinishRaw(root),
         .usage = parseSseUsage(root),
     };
+}
+
+/// The provider's own reason beside the unified one: the AI SDK folds Gemini
+/// stops it does not list, such as `UNEXPECTED_TOOL_CALL`, into `other`.
+/// Empty when the event has none or it is not a string.
+fn parseSseFinishRaw(root: std.json.Value) types.ProviderFinishRaw {
+    if (root != .object) return .{};
+    const finish_reason = root.object.get("finishReason") orelse return .{};
+    if (finish_reason != .object) return .{};
+    const raw = finish_reason.object.get("raw") orelse return .{};
+    if (raw != .string) return .{};
+    return .init(raw.string);
 }
 
 fn parseSseFinishReason(root: std.json.Value) SseFinishParseError!types.ProviderFinishReason {
@@ -4350,6 +4364,7 @@ fn consumeSseStreamTraced(
     }
 
     var finish_reason_holder: ?types.ProviderFinishReason = null;
+    var finish_raw: types.ProviderFinishRaw = .{};
     var finish_usage: types.Usage = .{};
     var finish_resolved_provider: ?[]const u8 = null;
     defer if (finish_resolved_provider) |provider| alloc.free(@constCast(provider));
@@ -4783,6 +4798,7 @@ fn consumeSseStreamTraced(
                 else => return err,
             };
             finish_reason_holder = finish_event.finish_reason;
+            finish_raw = finish_event.raw;
             finish_usage = finish_event.usage;
             finish_resolved_provider = parseSseResolvedProvider(alloc, root);
             finish_service_tier = parseSseServiceTier(root);
@@ -4830,14 +4846,16 @@ fn consumeSseStreamTraced(
     completion.service_tier = finish_service_tier;
     completion.generation_metadata_invalid = generation_metadata_invalid;
     completion.finish_reason = finish_reason_holder;
+    completion.finish_reason_raw = finish_raw;
     completion.usage = finish_usage;
 
     debug_trace.logf(
         "stream",
-        "sse summary events={d} finish_reason={s}",
+        "sse summary events={d} finish_reason={s} provider_finish_reason={s}",
         .{
             data_event_count,
             finish_reason_label(completion.finish_reason),
+            completion.finish_reason_raw.slice(),
         },
     );
 

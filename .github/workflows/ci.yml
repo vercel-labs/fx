@@ -69,6 +69,9 @@ jobs:
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
           TLA2TOOLS_JAR="$jar" tests/tla/recovery/check.sh
 
+      - name: Model-check the empty-reply nudge
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/agent_runtime/check.sh
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -85,6 +88,9 @@ jobs:
 
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
+
+      - name: Walk fx ask turns along the empty-reply model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/driver.ts --self-check
 
       # The zsh user profile tests in src/core/execution/command_runner.zig
       # skip without /bin/zsh. They start interactive zsh with no terminal,
