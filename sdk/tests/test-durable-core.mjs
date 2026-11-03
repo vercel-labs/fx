@@ -1123,7 +1123,7 @@ if (durabilityKind === "queue") {
     const dir = await mkdtemp(join(tmpdir(), "libfx-in-request-not-held-"));
     dirs.push(dir);
     const waited = [];
-    const { durability, broker } = await queueWorldAt(dir, { hold: "notHeld", holdConsumerGroup: "default", queueLeases: true, runInRequest: true, maxDurationMs: 60_000, waitUntil: (work) => waited.push(work) });
+    const { durability, broker } = await queueWorldAt(dir, { hold: "not_held", holdConsumerGroup: "default", queueLeases: true, runInRequest: true, maxDurationMs: 60_000, waitUntil: (work) => waited.push(work) });
     const agent = createAgent({ durability });
     const session = agent.session();
     const { text, result } = await textOf(session.prompt("unheld", { messageId: "turn-unheld" }));

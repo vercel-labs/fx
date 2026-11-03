@@ -15,9 +15,10 @@
 //   shared by two processes hands a message on;
 // - with `hold`, it declares `capabilities.experimental_queueHold`, as
 //   world-vercel does, and a send with `experimental_hold` comes back with
-//   `experimental_held`, whose `consume(handler)` runs the message's first
-//   delivery in the sender, or with `experimental_notHeld`, when `hold` is
-//   "notHeld" or the hold is refused, and the queue delivers it as usual.
+//   `experimental_hold: { status: "held" }`, whose `consume(handler)` runs
+//   the message's first delivery in the sender, or `{ status: "not_held" }`,
+//   when `hold` is
+//   "not_held" or the hold is refused, and the queue delivers it as usual.
 //
 // The test starts the World and passes it to world(), so it stays the
 // test's: `closeQueueWorlds()` closes them after the agents.
@@ -52,7 +53,7 @@ function createBroker({ retryMs, hold }) {
     const holding = hold !== undefined && options.experimental_hold !== undefined;
     if (holding && delaySeconds > 0) throw new Error("experimental_hold cannot be combined with delaySeconds");
     if (idempotencyKey !== undefined && keys.has(idempotencyKey)) {
-      return { messageId: keys.get(idempotencyKey), ...(holding ? { experimental_notHeld: { reason: "duplicate" } } : {}) };
+      return { messageId: keys.get(idempotencyKey), ...(holding ? { experimental_hold: { status: "not_held", reason: "duplicate" } } : {}) };
     }
     count += 1;
     const message = { id: `msg_${tag}${String(count).padStart(8, "0")}`, queueName, payload, attempt: 0, key: idempotencyKey, options };
@@ -61,10 +62,10 @@ function createBroker({ retryMs, hold }) {
     sent.push(message);
     if (holding && hold === "held") {
       message.held = true;
-      return { messageId: message.id, experimental_held: heldHandle(message) };
+      return { messageId: message.id, experimental_hold: heldHandle(message) };
     }
     later(() => deliver(message), delaySeconds * 1000);
-    return { messageId: message.id, ...(holding ? { experimental_notHeld: { reason: "lost" } } : {}) };
+    return { messageId: message.id, ...(holding ? { experimental_hold: { status: "not_held", reason: "lost" } } : {}) };
   };
   // A message held for its sender: its first delivery runs in `consume()`,
   // with what a delivery's handler returns meaning what it means there. One
@@ -72,6 +73,7 @@ function createBroker({ retryMs, hold }) {
   const heldHandle = (message) => {
     let used = false;
     return {
+      status: "held",
       messageId: message.id,
       leaseExpiresAt: new Date(Date.now() + 30_000),
       async consume(handler) {
@@ -200,7 +202,7 @@ function withInBandFence(stored, { settleMs = 0 } = {}) {
  * The durability, a World at `dir` with that queue passed to world(), and its
  * broker. With `inBandFence`, `true` or `{ settleMs }`, the World has the
  * in-band writer fence, and `fence.creates` holds what each create was asked.
- * With `hold`, "held" or "notHeld", the World's queue holds messages for
+ * With `hold`, "held" or "not_held", the World's queue holds messages for
  * their sender, and a send that asks for a hold gets it or is refused.
  */
 export async function queueWorldAt(dir, { retryMs = 20, inBandFence = false, hold, ...options } = {}) {

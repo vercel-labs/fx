@@ -26,12 +26,13 @@ export interface World {
   /**
    * What the World supports. With `experimental_queueHold`, a prompt that runs in the request that took it (see
    * `WorldOptions.runInRequest`) is sent with `experimental_hold`, for `WorldOptions.holdConsumerGroup` or
-   * `holdFunction`, and run through the result's `experimental_held.consume()`.
+   * `holdFunction`, and run through the result's `experimental_hold.consume()` when its `status` is `"held"`.
    */
   readonly capabilities?: {
     readonly experimental_queueHold?: boolean;
     readonly inBandFence?: boolean;
   };
+  /** Sends a message. A send with `experimental_hold` resolves with a `QueueResult` (see `QueueHoldResult`). */
   queue(queueName: string, message: unknown, options?: unknown): unknown;
   createQueueHandler(prefix: string, handler: (message: unknown, meta: any) => Promise<unknown>): (request: Request) => Promise<Response>;
   /** A World with `registerHandler` delivers to the agent in its process; any other delivers over HTTP to `agent.wakeHandler()`. */
@@ -41,6 +42,30 @@ export interface World {
   createRunId?(options?: Readonly<Record<string, unknown>>): string;
   start?(): unknown;
   close?(): unknown;
+}
+
+/**
+ * What a send that asked for a hold (`experimental_hold`) learns of it: the queue holds the message for the sender,
+ * which runs it with `consume(handler)`, or it does not, and the queue delivers it. Absent when the World ignored the
+ * hold, which also means the queue delivers it.
+ */
+export type QueueHoldResult =
+  | {
+    readonly status: "held";
+    readonly messageId: string;
+    readonly leaseExpiresAt: Date;
+    consume(handler: (message: unknown, meta: any) => Promise<unknown>): Promise<void>;
+    release(delaySeconds?: number): Promise<void>;
+  }
+  | {
+    readonly status: "not_held";
+    readonly reason: "unsupported" | "deferred" | "lost" | "coalesced" | "concurrency_limited" | "duplicate" | "error";
+  };
+
+/** What a World's `queue()` resolves with. */
+export interface QueueResult {
+  readonly messageId: string | null;
+  readonly experimental_hold?: QueueHoldResult;
 }
 
 /** A lease as `alive()` sees it: the fields `holderInfo()` returned when it was taken, beside libfx's own. */

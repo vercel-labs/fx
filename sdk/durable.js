@@ -1453,7 +1453,10 @@ function createWorldBackend(world, durability) {
           ...(holding ? { experimental_hold: { consumerGroup: holdConsumerGroup } } : {}),
         });
         const messageId = typeof sent?.messageId === "string" && sent.messageId.length > 0 ? sent.messageId : null;
-        const held = holding && typeof sent?.experimental_held?.consume === "function" ? sent.experimental_held : null;
+        // `experimental_hold` says whether the queue took the hold; absent,
+        // or anything but "held", the queue delivers the message.
+        const answer = holding ? sent?.experimental_hold : undefined;
+        const held = answer?.status === "held" && typeof answer.consume === "function" ? answer : null;
         return { ...(messageId ? { messageId } : {}), ...(held ? { held } : {}) };
       },
     },
