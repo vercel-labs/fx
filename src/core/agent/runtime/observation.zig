@@ -58,7 +58,7 @@ pub const Event = union(enum) {
         child_id: []const u8,
         work_id: []const u8,
         operation_id: ?[]const u8 = null,
-        phase: enum { dispatched, completed, yielded, replayed, failed, cancelled, feedback_queued, feedback_applied, feedback_not_applied },
+        phase: enum { dispatched, completed, replayed, failed, cancelled, feedback_queued, feedback_applied, feedback_not_applied },
     },
 };
 

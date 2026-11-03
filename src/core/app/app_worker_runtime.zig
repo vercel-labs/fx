@@ -381,6 +381,7 @@ pub fn Runtime(comptime App: type) type {
                 .begin_presented_prompt,
                 .begin_resumed_prompt,
                 .append_user_feedback,
+                .append_agent_message,
                 .notification,
                 .question_requested,
                 .clear_route_recovery_status,
@@ -719,6 +720,7 @@ pub fn Runtime(comptime App: type) type {
             } else false;
             if (approval_changed and in_child and agent.approval_prompt.isActive()) {
                 debug_trace.eventf("host", "approval_requested", .{}, "agent={s}", .{subagentIdOf(app, agent).?});
+                if (comptime @hasDecl(App, "notePromptAsked")) app.notePromptAsked(agent, .approval);
             }
             // The approval screen shows the agent on screen, so a hidden
             // agent's change leaves it be.
@@ -844,7 +846,9 @@ pub fn Runtime(comptime App: type) type {
             return entry.question;
         }
 
-        fn noteTurnStarted(app: *App, agent: *AppAgent) void {
+        /// A turn began with `author`'s prompt.
+        fn noteTurnStarted(app: *App, agent: *AppAgent, author: types.MessageAuthor) void {
+            if (comptime @hasDecl(App, "noteChildTurnBegun")) App.noteChildTurnBegun(app, agent, author);
             if (offScreen(app, agent)) return;
             if (comptime @hasField(App, "program_status")) app.program_status.noteTurnStarted();
         }
@@ -1028,7 +1032,7 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         resetStream(app, agent, true);
-                        noteTurnStarted(app, agent);
+                        noteTurnStarted(app, agent, prompt.author);
                         agent.stream.active = true;
                         agent.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
@@ -1041,7 +1045,7 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         resetStream(app, agent, true);
-                        noteTurnStarted(app, agent);
+                        noteTurnStarted(app, agent, begin.prompt.author);
                         agent.stream.active = true;
                         agent.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
@@ -1058,7 +1062,7 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         resetStream(app, agent, true);
-                        noteTurnStarted(app, agent);
+                        noteTurnStarted(app, agent, .user);
                         agent.stream.active = true;
                         agent.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
@@ -1075,19 +1079,22 @@ pub fn Runtime(comptime App: type) type {
                             break :events;
                         }
                         resetStream(app, agent, true);
-                        noteTurnStarted(app, agent);
+                        // A resumed request is the user's own, resent on resume.
+                        noteTurnStarted(app, agent, .user);
                         agent.stream.active = true;
                         agent.stream.turn_started_ms = io_mod.milliTimestamp();
                         app.shell.render_requests.request(.footer);
                         try handlers.semantic_notice(handlers.ctx, session_notices.resumed_request_notice);
                     },
-                    .append_user_feedback => |text| {
+                    .append_user_feedback, .append_agent_message => |text| {
                         if (!try requireAssistantTextDrain(handlers)) {
                             try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
                             drain_owns_current = false;
                             break :events;
                         }
-                        try handlers.write_user_prompt(handlers.ctx, .{ .text = text });
+                        // A subagent's message draws as its card.
+                        const author: types.MessageAuthor = if (event == .append_agent_message) .child else .user;
+                        try handlers.write_user_prompt(handlers.ctx, .{ .text = text, .author = author });
                         if (agent.stream.active and agent.stream.phase != .thinking) {
                             agent.stream.phase = .thinking;
                             app.shell.render_requests.request(.footer);
@@ -1165,6 +1172,9 @@ pub fn Runtime(comptime App: type) type {
                                 return err;
                             };
                             if (!was_active and agent.question_prompt.isActive()) {
+                                if (comptime @hasDecl(App, "notePromptAsked")) {
+                                    if (isSubagent(app, agent)) app.notePromptAsked(agent, .question);
+                                }
                                 app.shell.render_requests.request(.modal);
                                 if (comptime @hasDecl(App, "dispatchAttentionRequired")) {
                                     app.dispatchAttentionRequired(
@@ -1414,7 +1424,7 @@ pub fn Runtime(comptime App: type) type {
                 if (lifecycle == .turn_finished and !offScreen(app, agent)) app.program_status.noteTurnFinished(lifecycle.turn_finished.outcome);
             }
             if (comptime agents.hasAgentField(App, "child_run")) {
-                if (lifecycle == .turn_finished) app_agents_runtime.Runtime(App).noteChildTurnFinished(app, agent, lifecycle.turn_finished.outcome);
+                if (lifecycle == .turn_finished) app_agents_runtime.Runtime(App).noteChildTurnFinished(app, agent, lifecycle.turn_finished);
             }
             if (transition.applied_activity_kind) |kind| {
                 applyToolActivity(&agent.stream, kind);
