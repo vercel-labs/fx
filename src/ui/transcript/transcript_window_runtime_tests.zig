@@ -240,7 +240,7 @@ test "transcript window: Ctrl+O shows the cycle before the compaction with the n
     try std.testing.expectEqual(@as(?u32, 1), runtime.transcript_archive_request);
 
     // Once it is installed the newest page shows both cycles, older first.
-    try runtime.installTranscriptArchive(alloc, 1, true, try archivedCycle(alloc, 1, &.{ "older one\n", "older two\n", "older three\n" }));
+    try runtime.installTranscriptArchive(alloc, 1, true, try archivedCycle(alloc, 1, &.{ "older one\n", "older two\n", "older three\n" }), false);
     try std.testing.expectEqual(@as(?u32, null), runtime.transcript_archive_request);
     try std.testing.expectEqual(@as(usize, 0), runtime.full_transcript_page_anchor.entry_index);
     const joined = try pageTexts(alloc, &runtime, .tail);
@@ -254,7 +254,7 @@ test "transcript window: Ctrl+O shows the cycle before the compaction with the n
     try std.testing.expectEqual(@as(u32, 2), further.archive.back);
     runtime.moveToFullTranscriptPage(further, .last);
     try std.testing.expectEqual(@as(?u32, 2), runtime.transcript_archive_request);
-    try runtime.installTranscriptArchive(alloc, 2, false, try archivedCycle(alloc, 2, &.{"oldest\n"}));
+    try runtime.installTranscriptArchive(alloc, 2, false, try archivedCycle(alloc, 2, &.{"oldest\n"}), false);
     try std.testing.expectEqual(@as(u32, 2), runtime.transcript_archive.?.back);
     const oldest_range: full_transcript_page.SourceRange = .{ .start = 0, .end = 1 };
     try std.testing.expectEqual(@as(?full_transcript_page.Anchor, null), runtime.olderPageAnchor(runtime.full_transcript_page_anchor, oldest_range));
@@ -267,7 +267,7 @@ test "transcript window: Ctrl+O shows the cycle before the compaction with the n
     // Back down, the joined view loads its cycle again and lands on its top.
     runtime.moveToFullTranscriptPage(back_down, .first);
     try std.testing.expectEqual(@as(?u32, 1), runtime.transcript_archive_request);
-    try runtime.installTranscriptArchive(alloc, 1, true, try archivedCycle(alloc, 1, &.{ "older one\n", "older two\n", "older three\n" }));
+    try runtime.installTranscriptArchive(alloc, 1, true, try archivedCycle(alloc, 1, &.{ "older one\n", "older two\n", "older three\n" }), false);
     try std.testing.expectEqual(@as(usize, 0), runtime.full_transcript_page_anchor.entry_index);
     try std.testing.expectEqual(@as(?u32, runtime_mod.archiveEntryIdBase(1)), runtime.full_transcript.bookmark_entry_id);
 
@@ -279,14 +279,36 @@ test "transcript window: Ctrl+O shows the cycle before the compaction with the n
     try std.testing.expect(runtime.transcript_archive_failed);
     // The next cycle that loads takes the notice away, and so does closing.
     runtime.moveToFullTranscriptPage(back_down, .first);
-    try runtime.installTranscriptArchive(alloc, 1, true, try archivedCycle(alloc, 1, &.{ "older one\n", "older two\n", "older three\n" }));
+    try runtime.installTranscriptArchive(alloc, 1, true, try archivedCycle(alloc, 1, &.{ "older one\n", "older two\n", "older three\n" }), false);
     try std.testing.expect(!runtime.transcript_archive_failed);
+    // A cycle read across a damaged log line says so from then on, even
+    // after an undamaged cycle loads.
+    try runtime.installTranscriptArchive(alloc, 1, true, try archivedCycle(alloc, 1, &.{ "older one\n", "older two\n", "older three\n" }), true);
+    try std.testing.expect(runtime.transcript_archive_damaged);
+    try std.testing.expect(!runtime.transcript_archive_failed);
+    try runtime.installTranscriptArchive(alloc, 1, true, try archivedCycle(alloc, 1, &.{ "older one\n", "older two\n", "older three\n" }), false);
+    try std.testing.expect(runtime.transcript_archive_damaged);
+    // Damage that hides the requested cycle ends the request, as a failed
+    // load does, but without the retry.
+    runtime.moveToFullTranscriptPage(further, .last);
+    try std.testing.expectEqual(@as(?u32, 2), runtime.transcript_archive_request);
+    runtime.damageTranscriptArchive();
+    try std.testing.expectEqual(@as(?u32, null), runtime.transcript_archive_request);
+    try std.testing.expectEqual(@as(usize, 0), runtime.full_transcript_page_anchor.entry_index);
+    try std.testing.expect(runtime.transcript_archive_damaged);
+    try std.testing.expect(!runtime.transcript_archive_failed);
+    // Closing takes the failed-load notice away, but the damaged line is
+    // still in the log, so the damage notice stays until the transcript is
+    // cleared.
     runtime.moveToFullTranscriptPage(further, .last);
     runtime.failTranscriptArchive();
     runtime.closeFullTranscriptState();
     try std.testing.expect(!runtime.transcript_archive_failed);
+    try std.testing.expect(runtime.transcript_archive_damaged);
     try std.testing.expect(runtime.transcript_archive == null);
     try std.testing.expect(runtime.full_transcript_page_anchor == .tail);
+    runtime.clearFullTranscriptDetails(alloc);
+    try std.testing.expect(!runtime.transcript_archive_damaged);
 }
 
 test "transcript window: Ctrl+O pages the cycles before one the window still holds" {
@@ -306,7 +328,7 @@ test "transcript window: Ctrl+O pages the cycles before one the window still hol
     const older = runtime.olderPageAnchor(.{ .entry_index = 0 }, held_range).?;
     try std.testing.expectEqual(@as(u32, 1), older.archive.back);
     runtime.moveToFullTranscriptPage(older, .last);
-    try runtime.installTranscriptArchive(alloc, 1, false, try archivedCycle(alloc, 1, &.{"before both\n"}));
+    try runtime.installTranscriptArchive(alloc, 1, false, try archivedCycle(alloc, 1, &.{"before both\n"}), false);
     try std.testing.expectEqual(@as(usize, 0), runtime.full_transcript_page_anchor.archive.entry_index);
     const below = runtime.newerPageAnchor(runtime.full_transcript_page_anchor, .{ .start = 0, .end = 1 }).?;
     try std.testing.expectEqual(@as(usize, 0), below.entry_index);
@@ -392,7 +414,7 @@ test "transcript window: Ctrl+O reads the log only while it is open, and forgets
     try std.testing.expectEqual(@as(?u32, 1), runtime.transcript_archive_request);
 
     // A compaction makes that cycle two back, so it is let go.
-    try runtime.installTranscriptArchive(alloc, 1, false, try archivedCycle(alloc, 1, &.{"older\n"}));
+    try runtime.installTranscriptArchive(alloc, 1, false, try archivedCycle(alloc, 1, &.{"older\n"}), false);
     try std.testing.expect(runtime.transcript_archive != null);
     try runtime.transcriptWindowCompacted(alloc);
     try std.testing.expect(runtime.transcript_archive == null);

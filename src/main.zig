@@ -3302,7 +3302,7 @@ const App = struct {
             // A Ctrl+O page needs an older compaction cycle from the log.
             SessionAppRuntime.loadTranscriptArchive(self, self.screenAgent(), back) catch |err| {
                 debug_trace.logf("full_transcript_cache", "archive_load_failed back={d} err={s}", .{ back, @errorName(err) });
-                self.shell.failTranscriptArchive();
+                if (err == error.TranscriptArchiveDamaged) self.shell.damageTranscriptArchive() else self.shell.failTranscriptArchive();
             };
             RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
         }

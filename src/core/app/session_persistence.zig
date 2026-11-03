@@ -801,6 +801,21 @@ pub const TranscriptArchiveBoundaries = struct {
     /// `starts[k - 1]` is where cycle `k` back starts, and so where cycle
     /// `k + 1` ends; null at the log's start.
     starts: std.ArrayList(?session_adapter.LogCursor) = .empty,
+    /// The first cycle back whose start a damaged log line hid: it and every
+    /// older cycle Ctrl+O shows may be missing turns.
+    damaged_from: ?u32 = null,
+
+    /// Records that finding where cycle `back` starts stopped at a damaged
+    /// line, and returns the start to use: none, the log's start.
+    pub fn startOf(self: *TranscriptArchiveBoundaries, back: u32, found: session_adapter.Session.PreviousCompaction) ?session_adapter.LogCursor {
+        if (found.damaged and self.damaged_from == null) self.damaged_from = back;
+        return found.cursor;
+    }
+
+    pub fn damages(self: *const TranscriptArchiveBoundaries, back: u32) bool {
+        const from = self.damaged_from orelse return false;
+        return back >= from;
+    }
 
     pub fn deinit(self: *TranscriptArchiveBoundaries, alloc: Allocator) void {
         self.starts.deinit(alloc);

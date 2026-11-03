@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { onlySessionId, sessionDir } from "./saved-sessions";
@@ -111,8 +111,9 @@ async function press(session: Session, key: string, before: string): Promise<{ p
 }
 
 /// Opens Ctrl+O, pages up until three presses move nothing, closes it, and
-/// returns each cycle marker in the order it first appeared.
-async function walkUp(session: Session): Promise<string[]> {
+/// returns each cycle marker in the order it first appeared, with the last
+/// page before it closed.
+async function walkUp(session: Session): Promise<{ seen: string[]; top: string }> {
   await session.sendHexBytes(["0f"]);
   await session.waitForText(NAVIGATION, TIMEOUT);
   let pane = await session.capturePane();
@@ -132,7 +133,7 @@ async function walkUp(session: Session): Promise<string[]> {
   }
   await session.sendHexBytes(["0f"]);
   await session.waitForComposer(TIMEOUT);
-  return seen;
+  return { seen, top: pane };
 }
 
 describe.skipIf(!tmuxAvailable())("tui: transcript window", () => {
@@ -145,7 +146,7 @@ describe.skipIf(!tmuxAvailable())("tui: transcript window", () => {
       const built = await buildSession(cycles, 100_000);
       let session: Session | null = built.session;
       try {
-        expect(await walkUp(session)).toEqual(markers(cycles).reverse());
+        expect((await walkUp(session)).seen).toEqual(markers(cycles).reverse());
 
         const id = onlySessionId(built.home);
         await session.sendText("/quit");
@@ -163,9 +164,46 @@ describe.skipIf(!tmuxAvailable())("tui: transcript window", () => {
           scrollback = await resumed.captureFullScrollback();
         });
         expect([...new Set(pageMarkers(scrollback))]).toEqual([marker(cycles - 1)]);
-        expect(await walkUp(session)).toEqual(markers(cycles).reverse());
+        expect((await walkUp(session)).seen).toEqual(markers(cycles).reverse());
       } finally {
         await session?.kill();
+        built.gateway.stop();
+      }
+    },
+    300_000,
+  );
+
+  test(
+    "a damaged line in an older cycle: Ctrl+O shows what it can read and says older history couldn't be read, also when reopened",
+    async () => {
+      const built = await buildSession(4, 20_000);
+      const session = built.session;
+      try {
+        // One byte of cycle 1's second prompt changes, so that line's
+        // checksum fails.
+        const log = join(sessionDir(built.home, onlySessionId(built.home)), "log.jsonl");
+        const damaged = readFileSync(log);
+        const at = damaged.indexOf(`"second turn of cycle 1"`) + 1;
+        expect(at).toBeGreaterThan(0);
+        damaged[at] ^= 0x01;
+        writeFileSync(log, damaged);
+        const walk = await walkUp(session);
+        // The search for cycle 1's start stops at the damage, so Ctrl+O
+        // goes from cycle 2 to the log's first cycle.
+        expect(walk.seen).toEqual([marker(3), marker(2), marker(0)]);
+        expect(walk.top).toContain("part of older history couldn't be read · fx doctor");
+        expect(walk.top).not.toContain("couldn't load older history");
+        // Reopened, Ctrl+O can show the page it built without reading the
+        // log again; the damaged line is still there, so it still says so.
+        await session.sendHexBytes(["0f"]);
+        await session.waitForText("esc close", TIMEOUT);
+        const reopened = await session.capturePane();
+        expect(reopened).toContain("part of older history couldn't be read");
+        expect(reopened).not.toContain(NAVIGATION);
+        await session.sendHexBytes(["0f"]);
+        await session.waitForComposer(TIMEOUT);
+      } finally {
+        await session.kill();
         built.gateway.stop();
       }
     },
