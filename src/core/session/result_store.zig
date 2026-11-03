@@ -9,6 +9,7 @@ const session_child_store = @import("session_child_store.zig");
 const session_codec = @import("session_codec.zig");
 const compactor = @import("../compactor/compactor.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -549,7 +550,7 @@ pub fn searchByQueryManaged(
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     try out.writer.print("<tool_result_query handle=\"{s}\">\nquery: ", .{handle});
-    try std.json.Stringify.value(trimmed_query, .{}, &out.writer);
+    try json_encode.value(trimmed_query, .{}, &out.writer);
     try out.writer.writeAll("\n");
 
     var matches: usize = 0;

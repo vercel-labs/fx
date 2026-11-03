@@ -10,6 +10,7 @@ const io_mod = @import("../core/shared/io.zig");
 const catalog_state = @import("../core/mcp/catalog_state.zig");
 const session_child_store = @import("../core/session/session_child_store.zig");
 const session_adapter = @import("../core/session/session_adapter.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const Identity = catalog_state.ToolIdentity;
@@ -114,9 +115,9 @@ pub const Record = struct {
     }
 
     fn writeEntry(w: *std.Io.Writer, name: []const u8, identity: Identity) error{OutOfMemory}!void {
-        std.json.Stringify.value(name, .{}, w) catch return error.OutOfMemory;
+        json_encode.value(name, .{}, w) catch return error.OutOfMemory;
         w.writeByte(':') catch return error.OutOfMemory;
-        std.json.Stringify.value(.{
+        json_encode.value(.{
             .server = identity.server,
             .tool = identity.tool,
             .title = identity.title,

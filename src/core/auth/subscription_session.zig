@@ -10,6 +10,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const types = @import("../shared/types.zig");
 const secret = @import("secret.zig");
 const session_presence = @import("session_presence.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const schema_version: i64 = 1;
@@ -232,11 +233,11 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
             var out: std.Io.Writer.Allocating = .init(alloc);
             errdefer out.deinit();
             try out.writer.writeAll("{\"version\":1,\"access_token\":");
-            try std.json.Stringify.value(session.access_token, .{}, &out.writer);
+            try json_encode.value(session.access_token, .{}, &out.writer);
             try out.writer.writeAll(",\"refresh_token\":");
-            try std.json.Stringify.value(session.refresh_token, .{}, &out.writer);
+            try json_encode.value(session.refresh_token, .{}, &out.writer);
             try out.writer.print(",\"expires_at_ms\":{d},\"account_id\":", .{session.expires_at_ms});
-            try std.json.Stringify.value(session.account_id, .{}, &out.writer);
+            try json_encode.value(session.account_id, .{}, &out.writer);
             try out.writer.writeAll("}\n");
             return out.toOwnedSlice();
         }

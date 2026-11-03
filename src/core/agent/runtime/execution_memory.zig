@@ -18,6 +18,7 @@ const history_range = @import("../../shared/history_range.zig");
 
 const runtime_config = @import("config.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
+const json_encode = @import("../../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1207,7 +1208,7 @@ test "request image notices keep clipped source references as JSON text" {
     }
 
     var writer: std.Io.Writer.Allocating = .init(arena);
-    try std.json.Stringify.value(output, .{}, &writer.writer);
+    try json_encode.value(output, .{}, &writer.writer);
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, writer.written(), .{});
     try std.testing.expect(parsed.value == .string);
     try std.testing.expectEqualStrings(output, parsed.value.string);

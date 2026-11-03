@@ -3,6 +3,7 @@ const host_target = @import("../hosts/target.zig");
 const io_mod = @import("../shared/io.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const max_response_bytes: usize = 64 * 1024;
@@ -112,7 +113,7 @@ fn executeRequest(
 ) !oauth_transport.Response {
     var headers_json: std.Io.Writer.Allocating = .init(alloc);
     defer headers_json.deinit();
-    try std.json.Stringify.value(headers, .{}, &headers_json.writer);
+    try json_encode.value(headers, .{}, &headers_json.writer);
 
     const response_buffer = try alloc.alloc(u8, max_response_bytes);
     defer secret.zeroAndFree(alloc, response_buffer);

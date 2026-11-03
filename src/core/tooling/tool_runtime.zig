@@ -83,6 +83,7 @@ const test_browser_workspace_tools = if (builtin.is_test)
 else
     struct {};
 const js_host_workspace = @import("../hosts/js_host_workspace.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
@@ -1029,7 +1030,7 @@ fn bridgeReviewSchema(arena: Allocator, resolved: tool_mcp_runtime.SelectedTool)
     const input_schema = schema.object.get("inputSchema") orelse return error.InvalidToolSchema;
     if (description != .string or input_schema != .object) return error.InvalidToolSchema;
     var input: std.Io.Writer.Allocating = .init(arena);
-    try std.json.Stringify.value(input_schema, .{}, &input.writer);
+    try json_encode.value(input_schema, .{}, &input.writer);
     return model_tool_schema.dynamicFunctionSchemaJsonAlloc(arena, resolved.name, description.string, input.written());
 }
 
@@ -1153,7 +1154,7 @@ fn bridgeResultData(arena: Allocator, envelope: []const u8) ![]const u8 {
             return out.written();
         }
         if (structured != .null) {
-            try std.json.Stringify.value(structured, .{}, &out.writer);
+            try json_encode.value(structured, .{}, &out.writer);
             try out.writer.writeByte('\n');
             return out.written();
         }
@@ -1168,7 +1169,7 @@ fn bridgeResultData(arena: Allocator, envelope: []const u8) ![]const u8 {
         }
         if (out.written().len > 0) return out.written();
     };
-    try std.json.Stringify.value(result, .{}, &out.writer);
+    try json_encode.value(result, .{}, &out.writer);
     try out.writer.writeByte('\n');
     return out.written();
 }
@@ -2956,7 +2957,7 @@ fn runCommandArgsForTest(alloc: Allocator, command: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"action\":\"run\",\"command\":");
-    try std.json.Stringify.value(command, .{}, &out.writer);
+    try json_encode.value(command, .{}, &out.writer);
     try out.writer.writeAll(",\"timeout_ms\":600000}");
     return out.toOwnedSlice();
 }
@@ -2996,7 +2997,7 @@ fn terminalExecCallForTest(arena: Allocator, call: ToolCall) !ToolCall {
     try args.object.put(arena, "timeout_ms", .{ .integer = 600_000 });
     var out: std.Io.Writer.Allocating = .init(arena);
     defer out.deinit();
-    try std.json.Stringify.value(args, .{}, &out.writer);
+    try json_encode.value(args, .{}, &out.writer);
     var migrated = call;
     migrated.name = "shell";
     migrated.arguments_json = try out.toOwnedSlice();
@@ -6686,7 +6687,7 @@ fn testFileMutationArgs(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"path\":");
-    try std.json.Stringify.value(path, .{}, &out.writer);
+    try json_encode.value(path, .{}, &out.writer);
     switch (kind) {
         .write => {
             try out.writer.writeAll(",\"content\":\"after\\n\"}");
@@ -7545,9 +7546,9 @@ fn visionArgs(alloc: Allocator, image_ids: []const usize, focus: []const u8) ![]
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"image_ids\":");
-    try std.json.Stringify.value(image_ids, .{}, &out.writer);
+    try json_encode.value(image_ids, .{}, &out.writer);
     try out.writer.writeAll(",\"focus\":");
-    try std.json.Stringify.value(focus, .{}, &out.writer);
+    try json_encode.value(focus, .{}, &out.writer);
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
 }
@@ -8365,7 +8366,7 @@ test "vision runtime honors configured provider bounds without a hidden twenty K
     try large_out.writer.writeAll("{\"images\":[{\"image_id\":1,\"status\":\"ok\",\"summary\":\"large\",\"visible_text\":[");
     for (0..7) |index| {
         if (index > 0) try large_out.writer.writeByte(',');
-        try std.json.Stringify.value(evidence, .{}, &large_out.writer);
+        try json_encode.value(evidence, .{}, &large_out.writer);
     }
     try large_out.writer.writeAll("],\"details\":[]}]}");
     const large_json = try large_out.toOwnedSlice();

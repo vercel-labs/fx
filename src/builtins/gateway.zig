@@ -32,6 +32,7 @@ const web_search_provider = @import("../core/tooling/web_search_provider.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const sort_utils = @import("../core/shared/sort_utils.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const FetchGatewayGetResultFn = *const fn (Allocator, ?[]const u8, []const u8, *std.atomic.Value(bool)) anyerror!gateway_client.GetResult;
@@ -350,11 +351,11 @@ fn writeDynamicFunctionTool(
     tool: agent_stream_provider_contract.DynamicFunctionTool,
 ) !void {
     try writer.writeAll("{\"type\":\"function\",\"name\":");
-    try std.json.Stringify.value(tool.name, .{}, writer);
+    try json_encode.value(tool.name, .{}, writer);
     try writer.writeAll(",\"description\":");
-    try std.json.Stringify.value(tool.description, .{}, writer);
+    try json_encode.value(tool.description, .{}, writer);
     try writer.writeAll(",\"inputSchema\":");
-    try std.json.Stringify.value(tool.input_schema, .{}, writer);
+    try json_encode.value(tool.input_schema, .{}, writer);
     try writer.writeByte('}');
 }
 
@@ -1461,9 +1462,9 @@ fn writePerplexityDomains(alloc: Allocator, writer: *std.Io.Writer, domains: []c
         if (blocked) {
             const prefixed = try alloc.print("-{s}", .{domain});
             defer alloc.free(prefixed);
-            try std.json.Stringify.value(prefixed, .{}, writer);
+            try json_encode.value(prefixed, .{}, writer);
         } else {
-            try std.json.Stringify.value(domain, .{}, writer);
+            try json_encode.value(domain, .{}, writer);
         }
     }
     try writer.writeByte(']');
@@ -1473,7 +1474,7 @@ fn writeExaDomains(writer: *std.Io.Writer, name: []const u8, domains: []const []
     try writer.print(",\"{s}\":[", .{name});
     for (domains, 0..) |domain, index| {
         if (index > 0) try writer.writeByte(',');
-        try std.json.Stringify.value(domain, .{}, writer);
+        try json_encode.value(domain, .{}, writer);
     }
     try writer.writeByte(']');
 }
@@ -1482,7 +1483,7 @@ fn writeParallelDomains(writer: *std.Io.Writer, name: []const u8, domains: []con
     try writer.print(",\"sourcePolicy\":{{\"{s}\":[", .{name});
     for (domains, 0..) |domain, index| {
         if (index > 0) try writer.writeByte(',');
-        try std.json.Stringify.value(domain, .{}, writer);
+        try json_encode.value(domain, .{}, writer);
     }
     try writer.writeAll("]}");
 }
@@ -3046,7 +3047,7 @@ fn parseWebSearchPrice(alloc: std.mem.Allocator, pricing: ?std.json.Value) !?[]u
         .integer, .float => blk: {
             var out: std.Io.Writer.Allocating = .init(alloc);
             defer out.deinit();
-            try std.json.Stringify.value(price, .{}, &out.writer);
+            try json_encode.value(price, .{}, &out.writer);
             break :blk try out.toOwnedSlice();
         },
         else => null,

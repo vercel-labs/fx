@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("../shared/types.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const json_encode = @import("../shared/json_encode.zig");
 const Allocator = std.mem.Allocator;
 
 pub const max_encoded_image_bytes: usize = 5 * 1024 * 1024;
@@ -161,7 +162,7 @@ pub const strict_image_count: usize = 20;
 
 pub fn writeHostImageRecoveryNotice(writer: *std.Io.Writer, source_ref: []const u8, max_dimension: u32) std.Io.Writer.Error!void {
     try writer.writeAll("Host source reference: ");
-    try std.json.Stringify.value(source_ref, .{}, writer);
+    try json_encode.value(source_ref, .{}, writer);
     try writer.print(". Use an available host-provided tool that accepts this reference to make a new copy at most {d} pixels per side and 5 MiB encoded, then return the copy as image data. If no suitable host tool or source is available, ask the user for a smaller image.]\n", .{max_dimension});
 }
 

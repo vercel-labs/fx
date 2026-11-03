@@ -37,6 +37,7 @@ const auto_classifier_context = @import("../../../permissions/auto_classifier_co
 
 const test_support = @import("support.zig");
 const text_utils = @import("../../../shared/text_utils.zig");
+const json_encode = @import("../../../shared/json_encode.zig");
 
 const ChatMessage = types.ChatMessage;
 const PermissionGrant = types.PermissionGrant;
@@ -733,9 +734,9 @@ test "parallel skill admission binds identities preserves denies and isolates fa
     defer alloc.free(allowed_path);
     const denied_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "denied");
     defer alloc.free(denied_path);
-    const allowed_args = try std.json.Stringify.valueAlloc(alloc, .{ .location = allowed_path, .resource = "reference.md" }, .{});
+    const allowed_args = try json_encode.valueAlloc(alloc, .{ .location = allowed_path, .resource = "reference.md" }, .{});
     defer alloc.free(allowed_args);
-    const denied_args = try std.json.Stringify.valueAlloc(alloc, .{ .location = denied_path }, .{});
+    const denied_args = try json_encode.valueAlloc(alloc, .{ .location = denied_path }, .{});
     defer alloc.free(denied_args);
     const catalog = [_]contracts.Skill{
         .{ .name = "allowed-name", .description = "", .path = allowed_path, .source = .global_fx },

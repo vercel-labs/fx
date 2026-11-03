@@ -1,5 +1,6 @@
 const std = @import("std");
 const command_output_content = @import("../tooling/command_output_content.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 pub const CommandOutputStream = command_output_content.Stream;
 pub const CommandOutputCallback = command_output_content.Callback;
@@ -173,13 +174,13 @@ fn writeCommandJson(result: CommandResult, writer: *std.Io.Writer) !void {
 
 fn writeStringField(writer: *std.Io.Writer, comptime name: []const u8, value: []const u8) !void {
     try writer.writeAll(",\"" ++ name ++ "\":");
-    try std.json.Stringify.value(value, .{}, writer);
+    try json_encode.value(value, .{}, writer);
 }
 
 fn writeOptionalStringField(writer: *std.Io.Writer, comptime name: []const u8, value: ?[]const u8) !void {
     try writer.writeAll(",\"" ++ name ++ "\":");
     if (value) |text| {
-        try std.json.Stringify.value(text, .{}, writer);
+        try json_encode.value(text, .{}, writer);
     } else {
         try writer.writeAll("null");
     }

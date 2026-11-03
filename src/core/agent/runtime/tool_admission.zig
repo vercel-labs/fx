@@ -19,6 +19,7 @@ const io_mod = @import("../../shared/io.zig");
 
 const runtime_deps = @import("deps.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
+const json_encode = @import("../../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const PermissionGrant = types.PermissionGrant;
@@ -930,7 +931,7 @@ pub fn requestToolPermissionTraced(
             if (!std.mem.eql(u8, tool.name, call.name)) continue;
             var input: std.Io.Writer.Allocating = .init(arena);
             defer input.deinit();
-            try std.json.Stringify.value(tool.input_schema, .{}, &input.writer);
+            try json_encode.value(tool.input_schema, .{}, &input.writer);
             break :schema try @import("../../tooling/model_tool_schema.zig").dynamicFunctionSchemaJsonAlloc(arena, tool.name, tool.description, input.written());
         }
         break :schema null;

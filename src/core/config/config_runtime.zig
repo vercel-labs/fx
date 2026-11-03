@@ -15,6 +15,7 @@ const model_preferences = @import("model_preferences.zig");
 const configured_provider = @import("configured_provider.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
@@ -2158,7 +2159,7 @@ fn writeJsonValue(writer: anytype, value: std.json.Value) !void {
         .bool => |b| try writer.writeAll(if (b) "true" else "false"),
         .integer => |i| try writer.print("{d}", .{i}),
         .float => |f| try writer.print("{d}", .{f}),
-        .string => |s| try std.json.Stringify.value(s, .{}, writer),
+        .string => |s| try json_encode.value(s, .{}, writer),
         .array => |arr| {
             try writer.writeByte('[');
             for (arr.items, 0..) |item, idx| {
@@ -2174,7 +2175,7 @@ fn writeJsonValue(writer: anytype, value: std.json.Value) !void {
             while (it.next()) |entry| {
                 if (!first) try writer.writeByte(',');
                 first = false;
-                try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
+                try json_encode.value(entry.key_ptr.*, .{}, writer);
                 try writer.writeByte(':');
                 try writeJsonValue(writer, entry.value_ptr.*);
             }

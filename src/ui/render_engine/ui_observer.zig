@@ -13,6 +13,7 @@ const frame_surface = @import("frame_surface.zig");
 const paint_plan = @import("paint_plan.zig");
 const transcript_blocks = @import("transcript_blocks.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
+const json_encode = @import("../../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -242,13 +243,13 @@ pub const UiObserver = struct {
         while (try rows.next()) |observed| {
             if (observed.row > 1) try out.writer.writeByte(',');
             try out.writer.print("{{\"row\":{d},\"owner\":", .{observed.row});
-            try std.json.Stringify.value(
+            try json_encode.value(
                 @tagName(observed.owner),
                 .{},
                 &out.writer,
             );
             try out.writer.writeAll(",\"text\":");
-            try std.json.Stringify.value(observed.text, .{}, &out.writer);
+            try json_encode.value(observed.text, .{}, &out.writer);
             try out.writer.writeAll(",\"provenance\":");
             try writeProvenanceJson(&out.writer, observed.provenance);
             try out.writer.writeByte('}');
@@ -404,14 +405,14 @@ pub const UiObserver = struct {
             "{{\"scenario\":",
             .{},
         );
-        try std.json.Stringify.value(arm.scenario, .{}, &checkpoint.writer);
+        try json_encode.value(arm.scenario, .{}, &checkpoint.writer);
         try checkpoint.writer.writeAll(",\"checkpoint\":");
-        try std.json.Stringify.value(arm.checkpoint, .{}, &checkpoint.writer);
+        try json_encode.value(arm.checkpoint, .{}, &checkpoint.writer);
         try checkpoint.writer.print(
             ",\"sequence\":{d},\"kind\":",
             .{sequence},
         );
-        try std.json.Stringify.value(@tagName(arm.kind), .{}, &checkpoint.writer);
+        try json_encode.value(@tagName(arm.kind), .{}, &checkpoint.writer);
         try checkpoint.writer.writeAll("}\n");
         try self.writeArtifact(alloc, "checkpoint.json", checkpoint.written());
 
@@ -659,7 +660,7 @@ fn writeActivityJson(
         .none => try writer.writeAll("{\"kind\":\"none\"}"),
         .turn_thinking => |thinking| {
             try writer.writeAll("{\"kind\":\"turn_thinking\",\"label\":");
-            try std.json.Stringify.value(thinking.label, .{}, writer);
+            try json_encode.value(thinking.label, .{}, writer);
             try writer.writeByte('}');
         },
         .tool_slot => |tool| {
@@ -667,12 +668,12 @@ fn writeActivityJson(
                 tool.entry_id,
                 if (tool.active) "true" else "false",
             });
-            try std.json.Stringify.value(@tagName(tool.kind), .{}, writer);
+            try json_encode.value(@tagName(tool.kind), .{}, writer);
             try writer.writeAll(",\"fallback_label\":");
-            try std.json.Stringify.value(tool.fallback_label, .{}, writer);
+            try json_encode.value(tool.fallback_label, .{}, writer);
             try writer.writeAll(",\"thinking_label\":");
             if (tool.thinking_label) |label| {
-                try std.json.Stringify.value(label, .{}, writer);
+                try json_encode.value(label, .{}, writer);
             } else {
                 try writer.writeAll("null");
             }
@@ -692,7 +693,7 @@ fn writeProvenanceJson(
     switch (source) {
         .entry => |entry| {
             try writer.print("{{\"kind\":\"entry\",\"entry_id\":{d},\"entry_class\":", .{entry.entry_id});
-            try std.json.Stringify.value(@tagName(entry.entry_class), .{}, writer);
+            try json_encode.value(@tagName(entry.entry_class), .{}, writer);
             try writer.writeAll("}");
         },
         .block_separator,
@@ -702,7 +703,7 @@ fn writeProvenanceJson(
         .empty_transcript,
         => {
             try writer.writeAll("{\"kind\":");
-            try std.json.Stringify.value(@tagName(source), .{}, writer);
+            try json_encode.value(@tagName(source), .{}, writer);
             try writer.writeAll("}");
         },
         .folded_command_output => |output| {
@@ -713,7 +714,7 @@ fn writeProvenanceJson(
                 try writer.writeAll("null");
             }
             try writer.writeAll(",\"stream\":");
-            try std.json.Stringify.value(@tagName(output.stream), .{}, writer);
+            try json_encode.value(@tagName(output.stream), .{}, writer);
             try writer.writeAll("}");
         },
     }

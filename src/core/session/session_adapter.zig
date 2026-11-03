@@ -62,6 +62,7 @@ const model_provider = @import("../config/model_provider.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const history_range = @import("../shared/history_range.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const Event = session_event.ConversationEvent;
@@ -1061,7 +1062,7 @@ const BlobHost = struct {
         try map.ensureTotalCapacity(a, host.records.count());
         for (host.records.keys(), host.records.values()) |name, *hash| map.putAssumeCapacity(name, try a.dupe(u8, hash));
         var json: std.Io.Writer.Allocating = .init(a);
-        std.json.Stringify.value(std.json.ArrayHashMap([]const u8){ .map = map }, .{}, &json.writer) catch return error.OutOfMemory;
+        json_encode.value(std.json.ArrayHashMap([]const u8){ .map = map }, .{}, &json.writer) catch return error.OutOfMemory;
         return .{ .map_json = json.written(), .added = try a.dupe(Hash, host.records_added.items), .generation = host.records_generation };
     }
 
@@ -2393,7 +2394,7 @@ pub const Session = struct {
         const sa = scratch.allocator();
         var total = self.usage orelse try self.savedUsage(sa);
         total.add(reply);
-        const value = try std.json.Stringify.valueAlloc(sa, total, .{});
+        const value = try json_encode.valueAlloc(sa, total, .{});
         _ = try self.write(&.{.{ .set = .{ .key = .usage, .value = value } }});
         self.usage = total;
     }
@@ -2840,7 +2841,7 @@ fn sideFileLines(a: Allocator, handle: sm.Session, side: *io_mod.VerifiedDir, fo
     for (bodies.items) |body| moved.putAssumeCapacity(body.key, try a.dupe(u8, &body.hash));
     for (stored) |body| moved.putAssumeCapacity(body.key, try a.dupe(u8, &(try handle.putBlob(body.bytes))));
     var map_json: std.Io.Writer.Allocating = .init(a);
-    try std.json.Stringify.value(std.json.ArrayHashMap([]const u8){ .map = moved }, .{}, &map_json.writer);
+    try json_encode.value(std.json.ArrayHashMap([]const u8){ .map = moved }, .{}, &map_json.writer);
     const map_hash = try a.dupe(u8, &(try handle.putBlob(map_json.written())));
 
     var events: std.ArrayList(sm.Event) = .empty;
@@ -4879,14 +4880,14 @@ fn takenReportData(a: Allocator, event: Event, author: types.MessageAuthor) !?[]
     const sender = (try agent_frame.reportSender(a, text)) orelse return null;
     defer sender.deinit();
     var out: std.Io.Writer.Allocating = .init(a);
-    try std.json.Stringify.value(ChildReportData{ .child = sender.value.child_id, .work_id = sender.value.work_id }, .{}, &out.writer);
+    try json_encode.value(ChildReportData{ .child = sender.value.child_id, .work_id = sender.value.work_id }, .{}, &out.writer);
     return out.written();
 }
 
 /// The `author` item's data: `{"by":"child"}`.
 fn encodeAuthor(a: Allocator, author: types.MessageAuthor) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(a);
-    try std.json.Stringify.value(.{ .by = author }, .{}, &out.writer);
+    try json_encode.value(.{ .by = author }, .{}, &out.writer);
     return out.written();
 }
 
@@ -4970,7 +4971,7 @@ fn encodeFileReview(a: Allocator, event: Event) !?[]u8 {
     try session_event.validateCommittedFileReview(result.call_id, lifecycle_id, rows);
     var out: std.Io.Writer.Allocating = .init(a);
     errdefer out.deinit();
-    try std.json.Stringify.value(FileReview{ .call_id = result.call_id, .lifecycle_id = lifecycle_id, .rows = rows }, .{}, &out.writer);
+    try json_encode.value(FileReview{ .call_id = result.call_id, .lifecycle_id = lifecycle_id, .rows = rows }, .{}, &out.writer);
     return try out.toOwnedSlice();
 }
 
@@ -5125,9 +5126,9 @@ fn encodePiece(alloc: Allocator, event: Event) ![]u8 {
         .user => |user| {
             var scratch = std.heap.ArenaAllocator.init(alloc);
             defer scratch.deinit();
-            try std.json.Stringify.value(try WireUser.of(scratch.allocator(), user), .{}, &out.writer);
+            try json_encode.value(try WireUser.of(scratch.allocator(), user), .{}, &out.writer);
         },
-        inline else => |payload| try std.json.Stringify.value(payload, .{}, &out.writer),
+        inline else => |payload| try json_encode.value(payload, .{}, &out.writer),
     }
     return out.toOwnedSlice();
 }
@@ -5209,7 +5210,7 @@ const WireUser = struct {
                 const write = if (optional) @field(self, field_name) != null else !(in_blob and self.blob != null);
                 if (write) {
                     try writer.objectField(field_name);
-                    try writer.write(@field(self, field_name));
+                    try json_encode.write(writer, @field(self, field_name));
                 }
             }
             try writer.endObject();
@@ -5295,7 +5296,7 @@ const WireUser = struct {
 fn jsonValue(alloc: Allocator, value: anytype) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    try std.json.Stringify.value(value, .{}, &out.writer);
+    try json_encode.value(value, .{}, &out.writer);
     return out.toOwnedSlice();
 }
 
@@ -5319,7 +5320,7 @@ fn encodePreferences(alloc: Allocator, preferences: session_codec.DurableSession
     };
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    try std.json.Stringify.value(Saved{
+    try json_encode.value(Saved{
         .provider = preferences.provider,
         .model = preferences.model,
         .effort = preferences.effort.label(),
@@ -8948,7 +8949,7 @@ test "the listing shows v1 roots, an empty one too, and never a child, by its fl
     // A child from before the flag, known only by its owner marker.
     var older = try v1.metadata(family[2]);
     try older.put(v1.arena.allocator(), "subagent_child", .{ .bool = false });
-    try v1.put(family[2], null, "session.json", try std.json.Stringify.valueAlloc(v1.arena.allocator(), std.json.Value{ .object = older }, .{}));
+    try v1.put(family[2], null, "session.json", try json_encode.valueAlloc(v1.arena.allocator(), std.json.Value{ .object = older }, .{}));
 
     var cancel = std.atomic.Value(bool).init(false);
     var list = try listSummaries(&t.store, alloc, null, &cancel);
@@ -9124,8 +9125,8 @@ test "an image the oldest format saved as only its path is captured from its fil
     const a = v1.arena.allocator();
     const bytes = "\x89PNG\r\n\x1a\nkept";
     try t.tmp.dir.writeFile(io, .{ .sub_path = "kept.png", .data = bytes });
-    const kept = try std.json.Stringify.valueAlloc(a, try io_mod.dirRealpathAlloc(a, t.tmp.dir, "kept.png"), .{});
-    const gone = try std.json.Stringify.valueAlloc(a, try std.Io.Dir.path.join(a, &.{ try io_mod.dirRealpathAlloc(a, t.tmp.dir, "."), "gone.png" }), .{});
+    const kept = try json_encode.valueAlloc(a, try io_mod.dirRealpathAlloc(a, t.tmp.dir, "kept.png"), .{});
+    const gone = try json_encode.valueAlloc(a, try std.Io.Dir.path.join(a, &.{ try io_mod.dirRealpathAlloc(a, t.tmp.dir, "."), "gone.png" }), .{});
     try v1.put("v1-path-images", null, "session.json", try std.mem.concat(a, u8, &.{
         "{\"schema_version\":2,\"id\":\"v1-path-images\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"/w\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[",
         "{\"kind\":\"assistant\",\"user\":{\"text\":\"look [Image #1] [Image #2]\",\"images\":[{\"id\":1,\"path\":",
@@ -9167,7 +9168,7 @@ test "images the oldest format saved without an id get the numbers v1's resume g
     for ([_][]const u8{ "first", "second", "valid", "nine" }, 0..) |name, i| {
         const file = try std.mem.concat(a, u8, &.{ name, ".png" });
         try t.tmp.dir.writeFile(io, .{ .sub_path = file, .data = try std.mem.concat(a, u8, &.{ "\x89PNG\r\n\x1a\n", name }) });
-        quoted[i] = try std.json.Stringify.valueAlloc(a, try io_mod.dirRealpathAlloc(a, t.tmp.dir, file), .{});
+        quoted[i] = try json_encode.valueAlloc(a, try io_mod.dirRealpathAlloc(a, t.tmp.dir, file), .{});
     }
     try v1.put("v1-zero-ids", null, "session.json", try std.mem.concat(a, u8, &.{
         "{\"schema_version\":2,\"id\":\"v1-zero-ids\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"/w\",\"conversation_language\":\"en\",\"history_len\":4,\"history\":[",
@@ -9315,7 +9316,7 @@ fn nestThirdChild(v1: *V1Home, family: []const []const u8) !void {
             break;
         }
     } else return error.TestUnexpectedResult;
-    try v1.put(family[0], "subagent", "children.json", try std.json.Stringify.valueAlloc(a, registry, .{}));
+    try v1.put(family[0], "subagent", "children.json", try json_encode.valueAlloc(a, registry, .{}));
     try v1.put(family[2], "subagent", "owner.json", try a.print("{{\"schema_version\":1,\"parent_id\":\"{s}\"}}", .{family[1]}));
 }
 
@@ -9738,7 +9739,7 @@ test "a root with a registry converts its children from it, never from a relatio
         kept += 1;
     };
     children.shrinkRetainingCapacity(kept);
-    try v1.put(both, "subagent", "children.json", try std.json.Stringify.valueAlloc(a, registry, .{}));
+    try v1.put(both, "subagent", "children.json", try json_encode.valueAlloc(a, registry, .{}));
     const header = try relationship_index_codec.encodeHeader(alloc, .{ .high_watermark = 1, .active_count = 1 });
     defer alloc.free(header);
     try v1.put(both, "subagent", "relationship-index.bin", header);

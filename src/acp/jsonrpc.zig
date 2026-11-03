@@ -2,6 +2,7 @@ const std = @import("std");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -130,7 +131,7 @@ pub fn parseMessage(alloc: Allocator, line: []const u8) !Message {
 fn stringifyValueAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try std.json.Stringify.value(value, .{}, &out.writer);
+    try json_encode.value(value, .{}, &out.writer);
     return try out.toOwnedSlice();
 }
 
@@ -724,7 +725,7 @@ test "Writer keeps each frame on one line when caller JSON has line breaks" {
 
     const expected = try std.json.parseFromSlice(std.json.Value, alloc, input, .{});
     defer expected.deinit();
-    const expected_json = try std.json.Stringify.valueAlloc(alloc, expected.value, .{});
+    const expected_json = try json_encode.valueAlloc(alloc, expected.value, .{});
     defer alloc.free(expected_json);
     var lines = std.mem.splitScalar(u8, frames[0 .. frames.len - 1], '\n');
     for ([_][]const u8{ "params", "params", "result" }, 0..) |field, index| {
@@ -732,7 +733,7 @@ test "Writer keeps each frame on one line when caller JSON has line breaks" {
         defer frame.deinit();
         var value = frame.value.object.get(field).?;
         if (index == 0) value = value.object.get("input").?;
-        const actual_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
+        const actual_json = try json_encode.valueAlloc(alloc, value, .{});
         defer alloc.free(actual_json);
         try std.testing.expectEqualStrings(expected_json, actual_json);
     }

@@ -10,6 +10,7 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
 const journal = @import("../core/agent/runtime/journal.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 
 pub const Config = struct { capture_content: bool = false };
 
@@ -73,7 +74,7 @@ pub const Bridge = struct {
         if (!self.enabled) return;
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        std.json.Stringify.value(WireEvent{ .bridge = self, .step = step, .event = event }, .{}, &out.writer) catch |err| {
+        json_encode.value(WireEvent{ .bridge = self, .step = step, .event = event }, .{}, &out.writer) catch |err| {
             debug_trace.logf("hooks", "event encoding failed err={s}", .{@errorName(err)});
             return;
         };
@@ -179,7 +180,7 @@ const Content = struct {
             schemas.writeObjectSchema(self.alloc, &out, value) catch break :blk false;
             break :blk true;
         } else blk: {
-            std.json.Stringify.value(value, .{}, &out) catch break :blk false;
+            json_encode.value(value, .{}, &out) catch break :blk false;
             break :blk true;
         };
         if (!success or out.buffered().len > self.remaining) {
@@ -240,7 +241,7 @@ const Content = struct {
 
 fn field(writer: *std.json.Stringify, name: []const u8, value: anytype) !void {
     try writer.objectField(name);
-    try writer.write(value);
+    try json_encode.write(writer, value);
 }
 
 const WireEvent = struct {
@@ -421,7 +422,7 @@ const WireEvent = struct {
                 if (content.enabled) {
                     try writer.objectField("answers");
                     try writer.beginArray();
-                    for (value.answers[0..@min(value.answers.len, max_entries)]) |answer| try writer.write(content.text(answer, content.allot(answer)));
+                    for (value.answers[0..@min(value.answers.len, max_entries)]) |answer| try json_encode.write(writer, content.text(answer, content.allot(answer)));
                     content.truncated = content.truncated or value.answers.len > max_entries;
                     try writer.endArray();
                 }
@@ -479,7 +480,7 @@ test "libfx hook content is opt in bounded and excludes opaque provider state" {
             .tool_choice = .none,
             .provider_options = .{},
         } } } };
-        const encoded = try std.json.Stringify.valueAlloc(alloc, wire, .{});
+        const encoded = try json_encode.valueAlloc(alloc, wire, .{});
         defer alloc.free(encoded);
         try std.testing.expect(std.mem.find(u8, encoded, "opaque-secret") == null);
         try std.testing.expect((std.mem.find(u8, encoded, "visible") != null) == capture);
@@ -516,7 +517,7 @@ test "libfx model capture reserves the newest messages before instructions" {
         .tool_choice = .none,
         .provider_options = .{},
     } } } };
-    const encoded = try std.json.Stringify.valueAlloc(alloc, wire, .{});
+    const encoded = try json_encode.valueAlloc(alloc, wire, .{});
     defer alloc.free(encoded);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
     defer parsed.deinit();

@@ -15,6 +15,7 @@ const config_runtime = @import("../core/config/config_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const profile_paths = @import("../core/shared/profile_paths.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const McpServerConfig = mcp_contract.McpServerConfig;
@@ -419,26 +420,26 @@ fn renderConfigJson(alloc: Allocator, configs: []const McpServerConfig) ![]u8 {
     try out.writer.writeAll("{\"mcp\":{");
     for (configs, 0..) |config, i| {
         if (i > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(config.name, .{}, &out.writer);
+        try json_encode.value(config.name, .{}, &out.writer);
         try out.writer.writeAll(":{");
 
         switch (config.transport) {
             .stdio => {
                 try out.writer.writeAll("\"type\":\"local\",\"command\":[");
-                try std.json.Stringify.value(try config.stdioCommand(), .{}, &out.writer);
+                try json_encode.value(try config.stdioCommand(), .{}, &out.writer);
                 for (config.args) |arg| {
                     try out.writer.writeByte(',');
-                    try std.json.Stringify.value(arg, .{}, &out.writer);
+                    try json_encode.value(arg, .{}, &out.writer);
                 }
                 try out.writer.writeByte(']');
             },
             .sse => {
                 try out.writer.writeAll("\"type\":\"sse\",\"url\":");
-                try std.json.Stringify.value(try config.remoteUrl(), .{}, &out.writer);
+                try json_encode.value(try config.remoteUrl(), .{}, &out.writer);
             },
             .http => {
                 try out.writer.writeAll("\"type\":\"http\",\"url\":");
-                try std.json.Stringify.value(try config.remoteUrl(), .{}, &out.writer);
+                try json_encode.value(try config.remoteUrl(), .{}, &out.writer);
             },
         }
 
@@ -460,9 +461,9 @@ fn renderConfigJson(alloc: Allocator, configs: []const McpServerConfig) ![]u8 {
             try out.writer.writeAll(",\"headers\":{");
             for (config.headers, 0..) |header, header_i| {
                 if (header_i > 0) try out.writer.writeByte(',');
-                try std.json.Stringify.value(header.name, .{}, &out.writer);
+                try json_encode.value(header.name, .{}, &out.writer);
                 try out.writer.writeByte(':');
-                try std.json.Stringify.value(header.value, .{}, &out.writer);
+                try json_encode.value(header.value, .{}, &out.writer);
             }
             try out.writer.writeByte('}');
         }
@@ -470,15 +471,15 @@ fn renderConfigJson(alloc: Allocator, configs: []const McpServerConfig) ![]u8 {
             try out.writer.writeAll(",\"header_env\":{");
             for (config.header_env, 0..) |ref, ref_i| {
                 if (ref_i > 0) try out.writer.writeByte(',');
-                try std.json.Stringify.value(ref.name, .{}, &out.writer);
+                try json_encode.value(ref.name, .{}, &out.writer);
                 try out.writer.writeByte(':');
-                try std.json.Stringify.value(ref.env, .{}, &out.writer);
+                try json_encode.value(ref.env, .{}, &out.writer);
             }
             try out.writer.writeByte('}');
         }
         if (config.bearer_token_env) |env_name| {
             try out.writer.writeAll(",\"bearer_token_env\":");
-            try std.json.Stringify.value(env_name, .{}, &out.writer);
+            try json_encode.value(env_name, .{}, &out.writer);
         }
         if (config.auth) |auth| {
             try out.writer.writeAll(",\"oauth\":{");
@@ -494,7 +495,7 @@ fn renderConfigJson(alloc: Allocator, configs: []const McpServerConfig) ![]u8 {
                 try out.writer.writeAll("\"scopes\":[");
                 for (auth.scopes, 0..) |scope, scope_i| {
                     if (scope_i > 0) try out.writer.writeByte(',');
-                    try std.json.Stringify.value(scope, .{}, &out.writer);
+                    try json_encode.value(scope, .{}, &out.writer);
                 }
                 try out.writer.writeByte(']');
             }
@@ -509,9 +510,9 @@ fn renderConfigJson(alloc: Allocator, configs: []const McpServerConfig) ![]u8 {
             try out.writer.writeAll(",\"environment\":{");
             for (config.env, 0..) |entry, env_i| {
                 if (env_i > 0) try out.writer.writeByte(',');
-                try std.json.Stringify.value(entry.key, .{}, &out.writer);
+                try json_encode.value(entry.key, .{}, &out.writer);
                 try out.writer.writeByte(':');
-                try std.json.Stringify.value(entry.value, .{}, &out.writer);
+                try json_encode.value(entry.value, .{}, &out.writer);
             }
             try out.writer.writeByte('}');
         }
@@ -529,9 +530,9 @@ fn writeOptionalJsonField(
 ) !void {
     if (!first.*) try writer.writeByte(',');
     first.* = false;
-    try std.json.Stringify.value(key, .{}, writer);
+    try json_encode.value(key, .{}, writer);
     try writer.writeByte(':');
-    try std.json.Stringify.value(value, .{}, writer);
+    try json_encode.value(value, .{}, writer);
 }
 
 const TestHome = struct {

@@ -12,6 +12,7 @@ const context_limits = @import("../config/context_limits.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -791,7 +792,7 @@ fn writeHistoryTurnTo(writer: *std.Io.Writer, turn: session.HistoryTurn, image_b
             try writer.writeAll(",\"assistant\":");
             try writeDurableBytes(writer, entry.assistant);
             try writer.writeAll(",\"provider_replay\":");
-            try std.json.Stringify.value(entry.provider_replay, .{}, writer);
+            try json_encode.value(entry.provider_replay, .{}, writer);
             try writer.writeAll(",\"execution\":");
             try writeExecutionMemoryJsonFrom(writer, entry.execution, .durable, .{}, image_blobs);
             try writer.writeByte('}');
@@ -1149,7 +1150,7 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
         try writer.writeAll(",\"ultrafast_mode\":true");
     }
     try writer.writeAll(",\"provider\":");
-    try std.json.Stringify.value(state.preferences.provider, .{}, writer);
+    try json_encode.value(state.preferences.provider, .{}, writer);
     try writer.writeAll("},\"history\":[");
     for (state.history, 0..) |turn, i| {
         if (i > 0) try writer.writeByte(',');
@@ -1332,7 +1333,7 @@ fn writeRecoveryCheckpointFrom(writer: *std.Io.Writer, checkpoint: RecoveryCheck
     try writer.writeAll(",\"tool_state\":");
     try writeJsonString(writer, @tagName(checkpoint.tool_state));
     try writer.writeAll(",\"authority\":{\"provider\":");
-    try std.json.Stringify.value(checkpoint.authority.provider, .{}, writer);
+    try json_encode.value(checkpoint.authority.provider, .{}, writer);
     try writer.writeAll(",\"model\":");
     try writeDurableBytes(writer, checkpoint.authority.model);
     try writer.writeAll(",\"credential_source\":");
@@ -1908,7 +1909,7 @@ fn writeExecutionMemoryJsonFrom(
             try writer.writeAll("{\"text\":");
             try writeExecutionBytes(writer, note.text, format);
             try writer.print(",\"after_tool_step_count\":{d},\"sources\":", .{note.after_tool_step_count});
-            try std.json.Stringify.value(note.sources, .{}, writer);
+            try json_encode.value(note.sources, .{}, writer);
             try writer.writeByte('}');
         }
     }
@@ -1938,7 +1939,7 @@ fn writeExecutionToolStep(writer: *std.Io.Writer, step: session.ToolExecutionSte
     try writeOptionalExecutionBytes(writer, step.assistant, format);
     if (format == .durable) {
         try writer.writeAll(",\"provider_replay\":");
-        try std.json.Stringify.value(step.provider_replay, .{}, writer);
+        try json_encode.value(step.provider_replay, .{}, writer);
     }
     try writer.writeAll(",\"tool_calls\":[");
     for (step.tool_calls, 0..) |tool_call, call_index| {
@@ -3812,7 +3813,7 @@ fn writeOptionalU32(writer: *std.Io.Writer, value: ?u32) !void {
 }
 
 noinline fn writeJsonString(writer: *std.Io.Writer, bytes: []const u8) !void {
-    try std.json.Stringify.value(bytes, .{}, writer);
+    try json_encode.value(bytes, .{}, writer);
 }
 
 noinline fn validateSessionId(value: []const u8) !void {

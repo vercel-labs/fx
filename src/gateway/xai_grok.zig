@@ -15,6 +15,7 @@ const Allocator = std.mem.Allocator;
 const endpoint = "https://cli-chat-proxy.grok.com/v1/responses";
 // The proxy gates this as Grok wire compatibility; fx identifies itself separately below.
 const version_lookup = @import("provider_versions.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 const e2e_endpoint_env = "FX_TEST_XAI_GROK_RESPONSES_URL";
 const max_error_body_bytes: usize = 256 * 1024;
 const max_sse_line_bytes: usize = 1024 * 1024;
@@ -70,9 +71,9 @@ pub fn buildRequest(
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.writeAll("{\"model\":");
-    try std.json.Stringify.value(request.model, .{}, writer);
+    try json_encode.value(request.model, .{}, writer);
     try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
-    try std.json.Stringify.value(instructions.written(), .{}, writer);
+    try json_encode.value(instructions.written(), .{}, writer);
     try writer.writeAll(",\"input\":[");
     try writeResponsesInput(writer, std.heap.c_allocator, projected orelse request.messages, request.verified_images, budget);
     try writer.writeByte(']');
@@ -80,7 +81,7 @@ pub fn buildRequest(
     const tool_count = try responses_protocol.writeTools(writer, alloc, request.tools);
     if (tool_count > 0) {
         try writer.writeAll(",\"tool_choice\":");
-        try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
+        try json_encode.value(request.tool_choice.label(), .{}, writer);
         try writer.writeAll(",\"parallel_tool_calls\":true");
     }
     try writer.writeAll(",\"include\":[\"reasoning.encrypted_content\"]");
@@ -88,18 +89,18 @@ pub fn buildRequest(
     if (request.response_format) |format| {
         if (format.schema != .object) return error.InvalidStructuredResponseSchema;
         try writer.writeAll(",\"format\":{\"type\":\"json_schema\",\"name\":");
-        try std.json.Stringify.value(format.name, .{}, writer);
+        try json_encode.value(format.name, .{}, writer);
         try writer.writeAll(",\"description\":");
-        try std.json.Stringify.value(format.description, .{}, writer);
+        try json_encode.value(format.description, .{}, writer);
         try writer.writeAll(",\"schema\":");
-        try std.json.Stringify.value(format.schema, .{}, writer);
+        try json_encode.value(format.schema, .{}, writer);
         try writer.writeAll(",\"strict\":true}");
     }
     try writer.writeByte('}');
 
     if (request.provider_options.reasoning) |effort| {
         try writer.writeAll(",\"reasoning\":{\"effort\":");
-        try std.json.Stringify.value(effort.label(), .{}, writer);
+        try json_encode.value(effort.label(), .{}, writer);
         try writer.writeAll(",\"summary\":\"auto\"}");
     }
     // xAI exposes Fast mode as its priority service tier; the subscription

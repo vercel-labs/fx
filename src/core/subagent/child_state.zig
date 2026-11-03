@@ -11,6 +11,7 @@ const session_store = @import("../session/session_store.zig");
 const types = @import("../shared/types.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const schema_version: u64 = 2;
@@ -746,7 +747,7 @@ pub fn finishEndFacts(data: ?[]const u8) EndFacts {
 fn finishData(arena: Allocator, failure: ?[]const u8, report_owed: bool, end: EndFacts) !?[]const u8 {
     if (failure == null and !report_owed) return null;
     var out: std.Io.Writer.Allocating = .init(arena);
-    try std.json.Stringify.value(
+    try json_encode.value(
         FinishData{
             .failure = failure,
             .report = if (report_owed) true else null,
@@ -943,7 +944,7 @@ fn activeId(child: Child) ?[]const u8 {
 
 fn stringifyAlloc(arena: Allocator, value: anytype) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
-    try std.json.Stringify.value(value, .{}, &out.writer);
+    try json_encode.value(value, .{}, &out.writer);
     return out.written();
 }
 
@@ -1311,12 +1312,12 @@ test "subagent failure codec reads historical absence and rejects invalid detail
     };
     for (bad_values) |bad| {
         try record.object.put(parsed.arena.allocator(), "last_failure", bad);
-        const invalid = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+        const invalid = try json_encode.valueAlloc(alloc, parsed.value, .{});
         defer alloc.free(invalid);
         try std.testing.expectError(error.InvalidState, parseRegistry(alloc, invalid, parent_id));
     }
     parsed.value.object.getPtr("schema_version").?.* = .{ .integer = 99 };
-    const future = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    const future = try json_encode.valueAlloc(alloc, parsed.value, .{});
     defer alloc.free(future);
     try std.testing.expectError(error.UnsupportedSchema, parseRegistry(alloc, future, parent_id));
 }

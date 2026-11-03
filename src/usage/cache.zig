@@ -11,6 +11,7 @@ const report = @import("report.zig");
 const codex = @import("codex.zig");
 const grok = @import("grok.zig");
 const json_decode = @import("../core/shared/json_decode.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -183,7 +184,7 @@ const Wire = struct {
 pub fn encode(alloc: Allocator, identity: Identity, entry: Entry) ![]u8 {
     var out: Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    try std.json.Stringify.value(Wire{
+    try json_encode.value(Wire{
         .schema_version = schema_version,
         .identity = &identity,
         .today = entry.today,

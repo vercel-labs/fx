@@ -2,6 +2,7 @@ const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const session_layout = @import("../session/session_layout.zig");
 const types = @import("../shared/types.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1661,13 +1662,13 @@ pub const AuthorityClaim = struct {
     pub fn jsonStringify(self: AuthorityClaim, writer: anytype) !void {
         try writer.beginObject();
         try writer.objectField("principal");
-        try writer.write(self.principal);
+        try json_encode.write(writer, self.principal);
         try writer.objectField("actor");
-        try writer.write(self.actor);
+        try json_encode.write(writer, self.actor);
         try writer.objectField("generation");
-        try writer.write(self.generation);
+        try json_encode.write(writer, self.generation);
         try writer.objectField("proof");
-        try writer.write(self.proof);
+        try json_encode.write(writer, self.proof);
         try writer.endObject();
     }
 
@@ -3073,7 +3074,7 @@ test "authority wire encoding excludes host-authenticated process ownership" {
     };
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    try std.json.Stringify.value(claim, .{}, &output.writer);
+    try json_encode.value(claim, .{}, &output.writer);
     try std.testing.expect(std.mem.find(
         u8,
         output.written(),

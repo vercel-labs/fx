@@ -5,6 +5,7 @@ const io_mod = @import("../shared/io.zig");
 const message = @import("../shared/message.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
@@ -684,7 +685,7 @@ fn writeRedactedJsonValue(
     redact_value: bool,
 ) !void {
     if (redact_value) {
-        try std.json.Stringify.value("[REDACTED]", .{}, writer);
+        try json_encode.value("[REDACTED]", .{}, writer);
         return;
     }
 
@@ -696,7 +697,7 @@ fn writeRedactedJsonValue(
             while (iter.next()) |entry| {
                 if (!first) try writer.writeByte(',');
                 first = false;
-                try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
+                try json_encode.value(entry.key_ptr.*, .{}, writer);
                 try writer.writeByte(':');
                 if (policy.web_fetch and
                     std.mem.eql(u8, entry.key_ptr.*, "url") and
@@ -729,7 +730,7 @@ fn writeRedactedJsonValue(
             try writer.writeByte(']');
         },
         .string => |text| try writeMaskedJsonString(alloc, writer, text),
-        else => try std.json.Stringify.value(value, .{}, writer),
+        else => try json_encode.value(value, .{}, writer),
     }
 }
 
@@ -740,7 +741,7 @@ fn writeMaskedJsonString(
 ) !void {
     const masked = text_utils.maskSecrets(alloc, text) catch return error.OutOfMemory;
     defer if (masked.ptr != text.ptr) alloc.free(@constCast(masked));
-    try std.json.Stringify.value(masked, .{}, writer);
+    try json_encode.value(masked, .{}, writer);
 }
 
 fn shouldRedactArgumentValue(key: []const u8) bool {

@@ -7,6 +7,7 @@ const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_mcp_runtime = @import("../../core/tooling/tool_mcp_runtime.zig");
 const tool_result_limits = @import("../../core/tooling/tool_result_limits.zig");
 const skill_search = @import("../skills/skill_search.zig");
+const json_encode = @import("../../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const Input = struct {
@@ -263,7 +264,7 @@ fn renderCombined(
     try out.writer.writeAll("],\"mcp_tools\":[");
     for (mcp_tools, 0..) |value, index| {
         if (index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(value, .{}, &out.writer);
+        try json_encode.value(value, .{}, &out.writer);
     }
     try out.writer.print(
         "],\"counts\":{{\"skills\":{d},\"mcp_tools\":{d}}},\"total_matches\":{{\"skills\":{d},\"mcp_tools\":{d}}}",
@@ -284,23 +285,23 @@ fn renderCombined(
     }
     if (authentication_required) |value| {
         try out.writer.writeAll(",\"authentication_required\":");
-        try std.json.Stringify.value(value, .{}, &out.writer);
+        try json_encode.value(value, .{}, &out.writer);
     }
     if (mcp_state) |value| {
         try out.writer.writeAll(",\"mcp_state\":");
-        try std.json.Stringify.value(value, .{}, &out.writer);
+        try json_encode.value(value, .{}, &out.writer);
     }
     if (mcp_error) |value| {
         try out.writer.writeAll(",\"mcp_error\":");
-        try std.json.Stringify.value(value, .{}, &out.writer);
+        try json_encode.value(value, .{}, &out.writer);
     }
     if (mcp_context_limit) |value| {
         try out.writer.writeAll(",\"mcp_context_limit\":");
-        try std.json.Stringify.value(value, .{}, &out.writer);
+        try json_encode.value(value, .{}, &out.writer);
     }
     if (mcp_unavailable) |value| {
         try out.writer.writeAll(",\"mcp_unavailable\":");
-        try std.json.Stringify.value(value, .{}, &out.writer);
+        try json_encode.value(value, .{}, &out.writer);
     }
     try out.writer.writeByte('}');
     return out.toOwnedSlice();

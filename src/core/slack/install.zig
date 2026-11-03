@@ -10,6 +10,7 @@ const output = @import("../output/output_contracts.zig");
 const json_decode = @import("../shared/json_decode.zig");
 const cli_flags = @import("../cli/cli_flags.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
+const json_encode = @import("../shared/json_encode.zig");
 const Allocator = std.mem.Allocator;
 const callback_url = "https://fx.sh/api/slack/oauth/callback";
 const bot_scope = "app_mentions:read";
@@ -135,7 +136,7 @@ pub fn run(alloc: Allocator, action: Action, transport: transport_mod.Provider, 
     const identity = try request(alloc, transport, .post_form, identity_url, "", authorization);
     try validate_identity(alloc, identity, &record, if (action == .refresh) previous else null);
     var serialized: std.Io.Writer.Allocating = .init(alloc);
-    try std.json.Stringify.value(record, .{}, &serialized.writer);
+    try json_encode.value(record, .{}, &serialized.writer);
     try io.durableReplaceVerified(alloc, &dir, "installation.json", serialized.written());
     saved = true;
     return snapshot(action, record);

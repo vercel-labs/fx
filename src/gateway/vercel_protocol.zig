@@ -7,6 +7,7 @@ const model_capabilities = @import("../core/config/model_capabilities.zig");
 const tool_result_errors = @import("../core/tooling/tool_result_errors.zig");
 const types = @import("../core/shared/types.zig");
 const tool_call_ids = @import("tool_call_ids.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 
 pub const ChatRole = types.ChatRole;
 pub const ChatMessage = types.ChatMessage;
@@ -335,7 +336,7 @@ fn writeJoinedLeadingSystem(alloc: std.mem.Allocator, writer: *std.Io.Writer, me
     const joined = try std.mem.join(alloc, "\n\n", parts.items);
     defer alloc.free(joined);
     try writer.writeAll("{\"role\":\"system\",\"content\":");
-    try std.json.Stringify.value(joined, .{}, writer);
+    try json_encode.value(joined, .{}, writer);
     try writer.writeByte('}');
     return end;
 }
@@ -404,7 +405,7 @@ fn buildGatewayRequestBodyValidated(
     try out.writer.writeAll("],\"tools\":");
     try out.writer.writeAll(tools_json);
     try out.writer.writeAll(",\"toolChoice\":{\"type\":");
-    try std.json.Stringify.value(tool_choice, .{}, &out.writer);
+    try json_encode.value(tool_choice, .{}, &out.writer);
     try out.writer.writeByte('}');
 
     if (response_format) |format| {
@@ -417,7 +418,7 @@ fn buildGatewayRequestBodyValidated(
 
     if (options.reasoning) |*reasoning| {
         try out.writer.writeAll(",\"reasoning\":");
-        try std.json.Stringify.value(reasoningWireValue(reasoning.label()), .{}, &out.writer);
+        try json_encode.value(reasoningWireValue(reasoning.label()), .{}, &out.writer);
     }
     try writeProviderOptions(&out.writer, options);
 
@@ -439,7 +440,7 @@ pub fn withRequestUserAgent(
     errdefer out.deinit();
     try out.writer.writeAll(body[0 .. body.len - 1]);
     try out.writer.writeAll(",\"headers\":{\"user-agent\":");
-    try std.json.Stringify.value(user_agent, .{}, &out.writer);
+    try json_encode.value(user_agent, .{}, &out.writer);
     try out.writer.writeAll("}}");
     return try out.toOwnedSlice();
 }
@@ -453,11 +454,11 @@ fn writeStructuredResponseFormat(
     if (format.schema != .object) return error.InvalidStructuredResponseSchema;
 
     try writer.writeAll(",\"responseFormat\":{\"type\":\"json\",\"name\":");
-    try std.json.Stringify.value(format.name, .{}, writer);
+    try json_encode.value(format.name, .{}, writer);
     try writer.writeAll(",\"description\":");
-    try std.json.Stringify.value(format.description, .{}, writer);
+    try json_encode.value(format.description, .{}, writer);
     try writer.writeAll(",\"schema\":");
-    try std.json.Stringify.value(format.schema, .{}, writer);
+    try json_encode.value(format.schema, .{}, writer);
     try writer.writeByte('}');
 }
 
@@ -523,7 +524,7 @@ pub fn writeProviderOptions(writer: *std.Io.Writer, options: model_capabilities.
             try writer.writeAll(if (options.provider_strict) "\"only\":[" else "\"order\":[");
             for (options.provider_order, 0..) |slug, index| {
                 if (index > 0) try writer.writeByte(',');
-                try std.json.Stringify.value(slug, .{}, writer);
+                try json_encode.value(slug, .{}, writer);
             }
             try writer.writeByte(']');
         }
@@ -758,7 +759,7 @@ fn write_tool_image_user_message(writer: *std.Io.Writer, results: []const ChatMe
     }
     if (!has_images) return;
     try writer.writeAll(",{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
-    try std.json.Stringify.value(tool_image_followup_text, .{}, writer);
+    try json_encode.value(tool_image_followup_text, .{}, writer);
     try writer.writeByte('}');
     for (results) |result| {
         // Mirror the tool-result gate: images from permission-denied results
@@ -769,9 +770,9 @@ fn write_tool_image_user_message(writer: *std.Io.Writer, results: []const ChatMe
         for (memory.tool_images) |image| {
             if (budget) |active| try active.check();
             try writer.writeAll(",{\"type\":\"file\",\"mediaType\":");
-            try std.json.Stringify.value(image.mime_type, .{}, writer);
+            try json_encode.value(image.mime_type, .{}, writer);
             try writer.writeAll(",\"data\":{\"type\":\"data\",\"data\":");
-            try std.json.Stringify.value(image.data, .{}, writer);
+            try json_encode.value(image.data, .{}, writer);
             try writer.writeAll("}}");
         }
     }
@@ -780,9 +781,9 @@ fn write_tool_image_user_message(writer: *std.Io.Writer, results: []const ChatMe
 
 fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writer, message: ChatMessage, ids: *const tool_call_ids.Projection) !void {
     try writer.writeAll("{\"type\":\"tool-result\",\"toolCallId\":");
-    try std.json.Stringify.value(ids.resolve(message.tool_call_id orelse ""), .{}, writer);
+    try json_encode.value(ids.resolve(message.tool_call_id orelse ""), .{}, writer);
     try writer.writeAll(",\"toolName\":");
-    try std.json.Stringify.value(message.tool_name orelse "unknown", .{}, writer);
+    try json_encode.value(message.tool_name orelse "unknown", .{}, writer);
     const content = message.content orelse "";
     const failed = if (message.tool_result_status) |status|
         status == .failure
@@ -799,7 +800,7 @@ fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writ
         const text = if (failed) try scratch_alloc.print("Tool error: {s}", .{content}) else content;
         defer if (failed) scratch_alloc.free(text);
         try writer.writeAll("{\"type\":\"text\",\"text\":");
-        try std.json.Stringify.value(text, .{}, writer);
+        try json_encode.value(text, .{}, writer);
         try writer.writeAll("}]}}");
         return;
     }
@@ -810,7 +811,7 @@ fn write_tool_result_part(scratch_alloc: std.mem.Allocator, writer: *std.Io.Writ
     } else {
         try writer.writeAll(",\"output\":{\"type\":\"text\",\"value\":");
     }
-    try std.json.Stringify.value(content, .{}, writer);
+    try json_encode.value(content, .{}, writer);
     try writer.writeAll("}}");
 }
 
@@ -824,7 +825,7 @@ fn writeChatMessageJsonInner(
     cache_markers: model_capabilities.CacheMarkers,
 ) !void {
     try writer.writeAll("{\"role\":");
-    try std.json.Stringify.value(roleName(message.role), .{}, writer);
+    try json_encode.value(roleName(message.role), .{}, writer);
 
     if (message.role == .assistant) if (message.provider_replay) |replay| {
         try writeReplayContent(scratch_alloc, writer, message, replay, ids, budget);
@@ -836,7 +837,7 @@ fn writeChatMessageJsonInner(
         .system => {
             try writer.writeAll(",\"content\":");
             if (message.content) |content| {
-                try std.json.Stringify.value(content, .{}, writer);
+                try json_encode.value(content, .{}, writer);
             } else {
                 try writer.writeAll("\"\"");
             }
@@ -852,7 +853,7 @@ fn writeChatMessageJsonInner(
             if (message.content) |content| {
                 if (content.len > 0) {
                     try writer.writeAll("{\"type\":\"text\",\"text\":");
-                    try std.json.Stringify.value(content, .{}, writer);
+                    try json_encode.value(content, .{}, writer);
                     try writer.writeByte('}');
                     wrote_part = true;
                 }
@@ -897,7 +898,7 @@ fn writeChatMessageJsonInner(
             if (message.content) |content| {
                 if (content.len > 0) {
                     try writer.writeAll("{\"type\":\"text\",\"text\":");
-                    try std.json.Stringify.value(content, .{}, writer);
+                    try json_encode.value(content, .{}, writer);
                     try writer.writeByte('}');
                     wrote_part = true;
                 }
@@ -921,9 +922,9 @@ fn writeChatMessageJsonInner(
 
 fn writeToolCallPart(writer: *std.Io.Writer, call: ToolCall, metadata: ?std.json.Value, ids: *const tool_call_ids.Projection) !void {
     try writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":");
-    try std.json.Stringify.value(ids.resolve(call.id), .{}, writer);
+    try json_encode.value(ids.resolve(call.id), .{}, writer);
     try writer.writeAll(",\"toolName\":");
-    try std.json.Stringify.value(call.name, .{}, writer);
+    try json_encode.value(call.name, .{}, writer);
     try writer.writeAll(",\"input\":");
     try writer.writeAll(call.arguments_json);
     try writeReplayMetadata(writer, metadata);
@@ -935,7 +936,7 @@ fn writeReplayMetadata(writer: *std.Io.Writer, metadata: ?std.json.Value) !void 
     if (value != .object) return error.InvalidProviderState;
     for (value.object.values()) |options| if (options != .object) return error.InvalidProviderState;
     try writer.writeAll(",\"providerOptions\":");
-    try std.json.Stringify.value(value, .{}, writer);
+    try json_encode.value(value, .{}, writer);
 }
 
 /// Borrows unchanged replay, otherwise uses the caller's request arena. Selects
@@ -973,7 +974,7 @@ pub fn selectReplayParts(
     if (selected.items.len == parsed.value.array.items.len) return source;
     var out: std.Io.Writer.Allocating = .init(arena);
     errdefer out.deinit();
-    try std.json.Stringify.value(selected.items, .{}, &out.writer);
+    try json_encode.value(selected.items, .{}, &out.writer);
     return .{ .source = source.source, .parts_json = try out.toOwnedSlice() };
 }
 
@@ -1031,7 +1032,7 @@ fn writeReplayContent(
             const text_value = part.object.get("text") orelse return error.InvalidProviderState;
             if (text_value != .string) return error.InvalidProviderState;
             try writer.writeAll("{\"type\":\"reasoning\",\"text\":");
-            try std.json.Stringify.value(text_value.string, .{}, writer);
+            try json_encode.value(text_value.string, .{}, writer);
             try writeReplayMetadata(writer, metadata);
             try writer.writeByte('}');
         } else if (std.mem.eql(u8, kind.string, "text")) {
@@ -1044,7 +1045,7 @@ fn writeReplayContent(
             if (offset != text_end and !separatesReplayText(content, text_end, offset)) return error.InvalidProviderState;
             text_end = offset + length;
             try writer.writeAll("{\"type\":\"text\",\"text\":");
-            try std.json.Stringify.value(content[offset..text_end], .{}, writer);
+            try json_encode.value(content[offset..text_end], .{}, writer);
             try writeReplayMetadata(writer, metadata);
             try writer.writeByte('}');
         } else if (std.mem.eql(u8, kind.string, "tool-call")) {
@@ -1060,7 +1061,7 @@ fn writeReplayContent(
     if (text_end < content.len) {
         if (wrote_part) try writer.writeByte(',');
         try writer.writeAll("{\"type\":\"text\",\"text\":");
-        try std.json.Stringify.value(content[text_end..], .{}, writer);
+        try json_encode.value(content[text_end..], .{}, writer);
         try writer.writeByte('}');
         wrote_part = true;
     }

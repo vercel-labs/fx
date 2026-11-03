@@ -7,6 +7,7 @@ const tool_result_errors = @import("../tooling/tool_result_errors.zig");
 const types = @import("../shared/types.zig");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const legacy_schema_v1: i64 = 1;
@@ -57,12 +58,12 @@ pub noinline fn renderSessionJson(
     defer out.deinit();
 
     try out.writer.writeAll("{\"schema_version\":1,\"id\":");
-    try std.json.Stringify.value(active_id, .{}, &out.writer);
+    try json_encode.value(active_id, .{}, &out.writer);
     try out.writer.print(",\"created_at_ms\":{d},\"updated_at_ms\":{d}", .{ created_at_ms, updated_at_ms });
     try out.writer.writeAll(",\"workspace_root\":");
-    try std.json.Stringify.value(workspace_root, .{}, &out.writer);
+    try json_encode.value(workspace_root, .{}, &out.writer);
     try out.writer.writeAll(",\"conversation_language\":");
-    try std.json.Stringify.value(language.view(), .{}, &out.writer);
+    try json_encode.value(language.view(), .{}, &out.writer);
     if (token_usage.input > 0 or token_usage.output > 0) {
         try out.writer.print(",\"total_input_tokens\":{d},\"total_output_tokens\":{d}", .{ token_usage.input, token_usage.output });
     }
@@ -84,7 +85,7 @@ fn writeHistoryTurnJson(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
     switch (turn) {
         .compacted_summary => |entry| {
             try writer.writeAll("{\"kind\":\"compacted_summary\",\"summary\":");
-            try std.json.Stringify.value(entry.summary, .{}, writer);
+            try json_encode.value(entry.summary, .{}, writer);
             try writer.print(",\"removed_turn_count\":{d},\"compaction_count\":{d}", .{ entry.removed_turn_count, entry.compaction_count });
             try writer.writeByte('}');
         },
@@ -92,7 +93,7 @@ fn writeHistoryTurnJson(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writer.writeAll("{\"kind\":\"assistant\",\"user\":");
             try writeUserTurnJson(writer, entry.user);
             try writer.writeAll(",\"assistant\":");
-            try std.json.Stringify.value(entry.assistant, .{}, writer);
+            try json_encode.value(entry.assistant, .{}, writer);
             if (!entry.execution.isEmpty()) {
                 try writer.writeAll(",\"execution\":");
                 try writeExecutionMemoryJson(writer, entry.execution);
@@ -104,7 +105,7 @@ fn writeHistoryTurnJson(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writeUserTurnJson(writer, entry.user);
             try writer.writeAll(",\"assistant\":");
             if (entry.assistant) |assistant| {
-                try std.json.Stringify.value(assistant, .{}, writer);
+                try json_encode.value(assistant, .{}, writer);
             } else {
                 try writer.writeAll("null");
             }
@@ -117,7 +118,7 @@ fn writeHistoryTurnJson(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
             try writer.writeAll(",\"completed_tool_names\":");
             try writeStringArrayJson(writer, entry.completed_tool_names);
             try writer.writeAll(",\"terminal_reason\":");
-            try std.json.Stringify.value(@tagName(entry.terminal_reason), .{}, writer);
+            try json_encode.value(@tagName(entry.terminal_reason), .{}, writer);
             if (entry.cancellation_origin == .compaction) {
                 try writer.writeAll(",\"cancellation_origin\":\"compaction\"");
             }
@@ -132,14 +133,14 @@ fn writeHistoryTurnJson(writer: *std.Io.Writer, turn: session.HistoryTurn) !void
 
 fn writeToolCallJson(writer: *std.Io.Writer, tool_call: session.ToolCall) !void {
     try writer.writeAll("{\"id\":");
-    try std.json.Stringify.value(tool_call.id, .{}, writer);
+    try json_encode.value(tool_call.id, .{}, writer);
     try writer.writeAll(",\"name\":");
-    try std.json.Stringify.value(tool_call.name, .{}, writer);
+    try json_encode.value(tool_call.name, .{}, writer);
     try writer.writeAll(",\"arguments_json\":");
-    try std.json.Stringify.value(tool_call.arguments_json, .{}, writer);
+    try json_encode.value(tool_call.arguments_json, .{}, writer);
     try writer.writeAll(",\"provider_result\":");
     if (tool_call.provider_result) |provider_result| {
-        try std.json.Stringify.value(provider_result, .{}, writer);
+        try json_encode.value(provider_result, .{}, writer);
     } else {
         try writer.writeAll("null");
     }
@@ -152,22 +153,22 @@ pub fn writeExecutionMemoryJson(writer: *std.Io.Writer, execution: session.Execu
 
 fn writeUserTurnJson(writer: *std.Io.Writer, user: session.UserTurn) !void {
     try writer.writeAll("{\"text\":");
-    try std.json.Stringify.value(user.text, .{}, writer);
+    try json_encode.value(user.text, .{}, writer);
     try writer.writeAll(",\"images\":[");
     for (user.images, 0..) |image, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"path\":");
-        try std.json.Stringify.value(image.path, .{}, writer);
+        try json_encode.value(image.path, .{}, writer);
         try writer.writeAll(",\"media_type\":");
-        try std.json.Stringify.value(image.media_type, .{}, writer);
+        try json_encode.value(image.media_type, .{}, writer);
         try writer.writeAll(",\"snapshot_path\":");
         try writeImageSnapshotLocatorJson(writer, image.snapshot_path);
         try writer.writeAll(",\"snapshot_sha256\":");
-        try std.json.Stringify.value(image.snapshot_sha256, .{}, writer);
+        try json_encode.value(image.snapshot_sha256, .{}, writer);
         if (image.source_ref) |source_ref| {
             if (!image_data.validSourceRef(source_ref)) return error.InvalidSessionFormat;
             try writer.writeAll(",\"source_ref\":");
-            try std.json.Stringify.value(source_ref, .{}, writer);
+            try json_encode.value(source_ref, .{}, writer);
         }
         try writer.writeByte('}');
     }
@@ -181,7 +182,7 @@ fn writeImageSnapshotLocatorJson(writer: *std.Io.Writer, value: ?[]const u8) !vo
     };
     var locator_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const locator = try session.projectSnapshotLocator(&locator_buffer, path);
-    try std.json.Stringify.value(locator, .{}, writer);
+    try json_encode.value(locator, .{}, writer);
 }
 
 test "ordinary session JSON presentation omits per-turn work provenance" {
@@ -213,7 +214,7 @@ fn writeStringArrayJson(writer: *std.Io.Writer, items: anytype) !void {
     try writer.writeByte('[');
     for (items, 0..) |item, i| {
         if (i > 0) try writer.writeByte(',');
-        try std.json.Stringify.value(item, .{}, writer);
+        try json_encode.value(item, .{}, writer);
     }
     try writer.writeByte(']');
 }

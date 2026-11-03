@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("../shared/types.zig");
 
 const configured_provider = @import("configured_provider.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 pub const ProviderId = union(enum) {
     gateway,
@@ -36,8 +37,8 @@ pub const ProviderId = union(enum) {
         if (self == .configured) {
             const binding = self.configured.binding orelse return error.WriteFailed;
             const encoded = std.fmt.bytesToHex(binding, .lower);
-            try writer.write(.{ .name = self.label(), .binding = encoded[0..] });
-        } else try writer.write(self.label());
+            try json_encode.write(writer, .{ .name = self.label(), .binding = encoded[0..] });
+        } else try json_encode.write(writer, self.label());
     }
 
     pub fn eql(self: ProviderId, other: ProviderId) bool {
@@ -163,7 +164,7 @@ test "configured provider identity serializes its binding and rejects rebinding"
     try std.testing.expect(!unbound.same_authority(bound));
     var output: std.Io.Writer.Allocating = .init(alloc);
     defer output.deinit();
-    try std.json.Stringify.value(bound, .{}, &output.writer);
+    try json_encode.value(bound, .{}, &output.writer);
     var decoded = try std.json.parseFromSlice(ProviderId, alloc, output.written(), .{});
     defer decoded.deinit();
     try std.testing.expectEqualStrings("local", decoded.value.label());

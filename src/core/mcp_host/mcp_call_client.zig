@@ -18,6 +18,7 @@ const io_mod = @import("../shared/io.zig");
 const capability_mod = @import("../tooling/mcp_call_capability.zig");
 const mcp_call = @import("mcp_call.zig");
 const wire = @import("mcp_call_wire.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
@@ -234,7 +235,7 @@ fn describeShape(w: *Writer, value: std.json.Value, depth: u8, siblings: []const
                     try w.writeAll(": ");
                     for (values, 0..) |hint, hint_index| {
                         if (hint_index > 0) try w.writeAll("|");
-                        try std.json.Stringify.value(hint, .{}, w);
+                        try json_encode.value(hint, .{}, w);
                     }
                 } else if (depth < 2) {
                     // Two levels of fields, then names only, keeps the line short.
@@ -254,7 +255,7 @@ fn writeKey(w: *Writer, key: []const u8) Writer.Error!void {
         if (byte < 0x20 or byte == 0x7f or std.mem.findScalar(u8, "\"\\,:{}[]|", byte) != null) break false;
     } else true;
     if (plain) return w.writeAll(key);
-    return std.json.Stringify.value(key, .{}, w);
+    return json_encode.value(key, .{}, w);
 }
 
 /// The distinct values of `key` across `items` when every value is short text,

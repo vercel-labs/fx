@@ -28,6 +28,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
 const secret = @import("../auth/secret.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -337,7 +338,7 @@ const Doc = struct {
     /// this store: those read a version-2 document as empty and write over
     /// it. A profile server's entry has no workspace field.
     fn encode(d: *const Doc, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try std.json.Stringify.value(.{ .version = 2, .servers = d.entries.items }, .{ .emit_null_optional_fields = false }, w);
+        try json_encode.value(.{ .version = 2, .servers = d.entries.items }, .{ .emit_null_optional_fields = false }, w);
     }
 
     fn find(d: *const Doc, key: Key) ?usize {

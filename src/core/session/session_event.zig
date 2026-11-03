@@ -9,6 +9,7 @@ const context_limits = @import("../config/context_limits.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -110,7 +111,7 @@ pub const ConversationToolResult = struct {
         inline for (@typeInfo(ConversationToolResult).@"struct".field_names) |field_name| {
             if (!std.mem.eql(u8, field_name, "review_feedback") or self.review_feedback) {
                 try writer.objectField(field_name);
-                try writer.write(@field(self, field_name));
+                try json_encode.write(writer, @field(self, field_name));
             }
         }
         try writer.endObject();
@@ -160,22 +161,22 @@ pub const ConversationInterruption = struct {
     pub fn jsonStringify(self: ConversationInterruption, writer: *std.json.Stringify) !void {
         try writer.beginObject();
         try writer.objectField("reason");
-        try writer.write(self.reason);
+        try json_encode.write(writer, self.reason);
         try writer.objectField("partial_text");
-        try writer.write(self.partial_text);
+        try json_encode.write(writer, self.partial_text);
         try writer.objectField("command_replay_ref");
-        try writer.write(self.command_replay_ref);
+        try json_encode.write(writer, self.command_replay_ref);
         try writer.objectField("command_replay_bytes");
-        try writer.write(self.command_replay_bytes);
+        try json_encode.write(writer, self.command_replay_bytes);
         try writer.objectField("command_artifact_ref");
-        try writer.write(self.command_artifact_ref);
+        try json_encode.write(writer, self.command_artifact_ref);
         try writer.objectField("files");
-        try writer.write(self.files);
+        try json_encode.write(writer, self.files);
         try writer.objectField("turn_summary");
-        try writer.write(self.turn_summary);
+        try json_encode.write(writer, self.turn_summary);
         if (self.cancellation_origin == .compaction) {
             try writer.objectField("cancellation_origin");
-            try writer.write(self.cancellation_origin);
+            try json_encode.write(writer, self.cancellation_origin);
         }
         try writer.endObject();
     }
@@ -1688,7 +1689,7 @@ fn writePayload(writer: *std.Io.Writer, event: Event) !void {
             var wrote = false;
             if (payload.provider) |provider| {
                 try writer.writeAll("\"provider\":");
-                try std.json.Stringify.value(provider, .{}, writer);
+                try json_encode.value(provider, .{}, writer);
                 wrote = true;
             }
             if (payload.model) |model| {
@@ -2028,7 +2029,7 @@ fn writePreferences(
         try writer.writeAll(",\"ultrafast_mode\":true");
     }
     try writer.writeAll(",\"provider\":");
-    try std.json.Stringify.value(preferences.provider, .{}, writer);
+    try json_encode.value(preferences.provider, .{}, writer);
     try writer.writeByte('}');
 }
 
@@ -2126,7 +2127,7 @@ fn writeHexString(writer: *std.Io.Writer, bytes: []const u8) !void {
 }
 
 fn writeJsonString(writer: *std.Io.Writer, bytes: []const u8) !void {
-    try std.json.Stringify.value(bytes, .{}, writer);
+    try json_encode.value(bytes, .{}, writer);
 }
 
 fn sha256(bytes: []const u8) Digest {

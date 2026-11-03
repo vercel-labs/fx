@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const json = std.json;
@@ -224,7 +225,7 @@ fn pairs(a: Allocator, list: []const Pair) Allocator.Error!json.Value {
 fn render(alloc: Allocator, root: json.Value) Allocator.Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    json.Stringify.value(root, .{ .whitespace = .indent_2 }, &out.writer) catch return error.OutOfMemory;
+    json_encode.value(root, .{ .whitespace = .indent_2 }, &out.writer) catch return error.OutOfMemory;
     out.writer.writeByte('\n') catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }

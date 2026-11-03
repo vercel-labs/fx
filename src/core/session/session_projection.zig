@@ -3,6 +3,7 @@ const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const session_event = @import("session_event.zig");
 const types = @import("../shared/types.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -262,7 +263,7 @@ fn decodeCheckpointImpl(alloc: Allocator, bytes: []const u8) !Checkpoint {
 
     var state_json: std.Io.Writer.Allocating = .init(alloc);
     defer state_json.deinit();
-    try std.json.Stringify.value(
+    try json_encode.value(
         root.get("state") orelse return error.InvalidCheckpoint,
         .{},
         &state_json.writer,
@@ -469,7 +470,7 @@ fn writeHexString(writer: *std.Io.Writer, bytes: []const u8) !void {
 }
 
 fn writeJsonString(writer: *std.Io.Writer, bytes: []const u8) !void {
-    try std.json.Stringify.value(bytes, .{}, writer);
+    try json_encode.value(bytes, .{}, writer);
 }
 
 test "checkpoint decode semantic validation failure frees owned fields once" {

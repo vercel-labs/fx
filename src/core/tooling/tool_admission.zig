@@ -36,6 +36,7 @@ const worker_runtime = @import("../agent/worker_runtime.zig");
 const context_limits = @import("../config/context_limits.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const current_branch = @import("../workspace/current_branch.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const ToolCall = types.ToolCall;
@@ -1700,9 +1701,9 @@ fn canonicalVisionPathCall(
     var arguments: std.Io.Writer.Allocating = .init(arena);
     defer arguments.deinit();
     try arguments.writer.writeAll("{\"paths\":");
-    try std.json.Stringify.value(canonical_paths, .{}, &arguments.writer);
+    try json_encode.value(canonical_paths, .{}, &arguments.writer);
     try arguments.writer.writeAll(",\"focus\":");
-    try std.json.Stringify.value(request.focus, .{}, &arguments.writer);
+    try json_encode.value(request.focus, .{}, &arguments.writer);
     try arguments.writer.writeByte('}');
     return .{
         .id = call.id,

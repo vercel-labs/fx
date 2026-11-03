@@ -11,6 +11,7 @@ const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -137,7 +138,7 @@ const Wire = struct {
 pub fn encode(alloc: Allocator, record: Record) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try std.json.Stringify.value(Wire{
+    try json_encode.value(Wire{
         .version = format_version,
         .updated_ms = record.updated_ms,
         .sessions = record.sessions,

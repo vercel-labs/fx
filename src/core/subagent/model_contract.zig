@@ -4,6 +4,7 @@ const types = @import("../shared/types.zig");
 const profiles = @import("../profiles/profiles.zig");
 const reports = @import("reports.zig");
 const session_commands = @import("../session/session_commands.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -446,7 +447,7 @@ pub fn encodeResultAlloc(alloc: Allocator, result: Result) ![]u8 {
 
 fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
     if (value) |text| {
-        try std.json.Stringify.value(text, .{}, writer);
+        try json_encode.value(text, .{}, writer);
     } else {
         try writer.writeAll("null");
     }

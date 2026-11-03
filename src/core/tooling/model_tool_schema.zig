@@ -1,5 +1,6 @@
 const std = @import("std");
 const text_utils = @import("../shared/text_utils.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 pub const description_max_bytes: usize = 1024;
 pub const truncation_marker = "... [truncated]";
@@ -80,7 +81,7 @@ pub fn writeCappedDescriptionJsonString(
 ) !void {
     const capped_description = try cappedDescriptionAlloc(alloc, text);
     defer alloc.free(capped_description);
-    try std.json.Stringify.value(capped_description, .{}, writer);
+    try json_encode.value(capped_description, .{}, writer);
 }
 
 /// Opens the gateway's flattened function-tool envelope, up to the
@@ -91,9 +92,9 @@ fn writeFunctionSchemaOpen(
     description: []const u8,
 ) !void {
     try writer.writeAll("{\"type\":\"function\",\"name\":");
-    try std.json.Stringify.value(name, .{}, writer);
+    try json_encode.value(name, .{}, writer);
     try writer.writeAll(",\"description\":");
-    try std.json.Stringify.value(description, .{}, writer);
+    try json_encode.value(description, .{}, writer);
     try writer.writeAll(",\"inputSchema\":");
 }
 
@@ -171,7 +172,7 @@ fn writeDescribedObjectSchema(
     try writer.writeAll("{\"type\":\"object\",\"properties\":{");
     for (schema.properties, 0..) |property, index| {
         if (index > 0) try writer.writeByte(',');
-        try std.json.Stringify.value(property.name, .{}, writer);
+        try json_encode.value(property.name, .{}, writer);
         try writer.writeByte(':');
         try writePropertySchema(alloc, writer, property);
     }
@@ -186,7 +187,7 @@ fn writeDescribedObjectSchema(
         try writer.writeAll(",\"required\":[");
         for (schema.required, 0..) |name, index| {
             if (index > 0) try writer.writeByte(',');
-            try std.json.Stringify.value(name, .{}, writer);
+            try json_encode.value(name, .{}, writer);
         }
         try writer.writeByte(']');
     }
@@ -219,14 +220,14 @@ fn writePropertySchema(
         }
     }
     try writer.writeAll("{\"type\":");
-    try std.json.Stringify.value(@tagName(property.json_type), .{}, writer);
+    try json_encode.value(@tagName(property.json_type), .{}, writer);
     if (property.shape) |shape| {
         switch (shape.*) {
             .enum_values => |values| {
                 try writer.writeAll(",\"enum\":[");
                 for (values, 0..) |value, index| {
                     if (index > 0) try writer.writeByte(',');
-                    try std.json.Stringify.value(value, .{}, writer);
+                    try json_encode.value(value, .{}, writer);
                 }
                 try writer.writeByte(']');
             },
@@ -245,12 +246,12 @@ fn writePropertySchema(
         switch (shape.*) {
             .array_values => |values| {
                 try writer.writeAll(",\"items\":{\"type\":");
-                try std.json.Stringify.value(@tagName(values.json_type), .{}, writer);
+                try json_encode.value(@tagName(values.json_type), .{}, writer);
                 if (values.enum_values.len > 0) {
                     try writer.writeAll(",\"enum\":[");
                     for (values.enum_values, 0..) |value, index| {
                         if (index > 0) try writer.writeByte(',');
-                        try std.json.Stringify.value(value, .{}, writer);
+                        try json_encode.value(value, .{}, writer);
                     }
                     try writer.writeByte(']');
                 }

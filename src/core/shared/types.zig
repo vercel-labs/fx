@@ -3,6 +3,7 @@ const testing_allocator = @import("testing_allocator.zig");
 const text_utils = @import("text_utils.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const recovery = @import("../recovery/recovery.zig");
+const json_encode = @import("json_encode.zig");
 
 pub const Layout = struct {
     rows: u16,
@@ -546,15 +547,15 @@ pub const RouteRecoveryStatus = struct {
 
         pub fn writeJson(self: Report, writer: *std.Io.Writer) !void {
             try writer.writeAll("{\"state\":");
-            try std.json.Stringify.value(@tagName(self.state), .{}, writer);
+            try json_encode.value(@tagName(self.state), .{}, writer);
             try writer.print(",\"attempt\":{d}", .{self.attempt});
             if (self.need) |need| {
                 try writer.writeAll(",\"need\":");
-                try std.json.Stringify.value(@tagName(need), .{}, writer);
+                try json_encode.value(@tagName(need), .{}, writer);
             }
             if (self.message) |message| {
                 try writer.writeAll(",\"message\":");
-                try std.json.Stringify.value(message, .{}, writer);
+                try json_encode.value(message, .{}, writer);
             }
             try writer.writeByte('}');
         }
@@ -1103,7 +1104,7 @@ pub const CommittedFilePresentation = struct {
             const optional = comptime std.mem.eql(u8, field_name, "review_lines");
             if (!optional or self.review_lines != null) {
                 try writer.objectField(field_name);
-                try writer.write(@field(self, field_name));
+                try json_encode.write(writer, @field(self, field_name));
             }
         }
         try writer.endObject();

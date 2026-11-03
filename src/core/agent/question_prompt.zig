@@ -5,6 +5,7 @@ const edit_contract = @import("../input/editor_state.zig");
 const io_mod = @import("../shared/io.zig");
 const text_boundaries = @import("../input/text_boundaries.zig");
 const types = @import("../shared/types.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -642,9 +643,9 @@ pub const QuestionPrompt = struct {
             var out: std.Io.Writer.Allocating = .init(alloc);
             defer out.deinit();
             if (opt.is_freeform_slot) {
-                std.json.Stringify.value(.{ .value = entry.freeform_buffer.items }, .{}, &out.writer) catch return error.OutOfMemory;
+                json_encode.value(.{ .value = entry.freeform_buffer.items }, .{}, &out.writer) catch return error.OutOfMemory;
             } else {
-                std.json.Stringify.value(.{ .option = idx }, .{}, &out.writer) catch return error.OutOfMemory;
+                json_encode.value(.{ .option = idx }, .{}, &out.writer) catch return error.OutOfMemory;
             }
             break :blk try out.toOwnedSlice();
         } else null;

@@ -2,6 +2,7 @@ const std = @import("std");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const host_stream = @import("host_stream_provider.zig");
 const builtin_gateway = @import("../builtins/gateway.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 const Allocator = std.mem.Allocator;
 
 const max_catalog_bytes = 4 * 1024 * 1024;
@@ -53,7 +54,7 @@ pub fn get(
 ) Allocator.Error!GetResult {
     var encoded: std.Io.Writer.Allocating = .init(alloc);
     defer encoded.deinit();
-    std.json.Stringify.value(headers, .{}, &encoded.writer) catch return error.OutOfMemory;
+    json_encode.value(headers, .{}, &encoded.writer) catch return error.OutOfMemory;
     if (cancelled(cancel_flag)) return .{ .failure = .{ .category = .cancellation } };
     const handle = transport.open_fn(transport.context, "GET", url, encoded.written(), "") catch return .{ .failure = .{ .category = .transport } };
     if (handle < 0) return .{ .failure = .{ .category = .transport } };

@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -47,7 +48,7 @@ pub fn terminalActionFieldCorrectionJson(
 ) Allocator.Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    std.json.Stringify.value(.{ .@"error" = .{
+    json_encode.value(.{ .@"error" = .{
         .code = terminal_action_field_error_code,
         .action = correction.action,
         .invalid_fields = correction.invalid_fields,
@@ -175,11 +176,11 @@ pub fn toolPermissionDeniedJson(alloc: Allocator, tool_name: []const u8, reason:
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     out.writer.writeAll("{\"error\":{\"type\":\"tool_permission_denied\",\"tool_name\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(tool_name, .{}, &out.writer) catch return error.OutOfMemory;
+    json_encode.value(tool_name, .{}, &out.writer) catch return error.OutOfMemory;
     out.writer.writeAll(",\"message\":") catch return error.OutOfMemory;
     writeMaskedJsonString(alloc, &out.writer, permissionDeniedMessage(tool_name, reason)) catch return error.OutOfMemory;
     out.writer.writeAll(",\"reason\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(@tagName(reason), .{}, &out.writer) catch return error.OutOfMemory;
+    json_encode.value(@tagName(reason), .{}, &out.writer) catch return error.OutOfMemory;
     out.writer.writeAll(",\"denied\":true,\"suggestion\":") catch return error.OutOfMemory;
     writeMaskedJsonString(alloc, &out.writer, permissionDeniedSuggestion(reason)) catch return error.OutOfMemory;
     out.writer.writeAll("}}") catch return error.OutOfMemory;
@@ -203,7 +204,7 @@ pub fn toolReviewHeldJson(
     errdefer out.deinit();
     out.writer.writeAll("{\"error\":{\"type\":\"tool_review_held\",\"tool_name\":") catch
         return error.OutOfMemory;
-    std.json.Stringify.value(tool_name, .{}, &out.writer) catch return error.OutOfMemory;
+    json_encode.value(tool_name, .{}, &out.writer) catch return error.OutOfMemory;
     out.writer.writeAll(",\"message\":") catch return error.OutOfMemory;
     writeMaskedJsonString(
         alloc,
@@ -211,11 +212,11 @@ pub fn toolReviewHeldJson(
         if (malformed_response) "Safety reviewer returned an invalid response; action held" else permissionDeniedMessage(tool_name, reason),
     ) catch return error.OutOfMemory;
     out.writer.writeAll(",\"reason\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(@tagName(reason), .{}, &out.writer) catch
+    json_encode.value(@tagName(reason), .{}, &out.writer) catch
         return error.OutOfMemory;
     if (review_cause) |cause| {
         out.writer.writeAll(",\"review_cause\":") catch return error.OutOfMemory;
-        std.json.Stringify.value(@tagName(cause), .{}, &out.writer) catch
+        json_encode.value(@tagName(cause), .{}, &out.writer) catch
             return error.OutOfMemory;
     }
     out.writer.writeAll(",\"held\":true") catch return error.OutOfMemory;
@@ -332,7 +333,7 @@ pub fn toolExecutionFailureJson(alloc: Allocator, failure: ExecutionFailure) All
         out.writer.writeAll(",\"details\":{") catch return error.OutOfMemory;
         for (failure.details, 0..) |detail, i| {
             if (i > 0) out.writer.writeByte(',') catch return error.OutOfMemory;
-            std.json.Stringify.value(detail.name, .{}, &out.writer) catch return error.OutOfMemory;
+            json_encode.value(detail.name, .{}, &out.writer) catch return error.OutOfMemory;
             out.writer.writeByte(':') catch return error.OutOfMemory;
             writeDetailValue(alloc, &out.writer, detail.value) catch return error.OutOfMemory;
         }
@@ -538,7 +539,7 @@ fn writeDetailValue(alloc: Allocator, writer: *std.Io.Writer, value: DetailValue
 fn writeMaskedJsonString(alloc: Allocator, writer: *std.Io.Writer, value: []const u8) !void {
     const masked = try text_utils.maskSecrets(alloc, value);
     defer if (masked.ptr != value.ptr) alloc.free(masked);
-    try std.json.Stringify.value(masked, .{}, writer);
+    try json_encode.value(masked, .{}, writer);
 }
 
 test "tool permission denied JSON carries stable fields only" {

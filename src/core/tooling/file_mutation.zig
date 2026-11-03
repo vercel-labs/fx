@@ -8,6 +8,7 @@ const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const pathing = @import("../workspace/pathing.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const testing_permissions = if (builtin.is_test)
     @import("../permissions/permissions.zig")
@@ -1654,9 +1655,9 @@ fn writeArgumentsJson(
     defer out.deinit();
 
     try out.writer.writeAll("{\"path\":");
-    try std.json.Stringify.value(path, .{}, &out.writer);
+    try json_encode.value(path, .{}, &out.writer);
     try out.writer.writeAll(",\"content\":");
-    try std.json.Stringify.value(content, .{}, &out.writer);
+    try json_encode.value(content, .{}, &out.writer);
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
 }
@@ -1671,11 +1672,11 @@ fn editArgumentsJson(
     defer out.deinit();
 
     try out.writer.writeAll("{\"path\":");
-    try std.json.Stringify.value(path, .{}, &out.writer);
+    try json_encode.value(path, .{}, &out.writer);
     try out.writer.writeAll(",\"old_string\":");
-    try std.json.Stringify.value(old_string, .{}, &out.writer);
+    try json_encode.value(old_string, .{}, &out.writer);
     try out.writer.writeAll(",\"new_string\":");
-    try std.json.Stringify.value(new_string, .{}, &out.writer);
+    try json_encode.value(new_string, .{}, &out.writer);
     try out.writer.writeByte('}');
     return out.toOwnedSlice();
 }

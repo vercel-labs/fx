@@ -1,6 +1,7 @@
 const std = @import("std");
 const io_mod = @import("io.zig");
 const profile_paths = @import("profile_paths.zig");
+const json_encode = @import("json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -276,7 +277,7 @@ fn writeRedactedJsonValuePreview(
                             try writer.writeAll("...");
                             break;
                         }
-                        try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
+                        try json_encode.value(entry.key_ptr.*, .{}, writer);
                         try writer.writeByte(':');
                         try writeRedactedJsonValuePreview(writer, entry.value_ptr.*, depth + 1, key_policy);
                         written += 1;

@@ -29,6 +29,7 @@ const result_commit = @import("../../core/tooling/result_commit.zig");
 const result_store = @import("../../core/session/result_store.zig");
 const types = @import("../../core/shared/types.zig");
 const workspace_access = @import("../../core/workspace/workspace_access.zig");
+const json_encode = @import("../../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -431,7 +432,7 @@ fn correction_json(
 ) Allocator.Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    std.json.Stringify.value(.{ .@"error" = .{
+    json_encode.value(.{ .@"error" = .{
         .code = "invalid_shell_request",
         .executed = false,
         .problems = problems,
@@ -715,7 +716,7 @@ fn attachSnapshotNotice(
     errdefer out.deinit();
     out.writer.writeAll(body[0 .. body.len - 1]) catch return error.OutOfMemory;
     out.writer.writeAll(",\"notice\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(notice, .{}, &out.writer) catch return error.OutOfMemory;
+    json_encode.value(notice, .{}, &out.writer) catch return error.OutOfMemory;
     out.writer.writeByte('}') catch return error.OutOfMemory;
     const updated = try out.toOwnedSlice();
     alloc.free(body);
@@ -1247,7 +1248,7 @@ fn cloneTerminalFailure(
     if (result == .success) return runtimeFailure(ctx, error.InvalidTerminalResult);
     var out: std.Io.Writer.Allocating = .init(ctx.allocator);
     errdefer out.deinit();
-    std.json.Stringify.value(result, .{}, &out.writer) catch
+    json_encode.value(result, .{}, &out.writer) catch
         return error.OutOfMemory;
     return .{ .failure = try out.toOwnedSlice() };
 }
@@ -1397,7 +1398,7 @@ fn terminalEndedWithOwner(
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     var out: std.Io.Writer.Allocating = .init(ctx.allocator);
     errdefer out.deinit();
-    std.json.Stringify.value(.{ .@"error" = .{
+    json_encode.value(.{ .@"error" = .{
         .tool = "shell",
         .code = tool_result_errors.terminal_ended_error_code,
         .session_id = session_id,
@@ -1861,7 +1862,7 @@ fn formatSnapshotRaw(
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const retained = snapshot.retained;
-    try std.json.Stringify.value(.{
+    try json_encode.value(.{
         .session_id = if (retained) snapshot.execution_id else null,
         .state = snapshotStateName(snapshot.state),
         .backend = if (retained or snapshot.backend != .captured) @tagName(snapshot.backend) else null,
@@ -2129,7 +2130,7 @@ test "shell request correction suggests only unambiguous repairs without executi
         try std.testing.expect(detail.get("problems").?.array.items.len > 0);
         try std.testing.expect((try tool_result_errors.inspectTerminalActionFieldCorrection(alloc, failure)) != null);
         if (case.retry) |expected| {
-            const json = try std.json.Stringify.valueAlloc(alloc, detail.get("retry_with").?, .{});
+            const json = try json_encode.valueAlloc(alloc, detail.get("retry_with").?, .{});
             defer alloc.free(json);
             try std.testing.expectEqualStrings(expected, json);
             const decoded = try decode(.{ .allocator = alloc }, json);
@@ -2188,7 +2189,7 @@ test "shell request correction bounds feedback and preserves input bytes" {
     const alloc = std.testing.allocator;
     const command = "printf '\u{1f308}\\n'; echo \"$VALUE\"";
     const key = text_utils.repeat("x", 63) ++ "\u{1f308}";
-    const source = try std.json.Stringify.valueAlloc(alloc, .{
+    const source = try json_encode.valueAlloc(alloc, .{
         .command = command,
         .x = null,
     }, .{});

@@ -18,6 +18,7 @@ const sse = @import("sse.zig");
 const json_depth = @import("json_depth.zig");
 const host_stream_provider = @import("host_stream_provider.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 
 pub fn isRetryableGatewayError(err: anyerror) bool {
     return err == error.HttpConnectionClosing or
@@ -3151,7 +3152,7 @@ const GatewayReplayBuilder = struct {
                 .reasoning => {
                     if (!part.ended and part.metadata != null) return error.InvalidProviderState;
                     try out.writer.writeAll("{\"type\":\"reasoning\",\"text\":");
-                    try std.json.Stringify.value(part.text.items, .{}, &out.writer);
+                    try json_encode.value(part.text.items, .{}, &out.writer);
                 },
                 .text => {
                     if (part.offset > content.len or part.length > content.len - part.offset) return error.InvalidProviderState;
@@ -3159,7 +3160,7 @@ const GatewayReplayBuilder = struct {
                 },
                 .tool_call => {
                     try out.writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":");
-                    try std.json.Stringify.value(canonical_call.?.id, .{}, &out.writer);
+                    try json_encode.value(canonical_call.?.id, .{}, &out.writer);
                 },
             }
             if (metadata) |value| {
@@ -3519,7 +3520,7 @@ fn appendSupportedFinalInput(
         .object, .array => {
             var out: std.Io.Writer.Allocating = .init(alloc);
             defer out.deinit();
-            std.json.Stringify.value(input, .{}, &out.writer) catch return error.OutOfMemory;
+            json_encode.value(input, .{}, &out.writer) catch return error.OutOfMemory;
             try destination.appendSlice(alloc, out.written());
             return .{ .integrity = .valid };
         },
@@ -3538,7 +3539,7 @@ fn appendSupportedFinalInput(
 fn stringifyJsonValueOwned(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    std.json.Stringify.value(value, .{}, &out.writer) catch return error.OutOfMemory;
+    json_encode.value(value, .{}, &out.writer) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
@@ -6011,7 +6012,7 @@ test "Gateway replay preserves restarted reasoning and text segments" {
     const Fixture = struct {
         fn event(writer: *std.Io.Writer, value: anytype) !void {
             try writer.writeAll("data: ");
-            try std.json.Stringify.value(value, .{}, writer);
+            try json_encode.value(value, .{}, writer);
             try writer.writeAll("\n\n");
         }
 
@@ -6102,7 +6103,7 @@ test "Gateway separates provider message items in assistant text" {
 
         fn event(writer: *std.Io.Writer, value: anytype) !void {
             try writer.writeAll("data: ");
-            try std.json.Stringify.value(value, .{ .emit_null_optional_fields = false }, writer);
+            try json_encode.value(value, .{ .emit_null_optional_fields = false }, writer);
             try writer.writeAll("\n\n");
         }
 
@@ -6678,7 +6679,7 @@ test "consumeSseStream preserves valid serialized scalar roots" {
         var event: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer event.deinit();
         try event.writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":\"c1\",\"toolName\":\"dynamic_tool\",\"input\":");
-        try std.json.Stringify.value(input, .{}, &event.writer);
+        try json_encode.value(input, .{}, &event.writer);
         try event.writer.writeAll("}");
         const payload = try std.testing.allocator.print(
             "data: {s}\n\ndata: {{\"type\":\"finish\",\"finishReason\":{{\"unified\":\"tool-calls\"}}}}\n\n",
@@ -6715,7 +6716,7 @@ test "consumeSseStream replaces malformed trailing or duplicate-key serialized f
         var event: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer event.deinit();
         try event.writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":\"c1\",\"toolName\":\"ask_user_question\",\"input\":");
-        try std.json.Stringify.value(case.input, .{}, &event.writer);
+        try json_encode.value(case.input, .{}, &event.writer);
         try event.writer.writeAll("}");
 
         const payload = try std.testing.allocator.print(
@@ -6961,7 +6962,7 @@ test "consumeSseStream traces malformed argument metadata without source bytes" 
     var event: std.Io.Writer.Allocating = .init(alloc);
     defer event.deinit();
     try event.writer.writeAll("{\"type\":\"tool-call\",\"toolCallId\":\"c1\",\"toolName\":\"ask_user_question\",\"input\":");
-    try std.json.Stringify.value(sentinel, .{}, &event.writer);
+    try json_encode.value(sentinel, .{}, &event.writer);
     try event.writer.writeAll("}");
     const payload = try alloc.print(
         "data: {s}\n\ndata: {{\"type\":\"finish\",\"finishReason\":{{\"unified\":\"tool-calls\"}}}}\n\n",

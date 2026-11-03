@@ -14,6 +14,7 @@ const png_downscale = @import("png_downscale.zig");
 const types = @import("../shared/types.zig");
 const pathing = @import("../workspace/pathing.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 pub const max_image_bytes: usize = 20 * 1024 * 1024;
 /// The most images, and image bytes together, one libfx prompt holds: the
@@ -1069,7 +1070,7 @@ pub fn noteAttachmentLocations(arena: std.mem.Allocator, messages: []const types
             const path = savedImagePath(image) orelse continue;
             // Quoted, because a home folder can hold spaces or brackets.
             notes.writer.print("[Image #{d} ({s}) is saved at ", .{ image.id, image.media_type }) catch return error.OutOfMemory;
-            std.json.Stringify.value(path, .{}, &notes.writer) catch return error.OutOfMemory;
+            json_encode.value(path, .{}, &notes.writer) catch return error.OutOfMemory;
             notes.writer.writeAll(".]\n") catch return error.OutOfMemory;
         }
         if (notes.written().len == 0) continue;

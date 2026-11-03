@@ -15,6 +15,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1777,7 +1778,7 @@ fn record_wire(record: Record) RecordWire {
 fn render_json(alloc: Allocator, value: anytype) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(value, .{}, &out.writer) catch
+    json_encode.value(value, .{}, &out.writer) catch
         return error.OutOfMemory;
     out.writer.writeByte('\n') catch return error.OutOfMemory;
     return out.toOwnedSlice();

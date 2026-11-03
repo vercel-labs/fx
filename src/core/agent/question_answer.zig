@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const types = @import("../shared/types.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -28,9 +29,9 @@ pub fn encodeJson(
     for (entries, 0..) |entry, index| {
         if (index > 0) try out.writer.writeAll(",");
         try out.writer.writeAll("{\"question\":");
-        try std.json.Stringify.value(entry.question, .{}, &out.writer);
+        try json_encode.value(entry.question, .{}, &out.writer);
         try out.writer.writeAll(",\"answer\":");
-        try std.json.Stringify.value(answers[index], .{}, &out.writer);
+        try json_encode.value(answers[index], .{}, &out.writer);
         try out.writer.writeAll("}");
     }
     try out.writer.writeAll("]");

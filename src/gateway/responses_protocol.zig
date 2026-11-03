@@ -9,6 +9,7 @@ const tool_call_ids = @import("tool_call_ids.zig");
 const json_depth = @import("json_depth.zig");
 const json_comparison = @import("../core/shared/json_comparison.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 
 pub fn selectReplayParts(alloc: std.mem.Allocator, replay: ?types.ProviderReplay, _: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
     const source = replay orelse return null;
@@ -32,7 +33,7 @@ pub fn selectReplayParts(alloc: std.mem.Allocator, replay: ?types.ProviderReplay
         const keep = if (std.mem.eql(u8, kind, "reasoning")) reasoning else if (std.mem.eql(u8, kind, "message")) text else return error.InvalidProviderState;
         if (!keep) continue;
         if (count > 0) out.writer.writeByte(',') catch return error.OutOfMemory;
-        std.json.Stringify.value(item, .{}, &out.writer) catch return error.OutOfMemory;
+        json_encode.value(item, .{}, &out.writer) catch return error.OutOfMemory;
         count += 1;
     }
     if (count == 0) return null;
@@ -80,7 +81,7 @@ pub fn writeInput(
                 var first_part = true;
                 if (message.content) |content| if (content.len > 0) {
                     try writer.writeAll("{\"type\":\"input_text\",\"text\":");
-                    try std.json.Stringify.value(content, .{}, writer);
+                    try json_encode.value(content, .{}, writer);
                     try writer.writeByte('}');
                     first_part = false;
                 };
@@ -138,7 +139,7 @@ pub fn writeInput(
                         }
                         if (!std.mem.eql(u8, kind.string, "reasoning")) return error.InvalidProviderState;
                         try writeComma(writer, &first);
-                        try std.json.Stringify.value(item, .{}, writer);
+                        try json_encode.value(item, .{}, writer);
                     }
                 }
                 if (span_end) |end| {
@@ -149,22 +150,22 @@ pub fn writeInput(
                 for (message.tool_calls) |call| {
                     try writeComma(writer, &first);
                     try writer.writeAll("{\"type\":\"function_call\",\"call_id\":");
-                    try std.json.Stringify.value(ids.resolve(call.id), .{}, writer);
+                    try json_encode.value(ids.resolve(call.id), .{}, writer);
                     try writer.writeAll(",\"name\":");
-                    try std.json.Stringify.value(call.name, .{}, writer);
+                    try json_encode.value(call.name, .{}, writer);
                     try writer.writeAll(",\"arguments\":");
-                    try std.json.Stringify.value(call.arguments_json, .{}, writer);
+                    try json_encode.value(call.arguments_json, .{}, writer);
                     try writer.writeByte('}');
                 }
             },
             .tool => {
                 try writeComma(writer, &first);
                 try writer.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
-                try std.json.Stringify.value(ids.resolve(message.tool_call_id orelse ""), .{}, writer);
+                try json_encode.value(ids.resolve(message.tool_call_id orelse ""), .{}, writer);
                 try writer.writeAll(",\"output\":");
                 const tool_images = if (message.tool_result_memory) |memory| memory.tool_images else &.{};
                 if (tool_images.len == 0) {
-                    try std.json.Stringify.value(message.content orelse "", .{}, writer);
+                    try json_encode.value(message.content orelse "", .{}, writer);
                 } else {
                     const failed = message.tool_result_status == .failure;
                     const text = if (failed) try scratch_alloc.print("Tool error: {s}", .{message.content orelse ""}) else message.content orelse "";
@@ -172,7 +173,7 @@ pub fn writeInput(
                     try writer.writeByte('[');
                     if (text.len > 0) {
                         try writer.writeAll("{\"type\":\"input_text\",\"text\":");
-                        try std.json.Stringify.value(text, .{}, writer);
+                        try json_encode.value(text, .{}, writer);
                         try writer.writeByte('}');
                     }
                     for (tool_images, 0..) |image, index| {
@@ -181,7 +182,7 @@ pub fn writeInput(
                         defer scratch_alloc.free(url);
                         if (index > 0 or text.len > 0) try writer.writeByte(',');
                         try writer.writeAll("{\"type\":\"input_image\",\"image_url\":");
-                        try std.json.Stringify.value(url, .{}, writer);
+                        try json_encode.value(url, .{}, writer);
                         try writer.writeByte('}');
                         try budget.check();
                     }
@@ -202,11 +203,11 @@ fn replay_index(fields: std.json.ObjectMap, name: []const u8) ?usize {
 fn write_assistant_text(writer: *std.Io.Writer, first: *bool, content: []const u8, phase: ?AssistantMessagePhase) !void {
     try writeComma(writer, first);
     try writer.writeAll("{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":");
-    try std.json.Stringify.value(content, .{}, writer);
+    try json_encode.value(content, .{}, writer);
     try writer.writeAll(",\"annotations\":[]}]");
     if (phase) |value| {
         try writer.writeAll(",\"phase\":");
-        try std.json.Stringify.value(@tagName(value), .{}, writer);
+        try json_encode.value(@tagName(value), .{}, writer);
     }
     try writer.writeByte('}');
 }
@@ -849,7 +850,7 @@ pub const Reducer = struct {
 
         fn replay_json(self: MessageItem, buffer: []u8) ![]const u8 {
             var out: std.Io.Writer = .fixed(buffer);
-            try std.json.Stringify.value(.{ .type = "message", .offset = self.offset, .length = self.length, .phase = self.phase }, .{ .emit_null_optional_fields = false }, &out);
+            try json_encode.value(.{ .type = "message", .offset = self.offset, .length = self.length, .phase = self.phase }, .{ .emit_null_optional_fields = false }, &out);
             return out.buffered();
         }
     };
@@ -1109,7 +1110,7 @@ pub const Reducer = struct {
         const encrypted = fields.get("encrypted_content") orelse .null;
         if (encrypted != .null and encrypted != .string) return error.InvalidEvent;
         const json = if (evidence == .completed and encrypted == .string)
-            try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = fields }, .{})
+            try json_encode.valueAlloc(alloc, std.json.Value{ .object = fields }, .{})
         else
             null;
         errdefer if (json) |bytes| alloc.free(bytes);
@@ -1923,7 +1924,7 @@ test "Responses terminal failure classification is conservative and diagnostics 
     inline for (cases) |case| {
         var stream = ToolRecordTest.init(std.testing.allocator);
         defer stream.deinit();
-        const event = try std.json.Stringify.valueAlloc(std.testing.allocator, .{
+        const event = try json_encode.valueAlloc(std.testing.allocator, .{
             .type = "response.failed",
             .response = .{ .id = "resp_failure", .@"error" = .{ .code = case[0], .message = text_utils.repeat("é", 512) }, .usage = .{ .input_tokens = 7, .output_tokens = 3 } },
         }, .{});
@@ -2032,7 +2033,7 @@ const TextRecordTest = struct {
     fn json(self: *TextRecordTest, event: anytype) !void {
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try std.json.Stringify.value(event, .{}, &out.writer);
+        try json_encode.value(event, .{}, &out.writer);
         try self.apply(out.written());
     }
 
@@ -2317,7 +2318,7 @@ test "Responses completed response can finalize progressive arguments within the
         @memset(arguments, ' ');
         arguments[0] = '{';
         arguments[size - 1] = '}';
-        const event = try std.json.Stringify.valueAlloc(alloc, .{
+        const event = try json_encode.valueAlloc(alloc, .{
             .type = "response.completed",
             .response = .{ .status = "completed", .output = .{.{
                 .type = "function_call",
@@ -2643,7 +2644,7 @@ fn writeFunctionTool(
 ) !void {
     if (name.len == 0) return error.InvalidToolSchema;
     try writer.writeAll("{\"type\":\"function\",\"name\":");
-    try std.json.Stringify.value(name, .{}, writer);
+    try json_encode.value(name, .{}, writer);
     if (description.len > 0) {
         try writer.writeAll(",\"description\":");
         try model_tool_schema.writeCappedDescriptionJsonString(alloc, writer, description);
@@ -2653,7 +2654,7 @@ fn writeFunctionTool(
         .static => |schema| try model_tool_schema.writeObjectSchema(alloc, writer, schema),
         .dynamic => |schema| {
             if (schema != .object) return error.InvalidToolSchema;
-            try std.json.Stringify.value(schema, .{}, writer);
+            try json_encode.value(schema, .{}, writer);
         },
     }
     try writer.writeAll(",\"strict\":false}");

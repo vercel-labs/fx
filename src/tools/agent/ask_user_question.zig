@@ -6,6 +6,7 @@ const testing_allocator = @import("../../core/shared/testing_allocator.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const json_encode = @import("../../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -446,7 +447,7 @@ fn fuzzQuestionsText(_: void, smith: *std.testing.Smith) !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const args_json = try std.json.Stringify.valueAlloc(arena, .{ .questions = text }, .{});
+    const args_json = try json_encode.valueAlloc(arena, .{ .questions = text }, .{});
     if (parseQuestionBatch(arena, args_json)) |entries| {
         try std.testing.expect(entries.len >= 1 and entries.len <= question_answer.max_questions);
     } else |err| switch (err) {

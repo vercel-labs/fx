@@ -4,6 +4,7 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const elicitation = @import("elicitation.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -209,9 +210,9 @@ fn renderRequestsFallible(
     try out.writer.writeByte('{');
     for (requests, 0..) |request, index| {
         if (index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(request.key, .{}, &out.writer);
+        try json_encode.value(request.key, .{}, &out.writer);
         try out.writer.writeAll(":{\"method\":");
-        try std.json.Stringify.value(request.payload.method(), .{}, &out.writer);
+        try json_encode.value(request.payload.method(), .{}, &out.writer);
         switch (request.payload) {
             .unsupported => {},
             .elicitation_create => |value| {
@@ -254,7 +255,7 @@ fn stringifyBounded(
 ) Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(value, .{}, &out.writer) catch
+    json_encode.value(value, .{}, &out.writer) catch
         return error.OutOfMemory;
     if (out.written().len > max_bytes) return error.MetadataLimitExceeded;
     return try out.toOwnedSlice();

@@ -12,6 +12,7 @@ const configured_provider = @import("../core/config/configured_provider.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -203,13 +204,13 @@ pub fn redact_error_detail(alloc: Allocator, raw: []const u8, credential: []cons
         else => if (json_shaped) return alloc.dupe(u8, "Provider error details could not be decoded") else null,
     };
     defer if (parsed) |*value| value.deinit();
-    const detail = if (parsed) |value| try std.json.Stringify.valueAlloc(alloc, value.value, .{}) else try alloc.dupe(u8, raw);
+    const detail = if (parsed) |value| try json_encode.valueAlloc(alloc, value.value, .{}) else try alloc.dupe(u8, raw);
     if (detail.len > 64 * 1024) {
         defer alloc.free(detail);
         return alloc.dupe(u8, "Provider error details exceeded the local limit");
     }
     errdefer alloc.free(detail);
-    const encoded = try std.json.Stringify.valueAlloc(alloc, credential, .{});
+    const encoded = try json_encode.valueAlloc(alloc, credential, .{});
     defer alloc.free(encoded);
     mask_error_bytes(detail, encoded[1 .. encoded.len - 1]);
     mask_error_bytes(detail, credential);
@@ -362,9 +363,9 @@ fn write_replay(writer: *std.Io.Writer, alloc: Allocator, message: types.ChatMes
     while (fields.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, association_field)) continue;
         try writer.writeByte(',');
-        try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
+        try json_encode.value(entry.key_ptr.*, .{}, writer);
         try writer.writeByte(':');
-        try std.json.Stringify.value(entry.value_ptr.*, .{}, writer);
+        try json_encode.value(entry.value_ptr.*, .{}, writer);
     }
 }
 
@@ -444,7 +445,7 @@ fn write_user_content_parts(
     if (message.content) |content| {
         if (content.len > 0) {
             try writer.writeAll("{\"type\":\"text\",\"text\":");
-            try std.json.Stringify.value(content, .{}, writer);
+            try json_encode.value(content, .{}, writer);
             try writer.writeByte('}');
             wrote_part = true;
         }
@@ -470,7 +471,7 @@ fn write_tool_image_follow_up(writer: *std.Io.Writer, alloc: Allocator, tool_nam
         try alloc.print("Tool results returned {d} image(s).", .{images.len});
     defer alloc.free(label);
     try writer.writeAll("{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":");
-    try std.json.Stringify.value(label, .{}, writer);
+    try json_encode.value(label, .{}, writer);
     try writer.writeByte('}');
     for (images) |image| {
         try writer.writeByte(',');
@@ -496,7 +497,7 @@ fn flush_tool_image_follow_up(
 
 fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provider.RequestData, options: Options, functions: []const Function, projection: *const tool_call_ids.Projection) !void {
     try writer.writeAll("{\"model\":");
-    try std.json.Stringify.value(request.model, .{}, writer);
+    try json_encode.value(request.model, .{}, writer);
     try writer.writeAll(",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
     var count: usize = 0;
     // Images from tool results buffer across each contiguous tool-message run
@@ -515,28 +516,28 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
             if (count != 0) try writer.writeByte(',');
             count += 1;
             try writer.writeAll("{\"role\":");
-            try std.json.Stringify.value(@tagName(message.role), .{}, writer);
+            try json_encode.value(@tagName(message.role), .{}, writer);
             try writer.writeAll(",\"content\":");
             if (message.role == .user and message.images.len != 0) {
                 try write_user_content_parts(writer, alloc, message);
             } else {
-                try std.json.Stringify.value(message.content, .{}, writer);
+                try json_encode.value(message.content, .{}, writer);
             }
             try write_replay(writer, alloc, message);
             if (message.role == .tool) {
                 try writer.writeAll(",\"tool_call_id\":");
-                try std.json.Stringify.value(projection.resolve(message.tool_call_id.?), .{}, writer);
+                try json_encode.value(projection.resolve(message.tool_call_id.?), .{}, writer);
             }
             if (message.tool_calls.len != 0) {
                 try writer.writeAll(",\"tool_calls\":[");
                 for (message.tool_calls, 0..) |call, index| {
                     if (index != 0) try writer.writeByte(',');
                     try writer.writeAll("{\"id\":");
-                    try std.json.Stringify.value(projection.resolve(call.id), .{}, writer);
+                    try json_encode.value(projection.resolve(call.id), .{}, writer);
                     try writer.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
-                    try std.json.Stringify.value(call.name, .{}, writer);
+                    try json_encode.value(call.name, .{}, writer);
                     try writer.writeAll(",\"arguments\":");
-                    try std.json.Stringify.value(call.arguments_json, .{}, writer);
+                    try json_encode.value(call.arguments_json, .{}, writer);
                     try writer.writeAll("}}");
                 }
                 try writer.writeByte(']');
@@ -559,13 +560,13 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
         for (functions, 0..) |function, index| {
             if (index != 0) try writer.writeByte(',');
             try writer.writeAll("{\"type\":\"function\",\"function\":{\"name\":");
-            try std.json.Stringify.value(function.name, .{}, writer);
+            try json_encode.value(function.name, .{}, writer);
             try writer.writeAll(",\"description\":");
             try model_tool_schema.writeCappedDescriptionJsonString(alloc, writer, function.description);
             try writer.writeAll(",\"parameters\":");
             switch (function.schema) {
                 .builtin => |schema| try model_tool_schema.writeObjectSchema(alloc, writer, schema),
-                .dynamic => |schema| try std.json.Stringify.value(schema, .{}, writer),
+                .dynamic => |schema| try json_encode.value(schema, .{}, writer),
             }
             try writer.writeAll("}}");
         }
@@ -574,11 +575,11 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
     if (functions.len != 0) {
         if (options.tool_choice_mode == .send) {
             try writer.writeAll(",\"tool_choice\":");
-            try std.json.Stringify.value(@tagName(request.tool_choice), .{}, writer);
+            try json_encode.value(@tagName(request.tool_choice), .{}, writer);
         }
         if (request.provider_options.parallel_tool_calls) |parallel| {
             try writer.writeAll(",\"parallel_tool_calls\":");
-            try std.json.Stringify.value(parallel, .{}, writer);
+            try json_encode.value(parallel, .{}, writer);
         }
     }
     if (request.max_output_tokens) |limit| try writer.print(",\"max_tokens\":{d}", .{limit});
@@ -747,7 +748,7 @@ pub const Reducer = struct {
                 continue;
             }
             const text = try string(value);
-            const encoded = try std.json.Stringify.valueAlloc(self.alloc, value, .{});
+            const encoded = try json_encode.valueAlloc(self.alloc, value, .{});
             defer self.alloc.free(encoded);
             try self.count_reasoning(encoded.len);
             const start = part.bytes.items.len;
@@ -764,7 +765,7 @@ pub const Reducer = struct {
                 part.presence = .value;
                 for (value.array.items) |item| {
                     if (item != .object) return error.InvalidChunk;
-                    const encoded = try std.json.Stringify.valueAlloc(self.alloc, item, .{});
+                    const encoded = try json_encode.valueAlloc(self.alloc, item, .{});
                     defer self.alloc.free(encoded);
                     try self.count_reasoning(encoded.len + 1);
                     if (part.bytes.items.len != 0) try part.bytes.append(self.alloc, ',');
@@ -789,9 +790,9 @@ pub const Reducer = struct {
         try out.writer.writeByte('{');
         for (reasoning_fields, self.reasoning) |key, part| {
             if (part.presence == .absent) continue;
-            try std.json.Stringify.value(key, .{}, &out.writer);
+            try json_encode.value(key, .{}, &out.writer);
             try out.writer.writeByte(':');
-            try std.json.Stringify.value(if (part.presence == .value) part.bytes.items else @as(?[]const u8, null), .{}, &out.writer);
+            try json_encode.value(if (part.presence == .value) part.bytes.items else @as(?[]const u8, null), .{}, &out.writer);
             try out.writer.writeByte(',');
         }
         const details = self.reasoning_details;
@@ -809,7 +810,7 @@ pub const Reducer = struct {
         try out.writer.writeAll("\"" ++ association_field ++ "\":[");
         for (self.tools.items, 0..) |tool, index| {
             if (index != 0) try out.writer.writeByte(',');
-            try std.json.Stringify.value(tool.id.?, .{}, &out.writer);
+            try json_encode.value(tool.id.?, .{}, &out.writer);
         }
         try out.writer.writeAll("]}");
         if (out.written().len > @min(self.limits.reasoning_bytes, types.ProviderReplay.max_bytes)) return error.ReplayTooLarge;
@@ -2159,9 +2160,9 @@ test "chat completions returns unadvertised names and invalid arguments as sent"
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
         try out.writer.writeAll("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":");
-        try std.json.Stringify.value(case.name, .{}, &out.writer);
+        try json_encode.value(case.name, .{}, &out.writer);
         try out.writer.writeAll(",\"arguments\":");
-        try std.json.Stringify.value(case.arguments, .{}, &out.writer);
+        try json_encode.value(case.arguments, .{}, &out.writer);
         try out.writer.writeAll("}}]}}]}");
         try test_accept(&reducer, out.written());
         var result = try test_finish(&reducer, test_tools_finish);

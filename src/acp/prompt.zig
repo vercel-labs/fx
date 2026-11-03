@@ -93,6 +93,7 @@ const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const libfx_hooks = @import("libfx_hooks.zig");
 const runtime_gateway_step = @import("../core/agent/runtime/gateway_step.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
@@ -696,15 +697,15 @@ fn callHostTool(
     var params: std.Io.Writer.Allocating = .init(alloc);
     defer params.deinit();
     params.writer.writeAll("{\"sessionId\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(
+    json_encode.value(
         if (state.active_session) |*session| session.session_id else "",
         .{},
         &params.writer,
     ) catch return error.OutOfMemory;
     params.writer.writeAll(",\"name\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(name, .{}, &params.writer) catch return error.OutOfMemory;
+    json_encode.value(name, .{}, &params.writer) catch return error.OutOfMemory;
     params.writer.writeAll(",\"toolCallId\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(call_id, .{}, &params.writer) catch return error.OutOfMemory;
+    json_encode.value(call_id, .{}, &params.writer) catch return error.OutOfMemory;
     params.writer.writeAll(",\"input\":") catch return error.OutOfMemory;
     params.writer.writeAll(arguments_json) catch return error.OutOfMemory;
     params.writer.writeByte('}') catch return error.OutOfMemory;
@@ -2465,7 +2466,7 @@ fn writeValidatedToolArguments(alloc: Allocator, writer: *std.Io.Writer, argumen
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch
         return error.InvalidToolArgumentsJson;
     defer parsed.deinit();
-    try std.json.Stringify.value(parsed.value, .{}, writer);
+    try json_encode.value(parsed.value, .{}, writer);
 }
 
 fn writePermissionOption(
@@ -3448,7 +3449,7 @@ fn respondToAcpMcpInput(
     try out.writer.writeByte('{');
     for (responses, 0..) |response, index| {
         if (index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(response.key, .{}, &out.writer);
+        try json_encode.value(response.key, .{}, &out.writer);
         try out.writer.writeByte(':');
         try out.writer.writeAll(response.json);
     }
@@ -3772,7 +3773,7 @@ fn finishAcpUrlElicitations(
             var params: std.Io.Writer.Allocating = .init(alloc);
             defer params.deinit();
             params.writer.writeAll("{\"elicitationId\":") catch continue;
-            std.json.Stringify.value(id, .{}, &params.writer) catch continue;
+            json_encode.value(id, .{}, &params.writer) catch continue;
             params.writer.writeByte('}') catch continue;
             responder.acp.state.writer.writeNotification(
                 alloc,

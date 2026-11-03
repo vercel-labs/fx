@@ -193,7 +193,7 @@ Do not bypass the permission system for new tools.
 
 * Zig 0.17 removed the `**` operator. Fill arrays with `@splat` and build repeated comptime strings with `text_utils.repeat` from `src/core/shared/text_utils.zig`.
 
-* For JSON serialization, use `std.json.Stringify.value` with an allocating writer (`std.Io.Writer.Allocating`).
+* For JSON serialization, use `value` or `valueAlloc` from `src/core/shared/json_encode.zig`, with an allocating writer (`std.Io.Writer.Allocating`), and its `write` inside a `jsonStringify` method. They match `std.json.Stringify`'s, but share one writer across types instead of generating one per type. Code that cannot import it, such as `src/mcp/`, `src/core/session_manager/`, and files that import only `std`, keeps `std.json.Stringify`.
 
 * To parse JSON into a typed value, use `parseFromSlice` or `parseFromSliceLeaky` from `src/core/shared/json_decode.zig`. They match `std.json`'s, but share one parser across types instead of generating one per type. Parse into `std.json.Value` with `std.json` itself.
 

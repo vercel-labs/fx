@@ -19,6 +19,7 @@ const trace = @import("trace.zig");
 const records = @import("records.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -182,7 +183,7 @@ pub fn encode(alloc: Allocator, payload: Payload) Allocator.Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     out.writer.writeAll(marker) catch return error.OutOfMemory;
-    std.json.Stringify.value(payload, .{}, &out.writer) catch return error.OutOfMemory;
+    json_encode.value(payload, .{}, &out.writer) catch return error.OutOfMemory;
     return out.toOwnedSlice() catch error.OutOfMemory;
 }
 

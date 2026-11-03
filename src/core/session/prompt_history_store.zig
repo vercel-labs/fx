@@ -4,6 +4,7 @@ const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const session_codec = @import("session_codec.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const history_file = profile_paths.prompt_history_file_name;
@@ -590,7 +591,7 @@ fn serializeRecord(
     try out.writer.writeAll("{\"schema_version\":1,\"timestamp_ms\":");
     try out.writer.print("{d}", .{timestamp_ms});
     try out.writer.writeAll(",\"workspace_root\":");
-    try std.json.Stringify.value(workspace_root, .{}, &out.writer);
+    try json_encode.value(workspace_root, .{}, &out.writer);
     try out.writer.writeAll(",\"text\":");
     try session_codec.writeDurableBytes(&out.writer, text);
     try out.writer.writeAll("}\n");

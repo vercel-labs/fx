@@ -19,6 +19,7 @@ const std = @import("std");
 const text_utils = @import("../shared/text_utils.zig");
 const trace = @import("trace.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -299,7 +300,7 @@ fn writeCoverage(writer: *std.Io.Writer, query: Query, docs: []const Doc) !void 
             span.last = @max(span.last, id.number);
         }
         try writer.writeAll("Every word of ");
-        try std.json.Stringify.value(text, .{}, writer);
+        try json_encode.value(text, .{}, writer);
         var parts: usize = 0;
         for ([_]Kind{ .turn, .tool, .ledger }) |kind| {
             const span = spans.get(kind);
@@ -519,7 +520,7 @@ fn formatResults(alloc: Allocator, arena: Allocator, queries: []const []const u8
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.writeAll("<saved_search query=");
-    try std.json.Stringify.value(queries, .{}, writer);
+    try json_encode.value(queries, .{}, writer);
     try writer.print(" matches=\"{d}\">\n", .{docs.len});
     if (docs.len == 0) try writer.writeAll("(no saved turns or tool calls match)\n") else try writeCoverage(writer, query, all);
     for (docs, 1..) |doc, rank| {

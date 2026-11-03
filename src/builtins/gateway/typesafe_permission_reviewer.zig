@@ -13,6 +13,7 @@ const permission_auto_classifier = @import("../../core/permissions/auto_classifi
 const types = @import("../../core/shared/types.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const json_encode = @import("../../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -193,7 +194,7 @@ fn requestBodyJson(
     };
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(body, .{}, &out.writer) catch |err| switch (err) {
+    json_encode.value(body, .{}, &out.writer) catch |err| switch (err) {
         error.WriteFailed => return error.OutOfMemory,
     };
     return out.toOwnedSlice();
@@ -310,7 +311,7 @@ fn decisionArgumentsJson(alloc: Allocator, jev: JevDecision) Allocator.Error![]u
     defer alloc.free(rationale);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(Args{ .decision = jev.decision, .rationale = rationale }, .{}, &out.writer) catch |err| switch (err) {
+    json_encode.value(Args{ .decision = jev.decision, .rationale = rationale }, .{}, &out.writer) catch |err| switch (err) {
         error.WriteFailed => return error.OutOfMemory,
     };
     return out.toOwnedSlice();

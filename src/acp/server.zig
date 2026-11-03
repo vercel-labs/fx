@@ -56,6 +56,7 @@ const libfx_steering = @import("libfx_steering.zig");
 const journal_events = @import("../core/agent/runtime/journal.zig");
 const libfx_journal = @import("libfx_journal.zig");
 const tool_call_identities = @import("tool_call_identities.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
@@ -1420,7 +1421,7 @@ fn publishLegacyUrlCompletion(state: *ServerState, id: []u8) void {
     var params: std.Io.Writer.Allocating = .init(state.alloc);
     defer params.deinit();
     params.writer.writeAll("{\"elicitationId\":") catch return;
-    std.json.Stringify.value(id, .{}, &params.writer) catch return;
+    json_encode.value(id, .{}, &params.writer) catch return;
     params.writer.writeByte('}') catch return;
     state.writer.writeNotification(
         state.alloc,

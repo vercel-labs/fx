@@ -21,6 +21,7 @@ const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -174,9 +175,9 @@ pub const FailureSnapshot = struct {
 
     pub fn writeJson(self: FailureSnapshot, writer: *std.Io.Writer) !void {
         try writer.writeAll("{\"source\":");
-        try std.json.Stringify.value(credentials.sourceLabel(self.source), .{}, writer);
+        try json_encode.value(credentials.sourceLabel(self.source), .{}, writer);
         try writer.writeAll(",\"reason\":");
-        try std.json.Stringify.value(@tagName(self.reason), .{}, writer);
+        try json_encode.value(@tagName(self.reason), .{}, writer);
         if (self.http_status) |status| {
             try writer.print(",\"http_status\":{d}", .{@backingInt(status)});
         }

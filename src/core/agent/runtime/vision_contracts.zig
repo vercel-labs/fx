@@ -6,6 +6,7 @@ const image_attachments = @import("../../images/image_attachments.zig");
 const types = @import("../../shared/types.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
 const text_utils = @import("../../shared/text_utils.zig");
+const json_encode = @import("../../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -209,7 +210,7 @@ pub fn build_provider_response_schema(
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try std.json.Stringify.value(schema, .{}, &out.writer);
+    try json_encode.value(schema, .{}, &out.writer);
     return out.toOwnedSlice();
 }
 
@@ -404,11 +405,11 @@ pub fn stringify_vision_result(
         switch (image.outcome) {
             .ok => |evidence| {
                 try out.writer.writeAll("\"status\":\"ok\",\"summary\":");
-                try std.json.Stringify.value(evidence.summary, .{}, &out.writer);
+                try json_encode.value(evidence.summary, .{}, &out.writer);
                 try out.writer.writeAll(",\"visible_text\":");
-                try std.json.Stringify.value(evidence.visible_text, .{}, &out.writer);
+                try json_encode.value(evidence.visible_text, .{}, &out.writer);
                 try out.writer.writeAll(",\"details\":");
-                try std.json.Stringify.value(evidence.details, .{}, &out.writer);
+                try json_encode.value(evidence.details, .{}, &out.writer);
             },
             .failed => |failure| {
                 try out.writer.writeAll("\"status\":\"failed\",\"error\":");
@@ -426,15 +427,15 @@ fn write_failure_diagnostic(
     failure: VisionFailure,
 ) std.Io.Writer.Error!void {
     try writer.writeAll("{\"code\":");
-    try std.json.Stringify.value(@tagName(failure.code()), .{}, writer);
+    try json_encode.value(@tagName(failure.code()), .{}, writer);
     try writer.writeAll(",\"message\":");
     switch (failure) {
-        .image_unavailable => try std.json.Stringify.value(
+        .image_unavailable => try json_encode.value(
             "Vision could not safely load or verify this image.",
             .{},
             writer,
         ),
-        .provider_response_invalid => try std.json.Stringify.value(
+        .provider_response_invalid => try json_encode.value(
             "Vision received an invalid provider response after one retry.",
             .{},
             writer,
@@ -443,12 +444,12 @@ fn write_failure_diagnostic(
             "\"Vision produced {d} bytes; the configured budget is {d} bytes.\"",
             .{ limit.observed_bytes, limit.configured_bytes },
         ),
-        .vision_unavailable => try std.json.Stringify.value(
+        .vision_unavailable => try json_encode.value(
             "Vision could not obtain a usable provider response.",
             .{},
             writer,
         ),
-        .missing_provider_record => try std.json.Stringify.value(
+        .missing_provider_record => try json_encode.value(
             "Vision returned no record for this image.",
             .{},
             writer,
@@ -457,7 +458,7 @@ fn write_failure_diagnostic(
     try writer.writeAll(",\"retryable\":");
     try writer.writeAll(if (failure.retryable()) "true" else "false");
     try writer.writeAll(",\"suggestion\":");
-    try std.json.Stringify.value(failure.suggestion(), .{}, writer);
+    try json_encode.value(failure.suggestion(), .{}, writer);
     try writer.writeByte('}');
 }
 

@@ -10,6 +10,7 @@ const gateway_client = @import("client.zig");
 const responses_protocol = @import("responses_protocol.zig");
 const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const endpoint = "https://chatgpt.com/backend-api/codex/responses";
@@ -76,16 +77,16 @@ pub fn buildRequest(
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.writeAll("{\"model\":");
-    try std.json.Stringify.value(request.model, .{}, writer);
+    try json_encode.value(request.model, .{}, writer);
     try writer.writeAll(",\"store\":false,\"stream\":true,\"instructions\":");
-    try std.json.Stringify.value(instructions.written(), .{}, writer);
+    try json_encode.value(instructions.written(), .{}, writer);
     try writer.writeAll(",\"input\":[");
     try writeResponsesInput(writer, std.heap.c_allocator, projected orelse request.messages, request.verified_images, budget);
     try writer.writeByte(']');
 
     _ = try responses_protocol.writeTools(writer, alloc, request.tools);
     try writer.writeAll(",\"tool_choice\":");
-    try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
+    try json_encode.value(request.tool_choice.label(), .{}, writer);
     try writer.writeAll(",\"parallel_tool_calls\":true,\"include\":[\"reasoning.encrypted_content\"]");
     // Codex exposes Fast mode as its priority service tier for supported
     // ChatGPT subscription models.
@@ -95,11 +96,11 @@ pub fn buildRequest(
     if (request.response_format) |format| {
         if (format.schema != .object) return error.InvalidStructuredResponseSchema;
         try writer.writeAll(",\"format\":{\"type\":\"json_schema\",\"name\":");
-        try std.json.Stringify.value(format.name, .{}, writer);
+        try json_encode.value(format.name, .{}, writer);
         try writer.writeAll(",\"description\":");
-        try std.json.Stringify.value(format.description, .{}, writer);
+        try json_encode.value(format.description, .{}, writer);
         try writer.writeAll(",\"schema\":");
-        try std.json.Stringify.value(format.schema, .{}, writer);
+        try json_encode.value(format.schema, .{}, writer);
         try writer.writeAll(",\"strict\":true}");
     }
     try writer.writeByte('}');
@@ -107,7 +108,7 @@ pub fn buildRequest(
     if (request.provider_options.reasoning) |effort| {
         const label = if (std.mem.eql(u8, effort.label(), "minimal")) "low" else effort.label();
         try writer.writeAll(",\"reasoning\":{\"effort\":");
-        try std.json.Stringify.value(label, .{}, writer);
+        try json_encode.value(label, .{}, writer);
         try writer.writeAll(",\"summary\":\"auto\"}");
     }
     // The ChatGPT Codex endpoint chooses the model's output limit and rejects

@@ -25,6 +25,7 @@ const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_modes = @import("builtins/modes.zig");
 
 const c = @import("node_api");
+const json_encode = @import("core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const max_drain_bytes = 1024 * 1024;
@@ -438,7 +439,7 @@ const FetchBridge = struct {
         };
         var writer: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
         defer writer.deinit();
-        try std.json.Stringify.value(request, .{}, &writer.writer);
+        try json_encode.value(request, .{}, &writer.writer);
         const metadata = writer.writer.buffered();
         // The body travels raw beside its metadata, and both share one budget.
         if (metadata.len > max_fetch_request_bytes - body.len) return error.HostStreamBackpressure;

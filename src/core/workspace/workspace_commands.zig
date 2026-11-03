@@ -2,6 +2,7 @@ const std = @import("std");
 const config_runtime = @import("../config/config_runtime.zig");
 const io_mod = @import("../shared/io.zig");
 const workspace_access = @import("workspace_access.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -743,11 +744,11 @@ fn writeWorkspaceDirectoriesFixture(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"workspaces\":{");
-    try std.json.Stringify.value(workspace_root, .{}, &out.writer);
+    try json_encode.value(workspace_root, .{}, &out.writer);
     try out.writer.writeAll(":{\"additional_directories\":[");
     for (directories, 0..) |directory, index| {
         if (index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(directory, .{}, &out.writer);
+        try json_encode.value(directory, .{}, &out.writer);
     }
     try out.writer.writeAll("]}}}\n");
     try writeFixtureFile(dir, sub_path, out.written());

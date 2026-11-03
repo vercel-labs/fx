@@ -7,6 +7,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -137,7 +138,7 @@ pub fn respond(
     try out.writer.writeByte('{');
     for (requests, responses, 0..) |request, response, index| {
         if (index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(request.key, .{}, &out.writer);
+        try json_encode.value(request.key, .{}, &out.writer);
         try out.writer.writeByte(':');
         try out.writer.writeAll(response);
     }
@@ -690,7 +691,7 @@ fn answerMultiSelect(
     try out.writer.writeByte('[');
     for (selected.items, 0..) |value, index| {
         if (index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(value, .{}, &out.writer);
+        try json_encode.value(value, .{}, &out.writer);
     }
     try out.writer.writeByte(']');
     return .{ .value = try out.toOwnedSlice() };
@@ -794,7 +795,7 @@ fn buildAcceptedFormResponse(alloc: Allocator, values: []const FieldValue) Error
     for (values) |value| {
         const json = value.json orelse continue;
         if (wrote) try out.writer.writeByte(',');
-        try std.json.Stringify.value(value.name, .{}, &out.writer);
+        try json_encode.value(value.name, .{}, &out.writer);
         try out.writer.writeByte(':');
         try out.writer.writeAll(json);
         wrote = true;
@@ -840,7 +841,7 @@ fn buildReviewQuestion(
 fn stringifyString(alloc: Allocator, value: []const u8) Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    try std.json.Stringify.value(value, .{}, &out.writer);
+    try json_encode.value(value, .{}, &out.writer);
     return out.toOwnedSlice();
 }
 
@@ -1057,7 +1058,7 @@ fn renderUniformResponses(
     try out.writer.writeByte('{');
     for (requests, 0..) |request, index| {
         if (index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(request.key, .{}, &out.writer);
+        try json_encode.value(request.key, .{}, &out.writer);
         try out.writer.writeAll(switch (action) {
             .accept => ":{\"action\":\"accept\"}",
             .cancel => ":{\"action\":\"cancel\"}",

@@ -53,6 +53,7 @@ const session_codec = @import("../../session/session_codec.zig");
 const image_data = @import("../../images/image_data.zig");
 const checkpoint_codec = @import("checkpoint.zig");
 const compactor = @import("../../compactor/compactor.zig");
+const json_encode = @import("../../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -217,15 +218,15 @@ pub const Cursor = struct {
                 }
                 if (progress.placed.len > 0) {
                     try writer.writeAll(",\"inputs\":");
-                    try std.json.Stringify.value(progress.placed, .{}, writer);
+                    try json_encode.value(progress.placed, .{}, writer);
                 }
                 if (progress.model) |model| {
                     try writer.writeAll(",\"model\":");
-                    try std.json.Stringify.value(model, .{}, writer);
+                    try json_encode.value(model, .{}, writer);
                 }
                 if (progress.turn_id) |id| {
                     try writer.writeAll(",\"turnId\":");
-                    try std.json.Stringify.value(id, .{}, writer);
+                    try json_encode.value(id, .{}, writer);
                 }
             },
             .tool_intent => |calls| {
@@ -247,20 +248,20 @@ pub const Cursor = struct {
             },
             .input_accepted => |input| {
                 try writer.writeAll(",\"data\":");
-                try std.json.Stringify.value(.{ .id = input.id, .kind = @tagName(input.kind), .text = input.text }, .{}, writer);
+                try json_encode.value(.{ .id = input.id, .kind = @tagName(input.kind), .text = input.text }, .{}, writer);
             },
             .input_withdrawn => |id| {
                 try writer.writeAll(",\"data\":");
-                try std.json.Stringify.value(.{ .id = id }, .{}, writer);
+                try json_encode.value(.{ .id = id }, .{}, writer);
             },
             .turn_yielded => {},
             .tool_result => |result| {
                 try writer.writeAll(",\"data\":{\"id\":");
-                try std.json.Stringify.value(result.id, .{}, writer);
+                try json_encode.value(result.id, .{}, writer);
                 try writer.writeAll(",\"name\":");
-                try std.json.Stringify.value(result.name, .{}, writer);
+                try json_encode.value(result.name, .{}, writer);
                 try writer.print(",\"status\":\"{s}\",\"output\":", .{if (result.failed) "failure" else "success"});
-                try std.json.Stringify.value(result.output, .{}, writer);
+                try json_encode.value(result.output, .{}, writer);
                 if (result.images.len > 0) {
                     try writer.writeAll(",\"images\":");
                     try session_codec.writeToolImages(writer, result.images, stored != null);
@@ -470,7 +471,7 @@ fn writeOpenTurnWith(
     if (turn_id) |id| {
         std.debug.assert(id.len > 0 and id.len <= max_turn_id_bytes);
         try writer.writeAll("\"turnId\":");
-        try std.json.Stringify.value(id, .{}, writer);
+        try json_encode.value(id, .{}, writer);
         try writer.writeByte(',');
     }
     try writer.writeAll("\"progress\":");

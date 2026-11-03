@@ -31,6 +31,7 @@ const cache_warmer = @import("../cache_warmer.zig");
 
 const test_support = @import("support.zig");
 const text_utils = @import("../../../shared/text_utils.zig");
+const json_encode = @import("../../../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const HistoryTurn = types.HistoryTurn;
@@ -615,7 +616,7 @@ fn denseVisionProviderResult(alloc: Allocator) ![]u8 {
         try out.writer.print("\"visible item {d}\"", .{index});
     }
     try out.writer.writeAll("],\"details\":[]},{\"image_id\":2,\"status\":\"ok\",\"summary\":");
-    try std.json.Stringify.value(long_summary, .{}, &out.writer);
+    try json_encode.value(long_summary, .{}, &out.writer);
     try out.writer.writeAll(",\"visible_text\":[],\"details\":[]}]}");
     return out.toOwnedSlice();
 }

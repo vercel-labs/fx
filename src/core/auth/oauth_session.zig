@@ -10,6 +10,7 @@ const profile_paths = @import("../shared/profile_paths.zig");
 const js_host_auth = @import("js_host_auth.zig");
 const secret = @import("secret.zig");
 const session_presence = @import("session_presence.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -910,9 +911,9 @@ pub fn stringify(alloc: Allocator, session: Session) ![]u8 {
 
 fn writeField(writer: *std.Io.Writer, name: []const u8, value: []const u8) !void {
     try writer.writeAll(",");
-    try std.json.Stringify.value(name, .{}, writer);
+    try json_encode.value(name, .{}, writer);
     try writer.writeAll(":");
-    try std.json.Stringify.value(value, .{}, writer);
+    try json_encode.value(value, .{}, writer);
 }
 
 fn dupeRequiredString(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) ![]u8 {

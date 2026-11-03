@@ -4,6 +4,7 @@ const json_number = @import("../json_number.zig");
 const mcp_contract = @import("../mcp_contract.zig");
 const mrtr = @import("../mrtr.zig");
 const mem_utils = @import("../../shared/mem_utils.zig");
+const json_encode = @import("../../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -452,7 +453,7 @@ fn optionalBoundedString(object: std.json.ObjectMap, name: []const u8, max_bytes
 
 fn boundedJsonLength(value: std.json.Value, max_bytes: usize) Error!usize {
     var counter: std.Io.Writer.Discarding = .init(&.{});
-    std.json.Stringify.value(value, .{}, &counter.writer) catch return error.MetadataLimitExceeded;
+    json_encode.value(value, .{}, &counter.writer) catch return error.MetadataLimitExceeded;
     if (counter.fullCount() > max_bytes) return error.MetadataLimitExceeded;
     return @intCast(counter.fullCount());
 }
@@ -460,7 +461,7 @@ fn boundedJsonLength(value: std.json.Value, max_bytes: usize) Error!usize {
 fn stringifyValueAlloc(alloc: Allocator, value: std.json.Value, max_bytes: usize) Error![]u8 {
     var output: std.Io.Writer.Allocating = .init(alloc);
     defer output.deinit();
-    std.json.Stringify.value(value, .{}, &output.writer) catch |err| switch (err) {
+    json_encode.value(value, .{}, &output.writer) catch |err| switch (err) {
         error.WriteFailed => return error.OutOfMemory,
     };
     if (output.writer.buffered().len > max_bytes) return error.MetadataLimitExceeded;

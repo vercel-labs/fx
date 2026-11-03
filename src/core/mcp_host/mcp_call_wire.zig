@@ -19,6 +19,7 @@
 const std = @import("std");
 const capability_mod = @import("../tooling/mcp_call_capability.zig");
 const mcp_call = @import("mcp_call.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -102,7 +103,7 @@ pub fn parseRequest(arena: Allocator, line: []const u8) RequestError!Request {
             const arguments = object.get("arguments") orelse return error.MalformedRequest;
             if (arguments != .object) return error.MalformedRequest;
             var out: std.Io.Writer.Allocating = .init(arena);
-            std.json.Stringify.value(arguments, .{}, &out.writer) catch return error.OutOfMemory;
+            json_encode.value(arguments, .{}, &out.writer) catch return error.OutOfMemory;
             break :blk .{ .call = .{ .tool = try nonEmptyString(object, "tool"), .arguments_json = out.written() } };
         },
         .list => .{ .list = try nonEmptyString(object, "server") },
@@ -129,7 +130,7 @@ pub fn writeRequest(writer: *std.Io.Writer, token: mcp_call.Token, operation: Op
     switch (operation) {
         .call => |value| {
             try writer.writeAll(",\"tool\":");
-            try std.json.Stringify.value(value.tool, .{}, writer);
+            try json_encode.value(value.tool, .{}, writer);
             try writer.writeAll(",\"arguments\":");
             try writer.writeAll(value.arguments_json);
         },
@@ -142,7 +143,7 @@ pub fn writeRequest(writer: *std.Io.Writer, token: mcp_call.Token, operation: Op
 
 fn writeField(writer: *std.Io.Writer, comptime key: []const u8, text: []const u8) std.Io.Writer.Error!void {
     try writer.writeAll(",\"" ++ key ++ "\":");
-    try std.json.Stringify.value(text, .{}, writer);
+    try json_encode.value(text, .{}, writer);
 }
 
 pub const Status = enum { ok, tool_error, failed, denied, refused };

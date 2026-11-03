@@ -9,6 +9,7 @@ const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_result_limits = @import("../../core/tooling/tool_result_limits.zig");
 const context_limits = @import("../../core/config/context_limits.zig");
 const io_mod = @import("../../core/shared/io.zig");
+const json_encode = @import("../../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -319,7 +320,7 @@ test "skill preparation binds retained aliases and canonical paths before readin
     const diagnostics = [_]skill_contract.SkillDiagnostic{.{ .path = "/malformed", .source = .global_fx, .scope = .candidate, .cause = .{ .invalid_metadata = .missing_name } }};
     const locations: skill_contract.Locations = .{ .namespace = 7, .roots = &.{skills_dir}, .skills = &skills, .diagnostics = &diagnostics };
     for ([_][]const u8{ "skill:0000000000000007:0/workflow", path }) |location| {
-        const args = try std.json.Stringify.valueAlloc(alloc, .{ .location = location }, .{});
+        const args = try json_encode.valueAlloc(alloc, .{ .location = location }, .{});
         defer alloc.free(args);
         var ctx: tool_dispatch.DispatchContext = .{ .allocator = alloc, .workspace_root = root, .skills_dir = skills_dir, .skill_locations = &locations };
         const preparation = try prepare(ctx, args);
@@ -366,7 +367,7 @@ test "skill preparation discovers canonical locations added after the catalog" {
     defer alloc.free(managed);
     const path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "managed/new-directory");
     defer alloc.free(path);
-    const args = try std.json.Stringify.valueAlloc(alloc, .{ .location = path }, .{});
+    const args = try json_encode.valueAlloc(alloc, .{ .location = path }, .{});
     defer alloc.free(args);
     const empty_catalog: skill_contract.Locations = .{ .namespace = 3 };
     const preparation = try prepare(.{ .allocator = alloc, .workspace_root = root, .skills_dir = managed, .skill_locations = &empty_catalog }, args);

@@ -24,6 +24,7 @@ const loopback = @import("login.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const json_decode = @import("../shared/json_decode.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const engine = mcp.engine;
@@ -2321,7 +2322,7 @@ fn inputValues(a: Allocator, json: []const u8, keys: []const []const u8) ?[]cons
     for (keys, values) |token, *value| {
         const key = json_decode.parseFromSliceLeaky([]const u8, a, token, .{}) catch return null;
         const answer = answers.object.get(key) orelse return null;
-        value.* = std.json.Stringify.valueAlloc(a, answer, .{}) catch return null;
+        value.* = json_encode.valueAlloc(a, answer, .{}) catch return null;
     }
     return values;
 }
@@ -2357,7 +2358,7 @@ fn elicitAnswer(a: Allocator, json: ?[]const u8) ?mcp.elicitation.Answer {
     const action_value = reply.object.get("action") orelse return null;
     if (action_value != .string) return null;
     const action = std.meta.stringToEnum(@FieldType(mcp.elicitation.Answer, "action"), action_value.string) orelse return null;
-    const content = if (reply.object.get("content")) |c| std.json.Stringify.valueAlloc(a, c, .{}) catch return null else null;
+    const content = if (reply.object.get("content")) |c| json_encode.valueAlloc(a, c, .{}) catch return null else null;
     return .{ .action = action, .content = content };
 }
 

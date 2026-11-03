@@ -68,6 +68,7 @@ const usage = @import("../../usage/usage.zig");
 const usage_host = @import("../app/usage_host.zig");
 
 const slack_install = @import("../slack/install.zig");
+const json_encode = @import("../shared/json_encode.zig");
 const Allocator = std.mem.Allocator;
 const CommandCatalog = command_specs.TopLevelRegistry;
 const TopLevelKind = command_specs.TopLevelKind;
@@ -3021,9 +3022,9 @@ fn writeWorkspaceCommandError(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"kind\":\"workspace\",\"error\":");
-    try std.json.Stringify.value(message, .{}, &out.writer);
+    try json_encode.value(message, .{}, &out.writer);
     try out.writer.writeAll(",\"code\":");
-    try std.json.Stringify.value(@errorName(err), .{}, &out.writer);
+    try json_encode.value(@errorName(err), .{}, &out.writer);
     try out.writer.writeByte('}');
     try writeJsonLine(deps, out.writer.buffered());
 }
@@ -3049,7 +3050,7 @@ fn writeWorkspaceIndeterminateError(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"kind\":\"workspace\",\"error\":");
-    try std.json.Stringify.value(message, .{}, &out.writer);
+    try json_encode.value(message, .{}, &out.writer);
     try out.writer.writeAll(",\"code\":\"SettingsCommitIndeterminate\"}");
     try writeJsonLine(deps, out.writer.buffered());
 }

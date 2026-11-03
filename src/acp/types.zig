@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 const jsonrpc = @import("jsonrpc.zig");
 const core_types = @import("../core/shared/types.zig");
 const io_mod = @import("../core/shared/io.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const writeJsonStr = jsonrpc.writeJsonStr;
@@ -230,7 +231,7 @@ pub fn writeToolCall(
     try writeJsonStr(status.jsonString(), w);
     if (raw_input) |value| {
         try w.writeAll(",\"rawInput\":");
-        try std.json.Stringify.value(value, .{}, w);
+        try json_encode.value(value, .{}, w);
     }
     try writeToolCallMeta(w, meta);
     try w.writeAll("}");

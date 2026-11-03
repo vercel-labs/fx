@@ -20,6 +20,7 @@ const user_message_card = @import("assistant/user_message_card.zig");
 const ui_render = @import("render.zig");
 const types = @import("../core/shared/types.zig");
 const vt_emulator = @import("../core/terminal/engine.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -6650,7 +6651,7 @@ fn appendFullSemanticArguments(
             var fallback: std.Io.Writer.Allocating = .init(alloc);
             defer fallback.deinit();
             try fallback.writer.writeAll("arguments: ");
-            try std.json.Stringify.value(parsed.value, .{}, &fallback.writer);
+            try json_encode.value(parsed.value, .{}, &fallback.writer);
             try appendTerminalSafeToolOutputInterruptible(
                 writer,
                 alloc,
@@ -6683,7 +6684,7 @@ fn appendFullSemanticArguments(
         try line.writer.print("{s}: ", .{entry.key_ptr.*});
         switch (value) {
             .string => |text| try line.writer.writeAll(text),
-            else => try std.json.Stringify.value(value, .{}, &line.writer),
+            else => try json_encode.value(value, .{}, &line.writer),
         }
         try appendTerminalSafeToolOutputInterruptible(
             writer,

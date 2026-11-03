@@ -12,6 +12,7 @@ const std = @import("std");
 const model_context_encoding = @import("../shared/model_context_encoding.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const tool_args = @import("../tooling/tool_args.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
@@ -182,7 +183,7 @@ fn writeKey(arena: Allocator, out: *Writer, key: []const u8) WriteError!void {
     } else true;
     if (plain) return out.writeAll(key);
     const safe = try text_utils.encodeTerminalSafeInline(arena, key, 128);
-    try std.json.Stringify.value(safe.bytes, .{}, out);
+    try json_encode.value(safe.bytes, .{}, out);
 }
 
 /// A JSON Schema as a short type: `string`, `"a" | "b"`, `number[]`,
@@ -272,7 +273,7 @@ fn writeNamedType(arena: Allocator, out: *Writer, object: std.json.ObjectMap, na
 fn writeLiteral(arena: Allocator, out: *Writer, literal: std.json.Value) WriteError!void {
     var buffer: [max_literal_bytes * 2]u8 = undefined;
     var json: Writer = .fixed(&buffer);
-    std.json.Stringify.value(literal, .{}, &json) catch {};
+    json_encode.value(literal, .{}, &json) catch {};
     const text = json.buffered();
     if (text.len == 0) return out.writeAll("any");
     try writeSafe(arena, out, text, max_literal_bytes);
@@ -439,7 +440,7 @@ test "text the search encoded for the model reads plainly, and stays terminal-sa
     const description = try model_context_encoding.scalarAlloc(arena, "Ask about a repo\nand get an answer & \"more\" <here>\x1b[2J.");
     var page: Writer.Allocating = .init(arena);
     try page.writer.writeAll("{\"tools\":[{\"name\":\"mcp_deepwiki_ask_wiki_question\",\"description\":");
-    try std.json.Stringify.value(description, .{}, &page.writer);
+    try json_encode.value(description, .{}, &page.writer);
     try page.writer.writeAll("}],\"count\":1}");
     var out: Writer.Allocating = .init(arena);
     _ = try writeToolLines(arena, &out.writer, page.written());
@@ -448,7 +449,7 @@ test "text the search encoded for the model reads plainly, and stays terminal-sa
     const reason = try model_context_encoding.scalarAlloc(arena, "MCP server 'say \"hi\"' is unavailable:\n\x1b]52;c;x\x07 it exited");
     var empty: Writer.Allocating = .init(arena);
     try empty.writer.writeAll("{\"tools\":[],\"count\":0,\"unavailable\":[");
-    try std.json.Stringify.value(reason, .{}, &empty.writer);
+    try json_encode.value(reason, .{}, &empty.writer);
     try empty.writer.writeAll("]}");
     var none: Writer.Allocating = .init(arena);
     const result = try writeToolLines(arena, &none.writer, empty.written());
@@ -465,7 +466,7 @@ test "help decodes the description and server instructions, not the arguments" {
     const merged = try arena.print("{s}\n\nServer instructions: {s}", .{ encoded_description, encoded_instructions });
     var schema: Writer.Allocating = .init(arena);
     try schema.writer.writeAll("{\"name\":\"mcp_context7_resolve-library-id\",\"description\":");
-    try std.json.Stringify.value(merged, .{}, &schema.writer);
+    try json_encode.value(merged, .{}, &schema.writer);
     try schema.writer.writeAll(",\"inputSchema\":{\"type\":\"object\",\"required\":[\"query\"],\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Use 'Next.js' &amp; not \\\"nextjs\\\"\"}}}}");
     var out: Writer.Allocating = .init(arena);
     try writeHelp(arena, &out.writer, schema.written());

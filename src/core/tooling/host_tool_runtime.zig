@@ -4,6 +4,7 @@ const mem_utils = @import("../shared/mem_utils.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_set = @import("tool_set.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -108,7 +109,7 @@ pub const Runtime = struct {
             const description = try alloc.dupe(u8, description_value.string);
             var schema_out: std.Io.Writer.Allocating = .init(alloc);
             defer schema_out.deinit();
-            std.json.Stringify.value(schema_value, .{}, &schema_out.writer) catch
+            json_encode.value(schema_value, .{}, &schema_out.writer) catch
                 return error.OutOfMemory;
             if (schema_out.written().len > max_schema_bytes) {
                 return error.HostToolSchemaTooLarge;

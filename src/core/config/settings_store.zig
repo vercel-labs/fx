@@ -14,6 +14,7 @@ const sort_utils = @import("../shared/sort_utils.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const settings_keys = @import("settings_keys.zig");
 const theme_mod = @import("../shared/theme.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
@@ -1936,7 +1937,7 @@ test "configured model preference keys survive their producer frame" {
     Producer.overwrite_stack();
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    try std.json.Stringify.value(std.json.Value{ .object = root }, .{}, &output.writer);
+    try json_encode.value(std.json.Value{ .object = root }, .{}, &output.writer);
     try std.testing.expectEqualStrings("{\"models\":{\"workspace-only-connection\":\"opaque-model\"}}", output.written());
 }
 
@@ -2093,7 +2094,7 @@ fn writeJsonValue(writer: anytype, value: std.json.Value) !void {
         .bool => |boolean| try writer.writeAll(if (boolean) "true" else "false"),
         .integer => |integer| try writer.print("{d}", .{integer}),
         .float => |float| try writer.print("{d}", .{float}),
-        .string => |string| try std.json.Stringify.value(string, .{}, writer),
+        .string => |string| try json_encode.value(string, .{}, writer),
         .array => |array| {
             try writer.writeByte('[');
             for (array.items, 0..) |item, index| {
@@ -2109,7 +2110,7 @@ fn writeJsonValue(writer: anytype, value: std.json.Value) !void {
             while (it.next()) |entry| {
                 if (!first) try writer.writeByte(',');
                 first = false;
-                try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
+                try json_encode.value(entry.key_ptr.*, .{}, writer);
                 try writer.writeByte(':');
                 try writeJsonValue(writer, entry.value_ptr.*);
             }
@@ -4486,11 +4487,11 @@ test "workspace directory capacity compaction uses observed source identities" {
     var fixture: std.Io.Writer.Allocating = .init(alloc);
     defer fixture.deinit();
     try fixture.writer.writeAll("{\"workspaces\":{");
-    try std.json.Stringify.value(primary, .{}, &fixture.writer);
+    try json_encode.value(primary, .{}, &fixture.writer);
     try fixture.writer.writeAll(":{\"additional_directories\":[");
     for (aliases, 0..) |alias, index| {
         if (index > 0) try fixture.writer.writeByte(',');
-        try std.json.Stringify.value(alias, .{}, &fixture.writer);
+        try json_encode.value(alias, .{}, &fixture.writer);
     }
     try fixture.writer.writeAll("]}}}\n");
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture.written());
@@ -4558,11 +4559,11 @@ test "workspace directory add compacts saved aliases before applying effective c
     var fixture: std.Io.Writer.Allocating = .init(alloc);
     defer fixture.deinit();
     try fixture.writer.writeAll("{\"workspaces\":{");
-    try std.json.Stringify.value(primary, .{}, &fixture.writer);
+    try json_encode.value(primary, .{}, &fixture.writer);
     try fixture.writer.writeAll(":{\"additional_directories\":[");
     for (aliases, 0..) |alias, index| {
         if (index > 0) try fixture.writer.writeByte(',');
-        try std.json.Stringify.value(alias, .{}, &fixture.writer);
+        try json_encode.value(alias, .{}, &fixture.writer);
     }
     try fixture.writer.writeAll("]}}}\n");
     try writeStoreFixture(tmp.dir, "home/.fx/settings.json", fixture.written());

@@ -6,6 +6,7 @@ const vercel_protocol = @import("vercel_protocol.zig");
 const vercel_failure_diagnostics = @import("vercel_failure_diagnostics.zig");
 const chat_completions_protocol = @import("chat_completions_protocol.zig");
 const credential_authority = @import("../core/auth/credential_authority.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const max_error_body_bytes = 1024 * 1024;
@@ -226,7 +227,7 @@ pub fn openPost(
 ) !OpenedPost {
     var headers_json: std.Io.Writer.Allocating = .init(alloc);
     defer headers_json.deinit();
-    try std.json.Stringify.value(headers, .{}, &headers_json.writer);
+    try json_encode.value(headers, .{}, &headers_json.writer);
 
     try request.admission.admit();
     request.delivery.markPossiblySent();
@@ -271,7 +272,7 @@ pub fn get(
 ) !GetResponse {
     var headers_json: std.Io.Writer.Allocating = .init(alloc);
     defer headers_json.deinit();
-    try std.json.Stringify.value(headers, .{}, &headers_json.writer);
+    try json_encode.value(headers, .{}, &headers_json.writer);
 
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     const handle = try transport.open("GET", url, headers_json.writer.buffered(), "");

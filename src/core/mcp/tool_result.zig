@@ -12,6 +12,7 @@ const tools_feature = @import("features/tools.zig");
 const tool_content = @import("../tooling/tool_content.zig");
 const image_data = @import("../images/image_data.zig");
 const types = @import("../shared/types.zig");
+const json_encode = @import("../shared/json_encode.zig");
 const Allocator = std.mem.Allocator;
 
 pub const ExtractOptions = struct {
@@ -320,9 +321,9 @@ fn write_envelope(
     result: std.json.Value,
 ) !void {
     try writer.writeAll("{\"server\":");
-    try std.json.Stringify.value(server_name, .{}, writer);
+    try json_encode.value(server_name, .{}, writer);
     try writer.writeAll(",\"tool\":");
-    try std.json.Stringify.value(tool_name, .{}, writer);
+    try json_encode.value(tool_name, .{}, writer);
     try writer.writeAll(",\"result\":");
     try writeJsonProjection(alloc, writer, result, false);
     try writer.writeByte('}');
@@ -338,14 +339,14 @@ fn writeJsonProjection(
     comptime mask_strings: bool,
 ) !void {
     switch (value) {
-        .null, .bool, .integer, .float, .number_string => try std.json.Stringify.value(value, .{}, writer),
+        .null, .bool, .integer, .float, .number_string => try json_encode.value(value, .{}, writer),
         .string => |text| {
             const sanitized = try text_utils.sanitizeModelText(alloc, text);
             const projected = if (mask_strings)
                 try text_utils.maskSecrets(alloc, sanitized)
             else
                 sanitized;
-            try std.json.Stringify.value(projected, .{}, writer);
+            try json_encode.value(projected, .{}, writer);
         },
         .array => |array| {
             try writer.writeByte('[');
@@ -361,7 +362,7 @@ fn writeJsonProjection(
             var index: usize = 0;
             while (it.next()) |entry| : (index += 1) {
                 if (index > 0) try writer.writeByte(',');
-                try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
+                try json_encode.value(entry.key_ptr.*, .{}, writer);
                 try writer.writeByte(':');
                 try writeJsonProjection(alloc, writer, entry.value_ptr.*, mask_strings);
             }
@@ -424,11 +425,11 @@ fn build_truncated_envelope(
 ) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     try out.writer.writeAll("{\"server\":");
-    try std.json.Stringify.value(server_name, .{}, &out.writer);
+    try json_encode.value(server_name, .{}, &out.writer);
     try out.writer.writeAll(",\"tool\":");
-    try std.json.Stringify.value(tool_name, .{}, &out.writer);
+    try json_encode.value(tool_name, .{}, &out.writer);
     try out.writer.writeAll(",\"result\":{\"content\":[{\"type\":\"text\",\"text\":");
-    try std.json.Stringify.value(text, .{}, &out.writer);
+    try json_encode.value(text, .{}, &out.writer);
     try out.writer.writeAll("}],\"truncated\":true,\"original_bytes\":");
     try out.writer.print("{d}", .{original_bytes});
     try out.writer.writeAll(",\"cap_bytes\":");

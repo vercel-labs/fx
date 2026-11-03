@@ -21,6 +21,7 @@ const io_mod = @import("../shared/io.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1723,7 +1724,7 @@ const Session = struct {
 
         var config_output: std.Io.Writer.Allocating = .init(self.alloc);
         defer config_output.deinit();
-        try std.json.Stringify.value(LauncherConfig{
+        try json_encode.value(LauncherConfig{
             .argv = invocation.argv(),
             .cwd = request.cwd,
             .dimensions = self.dimensions,

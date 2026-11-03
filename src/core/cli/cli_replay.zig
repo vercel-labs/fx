@@ -11,6 +11,7 @@ const io_mod = @import("../shared/io.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const record_tape = @import("../workspace/record_tape.zig");
 const vt_emulator = @import("../terminal/engine.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -114,7 +115,7 @@ fn runWithOutput(alloc: Allocator, args: []const [:0]const u8, output: anytype) 
             "{{\"cols\":{d},\"rows\":{d},\"epoch_ms\":{d},\"version\":",
             .{ parser.header.cols, parser.header.rows, parser.header.epoch_ms },
         );
-        try std.json.Stringify.value(parser.header.version, .{}, &summary.writer);
+        try json_encode.value(parser.header.version, .{}, &summary.writer);
         try summary.writer.writeAll(",\"frames\":[");
     }
 
@@ -166,7 +167,7 @@ fn runWithOutput(alloc: Allocator, args: []const [:0]const u8, output: anytype) 
             if (!first_json_frame) try summary.writer.writeAll(",");
             first_json_frame = false;
             try summary.writer.print("{{\"delta_ms\":{d},\"kind\":", .{frame.delta_ms});
-            try std.json.Stringify.value(frameKindName(frame.kind), .{}, &summary.writer);
+            try json_encode.value(frameKindName(frame.kind), .{}, &summary.writer);
             try summary.writer.print(",\"len\":{d}}}", .{frame.payload.len});
         }
 
@@ -274,7 +275,7 @@ fn writeFrameArtifacts(
         "{{\"index\":{d},\"delta_ms\":{d},\"elapsed_ms\":{d},\"kind\":",
         .{ index, frame.delta_ms, elapsed_ms },
     );
-    try std.json.Stringify.value(frameKindName(frame.kind), .{}, &out.writer);
+    try json_encode.value(frameKindName(frame.kind), .{}, &out.writer);
     try out.writer.print(
         ",\"payload_len\":{d},\"size\":{{\"cols\":{d},\"rows\":{d}}},\"cursor\":{{\"row\":{d},\"col\":{d},\"visible\":{s}}},\"footer_candidates\":",
         .{
@@ -309,7 +310,7 @@ fn writeFramesManifest(
         "{{\"cols\":{d},\"rows\":{d},\"epoch_ms\":{d},\"version\":",
         .{ header.cols, header.rows, header.epoch_ms },
     );
-    try std.json.Stringify.value(header.version, .{}, &out.writer);
+    try json_encode.value(header.version, .{}, &out.writer);
     try out.writer.print(
         ",\"frame_count\":{d},\"resize_count\":{d},\"stdout_bytes\":{d},\"frames_dir\":\"frames\"}}\n",
         .{ frame_count, resize_count, stdout_bytes },
@@ -354,7 +355,7 @@ fn writeVisibleMarkers(writer: anytype, snapshot: []const u8, markers: []const [
         if (std.mem.find(u8, snapshot, marker) == null) continue;
         if (!first) try writer.writeByte(',');
         first = false;
-        try std.json.Stringify.value(marker, .{}, writer);
+        try json_encode.value(marker, .{}, writer);
     }
     try writer.writeByte(']');
 }

@@ -13,6 +13,7 @@ const mcp_server_instruction_search_bytes = context_limits.Name.mcp_server_instr
 const mcp_tool_description_search_bytes: usize = 2 * 1024;
 const mcp_tool_schema_search_bytes: usize = 4 * 1024;
 const catalog_state = @import("catalog_state.zig");
+const json_encode = @import("../shared/json_encode.zig");
 const McpTool = catalog_state.McpTool;
 
 const server_not_found_output = "{\"tools\":[],\"count\":0,\"total_matches\":0,\"more_available\":false,\"next_cursor\":null,\"state\":\"server_not_found\"}";
@@ -301,13 +302,13 @@ fn renderSearchResult(
         "],\"count\":{d},\"total_matches\":{d},\"more_available\":{s},\"next_cursor\":",
         .{ selected_count, total_matches, if (next_cursor != null) "true" else "false" },
     );
-    try std.json.Stringify.value(next_cursor, .{}, &out.writer);
+    try json_encode.value(next_cursor, .{}, &out.writer);
     if (limit_triggered) {
         try out.writer.print(
             ",\"context_limit\":{{\"name\":\"mcp_search_result_bytes\",\"action\":\"omitted\",\"omitted_count\":{d},\"observed_bytes\":{d},\"effective_bytes\":{d},\"source\":",
             .{ matches.len - selected_count, observed_bytes, result_limit.effectiveBytes() },
         );
-        try std.json.Stringify.value(result_limit.source.label(), .{}, &out.writer);
+        try json_encode.value(result_limit.source.label(), .{}, &out.writer);
         try out.writer.writeAll(",\"override\":\"--context-limit mcp_search_result_bytes=BYTES|off\"}");
     }
     try out.writer.writeByte('}');
@@ -374,7 +375,7 @@ fn writeToolMetadataJson(
     try writer.writeAll(",\"server\":");
     try writeEncodedJsonScalar(alloc, writer, match.server_name);
     try writer.writeAll(",\"description\":");
-    try std.json.Stringify.value(bounded.text, .{}, writer);
+    try json_encode.value(bounded.text, .{}, writer);
     try writer.writeAll(",\"usage\":[");
     for (tool.tags, 0..) |tag, index| {
         if (index > 0) try writer.writeByte(',');
@@ -388,7 +389,7 @@ fn writeToolMetadataJson(
             ",\"context_limit\":{{\"name\":\"mcp_description_bytes\",\"action\":\"truncated\",\"observed_bytes\":{d},\"effective_bytes\":{d},\"source\":",
             .{ bounded.observed_bytes, description_limit.effectiveBytes() },
         );
-        try std.json.Stringify.value(description_limit.source.label(), .{}, writer);
+        try json_encode.value(description_limit.source.label(), .{}, writer);
         try writer.writeAll(",\"override\":\"--context-limit mcp_description_bytes=BYTES|off\"}");
     }
     try writer.writeByte('}');

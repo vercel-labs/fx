@@ -4,6 +4,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const session = @import("session.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -187,16 +188,16 @@ pub fn encodeSidecar(alloc: Allocator, metadata: DisplayMetadata) ![]u8 {
     defer out.deinit();
 
     try out.writer.writeAll("{\"schema_version\":1,\"title\":");
-    try std.json.Stringify.value(metadata.title, .{}, &out.writer);
+    try json_encode.value(metadata.title, .{}, &out.writer);
     try out.writer.writeAll(",\"preview\":");
     if (metadata.preview) |preview| {
-        try std.json.Stringify.value(preview, .{}, &out.writer);
+        try json_encode.value(preview, .{}, &out.writer);
     } else {
         try out.writer.writeAll("null");
     }
     try out.writer.writeAll(",\"origin_workspace_root\":");
     if (metadata.origin_workspace_root) |root| {
-        try std.json.Stringify.value(root, .{}, &out.writer);
+        try json_encode.value(root, .{}, &out.writer);
     } else {
         try out.writer.writeAll("null");
     }

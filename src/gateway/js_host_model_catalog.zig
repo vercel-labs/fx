@@ -2,6 +2,7 @@ const std = @import("std");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const host_stream = @import("host_stream_provider.zig");
 const builtin_gateway = @import("../builtins/gateway.zig");
+const json_encode = @import("../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -55,7 +56,7 @@ fn fetch(
 
     var headers_json: std.Io.Writer.Allocating = .init(alloc);
     defer headers_json.deinit();
-    std.json.Stringify.value(headers.items, .{}, &headers_json.writer) catch return error.OutOfMemory;
+    json_encode.value(headers.items, .{}, &headers_json.writer) catch return error.OutOfMemory;
 
     const response_cap = 4 * 1024 * 1024;
     const response = try alloc.alloc(u8, response_cap);

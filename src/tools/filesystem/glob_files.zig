@@ -9,6 +9,7 @@ const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const tool_files = @import("../../core/workspace/tool_files.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
+const json_encode = @import("../../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -368,10 +369,10 @@ fn globArgsJson(alloc: Allocator, pattern: []const u8, maybe_path: ?[]const u8) 
     defer out.deinit();
 
     try out.writer.writeAll("{\"pattern\":");
-    try std.json.Stringify.value(pattern, .{}, &out.writer);
+    try json_encode.value(pattern, .{}, &out.writer);
     if (maybe_path) |path| {
         try out.writer.writeAll(",\"path\":");
-        try std.json.Stringify.value(path, .{}, &out.writer);
+        try json_encode.value(path, .{}, &out.writer);
     }
     try out.writer.writeByte('}');
     return try out.toOwnedSlice();

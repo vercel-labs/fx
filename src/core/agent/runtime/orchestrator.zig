@@ -74,6 +74,7 @@ const resend_strategy = @import("resend_strategy.zig");
 const runtime_request_recovery = @import("request_recovery.zig");
 const response_language = @import("response_language.zig");
 const tool_mcp_runtime = @import("../../tooling/tool_mcp_runtime.zig");
+const json_encode = @import("../../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -444,7 +445,7 @@ fn projected_read_tool_result_arguments(
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(request, .{}, &out.writer) catch
+    json_encode.value(request, .{}, &out.writer) catch
         return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
@@ -544,7 +545,7 @@ fn projectLegacyTerminalExecArguments(
     }
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(run, .{}, &out.writer) catch
+    json_encode.value(run, .{}, &out.writer) catch
         return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
@@ -900,7 +901,7 @@ fn project_subagent_result_content(
     }
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(compact, .{}, &out.writer) catch return error.OutOfMemory;
+    json_encode.value(compact, .{}, &out.writer) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
 
@@ -1336,7 +1337,7 @@ fn normalized_terminal_request_arguments(
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(args, .{}, &out.writer) catch return error.OutOfMemory;
+    json_encode.value(args, .{}, &out.writer) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
 
@@ -1366,7 +1367,7 @@ fn normalized_subagent_request_arguments(
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(request, .{}, &out.writer) catch return error.OutOfMemory;
+    json_encode.value(request, .{}, &out.writer) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
 

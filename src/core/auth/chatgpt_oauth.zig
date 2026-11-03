@@ -11,6 +11,7 @@ const oauth = @import("oauth.zig");
 const oauth_transport = @import("oauth_transport.zig");
 const secret = @import("secret.zig");
 const types = @import("../shared/types.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const FormBody = oauth.FormBody;
@@ -406,9 +407,9 @@ fn refreshSession(
     var body: std.Io.Writer.Allocating = .init(alloc);
     defer body.deinit();
     try body.writer.writeAll("{\"client_id\":");
-    try std.json.Stringify.value(client_id, .{}, &body.writer);
+    try json_encode.value(client_id, .{}, &body.writer);
     try body.writer.writeAll(",\"grant_type\":\"refresh_token\",\"refresh_token\":");
-    try std.json.Stringify.value(session.refresh_token, .{}, &body.writer);
+    try json_encode.value(session.refresh_token, .{}, &body.writer);
     try body.writer.writeByte('}');
     var token = requestRefreshToken(alloc, transport, body.written()) catch |err| switch (err) {
         error.CredentialRefreshRejected,

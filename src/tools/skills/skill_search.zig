@@ -8,6 +8,7 @@ const skill_runtime = @import("../../core/skills/skill_runtime.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const tool_result_limits = @import("../../core/tooling/tool_result_limits.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
+const json_encode = @import("../../core/shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -166,11 +167,11 @@ fn renderRawSearch(
             description_limit,
         );
         try out.writer.writeAll("{\"name\":");
-        try std.json.Stringify.value(skill.name, .{}, &out.writer);
+        try json_encode.value(skill.name, .{}, &out.writer);
         try out.writer.writeAll(",\"description\":");
-        try std.json.Stringify.value(skill.description[0..description_end], .{}, &out.writer);
+        try json_encode.value(skill.description[0..description_end], .{}, &out.writer);
         try out.writer.writeAll(",\"location\":");
-        try std.json.Stringify.value(skill.path, .{}, &out.writer);
+        try json_encode.value(skill.path, .{}, &out.writer);
         try out.writer.writeByte('}');
     }
     const items_end = out.written().len;
@@ -179,7 +180,7 @@ fn renderRawSearch(
         total_matches,
         if (next_cursor != null) "true" else "false",
     });
-    try std.json.Stringify.value(next_cursor, .{}, &out.writer);
+    try json_encode.value(next_cursor, .{}, &out.writer);
     try out.writer.writeByte('}');
     return .{
         .bytes = try out.toOwnedSlice(),

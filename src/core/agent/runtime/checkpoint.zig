@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("../../shared/types.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const session_codec = @import("../../session/session_codec.zig");
+const json_encode = @import("../../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -74,11 +75,11 @@ pub const Meta = struct {
     /// Writes it as the JSON object `fromJson` reads.
     pub fn writeJson(self: Meta, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.writeAll("{\"libfxVersion\":");
-        try std.json.Stringify.value(self.libfx_version, .{}, writer);
+        try json_encode.value(self.libfx_version, .{}, writer);
         try writer.writeAll(",\"toolSchemaHash\":");
-        try std.json.Stringify.value(self.tool_schema_hash, .{}, writer);
+        try json_encode.value(self.tool_schema_hash, .{}, writer);
         try writer.writeAll(",\"model\":");
-        try std.json.Stringify.value(self.model, .{}, writer);
+        try json_encode.value(self.model, .{}, writer);
         try writer.writeByte('}');
     }
 };
@@ -160,7 +161,7 @@ fn encodeWith(
         }
     }
     json.writer.writeAll("],\"usage\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(usage, .{}, &json.writer) catch return error.OutOfMemory;
+    json_encode.value(usage, .{}, &json.writer) catch return error.OutOfMemory;
     if (!meta.isEmpty()) {
         json.writer.writeAll(",\"meta\":") catch return error.OutOfMemory;
         meta.writeJson(&json.writer) catch return error.OutOfMemory;
@@ -543,7 +544,7 @@ test "kernel checkpoint decodes version 1 checkpoints with base64 images" {
     try payload.writer.writeAll("{\"history\":[");
     try session_codec.writeHistoryTurn(&payload.writer, fixture.history[0]);
     try payload.writer.writeAll("],\"usage\":");
-    try std.json.Stringify.value(types.Usage{}, .{}, &payload.writer);
+    try json_encode.value(types.Usage{}, .{}, &payload.writer);
     try payload.writer.writeByte('}');
 
     const legacy = try alloc.alloc(u8, header_bytes + payload.written().len);

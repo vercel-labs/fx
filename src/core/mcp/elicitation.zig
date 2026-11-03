@@ -2,6 +2,7 @@ const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const json_number = @import("json_number.zig");
 const json_schema_pattern = @import("json_schema_pattern.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -358,7 +359,7 @@ fn renderLegacyUrlRequiredRequestsFallible(
     try out.writer.writeByte('{');
     for (required.requests, 0..) |request, index| {
         if (index > 0) try out.writer.writeByte(',');
-        try std.json.Stringify.value(request.elicitation_id.?, .{}, &out.writer);
+        try json_encode.value(request.elicitation_id.?, .{}, &out.writer);
         try out.writer.writeAll(":{\"method\":\"elicitation/create\",\"params\":");
         try out.writer.writeAll(request.raw_params_json);
         try out.writer.writeByte('}');
@@ -491,13 +492,13 @@ fn projectToAcpCreateParamsFallible(
                 return error.InvalidRequest;
             }
             try out.writer.writeAll("\"sessionId\":");
-            try std.json.Stringify.value(value.session_id, .{}, &out.writer);
+            try json_encode.value(value.session_id, .{}, &out.writer);
             if (value.tool_call_id) |tool_call_id| {
                 if (tool_call_id.len == 0 or tool_call_id.len > limits.max_name_bytes) {
                     return error.InvalidRequest;
                 }
                 try out.writer.writeAll(",\"toolCallId\":");
-                try std.json.Stringify.value(tool_call_id, .{}, &out.writer);
+                try json_encode.value(tool_call_id, .{}, &out.writer);
             }
         },
         .request => |request_id| {
@@ -508,15 +509,15 @@ fn projectToAcpCreateParamsFallible(
                     if (value.len == 0 or value.len > limits.max_name_bytes) {
                         return error.InvalidRequest;
                     }
-                    try std.json.Stringify.value(value, .{}, &out.writer);
+                    try json_encode.value(value, .{}, &out.writer);
                 },
             }
         },
     }
     try out.writer.writeAll(",\"mode\":");
-    try std.json.Stringify.value(@tagName(request.mode), .{}, &out.writer);
+    try json_encode.value(@tagName(request.mode), .{}, &out.writer);
     try out.writer.writeAll(",\"message\":");
-    try std.json.Stringify.value(display_message orelse request.message, .{}, &out.writer);
+    try json_encode.value(display_message orelse request.message, .{}, &out.writer);
     switch (request.mode) {
         .form => {
             const schema = parsed.value.object.get("requestedSchema") orelse return error.InvalidRequest;
@@ -528,16 +529,16 @@ fn projectToAcpCreateParamsFallible(
             const id = url_elicitation_id orelse return error.InvalidRequest;
             if (id.len == 0 or id.len > limits.max_name_bytes) return error.InvalidRequest;
             try out.writer.writeAll(",\"url\":");
-            try std.json.Stringify.value(request.url orelse return error.InvalidRequest, .{}, &out.writer);
+            try json_encode.value(request.url orelse return error.InvalidRequest, .{}, &out.writer);
             try out.writer.writeAll(",\"elicitationId\":");
-            try std.json.Stringify.value(id, .{}, &out.writer);
+            try json_encode.value(id, .{}, &out.writer);
         },
         .unknown => return error.UnsupportedMode,
     }
     if (parsed.value.object.get("_meta")) |metadata| {
         if (metadata != .object) return error.InvalidRequest;
         try out.writer.writeAll(",\"_meta\":");
-        try std.json.Stringify.value(metadata, .{}, &out.writer);
+        try json_encode.value(metadata, .{}, &out.writer);
     }
     try out.writer.writeByte('}');
     if (out.written().len > limits.max_request_bytes) return error.LimitExceeded;
@@ -566,7 +567,7 @@ fn writeAcpSchemaValue(
                     std.mem.eql(u8, entry.key_ptr.*, "enumNames")) continue;
                 if (wrote) try writer.writeByte(',');
                 wrote = true;
-                try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
+                try json_encode.value(entry.key_ptr.*, .{}, writer);
                 try writer.writeByte(':');
                 try writeAcpSchemaValue(writer, entry.value_ptr.*, remaining);
             }
@@ -580,7 +581,7 @@ fn writeAcpSchemaValue(
             }
             try writer.writeByte(']');
         },
-        else => try std.json.Stringify.value(schema, .{}, writer),
+        else => try json_encode.value(schema, .{}, writer),
     }
 }
 
@@ -1196,11 +1197,11 @@ pub fn canonicalResponse(
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     out.writer.writeAll("{\"action\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(@tagName(action), .{}, &out.writer) catch return error.OutOfMemory;
+    json_encode.value(@tagName(action), .{}, &out.writer) catch return error.OutOfMemory;
     if (action == .accept and request.mode == .form) {
         const content = parsed.value.object.get("content") orelse return error.InvalidResponse;
         out.writer.writeAll(",\"content\":") catch return error.OutOfMemory;
-        std.json.Stringify.value(content, .{}, &out.writer) catch return error.OutOfMemory;
+        json_encode.value(content, .{}, &out.writer) catch return error.OutOfMemory;
     }
     out.writer.writeByte('}') catch return error.OutOfMemory;
     if (out.written().len > limits.max_response_bytes) return error.LimitExceeded;
@@ -1569,7 +1570,7 @@ fn copyString(
 fn stringifyBounded(alloc: Allocator, value: std.json.Value, max_bytes: usize) Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(value, .{}, &out.writer) catch return error.OutOfMemory;
+    json_encode.value(value, .{}, &out.writer) catch return error.OutOfMemory;
     if (out.written().len > max_bytes) return error.LimitExceeded;
     return out.toOwnedSlice();
 }

@@ -25,6 +25,7 @@ const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
 const settings_entries = @import("../config/settings_entries.zig");
 const settings_keys = @import("../config/settings_keys.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -56,11 +57,11 @@ pub const CommandFailureSnapshot = struct {
         defer out.deinit();
 
         try out.writer.writeAll("{\"kind\":");
-        try std.json.Stringify.value(self.kind, .{}, &out.writer);
+        try json_encode.value(self.kind, .{}, &out.writer);
         try out.writer.writeAll(",\"error\":");
-        try std.json.Stringify.value(self.message, .{}, &out.writer);
+        try json_encode.value(self.message, .{}, &out.writer);
         try out.writer.writeAll(",\"code\":");
-        try std.json.Stringify.value(self.code, .{}, &out.writer);
+        try json_encode.value(self.code, .{}, &out.writer);
         try out.writer.writeByte('}');
         return try out.toOwnedSlice();
     }
@@ -260,13 +261,13 @@ pub const UsageSnapshot = struct {
             .grok => "grok",
             .member, .api_key => "ai_gateway",
         }});
-        try std.json.Stringify.value(v.period.label(), .{}, &out.writer);
+        try json_encode.value(v.period.label(), .{}, &out.writer);
         try out.writer.writeAll(",\"status\":");
-        try std.json.Stringify.value(@tagName(s.status), .{}, &out.writer);
+        try json_encode.value(@tagName(s.status), .{}, &out.writer);
         try out.writer.writeAll(",\"reason\":");
         switch (s.status) {
-            .failed => |f| try std.json.Stringify.value(@tagName(f), .{}, &out.writer),
-            .unavailable => |u| try std.json.Stringify.value(@tagName(u), .{}, &out.writer),
+            .failed => |f| try json_encode.value(@tagName(f), .{}, &out.writer),
+            .unavailable => |u| try json_encode.value(@tagName(u), .{}, &out.writer),
             .ready, .fetching => try out.writer.writeAll("null"),
         }
         try out.writer.writeAll(",\"fetched_at_ms\":");
@@ -274,7 +275,7 @@ pub const UsageSnapshot = struct {
         try out.writer.writeAll(",\"budget\":");
         if (v.budget) |b| {
             try out.writer.print("{{\"limit\":{d},\"spent\":{d},\"period\":", .{ b.limit, b.spent });
-            try std.json.Stringify.value(@tagName(b.period), .{}, &out.writer);
+            try json_encode.value(@tagName(b.period), .{}, &out.writer);
             try out.writer.writeByte('}');
         } else try out.writer.writeAll("null");
         try out.writer.writeAll(",\"totals\":");
@@ -283,15 +284,15 @@ pub const UsageSnapshot = struct {
         for (v.models, 0..) |model, index| {
             if (index > 0) try out.writer.writeByte(',');
             try out.writer.writeAll("{\"model\":");
-            try std.json.Stringify.value(model.model, .{}, &out.writer);
+            try json_encode.value(model.model, .{}, &out.writer);
             try out.writer.writeAll(",\"totals\":");
             try writeUsageTotalsJson(&out.writer, model.totals);
             try out.writer.writeByte('}');
         }
         try out.writer.writeAll("],\"codex\":");
-        try std.json.Stringify.value(s.codex_usage, .{}, &out.writer);
+        try json_encode.value(s.codex_usage, .{}, &out.writer);
         try out.writer.writeAll(",\"grok\":");
-        try std.json.Stringify.value(s.grok_usage, .{}, &out.writer);
+        try json_encode.value(s.grok_usage, .{}, &out.writer);
         try out.writer.writeByte('}');
         return try out.toOwnedSlice();
     }
@@ -491,20 +492,20 @@ pub const ConfigSnapshot = struct {
         for (self.entries, 0..) |entry, index| {
             if (index > 0) try out.writer.writeByte(',');
             try out.writer.writeAll("{\"key\":");
-            try std.json.Stringify.value(entry.key, .{}, &out.writer);
+            try json_encode.value(entry.key, .{}, &out.writer);
             try out.writer.writeAll(",\"value\":");
-            try std.json.Stringify.value(entry.value, .{}, &out.writer);
+            try json_encode.value(entry.value, .{}, &out.writer);
             try out.writer.print(",\"origin\":\"{s}\"", .{@tagName(entry.origin)});
             if (entry.origin == .env) {
                 try out.writer.writeAll(",\"variable\":");
-                try std.json.Stringify.value(entry.variable.?, .{}, &out.writer);
+                try json_encode.value(entry.variable.?, .{}, &out.writer);
             } else if (entry.origin != .default) {
                 try out.writer.writeAll(",\"file\":");
-                try std.json.Stringify.value(if (entry.origin == .project) ".fx.json" else profile_paths.displayText("~/.fx/settings.json"), .{}, &out.writer);
+                try json_encode.value(if (entry.origin == .project) ".fx.json" else profile_paths.displayText("~/.fx/settings.json"), .{}, &out.writer);
             }
             if (entry.origin == .workspace) {
                 try out.writer.writeAll(",\"workspace\":");
-                try std.json.Stringify.value(self.workspace_root, .{}, &out.writer);
+                try json_encode.value(self.workspace_root, .{}, &out.writer);
             }
             try out.writer.writeByte('}');
         }
@@ -516,11 +517,11 @@ pub const ConfigSnapshot = struct {
             if (unknown.key.parent != null) try out.writer.writeByte('.');
             try std.json.Stringify.encodeJsonStringChars(unknown.key.name, .{}, &out.writer);
             try out.writer.writeAll("\",\"file\":");
-            try std.json.Stringify.value(unknown.file, .{}, &out.writer);
+            try json_encode.value(unknown.file, .{}, &out.writer);
             try out.writer.writeAll(",\"workspace\":");
-            try std.json.Stringify.value(unknown.key.workspace, .{}, &out.writer);
+            try json_encode.value(unknown.key.workspace, .{}, &out.writer);
             try out.writer.writeAll(",\"suggestion\":");
-            try std.json.Stringify.value(unknown.suggestion, .{}, &out.writer);
+            try json_encode.value(unknown.suggestion, .{}, &out.writer);
             try out.writer.writeByte('}');
         }
         try out.writer.writeAll("]}");
@@ -553,11 +554,11 @@ pub const ConfigChangeSnapshot = struct {
             },
             .json => {
                 try out.writer.print("{{\"kind\":\"config\",\"action\":\"{s}\",\"key\":", .{if (self.unset) "unset" else "set"});
-                try std.json.Stringify.value(self.key, .{}, &out.writer);
+                try json_encode.value(self.key, .{}, &out.writer);
                 try out.writer.writeAll(",\"value\":");
-                try std.json.Stringify.value(self.value orelse .null, .{}, &out.writer);
+                try json_encode.value(self.value orelse .null, .{}, &out.writer);
                 try out.writer.print(",\"changed\":{},\"file\":", .{self.changed});
-                try std.json.Stringify.value(profile_paths.displayText("~/.fx/settings.json"), .{}, &out.writer);
+                try json_encode.value(profile_paths.displayText("~/.fx/settings.json"), .{}, &out.writer);
                 try out.writer.writeByte('}');
             },
         }
@@ -578,7 +579,7 @@ fn writeConfigValue(writer: *std.Io.Writer, alloc: Allocator, value: std.json.Va
         .array, .object => {
             var json: std.Io.Writer.Allocating = .init(alloc);
             defer json.deinit();
-            try std.json.Stringify.value(value, .{}, &json.writer);
+            try json_encode.value(value, .{}, &json.writer);
             try writeTerminalSafe(writer, alloc, json.written());
         },
     }
@@ -695,15 +696,15 @@ pub const WorkspaceSnapshot = struct {
         const action = if (self.mutation) |mutation| mutation.action else "list";
         const changed = if (self.mutation) |mutation| mutation.saved_changed or mutation.runtime_changed else false;
         try out.writer.writeAll("{\"kind\":\"workspace\",\"action\":");
-        try std.json.Stringify.value(action, .{}, &out.writer);
+        try json_encode.value(action, .{}, &out.writer);
         try out.writer.print(",\"changed\":{}", .{changed});
         try out.writer.writeAll(",\"primary_directory\":");
-        try std.json.Stringify.value(self.primary_directory, .{}, &out.writer);
+        try json_encode.value(self.primary_directory, .{}, &out.writer);
         try out.writer.print(",\"saved_suppressed\":{},\"limit\":{d}", .{ self.saved_suppressed, workspace_access.max_additional_directories });
         if (self.mutation) |mutation| {
             if (mutation.path) |path| {
                 try out.writer.writeAll(",\"path\":");
-                try std.json.Stringify.value(path, .{}, &out.writer);
+                try json_encode.value(path, .{}, &out.writer);
             }
             try out.writer.print(",\"saved_changed\":{},\"runtime_changed\":{},\"launch_flag_can_restore\":{}", .{
                 mutation.saved_changed,
@@ -715,7 +716,7 @@ pub const WorkspaceSnapshot = struct {
         for (self.additional_directories, 0..) |entry, index| {
             if (index > 0) try out.writer.writeByte(',');
             try out.writer.writeAll("{\"path\":");
-            try std.json.Stringify.value(entry.path, .{}, &out.writer);
+            try json_encode.value(entry.path, .{}, &out.writer);
             try out.writer.print(",\"saved\":{},\"command_line\":{},\"available\":{},\"active\":{}}}", .{
                 entry.saved,
                 entry.command_line,
@@ -814,7 +815,7 @@ pub const McpLocalSnapshot = struct {
         try writer.writeAll("{\"connection_check\":\"not_checked\",\"servers\":[");
         for (self.servers, 0..) |server, index| {
             if (index > 0) try writer.writeByte(',');
-            try std.json.Stringify.value(.{
+            try json_encode.value(.{
                 .name = server.configured_name,
                 .source = server.source,
                 .scope = server.scope,
@@ -828,11 +829,11 @@ pub const McpLocalSnapshot = struct {
         try writer.writeAll("],\"configuration_issues\":[");
         for (self.configuration_issues, 0..) |issue, index| {
             if (index > 0) try writer.writeByte(',');
-            try std.json.Stringify.value(issue.message, .{}, writer);
+            try json_encode.value(issue.message, .{}, writer);
         }
         try writer.writeAll("],\"inspection_error\":");
         if (self.inspection_error) |error_name| {
-            try std.json.Stringify.value(error_name, .{}, writer);
+            try json_encode.value(error_name, .{}, writer);
         } else {
             try writer.writeAll("null");
         }
@@ -1030,39 +1031,39 @@ pub const StatusSnapshot = struct {
 
     pub fn writeJson(self: StatusSnapshot, writer: *std.Io.Writer) !void {
         try writer.writeAll("{\"kind\":\"status\",\"model\":");
-        try std.json.Stringify.value(self.model, .{}, writer);
+        try json_encode.value(self.model, .{}, writer);
         if (self.model_origin) |origin| {
             try writer.writeAll(",\"model_origin\":");
-            try std.json.Stringify.value(origin, .{}, writer);
+            try json_encode.value(origin, .{}, writer);
         }
         if (self.effort) |*effort| {
             try writer.writeAll(",\"effort\":");
-            try std.json.Stringify.value(effort.label(), .{}, writer);
+            try json_encode.value(effort.label(), .{}, writer);
         }
         if (self.provider != .gateway) {
             try writer.writeAll(",\"model_source\":");
-            try std.json.Stringify.value(providerDisplayName(&self.provider), .{}, writer);
+            try json_encode.value(providerDisplayName(&self.provider), .{}, writer);
         }
         if (self.provider_endpoint) |endpoint| {
             try writer.writeAll(",\"provider_endpoint\":");
-            try std.json.Stringify.value(endpoint, .{}, writer);
+            try json_encode.value(endpoint, .{}, writer);
         }
         try writer.writeAll(",\"update_channel\":");
-        try std.json.Stringify.value(self.update_channel, .{}, writer);
+        try json_encode.value(self.update_channel, .{}, writer);
         try writer.writeAll(",\"build_channel\":");
-        try std.json.Stringify.value(self.build_channel, .{}, writer);
+        try json_encode.value(self.build_channel, .{}, writer);
         try writer.writeAll(",\"build_revision\":");
-        try std.json.Stringify.value(self.build_revision, .{}, writer);
+        try json_encode.value(self.build_revision, .{}, writer);
         if (self.mcp_config_error) |error_name| {
             try writer.writeAll(",\"mcp_config_error\":");
-            try std.json.Stringify.value(error_name, .{}, writer);
+            try json_encode.value(error_name, .{}, writer);
         }
         if (self.mcp_config_warning) |warning| {
             try writer.writeAll(",\"mcp_config_warning\":{\"cause\":");
-            try std.json.Stringify.value(@tagName(warning.cause), .{}, writer);
+            try json_encode.value(@tagName(warning.cause), .{}, writer);
             try writer.writeAll(",\"key\":");
             if (warning.key()) |key| {
-                try std.json.Stringify.value(key, .{}, writer);
+                try json_encode.value(key, .{}, writer);
             } else {
                 try writer.writeAll("null");
             }
@@ -1072,27 +1073,27 @@ pub const StatusSnapshot = struct {
             );
         }
         try writer.writeAll(",\"auth\":");
-        try std.json.Stringify.value(self.auth.activeSourceLabel(), .{}, writer);
+        try json_encode.value(self.auth.activeSourceLabel(), .{}, writer);
         if (self.provider != .gateway) {
             try writer.writeAll(",\"connected_providers\":[");
             var wrote_provider = false;
             if (self.provider == .configured and self.auth.active_source == .configured) {
-                try std.json.Stringify.value(self.provider.label(), .{}, writer);
+                try json_encode.value(self.provider.label(), .{}, writer);
                 wrote_provider = true;
             }
             if (gatewayProviderConnected(self.auth)) {
                 if (wrote_provider) try writer.writeByte(',');
-                try std.json.Stringify.value("vercel-ai-gateway", .{}, writer);
+                try json_encode.value("vercel-ai-gateway", .{}, writer);
                 wrote_provider = true;
             }
             if (chatGptProviderConnected(self.auth)) {
                 if (wrote_provider) try writer.writeByte(',');
-                try std.json.Stringify.value("codex", .{}, writer);
+                try json_encode.value("codex", .{}, writer);
                 wrote_provider = true;
             }
             if (grokProviderConnected(self.auth)) {
                 if (wrote_provider) try writer.writeByte(',');
-                try std.json.Stringify.value("grok", .{}, writer);
+                try json_encode.value("grok", .{}, writer);
             }
             try writer.writeByte(']');
         }
@@ -1100,35 +1101,35 @@ pub const StatusSnapshot = struct {
         if (self.auth.expired) try writer.writeAll(",\"auth_expired\":true");
         if (self.auth_help) |help| {
             try writer.writeAll(",\"auth_help\":");
-            try std.json.Stringify.value(help, .{}, writer);
+            try json_encode.value(help, .{}, writer);
         }
         if (self.auth.team) |team| {
             try writer.writeAll(",\"team\":");
-            try std.json.Stringify.value(team, .{}, writer);
+            try json_encode.value(team, .{}, writer);
         }
         try writer.writeAll(",\"permission_mode\":");
-        try std.json.Stringify.value(permissionModeLabel(self.permission_mode), .{}, writer);
+        try json_encode.value(permissionModeLabel(self.permission_mode), .{}, writer);
         if (self.modes) |modes| {
             try writer.writeAll(",\"mode\":");
-            try std.json.Stringify.value(modes.current, .{}, writer);
+            try json_encode.value(modes.current, .{}, writer);
             try writer.writeAll(",\"modes\":[");
             for (modes.all, 0..) |mode, index| {
                 if (index > 0) try writer.writeByte(',');
                 try writer.writeAll("{\"id\":");
-                try std.json.Stringify.value(mode.id, .{}, writer);
+                try json_encode.value(mode.id, .{}, writer);
                 try writer.writeAll(",\"name\":");
-                try std.json.Stringify.value(mode.name, .{}, writer);
+                try json_encode.value(mode.name, .{}, writer);
                 try writer.writeAll(",\"description\":");
-                try std.json.Stringify.value(mode.description, .{}, writer);
+                try json_encode.value(mode.description, .{}, writer);
                 try writer.writeByte('}');
             }
             try writer.writeByte(']');
         }
         try writer.writeAll(",\"workspace\":");
-        try std.json.Stringify.value(self.workspace_root, .{}, writer);
+        try json_encode.value(self.workspace_root, .{}, writer);
         if (self.fx_home) |path| {
             try writer.writeAll(",\"fx_home\":");
-            try std.json.Stringify.value(path, .{}, writer);
+            try json_encode.value(path, .{}, writer);
         }
         try writer.print(",\"history_turns\":{d}", .{self.history_turns});
         try writer.print(",\"session_permission_grants\":{d}", .{self.session_permission_grants});
@@ -1233,7 +1234,7 @@ pub const PermissionsSnapshot = struct {
         defer out.deinit();
 
         try out.writer.writeAll("{\"kind\":\"permissions\",\"mode\":");
-        try std.json.Stringify.value(permissionModeLabel(self.mode), .{}, &out.writer);
+        try json_encode.value(permissionModeLabel(self.mode), .{}, &out.writer);
         try out.writer.print(",\"grant_count\":{d}", .{self.grants.len});
         try out.writer.writeAll(",\"grant_scope\":\"session\"");
         try out.writer.print(",\"runtime_grants_available\":{}", .{self.runtime_grants_available});
@@ -1248,11 +1249,11 @@ pub const PermissionsSnapshot = struct {
             defer alloc.free(display_target);
 
             try out.writer.writeAll("{\"tool_name\":");
-            try std.json.Stringify.value(grant.tool_name, .{}, &out.writer);
+            try json_encode.value(grant.tool_name, .{}, &out.writer);
             try out.writer.writeAll(",\"target_path\":");
-            try std.json.Stringify.value(grant.target_path, .{}, &out.writer);
+            try json_encode.value(grant.target_path, .{}, &out.writer);
             try out.writer.writeAll(",\"display_target\":");
-            try std.json.Stringify.value(display_target, .{}, &out.writer);
+            try json_encode.value(display_target, .{}, &out.writer);
             try out.writer.writeByte('}');
         }
 
@@ -1352,7 +1353,7 @@ pub const ModelListSnapshot = struct {
         );
         for (self.ids[0..shown], 0..) |id, i| {
             if (i > 0) try out.writer.writeByte(',');
-            try std.json.Stringify.value(id, .{}, &out.writer);
+            try json_encode.value(id, .{}, &out.writer);
         }
         const has_details = self.ids.len > 0 and self.details.len == self.ids.len;
         if (self.provider != .gateway or has_details) {
@@ -1360,10 +1361,10 @@ pub const ModelListSnapshot = struct {
             for (self.ids[0..shown], 0..) |id, i| {
                 if (i > 0) try out.writer.writeByte(',');
                 try out.writer.writeAll("{\"id\":");
-                try std.json.Stringify.value(id, .{}, &out.writer);
+                try json_encode.value(id, .{}, &out.writer);
                 if (self.provider != .gateway) {
                     try out.writer.writeAll(",\"source\":");
-                    try std.json.Stringify.value(providerDisplayName(&self.provider), .{}, &out.writer);
+                    try json_encode.value(providerDisplayName(&self.provider), .{}, &out.writer);
                 }
                 if (has_details) try writeModelDetailJson(&out.writer, &self.details[i]);
                 try out.writer.writeByte('}');
@@ -1376,12 +1377,12 @@ pub const ModelListSnapshot = struct {
     fn writeModelDetailJson(w: *std.Io.Writer, detail: *const ModelDetail) !void {
         if (detail.name) |name| {
             try w.writeAll(",\"name\":");
-            try std.json.Stringify.value(name, .{}, w);
+            try json_encode.value(name, .{}, w);
         }
         try w.writeAll(",\"efforts\":[");
         for (detail.efforts.slice(), 0..) |effort, i| {
             if (i > 0) try w.writeByte(',');
-            try std.json.Stringify.value(effort.label(), .{}, w);
+            try json_encode.value(effort.label(), .{}, w);
         }
         try w.print("],\"fast\":{},\"ultrafast\":{}", .{ detail.fast, detail.ultrafast });
     }
@@ -1483,17 +1484,17 @@ pub const SessionListSnapshot = struct {
         }
         if (self.has_more) {
             try out.writer.writeAll(",\"has_more\":true,\"next_cursor\":");
-            try std.json.Stringify.value(self.next_cursor orelse "", .{}, &out.writer);
+            try json_encode.value(self.next_cursor orelse "", .{}, &out.writer);
         }
         try out.writer.writeAll(",\"sessions\":[");
         for (self.sessions, 0..) |entry, i| {
             if (i > 0) try out.writer.writeByte(',');
             try out.writer.writeAll("{\"id\":");
-            try std.json.Stringify.value(entry.id, .{}, &out.writer);
+            try json_encode.value(entry.id, .{}, &out.writer);
             try writeSessionDisplayJsonFields(&out.writer, entry);
             try out.writer.print(",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"history_len\":{d}", .{ entry.created_at_ms, entry.updated_at_ms, entry.history_len });
             try out.writer.writeAll(",\"conversation_language\":");
-            try std.json.Stringify.value(entry.conversation_language.view(), .{}, &out.writer);
+            try json_encode.value(entry.conversation_language.view(), .{}, &out.writer);
             try out.writer.writeByte('}');
         }
         try out.writer.writeAll("]}");
@@ -1589,7 +1590,7 @@ pub const SessionSummarySnapshot = struct {
         defer out.deinit();
 
         try out.writer.writeAll("{\"kind\":\"session_summary\",\"id\":");
-        try std.json.Stringify.value(self.summary.id, .{}, &out.writer);
+        try json_encode.value(self.summary.id, .{}, &out.writer);
         try writeSessionDisplayJsonFields(&out.writer, self.summary);
         try out.writer.print(
             ",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"history_len\":{d},\"conversation_language\":",
@@ -1599,7 +1600,7 @@ pub const SessionSummarySnapshot = struct {
                 self.summary.history_len,
             },
         );
-        try std.json.Stringify.value(
+        try json_encode.value(
             self.summary.conversation_language.view(),
             .{},
             &out.writer,
@@ -1611,26 +1612,26 @@ pub const SessionSummarySnapshot = struct {
 
 fn writeSessionDisplayJsonFields(writer: *std.Io.Writer, summary: session_store.SessionSummary) !void {
     try writer.writeAll(",\"title\":");
-    try std.json.Stringify.value(
+    try json_encode.value(
         summary.title orelse session_display_metadata.fallback_title,
         .{},
         writer,
     );
     try writer.writeAll(",\"preview\":");
     if (summary.preview) |preview| {
-        try std.json.Stringify.value(preview, .{}, writer);
+        try json_encode.value(preview, .{}, writer);
     } else {
         try writer.writeAll("null");
     }
     try writer.writeAll(",\"workspace_root\":");
     if (summary.workspace_root) |workspace_root| {
-        try std.json.Stringify.value(workspace_root, .{}, writer);
+        try json_encode.value(workspace_root, .{}, writer);
     } else {
         try writer.writeAll("null");
     }
     try writer.writeAll(",\"origin_workspace_root\":");
     if (summary.origin_workspace_root) |origin_workspace_root| {
-        try std.json.Stringify.value(origin_workspace_root, .{}, writer);
+        try json_encode.value(origin_workspace_root, .{}, writer);
     } else {
         try writer.writeAll("null");
     }
@@ -1676,10 +1677,10 @@ pub const SessionDetailSnapshot = struct {
 
         const state = self.state;
         try out.writer.writeAll("{\"kind\":\"session_detail\",\"id\":");
-        try std.json.Stringify.value(state.id, .{}, &out.writer);
+        try json_encode.value(state.id, .{}, &out.writer);
         try out.writer.print(",\"created_at_ms\":{d},\"updated_at_ms\":{d},\"history_len\":{d}", .{ state.created_at_ms, state.updated_at_ms, state.history.len });
         try out.writer.writeAll(",\"conversation_language\":");
-        try std.json.Stringify.value(state.conversation_language.view(), .{}, &out.writer);
+        try json_encode.value(state.conversation_language.view(), .{}, &out.writer);
         try out.writer.writeAll(",\"history\":[");
 
         for (state.history, 0..) |turn, i| {
@@ -1737,19 +1738,19 @@ pub const SessionRecoverySnapshot = struct {
         try out.writer.writeAll(
             "{\"kind\":\"session_recovery\",\"source_id\":",
         );
-        try std.json.Stringify.value(
+        try json_encode.value(
             self.result.source_session_id,
             .{},
             &out.writer,
         );
         try out.writer.writeAll(",\"recovered_id\":");
-        try std.json.Stringify.value(
+        try json_encode.value(
             self.result.recovered_session_id,
             .{},
             &out.writer,
         );
         try out.writer.writeAll(",\"status\":");
-        try std.json.Stringify.value(
+        try json_encode.value(
             @tagName(self.result.status),
             .{},
             &out.writer,
@@ -1840,28 +1841,28 @@ pub const SessionConvertSnapshot = struct {
         // A skip fails the command; its error names the first one.
         if (self.skipped.len > 0) {
             try out.writer.writeAll(",\"error\":");
-            try std.json.Stringify.value(self.skipped[0].code, .{}, &out.writer);
+            try json_encode.value(self.skipped[0].code, .{}, &out.writer);
         }
         try out.writer.writeAll(",\"skipped\":[");
         for (self.skipped, 0..) |skipped, index| {
             if (index > 0) try out.writer.writeByte(',');
             try out.writer.writeAll("{\"id\":");
-            try std.json.Stringify.value(skipped.id, .{}, &out.writer);
+            try json_encode.value(skipped.id, .{}, &out.writer);
             try out.writer.writeAll(",\"error\":");
-            try std.json.Stringify.value(skipped.code, .{}, &out.writer);
+            try json_encode.value(skipped.code, .{}, &out.writer);
             if (skipped.reason) |reason| {
                 try out.writer.writeAll(",\"reason\":");
-                try std.json.Stringify.value(reason, .{}, &out.writer);
+                try json_encode.value(reason, .{}, &out.writer);
             }
             try out.writer.writeByte('}');
         }
         try out.writer.writeAll("],\"left_out\":[");
         for (self.left_out, 0..) |left, index| {
             if (index > 0) try out.writer.writeByte(',');
-            try std.json.Stringify.value(left, .{}, &out.writer);
+            try json_encode.value(left, .{}, &out.writer);
         }
         try out.writer.writeAll("],\"kept\":");
-        try std.json.Stringify.value(self.kept, .{}, &out.writer);
+        try json_encode.value(self.kept, .{}, &out.writer);
         try out.writer.writeByte('}');
         return out.toOwnedSlice();
     }
@@ -2002,33 +2003,33 @@ pub const DoctorSnapshot = struct {
             .{ counts.ok, counts.warn, counts.fail },
         );
         try writer.writeAll(",\"workspace\":");
-        try std.json.Stringify.value(self.workspace_root, .{}, writer);
+        try json_encode.value(self.workspace_root, .{}, writer);
         try writer.writeAll(",\"model\":");
-        try std.json.Stringify.value(self.model, .{}, writer);
+        try json_encode.value(self.model, .{}, writer);
         if (self.provider != .gateway) {
             try writer.writeAll(",\"model_source\":");
-            try std.json.Stringify.value(providerDisplayName(&self.provider), .{}, writer);
+            try json_encode.value(providerDisplayName(&self.provider), .{}, writer);
         }
         try writer.writeAll(",\"auth\":");
-        try std.json.Stringify.value(self.auth.activeSourceLabel(), .{}, writer);
+        try json_encode.value(self.auth.activeSourceLabel(), .{}, writer);
         try writer.print(",\"auth_refreshable\":{}", .{self.auth.refreshable()});
         if (self.auth.expired) try writer.writeAll(",\"auth_expired\":true");
         if (self.auth.team) |team| {
             try writer.writeAll(",\"team\":");
-            try std.json.Stringify.value(team, .{}, writer);
+            try json_encode.value(team, .{}, writer);
         }
         try writer.writeAll(",\"permission_mode\":");
-        try std.json.Stringify.value(permissionModeLabel(self.permission_mode), .{}, writer);
+        try json_encode.value(permissionModeLabel(self.permission_mode), .{}, writer);
         try writer.print(",\"agent_step_limit\":{d},\"checks\":[", .{self.agent_step_limit});
 
         for (self.checks, 0..) |entry, i| {
             if (i > 0) try writer.writeByte(',');
             try writer.writeAll("{\"name\":");
-            try std.json.Stringify.value(entry.name, .{}, writer);
+            try json_encode.value(entry.name, .{}, writer);
             try writer.writeAll(",\"status\":");
-            try std.json.Stringify.value(checkStatusLabel(entry.status), .{}, writer);
+            try json_encode.value(checkStatusLabel(entry.status), .{}, writer);
             try writer.writeAll(",\"detail\":");
-            try std.json.Stringify.value(entry.detail, .{}, writer);
+            try json_encode.value(entry.detail, .{}, writer);
             try writer.writeByte('}');
         }
 
@@ -2133,7 +2134,7 @@ pub const CreditsSnapshot = struct {
 
         if (self.err_message) |msg| {
             try out.writer.writeAll(",\"error\":");
-            try std.json.Stringify.value(msg, .{}, &out.writer);
+            try json_encode.value(msg, .{}, &out.writer);
             try out.writer.writeByte('}');
             return try out.toOwnedSlice();
         }
@@ -2143,7 +2144,7 @@ pub const CreditsSnapshot = struct {
             try out.writer.writeAll(pair[0]);
             try out.writer.writeAll("\":");
             if (pair[1]) |val| {
-                try std.json.Stringify.value(val, .{}, &out.writer);
+                try json_encode.value(val, .{}, &out.writer);
             } else {
                 try out.writer.writeAll("null");
             }
@@ -2241,30 +2242,30 @@ pub const UpgradeSnapshot = struct {
 
         if (self.err_message) |msg| {
             try out.writer.writeAll(",\"error\":");
-            try std.json.Stringify.value(msg, .{}, &out.writer);
+            try json_encode.value(msg, .{}, &out.writer);
             try out.writer.writeByte('}');
             return try out.toOwnedSlice();
         }
 
         try out.writer.writeAll(",\"current\":");
-        try std.json.Stringify.value(self.current, .{}, &out.writer);
+        try json_encode.value(self.current, .{}, &out.writer);
         try out.writer.writeAll(",\"latest\":");
-        try std.json.Stringify.value(self.latest, .{}, &out.writer);
+        try json_encode.value(self.latest, .{}, &out.writer);
         if (!std.mem.eql(u8, self.channel, "stable") or
             !std.mem.eql(u8, self.current_channel, "stable") or
             self.latest_revision.len > 0)
         {
             try out.writer.writeAll(",\"channel\":");
-            try std.json.Stringify.value(self.channel, .{}, &out.writer);
+            try json_encode.value(self.channel, .{}, &out.writer);
             try out.writer.writeAll(",\"current_channel\":");
-            try std.json.Stringify.value(self.current_channel, .{}, &out.writer);
+            try json_encode.value(self.current_channel, .{}, &out.writer);
             try out.writer.writeAll(",\"current_revision\":");
-            try std.json.Stringify.value(self.current_revision, .{}, &out.writer);
+            try json_encode.value(self.current_revision, .{}, &out.writer);
             try out.writer.writeAll(",\"latest_revision\":");
-            try std.json.Stringify.value(self.latest_revision, .{}, &out.writer);
+            try json_encode.value(self.latest_revision, .{}, &out.writer);
         }
         try out.writer.writeAll(",\"status\":");
-        try std.json.Stringify.value(self.status.label(), .{}, &out.writer);
+        try json_encode.value(self.status.label(), .{}, &out.writer);
         try out.writer.writeByte('}');
         return try out.toOwnedSlice();
     }
@@ -2310,11 +2311,11 @@ fn writePermissionRulesJson(writer: *std.Io.Writer, rules: types.PermissionRuleS
     for (rules.rules, 0..) |rule, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"permission\":");
-        try std.json.Stringify.value(rule.permission, .{}, writer);
+        try json_encode.value(rule.permission, .{}, writer);
         try writer.writeAll(",\"pattern\":");
-        try std.json.Stringify.value(rule.pattern, .{}, writer);
+        try json_encode.value(rule.pattern, .{}, writer);
         try writer.writeAll(",\"action\":");
-        try std.json.Stringify.value(@tagName(rule.action), .{}, writer);
+        try json_encode.value(@tagName(rule.action), .{}, writer);
         try writer.writeByte('}');
     }
     try writer.writeByte(']');
@@ -2443,7 +2444,7 @@ fn writeSessionHistoryTurnJson(writer: *std.Io.Writer, turn: types.HistoryTurn) 
     switch (turn) {
         .compacted_summary => |entry| {
             try writer.writeAll("{\"kind\":\"compacted_summary\",\"summary\":");
-            try std.json.Stringify.value(entry.summary, .{}, writer);
+            try json_encode.value(entry.summary, .{}, writer);
             try writer.print(",\"removed_turn_count\":{d},\"compaction_count\":{d}", .{ entry.removed_turn_count, entry.compaction_count });
             try writer.writeByte('}');
         },
@@ -2451,7 +2452,7 @@ fn writeSessionHistoryTurnJson(writer: *std.Io.Writer, turn: types.HistoryTurn) 
             try writer.writeAll("{\"kind\":\"assistant\",\"user\":");
             try writeSessionUserTurnJson(writer, entry.user);
             try writer.writeAll(",\"assistant\":");
-            try std.json.Stringify.value(entry.assistant, .{}, writer);
+            try json_encode.value(entry.assistant, .{}, writer);
             try writer.writeAll(",\"execution\":");
             try session_json.writeExecutionMemoryJson(writer, entry.execution);
             try writer.writeByte('}');
@@ -2461,18 +2462,18 @@ fn writeSessionHistoryTurnJson(writer: *std.Io.Writer, turn: types.HistoryTurn) 
             try writeSessionUserTurnJson(writer, entry.user);
             try writer.writeAll(",\"assistant\":");
             if (entry.assistant) |assistant| {
-                try std.json.Stringify.value(assistant, .{}, writer);
+                try json_encode.value(assistant, .{}, writer);
             } else {
                 try writer.writeAll("null");
             }
             try writer.writeAll(",\"tool_call\":");
             if (entry.tool_call) |tool_call| {
                 try writer.writeAll("{\"id\":");
-                try std.json.Stringify.value(tool_call.id, .{}, writer);
+                try json_encode.value(tool_call.id, .{}, writer);
                 try writer.writeAll(",\"name\":");
-                try std.json.Stringify.value(tool_call.name, .{}, writer);
+                try json_encode.value(tool_call.name, .{}, writer);
                 try writer.writeAll(",\"arguments_json\":");
-                try std.json.Stringify.value(tool_call.arguments_json, .{}, writer);
+                try json_encode.value(tool_call.arguments_json, .{}, writer);
                 try writer.writeByte('}');
             } else {
                 try writer.writeAll("null");
@@ -2480,7 +2481,7 @@ fn writeSessionHistoryTurnJson(writer: *std.Io.Writer, turn: types.HistoryTurn) 
             try writer.writeAll(",\"completed_tool_names\":[");
             for (entry.completed_tool_names, 0..) |name, i| {
                 if (i > 0) try writer.writeByte(',');
-                try std.json.Stringify.value(name, .{}, writer);
+                try json_encode.value(name, .{}, writer);
             }
             try writer.writeByte(']');
             if (!entry.execution.isEmpty()) {
@@ -2494,15 +2495,15 @@ fn writeSessionHistoryTurnJson(writer: *std.Io.Writer, turn: types.HistoryTurn) 
 
 fn writeSessionUserTurnJson(writer: *std.Io.Writer, user: types.UserTurn) !void {
     try writer.writeAll("{\"text\":");
-    try std.json.Stringify.value(user.text, .{}, writer);
+    try json_encode.value(user.text, .{}, writer);
     try writer.writeAll(",\"images\":[");
 
     for (user.images, 0..) |image, i| {
         if (i > 0) try writer.writeByte(',');
         try writer.writeAll("{\"path\":");
-        try std.json.Stringify.value(image.path, .{}, writer);
+        try json_encode.value(image.path, .{}, writer);
         try writer.writeAll(",\"media_type\":");
-        try std.json.Stringify.value(image.media_type, .{}, writer);
+        try json_encode.value(image.media_type, .{}, writer);
         try writer.writeByte('}');
     }
 
@@ -4022,7 +4023,7 @@ pub const SlackSnapshot = struct {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer out.deinit();
         if (format == .json) {
-            try std.json.Stringify.value(self, .{}, &out.writer);
+            try json_encode.value(self, .{}, &out.writer);
         } else if (!self.installed) {
             try out.writer.writeAll("No local Slack bot installation. Run fx slack install.\n");
         } else {

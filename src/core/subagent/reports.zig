@@ -8,6 +8,7 @@ const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const agent_frame = @import("../shared/agent_frame.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -170,7 +171,7 @@ pub fn messageText(alloc: Allocator, agent: []const u8, child_id: []const u8, te
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     out.writer.writeAll(message_header) catch return error.OutOfMemory;
-    std.json.Stringify.value(.{ .agent = agent, .child_id = child_id, .message = body }, .{}, &out.writer) catch return error.OutOfMemory;
+    json_encode.value(.{ .agent = agent, .child_id = child_id, .message = body }, .{}, &out.writer) catch return error.OutOfMemory;
     out.writer.writeByte('\n') catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
@@ -187,7 +188,7 @@ pub fn message(alloc: Allocator, report: Report, max_output_bytes: usize) error{
     errdefer out.deinit();
     // An allocating writer fails only when it cannot grow.
     out.writer.writeAll(header) catch return error.OutOfMemory;
-    std.json.Stringify.value(.{
+    json_encode.value(.{
         .agent = report.agent,
         .child_id = report.child_id,
         .work_id = report.work_id,

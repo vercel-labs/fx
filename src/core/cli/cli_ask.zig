@@ -102,6 +102,7 @@ const history_range = @import("../shared/history_range.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const ask_presentation = @import("../../ui/ask_presentation.zig");
 const url_opener = @import("../hosts/url_opener.zig");
+const json_encode = @import("../shared/json_encode.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -3966,37 +3967,37 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     errdefer out.deinit();
 
     try out.writer.writeAll("{\"output\":");
-    try std.json.Stringify.value(result.assistant_output, .{}, &out.writer);
+    try json_encode.value(result.assistant_output, .{}, &out.writer);
     try out.writer.writeAll(",\"final_output\":");
-    try std.json.Stringify.value(result.final_output, .{}, &out.writer);
+    try json_encode.value(result.final_output, .{}, &out.writer);
     try out.writer.print(",\"exit_code\":{d}", .{result.exit_code});
     try out.writer.writeAll(",\"model\":");
-    try std.json.Stringify.value(result.model, .{}, &out.writer);
+    try json_encode.value(result.model, .{}, &out.writer);
     try out.writer.writeAll(",\"resolved_provider\":");
     if (result.resolved_provider.len > 0) {
-        try std.json.Stringify.value(result.resolved_provider, .{}, &out.writer);
+        try json_encode.value(result.resolved_provider, .{}, &out.writer);
     } else {
         try out.writer.writeAll("null");
     }
     try out.writer.writeAll(",\"session_id\":");
-    try std.json.Stringify.value(result.session_id, .{}, &out.writer);
+    try json_encode.value(result.session_id, .{}, &out.writer);
     try out.writer.print(",\"steps\":{d}", .{result.step_count});
     try out.writer.writeAll(",\"tool_calls\":[");
     for (result.tool_calls, 0..) |tc, i| {
         if (i > 0) try out.writer.writeAll(",");
         try out.writer.writeAll("{\"name\":");
-        try std.json.Stringify.value(tc.name, .{}, &out.writer);
+        try json_encode.value(tc.name, .{}, &out.writer);
         try out.writer.writeAll(",\"status\":");
-        try std.json.Stringify.value(tc.status, .{}, &out.writer);
+        try json_encode.value(tc.status, .{}, &out.writer);
         if (tc.action) |action| {
             try out.writer.writeAll(",\"action\":");
-            try std.json.Stringify.value(@tagName(action), .{}, &out.writer);
+            try json_encode.value(@tagName(action), .{}, &out.writer);
         }
         if (tc.error_category) |category| {
             try out.writer.writeAll(",\"error\":{\"category\":");
-            try std.json.Stringify.value(@tagName(category), .{}, &out.writer);
+            try json_encode.value(@tagName(category), .{}, &out.writer);
             try out.writer.writeAll(",\"code\":");
-            try std.json.Stringify.value(
+            try json_encode.value(
                 tc.error_code orelse "tool_failed",
                 .{},
                 &out.writer,
@@ -4009,14 +4010,14 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         }
         if (tc.ask_question_text) |text| {
             try out.writer.writeAll(",\"question\":");
-            try std.json.Stringify.value(text, .{}, &out.writer);
+            try json_encode.value(text, .{}, &out.writer);
         }
         if (tc.web_search_completion) |completion| {
             try out.writer.print(",\"web_search\":{{\"searches\":{d},\"duration_ms\":{d}}}", .{ completion.searches, completion.duration_ms });
         }
         if (tc.web_fetch_completion) |completion| {
             try out.writer.writeAll(",\"web_fetch\":{\"url\":");
-            try std.json.Stringify.value(completion.url(), .{}, &out.writer);
+            try json_encode.value(completion.url(), .{}, &out.writer);
             try out.writer.print(",\"bytes\":{d},\"status\":{d},\"duration_ms\":{d},\"cache_hit\":{s},\"artifact\":\"{s}\"}}", .{
                 completion.bytes,
                 completion.status,
@@ -4028,9 +4029,9 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         try out.writer.writeAll("}");
     }
     try out.writer.writeAll("],\"usage\":{\"input_tokens\":");
-    try std.json.Stringify.value(result.usage.input_tokens, .{}, &out.writer);
+    try json_encode.value(result.usage.input_tokens, .{}, &out.writer);
     try out.writer.writeAll(",\"output_tokens\":");
-    try std.json.Stringify.value(result.usage.output_tokens, .{}, &out.writer);
+    try json_encode.value(result.usage.output_tokens, .{}, &out.writer);
     // Present only when the provider reports caching, so a missing count
     // never reads as zero cached tokens.
     if (result.usage.cache_read_tokens) |tokens| try out.writer.print(",\"cache_read_tokens\":{d}", .{tokens});
@@ -4038,7 +4039,7 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
     try out.writer.writeAll("}");
     if (result.error_code) |error_code| {
         try out.writer.writeAll(",\"error\":");
-        try std.json.Stringify.value(error_code, .{}, &out.writer);
+        try json_encode.value(error_code, .{}, &out.writer);
     }
     if (result.auth_failure) |failure| {
         try out.writer.writeAll(",\"auth_failure\":");
