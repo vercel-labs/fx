@@ -1,0 +1,8 @@
+{
+  "name": "fx-tla-transcript-window",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "verify": "bun ../drivers/transcript_window/verify.ts"
+  }
+}
