@@ -175,6 +175,136 @@ class IrSizeTests(LlvmCase):
         self.assertFalse(output.exists())
 
 
+# A struct's default value, 1,064 bytes: 1,024 zero bytes, then an i32, a
+# pointer, padding, and an i64. Its defined bytes are far past sparse-constants' leaf limits.
+DEFAULT_VALUE = (
+    "%Default = type { [128 x i64], i32, ptr, [3 x i32], i64 }\n"
+    "@target = internal global i32 7\n"
+    "@default = internal unnamed_addr constant %Default "
+    "{ [128 x i64] zeroinitializer, i32 7, ptr @target, [3 x i32] zeroinitializer, i64 -1 }, align 8\n"
+    + MEMCPY
+    + "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n"
+)
+# Fill a buffer with 0xAB, copy the default value over it, and exit 0 only
+# when every zero word, the i32, the pointer, and the i64 read back.
+DEFAULT_VALUE_MAIN = (
+    "define i32 @main() {\n"
+    "entry:\n"
+    "  %out = alloca %Default, align 8\n"
+    "  call void @llvm.memset.p0.i64(ptr align 8 %out, i8 171, i64 1064, i1 false)\n"
+    "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %out, ptr align 8 @default, i64 1064, i1 false)\n"
+    "  br label %loop\n"
+    "loop:\n"
+    "  %i = phi i64 [ 0, %entry ], [ %next, %zero ]\n"
+    "  %slot = getelementptr inbounds [128 x i64], ptr %out, i64 0, i64 %i\n"
+    "  %word = load i64, ptr %slot\n"
+    "  %is_zero = icmp eq i64 %word, 0\n"
+    "  br i1 %is_zero, label %zero, label %bad\n"
+    "zero:\n"
+    "  %next = add i64 %i, 1\n"
+    "  %more = icmp ult i64 %next, 128\n"
+    "  br i1 %more, label %loop, label %fields\n"
+    "fields:\n"
+    "  %code_slot = getelementptr inbounds %Default, ptr %out, i32 0, i32 1\n"
+    "  %code = load i32, ptr %code_slot\n"
+    "  %pointer_slot = getelementptr inbounds %Default, ptr %out, i32 0, i32 2\n"
+    "  %pointer = load ptr, ptr %pointer_slot\n"
+    "  %pad_slot = getelementptr inbounds %Default, ptr %out, i32 0, i32 3, i64 2\n"
+    "  %pad = load i32, ptr %pad_slot\n"
+    "  %tail_slot = getelementptr inbounds %Default, ptr %out, i32 0, i32 4\n"
+    "  %tail = load i64, ptr %tail_slot\n"
+    "  %code_ok = icmp eq i32 %code, 7\n"
+    "  %pointer_ok = icmp eq ptr %pointer, @target\n"
+    "  %pad_ok = icmp eq i32 %pad, 0\n"
+    "  %tail_ok = icmp eq i64 %tail, -1\n"
+    "  %a = and i1 %code_ok, %pointer_ok\n"
+    "  %b = and i1 %pad_ok, %tail_ok\n"
+    "  %ok = and i1 %a, %b\n"
+    "  %status = select i1 %ok, i32 0, i32 2\n"
+    "  ret i32 %status\n"
+    "bad:\n"
+    "  ret i32 1\n"
+    "}\n"
+)
+
+
+@unittest.skipUnless(AVAILABLE and (LLVM_BIN / "lli").is_file(), "pinned LLVM with libLLVM and lli is not installed")
+class ZeroFilledCopyTests(LlvmCase):
+    def exit_code(self, bitcode: pathlib.Path) -> int:
+        # LLVM's interpreter runs the module the same way on any host.
+        result = subprocess.run(
+            [str(LLVM_BIN / "lli"), "--force-interpreter", str(bitcode)], capture_output=True, text=True
+        )
+        self.assertEqual("", result.stderr)
+        return result.returncode
+
+    def test_mostly_zero_default_value_copy_becomes_a_zero_fill_and_its_nonzero_stores(self) -> None:
+        source = self.assemble(
+            "default_value",
+            DEFAULT_VALUE + "define void @init(ptr align 8 %out) {\n"
+            "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %out, ptr align 8 @default, i64 1064, i1 false)\n"
+            "  ret void\n}\n",
+        )
+        result, output = self.run_pass("sparse-constants", source)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual(1, summary["zero_filled_constants"])
+        self.assertEqual(1, summary["rewritten_copies"])
+        ir = self.cleaned_ir(output)
+        self.assertNotIn("@default", ir)
+        body = ir.split("define void @init", 1)[1].split("\n}", 1)[0]
+        self.assertNotIn("llvm.memcpy", body)
+        self.assertIn("call void @llvm.memset.p0.i64(ptr align 8 %out, i8 0, i64 1064, i1 false)", body)
+        stores = [line.strip() for line in body.splitlines() if line.strip().startswith("store ")]
+        self.assertEqual(3, len(stores), stores)
+        self.assertTrue(any(store.startswith("store i32 7, ptr") for store in stores), stores)
+        self.assertTrue(any(store.startswith("store ptr @target, ptr") for store in stores), stores)
+        self.assertTrue(any(store.startswith("store i64 -1, ptr") for store in stores), stores)
+
+    def test_zero_filled_copy_reads_back_the_constant(self) -> None:
+        source = self.assemble("default_main", DEFAULT_VALUE + DEFAULT_VALUE_MAIN)
+        self.assertEqual(0, self.exit_code(source))
+        result, output = self.run_pass("sparse-constants", source)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(1, json.loads(result.stdout)["zero_filled_constants"])
+        self.assertEqual(0, self.exit_code(output))
+
+    def test_dense_constant_keeps_its_copy(self) -> None:
+        values = ", ".join(f"i64 {n + 1}" for n in range(65))
+        source = self.assemble(
+            "dense",
+            "@dense = internal unnamed_addr constant { [65 x i64], [128 x i64] } "
+            f"{{ [65 x i64] [{values}], [128 x i64] zeroinitializer }}, align 8\n"
+            + MEMCPY
+            + "define void @init(ptr align 8 %out) {\n"
+            "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %out, ptr align 8 @dense, i64 1544, i1 false)\n"
+            "  ret void\n}\n",
+        )
+        result, output = self.run_pass("sparse-constants", source)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(0, json.loads(result.stdout)["rewritten_copies"])
+        self.assertIn("@dense", self.cleaned_ir(output))
+
+    def test_constants_within_the_leaf_limits_keep_leaf_stores_without_a_zero_fill(self) -> None:
+        source = self.assemble(
+            "small_default",
+            "@small = internal unnamed_addr constant { i64, i64, [48 x i8] } { i64 0, i64 5, [48 x i8] undef }\n"
+            + MEMCPY
+            + "define void @init(ptr align 8 %out) {\n"
+            "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %out, ptr align 8 @small, i64 64, i1 false)\n"
+            "  ret void\n}\n",
+        )
+        result, output = self.run_pass("sparse-constants", source)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(0, json.loads(result.stdout)["zero_filled_constants"])
+        ir = self.cleaned_ir(output)
+        self.assertNotIn("llvm.memset", ir)
+        self.assertIn("store i64 0, ptr %out, align 8", ir)
+
+
 def _blob_layout(ir: str) -> tuple[bytes, dict[str, int]]:
     """The overlaid blob's bytes and each alias's offset into it."""
     line = next(l for l in ir.splitlines() if l.startswith("@pgso.overlaid_constants = "))
