@@ -7,6 +7,7 @@ const session_codec = @import("../../session/session_codec.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
+const model_roles = @import("../../config/model_roles.zig");
 const types = @import("../../shared/types.zig");
 const worker_runtime = @import("../worker_runtime.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
@@ -196,10 +197,20 @@ pub const DiffMarkerStyles = struct {
     removed: []const u8 = "",
 };
 
+pub const ModelBinding = struct {
+    selection: model_roles.Selection,
+    stream_provider: agent_stream_provider.Provider,
+    credential: agent_stream_provider.CredentialLease,
+    capabilities: model_capabilities.Capabilities,
+    provider_options: model_capabilities.ResolvedProviderOptions = .{},
+};
+
 pub const AgentRuntimeDeps = struct {
     ctx: *anyopaque,
     observer: ?*observation.Observer = null,
     agent_stream_provider: agent_stream_provider.Provider = agent_stream_provider.unavailable_provider,
+    /// Host-owned model metrics; null for hosted SDK/test runtimes.
+    performance: ?*@import("../../model_hub/performance.zig").State = null,
     flush_assistant_stream_per_content_chunk: bool = false,
     render_assistant_text: bool = true,
     cooperative_transport_pulse: ?agent_stream_provider.CooperativePulse = null,
@@ -307,6 +318,21 @@ pub const AgentRuntimeDeps = struct {
     ask_out_of_credits: ?*const fn (ctx: *anyopaque) anyerror!OutOfCreditsChoice = null,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
     resolve_model_capabilities: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities = localModelCapabilities,
+    /// Returns an arena-owned, provider-qualified larger-context selection
+    /// explicitly named by catalog metadata, or null when promotion is not
+    /// configured/eligible. The runtime never guesses a target.
+    promote_context_model: ?*const fn (ctx: *anyopaque, arena: Allocator, current: model_roles.Selection) anyerror!?model_roles.Selection = null,
+    /// Binds a promoted selection to its provider transport, credential and
+    /// resolved request capabilities. Credential material stays host-owned.
+    bind_model: ?*const fn (ctx: *anyopaque, arena: Allocator, selection: model_roles.Selection) anyerror!?ModelBinding = null,
+    /// Publishes the effective provider/model after a transient promotion or
+    /// fallback. The selection is borrowed for this synchronous callback; the
+    /// host copies only the product state it needs and must not persist a
+    /// transient fallback as the user's profile choice.
+    publish_selection: ?*const fn (ctx: *anyopaque, selection: model_roles.Selection) anyerror!void = null,
+    /// Resolves an ordered role fallback chain. Returned selections borrow the
+    /// host role table for the current turn.
+    resolve_role_chain: ?*const fn (ctx: *anyopaque, role: model_roles.RoleId, out: []model_roles.Selection) usize = null,
     /// Reports that the model catalog is known to be failed or unreachable, so
     /// capability drops are provenance-attributed instead of silent. Null means
     /// the host cannot tell, and capability drops stay quiet.
@@ -325,10 +351,6 @@ pub const AgentRuntimeDeps = struct {
     /// The session's checklist; a turn that stops with open tasks is
     /// reminded of them (D232). Null in hosts without one.
     checklist: ?*@import("../../checklist/store.zig").Store = null,
-    /// Resolves the model roles an `llm:` rule condition names, in order, to
-    /// a model id. Null, or a null answer, uses the session's own model. The
-    /// terminal, `ask` and ACP resolve them through model roles (D207).
-    resolve_judge_model: ?*const fn (ctx: *anyopaque, roles: []const []const u8) ?[]const u8 = null,
     report_inner_tool_usage: ?*const fn (ctx: *anyopaque, tool_name: []const u8, usage: types.ToolUsage) void = null,
     // Accent for the +N / -N counts in a committed file's status line.
     // Captured by value at construction; that is safe only while the marker

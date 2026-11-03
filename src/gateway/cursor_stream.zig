@@ -60,6 +60,8 @@ pub const Reducer = struct {
     tools: std.ArrayList(Tool) = .empty,
     usage: msg.TurnUsage = .{},
     estimated_output: u64 = 0,
+    saw_progress_or_side_effect: bool = false,
+    saw_token_delta: bool = false,
     turn_ended: bool = false,
     /// Owned client messages waiting to be sent.
     replies: std.ArrayList([]u8) = .empty,
@@ -97,6 +99,10 @@ pub const Reducer = struct {
     /// the call returns.
     pub fn accept(self: *Reducer, scratch: Allocator, message: msg.ServerMessage, sink: streams.EventSink) !void {
         switch (message) {
+            .heartbeat, .ignored, .turn_ended => {},
+            else => self.saw_progress_or_side_effect = true,
+        }
+        switch (message) {
             .text_delta => |text| if (text.len != 0) {
                 if (text.len > self.limits.content_bytes - self.content.items.len) return error.ContentTooLarge;
                 try self.content.appendSlice(self.alloc, text);
@@ -127,7 +133,10 @@ pub const Reducer = struct {
                 const tool = self.byCallId(update.call_id) orelse try self.toolFor(update.call_id, call, update.tool_call_id);
                 try self.settleFrom(scratch, tool, call);
             },
-            .token_delta => |count| self.estimated_output +|= count,
+            .token_delta => |count| {
+                self.saw_token_delta = true;
+                self.estimated_output +|= count;
+            },
             .turn_ended => |usage| {
                 self.usage = usage;
                 self.turn_ended = true;

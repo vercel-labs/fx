@@ -544,7 +544,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .status, .command = "/status", .help_entry = "/status", .completion_description = "show runtime configuration and the session ID", .presentation_category = .general, .show_in_welcome = true },
     .{ .kind = .image, .command = "/image", .aliases = &.{"/img"}, .help_entry = "/image <path> (/img)", .completion_description = "attach an image by path", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
-    .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true, .accepts_payload = true },
+    .{ .kind = .model, .command = "/model", .help_entry = "/model", .completion_description = "open the model hub", .presentation_category = .model, .accepts_payload = true },
     .{ .kind = .role, .command = "/role", .help_entry = "/role [next|prev|<role> [model[:level], fallback…|@role|clear]]", .completion_description = "show model roles, assign one, or cycle through them", .presentation_category = .model, .has_args = true, .accepts_payload = true },
     .{ .kind = .effort, .command = "/effort", .help_entry = "/effort [level]", .completion_description = "choose the reasoning effort for the current model", .presentation_category = .model, .has_args = true, .accepts_payload = true },
     .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|full-access|reset]", .completion_description = "choose what proto-fx is allowed to do", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
@@ -698,7 +698,8 @@ test "built-in slash registry resolves primary commands and aliases" {
 
     const model_command = slash_registry.lookup("/model") orelse return error.TestExpectedEqual;
     try std.testing.expect(!model_command.requires_prompt_credential);
-    try std.testing.expect(slash_registry.lookup("/models") == null);
+    try std.testing.expect(!model_command.has_args);
+    try std.testing.expect(slash_registry.matchExact("/models") == null);
 
     try std.testing.expect(command_specs.matchedSlashPrefix(slash_registry, "/model\nmodel-id", .model) == null);
 }

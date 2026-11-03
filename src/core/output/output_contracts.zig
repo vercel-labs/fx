@@ -2467,6 +2467,10 @@ fn writeSessionUserTurnJson(writer: *std.Io.Writer, user: types.UserTurn) !void 
         try std.json.Stringify.value(image.path, .{}, writer);
         try writer.writeAll(",\"media_type\":");
         try std.json.Stringify.value(image.media_type, .{}, writer);
+        if (image.detail) |detail| {
+            try writer.writeAll(",\"detail\":");
+            try std.json.Stringify.value(@tagName(detail), .{}, writer);
+        }
         try writer.writeByte('}');
     }
 

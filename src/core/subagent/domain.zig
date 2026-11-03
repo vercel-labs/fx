@@ -1,6 +1,7 @@
 const std = @import("std");
 const mcp_access = @import("../mcp/access_policy.zig");
 const model_provider = @import("../config/model_provider.zig");
+const model_roles = @import("../config/model_roles.zig");
 const session_layout = @import("../session/session_layout.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const types = @import("../shared/types.zig");
@@ -47,6 +48,7 @@ pub const AdmissionSnapshot = struct {
     model: []u8,
     provider: model_provider.ProviderId = .gateway,
     effort: types.ReasoningEffort,
+    role: ?model_roles.RoleId = null,
     ultrafast_mode: bool = false,
     permission_mode: types.PermissionMode = .yolo,
     tool_names: [][]u8,
@@ -61,6 +63,7 @@ pub const AdmissionSnapshot = struct {
         alloc.free(self.parent_id);
         alloc.free(self.source_id);
         alloc.free(self.model);
+        freeRoleId(alloc, self.role);
         freeStrings(alloc, self.tool_names);
         self.rules.deinit(alloc);
         types.freePermissionGrantSlice(alloc, self.grants);
@@ -77,6 +80,7 @@ pub const AdmissionInput = struct {
     model: []const u8,
     provider: model_provider.ProviderId = .gateway,
     effort: types.ReasoningEffort,
+    role: ?model_roles.RoleId = null,
     ultrafast_mode: bool = false,
     permission_mode: types.PermissionMode = .yolo,
     tool_names: []const []const u8 = &.{},
@@ -94,6 +98,21 @@ pub const AdmissionError = error{
     TooManyAdmissionItems,
     InvalidAdmissionItem,
 };
+
+fn dupeRoleId(alloc: Allocator, role: ?model_roles.RoleId) !?model_roles.RoleId {
+    const value = role orelse return null;
+    return switch (value) {
+        .builtin => |builtin| .{ .builtin = builtin },
+        .custom => |name| .{ .custom = try alloc.dupe(u8, name) },
+    };
+}
+
+fn freeRoleId(alloc: Allocator, role: ?model_roles.RoleId) void {
+    if (role) |value| switch (value) {
+        .builtin => {},
+        .custom => |name| alloc.free(name),
+    };
+}
 
 pub fn captureAdmission(
     alloc: Allocator,
@@ -129,6 +148,8 @@ pub fn captureAdmission(
     errdefer alloc.free(source_id);
     const model = try alloc.dupe(u8, input.model);
     errdefer alloc.free(model);
+    const role = try dupeRoleId(alloc, input.role);
+    errdefer freeRoleId(alloc, role);
     const tool_names = try cloneStrings(alloc, input.tool_names);
     errdefer freeStrings(alloc, tool_names);
     var rules = try types.dupePermissionRuleSet(alloc, input.rules);
@@ -155,6 +176,7 @@ pub fn captureAdmission(
         .model = model,
         .provider = input.provider,
         .effort = input.effort,
+        .role = role,
         .ultrafast_mode = input.ultrafast_mode,
         .permission_mode = input.permission_mode,
         .tool_names = tool_names,

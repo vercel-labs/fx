@@ -5672,6 +5672,7 @@ const WireUser = struct {
         id: usize = 0,
         path: []const u8,
         media_type: []const u8,
+        detail: ?types.ImageDetail = null,
         snapshot_path: ?[]const u8 = null,
         snapshot_sha256: ?[]const u8 = null,
         inline_data: ?[]const u8 = null,
@@ -5683,7 +5684,9 @@ const WireUser = struct {
             inline for (@typeInfo(WireImage).@"struct".field_names) |field_name| {
                 // Written only when set, so an image without them encodes
                 // as it did before they existed.
-                const optional = comptime std.mem.eql(u8, field_name, "source_ref") or std.mem.eql(u8, field_name, "blob");
+                const optional = comptime std.mem.eql(u8, field_name, "detail") or
+                    std.mem.eql(u8, field_name, "source_ref") or
+                    std.mem.eql(u8, field_name, "blob");
                 // An image in its blob has no bytes, digest or snapshot here.
                 const in_blob = comptime std.mem.eql(u8, field_name, "snapshot_path") or
                     std.mem.eql(u8, field_name, "snapshot_sha256") or
@@ -5711,6 +5714,7 @@ const WireUser = struct {
                     .id = image.id,
                     .path = image.path,
                     .media_type = image.media_type,
+                    .detail = image.detail,
                     .source_ref = image.source_ref,
                     .blob = image.snapshot_sha256 orelse return error.InvalidSessionFormat,
                 };
@@ -5720,6 +5724,7 @@ const WireUser = struct {
                 .id = image.id,
                 .path = image.path,
                 .media_type = image.media_type,
+                .detail = image.detail,
                 .snapshot_path = image.snapshot_path,
                 .snapshot_sha256 = image.snapshot_sha256,
                 .inline_data = if (image.inline_data) |bytes| blk: {
@@ -5779,6 +5784,7 @@ const WireUser = struct {
                     .id = image.id,
                     .path = try a.dupe(u8, image.path),
                     .media_type = try a.dupe(u8, image.media_type),
+                    .detail = image.detail,
                     .snapshot_sha256 = try a.dupe(u8, hash),
                     .source_ref = if (image.source_ref) |value| try a.dupe(u8, value) else null,
                 };
@@ -5788,6 +5794,7 @@ const WireUser = struct {
                 .id = image.id,
                 .path = try a.dupe(u8, image.path),
                 .media_type = try a.dupe(u8, image.media_type),
+                .detail = image.detail,
                 .snapshot_path = if (image.snapshot_path) |value| try a.dupe(u8, value) else null,
                 .snapshot_sha256 = if (image.snapshot_sha256) |value| try a.dupe(u8, value) else null,
                 .inline_data = if (image.inline_data) |encoded| blk: {
@@ -5826,6 +5833,7 @@ fn encodePreferences(alloc: Allocator, preferences: session_codec.DurableSession
         effort: []const u8,
         fast_mode: bool,
         ultrafast_mode: ?bool,
+        role: ?[]const u8,
         instructions: ?[]const u8,
     };
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -5836,6 +5844,7 @@ fn encodePreferences(alloc: Allocator, preferences: session_codec.DurableSession
         .effort = preferences.effort.label(),
         .fast_mode = preferences.fast_mode,
         .ultrafast_mode = if (preferences.ultrafast_mode) true else null,
+        .role = preferences.role,
         .instructions = instructions,
     }, .{ .emit_null_optional_fields = false }, &out.writer);
     return out.toOwnedSlice();

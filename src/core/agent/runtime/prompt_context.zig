@@ -5,20 +5,37 @@ const types = @import("../../shared/types.zig");
 const stream_provider = @import("../stream_provider.zig");
 const text_utils = @import("../../shared/text_utils.zig");
 const json_decode = @import("../../shared/json_decode.zig");
+const tokenizer = @import("../../tokenizer/tokenizer.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 
 const textTokens = token_estimate.textTokens;
 
-pub const RequestCost = struct {
-    serialized_bytes: usize,
-    /// Uncalibrated serialization estimate; non-image usage may replace it.
-    text_tokens: usize,
-    /// Null means no image parts. Otherwise visual cost needs applicable usage.
-    image_identity: ?[32]u8 = null,
-    estimated_input_tokens: usize,
+const TextCounter = struct {
+    encoding: ?tokenizer.Encoding,
+    fallback: token_estimate.StreamingEstimator = .{},
+    native_tokens: usize = 0,
+
+    fn init(encoding: ?tokenizer.Encoding) TextCounter {
+        return .{ .encoding = encoding };
+    }
+
+    fn consume(self: *TextCounter, text: []const u8) void {
+        if (self.encoding) |encoding| {
+            self.native_tokens +|= token_estimate.textTokensForEncoding(text, encoding);
+        } else {
+            self.fallback.consume(text);
+        }
+    }
+
+    fn estimate(self: TextCounter) usize {
+        if (self.encoding != null) return self.native_tokens;
+        return @intCast(@min(self.fallback.estimate(), std.math.maxInt(usize)));
+    }
 };
+
+pub const RequestCost = stream_provider.RequestCost;
 
 pub const RequestTokenCalibration = struct {
     request: RequestCost,
@@ -85,6 +102,12 @@ const CostRequest = struct {
 
 pub const MeasurementError = error{ OutOfMemory, InvalidRequestMeasurement };
 
+/// Binary transports supply their own logical-input measurement.
+pub fn measureProviderRequestFor(provider: stream_provider.Provider, alloc: Allocator, body: []const u8, request: stream_provider.RequestData) !RequestCost {
+    if (provider.measure_request_fn) |measure| return measure(provider.context, alloc, body, request);
+    return measureProviderRequest(alloc, body, request);
+}
+
 /// Borrows the prepared body and request; releases parsing scratch before returning.
 /// Image payloads are transport bytes, not text. Their initial token cost is unknown.
 pub fn measureProviderRequest(alloc: Allocator, body: []const u8, request: stream_provider.RequestData) MeasurementError!RequestCost {
@@ -100,7 +123,7 @@ pub fn measureProviderRequest(alloc: Allocator, body: []const u8, request: strea
         break :image_input false;
     };
     if (!has_images) {
-        const tokens = textTokens(body);
+        const tokens = token_estimate.textTokensWithEncoding(body, request.provider_options.tokenizer);
         return .{ .serialized_bytes = body.len, .text_tokens = tokens, .estimated_input_tokens = tokens };
     }
 
@@ -123,7 +146,7 @@ pub fn measureProviderRequest(alloc: Allocator, body: []const u8, request: strea
         const tokens = textTokens(body);
         return .{ .serialized_bytes = body.len, .text_tokens = tokens, .estimated_input_tokens = tokens };
     };
-    var estimator = token_estimate.StreamingEstimator{};
+    var estimator = TextCounter.init(request.provider_options.tokenizer);
     var identity = std.crypto.hash.sha2.Sha256.init(.{});
     var cursor: usize = 0;
     var found_image = false;
@@ -164,7 +187,7 @@ pub fn measureProviderRequest(alloc: Allocator, body: []const u8, request: strea
         }
     }
     estimator.consume(body[cursor..]);
-    const tokens: usize = @intCast(@min(estimator.estimate(), std.math.maxInt(usize)));
+    const tokens = estimator.estimate();
     return .{
         .serialized_bytes = body.len,
         .text_tokens = tokens,
@@ -402,6 +425,15 @@ test "buildProviderPrompt keeps compacted session context out of instructions" {
     try std.testing.expectEqual(@as(usize, 1), interruption_count);
     try std.testing.expectEqualStrings("current portable prompt", prompt.messages.items[prompt.messages.items.len - 2].content.?);
     try std.testing.expectEqualStrings("within-turn suffix", prompt.messages.items[prompt.messages.items.len - 1].content.?);
+}
+
+test "provider request measurement uses selected native tokenizer" {
+    var request = measurement_test_request(false);
+    request.provider_options.tokenizer = .cl100k_base;
+    const body = "{\"prompt\":[{\"role\":\"user\",\"content\":\"hello world\"}]}";
+    const measured = try measureProviderRequest(std.testing.allocator, body, request);
+    try std.testing.expectEqual(token_estimate.textTokensForEncoding(body, .cl100k_base), measured.text_tokens);
+    try std.testing.expectEqual(measured.text_tokens, measured.estimated_input_tokens);
 }
 
 test "provider request measurement includes serialized structure" {

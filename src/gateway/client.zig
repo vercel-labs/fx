@@ -1371,6 +1371,7 @@ test "connection setup policy bounds retry by deadline attempts and delivery" {
 }
 
 pub const StreamRequest = struct {
+    extra_headers: []const std.http.Header = &.{},
     api_key: ?[]const u8,
     model: []const u8,
     retry_count: usize,
@@ -1661,12 +1662,14 @@ fn streamGatewayCompletionCoreWithOptions(
     }
 
     var extra_headers_buf: [10]std.http.Header = undefined;
-    const extra_headers = gatewayExtraHeaders(
+    const default_headers = gatewayExtraHeaders(
         &extra_headers_buf,
         model,
         request.team,
         request.session_id,
     );
+    const extra_headers = try @import("configured_request.zig").mergeHeaders(alloc, default_headers, request.extra_headers);
+    defer alloc.free(extra_headers);
 
     if (request.admission) |admission| try admission.admit();
     var attempt: usize = 0;

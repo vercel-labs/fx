@@ -2,6 +2,7 @@ const std = @import("std");
 const web_search_contract = @import("web_search_contract.zig");
 const web_search_policy = @import("web_search_policy.zig");
 const types = @import("../shared/types.zig");
+const model_provider = @import("../config/model_provider.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -10,6 +11,7 @@ pub const Inputs = struct {
     credential_source: ?types.CredentialSource = null,
     gateway_team: ?[]const u8 = null,
     worker_model: []const u8,
+    worker_provider: model_provider.ProviderId = .gateway,
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
     /// Account of the active subscription credential, when it has one.

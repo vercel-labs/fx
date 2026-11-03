@@ -48,6 +48,7 @@ const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const context_contract = @import("../workspace/context_contract.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const provider_set = @import("../gateway/provider_set.zig");
+const model_roles = @import("../config/model_roles.zig");
 const test_builtin_gateway = if (@import("builtin").is_test)
     @import("../../builtins/gateway.zig")
 else
@@ -214,6 +215,23 @@ pub fn Runtime(comptime App: type) type {
                 else
                     null;
             const selected_provider = provider_runtime.provider(app);
+            const review_selection = if (comptime @hasField(App, "model_roles")) model_role_runtime.reviewSelection(app) else null;
+            const review_provider = if (comptime @hasDecl(App, "providerSet"))
+                if (review_selection) |selection| app.providerSet().select(selection.provider).permission_reviewer else if (comptime @hasDecl(App, "permissionReviewerProvider")) app.permissionReviewerProvider() else null
+            else if (comptime @hasDecl(App, "permissionReviewerProvider"))
+                app.permissionReviewerProvider()
+            else
+                null;
+            const review_binding = if (review_selection) |selection|
+                (model_role_runtime.bindSelection(app, app.alloc, selection) catch null)
+            else
+                null;
+            const worker_selection = if (comptime @hasField(App, "model_roles")) model_role_runtime.workerSelection(app) else null;
+            const worker_binding = if (worker_selection) |selection|
+                (model_role_runtime.bindSelection(app, app.alloc, selection) catch null)
+            else
+                null;
+            const worker_credential = if (worker_binding) |binding| binding.credential else null;
             const provider_capabilities = if (comptime @hasDecl(App, "providerSet"))
                 app.providerSet().select(selected_provider).capabilities
             else if (selected_provider == .gateway)
@@ -247,7 +265,10 @@ pub fn Runtime(comptime App: type) type {
                 else
                     host.unavailable_secret_store,
                 .model = provider_runtime.model(app),
-                .reviewer_model = if (comptime @hasField(App, "model_roles")) model_role_runtime.reviewModel(app) else if (comptime @hasField(App, "review_model")) app.review_model else "",
+                .reviewer_model = if (review_selection) |selection| selection.model else if (comptime @hasField(App, "review_model")) app.review_model else "",
+                .reviewer_selection = review_selection,
+                .reviewer_credential = if (review_binding) |binding| binding.credential else null,
+                .permission_reviewer_provider = review_provider,
                 .gateway_retry_count = gateway_retry_count,
                 .gateway_chat_url = gateway_chat_url,
                 .gateway_models_path = if (comptime @hasField(App, "web_search_models_path")) app.web_search_models_path else "/v1/models",
@@ -295,7 +316,6 @@ pub fn Runtime(comptime App: type) type {
                     .allow_sandboxed => .allow_sandboxed,
                     .prompt => .prompt,
                 } else .none,
-                .permission_reviewer_provider = if (comptime @hasDecl(App, "permissionReviewerProvider")) app.permissionReviewerProvider() else null,
                 .tracker = &app.change_tracker,
                 .mcp_ctx = @ptrCast(app),
                 .mcp_has_tool = if (comptime runtime_profile.allows(App, .mcp)) mcpHasTool else null,
@@ -314,6 +334,38 @@ pub fn Runtime(comptime App: type) type {
                 .lifecycle_view = app.lifecycle_view,
                 .lifecycle_scope = lifecycleContext(app).scope,
             };
+            if (comptime @hasDecl(App, "providerSet")) if (review_selection) |primary| {
+                var chain: [64]model_roles.Selection = undefined;
+                const chain_count = model_role_runtime.selectionChain(app, .{ .builtin = .review }, &chain);
+                var primary_seen = false;
+                for (chain[0..chain_count]) |candidate| {
+                    if (!primary_seen) {
+                        if (candidate.provider.eql(primary.provider) and std.mem.eql(u8, candidate.model, primary.model)) primary_seen = true;
+                        continue;
+                    }
+                    if (ctx.reviewer_fallback_count == ctx.reviewer_fallback_storage.len) break;
+                    const reviewer = app.providerSet().select(candidate.provider).permission_reviewer orelse continue;
+                    const binding = (model_role_runtime.bindSelection(app, app.alloc, candidate) catch null) orelse continue;
+                    ctx.reviewer_fallback_storage[ctx.reviewer_fallback_count] = .{
+                        .provider = reviewer,
+                        .input = .{
+                            .credential = binding.credential.secret() orelse "",
+                            .credential_source = binding.credential.credentialSource(),
+                            .account_id = binding.credential.accountId(),
+                            .tenant = binding.credential.tenant(),
+                            .endpoint = gateway_chat_url,
+                            .reviewer_model = candidate.model,
+                            .reviewer_selection = candidate,
+                            .reviewer_provider = candidate.provider,
+                            .credential_lease = binding.credential,
+                            .cancel_flag = &app.worker.worker_cancel_requested,
+                        },
+                        .selection = candidate,
+                    };
+                    ctx.reviewer_fallback_count += 1;
+                }
+                ctx.reviewer_fallbacks = ctx.reviewer_fallback_storage[0..ctx.reviewer_fallback_count];
+            };
             if (comptime @hasField(App, "web_fetch_runtime")) {
                 ctx.web_fetch_runtime = &app.web_fetch_runtime;
                 ctx.web_fetch_artifact_store = app.session.webFetchArtifactStore();
@@ -323,20 +375,13 @@ pub fn Runtime(comptime App: type) type {
             }
             if (comptime @hasField(App, "web_search_runtime")) {
                 if (provider_capabilities.fx_search) {
-                    app.web_search_runtime.configure(.{
-                        .api_key = app.auth.apiKey() orelse "",
-                        .credential_source = app.auth.credentialSource(),
-                        .gateway_team = app.auth.gatewayTeam(),
-                        .worker_model = if (comptime @hasField(App, "model_roles")) model_role_runtime.searchWorkerModel(app) else provider_runtime.model(app),
-                        .gateway_retry_count = gateway_retry_count,
-                        .gateway_chat_url = gateway_chat_url,
-                    });
+                    app.web_search_runtime.configure(webSearchInputs(app, worker_credential, gateway_retry_count, gateway_chat_url));
                     ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
                     ctx.web_search_runtime_ready = false;
                 } else {
                     // Providers without native search run web_search through
                     // the search provider bank when it has a backend.
-                    const inputs = webSearchInputs(app, null, gateway_retry_count, gateway_chat_url);
+                    const inputs = webSearchInputs(app, worker_credential, gateway_retry_count, gateway_chat_url);
                     if (app.web_search_runtime.available(std.heap.c_allocator, inputs)) {
                         app.web_search_runtime.configure(inputs);
                         ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
@@ -361,14 +406,21 @@ pub fn Runtime(comptime App: type) type {
             }
             ctx.model_capability_resolver = app_callbacks.Bindings(App).modelCapabilityResolver(app);
             ctx.model_override_resolver = app_callbacks.Bindings(App).modelOverrideResolver(app);
-            if (comptime @hasField(App, "model_roles")) ctx.model_role_resolver = .{ .context = @ptrCast(app), .resolve_fn = resolveModelRole };
+            if (comptime @hasField(App, "model_roles")) {
+                ctx.model_role_resolver = .{ .context = @ptrCast(app), .resolve_fn = resolveModelRole };
+                const role_deps = app_callbacks.Bindings(App).agentRuntimeDeps(app);
+                ctx.model_binding_context = role_deps.ctx;
+                ctx.model_binder = role_deps.bind_model;
+                ctx.role_chain_resolver = role_deps.resolve_role_chain;
+            }
             return ctx;
         }
 
         fn resolveModelRole(raw: ?*anyopaque, name: []const u8) subagent_tool_host.ModelRoleResolver.Lookup {
             const app: *App = @ptrCast(@alignCast(raw.?));
             return switch (model_role_runtime.lookup(app, name)) {
-                .model => |picked| .{ .model = .{ .id = picked.model, .effort = picked.effort } },
+                .selection => |selection| .{ .model = .{ .id = selection.model, .effort = selection.effort, .provider = selection.provider } },
+                .model => |picked| .{ .model = .{ .id = picked.model, .effort = picked.effort, .provider = null } },
                 .unknown_role => .unknown_role,
                 .unavailable => .unavailable,
             };
@@ -819,18 +871,17 @@ pub fn Runtime(comptime App: type) type {
             ctx.account_id = credential.accountId();
             ctx.gateway_team = credential.tenant();
             if (comptime @hasField(App, "web_search_runtime") and @hasField(App, "session")) {
+                var worker_credential = credential;
+                if (comptime @hasField(App, "model_roles")) if (model_role_runtime.workerSelection(app)) |selection| {
+                    if (!selection.provider.eql(ctx.provider)) {
+                        worker_credential = if (model_role_runtime.bindSelection(app, app.alloc, selection) catch null) |binding| binding.credential else credential;
+                    }
+                };
                 if (ctx.provider_capabilities.fx_search) {
-                    app.web_search_runtime.configure(.{
-                        .api_key = credential_secret,
-                        .credential_source = credential_source,
-                        .gateway_team = credential.tenant(),
-                        .worker_model = if (comptime @hasField(App, "model_roles")) model_role_runtime.searchWorkerModel(app) else provider_runtime.model(app),
-                        .gateway_retry_count = gateway_retry_count,
-                        .gateway_chat_url = gateway_chat_url,
-                    });
+                    app.web_search_runtime.configure(webSearchInputs(app, worker_credential, gateway_retry_count, gateway_chat_url));
                     ctx.web_search_backend = app.web_search_runtime.dispatchBackend();
                 } else if (ctx.web_search_runtime_ready) {
-                    app.web_search_runtime.configure(webSearchInputs(app, credential, gateway_retry_count, gateway_chat_url));
+                    app.web_search_runtime.configure(webSearchInputs(app, worker_credential, gateway_retry_count, gateway_chat_url));
                 }
             }
         }
@@ -851,6 +902,7 @@ pub fn Runtime(comptime App: type) type {
                 .gateway_team = app.auth.gatewayTeam(),
                 .account_id = app.auth.accountId(),
                 .worker_model = if (comptime @hasField(App, "model_roles")) model_role_runtime.searchWorkerModel(app) else provider_runtime.model(app),
+                .worker_provider = if (comptime @hasField(App, "model_roles")) model_role_runtime.workerProvider(app) else provider_runtime.provider(app),
                 .gateway_retry_count = gateway_retry_count,
                 .gateway_chat_url = gateway_chat_url,
             };
@@ -863,7 +915,7 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "providerSet")) {
                 const set = app.providerSet();
                 const registry = @import("../config/configured_provider.zig").Registry{ .definitions = set.definitions };
-                const selected = provider_runtime.provider(app);
+                const selected = if (comptime @hasField(App, "model_roles")) model_role_runtime.workerProvider(app) else provider_runtime.provider(app);
                 if (selected == .configured) if (selected.bind(registry)) |bound| {
                     if (registry.get(bound.label())) |definition| if (definition.protocol == .@"anthropic-messages") {
                         inputs.anthropic_base_url = definition.base_url;
@@ -885,7 +937,11 @@ pub fn Runtime(comptime App: type) type {
             else
                 provider_set.Bundle.Capabilities{};
             if (capabilities.fx_search) return .provider_native;
-            const inputs = webSearchInputs(app, null, gateway_retry_count, gateway_chat_url);
+            const worker_lease = if (comptime @hasField(App, "model_roles")) blk: {
+                const selection = model_role_runtime.workerSelection(app) orelse break :blk null;
+                break :blk if (model_role_runtime.bindSelection(app, app.alloc, selection) catch null) |binding| binding.credential else null;
+            } else null;
+            const inputs = webSearchInputs(app, worker_lease, gateway_retry_count, gateway_chat_url);
             const exposure: tool_projection_mod.WebSearchExposure = if (app.web_search_runtime.available(std.heap.c_allocator, inputs)) .local else .hidden;
             debug_trace.logf("web_search", "exposure={t} provider={t}", .{ exposure, selected });
             return exposure;
@@ -1151,6 +1207,36 @@ pub fn Runtime(comptime App: type) type {
                 break :blk bundle.capabilities;
             } else .{};
             const settings = app.worker.effectiveAgentTurnSettings();
+            const compact_selection = if (comptime @hasField(App, "model_roles")) model_role_runtime.compactSelection(app) else null;
+            const summary_provider = if (compact_selection) |selection| selection.provider else null;
+            const summary_bundle = if (summary_provider) |provider| if (comptime @hasDecl(App, "providerSet")) app.providerSet().select(provider) else null else null;
+            var summary_credential_storage: ?credentials.Credential = null;
+            defer if (summary_credential_storage) |*value| value.deinit(arena);
+            const summary_credential = if (summary_provider) |provider| if (provider.eql(job.provider)) null else blk: {
+                if (comptime !@hasDecl(@TypeOf(app.auth), "oauthTransport") or !@hasDecl(@TypeOf(app.auth), "secretStore")) break :blk null;
+                summary_credential_storage = auth_runtime.prepareCredential(
+                    arena,
+                    app.auth.oauthTransport(),
+                    app.auth.secretStore(),
+                    provider,
+                    null,
+                ) catch null;
+                const value = summary_credential_storage orelse break :blk null;
+                break :blk agent_stream_provider.CredentialLease{ .direct = .{
+                    .secret_bytes = value.token,
+                    .source = value.source,
+                    .account_id = value.accountId(),
+                    .tenant_context = value.gatewayTeam(),
+                } };
+            } else null;
+            const summary_options = if (compact_selection) |selection| if (summary_bundle) |bundle|
+                model_capabilities.resolveProviderOptionsForCapabilities(
+                    bundle.fallbackModelCapabilities(selection.model),
+                    selection.effort orelse settings.effort,
+                    settings.fast_mode,
+                )
+            else
+                null else null;
             const result = manual_compaction.run(arena, &deps, .{
                 .model = .{
                     .provider = job.provider,
@@ -1161,7 +1247,11 @@ pub fn Runtime(comptime App: type) type {
                     .gateway_team = job.gateway_team,
                     .session_id = app_session_runtime.Runtime(App).activeSessionId(app),
                     .retry_count = gateway_retry_count,
-                    .summary_model = if (comptime @hasField(App, "model_roles")) model_role_runtime.compactModel(app) else "",
+                    .summary_model = if (compact_selection) |selection| selection.model else "",
+                    .summary_provider = summary_provider,
+                    .summary_stream_provider = if (summary_bundle) |bundle| bundle.agent_stream_or_unavailable() else null,
+                    .summary_credential = summary_credential,
+                    .summary_provider_options = summary_options,
                     .effort = settings.effort,
                     .fast_mode = settings.fast_mode,
                     .prompt_caching = provider_capabilities.gateway_prompt_caching,
@@ -1300,7 +1390,9 @@ pub fn Runtime(comptime App: type) type {
                 .agent_step_limit = app.agent_step_limit,
                 .max_tool_result_bytes = job.agent_settings.max_tool_result_bytes,
                 .auto_compact_percent = job.agent_settings.auto_compact_percent,
-                .compact_model = if (comptime @hasField(App, "model_roles")) model_role_runtime.compactModel(app) else "",
+                .context_promotion_enabled = job.agent_settings.context_promotion_enabled,
+                .compact_selection = if (comptime @hasField(App, "model_roles")) model_role_runtime.compactSelection(app) else null,
+                .fallback_role = .{ .builtin = .default },
                 .cancel_flag = &app.worker.worker_cancel_requested,
                 .recovery_continue_flag = &app.worker.recovery_continue_requested,
                 .review_enabled = false,

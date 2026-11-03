@@ -11,7 +11,16 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
-import { closeStatusPanel, lastTranscriptRow, panelSession, readPermissionsPanel, readStatusPanel, showsStatusPanel, waitForStatusPanel } from "./info-panel";
+import { createConfiguredProviderFixture } from "./fixtures/chat-completions";
+import {
+  closeStatusPanel,
+  lastTranscriptRow,
+  panelSession,
+  readPermissionsPanel,
+  readStatusPanel,
+  showsStatusPanel,
+  waitForStatusPanel,
+} from "./info-panel";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -32,8 +41,14 @@ let gateway: ReturnType<typeof startFakeGateway> | null = null;
 const tempDirs: string[] = [];
 
 afterEach(async () => {
-  if (session) { await session.kill(); session = null; }
-  if (gateway) { gateway.stop(); gateway = null; }
+  if (session) {
+    await session.kill();
+    session = null;
+  }
+  if (gateway) {
+    gateway.stop();
+    gateway = null;
+  }
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -73,7 +88,12 @@ async function launchNoKeyAndWait(record = false): Promise<{
     env: {
       HOME: home,
       FX_SOUND: "0",
-      ...(record ? { FX_RECORD: join(root, "terminal.fxtape"), FX_DEBUG_RECORD_SILENT_BANNER: "1" } : {}),
+      ...(record
+        ? {
+            FX_RECORD: join(root, "terminal.fxtape"),
+            FX_DEBUG_RECORD_SILENT_BANNER: "1",
+          }
+        : {}),
       AI_GATEWAY_API_KEY: undefined,
       FX_AUTO_UPGRADE: "0",
       FX_DISABLE_KEYCHAIN: "1",
@@ -96,14 +116,21 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       try {
         await session.sendText("/compact");
         await session.waitForText("No context to compact.", 5_000);
-        await session.waitForPane((pane) => !pane.includes("No context to compact."), 5_000);
+        await session.waitForPane(
+          (pane) => !pane.includes("No context to compact."),
+          5_000,
+        );
         await session.waitForComposer(5_000);
         const scrollback = await session.captureFullScrollbackEscapes();
         expect(scrollback).toContain("Run /help for commands");
-        expect(scrollback).not.toMatch(/No context to compact|Context:|Compacting/);
+        expect(scrollback).not.toMatch(
+          /No context to compact|Context:|Compacting/,
+        );
         await session.sendKeys("C-o");
         const transcript = await session.waitForText("full detail", 5_000);
-        expect(transcript).not.toMatch(/No context to compact|Context:|Compacting/);
+        expect(transcript).not.toMatch(
+          /No context to compact|Context:|Compacting/,
+        );
         await session.sendKeys("C-o");
         await session.waitForComposer(5_000);
         await session.sendLiteral("composer-after-noop");
@@ -112,7 +139,10 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
         expect(readFileSync(launched.stderrPath, "utf8")).toBe("");
       } catch (error) {
         tempDirs.splice(tempDirs.indexOf(launched.root), 1);
-        writeFileSync(join(launched.root, "failure.scrollback.ansi"), await session.captureFullScrollbackEscapes());
+        writeFileSync(
+          join(launched.root, "failure.scrollback.ansi"),
+          await session.captureFullScrollbackEscapes(),
+        );
         console.error(`no-op evidence retained: ${launched.root}`);
         throw error;
       }
@@ -139,9 +169,15 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
 
       const panel = await readPermissionsPanel(session, 5_000);
       expect(["ask", "auto"]).toContain(panel.fields.Mode);
-      expect(panel.labels.indexOf("Change mode")).toBeGreaterThan(panel.labels.indexOf("Mode"));
-      expect(panel.fields["Change mode"]).toBe("/permissions ask, auto, full-access, or reset");
-      expect(await session.captureFullScrollback()).not.toContain("* permissions:");
+      expect(panel.labels.indexOf("Change mode")).toBeGreaterThan(
+        panel.labels.indexOf("Mode"),
+      );
+      expect(panel.fields["Change mode"]).toBe(
+        "/permissions ask, auto, full-access, or reset",
+      );
+      expect(await session.captureFullScrollback()).not.toContain(
+        "* permissions:",
+      );
 
       await session.sendLiteral("composer-still-usable");
       const pane = await session.waitForText("composer-still-usable", 5_000);
@@ -154,7 +190,9 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
 
   /// A 60x12 shell over `gateway`, recording to a tape, for the tests of the
   /// `/status` panel in a terminal too short for all of it.
-  async function launchShortTerminal(name: string): Promise<{ stderrPath: string; tapePath: string }> {
+  async function launchShortTerminal(
+    name: string,
+  ): Promise<{ stderrPath: string; tapePath: string }> {
     const root = mkdtempSync(join(tmpdir(), `fx-status-${name}-`));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
@@ -193,71 +231,97 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
 
   /// Rows of `scrollback` that hold a labeled line of the `/status` panel.
   function panelLinesIn(scrollback: string): string[] {
-    return scrollback.split("\n").filter((row) =>
-      ["Session", "Permissions", "Session grants"].some((label) => new RegExp(`^ {2}${label} {2,}\\S`).test(row)));
+    return scrollback
+      .split("\n")
+      .filter((row) =>
+        ["Session", "Permissions", "Session grants"].some((label) =>
+          new RegExp(`^ {2}${label} {2,}\\S`).test(row),
+        ),
+      );
   }
 
-  test(
-    "compact status panel leaves native scrollback whole",
-    async () => {
-      gateway = startFakeGateway([]);
-      const { stderrPath, tapePath } = await launchShortTerminal("compact");
-      expect((await session!.captureFullScrollback()).split("Run /help for commands")).toHaveLength(2);
+  test("compact status panel leaves native scrollback whole", async () => {
+    gateway = startFakeGateway([]);
+    const { stderrPath, tapePath } = await launchShortTerminal("compact");
+    expect(
+      (await session!.captureFullScrollback()).split("Run /help for commands"),
+    ).toHaveLength(2);
 
-      // Twelve rows leave the panel room for one line at a time. It scrolls
-      // instead of covering the transcript, so the transcript's last row
-      // stays in view.
-      const kept = lastTranscriptRow((await session!.capturePane()).split("\n"));
-      await session!.sendText("/status");
-      const panel = await waitForStatusPanel(session!, 5_000);
-      expect(panel.labels[0]).toBe("Session");
-      expect(panel.labels.at(-1)).toBe("Build");
-      expect(panel.fields.Permissions).toBe("auto");
-      expect((await session!.capturePane()).split("\n").map((row) => row.trimEnd())).toContain(kept);
-      await closeStatusPanel(session!, 5_000);
-      await session!.waitForComposer(5_000);
-      const scrollback = await session!.captureFullScrollback();
-      expect(scrollback.split("Run /help for commands")).toHaveLength(2);
-      expect(panelLinesIn(scrollback)).toEqual([]);
-      expect(session!.paneStatus()).toEqual({ dead: false, status: null });
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    // Twelve rows leave the panel room for one line at a time. It scrolls
+    // instead of covering the transcript, so the transcript's last row
+    // stays in view.
+    const kept = lastTranscriptRow((await session!.capturePane()).split("\n"));
+    await session!.sendText("/status");
+    const panel = await waitForStatusPanel(session!, 5_000);
+    expect(panel.labels[0]).toBe("Session");
+    expect(panel.labels.at(-1)).toBe("Build");
+    expect(panel.fields.Permissions).toBe("auto");
+    expect(
+      (await session!.capturePane()).split("\n").map((row) => row.trimEnd()),
+    ).toContain(kept);
+    await closeStatusPanel(session!, 5_000);
+    await session!.waitForComposer(5_000);
+    const scrollback = await session!.captureFullScrollback();
+    expect(scrollback.split("Run /help for commands")).toHaveLength(2);
+    expect(panelLinesIn(scrollback)).toEqual([]);
+    expect(session!.paneStatus()).toEqual({ dead: false, status: null });
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
 
-      await session!.sendText("/quit");
-      expect(await session!.waitForSessionEnd(5_000)).toBe(true);
-      session = null;
+    await session!.sendText("/quit");
+    expect(await session!.waitForSessionEnd(5_000)).toBe(true);
+    session = null;
 
-      const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], {
+    const replay = JSON.parse(
+      execFileSync(FX_BIN, ["replay", tapePath, "--json"], {
         encoding: "utf8",
-      }));
-      expect(replay.frame_count).toBeGreaterThan(0);
-      expect(replay.stdout_bytes).toBeGreaterThan(0);
-    },
-    // Reading every line takes a ↓ and two captures a line.
-    60_000,
-  );
+      }),
+    );
+    expect(replay.frame_count).toBeGreaterThan(0);
+    expect(replay.stdout_bytes).toBeGreaterThan(0);
+  }, 60_000); // Reading every line takes a ↓ and two captures a line.
 
   test(
     "compact status panel keeps every transcript row when a turn answers while it is open",
     async () => {
       const held = heldFakeGatewayFinalText();
       gateway = startDynamicFakeGateway((body) =>
-        body.includes("slow question") ? held.response : fakeGatewayFinalText("unexpected request"));
+        body.includes("slow question")
+          ? held.response
+          : fakeGatewayFinalText("unexpected request"),
+      );
       const { stderrPath } = await launchShortTerminal("answer");
 
       await session!.sendText("slow question");
       await session!.waitForText("Thinking", 10_000);
       await session!.sendText("/status");
-      await waitForStatusPanel(session!, 5_000, (shown) => shown.labels[0] === "Session");
-      held.release("FIRST_ANSWER_LINE\n\nSECOND_ANSWER_LINE\n\nTHIRD_ANSWER_LINE");
+      await waitForStatusPanel(
+        session!,
+        5_000,
+        (shown) => shown.labels[0] === "Session",
+      );
+      held.release(
+        "FIRST_ANSWER_LINE\n\nSECOND_ANSWER_LINE\n\nTHIRD_ANSWER_LINE",
+      );
       // The answer shows above the panel, which stays open.
       await session!.waitForText("THIRD_ANSWER_LINE", 10_000);
-      expect(showsStatusPanel((await session!.capturePane()).split("\n"))).toBe(true);
+      expect(showsStatusPanel((await session!.capturePane()).split("\n"))).toBe(
+        true,
+      );
       await closeStatusPanel(session!, 5_000);
       await session!.waitForComposer(5_000);
 
       const scrollback = await session!.captureFullScrollback();
-      for (const row of ["Run /help for commands", "┃ slow question", "FIRST_ANSWER_LINE", "SECOND_ANSWER_LINE", "THIRD_ANSWER_LINE"]) {
-        expect({ row, count: scrollback.split(row).length - 1 }).toEqual({ row, count: 1 });
+      for (const row of [
+        "Run /help for commands",
+        "┃ slow question",
+        "FIRST_ANSWER_LINE",
+        "SECOND_ANSWER_LINE",
+        "THIRD_ANSWER_LINE",
+      ]) {
+        expect({ row, count: scrollback.split(row).length - 1 }).toEqual({
+          row,
+          count: 1,
+        });
       }
       expect(panelLinesIn(scrollback)).toEqual([]);
       expect(session!.paneStatus()).toEqual({ dead: false, status: null });
@@ -266,6 +330,74 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
     TIMEOUT,
   );
 });
+
+test.skipIf(TMUX_SKIP)(
+  "model hub selects a provider and persists workspace roles",
+  async () => {
+    const f = createConfiguredProviderFixture();
+    const stderrPath = join(f.home, "stderr.log");
+    try {
+      session = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: f.workspace,
+        env: f.env,
+        stderrPath,
+        width: 120,
+        height: 36,
+      });
+      await session.waitForComposer(15_000);
+      await session.sendText("/models");
+      await session.waitForText("Unknown command. Try /help.", 5_000);
+      await session.sendText("/model");
+      await session.waitForText("All models", 5_000);
+      await session.sendKeys("Up");
+      await session.sendKeys("Right");
+      await session.sendLiteral("nportcheck");
+      await session.sendKeys("Enter");
+      await session.waitForText("Created role", 5_000);
+      expect(
+        JSON.parse(readFileSync(f.settingsPath, "utf8")).model_tags,
+      ).toHaveProperty("portcheck");
+      await session.sendKeys("Escape");
+      await session.waitForComposer(5_000);
+      await session.sendText("/model");
+      await session.waitForText("All models", 5_000);
+      await session.sendKeys("Right");
+      await session.sendKeys("Down");
+      await session.sendKeys("C-r");
+      await session.waitForText("Role scope", 5_000);
+      await session.sendKeys("Enter");
+      await session.sendKeys("Enter");
+      await session.waitForText(
+        "default now uses remote-model on remote",
+        5_000,
+      );
+      const settings = JSON.parse(readFileSync(f.settingsPath, "utf8"));
+      expect(settings.workspaces[f.workspace].model_roles.default).toBe(
+        "remote/remote-model",
+      );
+      await session.sendKeys("Enter");
+      await session.waitForComposer(5_000);
+      await session.sendText("hello model port");
+      await session.waitForText("local reply", 15_000);
+      expect(f.requests.at(-1)?.body.model).toBe("remote-model");
+      expect(f.requests.at(-1)?.authorization).toBe(
+        "Bearer own-provider-token",
+      );
+      await session.sendText("/exit");
+      await session.waitForSessionEnd(10_000);
+      expect(session.recordedExitStatus()).toBe(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      if (session) {
+        await session.kill();
+        session = null;
+      }
+      f.close();
+    }
+  },
+  60_000,
+);
 
 describe.skipIf(SKIP)("tui: slash commands", () => {
   test(
@@ -295,17 +427,6 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
   );
 
   test(
-    "/model Enter lists available models inline",
-    async () => {
-      session = await launchAndWait();
-      await session.sendText("/model");
-      const pane = await session.waitForText(/anthropic|model/i, 10_000);
-      expect(pane.length).toBeGreaterThan(0);
-    },
-    TIMEOUT,
-  );
-
-  test(
     "unknown and removed commands show errors",
     async () => {
       session = await launchAndWait();
@@ -317,7 +438,6 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
         "/issue",
         "/history",
         "/rules",
-        "/models",
       ].entries()) {
         await session.sendText(command);
         const expectedCount = index + 1;
@@ -325,13 +445,14 @@ describe.skipIf(SKIP)("tui: slash commands", () => {
         let scrollback = "";
         while (Date.now() < deadline) {
           scrollback = await session.captureFullScrollback();
-          const actualCount = scrollback.split("Unknown command. Try /help.").length - 1;
+          const actualCount =
+            scrollback.split("Unknown command. Try /help.").length - 1;
           if (actualCount >= expectedCount) break;
           await Bun.sleep(50);
         }
-        expect(
-          scrollback.split("Unknown command. Try /help.").length - 1,
-        ).toBe(expectedCount);
+        expect(scrollback.split("Unknown command. Try /help.").length - 1).toBe(
+          expectedCount,
+        );
       }
     },
     TIMEOUT,

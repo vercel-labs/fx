@@ -69,7 +69,7 @@ pub const presets = [_]Preset{
         // Cursor's agent service over Connect; the protocol field is unused
         // because the cursor transport owns the preset (D200).
         .json =
-        \\{"protocol":"openai-chat-completions","base_url":"https://api2.cursor.sh","auth":{"type":"none"},"default_model":"composer-2.5","reviewer_model":"composer-2.5-fast"}
+        \\{"protocol":"openai-chat-completions","base_url":"https://api2.cursor.sh","auth":{"type":"login","env":"CURSOR_API_KEY"},"default_model":"composer-2.5","reviewer_model":"composer-2.5-fast"}
         ,
         .models = &cursor_models.metadata,
     },
@@ -131,15 +131,31 @@ pub fn extend(alloc: Allocator, registry: *?configured.Registry, fx_dir: ?[]cons
     const overrides = if (fx_dir) |dir| try loadOverrides(arena, dir) else null;
     for (&presets) |*preset| {
         const patch = if (overrides) |object| object.get(preset.id) else null;
-        // A user's own definition with this id replaces the preset entirely.
-        if (patch == null and target.get(preset.id) != null) continue;
-        try target.put(alloc, try buildPreset(alloc, arena, preset, patch));
+        // A user's own definition with this id replaces the preset entirely;
+        // a metadata patch must not silently restore the preset's endpoint.
+        if (target.get(preset.id)) |existing| {
+            const overlay = patch orelse continue;
+            if (overlay != .object) return error.InvalidModelsFile;
+            const source = existing.source orelse return error.InvalidModelsFile;
+            var definition = try configured.parse_definition(alloc, preset.id, try configured.overlayValue(arena, source, overlay));
+            definition.preset = existing.preset;
+            definition.catalog = existing.catalog;
+            definition.builtin_models = existing.builtin_models;
+            try target.put(alloc, definition);
+        } else try target.put(alloc, try buildPreset(alloc, arena, preset, patch));
     }
     const object = overrides orelse return;
     var iterator = object.iterator();
     while (iterator.next()) |entry| {
         if (presetFor(entry.key_ptr.*) != null) continue;
-        try target.put(alloc, try configured.parse_definition(alloc, entry.key_ptr.*, entry.value_ptr.*));
+        const id = entry.key_ptr.*;
+        if (configured.isNativeId(id)) {
+            try target.putNative(alloc, try configured.parseNative(alloc, id, entry.value_ptr.*));
+        } else {
+            const base = if (target.get(id)) |definition| definition.source else null;
+            const value = if (base) |source| try configured.overlayValue(arena, source, entry.value_ptr.*) else entry.value_ptr.*;
+            try target.put(alloc, try configured.parse_definition(alloc, id, value));
+        }
     }
 }
 
@@ -149,19 +165,31 @@ pub fn buildPreset(alloc: Allocator, arena: Allocator, preset: *const Preset, pa
     var base = try std.json.parseFromSliceLeaky(std.json.Value, arena, preset.json, .{});
     if (patch) |overlay| {
         if (overlay != .object) return error.InvalidModelsFile;
-        var iterator = overlay.object.iterator();
-        while (iterator.next()) |entry| {
-            const key = entry.key_ptr.*;
-            const merge = std.mem.eql(u8, key, "headers") or std.mem.eql(u8, key, "model_metadata");
-            const existing = base.object.getPtr(key);
-            if (merge and existing != null and existing.?.* == .object and entry.value_ptr.* == .object) {
-                var fields = entry.value_ptr.object.iterator();
-                while (fields.next()) |field| try existing.?.object.put(arena, field.key_ptr.*, field.value_ptr.*);
-            } else try base.object.put(arena, key, entry.value_ptr.*);
-        }
+        base = try configured.overlayValue(arena, base, overlay);
     }
     var definition = try configured.parse_definition(alloc, preset.id, base);
     definition.builtin_models = preset.models;
+    // Materialize preset policy once. Requests and catalog projections see
+    // the same effective defaults/overrides without changing the transport.
+    const parsed_models = definition.model_metadata;
+    const storage = definition.model_storage.?.allocator();
+    var models: std.ArrayList(configured.ModelMetadata) = .empty;
+    for (preset.models) |builtin| {
+        var metadata = builtin;
+        if (definition.model_defaults) |defaults| metadata = configured.overlayMetadata(metadata, defaults.*);
+        for (parsed_models) |override| if (std.mem.eql(u8, override.id, builtin.id)) {
+            metadata = configured.overlayMetadata(metadata, override);
+            break;
+        };
+        try models.append(storage, metadata);
+    }
+    for (parsed_models) |metadata| {
+        const builtin = for (preset.models) |model| {
+            if (std.mem.eql(u8, model.id, metadata.id)) break true;
+        } else false;
+        if (!builtin) try models.append(storage, metadata);
+    }
+    definition.model_metadata = models.items;
     definition.catalog = preset.catalog;
     definition.preset = true;
     return definition;
@@ -225,7 +253,10 @@ test "presets join the registry with their built-in models and routes" {
     try std.testing.expectEqual(configured.Protocol.@"anthropic-messages", zen.protocolFor("claude-sonnet-5-5"));
     try std.testing.expectEqual(configured.Protocol.@"openai-responses", zen.protocolFor("gpt-5.5"));
     try std.testing.expectEqual(configured.Protocol.@"openai-chat-completions", zen.protocolFor("kimi-k3"));
-    try std.testing.expect(zen.model("gemini-3-pro") == null);
+    try std.testing.expectEqual(configured.Protocol.@"google-generative-ai", zen.protocolFor("gemini-3-pro"));
+    const gemini = zen.model("gemini-3-pro").?;
+    try std.testing.expectEqualStrings("Gemini 3 Pro", gemini.name.?);
+    try std.testing.expect(gemini.cost != null);
     try std.testing.expect(zen.model(zen.default_model.?) != null);
     const cursor = value.get("cursor").?;
     try std.testing.expect(cursor.preset);
@@ -233,6 +264,32 @@ test "presets join the registry with their built-in models and routes" {
     try std.testing.expect(cursor.model("claude-opus-5-high") != null);
     const go = value.get("opencode-go").?;
     try std.testing.expect(go.model(go.default_model.?) != null);
+}
+
+test "native model overrides preserve native identity and merge provider defaults" {
+    const alloc = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const overrides = try parseOverrides(arena.allocator(),
+        \\{"providers":{"codex":{"default_model":"custom-codex","compat":{"supportsStore":false},"defaults":{"context_window":64000,"prefer_websockets":false},"model_metadata":{"custom-codex":{"name":"Custom Codex","max_output_tokens":4000,"headers":{"X-Model":"custom"}}}},"gateway":{"model_metadata":{"custom/model":{"supports_vision":true}}},"grok":{"model_metadata":{"custom-grok":{"tokenizer":"o200k_base"}}}}}
+    );
+    var registry: configured.Registry = .{};
+    defer registry.deinit(alloc);
+    var iterator = overrides.iterator();
+    while (iterator.next()) |entry| try registry.putNative(alloc, try configured.parseNative(alloc, entry.key_ptr.*, entry.value_ptr.*));
+    try std.testing.expectEqual(@as(usize, 0), registry.definitions.len);
+    try std.testing.expect(registry.get("codex") == null);
+    try std.testing.expectEqualStrings("custom-codex", registry.native("codex").?.default_model.?);
+    const model = registry.model("codex", "custom-codex").?;
+    try std.testing.expectEqual(@as(?u32, 64000), model.context_window);
+    try std.testing.expectEqual(@as(?u32, 4000), model.max_output_tokens);
+    try std.testing.expectEqual(@as(?bool, false), model.prefer_websockets);
+    try std.testing.expectEqual(@as(?bool, false), model.compat.supports_store);
+    try std.testing.expectEqualStrings("custom", model.headers[0].value);
+    try std.testing.expectEqual(@as(?u32, 64000), registry.model("codex", "discovered-codex").?.context_window);
+    try std.testing.expectEqual(@as(?bool, true), registry.model("gateway", "custom/model").?.supports_vision);
+    const forbidden = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"protocol\":\"openai-responses\"}", .{});
+    try std.testing.expectError(error.UnknownField, configured.parseNative(alloc, "codex", forbidden));
 }
 
 test "models.json patches presets by key and adds whole definitions" {

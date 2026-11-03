@@ -19,6 +19,7 @@ const tool_call_ids = @import("tool_call_ids.zig");
 const wire = @import("claude_agent_wire.zig");
 const streams = @import("../core/agent/stream_provider.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
+const image_attachments = @import("../core/images/image_attachments.zig");
 const types = @import("../core/shared/types.zig");
 const io_mod = @import("../core/shared/io.zig");
 const Allocator = std.mem.Allocator;
@@ -35,10 +36,18 @@ pub const BlobStore = std.AutoHashMapUnmanaged(BlobId, []const u8);
 pub const Model = struct {
     /// The id proto-fx knows the model by.
     id: []const u8,
-    /// The id sent to Cursor, after effort routing.
+    /// The discovered id used when Cursor's normalized request is rejected.
     wire_id: []const u8,
     name: []const u8,
     max_mode: bool = false,
+    /// Cursor's normalized model id. Null keeps the discovered id on the wire.
+    normalized_id: ?[]const u8 = null,
+    /// The effort parameter paired with `normalized_id`.
+    effort_parameter: ?[]const u8 = null,
+    /// The discovered id to retry when the normalized request is not found.
+    fallback_wire_id: ?[]const u8 = null,
+    /// Bare composer-2.5 otherwise silently selects Cursor's fast lane.
+    disable_fast: bool = false,
 };
 
 pub const Built = struct {
@@ -57,7 +66,9 @@ pub const Options = struct {
 /// Builds the request in `arena`, which owns everything returned.
 pub fn build(arena: Allocator, request: streams.RequestData, options: Options) !Built {
     if (request.response_format != null) return error.UnsupportedResponseFormat;
-    for (request.messages) |message| if (message.images.len != 0) return error.UnsupportedVision;
+    for (request.messages) |message| {
+        if (message.images.len != 0 and message.role != .user) return error.InvalidProviderPrompt;
+    }
     var projection = try tool_call_ids.Projection.init(arena, request.messages);
     var blobs: BlobStore = .empty;
 
@@ -85,21 +96,33 @@ pub fn build(arena: Allocator, request: streams.RequestData, options: Options) !
 
     var action = pb.Writer.init(arena);
     if (active) |index| {
-        const user = try userMessage(arena, messages[index].content orelse "", null);
+        const user = try userMessage(arena, messages[index], null);
         var user_action = pb.Writer.init(arena);
         try user_action.bytesField(1, user);
         try action.bytesField(1, user_action.bytes.items);
     } else try action.emptyField(2);
 
     const model = options.model;
+    const normalized_id = model.normalized_id orelse model.wire_id;
     var details = pb.Writer.init(arena);
-    try details.stringField(1, model.wire_id);
+    try details.stringField(1, normalized_id);
     try details.stringField(3, model.id);
     try details.stringField(4, model.name);
     if (model.max_mode) try details.boolField(7, true);
     var requested = pb.Writer.init(arena);
-    try requested.stringField(1, model.wire_id);
+    try requested.stringField(1, normalized_id);
     if (model.max_mode) try requested.boolField(2, true);
+    if (model.effort_parameter) |effort| {
+        var parameter = pb.Writer.init(arena);
+        try parameter.stringField(1, "reasoning");
+        try parameter.stringField(2, effort);
+        try requested.bytesField(3, parameter.bytes.items);
+    } else if (model.disable_fast) {
+        var parameter = pb.Writer.init(arena);
+        try parameter.stringField(1, "fast");
+        try parameter.stringField(2, "false");
+        try requested.bytesField(3, parameter.bytes.items);
+    }
 
     var run = pb.Writer.init(arena);
     try run.bytesField(1, state.bytes.items);
@@ -117,6 +140,81 @@ pub fn build(arena: Allocator, request: streams.RequestData, options: Options) !
     };
 }
 
+/// Rewrites the model and/or conversation fields in an encoded
+/// AgentClientMessage. Fallback retries use the discovered model id and omit
+/// normalized effort parameters; rotated conversations keep every blob and
+/// action from the original prepared request.
+pub fn rewriteRun(
+    arena: Allocator,
+    client_message: []const u8,
+    model_id: ?[]const u8,
+    conversation_id: ?[]const u8,
+    drop_parameters: bool,
+) ![]const u8 {
+    var outer = pb.Reader.init(client_message);
+    var output = pb.Writer.init(arena);
+    while (try outer.next()) |field| {
+        if (field.number == 1 and field.wire == .bytes) {
+            var run = pb.Reader.init(field.data);
+            var rewritten = pb.Writer.init(arena);
+            while (try run.next()) |run_field| {
+                if (run_field.number == 3 and run_field.wire == .bytes and model_id != null) {
+                    try rewritten.bytesField(3, try rewriteModelDetails(arena, run_field.data, model_id.?));
+                } else if (run_field.number == 5 and run_field.wire == .bytes and conversation_id != null) {
+                    try rewritten.bytesField(5, conversation_id.?);
+                } else if (run_field.number == 9 and run_field.wire == .bytes and model_id != null) {
+                    try rewritten.bytesField(9, try rewriteRequestedModel(arena, run_field.data, model_id.?, drop_parameters));
+                } else try copyField(&rewritten, run_field);
+            }
+            try output.bytesField(1, rewritten.bytes.items);
+        } else try copyField(&output, field);
+    }
+    return output.bytes.items;
+}
+
+fn rewriteModelDetails(arena: Allocator, encoded: []const u8, model_id: []const u8) ![]const u8 {
+    var reader = pb.Reader.init(encoded);
+    var output = pb.Writer.init(arena);
+    var replaced = false;
+    while (try reader.next()) |field| {
+        if (field.number == 1 and field.wire == .bytes) {
+            try output.stringField(1, model_id);
+            replaced = true;
+        } else try copyField(&output, field);
+    }
+    if (!replaced) try output.stringField(1, model_id);
+    return output.bytes.items;
+}
+
+fn rewriteRequestedModel(arena: Allocator, encoded: []const u8, model_id: []const u8, drop_parameters: bool) ![]const u8 {
+    var reader = pb.Reader.init(encoded);
+    var output = pb.Writer.init(arena);
+    var replaced = false;
+    while (try reader.next()) |field| {
+        if (field.number == 1 and field.wire == .bytes) {
+            try output.stringField(1, model_id);
+            replaced = true;
+        } else if (field.number == 3 and drop_parameters) {
+            continue;
+        } else try copyField(&output, field);
+    }
+    if (!replaced) try output.stringField(1, model_id);
+    return output.bytes.items;
+}
+
+fn copyField(writer: *pb.Writer, field: pb.Field) !void {
+    switch (field.wire) {
+        .bytes => try writer.bytesField(field.number, field.data),
+        .varint => try writer.uintField(field.number, field.int),
+        .fixed64 => try writer.doubleField(field.number, @bitCast(field.int)),
+        .fixed32 => {
+            try writer.tag(field.number, .fixed32);
+            try writer.bytes.appendSlice(writer.alloc, &std.mem.toBytes(std.mem.nativeToLittle(u32, @truncate(field.int))));
+        },
+        else => return error.UnsupportedWireType,
+    }
+}
+
 fn store(arena: Allocator, blobs: *BlobStore, data: []const u8) !BlobId {
     var id: BlobId = undefined;
     std.crypto.hash.sha2.Sha256.hash(data, &id, .{});
@@ -128,8 +226,8 @@ fn storeJson(arena: Allocator, blobs: *BlobStore, value: anytype) !BlobId {
     return store(arena, blobs, try std.json.Stringify.valueAlloc(arena, value, .{}));
 }
 
-/// UserMessage{text, message_id}. A null seed draws a fresh id.
-fn userMessage(arena: Allocator, text: []const u8, seed: ?[]const u8) ![]const u8 {
+/// UserMessage{text, message_id, selected_context}. A null seed draws a fresh id.
+fn userMessage(arena: Allocator, message: types.ChatMessage, seed: ?[]const u8) ![]const u8 {
     var id: [36]u8 = undefined;
     if (seed) |value| {
         id = wire.derivedUuid(value, 0);
@@ -139,9 +237,29 @@ fn userMessage(arena: Allocator, text: []const u8, seed: ?[]const u8) ![]const u
         id = wire.derivedUuid(&random, 1);
     }
     var w = pb.Writer.init(arena);
-    try w.stringField(1, std.mem.trim(u8, text, " \t\r\n"));
+    try w.stringField(1, std.mem.trim(u8, message.content orelse "", " \t\r\n"));
     try w.bytesField(2, try arena.dupe(u8, &id));
+    if (message.images.len != 0) {
+        var selected = pb.Writer.init(arena);
+        for (message.images) |image| try selected.bytesField(1, try selectedImage(arena, image));
+        try w.bytesField(3, selected.bytes.items);
+    }
     return w.bytes.items;
+}
+
+/// SelectedImage{uuid, mime_type, data}. Cursor's selected-context wire uses
+/// field 8 for inline bytes; the source path is intentionally not sent.
+fn selectedImage(arena: Allocator, attachment: types.ImageAttachment) ![]const u8 {
+    var verified = image_attachments.loadVerifiedSnapshot(arena, attachment, .{}) catch return error.ImageUnavailable;
+    defer verified.deinit(arena);
+    var random: [16]u8 = undefined;
+    io_mod.getIo().random(&random);
+    const uuid = wire.derivedUuid(&random, attachment.id);
+    var selected = pb.Writer.init(arena);
+    try selected.stringField(2, &uuid);
+    try selected.stringField(7, verified.media_type);
+    try selected.bytesField(8, verified.bytes);
+    return selected.bytes.items;
 }
 
 fn toolResults(history: []const types.ChatMessage) ToolResults {
@@ -182,9 +300,7 @@ fn appendRootHistory(arena: Allocator, blobs: *BlobStore, roots: *std.ArrayList(
     for (history) |message| switch (message.role) {
         .system => {},
         .user => {
-            const text = std.mem.trim(u8, message.content orelse "", " \t\r\n");
-            if (text.len == 0) continue;
-            try roots.append(arena, try storeJson(arena, blobs, .{ .role = "user", .content = &[_]TextPart{.{ .text = text }} }));
+            if (try rootUserBlob(arena, blobs, message)) |id| try roots.append(arena, id);
         },
         .assistant => {
             var out: std.Io.Writer.Allocating = .init(arena);
@@ -223,6 +339,39 @@ fn appendRootHistory(arena: Allocator, blobs: *BlobStore, roots: *std.ArrayList(
             try roots.append(arena, try storeJson(arena, blobs, .{ .role = "tool", .id = wire_id, .content = &[_]ToolResultPart{part} }));
         },
     };
+}
+
+/// Root prompt user content mirrors Cursor's selected image JSON: text parts
+/// are trimmed, while image bytes travel as data URLs with their media type.
+fn rootUserBlob(arena: Allocator, blobs: *BlobStore, message: types.ChatMessage) !?BlobId {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    try w.writeAll("{\"role\":\"user\",\"content\":[");
+    var parts: usize = 0;
+    const text = std.mem.trim(u8, message.content orelse "", " \t\r\n");
+    if (text.len != 0) {
+        try w.writeAll("{\"type\":\"text\",\"text\":");
+        try std.json.Stringify.value(text, .{}, w);
+        try w.writeByte('}');
+        parts += 1;
+    }
+    for (message.images) |attachment| {
+        var verified = image_attachments.loadVerifiedSnapshot(arena, attachment, .{}) catch return error.ImageUnavailable;
+        defer verified.deinit(arena);
+        if (parts != 0) try w.writeByte(',');
+        try w.writeAll("{\"type\":\"image\",\"image\":");
+        var uri: std.Io.Writer.Allocating = .init(arena);
+        try uri.writer.print("data:{s};base64,", .{verified.media_type});
+        try std.base64.standard.Encoder.encodeWriter(&uri.writer, verified.bytes);
+        try std.json.Stringify.value(uri.written(), .{}, w);
+        try w.writeAll(",\"mediaType\":");
+        try std.json.Stringify.value(verified.media_type, .{}, w);
+        try w.writeByte('}');
+        parts += 1;
+    }
+    if (parts == 0) return null;
+    try w.writeAll("]}");
+    return try store(arena, blobs, out.written());
 }
 
 const TextPart = struct { type: []const u8 = "text", text: []const u8 };
@@ -264,9 +413,9 @@ fn buildTurns(arena: Allocator, blobs: *BlobStore, history: []const types.ChatMe
         index += 1;
         if (message.role != .user) continue;
         const text = std.mem.trim(u8, message.content orelse "", " \t\r\n");
-        if (text.len == 0) continue;
-        const seed = try arena.print("u:{d}:{s}", .{ turns.items.len, text });
-        const user_id = try store(arena, blobs, try userMessage(arena, text, seed));
+        if (text.len == 0 and message.images.len == 0) continue;
+        const seed = try arena.print("u:{d}:{s}:{d}", .{ turns.items.len, text, message.images.len });
+        const user_id = try store(arena, blobs, try userMessage(arena, message, seed));
         var steps: std.ArrayList(BlobId) = .empty;
         while (index < history.len and history[index].role != .user) : (index += 1) {
             const step_message = history[index];

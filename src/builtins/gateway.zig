@@ -684,13 +684,17 @@ fn streamAgentCompletion(
         try buildAgentRequest(alloc, request.data());
     defer if (request.prepared_request_body == null) alloc.free(payload);
     var events = request.events;
+    const metadata = request.provider_options.model_metadata;
+    var model_headers = try @import("../gateway/configured_request.zig").resolveHeaderValues(alloc, if (metadata) |value| value.headers else &.{});
+    defer model_headers.deinit(alloc);
     const stream_request = gateway_client.StreamRequest{
+        .extra_headers = model_headers.items,
         .api_key = request.credential.secret(),
         .team = request.credential.tenant(),
         .session_id = request.session_id,
         .model = request.model,
         .retry_count = request.retry_count,
-        .chat_url = agentChatUrl(),
+        .chat_url = if (metadata) |value| value.base_url orelse agentChatUrl() else agentChatUrl(),
         .payload = payload,
         .trace_ctx = request.trace_ctx,
         .content_capture_limit = request.content_capture_limit,
@@ -923,7 +927,10 @@ const OAuthHttpOperation = struct {
                 .get => .GET,
                 .post_form, .post_json => .POST,
             },
-            .payload = self.request.payload,
+            .payload = switch (self.request.method) {
+                .get => null,
+                .post_form, .post_json => self.request.payload,
+            },
             .headers = .{
                 .content_type = switch (self.request.method) {
                     .get => .default,
@@ -2868,10 +2875,17 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
     errdefer alloc.free(owned_model_type);
     const name = try parseModelName(alloc, entry.object.get("name"));
     errdefer if (name) |value| alloc.free(value);
+    const description = try parseModelName(alloc, entry.object.get("description"));
+    errdefer if (description) |value| alloc.free(value);
 
     return .{
         .id = id,
         .name = name,
+        .description = description,
+        .cost = parseModelCost(entry.object.get("pricing")),
+        .intelligence = catalogNumber(entry.object.get("intelligence")),
+        .recommended = optionalTagListContains(tags_value, "recommended") or catalogBool(entry.object.get("recommended")),
+        .beta = optionalTagListContains(tags_value, "beta") or catalogBool(entry.object.get("beta")),
         .model_type = owned_model_type,
         .released = released,
         .has_tool_use = has_tool_use,
@@ -2887,6 +2901,35 @@ fn parseModelCatalogEntry(alloc: std.mem.Allocator, entry: std.json.Value) !?Mod
         .context_window = context_window,
         .max_tokens = max_tokens,
         .web_search_price = web_search_price,
+    };
+}
+
+fn catalogNumber(value: ?std.json.Value) ?f64 {
+    const actual = value orelse return null;
+    const number: f64 = switch (actual) {
+        .string => std.fmt.parseFloat(f64, actual.string) catch return null,
+        .float => actual.float,
+        .integer => @floatFromInt(actual.integer),
+        else => return null,
+    };
+    return if (std.math.isFinite(number) and number >= 0) number else null;
+}
+
+fn catalogBool(value: ?std.json.Value) bool {
+    const actual = value orelse return false;
+    return actual == .bool and actual.bool;
+}
+
+fn parseModelCost(pricing: ?std.json.Value) ?model_catalog.ModelCost {
+    const value = pricing orelse return null;
+    if (value != .object) return null;
+    const input = catalogNumber(value.object.get("input")) orelse return null;
+    const output = catalogNumber(value.object.get("output")) orelse return null;
+    return .{
+        .input = input * 1_000_000,
+        .output = output * 1_000_000,
+        .cache_read = (catalogNumber(value.object.get("input_cache_read")) orelse 0) * 1_000_000,
+        .cache_write = (catalogNumber(value.object.get("input_cache_write")) orelse 0) * 1_000_000,
     };
 }
 
@@ -3047,6 +3090,25 @@ fn tagListContains(value: std.json.Value, needle: []const u8) bool {
         if (item == .string and std.ascii.eqlIgnoreCase(item.string, needle)) return true;
     }
     return false;
+}
+
+test "model catalog carries descriptive metadata and per-million pricing" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"id":"model","name":"Model","description":"Fast model","tags":["tool-use","vision","recommended","beta"],"intelligence":71,"pricing":{"input":"0.000002","output":0.000008,"input_cache_read":"0.0000002"}}
+    , .{});
+    defer parsed.deinit();
+    const entry = (try parseModelCatalogEntry(alloc, parsed.value)).?;
+    defer model_catalog.freeModelCatalogEntry(alloc, entry);
+    try std.testing.expectEqualStrings("Fast model", entry.description.?);
+    try std.testing.expectEqual(@as(f64, 2), entry.cost.?.input);
+    try std.testing.expectEqual(@as(f64, 8), entry.cost.?.output);
+    try std.testing.expectEqual(@as(?f64, 71), entry.intelligence);
+    try std.testing.expect(entry.recommended and entry.beta and entry.has_vision);
+    const copy = try model_catalog.cloneModelCatalogEntry(alloc, entry);
+    defer model_catalog.freeModelCatalogEntry(alloc, copy);
+    try std.testing.expectEqualStrings(entry.description.?, copy.description.?);
+    try std.testing.expectEqual(entry.cost, copy.cost);
 }
 
 test "parseSortedModelIds filters non-language entries and surfaces popular models first" {

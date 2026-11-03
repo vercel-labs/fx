@@ -493,6 +493,7 @@ pub const V2Children = struct {
         for (self.seeds.keys(), self.seeds.values()) |key, seed| {
             self.alloc.free(key);
             self.alloc.free(seed.preferences.model);
+            if (seed.preferences.role) |role| self.alloc.free(role);
         }
         self.seeds.deinit(self.alloc);
         self.* = undefined;
@@ -514,8 +515,14 @@ pub const V2Children = struct {
         var owned = seed;
         owned.preferences.model = try self.alloc.dupe(u8, seed.preferences.model);
         errdefer self.alloc.free(owned.preferences.model);
+        owned.preferences.role = if (seed.preferences.role) |role|
+            try self.alloc.dupe(u8, role)
+        else
+            null;
+        errdefer if (owned.preferences.role) |role| self.alloc.free(role);
         if (self.seeds.getPtr(child_id)) |existing| {
             self.alloc.free(existing.preferences.model);
+            if (existing.preferences.role) |role| self.alloc.free(role);
             existing.* = owned;
             return;
         }
@@ -524,13 +531,19 @@ pub const V2Children = struct {
         try self.seeds.put(self.alloc, key, owned);
     }
 
-    /// A copy of the seed for `child_id`, or null. Free its model.
+    /// A copy of the seed for `child_id`, or null. The returned preferences
+    /// own their model and optional role bytes and must be deinitialized.
     pub fn seedFor(self: *V2Children, alloc: Allocator, child_id: []const u8) !?ChildSeed {
         self.state.lockUncancelable(io_mod.getIo());
         defer self.state.unlock(io_mod.getIo());
         const seed = self.seeds.get(child_id) orelse return null;
         var copy = seed;
         copy.preferences.model = try alloc.dupe(u8, seed.preferences.model);
+        errdefer alloc.free(copy.preferences.model);
+        copy.preferences.role = if (seed.preferences.role) |role|
+            try alloc.dupe(u8, role)
+        else
+            null;
         return copy;
     }
 
@@ -1520,10 +1533,16 @@ test "v2 children live in the parent's log and come back after a reopen (D22)" {
         try registry.finish(alloc, child_id, "work-1", .completed, null);
         try state_store.save(alloc, registry);
 
-        try children.rememberSeed(child_id, .{ .preferences = seed.preferences, .language = seed.language });
+        try children.rememberSeed(child_id, .{ .preferences = .{
+            .model = seed.preferences.model,
+            .effort = seed.preferences.effort,
+            .fast_mode = seed.preferences.fast_mode,
+            .role = @constCast("worker"),
+        }, .language = seed.language });
         var copy = (try children.seedFor(alloc, child_id)).?;
         defer copy.preferences.deinit(alloc);
         try std.testing.expectEqualStrings("test-model", copy.preferences.model);
+        try std.testing.expectEqualStrings("worker", copy.preferences.role.?);
         try std.testing.expect((try children.seedFor(alloc, "1786460757753-none")) == null);
     }
     parent.close();

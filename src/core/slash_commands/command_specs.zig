@@ -1788,7 +1788,7 @@ test "slash completion matches prefix and aliases" {
 test "slash completion ranks exact prefix and substring command matches" {
     const specs = [_]SlashSpec{
         .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename session", .presentation_category = .session },
-        .{ .kind = .model, .command = "/model", .help_entry = "/model <id>", .completion_description = "choose model", .presentation_category = .model },
+        .{ .kind = .model, .command = "/model", .help_entry = "/model", .completion_description = "open the model hub", .presentation_category = .model },
     };
     const registry = SlashRegistry{ .commands = specs[0..] };
 
@@ -1911,12 +1911,12 @@ test "child chat slash registry exposes only locally handled commands" {
     try std.testing.expectEqual(@as(usize, 3), child.commands.len);
     try std.testing.expect(matchesSlashExact(child, "/quit", .quit));
     try std.testing.expect(matchesSlashExact(child, "/model", .model));
-    try std.testing.expect(child.matchExact("/models") == null);
+    try std.testing.expect(!matchesSlashExact(child, "/models", .model));
     try std.testing.expect(matchesSlashExact(child, "/skills", .skills));
     try std.testing.expect(child.matchExact("/help") == null);
 }
 
-test "interactive model command has no plural spelling" {
+test "interactive model command has no plural alias" {
     const registry = testSlashRegistry();
     try std.testing.expect(registry.matchExact("/model") != null);
     try std.testing.expect(registry.matchExact("/models") == null);

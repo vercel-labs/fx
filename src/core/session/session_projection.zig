@@ -206,7 +206,16 @@ fn durablePreferencesEqual(
         left.provider.same_authority(right.provider) and
         left.effort.eql(right.effort) and
         left.fast_mode == right.fast_mode and
-        left.ultrafast_mode == right.ultrafast_mode;
+        left.ultrafast_mode == right.ultrafast_mode and
+        roleIdentityEqual(left.role, right.role);
+}
+
+fn roleIdentityEqual(left: ?[]u8, right: ?[]u8) bool {
+    if (left) |name| {
+        const other = right orelse return false;
+        return std.mem.eql(u8, name, other);
+    }
+    return right == null;
 }
 
 pub fn encodeCheckpoint(alloc: Allocator, checkpoint: Checkpoint) ![]u8 {

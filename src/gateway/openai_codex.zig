@@ -11,6 +11,12 @@ const responses_protocol = @import("responses_protocol.zig");
 const sse_stream = @import("sse.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const model_provider = @import("../core/config/model_provider.zig");
+const model_compatibility = @import("../core/config/model_compatibility.zig");
+const configured_provider = @import("../core/config/configured_provider.zig");
+const configured_request = @import("configured_request.zig");
+const codex_session = @import("openai_codex_session.zig");
+const codex_websocket = @import("openai_codex_websocket.zig");
+const codex_compression = @import("openai_codex_compression.zig");
 
 const Allocator = std.mem.Allocator;
 const endpoint = "https://chatgpt.com/backend-api/codex/responses";
@@ -25,6 +31,8 @@ const max_tool_arguments_bytes: usize = 4 * 1024 * 1024;
 const max_provider_state_bytes: usize = 4 * 1024 * 1024;
 const transfer_buffer_bytes: usize = 256 * 1024;
 const connect_timeout_ms: i64 = 30_000;
+const websocket_idle_reuse_ms: i64 = 30_000;
+const websocket_first_event_timeout_ms: i64 = 300_000;
 
 const CodexLimits = struct {
     aggregate_bytes: usize = max_sse_aggregate_bytes,
@@ -34,6 +42,8 @@ const CodexLimits = struct {
     tool_arguments_bytes: usize = max_tool_arguments_bytes,
     provider_state_bytes: usize = max_provider_state_bytes,
 };
+
+pub const TransportState = codex_session.TransportState;
 
 pub const agent_stream_provider = stream_provider.Provider{
     .stream_fn = streamCompletion,
@@ -80,6 +90,7 @@ pub fn buildRequestWith(
     try budget.check();
     const projected = try types.projectProviderReplay(alloc, request.messages, .{ .provider = options.provider, .model = request.model });
     defer if (projected) |messages| alloc.free(messages);
+    const compatibility: ?*const model_compatibility.Compatibility = if (request.provider_options.model_metadata) |metadata| &metadata.compat else null;
     if (projected != null) debug_trace.logf("gateway", "provider_replay_omitted provider=codex reason=source_mismatch", .{});
 
     var instructions: std.Io.Writer.Allocating = .init(alloc);
@@ -107,7 +118,7 @@ pub fn buildRequestWith(
     try writer.writeAll(",\"instructions\":");
     try std.json.Stringify.value(instructions.written(), .{}, writer);
     try writer.writeAll(",\"input\":[");
-    try writeResponsesInput(writer, std.heap.c_allocator, projected orelse request.messages, request.verified_images, budget);
+    try writeResponsesInput(writer, std.heap.c_allocator, projected orelse request.messages, request.verified_images, budget, compatibility);
     try writer.writeByte(']');
 
     _ = try responses_protocol.writeTools(writer, alloc, request.tools);
@@ -160,13 +171,14 @@ fn writeResponsesInput(
     messages: []const types.ChatMessage,
     images: ?[]const image_attachments.VerifiedSnapshot,
     budget: image_attachments.CaptureBudget,
+    compatibility: ?*const model_compatibility.Compatibility,
 ) !void {
-    return responses_protocol.writeInput(writer, alloc, messages, images, .{
+    return responses_protocol.writeInputWith(writer, alloc, messages, images, .{
         .tool_calls = max_tool_calls,
         .tool_identity_bytes = max_tool_identity_bytes,
         .tool_arguments_bytes = max_tool_arguments_bytes,
         .provider_state_bytes = max_provider_state_bytes,
-    }, budget) catch |err| switch (err) {
+    }, budget, .{ .compatibility = compatibility }) catch |err| switch (err) {
         error.ProviderStateTooLarge => error.OpenAICodexProviderStateTooLarge,
         error.InvalidProviderState => error.InvalidOpenAICodexProviderState,
         error.ToolCallLimitExceeded => error.OpenAICodexToolCallLimitExceeded,
@@ -176,10 +188,14 @@ fn writeResponsesInput(
 }
 
 fn streamCompletion(
-    _: ?*anyopaque,
+    raw: ?*anyopaque,
     alloc: Allocator,
     request: stream_provider.ModelRequest,
 ) !stream_provider.Result {
+    const transport_state: ?*TransportState = if (raw) |context|
+        @ptrCast(@alignCast(context))
+    else
+        null;
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     if (!acceptsCredential(request.credential)) {
         return stream_provider.failResult(error.CodexSubscriptionCredentialRequired);
@@ -192,6 +208,7 @@ fn streamCompletion(
         .alloc = alloc,
         .request = request,
         .payload = payload,
+        .transport_state = transport_state,
     };
     return (if (request.deadline) |deadline|
         gateway_client.runBoundedHttpOperation(
@@ -213,9 +230,10 @@ const PreparedStreamOperation = struct {
     alloc: Allocator,
     request: stream_provider.ModelRequest,
     payload: []const u8,
+    transport_state: ?*TransportState = null,
 
     pub fn run(self: *@This()) !stream_provider.Result {
-        return streamPrepared(self.alloc, self.request, self.payload);
+        return streamPreparedWithState(self.alloc, self.request, self.payload, self.transport_state);
     }
 };
 
@@ -232,6 +250,29 @@ pub fn responsesEndpoint() error{InvalidE2EOpenAICodexEndpoint}![]const u8 {
     const override = io_mod.getenv(e2e_endpoint_env) orelse return endpoint;
     if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EOpenAICodexEndpoint;
     return override;
+}
+
+fn requestEndpoint(alloc: Allocator, request: stream_provider.ModelRequest) ![]u8 {
+    // E2E overrides remain authoritative and are always loopback-validated.
+    if (io_mod.getenv(e2e_endpoint_env) != null) return alloc.dupe(u8, try responsesEndpoint());
+    if (request.provider_options.model_metadata) |metadata| if (metadata.base_url) |base| {
+        if (base.len > 0) {
+            if (std.mem.endsWith(u8, base, "/responses") or std.mem.endsWith(u8, base, "/codex/responses")) {
+                return alloc.dupe(u8, base);
+            }
+            return alloc.print("{s}/codex/responses", .{std.mem.trimEnd(u8, base, "/")});
+        }
+    };
+    return alloc.dupe(u8, endpoint);
+}
+
+fn resolveMetadataHeaders(alloc: Allocator, request: stream_provider.ModelRequest) !configured_request.Headers {
+    const metadata = request.provider_options.model_metadata orelse return .{};
+    if (metadata.headers.len == 0) return .{};
+    const selected = try alloc.alloc(configured_provider.Header, metadata.headers.len);
+    defer alloc.free(selected);
+    @memcpy(selected, metadata.headers);
+    return configured_request.resolveHeaderValues(alloc, selected);
 }
 
 pub const max_extra_headers = 6;
@@ -298,50 +339,520 @@ pub fn requestAuthHeaders(alloc: Allocator, auth: stream_provider.CredentialLeas
     };
 }
 
-pub fn streamPrepared(
+fn websocketUrl(alloc: Allocator, http_url: []const u8) ![]u8 {
+    if (std.mem.startsWith(u8, http_url, "https://")) {
+        const out = try alloc.alloc(u8, http_url.len - 2);
+        @memcpy(out[0..6], "wss://");
+        @memcpy(out[6..], http_url[8..]);
+        return out;
+    }
+    if (std.mem.startsWith(u8, http_url, "http://")) {
+        const out = try alloc.alloc(u8, http_url.len - 2);
+        @memcpy(out[0..5], "ws://");
+        @memcpy(out[5..], http_url[7..]);
+        return out;
+    }
+    return error.InvalidOpenAICodexEndpoint;
+}
+
+fn websocketHeaders(
+    buf: []std.http.Header,
+    authorization: ?[]const u8,
+    account_id: ?[]const u8,
+    session_id: ?[]const u8,
+    models_etag: ?[]const u8,
+    turn_state: ?[]const u8,
+    routing_hint: []const u8,
+) []std.http.Header {
+    var count: usize = 0;
+    if (authorization) |value| {
+        buf[count] = .{ .name = "Authorization", .value = value };
+        count += 1;
+    }
+    if (account_id) |value| {
+        buf[count] = .{ .name = "chatgpt-account-id", .value = value };
+        count += 1;
+    }
+    buf[count] = .{ .name = "originator", .value = "pi" };
+    count += 1;
+    buf[count] = .{ .name = "OpenAI-Beta", .value = "responses_websockets=2026-02-06" };
+    count += 1;
+    buf[count] = .{ .name = "version", .value = "0.159.0" };
+    count += 1;
+    if (routing_hint.len > 0) {
+        buf[count] = .{ .name = "x-codex-routing-hint", .value = routing_hint };
+        count += 1;
+    }
+    if (session_id) |value| if (value.len > 0) {
+        buf[count] = .{ .name = "session-id", .value = value };
+        count += 1;
+        buf[count] = .{ .name = "conversation-id", .value = value };
+        count += 1;
+        buf[count] = .{ .name = "x-client-request-id", .value = value };
+        count += 1;
+    };
+    if (models_etag) |value| {
+        buf[count] = .{ .name = "x-models-etag", .value = value };
+        count += 1;
+    }
+    if (turn_state) |value| {
+        buf[count] = .{ .name = "x-codex-turn-state", .value = value };
+        count += 1;
+    }
+    return buf[0..count];
+}
+
+const WebsocketRelay = struct {
+    sink: *stream_provider.EventSink,
+    emitted: bool = false,
+};
+
+fn relayContent(raw: *anyopaque, chunk: []const u8) void {
+    const relay: *WebsocketRelay = @ptrCast(@alignCast(raw));
+    relay.emitted = true;
+    relay.sink.emit(.{ .content_delta = chunk });
+}
+
+fn relayReasoning(raw: *anyopaque, chunk: []const u8) void {
+    const relay: *WebsocketRelay = @ptrCast(@alignCast(raw));
+    relay.emitted = true;
+    relay.sink.emit(.{ .reasoning_delta = chunk });
+}
+
+fn relayToolStart(raw: *anyopaque, id: []const u8, name: []const u8, label: ?[]const u8, args: ?[]const u8) void {
+    const relay: *WebsocketRelay = @ptrCast(@alignCast(raw));
+    relay.emitted = true;
+    relay.sink.emit(.{ .tool_started = .{ .id = id, .name = name, .label = label, .arguments_json = args } });
+}
+
+fn relayToolInput(raw: *anyopaque, delta: stream_provider.ToolInputDelta) void {
+    const relay: *WebsocketRelay = @ptrCast(@alignCast(raw));
+    relay.emitted = true;
+    relay.sink.emit(.{ .tool_input_delta = delta });
+}
+
+fn codexEventType(value: std.json.Value) ?[]const u8 {
+    if (value != .object) return null;
+    const type_value = value.object.get("type") orelse return null;
+    return if (type_value == .string) type_value.string else null;
+}
+
+fn codexResponseId(value: std.json.Value) ?[]const u8 {
+    if (value != .object) return null;
+    const response = value.object.get("response") orelse return null;
+    if (response != .object) return null;
+    const id = response.object.get("id") orelse return null;
+    return if (id == .string and id.string.len > 0) id.string else null;
+}
+
+fn codexErrorCode(value: std.json.Value) ?[]const u8 {
+    if (value != .object) return null;
+    if (value.object.get("code")) |code| if (code == .string) return code.string;
+    const response = value.object.get("response") orelse return null;
+    if (response != .object) return null;
+    const failure = response.object.get("error") orelse return null;
+    if (failure != .object) return null;
+    const code = failure.object.get("code") orelse return null;
+    return if (code == .string) code.string else null;
+}
+
+fn codexErrorMessage(value: std.json.Value) ?[]const u8 {
+    if (value != .object) return null;
+    if (value.object.get("message")) |message| if (message == .string) return message.string;
+    if (value.object.get("error")) |failure| if (failure == .object) {
+        if (failure.object.get("message")) |message| if (message == .string) return message.string;
+    };
+    if (value.object.get("response")) |response| if (response == .object) {
+        if (response.object.get("error")) |failure| if (failure == .object) {
+            if (failure.object.get("message")) |message| if (message == .string) return message.string;
+        };
+    };
+    return null;
+}
+
+fn isStalePreviousResponse(code: ?[]const u8, message: ?[]const u8) bool {
+    if (code) |value| {
+        if (std.mem.eql(u8, value, "previous_response_not_found") or
+            std.mem.eql(u8, value, "codex_previous_response_stale")) return true;
+    }
+    const detail = message orelse return false;
+    return std.ascii.findIgnoreCasePos(detail, 0, "previous response") != null and
+        (std.ascii.findIgnoreCasePos(detail, 0, "not found") != null or
+            std.ascii.findIgnoreCasePos(detail, 0, "invalid") != null or
+            std.ascii.findIgnoreCasePos(detail, 0, "expired") != null or
+            std.ascii.findIgnoreCasePos(detail, 0, "stale") != null or
+            std.ascii.findIgnoreCasePos(detail, 0, "unsupported") != null);
+}
+
+fn terminalResponseItems(alloc: Allocator, value: std.json.Value) !?[]u8 {
+    if (value != .object) return null;
+    const response = value.object.get("response") orelse return null;
+    if (response != .object) return null;
+    const output = response.object.get("output") orelse return null;
+    if (output != .array) return null;
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    errdefer writer.deinit();
+    try std.json.Stringify.value(output, .{}, &writer.writer);
+    return try writer.toOwnedSlice();
+}
+
+fn resetCodexSocket(
+    alloc: Allocator,
+    state: *TransportState,
+    request: stream_provider.ModelRequest,
+    auth: RequestAuthHeaders,
+    request_endpoint: []const u8,
+) !void {
+    const ws_url = try websocketUrl(alloc, request_endpoint);
+    defer alloc.free(ws_url);
+    if (try state.get(
+        request.session_id,
+        request.model,
+        auth.account_id orelse "",
+        ws_url,
+        auth.authorization orelse "",
+    )) |session| {
+        session.resetAppend();
+        if (session.connection) |*connection| connection.deinit();
+        session.connection = null;
+    }
+}
+
+fn streamCodexWebSocket(
     alloc: Allocator,
     request: stream_provider.ModelRequest,
     payload: []const u8,
+    state: *TransportState,
+    auth: RequestAuthHeaders,
+    request_endpoint: []const u8,
 ) !stream_provider.Result {
-    if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
+    const ws_url = try websocketUrl(alloc, request_endpoint);
+    defer alloc.free(ws_url);
+    const session = (try state.get(
+        request.session_id,
+        request.model,
+        auth.account_id orelse "",
+        ws_url,
+        auth.authorization orelse "",
+    )) orelse return error.CodexWebSocketFailure;
+    if (session.active) return error.CodexWebSocketFailure;
+    session.active = true;
+    defer session.active = false;
+
+    if (session.connection) |*connection| {
+        if (!connection.isHealthyForReuse(io_mod.monotonicMilliTimestamp(), websocket_idle_reuse_ms)) {
+            connection.deinit();
+            session.connection = null;
+            session.resetAppend();
+        }
+    }
+    if (session.connection == null) {
+        var metadata_headers = try resolveMetadataHeaders(alloc, request);
+        defer metadata_headers.deinit(alloc);
+        var headers_buf: [64]std.http.Header = undefined;
+        var routing_hint_buf: [2048]u8 = undefined;
+        const routing_hint = if (request.provider_options.fast)
+            std.fmt.bufPrint(&routing_hint_buf, "model={s};tier=priority", .{request.model}) catch ""
+        else
+            std.fmt.bufPrint(&routing_hint_buf, "model={s}", .{request.model}) catch "";
+        const default_headers = websocketHeaders(
+            headers_buf[0..],
+            auth.authorization,
+            auth.account_id,
+            request.session_id,
+            session.models_etag,
+            session.turn_state,
+            routing_hint,
+        );
+        const headers = try configured_request.mergeHeaders(alloc, default_headers, metadata_headers.items);
+        defer alloc.free(headers);
+        // The connection outlives this request and is reused by later turns;
+        // construct it in the session so std.http.Connection.client points at
+        // the persistent HTTP client, not a copied request-local value.
+        session.connection = codex_websocket.Client.init(session.alloc, session.endpoint, headers);
+        errdefer {
+            if (session.connection) |*connection| connection.deinit();
+            session.connection = null;
+        }
+        const connection = &session.connection.?;
+        try connection.connect(request.cancel_flag, connect_timeout_ms);
+        if (connection.handshakeHeader("x-models-etag")) |etag| {
+            session.models_etag = session.replaceOptional(session.models_etag, etag);
+        }
+        if (connection.handshakeHeader("x-codex-turn-state")) |turn_state| {
+            session.turn_state = session.replaceOptional(session.turn_state, turn_state);
+        }
+    }
+    const connection = &session.connection.?;
+    var websocket_request: std.Io.Writer.Allocating = .init(alloc);
+    defer websocket_request.deinit();
+    try websocket_request.writer.writeAll("{\"type\":\"response.create\"");
+    var full_payload: ?[]u8 = null;
+    defer if (full_payload) |planned| alloc.free(planned);
+    var chained = try buildCodexChainedPayload(
+        alloc,
+        payload,
+        session,
+        request.provider_options.model_metadata != null and
+            request.provider_options.model_metadata.?.compat.supports_configuration_update == true,
+        &full_payload,
+    );
+    defer alloc.free(chained);
+    if (chained.len >= 2 and chained[0] == '{' and chained[chained.len - 1] == '}') {
+        try websocket_request.writer.writeByte(',');
+        try websocket_request.writer.writeAll(chained[1 .. chained.len - 1]);
+    } else return error.CodexWebSocketEvent;
+    try websocket_request.writer.writeByte('}');
+    request.delivery.markPossiblySent();
+    try connection.sendText(websocket_request.written());
+
+    var reducer = responses_protocol.Reducer.init(alloc);
+    defer reducer.deinit(alloc);
+    var sink = request.events;
+    var relay = WebsocketRelay{ .sink = &sink };
+    const callbacks = responses_protocol.StreamCallbacks{
+        .context = @ptrCast(&relay),
+        .on_content = relayContent,
+        .on_tool_start = relayToolStart,
+        .on_reasoning = relayReasoning,
+        .on_tool_input = relayToolInput,
+    };
+    const limits = responses_protocol.StreamLimits{
+        .aggregate_bytes = max_sse_aggregate_bytes,
+        .events = max_sse_events,
+        .tool_calls = max_tool_calls,
+        .tool_identity_bytes = max_tool_identity_bytes,
+        .tool_arguments_bytes = max_tool_arguments_bytes,
+        .provider_state_bytes = max_provider_state_bytes,
+    };
+    var active_response_id: ?[]const u8 = null;
+    var last_sequence: ?i64 = null;
+    var terminal_frame: ?[]u8 = null;
+    defer if (terminal_frame) |frame| alloc.free(frame);
+    while (true) {
+        const frame = connection.receive(alloc, websocket_first_event_timeout_ms, request.cancel_flag) catch |err| {
+            if (relay.emitted and err != error.Cancelled) return error.CodexWebSocketPartialFailure;
+            return switch (err) {
+                error.Cancelled => error.Cancelled,
+                error.Timeout => error.CodexWebSocketTimeout,
+                else => error.CodexWebSocketFailure,
+            };
+        } orelse if (relay.emitted) return error.CodexWebSocketPartialFailure else return error.CodexWebSocketTimeout;
+        defer alloc.free(frame);
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, frame, .{}) catch return error.CodexWebSocketEvent;
+        defer parsed.deinit();
+        const event_type = codexEventType(parsed.value) orelse continue;
+        const frame_id = codexResponseId(parsed.value);
+        if (frame_id) |id| {
+            if (active_response_id == null) {
+                if (session.last_response_id) |prior| if (std.mem.eql(u8, prior, id)) continue;
+                active_response_id = id;
+            } else if (!std.mem.eql(u8, active_response_id.?, id)) {
+                if (relay.emitted) return error.CodexWebSocketPartialFailure;
+                return error.CodexWebSocketFailure;
+            }
+        }
+        if (parsed.value.object.get("sequence_number")) |sequence| {
+            if (sequence == .integer) {
+                if (sequence.integer < 0) return error.CodexWebSocketEvent;
+                if (last_sequence) |previous| if (sequence.integer < previous) {
+                    if (relay.emitted) return error.CodexWebSocketPartialFailure;
+                    return error.CodexWebSocketFailure;
+                };
+                last_sequence = sequence.integer;
+            }
+        }
+        if (std.mem.eql(u8, event_type, "error") or std.mem.eql(u8, event_type, "response.failed")) {
+            if (isStalePreviousResponse(codexErrorCode(parsed.value), codexErrorMessage(parsed.value))) {
+                if (relay.emitted) return error.CodexWebSocketPartialFailure;
+                return error.CodexStalePreviousResponse;
+            }
+        }
+        const done = reducer.applyJson(alloc, frame, callbacks, request.cancel_flag, request.content_capture_limit, limits) catch |err| {
+            if (relay.emitted) return error.CodexWebSocketPartialFailure;
+            return mapReducerError(err);
+        };
+        if (done) {
+            terminal_frame = try alloc.dupe(u8, frame);
+            break;
+        }
+    }
+    const completion = reducer.finish(alloc, request.cancel_flag, limits) catch |err| {
+        if (relay.emitted) return error.CodexWebSocketPartialFailure;
+        return mapReducerError(err);
+    };
+    errdefer {
+        var owned = stream_provider.Result{ .completed = .{ .completion = completion, .ownership = .owned } };
+        owned.deinit(alloc);
+    }
+    if (active_response_id) |response_id| {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, terminal_frame orelse "{}", .{}) catch null;
+        if (parsed) |*value| {
+            defer value.deinit();
+            const items = terminalResponseItems(alloc, value.value) catch null;
+            if (items) |response_items| {
+                defer alloc.free(response_items);
+                session.setRequest(full_payload orelse payload) catch session.resetAppend();
+                session.setResponse(response_id, response_items) catch session.resetAppend();
+            } else session.resetAppend();
+        } else session.resetAppend();
+    } else session.resetAppend();
+    return .{ .completed = .{ .completion = completion, .ownership = .owned } };
+}
+
+fn jsonValuesEqual(alloc: Allocator, left: std.json.Value, right: std.json.Value) !bool {
+    var left_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer left_writer.deinit();
+    var right_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer right_writer.deinit();
+    try std.json.Stringify.value(left, .{}, &left_writer.writer);
+    try std.json.Stringify.value(right, .{}, &right_writer.writer);
+    return std.mem.eql(u8, left_writer.written(), right_writer.written());
+}
+
+fn buildCodexChainedPayload(
+    alloc: Allocator,
+    payload: []const u8,
+    session: *codex_session.SessionState,
+    supports_configuration_update: bool,
+    full_payload_out: *?[]u8,
+) ![]u8 {
+    var current = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch {
+        full_payload_out.* = try alloc.dupe(u8, payload);
+        return alloc.dupe(u8, payload);
+    };
+    defer current.deinit();
+    if (current.value != .object) {
+        full_payload_out.* = try alloc.dupe(u8, payload);
+        return alloc.dupe(u8, payload);
+    }
+
+    if (supports_configuration_update) {
+        if (current.value.object.getPtr("input")) |input| {
+            if (input.* == .array) {
+                var requested_effort: ?[]const u8 = null;
+                if (current.value.object.getPtr("reasoning")) |reasoning| {
+                    if (reasoning.* == .object) {
+                        if (reasoning.object.get("effort")) |effort| {
+                            if (effort == .string) requested_effort = effort.string;
+                        }
+                    }
+                }
+                if (try session.planEffort(current.arena.allocator(), &input.array, requested_effort)) |baseline| {
+                    if (current.value.object.getPtr("reasoning")) |reasoning| {
+                        if (reasoning.* == .object) {
+                            try reasoning.object.put(current.arena.allocator(), "effort", .{ .string = baseline });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    var full_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer full_writer.deinit();
+    try std.json.Stringify.value(current.value, .{}, &full_writer.writer);
+    const full_payload = try full_writer.toOwnedSlice();
+    full_payload_out.* = full_payload;
+    errdefer {
+        alloc.free(full_payload);
+        full_payload_out.* = null;
+    }
+
+    if (!session.can_append or session.last_response_id == null or session.last_request_json == null) {
+        return alloc.dupe(u8, full_payload);
+    }
+    var previous = std.json.parseFromSlice(std.json.Value, alloc, session.last_request_json.?, .{}) catch return alloc.dupe(u8, full_payload);
+    defer previous.deinit();
+    if (previous.value != .object) return alloc.dupe(u8, full_payload);
+    const current_input = current.value.object.get("input") orelse return alloc.dupe(u8, full_payload);
+    const previous_input = previous.value.object.get("input") orelse return alloc.dupe(u8, full_payload);
+    if (current_input != .array or previous_input != .array) return alloc.dupe(u8, full_payload);
+    if (current_input.array.items.len < previous_input.array.items.len) return alloc.dupe(u8, full_payload);
+    for (previous_input.array.items, 0..) |item, index| {
+        if (!try jsonValuesEqual(alloc, item, current_input.array.items[index])) return alloc.dupe(u8, full_payload);
+    }
+    const delta = current_input.array.items[previous_input.array.items.len..];
+    if (delta.len == 0) return alloc.dupe(u8, full_payload);
+    current.value.object.put(alloc, "previous_response_id", .{ .string = session.last_response_id.? }) catch return error.OutOfMemory;
+    var delta_array: std.json.Array = .init(alloc);
+    for (delta) |item| try delta_array.append(item);
+    current.value.object.put(alloc, "input", .{ .array = delta_array }) catch return error.OutOfMemory;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try std.json.Stringify.value(current.value, .{}, &out.writer);
+    return out.toOwnedSlice();
+}
+
+fn streamCodexSse(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    payload: []const u8,
+    request_endpoint: []const u8,
+    admit_request: bool,
+) !stream_provider.Result {
+    // The official Codex service advertises zstd request bodies. The loopback
+    // endpoint is deliberately left plain so local fixtures remain simple and
+    // can inspect the JSON directly.
+    const compress = std.mem.eql(u8, request_endpoint, endpoint);
+    var compressed: ?[]u8 = null;
+    defer if (compressed) |body| alloc.free(body);
+    if (compress) {
+        const encoded = try codex_compression.encode(alloc, payload);
+        if (encoded.len < payload.len) compressed = encoded else alloc.free(encoded);
+    }
+    if (admit_request) try request.admission.admit();
+    return streamCodexSseAttempt(
+        alloc,
+        request,
+        compressed orelse payload,
+        request_endpoint,
+        compressed != null,
+    ) catch |err| switch (err) {
+        // Some deployments proxy the official endpoint without zstd request
+        // decoding. Retry exactly once with the same JSON and no encoding.
+        error.CodexCompressedRequestRejected => streamCodexSseAttempt(
+            alloc,
+            request,
+            payload,
+            request_endpoint,
+            false,
+        ),
+        else => return err,
+    };
+}
+
+fn streamCodexSseAttempt(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    payload: []const u8,
+    request_endpoint: []const u8,
+    compressed: bool,
+) !stream_provider.Result {
     var auth_headers = try requestAuthHeaders(alloc, request.credential);
     defer auth_headers.deinit(alloc);
-    const request_endpoint = responsesEndpoint() catch |err| return stream_provider.failResult(err);
     const uri = try std.Uri.parse(request_endpoint);
-
-    var extra_headers_buf: [max_extra_headers]std.http.Header = undefined;
-    const extra_headers = extraHeaders(&extra_headers_buf, auth_headers.account_id, request.session_id);
-
+    var metadata_headers = try resolveMetadataHeaders(alloc, request);
+    defer metadata_headers.deinit(alloc);
+    var default_headers_buf: [max_extra_headers + 1]std.http.Header = undefined;
+    var default_headers = extraHeaders(default_headers_buf[0..max_extra_headers], auth_headers.account_id, request.session_id);
+    if (compressed) {
+        default_headers_buf[default_headers.len] = .{ .name = "content-encoding", .value = "zstd" };
+        default_headers = default_headers_buf[0 .. default_headers.len + 1];
+    }
+    const extra_headers = try configured_request.mergeHeaders(alloc, default_headers, metadata_headers.items);
+    defer alloc.free(extra_headers);
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
-    var open_operation = gateway_client.PostOperation{
-        .client = &client,
-        .uri = uri,
-        .authorization = auth_headers.authorization,
-        .extra_headers = extra_headers,
-    };
-    const connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
-        .clock = .awake,
-        .raw = .fromMilliseconds(connect_timeout_ms),
-    });
-    try request.admission.admit();
-    var opened = try gateway_client.openBoundedPost(
-        alloc,
-        request.cancel_flag,
-        connect_deadline,
-        &open_operation,
-    );
+    var open_operation = gateway_client.PostOperation{ .client = &client, .uri = uri, .authorization = auth_headers.authorization, .extra_headers = extra_headers };
+    const connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{ .clock = .awake, .raw = .fromMilliseconds(connect_timeout_ms) });
+    var opened = try gateway_client.openBoundedPost(alloc, request.cancel_flag, connect_deadline, &open_operation);
     var http_request = opened.take();
     defer http_request.deinit();
-    var watch: gateway_client.ConnectionWatch = .init(.{
-        .patient = true,
-        .stall_timeout_ms = gateway_client.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
-    });
+    var watch: gateway_client.ConnectionWatch = .init(.{ .patient = true, .stall_timeout_ms = gateway_client.ConnectionWatch.bodyStallTimeoutMs(request.deadline) });
     defer watch.stop();
-    if (http_request.connection) |connection|
-        try watch.start(request.cancel_flag, null, connection.stream_writer.stream);
+    if (http_request.connection) |connection| try watch.start(request.cancel_flag, null, connection.stream_writer.stream);
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-
     http_request.transfer_encoding = .{ .content_length = payload.len };
     var send_buffer: [8192]u8 = undefined;
     request.delivery.markPossiblySent();
@@ -350,7 +861,6 @@ pub fn streamPrepared(
     try body_writer.end();
     if (http_request.connection) |connection| try connection.flush();
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-
     if (watch.armHead()) |err| return err;
     var response = http_request.receiveHead(&.{}) catch |err| return watch.failure(err);
     if (watch.commitHead()) |err| return err;
@@ -361,13 +871,12 @@ pub fn streamPrepared(
             error.StreamTooLong => try alloc.dupe(u8, "OpenAI Codex error response exceeded the local limit"),
             else => return err,
         };
-        return .{ .failed = .{
-            .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(response.head.status), body),
-            .detail = body,
-            .ownership = .owned,
-        } };
+        if (compressed and (response.head.status == .bad_request or response.head.status == .unsupported_media_type)) {
+            alloc.free(body);
+            return error.CodexCompressedRequestRejected;
+        }
+        return .{ .failed = .{ .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(response.head.status), body), .detail = body, .ownership = .owned } };
     }
-
     var transfer_buffer: [transfer_buffer_bytes]u8 = undefined;
     var result = completeFromStream(alloc, request, response.reader(&transfer_buffer), watch.progress()) catch |err| return watch.failure(err);
     if (watch.finish()) |err| {
@@ -375,6 +884,58 @@ pub fn streamPrepared(
         return err;
     }
     return result;
+}
+
+pub fn streamPrepared(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    payload: []const u8,
+) !stream_provider.Result {
+    return streamPreparedWithState(alloc, request, payload, null);
+}
+
+fn streamPreparedWithState(
+    alloc: Allocator,
+    request: stream_provider.ModelRequest,
+    payload: []const u8,
+    transport_state: ?*TransportState,
+) !stream_provider.Result {
+    if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
+    var auth_headers = try requestAuthHeaders(alloc, request.credential);
+    defer auth_headers.deinit(alloc);
+    const request_endpoint = requestEndpoint(alloc, request) catch |err| return stream_provider.failResult(err);
+    defer alloc.free(request_endpoint);
+    if (transport_state != null and request.session_id != null and request.provider_options.prefer_websockets != false) {
+        // Admission is owned by this attempt across WebSocket connection,
+        // stale-chain retry, and any pre-visible SSE replay.
+        try request.admission.admit();
+        return streamCodexWebSocket(alloc, request, payload, transport_state.?, auth_headers, request_endpoint) catch |err| switch (err) {
+            error.CodexStalePreviousResponse => blk: {
+                // The server may expire a response chain independently of the
+                // session. Clear only the append baseline and retry once with
+                // the full context on a fresh socket.
+                if (transport_state) |state| try resetCodexSocket(alloc, state, request, auth_headers, request_endpoint);
+                break :blk streamCodexWebSocket(alloc, request, payload, transport_state.?, auth_headers, request_endpoint) catch |retry_err| retry_err;
+            },
+            error.CodexWebSocketFailure,
+            error.CodexWebSocketEvent,
+            error.CodexWebSocketTimeout,
+            error.ConnectionClosed,
+            error.HandshakeFailed,
+            error.ProtocolViolation,
+            error.WriteFailed,
+            error.ReadFailed,
+            => blk: {
+                // A socket can fail before the first event. Replaying over
+                // SSE is the safe fallback; consumeSse emits the same contract.
+                if (transport_state) |state| resetCodexSocket(alloc, state, request, auth_headers, request_endpoint) catch {};
+                break :blk streamCodexSse(alloc, request, payload, request_endpoint, false);
+            },
+            else => |other| return other,
+        };
+    }
+
+    return streamCodexSse(alloc, request, payload, request_endpoint, true);
 }
 
 /// Parses one successful Codex event stream into a completion with its
@@ -469,6 +1030,15 @@ fn mapReducerError(err: anyerror) anyerror {
         error.ResourceLimitExceeded => error.OpenAICodexResourceLimitExceeded,
         else => err,
     };
+}
+
+test "OpenAI Codex websocket URL conversion preserves authority" {
+    const plain = try websocketUrl(std.testing.allocator, "http://127.0.0.1:1234/native/codex/responses");
+    defer std.testing.allocator.free(plain);
+    try std.testing.expectEqualStrings("ws://127.0.0.1:1234/native/codex/responses", plain);
+    const tls = try websocketUrl(std.testing.allocator, "https://chatgpt.com/backend-api/codex/responses");
+    defer std.testing.allocator.free(tls);
+    try std.testing.expectEqualStrings("wss://chatgpt.com/backend-api/codex/responses", tls);
 }
 
 test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas" {

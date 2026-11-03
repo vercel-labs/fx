@@ -25,8 +25,13 @@ fn annotation(state: *const hub.State, scope: hub.Scope, buf: []u8) []const u8 {
     return switch (scope.kind) {
         .roles => blk: {
             var assigned: usize = 0;
-            for (snapshot.roles) |row| assigned += @intFromBool(row.assigned != null);
-            break :blk std.mem.print(buf, "{d}/{d}", .{ assigned, snapshot.roles.len }) catch "";
+            var visible: usize = 0;
+            for (snapshot.roles) |row| {
+                if (row.hidden) continue;
+                visible += 1;
+                assigned += @intFromBool(row.assigned != null);
+            }
+            break :blk std.mem.print(buf, "{d}/{d}", .{ assigned, visible }) catch "";
         },
         .all_models => blk: {
             var count: usize = 0;
@@ -124,8 +129,9 @@ pub fn sidebar(alloc: Allocator, state: *const hub.State, width: u16, height: u1
 
 fn sidebarEntry(line: *Line, state: *const hub.State, scope: hub.Scope) !void {
     const selected = scope.kind == state.scope.kind and (scope.kind != .provider or scope.provider == state.scope.provider);
+    const hovered = if (state.hovered_scope) |value| value.kind == scope.kind and (scope.kind != .provider or value.provider == scope.provider) else false;
     try line.put(ui_render.hint_style, if (selected and state.focus == .scope) " › " else "   ");
-    var label_style = if (selected) ui_render.selected_completion_style else "";
+    var label_style = if (selected or hovered) ui_render.selected_completion_style else "";
     switch (scope.kind) {
         .provider => {
             const provider = state.snapshot.?.providers[scope.provider];
@@ -156,8 +162,26 @@ fn sidebarEntry(line: *Line, state: *const hub.State, scope: hub.Scope) !void {
 /// The hint row: what the keys do here, the open strip, or the hub's notice.
 pub fn hints(line: *Line, state: *const hub.State, compact: bool) !void {
     try line.spaces(1);
+    if (state.role_name_mode != .none) {
+        try line.put(ui_render.selected_completion_style, switch (state.role_name_mode) {
+            .create => "new role: ",
+            .rename => "rename: ",
+            .tag => "tag: ",
+            .none => "",
+        });
+        try line.putUntrusted(ui_render.bold_style, state.role_name_buf[0..state.role_name_len], line.remaining());
+        try line.put(ui_render.hint_style, "  enter save · esc cancel");
+        return;
+    }
     switch (state.strip) {
         .none => {},
+        .role_scope => |selected| {
+            const labels = [_][]const u8{ "workspace", "global" };
+            const holds = [_]bool{ state.selected_role_scope == .workspace, state.selected_role_scope == .global };
+            try line.put(ui_render.hint_style, "Role scope  ");
+            try chips(line, &labels, &holds, selected);
+            return;
+        },
         .roles => |selected| return roleStrip(line, state, selected),
         .thinking => |selected| return thinkingStrip(line, state, selected),
         .entry_thinking => |selected| return entryThinkingStrip(line, state, selected),
@@ -180,9 +204,9 @@ pub fn hints(line: *Line, state: *const hub.State, compact: bool) !void {
         else if (!state.listsModels())
             (if (compact) "enter sign in · ← back" else "enter signs in · ← sidebar · esc close")
         else if (compact)
-            "enter use · ^r role · ^t thinking · ← back"
+            "enter use · ^r role · ^t thinking · F/P/R fallback · ← back"
         else
-            "↑↓ models · enter use · ctrl+r role · ctrl+t thinking · type to search · ← sidebar · esc close",
+            "↑↓ models · enter use · ctrl+r role · ctrl+t thinking · F/P/R fallback · type to search · ← sidebar · esc close",
     };
     try line.put(ui_render.hint_style, text);
 }
@@ -193,13 +217,21 @@ fn roleStrip(line: *Line, state: *const hub.State, selected: usize) !void {
     try line.put(ui_render.hint_style, "Role for ");
     try line.putUntrusted(ui_render.bold_style, model.name, 28);
     try line.put(ui_render.hint_style, "  ");
-    var labels: [catalog.role_order.len][]const u8 = undefined;
-    var holds: [catalog.role_order.len]bool = undefined;
-    for (catalog.role_order, 0..) |role, index| {
-        labels[index] = catalog.roleName(role);
-        holds[index] = std.mem.findScalar(hub.Role, model.roles, role) != null;
+    var labels: std.ArrayList([]const u8) = .empty;
+    defer labels.deinit(line.alloc);
+    var holds: std.ArrayList(bool) = .empty;
+    defer holds.deinit(line.alloc);
+    for (state.snapshot.?.roles) |row| {
+        if (row.hidden) continue;
+        const label = if (row.label.len > 0) row.label else catalog.roleNameId(row.role);
+        try labels.append(line.alloc, label);
+        var held = false;
+        for (model.roles) |role| {
+            if (role.eql(row.role)) held = true;
+        }
+        try holds.append(line.alloc, held);
     }
-    try chips(line, &labels, &holds, selected);
+    if (labels.items.len > 0) try chips(line, labels.items, holds.items, @min(selected, labels.items.len - 1));
 }
 
 fn thinkingStrip(line: *Line, state: *const hub.State, selected: usize) !void {

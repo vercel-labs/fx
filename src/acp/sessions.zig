@@ -549,6 +549,14 @@ fn startV2Session(
     try writeNewSessionResponse(state, alloc, msg, session_id, start.observer_hooks);
 }
 
+fn ownedCatalogForOptions(
+    state: *server.ServerState,
+    alloc: Allocator,
+    provider: model_provider.ProviderId,
+) !std.ArrayList(model_catalog.ModelCatalogEntry) {
+    return (try server.snapshotModelCatalogFor(state, provider, alloc)) orelse .empty;
+}
+
 fn writeNewSessionResponse(
     state: *server.ServerState,
     alloc: Allocator,
@@ -558,6 +566,8 @@ fn writeNewSessionResponse(
 ) !void {
     state.active_session.?.observer_hooks = observer_hooks;
     try server.refreshModelCatalogForOptions(state);
+    var model_entries = try ownedCatalogForOptions(state, alloc, state.active_session.?.provider);
+    defer model_catalog.freeModelCatalog(alloc, &model_entries);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
@@ -571,7 +581,7 @@ fn writeNewSessionResponse(
     try writeModelConfigOption(
         &out.writer,
         state.active_session.?.model,
-        state.capability_resolver.catalogEntries(),
+        model_entries.items,
     );
     try out.writer.writeAll(",");
     try writeModeConfigOption(
@@ -1113,6 +1123,8 @@ fn writeLoadSessionResponse(
 ) !void {
     state.active_session.?.observer_hooks = observer_hooks;
     try server.refreshModelCatalogForOptions(state);
+    var model_entries = try ownedCatalogForOptions(state, alloc, state.active_session.?.provider);
+    defer model_catalog.freeModelCatalog(alloc, &model_entries);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try out.writer.writeAll("{\"configOptions\":[");
@@ -1123,7 +1135,7 @@ fn writeLoadSessionResponse(
     try writeModelConfigOption(
         &out.writer,
         model,
-        state.capability_resolver.catalogEntries(),
+        model_entries.items,
     );
     try out.writer.writeAll(",");
     try writeModeConfigOption(
@@ -2023,7 +2035,9 @@ pub fn sendActiveSessionUsageUpdate(state: *server.ServerState, alloc: Allocator
     const used = active.context_used.load(.acquire);
     if (used == 0) return;
     const provider_bundle = state.cfg.provider_set.select(active.provider);
-    const capabilities = state.capability_resolver.available(
+    const capabilities = server.modelCapabilitiesFor(
+        state,
+        active.provider,
         active.model,
         provider_bundle.fallbackModelCapabilities(active.model),
     );
@@ -2158,7 +2172,9 @@ pub const EffortConfigState = struct {
 pub fn effortConfigState(state: *server.ServerState) ?EffortConfigState {
     const active = if (state.active_session) |*session| session else return null;
     const bundle = state.cfg.provider_set.select(active.provider);
-    const capabilities = state.capability_resolver.available(
+    const capabilities = server.modelCapabilitiesFor(
+        state,
+        active.provider,
         active.model,
         bundle.fallbackModelCapabilities(active.model),
     );
@@ -2171,7 +2187,9 @@ pub fn effortConfigState(state: *server.ServerState) ?EffortConfigState {
 pub fn fastConfigState(state: *server.ServerState) ?bool {
     const active = if (state.active_session) |*session| session else return null;
     const bundle = state.cfg.provider_set.select(active.provider);
-    const capabilities = state.capability_resolver.available(
+    const capabilities = server.modelCapabilitiesFor(
+        state,
+        active.provider,
         active.model,
         bundle.fallbackModelCapabilities(active.model),
     );
@@ -2207,7 +2225,9 @@ pub fn ultrafastConfigState(state: *server.ServerState) ?bool {
     const active = if (state.active_session) |*session| session else return null;
     if (active.provider != .gateway) return null;
     const bundle = state.cfg.provider_set.select(active.provider);
-    const capabilities = state.capability_resolver.available(
+    const capabilities = server.modelCapabilitiesFor(
+        state,
+        active.provider,
         active.model,
         bundle.fallbackModelCapabilities(active.model),
     );

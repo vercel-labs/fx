@@ -7,6 +7,8 @@ const session = @import("session.zig");
 const stream_provider = @import("../agent/stream_provider.zig");
 const gateway_step = @import("../agent/runtime/gateway_step.zig");
 const types = @import("../shared/types.zig");
+const model_provider = @import("../config/model_provider.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
 const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
@@ -93,16 +95,38 @@ fn capUtf8(text: []const u8, max_bytes: usize) []const u8 {
     return text[0..end];
 }
 
+pub const CredentialInput = struct {
+    api_key: ?[]const u8 = null,
+    gateway_team: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    credential_source: ?types.CredentialSource = null,
+};
+
+pub const Fallback = struct {
+    stream_provider: stream_provider.Provider,
+    provider: model_provider.ProviderId = .gateway,
+    model: []const u8,
+    effort: types.ReasoningEffort = .auto,
+    provider_options: model_capabilities.ResolvedProviderOptions = .{},
+    credential: CredentialInput = .{},
+};
+
 pub const Request = struct {
     observer: ?*observation.Observer = null,
     stream_provider: stream_provider.Provider,
+    provider: model_provider.ProviderId = .gateway,
     model: []const u8,
+    effort: types.ReasoningEffort = .auto,
+    provider_options: model_capabilities.ResolvedProviderOptions = .{},
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]const u8 = null,
     gateway_team: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
     prompt_excerpt: []const u8,
+    /// Ordered provider-qualified title fallbacks. The first successful
+    /// candidate wins after a transport/provider/unusable-output failure.
+    fallbacks: []const Fallback = &.{},
     cancel_flag: *std.atomic.Value(bool),
     timeout_ms: u32 = default_timeout_ms,
 };
@@ -142,6 +166,31 @@ pub const Outcome = union(enum) {
 /// Runs one bounded title generation call. Effects live here; prompt
 /// selection and output sanitization stay pure above.
 pub fn run(alloc: Allocator, request: Request) !Outcome {
+    const outcome = try runOnce(alloc, request);
+    if (outcome == .unavailable and request.fallbacks.len > 0 and !request.cancel_flag.load(.seq_cst)) {
+        const next = request.fallbacks[0];
+        return run(alloc, .{
+            .observer = request.observer,
+            .stream_provider = next.stream_provider,
+            .provider = next.provider,
+            .model = next.model,
+            .effort = next.effort,
+            .provider_options = next.provider_options,
+            .api_key = next.credential.api_key orelse "",
+            .credential_source = next.credential.credential_source,
+            .account_id = next.credential.account_id,
+            .gateway_team = next.credential.gateway_team,
+            .session_id = request.session_id,
+            .prompt_excerpt = request.prompt_excerpt,
+            .fallbacks = request.fallbacks[1..],
+            .cancel_flag = request.cancel_flag,
+            .timeout_ms = request.timeout_ms,
+        });
+    }
+    return outcome;
+}
+
+fn runOnce(alloc: Allocator, request: Request) !Outcome {
     const instructions = [_]types.ChatMessage{.{ .role = .system, .content = instructions_text }};
     const messages = [_]types.ChatMessage{.{ .role = .user, .content = request.prompt_excerpt }};
     const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
@@ -174,7 +223,7 @@ pub fn run(alloc: Allocator, request: Request) !Outcome {
             .messages = &messages,
             .tools = .{},
             .tool_choice = .none,
-            .provider_options = .{},
+            .provider_options = request.provider_options,
             .max_output_tokens = max_output_tokens,
             .budget = .{ .cancel_flag = request.cancel_flag, .deadline = deadline },
             .deadline = deadline,
@@ -236,6 +285,10 @@ pub const Task = struct {
     account_id: ?[]u8 = null,
     credential_source: ?types.CredentialSource = null,
     stream_provider: stream_provider.Provider,
+    provider: model_provider.ProviderId = .gateway,
+    effort: types.ReasoningEffort = .auto,
+    provider_options: model_capabilities.ResolvedProviderOptions = .{},
+    fallbacks: []Fallback = &.{},
     title: ?[]u8 = null,
     failure: ?anyerror = null,
     started_at_ms: i64 = 0,
@@ -255,6 +308,10 @@ pub const Task = struct {
         account_id: ?[]const u8 = null,
         credential_source: ?types.CredentialSource = null,
         stream_provider: stream_provider.Provider,
+        provider: model_provider.ProviderId = .gateway,
+        effort: types.ReasoningEffort = .auto,
+        provider_options: model_capabilities.ResolvedProviderOptions = .{},
+        fallbacks: []const Fallback = &.{},
     };
 
     /// Copies every input; the task owns its copies. Uses c_allocator because
@@ -274,6 +331,23 @@ pub const Task = struct {
         const account_id: ?[]u8 = if (init.account_id) |value| try alloc.dupe(u8, value) else null;
         errdefer if (account_id) |value| alloc.free(value);
 
+        const fallbacks = try alloc.alloc(Fallback, init.fallbacks.len);
+        errdefer alloc.free(fallbacks);
+        var fallback_count: usize = 0;
+        errdefer for (fallbacks[0..fallback_count]) |fallback| {
+            alloc.free(@constCast(fallback.model));
+            if (fallback.credential.api_key) |value| alloc.free(@constCast(value));
+            if (fallback.credential.gateway_team) |value| alloc.free(@constCast(value));
+            if (fallback.credential.account_id) |value| alloc.free(@constCast(value));
+        };
+        for (init.fallbacks, fallbacks) |fallback, *copy| {
+            copy.* = fallback;
+            copy.model = try alloc.dupe(u8, fallback.model);
+            copy.credential.api_key = if (fallback.credential.api_key) |value| try alloc.dupe(u8, value) else null;
+            copy.credential.gateway_team = if (fallback.credential.gateway_team) |value| try alloc.dupe(u8, value) else null;
+            copy.credential.account_id = if (fallback.credential.account_id) |value| try alloc.dupe(u8, value) else null;
+            fallback_count += 1;
+        }
         const task = try alloc.create(Task);
         task.* = .{
             .observer = init.observer,
@@ -285,6 +359,10 @@ pub const Task = struct {
             .account_id = account_id,
             .credential_source = init.credential_source,
             .stream_provider = init.stream_provider,
+            .provider = init.provider,
+            .effort = init.effort,
+            .provider_options = init.provider_options,
+            .fallbacks = fallbacks,
         };
         return task;
     }
@@ -325,6 +403,13 @@ pub const Task = struct {
         }
         if (self.gateway_team) |team| alloc.free(team);
         if (self.account_id) |id| alloc.free(id);
+        for (self.fallbacks) |fallback| {
+            alloc.free(@constCast(fallback.model));
+            if (fallback.credential.api_key) |value| alloc.free(@constCast(value));
+            if (fallback.credential.gateway_team) |value| alloc.free(@constCast(value));
+            if (fallback.credential.account_id) |value| alloc.free(@constCast(value));
+        }
+        if (self.fallbacks.len > 0) alloc.free(self.fallbacks);
         if (self.title) |title| alloc.free(title);
         alloc.destroy(self);
     }
@@ -342,13 +427,17 @@ pub const Task = struct {
         const outcome = run(alloc, .{
             .observer = self.observer,
             .stream_provider = self.stream_provider,
+            .provider = self.provider,
             .model = self.model,
+            .effort = self.effort,
+            .provider_options = self.provider_options,
             .api_key = self.api_key orelse "",
             .credential_source = self.credential_source,
             .account_id = self.account_id,
             .gateway_team = self.gateway_team,
             .session_id = self.session_id,
             .prompt_excerpt = self.prompt_excerpt,
+            .fallbacks = self.fallbacks,
             .cancel_flag = &self.cancel_requested,
         }) catch |err| {
             self.failure = err;
@@ -565,6 +654,46 @@ test "run sanitizes provider content into a generated title" {
     try std.testing.expectEqual(@as(usize, 1), capture.count(.model_start));
     try std.testing.expectEqual(capture.count(.model_start), capture.count(.model_end));
     try std.testing.expectEqual(@as(usize, 1), capture.purposes[@backingInt(observation.ModelPurpose.title)]);
+}
+
+test "run retries a provider-qualified title fallback" {
+    const State = struct {
+        provider: []const u8,
+        calls: usize = 0,
+
+        fn stream(raw_ctx: ?*anyopaque, _: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            self.calls += 1;
+            try request.admission.admit();
+            if (std.mem.eql(u8, self.provider, "gateway")) return .{ .failed = .{ .kind = .rate_limited } };
+            try std.testing.expectEqualStrings("codex-key", request.credential.secret().?);
+            return .{ .completed = .{ .completion = .{ .content = "Fallback title", .finish_reason = .stop }, .ownership = .borrowed } };
+        }
+    };
+    var primary = State{ .provider = "gateway" };
+    var fallback = State{ .provider = "codex" };
+    var cancelled = std.atomic.Value(bool).init(false);
+    const outcome = try run(std.testing.allocator, .{
+        .stream_provider = .{ .context = @ptrCast(&primary), .stream_fn = State.stream },
+        .model = "gateway/title",
+        .api_key = "gateway-key",
+        .prompt_excerpt = "fix the renderer",
+        .fallbacks = &.{.{
+            .stream_provider = .{ .context = @ptrCast(&fallback), .stream_fn = State.stream },
+            .provider = .codex,
+            .model = "codex/title",
+            .credential = .{ .api_key = "codex-key", .credential_source = .stored_key },
+        }},
+        .cancel_flag = &cancelled,
+    });
+    const title = switch (outcome) {
+        .generated => |value| value,
+        .unavailable => return error.TestExpectedGeneratedTitle,
+    };
+    defer std.testing.allocator.free(title);
+    try std.testing.expectEqualStrings("Fallback title", title);
+    try std.testing.expectEqual(@as(usize, 1), primary.calls);
+    try std.testing.expectEqual(@as(usize, 1), fallback.calls);
 }
 
 test "run treats unsanitizable output as unavailable" {

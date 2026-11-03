@@ -277,6 +277,7 @@ fn complete(context: *anyopaque, arena: Allocator, request: harness_services.Com
         .cancel_flag = self.config.cancel_flag,
         // Another model keeps the routing but not this one's options.
         .provider_options = if (request.model == null) self.provider_options else .{
+            .tokenizer = model_capabilities.capabilitiesForModel(request.model.?).tokenizer,
             .prompt_caching = self.provider_options.prompt_caching,
             .provider_order = self.provider_options.provider_order,
             .provider_strict = self.provider_options.provider_strict,

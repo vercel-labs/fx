@@ -8,6 +8,8 @@ const io_mod = @import("../shared/io.zig");
 const permissions = @import("permissions.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
+const model_provider = @import("../config/model_provider.zig");
+const model_roles = @import("../config/model_roles.zig");
 
 pub const tool_name = "permission_decision";
 const max_rationale_bytes: usize = 240;
@@ -335,6 +337,12 @@ pub const ProviderInput = struct {
     /// Resolved review-model override (`review_model` setting or
     /// FX_REVIEW_MODEL). Empty means the provider's compiled default.
     reviewer_model: []const u8 = "",
+    /// Provider-qualified reviewer identity. Low-level serializers may still
+    /// consume reviewer_model, but provider selection and credentials remain
+    /// attached to the review request.
+    reviewer_selection: ?model_roles.Selection = null,
+    reviewer_provider: ?model_provider.ProviderId = null,
+    credential_lease: ?types.CredentialLease = null,
     cancel_flag: ?*std.atomic.Value(bool) = null,
 };
 
@@ -350,6 +358,14 @@ pub const ProviderFn = *const fn (
 pub const Provider = struct {
     context: ?*anyopaque = null,
     review_fn: ProviderFn,
+};
+
+/// One provider-qualified review fallback. The host owns the borrowed
+/// selection and credential bytes for the duration of the review call.
+pub const ProviderFallback = struct {
+    provider: Provider,
+    input: ProviderInput,
+    selection: ?model_roles.Selection = null,
 };
 
 pub const Reviewer = struct {
@@ -611,6 +627,7 @@ pub const Reviewer = struct {
 pub const Classifier = struct {
     provider: ?Provider = null,
     provider_input: ProviderInput = .{},
+    fallbacks: []const ProviderFallback = &.{},
     override_ctx: ?*anyopaque = null,
     override_fn: ?OverrideFn = null,
 
@@ -618,10 +635,11 @@ pub const Classifier = struct {
         return .{};
     }
 
-    pub fn withProvider(provider: Provider, provider_input: ProviderInput) Classifier {
+    pub fn withProvider(provider: Provider, provider_input: ProviderInput, fallbacks: []const ProviderFallback) Classifier {
         return .{
             .provider = provider,
             .provider_input = provider_input,
+            .fallbacks = fallbacks,
         };
     }
 
@@ -652,18 +670,38 @@ pub const Classifier = struct {
             };
         }
         const provider = self.provider orelse return .{ .invalid = .reviewer_unconfigured };
-        return provider.review_fn(
-            provider.context,
-            alloc,
-            self.provider_input,
-            request,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Cancelled => return error.Cancelled,
-            else => return .{ .invalid = .provider_failed },
-        };
+        var outcome = invokeProvider(provider, alloc, self.provider_input, request) catch |err| return err;
+        if (!retryableFallback(outcome)) return outcome;
+        for (self.fallbacks) |fallback| {
+            outcome = invokeProvider(fallback.provider, alloc, fallback.input, request) catch |err| return err;
+            if (!retryableFallback(outcome)) return outcome;
+        }
+        return outcome;
     }
 };
+
+fn invokeProvider(
+    provider: Provider,
+    alloc: std.mem.Allocator,
+    input: ProviderInput,
+    request: ReviewRequest,
+) error{ OutOfMemory, Cancelled }!ParseOutcome {
+    return provider.review_fn(provider.context, alloc, input, request) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Cancelled => return error.Cancelled,
+        else => return .{ .invalid = .provider_failed },
+    };
+}
+
+fn retryableFallback(outcome: ParseOutcome) bool {
+    return switch (outcome) {
+        .invalid => |reason| switch (reason) {
+            .transport_unconfigured, .transport_call_failed, .transport_transient, .transport_permanent, .transport_timed_out, .provider_context_missing, .provider_failed => true,
+            else => false,
+        },
+        else => false,
+    };
+}
 
 const max_action_field_bytes: usize = 64 * 1024;
 const max_context_bytes: usize = 8 * 1024;
@@ -1532,7 +1570,7 @@ test "automatic reviewer classifier routes through the registered provider" {
         .credential = "test-key",
         .tenant = "team_1",
         .endpoint = "https://example.test/chat",
-    });
+    }, &.{});
     const outcome = try classifier.review(std.testing.allocator, .{
         .review_turn = .{
             .model = "openai/gpt-5",
@@ -1549,6 +1587,49 @@ test "automatic reviewer classifier routes through the registered provider" {
 
     try std.testing.expectEqual(std.meta.Tag(ParseOutcome).invalid, std.meta.activeTag(outcome));
     try std.testing.expect(state.saw_input);
+}
+
+test "automatic reviewer retries a provider-qualified fallback" {
+    const Primary = struct {
+        fn review(_: ?*anyopaque, _: std.mem.Allocator, _: ProviderInput, _: ReviewRequest) anyerror!ParseOutcome {
+            return .{ .invalid = .provider_failed };
+        }
+    };
+    const Fallback = struct {
+        called: bool = false,
+
+        fn review(raw_ctx: ?*anyopaque, _: std.mem.Allocator, input: ProviderInput, _: ReviewRequest) anyerror!ParseOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            self.called = (if (input.reviewer_provider) |provider| provider == .codex else false) and input.reviewer_selection != null;
+            return .{ .invalid = .transport_permanent };
+        }
+    };
+    var fallback_state = Fallback{};
+    var fallbacks = [_]ProviderFallback{.{
+        .provider = .{ .context = @ptrCast(&fallback_state), .review_fn = Fallback.review },
+        .input = .{
+            .reviewer_provider = .codex,
+            .reviewer_selection = .{ .provider = .codex, .model = "mini", .source = .{ .builtin = .review } },
+        },
+        .selection = .{ .provider = .codex, .model = "mini", .source = .{ .builtin = .review } },
+    }};
+    const classifier = Classifier.withProvider(
+        .{ .review_fn = Primary.review },
+        .{},
+        &fallbacks,
+    );
+    const outcome = try classifier.review(std.testing.allocator, .{
+        .review_turn = .{
+            .model = "main",
+            .pending_assistant = .{ .role = .assistant },
+            .target_call_id = "call_1",
+            .origin = .root,
+        },
+        .targets = &.{},
+        .action = .{ .tool = .{ .tool_name = "run_command", .arguments_json = "{}" } },
+    });
+    try std.testing.expectEqual(std.meta.Tag(ParseOutcome).invalid, std.meta.activeTag(outcome));
+    try std.testing.expect(fallback_state.called);
 }
 
 test "automatic review policy matches the tested provider-neutral artifact" {

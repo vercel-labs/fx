@@ -128,9 +128,9 @@ pub fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest)
     defer mode.deinit(alloc);
     switch (mode) {
         .api_key => |key| {
-            const url = try definition.messages_url(alloc);
+            const url = try definition.messages_url(alloc, request.model);
             defer alloc.free(url);
-            var headers = try configured_request.resolveHeaders(alloc, definition);
+            var headers = try configured_request.resolveHeaders(alloc, definition, request.model);
             defer headers.deinit(alloc);
             const identity = anthropic_messages.bound_identity(definition);
             return anthropic_messages.stream_endpoint(alloc, .{
@@ -156,7 +156,6 @@ fn failed(alloc: Allocator, kind: streams.FailureKind, detail: []const u8) !stre
 /// temporary directory that is removed before returning.
 fn streamClaudeCode(alloc: Allocator, definition: *const definitions.Definition, token: ?[]const u8, request: streams.ModelRequest) !streams.Result {
     if (comptime builtin.target.os.tag == .windows or builtin.target.cpu.arch.isWasm()) return error.ClaudeCodeUnsupported;
-    if (request.response_format != null) return error.UnsupportedResponseFormat;
     const exe = executable.find(alloc, .current()) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return failed(alloc, .invalid_request, executable.override_env ++ " does not name an executable file."),
@@ -175,6 +174,10 @@ fn streamClaudeCode(alloc: Allocator, definition: *const definitions.Definition,
     var options = anthropic_messages.definition_options(definition, request.model, &identity);
     options.cache = .off;
     const body = request.prepared_request_body orelse try codec.build_request(arena, request.data(), options);
+    const json_schema: ?[]const u8 = if (request.response_format) |format| blk: {
+        if (format.schema != .object) return error.UnsupportedResponseFormat;
+        break :blk try std.json.Stringify.valueAlloc(arena, format.schema, .{});
+    } else null;
 
     var session_seed: [16]u8 = undefined;
     const seed: []const u8 = request.session_id orelse blk: {
@@ -214,6 +217,9 @@ fn streamClaudeCode(alloc: Allocator, definition: *const definitions.Definition,
         .tools = prepared.tool_count != 0,
         .model = request.model,
         .effort = effort(request.provider_options.reasoning),
+        .json_schema = json_schema,
+        .task_budget = if (request.provider_options.task_budget) |budget| budget.total else null,
+        .fallback_model = request.provider_options.fallback_model,
     });
     var env = try childEnvironment(arena, definition, token, scratch.path, request);
     defer env.deinit();
@@ -341,6 +347,9 @@ pub const ArgumentOptions = struct {
     tools: bool,
     model: []const u8,
     effort: ?[]const u8,
+    json_schema: ?[]const u8 = null,
+    task_budget: ?u32 = null,
+    fallback_model: ?[]const u8 = null,
 };
 
 /// The `claude` command line: one turn, stream-json both ways, partial
@@ -376,6 +385,9 @@ pub fn arguments(arena: Allocator, options: ArgumentOptions) ![]const []const u8
     }
     try argv.appendSlice(arena, &.{ if (options.resume_session) "--resume" else "--session-id", options.session });
     if (options.effort) |value| try argv.appendSlice(arena, &.{ "--effort", value });
+    if (options.json_schema) |value| try argv.appendSlice(arena, &.{ "--json-schema", value });
+    if (options.task_budget) |value| try argv.appendSlice(arena, &.{ "--task-budget", try arena.print("{d}", .{value}) });
+    if (options.fallback_model) |value| if (value.len != 0) try argv.appendSlice(arena, &.{ "--fallback-model", value });
     return argv.items;
 }
 
@@ -397,18 +409,25 @@ fn childEnvironment(arena: Allocator, definition: *const definitions.Definition,
     try isolateEnvironment(arena, &env, try std.Io.Dir.path.join(arena, &.{ scratch, "config" }), token);
     // A models.json base URL other than Anthropic's own goes to Claude as is;
     // otherwise the user's ANTHROPIC_BASE_URL, if any, passes through.
-    if (!std.mem.startsWith(u8, definition.base_url, "https://api.anthropic.com")) {
-        const base = if (std.mem.endsWith(u8, definition.base_url, "/v1")) definition.base_url[0 .. definition.base_url.len - 3] else definition.base_url;
+    const base_url = definition.baseUrlFor(request.model);
+    if (!std.mem.startsWith(u8, base_url, "https://api.anthropic.com")) {
+        const base = if (std.mem.endsWith(u8, base_url, "/v1")) base_url[0 .. base_url.len - 3] else base_url;
         try env.put("ANTHROPIC_BASE_URL", base);
     }
-    if (definition.headers.len != 0) {
-        const headers = try configured_request.resolveHeaders(arena, definition);
+    const model_headers = if (definition.model(request.model)) |metadata| metadata.headers else &.{};
+    if (definition.headers.len != 0 or model_headers.len != 0) {
+        const headers = try configured_request.resolveHeaders(arena, definition, request.model);
+        const identity = anthropic_messages.bound_identity(definition);
+        const options = anthropic_messages.definition_options(definition, request.model, &identity);
         var joined: std.ArrayList(u8) = .empty;
         for (headers.items) |header| {
+            // Claude Code mode uses the signed-in OAuth client even when no
+            // token was injected into this child process.
+            if (!anthropic_messages.customHeaderAllowed(header.name, options, base_url, true)) continue;
             if (joined.items.len != 0) try joined.append(arena, '\n');
             try joined.print(arena, "{s}: {s}", .{ header.name, header.value });
         }
-        try env.put("ANTHROPIC_CUSTOM_HEADERS", joined.items);
+        if (joined.items.len != 0) try env.put("ANTHROPIC_CUSTOM_HEADERS", joined.items);
     }
     if (request.max_output_tokens) |limit| try env.put("CLAUDE_CODE_MAX_OUTPUT_TOKENS", try arena.print("{d}", .{limit}));
     if (request.provider_options.reasoning == null) try env.put("MAX_THINKING_TOKENS", "0");

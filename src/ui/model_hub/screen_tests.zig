@@ -18,12 +18,12 @@ fn fixtureWith(small_chain: []const catalog.EntryRow) !catalog.Snapshot {
     const zen = try builder.addProvider(.{ .key = "opencode-zen", .name = "OpenCode Zen", .detail = "Saved key", .signed_in = true, .active = false, .sign_in = .login, .can_sign_out = true });
     const go = try builder.addProvider(.{ .key = "opencode-go", .name = "OpenCode Go", .detail = "Not signed in", .signed_in = false, .active = false, .sign_in = .login, .can_sign_out = false });
     const efforts = [_]types.ReasoningEffort{ types.ReasoningEffort.literal("low"), types.ReasoningEffort.literal("high") };
-    try builder.addModel(.{ .provider = cento, .id = "claude-cento", .name = "", .current = true, .context_window = 1_048_576, .efforts = &efforts, .roles = &.{ .default, .small } });
+    try builder.addModel(.{ .provider = cento, .id = "claude-cento", .name = "", .current = true, .context_window = 1_048_576, .efforts = &efforts, .roles = &.{ .{ .builtin = .default }, .{ .builtin = .small } } });
     try builder.addModel(.{ .provider = cento, .id = "claude-cento-lite", .name = "", .context_window = 200_000 });
     try builder.addModel(.{ .provider = zen, .id = "claude-sonnet-5-5", .name = "Claude Sonnet 5.5 with a very long catalog name that must clip" });
     try builder.addModel(.{ .provider = go, .id = "glm-5.3", .name = "" });
     for (catalog.role_order) |role| try builder.addRole(.{
-        .role = role,
+        .role = .{ .builtin = role },
         .assigned = if (role == .small) "cento · claude-cento" else null,
         .entries = if (role == .small) small_chain else &.{},
         .in_use = if (role == .small and small_chain.len > 1) 1 else null,
@@ -34,7 +34,7 @@ fn fixtureWith(small_chain: []const catalog.EntryRow) !catalog.Snapshot {
     try builder.addWebSearch(.{ .id = "exa", .name = "Exa", .excluded = true, .ready = false });
     try builder.addWebSearch(.{ .id = "duckduckgo", .name = "DuckDuckGo", .excluded = false, .ready = true });
     try builder.addWebSearch(.{ .id = "codex", .name = "Codex", .excluded = false, .ready = false, .needs = "needs sign-in" });
-    return builder.finish(&.{ .deep, .default, .small });
+    return builder.finish(&.{ .{ .builtin = .deep }, .{ .builtin = .default }, .{ .builtin = .small } });
 }
 
 /// Each painted row's text with styles removed, checked against `cols`.
@@ -66,7 +66,7 @@ fn joined(rows: []const []u8) ![]u8 {
     return std.mem.join(alloc, "\n", rows);
 }
 
-fn render(state: *const hub.State, rows: u16, cols: u16) ![]u8 {
+fn render(state: *hub.State, rows: u16, cols: u16) ![]u8 {
     var painted = try screen.paint(alloc, state, rows, cols, true);
     defer painted.deinit(alloc);
     const lines = try alloc.alloc([]u8, rows);

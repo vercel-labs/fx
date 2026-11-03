@@ -40,6 +40,7 @@ const session_title_generation = @import("../session/session_title_generation.zi
 const compactor = @import("../compactor/compactor.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const model_performance = @import("../model_hub/performance.zig");
 const model_provider = @import("../config/model_provider.zig");
 const mcp_elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
 const mcp_elicitation = @import("../mcp/elicitation.zig");
@@ -568,18 +569,24 @@ const AskContext = struct {
     credential_source: ?types.CredentialSource = null,
     account_id: ?[]const u8 = null,
     refreshed_credential: ?credentials.Credential = null,
+    reviewer_credential: ?credentials.Credential = null,
+    search_worker_credential: ?credentials.Credential = null,
+    reviewer_fallbacks: [8]permission_auto_classifier.ProviderFallback = undefined,
+    reviewer_fallback_count: usize = 0,
     provider: model_provider.ProviderId = .gateway,
     model_catalog_access: credentials.CatalogAccess = .{ .public_only = .no_credential },
     model: []const u8 = "",
     /// Resolved review-model override borrowed from the startup state for the
     /// duration of the run. Empty keeps the reviewer's compiled default.
     reviewer_model: []const u8 = "",
+    reviewer_selection: ?model_roles.Selection = null,
     /// The startup state whose model roles this run resolves (D170).
     /// Borrowed for the duration of the run.
     role_startup: ?*const app_lifecycle.StartupState = null,
     agent_step_limit: usize = 0,
     max_tool_result_bytes: usize = 64 * 1024,
     auto_compact_percent: u8 = compactor.default_percent,
+    context_promotion_enabled: bool = false,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
     /// Profile preference used only when creating a new durable session.
@@ -623,6 +630,9 @@ const AskContext = struct {
     context_enabled: bool = true,
     /// The ask's MCP servers; null when none are configured.
     mcp_host: ?*mcp_host.Host = null,
+    /// Owned model selected by a transient provider fallback/promotion. It
+    /// updates the raw result model without changing the saved profile.
+    effective_model: ?[]u8 = null,
     mcp_elicitation_capabilities: @import("../mcp/elicitation.zig").Capabilities = .{},
     failed: bool = false,
     typed_error_code: ?[]const u8 = null,
@@ -649,6 +659,7 @@ const AskContext = struct {
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
+    model_performance: model_performance.State = .{ .allocator = std.heap.c_allocator },
     lifecycle_runtime: hooks.Runtime,
     lifecycle_view: hooks.RuntimeView,
     active_turn_id: u64 = 0,
@@ -670,6 +681,7 @@ const AskContext = struct {
             .workspace_root = workspace_root,
             .model = cfg.default_model,
             .seed_model = cfg.default_model,
+            .model_performance = model_performance.State.init(alloc, if (comptime std_builtin.is_test) null else io_mod.homeDir()),
             .mode_id = cfg.mode_registry.default_mode_id,
             .session = session_runtime.SessionRuntime.init(cfg.max_history_turns),
             .web_search_runtime = web_search_runtime.Runtime.init(.{
@@ -781,7 +793,10 @@ const AskContext = struct {
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         if (self.refreshed_credential) |*credential| credential.deinit(self.alloc);
+        if (self.reviewer_credential) |*credential| credential.deinit(self.alloc);
+        if (self.search_worker_credential) |*credential| credential.deinit(self.alloc);
         self.capability_resolver.deinit(self.alloc);
+        self.model_performance.deinit();
         self.lifecycle_runtime.deinit();
         if (self.v2) |v2| v2.close();
         self.v2 = null;
@@ -794,6 +809,8 @@ const AskContext = struct {
         self.session.deinit(self.alloc);
         if (self.skills_dir.len > 0) self.alloc.free(self.skills_dir);
         self.context_snapshot.deinit(self.alloc);
+        if (self.effective_model) |model| self.alloc.free(model);
+        self.effective_model = null;
         // `fx ask` exits next, so nothing waits for its servers.
         if (self.mcp_host != null) mcp_host.signalServersForExit();
         if (self.image_snapshot_temp_dir) |path| {
@@ -1008,22 +1025,35 @@ const AskContext = struct {
     /// the session's model (D213).
     fn searchWorkerModel(self: *AskContext) []const u8 {
         const startup = self.role_startup orelse return self.model;
-        return startup.roleModel(.small, null) orelse self.model;
+        return if (startup.roleSelection(.{ .builtin = .small }, null, null)) |selection| selection.model else self.model;
+    }
+
+    fn searchWorkerProvider(self: *AskContext) model_provider.ProviderId {
+        const startup = self.role_startup orelse return self.provider;
+        return if (startup.roleSelection(.{ .builtin = .small }, null, null)) |selection| selection.provider else self.provider;
     }
 
     /// The credentials a bank web search may use; borrowed from `self`.
     fn webSearchInputs(self: *AskContext) web_search_runtime.Inputs {
+        const worker_provider = self.searchWorkerProvider();
         var inputs: web_search_runtime.Inputs = .{
             .api_key = self.api_key,
             .credential_source = self.credential_source,
             .gateway_team = self.gateway_team,
             .account_id = self.account_id,
             .worker_model = self.searchWorkerModel(),
+            .worker_provider = worker_provider,
             .gateway_retry_count = self.cfg.gateway_retry_count,
             .gateway_chat_url = self.cfg.gateway_chat_url,
         };
+        if (self.search_worker_credential) |*credential| {
+            inputs.api_key = credential.token;
+            inputs.credential_source = credential.source;
+            inputs.gateway_team = credential.gatewayTeam();
+            inputs.account_id = credential.accountId();
+        }
         const registry = configured_provider_mod.Registry{ .definitions = self.cfg.provider_set.definitions };
-        if (self.provider == .configured) if (self.provider.bind(registry)) |bound| {
+        if (worker_provider == .configured) if (worker_provider.bind(registry)) |bound| {
             if (registry.get(bound.label())) |definition| if (definition.protocol == .@"anthropic-messages") {
                 inputs.anthropic_base_url = definition.base_url;
                 inputs.anthropic_bearer = definition.key_header == .authorization;
@@ -1047,14 +1077,7 @@ const AskContext = struct {
             self.web_search_runtime.available(self.alloc, self.webSearchInputs());
         if (local_web_search) self.web_search_runtime.configure(self.webSearchInputs());
         if (provider_capabilities.fx_search) {
-            self.web_search_runtime.configure(.{
-                .api_key = self.api_key,
-                .credential_source = self.credential_source,
-                .gateway_team = self.gateway_team,
-                .worker_model = self.searchWorkerModel(),
-                .gateway_retry_count = self.cfg.gateway_retry_count,
-                .gateway_chat_url = self.cfg.gateway_chat_url,
-            });
+            self.web_search_runtime.configure(self.webSearchInputs());
         }
         var tc: tool_runtime.Context = .{
             .workspace_root = self.workspace_root,
@@ -1078,6 +1101,14 @@ const AskContext = struct {
             .secret_store = self.cfg.secret_store,
             .model = self.model,
             .reviewer_model = self.reviewer_model,
+            .reviewer_selection = self.reviewer_selection,
+            .reviewer_credential = if (self.reviewer_credential) |*value| .{ .direct = .{
+                .secret_bytes = value.token,
+                .source = value.source,
+                .account_id = value.accountId(),
+                .tenant_context = value.gatewayTeam(),
+            } } else null,
+            .permission_reviewer_provider = if (self.reviewer_selection) |selection| self.cfg.provider_set.select(selection.provider).permission_reviewer else null,
             .gateway_retry_count = self.cfg.gateway_retry_count,
             .gateway_chat_url = self.cfg.gateway_chat_url,
             .gateway_models_path = self.cfg.gateway_models_path,
@@ -1132,6 +1163,9 @@ const AskContext = struct {
                 .context = @ptrCast(self),
                 .resolve_fn = resolveModelRole,
             },
+            .model_binding_context = @ptrCast(self),
+            .model_binder = bindModel,
+            .role_chain_resolver = resolveRoleChain,
             .interactive = false,
             .lifecycle_view = self.lifecycle_view,
             .lifecycle_scope = self.lifecycleContext().scope,
@@ -1160,17 +1194,38 @@ const AskContext = struct {
 
     fn admissionAutoClassifier(self: *AskContext) permission_auto_classifier.Classifier {
         if (self.auto_classifier.enabled()) return self.auto_classifier;
-        const provider = self.cfg.provider_set.select(self.provider).permission_reviewer orelse
-            return permission_auto_classifier.Classifier.disabled();
-        return permission_auto_classifier.Classifier.withProvider(provider, .{
-            .credential = self.api_key,
-            .credential_source = self.credential_source,
-            .account_id = self.account_id,
-            .tenant = self.gateway_team,
+        const provider = if (self.reviewer_selection) |selection|
+            self.cfg.provider_set.select(selection.provider).permission_reviewer
+        else
+            self.cfg.provider_set.select(self.provider).permission_reviewer;
+        const reviewer = provider orelse return permission_auto_classifier.Classifier.disabled();
+        const reviewer_lease: ?types.CredentialLease = if (self.reviewer_credential) |*value| .{ .direct = .{
+            .secret_bytes = value.token,
+            .source = value.source,
+            .account_id = value.accountId(),
+            .tenant_context = value.gatewayTeam(),
+        } } else null;
+        const lease: types.CredentialLease = reviewer_lease orelse if (self.credential_source == .host_managed)
+            .host_managed
+        else
+            .{ .direct = .{
+                .secret_bytes = self.api_key,
+                .source = self.credential_source,
+                .account_id = self.account_id,
+                .tenant_context = self.gateway_team,
+            } };
+        return permission_auto_classifier.Classifier.withProvider(reviewer, .{
+            .credential = lease.secret() orelse "",
+            .credential_source = lease.credentialSource(),
+            .account_id = lease.accountId(),
+            .tenant = lease.tenant(),
             .endpoint = self.cfg.gateway_chat_url,
             .reviewer_model = self.reviewer_model,
+            .reviewer_selection = self.reviewer_selection,
+            .reviewer_provider = if (self.reviewer_selection) |selection| selection.provider else null,
+            .credential_lease = reviewer_lease,
             .cancel_flag = self.cancelFlag(),
-        });
+        }, self.reviewer_fallbacks[0..self.reviewer_fallback_count]);
     }
 
     fn agentStreamProvider(self: *const AskContext) agent_stream_provider.Provider {
@@ -1513,6 +1568,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     defer startup.deinit(alloc);
     applyAskThemeChoice(startup.theme);
     cfg.provider_set.definitions = startup.configured_providers.definitions;
+    cfg.provider_set.native_overrides = startup.configured_providers.native_overrides;
     // Bind gateway chat traffic to a per-process connection pool and warm one
     // connection in the background while the rest of startup continues.
     var gateway_pool: ?*http_pool.HttpPool = null;
@@ -1601,6 +1657,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.agent_step_limit = startup.agent_step_limit;
     ctx.max_tool_result_bytes = startup.max_tool_result_bytes;
     ctx.auto_compact_percent = startup.auto_compact_percent;
+    ctx.context_promotion_enabled = startup.context_promotion_enabled;
     ctx.context_limits = startup.context_limits;
     ctx.context_limits.applyCommandLine(cfg.context_limit_overrides);
     ctx.fast_mode = startup.fast_mode;
@@ -1611,7 +1668,26 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.effort = toCoreReasoningEffort(startup.effort);
     ctx.first_call_tool_choice = startup.first_call_tool_choice;
     ctx.permission_mode = permission_mode;
-    ctx.reviewer_model = startup.reviewModel();
+    ctx.reviewer_selection = startup.reviewSelection();
+    ctx.reviewer_model = if (ctx.reviewer_selection) |selection| selection.model else "";
+    if (startup.roleSelection(.{ .builtin = .small }, null, null)) |selection| if (!selection.provider.eql(ctx.provider)) {
+        ctx.search_worker_credential = auth_runtime.prepareCredential(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.secret_store,
+            selection.provider,
+            null,
+        ) catch null;
+    };
+    if (ctx.reviewer_selection) |selection| if (!selection.provider.eql(ctx.provider)) {
+        ctx.reviewer_credential = auth_runtime.prepareCredential(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.secret_store,
+            selection.provider,
+            null,
+        ) catch null;
+    };
     ctx.role_startup = &startup;
     ctx.mode_id = mode_id;
     ctx.permission_rules = try takeCorePermissionRules(alloc, &startup);
@@ -1723,6 +1799,38 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
             credential.gatewayTeam(),
             credential.accountId(),
         );
+    }
+
+    if (ctx.reviewer_selection) |primary| {
+        var chain: [64]model_roles.Selection = undefined;
+        const chain_count = startup.roleSelectionChain(.{ .builtin = .review }, &chain);
+        var primary_seen = false;
+        for (chain[0..chain_count]) |candidate| {
+            if (!primary_seen) {
+                if (candidate.provider.eql(primary.provider) and std.mem.eql(u8, candidate.model, primary.model)) primary_seen = true;
+                continue;
+            }
+            if (ctx.reviewer_fallback_count == ctx.reviewer_fallbacks.len) break;
+            const reviewer = cfg.provider_set.select(candidate.provider).permission_reviewer orelse continue;
+            const binding = (bindModel(@ptrCast(&ctx), alloc, candidate) catch null) orelse continue;
+            ctx.reviewer_fallbacks[ctx.reviewer_fallback_count] = .{
+                .provider = reviewer,
+                .input = .{
+                    .credential = binding.credential.secret() orelse "",
+                    .credential_source = binding.credential.credentialSource(),
+                    .account_id = binding.credential.accountId(),
+                    .tenant = binding.credential.tenant(),
+                    .endpoint = cfg.gateway_chat_url,
+                    .reviewer_model = candidate.model,
+                    .reviewer_selection = candidate,
+                    .reviewer_provider = candidate.provider,
+                    .credential_lease = binding.credential,
+                    .cancel_flag = ctx.cancelFlag(),
+                },
+                .selection = candidate,
+            };
+            ctx.reviewer_fallback_count += 1;
+        }
     }
 
     const restored_image_catalog = try ctx.session.snapshotImageCatalog(alloc, &.{});
@@ -1845,7 +1953,9 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .agent_step_limit = startup.agent_step_limit,
         .max_tool_result_bytes = startup.max_tool_result_bytes,
         .auto_compact_percent = startup.auto_compact_percent,
-        .compact_model = startup.roleModel(.compact, null) orelse "",
+        .context_promotion_enabled = startup.context_promotion_enabled,
+        .compact_selection = startup.roleSelection(.{ .builtin = .compact }, null, null),
+        .fallback_role = .{ .builtin = .default },
         .cancel_flag = ctx.cancelFlag(),
         .fast_mode = ctx.fast_mode,
         .ultrafast_mode = ctx.ultrafast_mode,
@@ -1907,23 +2017,95 @@ fn maybeStartAskTitleTask(
     if (ctx.session.agent.history.items.len != 0) return null;
     const session_id = ctx.activeSessionId() orelse return null;
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
-    const role_title = if (ctx.role_startup) |startup| startup.roleModel(.title, bundle.title_model) else null;
+    const role_title = if (ctx.role_startup) |startup| startup.roleSelection(.{ .builtin = .title }, bundle.title_model, null) else null;
     // As in the daemon, the session's model titles when nothing cheaper is set (D206).
-    const title_model = role_title orelse bundle.title_model orelse if (ctx.model.len != 0) ctx.model else return null;
-    const agent_stream = bundle.agent_stream orelse return null;
+    const selection = role_title orelse if (bundle.title_model) |model| model_roles.Selection{
+        .provider = ctx.provider,
+        .model = model,
+        .source = .{ .builtin = .title },
+    } else if (ctx.model.len != 0) model_roles.Selection{
+        .provider = ctx.provider,
+        .model = ctx.model,
+        .source = .{ .builtin = .default },
+    } else return null;
+    const title_bundle = ctx.cfg.provider_set.select(selection.provider);
+    const agent_stream = title_bundle.agent_stream orelse return null;
     const excerpt = session_title_generation.promptExcerpt(prompt) orelse return null;
-    // A configured provider resolves its own credential (D168) or, without
-    // auth, has no key and still answers.
-    if (ctx.credential_source != .host_managed and ctx.credential_source != .configured and ctx.api_key.len == 0) return null;
-    const task = session_title_generation.Task.create(.{
-        .session_id = session_id,
-        .model = title_model,
-        .prompt_excerpt = excerpt,
+    var owned_credential: ?credentials.Credential = null;
+    defer if (owned_credential) |*value| value.deinit(ctx.alloc);
+    const credential = if (selection.provider.eql(ctx.provider)) session_title_generation.CredentialInput{
         .api_key = if (ctx.api_key.len > 0) ctx.api_key else null,
         .gateway_team = ctx.gateway_team,
         .account_id = ctx.account_id,
         .credential_source = ctx.credential_source,
+    } else blk: {
+        owned_credential = auth_runtime.prepareCredential(
+            ctx.alloc,
+            ctx.cfg.gateway_provider.oauth_transport,
+            ctx.cfg.secret_store,
+            selection.provider,
+            null,
+        ) catch return null;
+        const value = owned_credential orelse return null;
+        break :blk session_title_generation.CredentialInput{
+            .api_key = value.token,
+            .gateway_team = value.gatewayTeam(),
+            .account_id = value.accountId(),
+            .credential_source = value.source,
+        };
+    };
+    const provider_options = model_capabilities.resolveProviderOptionsForCapabilities(
+        ctx.cfg.provider_set.modelCapabilities(selection.provider, selection.model),
+        selection.effort orelse .auto,
+        false,
+    );
+    var title_fallbacks: [64]session_title_generation.Fallback = undefined;
+    var title_fallback_count: usize = 0;
+    if (ctx.role_startup) |startup| {
+        var chain: [64]model_roles.Selection = undefined;
+        const chain_count = model_roles.selectionChain(&startup.model_roles, .{ .builtin = .title }, .{
+            .provider = ctx.provider.label(),
+            .default_model = startup.configured_model,
+            .legacy_review = if (ctx.provider == .gateway and startup.review_model.len > 0) startup.review_model else null,
+            .configured = startup.configured_providers.definitions,
+        }, &chain);
+        var primary_seen = false;
+        for (chain[0..chain_count]) |candidate| {
+            if (!primary_seen) {
+                if (candidate.provider.eql(selection.provider) and std.mem.eql(u8, candidate.model, selection.model)) primary_seen = true;
+                continue;
+            }
+            if (title_fallback_count == title_fallbacks.len) break;
+            const binding = bindModel(@ptrCast(ctx), ctx.alloc, candidate) catch null orelse continue;
+            title_fallbacks[title_fallback_count] = .{
+                .stream_provider = binding.stream_provider,
+                .provider = binding.selection.provider,
+                .model = binding.selection.model,
+                .effort = binding.selection.effort orelse .auto,
+                .provider_options = binding.provider_options,
+                .credential = .{
+                    .api_key = binding.credential.secret(),
+                    .gateway_team = binding.credential.tenant(),
+                    .account_id = binding.credential.accountId(),
+                    .credential_source = binding.credential.credentialSource(),
+                },
+            };
+            title_fallback_count += 1;
+        }
+    }
+    const task = session_title_generation.Task.create(.{
+        .session_id = session_id,
+        .provider = selection.provider,
+        .model = selection.model,
+        .effort = selection.effort orelse .auto,
+        .provider_options = provider_options,
+        .prompt_excerpt = excerpt,
+        .api_key = credential.api_key,
+        .gateway_team = credential.gateway_team,
+        .account_id = credential.account_id,
+        .credential_source = credential.credential_source,
         .stream_provider = agent_stream,
+        .fallbacks = title_fallbacks[0..title_fallback_count],
     }) catch return null;
     task.spawn() catch |err| {
         debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});
@@ -2023,17 +2205,75 @@ fn takeToolCallRecords(ctx: *AskContext, alloc: Allocator) ![]ToolCallRecord {
     return owned;
 }
 
+fn promoteContextModel(raw_ctx: *anyopaque, _: Allocator, current: model_roles.Selection) anyerror!?model_roles.Selection {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    return ctx.cfg.provider_set.contextPromotionTarget(current);
+}
+
+fn bindModel(raw_ctx: *anyopaque, arena: Allocator, selection: model_roles.Selection) anyerror!?agent_runtime.ModelBinding {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const bundle = ctx.cfg.provider_set.select(selection.provider);
+    const credential: agent_stream_provider.CredentialLease = if (selection.provider.eql(ctx.provider))
+        .{ .direct = .{
+            .secret_bytes = ctx.api_key,
+            .source = ctx.credential_source,
+            .account_id = ctx.account_id,
+            .tenant_context = ctx.gateway_team,
+        } }
+    else blk: {
+        const prepared = auth_runtime.prepareCredential(arena, ctx.cfg.gateway_provider.oauth_transport, ctx.cfg.secret_store, selection.provider, null) catch return null;
+        const value = prepared orelse return null;
+        break :blk .{ .direct = .{
+            .secret_bytes = value.token,
+            .source = value.source,
+            .account_id = value.accountId(),
+            .tenant_context = value.gatewayTeam(),
+        } };
+    };
+    const capabilities = ctx.cfg.provider_set.modelCapabilities(selection.provider, selection.model);
+    return .{
+        .selection = selection,
+        .stream_provider = bundle.agent_stream_or_unavailable(),
+        .credential = credential,
+        .capabilities = capabilities,
+        .provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, selection.effort orelse ctx.effort, ctx.fast_mode),
+    };
+}
+
+fn resolveRoleChain(raw_ctx: *anyopaque, role: model_roles.RoleId, out: []model_roles.Selection) usize {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const startup = ctx.role_startup orelse return 0;
+    return model_roles.selectionChain(&startup.model_roles, role, .{
+        .provider = ctx.provider.label(),
+        .default_model = startup.configured_model,
+        .legacy_review = if (ctx.provider == .gateway and startup.review_model.len > 0) startup.review_model else null,
+        .configured = startup.configured_providers.definitions,
+    }, out);
+}
+
+fn publishEffectiveSelection(raw_ctx: *anyopaque, selection: model_roles.Selection) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    const owned = try ctx.alloc.dupe(u8, selection.model);
+    if (ctx.effective_model) |old| ctx.alloc.free(old);
+    ctx.effective_model = owned;
+    ctx.model = owned;
+    // This is a per-run effective provider only. It is intentionally not
+    // written to profile/session preferences; downstream routing metadata
+    // remains separate in resolved_provider.
+    ctx.provider = selection.provider;
+}
+
 fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
     return .{
         .ctx = @ptrCast(ctx),
         .agent_stream_provider = ctx.agentStreamProvider(),
+        .performance = &ctx.model_performance,
         .render_assistant_text = ctx.output_mode.isTerminal(),
         .tool_registry = ctx.toolRegistry(),
         .context_registry = ctx.deps.context_registry,
         .context_enabled = ctx.context_enabled,
         .ttsr_enabled = !@import("builtin").is_test,
         .checklist = &ctx.session.checklist,
-        .resolve_judge_model = resolveJudgeModel,
         .finalize_turn = finalizeTurn,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
@@ -2072,6 +2312,10 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
         .resolve_model_capabilities = resolveModelCapabilities,
+        .bind_model = bindModel,
+        .promote_context_model = promoteContextModel,
+        .publish_selection = publishEffectiveSelection,
+        .resolve_role_chain = resolveRoleChain,
         .model_catalog_unavailable = modelCatalogUnavailable,
         .format_tool_execution_error = formatToolExecutionError,
         .record_tool_call_rejected = recordToolCallRejected,
@@ -2155,7 +2399,8 @@ fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
 fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
-    const catalog = bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model);
+    const fallback_capabilities = ctx.cfg.provider_set.modelCapabilities(ctx.provider, model);
+    const catalog = bundle.model_catalog orelse return fallback_capabilities;
     return ctx.capability_resolver.resolve(
         ctx.alloc,
         catalog,
@@ -2165,7 +2410,7 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
             .cancel_flag = ctx.cancelFlag(),
         },
         model,
-        bundle.fallbackModelCapabilities(model),
+        fallback_capabilities,
     );
 }
 
@@ -2173,32 +2418,19 @@ fn availableModelCapabilities(raw_ctx: *anyopaque, model: []const u8) model_capa
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     return ctx.capability_resolver.available(
         model,
-        ctx.cfg.provider_set.select(ctx.provider).fallbackModelCapabilities(model),
+        ctx.cfg.provider_set.modelCapabilities(ctx.provider, model),
     );
 }
 
 /// Subagent model overrides resolve against the same catalog the capability
 /// path uses. The resolve loads the catalog on first use; only cancellation
 /// or an unavailable catalog falls back to raw passthrough.
-/// A stream rule judge's model: the first of the rule's roles that resolves
-/// (D207). Null keeps the session's model.
-fn resolveJudgeModel(raw_ctx: *anyopaque, roles: []const []const u8) ?[]const u8 {
-    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
-    const startup = ctx.role_startup orelse return null;
-    const bundle = ctx.cfg.provider_set.select(ctx.provider);
-    for (roles) |name| {
-        const role = model_roles.Role.parse(name) orelse continue;
-        if (startup.roleModel(role, bundle.title_model)) |model| return model;
-    }
-    return null;
-}
-
 fn resolveModelRole(raw_ctx: ?*anyopaque, name: []const u8) subagent_tool_host.ModelRoleResolver.Lookup {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx.?));
-    const role = model_roles.Role.parse(name) orelse return .unknown_role;
+    const role = model_roles.parseRoleId(name) orelse return .unknown_role;
     const startup = ctx.role_startup orelse return .unavailable;
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
-    return if (startup.rolePick(role, bundle.title_model, null)) |picked| .{ .model = .{ .id = picked.model, .effort = picked.effort } } else .unavailable;
+    return if (startup.roleSelection(role, bundle.title_model, null)) |selection| .{ .model = .{ .id = selection.model, .effort = selection.effort, .provider = selection.provider } } else .unavailable;
 }
 
 fn resolveModelOverride(raw_ctx: ?*anyopaque, alloc: Allocator, raw_model: []const u8) Allocator.Error!subagent_model_contract.ModelCatalogMatch {
@@ -2214,7 +2446,7 @@ fn resolveModelOverride(raw_ctx: ?*anyopaque, alloc: Allocator, raw_model: []con
             .cancel_flag = ctx.cancelFlag(),
         },
         raw_model,
-        bundle.fallbackModelCapabilities(raw_model),
+        ctx.cfg.provider_set.modelCapabilities(ctx.provider, raw_model),
     ) catch return .no_catalog;
     const entries = ctx.capability_resolver.catalogEntries() orelse return .no_catalog;
     var ids = try model_catalog.projectModelIds(alloc, entries);

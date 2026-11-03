@@ -8,6 +8,7 @@ const command_admission = @import("../core/permissions/command_admission.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const model_provider = @import("../core/config/model_provider.zig");
+const model_catalog = @import("../core/gateway/model_catalog.zig");
 const host = @import("../core/hosts/host.zig");
 const host_target = @import("../core/hosts/target.zig");
 const session_title_generation = @import("../core/session/session_title_generation.zig");
@@ -69,6 +70,7 @@ const skill_invocation = @import("../core/skills/skill_invocation.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
+const model_roles = @import("../core/config/model_roles.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
@@ -164,17 +166,33 @@ fn fitsLibfxPrompt(images: []const PendingPromptImage) bool {
 /// The credentials a bank web search may use in this session. Borrowed from
 /// `state` and `session`.
 fn webSearchInputs(state: *server.ServerState, session: *const server.ActiveSessionState) web_search_provider_mod.Inputs {
+    return webSearchInputsWithCredential(state, session, null);
+}
+
+fn webSearchInputsWithCredential(
+    state: *server.ServerState,
+    session: *const server.ActiveSessionState,
+    worker_credential: ?*const credentials.Credential,
+) web_search_provider_mod.Inputs {
+    const worker_provider = if (server.roleHost(state, session).workerSelection()) |selection| selection.provider else session.provider;
     var inputs: web_search_provider_mod.Inputs = .{
         .api_key = session.api_key,
         .credential_source = session.credential_source,
         .gateway_team = state.gateway_team,
         .account_id = session.account_id,
         .worker_model = server.roleHost(state, session).searchWorkerModel(),
+        .worker_provider = worker_provider,
         .gateway_retry_count = state.cfg.gateway_retry_count,
         .gateway_chat_url = state.cfg.gateway_chat_url,
     };
+    if (worker_credential) |credential| {
+        inputs.api_key = credential.token;
+        inputs.credential_source = credential.source;
+        inputs.account_id = credential.accountId();
+        inputs.gateway_team = credential.gatewayTeam();
+    }
     const registry = configured_provider_mod.Registry{ .definitions = state.cfg.provider_set.definitions };
-    if (session.provider == .configured) if (session.provider.bind(registry)) |bound| {
+    if (worker_provider == .configured) if (worker_provider.bind(registry)) |bound| {
         if (registry.get(bound.label())) |definition| if (definition.protocol == .@"anthropic-messages") {
             inputs.anthropic_base_url = definition.base_url;
             inputs.anthropic_bearer = definition.key_header == .authorization;
@@ -186,9 +204,22 @@ fn webSearchInputs(state: *server.ServerState, session: *const server.ActiveSess
 /// Native provider search, a bank function when a bank provider is
 /// available, or hidden.
 fn webSearchExposure(state: *server.ServerState, session: *const server.ActiveSessionState) tool_projection_mod.WebSearchExposure {
+    var worker_credential: ?credentials.Credential = null;
+    defer if (worker_credential) |*value| value.deinit(state.alloc);
+    if (server.roleHost(state, session).workerSelection()) |selection| if (!selection.provider.eql(session.provider)) {
+        worker_credential = server.prepareCredentialForProvider(state, selection.provider) catch null;
+    };
+    return webSearchExposureWithCredential(state, session, if (worker_credential) |*value| value else null);
+}
+
+fn webSearchExposureWithCredential(
+    state: *server.ServerState,
+    session: *const server.ActiveSessionState,
+    worker_credential: ?*const credentials.Credential,
+) tool_projection_mod.WebSearchExposure {
     if (state.cfg.provider_set.select(session.provider).capabilities.fx_search) return .provider_native;
     if (state.web_search_runtime.provider == null) return .hidden;
-    return if (state.web_search_runtime.available(state.alloc, webSearchInputs(state, session))) .local else .hidden;
+    return if (state.web_search_runtime.available(state.alloc, webSearchInputsWithCredential(state, session, worker_credential))) .local else .hidden;
 }
 
 test "a libfx prompt holds at most its limit of images and image bytes" {
@@ -243,11 +274,12 @@ fn ultrafastPromptAllowed(
     session: *const server.ActiveSessionState,
 ) bool {
     if (!session.ultrafast_mode) return true;
-    const catalog_ready = state.capability_resolver.catalogEntries() != null;
-    const bundle = state.cfg.provider_set.select(session.provider);
-    const capabilities = state.capability_resolver.available(
+    const catalog_ready = server.catalogReadyFor(state, session.provider);
+    const capabilities = server.modelCapabilitiesFor(
+        @constCast(state),
+        session.provider,
         session.model,
-        bundle.fallbackModelCapabilities(session.model),
+        state.cfg.provider_set.modelCapabilities(session.provider, session.model),
     );
     return ultrafastCapabilityAllowed(
         session.provider,
@@ -295,6 +327,10 @@ const AcpContext = struct {
     captured_permission_mode: ?PermissionMode = null,
     current_prompt_input: ?*ParsedPromptInput = null,
     observer: ?*observation.Observer = null,
+    reviewer_credential: ?credentials.Credential = null,
+    search_worker_credential: ?credentials.Credential = null,
+    reviewer_fallback_storage: [8]permission_auto_classifier.ProviderFallback = undefined,
+    reviewer_fallback_count: usize = 0,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
         // A command that outlives this turn must not stream into it.
@@ -302,6 +338,10 @@ const AcpContext = struct {
         var keys = self.published_tool_calls.keyIterator();
         while (keys.next()) |key| self.alloc.free(key.*);
         self.published_tool_calls.deinit(self.alloc);
+        if (self.reviewer_credential) |*credential| credential.deinit(self.alloc);
+        if (self.search_worker_credential) |*credential| credential.deinit(self.alloc);
+        self.reviewer_credential = null;
+        self.search_worker_credential = null;
     }
 
     fn sendUpdate(self: *AcpContext, update_json: []const u8) !void {
@@ -568,15 +608,28 @@ const AcpContext = struct {
 
     fn toolContext(self: *AcpContext) tool_runtime.Context {
         const session = if (self.state.active_session) |*active| active else unreachable;
+        const reviewer_selection = server.roleHost(self.state, session).reviewSelection();
+        if (reviewer_selection) |selection| if (!selection.provider.eql(session.provider) and self.reviewer_credential == null) {
+            self.reviewer_credential = server.prepareCredentialForProvider(self.state, selection.provider) catch null;
+        };
+        if (server.roleHost(self.state, session).workerSelection()) |selection| if (!selection.provider.eql(session.provider) and self.search_worker_credential == null) {
+            self.search_worker_credential = server.prepareCredentialForProvider(self.state, selection.provider) catch null;
+        };
+        const reviewer_provider = if (reviewer_selection) |selection|
+            self.state.cfg.provider_set.select(selection.provider).permission_reviewer
+        else
+            self.state.cfg.provider_set.select(session.provider).permission_reviewer;
         const provider_capabilities = self.state.cfg.provider_set.select(session.provider).capabilities;
-        const local_web_search = webSearchExposure(self.state, session) == .local;
-        if (local_web_search) self.state.web_search_runtime.configure(webSearchInputs(self.state, session));
+        const local_web_search = webSearchExposureWithCredential(self.state, session, if (self.search_worker_credential) |*value| value else null) == .local;
+        if (local_web_search) self.state.web_search_runtime.configure(webSearchInputsWithCredential(self.state, session, if (self.search_worker_credential) |*value| value else null));
         if (provider_capabilities.fx_search) {
             self.state.web_search_runtime.configure(.{
-                .api_key = session.api_key,
-                .credential_source = session.credential_source,
-                .gateway_team = self.state.gateway_team,
+                .api_key = if (self.search_worker_credential) |*value| value.token else session.api_key,
+                .credential_source = if (self.search_worker_credential) |*value| value.source else session.credential_source,
+                .gateway_team = if (self.search_worker_credential) |*value| value.gatewayTeam() else self.state.gateway_team,
+                .account_id = if (self.search_worker_credential) |*value| value.accountId() else session.account_id,
                 .worker_model = server.roleHost(self.state, session).searchWorkerModel(),
+                .worker_provider = if (server.roleHost(self.state, session).workerSelection()) |selection| selection.provider else session.provider,
                 .gateway_retry_count = self.state.cfg.gateway_retry_count,
                 .gateway_chat_url = self.state.cfg.gateway_chat_url,
             });
@@ -616,7 +669,8 @@ const AcpContext = struct {
             .permission_rules = session.permission_rules,
             .tool_registry = self.toolRegistry(),
             .host_tool_provider = hostToolProvider(self.state),
-            .permission_reviewer_provider = self.state.cfg.provider_set.select(session.provider).permission_reviewer,
+            .reviewer_selection = reviewer_selection,
+            .permission_reviewer_provider = reviewer_provider,
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,
             .worker = &self.state.worker,
@@ -661,7 +715,16 @@ const AcpContext = struct {
                 .context = @ptrCast(self),
                 .resolve_fn = resolveModelRole,
             },
-            .reviewer_model = server.roleHost(self.state, session).reviewModel(),
+            .model_binding_context = @ptrCast(self),
+            .model_binder = bindModel,
+            .role_chain_resolver = resolveRoleChain,
+            .reviewer_model = if (reviewer_selection) |selection| selection.model else server.roleHost(self.state, session).reviewModel(),
+            .reviewer_credential = if (self.reviewer_credential) |*value| .{ .direct = .{
+                .secret_bytes = value.token,
+                .source = value.source,
+                .account_id = value.accountId(),
+                .tenant_context = value.gatewayTeam(),
+            } } else null,
             .interactive = false,
             .lifecycle_view = self.state.lifecycle_view,
             .lifecycle_scope = .{
@@ -670,6 +733,38 @@ const AcpContext = struct {
                 .session_id = session.session_id,
             },
         };
+        if (reviewer_selection) |primary| {
+            var chain: [64]model_roles.Selection = undefined;
+            const chain_count = server.roleHost(self.state, session).selectionChain(.{ .builtin = .review }, &chain);
+            var primary_seen = false;
+            for (chain[0..chain_count]) |candidate| {
+                if (!primary_seen) {
+                    if (candidate.provider.eql(primary.provider) and std.mem.eql(u8, candidate.model, primary.model)) primary_seen = true;
+                    continue;
+                }
+                if (self.reviewer_fallback_count == self.reviewer_fallback_storage.len) break;
+                const reviewer = self.state.cfg.provider_set.select(candidate.provider).permission_reviewer orelse continue;
+                const binding = (bindModel(@ptrCast(self), self.alloc, candidate) catch null) orelse continue;
+                self.reviewer_fallback_storage[self.reviewer_fallback_count] = .{
+                    .provider = reviewer,
+                    .input = .{
+                        .credential = binding.credential.secret() orelse "",
+                        .credential_source = binding.credential.credentialSource(),
+                        .account_id = binding.credential.accountId(),
+                        .tenant = binding.credential.tenant(),
+                        .endpoint = self.state.cfg.gateway_chat_url,
+                        .reviewer_model = candidate.model,
+                        .reviewer_selection = candidate,
+                        .reviewer_provider = candidate.provider,
+                        .credential_lease = binding.credential,
+                        .cancel_flag = &session.cancel_flag,
+                    },
+                    .selection = candidate,
+                };
+                self.reviewer_fallback_count += 1;
+            }
+            tc.reviewer_fallbacks = self.reviewer_fallback_storage[0..self.reviewer_fallback_count];
+        }
         if (comptime !host_target.is_wasm) {
             if (session.mcp_host) |h| h.catalog.wire(&tc);
         }
@@ -1349,22 +1444,51 @@ fn maybeStartAcpTitleTask(
     if (session.title_task != null) return;
     if (session.session_rt.agent.history.items.len != 0) return;
     const session_id = if (session.v2) |v2| v2.id() else return;
-    const bundle = state.cfg.provider_set.select(session.provider);
-    const title_model = server.roleHost(state, session).titleModel() orelse return;
-    const agent_stream = bundle.agent_stream orelse return;
+    const selection = server.roleHost(state, session).titleSelection() orelse return;
     const excerpt = session_title_generation.promptExcerpt(prompt_text) orelse return;
-    // A configured provider without auth has no key and still answers.
-    if (session.credential_source != .host_managed and session.credential_source != .configured and session.api_key.len == 0) return;
+    var bind_ctx = AcpContext{ .alloc = state.alloc, .state = state, .session_id = session_id };
+    const binding = (bindModel(@ptrCast(&bind_ctx), state.alloc, selection) catch return) orelse return;
+    var title_fallbacks: [64]session_title_generation.Fallback = undefined;
+    var title_fallback_count: usize = 0;
+    var chain: [64]model_roles.Selection = undefined;
+    const chain_count = server.roleHost(state, session).selectionChain(.{ .builtin = .title }, &chain);
+    var primary_seen = false;
+    for (chain[0..chain_count]) |candidate| {
+        if (!primary_seen) {
+            if (candidate.provider.eql(selection.provider) and std.mem.eql(u8, candidate.model, selection.model)) primary_seen = true;
+            continue;
+        }
+        if (title_fallback_count == title_fallbacks.len) break;
+        const candidate_binding = bindModel(@ptrCast(&bind_ctx), state.alloc, candidate) catch null orelse continue;
+        title_fallbacks[title_fallback_count] = .{
+            .stream_provider = candidate_binding.stream_provider,
+            .provider = candidate_binding.selection.provider,
+            .model = candidate_binding.selection.model,
+            .effort = candidate_binding.selection.effort orelse session.effort,
+            .provider_options = candidate_binding.provider_options,
+            .credential = .{
+                .api_key = candidate_binding.credential.secret(),
+                .gateway_team = candidate_binding.credential.tenant(),
+                .account_id = candidate_binding.credential.accountId(),
+                .credential_source = candidate_binding.credential.credentialSource(),
+            },
+        };
+        title_fallback_count += 1;
+    }
     const task = session_title_generation.Task.create(.{
         .observer = observer,
         .session_id = session_id,
-        .model = title_model,
+        .provider = selection.provider,
+        .model = selection.model,
+        .effort = selection.effort orelse session.effort,
+        .provider_options = binding.provider_options,
         .prompt_excerpt = excerpt,
-        .api_key = if (session.api_key.len > 0) session.api_key else null,
-        .gateway_team = state.gateway_team,
-        .account_id = session.account_id,
-        .credential_source = session.credential_source,
-        .stream_provider = agent_stream,
+        .api_key = binding.credential.secret(),
+        .gateway_team = binding.credential.tenant(),
+        .account_id = binding.credential.accountId(),
+        .credential_source = binding.credential.credentialSource(),
+        .stream_provider = binding.stream_provider,
+        .fallbacks = title_fallbacks[0..title_fallback_count],
     }) catch return;
     task.spawn() catch |err| {
         debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});
@@ -1546,7 +1670,9 @@ fn buildAgentConfig(
         .agent_step_limit = session.agent_step_limit,
         .max_tool_result_bytes = session.max_tool_result_bytes,
         .auto_compact_percent = state.auto_compact_percent,
-        .compact_model = server.roleHost(state, session).compactModel(),
+        .context_promotion_enabled = state.context_promotion_enabled,
+        .compact_selection = server.roleHost(state, session).compactSelection(),
+        .fallback_role = .{ .builtin = .default },
         .cancel_flag = &session.cancel_flag,
         .fast_mode = session.fast_mode,
         .ultrafast_mode = session.ultrafast_mode,
@@ -1561,11 +1687,12 @@ fn buildAgentConfig(
 
 test "libfx inline prompt source references survive capture without a filesystem" {
     const alloc = std.testing.allocator;
-    var parsed = try parsePromptInput(alloc, "{\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"sourceRef\":\"host:original\"}]}");
+    var parsed = try parsePromptInput(alloc, "{\"prompt\":[{\"type\":\"image\",\"mimeType\":\"image/png\",\"detail\":\"low\",\"sourceRef\":\"host:original\"}]}");
     defer parsed.deinit(alloc);
     try parsed.captureImagesInline(alloc);
     try std.testing.expectEqual(@as(usize, 1), parsed.images.len);
     try std.testing.expectEqualStrings("host:original", parsed.images[0].source_ref.?);
+    try std.testing.expectEqual(types.ImageDetail.low, parsed.images[0].detail.?);
     try std.testing.expect(parsed.images[0].inline_data == null);
     try std.testing.expect(parsed.images[0].snapshot_path == null);
     try std.testing.expectEqualStrings("[Image #1]", parsed.text);
@@ -1586,6 +1713,7 @@ const PendingPromptImage = struct {
     id: usize,
     bytes: []u8,
     media_type: []u8,
+    detail: ?types.ImageDetail = null,
     source_ref: ?[]u8 = null,
     /// The name the host stored the bytes under before it sent them.
     stored_name: ?session_codec.ImageName = null,
@@ -1646,6 +1774,7 @@ const ParsedPromptInput = struct {
                 snapshot_dir,
             );
             captured += 1;
+            images[index].detail = pending.detail;
             if (pending.source_ref) |value| images[index].source_ref = try alloc.dupe(u8, value);
         }
         self.images = images;
@@ -1681,6 +1810,7 @@ const ParsedPromptInput = struct {
                 pending.bytes,
             );
             errdefer types.freeImageAttachment(alloc, attachment);
+            attachment.detail = pending.detail;
             if (pending.source_ref) |value| attachment.source_ref = try alloc.dupe(u8, value);
             images[index] = attachment;
             captured += 1;
@@ -1867,6 +1997,10 @@ fn parsePromptInputWithFirstImageId(
             if (media_type_value != .string or media_type_value.string.len == 0) {
                 return error.InvalidPromptImage;
             }
+            const detail = if (block.object.get("detail")) |detail_value| switch (detail_value) {
+                .string => |name| types.ImageDetail.parse(name) orelse return error.InvalidPromptImage,
+                else => return error.InvalidPromptImage,
+            } else null;
             const source_ref_value: ?[]const u8 = if (block.object.get("sourceRef")) |value| ref: {
                 if (value != .string or !image_data.validSourceRef(value.string)) return error.InvalidPromptImage;
                 break :ref value.string;
@@ -1903,6 +2037,7 @@ fn parsePromptInputWithFirstImageId(
                 .id = image_id,
                 .bytes = decoded,
                 .media_type = media_type,
+                .detail = detail,
                 .source_ref = source_ref,
                 .stored_name = stored_name,
             });
@@ -2027,16 +2162,63 @@ fn localFileTargetPath(alloc: Allocator, uri_text: []const u8) Allocator.Error!?
     };
 }
 
+fn promoteContextModel(raw_ctx: *anyopaque, _: Allocator, current: model_roles.Selection) anyerror!?model_roles.Selection {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    return ctx.state.cfg.provider_set.contextPromotionTarget(current);
+}
+
+fn bindModel(raw_ctx: *anyopaque, arena: Allocator, selection: model_roles.Selection) anyerror!?agent_runtime.ModelBinding {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*active| active else return null;
+    const credential: agent_stream_provider.CredentialLease = if (selection.provider.eql(session.provider))
+        .{ .direct = .{
+            .secret_bytes = session.api_key,
+            .source = session.credential_source,
+            .account_id = session.account_id,
+            .tenant_context = ctx.state.gateway_team,
+        } }
+    else blk: {
+        const prepared = auth_runtime.prepareCredential(
+            arena,
+            ctx.state.cfg.gateway_provider.oauth_transport,
+            ctx.state.cfg.secret_store,
+            selection.provider,
+            null,
+        ) catch return null;
+        const value = prepared orelse return null;
+        break :blk .{ .direct = .{
+            .secret_bytes = value.token,
+            .source = value.source,
+            .account_id = value.accountId(),
+            .tenant_context = value.gatewayTeam(),
+        } };
+    };
+    const capabilities = ctx.state.cfg.provider_set.modelCapabilities(selection.provider, selection.model);
+    return .{
+        .selection = selection,
+        .stream_provider = server.streamProviderFor(ctx.state, selection.provider),
+        .credential = credential,
+        .capabilities = capabilities,
+        .provider_options = model_capabilities.resolveProviderOptionsForCapabilities(capabilities, selection.effort orelse session.effort, false),
+    };
+}
+
+fn resolveRoleChain(raw_ctx: *anyopaque, role: model_roles.RoleId, out: []model_roles.Selection) usize {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*active| active else return 0;
+    return server.roleHost(ctx.state, session).selectionChain(role, out);
+}
+
 fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
     const session = if (ctx.state.active_session) |*active| active else unreachable;
     var deps: agent_runtime.AgentRuntimeDeps = .{
         .ctx = @ptrCast(ctx),
         .observer = ctx.observer,
         .agent_stream_provider = server.streamProviderFor(ctx.state, ctx.state.active_session.?.provider),
+        .performance = &ctx.state.model_performance,
         .report_usage = reportUsage,
         .ttsr_enabled = !std_builtin.is_test,
         .checklist = &session.session_rt.checklist,
-        .resolve_judge_model = resolveJudgeModel,
         .flush_assistant_stream_per_content_chunk = host_target.is_wasm,
         .render_assistant_text = false,
         .tool_registry = ctx.toolRegistry(),
@@ -2097,6 +2279,9 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .refresh_gateway_credential = refreshGatewayCredential,
         .available_model_capabilities = availableModelCapabilities,
         .resolve_model_capabilities = resolveModelCapabilities,
+        .bind_model = bindModel,
+        .promote_context_model = promoteContextModel,
+        .resolve_role_chain = resolveRoleChain,
         .model_catalog_unavailable = modelCatalogUnavailable,
         .format_tool_execution_error = formatToolExecutionError,
         .record_tool_call_rejected = recordToolCallRejected,
@@ -2275,7 +2460,9 @@ fn reportUsage(raw_ctx: *anyopaque, usage: types.Usage) void {
 
 fn modelCatalogUnavailable(raw_ctx: *anyopaque) bool {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    return ctx.state.capability_resolver.state == .failed;
+    const provider = if (ctx.state.active_session) |session| session.provider else ctx.state.provider;
+    if (ctx.state.model_cache) |*cache| return cache.providerSnapshot(provider).status == .failed;
+    return false;
 }
 
 fn resolveModelCapabilities(
@@ -2285,41 +2472,23 @@ fn resolveModelCapabilities(
 ) model_capabilities.ResolveError!model_capabilities.Capabilities {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else return .{};
-    const bundle = ctx.state.cfg.provider_set.select(session.provider);
-    return ctx.state.capability_resolver.resolve(
-        ctx.state.alloc,
-        bundle.model_catalog orelse return bundle.fallbackModelCapabilities(model),
-        .{
-            .access = credentials.catalogAccessForCredentialAndAccount(
-                session.credential_source,
-                session.api_key,
-                ctx.state.gateway_team,
-                session.account_id,
-            ),
-            .endpoint = ctx.state.cfg.gateway_models_path,
-            .cancel_flag = &session.cancel_flag,
-        },
+    return server.resolveModelCapabilitiesFor(
+        ctx.state,
+        session.provider,
         model,
-        bundle.fallbackModelCapabilities(model),
+        &session.cancel_flag,
     );
 }
 
 /// Subagent model overrides resolve against the same catalog the capability
 /// path uses. The resolve loads the catalog on first use; only cancellation
 /// or an unavailable catalog falls back to raw passthrough.
-/// A stream rule judge's model: the first of the rule's roles that resolves
-/// (D207). Null keeps the session's model.
-fn resolveJudgeModel(raw_ctx: *anyopaque, roles: []const []const u8) ?[]const u8 {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const session = if (ctx.state.active_session) |*active| active else return null;
-    return server.roleHost(ctx.state, session).judgeModel(roles);
-}
-
 fn resolveModelRole(raw_ctx: ?*anyopaque, name: []const u8) @import("../core/subagent/tool_host.zig").ModelRoleResolver.Lookup {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx.?));
     const session = if (ctx.state.active_session) |*active| active else return .unavailable;
     return switch (server.roleHost(ctx.state, session).lookup(name)) {
-        .model => |picked| .{ .model = .{ .id = picked.model, .effort = picked.effort } },
+        .selection => |selection| .{ .model = .{ .id = selection.model, .effort = selection.effort, .provider = selection.provider } },
+        .model => |picked| .{ .model = .{ .id = picked.model, .effort = picked.effort, .provider = null } },
         .unknown_role => .unknown_role,
         .unavailable => .unavailable,
     };
@@ -2332,26 +2501,15 @@ fn resolveModelOverride(
 ) Allocator.Error!subagent_model_contract.ModelCatalogMatch {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx.?));
     const session = if (ctx.state.active_session) |*active| active else return .no_catalog;
-    const bundle = ctx.state.cfg.provider_set.select(session.provider);
-    const catalog_provider = bundle.model_catalog orelse return .no_catalog;
-    _ = ctx.state.capability_resolver.resolve(
-        ctx.state.alloc,
-        catalog_provider,
-        .{
-            .access = credentials.catalogAccessForCredentialAndAccount(
-                session.credential_source,
-                session.api_key,
-                ctx.state.gateway_team,
-                session.account_id,
-            ),
-            .endpoint = ctx.state.cfg.gateway_models_path,
-            .cancel_flag = &session.cancel_flag,
-        },
+    _ = server.resolveModelCapabilitiesFor(
+        ctx.state,
+        session.provider,
         raw_model,
-        bundle.fallbackModelCapabilities(raw_model),
+        &session.cancel_flag,
     ) catch return .no_catalog;
-    const entries = ctx.state.capability_resolver.catalogEntries() orelse return .no_catalog;
-    var ids = try gateway_model_catalog.projectModelIds(alloc, entries);
+    var catalog = (try server.snapshotModelCatalogFor(ctx.state, session.provider, alloc)) orelse return .no_catalog;
+    defer gateway_model_catalog.freeModelCatalog(alloc, &catalog);
+    var ids = try gateway_model_catalog.projectModelIds(alloc, catalog.items);
     defer {
         for (ids.items) |id| alloc.free(id);
         ids.deinit(alloc);
@@ -2365,9 +2523,11 @@ fn availableModelCapabilities(
 ) model_capabilities.Capabilities {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const session = if (ctx.state.active_session) |*active| active else return .{};
-    return ctx.state.capability_resolver.available(
+    return server.modelCapabilitiesFor(
+        ctx.state,
+        session.provider,
         model,
-        ctx.state.cfg.provider_set.select(session.provider).fallbackModelCapabilities(model),
+        ctx.state.cfg.provider_set.modelCapabilities(session.provider, model),
     );
 }
 
@@ -3243,8 +3403,31 @@ pub fn compactNow(state: *server.ServerState, alloc: Allocator) !ManualCompactio
     };
     const deps = agentRuntimeDeps(&ctx);
     session.cancel_flag.store(false, .seq_cst);
-    // ACP sessions have no gateway provider routing, and an ACP host shows no
-    // compaction activity, so neither is passed.
+    const compact_selection = server.roleHost(state, session).compactSelection();
+    const summary_provider = if (compact_selection) |selection| selection.provider else null;
+    const summary_bundle = if (summary_provider) |provider| state.cfg.provider_set.select(provider) else null;
+    var summary_credential_storage: ?credentials.Credential = null;
+    defer if (summary_credential_storage) |*value| value.deinit(arena_state.allocator());
+    const summary_credential = if (summary_provider) |provider| if (!provider.eql(session.provider)) blk: {
+        summary_credential_storage = auth_runtime.prepareCredential(
+            arena_state.allocator(),
+            state.cfg.gateway_provider.oauth_transport,
+            state.cfg.secret_store,
+            provider,
+            null,
+        ) catch null;
+        const value = summary_credential_storage orelse break :blk null;
+        break :blk agent_stream_provider.CredentialLease{ .direct = .{
+            .secret_bytes = value.token,
+            .source = value.source,
+            .account_id = value.accountId(),
+            .tenant_context = value.gatewayTeam(),
+        } };
+    } else null else null;
+    const summary_options = if (compact_selection) |selection| if (summary_bundle != null)
+        model_capabilities.resolveProviderOptionsForCapabilities(state.cfg.provider_set.modelCapabilities(selection.provider, selection.model), selection.effort orelse session.effort, false)
+    else
+        null else null;
     const result = try manual_compaction.run(arena_state.allocator(), &deps, .{
         .model = .{
             .provider = session.provider,
@@ -3255,7 +3438,11 @@ pub fn compactNow(state: *server.ServerState, alloc: Allocator) !ManualCompactio
             .gateway_team = state.gateway_team,
             .session_id = session.session_id,
             .retry_count = state.cfg.gateway_retry_count,
-            .summary_model = server.roleHost(state, session).compactModel(),
+            .summary_model = if (compact_selection) |selection| selection.model else "",
+            .summary_provider = summary_provider,
+            .summary_stream_provider = if (summary_provider) |provider| server.streamProviderFor(state, provider) else null,
+            .summary_credential = summary_credential,
+            .summary_provider_options = summary_options,
             .effort = session.effort,
             .fast_mode = session.fast_mode,
             .prompt_caching = state.cfg.provider_set.select(session.provider).capabilities.gateway_prompt_caching,

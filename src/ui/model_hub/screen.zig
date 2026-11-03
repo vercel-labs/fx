@@ -1,7 +1,7 @@
 //! Paints the model hub (D221) on the catalog-menu alternate screen: a title
 //! row, the sidebar of scopes beside the scope's list, and a hint row that
-//! becomes a chip strip while one is open. Below 64 columns only one pane
-//! shows at a time, as in proto's compact hub.
+//! becomes a chip strip while one is open. A narrow useful split switches
+//! to one pane at a time, as in proto's compact hub.
 
 const std = @import("std");
 const hub = @import("../../core/model_hub/hub.zig");
@@ -25,11 +25,10 @@ pub const Paint = struct {
     }
 };
 
-/// Below this width the sidebar and the list take turns.
-const compact_width: u16 = 64;
+/// Below the useful split width the sidebar and list take turns.
 const min_rows: u16 = 6;
 
-pub fn paint(alloc: Allocator, state: *const hub.State, rows: u16, cols: u16, clear: bool) !Paint {
+pub fn paint(alloc: Allocator, state: *hub.State, rows: u16, cols: u16, clear: bool) !Paint {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     const w = &out.writer;
@@ -46,13 +45,22 @@ pub fn paint(alloc: Allocator, state: *const hub.State, rows: u16, cols: u16, cl
         return result;
     }
 
-    const compact = cols < compact_width;
+    const sidebar_width_hint = chrome.sidebarWidth(state);
+    // Proto switches to a single pane when the split body would be narrower
+    // than a useful model row, rather than relying on a fixed terminal width.
+    const compact = cols -| (sidebar_width_hint + 3) < 40;
     const content_rows: u16 = rows - 4;
     const show_sidebar = !compact or state.focus == .scope;
     const show_body = !compact or state.focus == .list;
     const sidebar_width: u16 = if (compact) cols else chrome.sidebarWidth(state);
     const body_col: u16 = if (compact) 0 else sidebar_width + 3;
     const body_width: u16 = if (compact) cols else cols - body_col;
+    state.layout_rows = rows;
+    state.layout_cols = cols;
+    state.layout_sidebar_width = if (compact) cols else sidebar_width;
+    state.layout_content_rows = content_rows;
+    state.layout_body_offset = 1;
+    state.layout_compact = compact;
 
     var title: Line = .init(alloc, cols);
     defer title.deinit();

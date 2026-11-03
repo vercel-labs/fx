@@ -524,14 +524,14 @@ pub fn Runtime(comptime App: type) type {
 
         fn commandModel(ctx: *anyopaque, query: []const u8) !void {
             const app = appFrom(ctx);
-            const target = commandTarget(app, .model);
-            if (!target.isRoot() and query.len == 0) return runHostCommand(app, target, "reading its model", .{ .model = null });
-            if (query.len == 0) {
-                // Only the root's model is in the attached snapshot.
-                _ = try wireSession(app, target, "reading its model") orelse return;
-                return notice(app, "model", app.remote.model);
+            // `/model` is the picker command. Keep the detached backend on
+            // the same native hub path as the in-process
+            // backend instead of falling back to the old model notice.
+            if (std.mem.trim(u8, query, " \t\r\n").len != 0) {
+                return notice(app, "model", "/model does not take arguments");
             }
-            try setModel(app, target, query);
+            if (comptime @hasDecl(App, "openModelHub")) return app.openModelHub(.models, "");
+            return notice(app, "model", "model selection is not available in this runtime");
         }
 
         fn commandPermissions(ctx: *anyopaque, rest: []const u8) !void {

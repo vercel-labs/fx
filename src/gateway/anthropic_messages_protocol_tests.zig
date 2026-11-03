@@ -71,8 +71,8 @@ test "anthropic messages golden body places tool system and tail breakpoints" {
             "{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"plan\",\"signature\":\"sig/+=\"},{\"type\":\"redacted_thinking\",\"data\":\"opaque\"}," ++
             "{\"type\":\"text\",\"text\":\"Reading.\"},{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read_file\",\"input\":{\"path\":\"a.txt\"}" ++ cache_marker ++ "}]}," ++
             "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\",\"content\":\"hello\"" ++ cache_marker ++ "}]}]," ++
-            "\"tools\":[{\"name\":\"read_file\",\"description\":\"Read a file.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"additionalProperties\":false,\"required\":[\"path\"]}}," ++
-            "{\"name\":\"mcp_search\",\"description\":\"Search.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}},\"required\":[\"q\"]}" ++ cache_marker ++ "}]," ++
+            "\"tools\":[{\"name\":\"read_file\",\"description\":\"Read a file.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"additionalProperties\":false,\"required\":[\"path\"]},\"eager_input_streaming\":true}," ++
+            "{\"name\":\"mcp_search\",\"description\":\"Search.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}},\"required\":[\"q\"]},\"eager_input_streaming\":true" ++ cache_marker ++ "}]," ++
             "\"tool_choice\":{\"type\":\"auto\"},\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":3072}}",
         body,
     );
@@ -181,6 +181,35 @@ test "anthropic messages drops thinking replay for another model and turns think
     try std.testing.expect((try protocol.project_replay(alloc, messages[1].provider_replay, &call, false, true)) != null);
 }
 
+test "anthropic messages gates unsigned thinking replay by compatibility" {
+    const alloc = std.testing.allocator;
+    const id = provider();
+    const call = [_]types.ToolCall{.{ .id = "toolu_unsigned", .name = "read_file", .arguments_json = "{}" }};
+    const unsigned_replay = "{\"anthropic_thinking\":[{\"type\":\"thinking\",\"thinking\":\"plan\",\"signature\":\"\"}],\"_tool_call_ids\":[\"toolu_unsigned\"]}";
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "go" },
+        .{ .role = .assistant, .tool_calls = &call, .provider_replay = .{ .source = .{ .provider = id, .model = "claude-test" }, .parts_json = unsigned_replay } },
+        .{ .role = .tool, .content = "x", .tool_call_id = "toolu_unsigned", .tool_name = "read_file" },
+    };
+    const input = request(&messages);
+    const dropped = try protocol.build_request(alloc, input, .{ .provider = &id });
+    defer alloc.free(dropped);
+    try std.testing.expect(std.mem.find(u8, dropped, "\"thinking\":\"plan\"") == null);
+    const replayed = try protocol.build_request(alloc, input, .{ .provider = &id, .replay_unsigned_thinking = true });
+    defer alloc.free(replayed);
+    try std.testing.expect(std.mem.find(u8, replayed, "\"thinking\":\"plan\"") != null);
+    try std.testing.expect(std.mem.find(u8, replayed, "\"signature\":\"\"") != null);
+}
+
+test "anthropic messages emits required thinking presence without selected effort" {
+    const alloc = std.testing.allocator;
+    const id = provider();
+    const input = request(&.{.{ .role = .user, .content = "hello" }});
+    const body = try protocol.build_request(alloc, input, .{ .provider = &id, .requires_thinking_presence = true });
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024}") != null);
+}
+
 test "anthropic messages forced tools turn thinking off and none keeps definitions" {
     const alloc = std.testing.allocator;
     var input = request(&.{.{ .role = .user, .content = "hi" }});
@@ -197,6 +226,49 @@ test "anthropic messages forced tools turn thinking off and none keeps definitio
     try std.testing.expect(std.mem.find(u8, none, "\"tool_choice\":{\"type\":\"none\"}") != null);
     try std.testing.expectEqualStrings("mcp.search", protocol.canonical_tool_name(input.tools, "mcp_search"));
     try std.testing.expectEqualStrings("unknown", protocol.canonical_tool_name(input.tools, "unknown"));
+}
+
+test "anthropic messages downgrades unsupported forced tools before required thinking" {
+    const alloc = std.testing.allocator;
+    const id = provider();
+    var input = request(&.{.{ .role = .user, .content = "call the tool" }});
+    input.tool_choice = .required;
+    const body = try protocol.build_request(alloc, input, .{ .provider = &id, .requires_thinking_presence = true, .supports_forced_tool_choice = false });
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"tool_choice\":{\"type\":\"auto\"}") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":1024}") != null);
+}
+
+test "anthropic messages serializes advanced output controls and compaction" {
+    const alloc = std.testing.allocator;
+    const id = provider();
+    var schema = try std.json.parseFromSlice(std.json.Value, alloc, "{\"type\":\"object\",\"properties\":{}}", .{});
+    defer schema.deinit();
+    var input = request(&.{.{ .role = .user, .content = "hi" }});
+    input.provider_options.fast = true;
+    input.provider_options.task_budget = .{ .total = 4096, .remaining = 2048 };
+    input.provider_options.fallback_model = "claude-sonnet-5";
+    input.provider_options.anthropic_compaction = .{
+        .trigger_input_tokens = 1024,
+        .pause_after_compaction = true,
+        .instructions = "Summarize the history.",
+    };
+    input.response_format = .{ .name = "answer", .description = "A result.", .schema = schema.value };
+    const body = try protocol.build_request(alloc, input, .{ .provider = &id });
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.find(u8, body, "\"speed\":\"fast\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"task_budget\":{\"type\":\"tokens\",\"total\":4096,\"remaining\":2048}") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"fallbacks\":[{\"model\":\"claude-sonnet-5\"}]") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"format\":{\"type\":\"json_schema\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"context_management\":{\"edits\":[{\"type\":\"compact_20260112\",\"trigger\":{\"type\":\"input_tokens\",\"value\":50000}") != null);
+}
+
+test "anthropic compaction replay exposes its summary" {
+    const alloc = std.testing.allocator;
+    const raw = "{\"anthropic_thinking\":[],\"anthropic_compaction\":{\"content\":\"summary\",\"encrypted_content\":\"cipher\"},\"_tool_call_ids\":[]}";
+    const summary = (try protocol.compaction_summary(alloc, raw)).?;
+    defer alloc.free(summary);
+    try std.testing.expectEqualStrings("summary", summary);
 }
 
 test "anthropic messages sends an instruction-only prompt as one user turn" {

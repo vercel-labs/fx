@@ -2036,6 +2036,10 @@ fn writePreferences(
     }
     try writer.writeAll(",\"provider\":");
     try std.json.Stringify.value(preferences.provider, .{}, writer);
+    if (preferences.role) |role| {
+        try writer.writeAll(",\"role\":");
+        try writeJsonString(writer, role);
+    }
     try writer.writeByte('}');
 }
 

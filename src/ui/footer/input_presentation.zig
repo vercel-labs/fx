@@ -1201,7 +1201,7 @@ fn finishComposedInputRow(alloc: Allocator, row: *std.ArrayList(u8), width: u16)
 }
 
 const input_test_slash_specs = [_]command_specs.SlashSpec{
-    .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true },
+    .{ .kind = .model, .command = "/model", .help_entry = "/model", .completion_description = "open the model hub", .presentation_category = .model },
     .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a session", .presentation_category = .session },
 };
 const input_test_slash_registry = command_specs.SlashRegistry{ .commands = input_test_slash_specs[0..] };

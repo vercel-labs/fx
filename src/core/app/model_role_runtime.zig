@@ -20,6 +20,11 @@ const Allocator = std.mem.Allocator;
 const Role = model_roles.Role;
 const model_provider = @import("../config/model_provider.zig");
 const provider_set = @import("../gateway/provider_set.zig");
+const agent_runtime = @import("../agent/agent_runtime.zig");
+const agent_stream_provider = @import("../agent/stream_provider.zig");
+const auth_runtime = @import("../auth/auth_runtime.zig");
+const model_capabilities = @import("../config/model_capabilities.zig");
+const configured_provider = @import("../config/configured_provider.zig");
 
 const types = @import("../shared/types.zig");
 
@@ -29,11 +34,11 @@ const types = @import("../shared/types.zig");
 /// that role still names the session's model. A role without a level is
 /// effort-blind, except the default role, which returns to the startup
 /// level, so a deep role on the default model still cycles back (D265).
-pub const Step = struct { role: Role, model: []const u8, effort: ?types.ReasoningEffort = null };
+pub const Step = struct { role: model_roles.RoleId, model: []const u8, effort: ?types.ReasoningEffort = null };
 
-fn roleEffort(view: Host, role: Role, picked: Picked) ?types.ReasoningEffort {
+fn roleEffort(view: Host, role: model_roles.RoleId, picked: Picked) ?types.ReasoningEffort {
     if (picked.effort) |effort| return effort;
-    return if (role == .default) view.state.default_effort else null;
+    return if (role == .builtin and role.builtin == .default) view.state.default_effort else null;
 }
 
 /// Unknown levels on either side compare equal.
@@ -44,18 +49,20 @@ fn sameEffort(a: ?types.ReasoningEffort, b: ?types.ReasoningEffort) bool {
 }
 
 fn cycleStep(view: Host, backward: bool) ?Step {
-    const order = view.state.table.cycleOrder();
+    const order = view.state.table.cycleOrderIds();
     if (order.len == 0) return null;
     var start: usize = if (backward) 0 else order.len - 1;
-    // An unknown level (a detached frontend) is taken as the startup one.
     var current_effort = view.current_effort orelse view.state.default_effort;
-    const last: ?usize = if (view.state.last_cycled) |role| std.mem.findScalar(Role, order, role) else null;
-    const resumed = if (last) |index| if (view.pick(order[index])) |picked| std.mem.eql(u8, picked.model, view.current_model) else false else false;
+    const last: ?usize = if (view.state.last_cycled) |role| blk: {
+        for (order, 0..) |candidate, index| if (candidate.eql(role)) break :blk index;
+        break :blk null;
+    } else null;
+    const resumed = if (last) |index| if (view.pickId(order[index])) |picked| std.mem.eql(u8, picked.model, view.current_model) else false else false;
     if (resumed) {
         start = last.?;
-        current_effort = roleEffort(view, order[start], view.pick(order[start]).?);
+        current_effort = roleEffort(view, order[start], view.pickId(order[start]).?);
     } else for (order, 0..) |role, index| {
-        const picked = view.pick(role) orelse continue;
+        const picked = view.pickId(role) orelse continue;
         if (std.mem.eql(u8, picked.model, view.current_model) and sameEffort(roleEffort(view, role, picked), current_effort)) {
             start = index;
             break;
@@ -64,7 +71,7 @@ fn cycleStep(view: Host, backward: bool) ?Step {
     var offset: usize = 1;
     while (offset <= order.len) : (offset += 1) {
         const index = if (backward) (start + order.len * 2 - offset) % order.len else (start + offset) % order.len;
-        const picked = view.pick(order[index]) orelse continue;
+        const picked = view.pickId(order[index]) orelse continue;
         const effort = roleEffort(view, order[index], picked);
         if (std.mem.eql(u8, picked.model, view.current_model) and sameEffort(effort, current_effort)) continue;
         return .{ .role = order[index], .model = picked.model, .effort = effort };
@@ -81,7 +88,7 @@ pub const State = struct {
     /// returns to when cycling (D265).
     default_effort: ?types.ReasoningEffort = null,
     /// The role Alt+P or `/role next` last switched to.
-    last_cycled: ?Role = null,
+    last_cycled: ?model_roles.RoleId = null,
     /// Tables replaced while the app ran. Their bytes may still be borrowed.
     retired: std.ArrayList(model_roles.Table) = .empty,
     mutex: std.Io.Mutex = .init,
@@ -115,11 +122,11 @@ pub const State = struct {
         self.table = owned;
     }
 
-    /// Replaces `role`'s entry; null clears it.
-    pub fn assign(self: *State, alloc: Allocator, role: Role, value: ?[]const u8) !void {
+    /// Replaces a dynamic role entry; null clears it.
+    pub fn assignId(self: *State, alloc: Allocator, role: model_roles.RoleId, value: ?[]const u8) !void {
         var next = try self.table.dupe(alloc);
         errdefer next.deinit(alloc);
-        try next.set(alloc, role, value);
+        try next.setId(alloc, role, value);
         try self.retired.ensureUnusedCapacity(alloc, 1);
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
@@ -127,19 +134,179 @@ pub const State = struct {
         self.table = next;
     }
 
-    /// Replaces `cycle_order` (D222).
-    pub fn setCycle(self: *State, alloc: Allocator, order: []const Role) !void {
-        if (order.len > model_roles.role_count) return error.InvalidCycleOrderValue;
+    pub fn assign(self: *State, alloc: Allocator, role: Role, value: ?[]const u8) !void {
+        return self.assignId(alloc, .{ .builtin = role }, value);
+    }
+
+    /// Adds a custom role while preserving borrowed snapshots held by active
+    /// model-hub views. The new table owns the role name.
+    pub fn createRole(self: *State, alloc: Allocator, role: model_roles.RoleId) !void {
         var next = try self.table.dupe(alloc);
         errdefer next.deinit(alloc);
-        @memcpy(next.cycle[0..order.len], order);
-        next.cycle_len = order.len;
-        next.has_cycle = true;
+        try next.createRole(alloc, role);
         try self.retired.ensureUnusedCapacity(alloc, 1);
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         self.retired.appendAssumeCapacity(self.table);
         self.table = next;
+    }
+
+    /// Removes a custom role and its metadata from the live role table.
+    pub fn deleteRole(self: *State, alloc: Allocator, role: model_roles.RoleId) !void {
+        var next = try self.table.dupe(alloc);
+        errdefer next.deinit(alloc);
+        try next.deleteRole(alloc, role);
+        try self.retired.ensureUnusedCapacity(alloc, 1);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.retired.appendAssumeCapacity(self.table);
+        self.table = next;
+    }
+
+    /// Renames a custom role while preserving its assignment, tag, bank and
+    /// cycle membership in the copy-on-write replacement table.
+    pub fn renameRole(self: *State, alloc: Allocator, old: model_roles.RoleId, new: model_roles.RoleId) !void {
+        if (old != .custom or new != .custom) return error.InvalidRoleName;
+        var next = try self.table.dupe(alloc);
+        errdefer next.deinit(alloc);
+
+        var value_copy: ?[]u8 = null;
+        defer if (value_copy) |value| alloc.free(value);
+        if (next.getId(old)) |value| value_copy = try alloc.dupe(u8, value);
+
+        var tag_text: []u8 = &.{};
+        var tag_name: []u8 = &.{};
+        var tag_color: []u8 = &.{};
+        var tag_hidden = false;
+        var has_tag = false;
+        defer {
+            if (tag_text.len > 0) alloc.free(tag_text);
+            if (tag_name.len > 0) alloc.free(tag_name);
+            if (tag_color.len > 0) alloc.free(tag_color);
+        }
+        if (next.tagFor(old)) |tag| {
+            has_tag = true;
+            tag_text = try alloc.dupe(u8, tag.tag);
+            tag_name = try alloc.dupe(u8, tag.name);
+            tag_color = try alloc.dupe(u8, tag.color);
+            tag_hidden = tag.hidden;
+        }
+
+        var bank_selectors: [64][]const u8 = undefined;
+        var bank_len: usize = 0;
+        defer for (bank_selectors[0..bank_len]) |selector| alloc.free(selector);
+        if (next.bankFor(old)) |selectors| {
+            for (selectors) |selector| {
+                if (bank_len == bank_selectors.len) break;
+                bank_selectors[bank_len] = try alloc.dupe(u8, selector);
+                bank_len += 1;
+            }
+        }
+
+        const had_cycle = next.has_cycle;
+        var cycle_order: [64]model_roles.RoleId = undefined;
+        const original_cycle = next.cycleOrderIds();
+        const cycle_len = @min(original_cycle.len, cycle_order.len);
+        for (original_cycle[0..cycle_len], 0..) |id, index| {
+            cycle_order[index] = if (id.eql(old)) new else id;
+        }
+
+        try next.deleteRole(alloc, old);
+        try next.createRole(alloc, new);
+        if (value_copy) |value| try next.setId(alloc, new, value);
+        if (has_tag) try next.setTagInput(alloc, new, .{ .tag = tag_text, .name = tag_name, .color = tag_color, .hidden = tag_hidden });
+        if (bank_len > 0) try next.setBank(alloc, new, bank_selectors[0..bank_len]);
+        if (had_cycle) try next.setCycleIds(alloc, cycle_order[0..cycle_len]);
+
+        try self.retired.ensureUnusedCapacity(alloc, 1);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.retired.appendAssumeCapacity(self.table);
+        self.table = next;
+    }
+
+    pub fn setTag(self: *State, alloc: Allocator, role: model_roles.RoleId, tag: model_roles.TagInput) !void {
+        var next = try self.table.dupe(alloc);
+        errdefer next.deinit(alloc);
+        try next.setTagInput(alloc, role, tag);
+        try self.retired.ensureUnusedCapacity(alloc, 1);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.retired.appendAssumeCapacity(self.table);
+        self.table = next;
+    }
+
+    pub fn clearTag(self: *State, alloc: Allocator, role: model_roles.RoleId) !void {
+        var next = try self.table.dupe(alloc);
+        errdefer next.deinit(alloc);
+        next.clearTag(alloc, role);
+        try self.retired.ensureUnusedCapacity(alloc, 1);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.retired.appendAssumeCapacity(self.table);
+        self.table = next;
+    }
+
+    pub fn setBank(self: *State, alloc: Allocator, role: model_roles.RoleId, selectors: []const []const u8) !void {
+        var next = try self.table.dupe(alloc);
+        errdefer next.deinit(alloc);
+        try next.setBank(alloc, role, selectors);
+        try self.retired.ensureUnusedCapacity(alloc, 1);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.retired.appendAssumeCapacity(self.table);
+        self.table = next;
+    }
+
+    pub fn clearBank(self: *State, alloc: Allocator, role: model_roles.RoleId) !void {
+        var next = try self.table.dupe(alloc);
+        errdefer next.deinit(alloc);
+        next.clearBank(alloc, role);
+        try self.retired.ensureUnusedCapacity(alloc, 1);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.retired.appendAssumeCapacity(self.table);
+        self.table = next;
+    }
+
+    pub fn setFallback(self: *State, alloc: Allocator, selector: []const u8, chain: []const u8) !void {
+        var next = try self.table.dupe(alloc);
+        errdefer next.deinit(alloc);
+        try next.setFallback(alloc, selector, chain);
+        try self.retired.ensureUnusedCapacity(alloc, 1);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.retired.appendAssumeCapacity(self.table);
+        self.table = next;
+    }
+
+    pub fn clearFallback(self: *State, alloc: Allocator, selector: []const u8) !void {
+        var next = try self.table.dupe(alloc);
+        errdefer next.deinit(alloc);
+        next.clearFallback(alloc, selector);
+        try self.retired.ensureUnusedCapacity(alloc, 1);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.retired.appendAssumeCapacity(self.table);
+        self.table = next;
+    }
+
+    /// Replaces dynamic `cycle_order` (D222).
+    pub fn setCycleIds(self: *State, alloc: Allocator, order: []const model_roles.RoleId) !void {
+        var next = try self.table.dupe(alloc);
+        errdefer next.deinit(alloc);
+        try next.setCycleIds(alloc, order);
+        try self.retired.ensureUnusedCapacity(alloc, 1);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.retired.appendAssumeCapacity(self.table);
+        self.table = next;
+    }
+
+    pub fn setCycle(self: *State, alloc: Allocator, order: []const Role) !void {
+        var ids: [model_roles.role_count]model_roles.RoleId = undefined;
+        for (order, 0..) |role, index| ids[index] = .{ .builtin = role };
+        return self.setCycleIds(alloc, ids[0..order.len]);
     }
 };
 
@@ -155,66 +322,115 @@ pub const Host = struct {
     set: provider_set.Set,
     /// The legacy `review_model` setting or FX_REVIEW_MODEL; empty for none.
     review_model: []const u8 = "",
+    /// Provider/model candidates supplied by the registry. Empty means the
+    /// registry has not loaded and role references remain optimistic.
+    candidates: []const model_roles.Candidate = &.{},
     /// The active provider's catalog, which a fallback chain checks (D250).
     known: ?model_roles.Known = null,
 
-    /// Resolves `role` on the host's provider. The model borrows the role
-    /// table, the profile default, the host's model or a bundle string.
-    pub fn resolve(self: Host, role: Role) ?[]const u8 {
-        return if (self.pick(role)) |picked| picked.model else null;
-    }
-
-    /// The model the default role falls back to when it is unset: the
-    /// profile's model on its own provider, else the session's.
-    pub fn defaultModel(self: Host) []const u8 {
-        var provider = self.provider;
+    /// Resolves a role to a provider-qualified executable selection. This is
+    /// the only role API side calls should use.
+    pub fn pickSelectionId(self: Host, role: model_roles.RoleId) ?model_roles.Selection {
+        const provider = self.provider;
+        const label = provider.label();
         self.state.mutex.lockUncancelable(io_mod.getIo());
         defer self.state.mutex.unlock(io_mod.getIo());
-        return self.defaultModelLocked(provider.label());
+        const default_model = self.defaultModelLocked(label);
+        return model_roles.resolveSelection(&self.state.table, role, .{
+            .provider = label,
+            .default_model = default_model,
+            .builtin_small = self.set.select(provider).title_model,
+            .legacy_review = reviewerModelFor(self.set, provider, self.review_model),
+            .configured = self.set.definitions,
+            .known = self.known,
+            .candidates = self.candidates,
+        });
+    }
+
+    pub fn pickSelection(self: Host, role: Role) ?model_roles.Selection {
+        return self.pickSelectionId(.{ .builtin = role });
+    }
+
+    pub fn pickId(self: Host, role: model_roles.RoleId) ?Picked {
+        const selection = self.pickSelectionId(role) orelse return null;
+        if (!std.ascii.eqlIgnoreCase(selection.provider.label(), self.provider.label())) return null;
+        return .{ .model = selection.model, .effort = selection.effort };
+    }
+
+    pub fn defaultModel(self: Host) []const u8 {
+        self.state.mutex.lockUncancelable(io_mod.getIo());
+        defer self.state.mutex.unlock(io_mod.getIo());
+        return self.defaultModelLocked(self.provider.label());
     }
 
     fn defaultModelLocked(self: Host, label: []const u8) []const u8 {
-        return if (self.state.default_model.len > 0 and std.mem.eql(u8, self.state.default_provider, label))
+        return if (self.state.default_model.len > 0 and std.ascii.eqlIgnoreCase(self.state.default_provider, label))
             self.state.default_model
         else
             self.current_model;
     }
 
-    /// `resolve` with the thinking level the role's entry names.
-    pub fn pick(self: Host, role: Role) ?Picked {
-        var provider = self.provider;
+    pub fn selectionChain(self: Host, role: model_roles.RoleId, out: []model_roles.Selection) usize {
+        const provider = self.provider;
         const label = provider.label();
         self.state.mutex.lockUncancelable(io_mod.getIo());
         defer self.state.mutex.unlock(io_mod.getIo());
-        const default_model = self.defaultModelLocked(label);
-        const ref = model_roles.resolve(&self.state.table, role, .{
+        return model_roles.selectionChain(&self.state.table, role, .{
             .provider = label,
-            .default_model = default_model,
+            .default_model = self.defaultModelLocked(label),
             .builtin_small = self.set.select(provider).title_model,
-            // `review_model` was a gateway setting; other providers ignored it.
-            .legacy_review = if (self.review_model.len > 0 and provider == .gateway) self.review_model else null,
+            .legacy_review = reviewerModelFor(self.set, provider, self.review_model),
             .configured = self.set.definitions,
             .known = self.known,
-        }) orelse return null;
-        const model = ref.on(label) orelse {
-            debug_trace.logf("config", "model role={s} names provider={s} active={s}; using the consumer default", .{ role.label(), ref.provider.?, label });
-            return null;
-        };
-        return .{ .model = model, .effort = ref.effort };
+            .candidates = self.candidates,
+        }, out);
+    }
+
+    /// Built-in convenience for callers that explicitly require the active
+    /// provider's model string. Cross-provider selections are unavailable to
+    /// this API; side calls must use `pickSelection` instead.
+    pub fn pick(self: Host, role: Role) ?Picked {
+        const selection = self.pickSelection(role) orelse return null;
+        if (!std.ascii.eqlIgnoreCase(selection.provider.label(), self.provider.label())) return null;
+        return .{ .model = selection.model, .effort = selection.effort };
+    }
+
+    pub fn resolve(self: Host, role: Role) ?[]const u8 {
+        return if (self.pick(role)) |picked| picked.model else null;
     }
 
     /// The model for session titles: the title role, the provider's own
     /// low-cost model, then, as proto does, the session's model (D206).
     /// Null disables generated titles.
-    pub fn titleModel(self: Host) ?[]const u8 {
-        if (self.resolve(.title) orelse self.set.select(self.provider).title_model) |model| return model;
+    pub fn titleSelection(self: Host) ?model_roles.Selection {
+        if (self.pickSelection(.title)) |selection| return selection;
+        if (self.set.select(self.provider).title_model) |model| return .{ .provider = self.provider, .model = model, .source = .{ .builtin = .title } };
         if (self.current_model.len == 0 or self.current_model[0] == '@') return null;
-        return self.current_model;
+        return .{ .provider = self.provider, .model = self.current_model, .source = .{ .builtin = .default } };
+    }
+
+    pub fn titleModel(self: Host) ?[]const u8 {
+        return if (self.titleSelection()) |selection| selection.model else null;
     }
 
     /// The web search side worker's model: the profile's small role when
     /// it sets one on this provider, else the session's model, as before
     /// roles (D213).
+    pub fn workerSelection(self: Host) ?model_roles.Selection {
+        self.state.mutex.lockUncancelable(io_mod.getIo());
+        const configured = self.state.table.get(.small) != null;
+        self.state.mutex.unlock(io_mod.getIo());
+        if (configured) return self.pickSelection(.small);
+        return if (self.current_model.len > 0 and self.current_model[0] != '@')
+            .{ .provider = self.provider, .model = self.current_model, .source = .{ .builtin = .worker } }
+        else
+            null;
+    }
+
+    pub fn searchWorkerSelection(self: Host) ?model_roles.Selection {
+        return self.workerSelection();
+    }
+
     pub fn searchWorkerModel(self: Host) []const u8 {
         const configured = blk: {
             self.state.mutex.lockUncancelable(io_mod.getIo());
@@ -226,41 +442,78 @@ pub const Host = struct {
     }
 
     /// The permission reviewer's model; empty keeps the reviewer's default.
+    pub fn reviewSelection(self: Host) ?model_roles.Selection {
+        if (self.provider == .gateway and self.review_model.len > 0 and io_mod.getenv("FX_REVIEW_MODEL") != null)
+            return .{ .provider = .gateway, .model = self.review_model, .source = .{ .builtin = .review } };
+        return self.pickSelection(.review);
+    }
+
     pub fn reviewModel(self: Host) []const u8 {
         // FX_REVIEW_MODEL, a gateway override, outranks the profile's role.
         if (self.provider == .gateway and self.review_model.len > 0 and io_mod.getenv("FX_REVIEW_MODEL") != null) return self.review_model;
         return self.resolve(.review) orelse "";
     }
 
-    /// The compactor's summary model; empty keeps the conversation's model.
+    /// The compactor's summary model. A model-level compaction target takes
+    /// precedence over the role fallback, matching provider metadata policy.
+    pub fn compactSelection(self: Host) ?model_roles.Selection {
+        if (self.set.modelMetadata(self.provider, self.current_model)) |metadata|
+            if (metadata.compaction_model) |target_text| {
+                const ref = model_roles.parseRefId(target_text, .{ .builtin = .compact }, self.set.definitions);
+                const provider = model_provider.parse(ref.provider orelse self.provider.label()) orelse return self.pickSelection(.compact);
+                if (ref.model.len > 0) return .{
+                    .provider = provider,
+                    .model = ref.model,
+                    .effort = ref.effort,
+                    .routing = ref.routing,
+                    .source = .{ .builtin = .compact },
+                };
+            };
+        return self.pickSelection(.compact);
+    }
+
     pub fn compactModel(self: Host) []const u8 {
         return self.resolve(.compact) orelse "";
     }
 
-    /// A stream rule judge's model: the first of `roles` (proto's `tiny`,
-    /// `small` by default) that resolves on this provider (D207). Null leaves
-    /// the session's model to answer.
-    pub fn judgeModel(self: Host, roles: []const []const u8) ?[]const u8 {
-        for (roles) |name| {
-            const role = Role.parse(name) orelse continue;
-            if (self.resolve(role)) |model| return model;
-        }
-        return null;
-    }
-
-    /// Resolves a fleet worker's `@role` model request.
+    /// Resolves a fleet worker's `@role` model request, including custom
+    /// names and provider identity.
     pub fn lookup(self: Host, name: []const u8) Lookup {
-        const role = Role.parse(name) orelse return .unknown_role;
-        return if (self.pick(role)) |picked| .{ .model = picked } else .unavailable;
+        const role_name = if (name.len > 0 and name[0] == '@') name[1..] else name;
+        const role = model_roles.parseRoleId(role_name) orelse return .unknown_role;
+        const known = switch (role) {
+            .builtin => true,
+            .custom => self.state.table.hasRole(role),
+        };
+        if (!known) return .unknown_role;
+        return if (self.pickSelectionId(role)) |selection| .{ .selection = selection } else .unavailable;
     }
 
-    /// Roles that pick `model`, for the `/model` tags.
+    pub fn rolesForIds(self: Host, alloc: Allocator, model: []const u8) ![]model_roles.RoleId {
+        self.state.mutex.lockUncancelable(io_mod.getIo());
+        const ids = try self.state.table.roleIds(alloc);
+        self.state.mutex.unlock(io_mod.getIo());
+        defer alloc.free(ids);
+        var out = try alloc.alloc(model_roles.RoleId, ids.len);
+        var count: usize = 0;
+        for (ids) |id| {
+            if (id != .builtin or id.builtin != .default) if (self.state.table.getId(id) == null) continue;
+            const selection = self.pickSelectionId(id) orelse continue;
+            if (!std.mem.eql(u8, selection.model, model)) continue;
+            out[count] = id;
+            count += 1;
+        }
+        return out[0..count];
+    }
+
+    /// Built-in projection used by legacy command completion. Dynamic callers
+    /// use `rolesForIds`.
     pub fn rolesFor(self: Host, model: []const u8, out: *[model_roles.role_count]Role) usize {
         var count: usize = 0;
         for (model_roles.all_roles) |role| {
             if (role != .default and self.state.table.get(role) == null) continue;
-            const picked = self.resolve(role) orelse continue;
-            if (!std.mem.eql(u8, picked, model)) continue;
+            const picked = self.pick(role) orelse continue;
+            if (!std.mem.eql(u8, picked.model, model)) continue;
             out[count] = role;
             count += 1;
         }
@@ -270,7 +523,116 @@ pub const Host = struct {
 
 pub const Picked = model_roles.Picked;
 
+/// Returns the review model for a provider, honoring the explicit Gateway
+/// setting first and then native/catalog provider policy. Native overrides
+/// cover providers such as Codex and Grok that have no Definition entry.
+fn reviewerModelFor(set: provider_set.Set, provider: model_provider.ProviderId, legacy: []const u8) ?[]const u8 {
+    if (provider == .gateway and legacy.len > 0) return legacy;
+    const label = provider.label();
+    for (set.native_overrides) |overrides| {
+        if (std.ascii.eqlIgnoreCase(overrides.id, label)) return overrides.reviewer_model;
+    }
+    for (set.definitions) |definition| {
+        if (std.ascii.eqlIgnoreCase(definition.id, label)) return definition.reviewer_model;
+    }
+    return null;
+}
+
+/// Binds one provider-qualified role selection to the host's transport and
+/// credential. The returned binding borrows `arena`, so callers can use it for
+/// the complete request/compaction attempt and release the arena afterward.
+pub fn bindSelection(app: anytype, arena: Allocator, selection: model_roles.Selection) anyerror!?agent_runtime.ModelBinding {
+    const App = @TypeOf(app.*);
+    if (comptime !@hasField(App, "auth")) return null;
+    const active_provider = provider_runtime.provider(app);
+    const bundle: ?provider_set.Bundle = if (comptime @hasDecl(App, "providerSet"))
+        app.providerSet().select(selection.provider)
+    else if (selection.provider.eql(active_provider))
+        null
+    else
+        return null;
+    const stream = if (bundle) |value|
+        value.agent_stream_or_unavailable()
+    else if (comptime @hasDecl(App, "agentStreamProvider"))
+        app.agentStreamProvider()
+    else
+        agent_stream_provider.unavailable_provider;
+    const credential: agent_stream_provider.CredentialLease = if (selection.provider.eql(active_provider)) blk: {
+        if (app.auth.credentialSource() == .host_managed) break :blk .host_managed;
+        break :blk .{ .direct = .{
+            .secret_bytes = app.auth.apiKey() orelse "",
+            .source = app.auth.credentialSource(),
+            .account_id = app.auth.accountId(),
+            .tenant_context = app.auth.gatewayTeam(),
+        } };
+    } else blk: {
+        if (comptime !@hasDecl(@TypeOf(app.auth), "oauthTransport") or !@hasDecl(@TypeOf(app.auth), "secretStore")) return null;
+        const prepared = auth_runtime.prepareCredential(
+            arena,
+            app.auth.oauthTransport(),
+            app.auth.secretStore(),
+            selection.provider,
+            null,
+        ) catch return null;
+        const value = prepared orelse return null;
+        break :blk .{ .direct = .{
+            .secret_bytes = value.token,
+            .source = value.source,
+            .account_id = value.accountId(),
+            .tenant_context = value.gatewayTeam(),
+        } };
+    };
+    const capabilities = if (comptime @hasDecl(App, "providerSet"))
+        app.providerSet().modelCapabilities(selection.provider, selection.model)
+    else if (bundle) |value|
+        value.fallbackModelCapabilities(selection.model)
+    else
+        model_capabilities.capabilitiesForModel(selection.model);
+    return .{
+        .selection = selection,
+        .stream_provider = stream,
+        .credential = credential,
+        .capabilities = capabilities,
+        .provider_options = model_capabilities.resolveProviderOptionsForCapabilities(
+            capabilities,
+            selection.effort orelse .auto,
+            false,
+        ),
+    };
+}
+
+pub const SideCall = struct {
+    selection: model_roles.Selection,
+    attempt: usize,
+};
+
+pub const SideCallFn = *const fn (?*anyopaque, SideCall) anyerror!void;
+
+pub const FallbackError = error{ NoUsableRoleSelection, Cancelled };
+
+/// Executes a role's provider-qualified candidate chain. The callback owns
+/// transport/credential acquisition for the selection; runtime fallback is
+/// deliberately separate from provider-native fallback request fields.
+pub fn dispatchFallback(host_view: Host, role: model_roles.RoleId, context: ?*anyopaque, run: SideCallFn) anyerror!void {
+    var candidates: [64]model_roles.Selection = undefined;
+    const count = host_view.selectionChain(role, &candidates);
+    if (count == 0) return error.NoUsableRoleSelection;
+    var last_error: ?anyerror = null;
+    for (candidates[0..count], 0..) |selection, index| {
+        run(context, .{ .selection = selection, .attempt = index }) catch |err| {
+            if (err == error.Cancelled) return error.Cancelled;
+            last_error = err;
+            continue;
+        };
+        return;
+    }
+    return last_error orelse error.NoUsableRoleSelection;
+}
+
 pub const Lookup = union(enum) {
+    /// Provider-qualified role selection. Consumers that only support the
+    /// active provider may inspect `model`; side-call consumers use this.
+    selection: model_roles.Selection,
     model: Picked,
     unknown_role,
     /// The role resolves to nothing, or to another provider.
@@ -293,8 +655,23 @@ pub fn host(app: anytype) Host {
         .current_effort = if (comptime @hasField(App, "effort")) if (view_model == null) app.effort else null else null,
         .set = app.providerSet(),
         .review_model = app.review_model,
-        .known = if (comptime @hasField(App, "model_cache")) .{ .context = @ptrCast(@constCast(&app.model_cache)), .known_fn = knownInCache(@TypeOf(app.model_cache)) } else null,
+        .candidates = if (comptime @hasField(App, "model_role_candidates")) app.model_role_candidates else &.{},
+        .known = if (comptime @hasField(App, "model_cache")) .{
+            .context = @ptrCast(@constCast(&app.model_cache)),
+            .known_fn = knownInCache(@TypeOf(app.model_cache)),
+            .known_for_fn = if (comptime @hasDecl(@TypeOf(app.model_cache), "knowsModelFor")) knownForInCache(@TypeOf(app.model_cache)) else null,
+        } else null,
     };
+}
+
+fn knownForInCache(comptime Cache: type) *const fn (?*anyopaque, []const u8, []const u8) bool {
+    return struct {
+        fn known(raw: ?*anyopaque, provider: []const u8, model: []const u8) bool {
+            const cache: *Cache = @ptrCast(@alignCast(raw.?));
+            const id = model_provider.parse(provider) orelse return true;
+            return cache.knowsModelFor(id, model);
+        }
+    }.known;
 }
 
 fn knownInCache(comptime Cache: type) *const fn (?*anyopaque, []const u8) bool {
@@ -304,6 +681,30 @@ fn knownInCache(comptime Cache: type) *const fn (?*anyopaque, []const u8) bool {
             return cache.knowsModel(model);
         }
     }.known;
+}
+
+pub fn resolveSelection(app: anytype, role: model_roles.RoleId) ?model_roles.Selection {
+    return host(app).pickSelectionId(role);
+}
+
+pub fn selectionChain(app: anytype, role: model_roles.RoleId, out: []model_roles.Selection) usize {
+    return host(app).selectionChain(role, out);
+}
+
+pub fn titleSelection(app: anytype) ?model_roles.Selection {
+    return host(app).titleSelection();
+}
+pub fn tinySelection(app: anytype) ?model_roles.Selection {
+    return host(app).pickSelection(.tiny);
+}
+pub fn workerSelection(app: anytype) ?model_roles.Selection {
+    return host(app).workerSelection();
+}
+pub fn reviewSelection(app: anytype) ?model_roles.Selection {
+    return host(app).reviewSelection();
+}
+pub fn compactSelection(app: anytype) ?model_roles.Selection {
+    return host(app).compactSelection();
 }
 
 pub fn resolveModel(app: anytype, role: Role) ?[]const u8 {
@@ -316,6 +717,10 @@ pub fn titleModel(app: anytype) ?[]const u8 {
 
 pub fn searchWorkerModel(app: anytype) []const u8 {
     return host(app).searchWorkerModel();
+}
+
+pub fn workerProvider(app: anytype) model_provider.ProviderId {
+    return if (host(app).workerSelection()) |selection| selection.provider else provider_runtime.provider(app);
 }
 
 pub fn reviewModel(app: anytype) []const u8 {
@@ -345,26 +750,35 @@ pub fn Runtime(comptime App: type) type {
             const first = words.next() orelse return writeTable(app);
             if (std.mem.eql(u8, first, "next")) return cycle(app, false);
             if (std.mem.eql(u8, first, "prev")) return cycle(app, true);
-            const role = Role.parse(first) orelse {
+            const role = model_roles.parseRoleId(first) orelse {
                 return app.writeDomainNotice(.{ .topic = "role", .tone = .@"error", .body = usage }, true);
             };
             const value_text = std.mem.trim(u8, trimmed[first.len..], " \t");
-            if (value_text.len == 0) return assign(app, role, provider_runtime.model(app));
-            if (std.mem.eql(u8, value_text, "clear")) return assign(app, role, null);
-            return assign(app, role, value_text);
+            if (value_text.len == 0) return assignId(app, role, provider_runtime.model(app));
+            if (std.mem.eql(u8, value_text, "clear")) return assignId(app, role, null);
+            return assignId(app, role, value_text);
         }
 
-        /// Saves `role` in the profile and applies it, without a notice.
-        /// False when the reference was refused or the save failed; the
-        /// notice saying why is written.
-        pub fn save(app: *App, role: Role, value: ?[]const u8) !bool {
+        /// Saves a dynamic role in the profile and applies it, without a notice.
+        pub fn saveId(app: *App, role: model_roles.RoleId, value: ?[]const u8) !bool {
             if (value) |text| model_roles.validateChain(text) catch {
                 try app.writeDomainNotice(.{ .topic = "role", .tone = .@"error", .body = "That is not a model reference." }, true);
                 return false;
             };
             const owned = if (value) |text| try app.alloc.dupe(u8, text) else null;
             defer if (owned) |bytes| app.alloc.free(bytes);
-            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .model_role = .{ .role = role, .value = owned } });
+            const patch_role: config_runtime.UserSettingsPatch = .{ .model_role = .{
+                .role = switch (role) {
+                    .builtin => |builtin| builtin,
+                    .custom => .default,
+                },
+                .name = switch (role) {
+                    .builtin => null,
+                    .custom => |name| name,
+                },
+                .value = owned,
+            } };
+            var attempt = config_runtime.attemptUserPreferences(app.alloc, patch_role);
             defer attempt.deinit(app.alloc);
             switch (attempt) {
                 .failure => |failure| {
@@ -373,20 +787,27 @@ pub fn Runtime(comptime App: type) type {
                 },
                 .outcome => {},
             }
-            try app.model_roles.assign(app.alloc, role, owned);
+            try app.model_roles.assignId(app.alloc, role, owned);
             return true;
         }
 
-        /// Saves `role` in the profile and applies it.
-        pub fn assign(app: *App, role: Role, value: ?[]const u8) !void {
-            if (!try save(app, role, value)) return;
-            const owned = value;
-            const body = if (owned) |text|
+        /// Saves a builtin role in the profile and applies it, without a notice.
+        pub fn save(app: *App, role: Role, value: ?[]const u8) !bool {
+            return saveId(app, .{ .builtin = role }, value);
+        }
+
+        pub fn assignId(app: *App, role: model_roles.RoleId, value: ?[]const u8) !void {
+            if (!try saveId(app, role, value)) return;
+            const body = if (value) |text|
                 try app.alloc.print("{s} → {s}", .{ role.label(), text })
             else
                 try app.alloc.print("{s} cleared", .{role.label()});
             defer app.alloc.free(body);
             try app.writeDomainNotice(.{ .topic = "role", .tone = .neutral, .body = body }, true);
+        }
+
+        pub fn assign(app: *App, role: Role, value: ?[]const u8) !void {
+            return assignId(app, .{ .builtin = role }, value);
         }
 
         /// Switches the session to the next role's model in `cycle_order`.
@@ -422,23 +843,19 @@ pub fn Runtime(comptime App: type) type {
             var out: std.Io.Writer.Allocating = .init(app.alloc);
             defer out.deinit();
             const table = &app.model_roles.table;
-            for (model_roles.all_roles, 0..) |role, index| {
+            const ids = try table.roleIds(app.alloc);
+            defer app.alloc.free(ids);
+            for (ids, 0..) |role, index| {
                 if (index > 0) try out.writer.writeByte('\n');
-                const model = resolveModel(app, role) orelse {
-                    try out.writer.print("{s:<9} not set", .{role.label()});
+                const selection = host(app).pickSelectionId(role) orelse {
+                    try out.writer.print("{s:<16} not set", .{role.label()});
                     continue;
                 };
-                try out.writer.print("{s:<9} {s}", .{ role.label(), model });
-                if (table.get(role)) |raw| {
-                    if (!std.mem.eql(u8, raw, model)) try out.writer.print("  {s}", .{raw});
-                } else switch (role) {
-                    .default => {},
-                    .title, .tiny => try out.writer.writeAll("  follows small"),
-                    else => try out.writer.writeAll("  built in"),
-                }
+                try out.writer.print("{s:<16} {s}/{s}", .{ role.label(), selection.provider.label(), selection.model });
+                if (table.getId(role)) |raw| if (!std.mem.eql(u8, raw, selection.model)) try out.writer.print("  {s}", .{raw});
             }
             try out.writer.writeAll("\ncycle     ");
-            for (table.cycleOrder(), 0..) |role, index| {
+            for (table.cycleOrderIds(), 0..) |role, index| {
                 if (index > 0) try out.writer.writeAll(" → ");
                 try out.writer.writeAll(role.label());
             }
@@ -481,13 +898,15 @@ test "cycling steps through roles with distinct models and tags list roles" {
     try std.testing.expectEqualStrings("careful", cycleStep(view, true).?.model);
     // A model outside the order starts from the first role.
     view.current_model = "other";
-    try std.testing.expectEqual(Role.deep, cycleStep(view, false).?.role);
+    try std.testing.expectEqual(model_roles.RoleId{ .builtin = Role.deep }, cycleStep(view, false).?.role);
 
     var roles: [model_roles.role_count]Role = undefined;
     const count = view.rolesFor("fast", &roles);
     try std.testing.expectEqualSlices(Role, &.{ .small, .worker }, roles[0..count]);
     try std.testing.expectEqual(@as(usize, 1), view.rolesFor("main", &roles));
-    try std.testing.expectEqualStrings("fast", view.lookup("worker").model.model);
+    const worker_lookup = view.lookup("worker");
+    try std.testing.expect(worker_lookup == .selection);
+    try std.testing.expectEqualStrings("fast", worker_lookup.selection.model);
     try std.testing.expect(view.lookup("nobody") == .unknown_role);
     try std.testing.expect(view.lookup("compact") == .unavailable);
 
@@ -510,29 +929,29 @@ test "cycling reaches the default role when the deep role differs only in thinki
     var view: Host = .{ .state = &state, .provider = .gateway, .current_model = "main", .current_effort = .auto, .set = .{ .gateway = .{}, .codex = .{}, .grok = .{} } };
     // Order: deep, default, small. The session starts on the default.
     var step = cycleStep(view, false).?;
-    try std.testing.expectEqual(Role.small, step.role);
+    try std.testing.expectEqual(model_roles.RoleId{ .builtin = Role.small }, step.role);
     state.last_cycled = step.role;
     view.current_model = "fast";
     view.current_effort = null;
     step = cycleStep(view, false).?;
-    try std.testing.expectEqual(Role.deep, step.role);
+    try std.testing.expectEqual(model_roles.RoleId{ .builtin = Role.deep }, step.role);
     try std.testing.expectEqualStrings("high", step.effort.?.label());
     state.last_cycled = step.role;
     view.current_model = "main";
     view.current_effort = types.ReasoningEffort.literal("high");
     step = cycleStep(view, false).?;
-    try std.testing.expectEqual(Role.default, step.role);
+    try std.testing.expectEqual(model_roles.RoleId{ .builtin = Role.default }, step.role);
     try std.testing.expectEqualStrings("auto", step.effort.?.label());
     // A detached frontend knows no level; the last role still places it.
     view.current_effort = null;
-    try std.testing.expectEqual(Role.default, cycleStep(view, false).?.role);
-    try std.testing.expectEqual(Role.small, cycleStep(view, true).?.role);
+    try std.testing.expectEqual(model_roles.RoleId{ .builtin = Role.default }, cycleStep(view, false).?.role);
+    try std.testing.expectEqual(model_roles.RoleId{ .builtin = Role.small }, cycleStep(view, true).?.role);
     // Without a last role it is taken to be at the startup level, so roles
     // that differ from the default only in level still cycle.
     try state.assign(alloc, .small, "main:low");
     state.last_cycled = null;
     step = cycleStep(view, false).?;
-    try std.testing.expectEqual(Role.small, step.role);
+    try std.testing.expectEqual(model_roles.RoleId{ .builtin = Role.small }, step.role);
     try std.testing.expectEqualStrings("low", step.effort.?.label());
 }
 
@@ -551,6 +970,22 @@ test "the default role stays on the profile's model after the session switches" 
     // On another provider the default follows the session.
     view.provider = .codex;
     try std.testing.expectEqualStrings("fast", view.defaultModel());
+}
+
+test "compact selection honors provider-qualified metadata target" {
+    const alloc = std.testing.allocator;
+    var registry = try configured_provider.Registry.parse_json(alloc,
+        \\{"small":{"protocol":"openai-responses","base_url":"http://localhost:12011/v1","auth":{"type":"none"},"model_metadata":{"source":{"compaction_model":"large/summary"}}},"large":{"protocol":"openai-responses","base_url":"http://localhost:12012/v1","auth":{"type":"none"},"model_metadata":{"summary":{"context_window":64000}}}}
+    );
+    defer registry.deinit(alloc);
+    var state: State = .{};
+    defer state.deinit(alloc);
+    try state.init(alloc, .{}, "small", "source");
+    const set: provider_set.Set = .{ .gateway = .{}, .codex = .{}, .grok = .{}, .definitions = registry.definitions };
+    const view: Host = .{ .state = &state, .provider = model_provider.parse("small").?, .current_model = "source", .set = set };
+    const selection = view.compactSelection().?;
+    try std.testing.expectEqualStrings("large", selection.provider.label());
+    try std.testing.expectEqualStrings("summary", selection.model);
 }
 
 test "review falls back to the legacy gateway setting and titles to the bundle" {
@@ -581,20 +1016,6 @@ test "a provider without a low-cost model titles with the session's model" {
     try std.testing.expectEqualStrings("gpt-main", view.titleModel().?);
     view.current_model = "@default";
     try std.testing.expect(view.titleModel() == null);
-}
-
-test "a judge takes the first of its roles that resolves" {
-    const alloc = std.testing.allocator;
-    var state: State = .{};
-    defer state.deinit(alloc);
-    try state.init(alloc, .{}, "codex", "main");
-    const view: Host = .{ .state = &state, .provider = .codex, .current_model = "gpt-main", .set = .{ .gateway = .{}, .codex = .{}, .grok = .{} } };
-    // No role set and no low-cost model: the session's model answers.
-    try std.testing.expect(view.judgeModel(&.{ "tiny", "small" }) == null);
-    try state.assign(alloc, .small, "codex-mini");
-    try std.testing.expectEqualStrings("codex-mini", view.judgeModel(&.{ "tiny", "small" }).?);
-    try state.assign(alloc, .review, "codex-strict");
-    try std.testing.expectEqualStrings("codex-strict", view.judgeModel(&.{ "nope", "review", "small" }).?);
 }
 
 test "the web search worker takes the profile's small role, else the session's model" {

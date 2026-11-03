@@ -54,6 +54,9 @@ pub const Settings = struct {
     /// Share of usable input, 10 to 80 percent, at which automatic
     /// compaction starts. Profile-only.
     auto_compact_percent: ?u8 = null,
+    /// Whether automatic context promotion may replace compaction with a larger
+    /// configured target. Profile-only; defaults off for conservative behavior.
+    context_promotion_enabled: ?bool = null,
     context_limits: context_limits.Overrides = .{},
     first_call_tool_choice: ?types.ToolChoice = null,
     context: ?bool = null,
@@ -152,6 +155,7 @@ pub const ConfigSources = struct {
     fast_mode: ConfigSource = .compiled_default,
     ultrafast_mode: ConfigSource = .compiled_default,
     fast_mode_model_bound: ConfigSource = .compiled_default,
+    context_promotion_enabled: ConfigSource = .compiled_default,
     slash_menu_categories: ConfigSource = .compiled_default,
     collapse_tool_calls: ConfigSource = .compiled_default,
     startup_scrollback: ConfigSource = .compiled_default,
@@ -328,8 +332,8 @@ pub fn modelEnvOverride() ?[]const u8 {
 }
 
 pub const ModelSelectionError = error{
-    ProviderNotConfigured,
     GatewayDisabled,
+    ProviderNotConfigured,
     CodexModelNotSelected,
     GrokModelNotSelected,
     ConfiguredModelNotSelected,
@@ -349,17 +353,18 @@ pub fn selectProviderModel(
     if (provider == .gateway) return error.GatewayDisabled;
     const model = settings.models.get(provider) orelse switch (provider) {
         .gateway => default_model,
-        .codex => run_model orelse return error.CodexModelNotSelected,
-        .grok => run_model orelse return error.GrokModelNotSelected,
+        .codex => run_model orelse configuredDefaultModel(settings, provider) orelse return error.CodexModelNotSelected,
+        .grok => run_model orelse configuredDefaultModel(settings, provider) orelse return error.GrokModelNotSelected,
         .configured => run_model orelse configuredDefaultModel(settings, provider) orelse return error.ConfiguredModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }
 
-/// The model a configured provider's definition names as its default, such
-/// as a preset's. Borrows from `settings`.
+/// The provider's profile default, including metadata-only native overrides.
+/// Borrows from `settings`.
 pub fn configuredDefaultModel(settings: *const Settings, provider: model_provider.ProviderId) ?[]const u8 {
     const registry = settings.providers orelse return null;
+    if (registry.native(provider.label())) |overrides| return overrides.default_model;
     const definition = registry.get(provider.label()) orelse return null;
     return definition.default_model;
 }
@@ -923,10 +928,18 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "review_model",
         "model_roles",
         "cycle_order",
+        "model_role_bank",
+        "modelRoleBank",
+        "model_tags",
+        "modelTags",
+        "fallback_chains",
+        "fallbackChains",
+        "retry",
         "effort",
         "fast_mode",
         "ultrafast_mode",
         "fast_mode_model_bound",
+        "context_promotion_enabled",
         "slash_menu_categories",
         "collapse_tool_calls",
         "theme",
@@ -1020,6 +1033,7 @@ fn updateConfigSources(sources: *ConfigSources, settings: Settings, source: Conf
     if (settings.fast_mode != null) sources.fast_mode = source;
     if (settings.ultrafast_mode != null) sources.ultrafast_mode = source;
     if (settings.fast_mode_model_bound != null) sources.fast_mode_model_bound = source;
+    if (settings.context_promotion_enabled != null) sources.context_promotion_enabled = source;
     if (settings.slash_menu_categories != null) sources.slash_menu_categories = source;
     if (settings.collapse_tool_calls != null) sources.collapse_tool_calls = source;
     if (settings.session_titles != null) sources.session_titles = source;
@@ -1180,6 +1194,10 @@ pub const PermissionMutation = settings_store.PermissionMutation;
 pub const PermissionScope = settings_store.PermissionScope;
 pub const StatuslineItem = settings_store.StatuslineItem;
 pub const UserSettingsPatch = settings_store.UserSettingsPatch;
+pub const ModelRoleScope = settings_store.ModelRoleScope;
+pub const ModelRoleTagPatch = settings_store.ModelRoleTagPatch;
+pub const ModelRoleBankPatch = settings_store.ModelRoleBankPatch;
+pub const FallbackChainPatch = settings_store.FallbackChainPatch;
 pub const WorkspaceDirectoryMutation = settings_store.WorkspaceDirectoryMutation;
 pub const CommitOutcome = settings_store.CommitOutcome;
 pub const LegacyCleanup = settings_store.LegacyCleanup;
@@ -1733,6 +1751,10 @@ fn parseProfileOnlyFields(
         if (value.integer < 0 or !compactor.isValidPercent(@intCast(value.integer))) return error.InvalidAutoCompactPercentValue;
         settings.auto_compact_percent = @intCast(value.integer);
     }
+    if (root.object.get("context_promotion_enabled")) |value| {
+        if (value != .bool) return error.InvalidObject;
+        settings.context_promotion_enabled = value.bool;
+    }
     if (root.object.get("model")) |model_value| {
         const value = model_value;
         if (value != .string) return error.InvalidModelType;
@@ -1815,8 +1837,22 @@ fn parseProfileOnlyFields(
         }
     }
 
-    if (root.object.contains("model_roles") or root.object.contains("cycle_order")) {
-        settings.model_roles = try model_roles.Table.parse(alloc, root.object.get("model_roles"), root.object.get("cycle_order"));
+    const fallback_value = root.object.get("fallback_chains") orelse root.object.get("fallbackChains") orelse blk: {
+        if (root.object.get("retry")) |retry| if (retry == .object) break :blk retry.object.get("fallbackChains");
+        break :blk null;
+    };
+    if (root.object.contains("model_roles") or root.object.contains("cycle_order") or
+        root.object.contains("model_role_bank") or root.object.contains("modelRoleBank") or
+        root.object.contains("model_tags") or root.object.contains("modelTags") or fallback_value != null)
+    {
+        settings.model_roles = try model_roles.Table.parseExtended(
+            alloc,
+            root.object.get("model_roles"),
+            root.object.get("cycle_order"),
+            root.object.get("model_role_bank") orelse root.object.get("modelRoleBank"),
+            root.object.get("model_tags") orelse root.object.get("modelTags"),
+            fallback_value,
+        );
     }
 
     if (root.object.get("fast_mode")) |fast_mode_value| {
@@ -2055,6 +2091,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.max_agent_steps) |value| target.max_agent_steps = value;
     if (incoming.max_tool_result_bytes) |value| target.max_tool_result_bytes = value;
     if (incoming.auto_compact_percent) |value| target.auto_compact_percent = value;
+    if (incoming.context_promotion_enabled) |value| target.context_promotion_enabled = value;
     target.context_limits.merge(incoming.context_limits);
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;
     if (incoming.context) |value| target.context = value;
@@ -4782,6 +4819,22 @@ test "selectProviderModel accepts the run model when the provider has none saved
     try std.testing.expectError(error.GatewayDisabled, selectProviderModel("default/model", &gateway_only, null, "gpt-env"));
 }
 
+test "native provider model defaults yield to saved and run preferences" {
+    const alloc = std.testing.allocator;
+    var settings: Settings = .{ .provider = .codex, .providers = .{} };
+    defer settings.deinit(alloc);
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"default_model\":\"profile-default\"}", .{});
+    for ([_]model_provider.ProviderId{ .codex, .grok }) |provider| {
+        try settings.providers.?.putNative(alloc, try configured_provider.parseNative(alloc, provider.label(), value));
+        try std.testing.expectEqualStrings("profile-default", (try selectProviderModel("builtin", &settings, provider, null)).model);
+        try std.testing.expectEqualStrings("run", (try selectProviderModel("builtin", &settings, provider, "run")).model);
+        try settings.models.putCopy(alloc, provider, "saved");
+        try std.testing.expectEqualStrings("saved", (try selectProviderModel("builtin", &settings, provider, "run")).model);
+    }
+}
+
 test "modelNotSelectedMessage names the provider and both ways to recover" {
     const codex = modelNotSelectedMessage(error.CodexModelNotSelected).?;
     try std.testing.expect(std.mem.find(u8, codex, "`fx provider codex`") != null);
@@ -4829,4 +4882,16 @@ test "FX_ULTRAFAST overrides the profile and diagnoses malformed values" {
         if (diagnostic.cause == .invalid_ultrafast_mode_override) diagnosed = true;
     }
     try std.testing.expect(diagnosed);
+}
+
+test "extended model role settings parse custom metadata and fallback chains" {
+    var settings = try parseSettingsJson(std.testing.allocator,
+        \\{"model_roles":{"planner":"openrouter/google/*"},"modelRoleBank":{"planner":["openrouter/google/*"]},"modelTags":{"planner":{"tag":"plan","hidden":true}},"fallbackChains":{"openrouter/google/*":["codex/mini"]}}
+    );
+    defer settings.deinit(std.testing.allocator);
+    const planner = model_roles.parseRoleId("planner").?;
+    try std.testing.expectEqualStrings("openrouter/google/*", settings.model_roles.getId(planner).?);
+    try std.testing.expectEqualStrings("plan", settings.model_roles.tagFor(planner).?.tag);
+    try std.testing.expect(settings.model_roles.tagFor(planner).?.hidden);
+    try std.testing.expectEqualStrings("codex/mini", settings.model_roles.fallbackFor("openrouter/google/*").?);
 }

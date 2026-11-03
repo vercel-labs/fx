@@ -7,6 +7,7 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const model_provider = @import("../config/model_provider.zig");
+const model_roles = @import("../config/model_roles.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const auto_classifier = @import("../permissions/auto_classifier.zig");
@@ -316,6 +317,7 @@ pub fn run(
             .max_tool_result_bytes = config.tool_context.max_tool_result_bytes,
             .auto_compact_percent = config.tool_context.auto_compact_percent,
             .cancel_flag = cancel,
+            .fallback_role = admission.role,
             .fast_mode = config.tool_context.fast_mode,
             .ultrafast_mode = ultrafast_mode,
             .effort = admission.effort,
@@ -464,12 +466,28 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .push_command_output_complete = pushLiveCommandOutputComplete,
         .push_http_error = captureHttpError,
         .refresh_gateway_credential = refreshGatewayCredential,
+        .bind_model = if (context.config.tool_context.model_binder != null) bindChildModel else null,
+        .resolve_role_chain = if (context.config.tool_context.role_chain_resolver != null) resolveChildRoleChain else null,
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
         .record_usage = recordUsage,
         .ttsr_enabled = !@import("builtin").is_test,
         .checklist = &context.turn.runtime.checklist,
     };
+}
+
+fn bindChildModel(raw: *anyopaque, arena: Allocator, selection: model_roles.Selection) anyerror!?agent_runtime.ModelBinding {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    const bind = context.config.tool_context.model_binder orelse return null;
+    const callback_ctx = context.config.tool_context.model_binding_context orelse return null;
+    return bind(callback_ctx, arena, selection);
+}
+
+fn resolveChildRoleChain(raw: *anyopaque, role: model_roles.RoleId, out: []model_roles.Selection) usize {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    const resolve = context.config.tool_context.role_chain_resolver orelse return 0;
+    const callback_ctx = context.config.tool_context.model_binding_context orelse return 0;
+    return resolve(callback_ctx, role, out);
 }
 
 fn availableModelCapabilities(raw: *anyopaque, model: []const u8) model_capabilities.Capabilities {

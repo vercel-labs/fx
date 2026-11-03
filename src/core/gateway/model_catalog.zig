@@ -2,6 +2,7 @@ const std = @import("std");
 const credentials = @import("../auth/credentials.zig");
 const model_provider = @import("../config/model_provider.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const tokenizer = @import("../tokenizer/tokenizer.zig");
 const collections = @import("../shared/collections.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
@@ -153,6 +154,8 @@ pub const Provider = struct {
     lookup_capabilities_fn: ?*const fn (?*anyopaque, []const u8) model_capabilities.Capabilities = null,
     provider_id: model_provider.ProviderId = .gateway,
     refresh_interval_ms: ?i64 = null,
+    /// Declared rows are a startup seed, not a replacement for live discovery.
+    refresh_on_seed: bool = false,
 
     /// Returns owned catalog entries; the caller frees them with `freeModelCatalog`.
     pub fn fetch(self: Provider, alloc: Allocator, input: FetchInput) Allocator.Error!ProviderResult {
@@ -320,11 +323,20 @@ fn traceCatalogLoadOutcome(
     }
 }
 
+pub const ModelCost = @import("../config/configured_provider.zig").ModelCost;
+
 pub const ModelCatalogEntry = struct {
     id: []u8,
+    description: ?[]u8 = null,
+    cost: ?ModelCost = null,
+    intelligence: ?f64 = null,
+    recommended: bool = false,
+    beta: bool = false,
     /// The catalog's display name, trimmed; null when the catalog has none.
     name: ?[]u8 = null,
     model_type: []u8,
+    /// Parsed model tokenizer; this value owns no catalog storage.
+    tokenizer: ?tokenizer.Encoding = null,
     released: i64 = 0,
     has_tool_use: bool = false,
     has_reasoning: bool = false,
@@ -338,6 +350,9 @@ pub const ModelCatalogEntry = struct {
     has_implicit_caching: bool = false,
     context_window: u32 = 0,
     max_tokens: u32 = 0,
+    max_context_window: ?u32 = null,
+    omit_max_output_tokens: bool = false,
+    prefer_websockets: ?bool = null,
     web_search_price: ?[]u8 = null,
 };
 
@@ -349,6 +364,7 @@ pub fn freeModelCatalog(alloc: std.mem.Allocator, entries: *std.ArrayList(ModelC
 pub fn freeModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) void {
     alloc.free(entry.id);
     if (entry.name) |name| alloc.free(name);
+    if (entry.description) |description| alloc.free(description);
     alloc.free(entry.model_type);
     var reasoning_efforts = entry.reasoning_efforts;
     reasoning_efforts.deinit(alloc);
@@ -374,11 +390,14 @@ fn appendClonedModelCatalogEntry(alloc: std.mem.Allocator, entries: *std.ArrayLi
     };
 }
 
-fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !ModelCatalogEntry {
+/// Copies all owned catalog fields; caller releases with freeModelCatalogEntry.
+pub fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !ModelCatalogEntry {
     const id = try alloc.dupe(u8, entry.id);
     errdefer alloc.free(id);
     const name = if (entry.name) |value| try alloc.dupe(u8, value) else null;
     errdefer if (name) |value| alloc.free(value);
+    const description = if (entry.description) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (description) |value| alloc.free(value);
     const model_type = try alloc.dupe(u8, entry.model_type);
     errdefer alloc.free(model_type);
     var reasoning_efforts: std.ArrayList(types.ReasoningEffort) = .empty;
@@ -388,7 +407,13 @@ fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !M
     var cloned = ModelCatalogEntry{
         .id = id,
         .name = name,
+        .description = description,
+        .cost = entry.cost,
+        .intelligence = entry.intelligence,
+        .recommended = entry.recommended,
+        .beta = entry.beta,
         .model_type = model_type,
+        .tokenizer = entry.tokenizer,
         .released = entry.released,
         .has_tool_use = entry.has_tool_use,
         .has_reasoning = entry.has_reasoning,
@@ -402,6 +427,9 @@ fn cloneModelCatalogEntry(alloc: std.mem.Allocator, entry: ModelCatalogEntry) !M
         .has_implicit_caching = entry.has_implicit_caching,
         .context_window = entry.context_window,
         .max_tokens = entry.max_tokens,
+        .max_context_window = entry.max_context_window,
+        .omit_max_output_tokens = entry.omit_max_output_tokens,
+        .prefer_websockets = entry.prefer_websockets,
         .web_search_price = null,
     };
     if (entry.web_search_price) |price| {

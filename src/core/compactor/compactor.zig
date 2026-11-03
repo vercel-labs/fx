@@ -42,6 +42,7 @@ pub const Size = window.Size;
 
 // Reaching the model; the caller hands in a `ModelCaller`.
 pub const ModelCaller = model.ModelCaller;
+pub const NativeCompaction = model.NativeCompaction;
 pub const Call = model.Call;
 pub const CallError = model.CallError;
 pub const Reply = model.Reply;
@@ -192,9 +193,26 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
         );
         return error.ContextCompactionUnavailable;
     }
+    if (caller.summary_provider) |provider| {
+        const source = caller.summary_credential_source;
+        if (!model_provider.authorizesCredential(provider, source)) {
+            trace.failure(
+                trace_ctx,
+                .credential_unauthorized,
+                "provider={s} credential_source={s}",
+                .{ @tagName(provider), if (source) |value| @tagName(value) else "none" },
+            );
+            return error.ContextCompactionUnavailable;
+        }
+    }
     try Progress.report(request.progress, .summarizing);
     trace.log(false, "room after compaction after_tokens={d} fixed_tokens={any} kept_tokens={d} kept_used={d} compacted_tokens={d}", .{ request.size.afterTokens(), request.size.fixed_tokens, chosen.kept_tokens, chosen.kept_used, request.size.compactedTokens(chosen.kept_used) });
 
+    if (caller.native_compaction != null and
+        (caller.summary_provider == null or caller.summary_provider.?.eql(caller.provider)))
+    {
+        return try nativeCompact(alloc, arena, out, request, chosen, caller);
+    }
     const earlier = try earlierFrom(out, request.records, chosen.earlier);
     const turns = try turnsFrom(out, chosen.older, request.append_messages);
     if (turns.len == 0) return error.NothingToCompact;
@@ -229,6 +247,64 @@ pub fn compact(alloc: Allocator, request: Request) !?Result {
         .retained_history = chosen.retained_history,
         .cut = chosen.cut,
         .tool_count = summary.compacted.tool_count,
+    };
+}
+
+fn nativeCompact(
+    alloc: Allocator,
+    arena: *std.heap.ArenaAllocator,
+    out: Allocator,
+    request: Request,
+    chosen: window.Window,
+    caller: ModelCaller,
+) !Result {
+    const native = caller.native_compaction orelse unreachable;
+    var messages: std.ArrayList(types.ChatMessage) = .empty;
+    try request.append_messages(out, &messages, request.history);
+    if (request.active) |active| {
+        const active_history = [_]types.HistoryTurn{.{ .assistant = active }};
+        try request.append_messages(out, &messages, &active_history);
+    }
+    const model_name = model.summaryModel(caller);
+    var provider_result = try native.compact_fn(native.context, alloc, .{
+        .model = model_name,
+        .messages = messages.items,
+        .retained_message_budget = native.retained_message_budget,
+        .prompt_cache_key = native.prompt_cache_key,
+        .kind = native.kind,
+        .trace_ctx = request.trace_ctx,
+        .cancel_flag = request.cancel_flag,
+    });
+    defer provider_result.deinit(alloc);
+    const summary = provider_result.summary orelse return error.EmptyNativeCompaction;
+    if (std.mem.trim(u8, summary, " \t\r\n").len == 0) return error.EmptyNativeCompaction;
+    const state = provider_result.provider_state_json orelse provider_result.replacement_history_json;
+    var provider_replay: ?types.ProviderReplay = null;
+    if (state) |state_json| {
+        provider_replay = .{
+            .source = .{ .provider = native.provider_id, .model = try out.dupe(u8, model_name) },
+            .parts_json = try out.dupe(u8, state_json),
+        };
+    }
+    errdefer if (provider_replay) |replay| {
+        // Both slices are arena-owned; the arena will release them with the
+        // result. This branch only documents that no provider-owned bytes leak.
+        _ = replay;
+    };
+    const summary_copy = try out.dupe(u8, summary);
+    const checkpoint_turn = types.CompactedSummaryHistoryTurn{
+        .summary = summary_copy,
+        .removed_turn_count = chosen.cut.turns,
+        .compaction_count = latestCompactionCount(request.history) + 1,
+        .provider_replay = provider_replay,
+    };
+    return .{
+        .arena = arena,
+        .checkpoint = checkpoint_turn,
+        .model_text = summary_copy,
+        .retained_history = chosen.retained_history,
+        .cut = chosen.cut,
+        .tool_count = 0,
     };
 }
 

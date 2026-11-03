@@ -201,6 +201,69 @@ fn exec(arena: std.mem.Allocator, id: u64, case: msg.ExecCase, args: []const u8)
     return server.bytes.items;
 }
 
+const inline_png_bytes = "\x89PNG\r\n\x1a\n";
+const inline_png_sha256 = "4c4b6a3be1314ab86138bef4314dde022e600960d8689a2c8f8631802d20dab6";
+
+fn inlinePngAttachment() types.ImageAttachment {
+    return .{
+        .path = @constCast("inline.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_sha256 = @constCast(inline_png_sha256),
+        .inline_data = @constCast(inline_png_bytes),
+    };
+}
+
+test "Cursor sends verified active and historical user images" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const active_image = inlinePngAttachment();
+    const active_images = [_]types.ImageAttachment{active_image};
+    const active_messages = [_]types.ChatMessage{.{
+        .role = .user,
+        .content = "inspect this",
+        .images = &active_images,
+    }};
+    const active = try cursor_request.build(arena, baseRequest(&active_messages), .{
+        .model = model,
+        .conversation_id = "active-image",
+    });
+    const active_run = try runRequest(active.run_message);
+    const action = (try pb.findBytes(active_run, 2)).?;
+    const user_action = (try pb.findBytes(action, 1)).?;
+    const active_user = (try pb.findBytes(user_action, 1)).?;
+    const selected_context = (try pb.findBytes(active_user, 3)).?;
+    const selected_image = (try pb.findBytes(selected_context, 1)).?;
+    try std.testing.expectEqual(@as(usize, 36), (try pb.findBytes(selected_image, 2)).?.len);
+    try std.testing.expectEqualStrings("image/png", (try pb.findBytes(selected_image, 7)).?);
+    try std.testing.expectEqualSlices(u8, inline_png_bytes, (try pb.findBytes(selected_image, 8)).?);
+
+    const history_image = inlinePngAttachment();
+    const history_images = [_]types.ImageAttachment{history_image};
+    const history_messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "old image", .images = &history_images },
+        .{ .role = .user, .content = "new text" },
+    };
+    const historical = try cursor_request.build(arena, baseRequest(&history_messages), .{
+        .model = model,
+        .conversation_id = "history-image",
+    });
+    const historical_run = try runRequest(historical.run_message);
+    const state = (try pb.findBytes(historical_run, 1)).?;
+    var roots = pb.Reader.init(state);
+    var root_count: usize = 0;
+    var historical_user: ?[]const u8 = null;
+    while (try roots.next()) |field| {
+        if (field.number != 1) continue;
+        const blob = historical.blobs.get(field.data[0..32].*).?;
+        if (root_count == 1) historical_user = blob;
+        root_count += 1;
+    }
+    try std.testing.expect(historical_user != null);
+    try std.testing.expect(std.mem.indexOf(u8, historical_user.?, "data:image/png;base64,iVBORw0KGgo=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, historical_user.?, "\"mediaType\":\"image/png\"") != null);
+}
+
 test "a recorded tool turn streams text, reasoning and arguments and hands the call off" {
     const alloc = std.testing.allocator;
     var arena_state: std.heap.ArenaAllocator = .init(alloc);

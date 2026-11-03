@@ -92,6 +92,7 @@ pub const Action = union(enum) {
     toggle_permission_mode,
     open_all_sessions,
     open_model_catalog,
+    refresh_model_catalog,
     /// Alt+P: the next role model in `cycle_order`; Alt+Shift+P: the previous.
     cycle_role_model_forward,
     cycle_role_model_backward,

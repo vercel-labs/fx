@@ -23,6 +23,13 @@ const Allocator = std.mem.Allocator;
 
 pub const api_version = "2023-06-01";
 pub const interleaved_thinking_beta = "interleaved-thinking-2025-05-14";
+const fine_grained_tool_streaming_beta = "fine-grained-tool-streaming-2025-05-14";
+const fast_mode_beta = "fast-mode-2026-02-01";
+const task_budget_beta = "task-budgets-2026-03-13";
+const structured_outputs_beta = "structured-outputs-2025-12-15";
+const context_management_beta = "context-management-2025-06-27";
+const compaction_beta = "compact-2026-01-12";
+const server_side_fallback_beta = "server-side-fallback-2026-06-01";
 
 pub const KeyStyle = enum { none, x_api_key, bearer };
 
@@ -42,7 +49,13 @@ pub const Endpoint = struct {
 pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
     const context: *anyopaque = @ptrCast(@constCast(definition));
     return .{
-        .agent_stream = .{ .context = context, .stream_fn = stream, .build_request_fn = build, .project_replay_fn = project_replay },
+        .agent_stream = .{
+            .context = context,
+            .stream_fn = stream,
+            .compaction = .{ .context = context, .compact_fn = compact },
+            .build_request_fn = build,
+            .project_replay_fn = project_replay,
+        },
         .model_catalog = chat_completions.model_catalog_provider(definition),
         .cli_model_catalog = .{ .context = context, .fetch_fn = chat_completions.fetch_cli_catalog },
         .permission_reviewer = .{ .context = context, .review_fn = review },
@@ -67,9 +80,16 @@ pub fn definition_options(definition: *const definitions.Definition, model: []co
         .adaptive => .adaptive,
     } else .budget;
     var options: codec.Options = .{ .provider = identity, .thinking_mode = mode };
-    if (metadata) |value| if (value.max_output_tokens) |limit| {
-        options.default_max_tokens = limit;
-    };
+    if (metadata) |value| {
+        if (value.max_output_tokens) |limit| options.default_max_tokens = limit;
+        options.supports_context_management = value.compat.supports_context_management orelse true;
+        options.supports_eager_tool_input_streaming = value.compat.supports_eager_tool_input_streaming orelse true;
+        options.requires_tool_result_id = value.compat.requires_tool_result_id orelse false;
+        options.supports_forced_tool_choice = value.compat.supports_forced_tool_choice orelse true;
+        options.requires_thinking_presence = value.compat.requires_thinking_presence orelse false;
+        options.allow_anthropic_header_overrides = value.compat.allow_anthropic_header_overrides orelse false;
+        options.replay_unsigned_thinking = value.compat.replay_unsigned_thinking orelse false;
+    }
     return options;
 }
 
@@ -91,14 +111,14 @@ pub fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest)
     if (request.credential.credentialSource() != .configured) return error.ConfiguredProviderCredentialRequired;
     const token = request.credential.secret();
     try configured_request.checkToken(definition, token);
-    const url = try definition.messages_url(alloc);
+    const url = try definition.messages_url(alloc, request.model);
     defer alloc.free(url);
     const identity = bound_identity(definition);
     const style: KeyStyle = switch (definition.auth) {
         .none => .none,
         .bearer, .command, .login => if (definition.key_header == .x_api_key) .x_api_key else .bearer,
     };
-    var headers = try configured_request.resolveHeaders(alloc, definition);
+    var headers = try configured_request.resolveHeaders(alloc, definition, request.model);
     defer headers.deinit(alloc);
     return stream_endpoint(alloc, .{
         .messages_url = url,
@@ -108,8 +128,82 @@ pub fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest)
     }, if (style == .none) null else token, request);
 }
 
-/// Streams one request to `endpoint`. A rejected thinking signature is
-/// retried once with every thinking block dropped, as proto does.
+fn discard_compaction_event(_: *anyopaque, _: streams.Event) void {}
+
+fn usage_total(usage: types.Usage) ?u64 {
+    var total: u64 = 0;
+    var seen = false;
+    if (usage.input_tokens) |value| {
+        total +|= value;
+        seen = true;
+    }
+    if (usage.output_tokens) |value| {
+        total +|= value;
+        seen = true;
+    }
+    return if (seen) total else null;
+}
+
+/// Runs Anthropic's server-side compaction edit and exposes its summary and
+/// replay envelope to the core compactor. The normal Messages stream reducer
+/// owns response validation, usage, encrypted content, and provider state.
+fn compact(raw: ?*anyopaque, alloc: Allocator, request: streams.CompactionRequest) anyerror!streams.CompactionResult {
+    if (request.kind != .anthropic_native) return error.UnsupportedCompactionKind;
+    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    var options = request.provider_options;
+    if (options.anthropic_compaction == null) {
+        options.anthropic_compaction = .{
+            .trigger_input_tokens = 50_000,
+            .pause_after_compaction = true,
+            .instructions = if (request.instructions.len == 0) null else request.instructions,
+        };
+    }
+    var delivery: streams.DeliveryCertainty = .{};
+    var evidence: streams.AttemptEvidence = .{};
+    var event_context: u8 = 0;
+    var result = try stream(raw, alloc, .{
+        .observer = request.observer,
+        .admission = request.admission,
+        .purpose = .compaction,
+        .credential = request.credential,
+        .session_id = request.session_id,
+        .model = request.model,
+        .retry_count = 0,
+        .instructions = &.{},
+        .messages = request.messages,
+        .tools = request.tools,
+        .tool_choice = .none,
+        .provider_options = options,
+        .budget = request.budget,
+        .trace_ctx = request.trace_ctx,
+        .delivery = &delivery,
+        .attempt_evidence = &evidence,
+        .events = .{ .context = &event_context, .emit_fn = discard_compaction_event },
+        .content_capture_limit = 8 * 1024 * 1024,
+        .cancel_flag = request.cancel_flag,
+    });
+    defer result.deinit(alloc);
+    switch (result) {
+        .failed => return error.NativeCompactionFailed,
+        .completed => |completed| {
+            const state = completed.completion.provider_state_json orelse return error.EmptyNativeCompaction;
+            const summary = try codec.compaction_summary(alloc, state) orelse return error.EmptyNativeCompaction;
+            errdefer alloc.free(summary);
+            const state_copy = try alloc.dupe(u8, state);
+            return .{
+                .summary = summary,
+                .provider_state_json = state_copy,
+                .used_tokens = usage_total(completed.completion.usage),
+                .usage = completed.completion.usage,
+                .ownership = .owned,
+            };
+        },
+    }
+}
+
+/// Streams one request to `endpoint`. When compatibility permits unsigned
+/// replay, a signature rejection first demotes unsigned blocks and then falls
+/// back to dropping all replayed thinking if signed history is also rejected.
 pub fn stream_endpoint(alloc: Allocator, endpoint: Endpoint, token: ?[]const u8, request: streams.ModelRequest) !streams.Result {
     if (token) |value| {
         if (value.len > 16 * 1024) return error.InvalidConfiguredProviderCredential;
@@ -118,19 +212,45 @@ pub fn stream_endpoint(alloc: Allocator, endpoint: Endpoint, token: ?[]const u8,
     const built = if (request.prepared_request_body == null) try codec.build_request(alloc, request.data(), endpoint.options) else null;
     defer if (built) |body| alloc.free(body);
     var result = try post_guarded(alloc, endpoint, request, token, built orelse request.prepared_request_body.?);
-    if (result == .failed and result.failed.kind == .invalid_request and !endpoint.options.drop_thinking) {
-        const detail = result.failed.detail orelse "";
-        if (invalid_signature(detail)) {
-            debug_trace.logf("gateway", "anthropic_thinking_signature_rejected retry=drop_all", .{});
-            result.deinit(alloc);
-            var options = endpoint.options;
-            options.drop_thinking = true;
+    if (invalid_thinking_signature(result) and !endpoint.options.drop_thinking) {
+        var options = endpoint.options;
+        result.deinit(alloc);
+        if (options.replay_unsigned_thinking) {
+            // A signing proxy can reject only unsigned historical thinking.
+            // First demote those blocks while retaining signed replay; if the
+            // provider still rejects the signed history, retry once without it.
+            debug_trace.logf("gateway", "anthropic_thinking_signature_rejected retry=drop_unsigned", .{});
+            options.replay_unsigned_thinking = false;
             const retry_body = try codec.build_request(alloc, request.data(), options);
-            defer alloc.free(retry_body);
-            return post_guarded(alloc, endpoint, request, token, retry_body);
+            var retried = post_guarded(alloc, endpoint, request, token, retry_body) catch |err| {
+                alloc.free(retry_body);
+                return err;
+            };
+            alloc.free(retry_body);
+            if (invalid_thinking_signature(retried)) {
+                debug_trace.logf("gateway", "anthropic_thinking_signature_rejected retry=drop_all", .{});
+                retried.deinit(alloc);
+                options.drop_thinking = true;
+                const final_body = try codec.build_request(alloc, request.data(), options);
+                defer alloc.free(final_body);
+                return post_guarded(alloc, endpoint, request, token, final_body);
+            }
+            return retried;
         }
+        debug_trace.logf("gateway", "anthropic_thinking_signature_rejected retry=drop_all", .{});
+        options.drop_thinking = true;
+        const retry_body = try codec.build_request(alloc, request.data(), options);
+        defer alloc.free(retry_body);
+        return post_guarded(alloc, endpoint, request, token, retry_body);
     }
     return result;
+}
+
+fn invalid_thinking_signature(result: streams.Result) bool {
+    return switch (result) {
+        .failed => |failure| failure.kind == .invalid_request and invalid_signature(failure.detail orelse ""),
+        .completed => false,
+    };
 }
 
 /// Proto's INVALID_THINKING_SIGNATURE and MISSING_THINKING_SIGNATURE patterns.
@@ -162,25 +282,94 @@ fn phase_deadline(milliseconds: i64, caller: ?std.Io.Clock.Timestamp) std.Io.Clo
     return phase;
 }
 
+fn isAnthropicOAuthToken(token: ?[]const u8) bool {
+    return if (token) |value| std.mem.startsWith(u8, value, "sk-ant-oat") else false;
+}
+
+fn isOfficialAnthropicUrl(url: []const u8) bool {
+    const prefix = "https://api.anthropic.com";
+    return std.ascii.startsWithIgnoreCase(url, prefix) and (url.len == prefix.len or url[prefix.len] == '/');
+}
+
+fn isCoworkHeader(name: []const u8) bool {
+    return for ([_][]const u8{
+        "x-stainless-arch",        "x-stainless-lang",    "x-stainless-package-version",
+        "x-stainless-retry-count", "x-stainless-runtime", "x-stainless-runtime-version",
+        "x-stainless-timeout",
+    }) |known| {
+        if (std.ascii.eqlIgnoreCase(name, known)) break true;
+    } else false;
+}
+
+fn isAnthropicEnforcedHeader(name: []const u8) bool {
+    return isCoworkHeader(name) or for ([_][]const u8{
+        "accept",                                    "accept-encoding",          "connection",          "content-type",         "anthropic-version",
+        "anthropic-dangerous-direct-browser-access", "anthropic-beta",           "user-agent",          "x-app",                "authorization",
+        "x-api-key",                                 "x-claude-code-session-id", "x-client-request-id", "cf-aig-authorization",
+    }) |known| {
+        if (std.ascii.eqlIgnoreCase(name, known)) break true;
+    } else false;
+}
+
+fn isAnthropicOverridableHeader(name: []const u8) bool {
+    return isCoworkHeader(name) or for ([_][]const u8{ "anthropic-beta", "user-agent", "x-app" }) |known| {
+        if (std.ascii.eqlIgnoreCase(name, known)) break true;
+    } else false;
+}
+
+pub fn customHeaderAllowed(name: []const u8, options: codec.Options, base_url: []const u8, oauth_token: bool) bool {
+    if (!isAnthropicEnforcedHeader(name)) return true;
+    return options.allow_anthropic_header_overrides and oauth_token and
+        !isOfficialAnthropicUrl(base_url) and isAnthropicOverridableHeader(name);
+}
+
+fn appendExtraHeaders(alloc: Allocator, headers: *std.ArrayList(std.http.Header), endpoint: Endpoint, token: ?[]const u8) !void {
+    for (endpoint.extra_headers) |header| {
+        if (!customHeaderAllowed(header.name, endpoint.options, endpoint.messages_url, isAnthropicOAuthToken(token))) continue;
+        var replaced = false;
+        for (headers.items) |*existing| {
+            if (std.ascii.eqlIgnoreCase(existing.name, header.name)) {
+                existing.value = header.value;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) try headers.append(alloc, header);
+    }
+}
+
+fn append_beta(alloc: Allocator, betas: *std.ArrayList(u8), beta: []const u8) !void {
+    var it = std.mem.splitScalar(u8, betas.items, ',');
+    while (it.next()) |existing| if (std.mem.eql(u8, existing, beta)) return;
+    if (betas.items.len != 0) try betas.append(alloc, ',');
+    try betas.appendSlice(alloc, beta);
+}
+
 fn post(alloc: Allocator, endpoint: Endpoint, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8) !streams.Result {
     const authorization = if (endpoint.key_style == .bearer) if (token) |value| try alloc.print("Bearer {s}", .{value}) else null else null;
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
     var betas: std.ArrayList(u8) = .empty;
     defer betas.deinit(alloc);
-    for (endpoint.betas) |beta| {
-        if (betas.items.len != 0) try betas.append(alloc, ',');
-        try betas.appendSlice(alloc, beta);
+    for (endpoint.betas) |beta| try append_beta(alloc, &betas, beta);
+    if (codec.uses_budget_thinking(payload)) try append_beta(alloc, &betas, interleaved_thinking_beta);
+    // These controls are request-shaped in the native protocol. Deriving the
+    // beta set from the exact body keeps custom endpoints working without
+    // making every caller duplicate Anthropic's feature matrix.
+    if (std.mem.find(u8, payload, "\"eager_input_streaming\":true") != null) try append_beta(alloc, &betas, fine_grained_tool_streaming_beta);
+    if (std.mem.find(u8, payload, "\"speed\":\"fast\"") != null) try append_beta(alloc, &betas, fast_mode_beta);
+    if (std.mem.find(u8, payload, "\"task_budget\"") != null) try append_beta(alloc, &betas, task_budget_beta);
+    if (std.mem.find(u8, payload, "\"format\":{\"type\":\"json_schema\"") != null) try append_beta(alloc, &betas, structured_outputs_beta);
+    if (std.mem.find(u8, payload, "\"context_management\"") != null) {
+        try append_beta(alloc, &betas, context_management_beta);
+        if (std.mem.find(u8, payload, "\"compact_20260112\"") != null) try append_beta(alloc, &betas, compaction_beta);
     }
-    if (codec.uses_budget_thinking(payload)) {
-        if (betas.items.len != 0) try betas.append(alloc, ',');
-        try betas.appendSlice(alloc, interleaved_thinking_beta);
-    }
+    if (std.mem.find(u8, payload, "\"fallbacks\"") != null) try append_beta(alloc, &betas, server_side_fallback_beta);
     var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(alloc);
     try headers.appendSlice(alloc, &.{ .{ .name = "accept", .value = "text/event-stream" }, .{ .name = "anthropic-version", .value = api_version } });
     if (endpoint.key_style == .x_api_key) if (token) |value| try headers.append(alloc, .{ .name = "x-api-key", .value = value });
     if (betas.items.len != 0) try headers.append(alloc, .{ .name = "anthropic-beta", .value = betas.items });
-    try headers.appendSlice(alloc, endpoint.extra_headers);
+    try appendExtraHeaders(alloc, &headers, endpoint, token);
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io.getIo() };
     defer client.deinit();
@@ -234,7 +423,7 @@ fn post(alloc: Allocator, endpoint: Endpoint, request: streams.ModelRequest, tok
         }
         return .{ .failed = .{ .kind = failure_kind(response.head.status), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
-    var result = consume(alloc, reader, request, watch.progress()) catch |err| return watch.failure(err);
+    var result = consume(alloc, reader, request, endpoint.options.replay_unsigned_thinking, watch.progress()) catch |err| return watch.failure(err);
     if (watch.finish()) |err| {
         result.deinit(alloc);
         return err;
@@ -248,15 +437,24 @@ pub fn failure_kind(status: std.http.Status) streams.FailureKind {
     return chat_completions.failure_kind(status);
 }
 
-pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress) !streams.Result {
+pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, replay_unsigned_thinking: bool, progress: ?sse.Progress) !streams.Result {
     var limits: reducer.Limits = .{};
     if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
-    return reducer.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress);
+    return reducer.consume_stream_with_replay(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress, replay_unsigned_thinking);
 }
 
 /// The chat review flow, sent through this transport.
 pub fn review(raw: ?*anyopaque, alloc: Allocator, input: classifier.ProviderInput, request: classifier.ReviewRequest) !classifier.ParseOutcome {
     return chat_completions.review_with(raw, alloc, input, request, .{ .build_fn = build, .stream_fn = stream });
+}
+
+test "Anthropic header overrides require OAuth and a non-official endpoint" {
+    const options: codec.Options = .{ .allow_anthropic_header_overrides = true };
+    try std.testing.expect(customHeaderAllowed("anthropic-beta", options, "https://proxy.example/v1", true));
+    try std.testing.expect(!customHeaderAllowed("anthropic-beta", options, "https://api.anthropic.com/v1", true));
+    try std.testing.expect(!customHeaderAllowed("anthropic-version", options, "https://proxy.example/v1", true));
+    try std.testing.expect(!customHeaderAllowed("anthropic-beta", options, "https://proxy.example/v1", false));
+    try std.testing.expect(customHeaderAllowed("x-model-header", .{}, "https://api.anthropic.com/v1", false));
 }
 
 test "signature rejection patterns match proto" {

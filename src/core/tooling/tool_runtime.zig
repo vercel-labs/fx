@@ -61,6 +61,8 @@ const web_search_contract = @import("web_search_contract.zig");
 const web_fetch_artifacts = @import("../session/web_fetch_artifacts.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
+const model_roles = @import("../config/model_roles.zig");
+const runtime_deps = @import("../agent/runtime/deps.zig");
 const provider_set = @import("../gateway/provider_set.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
@@ -140,6 +142,12 @@ pub const Context = struct {
     /// Resolved review-model override for automatic permission review. Empty
     /// keeps the reviewer provider's compiled default.
     reviewer_model: []const u8 = "",
+    reviewer_selection: ?model_roles.Selection = null,
+    /// Provider-qualified authorization for a reviewer on another provider.
+    reviewer_credential: ?types.CredentialLease = null,
+    reviewer_fallbacks: []const permission_auto_classifier.ProviderFallback = &.{},
+    reviewer_fallback_storage: [8]permission_auto_classifier.ProviderFallback = undefined,
+    reviewer_fallback_count: usize = 0,
     permission_review_turn: ?permission_auto_classifier.ReviewTurnContext = null,
     root_user_intent_context: []const u8 = "",
     root_user_messages: []const []const u8 = &.{},
@@ -235,6 +243,13 @@ pub const Context = struct {
     model_capability_resolver: ?model_capabilities.Resolver = null,
     model_override_resolver: ?subagent_tool_host.ModelOverrideResolver = null,
     model_role_resolver: ?subagent_tool_host.ModelRoleResolver = null,
+    /// Provider-qualified role dispatch callbacks inherited by fleet child
+    /// turns. They are kept beside the role resolver so an @role delegation
+    /// can retry through the same bindings as its parent rather than falling
+    /// back to a model string with the wrong provider credential.
+    model_binding_context: ?*anyopaque = null,
+    model_binder: ?*const fn (*anyopaque, Allocator, model_roles.Selection) anyerror!?runtime_deps.ModelBinding = null,
+    role_chain_resolver: ?*const fn (*anyopaque, model_roles.RoleId, []model_roles.Selection) usize = null,
     /// False when running outside an interactive TUI (e.g. ACP). Tools
     /// that require a live user (like `ask_user_question`) short-circuit
     /// in that case.
@@ -321,15 +336,27 @@ pub const Context = struct {
         if (self.auto_classifier.enabled()) return self.auto_classifier;
         const provider = self.permission_reviewer_provider orelse
             return permission_auto_classifier.Classifier.disabled();
+        const lease: types.CredentialLease = self.reviewer_credential orelse if (self.credential_source == .host_managed)
+            .host_managed
+        else
+            .{ .direct = .{
+                .secret_bytes = self.api_key,
+                .source = self.credential_source,
+                .account_id = self.account_id,
+                .tenant_context = self.gateway_team,
+            } };
         return permission_auto_classifier.Classifier.withProvider(provider, .{
-            .credential = self.api_key,
-            .credential_source = self.credential_source,
-            .account_id = self.account_id,
-            .tenant = self.gateway_team,
+            .credential = lease.secret() orelse "",
+            .credential_source = lease.credentialSource(),
+            .account_id = lease.accountId(),
+            .tenant = lease.tenant(),
             .endpoint = self.gateway_chat_url,
             .reviewer_model = self.reviewer_model,
+            .reviewer_selection = self.reviewer_selection,
+            .reviewer_provider = if (self.reviewer_selection) |selection| selection.provider else null,
+            .credential_lease = self.reviewer_credential,
             .cancel_flag = self.cancel_flag,
-        });
+        }, self.reviewer_fallbacks);
     }
 };
 
@@ -2247,6 +2274,9 @@ fn executeSubagentProvider(
             .provider = ctx.provider,
             .model = ctx.model,
             .effort = ctx.effort,
+            // Fleet workers inherit the worker role when no explicit model is
+            // requested; explicit model IDs clear this in effectiveDefaults.
+            .role = .{ .builtin = .worker },
             .fast_mode = ctx.fast_mode,
             .ultrafast_mode = ctx.ultrafast_mode,
             .conversation_language = ctx.session.languageSnapshot(),
@@ -2260,6 +2290,9 @@ fn executeSubagentProvider(
         .model_capability_resolver = ctx.model_capability_resolver,
         .model_override_resolver = ctx.model_override_resolver,
         .model_role_resolver = ctx.model_role_resolver,
+        .model_binding_context = ctx.model_binding_context,
+        .model_binder = ctx.model_binder,
+        .role_chain_resolver = ctx.role_chain_resolver,
     }) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         if (err == error.Cancelled) return error.Cancelled;

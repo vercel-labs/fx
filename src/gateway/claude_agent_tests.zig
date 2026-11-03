@@ -286,6 +286,23 @@ test "the claude command line runs one tool-less turn with the stub and the sess
     try std.testing.expect(std.mem.find(u8, first_joined, "--session-id " ++ ids.session) != null);
     try std.testing.expect(std.mem.find(u8, first_joined, "--mcp-config") == null);
     try std.testing.expect(std.mem.find(u8, first_joined, "--effort") == null);
+    const advanced = try agent.arguments(arena, .{
+        .exe = "/bin/claude",
+        .self = "/bin/proto-fx",
+        .scratch = "/tmp/s",
+        .session = ids.session,
+        .resume_session = false,
+        .tools = false,
+        .model = "m",
+        .effort = null,
+        .json_schema = "{\"type\":\"object\"}",
+        .task_budget = 4096,
+        .fallback_model = "claude-sonnet-5",
+    });
+    const advanced_joined = try std.mem.join(arena, " ", advanced);
+    try std.testing.expect(std.mem.find(u8, advanced_joined, "--json-schema {\"type\":\"object\"}") != null);
+    try std.testing.expect(std.mem.find(u8, advanced_joined, "--task-budget 4096") != null);
+    try std.testing.expect(std.mem.find(u8, advanced_joined, "--fallback-model claude-sonnet-5") != null);
     try std.testing.expectEqualStrings("-private-tmp-a-b", try agent.projectDirName(arena, "/private/tmp/a.b"));
     try std.testing.expectError(error.PathTooLong, agent.projectDirName(arena, &@as([201]u8, @splat('a'))));
 }

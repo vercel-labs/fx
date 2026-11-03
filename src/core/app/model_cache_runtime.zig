@@ -1,5 +1,8 @@
 const std = @import("std");
 const model_roles = @import("../config/model_roles.zig");
+const model_provider = @import("../config/model_provider.zig");
+const configured_provider = @import("../config/configured_provider.zig");
+const chat_completions = @import("../../gateway/chat_completions.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
@@ -10,6 +13,7 @@ const model_capabilities = @import("../config/model_capabilities.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const io_mod = @import("../shared/io.zig");
+const host_target = @import("../hosts/target.zig");
 const list_window = @import("../shared/list_window.zig");
 const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const types = @import("../shared/types.zig");
@@ -33,6 +37,8 @@ pub const LoadTrigger = enum {
     /// The model picker opened. Revalidates unless a fetch is in flight or
     /// one started less than `picker_revalidate_floor_ms` ago.
     picker_open,
+    /// Ignore freshness and retry backoff for an explicit user refresh.
+    force,
 };
 
 /// Reopening the picker within this window reuses the catalog it just fetched.
@@ -142,6 +148,231 @@ const OwnedCatalogAccess = struct {
                 if (access.account_id) |account| alloc.free(@constCast(account));
             },
         }
+        self.* = undefined;
+    }
+};
+
+/// A provider source and its credentials as seen by the registry. The
+/// credential is borrowed for the call and copied by `syncProviders`; the
+/// registry never keeps a caller-owned secret slice.
+/// Builds owned seed rows from declared provider metadata. The caller keeps
+/// the returned entries alive until `syncProviders` copies them, then releases
+/// them with `model_catalog.freeModelCatalog`.
+pub fn metadataSeed(
+    alloc: Allocator,
+    metadata_lists: []const []const configured_provider.ModelMetadata,
+    defaults: ?*const configured_provider.ModelMetadata,
+) !std.ArrayList(model_catalog.ModelCatalogEntry) {
+    var result: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+    errdefer model_catalog.freeModelCatalog(alloc, &result);
+    for (metadata_lists) |list| for (list) |base| {
+        if (findCatalogModel(result.items, base.id) != null) continue;
+        const merged = if (defaults) |value|
+            configured_provider.overlayMetadata(base, value.*)
+        else
+            base;
+        const entry = try model_catalog.cloneModelCatalogEntry(alloc, chat_completions.metadata_entry(merged));
+        result.append(alloc, entry) catch |err| {
+            model_catalog.freeModelCatalogEntry(alloc, entry);
+            return err;
+        };
+    };
+    return result;
+}
+
+pub const ProviderConfig = struct {
+    provider: model_provider.ProviderId,
+    catalog: ?model_catalog.Provider = null,
+    endpoint: []const u8 = "/v1/models",
+    access: credentials.CatalogAccess = .{ .public_only = .no_credential },
+    refresh_interval_ms: ?i64 = null,
+    /// A seed may still require one initial live discovery. Declared-only
+    /// providers leave this false and keep their seed as the catalog.
+    refresh_on_seed: bool = false,
+    from_profile_settings: bool = false,
+    /// Optional durable provider-keyed cache. Runtime owns the copied path,
+    /// reads it before the first network load, and atomically replaces it only
+    /// after a non-empty catalog is published.
+    cache_path: ?[]const u8 = null,
+    /// Native policy metadata borrowed from the host provider registry. The
+    /// registry outlives this Runtime; snapshots copy any strings they expose.
+    native_overrides: ?*const configured_provider.NativeOverrides = null,
+    /// Declared models are copied into the provider snapshot before a live
+    /// refresh. They remain visible when the live endpoint is unavailable.
+    seed: []const model_catalog.ModelCatalogEntry = &.{},
+};
+
+const PersistedCatalogEntry = struct {
+    id: []const u8,
+    name: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    cost: ?model_catalog.ModelCost = null,
+    intelligence: ?f64 = null,
+    recommended: bool = false,
+    beta: bool = false,
+    model_type: []const u8 = "language",
+    tokenizer: ?[]const u8 = null,
+    released: i64 = 0,
+    has_tool_use: bool = false,
+    has_reasoning: bool = false,
+    reasoning_efforts: []const []const u8 = &.{},
+    supports_fast_mode: bool = false,
+    supports_ultrafast_mode: bool = false,
+    has_vision: bool = false,
+    has_file_input: bool = false,
+    has_web_search: bool = false,
+    has_explicit_caching: bool = false,
+    has_implicit_caching: bool = false,
+    context_window: u32 = 0,
+    max_tokens: u32 = 0,
+    web_search_price: ?[]const u8 = null,
+};
+
+const PersistedCatalog = struct {
+    version: u32 = 1,
+    saved_at_ms: i64 = 0,
+    models: []const PersistedCatalogEntry = &.{},
+};
+
+const PersistedLoad = struct {
+    catalog: std.ArrayList(model_catalog.ModelCatalogEntry),
+    age_ms: i64,
+};
+
+pub const ProviderCacheStatus = enum {
+    idle,
+    loading,
+    ready,
+    failed,
+};
+
+/// A point-in-time status for one provider. All fields are values or static
+/// strings; callers may keep this after the cache lock is released.
+pub const ProviderSnapshot = struct {
+    provider: model_provider.NameKey,
+    status: ProviderCacheStatus,
+    /// True after F5 arrives during another fetch and before replay starts.
+    force_refresh_pending: bool = false,
+    entries: usize,
+    auth_available: bool,
+    access_level: ?model_catalog.AccessLevel,
+    credential_source: ?credentials.Source,
+    public_only_reason: ?credentials.CatalogPublicOnlyReason,
+    private_models_hidden: bool,
+    from_profile_settings: bool,
+    last_attempt_age_ms: ?i64,
+    last_success_age_ms: ?i64,
+    failure: ?model_catalog.Failure,
+};
+
+/// One catalog model projected for the model hub.
+pub const HubEntry = struct {
+    id: []const u8,
+    name: []const u8,
+    description: ?[]const u8 = null,
+    cost: ?model_catalog.ModelCost = null,
+    intelligence: ?f64 = null,
+    recommended: bool = false,
+    beta: bool = false,
+    released: i64 = 0,
+    context_window: ?u32,
+    max_tokens: ?u32 = null,
+    has_tool_use: bool = false,
+    has_reasoning: bool = false,
+    has_vision: bool = false,
+    has_file_input: bool = false,
+    efforts: []const types.ReasoningEffort,
+};
+
+/// A provider's owned model projection for the model hub. `models` is copied
+/// into the arena supplied to `snapshotForHubAll`.
+pub const ProviderHubSnapshot = struct {
+    provider: model_provider.NameKey,
+    models: ?[]HubEntry,
+    state: ProviderSnapshot,
+};
+
+const ProviderSlot = struct {
+    alloc: Allocator,
+    provider: model_provider.ProviderId,
+    source: ?model_catalog.Provider,
+    endpoint: []const u8,
+    access: OwnedCatalogAccess,
+    refresh_interval_ms: ?i64,
+    refresh_on_seed: bool,
+    from_profile_settings: bool,
+    cache_path: ?[]u8 = null,
+    native_overrides: ?*const configured_provider.NativeOverrides = null,
+    catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty,
+    mutex: std.Io.Mutex = .init,
+    thread: ?std.Thread = null,
+    state: ModelCacheState = .idle,
+    fetch_in_flight: bool = false,
+    /// A forced refresh received during an active fetch is replayed after the
+    /// current publication boundary, so F5 cannot lose a credential refresh.
+    pending_force_refresh: bool = false,
+    failure_streak: u32 = 0,
+    retry_not_before_ms: i64 = 0,
+    staged: ?model_catalog.FetchResult = null,
+    completion_pending: bool = false,
+    last_attempt_ms: i64 = 0,
+    last_success_ms: i64 = 0,
+    cancel_requested: std.atomic.Value(bool) = .init(false),
+    requested_access: ?model_catalog.AccessMetadata = null,
+    outcome: CatalogOutcome = .{},
+
+    fn init(alloc: Allocator, config: ProviderConfig) !ProviderSlot {
+        var source = config.catalog;
+        if (source) |*value| {
+            value.provider_id = config.provider;
+            if (config.refresh_interval_ms) |interval| value.refresh_interval_ms = interval;
+        }
+        var slot = ProviderSlot{
+            .alloc = alloc,
+            .provider = config.provider,
+            .source = source,
+            .endpoint = config.endpoint,
+            .access = undefined,
+            .refresh_interval_ms = config.refresh_interval_ms orelse if (source) |value| value.refresh_interval_ms else null,
+            .refresh_on_seed = config.refresh_on_seed or (if (source) |value| value.refresh_on_seed else false),
+            .from_profile_settings = config.from_profile_settings,
+            .cache_path = if (config.cache_path) |path| try alloc.dupe(u8, path) else null,
+            .native_overrides = config.native_overrides,
+        };
+        errdefer if (slot.cache_path) |path| alloc.free(path);
+        slot.access = try OwnedCatalogAccess.init(alloc, config.access);
+        errdefer slot.access.deinit(alloc);
+        if (config.seed.len > 0) {
+            slot.catalog = try cloneCatalog(alloc, config.seed);
+            slot.state = .ready;
+            slot.last_success_ms = model_catalog.clockMs();
+            slot.outcome.loaded = .{ .access = model_catalog.AccessMetadata.init(config.access) };
+            slot.requested_access = model_catalog.AccessMetadata.init(config.access);
+        }
+        if (slot.cache_path) |path| if (try loadPersistedCatalog(alloc, path)) |persisted| {
+            if (persisted.catalog.items.len > 0) {
+                model_catalog.freeModelCatalog(alloc, &slot.catalog);
+                slot.catalog = persisted.catalog;
+                slot.state = .ready;
+                slot.last_success_ms = persistedSuccessTimestamp(persisted.age_ms);
+                slot.outcome = .{ .loaded = .{ .access = model_catalog.AccessMetadata.init(config.access) } };
+                slot.requested_access = model_catalog.AccessMetadata.init(config.access);
+            } else {
+                var empty = persisted.catalog;
+                model_catalog.freeModelCatalog(alloc, &empty);
+            }
+        };
+        return slot;
+    }
+
+    fn deinit(self: *ProviderSlot) void {
+        slotCancelAndJoin(self);
+        self.mutex.lockUncancelable(io_mod.getIo());
+        slotDiscardStagedLocked(self);
+        model_catalog.freeModelCatalog(self.alloc, &self.catalog);
+        self.mutex.unlock(io_mod.getIo());
+        self.access.deinit(self.alloc);
+        if (self.cache_path) |path| self.alloc.free(path);
         self.* = undefined;
     }
 };
@@ -407,6 +638,18 @@ pub const Runtime = struct {
 
     alloc: Allocator,
     models_path: []const u8,
+    /// The active provider is kept in the legacy fields below so existing app
+    /// consumers can borrow menu rows without a provider switch. Every other
+    /// provider lives in `provider_slots`; together they are the one cache.
+    active_provider: ?model_provider.ProviderId = null,
+    active_catalog_provider: ?model_catalog.Provider = null,
+    active_endpoint: []const u8 = "/v1/models",
+    active_access: ?OwnedCatalogAccess = null,
+    active_refresh_interval_ms: ?i64 = null,
+    active_refresh_on_seed: bool = false,
+    active_cache_path: ?[]u8 = null,
+    active_native_overrides: ?*const configured_provider.NativeOverrides = null,
+    provider_slots: std.ArrayList(ProviderSlot) = .empty,
     catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty,
     mutex: std.Io.Mutex = .init,
     thread: ?std.Thread = null,
@@ -416,6 +659,9 @@ pub const Runtime = struct {
     /// A request waits up to `failed_catalog_retry_wait_ms` for a failed
     /// catalog's retry, and on nothing else but a first load.
     fetch_in_flight: bool = false,
+    /// A forced refresh received during an active fetch is replayed after the
+    /// current publication boundary, so F5 cannot lose a credential refresh.
+    pending_force_refresh: bool = false,
     /// Consecutive failed fetches. A success or reset clears it.
     failure_streak: u32 = 0,
     /// After a failure, no fetch starts before this time, whatever the trigger.
@@ -425,6 +671,7 @@ pub const Runtime = struct {
     staged: ?model_catalog.FetchResult = null,
     completion_pending: bool = false,
     last_attempt_ms: i64 = 0,
+    last_success_ms: i64 = 0,
     cancel_requested: std.atomic.Value(bool) = .init(false),
     requested_access: ?model_catalog.AccessMetadata = null,
     outcome: CatalogOutcome = .{},
@@ -443,15 +690,322 @@ pub const Runtime = struct {
         self.discardStagedLocked();
         self.menu.deinit(self.alloc);
         model_catalog.freeModelCatalog(self.alloc, &self.catalog);
+        if (self.active_access) |*access| access.deinit(self.alloc);
+        if (self.active_cache_path) |path| self.alloc.free(path);
+        for (self.provider_slots.items) |*slot| slot.deinit();
+        self.provider_slots.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    /// Reconciles all known provider sources and credentials. Existing
+    /// snapshots are retained when their provider identity remains present;
+    /// an auth change resets only that provider and keeps a public snapshot.
+    pub fn syncProviders(
+        self: *Self,
+        configs: []const ProviderConfig,
+        active_provider: model_provider.ProviderId,
+    ) !void {
+        const active_config = for (configs) |config| {
+            if (config.provider.eql(active_provider)) break config;
+        } else return error.UnknownProvider;
+
+        const active_changed = if (self.active_provider) |current| !current.eql(active_config.provider) else false;
+        const active_source_changed = if (self.active_catalog_provider) |source|
+            !sameCatalogProvider(source, active_config.catalog)
+        else
+            active_config.catalog != null;
+        const active_access_changed = if (self.active_access) |owned|
+            !catalogAccessEqual(owned.access, active_config.access)
+        else
+            true;
+        const active_cache_changed = !optionalPathEqual(self.active_cache_path, active_config.cache_path);
+        if (active_changed) self.resetForProviderChange();
+        if (!active_changed and (active_source_changed or active_access_changed or active_cache_changed)) self.reset();
+        self.active_provider = active_config.provider;
+        self.active_catalog_provider = active_config.catalog;
+        self.active_endpoint = active_config.endpoint;
+        self.active_refresh_interval_ms = active_config.refresh_interval_ms orelse if (active_config.catalog) |source| source.refresh_interval_ms else null;
+        self.active_refresh_on_seed = active_config.refresh_on_seed or (if (active_config.catalog) |source| source.refresh_on_seed else false);
+        self.from_profile_settings = active_config.from_profile_settings;
+        self.active_native_overrides = active_config.native_overrides;
+        if (active_access_changed or self.active_access == null) _ = try self.rememberActiveAccess(active_config.access);
+        if (active_cache_changed or self.active_cache_path == null) try self.rememberActiveCachePath(active_config.cache_path);
+        if (self.state == .idle and active_config.seed.len > 0) {
+            model_catalog.freeModelCatalog(self.alloc, &self.catalog);
+            self.catalog = try cloneCatalog(self.alloc, active_config.seed);
+            self.outcome = .{ .loaded = .{ .access = model_catalog.AccessMetadata.init(active_config.access) } };
+            self.requested_access = model_catalog.AccessMetadata.init(active_config.access);
+            self.last_success_ms = model_catalog.clockMs();
+            self.state = .ready;
+        }
+        if (active_changed or active_source_changed or active_cache_changed) {
+            if (self.active_cache_path != null) {
+                try self.loadActivePersistedCatalog(active_config.access);
+            }
+        }
+
+        var index: usize = 0;
+        while (index < self.provider_slots.items.len) {
+            const slot = &self.provider_slots.items[index];
+            var wanted: ?ProviderConfig = null;
+            for (configs) |config| {
+                if (!config.provider.eql(active_config.provider) and config.provider.eql(slot.provider)) {
+                    wanted = config;
+                    break;
+                }
+            }
+            if (wanted == null) {
+                slot.deinit();
+                _ = self.provider_slots.swapRemove(index);
+                continue;
+            }
+            try slotReconfigure(slot, wanted.?);
+            index += 1;
+        }
+        for (configs) |config| {
+            if (config.provider.eql(active_config.provider)) continue;
+            if (findProviderSlot(self.provider_slots.items, config.provider) != null) continue;
+            try self.provider_slots.append(self.alloc, try ProviderSlot.init(self.alloc, config));
+        }
+    }
+
+    /// Starts one background fetch per configured provider. A provider with a
+    /// declared seed still refreshes independently in the background.
+    pub fn warmupAll(self: *Self, trigger: LoadTrigger) void {
+        if (self.active_catalog_provider) |provider| {
+            const access: credentials.CatalogAccess = if (self.active_access) |owned| owned.access else .{ .public_only = .no_credential };
+            self.startWarmup(provider, access, trigger);
+        }
+        for (self.provider_slots.items) |*slot| slotStartWarmup(slot, trigger);
+    }
+
+    /// Refreshes only `provider`; no active-provider mutation is performed.
+    pub fn refresh(self: *Self, provider: model_provider.ProviderId, trigger: LoadTrigger) bool {
+        if (self.active_provider) |active| if (active.eql(provider)) {
+            const source = self.active_catalog_provider orelse return false;
+            if (trigger == .force) {
+                self.finishThreadIfDone();
+                self.mutex.lockUncancelable(io_mod.getIo());
+                const busy = self.fetch_in_flight or self.thread != null or self.staged != null;
+                if (busy) self.pending_force_refresh = true;
+                self.mutex.unlock(io_mod.getIo());
+                if (busy) return true;
+            }
+            const access: credentials.CatalogAccess = if (self.active_access) |owned| owned.access else .{ .public_only = .no_credential };
+            self.startWarmup(source, access, trigger);
+            return true;
+        };
+        const slot = findProviderSlot(self.provider_slots.items, provider) orelse return false;
+        if (trigger == .force) {
+            slotFinishThreadIfDone(slot);
+            slot.mutex.lockUncancelable(io_mod.getIo());
+            const busy = slot.fetch_in_flight or slot.thread != null or slot.staged != null;
+            if (busy) slot.pending_force_refresh = true;
+            slot.mutex.unlock(io_mod.getIo());
+            if (busy) return true;
+        }
+        slotStartWarmup(slot, trigger);
+        return true;
+    }
+
+    /// Crosses every provider's publication boundary. The active menu is
+    /// refreshed by `pollLoadTransition`; non-active snapshots are adopted in
+    /// place and become visible to hub/role lookups on the next call.
+    pub fn pollLoadTransitions(self: *Self) !bool {
+        var changed = try self.pollLoadTransition();
+        for (self.provider_slots.items) |*slot| changed = slotPoll(slot) or changed;
+        return changed;
+    }
+
+    pub fn providerSnapshot(self: *Self, provider: model_provider.ProviderId) ProviderSnapshot {
+        if (self.active_provider) |active| if (active.eql(provider)) return self.activeSnapshot();
+        const slot = findProviderSlot(self.provider_slots.items, provider) orelse return .{
+            .provider = model_provider.NameKey.fromProvider(provider),
+            .status = .idle,
+            .entries = 0,
+            .auth_available = false,
+            .access_level = null,
+            .credential_source = null,
+            .public_only_reason = null,
+            .private_models_hidden = false,
+            .from_profile_settings = false,
+            .last_attempt_age_ms = null,
+            .last_success_age_ms = null,
+            .failure = null,
+        };
+        slotFinishThreadIfDone(slot);
+        return snapshotForSlot(slot);
+    }
+
+    /// Returns independent status snapshots for the active provider and every
+    /// configured provider. The returned array is owned by `arena`.
+    pub fn providerSnapshots(self: *Self, arena: Allocator) ![]ProviderSnapshot {
+        self.finishThreadIfDone();
+        var result = try arena.alloc(ProviderSnapshot, self.provider_slots.items.len + @intFromBool(self.active_provider != null));
+        var count: usize = 0;
+        if (self.active_provider != null) {
+            result[count] = self.activeSnapshot();
+            count += 1;
+        }
+        for (self.provider_slots.items) |*slot| {
+            slotFinishThreadIfDone(slot);
+            result[count] = snapshotForSlot(slot);
+            count += 1;
+        }
+        return result[0..count];
+    }
+
+    /// Copies every ready catalog into `arena`, retaining status for providers
+    /// that are still loading or failed.
+    pub fn snapshotForHubAll(self: *Self, arena: Allocator) ![]ProviderHubSnapshot {
+        const states = try self.providerSnapshots(arena);
+        const result = try arena.alloc(ProviderHubSnapshot, states.len);
+        var index: usize = 0;
+        if (self.active_provider != null) {
+            result[index] = .{ .provider = states[index].provider, .models = try self.snapshotForHub(arena), .state = states[index] };
+            index += 1;
+        }
+        for (self.provider_slots.items) |*slot| {
+            const state = states[index];
+            slot.mutex.lockUncancelable(io_mod.getIo());
+            const models = if (slot.state == .ready) hubEntriesForCatalogWithNative(
+                arena,
+                slot.catalog.items,
+                slot.native_overrides,
+            ) catch |err| {
+                slot.mutex.unlock(io_mod.getIo());
+                return err;
+            } else null;
+            slot.mutex.unlock(io_mod.getIo());
+            result[index] = .{ .provider = state.provider, .models = models, .state = state };
+            index += 1;
+        }
+        return result;
+    }
+
+    /// Returns an ownership-safe copy of one provider's ready catalog.
+    ///
+    /// The returned list and every entry it contains belong to `alloc`; callers
+    /// must release it with `model_catalog.freeModelCatalog`. Unknown,
+    /// loading, and failed providers return null rather than exposing a
+    /// borrowed catalog or creating a second cache.
+    pub fn snapshotCatalogFor(
+        self: *Self,
+        provider: model_provider.ProviderId,
+        alloc: Allocator,
+    ) !?std.ArrayList(model_catalog.ModelCatalogEntry) {
+        if (self.active_provider) |active| if (active.eql(provider)) {
+            self.finishThreadIfDone();
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            if (self.state != .ready) return null;
+            return try cloneCatalogWithNative(alloc, self.catalog.items, self.active_native_overrides);
+        };
+        const slot = findProviderSlot(self.provider_slots.items, provider) orelse return null;
+        slotFinishThreadIfDone(slot);
+        slot.mutex.lockUncancelable(io_mod.getIo());
+        defer slot.mutex.unlock(io_mod.getIo());
+        if (slot.state != .ready) return null;
+        return try cloneCatalogWithNative(alloc, slot.catalog.items, slot.native_overrides);
+    }
+
+    /// Provider-aware availability for role resolution. An unknown or
+    /// currently loading catalog deliberately returns true so a configured
+    /// fallback is not rejected before discovery settles.
+    pub fn knowsModelFor(self: *Self, provider: model_provider.ProviderId, model: []const u8) bool {
+        if (self.active_provider) |active| if (active.eql(provider)) {
+            if (nativeDeclaredModel(self.active_native_overrides, model)) return true;
+            return self.knowsModel(model);
+        };
+        const slot = findProviderSlot(self.provider_slots.items, provider) orelse return true;
+        slot.mutex.lockUncancelable(io_mod.getIo());
+        defer slot.mutex.unlock(io_mod.getIo());
+        if (nativeDeclaredModel(slot.native_overrides, model)) return true;
+        if (slot.state != .ready or slot.catalog.items.len == 0) return true;
+        return findCatalogModel(slot.catalog.items, model) != null;
+    }
+
+    pub fn metadataForModelFor(self: *Self, provider: model_provider.ProviderId, model: []const u8) ?model_capabilities.GatewayMetadata {
+        if (self.active_provider) |active| if (active.eql(provider)) return self.metadataForModel(model);
+        const slot = findProviderSlot(self.provider_slots.items, provider) orelse return null;
+        slot.mutex.lockUncancelable(io_mod.getIo());
+        defer slot.mutex.unlock(io_mod.getIo());
+        const entry = if (slot.state == .ready) findCatalogModel(slot.catalog.items, model) else null;
+        const base = if (entry) |found| model_catalog_metadata.fromCatalogEntry(found.*) else null;
+        return overlayNativeGatewayMetadata(base, nativeMetadataFor(slot.native_overrides, model));
+    }
+
+    pub fn resolveForRequestFor(
+        self: *Self,
+        provider: model_provider.ProviderId,
+        model: []const u8,
+        cancel_flag: *std.atomic.Value(bool),
+    ) model_capabilities.ResolveError!model_capabilities.Capabilities {
+        if (self.active_provider) |active| if (active.eql(provider)) return self.resolveForRequest(model, cancel_flag);
+        const slot = findProviderSlot(self.provider_slots.items, provider) orelse return model_capabilities.capabilitiesForModel(model);
+        slotFinishThreadIfDone(slot);
+        slot.mutex.lockUncancelable(io_mod.getIo());
+        defer slot.mutex.unlock(io_mod.getIo());
+        const entry = if (slot.state == .ready) findCatalogModel(slot.catalog.items, model) else null;
+        const base = if (entry) |found| model_catalog_metadata.fromCatalogEntry(found.*) else null;
+        return model_capabilities.resolveCapabilities(model, overlayNativeGatewayMetadata(base, nativeMetadataFor(slot.native_overrides, model)));
+    }
+
+    fn activeSnapshot(self: *Self) ProviderSnapshot {
+        self.finishThreadIfDone();
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return snapshotForActiveLocked(self);
+    }
+
+    fn rememberActiveAccess(self: *Self, access: credentials.CatalogAccess) !credentials.CatalogAccess {
+        const owned = try OwnedCatalogAccess.init(self.alloc, access);
+        if (self.active_access) |*previous| previous.deinit(self.alloc);
+        self.active_access = owned;
+        return owned.access;
+    }
+
+    fn rememberActiveCachePath(self: *Self, path: ?[]const u8) !void {
+        const replacement = if (path) |value| try self.alloc.dupe(u8, value) else null;
+        if (self.active_cache_path) |previous| self.alloc.free(previous);
+        self.active_cache_path = replacement;
+    }
+
+    fn loadActivePersistedCatalog(self: *Self, access: credentials.CatalogAccess) !void {
+        const path = self.active_cache_path orelse return;
+        const persisted = (try loadPersistedCatalog(self.alloc, path)) orelse return;
+        if (persisted.catalog.items.len == 0) {
+            var empty = persisted.catalog;
+            model_catalog.freeModelCatalog(self.alloc, &empty);
+            return;
+        }
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        model_catalog.freeModelCatalog(self.alloc, &self.catalog);
+        self.catalog = persisted.catalog;
+        self.outcome = .{ .loaded = .{ .access = model_catalog.AccessMetadata.init(access) } };
+        self.requested_access = model_catalog.AccessMetadata.init(access);
+        self.last_success_ms = persistedSuccessTimestamp(persisted.age_ms);
+        self.state = .ready;
+        self.completion_pending = true;
     }
 
     pub fn startWarmup(
         self: *Self,
         provider: model_catalog.Provider,
-        access: credentials.CatalogAccess,
+        requested_access: credentials.CatalogAccess,
         trigger: LoadTrigger,
     ) void {
+        self.active_provider = provider.provider_id;
+        self.active_catalog_provider = provider;
+        self.active_refresh_interval_ms = provider.refresh_interval_ms;
         self.from_profile_settings = provider.provider_id == .configured;
+        // Refresh callers may borrow active_access, which this replacement frees.
+        const access = self.rememberActiveAccess(requested_access) catch return;
+        if (comptime host_target.is_wasm) {
+            self.loadCooperativeWithTrigger(provider, access, trigger);
+            return;
+        }
         if (!self.beginLoad(access, provider.refresh_interval_ms, trigger)) return;
 
         const owned_access = OwnedCatalogAccess.init(self.alloc, access) catch {
@@ -485,15 +1039,41 @@ pub const Runtime = struct {
         provider: model_catalog.Provider,
         access: credentials.CatalogAccess,
     ) void {
+        self.loadCooperativeWithTrigger(provider, access, .activity);
+    }
+
+    fn loadCooperativeWithTrigger(
+        self: *Self,
+        provider: model_catalog.Provider,
+        access: credentials.CatalogAccess,
+        trigger: LoadTrigger,
+    ) void {
         self.from_profile_settings = provider.provider_id == .configured;
-        if (!self.beginLoad(access, provider.refresh_interval_ms, .activity)) return;
+        if (!self.beginLoad(access, provider.refresh_interval_ms, trigger)) return;
 
         self.completeFetch(model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
             .access = access,
-            .endpoint = self.models_path,
+            .endpoint = self.active_endpoint,
             .cancel_flag = &self.cancel_requested,
             .view = .picker,
         }));
+    }
+
+    /// Loads one configured provider inline without replacing the active
+    /// provider. This is used by one-shot hosts that need a complete
+    /// provider-aware snapshot without starting background cache threads.
+    pub fn loadCooperativeFor(self: *Self, provider: model_provider.ProviderId, trigger: LoadTrigger) void {
+        if (self.active_provider) |active| if (active.eql(provider)) {
+            const source = self.active_catalog_provider orelse return;
+            const access: credentials.CatalogAccess = if (self.active_access) |owned|
+                owned.access
+            else
+                .{ .public_only = .no_credential };
+            self.loadCooperativeWithTrigger(source, access, trigger);
+            return;
+        };
+        const slot = findProviderSlot(self.provider_slots.items, provider) orelse return;
+        slotLoadCooperative(slot, trigger);
     }
 
     fn beginLoad(
@@ -543,13 +1123,13 @@ pub const Runtime = struct {
         const picker_due = trigger == .picker_open and elapsed >= picker_revalidate_floor_ms;
         // A retained catalog whose refresh failed retries once its backoff ends.
         const retry_due = if (self.outcome.last_failure) |failed| failed.failure.retryable else false;
-        const backoff_over = now < self.last_attempt_ms or now >= self.retry_not_before_ms;
+        const backoff_over = trigger == .force or now < self.last_attempt_ms or now >= self.retry_not_before_ms;
         // A staged revalidation is newer than anything a fetch would start now.
         // A fetch that finished after the join above still holds its thread;
         // the next trigger joins it before starting another.
         const should_load = !self.fetch_in_flight and self.staged == null and self.thread == null and backoff_over and switch (self.state) {
             .idle, .failed => true,
-            .ready => expired or picker_due or retry_due,
+            .ready => trigger == .force or (self.active_refresh_on_seed and self.last_attempt_ms == 0) or expired or picker_due or retry_due,
             .loading => false,
         };
         if (!should_load) {
@@ -592,6 +1172,7 @@ pub const Runtime = struct {
             self.outcome = .{};
         }
         self.state = .idle;
+        self.pending_force_refresh = false;
         self.completion_pending = false;
         self.last_attempt_ms = 0;
         // A new credential or provider deserves an immediate load.
@@ -636,11 +1217,13 @@ pub const Runtime = struct {
         self.state = .ready;
         self.completion_pending = true;
         self.last_attempt_ms = model_catalog.clockMs();
+        self.last_success_ms = self.last_attempt_ms;
         self.failure_streak = 0;
         self.retry_not_before_ms = 0;
         self.requested_access = model_catalog.AccessMetadata.init(access);
         self.cancel_requested.store(false, .seq_cst);
         const entries = self.catalog.items.len;
+        persistCatalog(self.active_cache_path, self.alloc, self.catalog.items);
         diagnostics.recordModelCatalogEvent(false, .load, "outcome=adopted entries={d}", .{entries});
     }
 
@@ -675,16 +1258,27 @@ pub const Runtime = struct {
     /// refreshes an open menu. Call it where no borrowed catalog id is held.
     pub fn pollLoadTransition(self: *Self) !bool {
         self.finishThreadIfDone();
-        self.mutex.lockUncancelable(io_mod.getIo());
-        defer self.mutex.unlock(io_mod.getIo());
-        if (self.staged) |staged| {
-            self.staged = null;
-            self.applyFetchLocked(staged).record();
-        }
-        if (!self.completion_pending) return false;
+        var replay_force = false;
+        {
+            self.mutex.lockUncancelable(io_mod.getIo());
+            defer self.mutex.unlock(io_mod.getIo());
+            if (self.staged) |staged| {
+                self.staged = null;
+                self.applyFetchLocked(staged).record();
+            }
+            if (!self.completion_pending) return false;
 
-        if (self.menu.active) try self.refreshMenuLocked(&self.menu);
-        self.completion_pending = false;
+            if (self.menu.active) try self.refreshMenuLocked(&self.menu);
+            self.completion_pending = false;
+            replay_force = self.pending_force_refresh;
+            self.pending_force_refresh = false;
+        }
+        if (replay_force) {
+            if (self.active_catalog_provider) |source| {
+                const access: credentials.CatalogAccess = if (self.active_access) |owned| owned.access else .{ .public_only = .no_credential };
+                self.startWarmup(source, access, .force);
+            }
+        }
         return true;
     }
 
@@ -704,14 +1298,6 @@ pub const Runtime = struct {
         return try model_catalog.projectModelIds(alloc, self.catalog.items);
     }
 
-    /// One catalog model for the model hub (D221).
-    pub const HubEntry = struct {
-        id: []const u8,
-        name: []const u8,
-        context_window: ?u32,
-        efforts: []const types.ReasoningEffort,
-    };
-
     /// The ready catalog copied into `arena`, or null while it loads or
     /// after it failed.
     pub fn snapshotForHub(self: *Self, arena: Allocator) !?[]HubEntry {
@@ -719,14 +1305,7 @@ pub const Runtime = struct {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
         if (self.state != .ready) return null;
-        const entries = try arena.alloc(HubEntry, self.catalog.items.len);
-        for (self.catalog.items, entries) |entry, *out| out.* = .{
-            .id = try arena.dupe(u8, entry.id),
-            .name = try arena.dupe(u8, entry.name orelse ""),
-            .context_window = if (entry.context_window > 0) entry.context_window else null,
-            .efforts = try arena.dupe(types.ReasoningEffort, entry.reasoning_efforts.items),
-        };
-        return entries;
+        return try hubEntriesForCatalogWithNative(arena, self.catalog.items, self.active_native_overrides);
     }
 
     /// Whether the ready catalog lists `model`; true while no catalog is
@@ -744,10 +1323,9 @@ pub const Runtime = struct {
         self.finishThreadIfDone();
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        if (self.state != .ready) return null;
-
-        const entry = findCatalogModel(self.catalog.items, model) orelse return null;
-        return model_catalog_metadata.fromCatalogEntry(entry.*);
+        const entry = if (self.state == .ready) findCatalogModel(self.catalog.items, model) else null;
+        const base = if (entry) |found| model_catalog_metadata.fromCatalogEntry(found.*) else null;
+        return overlayNativeGatewayMetadata(base, nativeMetadataFor(self.active_native_overrides, model));
     }
 
     pub const TraceSnapshot = struct {
@@ -888,7 +1466,7 @@ pub const Runtime = struct {
 
         self.completeFetch(model_catalog.fetchWithPublicFallback(provider, self.alloc, .{
             .access = access.access,
-            .endpoint = self.models_path,
+            .endpoint = self.active_endpoint,
             .cancel_flag = &self.cancel_requested,
             .view = .picker,
         }));
@@ -941,7 +1519,8 @@ pub const Runtime = struct {
             },
             .loaded => |loaded| {
                 var catalog = loaded.catalog;
-                const reuse_previous = catalog.items.len == 0 and self.outcome.loaded != null and self.catalog.items.len > 0;
+                const has_catalog = catalog.items.len > 0;
+                const reuse_previous = !has_catalog and self.outcome.loaded != null and self.catalog.items.len > 0;
                 if (reuse_previous) {
                     model_catalog.freeModelCatalog(self.alloc, &catalog);
                     self.outcome.last_failure = if (loaded.provenance.fallback_failure) |failure| .{
@@ -954,7 +1533,9 @@ pub const Runtime = struct {
                     self.catalog = catalog;
                     self.outcome = .{ .loaded = loaded.provenance };
                 }
+                self.last_success_ms = model_catalog.clockMs();
                 self.state = .ready;
+                if (has_catalog) persistCatalog(self.active_cache_path, self.alloc, self.catalog.items);
                 return .{ .ready = .{
                     .entries = self.catalog.items.len,
                     .reused_previous = reuse_previous,
@@ -1019,6 +1600,745 @@ pub const Runtime = struct {
         menu.catalog_state = modelMenuCatalogState(self.outcome, self.from_profile_settings);
     }
 };
+
+fn cloneCatalogEntry(alloc: Allocator, entry: model_catalog.ModelCatalogEntry) !model_catalog.ModelCatalogEntry {
+    return model_catalog.cloneModelCatalogEntry(alloc, entry);
+}
+
+fn nativeDeclaredModel(
+    overrides: ?*const configured_provider.NativeOverrides,
+    model: []const u8,
+) bool {
+    const native = overrides orelse return false;
+    for (native.model_metadata) |metadata| {
+        if (std.mem.eql(u8, metadata.id, model)) return true;
+    }
+    return false;
+}
+
+fn nativeMetadataFor(
+    overrides: ?*const configured_provider.NativeOverrides,
+    model: []const u8,
+) ?*const configured_provider.ModelMetadata {
+    const native = overrides orelse return null;
+    return native.model(model);
+}
+
+fn overlayNativeGatewayMetadata(
+    base: ?model_capabilities.GatewayMetadata,
+    native: ?*const configured_provider.ModelMetadata,
+) ?model_capabilities.GatewayMetadata {
+    var result: model_capabilities.GatewayMetadata = base orelse .{};
+    const metadata = native orelse return if (base != null) result else null;
+    if (metadata.tokenizer != null or nativeFieldSet(metadata.*, "tokenizer")) {
+        result.tokenizer = if (metadata.tokenizer) |name|
+            @import("../tokenizer/tokenizer.zig").Encoding.parse(name)
+        else
+            null;
+    }
+    if (metadata.context_window != null or nativeFieldSet(metadata.*, "context_window")) result.context_window = metadata.context_window;
+    if (metadata.max_output_tokens != null or nativeFieldSet(metadata.*, "max_output_tokens")) result.max_output_tokens = metadata.max_output_tokens;
+    if (metadata.max_context_window != null or nativeFieldSet(metadata.*, "max_context_window")) result.max_context_window = metadata.max_context_window;
+    if (metadata.omit_max_output_tokens or nativeFieldSet(metadata.*, "omit_max_output_tokens")) result.omit_max_output_tokens = metadata.omit_max_output_tokens;
+    if (metadata.prefer_websockets != null or nativeFieldSet(metadata.*, "prefer_websockets")) result.prefer_websockets = metadata.prefer_websockets;
+    if (metadata.supports_tool_use != null or nativeFieldSet(metadata.*, "supports_tool_use")) result.supports_tool_use = metadata.supports_tool_use orelse false;
+    if (metadata.supports_vision != null or nativeFieldSet(metadata.*, "supports_vision")) result.supports_vision = metadata.supports_vision orelse false;
+    if (metadata.reasoning_efforts.len > 0 or nativeFieldSet(metadata.*, "reasoning_efforts")) {
+        result.reasoning_efforts = .fromSlice(metadata.reasoning_efforts);
+        result.supports_reasoning = metadata.reasoning_efforts.len > 0;
+    }
+    return result;
+}
+
+fn nativeFieldSet(metadata: configured_provider.ModelMetadata, field: []const u8) bool {
+    for (metadata.fields) |name| if (std.mem.eql(u8, name, field)) return true;
+    return false;
+}
+
+fn replaceOwnedOptionalCatalogText(
+    alloc: Allocator,
+    destination: *?[]u8,
+    source: ?[]const u8,
+) !void {
+    if (source) |value| return replaceOwnedCatalogText(alloc, destination, value);
+    if (destination.*) |previous| alloc.free(previous);
+    destination.* = null;
+}
+
+fn replaceOwnedCatalogText(
+    alloc: Allocator,
+    destination: *?[]u8,
+    source: []const u8,
+) !void {
+    const replacement = try alloc.dupe(u8, source);
+    if (destination.*) |previous| alloc.free(previous);
+    destination.* = replacement;
+}
+
+fn overlayNativeMetadata(
+    alloc: Allocator,
+    entry: *model_catalog.ModelCatalogEntry,
+    metadata: configured_provider.ModelMetadata,
+) !void {
+    if (metadata.name != null or nativeFieldSet(metadata, "name")) {
+        try replaceOwnedOptionalCatalogText(alloc, &entry.name, metadata.name);
+    }
+    if (metadata.description != null or nativeFieldSet(metadata, "description")) {
+        try replaceOwnedOptionalCatalogText(alloc, &entry.description, metadata.description);
+    }
+    if (metadata.cost != null or nativeFieldSet(metadata, "cost")) entry.cost = metadata.cost;
+    if (metadata.intelligence != null or nativeFieldSet(metadata, "intelligence")) entry.intelligence = metadata.intelligence;
+    if (metadata.recommended or nativeFieldSet(metadata, "recommended")) entry.recommended = metadata.recommended;
+    if (metadata.beta or nativeFieldSet(metadata, "beta")) entry.beta = metadata.beta;
+    if (metadata.released != 0 or nativeFieldSet(metadata, "released")) entry.released = metadata.released;
+    if (metadata.tokenizer != null or nativeFieldSet(metadata, "tokenizer")) {
+        entry.tokenizer = if (metadata.tokenizer) |name|
+            @import("../tokenizer/tokenizer.zig").Encoding.parse(name)
+        else
+            null;
+    }
+    if (metadata.context_window != null or nativeFieldSet(metadata, "context_window")) {
+        entry.context_window = metadata.context_window orelse 0;
+    }
+    if (metadata.max_output_tokens != null or nativeFieldSet(metadata, "max_output_tokens")) {
+        entry.max_tokens = metadata.max_output_tokens orelse 0;
+    }
+    if (metadata.max_context_window != null or nativeFieldSet(metadata, "max_context_window")) {
+        entry.max_context_window = metadata.max_context_window;
+    }
+    if (metadata.omit_max_output_tokens or nativeFieldSet(metadata, "omit_max_output_tokens")) {
+        entry.omit_max_output_tokens = metadata.omit_max_output_tokens;
+    }
+    if (metadata.prefer_websockets != null or nativeFieldSet(metadata, "prefer_websockets")) {
+        entry.prefer_websockets = metadata.prefer_websockets;
+    }
+    if (metadata.supports_tool_use != null or nativeFieldSet(metadata, "supports_tool_use")) {
+        entry.has_tool_use = metadata.supports_tool_use orelse false;
+    }
+    if (metadata.supports_vision != null or nativeFieldSet(metadata, "supports_vision")) {
+        entry.has_vision = metadata.supports_vision orelse false;
+        entry.has_file_input = entry.has_vision;
+    }
+    if (metadata.reasoning_efforts.len > 0 or nativeFieldSet(metadata, "reasoning_efforts")) {
+        var replacement: std.ArrayList(types.ReasoningEffort) = .empty;
+        errdefer replacement.deinit(alloc);
+        try replacement.appendSlice(alloc, metadata.reasoning_efforts);
+        entry.reasoning_efforts.deinit(alloc);
+        entry.reasoning_efforts = replacement;
+        entry.has_reasoning = metadata.reasoning_efforts.len > 0;
+    }
+}
+
+fn nativeCatalogEntry(
+    alloc: Allocator,
+    metadata: configured_provider.ModelMetadata,
+) !model_catalog.ModelCatalogEntry {
+    var entry = model_catalog.ModelCatalogEntry{
+        .id = try alloc.dupe(u8, metadata.id),
+        .model_type = try alloc.dupe(u8, "language"),
+    };
+    errdefer model_catalog.freeModelCatalogEntry(alloc, entry);
+    try overlayNativeMetadata(alloc, &entry, metadata);
+    return entry;
+}
+
+fn cloneCatalogWithNative(
+    alloc: Allocator,
+    source: []const model_catalog.ModelCatalogEntry,
+    overrides: ?*const configured_provider.NativeOverrides,
+) !std.ArrayList(model_catalog.ModelCatalogEntry) {
+    var result = try cloneCatalog(alloc, source);
+    errdefer model_catalog.freeModelCatalog(alloc, &result);
+    const native = overrides orelse return result;
+    for (result.items) |*entry| {
+        if (nativeMetadataFor(native, entry.id)) |metadata| try overlayNativeMetadata(alloc, entry, metadata.*);
+    }
+    for (native.model_metadata) |metadata| {
+        if (metadata.id.len == 0 or findCatalogModel(result.items, metadata.id) != null) continue;
+        const entry = try nativeCatalogEntry(alloc, metadata);
+        result.append(alloc, entry) catch |err| {
+            model_catalog.freeModelCatalogEntry(alloc, entry);
+            return err;
+        };
+    }
+    return result;
+}
+
+fn cloneCatalog(alloc: Allocator, source: []const model_catalog.ModelCatalogEntry) !std.ArrayList(model_catalog.ModelCatalogEntry) {
+    var result: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+    errdefer model_catalog.freeModelCatalog(alloc, &result);
+    try result.ensureTotalCapacity(alloc, source.len);
+    for (source) |entry| {
+        const cloned = try cloneCatalogEntry(alloc, entry);
+        result.append(alloc, cloned) catch |err| {
+            model_catalog.freeModelCatalogEntry(alloc, cloned);
+            return err;
+        };
+    }
+    return result;
+}
+
+const persisted_catalog_max_bytes = 16 * 1024 * 1024;
+const persisted_catalog_max_models = 2048;
+const persisted_catalog_max_model_bytes = 1024;
+
+fn persistedSuccessTimestamp(age_ms: i64) i64 {
+    const now = model_catalog.clockMs();
+    const age = @max(age_ms, 0);
+    return now - @min(age, now);
+}
+
+fn loadPersistedCatalog(alloc: Allocator, path: []const u8) !?PersistedLoad {
+    var file = io_mod.openExistingRegularFile(std.Io.Dir.cwd(), path, .read_only) catch return null;
+    defer file.close(io_mod.getIo());
+    const stat = file.stat(io_mod.getIo()) catch return null;
+    if (stat.kind != .file or stat.nlink != 1 or stat.size > persisted_catalog_max_bytes) return null;
+    const bytes = io_mod.readFileToEnd(alloc, &file, persisted_catalog_max_bytes) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return null;
+    };
+    defer alloc.free(bytes);
+
+    const parsed = std.json.parseFromSlice(PersistedCatalog, alloc, bytes, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return null;
+    };
+    defer parsed.deinit();
+    if (parsed.value.version != 1 or parsed.value.models.len > persisted_catalog_max_models) return null;
+
+    var catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+    errdefer model_catalog.freeModelCatalog(alloc, &catalog);
+    try catalog.ensureTotalCapacity(alloc, parsed.value.models.len);
+    for (parsed.value.models) |raw| {
+        if (raw.id.len == 0 or raw.id.len > persisted_catalog_max_model_bytes) continue;
+        const entry = try persistedCatalogEntry(alloc, raw);
+        catalog.append(alloc, entry) catch |err| {
+            model_catalog.freeModelCatalogEntry(alloc, entry);
+            return err;
+        };
+    }
+    const saved_at_ms = if (parsed.value.saved_at_ms > 0) parsed.value.saved_at_ms else stat.mtime.toMilliseconds();
+    const wall_now = io_mod.milliTimestamp();
+    const age_ms = if (saved_at_ms > 0 and wall_now >= saved_at_ms) wall_now - saved_at_ms else 0;
+    return .{ .catalog = catalog, .age_ms = age_ms };
+}
+
+fn persistedCatalogEntry(alloc: Allocator, raw: PersistedCatalogEntry) !model_catalog.ModelCatalogEntry {
+    var entry = model_catalog.ModelCatalogEntry{
+        .id = try alloc.dupe(u8, raw.id),
+        .name = if (raw.name) |value| try alloc.dupe(u8, value) else null,
+        .description = if (raw.description) |value| try alloc.dupe(u8, value) else null,
+        .cost = raw.cost,
+        .intelligence = raw.intelligence,
+        .recommended = raw.recommended,
+        .beta = raw.beta,
+        .model_type = try alloc.dupe(u8, raw.model_type),
+        .tokenizer = if (raw.tokenizer) |name| @import("../tokenizer/tokenizer.zig").Encoding.parse(name) else null,
+        .released = raw.released,
+        .has_tool_use = raw.has_tool_use,
+        .has_reasoning = raw.has_reasoning,
+        .supports_fast_mode = raw.supports_fast_mode,
+        .supports_ultrafast_mode = raw.supports_ultrafast_mode,
+        .has_vision = raw.has_vision,
+        .has_file_input = raw.has_file_input,
+        .has_web_search = raw.has_web_search,
+        .has_explicit_caching = raw.has_explicit_caching,
+        .has_implicit_caching = raw.has_implicit_caching,
+        .context_window = raw.context_window,
+        .max_tokens = raw.max_tokens,
+        .web_search_price = if (raw.web_search_price) |value| try alloc.dupe(u8, value) else null,
+    };
+    errdefer model_catalog.freeModelCatalogEntry(alloc, entry);
+    for (raw.reasoning_efforts) |effort_text| {
+        const effort = types.ReasoningEffort.parse(effort_text) orelse continue;
+        if (effort.isDefault()) continue;
+        try entry.reasoning_efforts.append(alloc, effort);
+    }
+    return entry;
+}
+
+fn savePersistedCatalog(alloc: Allocator, path: []const u8, entries: []const model_catalog.ModelCatalogEntry) !void {
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const persisted = try a.alloc(PersistedCatalogEntry, entries.len);
+    for (entries, persisted) |entry, *out| {
+        const efforts = try a.alloc([]const u8, entry.reasoning_efforts.items.len);
+        for (entry.reasoning_efforts.items, efforts) |*effort, *text| text.* = effort.label();
+        out.* = .{
+            .id = entry.id,
+            .name = entry.name,
+            .description = entry.description,
+            .cost = entry.cost,
+            .intelligence = entry.intelligence,
+            .recommended = entry.recommended,
+            .beta = entry.beta,
+            .model_type = entry.model_type,
+            .tokenizer = if (entry.tokenizer) |value| value.name() else null,
+            .released = entry.released,
+            .has_tool_use = entry.has_tool_use,
+            .has_reasoning = entry.has_reasoning,
+            .reasoning_efforts = efforts,
+            .supports_fast_mode = entry.supports_fast_mode,
+            .supports_ultrafast_mode = entry.supports_ultrafast_mode,
+            .has_vision = entry.has_vision,
+            .has_file_input = entry.has_file_input,
+            .has_web_search = entry.has_web_search,
+            .has_explicit_caching = entry.has_explicit_caching,
+            .has_implicit_caching = entry.has_implicit_caching,
+            .context_window = entry.context_window,
+            .max_tokens = entry.max_tokens,
+            .web_search_price = entry.web_search_price,
+        };
+    }
+    var output: std.Io.Writer.Allocating = .init(alloc);
+    defer output.deinit();
+    try std.json.Stringify.value(PersistedCatalog{
+        .version = 1,
+        .saved_at_ms = io_mod.milliTimestamp(),
+        .models = persisted,
+    }, .{}, &output.writer);
+    try io_mod.writeFileAtomic(alloc, path, output.written());
+}
+
+fn persistCatalog(path: ?[]const u8, alloc: Allocator, entries: []const model_catalog.ModelCatalogEntry) void {
+    const cache_path = path orelse return;
+    if (entries.len == 0) return;
+    savePersistedCatalog(alloc, cache_path, entries) catch |err| {
+        debug_trace.logf("catalog", "model catalog cache write failed err={s}", .{@errorName(err)});
+    };
+}
+
+fn slotCancelAndJoin(slot: *ProviderSlot) void {
+    slot.cancel_requested.store(true, .seq_cst);
+    slot.mutex.lockUncancelable(io_mod.getIo());
+    const thread = slot.thread;
+    slot.thread = null;
+    slot.mutex.unlock(io_mod.getIo());
+    if (thread) |handle| handle.join();
+}
+
+fn slotFinishThreadIfDone(slot: *ProviderSlot) void {
+    slot.mutex.lockUncancelable(io_mod.getIo());
+    const should_join = !slot.fetch_in_flight and slot.thread != null;
+    const thread = if (should_join) slot.thread.? else null;
+    if (should_join) slot.thread = null;
+    slot.mutex.unlock(io_mod.getIo());
+    if (thread) |handle| {
+        handle.join();
+        slot.mutex.lockUncancelable(io_mod.getIo());
+        slot.completion_pending = true;
+        slot.mutex.unlock(io_mod.getIo());
+    }
+}
+
+fn slotDiscardStagedLocked(slot: *ProviderSlot) void {
+    const staged = slot.staged orelse return;
+    slot.staged = null;
+    switch (staged) {
+        .loaded => |loaded| {
+            var catalog = loaded.catalog;
+            model_catalog.freeModelCatalog(slot.alloc, &catalog);
+        },
+        .failed => {},
+    }
+}
+
+fn slotReset(slot: *ProviderSlot) void {
+    slotCancelAndJoin(slot);
+    slot.mutex.lockUncancelable(io_mod.getIo());
+    slotDiscardStagedLocked(slot);
+    const preserve_public = if (slot.outcome.loaded) |loaded| loaded.access.level == .public_only else false;
+    if (!preserve_public) {
+        model_catalog.freeModelCatalog(slot.alloc, &slot.catalog);
+        slot.catalog = .empty;
+        slot.outcome = .{};
+    }
+    slot.state = .idle;
+    slot.pending_force_refresh = false;
+    slot.completion_pending = false;
+    slot.last_attempt_ms = 0;
+    slot.last_success_ms = if (preserve_public) slot.last_success_ms else 0;
+    slot.failure_streak = 0;
+    slot.retry_not_before_ms = 0;
+    slot.requested_access = null;
+    slot.mutex.unlock(io_mod.getIo());
+    slot.cancel_requested.store(false, .seq_cst);
+}
+
+fn slotBeginLoad(slot: *ProviderSlot, trigger: LoadTrigger) bool {
+    slotFinishThreadIfDone(slot);
+    if (slot.source == null) return false;
+    const requested_access = model_catalog.AccessMetadata.init(slot.access.access);
+    slot.mutex.lockUncancelable(io_mod.getIo());
+    const access_changed = slot.state != .idle and
+        (slot.requested_access == null or !std.meta.eql(slot.requested_access.?, requested_access));
+    slot.mutex.unlock(io_mod.getIo());
+    if (access_changed) slotReset(slot);
+
+    const now = model_catalog.clockMs();
+    slot.mutex.lockUncancelable(io_mod.getIo());
+    const elapsed = if (now < slot.last_attempt_ms) std.math.maxInt(i64) else now - slot.last_attempt_ms;
+    const interval = slot.refresh_interval_ms;
+    const expired = if (interval) |value| elapsed >= value else false;
+    const picker_due = trigger == .picker_open and elapsed >= picker_revalidate_floor_ms;
+    const retry_due = if (slot.outcome.last_failure) |failed| failed.failure.retryable else false;
+    const backoff_over = trigger == .force or now < slot.last_attempt_ms or now >= slot.retry_not_before_ms;
+    const should_load = !slot.fetch_in_flight and slot.staged == null and slot.thread == null and backoff_over and switch (slot.state) {
+        .idle, .failed => true,
+        .ready => trigger == .force or (slot.refresh_on_seed and slot.last_attempt_ms == 0) or expired or picker_due or retry_due,
+        .loading => false,
+    };
+    if (!should_load) {
+        slot.mutex.unlock(io_mod.getIo());
+        return false;
+    }
+    if (slot.state == .idle) slot.state = .loading;
+    slot.fetch_in_flight = true;
+    slot.last_attempt_ms = now;
+    slot.requested_access = requested_access;
+    slot.mutex.unlock(io_mod.getIo());
+    slot.cancel_requested.store(false, .seq_cst);
+    return true;
+}
+
+fn slotApplyFetchLocked(slot: *ProviderSlot, result: model_catalog.FetchResult) AppliedFetch {
+    switch (result) {
+        .failed => |failure| {
+            slot.outcome.last_failure = failure;
+            slot.state = if (slot.outcome.loaded != null and slot.catalog.items.len > 0) .ready else .failed;
+            return .{ .failed = .{ .outcome = failure, .kept_previous = slot.state == .ready } };
+        },
+        .loaded => |loaded| {
+            var catalog = loaded.catalog;
+            const has_catalog = catalog.items.len > 0;
+            const reuse_previous = !has_catalog and slot.outcome.loaded != null and slot.catalog.items.len > 0;
+            if (reuse_previous) {
+                model_catalog.freeModelCatalog(slot.alloc, &catalog);
+                slot.outcome.last_failure = if (loaded.provenance.fallback_failure) |failure| .{
+                    .access = loaded.provenance.access,
+                    .anonymous_fallback_used = loaded.provenance.anonymous_fallback_used,
+                    .failure = failure,
+                } else null;
+            } else {
+                model_catalog.freeModelCatalog(slot.alloc, &slot.catalog);
+                slot.catalog = catalog;
+                slot.outcome = .{ .loaded = loaded.provenance };
+            }
+            slot.last_success_ms = model_catalog.clockMs();
+            slot.state = .ready;
+            if (has_catalog) persistCatalog(slot.cache_path, slot.alloc, slot.catalog.items);
+            return .{ .ready = .{
+                .entries = slot.catalog.items.len,
+                .reused_previous = reuse_previous,
+                .provenance = loaded.provenance,
+            } };
+        },
+    }
+}
+
+fn slotCompleteFetch(slot: *ProviderSlot, result: model_catalog.FetchResult) void {
+    slot.mutex.lockUncancelable(io_mod.getIo());
+    defer slot.mutex.unlock(io_mod.getIo());
+    slot.fetch_in_flight = false;
+    slot.completion_pending = true;
+    switch (result) {
+        .loaded => {
+            slot.failure_streak = 0;
+            slot.retry_not_before_ms = 0;
+        },
+        .failed => |failed| if (failed.failure.category != .cancellation) {
+            slot.failure_streak +|= 1;
+            slot.retry_not_before_ms = model_catalog.clockMs() + failureBackoffMs(slot.failure_streak);
+        },
+    }
+    if (slot.state == .ready) {
+        std.debug.assert(slot.staged == null);
+        slot.staged = result;
+        return;
+    }
+    slotApplyFetchLocked(slot, result).record();
+}
+
+fn slotThreadMain(slot: *ProviderSlot, provider: model_catalog.Provider, access: OwnedCatalogAccess) void {
+    var owned = access;
+    defer owned.deinit(slot.alloc);
+    slotCompleteFetch(slot, model_catalog.fetchWithPublicFallback(provider, slot.alloc, .{
+        .access = owned.access,
+        .endpoint = slot.endpoint,
+        .cancel_flag = &slot.cancel_requested,
+        .view = .picker,
+    }));
+}
+
+fn slotStartWarmup(slot: *ProviderSlot, trigger: LoadTrigger) void {
+    if (comptime host_target.is_wasm) {
+        slotLoadCooperative(slot, trigger);
+        return;
+    }
+    slotFinishThreadIfDone(slot);
+    if (!slotBeginLoad(slot, trigger)) return;
+    const provider = slot.source orelse return;
+    const access = OwnedCatalogAccess.init(slot.alloc, slot.access.access) catch {
+        slotCompleteFetch(slot, .{ .failed = .{
+            .access = .init(slot.access.access),
+            .anonymous_fallback_used = false,
+            .failure = .{ .category = .resource_exhausted },
+        } });
+        return;
+    };
+    const thread = std.Thread.spawn(.{}, slotThreadMain, .{ slot, provider, access }) catch {
+        var failed_access = access;
+        const failure = model_catalog.FailedOutcome{
+            .access = .init(failed_access.access),
+            .anonymous_fallback_used = false,
+            .failure = .{ .category = .runtime, .retryable = true },
+        };
+        failed_access.deinit(slot.alloc);
+        slotCompleteFetch(slot, .{ .failed = failure });
+        return;
+    };
+    slot.mutex.lockUncancelable(io_mod.getIo());
+    slot.thread = thread;
+    slot.mutex.unlock(io_mod.getIo());
+}
+
+fn slotLoadCooperative(slot: *ProviderSlot, trigger: LoadTrigger) void {
+    if (!slotBeginLoad(slot, trigger)) return;
+    const provider = slot.source orelse return;
+    slotCompleteFetch(slot, model_catalog.fetchWithPublicFallback(provider, slot.alloc, .{
+        .access = slot.access.access,
+        .endpoint = slot.endpoint,
+        .cancel_flag = &slot.cancel_requested,
+        .view = .picker,
+    }));
+}
+
+fn slotPoll(slot: *ProviderSlot) bool {
+    slotFinishThreadIfDone(slot);
+    var replay_force = false;
+    {
+        slot.mutex.lockUncancelable(io_mod.getIo());
+        defer slot.mutex.unlock(io_mod.getIo());
+        if (slot.staged) |staged| {
+            slot.staged = null;
+            slotApplyFetchLocked(slot, staged).record();
+        }
+        if (!slot.completion_pending) return false;
+        slot.completion_pending = false;
+        replay_force = slot.pending_force_refresh;
+        slot.pending_force_refresh = false;
+    }
+    if (replay_force) slotStartWarmup(slot, .force);
+    return true;
+}
+
+fn sameCatalogProvider(a: model_catalog.Provider, b: ?model_catalog.Provider) bool {
+    const other = b orelse return false;
+    return a.context == other.context and
+        a.fetch_fn == other.fetch_fn and
+        a.lookup_capabilities_fn == other.lookup_capabilities_fn and
+        a.provider_id.eql(other.provider_id) and
+        a.refresh_interval_ms == other.refresh_interval_ms;
+}
+
+fn optionalPathEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if ((a == null) != (b == null)) return false;
+    if (a) |left| return std.mem.eql(u8, left, b.?);
+    return true;
+}
+
+fn catalogAccessEqual(a: credentials.CatalogAccess, b: credentials.CatalogAccess) bool {
+    switch (a) {
+        .public_only => |left| switch (b) {
+            .public_only => |right| return std.meta.eql(left, right),
+            else => return false,
+        },
+        .host_managed => return b == .host_managed,
+        .authenticated => |left| switch (b) {
+            .authenticated => |right| {
+                if (left.source != right.source or !std.mem.eql(u8, left.credential, right.credential)) return false;
+                if ((left.team_context == null) != (right.team_context == null)) return false;
+                if (left.team_context) |value| if (!std.mem.eql(u8, value, right.team_context.?)) return false;
+                if ((left.account_id == null) != (right.account_id == null)) return false;
+                if (left.account_id) |value| if (!std.mem.eql(u8, value, right.account_id.?)) return false;
+                return std.meta.eql(left.authority, right.authority);
+            },
+            else => return false,
+        },
+    }
+}
+
+fn findProviderSlot(slots: []ProviderSlot, provider: model_provider.ProviderId) ?*ProviderSlot {
+    for (slots) |*slot| if (slot.provider.eql(provider)) return slot;
+    return null;
+}
+
+fn slotReconfigure(slot: *ProviderSlot, config: ProviderConfig) !void {
+    const source_changed = if (slot.source) |source| !sameCatalogProvider(source, config.catalog) else config.catalog != null;
+    const access_changed = !catalogAccessEqual(slot.access.access, config.access);
+    const cache_changed = !optionalPathEqual(slot.cache_path, config.cache_path);
+    if (source_changed or access_changed or cache_changed or !std.mem.eql(u8, slot.endpoint, config.endpoint)) slotReset(slot);
+    if (access_changed) {
+        const replacement = try OwnedCatalogAccess.init(slot.alloc, config.access);
+        slot.access.deinit(slot.alloc);
+        slot.access = replacement;
+    }
+    var source = config.catalog;
+    if (source) |*value| {
+        value.provider_id = config.provider;
+        if (config.refresh_interval_ms) |interval| value.refresh_interval_ms = interval;
+    }
+    slot.provider = config.provider;
+    slot.source = source;
+    slot.endpoint = config.endpoint;
+    slot.refresh_interval_ms = config.refresh_interval_ms orelse if (source) |value| value.refresh_interval_ms else null;
+    slot.refresh_on_seed = config.refresh_on_seed or (if (source) |value| value.refresh_on_seed else false);
+    slot.from_profile_settings = config.from_profile_settings;
+    slot.native_overrides = config.native_overrides;
+    if (cache_changed) {
+        const replacement = if (config.cache_path) |path| try slot.alloc.dupe(u8, path) else null;
+        if (slot.cache_path) |previous| slot.alloc.free(previous);
+        slot.cache_path = replacement;
+    }
+    if (slot.state == .idle and config.seed.len > 0) {
+        slot.catalog = try cloneCatalog(slot.alloc, config.seed);
+        slot.outcome = .{ .loaded = .{ .access = model_catalog.AccessMetadata.init(config.access) } };
+        slot.requested_access = model_catalog.AccessMetadata.init(config.access);
+        slot.last_success_ms = model_catalog.clockMs();
+        slot.state = .ready;
+    }
+    if (cache_changed) {
+        if (slot.cache_path) |path| {
+            if (try loadPersistedCatalog(slot.alloc, path)) |persisted| {
+                if (persisted.catalog.items.len > 0) {
+                    model_catalog.freeModelCatalog(slot.alloc, &slot.catalog);
+                    slot.catalog = persisted.catalog;
+                    slot.outcome = .{ .loaded = .{ .access = model_catalog.AccessMetadata.init(config.access) } };
+                    slot.requested_access = model_catalog.AccessMetadata.init(config.access);
+                    slot.last_success_ms = persistedSuccessTimestamp(persisted.age_ms);
+                    slot.state = .ready;
+                } else {
+                    var empty = persisted.catalog;
+                    model_catalog.freeModelCatalog(slot.alloc, &empty);
+                }
+            }
+        }
+    }
+}
+
+fn snapshotAccess(outcome: CatalogOutcome, fallback: credentials.CatalogAccess) model_catalog.AccessMetadata {
+    if (outcome.last_failure) |failed| {
+        if (outcome.loaded == null or failed.anonymous_fallback_used) return failed.access;
+    }
+    if (outcome.loaded) |loaded| return loaded.access;
+    return model_catalog.AccessMetadata.init(fallback);
+}
+
+fn snapshotFailure(outcome: CatalogOutcome) ?model_catalog.Failure {
+    if (outcome.last_failure) |failure| return failure.failure;
+    if (outcome.loaded) |loaded| return loaded.fallback_failure;
+    return null;
+}
+
+fn projectedCatalogEntryCount(
+    catalog: []const model_catalog.ModelCatalogEntry,
+    overrides: ?*const configured_provider.NativeOverrides,
+) usize {
+    const native = overrides orelse return catalog.len;
+    var count = catalog.len;
+    for (native.model_metadata) |metadata| {
+        if (metadata.id.len > 0 and findCatalogModel(catalog, metadata.id) == null) count += 1;
+    }
+    return count;
+}
+
+fn snapshotForActiveLocked(runtime: *Runtime) ProviderSnapshot {
+    const provider = runtime.active_provider orelse .gateway;
+    const access = snapshotAccess(runtime.outcome, if (runtime.active_access) |owned| owned.access else credentials.CatalogAccess{ .public_only = .no_credential });
+    return .{
+        .provider = model_provider.NameKey.fromProvider(provider),
+        .status = switch (runtime.state) {
+            .idle => .idle,
+            .loading => .loading,
+            .ready => .ready,
+            .failed => .failed,
+        },
+        .force_refresh_pending = runtime.pending_force_refresh,
+        .entries = projectedCatalogEntryCount(runtime.catalog.items, runtime.active_native_overrides),
+        .auth_available = access.level == .authenticated,
+        .access_level = access.level,
+        .credential_source = access.source,
+        .public_only_reason = access.public_only_reason,
+        .private_models_hidden = access.private_models_may_be_hidden,
+        .from_profile_settings = runtime.from_profile_settings,
+        .last_attempt_age_ms = if (runtime.last_attempt_ms > 0) model_catalog.clockMs() - runtime.last_attempt_ms else null,
+        .last_success_age_ms = if (runtime.last_success_ms > 0) model_catalog.clockMs() - runtime.last_success_ms else null,
+        .failure = snapshotFailure(runtime.outcome),
+    };
+}
+
+fn snapshotForSlot(slot: *ProviderSlot) ProviderSnapshot {
+    slot.mutex.lockUncancelable(io_mod.getIo());
+    defer slot.mutex.unlock(io_mod.getIo());
+    const access = snapshotAccess(slot.outcome, slot.access.access);
+    return .{
+        .provider = model_provider.NameKey.fromProvider(slot.provider),
+        .status = switch (slot.state) {
+            .idle => .idle,
+            .loading => .loading,
+            .ready => .ready,
+            .failed => .failed,
+        },
+        .force_refresh_pending = slot.pending_force_refresh,
+        .entries = projectedCatalogEntryCount(slot.catalog.items, slot.native_overrides),
+        .auth_available = access.level == .authenticated,
+        .access_level = access.level,
+        .credential_source = access.source,
+        .public_only_reason = access.public_only_reason,
+        .private_models_hidden = access.private_models_may_be_hidden,
+        .from_profile_settings = slot.from_profile_settings,
+        .last_attempt_age_ms = if (slot.last_attempt_ms > 0) model_catalog.clockMs() - slot.last_attempt_ms else null,
+        .last_success_age_ms = if (slot.last_success_ms > 0) model_catalog.clockMs() - slot.last_success_ms else null,
+        .failure = snapshotFailure(slot.outcome),
+    };
+}
+
+fn hubEntryFromCatalog(arena: Allocator, entry: model_catalog.ModelCatalogEntry) !HubEntry {
+    return .{
+        .id = try arena.dupe(u8, entry.id),
+        .name = try arena.dupe(u8, entry.name orelse ""),
+        .description = if (entry.description) |description| try arena.dupe(u8, description) else null,
+        .cost = entry.cost,
+        .intelligence = entry.intelligence,
+        .recommended = entry.recommended,
+        .beta = entry.beta,
+        .released = entry.released,
+        .context_window = if (entry.context_window > 0) entry.context_window else null,
+        .max_tokens = if (entry.max_tokens > 0) entry.max_tokens else null,
+        .has_tool_use = entry.has_tool_use,
+        .has_reasoning = entry.has_reasoning,
+        .has_vision = entry.has_vision,
+        .has_file_input = entry.has_file_input,
+        .efforts = try arena.dupe(types.ReasoningEffort, entry.reasoning_efforts.items),
+    };
+}
+
+fn hubEntriesForCatalog(arena: Allocator, catalog: []const model_catalog.ModelCatalogEntry) ![]HubEntry {
+    const entries = try arena.alloc(HubEntry, catalog.len);
+    for (catalog, entries) |entry, *out| out.* = try hubEntryFromCatalog(arena, entry);
+    return entries;
+}
+
+fn hubEntriesForCatalogWithNative(
+    arena: Allocator,
+    catalog: []const model_catalog.ModelCatalogEntry,
+    overrides: ?*const configured_provider.NativeOverrides,
+) ![]HubEntry {
+    var projected = try cloneCatalogWithNative(arena, catalog, overrides);
+    defer model_catalog.freeModelCatalog(arena, &projected);
+    return hubEntriesForCatalog(arena, projected.items);
+}
 
 fn boolLabel(value: bool) []const u8 {
     return if (value) "true" else "false";
@@ -1254,6 +2574,61 @@ const StaleCatalog = struct {
         return .{ .context = self, .fetch_fn = fetch };
     }
 };
+
+test "provider catalog snapshot is ownership safe for active and side providers" {
+    const alloc = std.testing.allocator;
+    var fixture = RefreshCatalog{ .fallback_model = "snapshot-model" };
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    const provider = fixture.provider();
+    const configs = [_]ProviderConfig{
+        .{ .provider = .gateway, .catalog = provider },
+        .{ .provider = .codex, .catalog = provider },
+    };
+    try runtime.syncProviders(&configs, .gateway);
+    runtime.loadCooperativeFor(.gateway, .activity);
+    runtime.loadCooperativeFor(.codex, .activity);
+    _ = try runtime.pollLoadTransitions();
+
+    var active = (try runtime.snapshotCatalogFor(.gateway, alloc)).?;
+    defer model_catalog.freeModelCatalog(alloc, &active);
+    try std.testing.expectEqual(@as(usize, 1), active.items.len);
+    try std.testing.expectEqualStrings("snapshot-model", active.items[0].id);
+
+    var side = (try runtime.snapshotCatalogFor(.codex, alloc)).?;
+    defer model_catalog.freeModelCatalog(alloc, &side);
+    try std.testing.expectEqual(@as(usize, 1), side.items.len);
+    try std.testing.expectEqualStrings("snapshot-model", side.items[0].id);
+}
+
+test "native defaults do not make arbitrary catalog models known" {
+    const alloc = std.testing.allocator;
+    var fixture = RefreshCatalog{ .fallback_model = "listed-model" };
+    var storage = std.heap.ArenaAllocator.init(alloc);
+    defer storage.deinit();
+    const declared = [_]configured_provider.ModelMetadata{.{ .id = "declared-model" }};
+    const defaults = configured_provider.ModelMetadata{ .id = "native-default", .context_window = 128_000 };
+    var overrides = configured_provider.NativeOverrides{
+        .id = "gateway",
+        .model_metadata = &declared,
+        .defaults = &defaults,
+        .storage = storage,
+    };
+    var runtime = Runtime.init(alloc, "/v1/models");
+    defer runtime.deinit();
+    const provider = fixture.provider();
+    const configs = [_]ProviderConfig{.{
+        .provider = .gateway,
+        .catalog = provider,
+        .native_overrides = &overrides,
+    }};
+    try runtime.syncProviders(&configs, .gateway);
+    runtime.loadCooperativeFor(.gateway, .activity);
+    _ = try runtime.pollLoadTransitions();
+    try std.testing.expect(runtime.knowsModelFor(.gateway, "declared-model"));
+    try std.testing.expect(runtime.knowsModelFor(.gateway, "listed-model"));
+    try std.testing.expect(!runtime.knowsModelFor(.gateway, "arbitrary-model"));
+}
 
 test "model cache expires successful catalogs only when the provider requests refresh" {
     for ([_]bool{ false, true }) |expires| {
@@ -1720,9 +3095,14 @@ test "model cache refetches effective access across auth and team changes" {
         var snapshot = (try runtime.snapshotCachedModelIds(std.testing.allocator)).?;
         defer collections.freeStringList(std.testing.allocator, &snapshot);
         try std.testing.expectEqualStrings(case.model_id, snapshot.items[0]);
+
+        // Refresh reads the credential owned by the cache, not an external copy.
+        try std.testing.expect(runtime.refresh(.gateway, .force));
+        try waitForWarmup(&runtime);
+        try std.testing.expectEqualStrings(case.access.teamContext() orelse "", provider.team[0..provider.team_len]);
     }
 
-    try std.testing.expectEqual(@as(usize, cases.len), provider.calls);
+    try std.testing.expectEqual(@as(usize, cases.len * 2), provider.calls);
 }
 
 test "model cache reloads a ready authenticated catalog after fx login access downgrades" {

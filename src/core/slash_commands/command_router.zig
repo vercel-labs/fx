@@ -253,10 +253,6 @@ test "parse extracts an optional logout provider" {
     }
 }
 
-test "parse rejects removed plural model command" {
-    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/models"));
-}
-
 test "login and provider arguments reach their handlers when typed whole (D224)" {
     switch (parse(testSlashRegistry(), "/provider codex")) {
         .provider => |rest| try std.testing.expectEqualStrings("codex", rest),

@@ -23,7 +23,7 @@ export function createConfiguredProviderFixture(respond?: (body: any) => Respons
   const home = realpathSync(createIsolatedTestHome());
   const workspace = join(home, "workspace");
   mkdirSync(workspace);
-  mkdirSync(join(home, ".fx"), { mode: 0o700 });
+  mkdirSync(join(home, ".proto-fx"), { recursive: true, mode: 0o700 });
   const requests: Array<{ path: string; authorization: string | null; body: any }> = [];
   const server = Bun.serve({
     hostname: "127.0.0.1", port: 0,
@@ -35,9 +35,9 @@ export function createConfiguredProviderFixture(respond?: (body: any) => Respons
       return respond ? respond(body) : completion((body as any).model);
     },
   });
-  const settingsPath = join(home, ".fx", "settings.json");
+  const settingsPath = join(home, ".proto-fx", "settings.json");
   const settings = {
-    provider: "local", auto_upgrade: false, permission_mode: "ask",
+    provider: "local", auto_upgrade: false, session_titles: false, permission_mode: "ask",
     providers: {
       local: { protocol: "openai-chat-completions", base_url: `http://127.0.0.1:${server.port}/v1`, auth: { type: "none" }, model_metadata: { "local-model": { context_window: 262144, max_output_tokens: 8192, supports_tool_use: true } } },
       remote: { protocol: "openai-chat-completions", base_url: `http://127.0.0.1:${server.port}/v1`, auth: { type: "bearer", env: "FX_TEST_PROVIDER_TOKEN" }, model_metadata: { "remote-model": { context_window: 262144, max_output_tokens: 8192, supports_tool_use: true } } },

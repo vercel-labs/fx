@@ -7,35 +7,42 @@ const model_roles = @import("../config/model_roles.zig");
 const catalog = @import("catalog.zig");
 const types = @import("../shared/types.zig");
 
-const Role = model_roles.Role;
+const RoleId = model_roles.RoleId;
 
 /// `cycle` with `role` removed when present, else added at the end.
-pub fn toggleCycle(cycle: []const Role, role: Role, out: *[model_roles.role_count]Role) []Role {
+pub fn toggleCycle(cycle: []const RoleId, role: RoleId, out: []RoleId) []RoleId {
     var count: usize = 0;
     var removed = false;
     for (cycle) |item| {
-        if (item == role) {
+        if (item.eql(role)) {
             removed = true;
             continue;
         }
-        out[count] = item;
+        if (count < out.len) out[count] = item;
         count += 1;
     }
     if (!removed and count < out.len) {
         out[count] = role;
         count += 1;
     }
-    return out[0..count];
+    return out[0..@min(count, out.len)];
 }
 
 /// `cycle` with `role` swapped one place earlier or later; unchanged at an end.
-pub fn moveCycle(cycle: []const Role, role: Role, later: bool, out: *[model_roles.role_count]Role) []Role {
-    const items = out[0..cycle.len];
-    @memcpy(items, cycle);
-    const index = std.mem.findScalar(Role, items, role) orelse return items;
-    if (later and index + 1 < items.len) std.mem.swap(Role, &items[index], &items[index + 1]);
-    if (!later and index > 0) std.mem.swap(Role, &items[index], &items[index - 1]);
-    return items;
+pub fn moveCycle(cycle: []const RoleId, role: RoleId, later: bool, out: []RoleId) []RoleId {
+    const count = @min(cycle.len, out.len);
+    @memcpy(out[0..count], cycle[0..count]);
+    var index: ?usize = null;
+    for (out[0..count], 0..) |item, at| {
+        if (item.eql(role)) {
+            index = at;
+            break;
+        }
+    }
+    const at = index orelse return out[0..count];
+    if (later and at + 1 < count) std.mem.swap(RoleId, &out[at], &out[at + 1]);
+    if (!later and at > 0) std.mem.swap(RoleId, &out[at], &out[at - 1]);
+    return out[0..count];
 }
 
 /// A role chain change with the new model's reference spelled out.
@@ -148,11 +155,11 @@ pub fn editWebSearch(rows: []const catalog.WebSearchRow, edit: WebSearchEdit) We
 }
 
 test "cycle toggles append or remove and moves stop at the ends" {
-    var buf: [model_roles.role_count]Role = undefined;
-    try std.testing.expectEqualSlices(Role, &.{ .deep, .default, .small, .worker }, toggleCycle(&.{ .deep, .default, .small }, .worker, &buf));
-    try std.testing.expectEqualSlices(Role, &.{ .deep, .small }, toggleCycle(&.{ .deep, .default, .small }, .default, &buf));
-    try std.testing.expectEqualSlices(Role, &.{ .default, .deep, .small }, moveCycle(&.{ .deep, .default, .small }, .deep, true, &buf));
-    try std.testing.expectEqualSlices(Role, &.{ .deep, .default, .small }, moveCycle(&.{ .deep, .default, .small }, .deep, false, &buf));
+    var buf: [model_roles.role_count]RoleId = undefined;
+    try std.testing.expectEqualSlices(RoleId, &.{ .{ .builtin = .deep }, .{ .builtin = .default }, .{ .builtin = .small }, .{ .builtin = .worker } }, toggleCycle(&.{ .{ .builtin = .deep }, .{ .builtin = .default }, .{ .builtin = .small } }, .{ .builtin = .worker }, &buf));
+    try std.testing.expectEqualSlices(RoleId, &.{ .{ .builtin = .deep }, .{ .builtin = .small } }, toggleCycle(&.{ .{ .builtin = .deep }, .{ .builtin = .default }, .{ .builtin = .small } }, .{ .builtin = .default }, &buf));
+    try std.testing.expectEqualSlices(RoleId, &.{ .{ .builtin = .default }, .{ .builtin = .deep }, .{ .builtin = .small } }, moveCycle(&.{ .{ .builtin = .deep }, .{ .builtin = .default }, .{ .builtin = .small } }, .{ .builtin = .deep }, true, &buf));
+    try std.testing.expectEqualSlices(RoleId, &.{ .{ .builtin = .deep }, .{ .builtin = .default }, .{ .builtin = .small } }, moveCycle(&.{ .{ .builtin = .deep }, .{ .builtin = .default }, .{ .builtin = .small } }, .{ .builtin = .deep }, false, &buf));
 }
 
 test "web search edits save the shown order and the exclusions" {

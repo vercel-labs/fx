@@ -192,8 +192,15 @@ pub const CompactorCaller = struct {
     model: []const u8,
     /// The `compact` role's model, when set; empty uses `model`.
     summary_model: []const u8 = "",
+    /// Provider-qualified compact role selection. Null keeps the conversation provider.
+    summary_provider: ?model_provider.ProviderId = null,
+    summary_stream_provider: ?agent_stream_provider.Provider = null,
+    summary_credential: ?agent_stream_provider.CredentialLease = null,
+    summary_provider_options: ?model_capabilities.ResolvedProviderOptions = null,
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
+    /// Host-bound credential for a promoted/cross-provider selection.
+    credential_override: ?agent_stream_provider.CredentialLease = null,
     account_id: ?[]const u8 = null,
     gateway_team: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
@@ -209,15 +216,135 @@ pub const CompactorCaller = struct {
 
     /// Borrows `self`, which must outlive the compaction.
     pub fn caller(self: *CompactorCaller) compactor.ModelCaller {
+        const summary_transport = self.summary_stream_provider orelse self.stream_provider;
+        const summary_provider = self.summary_provider orelse self.provider;
+        const summary_options = self.summary_provider_options orelse self.provider_options;
+        const anthropic_native = summary_options.anthropic_compaction != null or
+            (summary_options.model_metadata != null and summary_options.model_metadata.?.protocol == .@"anthropic-messages" and
+                summary_options.model_metadata.?.compat.supports_context_management == true);
+        const codex_v1 = if (summary_provider.eql(.codex)) blk: {
+            const metadata = summary_options.model_metadata orelse break :blk false;
+            const remote = metadata.remote_compaction orelse break :blk false;
+            if (remote.v2_streaming_enabled) break :blk false;
+            const endpoint = remote.endpoint orelse break :blk false;
+            break :blk std.mem.trim(u8, endpoint, " \t\r\n").len > 0;
+        } else false;
+        const supports_v2_streaming = if (summary_transport.compaction) |compaction|
+            compaction.supports_v2_streaming
+        else
+            false;
+        const configured_responses_v2 = if (!summary_provider.eql(.codex) and supports_v2_streaming)
+            if (summary_options.model_metadata) |metadata|
+                if (metadata.remote_compaction) |remote| remote.v2_streaming_enabled else false
+            else
+                false
+        else
+            false;
+        const compaction_kind: agent_stream_provider.CompactionKind = if (codex_v1)
+            .remote
+        else if (summary_provider.eql(.codex) or configured_responses_v2)
+            .v2_streaming
+        else if (anthropic_native)
+            .anthropic_native
+        else
+            .remote;
+        const remote_compaction_enabled = if (summary_options.model_metadata) |metadata|
+            if (metadata.remote_compaction) |remote|
+                remote.enabled and (compaction_kind != .v2_streaming or remote.v2_streaming_enabled)
+            else
+                true
+        else
+            true;
+        // A generic Responses transport only exposes native compaction when
+        // the selected model declares its remote endpoint. Built-in Codex and
+        // Anthropic transports are capability-owned even without configured
+        // metadata, so they remain eligible through their typed kinds.
+        const remote_compaction_available = compaction_kind != .remote or
+            anthropic_native or
+            summary_provider.eql(.codex) or
+            (summary_options.model_metadata != null and summary_options.model_metadata.?.remote_compaction != null);
+        const native_compaction = if (summary_transport.compaction != null)
+            if (!remote_compaction_enabled or !remote_compaction_available) null else compactor.NativeCompaction{
+                .compact_fn = nativeCompact,
+                .context = self,
+                .provider_id = summary_provider,
+                .kind = switch (compaction_kind) {
+                    .remote => .remote,
+                    .v2_streaming => .v2_streaming,
+                    .anthropic_native => .anthropic_native,
+                },
+            }
+        else
+            null;
         return .{
             .context = self,
             .vtable = &.{ .capabilities = capabilities, .send = send },
             .model = self.model,
             .summary_model = self.summary_model,
+            .summary_provider = self.summary_provider,
+            .summary_credential_source = if (self.summary_credential) |value| value.credentialSource() else null,
             .provider = self.provider,
             .credential_source = self.credential_source,
             .sends_after_conversation = self.conversation != null,
+            .native_compaction = native_compaction,
         };
+    }
+
+    fn nativeCompact(
+        context: ?*anyopaque,
+        alloc: Allocator,
+        call: types.CompactionCall,
+    ) anyerror!types.CompactionResult {
+        const self: *CompactorCaller = @ptrCast(@alignCast(context.?));
+        const transport = self.summary_stream_provider orelse self.stream_provider;
+        const provider = transport.compaction orelse return error.ProviderCompactionUnavailable;
+        const credential = self.summary_credential orelse credentialFromSelf(self);
+        const options = self.summary_provider_options orelse self.provider_options;
+        const kind: agent_stream_provider.CompactionKind = switch (call.kind) {
+            .remote => .remote,
+            .v2_streaming => .v2_streaming,
+            .anthropic_native => .anthropic_native,
+        };
+        const budget = if (call.budget) |value| agent_stream_provider.BuildBudget{
+            .deadline = value.deadline,
+            .cancel_flag = value.cancel_flag,
+        } else null;
+        const result = try runtime_gateway_step.compactModelContext(provider, alloc, .{
+            .observer = self.observer,
+            .credential = credential,
+            .session_id = self.session_id,
+            .model = call.model,
+            .instructions = call.instructions,
+            .messages = call.messages,
+            .tools = if (self.conversation) |sent| sent.tools else .{},
+            .provider_options = options,
+            .retained_message_budget = call.retained_message_budget,
+            .prompt_cache_key = call.prompt_cache_key,
+            .kind = kind,
+            .budget = budget,
+            .trace_ctx = call.trace_ctx,
+            .cancel_flag = call.cancel_flag,
+        });
+        return .{
+            .summary = result.summary,
+            .provider_state_json = result.provider_state_json,
+            .replacement_history_json = result.replacement_history_json,
+            .used_tokens = result.used_tokens,
+            .usage = result.usage,
+            .owned = result.ownership == .owned,
+        };
+    }
+
+    fn credentialFromSelf(self: *CompactorCaller) agent_stream_provider.CredentialLease {
+        return self.credential_override orelse if (self.credential_source == .host_managed)
+            .host_managed
+        else
+            .{ .direct = .{
+                .secret_bytes = self.api_key,
+                .source = self.credential_source,
+                .account_id = self.account_id,
+                .tenant_context = self.gateway_team,
+            } };
     }
 
     fn capabilities(context: *anyopaque, model: []const u8) model_capabilities.Capabilities {
@@ -228,6 +355,7 @@ pub const CompactorCaller = struct {
     fn send(context: *anyopaque, alloc: Allocator, call: compactor.Call) compactor.CallError!compactor.Reply {
         const self: *CompactorCaller = @ptrCast(@alignCast(context));
         const own = std.mem.eql(u8, call.model, self.model);
+        const summary = self.summary_provider != null and !own and std.mem.eql(u8, call.model, self.summary_model);
         // Only the conversation's own model reads it; the request is built
         // for that model.
         var conversation: ?agent_stream_provider.RequestData = null;
@@ -239,25 +367,22 @@ pub const CompactorCaller = struct {
         // provider reuses its cache only for the same settings. Another model
         // keeps the user's provider routing but none of the options chosen
         // for this one.
-        var options: model_capabilities.ResolvedProviderOptions = if (conversation) |sent| sent.provider_options else if (own) self.provider_options else .{
+        var options: model_capabilities.ResolvedProviderOptions = if (conversation) |sent| sent.provider_options else if (own) self.provider_options else if (summary and self.summary_provider_options != null) self.summary_provider_options.? else .{
             .prompt_caching = self.provider_options.prompt_caching,
             .provider_order = self.provider_options.provider_order,
             .provider_strict = self.provider_options.provider_strict,
         };
         if (conversation == null) options.reasoning = call.reasoning;
         options.ultrafast = false;
+        const stream = if (summary) self.summary_stream_provider orelse self.stream_provider else self.stream_provider;
+        const credential: agent_stream_provider.CredentialLease = if (summary) self.summary_credential orelse credentialFromSelf(self) else credentialFromSelf(self);
         var usage: types.Usage = .{};
         const outcome = try complete(alloc, .{
             .observer = self.observer,
             .purpose = .compaction,
-            .stream_provider = self.stream_provider,
+            .stream_provider = stream,
             .cooperative_pulse = self.cooperative_transport_pulse,
-            .credential = if (self.credential_source == .host_managed) .host_managed else .{ .direct = .{
-                .secret_bytes = self.api_key,
-                .source = self.credential_source,
-                .account_id = self.account_id,
-                .tenant_context = self.gateway_team,
-            } },
+            .credential = credential,
             .session_id = self.session_id,
             .model = call.model,
             .retry_count = self.retry_count,

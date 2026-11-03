@@ -75,7 +75,10 @@ function solCatalogModel() {
   };
 }
 
-function writeProfileSettings(root: IsolatedRoot, settings: Record<string, unknown>) {
+function writeProfileSettings(
+  root: IsolatedRoot,
+  settings: Record<string, unknown>,
+) {
   writeFileSync(
     join(root.home, ".fx", "settings.json"),
     `${JSON.stringify({ session_titles: false, ...settings })}\n`,
@@ -83,7 +86,9 @@ function writeProfileSettings(root: IsolatedRoot, settings: Record<string, unkno
   );
 }
 
-function createIsolatedRoot(settings: Record<string, unknown> = {}): IsolatedRoot {
+function createIsolatedRoot(
+  settings: Record<string, unknown> = {},
+): IsolatedRoot {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-ultrafast-e2e-")));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -189,7 +194,10 @@ class AcpClient {
   private waiters: Array<(line: string) => void> = [];
   private closed = false;
   private stderr = "";
-  private readonly exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  private readonly exited: Promise<{
+    code: number | null;
+    signal: NodeJS.Signals | null;
+  }>;
 
   private constructor(private readonly proc: ChildProcess) {
     this.exited = new Promise((resolve) => {
@@ -224,15 +232,19 @@ class AcpClient {
         (entry): entry is [string, string] => entry[1] !== undefined,
       ),
     );
-    return new AcpClient(nodeSpawn(FX_BIN, ["acp", ...args], {
-      cwd,
-      env: processEnv,
-      stdio: ["pipe", "pipe", "pipe"],
-    }));
+    return new AcpClient(
+      nodeSpawn(FX_BIN, ["acp", ...args], {
+        cwd,
+        env: processEnv,
+        stdio: ["pipe", "pipe", "pipe"],
+      }),
+    );
   }
 
   async request(method: string, params: object, id: number): Promise<any> {
-    this.proc.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    this.proc.stdin!.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`,
+    );
     while (true) {
       const message = await this.readLine();
       if (message.id === id) return message;
@@ -240,15 +252,17 @@ class AcpClient {
   }
 
   async prompt(sessionId: string, text: string, id: number): Promise<any[]> {
-    this.proc.stdin!.write(`${JSON.stringify({
-      jsonrpc: "2.0",
-      id,
-      method: "session/prompt",
-      params: {
-        sessionId,
-        prompt: [{ type: "text", text }],
-      },
-    })}\n`);
+    this.proc.stdin!.write(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "session/prompt",
+        params: {
+          sessionId,
+          prompt: [{ type: "text", text }],
+        },
+      })}\n`,
+    );
     const messages: any[] = [];
     while (true) {
       const message = await this.readLine();
@@ -300,7 +314,11 @@ class AcpClient {
 }
 
 async function startAcpSession(client: AcpClient): Promise<string> {
-  const initialized = await client.request("initialize", { protocolVersion: 1 }, 1);
+  const initialized = await client.request(
+    "initialize",
+    { protocolVersion: 1 },
+    1,
+  );
   expect(initialized.error).toBeUndefined();
   const created = await client.request("session/new", { mcpServers: [] }, 2);
   expect(created.error).toBeUndefined();
@@ -313,7 +331,13 @@ describe("ultrafast fake Gateway", () => {
     "defaults off and honors profile, environment, and CLI overrides without contacting a real Gateway",
     async () => {
       const cases = [
-        { name: "default", settings: {}, extraEnv: {}, args: [], ultrafast: false },
+        {
+          name: "default",
+          settings: {},
+          extraEnv: {},
+          args: [],
+          ultrafast: false,
+        },
         {
           name: "profile setting",
           settings: { ultrafast_mode: true },
@@ -321,7 +345,13 @@ describe("ultrafast fake Gateway", () => {
           args: [],
           ultrafast: true,
         },
-        { name: "environment on", settings: {}, extraEnv: { FX_ULTRAFAST: "1" }, args: [], ultrafast: true },
+        {
+          name: "environment on",
+          settings: {},
+          extraEnv: { FX_ULTRAFAST: "1" },
+          args: [],
+          ultrafast: true,
+        },
         {
           name: "environment off",
           settings: { ultrafast_mode: true },
@@ -343,9 +373,30 @@ describe("ultrafast fake Gateway", () => {
           args: ["--no-ultrafast"],
           ultrafast: false,
         },
-        { name: "workspace on", settings: { ultrafast_mode: false }, workspace: true, extraEnv: {}, args: [], ultrafast: true },
-        { name: "workspace off", settings: { ultrafast_mode: true }, workspace: false, extraEnv: {}, args: [], ultrafast: false },
-        { name: "environment overrides workspace", settings: { ultrafast_mode: false }, workspace: true, extraEnv: { FX_ULTRAFAST: "0" }, args: [], ultrafast: false },
+        {
+          name: "workspace on",
+          settings: { ultrafast_mode: false },
+          workspace: true,
+          extraEnv: {},
+          args: [],
+          ultrafast: true,
+        },
+        {
+          name: "workspace off",
+          settings: { ultrafast_mode: true },
+          workspace: false,
+          extraEnv: {},
+          args: [],
+          ultrafast: false,
+        },
+        {
+          name: "environment overrides workspace",
+          settings: { ultrafast_mode: false },
+          workspace: true,
+          extraEnv: { FX_ULTRAFAST: "0" },
+          args: [],
+          ultrafast: false,
+        },
       ];
 
       for (const scenario of cases) {
@@ -353,18 +404,32 @@ describe("ultrafast fake Gateway", () => {
         if ("workspace" in scenario) {
           writeProfileSettings(root, {
             ...scenario.settings,
-            workspaces: { [root.workspace]: { ultrafast_mode: scenario.workspace } },
+            workspaces: {
+              [root.workspace]: { ultrafast_mode: scenario.workspace },
+            },
           });
         }
         const settingsPath = join(root.home, ".fx", "settings.json");
         const settingsBefore = readFileSync(settingsPath, "utf8");
         const gateway = startFakeGateway(
-          [finishWithServiceTier(`response for ${scenario.name}`, scenario.ultrafast ? "ultrafast" : "standard")],
+          [
+            finishWithServiceTier(
+              `response for ${scenario.name}`,
+              scenario.ultrafast ? "ultrafast" : "standard",
+            ),
+          ],
           { models: [ultrafastCatalogModel()] },
         );
         try {
           const result = await runFx(
-            ["ask", "--auto", "--json", "--no-save", ...scenario.args, `Test ${scenario.name}.`],
+            [
+              "ask",
+              "--auto",
+              "--json",
+              "--no-save",
+              ...scenario.args,
+              `Test ${scenario.name}.`,
+            ],
             {
               cwd: root.workspace,
               env: fakeGatewayEnv(root, gateway, scenario.extraEnv),
@@ -373,9 +438,12 @@ describe("ultrafast fake Gateway", () => {
           );
           expect(result.code, `${scenario.name}: ${result.stderr}`).toBe(0);
           if (!("workspace" in scenario)) expect(result.stderr).toBe("");
-          expect(JSON.parse(result.stdout).output).toBe(`response for ${scenario.name}`);
+          expect(JSON.parse(result.stdout).output).toBe(
+            `response for ${scenario.name}`,
+          );
           expect(gateway.requests).toHaveLength(1);
-          if (scenario.ultrafast) expectUltrafastRequest(gateway.requests[0]!.body);
+          if (scenario.ultrafast)
+            expectUltrafastRequest(gateway.requests[0]!.body);
           else expectStandardRequest(gateway.requests[0]!.body);
           expect(readFileSync(settingsPath, "utf8")).toBe(settingsBefore);
         } finally {
@@ -391,11 +459,24 @@ describe("ultrafast fake Gateway", () => {
     "ask rejects conflicting Ultrafast flags before any POST",
     async () => {
       const root = createIsolatedRoot();
-      const gateway = startFakeGateway([], { models: [ultrafastCatalogModel()] });
+      const gateway = startFakeGateway([], {
+        models: [ultrafastCatalogModel()],
+      });
       try {
         const result = await runFx(
-          ["ask", "--auto", "--no-save", "--ultrafast", "--no-ultrafast", "Conflicting flags must not spend."],
-          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway), timeoutMs: TIMEOUT },
+          [
+            "ask",
+            "--auto",
+            "--no-save",
+            "--ultrafast",
+            "--no-ultrafast",
+            "Conflicting flags must not spend.",
+          ],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway),
+            timeoutMs: TIMEOUT,
+          },
         );
         expect(result.code, result.stderr).toBe(1);
         expect(result.stdout).toBe("");
@@ -417,10 +498,18 @@ describe("ultrafast fake Gateway", () => {
     "rejects an invalid FX_ULTRAFAST value before any completion POST",
     async () => {
       const root = createIsolatedRoot({ ultrafast_mode: true });
-      const gateway = startFakeGateway([], { models: [ultrafastCatalogModel()] });
+      const gateway = startFakeGateway([], {
+        models: [ultrafastCatalogModel()],
+      });
       try {
         const result = await runFx(
-          ["ask", "--auto", "--json", "--no-save", "Invalid overrides must not spend."],
+          [
+            "ask",
+            "--auto",
+            "--json",
+            "--no-save",
+            "Invalid overrides must not spend.",
+          ],
           {
             cwd: root.workspace,
             env: fakeGatewayEnv(root, gateway, { FX_ULTRAFAST: "paid" }),
@@ -447,13 +536,22 @@ describe("ultrafast fake Gateway", () => {
         { mode: 0o600 },
       );
       const gateway = startFakeGateway(
-        [fakeGatewayFinalText("project default ignored"), fakeGatewayFinalText("Fast remains available")],
+        [
+          fakeGatewayFinalText("project default ignored"),
+          fakeGatewayFinalText("Fast remains available"),
+        ],
         { models: [ultrafastCatalogModel()] },
       );
       try {
         const env = fakeGatewayEnv(root, gateway);
         const defaultResult = await runFx(
-          ["ask", "--auto", "--json", "--no-save", "Project defaults must not enable Ultra."],
+          [
+            "ask",
+            "--auto",
+            "--json",
+            "--no-save",
+            "Project defaults must not enable Ultra.",
+          ],
           { cwd: root.workspace, env, timeoutMs: TIMEOUT },
         );
         expect(defaultResult.code, defaultResult.stderr).toBe(0);
@@ -461,15 +559,27 @@ describe("ultrafast fake Gateway", () => {
         expectStandardRequest(gateway.requests[0]!.body);
 
         const fastResult = await runFx(
-          ["ask", "--auto", "--json", "--no-save", "--fast", "Fast remains independent."],
+          [
+            "ask",
+            "--auto",
+            "--json",
+            "--no-save",
+            "--fast",
+            "Fast remains independent.",
+          ],
           { cwd: root.workspace, env, timeoutMs: TIMEOUT },
         );
         expect(fastResult.code, fastResult.stderr).toBe(0);
         expect(gateway.requests).toHaveLength(2);
         const request = JSON.parse(gateway.requests[1]!.body) as {
-          providerOptions?: { gateway?: { only?: string[]; speed?: string }; openai?: { serviceTier?: string } };
+          providerOptions?: {
+            gateway?: { only?: string[]; speed?: string };
+            openai?: { serviceTier?: string };
+          };
         };
-        expect(request.providerOptions?.gateway).toMatchObject({ speed: "fast" });
+        expect(request.providerOptions?.gateway).toMatchObject({
+          speed: "fast",
+        });
         expect(request.providerOptions?.gateway?.only).toBeUndefined();
         expect(request.providerOptions?.openai?.serviceTier).toBeUndefined();
       } finally {
@@ -483,7 +593,10 @@ describe("ultrafast fake Gateway", () => {
   test(
     "a saved session retains Ultrafast until an explicit CLI disable",
     async () => {
-      const root = createIsolatedRoot({ ultrafast_mode: true, models: { gateway: ULTRA_MODEL } });
+      const root = createIsolatedRoot({
+        ultrafast_mode: true,
+        models: { gateway: ULTRA_MODEL },
+      });
       const gateway = startFakeGateway(
         [
           finishWithServiceTier("paid preference saved", "ultrafast"),
@@ -510,7 +623,14 @@ describe("ultrafast fake Gateway", () => {
           models: { gateway: ULTRA_MODEL },
         });
         const durableResume = await runFx(
-          ["ask", "--auto", "--json", "--resume", sessionId, "Resume the saved paid preference."],
+          [
+            "ask",
+            "--auto",
+            "--json",
+            "--resume",
+            sessionId,
+            "Resume the saved paid preference.",
+          ],
           { cwd: root.workspace, env, timeoutMs: TIMEOUT },
         );
         expect(durableResume.code, durableResume.stderr).toBe(0);
@@ -519,15 +639,29 @@ describe("ultrafast fake Gateway", () => {
         expectUltrafastRequest(gateway.requests[1]!.body);
 
         const disabledResume = await runFx(
-          ["ask", "--auto", "--json", "--resume", sessionId, "--no-ultrafast", "Resume without the paid tier."],
+          [
+            "ask",
+            "--auto",
+            "--json",
+            "--resume",
+            sessionId,
+            "--no-ultrafast",
+            "Resume without the paid tier.",
+          ],
           { cwd: root.workspace, env, timeoutMs: TIMEOUT },
         );
         expect(disabledResume.code, disabledResume.stderr).toBe(0);
         expect(disabledResume.stderr).toBe("");
         expect(gateway.requests).toHaveLength(3);
         expectStandardRequest(gateway.requests[2]!.body);
-        expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
-          .toMatchObject({ ultrafast_mode: false, models: { gateway: ULTRA_MODEL } });
+        expect(
+          JSON.parse(
+            readFileSync(join(root.home, ".fx", "settings.json"), "utf8"),
+          ),
+        ).toMatchObject({
+          ultrafast_mode: false,
+          models: { gateway: ULTRA_MODEL },
+        });
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -549,17 +683,31 @@ describe("ultrafast fake Gateway", () => {
         });
         const gateway = startFakeGateway(
           [
-            finishWithServiceTier(`${scenario.name} process override`, "ultrafast"),
-            fakeGatewayFinalText(`${scenario.name} resume uses the default tier`),
+            finishWithServiceTier(
+              `${scenario.name} process override`,
+              "ultrafast",
+            ),
+            fakeGatewayFinalText(
+              `${scenario.name} resume uses the default tier`,
+            ),
           ],
           { models: [ultrafastCatalogModel()] },
         );
         try {
           const initial = await runFx(
-            ["ask", "--auto", "--json", ...scenario.args, "Use a process-only Ultra override."],
+            [
+              "ask",
+              "--auto",
+              "--json",
+              ...scenario.args,
+              "Use a process-only Ultra override.",
+            ],
             {
               cwd: root.workspace,
-              env: fakeGatewayEnv(root, gateway, { FX_MODEL: undefined, ...scenario.env }),
+              env: fakeGatewayEnv(root, gateway, {
+                FX_MODEL: undefined,
+                ...scenario.env,
+              }),
               timeoutMs: TIMEOUT,
             },
           );
@@ -570,7 +718,14 @@ describe("ultrafast fake Gateway", () => {
           expectUltrafastRequest(gateway.requests[0]!.body);
 
           const resumed = await runFx(
-            ["ask", "--auto", "--json", "--resume", sessionId, "Resume without process overrides."],
+            [
+              "ask",
+              "--auto",
+              "--json",
+              "--resume",
+              sessionId,
+              "Resume without process overrides.",
+            ],
             {
               cwd: root.workspace,
               env: fakeGatewayEnv(root, gateway, { FX_MODEL: undefined }),
@@ -581,8 +736,14 @@ describe("ultrafast fake Gateway", () => {
           expect(resumed.stderr).toBe("");
           expect(gateway.requests).toHaveLength(2);
           expectStandardRequest(gateway.requests[1]!.body);
-          expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
-            .toMatchObject({ ultrafast_mode: false, models: { gateway: ULTRA_MODEL } });
+          expect(
+            JSON.parse(
+              readFileSync(join(root.home, ".fx", "settings.json"), "utf8"),
+            ),
+          ).toMatchObject({
+            ultrafast_mode: false,
+            models: { gateway: ULTRA_MODEL },
+          });
         } finally {
           gateway.stop();
           rmSync(root.root, { recursive: true, force: true });
@@ -602,7 +763,14 @@ describe("ultrafast fake Gateway", () => {
       );
       try {
         const result = await runFx(
-          ["ask", "--auto", "--json", "--no-save", "--ultrafast", "Use eligible Sol."],
+          [
+            "ask",
+            "--auto",
+            "--json",
+            "--no-save",
+            "--ultrafast",
+            "Use eligible Sol.",
+          ],
           {
             cwd: root.workspace,
             env: fakeGatewayEnv(root, gateway, { FX_MODEL: SOL_MODEL }),
@@ -611,10 +779,15 @@ describe("ultrafast fake Gateway", () => {
         );
         expect(result.code, result.stderr).toBe(0);
         expect(result.stderr).toBe("");
-        expect(JSON.parse(result.stdout)).toMatchObject({ model: SOL_MODEL, output: "eligible Sol response" });
+        expect(JSON.parse(result.stdout)).toMatchObject({
+          model: SOL_MODEL,
+          output: "eligible Sol response",
+        });
         expect(gateway.modelRequests.length).toBeGreaterThan(0);
         expect(gateway.requests).toHaveLength(1);
-        expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(SOL_MODEL);
+        expect(gateway.requests[0]!.headers.get("ai-language-model-id")).toBe(
+          SOL_MODEL,
+        );
         expectUltrafastRequest(gateway.requests[0]!.body);
       } finally {
         gateway.stop();
@@ -642,14 +815,25 @@ describe("ultrafast fake Gateway", () => {
         const root = createIsolatedRoot();
         const gateway = startFakeGateway([], { models: scenario.models });
         try {
-          const env = fakeGatewayEnv(root, gateway, { FX_MODEL: scenario.model });
+          const env = fakeGatewayEnv(root, gateway, {
+            FX_MODEL: scenario.model,
+          });
           const result = await runFx(
-            ["ask", "--auto", "--json", "--no-save", "--ultrafast", "Attempt premium routing."],
+            [
+              "ask",
+              "--auto",
+              "--json",
+              "--no-save",
+              "--ultrafast",
+              "Attempt premium routing.",
+            ],
             { cwd: root.workspace, env, timeoutMs: TIMEOUT },
           );
           expectAskJsonError(result);
           if (scenario.model === SOL_MODEL) {
-            expect(JSON.parse(result.stdout).error).toBe("UltrafastUnavailable");
+            expect(JSON.parse(result.stdout).error).toBe(
+              "UltrafastUnavailable",
+            );
           }
           expect(gateway.modelRequests.length).toBeGreaterThan(0);
           expect(gateway.requests).toEqual([]);
@@ -666,7 +850,9 @@ describe("ultrafast fake Gateway", () => {
     "rejects strict provider routing that excludes OpenAI before a completion POST",
     async () => {
       const root = createIsolatedRoot();
-      const gateway = startFakeGateway([], { models: [ultrafastCatalogModel()] });
+      const gateway = startFakeGateway([], {
+        models: [ultrafastCatalogModel()],
+      });
       try {
         const result = await runFx(
           [
@@ -680,7 +866,11 @@ describe("ultrafast fake Gateway", () => {
             "--provider-strict",
             "Do not permit OpenAI routing.",
           ],
-          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway), timeoutMs: TIMEOUT },
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway),
+            timeoutMs: TIMEOUT,
+          },
         );
         expectAskJsonError(result);
         expect(gateway.requests).toEqual([]);
@@ -737,7 +927,10 @@ describe("ultrafast fake Gateway", () => {
         [fakeGatewayFinalText("ACP remains standard")],
         { models: [ultrafastCatalogModel()] },
       );
-      const client = AcpClient.create(root.workspace, fakeGatewayEnv(root, gateway));
+      const client = AcpClient.create(
+        root.workspace,
+        fakeGatewayEnv(root, gateway),
+      );
       try {
         const sessionId = await startAcpSession(client);
         for (const [index, value] of ["toggle", true].entries()) {
@@ -746,10 +939,16 @@ describe("ultrafast fake Gateway", () => {
             { sessionId, configId: "ultrafast", value },
             3 + index,
           );
-          expect(rejected.error, JSON.stringify(rejected)).toMatchObject({ code: -32602 });
+          expect(rejected.error, JSON.stringify(rejected)).toMatchObject({
+            code: -32602,
+          });
           expect(gateway.requests).toEqual([]);
         }
-        const updates = await client.prompt(sessionId, "Invalid options must leave Ultra off.", 5);
+        const updates = await client.prompt(
+          sessionId,
+          "Invalid options must leave Ultra off.",
+          5,
+        );
         expect(JSON.stringify(updates)).toContain("ACP remains standard");
         expect(gateway.requests).toHaveLength(1);
         expectStandardRequest(gateway.requests[0]!.body);
@@ -769,14 +968,43 @@ describe("ultrafast fake Gateway", () => {
     "ACP launch flags override environment and profile Ultrafast settings",
     async () => {
       for (const scenario of [
-        { name: "profile", settings: { ultrafast_mode: true }, env: {}, args: [], ultrafast: true },
-        { name: "environment", settings: { ultrafast_mode: false }, env: { FX_ULTRAFAST: "1" }, args: [], ultrafast: true },
-        { name: "CLI enable", settings: { ultrafast_mode: false }, env: { FX_ULTRAFAST: "0" }, args: ["--ultrafast"], ultrafast: true },
-        { name: "CLI disable", settings: { ultrafast_mode: true }, env: { FX_ULTRAFAST: "1" }, args: ["--no-ultrafast"], ultrafast: false },
+        {
+          name: "profile",
+          settings: { ultrafast_mode: true },
+          env: {},
+          args: [],
+          ultrafast: true,
+        },
+        {
+          name: "environment",
+          settings: { ultrafast_mode: false },
+          env: { FX_ULTRAFAST: "1" },
+          args: [],
+          ultrafast: true,
+        },
+        {
+          name: "CLI enable",
+          settings: { ultrafast_mode: false },
+          env: { FX_ULTRAFAST: "0" },
+          args: ["--ultrafast"],
+          ultrafast: true,
+        },
+        {
+          name: "CLI disable",
+          settings: { ultrafast_mode: true },
+          env: { FX_ULTRAFAST: "1" },
+          args: ["--no-ultrafast"],
+          ultrafast: false,
+        },
       ]) {
         const root = createIsolatedRoot(scenario.settings);
         const gateway = startFakeGateway(
-          [finishWithServiceTier(`ACP ${scenario.name}`, scenario.ultrafast ? "ultrafast" : "standard")],
+          [
+            finishWithServiceTier(
+              `ACP ${scenario.name}`,
+              scenario.ultrafast ? "ultrafast" : "standard",
+            ),
+          ],
           { models: [ultrafastCatalogModel()] },
         );
         const client = AcpClient.create(
@@ -787,13 +1015,21 @@ describe("ultrafast fake Gateway", () => {
         try {
           const sessionId = await startAcpSession(client);
           expect(gateway.requests).toEqual([]);
-          const updates = await client.prompt(sessionId, "Use the launch setting.", 3);
+          const updates = await client.prompt(
+            sessionId,
+            "Use the launch setting.",
+            3,
+          );
           expect(JSON.stringify(updates)).toContain(`ACP ${scenario.name}`);
           expect(gateway.requests).toHaveLength(1);
-          if (scenario.ultrafast) expectUltrafastRequest(gateway.requests[0]!.body);
+          if (scenario.ultrafast)
+            expectUltrafastRequest(gateway.requests[0]!.body);
           else expectStandardRequest(gateway.requests[0]!.body);
-          expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
-            .toMatchObject(scenario.settings);
+          expect(
+            JSON.parse(
+              readFileSync(join(root.home, ".fx", "settings.json"), "utf8"),
+            ),
+          ).toMatchObject(scenario.settings);
         } finally {
           try {
             await client.close();
@@ -810,7 +1046,10 @@ describe("ultrafast fake Gateway", () => {
   test(
     "ACP saves Ultrafast enable and disable across load and resume",
     async () => {
-      const root = createIsolatedRoot({ ultrafast_mode: false, models: { gateway: ULTRA_MODEL } });
+      const root = createIsolatedRoot({
+        ultrafast_mode: false,
+        models: { gateway: ULTRA_MODEL },
+      });
       const gateway = startFakeGateway(
         [
           finishWithServiceTier("ACP saved Ultra", "ultrafast"),
@@ -824,49 +1063,89 @@ describe("ultrafast fake Gateway", () => {
       try {
         const sessionId = await startAcpSession(client);
         const enabled = await client.request(
-          "session/set_config_option", { sessionId, configId: "ultrafast", value: "true" }, 3,
+          "session/set_config_option",
+          { sessionId, configId: "ultrafast", value: "true" },
+          3,
         );
         expect(enabled.error).toBeUndefined();
-        const saved = await client.prompt(sessionId, "Persist Ultra in this session.", 4);
+        const saved = await client.prompt(
+          sessionId,
+          "Persist Ultra in this session.",
+          4,
+        );
         expect(JSON.stringify(saved)).toContain("ACP saved Ultra");
         expect(gateway.requests).toHaveLength(1);
         expectUltrafastRequest(gateway.requests[0]!.body);
         await client.close();
 
         client = AcpClient.create(root.workspace, env);
-        expect((await client.request("initialize", { protocolVersion: 1 }, 1)).error).toBeUndefined();
-        const loaded = await client.request("session/load", { sessionId, mcpServers: [] }, 2);
+        expect(
+          (await client.request("initialize", { protocolVersion: 1 }, 1)).error,
+        ).toBeUndefined();
+        const loaded = await client.request(
+          "session/load",
+          { sessionId, mcpServers: [] },
+          2,
+        );
         expect(loaded.error, JSON.stringify(loaded)).toBeUndefined();
-        expect(loaded.result?.configOptions).toContainEqual(expect.objectContaining({
-          id: "ultrafast", currentValue: "true",
-        }));
+        expect(loaded.result?.configOptions).toContainEqual(
+          expect.objectContaining({
+            id: "ultrafast",
+            currentValue: "true",
+          }),
+        );
         expect(gateway.requests).toHaveLength(1);
-        const continued = await client.prompt(sessionId, "Continue the saved Ultra session.", 3);
+        const continued = await client.prompt(
+          sessionId,
+          "Continue the saved Ultra session.",
+          3,
+        );
         expect(JSON.stringify(continued)).toContain("ACP loaded Ultra");
         expect(gateway.requests).toHaveLength(2);
         expectUltrafastRequest(gateway.requests[1]!.body);
         expect(gateway.requests[1]!.body).toContain("ACP saved Ultra");
         const disabled = await client.request(
-          "session/set_config_option", { sessionId, configId: "ultrafast", value: "false" }, 4,
+          "session/set_config_option",
+          { sessionId, configId: "ultrafast", value: "false" },
+          4,
         );
         expect(disabled.error).toBeUndefined();
         await client.close();
 
-        writeProfileSettings(root, { ultrafast_mode: true, models: { gateway: ULTRA_MODEL } });
+        writeProfileSettings(root, {
+          ultrafast_mode: true,
+          models: { gateway: ULTRA_MODEL },
+        });
         client = AcpClient.create(root.workspace, env);
-        expect((await client.request("initialize", { protocolVersion: 1 }, 1)).error).toBeUndefined();
-        const resumed = await client.request("session/resume", { sessionId, mcpServers: [] }, 2);
+        expect(
+          (await client.request("initialize", { protocolVersion: 1 }, 1)).error,
+        ).toBeUndefined();
+        const resumed = await client.request(
+          "session/resume",
+          { sessionId, mcpServers: [] },
+          2,
+        );
         expect(resumed.error, JSON.stringify(resumed)).toBeUndefined();
-        expect(resumed.result?.configOptions).toContainEqual(expect.objectContaining({
-          id: "ultrafast", currentValue: "false",
-        }));
+        expect(resumed.result?.configOptions).toContainEqual(
+          expect.objectContaining({
+            id: "ultrafast",
+            currentValue: "false",
+          }),
+        );
         expect(gateway.requests).toHaveLength(2);
-        const standard = await client.prompt(sessionId, "Resume the durable disable.", 3);
+        const standard = await client.prompt(
+          sessionId,
+          "Resume the durable disable.",
+          3,
+        );
         expect(JSON.stringify(standard)).toContain("ACP resumed standard");
         expect(gateway.requests).toHaveLength(3);
         expectStandardRequest(gateway.requests[2]!.body);
-        expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
-          .toMatchObject({ ultrafast_mode: true });
+        expect(
+          JSON.parse(
+            readFileSync(join(root.home, ".fx", "settings.json"), "utf8"),
+          ),
+        ).toMatchObject({ ultrafast_mode: true });
       } finally {
         try {
           await client.close();
@@ -884,25 +1163,42 @@ describe("ultrafast fake Gateway", () => {
     async () => {
       const root = createIsolatedRoot();
       let turn = 0;
-      const gateway = startDynamicFakeGateway(() => {
-        turn += 1;
-        if (turn === 1) {
-          return fakeGatewayToolCall(
-            "subagent_1",
-            "subagent",
-            { request: { action: "run", task: "ultrafast-child-marker" } },
+      const gateway = startDynamicFakeGateway(
+        () => {
+          turn += 1;
+          if (turn === 1) {
+            return fakeGatewayToolCall("subagent_1", "subagent", {
+              request: { action: "run", task: "ultrafast-child-marker" },
+            });
+          }
+          if (turn === 2)
+            return finishWithServiceTier("child completed", "ultrafast");
+          return finishWithServiceTier(
+            "parent observed the child",
+            "ultrafast",
           );
-        }
-        if (turn === 2) return finishWithServiceTier("child completed", "ultrafast");
-        return finishWithServiceTier("parent observed the child", "ultrafast");
-      }, { models: [ultrafastCatalogModel()] });
+        },
+        { models: [ultrafastCatalogModel()] },
+      );
       try {
         const result = await runFx(
-          ["ask", "--full-access", "--json", "--ultrafast", "Delegate one task."],
-          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway), timeoutMs: TIMEOUT },
+          [
+            "ask",
+            "--full-access",
+            "--json",
+            "--ultrafast",
+            "Delegate one task.",
+          ],
+          {
+            cwd: root.workspace,
+            env: fakeGatewayEnv(root, gateway),
+            timeoutMs: TIMEOUT,
+          },
         );
         expect(result.code, result.stderr).toBe(0);
-        expect(JSON.parse(result.stdout).output).toBe("parent observed the child");
+        expect(JSON.parse(result.stdout).output).toBe(
+          "parent observed the child",
+        );
         expect(gateway.requests).toHaveLength(3);
         expect(gateway.requests[1]!.body).toContain("ultrafast-child-marker");
         for (const { body } of gateway.requests) expectUltrafastRequest(body);
@@ -917,39 +1213,53 @@ describe("ultrafast fake Gateway", () => {
   test(
     "a named v2 subagent continues its history but cannot bypass the parent's Ultrafast disable",
     async () => {
-      const root = createIsolatedRoot({ ultrafast_mode: true, models: { gateway: ULTRA_MODEL } });
+      const root = createIsolatedRoot({
+        ultrafast_mode: true,
+        models: { gateway: ULTRA_MODEL },
+      });
       const childBodies: string[] = [];
       let parentRequests = 0;
-      const gateway = startDynamicFakeGateway((body) => {
-        if (!body.includes('"name":"subagent"')) {
-          childBodies.push(body);
+      const gateway = startDynamicFakeGateway(
+        (body) => {
+          if (!body.includes('"name":"subagent"')) {
+            childBodies.push(body);
+            return finishWithServiceTier(
+              `ULTRA_CHILD_${childBodies.length}`,
+              childBodies.length < 3 ? "ultrafast" : "standard",
+            );
+          }
+          parentRequests += 1;
+          const round = Math.ceil(parentRequests / 2);
+          if (parentRequests > 6)
+            return new Response("unexpected parent turn", { status: 500 });
+          if (parentRequests % 2 === 1) {
+            return fakeGatewayToolCall(`named-ultra-${round}`, "subagent", {
+              request: {
+                action: "message",
+                agent: "reviewer",
+                message: `ultrafast named review round ${round}`,
+                ...(round === 1
+                  ? { instructions: "Follow ULTRA_REVIEWER_RULES." }
+                  : {}),
+              },
+            });
+          }
           return finishWithServiceTier(
-            `ULTRA_CHILD_${childBodies.length}`,
-            childBodies.length < 3 ? "ultrafast" : "standard",
+            `ULTRA_PARENT_${round}`,
+            round < 3 ? "ultrafast" : "standard",
           );
-        }
-        parentRequests += 1;
-        const round = Math.ceil(parentRequests / 2);
-        if (parentRequests > 6) return new Response("unexpected parent turn", { status: 500 });
-        if (parentRequests % 2 === 1) {
-          return fakeGatewayToolCall(`named-ultra-${round}`, "subagent", {
-            request: {
-              action: "message",
-              agent: "reviewer",
-              message: `ultrafast named review round ${round}`,
-              ...(round === 1 ? { instructions: "Follow ULTRA_REVIEWER_RULES." } : {}),
-            },
-          });
-        }
-        return finishWithServiceTier(`ULTRA_PARENT_${round}`, round < 3 ? "ultrafast" : "standard");
-      }, { models: [ultrafastCatalogModel()] });
+        },
+        { models: [ultrafastCatalogModel()] },
+      );
       try {
         const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined });
         let sessionId: string | undefined;
         for (const round of [1, 2, 3]) {
           const result = await runFx(
             [
-              "ask", "--full-access", "--json",
+              "ask",
+              "--full-access",
+              "--json",
               ...(sessionId ? ["--resume", sessionId] : []),
               ...(round === 3 ? ["--no-ultrafast"] : []),
               `Ask the named reviewer for round ${round}.`,
@@ -975,13 +1285,21 @@ describe("ultrafast fake Gateway", () => {
           expect(body).toContain("ULTRA_CHILD_1");
         }
         expect(childBodies[2]).toContain("ULTRA_CHILD_2");
-        const log = readFileSync(join(root.home, ".fx", "sessions", "v2", sessionId!, "log.jsonl"), "utf8")
-          .trimEnd().split("\n").map((line) => JSON.parse(line));
+        const log = readFileSync(
+          join(root.home, ".fx", "sessions", "v2", sessionId!, "log.jsonl"),
+          "utf8",
+        )
+          .trimEnd()
+          .split("\n")
+          .map((line) => JSON.parse(line));
         const spawned = log.filter((line) => line.kind === "child_spawned");
         expect(spawned).toHaveLength(3);
         expect(new Set(spawned.map((line) => line.child)).size).toBe(1);
-        expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
-          .toMatchObject({ ultrafast_mode: true });
+        expect(
+          JSON.parse(
+            readFileSync(join(root.home, ".fx", "settings.json"), "utf8"),
+          ),
+        ).toMatchObject({ ultrafast_mode: true });
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
@@ -1000,7 +1318,12 @@ describe("ultrafast fake Gateway", () => {
         ]) {
           const root = createIsolatedRoot({ ultrafast_mode: scenario.profile });
           const gateway = startFakeGateway(
-            [finishWithServiceTier("interactive launch response", scenario.ultrafast ? "ultrafast" : "standard")],
+            [
+              finishWithServiceTier(
+                "interactive launch response",
+                scenario.ultrafast ? "ultrafast" : "standard",
+              ),
+            ],
             { models: [ultrafastCatalogModel()] },
           );
           const stderrPath = join(root.root, "stderr.txt");
@@ -1011,23 +1334,39 @@ describe("ultrafast fake Gateway", () => {
               cwd: root.workspace,
               isolated: true,
               stderrPath,
-              env: fakeGatewayEnv(root, gateway, { FX_ULTRAFAST: scenario.env, COLORTERM: "truecolor" }),
+              env: fakeGatewayEnv(root, gateway, {
+                FX_ULTRAFAST: scenario.env,
+                COLORTERM: "truecolor",
+              }),
             });
             await session.waitForComposer(TIMEOUT);
             await waitForGatewayModelCatalog(gateway);
             await session.sendText("/ultrafast status");
-            await session.waitForText(`requested: ${scenario.ultrafast ? "on" : "off"}`, TIMEOUT);
+            await session.waitForText(
+              `requested: ${scenario.ultrafast ? "on" : "off"}`,
+              TIMEOUT,
+            );
             expect(gateway.requests).toEqual([]);
             await session.sendText("Return the interactive launch response.");
             await session.waitForText("interactive launch response", TIMEOUT);
             await session.waitForStableComposer(TIMEOUT);
-            expect((await session.capturePaneEscapes()).includes("\x1b[38;2;255;204;0m⚡︎")).toBe(scenario.ultrafast);
-            expect(await session.captureFullScrollback()).toContain("interactive launch response");
+            expect(
+              (await session.capturePaneEscapes()).includes(
+                "\x1b[38;2;255;204;0m⚡︎",
+              ),
+            ).toBe(scenario.ultrafast);
+            expect(await session.captureFullScrollback()).toContain(
+              "interactive launch response",
+            );
             expect(gateway.requests).toHaveLength(1);
-            if (scenario.ultrafast) expectUltrafastRequest(gateway.requests[0]!.body);
+            if (scenario.ultrafast)
+              expectUltrafastRequest(gateway.requests[0]!.body);
             else expectStandardRequest(gateway.requests[0]!.body);
-            expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
-              .toMatchObject({ ultrafast_mode: scenario.profile });
+            expect(
+              JSON.parse(
+                readFileSync(join(root.home, ".fx", "settings.json"), "utf8"),
+              ),
+            ).toMatchObject({ ultrafast_mode: scenario.profile });
             expect(session.paneStatus()).toEqual({ dead: false, status: null });
             await session.sendText("/quit");
             await session.waitForSessionEnd(TIMEOUT);
@@ -1046,7 +1385,10 @@ describe("ultrafast fake Gateway", () => {
     test(
       "the Settings Ultra row persists across restart and serializes the next prompt",
       async () => {
-        const root = createIsolatedRoot({ ultrafast_mode: false, models: { gateway: ULTRA_MODEL } });
+        const root = createIsolatedRoot({
+          ultrafast_mode: false,
+          models: { gateway: ULTRA_MODEL },
+        });
         const gateway = startFakeGateway(
           [
             finishWithServiceTier("Settings enabled Ultra", "ultrafast"),
@@ -1059,31 +1401,52 @@ describe("ultrafast fake Gateway", () => {
         const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined });
         let session: TmuxSession | null = null;
         try {
-          session = await TmuxSession.create({ cwd: root.workspace, isolated: true, stderrPath, env });
+          session = await TmuxSession.create({
+            cwd: root.workspace,
+            isolated: true,
+            stderrPath,
+            env,
+          });
           await session.waitForComposer(TIMEOUT);
           await waitForGatewayModelCatalog(gateway);
           await session.sendText("/settings");
           await session.waitForText("←→ change", TIMEOUT);
           await session.sendLiteral("ultra");
-          await session.waitForPane((pane) => /Ultra mode\s+off\s+on/.test(pane), TIMEOUT);
-          expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
-            .toMatchObject({ ultrafast_mode: false });
+          await session.waitForPane(
+            (pane) => /Ultra mode\s+off\s+on/.test(pane),
+            TIMEOUT,
+          );
+          expect(
+            JSON.parse(
+              readFileSync(join(root.home, ".fx", "settings.json"), "utf8"),
+            ),
+          ).toMatchObject({ ultrafast_mode: false });
           expect(gateway.requests).toEqual([]);
           await session.sendKeys("Right");
           await session.waitForPane(
-            (pane) => /Ultra mode\s+off\s+on/.test(pane) && pane.includes("* ultrafast: requested on"),
+            (pane) =>
+              /Ultra mode\s+off\s+on/.test(pane) &&
+              pane.includes("* ultrafast: requested on"),
             TIMEOUT,
           );
-          expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
-            .toMatchObject({ ultrafast_mode: true });
+          expect(
+            JSON.parse(
+              readFileSync(join(root.home, ".fx", "settings.json"), "utf8"),
+            ),
+          ).toMatchObject({ ultrafast_mode: true });
           await session.sendKeys("Escape");
-          await session.waitForPane((pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"), TIMEOUT);
+          await session.waitForPane(
+            (pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"),
+            TIMEOUT,
+          );
           await session.sendText("Return the Settings enabled marker.");
           await session.waitForText("Settings enabled Ultra", TIMEOUT);
           await session.waitForStableComposer(TIMEOUT);
           expect(gateway.requests).toHaveLength(1);
           expectUltrafastRequest(gateway.requests[0]!.body);
-          expect(await session.captureFullScrollback()).toContain("Settings enabled Ultra");
+          expect(await session.captureFullScrollback()).toContain(
+            "Settings enabled Ultra",
+          );
           await session.sendText("/quit");
           await session.waitForSessionEnd(TIMEOUT);
           expect(session.paneStatus()).toEqual({ dead: true, status: 0 });
@@ -1091,7 +1454,12 @@ describe("ultrafast fake Gateway", () => {
           await session.kill();
           session = null;
 
-          session = await TmuxSession.create({ cwd: root.workspace, isolated: true, stderrPath, env });
+          session = await TmuxSession.create({
+            cwd: root.workspace,
+            isolated: true,
+            stderrPath,
+            env,
+          });
           await session.waitForComposer(TIMEOUT);
           await session.sendText("Return the Settings restored marker.");
           await session.waitForText("Settings restored Ultra", TIMEOUT);
@@ -1101,23 +1469,39 @@ describe("ultrafast fake Gateway", () => {
           await session.sendText("/settings");
           await session.waitForText("←→ change", TIMEOUT);
           await session.sendLiteral("ultra");
-          await session.waitForPane((pane) => /Ultra mode\s+off\s+on/.test(pane), TIMEOUT);
-          expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
-            .toMatchObject({ ultrafast_mode: true });
-          await session.sendKeys("Left");
           await session.waitForPane(
-            (pane) => /Ultra mode\s+off\s+on/.test(pane) && pane.includes("* ultrafast: requested off"),
+            (pane) => /Ultra mode\s+off\s+on/.test(pane),
             TIMEOUT,
           );
-          expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
-            .toMatchObject({ ultrafast_mode: false });
+          expect(
+            JSON.parse(
+              readFileSync(join(root.home, ".fx", "settings.json"), "utf8"),
+            ),
+          ).toMatchObject({ ultrafast_mode: true });
+          await session.sendKeys("Left");
+          await session.waitForPane(
+            (pane) =>
+              /Ultra mode\s+off\s+on/.test(pane) &&
+              pane.includes("* ultrafast: requested off"),
+            TIMEOUT,
+          );
+          expect(
+            JSON.parse(
+              readFileSync(join(root.home, ".fx", "settings.json"), "utf8"),
+            ),
+          ).toMatchObject({ ultrafast_mode: false });
           await session.sendKeys("Escape");
-          await session.waitForPane((pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"), TIMEOUT);
+          await session.waitForPane(
+            (pane) => hasEmptyComposer(pane) && !pane.includes("←→ change"),
+            TIMEOUT,
+          );
           await session.sendText("Return the Settings disabled marker.");
           await session.waitForText("Settings disabled Ultra", TIMEOUT);
           const settled = await session.waitForStableComposer(TIMEOUT);
           expect(settled).not.toContain("⚡︎");
-          expect(await session.captureFullScrollback()).toContain("Settings disabled Ultra");
+          expect(await session.captureFullScrollback()).toContain(
+            "Settings disabled Ultra",
+          );
           expect(gateway.requests).toHaveLength(3);
           expectStandardRequest(gateway.requests[2]!.body);
           expect(session.paneStatus()).toEqual({ dead: false, status: null });
@@ -1149,34 +1533,41 @@ describe("ultrafast fake Gateway", () => {
             cwd: root.workspace,
             isolated: true,
             stderrPath,
-            env: fakeGatewayEnv(root, gateway, { FX_THEME: theme, COLORTERM: "truecolor" }),
+            env: fakeGatewayEnv(root, gateway, {
+              FX_THEME: theme,
+              COLORTERM: "truecolor",
+            }),
           });
           await session.waitForComposer(TIMEOUT);
           await waitForGatewayModelCatalog(gateway);
           await session.sendKeys("C-p");
-          const catalog = await session.waitForText("tab provider", TIMEOUT);
+          const catalog = await session.waitForText("All models", TIMEOUT);
           expect(catalog).toContain(ULTRA_MODEL);
-          expect(catalog).toContain("Ultra");
+          expect(catalog).toContain("Roles");
+          await session.sendLiteral(ULTRA_MODEL);
           await session.sendKeys("Enter");
-          await session.waitForPane(
-            (pane) => composerContains(pane, `/model ${ULTRA_MODEL}`) && pane.includes("xhigh"),
-            TIMEOUT,
-          );
-          await session.sendLiteral("xhigh");
-          await session.sendKeys("Enter");
-          await session.waitForPane(
-            (pane) => composerContains(pane, `/model ${ULTRA_MODEL} xhigh`) && pane.includes("ultrafast"),
-            TIMEOUT,
-          );
-          await session.sendLiteral("ultrafast");
-          await session.sendKeys("Enter");
-          const switched = `Switched to ${ULTRA_MODEL} (effort: xhigh, speed: ultrafast)`;
+          await session.waitForText(`Switched to ${ULTRA_MODEL}`, TIMEOUT);
+          await session.sendText("/effort xhigh");
+          await session.sendText("/ultrafast on");
+          await session.waitForText("requested on", TIMEOUT);
+          const switched = `Switched to ${ULTRA_MODEL}`;
           await session.waitForText(switched, TIMEOUT);
           await session.waitForText("gpt-6-astra · xhigh · ⚡︎", TIMEOUT);
-          expect(await session.capturePaneEscapes()).toContain("\x1b[38;2;255;204;0m⚡︎");
-          expect((await session.captureFullScrollback()).replace(/\s+/g, " ")).toContain(switched);
-          expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
-            .toMatchObject({ ultrafast_mode: true, models: { gateway: ULTRA_MODEL }, effort: "xhigh" });
+          expect(await session.capturePaneEscapes()).toContain(
+            "\x1b[38;2;255;204;0m⚡︎",
+          );
+          expect(
+            (await session.captureFullScrollback()).replace(/\s+/g, " "),
+          ).toContain(switched);
+          expect(
+            JSON.parse(
+              readFileSync(join(root.home, ".fx", "settings.json"), "utf8"),
+            ),
+          ).toMatchObject({
+            ultrafast_mode: true,
+            models: { gateway: ULTRA_MODEL },
+            effort: "xhigh",
+          });
           expect(gateway.requests).toEqual([]);
           await session.sendText("Return the marker selection response.");
           await session.waitForText("marker selection response", TIMEOUT);
@@ -1185,11 +1576,18 @@ describe("ultrafast fake Gateway", () => {
           await session.sendText("/ultrafast off");
           await session.waitForText("requested off", TIMEOUT);
           expect(await session.capturePane()).not.toContain("⚡︎");
-          await session.sendText(`/model ${ULTRA_MODEL} high fast`);
-          await session.waitForText(`Switched to ${ULTRA_MODEL} (effort: high, speed: fast)`, TIMEOUT);
+          await session.sendText("/model");
+          await session.waitForText("All models", TIMEOUT);
+          await session.sendLiteral(ULTRA_MODEL);
+          await session.sendKeys("Enter");
+          await session.sendText("/effort high");
+          await session.sendText("/ultrafast on");
+          await session.waitForText(`Switched to ${ULTRA_MODEL}`, TIMEOUT);
           const pane = await session.capturePane();
           expect(pane).toContain("gpt-6-astra · high · ⚡︎");
-          expect(await session.capturePaneEscapes()).not.toContain("\x1b[38;2;255;204;0m⚡︎");
+          expect(await session.capturePaneEscapes()).not.toContain(
+            "\x1b[38;2;255;204;0m⚡︎",
+          );
           expect(session.paneStatus()).toEqual({ dead: false, status: null });
           expect(gateway.requests).toHaveLength(1);
           await session.sendText("/quit");
@@ -1209,7 +1607,9 @@ describe("ultrafast fake Gateway", () => {
       "on, off, and status use the live slash command and persist the request",
       async () => {
         const root = createIsolatedRoot();
-        const gateway = startFakeGateway([], { models: [ultrafastCatalogModel()] });
+        const gateway = startFakeGateway([], {
+          models: [ultrafastCatalogModel()],
+        });
         const stderrPath = join(root.root, "stderr.txt");
         let session: TmuxSession | null = null;
         try {
@@ -1228,13 +1628,19 @@ describe("ultrafast fake Gateway", () => {
           await session.waitForText("requested on", TIMEOUT);
           await session.sendText("/ultrafast status");
           await session.waitForText("requested: on", TIMEOUT);
-          expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
-            .toMatchObject({ ultrafast_mode: true });
+          expect(
+            JSON.parse(
+              readFileSync(join(root.home, ".fx", "settings.json"), "utf8"),
+            ),
+          ).toMatchObject({ ultrafast_mode: true });
 
           await session.sendText("/ultrafast off");
           await session.waitForText("requested off", TIMEOUT);
-          expect(JSON.parse(readFileSync(join(root.home, ".fx", "settings.json"), "utf8")))
-            .toMatchObject({ ultrafast_mode: false });
+          expect(
+            JSON.parse(
+              readFileSync(join(root.home, ".fx", "settings.json"), "utf8"),
+            ),
+          ).toMatchObject({ ultrafast_mode: false });
           expect(session.paneStatus()).toEqual({ dead: false, status: null });
           expect(gateway.requests).toEqual([]);
           await session.sendText("/quit");
@@ -1314,7 +1720,12 @@ function fastOnlyCatalogModel() {
 }
 
 function plainCatalogModel() {
-  return { id: PLAIN_MODEL, type: "language" as const, owned_by: "provider", tags: ["tool-use"] };
+  return {
+    id: PLAIN_MODEL,
+    type: "language" as const,
+    owned_by: "provider",
+    tags: ["tool-use"],
+  };
 }
 
 function speedCatalog() {
@@ -1323,19 +1734,28 @@ function speedCatalog() {
 
 function expectFastRequest(body: string) {
   expectStandardRequest(body);
-  const request = JSON.parse(body) as { providerOptions?: { gateway?: { speed?: string } } };
+  const request = JSON.parse(body) as {
+    providerOptions?: { gateway?: { speed?: string } };
+  };
   expect(request.providerOptions?.gateway?.speed).toBe("fast");
 }
 
 function expectNoLaneRequest(body: string) {
   expectStandardRequest(body);
-  const request = JSON.parse(body) as { providerOptions?: { gateway?: { speed?: string } } };
+  const request = JSON.parse(body) as {
+    providerOptions?: { gateway?: { speed?: string } };
+  };
   expect(request.providerOptions?.gateway?.speed).toBeUndefined();
 }
 
-function speedOptions(result: { configOptions?: Array<{ id: string; currentValue?: string }> } | undefined) {
+function speedOptions(
+  result:
+    | { configOptions?: Array<{ id: string; currentValue?: string }> }
+    | undefined,
+) {
   const options = result?.configOptions ?? [];
-  const value = (id: string) => options.find((option) => option.id === id)?.currentValue ?? "absent";
+  const value = (id: string) =>
+    options.find((option) => option.id === id)?.currentValue ?? "absent";
   return { fast: value("fast"), ultrafast: value("ultrafast") };
 }
 
@@ -1345,32 +1765,64 @@ describe("ACP speed options", () => {
     async () => {
       const root = createIsolatedRoot();
       const gateway = startFakeGateway(
-        [fakeGatewayFinalText("fast answer"), fakeGatewayFinalText("ultra answer"), fakeGatewayFinalText("plain answer")],
+        [
+          fakeGatewayFinalText("fast answer"),
+          fakeGatewayFinalText("ultra answer"),
+          fakeGatewayFinalText("plain answer"),
+        ],
         { models: speedCatalog() },
       );
-      const client = AcpClient.create(root.workspace, fakeGatewayEnv(root, gateway));
+      const client = AcpClient.create(
+        root.workspace,
+        fakeGatewayEnv(root, gateway),
+      );
       try {
         await client.request("initialize", { protocolVersion: 1 }, 1);
-        const created = await client.request("session/new", { mcpServers: [] }, 2);
+        const created = await client.request(
+          "session/new",
+          { mcpServers: [] },
+          2,
+        );
         const sessionId = created.result.sessionId as string;
-        expect(speedOptions(created.result)).toEqual({ fast: "false", ultrafast: "false" });
+        expect(speedOptions(created.result)).toEqual({
+          fast: "false",
+          ultrafast: "false",
+        });
 
         const set = (id: number, configId: string, value: string) =>
-          client.request("session/set_config_option", { sessionId, configId, value }, id);
-        expect(speedOptions((await set(3, "fast", "true")).result)).toEqual({ fast: "true", ultrafast: "false" });
+          client.request(
+            "session/set_config_option",
+            { sessionId, configId, value },
+            id,
+          );
+        expect(speedOptions((await set(3, "fast", "true")).result)).toEqual({
+          fast: "true",
+          ultrafast: "false",
+        });
         await client.prompt(sessionId, "Use Fast.", 4);
         expectFastRequest(gateway.requests[0]!.body);
 
-        expect(speedOptions((await set(5, "ultrafast", "true")).result)).toEqual({ fast: "false", ultrafast: "true" });
+        expect(
+          speedOptions((await set(5, "ultrafast", "true")).result),
+        ).toEqual({ fast: "false", ultrafast: "true" });
         await client.prompt(sessionId, "Use Ultrafast.", 6);
         expectUltrafastRequest(gateway.requests[1]!.body);
 
-        expect(speedOptions((await set(7, "fast", "true")).result)).toEqual({ fast: "true", ultrafast: "false" });
-        expect(speedOptions((await set(8, "model", FAST_ONLY_MODEL)).result)).toEqual({ fast: "true", ultrafast: "absent" });
-        expect(speedOptions((await set(9, "model", PLAIN_MODEL)).result)).toEqual({ fast: "absent", ultrafast: "absent" });
+        expect(speedOptions((await set(7, "fast", "true")).result)).toEqual({
+          fast: "true",
+          ultrafast: "false",
+        });
+        expect(
+          speedOptions((await set(8, "model", FAST_ONLY_MODEL)).result),
+        ).toEqual({ fast: "true", ultrafast: "absent" });
+        expect(
+          speedOptions((await set(9, "model", PLAIN_MODEL)).result),
+        ).toEqual({ fast: "absent", ultrafast: "absent" });
         await client.prompt(sessionId, "Plain model.", 10);
         expectNoLaneRequest(gateway.requests[2]!.body);
-        expect(speedOptions((await set(11, "model", FAST_ONLY_MODEL)).result)).toEqual({ fast: "false", ultrafast: "absent" });
+        expect(
+          speedOptions((await set(11, "model", FAST_ONLY_MODEL)).result),
+        ).toEqual({ fast: "false", ultrafast: "absent" });
         expect(gateway.requests).toHaveLength(3);
       } finally {
         try {
@@ -1388,20 +1840,49 @@ describe("ACP speed options", () => {
     "rejects unsupported lanes and unknown config ids without changing the session",
     async () => {
       const root = createIsolatedRoot();
-      const gateway = startFakeGateway([fakeGatewayFinalText("standard answer")], { models: speedCatalog() });
-      const client = AcpClient.create(root.workspace, fakeGatewayEnv(root, gateway, { FX_MODEL: PLAIN_MODEL }));
+      const gateway = startFakeGateway(
+        [fakeGatewayFinalText("standard answer")],
+        { models: speedCatalog() },
+      );
+      const client = AcpClient.create(
+        root.workspace,
+        fakeGatewayEnv(root, gateway, { FX_MODEL: PLAIN_MODEL }),
+      );
       try {
         const sessionId = await startAcpSession(client);
-        const fast = await client.request("session/set_config_option", { sessionId, configId: "fast", value: "true" }, 3);
+        const fast = await client.request(
+          "session/set_config_option",
+          { sessionId, configId: "fast", value: "true" },
+          3,
+        );
         expect(fast.error).toMatchObject({
           code: -32602,
-          data: { code: "LIBFX_MODEL_UNSUPPORTED_FAST", model: PLAIN_MODEL, capability: "fast" },
+          data: {
+            code: "LIBFX_MODEL_UNSUPPORTED_FAST",
+            model: PLAIN_MODEL,
+            capability: "fast",
+          },
         });
-        const off = await client.request("session/set_config_option", { sessionId, configId: "fast", value: "false" }, 4);
+        const off = await client.request(
+          "session/set_config_option",
+          { sessionId, configId: "fast", value: "false" },
+          4,
+        );
         expect(off.error).toBeUndefined();
-        const unknown = await client.request("session/set_config_option", { sessionId, configId: "speed", value: "fast" }, 5);
-        expect(unknown.error).toMatchObject({ code: -32602, message: "Unknown config option" });
-        const invalid = await client.request("session/set_config_option", { sessionId, configId: "fast", value: "on" }, 6);
+        const unknown = await client.request(
+          "session/set_config_option",
+          { sessionId, configId: "speed", value: "fast" },
+          5,
+        );
+        expect(unknown.error).toMatchObject({
+          code: -32602,
+          message: "Unknown config option",
+        });
+        const invalid = await client.request(
+          "session/set_config_option",
+          { sessionId, configId: "fast", value: "on" },
+          6,
+        );
         expect(invalid.error).toMatchObject({ code: -32602 });
         expect(gateway.requests).toEqual([]);
         await client.prompt(sessionId, "Still standard.", 7);
@@ -1422,17 +1903,31 @@ describe("ACP speed options", () => {
     "turns Ultrafast off when switching to a model without it so the next prompt runs",
     async () => {
       const root = createIsolatedRoot();
-      const gateway = startFakeGateway([fakeGatewayFinalText("plain after ultra")], { models: speedCatalog() });
-      const client = AcpClient.create(root.workspace, fakeGatewayEnv(root, gateway));
+      const gateway = startFakeGateway(
+        [fakeGatewayFinalText("plain after ultra")],
+        { models: speedCatalog() },
+      );
+      const client = AcpClient.create(
+        root.workspace,
+        fakeGatewayEnv(root, gateway),
+      );
       try {
         const sessionId = await startAcpSession(client);
         const set = (id: number, configId: string, value: string) =>
-          client.request("session/set_config_option", { sessionId, configId, value }, id);
+          client.request(
+            "session/set_config_option",
+            { sessionId, configId, value },
+            id,
+          );
         expect((await set(3, "ultrafast", "true")).error).toBeUndefined();
-        expect(speedOptions((await set(4, "model", PLAIN_MODEL)).result)).toEqual({ fast: "absent", ultrafast: "absent" });
+        expect(
+          speedOptions((await set(4, "model", PLAIN_MODEL)).result),
+        ).toEqual({ fast: "absent", ultrafast: "absent" });
         await client.prompt(sessionId, "Run on the plain model.", 5);
         expectNoLaneRequest(gateway.requests[0]!.body);
-        expect(speedOptions((await set(6, "model", ULTRA_MODEL)).result)).toEqual({ fast: "false", ultrafast: "false" });
+        expect(
+          speedOptions((await set(6, "model", ULTRA_MODEL)).result),
+        ).toEqual({ fast: "false", ultrafast: "false" });
       } finally {
         try {
           await client.close();
@@ -1450,33 +1945,66 @@ describe("ACP speed options", () => {
     async () => {
       const root = createIsolatedRoot({ models: { gateway: FAST_ONLY_MODEL } });
       const gateway = startFakeGateway(
-        [fakeGatewayFinalText("saved fast"), fakeGatewayFinalText("resumed fast"), fakeGatewayFinalText("resumed standard")],
+        [
+          fakeGatewayFinalText("saved fast"),
+          fakeGatewayFinalText("resumed fast"),
+          fakeGatewayFinalText("resumed standard"),
+        ],
         { models: speedCatalog() },
       );
       const env = fakeGatewayEnv(root, gateway, { FX_MODEL: undefined });
       let client = AcpClient.create(root.workspace, env);
       try {
         const sessionId = await startAcpSession(client);
-        const enabled = await client.request("session/set_config_option", { sessionId, configId: "fast", value: "true" }, 3);
-        expect(speedOptions(enabled.result)).toEqual({ fast: "true", ultrafast: "absent" });
+        const enabled = await client.request(
+          "session/set_config_option",
+          { sessionId, configId: "fast", value: "true" },
+          3,
+        );
+        expect(speedOptions(enabled.result)).toEqual({
+          fast: "true",
+          ultrafast: "absent",
+        });
         await client.prompt(sessionId, "Save Fast.", 4);
         expectFastRequest(gateway.requests[0]!.body);
         await client.close();
 
         client = AcpClient.create(root.workspace, env);
-        expect((await client.request("initialize", { protocolVersion: 1 }, 1)).error).toBeUndefined();
-        const resumed = await client.request("session/resume", { sessionId, mcpServers: [] }, 2);
-        expect(speedOptions(resumed.result)).toEqual({ fast: "true", ultrafast: "absent" });
+        expect(
+          (await client.request("initialize", { protocolVersion: 1 }, 1)).error,
+        ).toBeUndefined();
+        const resumed = await client.request(
+          "session/resume",
+          { sessionId, mcpServers: [] },
+          2,
+        );
+        expect(speedOptions(resumed.result)).toEqual({
+          fast: "true",
+          ultrafast: "absent",
+        });
         await client.prompt(sessionId, "Resume Fast.", 3);
         expectFastRequest(gateway.requests[1]!.body);
-        const disabled = await client.request("session/set_config_option", { sessionId, configId: "fast", value: "false" }, 4);
+        const disabled = await client.request(
+          "session/set_config_option",
+          { sessionId, configId: "fast", value: "false" },
+          4,
+        );
         expect(disabled.error).toBeUndefined();
         await client.close();
 
         client = AcpClient.create(root.workspace, env);
-        expect((await client.request("initialize", { protocolVersion: 1 }, 1)).error).toBeUndefined();
-        const standard = await client.request("session/resume", { sessionId, mcpServers: [] }, 2);
-        expect(speedOptions(standard.result)).toEqual({ fast: "false", ultrafast: "absent" });
+        expect(
+          (await client.request("initialize", { protocolVersion: 1 }, 1)).error,
+        ).toBeUndefined();
+        const standard = await client.request(
+          "session/resume",
+          { sessionId, mcpServers: [] },
+          2,
+        );
+        expect(speedOptions(standard.result)).toEqual({
+          fast: "false",
+          ultrafast: "absent",
+        });
         await client.prompt(sessionId, "Resume standard.", 3);
         expectNoLaneRequest(gateway.requests[2]!.body);
       } finally {

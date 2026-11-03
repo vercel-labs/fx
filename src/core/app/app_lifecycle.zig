@@ -204,6 +204,7 @@ pub const StartupState = struct {
     agent_step_limit: usize,
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     auto_compact_percent: u8 = compactor.default_percent,
+    context_promotion_enabled: bool = false,
     context_limits: config_runtime.context_limits.Values = .{},
     context_enabled: bool = true,
     fast_mode: bool = false,
@@ -370,35 +371,48 @@ pub const StartupState = struct {
         return value;
     }
 
-    /// The model `role` picks on the startup provider, borrowed from this
-    /// state or `builtin_small`; null keeps the consumer's default (D170).
-    pub fn roleModel(self: *const StartupState, role: model_roles.Role, builtin_small: ?[]const u8) ?[]const u8 {
-        return if (self.rolePick(role, builtin_small, null)) |picked| picked.model else null;
-    }
-
-    /// `roleModel` with the thinking level the role's entry names (D251).
-    /// `known`, when given, lets a fallback chain skip models the provider's
-    /// catalog does not list (D250).
-    pub fn rolePick(self: *const StartupState, role: model_roles.Role, builtin_small: ?[]const u8, known: ?model_roles.Known) ?model_roles.Picked {
-        var provider = self.provider;
-        const label = provider.label();
-        const ref = model_roles.resolve(&self.model_roles, role, .{
-            .provider = label,
+    /// Resolves a role to the provider-qualified startup selection. Side-call
+    /// consumers must retain this provider identity when acquiring credentials
+    /// and dispatching the request.
+    pub fn roleSelection(
+        self: *const StartupState,
+        role: model_roles.RoleId,
+        builtin_small: ?[]const u8,
+        known: ?model_roles.Known,
+    ) ?model_roles.Selection {
+        const provider = self.provider;
+        const reviewer_model = self.reviewerModel(provider);
+        return model_roles.resolveSelection(&self.model_roles, role, .{
+            .provider = provider.label(),
             .default_model = self.configured_model,
             .builtin_small = builtin_small,
-            // `review_model` was a gateway setting; other providers ignored it.
-            .legacy_review = if (self.provider == .gateway and self.review_model.len > 0) self.review_model else null,
+            .legacy_review = reviewer_model,
             .configured = self.configured_providers.definitions,
             .known = known,
-        }) orelse return null;
-        return .{ .model = ref.on(label) orelse return null, .effort = ref.effort };
+        });
     }
 
-    /// The permission reviewer's model; FX_REVIEW_MODEL, a gateway
-    /// override, outranks the profile's `review` role.
-    pub fn reviewModel(self: *const StartupState) []const u8 {
-        if (self.provider == .gateway and self.review_model.len > 0 and io_mod.getenv("FX_REVIEW_MODEL") != null) return self.review_model;
-        return self.roleModel(.review, null) orelse "";
+    pub fn roleSelectionChain(self: *const StartupState, role: model_roles.RoleId, out: []model_roles.Selection) usize {
+        const provider = self.provider;
+        return model_roles.selectionChain(&self.model_roles, role, .{
+            .provider = provider.label(),
+            .default_model = self.configured_model,
+            .legacy_review = self.reviewerModel(provider),
+            .configured = self.configured_providers.definitions,
+        }, out);
+    }
+
+    fn reviewerModel(self: *const StartupState, provider: model_provider.ProviderId) ?[]const u8 {
+        if (provider == .gateway and self.review_model.len > 0) return self.review_model;
+        if (self.configured_providers.native(provider.label())) |native| if (native.reviewer_model) |model| return model;
+        if (self.configured_providers.get(provider.label())) |definition| if (definition.reviewer_model) |model| return model;
+        return null;
+    }
+
+    pub fn reviewSelection(self: *const StartupState) ?model_roles.Selection {
+        if (self.provider == .gateway and self.review_model.len > 0 and io_mod.getenv("FX_REVIEW_MODEL") != null)
+            return .{ .provider = .gateway, .model = self.review_model, .source = .{ .builtin = .review } };
+        return self.roleSelection(.{ .builtin = .review }, null, null);
     }
 
     /// Moves the owned model-role table out; caller owns it.
@@ -872,6 +886,7 @@ fn loadStartupStateWithKeychainRead(
     state.agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps);
     state.max_tool_result_bytes = tool_result_limits.resolveMaxToolResultBytes(settings.max_tool_result_bytes, tool_result_limits.default_max_tool_result_bytes);
     state.auto_compact_percent = compactor.resolvePercent(settings.auto_compact_percent, io_mod.getenv("FX_AUTO_COMPACT_PERCENT"));
+    state.context_promotion_enabled = settings.context_promotion_enabled orelse false;
     state.context_limits = config_runtime.resolveContextLimits(settings, &.{});
     state.context_enabled = settings.context orelse true;
     const fast_mode = resolveStartupFastMode(

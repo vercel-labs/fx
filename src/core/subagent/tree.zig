@@ -4,6 +4,7 @@
 //! (D92), the approval registry (D93) and the hosts of every node below the
 //! root (D96). Node hosts borrow it; the root host owns it.
 const std = @import("std");
+const host_target = @import("../hosts/target.zig");
 const approval_registry = @import("approval_registry.zig");
 const child_state = @import("child_state.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -128,7 +129,7 @@ pub const Tree = struct {
     /// the tree kept for its subagents.
     pub fn destroy(self: *Tree) void {
         self.nodes.closeAll();
-        kernel_pool.releaseRetained(self);
+        if (comptime !host_target.is_wasm) kernel_pool.releaseRetained(self);
         self.approvals.deinit();
         self.recall_cache.deinit();
         self.mail.deinit();

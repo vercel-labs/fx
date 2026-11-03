@@ -1,4 +1,5 @@
 const std = @import("std");
+const tokenizer = @import("../tokenizer/tokenizer.zig");
 
 /// Incrementally estimates raw model or request text without making the result
 /// depend on transport chunk boundaries.
@@ -35,6 +36,19 @@ pub fn textTokens(text: []const u8) usize {
     var estimator = StreamingEstimator{};
     estimator.consume(text);
     return @intCast(@min(estimator.estimate(), std.math.maxInt(usize)));
+}
+
+/// Counts text with the selected native model tokenizer. Unlike `textTokens`,
+/// this is an exact model-family count and may lazily load its tokenizer table
+/// on first use.
+pub fn textTokensForEncoding(text: []const u8, encoding: tokenizer.Encoding) usize {
+    return tokenizer.count(text, encoding);
+}
+
+/// Uses a native model count when a request selected one, retaining the cheap
+/// byte estimator for providers without tokenizer metadata.
+pub fn textTokensWithEncoding(text: []const u8, encoding: ?tokenizer.Encoding) usize {
+    return if (encoding) |value| textTokensForEncoding(text, value) else textTokens(text);
 }
 
 test "StreamingEstimator is invariant across chunk boundaries" {

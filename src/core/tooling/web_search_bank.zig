@@ -752,8 +752,61 @@ const test_members = [_]Member{
     .{ .id = "keyed", .label = "Keyed", .available_fn = keyedAvailable, .explicit_available_fn = alwaysAvailable, .search_fn = keyedSearch },
 };
 
+const CrossProviderSearch = struct {
+    codex_calls: usize = 0,
+    grok_calls: usize = 0,
+    codex_token_ok: bool = false,
+    grok_token_ok: bool = false,
+};
+
+var cross_provider_search = CrossProviderSearch{};
+
+fn crossCodexAvailable(env: *const Env) bool {
+    return env.chatgpt_token != null;
+}
+
+fn crossGrokAvailable(env: *const Env) bool {
+    return env.grok_token != null;
+}
+
+fn crossCodexSearch(_: Allocator, env: *const Env, _: Query) anyerror!Answer {
+    cross_provider_search.codex_calls += 1;
+    cross_provider_search.codex_token_ok = std.mem.eql(u8, env.chatgpt_token orelse "", "codex-token") and
+        std.mem.eql(u8, env.chatgpt_account orelse "", "codex-account");
+    return error.SearchRateLimited;
+}
+
+fn crossGrokSearch(alloc: Allocator, env: *const Env, query: Query) anyerror!Answer {
+    cross_provider_search.grok_calls += 1;
+    cross_provider_search.grok_token_ok = std.mem.eql(u8, env.grok_token orelse "", "grok-token");
+    return goodSearch(alloc, env, query);
+}
+
 fn testQuery(cancel: *std.atomic.Value(bool)) Query {
     return .{ .text = "zig", .cancel_flag = cancel };
+}
+
+test "cross-provider credentials survive bank fallback" {
+    cross_provider_search = .{};
+    const alloc = std.testing.allocator;
+    const members = [_]Member{
+        .{ .id = "codex", .label = "Codex", .available_fn = crossCodexAvailable, .search_fn = crossCodexSearch },
+        .{ .id = "grok", .label = "Grok", .available_fn = crossGrokAvailable, .search_fn = crossGrokSearch },
+    };
+    const env = Env{
+        .chatgpt_token = "codex-token",
+        .chatgpt_account = "codex-account",
+        .grok_token = "grok-token",
+    };
+    var cancel = std.atomic.Value(bool).init(false);
+    var outcome = try run(alloc, &members, .{}, &env, testQuery(&cancel), null);
+    defer outcome.deinit(alloc);
+
+    try std.testing.expectEqualStrings("grok", outcome.provider.?);
+    try std.testing.expectEqual(@as(usize, 1), cross_provider_search.codex_calls);
+    try std.testing.expectEqual(@as(usize, 1), cross_provider_search.grok_calls);
+    try std.testing.expect(cross_provider_search.codex_token_ok);
+    try std.testing.expect(cross_provider_search.grok_token_ok);
 }
 
 test "chain falls back past errors and empty results and reports the answering provider" {

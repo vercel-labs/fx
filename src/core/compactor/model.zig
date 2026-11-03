@@ -13,7 +13,6 @@ const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
-
 const Allocator = std.mem.Allocator;
 
 /// A summary larger than this is not a summary; it only bounds memory.
@@ -21,6 +20,16 @@ const max_summary_bytes = 8 * 1024 * 1024;
 
 /// Reaches the conversation's model, and other models through the same
 /// provider and credential.
+pub const NativeCompaction = struct {
+    /// Host-owned adapter; the compactor never imports provider runtime types.
+    compact_fn: types.CompactionFn,
+    context: ?*anyopaque = null,
+    provider_id: model_provider.ProviderId,
+    kind: types.CompactionKind = .remote,
+    retained_message_budget: ?u32 = null,
+    prompt_cache_key: ?[]const u8 = null,
+};
+
 pub const ModelCaller = struct {
     context: *anyopaque,
     vtable: *const VTable,
@@ -29,12 +38,18 @@ pub const ModelCaller = struct {
     /// The model that writes the summary when it is not the conversation's
     /// own: the `compact` model role (D172). Empty uses `model`.
     summary_model: []const u8 = "",
+    /// Provider for the compact role when it differs from the conversation.
+    summary_provider: ?model_provider.ProviderId = null,
+    summary_credential_source: ?types.CredentialSource = null,
     provider: model_provider.ProviderId,
     credential_source: ?types.CredentialSource,
     /// The caller can send a request right after the conversation, exactly
     /// as the agent was about to send it, so the provider can reuse what it
     /// cached of it.
     sends_after_conversation: bool = false,
+    /// Optional provider-native compaction capability. The compactor invokes
+    /// this before structural summarization and owns the returned checkpoint.
+    native_compaction: ?NativeCompaction = null,
 
     pub const VTable = struct {
         /// What `model` accepts.

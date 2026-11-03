@@ -66,6 +66,7 @@ pub const CatalogAuthenticatedSource = enum {
     stored_key,
     chatgpt_subscription,
     grok_subscription,
+    configured,
 
     fn credentialSource(self: CatalogAuthenticatedSource) Source {
         return switch (self) {
@@ -75,6 +76,7 @@ pub const CatalogAuthenticatedSource = enum {
             .stored_key => .stored_key,
             .chatgpt_subscription => .chatgpt_subscription,
             .grok_subscription => .grok_subscription,
+            .configured => .configured,
         };
     }
 };
@@ -123,7 +125,7 @@ pub const CatalogAccess = union(enum) {
             .public_only => null,
             .authenticated => |access| if (access.authority == .explicit or
                 access.source == .chatgpt_subscription or
-                access.source == .grok_subscription)
+                access.source == .grok_subscription or access.source == .configured)
                 null
             else
                 .{
@@ -223,7 +225,7 @@ pub fn catalogAccessForCredentialAndAccount(
         .chatgpt_subscription => .chatgpt_subscription,
         .grok_subscription => .grok_subscription,
         .host_managed => unreachable,
-        .configured => return .{ .public_only = .no_credential },
+        .configured => .configured,
         .fx_login => blk: {
             const team = team_context orelse
                 return .{ .public_only = .fx_login_team_required };
@@ -991,6 +993,11 @@ test "catalog access isolates public and authenticated provider credentials" {
     try std.testing.expectEqualStrings("chatgpt-secret", chatgpt.authorizationCredential().?);
     try std.testing.expect(chatgpt.teamContext() == null);
     try std.testing.expect(chatgpt.publicFallbackAfterRejection() == null);
+
+    const configured = catalogAccessForCredential(.configured, "cursor-access|refresh", null);
+    try std.testing.expectEqual(Source.configured, configured.credentialSource().?);
+    try std.testing.expectEqualStrings("cursor-access|refresh", configured.authorizationCredential().?);
+    try std.testing.expect(configured.publicFallbackAfterRejection() == null);
 
     var grok_credential = Credential{
         .token = try std.testing.allocator.dupe(u8, "grok-secret"),

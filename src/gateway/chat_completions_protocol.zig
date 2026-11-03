@@ -14,6 +14,7 @@ const io_mod = @import("../core/shared/io.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
 const model_capabilities = @import("../core/config/model_capabilities.zig");
+const model_compatibility = @import("../core/config/model_compatibility.zig");
 const Allocator = std.mem.Allocator;
 
 pub const ToolChoiceMode = configured_provider.ToolChoiceMode;
@@ -24,6 +25,13 @@ pub const Options = struct {
     reasoning_format: ReasoningFormat = .none,
     /// Borrowed only during serialization; includes the configured authority binding.
     provider: ?*const model_provider.ProviderId = null,
+    /// Per-model wire policy, borrowed for the synchronous serialization call.
+    compatibility: ?*const model_compatibility.Compatibility = null,
+    /// Model metadata output cap used when a compatibility policy requires one.
+    default_max_output_tokens: ?u32 = null,
+    /// Endpoint routing facts used for compatibility-owned gateway routing.
+    openrouter_host: bool = false,
+    vercel_gateway_host: bool = false,
 };
 
 pub const Error = error{
@@ -168,7 +176,8 @@ fn validate_dynamic_schema(value: std.json.Value, depth: usize, budget: *SchemaB
     }
 }
 
-fn validate_request(request: stream_provider.RequestData, format: ReasoningFormat) Error!void {
+fn validate_request(request: stream_provider.RequestData, format: ReasoningFormat, compatibility: ?*const model_compatibility.Compatibility) Error!void {
+    _ = compatibility;
     try request.validatePrompt();
     configured_provider.validate_model_id(request.model) catch return error.InvalidModel;
     const options = request.provider_options;
@@ -401,7 +410,7 @@ fn write_replay(writer: *std.Io.Writer, alloc: Allocator, message: types.ChatMes
 /// max_output_tokens deliberately maps to max_tokens, not max_completion_tokens.
 /// Deadline enforcement and prepared-body reuse belong to the transport owner.
 pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, options: Options) Error![]u8 {
-    try validate_request(input, options.reasoning_format);
+    try validate_request(input, options.reasoning_format, options.compatibility);
     var projected: ?[]types.ChatMessage = null;
     if (options.provider) |provider| {
         projected = try types.projectProviderReplay(alloc, input.messages, .{ .provider = provider.*, .model = input.model });
@@ -419,14 +428,25 @@ pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, optio
         else => return error.InvalidToolCallId,
     };
     defer projection.deinit(alloc);
+    const effective_compatibility = active_compatibility(options, request.provider_options.reasoning != null);
+    var mistral_projection: ?MistralProjection = if (effective_compatibility) |compatibility|
+        if (compatibility.requires_mistral_tool_ids == true) MistralProjection.init(alloc, request.messages) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidToolCallId,
+        } else null
+    else
+        null;
+    defer if (mistral_projection) |*value| value.deinit(alloc);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    write_request(&out.writer, alloc, request, options, functions.items, &projection) catch |err| switch (err) {
+    write_request(&out.writer, alloc, request, options, functions.items, &projection, if (mistral_projection) |*value| value else null) catch |err| switch (err) {
         error.WriteFailed, error.OutOfMemory => return error.OutOfMemory,
         error.InvalidProviderState, error.ReplayTooLarge, error.JsonTooDeep, error.ImageUnavailable, error.InvalidProviderPrompt => |failure| return failure,
         else => return error.InvalidToolSchema,
     };
-    return out.toOwnedSlice();
+    const serialized = try out.toOwnedSlice();
+    defer alloc.free(serialized);
+    return merge_extra_body(alloc, serialized, effective_compatibility);
 }
 
 fn toolResultDenied(message: types.ChatMessage) bool {
@@ -438,16 +458,21 @@ fn toolResultDenied(message: types.ChatMessage) bool {
 }
 
 /// Writes one OpenAI-style image_url part. `base64_data` is already encoded.
-fn write_image_url_part_encoded(writer: *std.Io.Writer, media_type: []const u8, base64_data: []const u8) !void {
+fn write_image_url_part_encoded(writer: *std.Io.Writer, media_type: []const u8, base64_data: []const u8, detail: ?types.ImageDetail) !void {
     try writer.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
     try writer.writeAll(media_type);
     try writer.writeAll(";base64,");
     try writer.writeAll(base64_data);
-    try writer.writeAll("\"}}");
+    try writer.writeByte('"');
+    if (detail) |value| if (value != .original) {
+        try writer.writeAll(",\"detail\":");
+        try std.json.Stringify.value(@tagName(value), .{}, writer);
+    };
+    try writer.writeAll("}}");
 }
 
 /// Writes one OpenAI-style image_url part from raw bytes, encoding in chunks.
-fn write_image_url_part_raw(writer: *std.Io.Writer, media_type: []const u8, bytes: []const u8) !void {
+fn write_image_url_part_raw(writer: *std.Io.Writer, media_type: []const u8, bytes: []const u8, detail: ?types.ImageDetail) !void {
     try writer.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:");
     try writer.writeAll(media_type);
     try writer.writeAll(";base64,");
@@ -457,7 +482,12 @@ fn write_image_url_part_raw(writer: *std.Io.Writer, media_type: []const u8, byte
         try std.base64.standard.Encoder.encodeWriter(writer, bytes[offset..end]);
         offset = end;
     }
-    try writer.writeAll("\"}}");
+    try writer.writeByte('"');
+    if (detail) |value| if (value != .original) {
+        try writer.writeAll(",\"detail\":");
+        try std.json.Stringify.value(@tagName(value), .{}, writer);
+    };
+    try writer.writeAll("}}");
 }
 
 /// User messages carry image attachments as content parts instead of a plain
@@ -480,7 +510,7 @@ fn write_user_content_parts(
         if (wrote_part) try writer.writeByte(',');
         var snapshot = image_attachments.loadVerifiedSnapshot(alloc, image, .{}) catch return error.ImageUnavailable;
         defer snapshot.deinit(alloc);
-        try write_image_url_part_raw(writer, snapshot.media_type, snapshot.bytes);
+        try write_image_url_part_raw(writer, snapshot.media_type, snapshot.bytes, snapshot.detail);
         wrote_part = true;
     }
     try writer.writeByte(']');
@@ -493,6 +523,22 @@ fn write_text_part(writer: *std.Io.Writer, text: []const u8, cache_breakpoint: b
     try writer.writeByte('}');
 }
 
+test "chat image detail preserves supported values and omits original" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try write_image_url_part_raw(&out.writer, "image/png", "pixel", .low);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    const image_url = parsed.value.object.get("image_url").?.object;
+    try std.testing.expectEqualStrings("low", image_url.get("detail").?.string);
+    parsed.deinit();
+
+    out.clearRetainingCapacity();
+    try write_image_url_part_raw(&out.writer, "image/png", "pixel", .original);
+    parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("image_url").?.object.get("detail") == null);
+}
+
 /// Where Anthropic-style `cache_control` breakpoints go (D134): the last
 /// instruction, which caches the stable head, and the last user or
 /// assistant text, which caches the conversation so far as proto's
@@ -501,8 +547,9 @@ const CacheBreakpoints = struct {
     instruction: ?usize = null,
     message: ?usize = null,
 
-    fn of(request: stream_provider.RequestData) CacheBreakpoints {
-        if (!request.provider_options.prompt_caching and !honorsCacheControl(request.model)) return .{};
+    fn of(request: stream_provider.RequestData, compatibility: ?*const model_compatibility.Compatibility) CacheBreakpoints {
+        const explicit_format = compatibility != null and compatibility.?.cache_control_format == .anthropic;
+        if (!request.provider_options.prompt_caching and !explicit_format and !honorsCacheControl(request.model)) return .{};
         return .{
             .instruction = lastCacheableText(request.instructions, .system),
             .message = lastCacheableText(request.messages, null),
@@ -546,7 +593,7 @@ fn write_tool_image_follow_up(writer: *std.Io.Writer, alloc: Allocator, tool_nam
     try writer.writeByte('}');
     for (images) |image| {
         try writer.writeByte(',');
-        try write_image_url_part_encoded(writer, image.mime_type, image.data);
+        try write_image_url_part_encoded(writer, image.mime_type, image.data, null);
     }
     try writer.writeAll("]}");
 }
@@ -566,10 +613,177 @@ fn flush_tool_image_follow_up(
     pending_images.clearRetainingCapacity();
 }
 
-fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provider.RequestData, options: Options, functions: []const Function, projection: *const tool_call_ids.Projection) !void {
+fn active_compatibility(options: Options, reasoning_requested: bool) ?*const model_compatibility.Compatibility {
+    const base = options.compatibility orelse return null;
+    if (reasoning_requested) return base.when_thinking orelse base;
+    return base;
+}
+
+const MistralProjection = struct {
+    ids: std.StringHashMapUnmanaged([]const u8) = .empty,
+    owned: std.ArrayList([]u8) = .empty,
+
+    fn init(alloc: Allocator, messages: []const types.ChatMessage) !MistralProjection {
+        var result: MistralProjection = .{};
+        errdefer result.deinit(alloc);
+        for (messages) |message| {
+            if (message.role == .assistant) for (message.tool_calls) |call| try result.intern(alloc, call.id);
+            if (message.role == .tool) if (message.tool_call_id) |id| try result.intern(alloc, id);
+        }
+        return result;
+    }
+
+    fn deinit(self: *MistralProjection, alloc: Allocator) void {
+        self.ids.deinit(alloc);
+        for (self.owned.items) |value| alloc.free(value);
+        self.owned.deinit(alloc);
+    }
+
+    fn resolve(self: *const MistralProjection, id: []const u8) []const u8 {
+        return self.ids.get(id) orelse id;
+    }
+
+    fn intern(self: *MistralProjection, alloc: Allocator, id: []const u8) !void {
+        if (self.ids.contains(id)) return;
+        if (id.len > 0 and id.len <= 9 and is_mistral_id(id)) {
+            try self.ids.put(alloc, id, id);
+            return;
+        }
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(id, &digest, .{});
+        const hex = std.fmt.bytesToHex(digest[0..4].*, .lower);
+        var attempt: u8 = 0;
+        while (attempt < 36) : (attempt += 1) {
+            var candidate: [9]u8 = undefined;
+            @memcpy(candidate[0..8], &hex);
+            candidate[8] = if (attempt < 10) '0' + attempt else 'a' + (attempt - 10);
+            var duplicate = false;
+            var iterator = self.ids.iterator();
+            while (iterator.next()) |entry| if (std.mem.eql(u8, entry.value_ptr.*, &candidate)) {
+                duplicate = true;
+                break;
+            };
+            if (duplicate) continue;
+            const owned = try alloc.dupe(u8, &candidate);
+            errdefer alloc.free(owned);
+            try self.ids.put(alloc, id, owned);
+            try self.owned.append(alloc, owned);
+            return;
+        }
+        return error.InvalidToolCallId;
+    }
+};
+
+fn is_mistral_id(id: []const u8) bool {
+    for (id) |byte| if (!std.ascii.isAlphanumeric(byte)) return false;
+    return true;
+}
+
+fn write_wire_tool_id(writer: *std.Io.Writer, projection: *const tool_call_ids.Projection, mistral: ?*const MistralProjection, id: []const u8) !void {
+    const resolved = projection.resolve(id);
+    try std.json.Stringify.value(if (mistral) |value| value.resolve(resolved) else resolved, .{}, writer);
+}
+
+fn replay_has_reasoning_fields(alloc: Allocator, replay: types.ProviderReplay) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, replay.parts_json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    return parsed.value.object.contains("reasoning") or parsed.value.object.contains("reasoning_content") or parsed.value.object.contains("reasoning_text");
+}
+
+fn replay_option_has_reasoning_fields(alloc: Allocator, replay: ?types.ProviderReplay) bool {
+    return if (replay) |value| replay_has_reasoning_fields(alloc, value) else false;
+}
+
+fn write_replay_fields(writer: *std.Io.Writer, alloc: Allocator, message: types.ChatMessage, compatibility: ?*const model_compatibility.Compatibility) (Error || std.Io.Writer.Error)!void {
+    const replay = message.provider_replay orelse return;
+    var parsed = try parse_replay(alloc, replay.parts_json);
+    defer parsed.deinit();
+    var wrote_reasoning = false;
+    var fields = parsed.value.object.iterator();
+    while (fields.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, association_field)) continue;
+        const is_reasoning = contains_name(&reasoning_fields, entry.key_ptr.*);
+        if (is_reasoning and compatibility != null and compatibility.?.requires_thinking_as_text == true) continue;
+        if (is_reasoning and compatibility != null and compatibility.?.reasoning_content_field != null) {
+            if (wrote_reasoning) continue;
+            try writer.writeByte(',');
+            const selected = @tagName(compatibility.?.reasoning_content_field.?);
+            try std.json.Stringify.value(selected, .{}, writer);
+            try writer.writeByte(':');
+            try std.json.Stringify.value(entry.value_ptr.*, .{}, writer);
+            wrote_reasoning = true;
+            continue;
+        }
+        try writer.writeByte(',');
+        try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
+        try writer.writeByte(':');
+        try std.json.Stringify.value(entry.value_ptr.*, .{}, writer);
+    }
+}
+
+fn replay_reasoning_text(alloc: Allocator, message: types.ChatMessage) !?[]u8 {
+    const replay = message.provider_replay orelse return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, replay.parts_json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    for (reasoning_fields) |field| if (parsed.value.object.get(field)) |value| if (value == .string and value.string.len != 0) {
+        if (out.written().len != 0) try out.writer.writeAll("\n\n");
+        try out.writer.writeAll(value.string);
+    };
+    if (out.written().len == 0) return null;
+    return try out.toOwnedSlice();
+}
+
+fn write_assistant_content(
+    writer: *std.Io.Writer,
+    alloc: Allocator,
+    message: types.ChatMessage,
+    compatibility: ?*const model_compatibility.Compatibility,
+) !void {
+    if (compatibility) |value| if (value.requires_thinking_as_text == true) {
+        if (try replay_reasoning_text(alloc, message)) |reasoning| {
+            defer alloc.free(reasoning);
+            if (message.content) |content| if (content.len != 0) {
+                const combined = try std.mem.concat(alloc, u8, &.{ reasoning, "\\n\\n", content });
+                defer alloc.free(combined);
+                try std.json.Stringify.value(combined, .{}, writer);
+                return;
+            };
+            try std.json.Stringify.value(reasoning, .{}, writer);
+            return;
+        }
+    };
+    try std.json.Stringify.value(message.content, .{}, writer);
+}
+
+fn merge_extra_body(alloc: Allocator, body: []const u8, compatibility: ?*const model_compatibility.Compatibility) Error![]u8 {
+    const extra = if (compatibility) |value| value.extra_body else null;
+    if (extra == null or extra.? != .object or extra.?.object.count() == 0) return alloc.dupe(u8, body);
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    var parsed = std.json.parseFromSliceLeaky(std.json.Value, scratch, body, .{}) catch return error.InvalidProviderState;
+    var iterator = extra.?.object.iterator();
+    while (iterator.next()) |entry| parsed.object.put(scratch, entry.key_ptr.*, entry.value_ptr.*) catch return error.OutOfMemory;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    std.json.Stringify.value(parsed, .{}, &out.writer) catch return error.OutOfMemory;
+    return out.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provider.RequestData, options: Options, functions: []const Function, projection: *const tool_call_ids.Projection, mistral: ?*const MistralProjection) !void {
+    const compatibility = active_compatibility(options, request.provider_options.reasoning != null);
     try writer.writeAll("{\"model\":");
     try std.json.Stringify.value(request.model, .{}, writer);
-    try writer.writeAll(",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
+    if (compatibility) |value| if (value.supports_store == true) try writer.writeAll(",\"store\":false");
+    try writer.writeAll(",\"stream\":true");
+    if (compatibility == null or compatibility.?.supports_usage_in_streaming != false) {
+        try writer.writeAll(",\"stream_options\":{\"include_usage\":true}");
+    }
+    try writer.writeAll(",\"messages\":[");
     var count: usize = 0;
     // Images from tool results buffer across each contiguous tool-message run
     // and flush as one user message when the run ends, so tool messages stay
@@ -578,20 +792,53 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
     defer pending_names.deinit(alloc);
     var pending_images: std.ArrayList(types.ToolImage) = .empty;
     defer pending_images.deinit(alloc);
+    var previous_tool_result = false;
+    const combine_system = compatibility != null and compatibility.?.supports_multiple_system_messages == false;
     const lanes = [_][]const types.ChatMessage{ request.instructions, request.messages };
-    const breakpoints = CacheBreakpoints.of(request);
-    for (lanes, [_]?usize{ breakpoints.instruction, breakpoints.message }) |lane, breakpoint| {
-        for (lane, 0..) |message, message_index| {
-            const cache_breakpoint = breakpoint != null and breakpoint.? == message_index;
+    const breakpoints = CacheBreakpoints.of(request, compatibility);
+    for (lanes, [_]?usize{ breakpoints.instruction, breakpoints.message }, 0..) |lane, breakpoint, lane_index| {
+        for (lane, 0..) |source_message, message_index| {
+            if (combine_system and lane_index == 0 and message_index != 0) continue;
+            var message = source_message;
+            var combined_instruction: ?[]u8 = null;
+            defer if (combined_instruction) |value| alloc.free(value);
+            if (combine_system and lane_index == 0 and message_index == 0) {
+                var joined: std.ArrayList(u8) = .empty;
+                defer joined.deinit(alloc);
+                for (request.instructions, 0..) |instruction, index| {
+                    if (instruction.content) |content| if (content.len != 0) {
+                        if (joined.items.len != 0) try joined.appendSlice(alloc, "\n\n");
+                        try joined.appendSlice(alloc, content);
+                    };
+                    _ = index;
+                }
+                combined_instruction = try joined.toOwnedSlice(alloc);
+                message.content = combined_instruction;
+            }
+            const cache_breakpoint = breakpoint != null and (if (combine_system and lane_index == 0) message_index == 0 else breakpoint.? == message_index);
             // Source validation rejects empty assistants; only stripped replay can leave one here.
             if (message.role == .assistant and message.content == null and message.tool_calls.len == 0 and message.provider_replay == null) continue;
+            if (previous_tool_result and message.role != .tool and compatibility != null and compatibility.?.requires_assistant_after_tool_result == true) {
+                if (count != 0) try writer.writeByte(',');
+                count += 1;
+                try writer.writeAll("{\"role\":\"assistant\",\"content\":\"I have processed the tool results.\"}");
+                previous_tool_result = false;
+            }
             if (message.role != .tool) try flush_tool_image_follow_up(writer, alloc, &count, &pending_names, &pending_images);
             if (count != 0) try writer.writeByte(',');
             count += 1;
             try writer.writeAll("{\"role\":");
-            try std.json.Stringify.value(@tagName(message.role), .{}, writer);
+            const role = if (message.role == .system and compatibility != null and compatibility.?.supports_developer_role == true) "developer" else @tagName(message.role);
+            try std.json.Stringify.value(role, .{}, writer);
             try writer.writeAll(",\"content\":");
-            if (message.role == .user and message.images.len != 0) {
+            const synthetic_assistant_content = message.role == .assistant and message.tool_calls.len != 0 and
+                compatibility != null and compatibility.?.requires_assistant_content_for_tool_calls == true and
+                (message.content == null or message.content.?.len == 0);
+            if (synthetic_assistant_content) {
+                try writer.writeAll("\".\"");
+            } else if (message.role == .assistant and compatibility != null and compatibility.?.requires_thinking_as_text == true) {
+                try write_assistant_content(writer, alloc, message, compatibility);
+            } else if (message.role == .user and message.images.len != 0 and (compatibility == null or compatibility.?.strip_image_input != true)) {
                 try write_user_content_parts(writer, alloc, message, cache_breakpoint);
             } else if (cache_breakpoint) {
                 try writer.writeByte('[');
@@ -600,17 +847,32 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
             } else {
                 try std.json.Stringify.value(message.content, .{}, writer);
             }
-            try write_replay(writer, alloc, message);
+            try write_replay_fields(writer, alloc, message, compatibility);
+            if (message.role == .assistant and message.tool_calls.len != 0 and compatibility != null and
+                compatibility.?.requires_reasoning_content_for_tool_calls == true and
+                compatibility.?.requires_thinking_as_text != true and
+                !replay_option_has_reasoning_fields(alloc, message.provider_replay))
+            {
+                const field = @tagName(compatibility.?.reasoning_content_field orelse .reasoning_content);
+                try writer.writeByte(',');
+                try std.json.Stringify.value(field, .{}, writer);
+                try writer.writeAll(":");
+                try std.json.Stringify.value(if (compatibility.?.allows_synthetic_reasoning_content_for_tool_calls == true) "." else "", .{}, writer);
+            }
             if (message.role == .tool) {
                 try writer.writeAll(",\"tool_call_id\":");
-                try std.json.Stringify.value(projection.resolve(message.tool_call_id.?), .{}, writer);
+                try write_wire_tool_id(writer, projection, mistral, message.tool_call_id.?);
+                if (compatibility != null and compatibility.?.requires_tool_result_name == true) if (message.tool_name) |name| {
+                    try writer.writeAll(",\"name\":");
+                    try std.json.Stringify.value(name, .{}, writer);
+                };
             }
             if (message.tool_calls.len != 0) {
                 try writer.writeAll(",\"tool_calls\":[");
                 for (message.tool_calls, 0..) |call, index| {
                     if (index != 0) try writer.writeByte(',');
                     try writer.writeAll("{\"id\":");
-                    try std.json.Stringify.value(projection.resolve(call.id), .{}, writer);
+                    try write_wire_tool_id(writer, projection, mistral, call.id);
                     try writer.writeAll(",\"type\":\"function\",\"function\":{\"name\":");
                     try std.json.Stringify.value(call.name, .{}, writer);
                     try writer.writeAll(",\"arguments\":");
@@ -619,12 +881,14 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
                 }
                 try writer.writeByte(']');
             }
+            if (message.role == .tool) previous_tool_result = true;
             try writer.writeByte('}');
             if (message.role == .tool) {
                 const tool_images = if (message.tool_result_memory) |memory| memory.tool_images else &.{};
-                if (tool_images.len != 0 and !toolResultDenied(message)) {
+                const compatible_tool_images = if (compatibility != null and compatibility.?.strip_image_input == true) @as([]const types.ToolImage, &.{}) else tool_images;
+                if (compatible_tool_images.len != 0 and !toolResultDenied(message)) {
                     try pending_names.append(alloc, message.tool_name orelse "unknown");
-                    try pending_images.appendSlice(alloc, tool_images);
+                    try pending_images.appendSlice(alloc, compatible_tool_images);
                 }
             }
         }
@@ -645,39 +909,153 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
                 .builtin => |schema| try model_tool_schema.writeObjectSchema(alloc, writer, schema),
                 .dynamic => |schema| try std.json.Stringify.value(schema, .{}, writer),
             }
+            if (compatibility != null and compatibility.?.supports_strict_mode != false and compatibility.?.tool_strict_mode == .all_strict) {
+                try writer.writeAll(",\"strict\":true");
+            }
             try writer.writeAll("}}");
         }
         try writer.writeByte(']');
     }
     if (functions.len != 0) {
-        if (options.tool_choice_mode == .send) {
+        if (options.tool_choice_mode == .send and (compatibility == null or compatibility.?.supports_tool_choice != false)) {
             try writer.writeAll(",\"tool_choice\":");
-            try std.json.Stringify.value(@tagName(request.tool_choice), .{}, writer);
+            const choice = if (request.tool_choice == .required and compatibility != null and compatibility.?.supports_forced_tool_choice == false) "auto" else @tagName(request.tool_choice);
+            try std.json.Stringify.value(choice, .{}, writer);
         }
         if (request.provider_options.parallel_tool_calls) |parallel| {
             try writer.writeAll(",\"parallel_tool_calls\":");
             try std.json.Stringify.value(parallel, .{}, writer);
         }
     }
-    if (request.max_output_tokens) |limit| try writer.print(",\"max_tokens\":{d}", .{limit});
-    try write_reasoning(writer, request.provider_options, options.reasoning_format);
+    if (compatibility) |value| {
+        if (options.openrouter_host and value.openrouter_routing != null and request.provider_options.provider_order.len == 0) {
+            const route = value.openrouter_routing.?;
+            if (route.only.len != 0 or route.order.len != 0) {
+                try writer.writeAll(",\"provider\":{");
+                if (route.only.len != 0) {
+                    try writer.writeAll("\"only\":");
+                    try std.json.Stringify.value(route.only, .{}, writer);
+                } else {
+                    try writer.writeAll("\"order\":");
+                    try std.json.Stringify.value(route.order, .{}, writer);
+                }
+                try writer.writeByte('}');
+            }
+        }
+        if (options.vercel_gateway_host and value.vercel_gateway_routing != null) {
+            const route = value.vercel_gateway_routing.?;
+            if (route.only.len != 0 or route.order.len != 0) {
+                try writer.writeAll(",\"providerOptions\":{\"gateway\":{");
+                var wrote_route = false;
+                if (route.only.len != 0) {
+                    try writer.writeAll("\"only\":");
+                    try std.json.Stringify.value(route.only, .{}, writer);
+                    wrote_route = true;
+                }
+                if (route.order.len != 0) {
+                    if (wrote_route) try writer.writeByte(',');
+                    try writer.writeAll("\"order\":");
+                    try std.json.Stringify.value(route.order, .{}, writer);
+                }
+                try writer.writeAll("}}");
+            }
+        }
+    }
+    const output_limit = request.max_output_tokens orelse if (compatibility != null and compatibility.?.always_send_max_tokens == true)
+        options.default_max_output_tokens
+    else
+        null;
+    if (output_limit) |limit| {
+        const field = if (compatibility) |value| if (value.max_tokens_field) |selected| @tagName(selected) else "max_tokens" else "max_tokens";
+        try writer.print(",\"{s}\":{d}", .{ field, limit });
+    }
+    try write_reasoning(writer, request.provider_options, options.reasoning_format, compatibility, functions.len, request.tool_choice);
     try writer.writeByte('}');
 }
 
 /// OpenRouter takes `reasoning.effort` up to `xhigh` and a `provider` route;
 /// OpenAI-style endpoints take `reasoning_effort` as the catalog names it.
-fn write_reasoning(writer: *std.Io.Writer, options: model_capabilities.ResolvedProviderOptions, format: ReasoningFormat) !void {
-    if (options.reasoning) |effort| if (effort.gatewayValue()) |name| switch (format) {
-        .none => {},
-        .openrouter => {
-            try writer.writeAll(",\"reasoning\":{\"effort\":");
-            try std.json.Stringify.value(if (std.mem.eql(u8, name, "max")) "xhigh" else name, .{}, writer);
-            try writer.writeByte('}');
-        },
-        .openai => {
-            try writer.writeAll(",\"reasoning_effort\":");
-            try std.json.Stringify.value(name, .{}, writer);
-        },
+fn write_reasoning(
+    writer: *std.Io.Writer,
+    options: model_capabilities.ResolvedProviderOptions,
+    format: ReasoningFormat,
+    compatibility: ?*const model_compatibility.Compatibility,
+    function_count: usize,
+    tool_choice: types.ToolChoice,
+) !void {
+    const disabled = if (compatibility) |value|
+        (function_count != 0 and value.disable_reasoning_with_tools == true) or
+            (tool_choice == .required and value.disable_reasoning_on_forced_tool_choice == true) or
+            (tool_choice != .auto and value.disable_reasoning_on_tool_choice == true)
+    else
+        false;
+    const supports_params = compatibility == null or compatibility.?.supports_reasoning_params != false;
+    const supports_effort = compatibility == null or compatibility.?.supports_reasoning_effort != false;
+    if (!disabled and supports_params) if (options.reasoning) |effort| if (effort.gatewayValue()) |raw_name| {
+        const selected = active_effort_name(compatibility, raw_name);
+        if (supports_effort) switch (format) {
+            .none => {},
+            .openrouter => {
+                if (compatibility) |value| {
+                    switch (value.thinking_format orelse .openrouter) {
+                        .openrouter, .openai, .zai => {
+                            try writer.writeAll(",\"reasoning\":{\"effort\":");
+                            try std.json.Stringify.value(if (std.mem.eql(u8, selected, "max")) "xhigh" else selected, .{}, writer);
+                            try writer.writeByte('}');
+                        },
+                        .qwen => {
+                            try writer.writeAll(",\"enable_thinking\":true,\"reasoning_effort\":");
+                            try std.json.Stringify.value(selected, .{}, writer);
+                        },
+                        .qwen_chat_template => {
+                            try writer.writeAll(",\"chat_template_kwargs\":{\"enable_thinking\":true,\"reasoning_effort\":");
+                            try std.json.Stringify.value(selected, .{}, writer);
+                            try writer.writeByte('}');
+                        },
+                    }
+                } else {
+                    try writer.writeAll(",\"reasoning\":{\"effort\":");
+                    try std.json.Stringify.value(if (std.mem.eql(u8, selected, "max")) "xhigh" else selected, .{}, writer);
+                    try writer.writeByte('}');
+                }
+            },
+            .openai => {
+                if (compatibility) |value| {
+                    switch (value.thinking_format orelse .openai) {
+                        .openai, .openrouter, .zai => {
+                            try writer.writeAll(",\"reasoning_effort\":");
+                            try std.json.Stringify.value(selected, .{}, writer);
+                        },
+                        .qwen => {
+                            try writer.writeAll(",\"enable_thinking\":true");
+                            if (value.qwen_template_reasoning_effort == true) {
+                                try writer.writeAll(",\"reasoning_effort\":");
+                                try std.json.Stringify.value(selected, .{}, writer);
+                            }
+                        },
+                        .qwen_chat_template => {
+                            try writer.writeAll(",\"chat_template_kwargs\":{\"enable_thinking\":true");
+                            if (value.qwen_template_reasoning_effort == true) {
+                                try writer.writeAll(",\"reasoning_effort\":");
+                                try std.json.Stringify.value(selected, .{}, writer);
+                            }
+                            try writer.writeByte('}');
+                        },
+                    }
+                } else {
+                    try writer.writeAll(",\"reasoning_effort\":");
+                    try std.json.Stringify.value(selected, .{}, writer);
+                }
+            },
+        };
+    };
+    if (disabled and supports_effort and format != .none) if (compatibility) |value| {
+        switch (value.thinking_format orelse .openai) {
+            .zai => try writer.writeAll(",\"thinking\":{\"type\":\"disabled\"}"),
+            .qwen => try writer.writeAll(",\"enable_thinking\":false"),
+            .qwen_chat_template => try writer.writeAll(",\"chat_template_kwargs\":{\"enable_thinking\":false}"),
+            else => try writer.writeAll(",\"reasoning_effort\":\"none\""),
+        }
     };
     if (format == .openrouter and options.provider_order.len != 0) {
         try writer.writeAll(",\"provider\":{");
@@ -687,7 +1065,14 @@ fn write_reasoning(writer: *std.Io.Writer, options: model_capabilities.ResolvedP
     }
 }
 
+fn active_effort_name(compatibility: ?*const model_compatibility.Compatibility, raw_name: []const u8) []const u8 {
+    if (compatibility) |value| if (value.reasoning_effort_map) |map| if (map.get(raw_name)) |mapped| return mapped;
+    return raw_name;
+}
+
 pub const Limits = struct {
+    /// Compatibility stream shaping selected by the configured model.
+    compatibility: ?*const model_compatibility.Compatibility = null,
     event_bytes: usize = 1024 * 1024,
     total_wire_bytes: usize = 32 * 1024 * 1024,
     events: usize = 100_000,
@@ -751,10 +1136,12 @@ pub const Reducer = struct {
     phase: enum { receiving, finished, done, closed } = .receiving,
     event_count: usize = 0,
     json_bytes: usize = 0,
+    thinking_markup: bool = false,
+    markup_pending: std.ArrayList(u8) = .empty,
 
     pub fn init(alloc: Allocator, request: stream_provider.RequestData, limits: Limits) Error!Reducer {
         // The request was already sent; any accepted reasoning format applies.
-        try validate_request(request, .openrouter);
+        try validate_request(request, .openrouter, limits.compatibility);
         return .{ .alloc = alloc, .limits = limits, .choice = request.tool_choice };
     }
 
@@ -762,6 +1149,7 @@ pub const Reducer = struct {
         for (self.tools.items) |*tool| tool.deinit(self.alloc);
         self.tools.deinit(self.alloc);
         self.content.deinit(self.alloc);
+        self.markup_pending.deinit(self.alloc);
         for (&self.reasoning) |*part| part.bytes.deinit(self.alloc);
         self.reasoning_details.bytes.deinit(self.alloc);
         if (self.generation_id) |id| self.alloc.free(id);
@@ -825,9 +1213,11 @@ pub const Reducer = struct {
         if (non_null(delta, "role")) |role| if (!std.mem.eql(u8, try string(role), "assistant")) return error.InvalidChunk;
         // These fields carry semantics outside this codec's text/function subset.
         for ([_][]const u8{ "function_call", "audio" }) |key| if (non_null(delta, key) != null) return error.InvalidChunk;
-        const reasoning_delta = try self.accept_reasoning(delta);
+        const reasoning_start = self.reasoning[0].bytes.items.len;
+        var deltas = Deltas{ .reasoning = try self.accept_reasoning(delta) };
         const content_start = self.content.items.len;
-        if (non_null(delta, "content")) |value| try append_bounded(self.alloc, &self.content, try string(value), self.limits.content_bytes, error.ContentTooLarge);
+        if (non_null(delta, "content")) |value| try self.accept_content_markup(try string(value), &deltas);
+        if (self.reasoning[0].bytes.items.len > reasoning_start) deltas.reasoning[0] = self.reasoning[0].bytes.items[reasoning_start..];
         if (non_null(delta, "refusal")) |value| {
             const refusal = try string(value);
             self.refusal_seen = self.refusal_seen or refusal.len != 0;
@@ -841,8 +1231,126 @@ pub const Reducer = struct {
         }
         return .{
             .content = if (self.content.items.len > content_start) self.content.items[content_start..] else null,
-            .reasoning = reasoning_delta,
+            .reasoning = deltas.reasoning,
         };
+    }
+
+    fn accept_content_markup(self: *Reducer, text: []const u8, deltas: *Deltas) Error!void {
+        const pattern = if (self.limits.compatibility) |compatibility| compatibility.stream_markup_healing_pattern else null;
+        if (pattern == null) {
+            try append_bounded(self.alloc, &self.content, text, self.limits.content_bytes, error.ContentTooLarge);
+            return;
+        }
+        // Kimi/DSML/Qwen and thinking streams all use a thinking-tag envelope
+        // in practice. Keep the scanner deliberately provider-agnostic: visible
+        // text survives unchanged while leaked <think>/<analysis> markup becomes
+        // a reasoning delta and is omitted from the final answer.
+        var work = try std.mem.concat(self.alloc, u8, &.{ self.markup_pending.items, text });
+        defer self.alloc.free(work);
+        self.markup_pending.clearRetainingCapacity();
+        var pos: usize = 0;
+        while (pos < work.len) {
+            const next = find_markup(work[pos..]);
+            if (next) |match| {
+                const absolute = pos + match.index;
+                if (absolute > pos) try self.append_markup_segment(work[pos..absolute], deltas);
+                if (!match.suppress) self.thinking_markup = match.open;
+                pos = absolute + match.len;
+            } else {
+                const hold = markup_prefix_len(work[pos..]);
+                const end = work.len - hold;
+                if (end > pos) try self.append_markup_segment(work[pos..end], deltas);
+                if (hold != 0) try self.markup_pending.appendSlice(self.alloc, work[end..]);
+                break;
+            }
+        }
+    }
+
+    fn append_markup_segment(self: *Reducer, text: []const u8, deltas: *Deltas) Error!void {
+        if (text.len == 0) return;
+        if (self.thinking_markup) {
+            const part = &self.reasoning[0];
+            try self.count_reasoning(text.len);
+            const start = part.bytes.items.len;
+            try part.bytes.appendSlice(self.alloc, text);
+            part.presence = .value;
+            if (deltas.reasoning[0] == null) deltas.reasoning[0] = part.bytes.items[start..];
+        } else {
+            try append_bounded(self.alloc, &self.content, text, self.limits.content_bytes, error.ContentTooLarge);
+        }
+    }
+
+    const MarkupMatch = struct { index: usize, len: usize, open: bool, suppress: bool = false };
+
+    fn find_markup(text: []const u8) ?MarkupMatch {
+        const tags = [_]struct { text: []const u8, open: bool }{
+            .{ .text = "<think>", .open = true },
+            .{ .text = "</think>", .open = false },
+            .{ .text = "<analysis>", .open = true },
+            .{ .text = "</analysis>", .open = false },
+            .{ .text = "<|thinking|>", .open = true },
+            .{ .text = "<|/thinking|>", .open = false },
+        };
+        var result: ?MarkupMatch = null;
+        for (tags) |tag| if (std.mem.find(u8, text, tag.text)) |index| {
+            if (result == null or index < result.?.index) result = .{ .index = index, .len = tag.text.len, .open = tag.open };
+        };
+        if (find_special_token(text)) |special| {
+            if (result == null or special.index < result.?.index) result = special;
+        }
+        return result;
+    }
+
+    fn find_special_token(text: []const u8) ?MarkupMatch {
+        var start: ?usize = null;
+        var close: []const u8 = "";
+        if (std.mem.find(u8, text, "<｜")) |index| {
+            start = index;
+            close = "｜>";
+        }
+        if (std.mem.find(u8, text, "<|")) |index| {
+            if (start == null or index < start.?) {
+                start = index;
+                close = "|>";
+            }
+        }
+        const index = start orelse return null;
+        const end = std.mem.findPos(u8, text, index + 2, close) orelse return null;
+        const length = end + close.len - index;
+        if (length > 256) return null;
+        return .{ .index = index, .len = length, .open = false, .suppress = true };
+    }
+
+    fn markup_prefix_len(text: []const u8) usize {
+        var special_start: ?usize = null;
+        var special_close: []const u8 = "";
+        if (std.mem.findScalarLast(u8, text, '<')) |index| {
+            if (index + 1 < text.len) {
+                if (text[index + 1] == '｜') {
+                    special_start = index;
+                    special_close = "｜>";
+                } else if (text[index + 1] == '|') {
+                    special_start = index;
+                    special_close = "|>";
+                }
+            }
+        }
+        if (special_start) |index| {
+            if (std.mem.findPos(u8, text, index + 2, special_close) == null) {
+                const length = text.len - index;
+                if (length <= 256) return length;
+            }
+        }
+        const tags = [_][]const u8{ "<think>", "</think>", "<analysis>", "</analysis>", "<|thinking|>", "<|/thinking|>", "<｜", "<|" };
+        var longest: usize = 0;
+        for (tags) |tag| {
+            const max = @min(tag.len - 1, text.len);
+            var n: usize = 1;
+            while (n <= max) : (n += 1) {
+                if (std.mem.endsWith(u8, text, tag[0..n])) longest = @max(longest, n);
+            }
+        }
+        return longest;
     }
 
     fn accept_reasoning(self: *Reducer, fields: std.json.ObjectMap) Error![2]?[]const u8 {
@@ -1039,6 +1547,11 @@ pub const Reducer = struct {
             else => return error.InvalidFinishReason,
         }
         if (self.refusal_seen) return error.Refused;
+        if (self.markup_pending.items.len != 0) {
+            var ignored = Deltas{};
+            try self.append_markup_segment(self.markup_pending.items, &ignored);
+            self.markup_pending.clearRetainingCapacity();
+        }
         // A cut-off reply may stop anywhere, so only a finished one has to
         // agree with its tool calls.
         if (reason != .length) {
@@ -1230,6 +1743,25 @@ fn test_finish(reducer: *Reducer, terminal: []const u8) Error!stream_provider.Re
     try test_accept(reducer, terminal);
     try test_accept(reducer, "[DONE]");
     return reducer.finish(false);
+}
+
+test "chat completions heals thinking markup across stream chunks" {
+    const alloc = std.testing.allocator;
+    var compatibility: model_compatibility.Compatibility = .{ .stream_markup_healing_pattern = .thinking };
+    var reducer = try Reducer.init(alloc, test_request(), .{ .compatibility = &compatibility });
+    defer reducer.deinit();
+    const first = try reducer.accept("{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"<thi\"}}]}", false);
+    try std.testing.expect(first.content == null);
+    const second = try reducer.accept("{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"nk>plan\"}}]}", false);
+    try std.testing.expectEqualStrings("plan", second.reasoning[0].?);
+    const third = try reducer.accept("{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"</think>answer\"}}]}", false);
+    try std.testing.expectEqualStrings("answer", third.content.?);
+    var result = try test_finish(&reducer, test_stop);
+    defer result.deinit(alloc);
+    try std.testing.expectEqualStrings("answer", result.completed.completion.content.?);
+    var state = try std.json.parseFromSlice(std.json.Value, alloc, result.completed.completion.provider_state_json.?, .{});
+    defer state.deinit();
+    try std.testing.expectEqualStrings("plan", state.value.object.get("reasoning").?.string);
 }
 
 test "chat completions reasoning fields survive a completed response" {

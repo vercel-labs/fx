@@ -402,7 +402,12 @@ pub fn runCommand(arena: Allocator, state: *server.ServerState, node_id: []const
         .context => {
             var preferences = try store.childPreferences(arena, node_id);
             defer preferences.deinit(arena);
-            const capabilities = state.capability_resolver.available(preferences.model, state.cfg.provider_set.select(preferences.provider).fallbackModelCapabilities(preferences.model));
+            const capabilities = server.modelCapabilitiesFor(
+                state,
+                preferences.provider,
+                preferences.model,
+                state.cfg.provider_set.select(preferences.provider).fallbackModelCapabilities(preferences.model),
+            );
             try host_commands.writeResult(out, command, .{ .context = .{
                 .used = (try store.contextUsage(arena, node_id)) orelse 0,
                 .total = capabilities.context_window,

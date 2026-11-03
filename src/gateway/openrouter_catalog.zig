@@ -1,15 +1,12 @@
 //! OpenRouter's live model list (D146). `GET <base>/models` is public; the
-//! models that take tools are kept, cached in the profile, and answer
-//! capability lookups for models outside the preset's starter list.
+//! models that take tools are returned to the app registry, which owns their
+//! provider-keyed persistence and capability lookup.
 const std = @import("std");
 const definitions = @import("../core/config/configured_provider.zig");
 const http = @import("client.zig");
-const io_mod = @import("../core/shared/io.zig");
-const profile_paths = @import("../core/shared/profile_paths.zig");
 const types = @import("../core/shared/types.zig");
 const Allocator = std.mem.Allocator;
 
-pub const cache_file_name = "openrouter-models.json";
 const max_models = 2048;
 const max_body_bytes = 16 * 1024 * 1024;
 const reasoning_efforts = [_]types.ReasoningEffort{ .literal("low"), .literal("medium"), .literal("high") };
@@ -28,8 +25,8 @@ pub const Fetched = struct {
     }
 };
 
-/// The live list from `base_url`, refreshing the cache, or the cached list
-/// when the network fails. Empty when neither is available.
+/// The live list from `base_url`. Runtime owns stale-snapshot retention and
+/// durable persistence when the network fails.
 pub fn fetch(alloc: Allocator, base_url: []const u8, cancel_flag: ?*std.atomic.Value(bool)) Fetched {
     return fetchOrError(alloc, base_url, cancel_flag) catch .{};
 }
@@ -46,13 +43,10 @@ fn fetchOrError(alloc: Allocator, base_url: []const u8, cancel_flag: ?*std.atomi
         .success => |bytes| bytes,
         .http_status => null,
     } else |_| null;
-    if (live) |bytes| {
-        result.models = try parse(a, bytes);
-        if (result.models.len != 0) writeCache(a, bytes) catch {};
-        return result;
-    }
-    const cached = (try readCache(a)) orelse return result;
-    result.models = try parse(a, cached);
+    if (live) |bytes| result.models = try parse(a, bytes);
+    // Runtime-owned provider snapshots retain the previous catalog after a
+    // failed refresh. This adapter deliberately has no second profile or
+    // process cache, so every live result follows the same publication path.
     return result;
 }
 
@@ -71,6 +65,13 @@ pub fn parse(arena: Allocator, bytes: []const u8) ![]const definitions.ModelMeta
         definitions.validate_model_id(id.string) catch continue;
         if (!hasString(item.object.get("supported_parameters"), "tools")) continue;
         var metadata: definitions.ModelMetadata = .{ .id = id.string, .supports_tool_use = true };
+        metadata.name = stringValue(item.object.get("name"));
+        metadata.description = stringValue(item.object.get("description"));
+        metadata.cost = parseCost(item.object.get("pricing"));
+        metadata.intelligence = numberValue(item.object.get("intelligence") orelse item.object.get("int"));
+        metadata.recommended = boolValue(item.object.get("recommended"));
+        metadata.beta = boolValue(item.object.get("beta"));
+        metadata.released = integerValue(item.object.get("released") orelse item.object.get("created"));
         metadata.context_window = positive(item.object.get("context_length"));
         if (item.object.get("top_provider")) |top| if (top == .object) {
             metadata.max_output_tokens = positive(top.object.get("max_completion_tokens"));
@@ -98,56 +99,61 @@ fn positive(value: ?std.json.Value) ?u32 {
     return @intCast(present.integer);
 }
 
-fn cachePath(alloc: Allocator) !?[]u8 {
-    const home = io_mod.homeDir() orelse return null;
-    return try std.Io.Dir.path.join(alloc, &.{ home, profile_paths.root_dir_name, cache_file_name });
+fn stringValue(value: ?std.json.Value) ?[]const u8 {
+    const present = value orelse return null;
+    return if (present == .string and present.string.len > 0) present.string else null;
 }
 
-fn writeCache(arena: Allocator, bytes: []const u8) !void {
-    const path = (try cachePath(arena)) orelse return;
-    try io_mod.writeFileAtomic(arena, path, bytes);
+fn boolValue(value: ?std.json.Value) bool {
+    const present = value orelse return false;
+    return if (present == .bool) present.bool else false;
 }
 
-fn readCache(arena: Allocator) !?[]u8 {
-    const path = (try cachePath(arena)) orelse return null;
-    var file = io_mod.openExistingRegularFile(std.Io.Dir.cwd(), path, .read_only) catch return null;
-    defer file.close(io_mod.getIo());
-    return try io_mod.readFileToEnd(arena, &file, max_body_bytes);
+fn integerValue(value: ?std.json.Value) i64 {
+    const present = value orelse return 0;
+    return if (present == .integer and present.integer >= 0 and present.integer <= std.math.maxInt(i64)) @intCast(present.integer) else 0;
 }
 
-var lookup_mutex: std.Io.Mutex = .init;
-var lookup_loaded = false;
-var lookup_cache: Fetched = .{};
+fn numberValue(value: ?std.json.Value) ?f64 {
+    const present = value orelse return null;
+    const number: f64 = switch (present) {
+        .integer => @floatFromInt(present.integer),
+        .float => present.float,
+        .string => std.fmt.parseFloat(f64, present.string) catch return null,
+        else => return null,
+    };
+    return if (std.math.isFinite(number) and number >= 0) number else null;
+}
 
-/// Capabilities of `model` from the cached catalog, loaded once per process.
-/// The result borrows process-lifetime storage.
-pub fn lookup(model: []const u8) ?definitions.ModelMetadata {
-    const io = io_mod.getIo();
-    lookup_mutex.lockUncancelable(io);
-    defer lookup_mutex.unlock(io);
-    if (!lookup_loaded) {
-        lookup_loaded = true;
-        lookup_cache = loadCached(std.heap.c_allocator) catch .{};
+fn parseCost(value: ?std.json.Value) ?definitions.ModelCost {
+    const object = value orelse return null;
+    if (object != .object) return null;
+    var cost: definitions.ModelCost = .{};
+    var found = false;
+    if (numberValue(object.object.get("prompt"))) |rate| {
+        cost.input = rate * 1_000_000;
+        found = true;
     }
-    for (lookup_cache.models) |metadata| if (std.mem.eql(u8, metadata.id, model)) return metadata;
-    return null;
-}
-
-fn loadCached(alloc: Allocator) !Fetched {
-    const arena = try alloc.create(std.heap.ArenaAllocator);
-    arena.* = .init(alloc);
-    var result: Fetched = .{ .arena = arena };
-    errdefer result.deinit(alloc);
-    const bytes = (try readCache(arena.allocator())) orelse return result;
-    result.models = try parse(arena.allocator(), bytes);
-    return result;
+    if (numberValue(object.object.get("completion"))) |rate| {
+        cost.output = rate * 1_000_000;
+        found = true;
+    }
+    if (numberValue(object.object.get("input_cache_read") orelse object.object.get("cache_read"))) |rate| {
+        cost.cache_read = rate * 1_000_000;
+        found = true;
+    }
+    if (numberValue(object.object.get("input_cache_write") orelse object.object.get("cache_write"))) |rate| {
+        cost.cache_write = rate * 1_000_000;
+        found = true;
+    }
+    return if (found) cost else null;
 }
 
 test "OpenRouter catalog keeps tool models with their limits and modalities" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const models = try parse(arena_state.allocator(),
-        \\{"data":[{"id":"anthropic/claude-sonnet-5.5","context_length":1000000,"top_provider":{"max_completion_tokens":64000},"architecture":{"input_modalities":["text","image"]},"supported_parameters":["tools","reasoning","max_tokens"]},
+        \\{"data":[{"id":"anthropic/claude-sonnet-5.5","name":"Claude Sonnet","description":"A capable model","pricing":{"prompt":"0.000003","completion":"0.000015","input_cache_read":"0.000001","input_cache_write":"0.000002"},"intelligence":88,"recommended":true,"beta":true,"released":123,"context_length":1000000,"top_provider":{"max_completion_tokens":64000},"architecture":{"input_modalities":["text","image"]},"supported_parameters":["tools","reasoning","max_tokens"]},
         \\{"id":"some/chat-only","context_length":8192,"supported_parameters":["max_tokens"]},
         \\{"id":"x-ai/grok-code","context_length":256000,"top_provider":{"max_completion_tokens":null},"architecture":{"input_modalities":["text"]},"supported_parameters":["tools"]},
         \\{"id":"","supported_parameters":["tools"]},"junk"]}
@@ -157,6 +163,16 @@ test "OpenRouter catalog keeps tool models with their limits and modalities" {
     try std.testing.expectEqual(@as(?u32, 1_000_000), models[0].context_window);
     try std.testing.expectEqual(@as(?u32, 64_000), models[0].max_output_tokens);
     try std.testing.expectEqual(@as(?bool, true), models[0].supports_vision);
+    try std.testing.expectEqualStrings("Claude Sonnet", models[0].name.?);
+    try std.testing.expectEqualStrings("A capable model", models[0].description.?);
+    try std.testing.expectEqual(@as(f64, 3), models[0].cost.?.input);
+    try std.testing.expectEqual(@as(f64, 15), models[0].cost.?.output);
+    try std.testing.expectEqual(@as(f64, 1), models[0].cost.?.cache_read);
+    try std.testing.expectEqual(@as(f64, 2), models[0].cost.?.cache_write);
+    try std.testing.expectEqual(@as(?f64, 88), models[0].intelligence);
+    try std.testing.expect(models[0].recommended);
+    try std.testing.expect(models[0].beta);
+    try std.testing.expectEqual(@as(i64, 123), models[0].released);
     try std.testing.expectEqual(@as(usize, 3), models[0].reasoning_efforts.len);
     try std.testing.expect(models[1].max_output_tokens == null);
     try std.testing.expectEqual(@as(?bool, false), models[1].supports_vision);

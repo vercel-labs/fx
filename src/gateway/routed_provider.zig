@@ -12,6 +12,8 @@ const chat_completions = @import("chat_completions.zig");
 const anthropic_messages = @import("anthropic_messages.zig");
 const anthropic_codec = @import("anthropic_messages_protocol.zig");
 const openai_responses = @import("openai_responses.zig");
+const google_generative = @import("google_generative.zig");
+const google_generative_protocol = @import("google_generative_protocol.zig");
 const Allocator = std.mem.Allocator;
 
 pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
@@ -34,6 +36,7 @@ fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) anyer
         .@"openai-chat-completions" => chat_completions.build(raw, alloc, request),
         .@"anthropic-messages" => anthropic_messages.build(raw, alloc, request),
         .@"openai-responses" => openai_responses.build(raw, alloc, request),
+        .@"google-generative-ai" => google_generative.build(raw, alloc, request),
     };
 }
 
@@ -42,6 +45,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) any
         .@"openai-chat-completions" => chat_completions.stream(raw, alloc, request),
         .@"anthropic-messages" => anthropic_messages.stream(raw, alloc, request),
         .@"openai-responses" => openai_responses.stream(raw, alloc, request),
+        .@"google-generative-ai" => google_generative.stream(raw, alloc, request),
     };
 }
 
@@ -51,6 +55,7 @@ pub fn replayProtocol(parts_json: []const u8) definitions.Protocol {
     const trimmed = std.mem.trimStart(u8, parts_json, " \t\r\n");
     if (trimmed.len != 0 and trimmed[0] == '[') return .@"openai-responses";
     if (std.mem.find(u8, parts_json, "\"" ++ anthropic_codec.thinking_field ++ "\"") != null) return .@"anthropic-messages";
+    if (std.mem.find(u8, parts_json, "\"" ++ google_generative_protocol.parts_field ++ "\"") != null) return .@"google-generative-ai";
     return .@"openai-chat-completions";
 }
 
@@ -60,6 +65,7 @@ fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []cons
         .@"openai-chat-completions" => chat_completions.project_replay(alloc, replay, calls, text, reasoning),
         .@"anthropic-messages" => anthropic_messages.project_replay(alloc, replay, calls, text, reasoning),
         .@"openai-responses" => openai_responses.project_replay(alloc, replay, calls, text, reasoning),
+        .@"google-generative-ai" => google_generative.project_replay(alloc, replay, calls, text, reasoning),
     };
 }
 
@@ -70,6 +76,7 @@ fn review(raw: ?*anyopaque, alloc: Allocator, input: classifier.ProviderInput, r
         .@"openai-chat-completions" => chat_completions.review(raw, alloc, input, request),
         .@"anthropic-messages" => anthropic_messages.review(raw, alloc, input, request),
         .@"openai-responses" => openai_responses.review(raw, alloc, input, request),
+        .@"google-generative-ai" => google_generative.review(raw, alloc, input, request),
     };
 }
 

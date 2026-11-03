@@ -40,8 +40,6 @@ const surface_frame = @import("../../ui/footer/surface_frame.zig");
 const footer_paint_plan = @import("../../ui/footer/paint_plan.zig");
 const render_request = @import("../../ui/render_request.zig");
 
-const ModelPickerStage = picker_state.ModelPickerStage;
-
 pub const FilePickerReceipt = file_completion_state.Receipt;
 pub const file_picker_completion_cap: usize = file_completion_state.capacity;
 const file_picker_match_span_cap = file_picker_completion_cap * file_index.max_path_len;
@@ -150,14 +148,14 @@ pub fn CompletionRuntime(comptime App: type) type {
             }
             if (comptime @hasField(App, "stream")) {
                 if (app.stream.active) {
-                    if (hasModelQuery(app)) return .model;
+                    if (hasEffortQuery(app)) return .model;
                     if (hasFileQuery(app)) return .file;
                     if (visibleInlineSlashCompletion(app) != null) return .slash;
                     if (visibleSlashCompletionCount(app) > 0) return .slash;
                     return null;
                 }
             }
-            if (hasModelQuery(app)) return .model;
+            if (hasEffortQuery(app)) return .model;
             if (provider_picker_runtime.Runtime(App).hasQuery(app)) return .provider;
             if (hasFileQuery(app)) return .file;
             if (visibleInlineCompletion(app)) |completion| {
@@ -398,7 +396,6 @@ pub fn CompletionRuntime(comptime App: type) type {
             if (try routeMcpHostMenuMove(app, delta)) return true;
             if (try routeSettingsMenuMove(app, delta)) return true;
             if (try routeHelpMenuMove(app, delta)) return true;
-            if (try routeModelMenuMove(app, delta)) return true;
             if (try routeEffortMenuMove(app, delta)) return true;
             if (routeAuthPickerMove(app, delta)) return true;
             if (try routeSkillsMenuMove(app, delta)) return true;
@@ -410,8 +407,8 @@ pub fn CompletionRuntime(comptime App: type) type {
                 navigateFilePicker(app, delta);
                 return true;
             }
-            if (hasModelQuery(app)) {
-                navigateModelPicker(app, delta);
+            if (hasEffortQuery(app)) {
+                navigateEffortPicker(app, delta);
                 return true;
             }
             if (provider_picker_runtime.Runtime(App).hasQuery(app)) {
@@ -434,28 +431,11 @@ pub fn CompletionRuntime(comptime App: type) type {
             const menu = &app.input_runtime.settings_menu;
             if (!menu.active) return false;
             const snapshot = app_commands.settingsCatalogSnapshot(app);
-            var projection = render_input.settingsMenuProjection(
+            const projection = render_input.settingsMenuProjection(
                 menu,
                 snapshot,
                 app.input_runtime.edit_state.input.items,
             );
-            if (comptime @hasField(App, "model_cache")) {
-                if (app.model_cache.menu.active) {
-                    projection.models = render_input.modelMenuProjection(&app.model_cache);
-                    _ = app.model_cache.menu.moveVisibleItems(
-                        delta,
-                        @max(
-                            settings_menu_presentation.visibleModelItemsForBudget(
-                                projection,
-                                app.shell.layout.cols,
-                                try inlineMenuRowBudget(app, settings_menu_presentation.max_inline_rows),
-                            ),
-                            1,
-                        ),
-                    );
-                    return true;
-                }
-            }
             const visible_items = settings_menu_presentation.visibleNavigationItemsForBudget(
                 projection,
                 app.shell.layout.cols,
@@ -482,19 +462,6 @@ pub fn CompletionRuntime(comptime App: type) type {
                 delta,
                 visible_items,
             );
-        }
-
-        fn routeModelMenuMove(app: *App, delta: i32) !bool {
-            if (comptime !@hasField(App, "model_cache")) return false;
-            if (!app.model_cache.menu.active) return false;
-            _ = app.model_cache.menu.moveVisibleItems(
-                delta,
-                model_menu_presentation.visibleNavigationItemsForBudget(
-                    render_input.modelMenuProjection(&app.model_cache),
-                    try inlineMenuRowBudget(app, model_menu_presentation.max_inline_rows),
-                ),
-            );
-            return true;
         }
 
         fn routeSessionPickerMove(app: *App, delta: i32) !bool {
@@ -629,8 +596,9 @@ pub fn CompletionRuntime(comptime App: type) type {
             );
         }
 
-        pub fn hasModelQuery(app: *App) bool {
-            return app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) != null;
+        pub fn hasEffortQuery(app: *App) bool {
+            const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
+            return query.command == .effort and query.stage == .effort;
         }
 
         /// The file index covers this process's workspace, so it completes
@@ -768,9 +736,6 @@ pub fn CompletionRuntime(comptime App: type) type {
                 if (comptime @hasField(@TypeOf(app.skills), "menu")) {
                     if (app.skills.menuVisible()) return true;
                 }
-            }
-            if (comptime @hasField(App, "model_cache")) {
-                if (app.model_cache.menu.active) return true;
             }
             if (comptime @hasField(App, "session_persistence")) {
                 if (app.session_persistence.session_picker.active) return true;
@@ -1082,233 +1047,31 @@ pub fn CompletionRuntime(comptime App: type) type {
             return true;
         }
 
-        pub fn navigateModelPicker(app: *App, delta: i32) void {
-            const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return;
-            switch (query.stage) {
-                .model => navigateModelCompletion(app, query.query, delta),
-                .effort => {
-                    var values: [types.ReasoningEffort.max_options + 1]types.ReasoningEffort = undefined;
-                    navigatePickerOptions(&app.input_runtime.picker.model_picker_effort_index, &app.input_runtime.picker.model_picker_effort_window_start, effortCompletionValues(app, effortPickerModel(app, query.command), query.query, &values), delta);
-                },
-                .fast => {
-                    var labels: [3][]const u8 = undefined;
-                    const count = speedPickerLabels(app, query.query, &labels);
-                    if (count == 0) return;
-                    var display_index = speedPickerIndex(app, labels[0..count]);
-                    navigatePickerOptions(
-                        &display_index,
-                        &app.input_runtime.picker.model_picker_fast_window_start,
-                        count,
-                        delta,
-                    );
-                    app.input_runtime.picker.model_picker_fast_index = speedOptionIndex(
-                        labels[display_index % count],
-                    );
-                },
-            }
-        }
-
-        fn navigateModelCompletion(app: *App, query: []const u8, delta: i32) void {
-            var buf: [32][]const u8 = undefined;
-            const count = modelPickerCompletions(app, query, &buf);
-            if (count == 0) return;
-            app.input_runtime.picker.model_completion_index = modelPickerIndex(app, buf[0..count]);
-            app.input_runtime.picker.model_completion_window_start = modelPickerWindowStart(app, count, app.input_runtime.picker.model_completion_index);
-            app.input_runtime.picker.model_completion_anchor_current = false;
-            navigatePickerOptions(&app.input_runtime.picker.model_completion_index, &app.input_runtime.picker.model_completion_window_start, count, delta);
-        }
-
-        pub fn modelPickerCompletions(app: *App, query: []const u8, out: *[32][]const u8) usize {
-            const count = app.modelCompletions(query, out);
-            if (comptime !provider_runtime.supported(App)) return count;
-            if (!app.input_runtime.picker.model_completion_anchor_current or query.len != 0) return count;
-
-            const selected_model = provider_runtime.model(app);
-            if (modelCompletionIndex(out[0..count], selected_model) == null) {
-                if (catalogModelCompletion(app, selected_model)) |current| {
-                    if (count < out.len) {
-                        out[count] = current;
-                        return count + 1;
-                    }
-                    if (count > 0) out[count - 1] = current;
-                }
-            }
-            return count;
-        }
-
-        fn catalogModelCompletion(app: *App, model: []const u8) ?[]const u8 {
-            if (comptime @hasDecl(App, "catalogModelCompletion")) return app.catalogModelCompletion(model);
-
-            var buf: [32][]const u8 = undefined;
-            const count = app.modelCompletions(model, &buf);
-            const index = modelCompletionIndex(buf[0..count], model) orelse return null;
-            return buf[index];
-        }
-
-        pub fn modelPickerIndex(app: *App, completions: []const []const u8) usize {
-            if (completions.len == 0) return 0;
-            if (comptime !provider_runtime.supported(App)) return app.input_runtime.picker.model_completion_index % completions.len;
-            if (app.input_runtime.picker.model_completion_anchor_current) {
-                if (modelCompletionIndex(completions, provider_runtime.model(app))) |index| return index;
-            }
-            return app.input_runtime.picker.model_completion_index % completions.len;
-        }
-
-        pub fn modelPickerWindowStart(app: *App, count: usize, index: usize) usize {
-            if (app.input_runtime.picker.model_completion_anchor_current) {
-                return list_window.updateEdgeStart(0, count, index, list_window.default_max_picker_rows);
-            }
-            return app.input_runtime.picker.model_completion_window_start;
-        }
-
-        fn modelCompletionIndex(completions: []const []const u8, model: []const u8) ?usize {
-            for (completions, 0..) |candidate, index| {
-                if (std.mem.eql(u8, candidate, model)) return index;
-            }
-            return null;
-        }
-
         const navigatePickerOptions = list_window.advanceSelection;
 
-        fn setModelComposerText(app: *App, comptime fmt: []const u8, args: anytype) !void {
-            const text = try app.alloc.print(fmt, args);
-            defer app.alloc.free(text);
-            try app.input_runtime.textReplacementState().replace(app.alloc, text);
+        pub fn navigateEffortPicker(app: *App, delta: i32) void {
+            const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return;
+            if (query.command != .effort or query.stage != .effort) return;
+            var values: [types.ReasoningEffort.max_options + 1]types.ReasoningEffort = undefined;
+            const count = effortCompletionValues(app, effortPickerModel(app, .effort), query.query, &values);
+            navigatePickerOptions(
+                &app.input_runtime.picker.model_picker_effort_index,
+                &app.input_runtime.picker.model_picker_effort_window_start,
+                count,
+                delta,
+            );
         }
 
-        pub fn autocompleteModelPickerSelection(app: *App) !void {
-            const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return;
-            if (query.command == .effort) {
-                // Tab writes the highlighted level after `/effort`, as it
-                // writes the highlighted model after `/model`.
-                const effort = selectedEffortCompletion(app) orelse return;
-                try setModelComposerText(app, "{s}{s}", .{ picker_state.effort_prefix, effort.displayLabel() });
-                app.shell.render_requests.request(.footer);
-                return;
-            }
-            switch (query.stage) {
-                .model => {
-                    const model = selectedModelCompletion(app) orelse return;
-                    try setModelComposerText(app, "/model {s}", .{model});
-                },
-                .effort => {
-                    const model = try app.alloc.dupe(u8, app.input_runtime.picker.model_picker_pending_model.items);
-                    defer app.alloc.free(model);
-                    const effort = selectedEffortCompletion(app) orelse return;
-                    const capabilities = model_capabilities.resolveForApp(App, app, model);
-                    try setModelComposerText(app, "/model {s} {s}", .{ model, effort.label() });
-                    try app.input_runtime.picker.beginModelPickerFlow(
-                        app.alloc,
-                        model,
-                        model_capabilities.reasoningEffortIndex(capabilities, effort),
-                        capabilities.supports_fast_mode,
-                        false,
-                        .effort,
-                    );
-                },
-                .fast => {
-                    const model = try app.alloc.dupe(u8, app.input_runtime.picker.model_picker_pending_model.items);
-                    defer app.alloc.free(model);
-                    const capabilities = model_capabilities.resolveForApp(App, app, model);
-                    const effort = model_capabilities.reasoningEffortAtIndex(capabilities, app.input_runtime.picker.model_picker_effort_index);
-                    const effort_index = model_capabilities.reasoningEffortIndex(capabilities, effort);
-                    const speed = selectedSpeedCompletion(app) orelse return;
-                    try setModelComposerText(app, "/model {s} {s} {s}", .{ model, effort.label(), speed.label });
-                    try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, effort_index, speed.fast_mode, speed.ultrafast_mode, .fast);
-                },
-            }
+        pub fn autocompleteEffortPickerSelection(app: *App) !void {
+            const effort = selectedEffortCompletion(app) orelse return;
+            const text = try app.alloc.print("{s}{s}", .{ picker_state.effort_prefix, effort.displayLabel() });
+            defer app.alloc.free(text);
+            try app.input_runtime.textReplacementState().replace(app.alloc, text);
             app.shell.render_requests.request(.footer);
         }
 
-        pub fn advanceModelPickerOnSpace(app: *App) !bool {
-            const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
-            if (app.input_runtime.edit_state.cursor != app.input_runtime.edit_state.input.items.len) return false;
-
-            switch (query.stage) {
-                .model => {
-                    const model = exactModelCompletion(app, query.query) orelse return false;
-                    try beginModelPickerOptions(app, model);
-                    return true;
-                },
-                .effort => {
-                    if (query.command == .effort) return false;
-                    if (!app.input_runtime.picker.hasPendingModelPickerSelection()) return false;
-                    const model = try app.alloc.dupe(u8, app.input_runtime.picker.model_picker_pending_model.items);
-                    defer app.alloc.free(model);
-                    const effort = exactEffortCompletion(app, model, query.query) orelse return false;
-                    const capabilities = model_capabilities.resolveForApp(App, app, model);
-                    if (!capabilities.supports_fast_mode and !capabilities.supports_ultrafast_mode) return false;
-
-                    try setModelComposerText(app, "/model {s} {s} ", .{ model, effort.label() });
-                    try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), capabilities.supports_fast_mode, false, .fast);
-                    return true;
-                },
-                .fast => return false,
-            }
-        }
-
-        fn exactModelCompletion(app: *App, raw_query: []const u8) ?[]const u8 {
-            const query = std.mem.trim(u8, raw_query, " \t");
-            if (query.len == 0) return null;
-
-            var buf: [32][]const u8 = undefined;
-            const count = modelPickerCompletions(app, query, &buf);
-            for (buf[0..count]) |candidate| {
-                if (std.ascii.eqlIgnoreCase(candidate, query)) return candidate;
-            }
-            return null;
-        }
-
-        pub fn submitModelPicker(app: *App) !bool {
-            if (app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state)) |query| {
-                if (query.command == .effort) return submitEffortPicker(app);
-            }
-            switch (app.input_runtime.picker.model_picker_stage) {
-                .model => {
-                    if (app.isModelCacheLoading()) {
-                        const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
-                        if (std.mem.trim(u8, query.query, " \t").len > 0) return false;
-                        app.shell.render_requests.request(.footer);
-                        return true;
-                    }
-                    const model = selectedModelCompletion(app) orelse return false;
-                    try beginModelPickerOptions(app, model);
-                    return true;
-                },
-                .effort => {
-                    if (!app.input_runtime.picker.hasPendingModelPickerSelection()) return false;
-                    const model = try app.alloc.dupe(u8, app.input_runtime.picker.model_picker_pending_model.items);
-                    defer app.alloc.free(model);
-                    const effort = selectedEffortCompletion(app) orelse {
-                        app.shell.render_requests.request(.footer);
-                        return true;
-                    };
-                    const capabilities = model_capabilities.resolveForApp(App, app, model);
-                    if (capabilities.supports_fast_mode) {
-                        try setModelComposerText(app, "/model {s} {s} ", .{ model, effort.label() });
-                        try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, model_capabilities.reasoningEffortIndex(capabilities, effort), true, false, .fast);
-                    } else {
-                        try session_backend.Ops(App).selectModel(app, .{ .model = model, .effort = effort, .fast_mode = app.fast_mode, .ultrafast_mode = false });
-                        app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                    }
-                    app.shell.render_requests.request(.footer);
-                    return true;
-                },
-                .fast => {
-                    if (!app.input_runtime.picker.hasPendingModelPickerSelection()) return false;
-                    const model = try app.alloc.dupe(u8, app.input_runtime.picker.model_picker_pending_model.items);
-                    defer app.alloc.free(model);
-                    const speed = selectedSpeedCompletion(app) orelse {
-                        app.shell.render_requests.request(.footer);
-                        return true;
-                    };
-                    const effort = model_capabilities.reasoningEffortAtIndex(model_capabilities.resolveForApp(App, app, model), app.input_runtime.picker.model_picker_effort_index);
-                    try session_backend.Ops(App).selectModel(app, .{ .model = model, .effort = effort, .fast_mode = speed.fast_mode, .ultrafast_mode = speed.ultrafast_mode });
-                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                    app.shell.render_requests.request(.footer);
-                    return true;
-                },
-            }
+        pub fn submitEffortPickerSelection(app: *App) !bool {
+            return submitEffortPicker(app);
         }
 
         /// Enter in the `/effort ` column applies the highlighted level, or
@@ -1340,136 +1103,11 @@ pub fn CompletionRuntime(comptime App: type) type {
             );
         }
 
-        fn selectedModelCompletion(app: *App) ?[]const u8 {
-            const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return null;
-            if (query.stage != .model) return null;
-            if (exactModelCompletion(app, query.query)) |model| return model;
-            var buf: [32][]const u8 = undefined;
-            const count = modelPickerCompletions(app, query.query, &buf);
-            if (count == 0) return null;
-            const idx = modelPickerIndex(app, buf[0..count]);
-            return buf[idx];
-        }
-
-        pub fn openCurrentModelPicker(app: *App) !void {
-            try app.input_runtime.textReplacementState().replace(app.alloc, "/model ");
-            app.input_runtime.picker.model_completion_anchor_current = true;
-            app.shell.render_requests.request(.footer);
-        }
-
-        fn beginModelPickerOptions(app: *App, model: []const u8) !void {
-            // Only offer the stages this process knows the model supports.
-            const offers_options = session_backend.Ops(App).view(app).model_options;
-            const capabilities = model_capabilities.resolveForApp(App, app, model);
-            const supports_effort = offers_options and capabilities.reasoning_efforts.len > 0;
-            const supports_fast = offers_options and capabilities.supports_fast_mode;
-            const supports_ultrafast = offers_options and capabilities.supports_ultrafast_mode;
-            const supports_speed = supports_fast or supports_ultrafast;
-
-            if (!supports_effort and !supports_speed) {
-                try session_backend.Ops(App).selectModel(app, .{ .model = model, .effort = app.effort, .fast_mode = app.fast_mode, .ultrafast_mode = false });
-                app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                app.shell.render_requests.request(.footer);
-                return;
-            }
-
-            const stage: ModelPickerStage = if (supports_effort) .effort else .fast;
-            if (supports_effort) {
-                try setModelComposerText(app, "/model {s} ", .{model});
-            } else {
-                try setModelComposerText(app, "/model {s} auto ", .{model});
-            }
-            // Preselect the product effort default and Fast mode when supported.
-            try app.input_runtime.picker.beginModelPickerFlow(
-                app.alloc,
-                model,
-                model_capabilities.reasoningEffortIndex(capabilities, .auto),
-                supports_fast,
-                false,
-                stage,
-            );
-            app.shell.render_requests.request(.footer);
-        }
-
-        pub fn beginExactModelSelection(app: *App, model: []const u8) !void {
-            try beginModelPickerOptions(app, model);
-        }
-
-        pub fn stepBackModelPicker(app: *App) !bool {
-            const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
-            if (query.stage == .model or query.command == .effort) return false;
-            if (!app.input_runtime.picker.hasPendingModelPickerSelection()) return false;
-
-            const model = try app.alloc.dupe(u8, app.input_runtime.picker.model_picker_pending_model.items);
-            defer app.alloc.free(model);
-            switch (query.stage) {
-                .model => return false,
-                .effort => {
-                    try restoreModelPickerModelStage(app, model);
-                    return true;
-                },
-                .fast => {
-                    const capabilities = model_capabilities.resolveForApp(App, app, model);
-                    if (capabilities.reasoning_efforts.len > 0) {
-                        const effort_index = model_capabilities.reasoningEffortIndex(capabilities, model_capabilities.reasoningEffortAtIndex(capabilities, app.input_runtime.picker.model_picker_effort_index));
-                        try setModelComposerText(app, "/model {s} ", .{model});
-                        try app.input_runtime.picker.beginModelPickerFlow(app.alloc, model, effort_index, app.fast_mode, app.worker.agent_turn_settings.ultrafast_mode, .effort);
-                    } else {
-                        try restoreModelPickerModelStage(app, model);
-                    }
-                    return true;
-                },
-            }
-        }
-
-        fn restoreModelPickerModelStage(app: *App, model: []const u8) !void {
-            try setModelComposerText(app, "/model {s}", .{model});
-            syncModelCompletionSelection(app, model, model);
-        }
-
-        fn syncModelCompletionSelection(app: *App, query: []const u8, model: []const u8) void {
-            var buf: [32][]const u8 = undefined;
-            const count = app.modelCompletions(query, &buf);
-            var index: usize = 0;
-            for (buf[0..count], 0..) |candidate, i| {
-                if (std.mem.eql(u8, candidate, model)) {
-                    index = i;
-                    break;
-                }
-            }
-            app.input_runtime.picker.model_completion_index = index;
-            app.input_runtime.picker.model_completion_window_start = list_window.updateEdgeStart(
-                0,
-                count,
-                index,
-                list_window.default_max_picker_rows,
-            );
-        }
-
-        pub fn abandonModelPickerOptions(app: *App) void {
-            if (app.input_runtime.picker.model_picker_stage == .model) return;
-            app.input_runtime.picker.clearModelPickerFlow();
-        }
-
-        pub fn shouldPreserveModelPickerInsert(app: *App) bool {
-            const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
-            return query.stage != .model and app.input_runtime.edit_state.cursor == app.input_runtime.edit_state.input.items.len;
-        }
-
-        pub fn shouldPreserveModelPickerBackspace(app: *App) bool {
-            const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return false;
-            return query.stage != .model and query.query.len > 0 and app.input_runtime.edit_state.cursor == app.input_runtime.edit_state.input.items.len;
-        }
-
-        /// The model whose levels the effort column lists: the current one
-        /// for `/effort `, the one picked in the `/model` column otherwise.
+        /// The model whose levels the effort column lists.
         fn effortPickerModel(app: *App, command: picker_state.ModelPickerCommand) ?[]const u8 {
             return switch (command) {
                 .effort => if (comptime provider_runtime.supported(App)) provider_runtime.model(app) else null,
-                .model => if (app.input_runtime.picker.hasPendingModelPickerSelection())
-                    app.input_runtime.picker.model_picker_pending_model.items
-                else
-                    null,
+                .model => null,
             };
         }
 
@@ -1522,78 +1160,6 @@ pub fn CompletionRuntime(comptime App: type) type {
             const count = effortCompletionValues(app, model, normalized_query, &values);
             if (count == 0) return null;
             return values[app.input_runtime.picker.model_picker_effort_index % count];
-        }
-
-        const SpeedSelection = struct {
-            label: []const u8,
-            fast_mode: bool,
-            ultrafast_mode: bool,
-        };
-
-        pub fn speedPickerLabels(app: *App, query: []const u8, out: *[3][]const u8) usize {
-            const capabilities = model_capabilities.resolveForApp(
-                App,
-                app,
-                app.input_runtime.picker.model_picker_pending_model.items,
-            );
-            var options: [3][]const u8 = .{ picker_state.model_picker_speed_options[0], undefined, undefined };
-            var option_count: usize = 1;
-            if (capabilities.supports_fast_mode) {
-                options[option_count] = picker_state.model_picker_speed_options[1];
-                option_count += 1;
-            }
-            if (capabilities.supports_ultrafast_mode) {
-                options[option_count] = picker_state.model_picker_speed_options[2];
-                option_count += 1;
-            }
-            return picker_state.filterCompletionLabels(query, options[0..option_count], out[0..]);
-        }
-
-        pub fn speedPickerIndex(app: *const App, labels: []const []const u8) usize {
-            const selected = picker_state.model_picker_speed_options[
-                app.input_runtime.picker.model_picker_fast_index % picker_state.model_picker_speed_options.len
-            ];
-            for (labels, 0..) |label, index| {
-                if (std.ascii.eqlIgnoreCase(label, selected)) return index;
-            }
-            return 0;
-        }
-
-        fn speedOptionIndex(label: []const u8) usize {
-            for (picker_state.model_picker_speed_options, 0..) |option, index| {
-                if (std.ascii.eqlIgnoreCase(label, option)) return index;
-            }
-            return 0;
-        }
-
-        fn speedSelection(label: []const u8) ?SpeedSelection {
-            if (std.ascii.eqlIgnoreCase(label, picker_state.model_picker_speed_options[0])) {
-                return .{ .label = picker_state.model_picker_speed_options[0], .fast_mode = false, .ultrafast_mode = false };
-            }
-            if (std.ascii.eqlIgnoreCase(label, picker_state.model_picker_speed_options[1])) {
-                return .{ .label = picker_state.model_picker_speed_options[1], .fast_mode = true, .ultrafast_mode = false };
-            }
-            if (std.ascii.eqlIgnoreCase(label, picker_state.model_picker_speed_options[2])) {
-                return .{ .label = picker_state.model_picker_speed_options[2], .fast_mode = false, .ultrafast_mode = true };
-            }
-            return null;
-        }
-
-        fn selectedSpeedCompletion(app: *App) ?SpeedSelection {
-            const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse return null;
-            if (query.stage != .fast) return null;
-
-            const normalized_query = std.mem.trim(u8, query.query, " \t");
-            var labels: [3][]const u8 = undefined;
-            const count = speedPickerLabels(app, normalized_query, &labels);
-            if (count == 0) return null;
-            if (speedSelection(normalized_query)) |selection| {
-                for (labels[0..count]) |label| {
-                    if (std.ascii.eqlIgnoreCase(label, selection.label)) return selection;
-                }
-                return null;
-            }
-            return speedSelection(labels[speedPickerIndex(app, labels[0..count])]);
         }
     };
 }
@@ -1745,11 +1311,6 @@ const InlineCompletionTestApp = struct {
     input_runtime: core_input_runtime.Runtime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     skills: skill_runtime.Runtime = .{},
-    model_cache: struct {
-        menu: struct {
-            active: bool = false,
-        } = .{},
-    } = .{},
     session_persistence: struct {
         session_picker: struct {
             active: bool = false,
@@ -1771,47 +1332,6 @@ const InlineCompletionTestApp = struct {
         self.pending_images.deinit(self.alloc);
     }
 };
-
-const ModelPickerCompletionTestApp = struct {
-    alloc: std.mem.Allocator,
-    input_runtime: core_input_runtime.Runtime = .{},
-
-    fn deinit(self: *ModelPickerCompletionTestApp) void {
-        self.input_runtime.deinit(self.alloc);
-    }
-
-    pub fn resolvedModelCapabilities(_: *const ModelPickerCompletionTestApp, _: []const u8) model_capabilities.Capabilities {
-        return .{
-            .reasoning_efforts = .fromSlice(&.{
-                types.ReasoningEffort.literal("future-tier"),
-                types.ReasoningEffort.literal("high"),
-            }),
-        };
-    }
-};
-
-noinline fn clobberCompletionStack() void {
-    var bytes: [8192]u8 = undefined;
-    @memset(&bytes, 0xa5);
-    std.mem.doNotOptimizeAway(&bytes);
-}
-
-test "model picker effort completion labels survive capability resolution" {
-    const alloc = std.testing.allocator;
-    const rt = CompletionRuntime(ModelPickerCompletionTestApp);
-    var app = ModelPickerCompletionTestApp{ .alloc = alloc };
-    defer app.deinit();
-    try app.input_runtime.picker.beginModelPickerFlow(alloc, "test/model", 0, false, false, .effort);
-
-    var values: [types.ReasoningEffort.max_options + 1]types.ReasoningEffort = undefined;
-    const count = rt.effortCompletionValues(&app, rt.effortPickerModel(&app, .model), "", &values);
-    clobberCompletionStack();
-
-    try std.testing.expectEqual(@as(usize, 3), count);
-    try std.testing.expectEqualStrings("default", values[0].displayLabel());
-    try std.testing.expectEqualStrings("future-tier", values[1].displayLabel());
-    try std.testing.expectEqualStrings("high", values[2].displayLabel());
-}
 
 test "inline slash completion uses the shared visible suffix and acceptance path" {
     const alloc = std.testing.allocator;
@@ -1936,76 +1456,6 @@ test "inline skill completion stays inactive when its suffix cannot render" {
         "aged-menu",
         rt.visibleInlineSkillCompletion(&app).?.suffix,
     );
-}
-
-test "model picker ownership suppresses inline skill completion" {
-    const alloc = std.testing.allocator;
-    const rt = CompletionRuntime(InlineCompletionTestApp);
-    const skills = [_]skill_runtime.Skill{.{
-        .name = "managed-menu",
-        .description = "",
-        .path = "/tmp/managed-menu/SKILL.md",
-        .source = .global_fx,
-    }};
-    var app = InlineCompletionTestApp{
-        .alloc = alloc,
-        .skills = .{ .items = @constCast(&skills) },
-    };
-    defer app.deinit();
-    try app.input_runtime.textReplacementState().replace(alloc, "/model anything $man");
-
-    try std.testing.expect(app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) != null);
-    try std.testing.expectEqual(
-        @as(?InlineSkillCompletion, null),
-        rt.visibleInlineSkillCompletion(&app),
-    );
-    try std.testing.expectEqual(
-        edit_contract.InsertResult.inactive,
-        try rt.autocompleteInlineSkillCompletion(&app, 4096),
-    );
-    try std.testing.expectEqualStrings("/model anything $man", app.input_runtime.edit_state.input.items);
-}
-
-test "dedicated catalog ownership suppresses inline skill completion" {
-    const alloc = std.testing.allocator;
-    const rt = CompletionRuntime(InlineCompletionTestApp);
-    const skills = [_]skill_runtime.Skill{.{
-        .name = "managed-menu",
-        .description = "",
-        .path = "/tmp/managed-menu/SKILL.md",
-        .source = .global_fx,
-    }};
-    var app = InlineCompletionTestApp{
-        .alloc = alloc,
-        .skills = .{ .items = @constCast(&skills) },
-    };
-    defer app.deinit();
-    try app.input_runtime.textReplacementState().replace(alloc, "x $man");
-
-    try std.testing.expect(rt.visibleInlineSkillCompletion(&app) != null);
-
-    app.input_runtime.help_menu.active = true;
-    try expectInlineSkillCompletionInactive(&app);
-    app.input_runtime.help_menu.active = false;
-
-    app.input_runtime.settings_menu.active = true;
-    try expectInlineSkillCompletionInactive(&app);
-    app.input_runtime.settings_menu.active = false;
-
-    app.model_cache.menu.active = true;
-    try expectInlineSkillCompletionInactive(&app);
-    app.model_cache.menu.active = false;
-
-    app.session_persistence.session_picker.active = true;
-    try expectInlineSkillCompletionInactive(&app);
-    app.session_persistence.session_picker.active = false;
-
-    app.skills.menu.active = true;
-    try expectInlineSkillCompletionInactive(&app);
-
-    try std.testing.expect(app.skills.menu.active);
-    try std.testing.expectEqualStrings("x $man", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqual(@as(usize, 0), app.input_runtime.entities.skill_tokens.items.len);
 }
 
 fn expectInlineSkillCompletionInactive(app: *InlineCompletionTestApp) !void {

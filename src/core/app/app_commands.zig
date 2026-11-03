@@ -287,7 +287,6 @@ pub fn Handlers(comptime App: type) type {
 
         /// What the MCP host and `/mcp` have to say, and the reload a `/mcp` change asked for.
         fn closeOtherMenusForMcp(app: *App) void {
-            closeModelMenuIfPresent(app);
             closeHelpMenuIfPresent(app);
             closeInlineCommandMenusIfPresent(app);
             if (comptime @hasField(App, "skills")) app.skills.closeMenu();
@@ -439,7 +438,6 @@ pub fn Handlers(comptime App: type) type {
         fn commandShowHelp(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-            if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
             app.input_runtime.help_menu.open();
             app.shell.render_requests.request(.footer);
         }
@@ -497,7 +495,6 @@ pub fn Handlers(comptime App: type) type {
         /// Shows `snapshot` in place of any other footer menu. Takes ownership.
         fn openInfoPanel(app: *App, snapshot: info_panel.Snapshot) void {
             if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-            if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
             closeHelpMenuIfPresent(app);
             app.input_runtime.settings_menu.close();
             closeInlineCommandMenusIfPresent(app);
@@ -537,7 +534,19 @@ pub fn Handlers(comptime App: type) type {
 
         fn commandHandleModel(ctx: *anyopaque, query: []const u8) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try session_commands.Commands(App).handleModel(app, query);
+            // Proto's registered /model command is a picker command. Its
+            // explicit-argument branch is unreachable because the command
+            // spec does not allow arguments; keep that observed behavior
+            // instead of resurrecting the dead direct-assignment handler.
+            if (std.mem.trim(u8, query, " \t\r\n").len != 0) {
+                try app.writeDomainNotice(.{ .topic = "model", .tone = .@"error", .body = "/model does not take arguments" }, true);
+                return;
+            }
+            if (comptime @hasDecl(App, "openModelHub")) {
+                try app.openModelHub(.models, "");
+                return;
+            }
+            try app.writeDomainNotice(.{ .topic = "model", .tone = .@"error", .body = "model selection is not available in this runtime" }, true);
         }
 
         /// Bare `/effort` opens the menu of the current model's reasoning
@@ -548,7 +557,6 @@ pub fn Handlers(comptime App: type) type {
                 .done => {},
                 .open_menu => |capabilities| {
                     if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-                    if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
                     closeHelpMenuIfPresent(app);
                     app.input_runtime.settings_menu.close();
                     closeInlineCommandMenusIfPresent(app);
@@ -787,7 +795,6 @@ pub fn Handlers(comptime App: type) type {
                 return;
             }
             if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-            if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
             closeHelpMenuIfPresent(app);
             app.input_runtime.settings_menu.close();
             closeInlineCommandMenusIfPresent(app);
@@ -1004,7 +1011,6 @@ pub fn Handlers(comptime App: type) type {
                 },
                 .show => |name| switch (skill_runtime.resolveSkill(app.skills.items, name, null)) {
                     .ambiguous_name => {
-                        closeModelMenuIfPresent(app);
                         closeHelpMenuIfPresent(app);
                         try app.input_runtime.textReplacementState().replace(app.alloc, name);
                         app.skills.openMenuWithQuery(.command, null, name);
@@ -1073,13 +1079,11 @@ pub fn Handlers(comptime App: type) type {
         fn applySkillsCommandResult(app: *App, result: *const skill_commands.CommandResult) !void {
             switch (result.*) {
                 .open_menu => {
-                    closeModelMenuIfPresent(app);
                     closeHelpMenuIfPresent(app);
                     app.skills.openMenu();
                     app.shell.render_requests.request(.footer);
                 },
                 .focus_menu => |name| {
-                    closeModelMenuIfPresent(app);
                     closeHelpMenuIfPresent(app);
                     if (app.skills.openMenuFocusedByName(name)) {
                         app.shell.render_requests.request(.footer);
@@ -1129,10 +1133,6 @@ pub fn Handlers(comptime App: type) type {
                 generation,
                 .{ .notice = body },
             );
-        }
-
-        fn closeModelMenuIfPresent(app: *App) void {
-            if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
         }
 
         noinline fn closeHelpMenuIfPresent(app: *App) void {
@@ -1210,7 +1210,6 @@ pub fn Handlers(comptime App: type) type {
                 };
                 defer settings.deinit(app.alloc);
                 if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-                if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
                 closeHelpMenuIfPresent(app);
                 closeInlineCommandMenusIfPresent(app);
                 app.input_runtime.settings_menu.openWithStartupScrollback(
@@ -1284,7 +1283,6 @@ pub fn Handlers(comptime App: type) type {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (std.mem.trim(u8, rest, " \t").len == 0) {
                 if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-                if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
                 closeHelpMenuIfPresent(app);
                 app.input_runtime.settings_menu.close();
                 closeInlineCommandMenusIfPresent(app);
@@ -1328,7 +1326,6 @@ pub fn Handlers(comptime App: type) type {
                     return;
                 };
                 if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-                if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
                 closeHelpMenuIfPresent(app);
                 app.input_runtime.settings_menu.close();
                 closeInlineCommandMenusIfPresent(app);

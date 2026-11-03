@@ -30,14 +30,27 @@ pub const Headers = struct {
     }
 };
 
-pub fn resolveHeaders(alloc: Allocator, definition: *const definitions.Definition) !Headers {
-    const items = try alloc.alloc(std.http.Header, definition.headers.len);
+pub fn resolveHeaders(alloc: Allocator, definition: *const definitions.Definition, model: []const u8) !Headers {
+    const overrides = if (definition.model(model)) |metadata| metadata.headers else &.{};
+    var selected: std.ArrayList(definitions.Header) = .empty;
+    defer selected.deinit(alloc);
+    for (definition.headers) |header| {
+        for (overrides) |override| {
+            if (std.ascii.eqlIgnoreCase(header.name, override.name)) break;
+        } else try selected.append(alloc, header);
+    }
+    try selected.appendSlice(alloc, overrides);
+    return resolveHeaderValues(alloc, selected.items);
+}
+
+pub fn resolveHeaderValues(alloc: Allocator, selected: []const definitions.Header) !Headers {
+    const items = try alloc.alloc(std.http.Header, selected.len);
     var resolved: usize = 0;
     errdefer {
         for (items[0..resolved]) |header| alloc.free(header.value);
         alloc.free(items);
     }
-    for (definition.headers, items) |header, *out| {
+    for (selected, items) |header, *out| {
         const value = secret_command.resolve(alloc, header.value) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.ConfiguredHeaderCommandFailed,
@@ -50,6 +63,19 @@ pub fn resolveHeaders(alloc: Allocator, definition: *const definitions.Definitio
         resolved += 1;
     }
     return .{ .items = items };
+}
+
+/// Caller owns the returned slice; names and values borrow both inputs.
+pub fn mergeHeaders(alloc: Allocator, defaults: []const std.http.Header, overrides: []const std.http.Header) ![]std.http.Header {
+    var result: std.ArrayList(std.http.Header) = .empty;
+    errdefer result.deinit(alloc);
+    for (defaults) |header| {
+        for (overrides) |override| {
+            if (std.ascii.eqlIgnoreCase(header.name, override.name)) break;
+        } else try result.append(alloc, header);
+    }
+    try result.appendSlice(alloc, overrides);
+    return result.toOwnedSlice(alloc);
 }
 
 test "configured request checks the slot and resolves header commands" {
@@ -65,7 +91,7 @@ test "configured request checks the slot and resolves header commands" {
     try std.testing.expectError(error.InvalidConfiguredProviderCredential, checkToken(keyed, "a b"));
     try checkToken(registry.get("n").?, "");
     try std.testing.expectError(error.UnexpectedConfiguredProviderCredential, checkToken(registry.get("n").?, "k"));
-    var headers = try resolveHeaders(alloc, keyed);
+    var headers = try resolveHeaders(alloc, keyed, "model");
     defer headers.deinit(alloc);
     for (headers.items) |header| {
         const expected = if (std.mem.eql(u8, header.name, "X-Lit")) "v" else if (std.mem.eql(u8, header.name, "X-Cmd")) "from-command" else "!x";

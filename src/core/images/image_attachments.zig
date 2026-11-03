@@ -1122,6 +1122,7 @@ fn deleteSnapshotPath(path: []const u8, reason: []const u8) void {
 pub const VerifiedSnapshot = struct {
     bytes: []u8,
     media_type: []const u8,
+    detail: ?types.ImageDetail = null,
 
     pub fn deinit(self: *VerifiedSnapshot, alloc: std.mem.Allocator) void {
         alloc.free(self.bytes);
@@ -1277,6 +1278,7 @@ pub fn loadVerifiedSnapshot(
         return .{
             .bytes = try alloc.dupe(u8, inline_bytes),
             .media_type = detected,
+            .detail = attachment.detail,
         };
     }
     const source = imageFile(attachment) orelse return error.MissingImageSnapshot;
@@ -1317,6 +1319,7 @@ pub fn loadVerifiedSnapshot(
     return .{
         .bytes = try bytes.toOwnedSlice(alloc),
         .media_type = detected,
+        .detail = attachment.detail,
     };
 }
 
@@ -1362,6 +1365,7 @@ pub fn cloneVerifiedImageAttachment(
             .id = new_id,
             .path = path,
             .media_type = media_type,
+            .detail = attachment.detail,
             .snapshot_sha256 = try alloc.dupe(u8, digest),
             .inline_data = verified.bytes,
         };
@@ -1449,6 +1453,7 @@ fn copyVerifiedImageAttachmentToDir(
         .id = new_id,
         .path = path,
         .media_type = media_type,
+        .detail = attachment.detail,
         .snapshot_path = final_path,
         .snapshot_sha256 = digest,
     };

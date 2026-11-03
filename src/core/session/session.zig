@@ -1,4 +1,5 @@
 const std = @import("std");
+const host_target = @import("../hosts/target.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const kernel_agent = @import("../agent/runtime/agent.zig");
 const dynamic_tool_set = @import("../agent/runtime/dynamic_tool_set.zig");
@@ -353,6 +354,7 @@ fn image_attachments_equal(lhs: ImageAttachment, rhs: ImageAttachment) bool {
     return lhs.id == rhs.id and
         std.mem.eql(u8, lhs.path, rhs.path) and
         std.mem.eql(u8, lhs.media_type, rhs.media_type) and
+        lhs.detail == rhs.detail and
         optionalBytesEqual(lhs.snapshot_path, rhs.snapshot_path) and
         optionalBytesEqual(lhs.snapshot_sha256, rhs.snapshot_sha256);
 }
@@ -1462,8 +1464,11 @@ pub const SessionRuntime = struct {
     }
 
     pub fn deinit(self: *SessionRuntime, alloc: Allocator) void {
-        self.kernel.deinit();
-        self.browser.deinit();
+        // Hosted WebAssembly sessions cannot acquire native processes.
+        if (comptime !host_target.is_wasm) {
+            self.kernel.deinit();
+            self.browser.deinit();
+        }
         self.checklist.deinit();
         self.clearWebFetchArtifacts();
         self.permission_state.deinit(alloc);
@@ -1490,8 +1495,11 @@ pub const SessionRuntime = struct {
     }
 
     pub fn reset(self: *SessionRuntime, alloc: Allocator) void {
-        self.kernel.deinit();
-        self.browser.deinit();
+        // Hosted WebAssembly sessions cannot acquire native processes.
+        if (comptime !host_target.is_wasm) {
+            self.kernel.deinit();
+            self.browser.deinit();
+        }
         self.checklist.clear();
         self.clearWebFetchArtifacts();
         self.clearPermissionState(alloc);
@@ -2527,6 +2535,13 @@ fn appendHistoryChatMessagesImpl(
                     .content = text,
                     .context_origin = .handoff,
                 });
+                // Provider-native compaction keeps opaque replay state on a
+                // marker assistant message immediately after the handoff.
+                // Providers that do not understand it ignore the optional
+                // field through their normal replay projection.
+                if (entry.provider_replay) |replay| {
+                    try messages.append(alloc, .{ .role = .assistant, .content = "", .provider_replay = replay });
+                }
             },
             .assistant => |entry| {
                 try appendUserTurnChatMessages(alloc, messages, entry.user);

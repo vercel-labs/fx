@@ -6,6 +6,52 @@ const tool_input_preview = @import("tool_input_preview.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const recovery = @import("../recovery/recovery.zig");
 
+/// Provider-native compaction kinds shared across the core boundary. The
+/// provider transport request remains an agent concern; the compactor sees
+/// only this opaque, provider-neutral call and result.
+pub const CompactionKind = enum {
+    remote,
+    v2_streaming,
+    anthropic_native,
+};
+
+pub const CompactionBudget = struct {
+    deadline: ?std.Io.Clock.Timestamp = null,
+    cancel_flag: ?*std.atomic.Value(bool) = null,
+};
+
+pub const CompactionCall = struct {
+    model: []const u8,
+    instructions: []const u8 = "",
+    messages: []const ChatMessage,
+    retained_message_budget: ?u32 = null,
+    prompt_cache_key: ?[]const u8 = null,
+    kind: CompactionKind = .remote,
+    budget: ?CompactionBudget = null,
+    trace_ctx: @import("debug_trace.zig").TraceContext = .{},
+    cancel_flag: *std.atomic.Value(bool),
+};
+
+pub const CompactionResult = struct {
+    summary: ?[]const u8 = null,
+    provider_state_json: ?[]const u8 = null,
+    replacement_history_json: ?[]const u8 = null,
+    used_tokens: ?u64 = null,
+    usage: Usage = .{},
+    owned: bool = false,
+
+    pub fn deinit(self: *CompactionResult, alloc: std.mem.Allocator) void {
+        if (self.owned) {
+            if (self.summary) |value| alloc.free(@constCast(value));
+            if (self.provider_state_json) |value| alloc.free(@constCast(value));
+            if (self.replacement_history_json) |value| alloc.free(@constCast(value));
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CompactionFn = *const fn (?*anyopaque, std.mem.Allocator, CompactionCall) anyerror!CompactionResult;
+
 pub const Layout = struct {
     rows: u16,
     cols: u16,
@@ -1757,10 +1803,29 @@ pub const ContextHistoryCut = struct {
     steering: usize = 0,
 };
 
+/// Detail requested for an image input. A null value on ImageAttachment
+/// preserves the historical provider default (usually "auto").
+pub const ImageDetail = enum {
+    auto,
+    low,
+    high,
+    original,
+
+    pub fn parse(value: []const u8) ?ImageDetail {
+        if (std.mem.eql(u8, value, "auto")) return .auto;
+        if (std.mem.eql(u8, value, "low")) return .low;
+        if (std.mem.eql(u8, value, "high")) return .high;
+        if (std.mem.eql(u8, value, "original")) return .original;
+        return null;
+    }
+};
+
 pub const ImageAttachment = struct {
     id: usize = 0,
     path: []u8,
     media_type: []u8,
+    /// Optional request metadata; absent retains the existing provider default.
+    detail: ?ImageDetail = null,
     snapshot_path: ?[]u8 = null,
     snapshot_sha256: ?[]u8 = null,
     /// Owned decoded image bytes for sessions without a filesystem snapshot
@@ -2551,6 +2616,9 @@ pub const CompactedSummaryHistoryTurn = struct {
     permission_feedback: [][]u8 = &.{},
     /// Legacy completeness marker retained for storage compatibility.
     permission_feedback_complete: bool = true,
+    /// Provider-native replay state returned with this compaction. The JSON
+    /// is opaque to core and projected back into the provider's next request.
+    provider_replay: ?ProviderReplay = null,
 };
 
 pub const HistoryTurn = union(enum) {
@@ -2860,6 +2928,7 @@ pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
             alloc.free(entry.summary);
             freeCompletedToolNames(alloc, entry.root_user_messages);
             freePermissionFeedback(alloc, entry.permission_feedback);
+            if (entry.provider_replay) |replay| freeProviderReplay(alloc, replay);
         },
         .assistant => |entry| {
             freeUserTurn(alloc, entry.user);
@@ -2915,6 +2984,7 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .root_user_messages_complete = entry.root_user_messages_complete,
                 .permission_feedback = permission_feedback,
                 .permission_feedback_complete = entry.permission_feedback_complete,
+                .provider_replay = if (entry.provider_replay) |replay| try dupeProviderReplay(alloc, replay) else null,
             } };
         },
         .assistant => |entry| blk: {
@@ -3814,6 +3884,7 @@ pub fn dupeImageAttachment(alloc: std.mem.Allocator, attachment: ImageAttachment
         .id = attachment.id,
         .path = path,
         .media_type = media_type,
+        .detail = attachment.detail,
         .snapshot_path = snapshot_path,
         .snapshot_sha256 = snapshot_sha256,
         .inline_data = inline_data,

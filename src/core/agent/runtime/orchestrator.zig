@@ -7,6 +7,7 @@ const builtin = @import("builtin");
 const agent_steps = @import("../../config/agent_steps.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
+const model_roles = @import("../../config/model_roles.zig");
 const types = @import("../../shared/types.zig");
 const history_range = @import("../../shared/history_range.zig");
 const worker_runtime = @import("../worker_runtime.zig");
@@ -3985,10 +3986,13 @@ fn appendRunningToolCalls(
 /// recovery path; other check failures are only traced.
 fn streamMainCompletion(
     deps: *const AgentRuntimeDeps,
+    provider: agent_stream_provider.Provider,
     arena: Allocator,
     request: agent_stream_provider.ModelRequest,
 ) !runtime_gateway_step.StreamResult {
-    var result = try runtime_gateway_step.streamModelCompletion(deps.agent_stream_provider, arena, request);
+    var observed_request = request;
+    observed_request.performance = deps.performance;
+    var result = try runtime_gateway_step.streamModelCompletion(provider, arena, observed_request);
     if (result != .completed) return result;
     const confirm = deps.confirm_session_writer orelse return result;
     confirm(deps.ctx) catch |err| switch (err) {
@@ -4431,6 +4435,17 @@ fn pushNetworkRecord(
     deps.push_event(deps.ctx, .{ .full_detail_record = owned }) catch |err| {
         types.freeSemanticNotice(std.heap.c_allocator, owned);
         debug_trace.logf("agent", "network record publication failed err={s}", .{@errorName(err)});
+    };
+}
+
+fn publishEffectiveSelection(deps: *const AgentRuntimeDeps, selection: model_roles.Selection) void {
+    const publish = deps.publish_selection orelse return;
+    publish(deps.ctx, selection) catch |err| {
+        debug_trace.logf(
+            "agent",
+            "effective_selection_publication_failed provider={s} model={s} err={s}",
+            .{ selection.provider.label(), selection.model, @errorName(err) },
+        );
     };
 }
 
@@ -6993,6 +7008,25 @@ fn processQueuedPromptLoop(
             ),
     };
     var active_api_key: []const u8 = job.api_key;
+    var serving_provider = job.provider;
+    var serving_stream_provider = deps.agent_stream_provider;
+    var serving_credential: ?agent_stream_provider.CredentialLease = null;
+    var serving_provider_options: ?model_capabilities.ResolvedProviderOptions = null;
+    var promoted_context_selection: ?model_roles.Selection = null;
+    var role_fallback_candidates: [64]model_roles.Selection = undefined;
+    var role_fallback_count: usize = 0;
+    var role_fallback_index: usize = 0;
+    var role_fallback_current_seen = false;
+    if (config.fallback_role) |role| if (deps.resolve_role_chain) |resolve| {
+        role_fallback_count = @min(resolve(deps.ctx, role, &role_fallback_candidates), role_fallback_candidates.len);
+        for (role_fallback_candidates[0..role_fallback_count], 0..) |candidate, index| {
+            if (candidate.provider.eql(job.provider) and std.mem.eql(u8, candidate.model, job.model)) {
+                role_fallback_index = index;
+                role_fallback_current_seen = true;
+                break;
+            }
+        }
+    };
     var owned_refreshed_api_key: ?[]u8 = null;
     defer if (owned_refreshed_api_key) |key| secret.zeroAndFree(std.heap.c_allocator, key);
     var summary_accumulator = summary_accumulator_ptr.*;
@@ -7345,17 +7379,22 @@ fn processQueuedPromptLoop(
             }
         }
 
-        while (true) {
+        request_attempt_loop: while (true) {
             if (reset_stream_for_next_attempt) {
                 try stream_ctx.beginRecoveryAttempt();
                 reset_stream_for_next_attempt = false;
             }
 
-            gateway_model = job.model;
+            gateway_model = if (promoted_context_selection) |selection| selection.model else job.model;
             // A resend without Fast keeps it off for the rest of this request.
             const attempt_fast_mode = route_fast_mode and !request_recovery.send.no_fast;
             const just_rebuilt_request = skip_next_preflight_refresh and active_compaction_handoff != null and context_overflow_recovery != .pending;
-            if (skip_next_preflight_refresh and !credential_reload_pending) {
+            if (serving_credential != null) {
+                // A promoted binding already owns the target credential; the
+                // original job refresh path must not overwrite it.
+                skip_next_preflight_refresh = false;
+                credential_reload_pending = false;
+            } else if (skip_next_preflight_refresh and !credential_reload_pending) {
                 skip_next_preflight_refresh = false;
             } else {
                 skip_next_preflight_refresh = false;
@@ -7487,8 +7526,8 @@ fn processQueuedPromptLoop(
                         overlay_arena,
                         recovery_source_messages,
                         current_user_message_index,
-                        deps.agent_stream_provider,
-                        .{ .provider = job.provider, .model = gateway_model },
+                        serving_stream_provider,
+                        .{ .provider = serving_provider, .model = gateway_model },
                     ),
                     .fallback => fallback: {
                         if (job.authorized_image_catalog.len == 0) {
@@ -7517,16 +7556,16 @@ fn processQueuedPromptLoop(
                 deps.tool_registry,
                 request_unwrap,
                 projected_request_messages,
-                deps.agent_stream_provider,
-                .{ .provider = job.provider, .model = gateway_model },
+                serving_stream_provider,
+                .{ .provider = serving_provider, .model = gateway_model },
             );
             const subagent_request_messages = try project_subagent_request_messages(
                 overlay_arena,
                 deps.tool_registry,
                 request_unwrap,
                 terminal_request_messages,
-                deps.agent_stream_provider,
-                .{ .provider = job.provider, .model = gateway_model },
+                serving_stream_provider,
+                .{ .provider = serving_provider, .model = gateway_model },
             );
             if (terminal_request_messages.ptr != projected_request_messages.ptr or subagent_request_messages.ptr != terminal_request_messages.ptr) {
                 debug_trace.logf("history", "legacy_tool_history_projected terminal={s} subagent={s} messages={d}", .{
@@ -7578,10 +7617,12 @@ fn processQueuedPromptLoop(
                 try deps.push_text(deps.ctx, .{ .operational = "\n" });
             }
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
-            var provider_opts = try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, job.provider, gateway_model, step_effort, attempt_fast_mode, config.ultrafast_mode);
-            provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
-            provider_opts.provider_order = config.provider_order;
-            provider_opts.provider_strict = config.provider_strict;
+            var provider_opts = serving_provider_options orelse try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, serving_provider, gateway_model, step_effort, attempt_fast_mode, config.ultrafast_mode);
+            if (serving_provider_options == null) {
+                provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
+                provider_opts.provider_order = config.provider_order;
+                provider_opts.provider_strict = config.provider_strict;
+            }
             runtime_telemetry.traceGatewayProviderOptions(step_ctx, gateway_model, attempt_fast_mode, step_effort, provider_opts);
             // Fast drops silently when the catalog cannot confirm support.
             // Tell the user once per turn, but only when the catalog itself is
@@ -7634,25 +7675,25 @@ fn processQueuedPromptLoop(
             var prepared_request_body: ?[]const u8 = null;
             var request_cost_for_attempt: ?runtime_prompt_context.RequestCost = null;
             var request_images_for_attempt: usize = 0;
-            if (try deps.agent_stream_provider.buildRequest(
+            if (try serving_stream_provider.buildRequest(
                 overlay_arena,
                 request_data,
             )) |built_request_body| {
                 const request_body = try fitRequestImages(
                     overlay_arena,
-                    deps.agent_stream_provider,
+                    serving_stream_provider,
                     &request_data,
                     built_request_body,
                     .{ .max_request_bytes = request_image_budget.maxRequestBytes(
                         agent.requestByteLimit(gateway_model),
-                        deps.agent_stream_provider.max_request_bytes,
+                        serving_stream_provider.max_request_bytes,
                     ) },
                     config.max_tool_result_bytes,
                     step_ctx,
                 );
                 prepared_request_body = request_body;
                 request_images_for_attempt = image_data.countRequestImages(request_data.messages);
-                const measured_request_cost = try runtime_prompt_context.measureProviderRequest(std.heap.c_allocator, request_body, request_data);
+                const measured_request_cost = try runtime_prompt_context.measureProviderRequestFor(serving_stream_provider, std.heap.c_allocator, request_body, request_data);
                 const applicable_calibration = if (agent.request_token_calibration) |*calibration|
                     if (std.mem.eql(u8, calibration.modelSlice(), gateway_model) and calibration.cost.applies(measured_request_cost))
                         calibration.cost
@@ -7671,8 +7712,8 @@ fn processQueuedPromptLoop(
                 // way: the part compaction cannot shrink.
                 var fixed_request = request_data;
                 fixed_request.messages = &.{};
-                agent.request_fixed_tokens = if (try deps.agent_stream_provider.buildRequest(overlay_arena, fixed_request)) |fixed_body| fixed: {
-                    const measured = try runtime_prompt_context.measureProviderRequest(std.heap.c_allocator, fixed_body, fixed_request);
+                agent.request_fixed_tokens = if (try serving_stream_provider.buildRequest(overlay_arena, fixed_request)) |fixed_body| fixed: {
+                    const measured = try runtime_prompt_context.measureProviderRequestFor(serving_stream_provider, std.heap.c_allocator, fixed_body, fixed_request);
                     const fixed = if (applicable_calibration) |calibration| runtime_prompt_context.calibrateProviderRequest(measured, calibration) else measured;
                     break :fixed fixed.estimated_input_tokens;
                 } else null;
@@ -7713,6 +7754,46 @@ fn processQueuedPromptLoop(
                         return error.ContextCapacityExceeded;
                     };
                 } else {
+                    // Before structural/native compaction, let the active
+                    // provider name a larger-context model. Resolution is
+                    // pure; binding supplies the transport, credential and
+                    // capability snapshot for a cross-provider target.
+                    if (config.context_promotion_enabled) if (deps.promote_context_model) |resolve_promotion| if (deps.bind_model) |bind_selection| {
+                        const current_selection: model_roles.Selection = .{
+                            .provider = serving_provider,
+                            .model = gateway_model,
+                            .effort = if (step_effort == .auto) null else step_effort,
+                            .source = .{ .builtin = .default },
+                        };
+                        if (try resolve_promotion(deps.ctx, arena, current_selection)) |target_selection| {
+                            if (!target_selection.provider.eql(current_selection.provider) or
+                                !std.mem.eql(u8, target_selection.model, current_selection.model))
+                            {
+                                if (try bind_selection(deps.ctx, arena, target_selection)) |binding| {
+                                    const current_window = request_capabilities.context_window orelse 0;
+                                    const target_window = binding.capabilities.context_window orelse 0;
+                                    if (current_window > 0 and target_window > current_window) {
+                                        promoted_context_selection = binding.selection;
+                                        publishEffectiveSelection(deps, binding.selection);
+                                        serving_provider = binding.selection.provider;
+                                        serving_stream_provider = binding.stream_provider;
+                                        serving_credential = binding.credential;
+                                        serving_provider_options = binding.provider_options;
+                                        request_capabilities = binding.capabilities;
+                                        context_overflow_recovery = .ready;
+                                        request_size_retries = 0;
+                                        request_images_last_refused = null;
+                                        compactor.traceEvent(step_ctx, .decision, "decision=promote_context_model from={s}/{s} to={s}/{s} current_window={d} target_window={d}", .{
+                                            current_selection.provider.label(), current_selection.model,
+                                            binding.selection.provider.label(), binding.selection.model,
+                                            current_window,                     target_window,
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    };
                     // The pending user is source too, even before the first tool.
                     const active_prefix: types.AssistantHistoryTurn = .{
                         .user = job.userTurn(),
@@ -7732,15 +7813,27 @@ fn processQueuedPromptLoop(
                         .tool_evidence = preserved_tool_evidence,
                         .trace_ctx = step_ctx,
                     };
+                    var compact_binding: ?runtime_deps.ModelBinding = null;
+                    if (config.compact_selection) |selection| if (deps.bind_model) |bind| {
+                        compact_binding = bind(deps.ctx, arena, selection) catch null;
+                    };
+                    const compact_selection = config.compact_selection;
+                    const compact_provider = if (compact_binding) |binding| binding.selection.provider else if (compact_selection) |selection| selection.provider else null;
+                    const compact_model = if (compact_binding) |binding| binding.selection.model else if (compact_selection) |selection| selection.model else "";
                     var summary_model: runtime_text_completion.CompactorCaller = .{
                         .observer = deps.observer,
-                        .stream_provider = deps.agent_stream_provider,
+                        .stream_provider = serving_stream_provider,
                         .cooperative_transport_pulse = deps.cooperative_transport_pulse,
-                        .provider = job.provider,
+                        .provider = serving_provider,
                         .model = gateway_model,
-                        .summary_model = config.compact_model,
+                        .summary_model = compact_model,
+                        .summary_provider = compact_provider,
+                        .summary_stream_provider = if (compact_binding) |binding| binding.stream_provider else null,
+                        .summary_credential = if (compact_binding) |binding| binding.credential else null,
+                        .summary_provider_options = if (compact_binding) |binding| binding.provider_options else null,
                         .api_key = active_api_key,
                         .credential_source = job.credential_source,
+                        .credential_override = serving_credential,
                         .account_id = job.account_id,
                         .gateway_team = job.gateway_team,
                         .session_id = lifecycle.scope.session_id,
@@ -7799,7 +7892,7 @@ fn processQueuedPromptLoop(
                         explicit_note_index = try keepExplicitSkillNote(arena, &within_turn_suffix, skills.explicit, explicit_note_index, compacted_suffix_len);
                         var retained_messages: std.ArrayList(ChatMessage) = .empty;
                         try session_runtime.appendHistoryChatMessages(arena, &retained_messages, outcome.retained_history);
-                        try projectEmptyHistoryReplay(arena, deps.agent_stream_provider, .{ .provider = job.provider, .model = gateway_model }, retained_messages.items);
+                        try projectEmptyHistoryReplay(arena, serving_stream_provider, .{ .provider = serving_provider, .model = gateway_model }, retained_messages.items);
                         active_compaction_handoff = outcome.model_text;
                         trace_count_after_compaction = true;
                         active_compaction_history_tail = retained_messages.items;
@@ -7861,7 +7954,7 @@ fn processQueuedPromptLoop(
                 return error.ContextCapacityExceeded;
             }
             summary_accumulator.prepareTokenRequest();
-            if (job.provider == .gateway) {
+            if (serving_provider == .gateway) {
                 try persistRecoveryCheckpoint(
                     deps,
                     finalization,
@@ -7901,15 +7994,7 @@ fn processQueuedPromptLoop(
             };
             var model_request = agent_stream_provider.ModelRequest{
                 .observer = deps.observer,
-                .credential = if (job.credential_source == .host_managed)
-                    .host_managed
-                else
-                    .{ .direct = .{
-                        .secret_bytes = active_api_key,
-                        .source = job.credential_source orelse .ai_gateway_api_key,
-                        .account_id = job.account_id,
-                        .tenant_context = job.gateway_team,
-                    } },
+                .credential = serving_credential orelse activeCredentialLease(active_api_key, job),
                 .session_id = lifecycle.scope.session_id,
                 .model = gateway_model,
                 .retry_count = config.gateway_retry_count,
@@ -7932,15 +8017,33 @@ fn processQueuedPromptLoop(
                 .cancel_flag = config.cancel_flag,
                 .provider_attempt_owner = .agent,
             };
+            var judge_fallbacks: []runtime_stream_rules.JudgeFallback = stream_rules.arena.allocator().alloc(runtime_stream_rules.JudgeFallback, 8) catch @constCast(&[_]runtime_stream_rules.JudgeFallback{});
+            var judge_fallback_count: usize = 0;
+            if (judge_fallbacks.len > 0) if (deps.resolve_role_chain) |resolve| {
+                var judge_chain: [64]model_roles.Selection = undefined;
+                const chain_count = resolve(deps.ctx, .{ .builtin = .tiny }, &judge_chain);
+                var primary_seen = false;
+                for (judge_chain[0..chain_count]) |candidate| {
+                    if (!primary_seen) {
+                        if (candidate.provider.eql(serving_provider) and std.mem.eql(u8, candidate.model, gateway_model)) primary_seen = true;
+                        continue;
+                    }
+                    if (judge_fallback_count == judge_fallbacks.len) break;
+                    const bound = (deps.bind_model orelse break)(deps.ctx, stream_rules.arena.allocator(), candidate) catch null orelse continue;
+                    judge_fallbacks[judge_fallback_count] = .{ .stream_provider = bound };
+                    judge_fallback_count += 1;
+                }
+            };
             stream_rules.bind(.{
                 .credential = model_request.credential,
                 .session_id = model_request.session_id,
                 .model = gateway_model,
                 .provider_options = model_request.provider_options,
                 .trace_ctx = step_ctx,
+                .fallbacks = judge_fallbacks[0..judge_fallback_count],
             });
             request_recovery.beginSend();
-            const streamed = streamMainCompletion(deps, arena, model_request);
+            const streamed = streamMainCompletion(deps, serving_stream_provider, arena, model_request);
             request_recovery.endSend();
             stream_result = streamed catch |err| {
                 parent_turn_delivery.observeGatewayDelivery(
@@ -8035,6 +8138,34 @@ fn processQueuedPromptLoop(
                     step_ctx,
                     .keep,
                 );
+                if (retryable and role_fallback_count > 0 and (!role_fallback_current_seen or role_fallback_index + 1 < role_fallback_count)) {
+                    var next_index = if (role_fallback_current_seen) role_fallback_index + 1 else 0;
+                    while (next_index < role_fallback_count) : (next_index += 1) {
+                        const candidate = role_fallback_candidates[next_index];
+                        const binding = if (deps.bind_model) |bind| bind(deps.ctx, arena, candidate) catch null else null;
+                        if (binding) |bound| {
+                            role_fallback_index = next_index;
+                            role_fallback_current_seen = true;
+                            promoted_context_selection = bound.selection;
+                            publishEffectiveSelection(deps, bound.selection);
+                            serving_provider = bound.selection.provider;
+                            serving_stream_provider = bound.stream_provider;
+                            serving_credential = bound.credential;
+                            serving_provider_options = bound.provider_options;
+                            request_capabilities = bound.capabilities;
+                            recovery_strategy = next_strategy;
+                            recovery_cause = failure_cause;
+                            preserved_tool_evidence = failure_tool_evidence;
+                            reset_stream_for_next_attempt = true;
+                            debug_trace.eventf("agent", "role_fallback", step_ctx, "from={s}/{s} to={s}/{s} attempt={d}", .{
+                                job.provider.label(),             gateway_model,
+                                bound.selection.provider.label(), bound.selection.model,
+                                request_recovery.attempt(),
+                            });
+                            continue :request_attempt_loop;
+                        }
+                    }
+                }
                 var delay_completed = true;
                 if (will_auto_retry) {
                     _ = try request_recovery.failed(.{ .kind = failure_kind.? });
@@ -8161,11 +8292,11 @@ fn processQueuedPromptLoop(
                 gateway_delivery.load(),
             );
             stream_result_set = true;
-            pushNetworkRecord(deps, job.provider, gateway_model, gateway_wait_started_ms, &stream_result);
+            pushNetworkRecord(deps, serving_provider, gateway_model, gateway_wait_started_ms, &stream_result);
             const first_failure = streamFailure(stream_result);
             const auth_replay = auth_transition.decideAuthReplay(.{
                 .authentication_rejected = first_failure != null and first_failure.?.kind == .unauthorized,
-                .refreshable = if (job.credential_source) |source| credentials.sourceRefreshable(source) else false,
+                .refreshable = serving_credential == null and (if (job.credential_source) |source| credentials.sourceRefreshable(source) else false),
                 .delivery_safe = stream_ctx.interruption_source_or("").len == 0 and
                     !stream_ctx.saw_tool_start and
                     streamCompletion(stream_result).tool_calls.len == 0,
@@ -8188,8 +8319,8 @@ fn processQueuedPromptLoop(
                     model_request.delivery = &replay_delivery;
                     model_request.attempt_evidence = &replay_evidence;
                     const replay_wait_started_ms = io_mod.milliTimestamp();
-                    stream_result = try streamMainCompletion(deps, arena, model_request);
-                    pushNetworkRecord(deps, job.provider, gateway_model, replay_wait_started_ms, &stream_result);
+                    stream_result = try streamMainCompletion(deps, serving_stream_provider, arena, model_request);
+                    pushNetworkRecord(deps, serving_provider, gateway_model, replay_wait_started_ms, &stream_result);
                     parent_turn_delivery.observeGatewayDelivery(
                         deps,
                         overlay_arena,
@@ -8359,7 +8490,7 @@ fn processQueuedPromptLoop(
                     config,
                     turn_id,
                     response_completion,
-                    .{ .provider = job.provider, .model = gateway_model },
+                    .{ .provider = serving_provider, .model = gateway_model },
                     advertised_dynamic_tool_names,
                     step_ctx,
                     &within_turn_suffix,
@@ -8426,6 +8557,37 @@ fn processQueuedPromptLoop(
                 assistant_prefill_recovery_used = true;
                 reset_stream_for_next_attempt = true;
                 continue;
+            }
+
+            if (response_failure) |failure| {
+                if (!config.cancel_flag.load(.seq_cst) and role_fallback_count > 0 and (!role_fallback_current_seen or role_fallback_index + 1 < role_fallback_count)) {
+                    var next_index = if (role_fallback_current_seen) role_fallback_index + 1 else 0;
+                    while (next_index < role_fallback_count) : (next_index += 1) {
+                        const candidate = role_fallback_candidates[next_index];
+                        const binding = if (deps.bind_model) |bind| bind(deps.ctx, arena, candidate) catch null else null;
+                        if (binding) |bound| {
+                            role_fallback_index = next_index;
+                            role_fallback_current_seen = true;
+                            promoted_context_selection = bound.selection;
+                            publishEffectiveSelection(deps, bound.selection);
+                            serving_provider = bound.selection.provider;
+                            serving_stream_provider = bound.stream_provider;
+                            serving_credential = bound.credential;
+                            serving_provider_options = bound.provider_options;
+                            request_capabilities = bound.capabilities;
+                            stream_result.deinit(arena);
+                            stream_result_set = false;
+                            reset_stream_for_next_attempt = true;
+                            debug_trace.eventf("agent", "role_fallback", step_ctx, "from={s}/{s} to={s}/{s} attempt={d}", .{
+                                job.provider.label(),             gateway_model,
+                                bound.selection.provider.label(), bound.selection.model,
+                                request_recovery.attempt(),
+                            });
+                            continue :request_attempt_loop;
+                        }
+                    }
+                    _ = failure;
+                }
             }
 
             if (response_failure) |failure| if (isRetryableModelFailure(failure.kind)) {
@@ -8577,8 +8739,8 @@ fn processQueuedPromptLoop(
                 switch (language_decision) {
                     .accept, .undecidable => try stream_ctx.accept_staged_response_language(),
                     .accept_without_prose => {
-                        try discardCompletionProse(arena, deps.agent_stream_provider, .{
-                            .provider = job.provider,
+                        try discardCompletionProse(arena, serving_stream_provider, .{
+                            .provider = serving_provider,
                             .model = gateway_model,
                         }, &stream_result.completed);
                         attempt_completion = stream_result.completed.completion;
@@ -8828,7 +8990,7 @@ fn processQueuedPromptLoop(
         const provider_replay: ?types.ProviderReplay = if (completion.provider_state_json) |parts| replay: {
             // Later requests borrow these turn-arena bytes after response cleanup.
             stream_result.completed.completion.provider_state_json = null;
-            break :replay .{ .source = .{ .provider = job.provider, .model = gateway_model }, .parts_json = parts };
+            break :replay .{ .source = .{ .provider = serving_provider, .model = gateway_model }, .parts_json = parts };
         } else null;
         if (successful_request_cost) |request_cost| {
             if (completion.usage.input_tokens) |exact_input_tokens| {
@@ -9514,7 +9676,7 @@ fn processQueuedPromptLoop(
                             .tool_name = "vision",
                             .message = runtime_vision_contracts.native_route_unavailable_message,
                             .suggestion = if (request_capabilities.image_input_support == .native or
-                                (request_capabilities.image_input_support == .unknown and job.provider != .gateway))
+                                (request_capabilities.image_input_support == .unknown and serving_provider != .gateway))
                                 "Continue using the model's native image input without Vision."
                             else
                                 "Continue without Vision.",

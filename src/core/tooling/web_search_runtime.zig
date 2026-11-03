@@ -3,6 +3,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
+const model_provider = @import("../config/model_provider.zig");
 const tool_dispatch = @import("tool_dispatch.zig");
 const tool_result_errors = @import("tool_result_errors.zig");
 const model_request_budget = @import("model_request_budget.zig");
@@ -40,6 +41,7 @@ pub const Config = struct {
     credential_source: ?types.CredentialSource = null,
     gateway_team: ?[]const u8 = null,
     worker_model: []const u8 = "",
+    worker_provider: model_provider.ProviderId = .gateway,
     gateway_retry_count: usize = 3,
     gateway_chat_url: []const u8 = "https://ai-gateway.vercel.sh/v4/ai/language-model",
 };
@@ -51,6 +53,7 @@ const OwnedInputs = struct {
     credential_source: ?types.CredentialSource = null,
     gateway_team: ?[]u8 = null,
     worker_model: []u8,
+    worker_provider: model_provider.ProviderId,
     gateway_retry_count: usize,
     gateway_chat_url: []u8,
     account_id: ?[]u8 = null,
@@ -74,6 +77,7 @@ const OwnedInputs = struct {
             .credential_source = self.credential_source,
             .gateway_team = self.gateway_team,
             .worker_model = self.worker_model,
+            .worker_provider = self.worker_provider,
             .gateway_retry_count = self.gateway_retry_count,
             .gateway_chat_url = self.gateway_chat_url,
             .account_id = self.account_id,
@@ -93,6 +97,7 @@ pub const Runtime = struct {
     credential_source: ?types.CredentialSource = null,
     gateway_team: ?[]const u8 = null,
     worker_model: []const u8,
+    worker_provider: model_provider.ProviderId = .gateway,
     gateway_retry_count: usize,
     gateway_chat_url: []const u8,
     account_id: ?[]const u8 = null,
@@ -110,6 +115,7 @@ pub const Runtime = struct {
             .credential_source = config.credential_source,
             .gateway_team = config.gateway_team,
             .worker_model = config.worker_model,
+            .worker_provider = config.worker_provider,
             .gateway_retry_count = config.gateway_retry_count,
             .gateway_chat_url = config.gateway_chat_url,
         };
@@ -124,6 +130,7 @@ pub const Runtime = struct {
         self.credential_source = inputs.credential_source;
         self.gateway_team = inputs.gateway_team;
         self.worker_model = inputs.worker_model;
+        self.worker_provider = inputs.worker_provider;
         self.gateway_retry_count = inputs.gateway_retry_count;
         self.gateway_chat_url = inputs.gateway_chat_url;
         self.account_id = inputs.account_id;
@@ -253,6 +260,7 @@ pub const Runtime = struct {
             .credential_source = self.credential_source,
             .gateway_team = gateway_team,
             .worker_model = worker_model,
+            .worker_provider = self.worker_provider,
             .gateway_retry_count = self.gateway_retry_count,
             .gateway_chat_url = gateway_chat_url,
         };

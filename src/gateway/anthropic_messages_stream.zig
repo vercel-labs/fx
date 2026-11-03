@@ -13,7 +13,7 @@ pub const Error = protocol.Error;
 
 pub const Limits = chat.Limits;
 
-const Kind = enum { text, thinking, redacted, tool_use, ignored };
+const Kind = enum { text, thinking, redacted, tool_use, compaction, ignored };
 
 const Block = struct {
     kind: Kind,
@@ -37,6 +37,11 @@ const Tool = struct {
     /// bytes were already streamed out.
     announced: bool = false,
     emitted: usize = 0,
+};
+
+const Compaction = struct {
+    content: std.ArrayList(u8) = .empty,
+    encrypted_content: std.ArrayList(u8) = .empty,
 };
 
 /// What one accepted event contributes to presentation. Slices borrow
@@ -66,9 +71,11 @@ pub const Reducer = struct {
     alloc: Allocator,
     limits: Limits,
     request: stream_provider.RequestData,
+    replay_unsigned_thinking: bool = false,
     blocks: std.ArrayList(Block) = .empty,
     thinking: std.ArrayList(Thinking) = .empty,
     tools: std.ArrayList(Tool) = .empty,
+    compaction: ?Compaction = null,
     content: std.ArrayList(u8) = .empty,
     message_id: ?[]u8 = null,
     usage: UsageCounters = .{},
@@ -80,8 +87,12 @@ pub const Reducer = struct {
     thinking_bytes: usize = 0,
 
     pub fn init(alloc: Allocator, request: stream_provider.RequestData, limits: Limits) Error!Reducer {
+        return init_with_replay(alloc, request, limits, false);
+    }
+
+    pub fn init_with_replay(alloc: Allocator, request: stream_provider.RequestData, limits: Limits, replay_unsigned_thinking: bool) Error!Reducer {
         try protocol.validate(request);
-        return .{ .alloc = alloc, .limits = limits, .request = request };
+        return .{ .alloc = alloc, .limits = limits, .request = request, .replay_unsigned_thinking = replay_unsigned_thinking };
     }
 
     pub fn deinit(self: *Reducer) void {
@@ -97,6 +108,10 @@ pub const Reducer = struct {
             tool.arguments.deinit(self.alloc);
         }
         self.tools.deinit(self.alloc);
+        if (self.compaction) |*value| {
+            value.content.deinit(self.alloc);
+            value.encrypted_content.deinit(self.alloc);
+        }
         self.content.deinit(self.alloc);
         if (self.message_id) |id| self.alloc.free(id);
         if (self.stop_reason) |reason| self.alloc.free(reason);
@@ -190,6 +205,20 @@ pub const Reducer = struct {
                 if (non_null(block, "thinking")) |text| try self.append_thinking(&part.text, try string(text));
                 if (non_null(block, "signature")) |signature| try self.append_thinking(&part.signature, try string(signature));
             }
+        } else if (std.mem.eql(u8, kind, "compaction")) {
+            if (self.compaction != null) return error.ConflictingIdentity;
+            self.compaction = .{};
+            try self.blocks.append(self.alloc, .{ .kind = .compaction });
+            if (non_null(block, "content")) |content| {
+                const text = try string(content);
+                if (text.len > self.limits.content_bytes) return error.ContentTooLarge;
+                try self.compaction.?.content.appendSlice(self.alloc, text);
+            }
+            if (non_null(block, "encrypted_content")) |encrypted| {
+                const value = try string(encrypted);
+                if (value.len > types.ProviderReplay.max_bytes) return error.ReplayTooLarge;
+                try self.compaction.?.encrypted_content.appendSlice(self.alloc, value);
+            }
         } else if (std.mem.eql(u8, kind, "tool_use")) {
             if (self.request.tool_choice == .none) return error.UnexpectedToolCall;
             if (self.tools.items.len == self.limits.tool_calls) return error.TooManyTools;
@@ -241,6 +270,24 @@ pub const Reducer = struct {
                 return .{ .reasoning = if (text.len != 0) part.text.items[start..] else null };
             },
             .redacted => return error.InvalidChunk,
+            .compaction => {
+                if (!std.mem.eql(u8, kind, "compaction_delta")) return error.InvalidChunk;
+                if (self.compaction == null) return error.InvalidChunk;
+                const value = &self.compaction.?;
+                if (non_null(delta, "content")) |content| {
+                    const text = try string(content);
+                    value.content.clearRetainingCapacity();
+                    if (text.len > self.limits.content_bytes) return error.ContentTooLarge;
+                    try value.content.appendSlice(self.alloc, text);
+                }
+                if (non_null(delta, "encrypted_content")) |encrypted| {
+                    const text = try string(encrypted);
+                    value.encrypted_content.clearRetainingCapacity();
+                    if (text.len > types.ProviderReplay.max_bytes) return error.ReplayTooLarge;
+                    try value.encrypted_content.appendSlice(self.alloc, text);
+                }
+                return .{};
+            },
             .tool_use => {
                 if (!std.mem.eql(u8, kind, "input_json_delta")) return error.InvalidChunk;
                 const tool = &self.tools.items[block.slot];
@@ -312,19 +359,25 @@ pub const Reducer = struct {
     }
 
     /// The replay envelope: signed and redacted thinking in order, bound to
-    /// this response's call IDs. Unsigned thinking cannot be replayed and is
-    /// left out. Caller owns the result.
+    /// this response's call IDs. Unsigned thinking is retained only when the
+    /// compatibility policy explicitly permits it. Caller owns the result.
     fn replay_state(self: *const Reducer) (Error || std.Io.Writer.Error)!?[]u8 {
-        var any = false;
-        for (self.thinking.items) |part| any = any or part.signature.items.len != 0;
-        if (!any) return null;
+        var any_thinking = false;
+        for (self.thinking.items) |part| {
+            any_thinking = any_thinking or part.signature.items.len != 0 or (self.replay_unsigned_thinking and part.text.items.len != 0);
+        }
+        const any_compaction = if (self.compaction) |value|
+            value.content.items.len != 0 or value.encrypted_content.items.len != 0
+        else
+            false;
+        if (!any_thinking and !any_compaction) return null;
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         const w = &out.writer;
         try w.writeAll("{\"" ++ protocol.thinking_field ++ "\":[");
         var count: usize = 0;
         for (self.thinking.items) |part| {
-            if (part.signature.items.len == 0) continue;
+            if (part.signature.items.len == 0 and (!self.replay_unsigned_thinking or part.text.items.len == 0)) continue;
             if (count != 0) try w.writeByte(',');
             count += 1;
             if (part.redacted) {
@@ -338,7 +391,17 @@ pub const Reducer = struct {
             }
             try w.writeByte('}');
         }
-        try w.writeAll("],\"" ++ protocol.association_field ++ "\":[");
+        try w.writeByte(']');
+        if (self.compaction) |value| if (any_compaction) {
+            try w.writeAll(",\"" ++ protocol.compaction_field ++ "\":{\"content\":");
+            try std.json.Stringify.value(value.content.items, .{}, w);
+            if (value.encrypted_content.items.len != 0) {
+                try w.writeAll(",\"encrypted_content\":");
+                try std.json.Stringify.value(value.encrypted_content.items, .{}, w);
+            }
+            try w.writeByte('}');
+        };
+        try w.writeAll(",\"" ++ protocol.association_field ++ "\":[");
         for (self.tools.items, 0..) |tool, index| {
             if (index != 0) try w.writeByte(',');
             try std.json.Stringify.value(tool.id, .{}, w);
@@ -368,6 +431,8 @@ pub const Reducer = struct {
             return error.OutputTruncated
         else if (std.mem.eql(u8, raw, "refusal"))
             return error.Refused
+        else if (std.mem.eql(u8, raw, "compaction"))
+            .stop
         else
             return error.InvalidFinishReason;
         if ((reason == .tool_calls) != (self.tools.items.len != 0)) return error.InconsistentFinishReason;
@@ -452,8 +517,12 @@ fn token_count(fields: std.json.ObjectMap, key: []const u8) Error!?u64 {
 /// Reads framed events until message_stop or an error event, emitting text
 /// and thinking deltas to `events`. `progress` is told about each event.
 pub fn consume_stream(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool), progress: ?sse.Progress) Error!stream_provider.Result {
+    return consume_stream_with_replay(alloc, source, request, limits, events, cancel_flag, progress, false);
+}
+
+pub fn consume_stream_with_replay(alloc: Allocator, source: *std.Io.Reader, request: stream_provider.RequestData, limits: Limits, events: ?stream_provider.EventSink, cancel_flag: *const std.atomic.Value(bool), progress: ?sse.Progress, replay_unsigned_thinking: bool) Error!stream_provider.Result {
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-    var reducer = try Reducer.init(alloc, request, limits);
+    var reducer = try Reducer.init_with_replay(alloc, request, limits, replay_unsigned_thinking);
     defer reducer.deinit();
     var framing = sse.Reader{ .max_event_bytes = limits.event_bytes, .progress = progress };
     defer framing.deinit(alloc);

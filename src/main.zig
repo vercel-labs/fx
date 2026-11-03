@@ -5,6 +5,7 @@ const text_utils = @import("core/shared/text_utils.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_mod = @import("core/shared/io.zig");
+const profile_paths = @import("core/shared/profile_paths.zig");
 
 pub const version = "0.0.16";
 
@@ -14,6 +15,7 @@ const model_role_runtime = @import("core/app/model_role_runtime.zig");
 const model_hub = @import("core/model_hub/hub.zig");
 const checklist_panel = @import("core/checklist/panel.zig");
 const model_hub_runtime = @import("core/app/model_hub_runtime.zig");
+const model_performance = @import("core/model_hub/performance.zig");
 const provider_picker_runtime = @import("core/app/provider_picker_runtime.zig");
 const auth_runtime = @import("core/auth/auth_runtime.zig");
 const api_key_validator = @import("core/auth/api_key_validator.zig");
@@ -69,6 +71,7 @@ const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
 const provider_catalog = @import("core/auth/provider_catalog.zig");
 const vercel_model_policy = @import("gateway/vercel_model_policy.zig");
+const openai_codex = @import("gateway/openai_codex.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
 const agent_stream_provider = @import("core/agent/stream_provider.zig");
 const builtin_hooks = @import("builtins/hooks.zig");
@@ -575,6 +578,7 @@ const App = struct {
     ),
     provider_selection: provider_runtime.Runtime = provider_runtime.Runtime.init(std.heap.c_allocator),
     model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.heap.c_allocator, builtin_gateway.models_path),
+    model_performance: model_performance.State = .{ .allocator = std.heap.c_allocator },
     /// Replaced in `init` with the real home directory.
     usage_dashboard: usage.Dashboard = usage.Dashboard.init(std.heap.c_allocator, usage_host.host("")),
     workspace_root: []u8 = &.{},
@@ -655,6 +659,8 @@ const App = struct {
     session_title: std.ArrayList(u8) = .empty,
     total_input_tokens: u64 = 0,
     total_output_tokens: u64 = 0,
+    /// Process-long Codex WebSocket/session state for interactive turns.
+    codex_transport_state: ?*openai_codex.TransportState = null,
     total_web_search_requests: u64 = 0,
 
     stream: StreamState = .{},
@@ -668,10 +674,16 @@ const App = struct {
             .alloc = alloc,
             .auth = undefined,
             .usage_dashboard = undefined,
+            .model_performance = model_performance.State.init(alloc, if (comptime host_target.is_wasm) null else io_mod.homeDir()),
             .session_persistence = undefined,
             .input_runtime = undefined,
             .session = undefined,
             .shell = TranscriptRuntime.init(),
+            .codex_transport_state = if (comptime host_target.is_wasm) null else blk: {
+                const state = try alloc.create(openai_codex.TransportState);
+                state.* = openai_codex.TransportState.init(alloc);
+                break :blk state;
+            },
             .lifecycle_runtime = hooks.Runtime.init(alloc),
             .terminal_client = terminal_client_runtime.Runtime.init(if (comptime host_target.is_wasm)
                 process_provider.unavailable_provider
@@ -1075,6 +1087,7 @@ const App = struct {
         self.terminal_client.deinit();
         self.managed_executions.deinit();
         self.model_hub.deinit(self.alloc);
+        self.model_performance.deinit();
         self.checklist_panel.deinit();
         self.model_cache.deinit();
         self.usage_dashboard.deinit();
@@ -1082,6 +1095,11 @@ const App = struct {
         SessionAppRuntime.finalizePersistence(self);
         shutdown_trace.mark("persistence_finalized");
         self.worker.deinit(std.heap.c_allocator);
+        if (self.codex_transport_state) |state| {
+            state.deinit();
+            self.alloc.destroy(state);
+            self.codex_transport_state = null;
+        }
         self.web_fetch_runtime.deinit(self.alloc);
         self.web_search_runtime.deinit();
         self.prompt_history.deinit(self.alloc);
@@ -2185,6 +2203,7 @@ const App = struct {
         }
         var providers = builtin_providers.native;
         providers.definitions = self.provider_selection.definitions.definitions;
+        providers.native_overrides = self.provider_selection.definitions.native_overrides;
         if (self.provider_selection.gateway_http_pool) |pool| {
             // Rebind the gateway stream provider to the process-long pooled
             // client so chat requests reuse warm keep-alive connections.
@@ -2192,6 +2211,13 @@ const App = struct {
                 var stamped = stream;
                 stamped.context = pool;
                 providers.gateway.agent_stream = stamped;
+            }
+        }
+        if (self.codex_transport_state) |state| {
+            if (providers.codex.agent_stream) |stream| {
+                var stamped = stream;
+                stamped.context = @ptrCast(state);
+                providers.codex.agent_stream = stamped;
             }
         }
         if (comptime !host_profile.tools) {
@@ -2306,17 +2332,123 @@ const App = struct {
         self.loadModelCatalog(.picker_open);
     }
 
+    fn modelCatalogAccessForProvider(self: *App, provider: model_provider.ProviderId, force_credentials: bool) !credentials.CatalogAccess {
+        if (self.auth.isHostManaged()) return .host_managed;
+        const active = self.provider_selection.selection().provider;
+        if (!force_credentials and active.eql(provider)) return self.auth.modelCatalogAccess();
+        const resolution = credentials.resolveForProvider(
+            self.alloc,
+            self.auth.oauthTransport(),
+            self.auth.secretStore(),
+            .stored,
+            provider,
+            null,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            debug_trace.logf("auth", "model_catalog_provider_access_unavailable provider={t} err={s}", .{ provider, @errorName(err) });
+            return .{ .public_only = .no_credential };
+        };
+        if (resolution.credential) |credential| {
+            var owned = credential;
+            defer owned.deinit(self.alloc);
+            return credentials.catalogAccessForCredentialAndAccount(
+                owned.source,
+                owned.token,
+                owned.gatewayTeam(),
+                owned.accountId(),
+            );
+        }
+        return .{ .public_only = .no_credential };
+    }
+
+    fn syncModelCatalogProviders(self: *App) !void {
+        return self.syncModelCatalogProvidersWithForce(false);
+    }
+
+    fn syncModelCatalogProvidersWithForce(self: *App, force_credentials: bool) !void {
+        var configs: std.ArrayList(model_cache_runtime.ProviderConfig) = .empty;
+        defer configs.deinit(self.alloc);
+        var cache_paths: std.ArrayList([]u8) = .empty;
+        defer {
+            for (cache_paths.items) |path| self.alloc.free(path);
+            cache_paths.deinit(self.alloc);
+        }
+        var seeds: std.ArrayList(std.ArrayList(model_catalog.ModelCatalogEntry)) = .empty;
+        defer {
+            for (seeds.items) |*seed| model_catalog.freeModelCatalog(self.alloc, seed);
+            seeds.deinit(self.alloc);
+        }
+        const providers = self.providerSet();
+        const active = self.provider_selection.selection().provider;
+        const home = io_mod.homeDir();
+
+        for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
+            const source = providers.select(provider).model_catalog orelse continue;
+            const cache_path = if (home) |value|
+                try profile_paths.modelCatalogCachePath(self.alloc, value, provider.label())
+            else
+                null;
+            if (cache_path) |path| try cache_paths.append(self.alloc, path);
+            const native_overrides = for (providers.native_overrides) |*overrides| {
+                if (std.mem.eql(u8, overrides.id, provider.label())) break overrides;
+            } else null;
+            try configs.append(self.alloc, .{
+                .provider = provider,
+                .catalog = source,
+                .native_overrides = native_overrides,
+                .endpoint = if (provider == .gateway) builtin_gateway.models_path else "",
+                .access = try self.modelCatalogAccessForProvider(provider, force_credentials),
+                .cache_path = cache_path,
+            });
+        }
+        for (providers.definitions) |definition| {
+            var provider = model_provider.parse(definition.id) orelse continue;
+            provider.configured.binding = definition.binding_identity();
+            const source = providers.select(provider).model_catalog orelse continue;
+            const cache_path = if (home) |value|
+                try profile_paths.modelCatalogCachePath(self.alloc, value, provider.label())
+            else
+                null;
+            if (cache_path) |path| try cache_paths.append(self.alloc, path);
+            const native_overrides = for (providers.native_overrides) |*overrides| {
+                if (std.mem.eql(u8, overrides.id, provider.label())) break overrides;
+            } else null;
+            var seed = try model_cache_runtime.metadataSeed(
+                self.alloc,
+                &.{ definition.model_metadata, definition.builtin_models },
+                definition.model_defaults,
+            );
+            errdefer model_catalog.freeModelCatalog(self.alloc, &seed);
+            try seeds.append(self.alloc, seed);
+            try configs.append(self.alloc, .{
+                .provider = provider,
+                .catalog = source,
+                .native_overrides = native_overrides,
+                .seed = seeds.items[seeds.items.len - 1].items,
+                .refresh_on_seed = definition.discovery != null or definition.catalog == .openrouter,
+                .endpoint = definition.base_url,
+                .access = try self.modelCatalogAccessForProvider(provider, force_credentials),
+                .from_profile_settings = true,
+                .cache_path = cache_path,
+            });
+        }
+        try self.model_cache.syncProviders(configs.items, active);
+    }
+
     fn loadModelCatalog(self: *App, trigger: model_cache_runtime.LoadTrigger) void {
+        self.syncModelCatalogProviders() catch |err| {
+            debug_trace.logf("catalog", "model_provider_sync_failed err={s}", .{@errorName(err)});
+            return;
+        };
         if (comptime host_profile.cooperative_agent) {
             // Cooperative hosts fetch inline, so only stale catalogs reload there.
             if (self.auth.credentialNeedsRefresh()) {
                 debug_trace.logf("auth", "model_cache_warmup_deferred reason=credential_refresh_required", .{});
                 return;
             }
-            self.model_cache.loadCooperative(
-                js_host_model_catalog.provider,
-                self.auth.modelCatalogAccess(),
-            );
+            const active = self.provider_selection.selection().provider;
+            const source = self.providerSet().select(active).model_catalog orelse return;
+            self.model_cache.loadCooperative(source, self.auth.modelCatalogAccess());
         } else {
             // Warming without the launch credential would fetch the catalog
             // twice; the credential's arrival starts the warmup instead.
@@ -2324,16 +2456,20 @@ const App = struct {
                 debug_trace.logf("auth", "model_cache_warmup_deferred reason=startup_credential_pending", .{});
                 return;
             }
-            self.model_cache.startWarmup(
-                self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return,
-                self.auth.modelCatalogAccess(),
-                trigger,
-            );
+            self.model_cache.warmupAll(trigger);
         }
     }
 
     pub fn ensureModelCache(self: *App) void {
         self.startModelCacheWarmup();
+    }
+
+    /// Re-resolves provider credentials before a user-forced catalog refresh.
+    /// This is deliberately narrow: it reconciles access for every configured
+    /// provider, then queues only the requested provider with force semantics.
+    pub fn forceRefreshModelCatalogProvider(self: *App, provider: model_provider.ProviderId) !bool {
+        try self.syncModelCatalogProvidersWithForce(true);
+        return self.model_cache.refresh(provider, .force);
     }
 
     pub fn isModelCacheLoading(self: *App) bool {
@@ -2350,9 +2486,9 @@ const App = struct {
     }
 
     pub fn resolvedModelCapabilities(self: *App, model: []const u8) model_capabilities.Capabilities {
-        const bundle = self.providerSet().select(self.provider_selection.selection().provider);
+        const providers = self.providerSet();
         return model_capabilities.mergeCapabilities(
-            bundle.fallbackModelCapabilities(model),
+            providers.modelCapabilities(self.provider_selection.selection().provider, model),
             self.model_cache.metadataForModel(model),
         );
     }
@@ -3205,7 +3341,7 @@ const App = struct {
             app_permission_runtime.monotonicMillis(),
         );
 
-        if (try self.model_cache.pollLoadTransition()) {
+        if (try self.model_cache.pollLoadTransitions()) {
             try model_hub_runtime.Runtime(App).refresh(self);
             RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
         }
@@ -5192,6 +5328,7 @@ test {
     _ = @import("core/gateway/provider_set.zig");
     _ = @import("core/gateway/model_catalog.zig");
     _ = @import("gateway/chat_completions.zig");
+    _ = @import("gateway/configured_discovery.zig");
     _ = @import("gateway/anthropic_messages.zig");
     _ = @import("gateway/anthropic_messages_protocol.zig");
     _ = @import("gateway/anthropic_messages_stream.zig");
@@ -5208,6 +5345,7 @@ test {
     _ = @import("core/shared/io.zig");
     _ = @import("core/shared/message.zig");
     _ = @import("core/shared/token_estimate.zig");
+    _ = @import("core/tokenizer/tokenizer.zig");
     _ = @import("core/shell_command/command_effect.zig");
     _ = @import("core/shell_command/safe_git.zig");
     _ = @import("core/execution/router.zig");

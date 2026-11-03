@@ -2545,9 +2545,10 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   buffers: a call's final arguments, or the finished reply's prose. The
   judge uses proto's prompt, takes the last yes or no in the answer,
   caches by question, roles and buffer, and spends at most 64 calls a
-  turn. The model comes from `AgentRuntimeDeps.resolve_judge_model`, given
-  the rule's roles (`tiny`, `small` by default); unset, or answering null,
-  the request's own model and connection answer. `proto-fx ttsr test` and
+  turn. The model comes from the typed role-chain and model-binding hooks
+  (`AgentRuntimeDeps.resolve_role_chain` and `bind_model`), given the rule's
+  roles (`tiny`, `small` by default); an empty chain uses the request's own
+  model and connection. `proto-fx ttsr test` and
   `scan` never call a model, so a judged condition does not match there.
   **Why:** model roles bind this seam without touching the rule engine.
   **Alternative:** the title model, which is not every provider's.
@@ -2607,13 +2608,12 @@ Settled for persistent node hosts and rewinding nodes (2026-10-25):
   title. **Alternative:** requiring `reviewer_model`, which few
   definitions set.
 
-- **D207 Decision:** the terminal, `ask` and ACP bind
-  `resolve_judge_model` (D182) to model roles: a judge takes the first of
+- **D207 Decision:** the terminal, `ask` and ACP bind the typed role-chain
+  and model-binding hooks (D182) to model roles: a judge takes the first of
   the rule's roles (`tiny`, `small` by default, as proto's
-  `ttsr-judge.ts`) that resolves on the session's provider, following
-  each role's fallback, so an unset `tiny` reaches `small` and then the
-  provider's own low-cost model; with none, the session's model answers.
-  A role naming another provider does not resolve. `proto-fx ttsr test`
+  `ttsr-judge.ts`) that resolves, following each role's provider-qualified
+  fallback and retaining its credential, transport, and options; with no
+  candidate, the session's model answers. `proto-fx ttsr test`
   still never calls a model: `--llm` would need `ask`'s credential and
   provider startup. **Why:** proto's judge selection. **Alternative:**
   always the session's model, which spends the large model on yes or no.

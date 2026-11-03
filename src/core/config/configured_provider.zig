@@ -2,6 +2,7 @@ const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
+const tokenizer = @import("../tokenizer/tokenizer.zig");
 const Allocator = std.mem.Allocator;
 
 const max_providers = 32;
@@ -33,13 +34,18 @@ pub const ParseError = Allocator.Error || error{
     InvalidCommand,
 };
 
-pub const Protocol = enum { @"openai-chat-completions", @"anthropic-messages", @"openai-responses" };
+pub const Protocol = enum { @"openai-chat-completions", @"anthropic-messages", @"openai-responses", @"google-generative-ai" };
 /// How a Chat Completions endpoint takes a reasoning effort: not at all,
 /// OpenRouter's `reasoning` object, or OpenAI's `reasoning_effort` (D146).
 pub const ReasoningFormat = enum { none, openrouter, openai };
 /// Where a definition's model list comes from: only what it declares, or
 /// also OpenRouter's public catalog, fetched and cached (D146).
 pub const CatalogSource = enum { declared, openrouter };
+pub const Discovery = struct {
+    type: enum { ollama, @"llama.cpp", @"lm-studio", @"openai-models-list", proxy, litellm },
+    timeout_ms: u32 = 10_000,
+    inject_v1: bool = true,
+};
 /// An extra request header. A value starting with `!` is a command whose
 /// trimmed output is the value; `!!` escapes a literal `!` (D148).
 pub const Header = struct { name: []const u8, value: []const u8 };
@@ -63,8 +69,45 @@ pub const Auth = union(enum) {
     login: []const u8,
 };
 
+/// Prices per million tokens, matching the model picker and provider catalogs.
+pub const ModelCost = struct {
+    input: f64 = 0,
+    output: f64 = 0,
+    cache_read: f64 = 0,
+    cache_write: f64 = 0,
+};
+
+pub const RemoteCompaction = struct {
+    enabled: bool = true,
+    protocol: ?Protocol = null,
+    endpoint: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    v2_streaming_enabled: bool = false,
+    v2_endpoint: ?[]const u8 = null,
+    streaming_endpoint: ?[]const u8 = null,
+};
+
 pub const ModelMetadata = struct {
     id: []const u8,
+    /// Set only for parsed overrides, so explicit false/zero values still win.
+    fields: []const []const u8 = &.{},
+    name: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    cost: ?ModelCost = null,
+    intelligence: ?f64 = null,
+    recommended: bool = false,
+    beta: bool = false,
+    released: i64 = 0,
+    base_url: ?[]const u8 = null,
+    headers: []const Header = &.{},
+    max_context_window: ?u32 = null,
+    omit_max_output_tokens: bool = false,
+    prefer_websockets: ?bool = null,
+    tokenizer: ?[]const u8 = null,
+    context_promotion_target: ?[]const u8 = null,
+    compaction_model: ?[]const u8 = null,
+    remote_compaction: ?RemoteCompaction = null,
+    compat: @import("model_compatibility.zig").Compatibility = .{},
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
     supports_tool_use: ?bool = null,
@@ -87,6 +130,12 @@ pub const Definition = struct {
     tool_choice_mode: ToolChoiceMode = .omit,
     reviewer_model: ?[]const u8 = null,
     model_metadata: []const ModelMetadata = &.{},
+    /// Owns parsed model metadata; preset model tables remain borrowed.
+    model_storage: ?std.heap.ArenaAllocator = null,
+    /// Original, owned config for profile patches; never used as a transport.
+    source: ?std.json.Value = null,
+    model_defaults: ?*const ModelMetadata = null,
+    discovery: ?Discovery = null,
     headers: []const Header = &.{},
     reasoning_format: ReasoningFormat = .none,
     /// The model a first switch to this provider selects.
@@ -98,19 +147,25 @@ pub const Definition = struct {
     /// Built in rather than written by the user (D145).
     preset: bool = false,
 
+    /// The model's endpoint override, otherwise the provider's endpoint.
+    pub fn baseUrlFor(self: Definition, model_id: []const u8) []const u8 {
+        const metadata = self.model(model_id) orelse return self.base_url;
+        return metadata.base_url orelse self.base_url;
+    }
+
     /// Caller owns the returned URL. base_url is already a validated API prefix.
-    pub fn chat_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
-        return std.mem.concat(alloc, u8, &.{ self.base_url, "/chat/completions" });
+    pub fn chat_url(self: Definition, alloc: Allocator, model_id: []const u8) Allocator.Error![]u8 {
+        return std.mem.concat(alloc, u8, &.{ self.baseUrlFor(model_id), "/chat/completions" });
     }
 
     /// Caller owns the returned URL.
-    pub fn messages_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
-        return std.mem.concat(alloc, u8, &.{ self.base_url, "/messages" });
+    pub fn messages_url(self: Definition, alloc: Allocator, model_id: []const u8) Allocator.Error![]u8 {
+        return std.mem.concat(alloc, u8, &.{ self.baseUrlFor(model_id), "/messages" });
     }
 
     /// Caller owns the returned URL.
-    pub fn responses_url(self: Definition, alloc: Allocator) Allocator.Error![]u8 {
-        return std.mem.concat(alloc, u8, &.{ self.base_url, "/responses" });
+    pub fn responses_url(self: Definition, alloc: Allocator, model_id: []const u8) Allocator.Error![]u8 {
+        return std.mem.concat(alloc, u8, &.{ self.baseUrlFor(model_id), "/responses" });
     }
 
     /// Borrowed metadata; absence and unspecified fields remain unknown.
@@ -122,7 +177,7 @@ pub const Definition = struct {
         for (self.builtin_models) |*metadata| {
             if (std.mem.eql(u8, metadata.id, id)) return metadata;
         }
-        return null;
+        return self.model_defaults;
     }
 
     /// The wire protocol `id` is sent with.
@@ -181,16 +236,65 @@ pub const Definition = struct {
             alloc.free(header.value);
         }
         alloc.free(self.headers);
-        for (self.model_metadata) |metadata| {
-            alloc.free(metadata.id);
-            alloc.free(metadata.reasoning_efforts);
+        if (self.model_storage) |storage| {
+            var owned = storage;
+            owned.deinit();
         }
-        alloc.free(self.model_metadata);
+    }
+};
+
+/// Native providers keep their transport/auth identity. This is only policy.
+pub const NativeOverrides = struct {
+    id: []const u8,
+    default_model: ?[]const u8 = null,
+    reviewer_model: ?[]const u8 = null,
+    model_metadata: []const ModelMetadata = &.{},
+    defaults: ?*const ModelMetadata = null,
+    storage: std.heap.ArenaAllocator,
+
+    pub fn model(self: NativeOverrides, id: []const u8) ?*const ModelMetadata {
+        for (self.model_metadata) |*metadata| if (std.mem.eql(u8, metadata.id, id)) return metadata;
+        return self.defaults;
+    }
+
+    pub fn deinit(self: NativeOverrides) void {
+        var storage = self.storage;
+        storage.deinit();
     }
 };
 
 pub const Registry = struct {
     definitions: []const Definition = &.{},
+    native_overrides: []const NativeOverrides = &.{},
+
+    pub fn native(self: Registry, id: []const u8) ?*const NativeOverrides {
+        for (self.native_overrides) |*overrides| if (std.mem.eql(u8, overrides.id, id)) return overrides;
+        return null;
+    }
+
+    pub fn model(self: Registry, provider: []const u8, id: []const u8) ?*const ModelMetadata {
+        if (self.native(provider)) |overrides| return overrides.model(id);
+        if (self.get(provider)) |definition| return definition.model(id);
+        return null;
+    }
+
+    /// Takes ownership on success and failure, like put.
+    pub fn putNative(self: *Registry, alloc: Allocator, overrides: NativeOverrides) Allocator.Error!void {
+        for (self.native_overrides, 0..) |existing, index| {
+            if (!std.mem.eql(u8, existing.id, overrides.id)) continue;
+            existing.deinit();
+            @constCast(self.native_overrides)[index] = overrides;
+            return;
+        }
+        const grown = alloc.alloc(NativeOverrides, self.native_overrides.len + 1) catch |err| {
+            overrides.deinit();
+            return err;
+        };
+        @memcpy(grown[0..self.native_overrides.len], self.native_overrides);
+        grown[self.native_overrides.len] = overrides;
+        alloc.free(self.native_overrides);
+        self.native_overrides = grown;
+    }
 
     /// Parse the providers object itself, not the surrounding settings object.
     /// All returned storage is owned, independent of `providers`, and must be
@@ -236,6 +340,8 @@ pub const Registry = struct {
     pub fn deinit(self: *Registry, alloc: Allocator) void {
         for (self.definitions) |definition| definition.deinit(alloc);
         alloc.free(self.definitions);
+        for (self.native_overrides) |overrides| overrides.deinit();
+        alloc.free(self.native_overrides);
         self.* = .{};
     }
 
@@ -278,7 +384,7 @@ pub const Registry = struct {
 /// Parses one definition. All returned storage is owned by `alloc`.
 pub fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata", "headers", "reasoning_format", "default_model" });
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "model_metadata", "headers", "reasoning_format", "default_model", "defaults", "compat", "remote_compaction", "discovery" });
     const protocol = try required(value, "protocol");
     if (protocol != .string) return error.InvalidProtocol;
     const kind = std.meta.stringToEnum(Protocol, protocol.string) orelse return error.InvalidProtocol;
@@ -324,10 +430,95 @@ pub fn parse_definition(alloc: Allocator, id: []const u8, value: std.json.Value)
     if (reviewer) |model_id| definition.reviewer_model = try alloc.dupe(u8, model_id);
     if (default_model) |model_id| definition.default_model = try alloc.dupe(u8, model_id);
     if (value.object.get("headers")) |headers| definition.headers = try parse_headers(alloc, headers);
-    if (value.object.get("model_metadata")) |metadata| definition.model_metadata = try parse_metadata(alloc, metadata, kind, reasoning_format);
+    definition.model_storage = .init(alloc);
+    const arena = definition.model_storage.?.allocator();
+    const source_json = try std.json.Stringify.valueAlloc(arena, value, .{});
+    definition.source = std.json.parseFromSliceLeaky(std.json.Value, arena, source_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidObject,
+    };
+    const policy = try parsePolicy(arena, value, kind, reasoning_format);
+    definition.model_metadata = policy.models;
+    definition.model_defaults = policy.defaults;
+    if (value.object.get("discovery")) |discovery| {
+        if (kind != .@"openai-chat-completions" and kind != .@"openai-responses") return error.InvalidProtocol;
+        try check_fields(discovery, &.{ "type", "timeout_ms", "inject_v1" });
+        definition.discovery = try metadataValue(?Discovery, arena, value, "discovery", null);
+        if (definition.discovery.?.timeout_ms == 0) return error.InvalidModelMetadata;
+        if (discovery.object.contains("inject_v1") and definition.discovery.?.type != .@"openai-models-list") return error.UnknownField;
+    }
     // Only the Messages transport has a separate key header.
     if (auth_value.object.get("type").?.string[0] == 'x' and kind != .@"anthropic-messages" and !definition.mixed()) return error.InvalidAuth;
     return definition;
+}
+
+pub fn isNativeId(id: []const u8) bool {
+    return std.mem.eql(u8, id, "gateway") or std.mem.eql(u8, id, "codex") or std.mem.eql(u8, id, "grok");
+}
+
+pub fn parseNative(alloc: Allocator, id: []const u8, value: std.json.Value) ParseError!NativeOverrides {
+    if (!isNativeId(id)) return error.InvalidProviderId;
+    try check_fields(value, &.{ "default_model", "reviewer_model", "model_metadata", "defaults", "base_url", "headers", "compat", "remote_compaction" });
+    var overrides: NativeOverrides = .{ .id = "", .storage = .init(alloc) };
+    errdefer overrides.deinit();
+    const arena = overrides.storage.allocator();
+    overrides.id = try arena.dupe(u8, id);
+    if (try optional_model(value.object.get("default_model"))) |model| overrides.default_model = try arena.dupe(u8, model);
+    if (try optional_model(value.object.get("reviewer_model"))) |model| overrides.reviewer_model = try arena.dupe(u8, model);
+    var policy_value = value;
+    policy_value.object = try value.object.clone(arena);
+    var defaults: std.json.Value = value.object.get("defaults") orelse .{ .object = .empty };
+    if (defaults != .object) return error.InvalidObject;
+    defaults.object = try defaults.object.clone(arena);
+    for ([_][]const u8{ "base_url", "headers" }) |key| if (value.object.get(key)) |field| try defaults.object.put(arena, key, field);
+    try policy_value.object.put(arena, "defaults", defaults);
+    const protocol: Protocol = if (std.mem.eql(u8, id, "grok")) .@"openai-chat-completions" else .@"openai-responses";
+    const policy = try parsePolicy(arena, policy_value, protocol, .openai);
+    // Native wire protocols are owned by their transports, not models.json.
+    if (policy.defaults) |metadata| if (metadata.protocol != null) return error.InvalidProtocol;
+    for (policy.models) |metadata| if (metadata.protocol != null) return error.InvalidProtocol;
+    overrides.model_metadata = policy.models;
+    overrides.defaults = policy.defaults;
+    return overrides;
+}
+
+const Policy = struct { models: []const ModelMetadata, defaults: ?*const ModelMetadata };
+
+fn parsePolicy(arena: Allocator, value: std.json.Value, protocol: Protocol, reasoning: ReasoningFormat) ParseError!Policy {
+    var defaults: std.json.Value = .{ .object = .empty };
+    if (value.object.get("defaults")) |fields| {
+        if (fields != .object) return error.InvalidObject;
+        defaults.object = try fields.object.clone(arena);
+    }
+    for ([_][]const u8{ "compat", "remote_compaction" }) |key| if (value.object.get(key)) |field| try defaults.object.put(arena, key, field);
+    var result: Policy = .{ .models = &.{}, .defaults = null };
+    if (defaults.object.count() > 0) {
+        var single: std.json.Value = .{ .object = .empty };
+        try single.object.put(arena, "__defaults__", defaults);
+        const parsed = try parse_metadata(arena, single, protocol, reasoning);
+        result.defaults = &parsed[0];
+    }
+    if (value.object.get("model_metadata")) |models| {
+        if (models != .object) return error.InvalidObject;
+        var effective: std.json.Value = .{ .object = .empty };
+        var iterator = models.object.iterator();
+        while (iterator.next()) |entry| try effective.object.put(arena, entry.key_ptr.*, try overlayValue(arena, defaults, entry.value_ptr.*));
+        result.models = try parse_metadata(arena, effective, protocol, reasoning);
+    }
+    return result;
+}
+
+/// Object fields merge recursively; explicit scalar/array values replace.
+/// The result borrows leaf values from its inputs and owns only map storage.
+pub fn overlayValue(arena: Allocator, base: std.json.Value, patch: std.json.Value) Allocator.Error!std.json.Value {
+    if (base != .object or patch != .object) return patch;
+    var result: std.json.Value = .{ .object = try base.object.clone(arena) };
+    var iterator = patch.object.iterator();
+    while (iterator.next()) |entry| {
+        const current = result.object.get(entry.key_ptr.*);
+        try result.object.put(arena, entry.key_ptr.*, if (current) |field| try overlayValue(arena, field, entry.value_ptr.*) else entry.value_ptr.*);
+    }
+    return result;
 }
 
 fn optional_model(value: ?std.json.Value) ParseError!?[]const u8 {
@@ -419,18 +610,16 @@ fn parse_metadata(alloc: Allocator, value: std.json.Value, protocol: Protocol, r
     if (value.object.count() > max_models) return error.LimitExceeded;
     const models = try alloc.alloc(ModelMetadata, value.object.count());
     var initialized: usize = 0;
-    errdefer {
-        for (models[0..initialized]) |metadata| {
-            alloc.free(metadata.id);
-            alloc.free(metadata.reasoning_efforts);
-        }
-        alloc.free(models);
-    }
     var iterator = value.object.iterator();
     while (iterator.next()) |entry| {
         try validate_model_id(entry.key_ptr.*);
         const metadata = entry.value_ptr.*;
-        try check_fields(metadata, &.{ "context_window", "max_output_tokens", "supports_tool_use", "supports_vision", "reasoning_efforts", "thinking", "protocol" });
+        try check_fields(metadata, &.{
+            "context_window",   "max_output_tokens", "supports_tool_use",  "supports_vision",        "reasoning_efforts", "thinking",  "protocol",
+            "name",             "description",       "cost",               "intelligence",           "recommended",       "beta",      "released",
+            "base_url",         "headers",           "max_context_window", "omit_max_output_tokens", "prefer_websockets", "tokenizer", "context_promotion_target",
+            "compaction_model", "remote_compaction", "compat",
+        });
         var model_protocol: ?Protocol = null;
         if (metadata.object.get("protocol")) |kind| {
             if (kind != .string) return error.InvalidProtocol;
@@ -448,11 +637,16 @@ fn parse_metadata(alloc: Allocator, value: std.json.Value, protocol: Protocol, r
         const context = try positive_limit(metadata.object.get("context_window"));
         const output = try positive_limit(metadata.object.get("max_output_tokens"));
         if (context != null and output != null and output.? >= context.?) return error.InvalidModelMetadata;
+        if (metadata.object.get("tokenizer")) |tokenizer_value| switch (tokenizer_value) {
+            .null => {},
+            .string => if (tokenizer.Encoding.parse(tokenizer_value.string) == null) return error.InvalidModelMetadata,
+            else => return error.InvalidModelMetadata,
+        };
         const tools = try optional_bool(metadata.object.get("supports_tool_use"));
         const vision = try optional_bool(metadata.object.get("supports_vision"));
         const efforts = try parse_efforts(alloc, metadata.object.get("reasoning_efforts"));
-        errdefer alloc.free(efforts);
         models[initialized] = .{
+            .fields = try metadataFields(alloc, metadata.object),
             .reasoning_efforts = efforts,
             .thinking = thinking,
             .protocol = model_protocol,
@@ -461,10 +655,58 @@ fn parse_metadata(alloc: Allocator, value: std.json.Value, protocol: Protocol, r
             .max_output_tokens = output,
             .supports_tool_use = tools,
             .supports_vision = vision,
+            .name = try metadataValue(?[]const u8, alloc, metadata, "name", null),
+            .description = try metadataValue(?[]const u8, alloc, metadata, "description", null),
+            .cost = try metadataValue(?ModelCost, alloc, metadata, "cost", null),
+            .intelligence = try metadataValue(?f64, alloc, metadata, "intelligence", null),
+            .recommended = try metadataValue(bool, alloc, metadata, "recommended", false),
+            .beta = try metadataValue(bool, alloc, metadata, "beta", false),
+            .released = try metadataValue(i64, alloc, metadata, "released", 0),
+            .base_url = if (metadata.object.get("base_url")) |url| try alloc.dupe(u8, try validate_url(if (url == .string) url.string else return error.InvalidBaseUrl)) else null,
+            .headers = if (metadata.object.get("headers")) |headers| try parse_headers(alloc, headers) else &.{},
+            .max_context_window = try positive_limit(metadata.object.get("max_context_window")),
+            .omit_max_output_tokens = try metadataValue(bool, alloc, metadata, "omit_max_output_tokens", false),
+            .prefer_websockets = try optional_bool(metadata.object.get("prefer_websockets")),
+            .tokenizer = try metadataValue(?[]const u8, alloc, metadata, "tokenizer", null),
+            .context_promotion_target = try metadataValue(?[]const u8, alloc, metadata, "context_promotion_target", null),
+            .compaction_model = try metadataValue(?[]const u8, alloc, metadata, "compaction_model", null),
+            .remote_compaction = try metadataValue(?RemoteCompaction, alloc, metadata, "remote_compaction", null),
+            .compat = try metadataValue(@import("model_compatibility.zig").Compatibility, alloc, metadata, "compat", .{}),
         };
         initialized += 1;
     }
     return models;
+}
+
+fn metadataFields(arena: Allocator, object: std.json.ObjectMap) Allocator.Error![]const []const u8 {
+    const names = try arena.alloc([]const u8, object.count());
+    for (object.keys(), names) |name, *owned| owned.* = try arena.dupe(u8, name);
+    return names;
+}
+
+/// A parsed override changes only explicitly supplied fields. Static catalog
+/// metadata has no field mask, and is not itself an override.
+pub fn overlayMetadata(base: ModelMetadata, patch: ModelMetadata) ModelMetadata {
+    var result = base;
+    inline for (@typeInfo(ModelMetadata).@"struct".field_names) |field_name| {
+        if (comptime !std.mem.eql(u8, field_name, "id") and !std.mem.eql(u8, field_name, "fields")) {
+            for (patch.fields) |name| if (std.mem.eql(u8, name, field_name)) {
+                @field(result, field_name) = @field(patch, field_name);
+                break;
+            };
+        }
+    }
+    result.id = base.id;
+    result.fields = patch.fields;
+    return result;
+}
+
+fn metadataValue(comptime T: type, arena: Allocator, object: std.json.Value, key: []const u8, default: T) ParseError!T {
+    const value = object.object.get(key) orelse return default;
+    return std.json.parseFromValueLeaky(T, arena, value, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidModelMetadata,
+    };
 }
 
 fn parse_efforts(alloc: Allocator, value: ?std.json.Value) ParseError![]const types.ReasoningEffort {
@@ -606,7 +848,7 @@ test "configured provider owns definitions and preserves unknown metadata" {
     try std.testing.expectEqual(Auth.none, local.auth);
     try std.testing.expectEqual(ToolChoiceMode.omit, local.tool_choice_mode);
     try std.testing.expect(local.reviewer_model == null);
-    const chat = try local.chat_url(alloc);
+    const chat = try local.chat_url(alloc, "small");
     defer alloc.free(chat);
     try std.testing.expectEqualStrings("http://localhost:11434/v1/chat/completions", chat);
     const router = registry.get("router").?;
@@ -687,7 +929,7 @@ fn test_allocations(alloc: Allocator) !void {
     var registry = try Registry.parse_json(alloc, test_json);
     defer registry.deinit(alloc);
     const definition = registry.get("router").?;
-    const chat = try definition.chat_url(alloc);
+    const chat = try definition.chat_url(alloc, "model");
     defer alloc.free(chat);
     _ = definition.binding_identity();
 }
@@ -735,6 +977,8 @@ test "configured provider invalid schemas fail explicitly" {
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"context_window\":2,\"max_output_tokens\":3}}}}", .err = error.InvalidModelMetadata },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"supports_tool_use\":1}}}}", .err = error.InvalidModelMetadata },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"supports_vision\":null}}}}", .err = error.InvalidModelMetadata },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"tokenizer\":\"not-a-tokenizer\"}}}}", .err = error.InvalidModelMetadata },
+        .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"tokenizer\":1}}}}", .err = error.InvalidModelMetadata },
         .{ .json = "{\"local\":{" ++ test_required_fields ++ ",\"model_metadata\":{\"m\":{\"supports_search\":true}}}}", .err = error.UnknownField },
     };
     for (cases) |case| try std.testing.expectError(case.err, Registry.parse_json(std.testing.allocator, case.json));
@@ -872,7 +1116,7 @@ test "configured anthropic messages provider takes an x-api-key slot and thinkin
     try std.testing.expectEqual(Protocol.@"anthropic-messages", claude.protocol);
     try std.testing.expectEqual(KeyHeader.x_api_key, claude.key_header);
     try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", claude.auth.bearer);
-    const url = try claude.messages_url(alloc);
+    const url = try claude.messages_url(alloc, "claude-opus");
     defer alloc.free(url);
     try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages", url);
     const metadata = claude.model("claude-opus").?;
@@ -897,6 +1141,24 @@ test "configured anthropic messages provider takes an x-api-key slot and thinkin
             return error.TestUnexpectedResult;
         } else |_| {}
     }
+}
+
+test "configured model metadata preserves display and request policy" {
+    const alloc = std.testing.allocator;
+    var registry = try Registry.parse_json(alloc,
+        \\{"local":{"protocol":"openai-responses","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"model_metadata":{"small":{"name":"Small","description":"Fast text and images","cost":{"input":1,"output":4,"cache_read":0.1},"base_url":"https://models.example/v1","headers":{"X-Model":"small"},"prefer_websockets":true,"context_promotion_target":"large","compaction_model":"summary","remote_compaction":{"enabled":true,"endpoint":"https://models.example/v1/responses/compact"},"compat":{"supportsStore":false}}}}}
+    );
+    defer registry.deinit(alloc);
+    const metadata = registry.get("local").?.model("small").?;
+    try std.testing.expectEqualStrings("Small", metadata.name.?);
+    try std.testing.expectEqual(@as(f64, 4), metadata.cost.?.output);
+    try std.testing.expectEqualStrings("https://models.example/v1", metadata.base_url.?);
+    try std.testing.expectEqualStrings("X-Model", metadata.headers[0].name);
+    try std.testing.expect(metadata.prefer_websockets.?);
+    try std.testing.expectEqualStrings("large", metadata.context_promotion_target.?);
+    try std.testing.expectEqualStrings("summary", metadata.compaction_model.?);
+    try std.testing.expectEqualStrings("https://models.example/v1/responses/compact", metadata.remote_compaction.?.endpoint.?);
+    try std.testing.expectEqual(@as(?bool, false), metadata.compat.supports_store);
 }
 
 test "configured provider routes per model and parses headers, login and command keys" {

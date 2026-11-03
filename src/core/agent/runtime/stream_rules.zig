@@ -21,21 +21,33 @@ const types = @import("../../shared/types.zig");
 const io_mod = @import("../../shared/io.zig");
 const debug_trace = @import("../../shared/debug_trace.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
+const model_roles = @import("../../config/model_roles.zig");
 const runtime_deps = @import("deps.zig");
 const runtime_config = @import("config.zig");
 const runtime_text_completion = @import("text_completion.zig");
+const agent_stream_provider = @import("../stream_provider.zig");
+const command_admission = @import("../../permissions/command_admission.zig");
+const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
+const runtime_tool_contracts = @import("tool_contracts.zig");
+const file_mutation = @import("../../tooling/file_mutation.zig");
+const worker_runtime = @import("../worker_runtime.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
 const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 
 /// The current request's model connection, which `llm:` judges reuse.
+pub const JudgeFallback = struct {
+    stream_provider: runtime_deps.ModelBinding,
+};
+
 pub const JudgeBinding = struct {
     credential: types.CredentialLease,
     session_id: ?[]const u8,
     model: []const u8,
     provider_options: model_capabilities.ResolvedProviderOptions,
     trace_ctx: debug_trace.TraceContext,
+    fallbacks: []const JudgeFallback = &.{},
 };
 
 pub const TurnRules = struct {
@@ -101,40 +113,71 @@ pub fn init(deps: *const AgentRuntimeDeps, config: *const runtime_config.Config)
 fn completeJudge(raw: *anyopaque, alloc: Allocator, roles: []const []const u8, prompt: []const u8) ?[]u8 {
     const self: *TurnRules = @ptrCast(@alignCast(raw));
     const binding = self.binding orelse return null;
-    // Model roles pick the judge's model when the host resolves them; the
-    // session's own model answers otherwise.
+    // Resolve every judge role through the typed provider binding supplied by
+    // the host. Provider, credentials, transport, and options stay together.
     var model = binding.model;
-    if (self.deps.resolve_judge_model) |resolve| {
-        if (resolve(self.deps.ctx, roles)) |resolved| model = resolved;
-    }
-    const same_model = std.mem.eql(u8, model, binding.model);
-    const outcome = runtime_text_completion.complete(alloc, .{
-        .observer = self.deps.observer,
-        .stream_provider = self.deps.agent_stream_provider,
-        .cooperative_pulse = self.deps.cooperative_transport_pulse,
-        .credential = binding.credential,
-        .session_id = binding.session_id,
-        .model = model,
-        .retry_count = self.config.gateway_retry_count,
-        .cancel_flag = self.config.cancel_flag,
-        .provider_options = if (same_model) binding.provider_options else .{
-            .prompt_caching = binding.provider_options.prompt_caching,
-            .provider_order = binding.provider_options.provider_order,
-            .provider_strict = binding.provider_options.provider_strict,
-        },
-        .max_output_tokens = 2048,
-        .max_bytes = 8 * 1024,
-        .trace_ctx = binding.trace_ctx,
-        .system = "",
-        .user = prompt,
-    }) catch return null;
-    return switch (outcome) {
-        .text => |text| text,
-        .failed => |failure| blk: {
-            debug_trace.logf("ttsr", "judge completion failed reason={s}", .{@tagName(failure.reason)});
-            break :blk null;
-        },
+    var credential = binding.credential;
+    var stream_provider = self.deps.agent_stream_provider;
+    var provider_options = binding.provider_options;
+    var fallbacks = binding.fallbacks;
+    var typed_fallbacks: [8]JudgeFallback = undefined;
+    var typed_fallback_count: usize = 0;
+    var typed_primary = false;
+    if (self.deps.resolve_role_chain) |resolve| if (self.deps.bind_model) |bind| {
+        role_loop: for (roles) |raw_role| {
+            const role_name = if (raw_role.len > 0 and raw_role[0] == '@') raw_role[1..] else raw_role;
+            const role = model_roles.parseRoleId(role_name) orelse continue;
+            var chain: [64]model_roles.Selection = undefined;
+            const chain_count = @min(resolve(self.deps.ctx, role, &chain), chain.len);
+            for (chain[0..chain_count]) |candidate| {
+                const bound = bind(self.deps.ctx, self.arena.allocator(), candidate) catch null orelse continue;
+                if (!typed_primary) {
+                    typed_primary = true;
+                    model = bound.selection.model;
+                    credential = bound.credential;
+                    stream_provider = bound.stream_provider;
+                    provider_options = bound.provider_options;
+                } else if (typed_fallback_count < typed_fallbacks.len) {
+                    typed_fallbacks[typed_fallback_count] = .{ .stream_provider = bound };
+                    typed_fallback_count += 1;
+                }
+            }
+            if (typed_primary) break :role_loop;
+        }
+        if (typed_primary) fallbacks = typed_fallbacks[0..typed_fallback_count];
     };
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        const fallback = if (attempt < fallbacks.len) fallbacks[attempt].stream_provider else null;
+        const attempt_credential = if (fallback) |value| value.credential else credential;
+        const attempt_stream_provider = if (fallback) |value| value.stream_provider else stream_provider;
+        const attempt_model = if (fallback) |value| value.selection.model else model;
+        const attempt_options = if (fallback) |value| value.provider_options else provider_options;
+        const outcome = runtime_text_completion.complete(alloc, .{
+            .observer = self.deps.observer,
+            .stream_provider = attempt_stream_provider,
+            .cooperative_pulse = self.deps.cooperative_transport_pulse,
+            .credential = attempt_credential,
+            .session_id = binding.session_id,
+            .model = attempt_model,
+            .retry_count = self.config.gateway_retry_count,
+            .cancel_flag = self.config.cancel_flag,
+            .provider_options = attempt_options,
+            .max_output_tokens = 2048,
+            .max_bytes = 8 * 1024,
+            .trace_ctx = binding.trace_ctx,
+            .system = "",
+            .user = prompt,
+        }) catch return null;
+        switch (outcome) {
+            .text => |text| return text,
+            .failed => |failure| {
+                debug_trace.logf("ttsr", "judge completion failed reason={s}", .{@tagName(failure.reason)});
+                alloc.free(failure.detail);
+                if (attempt >= fallbacks.len) return null;
+            },
+        }
+    }
 }
 
 fn publishNotice(deps: *const AgentRuntimeDeps, body: []const u8) void {
@@ -239,4 +282,197 @@ pub fn deferAfterReply(
     try rules.deps.push_text(rules.deps.ctx, .{ .assistant_rendered = "\n" });
     publishNotice(rules.deps, deferred.notice);
     return true;
+}
+
+const TinyJudgeFixture = struct {
+    primary: agent_stream_provider.Provider,
+    fallback: agent_stream_provider.Provider,
+    primary_calls: usize = 0,
+    fallback_calls: usize = 0,
+    primary_model: ?[]const u8 = null,
+    fallback_model: ?[]const u8 = null,
+    primary_credential: ?[]const u8 = null,
+    fallback_credential: ?[]const u8 = null,
+
+    fn stream(raw_ctx: ?*anyopaque, _: Allocator, request: agent_stream_provider.ModelRequest) anyerror!agent_stream_provider.Result {
+        const self: *TinyJudgeFixture = @ptrCast(@alignCast(raw_ctx.?));
+        if (std.mem.eql(u8, request.model, "tiny-primary")) {
+            self.primary_calls += 1;
+            self.primary_model = request.model;
+            self.primary_credential = request.credential.secret();
+            return .{ .failed = .{ .kind = .server_error } };
+        }
+        self.fallback_calls += 1;
+        self.fallback_model = request.model;
+        self.fallback_credential = request.credential.secret();
+        return .{ .completed = .{ .completion = .{ .content = "yes", .finish_reason = .stop } } };
+    }
+
+    fn provider(self: *TinyJudgeFixture, _: bool) agent_stream_provider.Provider {
+        return .{
+            .context = @ptrCast(self),
+            .stream_fn = stream,
+        };
+    }
+};
+
+fn tinyJudgeAppendRuntimeContext(_: *anyopaque, _: Allocator, _: *std.ArrayList(ChatMessage)) !void {}
+
+fn tinyJudgeRequestToolPermission(
+    _: *anyopaque,
+    _: Allocator,
+    _: types.ToolCall,
+    _: permission_auto_classifier.ReviewTurnContext,
+    _: types.PermissionMode,
+    _: []const types.PermissionGrant,
+    _: ?runtime_deps.LiveToolAuthority,
+    _: ?runtime_tool_contracts.LivePermissionRevalidation,
+    _: []const []const u8,
+    _: ?[]const u8,
+) !command_admission.PermissionOutcome {
+    return .{};
+}
+
+fn tinyJudgeDescribeToolAction(
+    _: *anyopaque,
+    _: Allocator,
+    _: types.ToolCall,
+    _: ?[]const u8,
+    _: []const []const u8,
+) ![]const u8 {
+    return "";
+}
+
+fn tinyJudgeDescribeToolActionCompleted(
+    _: *anyopaque,
+    _: Allocator,
+    _: types.ToolCall,
+    _: ?[]const u8,
+    _: []const []const u8,
+) ![]const u8 {
+    return "";
+}
+
+fn tinyJudgeDescribeToolActionDenied(
+    _: *anyopaque,
+    _: Allocator,
+    _: types.ToolCall,
+    _: ?[]const u8,
+    _: []const u8,
+    _: []const []const u8,
+) ![]const u8 {
+    return "";
+}
+
+fn tinyJudgePermissionTarget(
+    _: *anyopaque,
+    _: Allocator,
+    _: types.ToolCall,
+    _: []const []const u8,
+) ![]const u8 {
+    return "";
+}
+
+fn tinyJudgeExecuteToolCall(_: *anyopaque, _: runtime_tool_contracts.ToolExecutionRequest) !runtime_tool_contracts.ToolExecutionResult {
+    return .{ .model_output = "" };
+}
+
+fn tinyJudgePublishCommittedFileHandoff(
+    _: *anyopaque,
+    _: file_mutation.CommittedFileHandoff,
+) runtime_tool_contracts.SecondaryPublicationReport {
+    return .{ .diff = .skipped, .tracker = .skipped };
+}
+
+fn tinyJudgePropagateHistoryTurn(_: *anyopaque, _: types.HistoryTurn) !void {}
+fn tinyJudgePropagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}
+fn tinyJudgePushEvent(_: *anyopaque, _: worker_runtime.WorkerEvent) !void {}
+fn tinyJudgePushText(_: *anyopaque, _: runtime_deps.TextEmission) !void {}
+fn tinyJudgePushDiffBlock(_: *anyopaque, _: runtime_tool_contracts.DiffEntryPayload) !void {}
+fn tinyJudgePushSystemNotice(_: *anyopaque, _: []const u8) !void {}
+fn tinyJudgePushCommandOutputComplete(_: *anyopaque, _: ?types.ToolLifecycleId) !void {}
+fn tinyJudgePushHttpError(_: *anyopaque, _: std.http.Status, _: []const u8, _: ?types.CredentialSource) !void {}
+fn tinyJudgeFormatToolExecutionError(_: *anyopaque, _: Allocator, _: []const u8, _: anyerror) ![]const u8 {
+    return "";
+}
+
+const TinyJudgeBindingContext = struct {
+    fixture: *TinyJudgeFixture,
+
+    fn resolveRoleChain(raw_ctx: *anyopaque, role: model_roles.RoleId, out: []model_roles.Selection) usize {
+        const self: *TinyJudgeBindingContext = @ptrCast(@alignCast(raw_ctx));
+        if (role != .builtin or role.builtin != .tiny or out.len < 2) return 0;
+        out[0] = .{ .provider = .gateway, .model = "tiny-primary", .source = role };
+        out[1] = .{ .provider = .codex, .model = "tiny-fallback", .source = role };
+        _ = self;
+        return 2;
+    }
+
+    fn bindModel(raw_ctx: *anyopaque, _: Allocator, selection: model_roles.Selection) anyerror!?runtime_deps.ModelBinding {
+        const self: *TinyJudgeBindingContext = @ptrCast(@alignCast(raw_ctx));
+        if (selection.provider == .gateway) return .{ .selection = selection, .stream_provider = self.fixture.primary, .credential = .{ .direct = .{ .secret_bytes = "primary-key", .source = .ai_gateway_api_key } }, .capabilities = .{} };
+        if (selection.provider == .codex) return .{ .selection = selection, .stream_provider = self.fixture.fallback, .credential = .{ .direct = .{ .secret_bytes = "fallback-key", .source = .chatgpt_subscription, .account_id = "account" } }, .capabilities = .{} };
+        return null;
+    }
+};
+
+test "tiny judge retries a failed primary with the provider-qualified credential" {
+    var fixture = TinyJudgeFixture{ .primary = undefined, .fallback = undefined };
+    fixture.primary = fixture.provider(true);
+    fixture.fallback = fixture.provider(false);
+    var context = TinyJudgeBindingContext{ .fixture = &fixture };
+    var deps: runtime_deps.AgentRuntimeDeps = .{
+        .ctx = @ptrCast(&context),
+        .agent_stream_provider = fixture.primary,
+        .append_runtime_context = tinyJudgeAppendRuntimeContext,
+        .request_tool_permission = tinyJudgeRequestToolPermission,
+        .describe_tool_action = tinyJudgeDescribeToolAction,
+        .describe_tool_action_completed = tinyJudgeDescribeToolActionCompleted,
+        .describe_tool_action_denied = tinyJudgeDescribeToolActionDenied,
+        .permission_target_for_call = tinyJudgePermissionTarget,
+        .execute_tool_call = tinyJudgeExecuteToolCall,
+        .publish_committed_file_handoff = tinyJudgePublishCommittedFileHandoff,
+        .propagate_history_turn = tinyJudgePropagateHistoryTurn,
+        .propagate_grant = tinyJudgePropagateGrant,
+        .push_event = tinyJudgePushEvent,
+        .push_text = tinyJudgePushText,
+        .push_diff_block = tinyJudgePushDiffBlock,
+        .push_system_notice = tinyJudgePushSystemNotice,
+        .push_command_output_complete = tinyJudgePushCommandOutputComplete,
+        .push_http_error = tinyJudgePushHttpError,
+        .format_tool_execution_error = tinyJudgeFormatToolExecutionError,
+        .resolve_role_chain = TinyJudgeBindingContext.resolveRoleChain,
+        .bind_model = TinyJudgeBindingContext.bindModel,
+    };
+    var cancel = std.atomic.Value(bool).init(false);
+    var config: runtime_config.Config = .{
+        .system_prompt = "",
+        .gateway_retry_count = 0,
+        .gateway_chat_url = "",
+        .agent_step_limit = 1,
+        .cancel_flag = &cancel,
+    };
+    var rules = TurnRules{
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+        .deps = &deps,
+        .config = &config,
+    };
+    defer rules.arena.deinit();
+    rules.bind(.{
+        .credential = .{ .direct = .{ .secret_bytes = "session-key", .source = .ai_gateway_api_key } },
+        .session_id = null,
+        .model = "session-model",
+        .provider_options = .{},
+        .trace_ctx = .{},
+    });
+
+    const answer = completeJudge(@ptrCast(&rules), std.testing.allocator, &.{"@tiny"}, "judge this");
+    defer if (answer) |text| std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("yes", answer.?);
+    try std.testing.expectEqual(@as(usize, 1), fixture.primary_calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.fallback_calls);
+    try std.testing.expectEqualStrings("tiny-primary", fixture.primary_model.?);
+    try std.testing.expectEqualStrings("tiny-fallback", fixture.fallback_model.?);
+    try std.testing.expectEqualStrings("primary-key", fixture.primary_credential.?);
+    try std.testing.expectEqualStrings("fallback-key", fixture.fallback_credential.?);
 }

@@ -8,6 +8,7 @@ const mem_utils = @import("../shared/mem_utils.zig");
 const types = @import("../shared/types.zig");
 const captured_command = @import("../tooling/captured_command.zig");
 const model_provider = @import("../config/model_provider.zig");
+const model_roles = @import("../config/model_roles.zig");
 const context_limits = @import("../config/context_limits.zig");
 const credential_authority = @import("../auth/credential_authority.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -22,9 +23,13 @@ pub const DurableSessionPreferences = struct {
     effort: types.ReasoningEffort,
     fast_mode: bool,
     ultrafast_mode: bool = false,
+    /// The typed role that selected this child model. Stored as its stable
+    /// label in the session JSON so custom role identities survive restart.
+    role: ?[]u8 = null,
 
     pub fn deinit(self: *DurableSessionPreferences, alloc: Allocator) void {
         alloc.free(self.model);
+        if (self.role) |role| alloc.free(role);
         self.* = undefined;
     }
 
@@ -35,6 +40,7 @@ pub const DurableSessionPreferences = struct {
             .effort = self.effort,
             .fast_mode = self.fast_mode,
             .ultrafast_mode = self.ultrafast_mode,
+            .role = if (self.role) |role| try alloc.dupe(u8, role) else null,
         };
     }
 };
@@ -44,20 +50,35 @@ pub fn parse_preferences(alloc: Allocator, value: std.json.Value) !DurableSessio
     const raw = try requireObject(value);
     const legacy = raw.contains("connection_id") or raw.contains("model_id");
     const has_ultrafast_mode = raw.contains("ultrafast_mode");
-    const object = if (legacy)
-        if (has_ultrafast_mode)
-            try exactObject(value, &.{ "connection_id", "model_id", "effort", "fast_mode", "ultrafast_mode" })
-        else
-            try exactObject(value, &.{ "connection_id", "model_id", "effort", "fast_mode" })
-    else if (raw.contains("provider"))
-        if (has_ultrafast_mode)
-            try exactObject(value, &.{ "provider", "model", "effort", "fast_mode", "ultrafast_mode" })
-        else
-            try exactObject(value, &.{ "provider", "model", "effort", "fast_mode" })
-    else if (has_ultrafast_mode)
-        try exactObject(value, &.{ "model", "effort", "fast_mode", "ultrafast_mode" })
-    else
-        try exactObject(value, &.{ "model", "effort", "fast_mode" });
+    const has_role = raw.contains("role");
+    if (legacy and has_role) return error.InvalidDurableField;
+
+    // exactObject keeps the durable schema strict while allowing the optional
+    // role field on modern preferences. Older sessions remain byte-for-byte
+    // compatible and simply decode with no role identity.
+    var allowed: [7][]const u8 = undefined;
+    var allowed_len: usize = 0;
+    const add = struct {
+        fn one(items: *[7][]const u8, len: *usize, item: []const u8) void {
+            items[len.*] = item;
+            len.* += 1;
+        }
+    }.one;
+    if (legacy) {
+        add(&allowed, &allowed_len, "connection_id");
+        add(&allowed, &allowed_len, "model_id");
+    } else if (raw.contains("provider")) {
+        add(&allowed, &allowed_len, "provider");
+        add(&allowed, &allowed_len, "model");
+    } else {
+        add(&allowed, &allowed_len, "model");
+    }
+    add(&allowed, &allowed_len, "effort");
+    add(&allowed, &allowed_len, "fast_mode");
+    if (has_ultrafast_mode) add(&allowed, &allowed_len, "ultrafast_mode");
+    if (has_role) add(&allowed, &allowed_len, "role");
+    const object = try exactObject(value, allowed[0..allowed_len]);
+
     const provider: model_provider.ProviderId = if (legacy) blk: {
         if (!std.mem.eql(u8, try requireString(object, "connection_id"), "vercel")) return error.InvalidDurableField;
         break :blk .gateway;
@@ -70,7 +91,21 @@ pub fn parse_preferences(alloc: Allocator, value: std.json.Value) !DurableSessio
     const effort = types.ReasoningEffort.parse(try requireString(object, "effort")) orelse return error.InvalidDurableField;
     const fast_mode = try requireBool(object, "fast_mode");
     const ultrafast_mode = if (has_ultrafast_mode) try requireBool(object, "ultrafast_mode") else false;
-    return .{ .provider = provider, .model = try alloc.dupe(u8, model), .effort = effort, .fast_mode = fast_mode, .ultrafast_mode = ultrafast_mode };
+    const owned_model = try alloc.dupe(u8, model);
+    errdefer alloc.free(owned_model);
+    const role = if (has_role) blk: {
+        const name = try requireString(object, "role");
+        if (model_roles.parseRoleId(name) == null) return error.InvalidDurableField;
+        break :blk try alloc.dupe(u8, name);
+    } else null;
+    return .{
+        .provider = provider,
+        .model = owned_model,
+        .effort = effort,
+        .fast_mode = fast_mode,
+        .ultrafast_mode = ultrafast_mode,
+        .role = role,
+    };
 }
 
 test "legacy connection preferences decode through the shared state codec" {
@@ -783,6 +818,10 @@ fn writeHistoryTurnTo(writer: *std.Io.Writer, turn: session.HistoryTurn, image_b
                 entry.removed_turn_count,
                 entry.compaction_count,
             });
+            if (entry.provider_replay) |replay| {
+                try writer.writeAll(",\"provider_replay\":");
+                try std.json.Stringify.value(replay, .{}, writer);
+            }
             try writer.writeByte('}');
         },
         .assistant => |entry| {
@@ -882,15 +921,24 @@ pub fn parseHistoryTurnWithImages(
         const has_completeness = raw_object.get("root_user_messages_complete") != null;
         const has_permission_feedback = raw_object.get("permission_feedback") != null;
         const has_feedback_completeness = raw_object.get("permission_feedback_complete") != null;
+        const has_provider_replay = raw_object.get("provider_replay") != null;
         if (has_permission_feedback != has_feedback_completeness) {
             return error.InvalidSessionFormat;
         }
-        const object = if (has_feedback_completeness)
+        const object = if (has_feedback_completeness and has_provider_replay)
+            try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count", "root_user_messages", "root_user_messages_complete", "permission_feedback", "permission_feedback_complete", "provider_replay" })
+        else if (has_feedback_completeness)
             try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count", "root_user_messages", "root_user_messages_complete", "permission_feedback", "permission_feedback_complete" })
+        else if (has_completeness and has_provider_replay)
+            try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count", "root_user_messages", "root_user_messages_complete", "provider_replay" })
         else if (has_completeness)
             try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count", "root_user_messages", "root_user_messages_complete" })
+        else if (has_root_user_messages and has_provider_replay)
+            try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count", "root_user_messages", "provider_replay" })
         else if (has_root_user_messages)
             try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count", "root_user_messages" })
+        else if (has_provider_replay)
+            try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count", "provider_replay" })
         else
             try exactObject(value, &.{ "kind", "summary", "removed_turn_count", "compaction_count" });
         const summary = try parseRequiredDurableBytes(alloc, object, "summary");
@@ -911,6 +959,8 @@ pub fn parseHistoryTurnWithImages(
         else
             &.{};
         errdefer types.freePermissionFeedback(alloc, permission_feedback);
+        const provider_replay = try parseProviderReplay(alloc, object.get("provider_replay") orelse .null);
+        errdefer if (provider_replay) |replay| types.freeProviderReplay(alloc, replay);
         const removed_turn_count = try requireUsize(object, "removed_turn_count");
         return .{ .compacted_summary = .{
             .summary = summary,
@@ -926,6 +976,7 @@ pub fn parseHistoryTurnWithImages(
                 try requireBool(object, "permission_feedback_complete")
             else
                 removed_turn_count == 0,
+            .provider_replay = provider_replay,
         } };
     }
     if (std.mem.eql(u8, kind, "assistant")) {
@@ -1069,6 +1120,7 @@ fn validateStateWithPermissionMigration(
     if (state.created_at_ms < 0 or state.updated_at_ms < 0) return error.InvalidDurableField;
     try validateConversationLanguage(state.conversation_language);
     try validateModel(state.preferences.model);
+    if (state.preferences.role) |role| if (model_roles.parseRoleId(role) == null) return error.InvalidDurableField;
     if (state.context_history_start > state.history.len) return error.InvalidDurableField;
     if (state.last_subagent_work_id) |id| {
         session.validateWorkId(id) catch return error.InvalidDurableField;
@@ -1150,6 +1202,10 @@ fn writeState(writer: *std.Io.Writer, state: DurableSessionState) !void {
     }
     try writer.writeAll(",\"provider\":");
     try std.json.Stringify.value(state.preferences.provider, .{}, writer);
+    if (state.preferences.role) |role| {
+        try writer.writeAll(",\"role\":");
+        try writeJsonString(writer, role);
+    }
     try writer.writeAll("},\"history\":[");
     for (state.history, 0..) |turn, i| {
         if (i > 0) try writer.writeByte(',');
@@ -1796,6 +1852,12 @@ fn writeUserTurn(writer: *std.Io.Writer, user: session.UserTurn, image_blobs: an
         try writeDurableBytes(writer, image.path);
         try writer.writeAll(",\"media_type\":");
         try writeDurableBytes(writer, image.media_type);
+        try writer.writeAll(",\"detail\":");
+        if (image.detail) |detail| {
+            try writeJsonString(writer, @tagName(detail));
+        } else {
+            try writer.writeAll("null");
+        }
         try writer.writeAll(",\"snapshot_path\":");
         try writeSnapshotLocator(writer, image.snapshot_path);
         try writer.writeAll(",\"snapshot_sha256\":");
@@ -2427,6 +2489,11 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value, sources: ImageSources)
         errdefer mem_utils.free(alloc, path);
         const media_type = try parseRequiredDurableBytes(alloc, image, "media_type");
         errdefer mem_utils.free(alloc, media_type);
+        const detail = if (image.get("detail")) |detail_value| switch (detail_value) {
+            .null => null,
+            .string => |name| types.ImageDetail.parse(name) orelse return error.InvalidSessionFormat,
+            else => return error.InvalidSessionFormat,
+        } else null;
         const snapshot_path = try parseOptionalDurableBytes(
             alloc,
             image.get("snapshot_path") orelse .null,
@@ -2471,6 +2538,7 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value, sources: ImageSources)
             .id = try requireUsize(image, "id"),
             .path = path,
             .media_type = media_type,
+            .detail = detail,
             .snapshot_path = snapshot_path,
             .snapshot_sha256 = snapshot_sha256,
             .inline_data = inline_data,
@@ -2533,7 +2601,8 @@ fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {
             has_path = true;
         } else if (std.mem.eql(u8, entry.key_ptr.*, "media_type")) {
             has_media_type = true;
-        } else if (std.mem.eql(u8, entry.key_ptr.*, "snapshot_path") or
+        } else if (std.mem.eql(u8, entry.key_ptr.*, "detail") or
+            std.mem.eql(u8, entry.key_ptr.*, "snapshot_path") or
             std.mem.eql(u8, entry.key_ptr.*, "snapshot_sha256") or
             std.mem.eql(u8, entry.key_ptr.*, "inline_data") or
             std.mem.eql(u8, entry.key_ptr.*, "inline_blob") or
@@ -5811,6 +5880,7 @@ fn expectUserTurnEqual(expected: session.UserTurn, actual: session.UserTurn) !vo
         try std.testing.expectEqual(image.id, got.id);
         try std.testing.expectEqualSlices(u8, image.path, got.path);
         try std.testing.expectEqualSlices(u8, image.media_type, got.media_type);
+        try std.testing.expectEqual(image.detail, got.detail);
         try expectOptionalBytesEqual(image.snapshot_path, got.snapshot_path);
         try expectOptionalBytesEqual(image.snapshot_sha256, got.snapshot_sha256);
         try expectOptionalBytesEqual(image.inline_data, got.inline_data);
@@ -5871,6 +5941,7 @@ test "inline image bytes round trip through the history turn codec" {
             .id = 2,
             .path = @constCast("inline://image-2"),
             .media_type = @constCast("image/png"),
+            .detail = .high,
             .snapshot_sha256 = @constCast(&digest_hex),
             .inline_data = @constCast(png),
             .source_ref = @constCast("host:original"),

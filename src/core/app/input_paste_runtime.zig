@@ -359,28 +359,14 @@ pub fn PasteEditRuntime(comptime App: type) type {
             }
         }
 
-        /// The model picker lends the composer out as its query box: the
-        /// catalog, then a Ctrl+P flow's inline stages. An image attached
-        /// there would outlive the query, so image input stays out of it.
-        pub fn modelPickerBorrowsComposer(app: *const App) bool {
-            if (comptime @hasField(@TypeOf(app.input_runtime), "model_picker_draft")) {
-                if (app.input_runtime.model_picker_draft != null) return true;
-            }
-            if (comptime !@hasField(App, "model_cache")) return false;
-            return app.model_cache.menu.active;
-        }
-
         pub fn finalizePastedBlock(app: *App, max_input_len: usize) !void {
             if (app.input_runtime.paste.buffer.items.len == 0) return;
 
             // Inline image paths create pending attachments, not pasted-text blocks.
             if (image_attachments.hasImagePathToken(app.input_runtime.paste.buffer.items)) {
-                if (!modelPickerBorrowsComposer(app)) {
-                    try handlePastedBytes(app, app.input_runtime.paste.buffer.items, max_input_len);
-                    app.input_runtime.paste.buffer.clearRetainingCapacity();
-                    return;
-                }
-                debug_trace.logf("input", "image path paste kept as text reason=model_picker_borrows_composer", .{});
+                try handlePastedBytes(app, app.input_runtime.paste.buffer.items, max_input_len);
+                app.input_runtime.paste.buffer.clearRetainingCapacity();
+                return;
             }
 
             const text = try app.alloc.dupe(u8, app.input_runtime.paste.buffer.items);

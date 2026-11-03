@@ -5,6 +5,7 @@ const tool_result_limits = @import("../../tooling/tool_result_limits.zig");
 const session_child_store = @import("../../session/session_child_store.zig");
 const command_replay_store = @import("../../session/command_replay_store.zig");
 const context_limits = @import("../../config/context_limits.zig");
+const model_roles = @import("../../config/model_roles.zig");
 const compactor = @import("../../compactor/compactor.zig");
 const workspace_access = @import("../../workspace/workspace_access.zig");
 const provider_set = @import("../../gateway/provider_set.zig");
@@ -46,9 +47,15 @@ pub const Config = struct {
     max_tool_result_bytes: usize = tool_result_limits.default_max_tool_result_bytes,
     /// Share of the model's usable input at which automatic compaction starts.
     auto_compact_percent: u8 = compactor.default_percent,
-    /// The `compact` model role's model; empty summarizes with the
-    /// conversation's model. Borrowed.
-    compact_model: []const u8 = "",
+    /// Host setting gate for configured larger-context promotion.
+    context_promotion_enabled: bool = false,
+    /// Provider-qualified `compact` role selection. Null summarizes with the
+    /// conversation's model. The host binds this selection through runtime
+    /// dependencies when its provider differs from the conversation.
+    compact_selection: ?model_roles.Selection = null,
+    /// Role whose ordered provider-qualified fallback chain is attempted after
+    /// a request failure. Null disables runtime role fallback.
+    fallback_role: ?model_roles.RoleId = null,
     step_limit_notice: []const u8 = default_step_limit_notice,
     cancel_flag: *std.atomic.Value(bool),
     /// Set by a host that can ask the user, which only the TUI does: a

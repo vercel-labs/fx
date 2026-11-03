@@ -1,7 +1,7 @@
 //! The app side of the model hub (D221): builds the hub's snapshot from the
 //! app's providers, catalog, roles and web search settings, routes keys to
-//! it while it is open, and carries out what it asks for through the same
-//! commands and settings writes `/model`, `/role` and `/login` use.
+//! it while it is open, and carries out what it asks for through typed
+//! backend operations plus the settings writes `/role` and `/login` use.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,12 +24,14 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const model_role_runtime = @import("model_role_runtime.zig");
+const model_cache_runtime = @import("model_cache_runtime.zig");
+const model_performance = @import("../model_hub/performance.zig");
 const session_backend = @import("session_backend.zig");
 const session_commands = @import("../session/session_commands.zig");
 const app_auth_runtime = @import("app_auth_runtime.zig");
 
 const Allocator = std.mem.Allocator;
-const Role = model_roles.Role;
+const RoleId = model_roles.RoleId;
 
 pub fn supported(comptime App: type) bool {
     return @hasField(App, "model_hub") and @hasField(App, "model_cache") and
@@ -39,6 +41,11 @@ pub fn supported(comptime App: type) bool {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        fn performanceSnapshot(app: *App, id: []const u8) model_performance.Metrics {
+            if (comptime @hasField(App, "model_performance")) return app.model_performance.snapshot(id);
+            return .{};
+        }
+
         /// Opens the hub. `/provider <name>` starts on that provider.
         pub fn open(app: *App, start: hub.Start, args: []const u8) !void {
             if (comptime !supported(App)) return;
@@ -137,10 +144,26 @@ pub fn Runtime(comptime App: type) type {
                     close(app);
                     return true;
                 },
+                .refresh_model_catalog => .force_refresh,
                 .mouse_wheel => |wheel| if (wheel == .up) .up else .down,
+                .mouse_pointer => |pointer| .{ .mouse = .{
+                    .kind = switch (pointer.kind) {
+                        .press => .press,
+                        .drag => .motion,
+                        .release => .release,
+                    },
+                    .row = pointer.row,
+                    .column = pointer.column,
+                } },
                 else => null,
             };
-            if (key) |value| try press(app, .{ .key = value });
+            if (key) |value| {
+                if (value == .mouse) {
+                    const effect = try app.model_hub.handleMouse(app.alloc, value.mouse);
+                    if (effect != .none) app.shell.render_requests.request(.footer);
+                    try apply(app, effect);
+                } else try press(app, .{ .key = value });
+            }
             return true;
         }
 
@@ -164,21 +187,28 @@ pub fn Runtime(comptime App: type) type {
                 .none, .redraw => {},
                 .close => close(app),
                 .select_model => |choice| try selectModel(app, choice.model, choice.effort),
-                .edit_role => |change| try editRole(app, change.role, change.edit),
+                .edit_role => |change| try editRole(app, change.role, change.edit, change.scope),
                 .clear_role => |role| {
-                    if (!try model_role_runtime.Runtime(App).save(app, role, null)) return;
+                    if (!try model_role_runtime.Runtime(App).saveId(app, role, null)) return;
                     var notice_buf: [96]u8 = undefined;
-                    const notice = std.mem.print(&notice_buf, "{s} cleared", .{catalog.roleName(role)}) catch "";
+                    const notice = std.mem.print(&notice_buf, "{s} cleared", .{role.label()}) catch "";
                     try app.writeDomainNotice(.{ .topic = "role", .tone = .neutral, .body = notice }, true);
                     app.model_hub.setNotice(notice);
                     try refresh(app);
                 },
+                .create_role => |create| try createRole(app, create.name),
+                .rename_role => |rename| try renameRole(app, rename.role, rename.name),
+                .delete_role => |role| try deleteRole(app, role),
+                .edit_tag => |change| try editTag(app, change.role, change.edit),
+                .edit_bank => |change| try editBank(app, change.role, change.selectors),
+                .edit_fallback => |change| try editFallback(app, change.selector, change.chain),
+                .refresh_provider => |index| try refreshProvider(app, index),
                 .toggle_cycle => |role| {
-                    var buf: [model_roles.role_count]Role = undefined;
+                    var buf: [64]RoleId = undefined;
                     try saveCycle(app, edits.toggleCycle(app.model_hub.snapshot.?.cycle, role, &buf));
                 },
                 .move_cycle => |move| {
-                    var buf: [model_roles.role_count]Role = undefined;
+                    var buf: [64]RoleId = undefined;
                     try saveCycle(app, edits.moveCycle(app.model_hub.snapshot.?.cycle, move.role, move.later, &buf));
                 },
                 .toggle_web_search => |index| try saveWebSearch(app, .{ .toggle = index }),
@@ -208,14 +238,158 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        fn createRole(app: *App, name: []const u8) !void {
+            const role = model_roles.parseRoleId(name) orelse {
+                app.model_hub.setNotice("Role names use letters, numbers, _ and -");
+                return;
+            };
+            if (role == .builtin) {
+                app.model_hub.setNotice("That name is already a built-in role");
+                return;
+            }
+            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .model_role_create = name });
+            defer attempt.deinit(app.alloc);
+            switch (attempt) {
+                .failure => |failure| return session_commands.reportUserSettingsFailure(app, "role", failure.err, failure.cleanup, false),
+                .outcome => {},
+            }
+            try app.model_roles.createRole(app.alloc, role);
+            app.model_hub.setNotice("Created role");
+            try refresh(app);
+        }
+
+        fn renameRole(app: *App, role: RoleId, name: []const u8) !void {
+            if (role != .custom) return;
+            const next = model_roles.parseRoleId(name) orelse {
+                app.model_hub.setNotice("Invalid role name");
+                return;
+            };
+            if (next == .builtin) return;
+            const old_name = role.custom;
+            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .model_role_rename = .{ .old_name = old_name, .new_name = next.custom } });
+            defer attempt.deinit(app.alloc);
+            switch (attempt) {
+                .failure => |failure| return session_commands.reportUserSettingsFailure(app, "role", failure.err, failure.cleanup, false),
+                .outcome => {},
+            }
+            const value = app.model_roles.table.getId(role);
+            try app.model_roles.renameRole(app.alloc, role, next);
+            if (value) |text| _ = try model_role_runtime.Runtime(App).saveId(app, next, text);
+            app.model_hub.setNotice("Renamed role");
+            try refresh(app);
+        }
+
+        fn deleteRole(app: *App, role: RoleId) !void {
+            if (role != .custom) return;
+            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .model_role_delete = .{ .name = role.custom } });
+            defer attempt.deinit(app.alloc);
+            switch (attempt) {
+                .failure => |failure| return session_commands.reportUserSettingsFailure(app, "role", failure.err, failure.cleanup, false),
+                .outcome => {},
+            }
+            try app.model_roles.deleteRole(app.alloc, role);
+            app.model_hub.setNotice("Deleted role");
+            try refresh(app);
+        }
+
+        fn editTag(app: *App, role: RoleId, edit: hub.TagEdit) !void {
+            const name = role.label();
+            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .model_role_tag = .{ .name = name, .tag = edit.tag, .display_name = edit.display_name, .color = edit.color, .hidden = edit.hidden, .clear = edit.clear } });
+            defer attempt.deinit(app.alloc);
+            switch (attempt) {
+                .failure => |failure| return session_commands.reportUserSettingsFailure(app, "role tag", failure.err, failure.cleanup, false),
+                .outcome => {},
+            }
+            if (edit.clear) {
+                try app.model_roles.clearTag(app.alloc, role);
+            } else {
+                try app.model_roles.setTag(app.alloc, role, .{
+                    .tag = edit.tag orelse "",
+                    .name = edit.display_name orelse "",
+                    .color = edit.color orelse "",
+                    .hidden = edit.hidden orelse false,
+                });
+            }
+            app.model_hub.setNotice("Saved role tag");
+            try refresh(app);
+        }
+
+        fn editBank(app: *App, role: RoleId, selectors: []const []const u8) !void {
+            const name = role.label();
+            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .model_role_bank = .{ .name = name, .selectors = selectors, .clear = selectors.len == 0 } });
+            defer attempt.deinit(app.alloc);
+            switch (attempt) {
+                .failure => |failure| return session_commands.reportUserSettingsFailure(app, "role bank", failure.err, failure.cleanup, false),
+                .outcome => {},
+            }
+            if (selectors.len == 0) try app.model_roles.clearBank(app.alloc, role) else try app.model_roles.setBank(app.alloc, role, selectors);
+            app.model_hub.setNotice("Saved role bank");
+            try refresh(app);
+        }
+
+        fn editFallback(app: *App, selector: []const u8, chain: ?[]const u8) !void {
+            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .fallback_chain = .{ .selector = selector, .chain = chain } });
+            defer attempt.deinit(app.alloc);
+            switch (attempt) {
+                .failure => |failure| return session_commands.reportUserSettingsFailure(app, "fallback chain", failure.err, failure.cleanup, false),
+                .outcome => {},
+            }
+            if (chain) |value| try app.model_roles.setFallback(app.alloc, selector, value) else try app.model_roles.clearFallback(app.alloc, selector);
+            app.model_hub.setNotice("Saved fallback chain");
+            try refresh(app);
+        }
+
+        fn refreshProvider(app: *App, index: u16) !void {
+            const snapshot = app.model_hub.snapshot orelse return;
+            if (index >= snapshot.providers.len) return;
+            const key = snapshot.providers[index].key;
+            if (model_provider.parse(key)) |provider| {
+                const queued = if (comptime @hasDecl(App, "forceRefreshModelCatalogProvider"))
+                    try app.forceRefreshModelCatalogProvider(provider)
+                else
+                    app.model_cache.refresh(provider, .force);
+                if (!queued) {
+                    app.model_hub.setNotice("That provider is not configured");
+                    return;
+                }
+                app.model_hub.setNotice("Refreshing model list and credentials…");
+                try refresh(app);
+            }
+        }
+
+        fn saveRoleId(app: *App, role: RoleId, value: ?[]const u8, scope: hub.RoleScope) !bool {
+            if (value) |text| model_roles.validateChain(text) catch {
+                try app.writeDomainNotice(.{ .topic = "role", .tone = .@"error", .body = "That is not a model reference." }, true);
+                return false;
+            };
+            const owned = if (value) |text| try app.alloc.dupe(u8, text) else null;
+            defer if (owned) |bytes| app.alloc.free(bytes);
+            const patch_scope: config_runtime.ModelRoleScope = if (scope == .workspace and @hasField(App, "workspace_root")) .workspace else .global;
+            const workspace_root: ?[]const u8 = if (patch_scope == .workspace) app.workspace_root else null;
+            var attempt = switch (role) {
+                .builtin => |builtin_role| config_runtime.attemptUserPreferences(app.alloc, .{ .model_role = .{ .role = builtin_role, .value = owned }, .model_role_scope = patch_scope, .workspace_root = workspace_root }),
+                .custom => |name| config_runtime.attemptUserPreferences(app.alloc, .{ .model_role = .{ .name = name, .value = owned }, .model_role_scope = patch_scope, .workspace_root = workspace_root }),
+            };
+            defer attempt.deinit(app.alloc);
+            switch (attempt) {
+                .failure => |failure| {
+                    try session_commands.reportUserSettingsFailure(app, "role", failure.err, failure.cleanup, false);
+                    return false;
+                },
+                .outcome => {},
+            }
+            try app.model_roles.assignId(app.alloc, role, owned);
+            return true;
+        }
+
         /// Saves one role's changed chain (D250) and says what it does now.
-        fn editRole(app: *App, role: Role, edit: hub.RoleEdit) !void {
+        fn editRole(app: *App, role: RoleId, edit: hub.RoleEdit, scope: hub.RoleScope) !void {
             const snapshot = &app.model_hub.snapshot.?;
             const row = snapshot.roleRow(role) orelse return;
             var ref: ?[]u8 = null;
             defer if (ref) |bytes| app.alloc.free(bytes);
             var notice_buf: [160]u8 = undefined;
-            const name = catalog.roleName(role);
+            const name = roleLabel(app, role);
             var notice: []const u8 = "";
             const chain_edit: edits.ChainEdit = switch (edit) {
                 .put => |put| blk: {
@@ -245,7 +419,7 @@ pub fn Runtime(comptime App: type) type {
             const value = try edits.editRoleChain(app.alloc, row.entries, chain_edit);
             defer if (value) |bytes| app.alloc.free(bytes);
             debug_trace.logf("model_hub", "role={s} chain={s}", .{ role.label(), value orelse "" });
-            if (!try model_role_runtime.Runtime(App).save(app, role, value)) return;
+            if (!try saveRoleId(app, role, value, scope)) return;
             try app.writeDomainNotice(.{ .topic = "role", .tone = .neutral, .body = notice }, true);
             app.model_hub.setNotice(notice);
             try refresh(app);
@@ -276,19 +450,32 @@ pub fn Runtime(comptime App: type) type {
                     attempt.deinit(app.alloc);
                 }
                 const switched = try switchProvider(app, key);
-                if (switched) try selectOnActive(app, id, effort, has_levels);
+                if (switched) {
+                    if (comptime @hasField(App, "model_performance")) app.model_performance.recordUsage(id);
+                    try selectOnActive(app, id, effort, has_levels);
+                }
                 return;
             }
             close(app);
+            if (comptime @hasField(App, "model_performance")) app.model_performance.recordUsage(id);
             try selectOnActive(app, id, effort, has_levels);
         }
 
         fn selectOnActive(app: *App, id: []const u8, effort: ?types.ReasoningEffort, has_levels: bool) !void {
-            const command = try app.alloc.print("/model {s}", .{id});
-            defer app.alloc.free(command);
-            try runCommand(app, command);
+            // The public `/model` command deliberately rejects arguments. Hub
+            // selection uses the typed backend operation so detached sessions
+            // enqueue their model config directly instead of routing through
+            // that public command.
+            try session_backend.Ops(App).selectModel(app, .{
+                .model = id,
+                .effort = effort orelse .auto,
+                .fast_mode = false,
+                .ultrafast_mode = false,
+            });
             // A model without levels has nothing to set; `auto` is its only chip.
-            if (effort) |value| if (has_levels) {
+            // In-process selection applies effort as part of the typed operation;
+            // detached sessions still expose effort as a separate remote option.
+            if (effort) |value| if (has_levels and !session_backend.Ops(App).agentInProcess(app)) {
                 const effort_command = try app.alloc.print("/effort {s}", .{value.label()});
                 defer app.alloc.free(effort_command);
                 try runCommand(app, effort_command);
@@ -306,14 +493,14 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
-        fn saveCycle(app: *App, order: []const Role) !void {
-            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .cycle_order = order });
+        fn saveCycle(app: *App, order: []const RoleId) !void {
+            var attempt = config_runtime.attemptUserPreferences(app.alloc, .{ .cycle_order_ids = order });
             defer attempt.deinit(app.alloc);
             switch (attempt) {
                 .failure => |failure| return session_commands.reportUserSettingsFailure(app, "role", failure.err, failure.cleanup, false),
                 .outcome => {},
             }
-            try app.model_roles.setCycle(app.alloc, order);
+            try app.model_roles.setCycleIds(app.alloc, order);
             app.model_hub.setNotice("Saved the Alt+P cycle");
             try refresh(app);
         }
@@ -335,6 +522,58 @@ pub fn Runtime(comptime App: type) type {
             return view_model orelse provider_runtime.model(app);
         }
 
+        fn cachedProvider(catalogs: []const model_cache_runtime.ProviderHubSnapshot, key: []const u8) ?model_cache_runtime.ProviderHubSnapshot {
+            for (catalogs) |catalog_snapshot| {
+                if (std.mem.eql(u8, catalog_snapshot.provider.label(), key)) return catalog_snapshot;
+            }
+            return null;
+        }
+
+        fn cachedFailureStatus(catalogs: ?[]const model_cache_runtime.ProviderHubSnapshot, key: []const u8) ?u16 {
+            const list = catalogs orelse return null;
+            const cached = cachedProvider(list, key) orelse return null;
+            const failure = cached.state.failure orelse return null;
+            const status = failure.http_status orelse return null;
+            return @backingInt(status);
+        }
+
+        fn addCachedCatalog(
+            app: *App,
+            builder: *catalog.Builder,
+            index: u16,
+            current: []const u8,
+            cached: model_cache_runtime.ProviderHubSnapshot,
+        ) !void {
+            if (cached.models) |models| {
+                for (models) |entry| {
+                    const observed = performanceSnapshot(app, entry.id);
+                    try builder.addModel(.{
+                        .provider = index,
+                        .id = entry.id,
+                        .name = entry.name,
+                        .description = entry.description orelse "",
+                        .context_window = entry.context_window,
+                        .max_tokens = entry.max_tokens,
+                        .cost = if (entry.cost) |value| .{ .input = value.input, .output = value.output, .cache_read = value.cache_read, .cache_write = value.cache_write } else null,
+                        .intelligence = entry.intelligence,
+                        .is_beta = entry.beta,
+                        .is_recommended = entry.recommended,
+                        .released = entry.released,
+                        .has_reasoning = entry.has_reasoning,
+                        .has_vision = entry.has_vision,
+                        .efforts = entry.efforts,
+                        .current = std.mem.eql(u8, entry.id, current),
+                        .mru_index = observed.mru_index,
+                        .ttft_ms = observed.ttft_ms,
+                        .tokens_per_second = observed.tokens_per_second,
+                        .roles = try rolesFor(app, builder.arena(), builder.providers.items[index].key, entry.id),
+                    });
+                }
+            } else if (cached.state.status == .loading and builder.providers.items[index].active) {
+                builder.snapshot.loading = true;
+            }
+        }
+
         fn buildSnapshot(app: *App) !hub.Snapshot {
             var builder: catalog.Builder = .init(app.alloc);
             errdefer builder.deinit();
@@ -344,10 +583,15 @@ pub fn Runtime(comptime App: type) type {
             const current = currentModel(app);
             const view = app.auth.view();
             const inventory = sourceSet(view);
+            const cached_catalogs = app.model_cache.snapshotForHubAll(arena) catch null;
 
             // Built-in providers sign in outside the hub; they appear once
             // signed in or in use.
-            for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |id| {
+            // Vercel AI Gateway is deliberately disabled as a selectable
+            // provider in fx. Its credentials/auth remain owned by the
+            // auth/runtime paths, but it must not become a hub scope merely
+            // because a token happens to be present in the test environment.
+            for ([_]model_provider.ProviderId{ .codex, .grok }) |id| {
                 const is_active = active_id.eql(id);
                 const signed_in = is_active or switch (id) {
                     .codex => inventory.contains(.chatgpt_subscription),
@@ -365,14 +609,25 @@ pub fn Runtime(comptime App: type) type {
                     .sign_in = .external,
                     .can_sign_out = false,
                     .models_known = is_active,
+                    .refreshing = if (cached_catalogs) |catalogs| if (cachedProvider(catalogs, id.label())) |cached| cached.state.status == .loading or cached.state.force_refresh_pending else false else false,
+                    .last_attempt_age_ms = if (cached_catalogs) |catalogs| if (cachedProvider(catalogs, id.label())) |cached| cached.state.last_attempt_age_ms else null else null,
+                    .last_success_age_ms = if (cached_catalogs) |catalogs| if (cachedProvider(catalogs, id.label())) |cached| cached.state.last_success_age_ms else null else null,
+                    .failure_category = if (cached_catalogs) |catalogs| if (cachedProvider(catalogs, id.label())) |cached| if (cached.state.failure) |failure| @tagName(failure.category) else null else null else null,
+                    .failure_status = cachedFailureStatus(cached_catalogs, id.label()),
+                    .credential_source = if (cached_catalogs) |catalogs| if (cachedProvider(catalogs, id.label())) |cached| if (cached.state.credential_source) |source| @tagName(source) else null else null else null,
                 });
-                if (is_active) try addActiveCatalog(app, &builder, index, current, null);
+                if (cached_catalogs) |catalogs| {
+                    if (cachedProvider(catalogs, id.label())) |cached| {
+                        try addCachedCatalog(app, &builder, index, current, cached);
+                    } else if (is_active) try addActiveCatalog(app, &builder, index, current, null);
+                } else if (is_active) try addActiveCatalog(app, &builder, index, current, null);
             }
 
             const definitions = app.provider_selection.definitions.definitions;
             for (definitions) |*definition| {
                 const is_active = active_id == .configured and std.mem.eql(u8, active_key, definition.id);
                 const state = try credentialState(arena, definition, is_active);
+                const cached = if (cached_catalogs) |catalogs| cachedProvider(catalogs, definition.id) else null;
                 const index = try builder.addProvider(.{
                     .key = definition.id,
                     .name = if (provider_registry.presetFor(definition.id)) |preset| preset.name else definition.id,
@@ -381,23 +636,25 @@ pub fn Runtime(comptime App: type) type {
                     .active = is_active,
                     .sign_in = if (definition.preset) .login else .settings,
                     .can_sign_out = state.saved_key,
+                    .models_known = if (cached) |value| value.models != null else is_active,
+                    .refreshing = if (cached) |value| value.state.status == .loading or value.state.force_refresh_pending else false,
+                    .last_attempt_age_ms = if (cached) |value| value.state.last_attempt_age_ms else null,
+                    .last_success_age_ms = if (cached) |value| value.state.last_success_age_ms else null,
+                    .failure_category = if (cached) |value| if (value.state.failure) |failure| @tagName(failure.category) else null else null,
+                    .failure_status = if (cached) |value| if (value.state.failure) |failure| if (failure.http_status) |status| @backingInt(status) else null else null else null,
+                    .credential_source = if (cached) |value| if (value.state.credential_source) |source| @tagName(source) else null else null,
                 });
-                if (is_active) {
-                    try addActiveCatalog(app, &builder, index, current, definition);
-                } else {
-                    try addDeclaredModels(app, &builder, index, definition, false, current);
-                }
+                if (cached) |value| try addCachedCatalog(app, &builder, index, current, value);
+                if (is_active and cached == null) try addActiveCatalog(app, &builder, index, current, definition);
+                try addDeclaredModels(app, &builder, index, definition, is_active, current);
             }
 
             try addRoles(app, &builder, definitions);
-            try addWebSearch(app, &builder, inventory, active_id);
             // A detached session keeps its effort in the supervisor, which
             // does not report it; the hub then marks no level as in use.
             builder.snapshot.effort = if (session_backend.Ops(App).agentInProcess(app)) app.effort else null;
-            var cycle_buf: [model_roles.role_count]Role = undefined;
-            const cycle = app.model_roles.table.cycleOrder();
-            @memcpy(cycle_buf[0..cycle.len], cycle);
-            return builder.finish(cycle_buf[0..cycle.len]);
+            const cycle = app.model_roles.table.cycleOrderIds();
+            return builder.finish(cycle);
         }
 
         fn sourceSet(view: anytype) std.EnumSet(credentials.Source) {
@@ -454,15 +711,30 @@ pub fn Runtime(comptime App: type) type {
         ) !void {
             const entries = try app.model_cache.snapshotForHub(builder.arena());
             if (entries) |list| {
-                for (list) |entry| try builder.addModel(.{
-                    .provider = index,
-                    .id = entry.id,
-                    .name = entry.name,
-                    .context_window = entry.context_window,
-                    .efforts = entry.efforts,
-                    .current = std.mem.eql(u8, entry.id, current),
-                    .roles = try rolesFor(app, builder.arena(), builder.providers.items[index].key, entry.id),
-                });
+                for (list) |entry| {
+                    const observed = performanceSnapshot(app, entry.id);
+                    try builder.addModel(.{
+                        .provider = index,
+                        .id = entry.id,
+                        .name = entry.name,
+                        .description = entry.description orelse "",
+                        .context_window = entry.context_window,
+                        .max_tokens = entry.max_tokens,
+                        .cost = if (entry.cost) |value| .{ .input = value.input, .output = value.output, .cache_read = value.cache_read, .cache_write = value.cache_write } else null,
+                        .intelligence = entry.intelligence,
+                        .is_beta = entry.beta,
+                        .is_recommended = entry.recommended,
+                        .released = entry.released,
+                        .has_reasoning = entry.has_reasoning,
+                        .has_vision = entry.has_vision,
+                        .efforts = entry.efforts,
+                        .current = std.mem.eql(u8, entry.id, current),
+                        .mru_index = observed.mru_index,
+                        .ttft_ms = observed.ttft_ms,
+                        .tokens_per_second = observed.tokens_per_second,
+                        .roles = try rolesFor(app, builder.arena(), builder.providers.items[index].key, entry.id),
+                    });
+                }
             } else builder.snapshot.loading = app.model_cache.isLoading();
             // The definition's own models fill in what the catalog lacks.
             if (definition) |value| try addDeclaredModels(app, builder, index, value, true, current);
@@ -485,63 +757,102 @@ pub fn Runtime(comptime App: type) type {
             current: []const u8,
         ) !void {
             for ([_][]const configured_provider.ModelMetadata{ definition.model_metadata, definition.builtin_models }) |list| {
-                for (list) |metadata| try builder.addModel(.{
-                    .provider = index,
-                    .id = metadata.id,
-                    .name = "",
-                    .context_window = metadata.context_window,
-                    .efforts = metadata.reasoning_efforts,
-                    .current = is_active and std.mem.eql(u8, metadata.id, current),
-                    .roles = try rolesFor(app, builder.arena(), definition.id, metadata.id),
-                });
+                for (list) |metadata| {
+                    const observed = performanceSnapshot(app, metadata.id);
+                    try builder.addModel(.{
+                        .provider = index,
+                        .id = metadata.id,
+                        .name = metadata.name orelse "",
+                        .description = metadata.description orelse "",
+                        .context_window = metadata.context_window,
+                        .max_tokens = metadata.max_output_tokens,
+                        .cost = if (metadata.cost) |value| .{ .input = value.input, .output = value.output, .cache_read = value.cache_read, .cache_write = value.cache_write } else null,
+                        .intelligence = metadata.intelligence,
+                        .is_beta = metadata.beta,
+                        .is_recommended = metadata.recommended,
+                        .released = metadata.released,
+                        .efforts = metadata.reasoning_efforts,
+                        .has_reasoning = metadata.reasoning_efforts.len > 0,
+                        .has_vision = metadata.supports_vision orelse false,
+                        .current = is_active and std.mem.eql(u8, metadata.id, current),
+                        .mru_index = observed.mru_index,
+                        .ttft_ms = observed.ttft_ms,
+                        .tokens_per_second = observed.tokens_per_second,
+                        .roles = try rolesFor(app, builder.arena(), definition.id, metadata.id),
+                    });
+                }
             }
         }
 
         /// The roles whose assignment names `id` on `provider`, plus the
         /// default role on the model it falls back to, the one Alt+P picks.
-        fn rolesFor(app: *App, arena: Allocator, provider: []const u8, id: []const u8) ![]const Role {
+        fn rolesFor(app: *App, arena: Allocator, provider: []const u8, id: []const u8) ![]const RoleId {
             const host = model_role_runtime.host(app);
             const active_key = host.provider.label();
-            var out: [model_roles.role_count]Role = undefined;
+            const ids = try app.model_roles.table.roleIds(arena);
+            var out = try arena.alloc(RoleId, ids.len);
             var count: usize = 0;
-            for (catalog.role_order) |role| {
-                const ref = model_roles.resolve(&app.model_roles.table, role, .{
-                    .provider = active_key,
-                    .default_model = host.defaultModel(),
-                    .configured = host.set.definitions,
-                }) orelse continue;
-                if (role != .default and app.model_roles.table.get(role) == null) continue;
+            for (ids) |role| {
+                switch (role) {
+                    .builtin => |builtin_role| {
+                        if (builtin_role != .default and app.model_roles.table.getId(role) == null) continue;
+                    },
+                    .custom => {},
+                }
+                const ref = model_roles.resolveId(&app.model_roles.table, role, roleContext(host, active_key)) orelse continue;
                 const ref_provider = ref.provider orelse active_key;
                 if (!std.mem.eql(u8, ref_provider, provider) or !std.mem.eql(u8, ref.model, id)) continue;
                 out[count] = role;
                 count += 1;
             }
-            return arena.dupe(Role, out[0..count]);
+            return out[0..count];
+        }
+
+        fn roleLabel(app: *App, role: RoleId) []const u8 {
+            if (app.model_roles.table.tagFor(role)) |tag| {
+                if (tag.tag.len > 0) return tag.tag;
+                if (tag.name.len > 0) return tag.name;
+            }
+            return role.label();
         }
 
         fn addRoles(app: *App, builder: *catalog.Builder, definitions: []const configured_provider.Definition) !void {
             const arena = builder.arena();
             const table = &app.model_roles.table;
-            const cycle = table.cycleOrder();
+            const cycle = table.cycleOrderIds();
             const host = model_role_runtime.host(app);
             const active_id = provider_runtime.provider(app);
             const active_key = active_id.label();
-            for (catalog.role_order) |role| {
-                const raw = table.get(role);
-                const resolved = model_role_runtime.resolveModel(app, role);
+            const ids = try table.roleIds(arena);
+            for (ids) |role| {
+                const raw = table.getId(role);
                 var entries: std.ArrayList(catalog.EntryRow) = .empty;
                 if (raw) |text| {
                     const chain = model_roles.Chain.parse(text);
                     for (chain.entries()) |entry| try entries.append(arena, try entryRow(app, builder, entry, definitions, host));
                 }
+                const resolved = host.pickSelectionId(role);
+                const tag = table.tagFor(role);
+                const label = if (tag) |value| if (value.tag.len > 0) value.tag else if (value.name.len > 0) value.name else role.label() else role.label();
+                const summary = if (tag) |value| if (value.name.len > 0) value.name else role.label() else role.label();
+                var cycle_position: ?usize = null;
+                for (cycle, 0..) |member, position| {
+                    if (member.eql(role)) {
+                        cycle_position = position + 1;
+                        break;
+                    }
+                }
                 try builder.addRole(.{
                     .role = role,
+                    .label = label,
+                    .summary = summary,
+                    .hidden = if (tag) |value| value.hidden else false,
                     .assigned = if (entries.items.len > 0) entries.items[0].shown else null,
                     .entries = entries.items,
-                    .in_use = model_roles.chosenEntry(table, role, roleContext(host, active_key)),
-                    .resolved = if (resolved) |model| try describeModel(app, arena, active_key, model, definitions) else null,
+                    .in_use = model_roles.chosenEntryId(table, role, roleContext(host, active_key)),
+                    .resolved = if (resolved) |selection| try describeModel(app, arena, selection.provider.label(), selection.model, definitions) else null,
                     .chain = fallbackChain(role),
-                    .cycle_position = if (std.mem.findScalar(Role, cycle, role)) |position| position + 1 else null,
+                    .cycle_position = cycle_position,
                 });
             }
         }
@@ -555,6 +866,7 @@ pub fn Runtime(comptime App: type) type {
                 .default_model = host.defaultModel(),
                 .configured = host.set.definitions,
                 .known = host.known,
+                .candidates = host.candidates,
             };
         }
 
@@ -575,7 +887,7 @@ pub fn Runtime(comptime App: type) type {
             }
             var provider = host.provider;
             const active_key = provider.label();
-            const ref = model_roles.parseRef(entry.ref, .default, definitions);
+            const ref = model_roles.parseRefId(entry.ref, .{ .builtin = .default }, definitions);
             const key = ref.provider orelse active_key;
             for (builder.models.items) |model| {
                 if (!std.mem.eql(u8, builder.providers.items[model.provider].key, key)) continue;
@@ -597,8 +909,8 @@ pub fn Runtime(comptime App: type) type {
         /// `provider/model` names the provider.
         fn describeRef(app: *App, arena: Allocator, raw: []const u8, definitions: []const configured_provider.Definition) ![]const u8 {
             if (raw[0] == '@') {
-                const role = Role.parse(raw[1..]) orelse return arena.dupe(u8, raw);
-                return arena.print("follows {s}", .{catalog.roleName(role)});
+                const role = model_roles.parseRoleId(raw[1..]) orelse return arena.dupe(u8, raw);
+                return arena.print("follows {s}", .{role.label()});
             }
             if (std.mem.findScalar(u8, raw, '/')) |slash| {
                 const prefix = raw[0..slash];
@@ -621,14 +933,17 @@ pub fn Runtime(comptime App: type) type {
             return provider_catalog.find(id).name;
         }
 
-        fn fallbackChain(role: Role) []const u8 {
+        fn fallbackChain(role: RoleId) []const u8 {
             return switch (role) {
-                .default => "the model the profile saved for this provider",
-                .small => "the provider's low-cost model",
-                .title, .tiny => "follows Small",
-                .review => "the reviewer's default model",
-                .worker, .deep, .compact => "the session's model",
-                .designer, .commit, .advisor => "unused by proto-fx",
+                .custom => "the session's model",
+                .builtin => |builtin_role| switch (builtin_role) {
+                    .default => "the model the profile saved for this provider",
+                    .small => "the provider's low-cost model",
+                    .title, .tiny => "follows Small",
+                    .review => "the reviewer's default model",
+                    .worker, .deep, .compact => "the session's model",
+                    .designer, .commit, .advisor => "unused by proto-fx",
+                },
             };
         }
 

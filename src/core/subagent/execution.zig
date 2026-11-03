@@ -4,6 +4,7 @@ const permission_request = @import("../permissions/permission_request.zig");
 const permission_prompter = @import("../permissions/permission_prompter.zig");
 const runtime_deps = @import("../agent/runtime/deps.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const model_roles = @import("../config/model_roles.zig");
 const authority_mod = @import("authority.zig");
 const approval_registry_mod = @import("approval_registry.zig");
 const child_state = @import("child_state.zig");
@@ -68,6 +69,9 @@ pub const TurnPreferences = struct {
     provider: @import("../config/model_provider.zig").ProviderId = .gateway,
     model: []const u8,
     effort: types.ReasoningEffort,
+    /// The typed role that selected this child model, retained through
+    /// admission so runtime fallback never has to reverse-match model text.
+    role: ?model_roles.RoleId = null,
     /// The durable child preference wins when work resumes. Parent defaults are
     /// used only while creating a new child session.
     ultrafast_mode: bool = false,

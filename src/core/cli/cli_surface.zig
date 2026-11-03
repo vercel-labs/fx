@@ -25,6 +25,7 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
+const model_cache_runtime = @import("../app/model_cache_runtime.zig");
 const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const provider_set = @import("../gateway/provider_set.zig");
@@ -1446,10 +1447,10 @@ fn runNonInteractiveWithDeps(
             defer startup.deinit(alloc);
             try writeConfigDiagnostics(alloc, deps, startup.config_diagnostics);
 
-            const catalog_access = startup.modelCatalogAccess();
             var available_providers = cfg.provider_set;
             available_providers.definitions = startup.configured_providers.definitions;
-            const catalog_provider = available_providers.select(startup.provider).cli_model_catalog orelse {
+            var runtime = initCliCatalogRuntime(alloc, cfg, &startup) catch |err| {
+                if (err == error.OutOfMemory) return err;
                 try writeStderr(deps, switch (startup.provider) {
                     .gateway => "proto-fx models: Gateway model catalog is unavailable\n",
                     .codex => "proto-fx models: Codex model catalog is unavailable\n",
@@ -1458,38 +1459,45 @@ fn runNonInteractiveWithDeps(
                 });
                 return .handled_failure;
             };
-            const loaded = switch (catalog_provider.fetch(alloc, .{
-                .access = catalog_access,
-                .endpoint = cfg.models_path,
-            })) {
-                .loaded => |loaded| loaded,
-                .failure => |failure| {
-                    const error_name = @errorName(failure.failure.asError());
-                    const message = try alloc.print(
-                        "could not list models: {s}",
-                        .{catalogFailureDetail(failure.failure)},
-                    );
-                    defer alloc.free(message);
-                    if (opts.format == .json) {
-                        try writeJsonCommandFailureCode(
-                            alloc,
-                            deps,
-                            "models",
-                            error_name,
-                            message,
-                        );
-                    } else {
-                        try writeStderr(deps, "proto-fx models: ");
-                        try writeStderr(deps, message);
-                        try writeStderr(deps, "\n");
-                    }
-                    return .handled_failure;
-                },
+            defer runtime.deinit();
+            var entries = (runtime.snapshotCatalogFor(startup.provider, alloc) catch |err| {
+                debug_trace.logf("catalog", "cli_model_catalog_snapshot_failed err={s}", .{@errorName(err)});
+                return error.ModelCatalogUnavailable;
+            }) orelse {
+                const failure: model_catalog.Failure = runtime.providerSnapshot(startup.provider).failure orelse .{ .category = .runtime };
+                const error_name = @errorName(failure.asError());
+                const message = try alloc.print(
+                    "could not list models: {s}",
+                    .{catalogFailureDetail(failure)},
+                );
+                defer alloc.free(message);
+                if (opts.format == .json) {
+                    try writeJsonCommandFailureCode(alloc, deps, "models", error_name, message);
+                } else {
+                    try writeStderr(deps, "proto-fx models: ");
+                    try writeStderr(deps, message);
+                    try writeStderr(deps, "\n");
+                }
+                return .handled_failure;
             };
-            var ids = loaded.ids;
-            defer collections.freeStringList(alloc, &ids);
-            var entries = loaded.entries;
             defer model_catalog.freeModelCatalog(alloc, &entries);
+            var ids = try model_catalog.projectModelIds(alloc, entries.items);
+            defer collections.freeStringList(alloc, &ids);
+            const loaded_access = runtime.providerSnapshot(startup.provider);
+            var role_arena = std.heap.ArenaAllocator.init(alloc);
+            defer role_arena.deinit();
+            const role_snapshots = try runtime.snapshotForHubAll(role_arena.allocator());
+            var role_candidates: std.ArrayList(model_roles.Candidate) = .empty;
+            defer role_candidates.deinit(alloc);
+            for (role_snapshots) |snapshot| {
+                if (snapshot.models) |models| for (models) |model| {
+                    try role_candidates.append(alloc, .{
+                        .provider = snapshot.provider.label(),
+                        .model = model.id,
+                        .credential_ready = snapshot.state.auth_available or snapshot.state.status == .ready,
+                    });
+                };
+            }
             const details = try modelDetails(
                 alloc,
                 ids.items,
@@ -1503,10 +1511,10 @@ fn runNonInteractiveWithDeps(
             const text = try (output_contracts.ModelListSnapshot{
                 .ids = ids.items,
                 .details = details,
-                .roles = modelRoleAssignments(&startup, available_providers.select(startup.provider), &role_rows),
+                .roles = modelRoleAssignments(&startup, available_providers.select(startup.provider), role_candidates.items, &role_rows),
                 .provider = startup.provider,
-                .private_models_hidden = loaded.provenance.access.private_models_may_be_hidden,
-                .public_only_reason = loaded.provenance.access.public_only_reason,
+                .private_models_hidden = loaded_access.private_models_hidden,
+                .public_only_reason = loaded_access.public_only_reason,
             }).render(alloc, opts.format);
             defer alloc.free(text);
             try writeFormattedOutput(deps, text, opts.format);
@@ -1731,19 +1739,20 @@ fn runNonInteractiveWithDeps(
                 providers.definitions = startup.configured_providers.definitions;
                 const bundle = providers.select(startup.provider);
                 judge_roles = .{ .startup = startup, .builtin_small = bundle.title_model };
-                // The catalog lets a role's fallback chain skip models the
-                // provider does not list, as the terminal's does.
-                if (bundle.cli_model_catalog) |catalog_provider| switch (catalog_provider.fetch(alloc, .{
-                    .access = startup.modelCatalogAccess(),
-                    .endpoint = cfg.models_path,
-                })) {
-                    .loaded => |loaded| {
-                        var entries = loaded.entries;
-                        model_catalog.freeModelCatalog(alloc, &entries);
-                        judge_roles.ids = loaded.ids;
-                    },
-                    .failure => {},
+                // The shared registry lets a role's fallback chain skip
+                // models the provider does not list without a second catalog.
+                var judge_runtime: ?model_cache_runtime.Runtime = initCliCatalogRuntime(alloc, cfg, startup) catch |err| blk: {
+                    if (err == error.OutOfMemory) return err;
+                    break :blk null;
                 };
+                defer if (judge_runtime) |*runtime| runtime.deinit();
+                if (judge_runtime) |*runtime| {
+                    if (runtime.snapshotCatalogFor(startup.provider, alloc) catch null) |catalog| {
+                        var entries = catalog;
+                        defer model_catalog.freeModelCatalog(alloc, &entries);
+                        judge_roles.ids = try model_catalog.projectModelIds(alloc, entries.items);
+                    }
+                }
                 const lease: ?@import("../agent/stream_provider.zig").CredentialLease = if (cfg.auth_mode == .host_managed) .host_managed else lease: {
                     judge_credential = auth_runtime.prepareCredential(alloc, cfg.gateway_provider.oauth_transport, cfg.secret_store, startup.provider, null) catch null;
                     const credential = judge_credential orelse break :lease null;
@@ -2384,9 +2393,131 @@ fn permissionRulesForSnapshot(alloc: Allocator, active_rules: anytype) !types.Pe
     return .{ .rules = rules };
 }
 
-/// One detail per id when the provider described its models, by the same capability merge a
-/// session uses for its effort and speed options; Ultrafast is a Gateway-only lane. Empty when
-/// there are no entries. Names borrow from `entries`. Caller frees the returned slice.
+/// Resolves one provider's catalog access without borrowing a credential after
+/// the Runtime copies it into its provider slot.
+fn cliCatalogAccessForProvider(
+    alloc: Allocator,
+    cfg: Config,
+    startup: *const app_lifecycle.StartupState,
+    provider: model_provider.ProviderId,
+    owned_credentials: *std.ArrayList(credentials.Credential),
+) !credentials.CatalogAccess {
+    if (cfg.auth_mode == .host_managed) return .host_managed;
+    if (provider.eql(startup.provider)) return startup.modelCatalogAccess();
+    const resolution = credentials.resolveForProvider(
+        alloc,
+        cfg.gateway_provider.oauth_transport,
+        cfg.secret_store,
+        .stored,
+        provider,
+        null,
+    ) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        debug_trace.logf("auth", "cli_model_catalog_access_unavailable provider={t} err={s}", .{ provider, @errorName(err) });
+        return .{ .public_only = .no_credential };
+    };
+    if (resolution.credential) |credential| {
+        owned_credentials.append(alloc, credential) catch |err| {
+            var discarded = credential;
+            discarded.deinit(alloc);
+            return err;
+        };
+        const owned = &owned_credentials.items[owned_credentials.items.len - 1];
+        return credentials.catalogAccessForCredentialAndAccount(
+            owned.source,
+            owned.token,
+            owned.gatewayTeam(),
+            owned.accountId(),
+        );
+    }
+    return .{ .public_only = .no_credential };
+}
+
+fn cliCatalogCachePath(alloc: Allocator, provider: model_provider.ProviderId) !?[]u8 {
+    const home = io_mod.homeDir() orelse return null;
+    return try profile_paths.modelCatalogCachePath(alloc, home, provider.label());
+}
+
+fn initCliCatalogRuntime(
+    alloc: Allocator,
+    cfg: Config,
+    startup: *const app_lifecycle.StartupState,
+) !model_cache_runtime.Runtime {
+    var runtime = model_cache_runtime.Runtime.init(alloc, cfg.models_path);
+    errdefer runtime.deinit();
+    var available_providers = cfg.provider_set;
+    available_providers.definitions = startup.configured_providers.definitions;
+    available_providers.native_overrides = startup.configured_providers.native_overrides;
+    var configs: std.ArrayList(model_cache_runtime.ProviderConfig) = .empty;
+    defer configs.deinit(alloc);
+    var cache_paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (cache_paths.items) |path| alloc.free(path);
+        cache_paths.deinit(alloc);
+    }
+    var catalog_credentials: std.ArrayList(credentials.Credential) = .empty;
+    defer {
+        for (catalog_credentials.items) |*credential| credential.deinit(alloc);
+        catalog_credentials.deinit(alloc);
+    }
+    var seeds: std.ArrayList(std.ArrayList(model_catalog.ModelCatalogEntry)) = .empty;
+    defer {
+        for (seeds.items) |*seed| model_catalog.freeModelCatalog(alloc, seed);
+        seeds.deinit(alloc);
+    }
+    var active_configured = false;
+
+    for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
+        const source = available_providers.select(provider).model_catalog orelse continue;
+        const cache_path = try cliCatalogCachePath(alloc, provider);
+        if (cache_path) |path| try cache_paths.append(alloc, path);
+        if (provider.eql(startup.provider)) active_configured = true;
+        const native_overrides = for (available_providers.native_overrides) |*overrides| {
+            if (std.mem.eql(u8, overrides.id, provider.label())) break overrides;
+        } else null;
+        try configs.append(alloc, .{
+            .provider = provider,
+            .catalog = source,
+            .native_overrides = native_overrides,
+            .endpoint = if (provider == .gateway) cfg.models_path else "",
+            .access = try cliCatalogAccessForProvider(alloc, cfg, startup, provider, &catalog_credentials),
+            .cache_path = cache_path,
+        });
+    }
+    for (startup.configured_providers.definitions) |definition| {
+        var provider = model_provider.parse(definition.id) orelse continue;
+        provider.configured.binding = definition.binding_identity();
+        const source = available_providers.select(provider).model_catalog orelse continue;
+        const cache_path = try cliCatalogCachePath(alloc, provider);
+        if (cache_path) |path| try cache_paths.append(alloc, path);
+        if (provider.eql(startup.provider)) active_configured = true;
+        var seed = try model_cache_runtime.metadataSeed(
+            alloc,
+            &.{ definition.model_metadata, definition.builtin_models },
+            definition.model_defaults,
+        );
+        errdefer model_catalog.freeModelCatalog(alloc, &seed);
+        try seeds.append(alloc, seed);
+        try configs.append(alloc, .{
+            .provider = provider,
+            .catalog = source,
+            .seed = seed.items,
+            .refresh_on_seed = definition.discovery != null or definition.catalog == .openrouter,
+            .endpoint = definition.base_url,
+            .access = try cliCatalogAccessForProvider(alloc, cfg, startup, provider, &catalog_credentials),
+            .from_profile_settings = true,
+            .cache_path = cache_path,
+        });
+    }
+    if (!active_configured) return error.UnknownProvider;
+    try runtime.syncProviders(configs.items, startup.provider);
+    for (configs.items) |config| runtime.loadCooperativeFor(config.provider, .activity);
+    _ = runtime.pollLoadTransitions() catch |err| {
+        debug_trace.logf("catalog", "cli_model_cache_poll_failed err={s}", .{@errorName(err)});
+    };
+    return runtime;
+}
+
 fn modelDetails(
     alloc: Allocator,
     ids: []const []const u8,
@@ -2418,6 +2549,7 @@ fn modelDetails(
 fn modelRoleAssignments(
     startup: anytype,
     bundle: provider_set.Bundle,
+    candidates: []const model_roles.Candidate,
     out: *[model_roles.role_count]output_contracts.ModelListSnapshot.RoleAssignment,
 ) []const output_contracts.ModelListSnapshot.RoleAssignment {
     var provider = startup.provider;
@@ -2428,6 +2560,8 @@ fn modelRoleAssignments(
         .builtin_small = bundle.title_model,
         .legacy_review = if (startup.provider == .gateway and startup.review_model.len > 0) startup.review_model else null,
         .configured = startup.configured_providers.definitions,
+        .candidates = candidates,
+        .provider_order = startup.provider_order,
     };
     for (model_roles.all_roles, 0..) |role, index| {
         const model = if (model_roles.resolve(&startup.model_roles, role, ctx)) |ref| ref.on(label) else null;
@@ -2448,7 +2582,7 @@ const TtsrJudgeRoles = struct {
     fn pick(raw: *const anyopaque, role: model_roles.Role) ?[]const u8 {
         const self: *const TtsrJudgeRoles = @ptrCast(@alignCast(raw));
         const known: model_roles.Known = .{ .context = @ptrCast(@constCast(self)), .known_fn = knows };
-        const picked = self.startup.rolePick(role, self.builtin_small, known) orelse return null;
+        const picked = self.startup.roleSelection(.{ .builtin = role }, self.builtin_small, known) orelse return null;
         return picked.model;
     }
 
@@ -4925,6 +5059,7 @@ test "runIfRequested model fetch failure is handled" {
     var probe = ModelFetchProbe{ .outcome = .failure };
     var cfg = testConfig();
     cfg.provider_set.gateway.cli_model_catalog = probe.provider();
+    cfg.provider_set.gateway.model_catalog = probe.modelCatalogProvider();
 
     var deps = capture.deps();
     deps.load_startup_state = stubLoadStartupState;
@@ -4943,6 +5078,7 @@ test "runIfRequested model fetch failure preserves json output" {
     var probe = ModelFetchProbe{ .outcome = .failure };
     var cfg = testConfig();
     cfg.provider_set.gateway.cli_model_catalog = probe.provider();
+    cfg.provider_set.gateway.model_catalog = probe.modelCatalogProvider();
 
     var deps = capture.deps();
     deps.load_startup_state = stubLoadStartupState;
@@ -4967,6 +5103,7 @@ test "runIfRequested model provider cancellation is handled" {
     var probe = ModelFetchProbe{ .outcome = .cancelled };
     var cfg = testConfig();
     cfg.provider_set.gateway.cli_model_catalog = probe.provider();
+    cfg.provider_set.gateway.model_catalog = probe.modelCatalogProvider();
 
     var deps = capture.deps();
     deps.load_startup_state = stubLoadStartupState;
@@ -4985,6 +5122,7 @@ test "runIfRequested models passes startup team to fetch seam" {
     var probe = ModelFetchProbe{};
     var cfg = testConfig();
     cfg.provider_set.gateway.cli_model_catalog = probe.provider();
+    cfg.provider_set.gateway.model_catalog = probe.modelCatalogProvider();
 
     var deps = capture.deps();
     deps.load_startup_state = stubLoadStartupState;
@@ -5004,6 +5142,7 @@ test "runIfRequested models json describes each model from its catalog entry" {
     var probe = ModelFetchProbe{ .outcome = .described };
     var cfg = testConfig();
     cfg.provider_set.gateway.cli_model_catalog = probe.provider();
+    cfg.provider_set.gateway.model_catalog = probe.modelCatalogProvider();
 
     var deps = capture.deps();
     deps.load_startup_state = stubLoadStartupState;
@@ -5435,6 +5574,40 @@ const ModelFetchProbe = struct {
         };
     }
 
+    fn modelCatalogProvider(self: *ModelFetchProbe) model_catalog.Provider {
+        return .{ .context = self, .fetch_fn = fetchCatalog };
+    }
+
+    fn fetchCatalog(
+        raw: ?*anyopaque,
+        alloc: Allocator,
+        input: model_catalog.FetchInput,
+    ) Allocator.Error!model_catalog.ProviderResult {
+        return switch (fetch(raw, alloc, .{
+            .access = input.access,
+            .endpoint = input.endpoint,
+            .cancel_flag = input.cancel_flag,
+        })) {
+            .loaded => |loaded| blk: {
+                var ids = loaded.ids;
+                defer collections.freeStringList(alloc, &ids);
+                var entries = loaded.entries;
+                errdefer model_catalog.freeModelCatalog(alloc, &entries);
+                if (entries.items.len == 0) {
+                    for (ids.items) |id| {
+                        const id_copy = try alloc.dupe(u8, id);
+                        errdefer alloc.free(id_copy);
+                        const type_copy = try alloc.dupe(u8, "language");
+                        errdefer alloc.free(type_copy);
+                        try entries.append(alloc, .{ .id = id_copy, .model_type = type_copy });
+                    }
+                }
+                break :blk .{ .catalog = entries };
+            },
+            .failure => |failed| .{ .failure = failed.failure },
+        };
+    }
+
     fn failure(
         input: gateway_provider.CliModelCatalogInput,
         category: model_catalog.FailureCategory,
@@ -5456,8 +5629,7 @@ const ModelFetchProbe = struct {
         if (!std.mem.eql(u8, input.access.authorizationCredential() orelse "", "test-key") or
             !std.mem.eql(u8, input.access.teamContext() orelse "", "team_123") or
             input.access.credentialSource() != .ai_gateway_api_key or
-            !std.mem.eql(u8, input.endpoint, "/v1/models") or
-            input.cancel_flag != null)
+            !std.mem.eql(u8, input.endpoint, "/v1/models"))
         {
             return failure(input, .runtime);
         }

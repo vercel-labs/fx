@@ -4,6 +4,9 @@
 //! own; only the HTTP client differs. The host adds the API key, if any.
 const std = @import("std");
 const stream_provider = @import("../core/agent/stream_provider.zig");
+const model_catalog = @import("../core/gateway/model_catalog.zig");
+const model_capabilities = @import("../core/config/model_capabilities.zig");
+const model_catalog_metadata = @import("../core/gateway/model_catalog_metadata.zig");
 const provider_set = @import("../core/gateway/provider_set.zig");
 const definitions = @import("../core/config/configured_provider.zig");
 const chat_completions = @import("chat_completions.zig");
@@ -22,7 +25,10 @@ pub const Context = struct {
     pub fn init(alloc: Allocator, transport: host_stream.Transport, json: []const u8) !Context {
         var registry = try definitions.Registry.parse_json(alloc, json);
         errdefer registry.deinit(alloc);
-        if (registry.definitions.len != 1 or registry.definitions[0].auth != .none or registry.definitions[0].protocol != .@"openai-chat-completions") {
+        if (registry.definitions.len != 1 or registry.definitions[0].auth != .none or
+            registry.definitions[0].protocol != .@"openai-chat-completions" or
+            registry.definitions[0].discovery != null)
+        {
             return error.InvalidConfiguredProvider;
         }
         return .{ .transport = transport, .registry = registry };
@@ -51,8 +57,55 @@ pub fn bundle(raw: ?*anyopaque, definition: *const definitions.Definition) provi
             .build_request_fn = buildRequest,
             .project_replay_fn = chat_completions.project_replay,
         },
-        .model_catalog = chat_completions.model_catalog_provider(own),
+        .model_catalog = declared_model_catalog_provider(context),
     };
+}
+
+fn declared_model_catalog_provider(context: *Context) model_catalog.Provider {
+    return .{
+        .context = context,
+        .fetch_fn = fetch_declared_catalog,
+        .lookup_capabilities_fn = lookup_declared_capabilities,
+        .provider_id = chat_completions.bound_identity(context.definition()),
+    };
+}
+
+fn lookup_declared_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
+    const context: *Context = @ptrCast(@alignCast(raw.?));
+    const metadata = context.definition().model(model) orelse return .{};
+    return model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(
+        chat_completions.metadata_entry(metadata.*),
+    ));
+}
+
+fn fetch_declared_catalog(
+    raw: ?*anyopaque,
+    alloc: Allocator,
+    input: model_catalog.FetchInput,
+) Allocator.Error!model_catalog.ProviderResult {
+    if (input.cancel_flag) |flag| if (flag.load(.seq_cst)) return .{ .failure = .{ .category = .cancellation } };
+    const context: *Context = @ptrCast(@alignCast(raw.?));
+    const definition = context.definition();
+    var entries: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+    errdefer model_catalog.freeModelCatalog(alloc, &entries);
+    for ([_][]const definitions.ModelMetadata{ definition.model_metadata, definition.builtin_models }) |list| for (list) |base| {
+        var metadata = base;
+        if (definition.model_defaults) |defaults| metadata = definitions.overlayMetadata(metadata, defaults.*);
+        for (definition.model_metadata) |override| if (std.mem.eql(u8, override.id, base.id)) {
+            metadata = definitions.overlayMetadata(metadata, override);
+            break;
+        };
+        var duplicate = false;
+        for (entries.items) |entry| if (std.mem.eql(u8, entry.id, metadata.id)) {
+            duplicate = true;
+            break;
+        };
+        if (duplicate) continue;
+        const entry = try model_catalog.cloneModelCatalogEntry(alloc, chat_completions.metadata_entry(metadata));
+        errdefer model_catalog.freeModelCatalogEntry(alloc, entry);
+        try entries.append(alloc, entry);
+    };
+    return .{ .catalog = entries };
 }
 
 fn buildRequest(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.RequestData) anyerror![]u8 {
@@ -73,7 +126,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     const payload = request.prepared_request_body orelse
         try chat_completions.build_for(definition, alloc, request.data());
     defer if (request.prepared_request_body == null) alloc.free(payload);
-    const endpoint = try definition.chat_url(alloc);
+    const endpoint = try definition.chat_url(alloc, request.model);
     defer alloc.free(endpoint);
     const headers = [_]std.http.Header{
         .{ .name = "content-type", .value = "application/json" },

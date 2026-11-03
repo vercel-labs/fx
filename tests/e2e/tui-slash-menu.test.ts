@@ -27,6 +27,7 @@ import {
   tmuxAvailable,
 } from "./tmux-helpers";
 import { savedSessionIds } from "./saved-sessions";
+import { createConfiguredProviderFixture } from "./fixtures/chat-completions";
 
 const SKIP = !tmuxAvailable();
 const TIMEOUT = 30_000;
@@ -51,9 +52,7 @@ afterEach(async () => {
 });
 
 function isSlashCommandRow(line: string): boolean {
-  const visible = line
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
-    .trimStart();
+  const visible = line.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").trimStart();
   return visible.startsWith("/");
 }
 
@@ -67,7 +66,9 @@ test("slash menu selection index ignores the welcome header help hint", () => {
   const unselected = "\x1b[38;5;245m/help show available slash commands";
   const selected = `${SELECTED_COMPLETION_SGR}  /clear\x1b[38;5;245m start a fresh session and keep background processes`;
 
-  expect(selectedSlashRowIndex(`${header}\n${unselected}\n${selected}`)).toBe(1);
+  expect(selectedSlashRowIndex(`${header}\n${unselected}\n${selected}`)).toBe(
+    1,
+  );
 });
 
 function capturePaneHistory(session: TmuxSession, start = -120): string {
@@ -78,14 +79,20 @@ function capturePaneHistory(session: TmuxSession, start = -120): string {
 }
 
 function captureViewportEscapes(session: TmuxSession): string {
-  return execFileSync("tmux", ["capture-pane", "-t", session.name, "-e", "-p"], {
-    stdio: "pipe",
-    encoding: "utf-8",
-  });
+  return execFileSync(
+    "tmux",
+    ["capture-pane", "-t", session.name, "-e", "-p"],
+    {
+      stdio: "pipe",
+      encoding: "utf-8",
+    },
+  );
 }
 
 function runningBinaryTitle(workspace: string): string {
-  const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
+  const version = execFileSync(FX_BIN, ["--version"], {
+    encoding: "utf8",
+  }).trim();
   expect(version).toMatch(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/);
   return `fx v${version} | ${basename(workspace)}`;
 }
@@ -105,7 +112,10 @@ async function waitForPaneTitle(
   throw new Error(`pane title never became ${expected}; last saw ${latest}`);
 }
 
-async function waitForSkillsMenu(session: TmuxSession, count: number): Promise<string[]> {
+async function waitForSkillsMenu(
+  session: TmuxSession,
+  count: number,
+): Promise<string[]> {
   const deadline = Date.now() + TIMEOUT;
   let latest: string[] = [];
   while (Date.now() < deadline) {
@@ -113,21 +123,31 @@ async function waitForSkillsMenu(session: TmuxSession, count: number): Promise<s
     if (latest.join("\n").includes(`Skills ${count}`)) return latest;
     await Bun.sleep(100);
   }
-  throw new Error(`Timed out waiting for skills menu.\nPane:\n${latest.join("\n")}`);
+  throw new Error(
+    `Timed out waiting for skills menu.\nPane:\n${latest.join("\n")}`,
+  );
 }
 
-async function waitForModelsMenu(session: TmuxSession, count: number): Promise<string[]> {
+async function waitForModelsMenu(
+  session: TmuxSession,
+  _count: number,
+): Promise<string[]> {
   const deadline = Date.now() + TIMEOUT;
   let latest: string[] = [];
   while (Date.now() < deadline) {
     latest = await session.capturePaneGrid();
-    if (latest.join("\n").includes(`Models ${count}`)) return latest;
+    if (latest.join("\n").includes("All models")) return latest;
     await Bun.sleep(100);
   }
-  throw new Error(`Timed out waiting for models menu.\nPane:\n${latest.join("\n")}`);
+  throw new Error(
+    `Timed out waiting for model hub.\nPane:\n${latest.join("\n")}`,
+  );
 }
 
-async function waitForHelpMenu(session: TmuxSession, count: number): Promise<string[]> {
+async function waitForHelpMenu(
+  session: TmuxSession,
+  count: number,
+): Promise<string[]> {
   const deadline = Date.now() + TIMEOUT;
   let latest: string[] = [];
   while (Date.now() < deadline) {
@@ -135,7 +155,9 @@ async function waitForHelpMenu(session: TmuxSession, count: number): Promise<str
     if (latest.join("\n").includes(`Commands ${count}`)) return latest;
     await Bun.sleep(100);
   }
-  throw new Error(`Timed out waiting for help menu.\nPane:\n${latest.join("\n")}`);
+  throw new Error(
+    `Timed out waiting for help menu.\nPane:\n${latest.join("\n")}`,
+  );
 }
 
 async function waitForSettingsMenu(session: TmuxSession): Promise<string[]> {
@@ -147,10 +169,13 @@ async function waitForSettingsMenu(session: TmuxSession): Promise<string[]> {
     if (
       pane.includes("←→ change") &&
       (pane.includes("Settings") || pane.includes("Status line context"))
-    ) return latest;
+    )
+      return latest;
     await Bun.sleep(100);
   }
-  throw new Error(`Timed out waiting for settings menu.\nPane:\n${latest.join("\n")}`);
+  throw new Error(
+    `Timed out waiting for settings menu.\nPane:\n${latest.join("\n")}`,
+  );
 }
 
 async function waitForSettingValue(
@@ -205,10 +230,13 @@ async function waitForStatuslineMenu(
       pane.includes("↑↓ navigate") &&
       pane.includes("←→ change") &&
       (expectedSelection === undefined || pane.includes(expectedSelection))
-    ) return latest;
+    )
+      return latest;
     await Bun.sleep(100);
   }
-  throw new Error(`Timed out waiting for status line menu.\nPane:\n${latest.join("\n")}`);
+  throw new Error(
+    `Timed out waiting for status line menu.\nPane:\n${latest.join("\n")}`,
+  );
 }
 
 async function waitForWorkspaceMenu(session: TmuxSession): Promise<string[]> {
@@ -222,10 +250,13 @@ async function waitForWorkspaceMenu(session: TmuxSession): Promise<string[]> {
       pane.includes("Additional directories") &&
       pane.includes("Add directory…") &&
       pane.includes("enter use")
-    ) return latest;
+    )
+      return latest;
     await Bun.sleep(100);
   }
-  throw new Error(`Timed out waiting for workspace menu.\nPane:\n${latest.join("\n")}`);
+  throw new Error(
+    `Timed out waiting for workspace menu.\nPane:\n${latest.join("\n")}`,
+  );
 }
 
 type HeldSkillStream = {
@@ -244,28 +275,35 @@ function heldSkillStreamResponse(state: HeldSkillStream): Response {
     new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(event({ type: "text-start", id: "answer_1" }));
-        controller.enqueue(event({
-          type: "text-delta",
-          id: "answer_1",
-          delta: "catalog stream active",
-        }));
+        controller.enqueue(
+          event({
+            type: "text-delta",
+            id: "answer_1",
+            delta: "catalog stream active",
+          }),
+        );
         timer = setInterval(() => {
-          if (!closed) controller.enqueue(encoder.encode(": hold-skill-stream\n\n"));
+          if (!closed)
+            controller.enqueue(encoder.encode(": hold-skill-stream\n\n"));
         }, 50);
         state.release = () => {
           if (closed) return;
           closed = true;
           if (timer) clearInterval(timer);
-          controller.enqueue(event({
-            type: "text-delta",
-            id: "answer_1",
-            delta: " catalog stream completed",
-          }));
+          controller.enqueue(
+            event({
+              type: "text-delta",
+              id: "answer_1",
+              delta: " catalog stream completed",
+            }),
+          );
           controller.enqueue(event({ type: "text-end", id: "answer_1" }));
-          controller.enqueue(event({
-            type: "finish",
-            finishReason: { unified: "stop", raw: "stop" },
-          }));
+          controller.enqueue(
+            event({
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+            }),
+          );
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
           controller.close();
         };
@@ -303,14 +341,20 @@ function nestedText(content: unknown): string {
   if (Array.isArray(content)) return content.map(nestedText).join("");
   if (content && typeof content === "object") {
     const value = content as Record<string, unknown>;
-    return [nestedText(value.text), nestedText(value.value), nestedText(value.content)].join("");
+    return [
+      nestedText(value.text),
+      nestedText(value.value),
+      nestedText(value.content),
+    ].join("");
   }
   return "";
 }
 
 function gatewayPromptText(body: string): string {
   const request = JSON.parse(body) as { prompt: Array<{ content: unknown }> };
-  return request.prompt.map((message) => nestedText(message.content)).join("\n");
+  return request.prompt
+    .map((message) => nestedText(message.content))
+    .join("\n");
 }
 
 function countOccurrences(text: string, needle: string): number {
@@ -330,7 +374,9 @@ function createSkillsMenuFixture() {
   const stderrPath = join(root, "stderr.log");
   mkdirSync(join(home, ".fx", "skills", "managed-menu"), { recursive: true });
   mkdirSync(join(home, ".codex", "skills", "codex-menu"), { recursive: true });
-  mkdirSync(join(home, ".agents", "skills", "compat-menu"), { recursive: true });
+  mkdirSync(join(home, ".agents", "skills", "compat-menu"), {
+    recursive: true,
+  });
   mkdirSync(join(workspace, "skills", "workspace-menu"), { recursive: true });
   writeFileSync(
     join(home, ".fx", "skills", "managed-menu", "SKILL.md"),
@@ -358,8 +404,12 @@ function createSkillRankingFixture() {
   const home = join(root, "home");
   const workspace = join(root, "workspace");
   const stderrPath = join(root, "stderr.log");
-  mkdirSync(join(home, ".fx", "skills", "workflow-helper"), { recursive: true });
-  mkdirSync(join(home, ".codex", "skills", "zig-best-practices"), { recursive: true });
+  mkdirSync(join(home, ".fx", "skills", "workflow-helper"), {
+    recursive: true,
+  });
+  mkdirSync(join(home, ".codex", "skills", "zig-best-practices"), {
+    recursive: true,
+  });
   mkdirSync(workspace, { recursive: true });
   writeFileSync(
     join(home, ".fx", "skills", "workflow-helper", "SKILL.md"),
@@ -374,7 +424,9 @@ function createSkillRankingFixture() {
 }
 
 function createLinkedSkillsMenuFixture() {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-linked-skills-menu-")));
+  const root = realpathSync(
+    mkdtempSync(join(tmpdir(), "fx-linked-skills-menu-")),
+  );
   workDirs.push(root);
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -399,7 +451,9 @@ function createLinkedSkillsMenuFixture() {
 }
 
 function createLinkedMetadataSkillsMenuFixture() {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-linked-skill-metadata-menu-")));
+  const root = realpathSync(
+    mkdtempSync(join(tmpdir(), "fx-linked-skill-metadata-menu-")),
+  );
   workDirs.push(root);
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -424,7 +478,9 @@ function createLinkedMetadataSkillsMenuFixture() {
 }
 
 function createUnavailableLinkedSkillFixture() {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-unavailable-linked-skill-")));
+  const root = realpathSync(
+    mkdtempSync(join(tmpdir(), "fx-unavailable-linked-skill-")),
+  );
   workDirs.push(root);
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -478,7 +534,9 @@ function createMentionGuardFixture() {
 }
 
 function createExactSkillsMenuFixture() {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-exact-skills-menu-")));
+  const root = realpathSync(
+    mkdtempSync(join(tmpdir(), "fx-exact-skills-menu-")),
+  );
   workDirs.push(root);
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -517,7 +575,9 @@ function createExactSkillsMenuFixture() {
 }
 
 function createManySkillsMenuFixture(count: number) {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-skills-menu-many-")));
+  const root = realpathSync(
+    mkdtempSync(join(tmpdir(), "fx-skills-menu-many-")),
+  );
   workDirs.push(root);
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -544,7 +604,10 @@ function visibleFxSkillNames(grid: string[]): string[] {
 function selectedSkillName(escapes: string): string | null {
   const row = escapes
     .split("\n")
-    .find((line) => line.includes(SELECTED_COMPLETION_SGR) && line.includes("skill-"));
+    .find(
+      (line) =>
+        line.includes(SELECTED_COMPLETION_SGR) && line.includes("skill-"),
+    );
   return row?.match(/skill-\d+/)?.[0] ?? null;
 }
 
@@ -553,16 +616,19 @@ function stripAnsi(text: string): string {
 }
 
 function submittedSkillRows(escapes: string): string[] {
-  return escapes.split("\n").filter((line) =>
-    /┃ managed-menu please/.test(stripAnsi(line))
-  );
+  return escapes
+    .split("\n")
+    .filter((line) => /┃ managed-menu please/.test(stripAnsi(line)));
 }
 
 function gridFromAnsiCapture(capture: string): string[] {
   return capture.replace(/\n$/, "").split("\n").map(stripAnsi);
 }
 
-function lastRowMatching(grid: string[], predicate: (line: string) => boolean): number {
+function lastRowMatching(
+  grid: string[],
+  predicate: (line: string) => boolean,
+): number {
   for (let index = grid.length - 1; index >= 0; index -= 1) {
     if (predicate(grid[index] ?? "")) return index + 1;
   }
@@ -591,7 +657,10 @@ function assertNoBlankGapBetweenTranscriptAndComposer(grid: string[]) {
   for (let row = transcriptTail + 1; row < composer; row += 1) {
     if ((grid[row - 1] ?? "").trim() === "") {
       consecutiveBlankRows += 1;
-      expect(consecutiveBlankRows, `blank block above composer reaches row ${row}`).toBeLessThanOrEqual(2);
+      expect(
+        consecutiveBlankRows,
+        `blank block above composer reaches row ${row}`,
+      ).toBeLessThanOrEqual(2);
     } else {
       consecutiveBlankRows = 0;
     }
@@ -727,14 +796,19 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
       await session.sendKeys("C-o");
       await session.waitForPane(
-        (pane) => pane.replace(/\s+/g, " ").includes(
-          "linked skill directory could not be resolved to an authorized readable directory",
-        ),
+        (pane) =>
+          pane
+            .replace(/\s+/g, " ")
+            .includes(
+              "linked skill directory could not be resolved to an authorized readable directory",
+            ),
         5_000,
       );
       const detail = (await session.capturePane()).replace(/\s+/g, " ");
       expect(detail).toContain("repair or remove the link");
-      expect(detail).not.toContain("SKILL.md is unreadable or not a regular file");
+      expect(detail).not.toContain(
+        "SKILL.md is unreadable or not a regular file",
+      );
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
 
       await session.sendKeys("C-o");
@@ -770,8 +844,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendLiteralText("$zig");
       const grid = await waitForSkillsMenu(session, 2);
-      const directIndex = grid.findIndex((line) => line.includes("zig-best-practices"));
-      const metadataIndex = grid.findIndex((line) => line.includes("workflow-helper"));
+      const directIndex = grid.findIndex((line) =>
+        line.includes("zig-best-practices"),
+      );
+      const metadataIndex = grid.findIndex((line) =>
+        line.includes("workflow-helper"),
+      );
       expect(directIndex).toBeGreaterThanOrEqual(0);
       expect(metadataIndex).toBeGreaterThan(directIndex);
 
@@ -828,8 +906,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendLiteralText("$zbp");
       const skills = await waitForSkillsMenu(session, 1);
-      expect(skills.some((line) => line.includes("zig-best-practices"))).toBe(true);
-      expect(skills.some((line) => line.includes("workflow-helper"))).toBe(false);
+      expect(skills.some((line) => line.includes("zig-best-practices"))).toBe(
+        true,
+      );
+      expect(skills.some((line) => line.includes("workflow-helper"))).toBe(
+        false,
+      );
       await session.sendKeys("Enter");
       await session.waitForPane(
         (pane) => composerContains(pane, "zig-best-practices"),
@@ -837,10 +919,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
       await session.sendKeys("C-u");
 
-      const serverRow = (name: string) => new RegExp(`^\\s*(?:›\\s*)?${name}\\s{2,}.*profile\\s*$`, "m");
+      const serverRow = (name: string) =>
+        new RegExp(`^\\s*(?:›\\s*)?${name}\\s{2,}.*profile\\s*$`, "m");
       await session.sendText("/mcp");
       await session.waitForPane(
-        (pane) => serverRow("context7").test(pane) && serverRow("linear").test(pane),
+        (pane) =>
+          serverRow("context7").test(pane) && serverRow("linear").test(pane),
         10_000,
       );
       await session.sendLiteralText("ctx7");
@@ -879,7 +963,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const stderrPath = join(workDir, "stderr.log");
       const resumedStderrPath = join(workDir, "resumed-stderr.log");
       const model = "openai/gpt-5";
-      gateway = startFakeGateway([fakeGatewayFinalText("TITLE_RENAME_COMPLETE")]);
+      gateway = startFakeGateway([
+        fakeGatewayFinalText("TITLE_RENAME_COMPLETE"),
+      ]);
 
       const env = {
         HOME: home,
@@ -914,7 +1000,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       // A rename replaces the tab title.
       await session.sendText("/rename deploy pipeline fix");
-      await session.waitForText("renamed to \"deploy pipeline fix\"", 10_000);
+      await session.waitForText('renamed to "deploy pipeline fix"', 10_000);
       await session.waitForStableComposer();
       await waitForPaneTitle(session, "deploy pipeline fix", 5_000);
 
@@ -949,7 +1035,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
       await session.waitForComposer(10_000);
       await waitForPaneTitle(session, "deploy pipeline fix", 5_000);
-      expect(await session.captureFullScrollback()).toContain("TITLE_RENAME_COMPLETE");
+      expect(await session.captureFullScrollback()).toContain(
+        "TITLE_RENAME_COMPLETE",
+      );
 
       // A fresh session resets the tab to the build and current folder.
       await session.sendText("/new");
@@ -968,268 +1056,316 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
     TEST_TIMEOUT,
   );
 
-  test(
-    "slash picker growth preserves displaced transcript history",
-    async () => {
-      const workDir = mkdtempSync(join(tmpdir(), "fx-slash-footer-e2e-"));
-      workDirs.push(workDir);
-      const home = join(workDir, "home");
-      const workspace = join(workDir, "workspace");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspace, { recursive: true });
-      writeFileSync(join(home, ".fx", "settings.json"), JSON.stringify({ sandbox: "none", permission: {} }));
+  test("slash picker growth preserves displaced transcript history", async () => {
+    const workDir = mkdtempSync(join(tmpdir(), "fx-slash-footer-e2e-"));
+    workDirs.push(workDir);
+    const home = join(workDir, "home");
+    const workspace = join(workDir, "workspace");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(
+      join(home, ".fx", "settings.json"),
+      JSON.stringify({ sandbox: "none", permission: {} }),
+    );
 
-      const tracePath = join(workDir, "trace.log");
-      const tapePath = join(workDir, "resumed.fxtape");
-      const stderrPath = join(workDir, "stderr.log");
-      const resumedStderrPath = join(workDir, "resumed-stderr.log");
-      gateway = startFakeGateway([fakeGatewayFinalText(longAssistantResponse())]);
+    const tracePath = join(workDir, "trace.log");
+    const tapePath = join(workDir, "resumed.fxtape");
+    const stderrPath = join(workDir, "stderr.log");
+    const resumedStderrPath = join(workDir, "resumed-stderr.log");
+    gateway = startFakeGateway([fakeGatewayFinalText(longAssistantResponse())]);
 
-      session = await TmuxSession.create({
-        cmd: FX_BIN,
-        cwd: workspace,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-slash-footer-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_MODEL: "openai/gpt-5",
-          FX_AUTO_UPGRADE: "0",
-          NO_COLOR: "1",
-        },
-        stderrPath,
-        width: 124,
-        height: 75,
-        isolated: true,
-        minimumHistoryLines: 500,
-      });
-      await session.waitForComposer(10_000);
-      await session.sendText("Print the deterministic slash footer transcript fixture.");
-      await session.waitForText("SLASH_FOOTER_E2E_082", 30_000);
-      await session.waitForPane(
-        (pane) => !pane.includes("esc interrupt") && !pane.includes("Thinking"),
-        5_000,
-      );
-      await Bun.sleep(300);
-      await session.sendText("/quit");
-      expect(await session.waitForSessionEnd(10_000)).toBe(true);
-      await session.kill();
-      session = null;
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    session = await TmuxSession.create({
+      cmd: FX_BIN,
+      cwd: workspace,
+      env: {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-slash-footer-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_MODEL: "openai/gpt-5",
+        FX_AUTO_UPGRADE: "0",
+        NO_COLOR: "1",
+      },
+      stderrPath,
+      width: 124,
+      height: 75,
+      isolated: true,
+      minimumHistoryLines: 500,
+    });
+    await session.waitForComposer(10_000);
+    await session.sendText(
+      "Print the deterministic slash footer transcript fixture.",
+    );
+    await session.waitForText("SLASH_FOOTER_E2E_082", 30_000);
+    await session.waitForPane(
+      (pane) => !pane.includes("esc interrupt") && !pane.includes("Thinking"),
+      5_000,
+    );
+    await Bun.sleep(300);
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(10_000)).toBe(true);
+    await session.kill();
+    session = null;
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
 
-      const sessionIds = savedSessionIds(home);
-      expect(sessionIds).toHaveLength(1);
-      gateway.stop();
-      gateway = startFakeGateway([]);
-      session = await TmuxSession.create({
-        cmd: `${FX_BIN} resume ${sessionIds[0]}`,
-        cwd: workspace,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: "fake-slash-footer-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_MODEL: "openai/gpt-5",
-          FX_AUTO_UPGRADE: "0",
-          FX_RECORD: tapePath,
-          FX_RECORD_INPUT: "1",
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "frame_plan,frame_layout,scroll,render,paint,frame_diff,frame_commit",
-          NO_COLOR: "1",
-        },
-        stderrPath: resumedStderrPath,
-        width: 124,
-        height: 75,
-        isolated: true,
-        minimumHistoryLines: 500,
-      });
-      await session.waitForComposer(10_000);
-      await session.waitForText("SLASH_FOOTER_E2E_082", 30_000);
+    const sessionIds = savedSessionIds(home);
+    expect(sessionIds).toHaveLength(1);
+    gateway.stop();
+    gateway = startFakeGateway([]);
+    session = await TmuxSession.create({
+      cmd: `${FX_BIN} resume ${sessionIds[0]}`,
+      cwd: workspace,
+      env: {
+        HOME: home,
+        AI_GATEWAY_API_KEY: "fake-slash-footer-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_MODEL: "openai/gpt-5",
+        FX_AUTO_UPGRADE: "0",
+        FX_RECORD: tapePath,
+        FX_RECORD_INPUT: "1",
+        FX_TRACE_LOG: tracePath,
+        FX_TRACE_SCOPES:
+          "frame_plan,frame_layout,scroll,render,paint,frame_diff,frame_commit",
+        NO_COLOR: "1",
+      },
+      stderrPath: resumedStderrPath,
+      width: 124,
+      height: 75,
+      isolated: true,
+      minimumHistoryLines: 500,
+    });
+    await session.waitForComposer(10_000);
+    await session.waitForText("SLASH_FOOTER_E2E_082", 30_000);
 
-      async function capture(label: string): Promise<string[]> {
-        const deadline = Date.now() + 5_000;
-        let previous = "";
-        let viewportAnsi = "";
-        let stableSamples = 0;
-        while (Date.now() < deadline && stableSamples < 5) {
-          viewportAnsi = await session!.capturePaneEscapes();
-          if (viewportAnsi === previous) {
-            stableSamples += 1;
-          } else {
-            previous = viewportAnsi;
-            stableSamples = 0;
-          }
-          await Bun.sleep(50);
+    async function capture(label: string): Promise<string[]> {
+      const deadline = Date.now() + 5_000;
+      let previous = "";
+      let viewportAnsi = "";
+      let stableSamples = 0;
+      while (Date.now() < deadline && stableSamples < 5) {
+        viewportAnsi = await session!.capturePaneEscapes();
+        if (viewportAnsi === previous) {
+          stableSamples += 1;
+        } else {
+          previous = viewportAnsi;
+          stableSamples = 0;
         }
-        if (stableSamples < 5) {
-          throw new Error(`Timed out waiting for a stable viewport before ${label}`);
-        }
-        const fullAnsi = await session!.captureFullScrollbackEscapes();
-        writeFileSync(join(workDir, `${label}.ansi.txt`), fullAnsi);
-        writeFileSync(join(workDir, `${label}.pane.ansi.txt`), viewportAnsi);
-        writeFileSync(join(workDir, `${label}.pane.txt`), stripAnsi(viewportAnsi));
-        return gridFromAnsiCapture(viewportAnsi);
+        await Bun.sleep(50);
       }
-
-      const afterResponse = await capture("after-response");
-      const closedComposerRow = composerRow(afterResponse);
-      expect(
-        visibleTranscriptTailRow(afterResponse),
-        `resumed baseline grid:\n${afterResponse.join("\n")}`,
-      ).toBe(69);
-      expect(closedComposerRow).toBe(73);
-      await session.sendLiteralText("/");
-      await session.waitForText("Commands 38", 5_000);
-      const afterSlash = await capture("after-slash");
-      expect(visibleTranscriptTailRow(afterSlash)).toBe(60);
-      expect(composerRow(afterSlash)).toBe(64);
-      await session.sendLiteralText("f");
-      await session.waitForText("/feedback", 5_000);
-      const afterSlashF = await capture("after-slash-f");
-      await session.sendLiteralText("e");
-      await session.waitForText("/feedback", 5_000);
-      const afterSlashFe = await capture("after-slash-fe");
-      await session.sendLiteralText("edback");
-      await session.waitForText("/feedback", 5_000);
-      const afterSlashFeedback = await capture("after-slash-feedback");
-
-      await session.sendKeys("Escape");
-      await session.waitForPane(
-        (pane) =>
-          composerContains(pane, "/feedback") &&
-          !pane.includes("open the fx feedback form"),
-        5_000,
-      );
-      const afterDismiss = await capture("after-dismiss");
-      expect(visibleTranscriptTailRow(afterDismiss)).toBe(60);
-      expect(composerRow(afterDismiss)).toBe(64);
-      expect(footerStatusRow(afterDismiss)).toBe(66);
-      await session.sendLiteralText("x");
-      await session.waitForPane(
-        (pane) =>
-          composerContains(pane, "/feedbackx") &&
-          !pane.includes("open the fx feedback form"),
-        5_000,
-      );
-      const afterDismissEdit = await capture("after-dismiss-edit");
-      expect(visibleTranscriptTailRow(afterDismissEdit)).toBe(60);
-      expect(composerRow(afterDismissEdit)).toBe(64);
-      expect(footerStatusRow(afterDismissEdit)).toBe(66);
-
-      await session.sendKeys("C-u");
-      await session.waitForPane(hasEmptyComposer, 5_000);
-      const afterClear = await capture("after-clear");
-
-      const openComposerRows = [
-        composerRow(afterSlash),
-        composerRow(afterSlashF),
-        composerRow(afterSlashFe),
-        composerRow(afterSlashFeedback),
-      ];
-      const openFooterRows = [
-        footerStatusRow(afterSlash),
-        footerStatusRow(afterSlashF),
-        footerStatusRow(afterSlashFe),
-        footerStatusRow(afterSlashFeedback),
-      ];
-      expect(new Set(openComposerRows).size).toBe(1);
-      expect(new Set(openFooterRows).size).toBe(1);
-      expect(openComposerRows[0]).toBeLessThan(composerRow(afterResponse));
-      expect(composerRow(afterDismiss)).toBeLessThan(closedComposerRow);
-      expect(composerRow(afterDismissEdit)).toBe(composerRow(afterDismiss));
-      expect(composerRow(afterClear)).toBe(composerRow(afterDismiss));
-      expect(footerStatusRow(afterDismiss)).toBeLessThan(footerStatusRow(afterResponse));
-      expect(footerStatusRow(afterDismissEdit)).toBe(footerStatusRow(afterDismiss));
-      expect(footerStatusRow(afterClear)).toBe(footerStatusRow(afterDismiss));
-
-      for (const grid of [
-        afterResponse,
-        afterSlash,
-        afterSlashF,
-        afterSlashFe,
-        afterSlashFeedback,
-        afterDismiss,
-        afterDismissEdit,
-        afterClear,
-      ]) {
-        assertNoBlankGapBetweenTranscriptAndComposer(grid);
+      if (stableSamples < 5) {
+        throw new Error(
+          `Timed out waiting for a stable viewport before ${label}`,
+        );
       }
-
-      const historyLabels = [
-        "after-response",
-        "after-slash",
-        "after-slash-f",
-        "after-slash-fe",
-        "after-slash-feedback",
-        "after-dismiss",
-        "after-dismiss-edit",
-        "after-clear",
-      ];
-      const baselineScrollback = stripAnsi(
-        readFileSync(join(workDir, "after-response.ansi.txt"), "utf8"),
+      const fullAnsi = await session!.captureFullScrollbackEscapes();
+      writeFileSync(join(workDir, `${label}.ansi.txt`), fullAnsi);
+      writeFileSync(join(workDir, `${label}.pane.ansi.txt`), viewportAnsi);
+      writeFileSync(
+        join(workDir, `${label}.pane.txt`),
+        stripAnsi(viewportAnsi),
       );
-      const expectedMarkerCopies = Array.from({ length: 82 }, (_, index) => {
-        const marker = `SLASH_FOOTER_E2E_${String(index + 1).padStart(3, "0")}`;
-        const copies = countOccurrences(baselineScrollback, marker);
-        expect(copies, `after-response: ${marker}`).toBeGreaterThanOrEqual(1);
-        expect(copies, `after-response: ${marker}`).toBeLessThanOrEqual(2);
-        return { marker, copies };
-      });
-      for (const label of historyLabels.slice(1)) {
-        const scrollback = stripAnsi(readFileSync(join(workDir, `${label}.ansi.txt`), "utf8"));
-        for (const { marker, copies } of expectedMarkerCopies) {
-          expect(countOccurrences(scrollback, marker), `${label}: ${marker}`).toBe(copies);
-        }
+      return gridFromAnsiCapture(viewportAnsi);
+    }
+
+    const afterResponse = await capture("after-response");
+    const closedComposerRow = composerRow(afterResponse);
+    expect(
+      visibleTranscriptTailRow(afterResponse),
+      `resumed baseline grid:\n${afterResponse.join("\n")}`,
+    ).toBe(69);
+    expect(closedComposerRow).toBe(73);
+    await session.sendLiteralText("/");
+    await session.waitForText("Commands 38", 5_000);
+    const afterSlash = await capture("after-slash");
+    expect(visibleTranscriptTailRow(afterSlash)).toBe(60);
+    expect(composerRow(afterSlash)).toBe(64);
+    await session.sendLiteralText("f");
+    await session.waitForText("/feedback", 5_000);
+    const afterSlashF = await capture("after-slash-f");
+    await session.sendLiteralText("e");
+    await session.waitForText("/feedback", 5_000);
+    const afterSlashFe = await capture("after-slash-fe");
+    await session.sendLiteralText("edback");
+    await session.waitForText("/feedback", 5_000);
+    const afterSlashFeedback = await capture("after-slash-feedback");
+
+    await session.sendKeys("Escape");
+    await session.waitForPane(
+      (pane) =>
+        composerContains(pane, "/feedback") &&
+        !pane.includes("open the fx feedback form"),
+      5_000,
+    );
+    const afterDismiss = await capture("after-dismiss");
+    expect(visibleTranscriptTailRow(afterDismiss)).toBe(60);
+    expect(composerRow(afterDismiss)).toBe(64);
+    expect(footerStatusRow(afterDismiss)).toBe(66);
+    await session.sendLiteralText("x");
+    await session.waitForPane(
+      (pane) =>
+        composerContains(pane, "/feedbackx") &&
+        !pane.includes("open the fx feedback form"),
+      5_000,
+    );
+    const afterDismissEdit = await capture("after-dismiss-edit");
+    expect(visibleTranscriptTailRow(afterDismissEdit)).toBe(60);
+    expect(composerRow(afterDismissEdit)).toBe(64);
+    expect(footerStatusRow(afterDismissEdit)).toBe(66);
+
+    await session.sendKeys("C-u");
+    await session.waitForPane(hasEmptyComposer, 5_000);
+    const afterClear = await capture("after-clear");
+
+    const openComposerRows = [
+      composerRow(afterSlash),
+      composerRow(afterSlashF),
+      composerRow(afterSlashFe),
+      composerRow(afterSlashFeedback),
+    ];
+    const openFooterRows = [
+      footerStatusRow(afterSlash),
+      footerStatusRow(afterSlashF),
+      footerStatusRow(afterSlashFe),
+      footerStatusRow(afterSlashFeedback),
+    ];
+    expect(new Set(openComposerRows).size).toBe(1);
+    expect(new Set(openFooterRows).size).toBe(1);
+    expect(openComposerRows[0]).toBeLessThan(composerRow(afterResponse));
+    expect(composerRow(afterDismiss)).toBeLessThan(closedComposerRow);
+    expect(composerRow(afterDismissEdit)).toBe(composerRow(afterDismiss));
+    expect(composerRow(afterClear)).toBe(composerRow(afterDismiss));
+    expect(footerStatusRow(afterDismiss)).toBeLessThan(
+      footerStatusRow(afterResponse),
+    );
+    expect(footerStatusRow(afterDismissEdit)).toBe(
+      footerStatusRow(afterDismiss),
+    );
+    expect(footerStatusRow(afterClear)).toBe(footerStatusRow(afterDismiss));
+
+    for (const grid of [
+      afterResponse,
+      afterSlash,
+      afterSlashF,
+      afterSlashFe,
+      afterSlashFeedback,
+      afterDismiss,
+      afterDismissEdit,
+      afterClear,
+    ]) {
+      assertNoBlankGapBetweenTranscriptAndComposer(grid);
+    }
+
+    const historyLabels = [
+      "after-response",
+      "after-slash",
+      "after-slash-f",
+      "after-slash-fe",
+      "after-slash-feedback",
+      "after-dismiss",
+      "after-dismiss-edit",
+      "after-clear",
+    ];
+    const baselineScrollback = stripAnsi(
+      readFileSync(join(workDir, "after-response.ansi.txt"), "utf8"),
+    );
+    const expectedMarkerCopies = Array.from({ length: 82 }, (_, index) => {
+      const marker = `SLASH_FOOTER_E2E_${String(index + 1).padStart(3, "0")}`;
+      const copies = countOccurrences(baselineScrollback, marker);
+      expect(copies, `after-response: ${marker}`).toBeGreaterThanOrEqual(1);
+      expect(copies, `after-response: ${marker}`).toBeLessThanOrEqual(2);
+      return { marker, copies };
+    });
+    for (const label of historyLabels.slice(1)) {
+      const scrollback = stripAnsi(
+        readFileSync(join(workDir, `${label}.ansi.txt`), "utf8"),
+      );
+      for (const { marker, copies } of expectedMarkerCopies) {
+        expect(
+          countOccurrences(scrollback, marker),
+          `${label}: ${marker}`,
+        ).toBe(copies);
       }
+    }
 
-      await session.sendText("/quit");
-      expect(await session.waitForSessionEnd(10_000)).toBe(true);
-      session = null;
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(10_000)).toBe(true);
+    session = null;
 
-      const trace = readFileSync(tracePath, "utf8");
-      const traceLines = trace.split(/\r?\n/);
-      const footerUpdates = traceLines.filter((line) => line.includes("footer_extra_update"));
-      expect(footerUpdates.some((line) => /old=0 new=9 .*picker_rows=8 show_picker=true/.test(line))).toBe(true);
-      expect(footerUpdates.some((line) => /old=9 new=0 .*picker_rows=0 show_picker=false/.test(line))).toBe(true);
-      expect(footerUpdates.some((line) => /show_picker=true/.test(line) && /new=[1-8](?:\s|$)/.test(line))).toBe(false);
-      const openUpdateIndex = traceLines.findIndex((line) => /footer_extra_update old=0 new=9 /.test(line));
-      expect(openUpdateIndex).toBeGreaterThanOrEqual(0);
-      const openPlan = traceLines.slice(0, openUpdateIndex).reverse().find((line) =>
-        line.includes("transcript_transition_plan") &&
-        line.includes("replay_displaced_footer_history=true") &&
-        /planned_rows=[1-9][0-9]*/.test(line)
+    const trace = readFileSync(tracePath, "utf8");
+    const traceLines = trace.split(/\r?\n/);
+    const footerUpdates = traceLines.filter((line) =>
+      line.includes("footer_extra_update"),
+    );
+    expect(
+      footerUpdates.some((line) =>
+        /old=0 new=9 .*picker_rows=8 show_picker=true/.test(line),
+      ),
+    ).toBe(true);
+    expect(
+      footerUpdates.some((line) =>
+        /old=9 new=0 .*picker_rows=0 show_picker=false/.test(line),
+      ),
+    ).toBe(true);
+    expect(
+      footerUpdates.some(
+        (line) =>
+          /show_picker=true/.test(line) && /new=[1-8](?:\s|$)/.test(line),
+      ),
+    ).toBe(false);
+    const openUpdateIndex = traceLines.findIndex((line) =>
+      /footer_extra_update old=0 new=9 /.test(line),
+    );
+    expect(openUpdateIndex).toBeGreaterThanOrEqual(0);
+    const openPlan = traceLines
+      .slice(0, openUpdateIndex)
+      .reverse()
+      .find(
+        (line) =>
+          line.includes("transcript_transition_plan") &&
+          line.includes("replay_displaced_footer_history=true") &&
+          /planned_rows=[1-9][0-9]*/.test(line),
       );
-      expect(openPlan).toContain("source_compatible=true");
-      const openCommit = traceLines.slice(openUpdateIndex + 1).find((line) =>
-        line.includes("[frame_diff] attempt_result") &&
-        /planned_scroll_rows=[1-9][0-9]*/.test(line)
+    expect(openPlan).toContain("source_compatible=true");
+    const openCommit = traceLines
+      .slice(openUpdateIndex + 1)
+      .find(
+        (line) =>
+          line.includes("[frame_diff] attempt_result") &&
+          /planned_scroll_rows=[1-9][0-9]*/.test(line),
       );
-      expect(openCommit).toMatch(
-        /planned_scroll_rows=([1-9][0-9]*) committed_scroll_rows=\1 .*unplanned_scroll_rows=0/,
+    expect(openCommit).toMatch(
+      /planned_scroll_rows=([1-9][0-9]*) committed_scroll_rows=\1 .*unplanned_scroll_rows=0/,
+    );
+    const closeUpdateIndex = traceLines.findIndex((line) =>
+      /footer_extra_update old=9 new=0 /.test(line),
+    );
+    expect(closeUpdateIndex).toBeGreaterThanOrEqual(0);
+    const closePlan = traceLines
+      .slice(openUpdateIndex + 1, closeUpdateIndex)
+      .reverse()
+      .find(
+        (line) =>
+          line.includes("transcript_transition_plan") &&
+          line.includes("replay_displaced_footer_history=false"),
       );
-      const closeUpdateIndex = traceLines.findIndex((line) => /footer_extra_update old=9 new=0 /.test(line));
-      expect(closeUpdateIndex).toBeGreaterThanOrEqual(0);
-      const closePlan = traceLines.slice(openUpdateIndex + 1, closeUpdateIndex).reverse().find((line) =>
-        line.includes("transcript_transition_plan") &&
-        line.includes("replay_displaced_footer_history=false")
-      );
-      expect(closePlan).toContain("planned_rows=0");
-      const closeFrame = traceLines.slice(closeUpdateIndex + 1).find((line) => line.includes("[frame_diff] result"));
-      expect(closeFrame).toMatch(/full_repaint=true invalidation=external_clear/);
-      expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
+    expect(closePlan).toContain("planned_rows=0");
+    const closeFrame = traceLines
+      .slice(closeUpdateIndex + 1)
+      .find((line) => line.includes("[frame_diff] result"));
+    expect(closeFrame).toMatch(/full_repaint=true invalidation=external_clear/);
+    expect(readFileSync(resumedStderrPath, "utf8")).toBe("");
 
-      const replayOutput = execFileSync(FX_BIN, ["replay", tapePath, "--json"], {
-        encoding: "utf8",
-      });
-      writeFileSync(join(workDir, "replay.json"), replayOutput);
-      const replay = JSON.parse(replayOutput);
-      expect(replay.frame_count).toBeGreaterThan(0);
-      expect(replay.stdout_bytes).toBeGreaterThan(0);
-    },
-    90_000,
-  );
+    const replayOutput = execFileSync(FX_BIN, ["replay", tapePath, "--json"], {
+      encoding: "utf8",
+    });
+    writeFileSync(join(workDir, "replay.json"), replayOutput);
+    const replay = JSON.parse(replayOutput);
+    expect(replay.frame_count).toBeGreaterThan(0);
+    expect(replay.stdout_bytes).toBeGreaterThan(0);
+  }, 90_000);
 
   test(
     "slash menu renders its header described rows categories and controls",
@@ -1261,28 +1397,30 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       );
 
       const initialGrid = await session.capturePaneGrid();
-      const modelRow = initialGrid.find((line) =>
-        line.includes("/model") && line.includes("choose what model and reasoning effort to use")
+      const modelRow = initialGrid.find(
+        (line) =>
+          line.includes("/model") &&
+          line.includes("choose what model and reasoning effort to use"),
       );
       expect(modelRow).toBeDefined();
       expect(modelRow!.trimStart().startsWith("/model")).toBe(true);
       const metadataColumn = modelRow!.lastIndexOf("Model");
 
       await session.sendKeys("Down");
-      await session.waitForText(
-        "manage MCP servers and their logins",
-        5_000,
-      );
+      await session.waitForText("manage MCP servers and their logins", 5_000);
       const scrolledGrid = await session.capturePaneGrid();
-      const mcpRow = scrolledGrid.find((line) =>
-        line.includes("/mcp") &&
-        line.includes("manage MCP servers and their logins")
+      const mcpRow = scrolledGrid.find(
+        (line) =>
+          line.includes("/mcp") &&
+          line.includes("manage MCP servers and their logins"),
       );
       expect(mcpRow).toBeDefined();
       expect(mcpRow!.indexOf("Extensions")).toBe(metadataColumn);
       expect(mcpRow!.indexOf("Extensions") + "Extensions".length).toBe(99);
       expect(modelRow).toContain("Model");
-      expect(scrolledGrid.join("\n")).toContain("↑↓ navigate     enter use     esc close");
+      expect(scrolledGrid.join("\n")).toContain(
+        "↑↓ navigate     enter use     esc close",
+      );
       expect(session.isAlive()).toBe(true);
 
       await session.sendKeys("C-u");
@@ -1339,18 +1477,20 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       grid = await session.capturePaneGrid();
       const modelRow = grid.find((line) => line.includes("/model"));
       const mcpRow = grid.find((line) => line.includes("/mcp"));
-      expect(modelRow).toContain("choose what model and reasoning effort to use");
-      expect(modelRow).not.toContain("Model");
-      expect(mcpRow).toContain(
-        "manage MCP servers and their logins",
+      expect(modelRow).toContain(
+        "choose what model and reasoning effort to use",
       );
+      expect(modelRow).not.toContain("Model");
+      expect(mcpRow).toContain("manage MCP servers and their logins");
       expect(mcpRow).not.toContain("Extensions");
 
       await session.sendKeys("C-u");
       await session.sendLiteralText("/managed-menu");
       await session.waitForText("managed menu first line", 5_000);
       grid = await session.capturePaneGrid();
-      const skillRow = grid.find((line) => line.includes("managed menu first line"));
+      const skillRow = grid.find((line) =>
+        line.includes("managed menu first line"),
+      );
       expect(skillRow).toContain("managed-menu");
       expect(skillRow).not.toContain("global .fx");
 
@@ -1444,7 +1584,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   test(
     "slash query lifecycle keeps eligibility projection and submission aligned",
     async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-slash-lifecycle-")));
+      const root = realpathSync(
+        mkdtempSync(join(tmpdir(), "fx-slash-lifecycle-")),
+      );
       workDirs.push(root);
       const home = join(root, "home");
       const workspace = join(root, "workspace");
@@ -1486,7 +1628,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       for (let index = 0; index < 5; index++) await session.sendKeys("BSpace");
       await session.waitForPane(
-        (current) => composerContains(current, "/he") && current.includes("enter use"),
+        (current) =>
+          composerContains(current, "/he") && current.includes("enter use"),
         5_000,
       );
 
@@ -1505,10 +1648,13 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("C-u");
       await session.sendLiteralText("/name");
       pane = await session.waitForPane(
-        (current) => current.includes("/rename") && current.includes("resume-helper"),
+        (current) =>
+          current.includes("/rename") && current.includes("resume-helper"),
         5_000,
       );
-      expect(pane.indexOf("/rename")).toBeLessThan(pane.indexOf("resume-helper"));
+      expect(pane.indexOf("/rename")).toBeLessThan(
+        pane.indexOf("resume-helper"),
+      );
 
       await session.sendKeys("C-u");
       await session.pasteText("\n   ");
@@ -1522,7 +1668,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("Commands"),
+        (current) =>
+          hasEmptyComposer(current) &&
+          current.includes("𝒇x") &&
+          !current.includes("Commands"),
         5_000,
       );
       await session.sendLiteralText("/resume ");
@@ -1539,7 +1688,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("Sessions"),
+        (current) =>
+          hasEmptyComposer(current) &&
+          current.includes("𝒇x") &&
+          !current.includes("Sessions"),
         5_000,
       );
       for (const retired of ["/appearance", "/input", "/maxxing"]) {
@@ -1610,7 +1762,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       let pane = grid.join("\n");
       expect(pane).toContain("𝒇x");
       expect(pane).toContain("Run /help for commands");
-      expect(pane).toContain("[All]");
+      expect(pane).toContain("All models");
       expect(pane).toContain("/help");
       expect(pane).not.toContain("● /help");
       expect(pane).toContain("show available slash commands");
@@ -1623,7 +1775,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(grid.join("\n")).toContain("[General]");
       await session.sendKeys("BTab");
       grid = await waitForHelpMenu(session, 38);
-      expect(grid.join("\n")).toContain("[All]");
+      expect(grid.join("\n")).toContain("All models");
 
       await session.sendLiteralText("clipboard");
       grid = await waitForHelpMenu(session, 1);
@@ -1637,7 +1789,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Commands 38"),
+        (current) =>
+          hasEmptyComposer(current) && !current.includes("Commands 38"),
         5_000,
       );
       expect(composerContains(pane, "/clear")).toBe(false);
@@ -1668,7 +1821,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForText("No commands found.", 5_000);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("enter open"),
+        (current) =>
+          hasEmptyComposer(current) &&
+          current.includes("𝒇x") &&
+          !current.includes("enter open"),
         5_000,
       );
 
@@ -1682,7 +1838,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   test(
     "settings command opens the inline list and saves selected values",
     async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-settings-menu-")));
+      const root = realpathSync(
+        mkdtempSync(join(tmpdir(), "fx-settings-menu-")),
+      );
       workDirs.push(root);
       const home = join(root, "home");
       const workspace = join(root, "workspace-statusline-visible");
@@ -1716,7 +1874,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("Run /help for commands");
       expect(pane).toContain("Settings");
       expect(pane).toContain("Interface");
-      expect(pane).toContain("[All]");
+      expect(pane).toContain("All models");
       expect(pane).toContain("↑↓ navigate");
       expect(pane).toContain("tab category");
       expect(pane).toContain("←→ change");
@@ -1730,7 +1888,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("[Interface]");
       await session.sendKeys("BTab");
       pane = (await waitForSettingsMenu(session)).join("\n");
-      expect(pane).toContain("[All]");
+      expect(pane).toContain("All models");
       for (let index = 0; index < 2; index += 1) await session.sendKeys("Down");
       await session.waitForText(/Status line workspace\s+off/, 5_000);
       await session.sendKeys("Right");
@@ -1745,7 +1903,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           !current.includes("←→ change"),
         5_000,
       );
-      expect(capturePaneHistory(session, -1000)).not.toMatch(/[*✓!✗⊘i] settings:/);
+      expect(capturePaneHistory(session, -1000)).not.toMatch(
+        /[*✓!✗⊘i] settings:/,
+      );
 
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(10_000)).toBe(true);
@@ -1757,7 +1917,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   test(
     "compact catalogs keep their actionable rows visible",
     async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-compact-catalogs-")));
+      const root = realpathSync(
+        mkdtempSync(join(tmpdir(), "fx-compact-catalogs-")),
+      );
       workDirs.push(root);
       const home = join(root, "home");
       const workspace = join(root, "workspace");
@@ -1795,7 +1957,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("Status line context");
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("←→ change"),
+        (current) =>
+          hasEmptyComposer(current) && !current.includes("←→ change"),
         5_000,
       );
 
@@ -1809,7 +1972,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   test(
     "statusline command toggles independent items from a compact inline panel",
     async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-statusline-menu-")));
+      const root = realpathSync(
+        mkdtempSync(join(tmpdir(), "fx-statusline-menu-")),
+      );
       workDirs.push(root);
       const home = join(root, "home");
       const workspace = join(root, "compact-statusline-workspace");
@@ -1883,7 +2048,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForText("* statusline: workspace: off", 5_000);
       await waitForStatuslineValue(settingsPath, "workspace", false);
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("compact-statusline-workspace"),
+        (current) =>
+          hasEmptyComposer(current) &&
+          !current.includes("compact-statusline-workspace"),
         5_000,
       );
 
@@ -1897,7 +2064,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   test(
     "workspace command opens a compact inline manager and prepares existing commands",
     async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-workspace-menu-")));
+      const root = realpathSync(
+        mkdtempSync(join(tmpdir(), "fx-workspace-menu-")),
+      );
       workDirs.push(root);
       const home = join(root, "home");
       const workspace = join(root, "workspace");
@@ -1939,8 +2108,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         grid.some((line) => line.includes("Primary") && line.includes("/")),
       ).toBe(true);
       expect(
-        grid.some((line) =>
-          line.includes("/") && line.includes("Active · Saved")
+        grid.some(
+          (line) => line.includes("/") && line.includes("Active · Saved"),
         ),
       ).toBe(true);
       expect(pane).toMatch(/Additional directories\s+1 \/ 16/);
@@ -1964,7 +2133,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           !current.includes("enter use"),
         5_000,
       );
-      expect(composerContains(pane, `/workspace remove ${sharedRoot}`)).toBe(true);
+      expect(composerContains(pane, `/workspace remove ${sharedRoot}`)).toBe(
+        true,
+      );
 
       await session.sendKeys("C-u");
       await session.sendText("/quit");
@@ -2010,7 +2181,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).toContain("Run /help for commands");
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
-      expect(pane).toContain("[All]");
+      expect(pane).toContain("All models");
       expect(pane).toContain("fx");
       expect(pane).not.toContain("[Fx]");
       expect(pane).toContain("Workspace");
@@ -2075,7 +2246,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(composerContains(grid.join("\n"), " $")).toBe(true);
       await session.sendKeys("C-[");
       await session.waitForPane(
-        (current) => composerContains(current, " $") && !current.includes("Skills 4"),
+        (current) =>
+          composerContains(current, " $") && !current.includes("Skills 4"),
         5_000,
       );
       await session.sendKeys("C-u");
@@ -2099,8 +2271,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("C-[");
       await session.waitForPane(
         (current) =>
-          composerContains(current, "price$") &&
-          !current.includes("Skills 4"),
+          composerContains(current, "price$") && !current.includes("Skills 4"),
         5_000,
       );
       await session.sendKeys("C-u");
@@ -2108,7 +2279,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendLiteralText("explain $man");
       grid = await waitForSkillsMenu(session, 1);
       expect(composerContains(grid.join("\n"), "explain $man")).toBe(true);
-      expect(await session.capturePaneEscapes()).not.toContain(`${DIM_SGR}aged-menu`);
+      expect(await session.capturePaneEscapes()).not.toContain(
+        `${DIM_SGR}aged-menu`,
+      );
 
       await session.sendLiteralText("zzzzzz");
       await session.waitForPane(
@@ -2211,7 +2384,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Tab");
       await session.waitForText("[fx]", 5_000);
       await session.sendKeys("BTab");
-      await session.waitForText("[All]", 5_000);
+      await session.waitForText("All models", 5_000);
       await session.sendLiteralText("workspace");
       await waitForSkillsMenu(session, 1);
       await session.sendKeys("Enter");
@@ -2219,7 +2392,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(composerContains(grid.join("\n"), "workspace-menu")).toBe(true);
       expect(grid.join("\n")).toContain("𝒇x");
       expect(grid.join("\n")).not.toContain("↑↓ navigate");
-      expect(capturePaneHistory(session, -1000)).not.toContain("Unknown command");
+      expect(capturePaneHistory(session, -1000)).not.toContain(
+        "Unknown command",
+      );
       expect(session.isAlive()).toBe(true);
 
       await session.sendKeys("C-u");
@@ -2236,7 +2411,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(codexPane).toContain("Codex · Global");
 
       await session.sendKeys("C-[");
-      await session.waitForPane((current) => !current.includes("↑↓ navigate"), 5_000);
+      await session.waitForPane(
+        (current) => !current.includes("↑↓ navigate"),
+        5_000,
+      );
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
 
@@ -2247,7 +2425,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("enter open"),
+        (current) =>
+          hasEmptyComposer(current) && !current.includes("enter open"),
         5_000,
       );
 
@@ -2258,7 +2437,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("←→ change"),
+        (current) =>
+          hasEmptyComposer(current) && !current.includes("←→ change"),
         5_000,
       );
 
@@ -2270,7 +2450,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("enter resume"),
+        (current) =>
+          hasEmptyComposer(current) && !current.includes("enter resume"),
         5_000,
       );
 
@@ -2341,10 +2522,15 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         initialNames[initialNames.length - 1],
       );
       expect(session.isAlive()).toBe(true);
-      expect(capturePaneHistory(session, -1000)).not.toContain("Unknown command");
+      expect(capturePaneHistory(session, -1000)).not.toContain(
+        "Unknown command",
+      );
 
       await session.sendKeys("C-[");
-      await session.waitForPane((current) => !current.includes("↑↓ navigate"), 5_000);
+      await session.waitForPane(
+        (current) => !current.includes("↑↓ navigate"),
+        5_000,
+      );
       await session.sendKeys("C-u");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -2355,192 +2541,65 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "model Enter opens an inline provider catalog and selects through the existing model flow",
+    "model opens the native model hub and selects through a configured provider",
     async () => {
-      const fixture = createModelsMenuFixture();
-      const currentModel = "anthropic/claude-opus-4.8";
-      const selectedModel = "private-team/plain-model";
-      gateway = startFakeGateway([], {
-        models: [
-          {
-            id: currentModel,
-            type: "language",
-            released: 400,
-            tags: ["reasoning", "tool-use", "vision", "file-input", "web-search"],
-            reasoning_options: [{ type: "effort", values: ["high", "xhigh"] }],
-            fast_options: [{ type: "toggle" }],
-            context_window: 1_000_000,
-            max_tokens: 32_000,
-          },
-          {
-            id: "openai/gpt-5.4",
-            type: "language",
-            released: 300,
-            tags: ["reasoning", "tool-use"],
-            context_window: 400_000,
-            max_tokens: 64_000,
-          },
-          {
-            id: "google/gemini-3-pro",
-            type: "language",
-            released: 200,
-            tags: ["tool-use", "vision"],
-            context_window: 2_000_000,
-          },
-          {
-            id: selectedModel,
-            type: "language",
-            released: 100,
-            tags: ["tool-use"],
-            context_window: 128_000,
-          },
-        ],
-      });
-      session = await TmuxSession.create({
-        cwd: fixture.workspace,
-        env: {
-          HOME: fixture.home,
-          AI_GATEWAY_API_KEY: "fake-models-menu-key",
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-          FX_MODEL: currentModel,
-          FX_AUTO_UPGRADE: "0",
-          FX_RECORD: fixture.tapePath,
-          FX_RECORD_INPUT: "1",
-        },
-        width: 120,
-        height: 32,
-      });
-      await session.waitForComposer(10_000);
-      expect(await session.paneTitle()).toBe(runningBinaryTitle(fixture.workspace));
+      const fixture = createConfiguredProviderFixture();
+      const selectedModel = "remote-model";
+      const stderrPath = join(fixture.home, "stderr.log");
+      writeFileSync(stderrPath, "");
+      try {
+        session = await TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: fixture.workspace,
+          stderrPath,
+          env: fixture.env,
+          width: 120,
+          height: 32,
+        });
+        await session.waitForComposer(15_000);
+        await session.sendText("/model ignored");
+        await session.waitForText("/model does not take arguments", 5_000);
+        await session.sendText("/model");
+        let grid = await waitForModelsMenu(session, 4);
+        let pane = grid.join("\n");
+        expect(pane).toContain("All models");
+        expect(pane).toContain("Roles");
+        // The Gateway remains an auth/configuration owner, not a selectable
+        // hub scope, even though this fixture intentionally exports its token.
+        expect(pane).not.toContain("Vercel AI Gateway");
 
-      const alternateCount = (sequence: string) =>
-        countOccurrences(readFileSync(fixture.tapePath).toString("latin1"), sequence);
-      const entersBeforeModelMenu = alternateCount("\x1b[?1049h");
-      const leavesBeforeModelMenu = alternateCount("\x1b[?1049l");
+        // Bare /model opens the scope pane; Enter enters the browser list.
+        await session.sendKeys("Enter");
+        grid = await waitForModelsMenu(session, 4);
+        pane = grid.join("\n");
+        expect(pane).toContain("local-model");
+        expect(pane).toContain(selectedModel);
+        expect(pane).not.toContain("Vercel AI Gateway");
 
-      await session.sendLiteralText("/mode");
-      await session.sendKeys("Enter");
-      await waitForModelsMenu(session, 4);
-      expect(await session.captureFullScrollback()).not.toContain(`* model: ${currentModel}`);
-      await session.sendKeys("Escape");
-      await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("tab provider"),
-        5_000,
-      );
+        await session.sendLiteralText(selectedModel);
+        await session.waitForText(selectedModel, 5_000);
+        await session.sendKeys("Enter");
+        await session.waitForComposer(5_000);
+        expect(composerContains(await session.capturePane(), "/model")).toBe(
+          false,
+        );
 
-      await session.sendLiteralText("/model");
-      await session.sendKeys("Tab");
-      const stagedPane = await session.waitForPane(
-        (current) =>
-          composerContains(current, "/model") &&
-          current.includes(currentModel) &&
-          !current.includes("tab provider"),
-        5_000,
-      );
-      expect(stagedPane).not.toContain("Models 4");
-      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeModelMenu);
-      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeModelMenu);
-      await session.sendKeys("Escape");
-      await session.sendKeys("C-u");
-      await session.waitForPane(hasEmptyComposer, 5_000);
+        await session.sendText("prove selected model routing");
+        await session.waitForText("local reply", 15_000);
+        expect(fixture.requests.at(-1)?.body.model).toBe(selectedModel);
+        expect(fixture.requests.at(-1)?.authorization).toBe(
+          "Bearer own-provider-token",
+        );
+        expect(session.isAlive()).toBe(true);
 
-      await session.sendText("/model");
-      let grid = await waitForModelsMenu(session, 4);
-      let pane = grid.join("\n");
-      expect(pane).toContain("𝒇x");
-      expect(pane).toContain("Run /help for commands");
-      expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeModelMenu);
-      expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeModelMenu);
-      expect(pane).toContain("[All]");
-      expect(pane).toContain("Anthropic");
-      expect(pane).toContain("OpenAI");
-      expect(pane).toContain("Others");
-      expect(pane).not.toContain("xAI");
-      expect(pane).not.toContain("Z.AI");
-      expect(pane).toContain(currentModel);
-      expect(pane).toContain("1M context · 32K output · Fast mode");
-      expect(pane).toContain("Note: Gateway catalog is authenticated with an API key");
-      const headerRow = grid.findIndex((line) => line.includes("Models 4"));
-      const firstModelRow = grid.findIndex((line) => line.includes("openai/gpt-5.4"));
-      const lastModelRow = grid.findIndex((line) => line.includes(selectedModel));
-      const statusRow = grid.findIndex((line) =>
-        line.includes("Note: Gateway catalog is authenticated with an API key")
-      );
-      const currentRow = grid[firstModelRow + 1]!;
-      const openaiRow = grid[firstModelRow]!;
-      const currentFactsColumn = currentRow.indexOf("1M context");
-      const openaiFactsColumn = openaiRow.indexOf("400K context");
-      const currentNameEnd = currentRow.indexOf(currentModel) + currentModel.length;
-      expect(firstModelRow).toBe(headerRow + 2);
-      expect(statusRow).toBe(lastModelRow + 2);
-      expect(currentFactsColumn - currentNameEnd).toBe(2);
-      expect(openaiFactsColumn).toBe(currentFactsColumn);
-      expect(pane).not.toContain("Authenticated model catalog loaded.");
-      expect(pane).not.toContain("Current");
-      expect(pane).not.toContain("Reasoning");
-      expect(pane).toContain("↑↓ navigate");
-      expect(pane).toContain("tab provider");
-
-      await session.sendKeys("Tab");
-      grid = await waitForModelsMenu(session, 1);
-      expect(grid.join("\n")).toContain("[Anthropic]");
-
-      await session.sendKeys("BTab");
-      await waitForModelsMenu(session, 4);
-      await session.sendLiteralText("no-such-model");
-      await session.waitForText("No models found.", 5_000);
-      await session.sendKeys("C-u");
-      await waitForModelsMenu(session, 4);
-      await session.sendLiteralText("gemini");
-      grid = await waitForModelsMenu(session, 1);
-      pane = grid.join("\n");
-      expect(composerContains(pane, "gemini")).toBe(true);
-      expect(pane).toContain("google/gemini-3-pro");
-      expect(pane).not.toContain("openai/gpt-5.4");
-
-      await session.sendKeys("C-[");
-      await session.waitForPane(
-        (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("tab provider"),
-        5_000,
-      );
-
-      await session.sendText("/model");
-      await waitForModelsMenu(session, 4);
-      await session.sendKeys("Down");
-      await session.sendKeys("Enter");
-      await session.waitForPane(
-        (current) => composerContains(current, `/model ${currentModel}`) && current.includes("default"),
-        5_000,
-      );
-      expect((JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { models?: { gateway?: string } }).models?.gateway).toBeUndefined();
-      await session.sendKeys("C-u");
-      await session.waitForPane(hasEmptyComposer, 5_000);
-
-      await session.sendText("/model");
-      await waitForModelsMenu(session, 4);
-      await session.sendKeys("Down");
-      await session.sendKeys("Down");
-      await session.sendKeys("Down");
-      await session.sendKeys("Enter");
-      await session.waitForText(`* Switched to ${selectedModel}`, 5_000);
-
-      const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { models?: { gateway?: string } };
-      expect(settings.models?.gateway).toBe(selectedModel);
-      expect(await session.paneTitle()).toBe(runningBinaryTitle(fixture.workspace));
-      expect(session.isAlive()).toBe(true);
-
-      await session.sendText("/quit");
-      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
-      session = null;
-      expect(existsSync(fixture.tapePath)).toBe(true);
-      const replay = JSON.parse(
-        execFileSync(FX_BIN, ["replay", fixture.tapePath, "--json"], { encoding: "utf8" }),
-      ) as { frame_count: number; stdout_bytes: number };
-      expect(replay.frame_count).toBeGreaterThan(0);
-      expect(replay.stdout_bytes).toBeGreaterThan(0);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+        expect(session.recordedExitStatus()).toBe(0);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        session = null;
+      } finally {
+        fixture.close();
+      }
     },
     TEST_TIMEOUT,
   );
@@ -2597,14 +2656,16 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("C-p");
       let grid = await waitForModelsMenu(session, 2);
       let pane = grid.join("\n");
-      expect(pane).toContain("[All]");
-      expect(pane).toContain("tab provider");
+      expect(pane).toContain("All models");
+      expect(pane).toContain("Roles");
       expect(pane).not.toContain("hello draft");
       expect(hasEmptyComposer(pane)).toBe(true);
 
       await session.sendKeys("Escape");
       await session.waitForPane(
-        (current) => composerContains(current, "hello draft") && !current.includes("tab provider"),
+        (current) =>
+          composerContains(current, "hello draft") &&
+          !current.includes("esc close"),
         5_000,
       );
       // The cursor is restored with the text: typing lands mid-draft.
@@ -2620,7 +2681,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await waitForModelsMenu(session, 2);
       await session.sendLiteralText("plain");
       await session.waitForPane(
-        (current) => current.includes(selectedModel) && !current.includes(currentModel),
+        (current) =>
+          current.includes(selectedModel) && !current.includes(currentModel),
         5_000,
       );
       await session.sendKeys("Enter");
@@ -2629,39 +2691,29 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(composerContains(pane, "hello drXaft")).toBe(true);
       expect(composerContains(pane, "/model")).toBe(false);
 
-      const settings = JSON.parse(readFileSync(fixture.settingsPath, "utf8")) as { models?: { gateway?: string } };
+      const settings = JSON.parse(
+        readFileSync(fixture.settingsPath, "utf8"),
+      ) as { models?: { gateway?: string } };
       expect(settings.models?.gateway).toBe(selectedModel);
 
-      // A model with effort and Fast options continues into the same inline
-      // stages /model offers, and the draft returns once the model applies.
+      // A model with reasoning options is selected in the native hub, then
+      // its effort is changed through the dedicated effort command.
       await session.sendKeys("C-p");
       await waitForModelsMenu(session, 2);
       await session.sendLiteralText("staged");
-      // The transcript already names the plain model; only its catalog row
-      // must be filtered out.
       await session.waitForPane(
         (current) =>
-          current.includes(currentModel) &&
-          !current.split("\n").some((line) => line.includes(selectedModel) && !line.includes("Switched to")),
+          current.includes(currentModel) && !current.includes(selectedModel),
         5_000,
       );
-      await session.sendKeys("Enter");
-      await session.waitForPane(
-        (current) => composerContains(current, `/model ${currentModel}`) && current.includes("xhigh"),
-        5_000,
-      );
-      pane = await session.capturePane();
-      expect(composerContains(pane, "hello drXaft")).toBe(false);
-      await session.sendLiteralText("xhigh");
-      await session.sendKeys("Enter");
-      await session.waitForPane(
-        (current) => composerContains(current, `/model ${currentModel} xhigh`) && current.includes("normal"),
-        5_000,
-      );
-      await session.sendLiteralText("normal");
       await session.sendKeys("Enter");
       await session.waitForText(`* Switched to ${currentModel}`, 5_000);
-      await session.waitForPane((current) => composerContains(current, "hello drXaft"), 5_000);
+      await session.sendText("/effort xhigh");
+      await session.waitForText("xhigh", 5_000);
+      await session.waitForPane(
+        (current) => composerContains(current, "hello drXaft"),
+        5_000,
+      );
       pane = await session.capturePane();
       expect(composerContains(pane, "/model")).toBe(false);
 
@@ -2672,7 +2724,6 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       };
       expect(staged.models?.gateway).toBe(currentModel);
       expect(staged.effort).toBe("xhigh");
-      expect(staged.fast_mode).toBe(false);
       expect(session.isAlive()).toBe(true);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
 
@@ -2694,8 +2745,18 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const currentModel = "acme/original-model";
       const releasedModel = "acme/released-model";
       const catalog = [
-        { id: currentModel, type: "language", released: 100, tags: ["tool-use"] },
-        { id: "acme/second-model", type: "language", released: 90, tags: ["tool-use"] },
+        {
+          id: currentModel,
+          type: "language",
+          released: 100,
+          tags: ["tool-use"],
+        },
+        {
+          id: "acme/second-model",
+          type: "language",
+          released: 90,
+          tags: ["tool-use"],
+        },
       ];
       gateway = startFakeGateway([], { models: () => catalog });
       session = await TmuxSession.create({
@@ -2716,7 +2777,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
       const closePicker = async () => {
         await session!.sendKeys("Escape");
-        await session!.waitForPane((current) => !current.includes("tab provider"), 5_000);
+        await session!.waitForPane(
+          (current) => !current.includes("esc close"),
+          5_000,
+        );
       };
 
       await session.sendKeys("C-p");
@@ -2730,7 +2794,12 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       // The gateway ships a model while fx runs. Opening the picker lists the
       // cached models and revalidates in the background; the open menu then
       // picks up the new model.
-      catalog.unshift({ id: releasedModel, type: "language", released: 200, tags: ["tool-use"] });
+      catalog.unshift({
+        id: releasedModel,
+        type: "language",
+        released: 200,
+        tags: ["tool-use"],
+      });
       await session.sendKeys("C-p");
       const grid = await waitForModelsMenu(session, 3);
       expect(grid.join("\n")).toContain(releasedModel);
@@ -2751,7 +2820,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "model inline catalog keeps shared-prefix ids distinguishable at narrow widths",
+    "model hub keeps shared-prefix ids distinguishable at narrow widths",
     async () => {
       const fixture = createModelsMenuFixture();
       const modelIds = [
@@ -2788,7 +2857,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/model");
-      const pane = (await waitForModelsMenu(session, modelIds.length)).join("\n");
+      const pane = (await waitForModelsMenu(session, modelIds.length)).join(
+        "\n",
+      );
       for (const suffix of ["alpha", "beta", "gamma", "delta"]) {
         expect(pane).toContain(`ing-${suffix}`);
       }
@@ -2804,7 +2875,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "model picker skips effort stage for reasoning models without declared tiers",
+    "model hub selects reasoning models without declared tiers",
     async () => {
       const fixture = createModelsMenuFixture();
       const selectedModel = "deepseek/deepseek-v4-pro-0813";
@@ -2837,8 +2908,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       });
       await session.waitForComposer(10_000);
 
-      await session.sendLiteralText("/model ");
-      await session.waitForText(selectedModel, 10_000);
+      await session.sendText("/model");
+      await session.waitForPane(
+        (pane) => pane.includes("All models") && pane.includes(selectedModel),
+        10_000,
+      );
       await session.sendLiteralText(selectedModel);
       await session.sendKeys("Enter");
       await session.waitForText(`* Switched to ${selectedModel}`, 5_000);
@@ -2846,10 +2920,18 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       const pane = (await session.capturePaneGrid()).join("\n");
       expect(hasEmptyComposer(pane)).toBe(true);
       expect(pane).not.toContain("Reasoning effort");
-      expect(pane).toContain(`Switched to ${selectedModel} (effort: default, speed: normal)`);
-      expect(pane.split("\n").find((line) => line.startsWith("auto · "))).toBe("auto · deepseek-v4-pro-0813");
-      expect(JSON.parse(readFileSync(fixture.settingsPath, "utf8")).models.gateway).toBe(selectedModel);
-      expect(await session.paneTitle()).toBe(runningBinaryTitle(fixture.workspace));
+      expect(pane).toContain(
+        `Switched to ${selectedModel} (effort: default, speed: normal)`,
+      );
+      expect(pane.split("\n").find((line) => line.startsWith("auto · "))).toBe(
+        "auto · deepseek-v4-pro-0813",
+      );
+      expect(
+        JSON.parse(readFileSync(fixture.settingsPath, "utf8")).models.gateway,
+      ).toBe(selectedModel);
+      expect(await session.paneTitle()).toBe(
+        runningBinaryTitle(fixture.workspace),
+      );
       expect(session.isAlive()).toBe(true);
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
 
@@ -2861,7 +2943,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
-    "model picker completes every stage while a turn is in flight",
+    "model hub selects models while a turn is in flight",
     async () => {
       const fixture = createModelsMenuFixture();
       const currentModel = "anthropic/claude-opus-4.8";
@@ -2911,33 +2993,21 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         await session.sendText("Keep this model turn active.");
         await session.waitForText("Thinking", 10_000);
 
-        await session.sendLiteralText("/model");
-        await session.sendKeys("Tab");
+        await session.sendText("/model");
         await session.waitForPane(
-          (pane) => pane.split("\n").some((line) =>
-            !isComposerLine(line) && line.includes(currentModel)
-          ),
+          (pane) => pane.includes("All models") && pane.includes(currentModel),
           5_000,
         );
-        await session.sendKeys("Enter");
-        await session.waitForPane(
-          (pane) => pane.includes("default") && pane.includes("xhigh"),
-          5_000,
-        );
-        await session.sendKeys("Enter");
-        await session.waitForPane(
-          (pane) => pane.includes("normal") && pane.includes("fast"),
-          5_000,
-        );
+        await session.sendLiteralText(currentModel);
         await session.sendKeys("Enter");
         await session.waitForText(`Next turn will use ${currentModel}`, 5_000);
 
-        await session.sendLiteralText(`/model ${fastOnlyModel}`);
-        await session.sendKeys("Enter");
+        await session.sendText("/model");
         await session.waitForPane(
-          (pane) => pane.includes("normal") && pane.includes("fast"),
+          (pane) => pane.includes("All models") && pane.includes(fastOnlyModel),
           5_000,
         );
+        await session.sendLiteralText(fastOnlyModel);
         await session.sendKeys("Enter");
         await session.waitForText(`Next turn will use ${fastOnlyModel}`, 5_000);
 
@@ -2982,12 +3052,15 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(session.isAlive()).toBe(true);
 
       await session.sendKeys("C-[");
-      await session.waitForPane((current) => !current.includes("↑↓ navigate"), 5_000);
+      await session.waitForPane(
+        (current) => !current.includes("↑↓ navigate"),
+        5_000,
+      );
       await session.sendText("/skills");
       await waitForSkillsMenu(session, 4);
       await session.sendHexBytes(["1b", "18"]);
       await session.waitForComposer(5_000);
-      expect((await session.capturePane())).not.toContain("Agents & processes");
+      expect(await session.capturePane()).not.toContain("Agents & processes");
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
       session = null;
@@ -3161,7 +3234,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
     "selected dollar skill token stays formatted after submit and reflow",
     async () => {
       const fixture = createSkillsMenuFixture();
-      const gateway = startFakeGateway([fakeGatewayFinalText("skill token prompt complete")]);
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("skill token prompt complete"),
+      ]);
       try {
         session = await TmuxSession.create({
           cwd: fixture.workspace,
@@ -3181,7 +3256,10 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         await session.sendKeys("-l '$man'");
         await session.waitForText("managed-menu", 5_000);
         await session.sendKeys("Enter");
-        await session.waitForPane((pane) => composerContains(pane, "managed-menu"), 5_000);
+        await session.waitForPane(
+          (pane) => composerContains(pane, "managed-menu"),
+          5_000,
+        );
         await session.sendKeys("-l 'please'");
 
         let escapes = await session.capturePaneEscapes();
@@ -3227,7 +3305,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
     "shell variable with no skill match keeps spaces and submits raw",
     async () => {
       const fixture = createMentionGuardFixture();
-      const gateway = startFakeGateway([fakeGatewayFinalText("raw variable prompt complete")]);
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("raw variable prompt complete"),
+      ]);
       try {
         session = await TmuxSession.create({
           cwd: fixture.workspace,
@@ -3260,7 +3340,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         await session.sendKeys("Enter");
         await session.waitForText("raw variable prompt complete", 10_000);
         expect(gateway.requests).toHaveLength(1);
-        expect(gateway.requests[0]!.body).toContain("Explain echo $HOME please");
+        expect(gateway.requests[0]!.body).toContain(
+          "Explain echo $HOME please",
+        );
 
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -3276,7 +3358,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
     "space after matched dollar token inserts and closes the menu",
     async () => {
       const fixture = createMentionGuardFixture();
-      const gateway = startFakeGateway([fakeGatewayFinalText("mention space prompt complete")]);
+      const gateway = startFakeGateway([
+        fakeGatewayFinalText("mention space prompt complete"),
+      ]);
       try {
         session = await TmuxSession.create({
           cwd: fixture.workspace,
@@ -3314,113 +3398,117 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
     TEST_TIMEOUT,
   );
 
-  test(
-    "selected duplicate skill binds one advertised location",
-    async () => {
-      const fixture = createExactSkillsMenuFixture();
-      const tracePath = join(fixture.root, "trace.log");
-      const stderrPath = join(fixture.root, "stderr.log");
-      gateway = startFakeGateway([
-        fakeGatewayFinalText("exact picker selection complete"),
-      ]);
-      session = await TmuxSession.create({
-        cwd: fixture.workspace,
-        env: {
-          HOME: fixture.home,
-          AI_GATEWAY_API_KEY: "fake-exact-picker-key",
-          FX_GATEWAY_BASE_URL: gateway.baseUrl,
-          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_MODEL: FAKE_GATEWAY_MODEL,
-          FX_AUTO_UPGRADE: "0",
-          FX_TRACE_LOG: tracePath,
-          FX_TRACE_SCOPES: "skill,skills,agent,core",
-        },
-        stderrPath,
-        width: 120,
-        height: 36,
-      });
+  test("selected duplicate skill binds one advertised location", async () => {
+    const fixture = createExactSkillsMenuFixture();
+    const tracePath = join(fixture.root, "trace.log");
+    const stderrPath = join(fixture.root, "stderr.log");
+    gateway = startFakeGateway([
+      fakeGatewayFinalText("exact picker selection complete"),
+    ]);
+    session = await TmuxSession.create({
+      cwd: fixture.workspace,
+      env: {
+        HOME: fixture.home,
+        AI_GATEWAY_API_KEY: "fake-exact-picker-key",
+        FX_GATEWAY_BASE_URL: gateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+        FX_MODEL: FAKE_GATEWAY_MODEL,
+        FX_AUTO_UPGRADE: "0",
+        FX_TRACE_LOG: tracePath,
+        FX_TRACE_SCOPES: "skill,skills,agent,core",
+      },
+      stderrPath,
+      width: 120,
+      height: 36,
+    });
 
-      await session.waitForComposer(10_000);
-      await session.sendKeys("C-o");
-      await session.waitForText("skill discovery warning:", 5_000);
-      const tracePathPattern = tracePath
-        .split("/")
-        .map((segment) => segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-        .join("/\\s*");
-      expect((await session.capturePane()).replace(/\s+/g, " ")).toMatch(
-        new RegExp(`see "${tracePathPattern}" for details`),
-      );
-      await session.sendKeys("C-o");
-      await session.waitForComposer(5_000);
-      const inline = await session.captureFullScrollback();
-      expect(inline).not.toContain("skills:");
-      expect(inline).not.toContain("skill discovery warning:");
-      const startupDiagnosticCount = fileMarkerCount(
-        tracePath,
-        fixture.malformedMarker,
-      );
-      expect(startupDiagnosticCount).toBeGreaterThan(0);
+    await session.waitForComposer(10_000);
+    await session.sendKeys("C-o");
+    await session.waitForText("skill discovery warning:", 5_000);
+    const tracePathPattern = tracePath
+      .split("/")
+      .map((segment) => segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      .join("/\\s*");
+    expect((await session.capturePane()).replace(/\s+/g, " ")).toMatch(
+      new RegExp(`see "${tracePathPattern}" for details`),
+    );
+    await session.sendKeys("C-o");
+    await session.waitForComposer(5_000);
+    const inline = await session.captureFullScrollback();
+    expect(inline).not.toContain("skills:");
+    expect(inline).not.toContain("skill discovery warning:");
+    const startupDiagnosticCount = fileMarkerCount(
+      tracePath,
+      fixture.malformedMarker,
+    );
+    expect(startupDiagnosticCount).toBeGreaterThan(0);
 
-      await session.sendLiteralText("$exact-picker");
-      await session.waitForPane(
-        (pane) => countOccurrences(pane, "exact-picker") >= 3,
-        5_000,
+    await session.sendLiteralText("$exact-picker");
+    await session.waitForPane(
+      (pane) => countOccurrences(pane, "exact-picker") >= 3,
+      5_000,
+    );
+    await session.sendKeys("Down");
+    const selectedRows = (await session.capturePaneEscapes())
+      .split("\n")
+      .filter(
+        (line) =>
+          line.includes(SELECTED_COMPLETION_SGR) &&
+          line.includes("exact-picker"),
       );
-      await session.sendKeys("Down");
-      const selectedRows = (await session.capturePaneEscapes())
-        .split("\n")
-        .filter((line) =>
-          line.includes(SELECTED_COMPLETION_SGR) && line.includes("exact-picker")
-        );
-      expect(selectedRows).toHaveLength(1);
-      expect(selectedRows[0]).toContain("Workspace");
-      await session.sendKeys("Enter");
-      await session.waitForPane((pane) => composerContains(pane, "exact-picker"), 5_000);
-      await session.sendLiteralText(" inspect the exact selection");
-      await session.sendKeys("Enter");
-      await session.waitForPane(
-        (pane) =>
-          pane.includes("exact picker selection complete") && hasEmptyComposer(pane),
-        15_000,
-      );
+    expect(selectedRows).toHaveLength(1);
+    expect(selectedRows[0]).toContain("Workspace");
+    await session.sendKeys("Enter");
+    await session.waitForPane(
+      (pane) => composerContains(pane, "exact-picker"),
+      5_000,
+    );
+    await session.sendLiteralText(" inspect the exact selection");
+    await session.sendKeys("Enter");
+    await session.waitForPane(
+      (pane) =>
+        pane.includes("exact picker selection complete") &&
+        hasEmptyComposer(pane),
+      15_000,
+    );
 
-      expect(gateway.requests).toHaveLength(1);
-      const firstPrompt = gatewayPromptText(gateway.requests[0]!.body);
-      expect(firstPrompt).toContain(
-        "Use every successfully loaded skill for this query.",
-      );
-      expect(firstPrompt).toContain(
-        "Report blocked or ambiguous requests.",
-      );
-      expect(firstPrompt).toContain('<skill_content name="exact-picker"');
-      expect(firstPrompt).toContain(fixture.workspaceDescription);
-      expect(firstPrompt).toContain(fixture.bodyB);
-      expect(firstPrompt).not.toContain(fixture.bodyA);
+    expect(gateway.requests).toHaveLength(1);
+    const firstPrompt = gatewayPromptText(gateway.requests[0]!.body);
+    expect(firstPrompt).toContain(
+      "Use every successfully loaded skill for this query.",
+    );
+    expect(firstPrompt).toContain("Report blocked or ambiguous requests.");
+    expect(firstPrompt).toContain('<skill_content name="exact-picker"');
+    expect(firstPrompt).toContain(fixture.workspaceDescription);
+    expect(firstPrompt).toContain(fixture.bodyB);
+    expect(firstPrompt).not.toContain(fixture.bodyA);
 
-      const loadScrollback = await session.captureFullScrollback();
-      expect(countOccurrences(loadScrollback, "1 requested skill loaded")).toBe(1);
-      expect(loadScrollback).toContain("Loaded skill exact-picker");
-      expect(loadScrollback.indexOf("1 requested skill loaded")).toBeLessThan(
-        loadScrollback.indexOf("exact picker selection complete"),
-      );
-      expect(loadScrollback).not.toContain("1 tool call");
+    const loadScrollback = await session.captureFullScrollback();
+    expect(countOccurrences(loadScrollback, "1 requested skill loaded")).toBe(
+      1,
+    );
+    expect(loadScrollback).toContain("Loaded skill exact-picker");
+    expect(loadScrollback.indexOf("1 requested skill loaded")).toBeLessThan(
+      loadScrollback.indexOf("exact picker selection complete"),
+    );
+    expect(loadScrollback).not.toContain("1 tool call");
 
-      const finalScrollback = await session.captureFullScrollback();
-      expect(finalScrollback).not.toContain("discovery issue");
-      expect(finalScrollback).not.toContain("skill discovery warning:");
-      expect(session.isAlive()).toBe(true);
-      await session.sendText("/quit");
-      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
-      session = null;
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-    },
-    45_000,
-  );
+    const finalScrollback = await session.captureFullScrollback();
+    expect(finalScrollback).not.toContain("discovery issue");
+    expect(finalScrollback).not.toContain("skill discovery warning:");
+    expect(session.isAlive()).toBe(true);
+    await session.sendText("/quit");
+    expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    session = null;
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+  }, 45_000);
 
   test(
     "slash menu highlight reaches bottom before the list scrolls",
     async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-slash-highlight-")));
+      const root = realpathSync(
+        mkdtempSync(join(tmpdir(), "fx-slash-highlight-")),
+      );
       workDirs.push(root);
       const home = join(root, "home");
       const workspace = join(root, "workspace");
@@ -3446,13 +3534,17 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         await session.sendKeys("Down");
       }
 
-      const selectedRow = selectedSlashRowIndex(await session.capturePaneEscapes());
+      const selectedRow = selectedSlashRowIndex(
+        await session.capturePaneEscapes(),
+      );
       expect(selectedRow).toBeGreaterThanOrEqual(5);
 
       await session.sendKeys("Down");
       await session.sendKeys("Up");
 
-      const reversedRow = selectedSlashRowIndex(await session.capturePaneEscapes());
+      const reversedRow = selectedSlashRowIndex(
+        await session.capturePaneEscapes(),
+      );
       expect(reversedRow).toBe(4);
       expect(session.isAlive()).toBe(true);
 

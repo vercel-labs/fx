@@ -29,6 +29,29 @@ function cutToolCall(model: string, command: string) {
 }
 
 describe("configured providers", () => {
+  test("promotes oversized context using the target provider credential", async () => {
+    const f = fixture();
+    try {
+      Object.assign(f.settings, { context_promotion_enabled: true });
+      Object.assign(f.settings.providers.local.model_metadata["local-model"], {
+        context_window: 8192,
+        max_output_tokens: 1024,
+        context_promotion_target: "remote/remote-model",
+      });
+      f.save();
+      const result = await runFx([
+        "ask", "--json", "--no-save",
+        "Summarize this context: " + "A detailed observation about model routing. ".repeat(1500),
+      ], { cwd: f.workspace, env: f.env, timeoutMs: 30000 });
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(JSON.parse(result.stdout).model).toBe("remote-model");
+      expect(f.requests).toHaveLength(1);
+      expect(f.requests[0].body.model).toBe("remote-model");
+      expect(f.requests[0].authorization).toBe("Bearer own-provider-token");
+    } finally { f.close(); }
+  }, 35000);
+
   test.each(["reasoning", "reasoning_content"])("replays %s through a tool result and saved-session continuation", async field => {
     let calls = 0;
     const f = fixture(body => {
@@ -315,7 +338,7 @@ describe("configured providers", () => {
     const f = fixture(body => {
       if (body.messages.some((message: any) => message.role === "user" && message.content?.includes("child-marker"))) return completion(body.model, "child reply");
       if (body.messages.some((message: any) => message.role === "tool")) return completion(body.model, "parent reply");
-      return toolCompletion(body.model, "subagent", { request: { action: "run", task: "child-marker", ...(mode === "inherited" ? {} : { model: childModel }) } });
+      return toolCompletion(body.model, "fleet", { op: "run", message: "child-marker", ...(mode === "inherited" ? {} : { model: childModel }) });
     });
     f.settings.providers.local.model_metadata["local-model"].max_output_tokens = 512;
     (f.settings.providers.local.model_metadata as any)["child-model"] = { context_window: 32768, max_output_tokens: 1024, supports_tool_use: true };
@@ -334,9 +357,12 @@ describe("configured providers", () => {
   test("persistent child capabilities stay bound when the parent changes providers", async () => {
     let callId = 0;
     const f = fixture(body => {
-      if (!body.tools?.some((tool: any) => tool.function?.name === "subagent")) return completion(body.model, "child reply");
+      // The child still advertises fleet, but this fixture's child prompt is
+      // terminal. Guard on its user text so the child does not recursively
+      // invoke the same named worker while exercising persistence.
+      if (body.messages.some((message: any) => message.role === "user" && message.content?.includes("read the child fixture"))) return completion(body.model, "child reply");
       if (body.messages.at(-1)?.role === "tool") return completion(body.model, "parent reply");
-      return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: "read the child fixture" } }, `child-call-${++callId}`);
+      return toolCompletion(body.model, "fleet", { op: "run", label: "reader", message: "read the child fixture" }, `child-call-${++callId}`);
     });
     f.settings.models.local = "shared-model";
     f.settings.models.remote = "shared-model";
@@ -376,7 +402,7 @@ describe("configured providers", () => {
       }
       if (body.messages.at(-1)?.role === "tool") return completion(body.model, "parent reply");
       parentTurns++;
-      return toolCompletion(body.model, "subagent", { request: { action: "message", agent: "reader", message: `child context ${parentTurns}`, ...(parentTurns === 1 ? { model: "child-model" } : {}) } }, `context-call-${parentTurns}`);
+      return toolCompletion(body.model, "fleet", { op: "run", label: "reader", message: `child context ${parentTurns}`, ...(parentTurns === 1 ? { model: "child-model" } : {}) }, `context-call-${parentTurns}`);
     });
     (f.settings.providers.local.model_metadata as any)["child-model"] = { context_window: 32768, max_output_tokens: 512, supports_tool_use: true };
     f.save();
@@ -563,7 +589,7 @@ describe("configured providers", () => {
 
       const blank = await runFx(["status"], { cwd: f.workspace, env: { ...f.env, FX_MODEL: "   " } });
       expect(blank.code).toBe(1);
-      expect(blank.stderr).toBe("fx: no model is selected for this connection; save one under \"models\" in ~/.fx/settings.json, or set a model for this run with --model or FX_MODEL\n");
+      expect(blank.stderr).toBe("proto-fx: no model is selected for this connection; save one under \"models\" in ~/.proto-fx/settings.json, or set a model for this run with --model or FX_MODEL\n");
       expect(chatModels()).toHaveLength(2);
       expect(JSON.parse(readFileSync(f.settingsPath, "utf8")).models.local).toBeUndefined();
     } finally { f.close(); }

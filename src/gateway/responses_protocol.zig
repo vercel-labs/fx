@@ -2,6 +2,7 @@ const std = @import("std");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const model_provider = @import("../core/config/model_provider.zig");
+const model_compatibility = @import("../core/config/model_compatibility.zig");
 const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
 const types = @import("../core/shared/types.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
@@ -29,7 +30,14 @@ pub fn selectReplayParts(alloc: std.mem.Allocator, replay: ?types.ProviderReplay
     for (parsed.value.array.items) |item| {
         if (item != .object) return error.InvalidProviderState;
         const kind = stringField(item.object, "type") orelse return error.InvalidProviderState;
-        const keep = if (std.mem.eql(u8, kind, "reasoning")) reasoning else if (std.mem.eql(u8, kind, "message")) text else return error.InvalidProviderState;
+        const keep = if (std.mem.eql(u8, kind, "reasoning"))
+            reasoning
+        else if (std.mem.eql(u8, kind, "message"))
+            text
+        else if (isCompactionItem(kind))
+            true
+        else
+            return error.InvalidProviderState;
         if (!keep) continue;
         if (count > 0) out.writer.writeByte(',') catch return error.OutOfMemory;
         std.json.Stringify.value(item, .{}, &out.writer) catch return error.OutOfMemory;
@@ -41,11 +49,19 @@ pub fn selectReplayParts(alloc: std.mem.Allocator, replay: ?types.ProviderReplay
     return .{ .source = source.source, .parts_json = try out.toOwnedSlice() };
 }
 
+fn isCompactionItem(kind: []const u8) bool {
+    return std.mem.eql(u8, kind, "compaction") or std.mem.eql(u8, kind, "compaction_summary");
+}
+
 pub const ReplayLimits = struct {
     tool_calls: usize,
     tool_identity_bytes: usize,
     tool_arguments_bytes: usize,
     provider_state_bytes: usize,
+};
+
+pub const WriteOptions = struct {
+    compatibility: ?*const model_compatibility.Compatibility = null,
 };
 
 /// Verifies captured image files and releases replay/image scratch before returning.
@@ -58,7 +74,22 @@ pub fn writeInput(
     limits: ReplayLimits,
     budget: image_attachments.CaptureBudget,
 ) !void {
+    return writeInputWith(writer, scratch_alloc, messages, verified_images, limits, budget, .{});
+}
+
+pub fn writeInputWith(
+    writer: *std.Io.Writer,
+    scratch_alloc: std.mem.Allocator,
+    messages: []const types.ChatMessage,
+    verified_images: ?[]const image_attachments.VerifiedSnapshot,
+    limits: ReplayLimits,
+    budget: image_attachments.CaptureBudget,
+    options: WriteOptions,
+) !void {
     try budget.check();
+    if (options.compatibility != null and options.compatibility.?.strict_responses_pairing == true) {
+        try validate_strict_pairing(scratch_alloc, messages);
+    }
     if (verified_images != null and (messages.len != 1 or
         messages[0].role != .user or messages[0].images.len != 0))
     {
@@ -84,19 +115,21 @@ pub fn writeInput(
                     try writer.writeByte('}');
                     first_part = false;
                 };
-                if (verified_images) |images| {
-                    for (images) |image| {
-                        if (!first_part) try writer.writeByte(',');
-                        try writeInputImage(writer, image, budget);
-                        first_part = false;
-                    }
-                } else {
-                    for (message.images) |attachment| {
-                        var image = try image_attachments.loadVerifiedSnapshot(scratch_alloc, attachment, budget);
-                        defer image.deinit(scratch_alloc);
-                        if (!first_part) try writer.writeByte(',');
-                        try writeInputImage(writer, image, budget);
-                        first_part = false;
+                if (options.compatibility == null or options.compatibility.?.strip_image_input != true) {
+                    if (verified_images) |images| {
+                        for (images) |image| {
+                            if (!first_part) try writer.writeByte(',');
+                            try writeInputImage(writer, image, budget, options.compatibility);
+                            first_part = false;
+                        }
+                    } else {
+                        for (message.images) |attachment| {
+                            var image = try image_attachments.loadVerifiedSnapshot(scratch_alloc, attachment, budget);
+                            defer image.deinit(scratch_alloc);
+                            if (!first_part) try writer.writeByte(',');
+                            try writeInputImage(writer, image, budget, options.compatibility);
+                            first_part = false;
+                        }
                     }
                 }
                 try writer.writeAll("]}");
@@ -118,6 +151,19 @@ pub fn writeInput(
                         const kind = item.object.get("type") orelse return error.InvalidProviderState;
                         if (kind != .string) return error.InvalidProviderState;
                         if (std.mem.eql(u8, kind.string, "message")) {
+                            // Native compaction replacement histories may retain
+                            // provider input messages alongside the compaction item.
+                            // Those are already complete Responses wire items; do
+                            // not reinterpret them as the synthetic assistant
+                            // marker that carries the replay envelope.
+                            if (item.object.get("role")) |role| if (role == .string and !std.mem.eql(u8, role.string, "assistant")) {
+                                if (!std.mem.eql(u8, role.string, "user") and
+                                    !std.mem.eql(u8, role.string, "system") and
+                                    !std.mem.eql(u8, role.string, "developer")) return error.InvalidProviderState;
+                                try writeComma(writer, &first);
+                                try std.json.Stringify.value(item, .{}, writer);
+                                continue;
+                            };
                             const phase = assistantMessagePhase(item.object) catch return error.InvalidProviderState;
                             if (item.object.contains("offset") or item.object.contains("length")) {
                                 if (legacy_phase != null) return error.InvalidProviderState;
@@ -136,7 +182,7 @@ pub fn writeInput(
                             }
                             continue;
                         }
-                        if (!std.mem.eql(u8, kind.string, "reasoning")) return error.InvalidProviderState;
+                        if (!std.mem.eql(u8, kind.string, "reasoning") and !isCompactionItem(kind.string)) return error.InvalidProviderState;
                         try writeComma(writer, &first);
                         try std.json.Stringify.value(item, .{}, writer);
                     }
@@ -162,7 +208,8 @@ pub fn writeInput(
                 try writer.writeAll("{\"type\":\"function_call_output\",\"call_id\":");
                 try std.json.Stringify.value(ids.resolve(message.tool_call_id orelse ""), .{}, writer);
                 try writer.writeAll(",\"output\":");
-                const tool_images = if (message.tool_result_memory) |memory| memory.tool_images else &.{};
+                const stored_tool_images = if (message.tool_result_memory) |memory| memory.tool_images else &.{};
+                const tool_images = if (options.compatibility != null and options.compatibility.?.strip_image_input == true) @as([]const types.ToolImage, &.{}) else stored_tool_images;
                 if (tool_images.len == 0) {
                     try std.json.Stringify.value(message.content orelse "", .{}, writer);
                 } else {
@@ -384,6 +431,18 @@ test "non-object function arguments cannot enter a Responses request" {
     }
 }
 
+fn validate_strict_pairing(alloc: std.mem.Allocator, messages: []const types.ChatMessage) !void {
+    var ids: std.StringHashMapUnmanaged(void) = .empty;
+    defer ids.deinit(alloc);
+    for (messages) |message| if (message.role == .assistant) for (message.tool_calls) |call| {
+        try ids.put(alloc, call.id, {});
+    };
+    for (messages) |message| if (message.role == .tool) {
+        const id = message.tool_call_id orelse return error.InvalidProviderState;
+        if (!ids.contains(id)) return error.InvalidProviderState;
+    };
+}
+
 fn validateReplayMessage(alloc: std.mem.Allocator, message: types.ChatMessage, limits: ReplayLimits) !void {
     if (message.provider_replay) |replay| {
         const state_json = replay.parts_json;
@@ -577,7 +636,7 @@ test "Responses image encoding observes cancellation after partial output" {
     @memset(&bytes, 'x');
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try std.testing.expectError(error.Cancelled, writeInputImage(&out.writer, .{ .bytes = &bytes, .media_type = "image/png" }, .{ .test_hook = .{ .ctx = &out, .check = Cancel.check } }));
+    try std.testing.expectError(error.Cancelled, writeInputImage(&out.writer, .{ .bytes = &bytes, .media_type = "image/png" }, .{ .test_hook = .{ .ctx = &out, .check = Cancel.check } }, null));
     try std.testing.expect(out.written().len > 1024);
     try std.testing.expect(out.written().len < bytes.len);
 }
@@ -603,13 +662,35 @@ test "Responses tool images observe cancellation after bounded image output" {
     try std.testing.expect(out.written().len > data.len);
 }
 
+test "Responses image detail clamps original when unsupported" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const unsupported: model_compatibility.Compatibility = .{ .supports_image_detail_original = false };
+    try writeInputImage(
+        &out.writer,
+        .{ .bytes = @constCast("pixel"), .media_type = "image/png", .detail = .original },
+        .{},
+        &unsupported,
+    );
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("auto", parsed.value.object.get("detail").?.string);
+}
+
 fn writeInputImage(
     writer: *std.Io.Writer,
     image: image_attachments.VerifiedSnapshot,
     budget: image_attachments.CaptureBudget,
+    compatibility: ?*const model_compatibility.Compatibility,
 ) !void {
     try budget.check();
-    try writer.writeAll("{\"type\":\"input_image\",\"detail\":\"auto\",\"image_url\":\"data:");
+    var detail = image.detail orelse .auto;
+    if (detail == .original and compatibility != null and compatibility.?.supports_image_detail_original == false) {
+        detail = .auto;
+    }
+    try writer.writeAll("{\"type\":\"input_image\",\"detail\":");
+    try std.json.Stringify.value(@tagName(detail), .{}, writer);
+    try writer.writeAll(",\"image_url\":\"data:");
     try writer.writeAll(image.media_type);
     try writer.writeAll(";base64,");
     var offset: usize = 0;
@@ -635,6 +716,15 @@ pub fn writeTools(
     alloc: std.mem.Allocator,
     tools: stream_provider.ToolSelection,
 ) !usize {
+    return writeToolsWith(writer, alloc, tools, .{});
+}
+
+pub fn writeToolsWith(
+    writer: *std.Io.Writer,
+    alloc: std.mem.Allocator,
+    tools: stream_provider.ToolSelection,
+    options: WriteOptions,
+) !usize {
     var count: usize = 0;
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -649,6 +739,7 @@ pub fn writeTools(
             tool.name,
             tool.description,
             .{ .static = tool.input_schema },
+            options.compatibility,
         );
         count += 1;
     }
@@ -661,6 +752,7 @@ pub fn writeTools(
             tool.name,
             tool.description,
             .{ .static = tool.input_schema },
+            options.compatibility,
         );
         count += 1;
     }
@@ -673,6 +765,7 @@ pub fn writeTools(
             tool.name,
             tool.description,
             .{ .dynamic = tool.input_schema },
+            options.compatibility,
         );
         count += 1;
     }
@@ -2641,6 +2734,7 @@ fn writeFunctionTool(
     name: []const u8,
     description: []const u8,
     input_schema: InputSchema,
+    compatibility: ?*const model_compatibility.Compatibility,
 ) !void {
     if (name.len == 0) return error.InvalidToolSchema;
     try writer.writeAll("{\"type\":\"function\",\"name\":");
@@ -2657,7 +2751,12 @@ fn writeFunctionTool(
             try std.json.Stringify.value(schema, .{}, writer);
         },
     }
-    try writer.writeAll(",\"strict\":false}");
+    if (compatibility == null or compatibility.?.tool_strict_mode != .all_strict) {
+        try writer.writeAll(",\"strict\":false");
+    } else if (compatibility.?.supports_strict_mode != false) {
+        try writer.writeAll(",\"strict\":true");
+    }
+    try writer.writeByte('}');
 }
 
 fn containsName(names: []const []const u8, expected: []const u8) bool {

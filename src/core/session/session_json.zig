@@ -160,6 +160,10 @@ fn writeUserTurnJson(writer: *std.Io.Writer, user: session.UserTurn) !void {
         try std.json.Stringify.value(image.path, .{}, writer);
         try writer.writeAll(",\"media_type\":");
         try std.json.Stringify.value(image.media_type, .{}, writer);
+        if (image.detail) |detail| {
+            try writer.writeAll(",\"detail\":");
+            try std.json.Stringify.value(@tagName(detail), .{}, writer);
+        }
         try writer.writeAll(",\"snapshot_path\":");
         try writeImageSnapshotLocatorJson(writer, image.snapshot_path);
         try writer.writeAll(",\"snapshot_sha256\":");
@@ -1090,6 +1094,11 @@ fn validateImagesArray(alloc: Allocator, maybe_value: ?std.json.Value) ![]sessio
             break :source try alloc.dupe(u8, value_bytes);
         } else null;
         errdefer if (source_ref) |value_bytes| alloc.free(value_bytes);
+        const detail = if (object.get("detail")) |detail_value| switch (detail_value) {
+            .null => null,
+            .string => |name| types.ImageDetail.parse(name) orelse return error.InvalidSessionFormat,
+            else => return error.InvalidSessionFormat,
+        } else null;
         const snapshot_path = try optionalStringDup(alloc, object.get("snapshot_path"));
         var owns_snapshot_path = true;
         errdefer if (owns_snapshot_path) {
@@ -1106,6 +1115,7 @@ fn validateImagesArray(alloc: Allocator, maybe_value: ?std.json.Value) ![]sessio
             if (object.get("id") != null) try requireUsize(object, "id") else 0,
             try requireString(object, "path"),
             try requireString(object, "media_type"),
+            detail,
             snapshot_path,
             snapshot_sha256,
         );
@@ -1122,6 +1132,7 @@ fn dupeParsedImageAttachment(
     id: usize,
     path_src: []const u8,
     media_type_src: []const u8,
+    detail: ?types.ImageDetail,
     snapshot_path_src: ?[]u8,
     snapshot_sha256_src: ?[]u8,
 ) !session.ImageAttachment {
@@ -1133,6 +1144,7 @@ fn dupeParsedImageAttachment(
         .id = id,
         .path = path,
         .media_type = media_type,
+        .detail = detail,
         .snapshot_path = snapshot_path_src,
         .snapshot_sha256 = snapshot_sha256_src,
     };
@@ -2038,6 +2050,7 @@ test "session JSON image source refs round trip and reject malformed metadata" {
         .id = 1,
         .path = @constCast("inline://image-1"),
         .media_type = @constCast("image/png"),
+        .detail = .high,
         .source_ref = @constCast("host:original"),
     }};
     const history = [_]types.HistoryTurn{.{ .assistant = .{
@@ -2052,6 +2065,7 @@ test "session JSON image source refs round trip and reject malformed metadata" {
             defer loaded.deinit(a);
             const image = loaded.history[0].assistant.user.images[0];
             try std.testing.expectEqualStrings("host:original", image.source_ref.?);
+            try std.testing.expectEqual(types.ImageDetail.high, image.detail.?);
             try std.testing.expect(image.inline_data == null);
             try std.testing.expect(image.snapshot_path == null);
             try std.testing.expect(image.snapshot_sha256 == null);

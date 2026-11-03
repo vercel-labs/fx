@@ -2,6 +2,8 @@ const std = @import("std");
 const observation = @import("runtime/observation.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const model_performance = @import("../model_hub/performance.zig");
+const model_compatibility = @import("../config/model_compatibility.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const types = @import("../shared/types.zig");
@@ -452,6 +454,10 @@ pub const ModelRequest = struct {
     admission: Admission = .{},
     cancel_flag: *std.atomic.Value(bool),
     provider_attempt_owner: ProviderAttemptOwner = .transport,
+    /// Borrowed model transport policy carried into the response reducer.
+    compatibility: ?*const model_compatibility.Compatibility = null,
+    /// Optional host-owned observed model metrics. Hosted runtimes leave this null.
+    performance: ?*model_performance.State = null,
 
     pub fn data(self: ModelRequest) RequestData {
         return .{
@@ -667,6 +673,85 @@ test "result failure writer preserves exact error type and identity" {
     try std.testing.expectError(error.Cancelled, failure);
 }
 
+/// Provider-native context compaction. The core owns selection, history and
+/// publication; a provider owns request serialization, network I/O and reply
+/// reduction behind this typed callback.
+pub const CompactionKind = enum {
+    /// The provider's non-streaming remote compaction endpoint.
+    remote,
+    /// Codex/Responses compaction that emits a replacement history stream.
+    v2_streaming,
+    /// Anthropic Messages context-management compaction.
+    anthropic_native,
+};
+
+pub const CompactionRequest = struct {
+    observer: ?*observation.Observer = null,
+    admission: Admission = .{},
+    credential: CredentialLease,
+    session_id: ?[]const u8 = null,
+    model: []const u8,
+    /// Provider-native compaction instructions. Borrowed for the call.
+    instructions: []const u8,
+    /// The complete provider-visible history, including any replay state.
+    messages: []const types.ChatMessage,
+    tools: ToolSelection = .{},
+    provider_options: model_capabilities.ResolvedProviderOptions = .{},
+    max_output_tokens: ?u32 = null,
+    retained_message_budget: ?u32 = null,
+    prompt_cache_key: ?[]const u8 = null,
+    kind: CompactionKind = .remote,
+    budget: ?BuildBudget = null,
+    trace_ctx: debug_trace.TraceContext = .{},
+    cancel_flag: *std.atomic.Value(bool),
+};
+
+pub const CompactionResult = struct {
+    /// Readable summary returned by the provider. Native providers may omit
+    /// it only when they return no usable compaction block.
+    summary: ?[]const u8 = null,
+    /// Opaque provider replay state, retained with the compaction boundary.
+    provider_state_json: ?[]const u8 = null,
+    /// Responses V2 replacement history, encoded as a JSON array.
+    replacement_history_json: ?[]const u8 = null,
+    used_tokens: ?u64 = null,
+    usage: types.Usage = .{},
+    ownership: ResultOwnership = .borrowed,
+
+    pub fn deinit(self: *CompactionResult, alloc: Allocator) void {
+        if (self.ownership == .owned) {
+            if (self.summary) |value| alloc.free(@constCast(value));
+            if (self.provider_state_json) |value| alloc.free(@constCast(value));
+            if (self.replacement_history_json) |value| alloc.free(@constCast(value));
+        }
+        self.* = undefined;
+    }
+};
+
+pub const CompactionFn = *const fn (
+    context: ?*anyopaque,
+    alloc: Allocator,
+    request: CompactionRequest,
+) anyerror!CompactionResult;
+
+pub const CompactionProvider = struct {
+    /// When set, context must remain valid until every in-flight compaction
+    /// returns.
+    context: ?*anyopaque = null,
+    /// The transport can run Responses-style streaming compaction when the
+    /// selected model's remote-compaction metadata enables it.
+    supports_v2_streaming: bool = false,
+    compact_fn: CompactionFn,
+
+    pub fn compact(
+        self: CompactionProvider,
+        alloc: Allocator,
+        request: CompactionRequest,
+    ) !CompactionResult {
+        return self.compact_fn(self.context, alloc, request);
+    }
+};
+
 pub const StreamFn = *const fn (
     context: ?*anyopaque,
     alloc: Allocator,
@@ -679,10 +764,25 @@ pub const BuildRequestFn = *const fn (
     request: RequestData,
 ) anyerror![]u8;
 
+pub const RequestCost = struct {
+    serialized_bytes: usize,
+    /// Uncalibrated text count, excluding image payloads. A selected model
+    /// encoding replaces the byte estimator for known text spans.
+    text_tokens: usize,
+    /// Null means no image parts. Otherwise visual cost needs applicable usage.
+    image_identity: ?[32]u8 = null,
+    estimated_input_tokens: usize,
+};
+
 pub const Provider = struct {
+    /// Optional measurement for transports whose prepared body is not a JSON prompt.
+    measure_request_fn: ?*const fn (?*anyopaque, Allocator, []const u8, RequestData) anyerror!RequestCost = null,
     /// When set, context must remain valid until every in-flight `stream` returns.
     context: ?*anyopaque = null,
     stream_fn: StreamFn,
+    /// Provider-native context compaction. Null means this provider has no
+    /// native capability; callers must then use structural compaction.
+    compaction: ?CompactionProvider = null,
     /// Optional exact provider serializer used for request-capacity decisions.
     build_request_fn: ?BuildRequestFn = null,
     /// Pure provider-owned slicing when one reply becomes separate history units.
@@ -700,6 +800,16 @@ pub const Provider = struct {
     pub fn stream(self: Provider, alloc: Allocator, request: ModelRequest) !Result {
         try request.data().validatePrompt();
         return self.stream_fn(self.context, alloc, request);
+    }
+
+    pub fn compact(
+        self: Provider,
+        alloc: Allocator,
+        request: CompactionRequest,
+    ) !CompactionResult {
+        try validate_prompt_lanes(request.instructions, request.messages);
+        const compaction = self.compaction orelse return error.ProviderCompactionUnavailable;
+        return compaction.compact(alloc, request);
     }
 
     /// Returns an owned provider request body when this provider exposes its

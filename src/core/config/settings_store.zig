@@ -121,8 +121,21 @@ pub const UserSettingsPatch = struct {
     notification_max: ?bool = null,
     /// Sets or clears one `model_roles` entry (D170).
     model_role: ?ModelRolePatch = null,
-    /// Replaces `cycle_order` (D222).
+    model_role_create: ?[]const u8 = null,
+    /// Creates/renames/deletes dynamic role identities and their metadata.
+    model_role_rename: ?ModelRoleRenamePatch = null,
+    model_role_delete: ?ModelRoleDeletePatch = null,
+    model_role_tag: ?ModelRoleTagPatch = null,
+    model_role_bank: ?ModelRoleBankPatch = null,
+    fallback_chain: ?FallbackChainPatch = null,
+    /// Replaces `cycle_order` (D222). Built-in convenience callers use this;
+    /// custom-role callers use `cycle_order_ids`.
     cycle_order: ?[]const model_roles.Role = null,
+    cycle_order_ids: ?[]const model_roles.RoleId = null,
+    /// Role mutations may live in profile workspace overrides. Other settings
+    /// remain global in this patch type.
+    model_role_scope: ModelRoleScope = .global,
+    workspace_root: ?[]const u8 = null,
     /// Replaces `web_search.order` and `web_search.exclude`, keeping the
     /// object's other keys (D223).
     web_search: ?WebSearchPatch = null,
@@ -130,7 +143,14 @@ pub const UserSettingsPatch = struct {
     fn isEmpty(self: UserSettingsPatch) bool {
         return self.connections_json == null and self.model_preference == null and
             self.model_role == null and
+            self.model_role_create == null and
+            self.model_role_rename == null and
+            self.model_role_delete == null and
+            self.model_role_tag == null and
+            self.model_role_bank == null and
+            self.fallback_chain == null and
             self.cycle_order == null and
+            self.cycle_order_ids == null and
             self.web_search == null and
             self.provider == null and
             self.permission_mode == null and
@@ -159,9 +179,43 @@ pub const WebSearchPatch = struct {
 };
 
 /// `value` null removes the role's entry.
+pub const ModelRoleScope = enum { global, workspace };
+
 pub const ModelRolePatch = struct {
-    role: model_roles.Role,
+    role: model_roles.Role = .default,
+    /// Custom role name. When set, this is the role identity and `role` is
+    /// ignored; names are owned by the durable JSON document.
+    name: ?[]const u8 = null,
     value: ?[]const u8,
+};
+
+pub const ModelRoleRenamePatch = struct {
+    old_name: []const u8,
+    new_name: []const u8,
+};
+
+pub const ModelRoleDeletePatch = struct {
+    name: []const u8,
+};
+
+pub const ModelRoleTagPatch = struct {
+    name: []const u8,
+    tag: ?[]const u8 = null,
+    display_name: ?[]const u8 = null,
+    color: ?[]const u8 = null,
+    hidden: ?bool = null,
+    clear: bool = false,
+};
+
+pub const ModelRoleBankPatch = struct {
+    name: []const u8,
+    selectors: []const []const u8 = &.{},
+    clear: bool = false,
+};
+
+pub const FallbackChainPatch = struct {
+    selector: []const u8,
+    chain: ?[]const u8 = null,
 };
 
 pub const ModelPreferencePatch = struct {
@@ -993,10 +1047,34 @@ pub fn validateProviderSlug(slug: []const u8) bool {
 
 fn validateUserPatch(patch: UserSettingsPatch) !void {
     if (patch.model_preference) |preference| try validateModel(preference.model);
-    if (patch.model_role) |role_patch| if (role_patch.value) |value| {
-        model_roles.validateChain(value) catch return error.InvalidDurableField;
-    };
+    if (patch.model_role_create) |name| model_roles.validateRoleName(name) catch return error.InvalidDurableField;
+    if (patch.model_role) |role_patch| {
+        if (role_patch.name) |name| model_roles.validateRoleName(name) catch return error.InvalidDurableField;
+        if (role_patch.value) |value| model_roles.validateChain(value) catch return error.InvalidDurableField;
+    }
+    if (patch.model_role_rename) |rename| {
+        model_roles.validateRoleName(rename.old_name) catch return error.InvalidDurableField;
+        model_roles.validateRoleName(rename.new_name) catch return error.InvalidDurableField;
+    }
+    if (patch.model_role_delete) |deleted| model_roles.validateRoleName(deleted.name) catch return error.InvalidDurableField;
+    if (patch.model_role_tag) |tag| {
+        model_roles.validateRoleName(tag.name) catch return error.InvalidDurableField;
+    }
+    if (patch.model_role_bank) |bank| {
+        model_roles.validateRoleName(bank.name) catch return error.InvalidDurableField;
+        if (bank.selectors.len > 64) return error.InvalidDurableField;
+        for (bank.selectors) |selector| model_roles.validateSelector(selector) catch return error.InvalidDurableField;
+    }
+    if (patch.fallback_chain) |fallback| {
+        model_roles.validateSelector(fallback.selector) catch return error.InvalidDurableField;
+        if (fallback.chain) |chain| model_roles.validateChain(chain) catch return error.InvalidDurableField;
+    }
     if (patch.cycle_order) |order| if (order.len > model_roles.role_count) return error.InvalidDurableField;
+    if (patch.cycle_order_ids) |order| if (order.len > 64) return error.InvalidDurableField;
+    if (patch.model_role_scope == .workspace) {
+        const workspace_root = patch.workspace_root orelse return error.InvalidDurableField;
+        try validateWorkspaceRoot(workspace_root);
+    } else if (patch.workspace_root != null) return error.InvalidDurableField;
     if (patch.web_search) |web_search| for ([_][]const []const u8{ web_search.order, web_search.exclude }) |list| {
         if (list.len > 32) return error.InvalidDurableField;
         for (list) |id| if (!validateProviderSlug(id)) return error.InvalidDurableField;
@@ -1172,6 +1250,22 @@ fn applyMutationToRoot(
     return application;
 }
 
+fn roleMutationObject(
+    arena: Allocator,
+    root: *std.json.Value,
+    patch: UserSettingsPatch,
+) !*std.json.ObjectMap {
+    if (patch.model_role_scope == .global) return &root.object;
+    const workspace_root = patch.workspace_root orelse return error.InvalidDurableField;
+    if (!root.object.contains("workspaces")) try root.object.put(arena, "workspaces", .{ .object = .empty });
+    const workspaces = root.object.getPtr("workspaces").?;
+    if (workspaces.* != .object) return error.InvalidSettingsFormat;
+    if (!workspaces.object.contains(workspace_root)) try workspaces.object.put(arena, workspace_root, .{ .object = .empty });
+    const workspace = workspaces.object.getPtr(workspace_root).?;
+    if (workspace.* != .object) return error.InvalidSettingsFormat;
+    return &workspace.object;
+}
+
 fn applyUserPatchToRoot(
     arena: Allocator,
     root: *std.json.Value,
@@ -1192,24 +1286,115 @@ fn applyUserPatchToRoot(
     if (patch.model_preference) |preference| {
         application.changed = try putModelPreference(arena, &root.object, preference) or application.changed;
     }
-    if (patch.model_role) |role_patch| {
-        if (!root.object.contains("model_roles")) try root.object.put(arena, "model_roles", .{ .object = .empty });
-        const roles = root.object.getPtr("model_roles").?;
-        if (roles.* != .object) return error.InvalidSettingsFormat;
-        // proto's older name for the role goes; the new name is written.
-        if (role_patch.role.legacyName()) |legacy| {
-            if (roles.object.orderedRemove(legacy)) application.changed = true;
+    if (patch.model_role != null or patch.model_role_create != null or patch.model_role_rename != null or patch.model_role_delete != null or
+        patch.model_role_tag != null or patch.model_role_bank != null or patch.fallback_chain != null or
+        patch.cycle_order != null or patch.cycle_order_ids != null)
+    {
+        const target = try roleMutationObject(arena, root, patch);
+        if (patch.model_role_create) |name| {
+            if (!target.contains("model_tags")) try target.put(arena, "model_tags", .{ .object = .empty });
+            const tags = target.getPtr("model_tags").?;
+            if (tags.* != .object) return error.InvalidSettingsFormat;
+            if (!tags.object.contains(name)) {
+                try tags.object.put(arena, name, .{ .object = .empty });
+                application.changed = true;
+            }
         }
-        if (role_patch.value) |value| {
-            application.changed = try putString(arena, &roles.object, role_patch.role.label(), value) or application.changed;
-        } else if (roles.object.orderedRemove(role_patch.role.label())) {
-            application.changed = true;
+        if (patch.model_role) |role_patch| {
+            const id: model_roles.RoleId = if (role_patch.name) |name| model_roles.parseRoleId(name) orelse return error.InvalidDurableField else .{ .builtin = role_patch.role };
+            if (!target.contains("model_roles")) try target.put(arena, "model_roles", .{ .object = .empty });
+            const roles = target.getPtr("model_roles").?;
+            if (roles.* != .object) return error.InvalidSettingsFormat;
+            // proto's older name for a built-in goes; the canonical name is written.
+            if (id == .builtin) {
+                if (id.builtin.legacyName()) |legacy| {
+                    if (roles.object.orderedRemove(legacy)) application.changed = true;
+                }
+            }
+            if (role_patch.value) |value| {
+                application.changed = try putString(arena, &roles.object, id.label(), value) or application.changed;
+            } else if (roles.object.orderedRemove(id.label())) {
+                application.changed = true;
+            }
         }
-    }
-    if (patch.cycle_order) |order| {
-        var names: [model_roles.role_count][]const u8 = undefined;
-        for (order, 0..) |role, index| names[index] = role.label();
-        application.changed = try putStringArray(arena, &root.object, "cycle_order", names[0..order.len]) or application.changed;
+        if (patch.model_role_rename) |rename| {
+            if (std.mem.eql(u8, rename.old_name, rename.new_name)) return error.InvalidDurableField;
+            if (target.getPtr("model_roles")) |roles_value| if (roles_value.* == .object) {
+                if (roles_value.object.getPtr(rename.old_name)) |value| {
+                    const moved = value.*;
+                    _ = roles_value.object.orderedRemove(rename.old_name);
+                    try roles_value.object.put(arena, rename.new_name, moved);
+                    application.changed = true;
+                }
+            };
+            for ([_][]const u8{ "model_tags", "modelRoleTags" }) |key| if (target.getPtr(key)) |tags_value| if (tags_value.* == .object) {
+                if (tags_value.object.getPtr(rename.old_name)) |value| {
+                    const moved = value.*;
+                    _ = tags_value.object.orderedRemove(rename.old_name);
+                    try tags_value.object.put(arena, rename.new_name, moved);
+                    application.changed = true;
+                }
+            };
+            for ([_][]const u8{ "model_role_bank", "modelRoleBank" }) |key| if (target.getPtr(key)) |banks_value| if (banks_value.* == .object) {
+                if (banks_value.object.getPtr(rename.old_name)) |value| {
+                    const moved = value.*;
+                    _ = banks_value.object.orderedRemove(rename.old_name);
+                    try banks_value.object.put(arena, rename.new_name, moved);
+                    application.changed = true;
+                }
+            };
+        }
+        if (patch.model_role_delete) |deleted| {
+            for ([_][]const u8{ "model_roles", "model_tags", "modelRoleTags", "model_role_bank", "modelRoleBank" }) |key| {
+                if (target.getPtr(key)) |value| {
+                    if (value.* == .object) {
+                        if (value.object.orderedRemove(deleted.name)) application.changed = true;
+                    }
+                }
+            }
+        }
+        if (patch.model_role_tag) |tag| {
+            if (!target.contains("model_tags")) try target.put(arena, "model_tags", .{ .object = .empty });
+            const tags = target.getPtr("model_tags").?;
+            if (tags.* != .object) return error.InvalidSettingsFormat;
+            if (tag.clear) {
+                if (tags.object.orderedRemove(tag.name)) application.changed = true;
+            } else {
+                var object = if (tags.object.get(tag.name)) |old| if (old == .object) old.object else return error.InvalidSettingsFormat else std.json.ObjectMap.empty;
+                if (tag.tag) |value| application.changed = try putString(arena, &object, "tag", value) or application.changed;
+                if (tag.display_name) |value| application.changed = try putString(arena, &object, "name", value) or application.changed;
+                if (tag.color) |value| application.changed = try putString(arena, &object, "color", value) or application.changed;
+                if (tag.hidden) |value| application.changed = try putBool(arena, &object, "hidden", value) or application.changed;
+                application.changed = try putObject(arena, &tags.object, tag.name, object) or application.changed;
+            }
+        }
+        if (patch.model_role_bank) |bank| {
+            if (!target.contains("model_role_bank")) try target.put(arena, "model_role_bank", .{ .object = .empty });
+            const banks = target.getPtr("model_role_bank").?;
+            if (banks.* != .object) return error.InvalidSettingsFormat;
+            if (bank.clear) {
+                if (banks.object.orderedRemove(bank.name)) application.changed = true;
+            } else {
+                application.changed = try putStringArray(arena, &banks.object, bank.name, bank.selectors) or application.changed;
+            }
+        }
+        if (patch.fallback_chain) |fallback| {
+            if (!target.contains("fallback_chains")) try target.put(arena, "fallback_chains", .{ .object = .empty });
+            const chains = target.getPtr("fallback_chains").?;
+            if (chains.* != .object) return error.InvalidSettingsFormat;
+            if (fallback.chain) |chain| {
+                application.changed = try putString(arena, &chains.object, fallback.selector, chain) or application.changed;
+            } else if (chains.object.orderedRemove(fallback.selector)) application.changed = true;
+        }
+        if (patch.cycle_order) |order| {
+            var names: [model_roles.role_count][]const u8 = undefined;
+            for (order, 0..) |role, index| names[index] = role.label();
+            application.changed = try putStringArray(arena, target, "cycle_order", names[0..order.len]) or application.changed;
+        } else if (patch.cycle_order_ids) |order| {
+            var names = try arena.alloc([]const u8, order.len);
+            for (order, 0..) |id, index| names[index] = id.label();
+            application.changed = try putStringArray(arena, target, "cycle_order", names) or application.changed;
+        }
     }
     if (patch.web_search) |web_search| {
         if (!root.object.contains("web_search")) try root.object.put(arena, "web_search", .{ .object = .empty });
@@ -1760,6 +1945,11 @@ fn workspaceObject(
     return &workspace.object;
 }
 
+fn putObject(arena: Allocator, object: *std.json.ObjectMap, key: []const u8, value: std.json.ObjectMap) !bool {
+    try object.put(arena, key, .{ .object = value });
+    return true;
+}
+
 fn putString(arena: Allocator, object: *std.json.ObjectMap, key: []const u8, value: []const u8) !bool {
     if (object.get(key)) |existing| {
         if (existing == .string and std.mem.eql(u8, existing.string, value)) return false;
@@ -2080,11 +2270,24 @@ fn validateKnownSettingsObject(
         if (value != .string) return error.InvalidSettingsFormat;
         try validateModel(value.string);
     }
-    if (object.get("model_roles") != null or object.get("cycle_order") != null) {
-        // Every reference fits: at most `role_count` of `max_ref_bytes`.
-        var buf: [model_roles.role_count * model_roles.max_ref_bytes]u8 = undefined;
+    const fallback_value = object.get("fallback_chains") orelse object.get("fallbackChains") orelse blk: {
+        if (object.get("retry")) |retry| if (retry == .object) break :blk retry.object.get("fallbackChains");
+        break :blk null;
+    };
+    if (object.get("model_roles") != null or object.get("cycle_order") != null or
+        object.get("model_role_bank") != null or object.get("modelRoleBank") != null or
+        object.get("model_tags") != null or object.get("modelTags") != null or fallback_value != null)
+    {
+        var buf: [64 * 1024]u8 = undefined;
         var fixed = std.heap.FixedBufferAllocator.init(&buf);
-        _ = model_roles.Table.parse(fixed.allocator(), object.get("model_roles"), object.get("cycle_order")) catch return error.InvalidSettingsFormat;
+        _ = model_roles.Table.parseExtended(
+            fixed.allocator(),
+            object.get("model_roles"),
+            object.get("cycle_order"),
+            object.get("model_role_bank") orelse object.get("modelRoleBank"),
+            object.get("model_tags") orelse object.get("modelTags"),
+            fallback_value,
+        ) catch return error.InvalidSettingsFormat;
     }
     if (object.get("grok_model")) |value| {
         if (value != .string) return error.InvalidSettingsFormat;
@@ -4380,4 +4583,21 @@ test "workspace directory add compacts saved aliases before applying effective c
     defer alloc.free(retained_identity);
     try std.testing.expectEqualStrings(shared, retained_identity);
     try std.testing.expectEqualStrings(added, directories[1].string);
+}
+
+test "custom model role patch writes workspace override" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{}", .{});
+    const application = try applyUserPatchToRoot(arena.allocator(), &root, .{
+        .model_role = .{ .name = "planner", .value = "openrouter/google/gemini-*" },
+        .model_role_scope = .workspace,
+        .workspace_root = "/repo",
+    });
+    try std.testing.expect(application.changed);
+    const workspace = root.object.get("workspaces").?.object.get("/repo").?.object;
+    try std.testing.expectEqualStrings("openrouter/google/gemini-*", workspace.get("model_roles").?.object.get("planner").?.string);
+    try std.testing.expect(!root.object.contains("model_roles"));
+    try validateKnownSettingsObject(root.object, false);
 }

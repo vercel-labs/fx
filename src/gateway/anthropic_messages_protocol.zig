@@ -43,6 +43,19 @@ pub const Options = struct {
     default_max_tokens: u32 = 32_000,
     /// Replays no thinking at all, for the retry after a signature rejection.
     drop_thinking: bool = false,
+    /// Compatibility metadata gates newer Anthropic wire controls.
+    supports_context_management: bool = true,
+    supports_eager_tool_input_streaming: bool = true,
+    requires_tool_result_id: bool = false,
+    /// Models that do not implement `tool_choice: any` receive `auto`.
+    supports_forced_tool_choice: bool = true,
+    /// Some Anthropic-compatible models reject requests that omit thinking,
+    /// even when the caller did not select an effort.
+    requires_thinking_presence: bool = false,
+    /// OAuth requests to non-official endpoints may override selected SDK headers.
+    allow_anthropic_header_overrides: bool = false,
+    /// Signing proxies may accept replayed thinking with an empty signature.
+    replay_unsigned_thinking: bool = false,
 };
 
 pub const volatile_instruction_markers = [_][]const u8{ "<fx-turn-context", "<memories>" };
@@ -51,6 +64,7 @@ pub const decimation_interval = 15;
 
 /// Replay envelope key for ordered thinking and redacted thinking blocks.
 pub const thinking_field = "anthropic_thinking";
+pub const compaction_field = "anthropic_compaction";
 pub const association_field = "_tool_call_ids";
 const max_name_bytes = 128;
 const max_selected_tools = 256;
@@ -113,8 +127,9 @@ fn validate_request(request: stream_provider.RequestData) Error!void {
     try request.validatePrompt();
     configured_provider.validate_model_id(request.model) catch return error.InvalidModel;
     const options = request.provider_options;
-    if (options.fast or options.ultrafast or options.provider_order.len != 0) return error.UnsupportedProviderOption;
-    if (request.response_format != null) return error.UnsupportedResponseFormat;
+    // Anthropic Messages supports Fast mode directly. Ultrafast and gateway
+    // routing are unrelated controls and must not leak into this endpoint.
+    if (options.ultrafast or options.provider_order.len != 0) return error.UnsupportedProviderOption;
     if (request.vision_mode != .unavailable) return error.UnsupportedVision;
     if (request.verified_images != null and request.verified_images.?.len != 0) return error.UnsupportedVision;
     if (request.max_output_tokens == 0) return error.InvalidOutputLimit;
@@ -141,7 +156,7 @@ fn parse_replay(alloc: Allocator, raw: []const u8) Error!std.json.Parsed(std.jso
         else => return error.InvalidProviderState,
     };
     errdefer parsed.deinit();
-    if (parsed.value != .object or parsed.value.object.count() != 2) return error.InvalidProviderState;
+    if (parsed.value != .object or parsed.value.object.count() < 2 or parsed.value.object.count() > 3) return error.InvalidProviderState;
     const fields = parsed.value.object;
     const blocks = fields.get(thinking_field) orelse return error.InvalidProviderState;
     if (blocks != .array) return error.InvalidProviderState;
@@ -152,11 +167,20 @@ fn parse_replay(alloc: Allocator, raw: []const u8) Error!std.json.Parsed(std.jso
         if (std.mem.eql(u8, kind.string, "thinking")) {
             const signature = item.object.get("signature") orelse return error.InvalidProviderState;
             const text = item.object.get("thinking") orelse return error.InvalidProviderState;
-            if (signature != .string or signature.string.len == 0 or text != .string or item.object.count() != 3) return error.InvalidProviderState;
+            if (signature != .string or text != .string or item.object.count() != 3) return error.InvalidProviderState;
         } else if (std.mem.eql(u8, kind.string, "redacted_thinking")) {
             const data = item.object.get("data") orelse return error.InvalidProviderState;
             if (data != .string or data.string.len == 0 or item.object.count() != 2) return error.InvalidProviderState;
         } else return error.InvalidProviderState;
+    }
+    if (fields.get(compaction_field)) |compaction| {
+        if (compaction != .object) return error.InvalidProviderState;
+        const content = compaction.object.get("content") orelse return error.InvalidProviderState;
+        if (content != .string or content.string.len == 0) return error.InvalidProviderState;
+        if (compaction.object.count() > 2) return error.InvalidProviderState;
+        if (compaction.object.get("encrypted_content")) |encrypted| {
+            if (encrypted != .string or encrypted.string.len == 0) return error.InvalidProviderState;
+        }
     }
     const ids = fields.get(association_field) orelse return error.InvalidProviderState;
     if (ids != .array or ids.array.items.len > max_selected_tools) return error.InvalidProviderState;
@@ -176,11 +200,25 @@ fn replay_calls_match(fields: std.json.ObjectMap, calls: []const types.ToolCall)
 
 /// Signed thinking is indivisible from the calls it preceded: the whole
 /// envelope is kept only with every associated call, or dropped.
+/// Extracts the server-generated compaction summary from a reducer replay
+/// envelope. The returned bytes belong to `alloc`; null means the envelope
+/// contains no compaction block.
+pub fn compaction_summary(alloc: Allocator, raw: []const u8) Error!?[]u8 {
+    var parsed = try parse_replay(alloc, raw);
+    defer parsed.deinit();
+    const value = parsed.value.object.get(compaction_field) orelse return null;
+    const content = value.object.get("content").?.string;
+    return try alloc.dupe(u8, content);
+}
+
 pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, _: bool, reasoning: bool) Error!?types.ProviderReplay {
     const value = replay orelse return null;
-    if (!reasoning) return null;
     var parsed = try parse_replay(alloc, value.parts_json);
     defer parsed.deinit();
+    // Compaction summaries are provider context, not reasoning. Keep them on
+    // a text-only turn even when the caller asks to drop signed thinking.
+    const has_compaction = parsed.value.object.get(compaction_field) != null;
+    if (!reasoning and !has_compaction) return null;
     return if (replay_calls_match(parsed.value.object, calls)) value else null;
 }
 
@@ -219,7 +257,7 @@ fn tool_result_denied(message: types.ChatMessage) bool {
     return failed and tool_result_errors.toolPermissionDenialReason(message.content orelse "") != null;
 }
 
-fn tool_result_block(arena: Allocator, message: types.ChatMessage, id: []const u8) !Block {
+fn tool_result_block(arena: Allocator, message: types.ChatMessage, id: []const u8, requires_id: bool) !Block {
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
     try w.writeAll("{\"type\":\"tool_result\",\"tool_use_id\":");
@@ -255,6 +293,10 @@ fn tool_result_block(arena: Allocator, message: types.ChatMessage, id: []const u
         try w.writeByte(']');
     }
     if (message.tool_result_status == .failure) try w.writeAll(",\"is_error\":true");
+    if (requires_id) {
+        try w.writeAll(",\"id\":");
+        try std.json.Stringify.value(id, .{}, w);
+    }
     return finish_block(&out, true);
 }
 
@@ -272,12 +314,26 @@ fn tool_use_block(arena: Allocator, call: types.ToolCall, id: []const u8) !Block
 }
 
 /// Appends the replayed thinking blocks of `message` in their original order.
-fn replay_blocks(arena: Allocator, blocks: *std.ArrayList(Block), message: types.ChatMessage) !void {
+fn replay_blocks(arena: Allocator, blocks: *std.ArrayList(Block), message: types.ChatMessage, replay_unsigned_thinking: bool) !void {
     const replay = message.provider_replay orelse return;
     var parsed = try parse_replay(arena, replay.parts_json);
     defer parsed.deinit();
     if (!replay_calls_match(parsed.value.object, message.tool_calls)) return error.InvalidProviderState;
+    if (parsed.value.object.get(compaction_field)) |value| {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        try out.writer.writeAll("{\"type\":\"compaction\",\"content\":");
+        try std.json.Stringify.value(value.object.get("content").?.string, .{}, &out.writer);
+        if (value.object.get("encrypted_content")) |encrypted| {
+            try out.writer.writeAll(",\"encrypted_content\":");
+            try std.json.Stringify.value(encrypted.string, .{}, &out.writer);
+        }
+        try out.writer.writeByte('}');
+        const json = try out.toOwnedSlice();
+        try blocks.append(arena, .{ .json = json[0 .. json.len - 1], .cacheable = false });
+    }
     for (parsed.value.object.get(thinking_field).?.array.items) |item| {
+        const kind = item.object.get("type").?.string;
+        if (!replay_unsigned_thinking and std.mem.eql(u8, kind, "thinking") and item.object.get("signature").?.string.len == 0) continue;
         var out: std.Io.Writer.Allocating = .init(arena);
         try std.json.Stringify.value(item, .{}, &out.writer);
         const json = try out.toOwnedSlice();
@@ -314,11 +370,11 @@ fn build_messages(arena: Allocator, wire: *Wire, messages: []const types.ChatMes
         .tool => {
             const target = try user_message(arena, wire);
             target.tool_results = true;
-            try target.blocks.append(arena, try tool_result_block(arena, message, projection.resolve(message.tool_call_id.?)));
+            try target.blocks.append(arena, try tool_result_block(arena, message, projection.resolve(message.tool_call_id.?), options.requires_tool_result_id));
         },
         .assistant => {
             var blocks: std.ArrayList(Block) = .empty;
-            if (!options.drop_thinking) try replay_blocks(arena, &blocks, message);
+            if (!options.drop_thinking) try replay_blocks(arena, &blocks, message, options.replay_unsigned_thinking);
             const text = message.content orelse "";
             if (std.mem.trim(u8, text, " \t\r\n").len != 0) try blocks.append(arena, try text_block(arena, text));
             for (message.tool_calls) |call| try blocks.append(arena, try tool_use_block(arena, call, projection.resolve(call.id)));
@@ -336,7 +392,7 @@ fn build_system(arena: Allocator, wire: *Wire, instructions: []const types.ChatM
     }
 }
 
-fn build_tools(arena: Allocator, wire: *Wire, functions: []const chat.Function) !void {
+fn build_tools(arena: Allocator, wire: *Wire, functions: []const chat.Function, eager_input_streaming: bool) !void {
     for (functions, 0..) |function, index| {
         var out: std.Io.Writer.Allocating = .init(arena);
         const w = &out.writer;
@@ -351,6 +407,9 @@ fn build_tools(arena: Allocator, wire: *Wire, functions: []const chat.Function) 
             .builtin => |schema| try model_tool_schema.writeObjectSchema(arena, w, schema),
             .dynamic => |schema| try std.json.Stringify.value(schema, .{}, w),
         }
+        // Fine-grained input streaming is the native Messages behavior; the
+        // transport adds the beta header when it sees this marker.
+        if (eager_input_streaming) try w.writeAll(",\"eager_input_streaming\":true");
         try wire.tools.append(arena, try finish_block(&out, true));
     }
 }
@@ -459,17 +518,31 @@ fn adaptive_effort(effort: types.ReasoningEffort) ?[]const u8 {
 }
 
 fn resolve_thinking(request: stream_provider.RequestData, options: Options, wire: *const Wire, max_tokens: u32) Thinking {
-    const effort = request.provider_options.reasoning orelse return .off;
-    // Forced tool use and thinking are mutually exclusive on the Messages API.
-    if (request.tool_choice == .required) return .off;
+    const effort = request.provider_options.reasoning orelse if (options.requires_thinking_presence) types.ReasoningEffort.auto else return .off;
+    // Anthropic rejects thinking alongside a genuinely forced tool choice.
+    // Unsupported forced choice is downgraded to `auto` below.
+    if (request.tool_choice == .required and options.supports_forced_tool_choice) return .off;
     if (!tool_loop_has_thinking(wire)) return .off;
     return switch (options.thinking_mode) {
         .adaptive => .{ .adaptive = if (effort == .auto) null else adaptive_effort(effort) },
         .budget => budget: {
-            if (max_tokens <= 2048) break :budget .off;
+            if (max_tokens <= 2048 and !options.requires_thinking_presence) break :budget .off;
+            if (options.requires_thinking_presence and request.provider_options.reasoning == null) break :budget .{ .budget = 1024 };
             break :budget .{ .budget = @max(1024, @min(budget_for(effort), max_tokens - 1024)) };
         },
     };
+}
+
+fn write_structured_format(writer: *std.Io.Writer, format: stream_provider.StructuredResponseFormat) !void {
+    // Anthropic's structured-output beta accepts JSON Schema objects only.
+    if (format.schema != .object) return error.UnsupportedResponseFormat;
+    try writer.writeAll("{\"type\":\"json_schema\",\"name\":");
+    try std.json.Stringify.value(format.name, .{}, writer);
+    try writer.writeAll(",\"description\":");
+    try std.json.Stringify.value(format.description, .{}, writer);
+    try writer.writeAll(",\"schema\":");
+    try std.json.Stringify.value(format.schema, .{}, writer);
+    try writer.writeAll(",\"strict\":true}");
 }
 
 fn write_blocks(writer: *std.Io.Writer, blocks: []const Block, cache: CacheMode) !void {
@@ -515,7 +588,7 @@ pub fn build_request(alloc: Allocator, input: stream_provider.RequestData, optio
     defer out.deinit();
     write_request(arena, &out.writer, request, options, functions.items, &projection) catch |err| switch (err) {
         error.WriteFailed, error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidProviderState, error.ReplayTooLarge, error.JsonTooDeep, error.ImageUnavailable, error.InvalidProviderPrompt, error.InvalidToolSelection => |failure| return failure,
+        error.InvalidProviderState, error.ReplayTooLarge, error.JsonTooDeep, error.ImageUnavailable, error.InvalidProviderPrompt, error.InvalidToolSelection, error.UnsupportedResponseFormat => |failure| return failure,
         else => return error.InvalidToolSchema,
     };
     return out.toOwnedSlice();
@@ -533,7 +606,7 @@ fn write_request(arena: Allocator, w: *std.Io.Writer, request: stream_provider.R
         try wire.messages.items[0].blocks.append(arena, try text_block(arena, if (last.len == 0) "(empty)" else last));
     }
     try build_system(arena, &wire, instructions);
-    try build_tools(arena, &wire, functions);
+    try build_tools(arena, &wire, functions, options.supports_eager_tool_input_streaming);
     try build_messages(arena, &wire, request.messages, options, projection);
     if (wire.messages.items.len == 0) return error.InvalidProviderPrompt;
     const caching = options.cache != .off;
@@ -561,11 +634,14 @@ fn write_request(arena: Allocator, w: *std.Io.Writer, request: stream_provider.R
         try w.writeAll(",\"tools\":[");
         try write_blocks(w, wire.tools.items, options.cache);
         try w.writeAll("],\"tool_choice\":{\"type\":");
-        try w.writeAll(switch (request.tool_choice) {
+        const choice = if (request.tool_choice == .required and !options.supports_forced_tool_choice)
+            "\"auto\""
+        else switch (request.tool_choice) {
             .auto => "\"auto\"",
             .required => "\"any\"",
             .none => "\"none\"",
-        });
+        };
+        try w.writeAll(choice);
         if (request.provider_options.parallel_tool_calls == false and request.tool_choice != .none) try w.writeAll(",\"disable_parallel_tool_use\":true");
         try w.writeByte('}');
     }
@@ -574,8 +650,62 @@ fn write_request(arena: Allocator, w: *std.Io.Writer, request: stream_provider.R
         .budget => |tokens| try w.print(",\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{d}}}", .{tokens}),
         .adaptive => |effort| {
             try w.writeAll(",\"thinking\":{\"type\":\"adaptive\"}");
-            if (effort) |name| try w.print(",\"output_config\":{{\"effort\":\"{s}\"}}", .{name});
+            _ = effort;
         },
+    }
+
+    // Structured output, adaptive effort and task budgets share one output
+    // configuration object. Keeping it in one place avoids emitting duplicate
+    // `output_config` keys when reasoning and JSON output are both requested.
+    const effort = switch (thinking) {
+        .adaptive => |value| value,
+        else => null,
+    };
+    const task_budget = request.provider_options.task_budget;
+    if (effort != null or task_budget != null or request.response_format != null) {
+        try w.writeAll(",\"output_config\":{");
+        var field: usize = 0;
+        if (effort) |name| {
+            try w.writeAll("\"effort\":");
+            try std.json.Stringify.value(name, .{}, w);
+            field += 1;
+        }
+        if (task_budget) |budget| {
+            if (field != 0) try w.writeByte(',');
+            try w.writeAll("\"task_budget\":{\"type\":\"tokens\",\"total\":");
+            try w.print("{d}", .{budget.total});
+            if (budget.remaining) |remaining| try w.print(",\"remaining\":{d}", .{remaining});
+            try w.writeByte('}');
+            field += 1;
+        }
+        if (request.response_format) |format| {
+            if (field != 0) try w.writeByte(',');
+            try w.writeAll("\"format\":");
+            try write_structured_format(w, format);
+        }
+        try w.writeByte('}');
+    }
+    if (request.provider_options.fallback_model) |fallback| if (fallback.len != 0) {
+        try w.writeAll(",\"fallbacks\":[{\"model\":");
+        try std.json.Stringify.value(fallback, .{}, w);
+        try w.writeAll("}]");
+    };
+    if (request.provider_options.fast) try w.writeAll(",\"speed\":\"fast\"");
+    if (options.supports_context_management) {
+        if (request.provider_options.anthropic_compaction) |compaction| {
+            try w.writeAll(",\"context_management\":{\"edits\":[{\"type\":\"compact_20260112\"");
+            if (compaction.trigger_input_tokens) |trigger| {
+                try w.print(",\"trigger\":{{\"type\":\"input_tokens\",\"value\":{d}}}", .{@max(trigger, 50_000)});
+            }
+            if (compaction.pause_after_compaction) try w.writeAll(",\"pause_after_compaction\":true");
+            if (compaction.instructions) |text| {
+                if (text.len != 0) {
+                    try w.writeAll(",\"instructions\":");
+                    try std.json.Stringify.value(text, .{}, w);
+                }
+            }
+            try w.writeAll("}]}");
+        }
     }
     try w.writeByte('}');
 }

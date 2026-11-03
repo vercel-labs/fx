@@ -2,11 +2,13 @@
 //! (D204). Effort selection routes to the wire id Cursor discovery reported
 //! for that effort (`effortRouting`, with `off` for no reasoning effort), and
 //! `max_mode` is the catalog's `cursorMaxMode`, or the `-xhigh`/`-max` tier
-//! rule proto falls back to. Images are not sent yet, so no model claims
-//! vision.
+//! rule proto falls back to. Vision capability remains catalog metadata; the
+//! Cursor request transport serializes verified images when routing permits.
 const std = @import("std");
 const types = @import("../core/shared/types.zig");
-const ModelMetadata = @import("../core/config/configured_provider.zig").ModelMetadata;
+const configured_provider = @import("../core/config/configured_provider.zig");
+const ModelMetadata = configured_provider.ModelMetadata;
+const ModelCost = configured_provider.ModelCost;
 
 pub const Model = struct {
     id: []const u8,
@@ -17,6 +19,9 @@ pub const Model = struct {
     /// Effort name (or "off") to the wire id it runs as, where it differs.
     routes: []const [2][]const u8 = &.{},
     max_mode: ?bool = null,
+    cost: ModelCost = .{},
+    description: ?[]const u8 = null,
+    intelligence: ?f64 = null,
 };
 
 pub const default_model = "composer-2.5";
@@ -169,10 +174,48 @@ pub const metadata = blk: {
         var efforts: [model.efforts.len]types.ReasoningEffort = undefined;
         for (model.efforts, &efforts) |name, *effort| effort.* = types.ReasoningEffort.literal(name);
         const frozen = efforts;
-        entry.* = .{ .id = model.id, .context_window = model.context_window, .max_output_tokens = model.max_output_tokens, .supports_tool_use = true, .supports_vision = false, .reasoning_efforts = &frozen };
+        entry.* = .{
+            .id = model.id,
+            .name = model.name,
+            .description = model.description,
+            .cost = model.cost,
+            .intelligence = model.intelligence,
+            .context_window = model.context_window,
+            .max_output_tokens = model.max_output_tokens,
+            .supports_tool_use = true,
+            .supports_vision = resolveInput(model.id),
+            .reasoning_efforts = &frozen,
+        };
     }
     break :blk list;
 };
+
+/// Cursor's discovery response carries no modality bits. These are the same
+/// family rules used by the reference catalog; unknown static rows stay text.
+pub fn resolveInput(id: []const u8) bool {
+    const no_vision = [_][]const u8{
+        "claude-4.6-opus-high",        "claude-4.6-sonnet-medium", "composer-1",               "composer-1.5",        "glm-5.2",
+        "gpt-5.1-high",                "gpt-5.4-fast",             "grok-code-fast-1",         "gpt-5.2-codex-fast",  "gpt-5.2-codex-high",
+        "gpt-5.2-codex-high-fast",     "gpt-5.2-codex-low",        "gpt-5.2-codex-low-fast",   "gpt-5.2-codex-xhigh", "gpt-5.2-codex-xhigh-fast",
+        "gpt-5.3-codex-fast",          "gpt-5.3-codex-high",       "gpt-5.3-codex-high-fast",  "gpt-5.3-codex-low",   "gpt-5.3-codex-low-fast",
+        "gpt-5.3-codex-spark-preview", "gpt-5.3-codex-xhigh",      "gpt-5.3-codex-xhigh-fast",
+    };
+    for (no_vision) |excluded| if (std.ascii.eqlIgnoreCase(id, excluded)) return false;
+    if (std.ascii.eqlIgnoreCase(id, "composer-2.5") or std.ascii.startsWithIgnoreCase(id, "composer-2.5-")) return true;
+    if (std.ascii.startsWithIgnoreCase(id, "kimi-k3") or std.ascii.startsWithIgnoreCase(id, "kimi-k2.")) return true;
+    if (std.ascii.startsWithIgnoreCase(id, "cursor-grok-4")) return true;
+    return containsIgnoreCase(id, "claude") or containsIgnoreCase(id, "gemini") or
+        containsIgnoreCase(id, "gpt-") or containsIgnoreCase(id, "codex");
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var index: usize = 0;
+    while (index <= haystack.len - needle.len) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
+    }
+    return false;
+}
 
 test "efforts route to the wire ids Cursor reported" {
     const opus = route("claude-opus-5-high", "high");

@@ -15,7 +15,6 @@ const model_capabilities = @import("../config/model_capabilities.zig");
 const picker_state = @import("../input/picker_state.zig");
 const core_input_runtime = @import("../input/runtime.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
-const model_cache_runtime = @import("model_cache_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const diff_mod = @import("../output/diff.zig");
@@ -453,12 +452,6 @@ noinline fn approvalScreenNeedsClear(
 
 pub fn Runtime(comptime App: type) type {
     return struct {
-        fn modelMenuProjection(app: *const App) render_input.ModelMenuProjection {
-            var projection = render_input.modelMenuProjection(&app.model_cache);
-            if (comptime @hasField(App, "model_roles")) projection.role_tags = .{ .context = app, .tags_fn = modelRoleTags };
-            return projection;
-        }
-
         fn modelRoleTags(context: ?*const anyopaque, model: []const u8, out: *[model_roles.role_count]model_roles.Role) usize {
             const app: *const App = @ptrCast(@alignCast(context.?));
             return model_role_runtime.rolesFor(app, model, out);
@@ -573,10 +566,8 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
-        var model_completions_buf: [32][]const u8 = undefined;
         var effort_picker_values_buf: [types.ReasoningEffort.max_options + 1]types.ReasoningEffort = undefined;
         var effort_picker_labels_buf: [types.ReasoningEffort.max_options + 1][]const u8 = undefined;
-        var fast_picker_labels_buf: [3][]const u8 = undefined;
         var provider_picker_column: provider_picker_runtime.ColumnBuffer = .{};
         var tool_preview_cache: tool_input_preview_view.Cache = .{};
         /// Keeps the checklist panel on an in-process session's list
@@ -599,17 +590,12 @@ pub fn Runtime(comptime App: type) type {
             shimmer_pos: i16,
             steering: *const SteeringProjection,
         ) render_input.RenderContext {
-            const model_query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state);
-            // `/effort ` lists the current model's levels, whatever a `/model`
-            // flow left pending.
-            const effort_command = if (model_query) |query| query.command == .effort else false;
-            const pending_model = if (!effort_command and app.input_runtime.picker.hasPendingModelPickerSelection()) app.input_runtime.picker.model_picker_pending_model.items else null;
-            // The level the `/effort ` column highlights, which the status line
-            // shows until the column applies or closes.
+            const model_query = blk: {
+                const query = app.input_runtime.picker.activeModelPickerQuery(&app.input_runtime.edit_state) orelse break :blk null;
+                if (query.command != .effort or query.stage != .effort) break :blk null;
+                break :blk query;
+            };
             var effort_command_preview: ?types.ReasoningEffort = null;
-            // A model with no levels, or none loaded yet, shows no `/effort `
-            // column, as `/model` skips its effort column; Enter runs the
-            // command, which says why.
             var effort_command_without_levels = false;
             var model_picker_stage: picker_state.ModelPickerStage = .model;
             var picker_items: []const []const u8 = &.{};
@@ -618,45 +604,22 @@ pub fn Runtime(comptime App: type) type {
             var picker_anchor: usize = 0;
 
             if (model_query) |picker_query| {
-                model_picker_stage = picker_query.stage;
+                model_picker_stage = .effort;
                 picker_anchor = picker_query.token_start;
-                switch (picker_query.stage) {
-                    .model => {
-                        const count = input_completion_runtime.CompletionRuntime(App).modelPickerCompletions(app, picker_query.query, &model_completions_buf);
-                        picker_items = model_completions_buf[0..count];
-                        picker_index = input_completion_runtime.CompletionRuntime(App).modelPickerIndex(app, picker_items);
-                        picker_window_start = input_completion_runtime.CompletionRuntime(App).modelPickerWindowStart(app, count, picker_index);
-                    },
-                    .effort => {
-                        const target = pending_model orelse provider_runtime.model(app);
-                        const capabilities = model_capabilities.resolveForApp(App, app, target);
-                        const effort_count = model_capabilities.reasoningEffortOptionCount(capabilities);
-                        effort_command_without_levels = effort_command and effort_count == 0;
-                        for (0..effort_count) |i| {
-                            effort_picker_values_buf[i] = model_capabilities.reasoningEffortAtIndex(capabilities, i);
-                            effort_picker_labels_buf[i] = effort_picker_values_buf[i].displayLabel();
-                        }
-                        const count = picker_state.filterCompletionLabels(picker_query.query, effort_picker_labels_buf[0..effort_count], effort_picker_labels_buf[0..]);
-                        picker_items = effort_picker_labels_buf[0..count];
-                        picker_index = app.input_runtime.picker.model_picker_effort_index;
-                        picker_window_start = app.input_runtime.picker.model_picker_effort_window_start;
-                        if (effort_command and count > 0) {
-                            effort_command_preview = types.ReasoningEffort.parseDisplayLabel(picker_items[picker_index % count]);
-                        }
-                    },
-                    .fast => {
-                        const count = input_completion_runtime.CompletionRuntime(App).speedPickerLabels(
-                            app,
-                            picker_query.query,
-                            &fast_picker_labels_buf,
-                        );
-                        picker_items = fast_picker_labels_buf[0..count];
-                        picker_index = input_completion_runtime.CompletionRuntime(App).speedPickerIndex(
-                            app,
-                            picker_items,
-                        );
-                        picker_window_start = app.input_runtime.picker.model_picker_fast_window_start;
-                    },
+                const target = provider_runtime.model(app);
+                const capabilities = model_capabilities.resolveForApp(App, app, target);
+                const effort_count = model_capabilities.reasoningEffortOptionCount(capabilities);
+                effort_command_without_levels = effort_count == 0;
+                for (0..effort_count) |i| {
+                    effort_picker_values_buf[i] = model_capabilities.reasoningEffortAtIndex(capabilities, i);
+                    effort_picker_labels_buf[i] = effort_picker_values_buf[i].displayLabel();
+                }
+                const count = picker_state.filterCompletionLabels(picker_query.query, effort_picker_labels_buf[0..effort_count], effort_picker_labels_buf[0..]);
+                picker_items = effort_picker_labels_buf[0..count];
+                picker_index = app.input_runtime.picker.model_picker_effort_index;
+                picker_window_start = app.input_runtime.picker.model_picker_effort_window_start;
+                if (count > 0) {
+                    effort_command_preview = types.ReasoningEffort.parseDisplayLabel(picker_items[picker_index % count]);
                 }
             }
 
@@ -716,17 +679,14 @@ pub fn Runtime(comptime App: type) type {
             const inline_completion =
                 input_completion_runtime.CompletionRuntime(App).visibleInlineCompletion(app);
 
-            const visible_model = session_backend.Ops(App).view(app).model orelse pending_model orelse provider_runtime.model(app);
+            const visible_model = session_backend.Ops(App).view(app).model orelse provider_runtime.model(app);
             const visible_capabilities = model_capabilities.resolveForApp(App, app, visible_model);
-            const active_capabilities_pending = pending_model == null and app.isModelCacheLoading();
-            const model_supports_fast = visible_capabilities.supports_fast_mode;
+            const active_capabilities_pending = false;
             const model_supports_effort = visible_capabilities.reasoning_efforts.len > 0 or
                 (active_capabilities_pending and !app.effort.isDefault());
             const visible_effort = if (effort_command_preview) |effort|
                 effort
-            else if (pending_model != null and model_supports_effort)
-                pendingPickerEffort(app, visible_model, model_query, app.input_runtime.picker.model_picker_effort_index)
-            else if (active_capabilities_pending or model_capabilities.reasoningEffortSupported(visible_capabilities, app.effort))
+            else if (model_capabilities.reasoningEffortSupported(visible_capabilities, app.effort))
                 app.effort
             else
                 .auto;
@@ -734,12 +694,8 @@ pub fn Runtime(comptime App: type) type {
                 app.fastModeModelBound()
             else
                 true;
-            const fast_indicator_active = if (pending_model != null)
-                visible_capabilities.intrinsic_fast or
-                    (model_supports_fast and pendingPickerFastMode(model_query, app.input_runtime.picker.model_picker_fast_index))
-            else
-                visible_capabilities.intrinsic_fast or
-                    (app.fast_mode and active_fast_mode_model_bound);
+            const fast_indicator_active = visible_capabilities.intrinsic_fast or
+                (app.fast_mode and active_fast_mode_model_bound);
 
             const upgrade_label = app.upgrader.statusLabel(upgrade_status_buf);
             const yolo_warning_active =
@@ -777,9 +733,7 @@ pub fn Runtime(comptime App: type) type {
             }
 
             var statusline = buildStatuslineItems(app, visible_model);
-            statusline.ultrafast_indicator_active = if (pending_model != null)
-                visible_capabilities.supports_ultrafast_mode and std.mem.eql(u8, pendingPickerSpeed(model_query, app.input_runtime.picker.model_picker_fast_index), "ultrafast")
-            else if (comptime @hasField(@TypeOf(app.worker), "agent_turn_settings"))
+            statusline.ultrafast_indicator_active = if (comptime @hasField(@TypeOf(app.worker), "agent_turn_settings"))
                 app.worker.agent_turn_settings.ultrafast_mode
             else
                 false;
@@ -811,8 +765,8 @@ pub fn Runtime(comptime App: type) type {
                 .now_ms = now_ms,
                 .model_query_active = model_query != null and !effort_command_without_levels,
                 .model_picker_stage = model_picker_stage,
-                .model_completions_loading = if (model_query != null and model_picker_stage == .model) app.isModelCacheLoading() else false,
-                .model_completions_failed = if (model_query != null and model_picker_stage == .model) app.isModelCacheFailed() else false,
+                .model_completions_loading = false,
+                .model_completions_failed = false,
                 .model_completions = picker_items,
                 .model_completion_index = picker_index,
                 .model_completion_window_start = picker_window_start,
@@ -860,20 +814,14 @@ pub fn Runtime(comptime App: type) type {
                     app.input_runtime.edit_state.input.items,
                 ),
                 .settings_menu = blk: {
-                    var projection = render_input.settingsMenuProjection(
+                    const projection = render_input.settingsMenuProjection(
                         &app.input_runtime.settings_menu,
                         settings_snapshot,
                         app.input_runtime.edit_state.input.items,
                     );
-                    if (comptime @hasField(App, "model_cache")) {
-                        projection.models = modelMenuProjection(app);
-                    }
                     break :blk projection;
                 },
-                .model_menu = if (comptime @hasField(App, "model_cache"))
-                    modelMenuProjection(app)
-                else
-                    .{},
+                .model_menu = .{},
                 .session_browser = if (app.input_runtime.session_browser.active) &app.input_runtime.session_browser else null,
                 .session_menu = if (comptime @hasField(App, "session_persistence")) .{
                     .active = app.session_persistence.session_picker.active,
@@ -935,19 +883,6 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
-        fn pendingPickerEffort(app: *App, model: []const u8, query: ?picker_state.ModelPickerQuery, effort_index: usize) types.ReasoningEffort {
-            const capabilities = model_capabilities.resolveForApp(App, app, model);
-            if (query) |picker_query| {
-                if (picker_query.stage == .effort) {
-                    const typed = std.mem.trim(u8, picker_query.query, " \t");
-                    if (types.ReasoningEffort.parseDisplayLabel(typed)) |effort| {
-                        if (model_capabilities.reasoningEffortSupported(capabilities, effort)) return effort;
-                    }
-                }
-            }
-            return model_capabilities.reasoningEffortAtIndex(capabilities, effort_index);
-        }
-
         fn buildStatuslineItems(
             app: *App,
             visible_model: []const u8,
@@ -977,22 +912,6 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
             return items;
-        }
-
-        fn pendingPickerSpeed(query: ?picker_state.ModelPickerQuery, speed_index: usize) []const u8 {
-            if (query) |picker_query| {
-                if (picker_query.stage == .fast) {
-                    const typed = std.mem.trim(u8, picker_query.query, " \t");
-                    for (picker_state.model_picker_speed_options) |speed| {
-                        if (std.ascii.eqlIgnoreCase(typed, speed)) return speed;
-                    }
-                }
-            }
-            return picker_state.model_picker_speed_options[speed_index % picker_state.model_picker_speed_options.len];
-        }
-
-        fn pendingPickerFastMode(query: ?picker_state.ModelPickerQuery, speed_index: usize) bool {
-            return std.mem.eql(u8, pendingPickerSpeed(query, speed_index), "fast");
         }
 
         pub fn flushRequestedFrame(app: *App) !void {
@@ -1295,7 +1214,7 @@ pub fn Runtime(comptime App: type) type {
                 .restore_normal_screen => {
                     if (!question_active and approval == null and
                         (settingsMenuActive(app) or helpMenuActive(app) or
-                            skillsMenuActive(app) or modelMenuActive(app) or
+                            skillsMenuActive(app) or
                             sessionMenuActive(app) or forkMenuActive(app) or effortMenuActive(app)))
                     {
                         app.shell.render_requests.request(.footer);
@@ -1318,7 +1237,7 @@ pub fn Runtime(comptime App: type) type {
                 return .model_hub_screen;
             }
 
-            if (!question_active and approval == null and (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or modelMenuActive(app) or sessionMenuActive(app) or forkMenuActive(app) or effortMenuActive(app))) {
+            if (!question_active and approval == null and (settingsMenuActive(app) or helpMenuActive(app) or skillsMenuActive(app) or sessionMenuActive(app) or forkMenuActive(app) or effortMenuActive(app))) {
                 if (try app_lifecycle.closeFullTranscriptIfActive(
                     app.alloc,
                     &app.terminal,
@@ -2153,11 +2072,6 @@ pub fn Runtime(comptime App: type) type {
             return .{ .shadow_state = .committed, .animation_visible = false };
         }
 
-        fn modelMenuActive(app: *const App) bool {
-            if (comptime @hasField(App, "model_cache")) return app.model_cache.menu.active;
-            return false;
-        }
-
         fn sessionMenuActive(app: *const App) bool {
             if (comptime @hasField(App, "input_runtime")) {
                 if (app.input_runtime.session_browser.active) return true;
@@ -2184,10 +2098,6 @@ pub fn Runtime(comptime App: type) type {
         fn settingsMenuActive(app: *const App) bool {
             if (comptime @hasField(App, "input_runtime")) return app.input_runtime.settings_menu.active;
             return false;
-        }
-
-        fn catalogMenuActive(app: *const App) bool {
-            return modelMenuActive(app) and !settingsMenuActive(app);
         }
 
         fn activityProjection(app: *const App) activity_runtime.ActivityProjection {
@@ -4008,8 +3918,6 @@ const CoordinatorTestApp = struct {
     auth: auth_runtime.Runtime = .{},
     pending_images: std.ArrayList(types.ImageAttachment) = .empty,
     skills: skill_runtime.Runtime = .{},
-    model_cache: model_cache_runtime.Runtime = model_cache_runtime.Runtime.init(std.testing.allocator, "/v1/models"),
-    model_cache_loading: bool = false,
     stream: types.StreamState = .{},
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
@@ -4044,7 +3952,6 @@ const CoordinatorTestApp = struct {
         self.selected_model.deinit(self.alloc);
         self.workspace_identity.deinit(self.alloc);
         self.pending_images.deinit(self.alloc);
-        self.model_cache.deinit();
     }
 
     pub fn prepareDirectoryCompletion(self: *CoordinatorTestApp) void {
@@ -4056,10 +3963,6 @@ const CoordinatorTestApp = struct {
         };
         self.file_completion_calls += 1;
         state.stage(self.alloc, .{ .state = .ready }, if (rows.results.len == 0) .empty else .ready, rows);
-    }
-
-    pub fn modelCompletions(_: *CoordinatorTestApp, _: []const u8, _: [][]const u8) usize {
-        return 0;
     }
 
     pub fn fileCompletions(
@@ -4076,10 +3979,6 @@ const CoordinatorTestApp = struct {
     }
 
     pub fn writeDomainNotice(_: *CoordinatorTestApp, _: types.SemanticNotice, _: bool) !void {}
-
-    fn isModelCacheLoading(self: *CoordinatorTestApp) bool {
-        return self.model_cache_loading;
-    }
 
     fn isModelCacheFailed(_: *CoordinatorTestApp) bool {
         return false;
@@ -4297,7 +4196,6 @@ test "core.app_render_runtime keeps configured controls visible while model capa
     var app = CoordinatorTestApp{
         .alloc = alloc,
         .shell = .{},
-        .model_cache_loading = true,
         .fast_mode = true,
         .effort = types.ReasoningEffort.literal("xhigh"),
     };
@@ -4350,7 +4248,6 @@ test "core.app_render_runtime keeps Kimi fast indicator stable across catalog hy
             var app = CoordinatorTestApp{
                 .alloc = std.testing.allocator,
                 .shell = .{},
-                .model_cache_loading = catalog_loading,
                 .fast_mode = case.fast_mode,
                 .intrinsic_fast_model = if (case.intrinsic_fast) case.model else null,
                 .gateway_metadata_model = if (catalog_loading) null else case.model,
@@ -5732,154 +5629,6 @@ test "core.app_render_runtime roomy resume footer paints twenty VT session rows"
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "twenty-row transcript remains visible"));
 }
 
-test "core.app_render_runtime inline menus survive the VT size and resize matrix" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var file = try tmp.dir.createFile(std.testing.io, "inline-menu-size-matrix.log", .{ .read = true });
-    defer file.close(io_mod.getIo());
-
-    const skills = [_]skill_runtime.Skill{
-        .{ .name = "one", .description = "", .path = "/skills/one/SKILL.md", .source = .global_fx },
-        .{ .name = "two", .description = "", .path = "/skills/two/SKILL.md", .source = .global_fx },
-        .{ .name = "three", .description = "", .path = "/skills/three/SKILL.md", .source = .global_fx },
-        .{ .name = "four", .description = "", .path = "/skills/four/SKILL.md", .source = .global_fx },
-        .{ .name = "five", .description = "", .path = "/skills/five/SKILL.md", .source = .global_fx },
-        .{ .name = "six", .description = "", .path = "/skills/six/SKILL.md", .source = .global_fx },
-        .{ .name = "seven", .description = "", .path = "/skills/seven/SKILL.md", .source = .global_fx },
-    };
-    var summaries: [25]@import("../session/session_store.zig").SessionSummary = undefined;
-    for (&summaries) |*summary| {
-        summary.* = .{
-            .id = @constCast("session-id"),
-            .workspace_root = @constCast("/workspace"),
-            .title = @constCast("Responsive session title"),
-            .created_at_ms = 1,
-            .updated_at_ms = 1,
-            .conversation_language = .literal("en"),
-            .history_len = 1,
-        };
-    }
-
-    var app = CoordinatorTestApp{
-        .alloc = alloc,
-        .shell = .{
-            .stdout_file = file,
-            .layout = .{
-                .rows = 24,
-                .cols = 100,
-                .content_bottom = 20,
-                .divider_top_row = 21,
-                .input_row = 22,
-                .divider_bottom_row = 23,
-                .hint_row = 24,
-            },
-            .owned_top_row = 1,
-            .viewport_top_row = 1,
-        },
-    };
-    defer app.deinit();
-    try app.selected_model.appendSlice(alloc, "test-model");
-    app.skills.items = @constCast(&skills);
-    app.session_persistence.session_picker.summaries.items = summaries[0..];
-    app.session_persistence.session_picker.load_state = .ready;
-    app.session_persistence.session_picker.has_more = true;
-    for (0..25) |index| {
-        const id = if (index == 24) "provider/selected-model" else "provider/model";
-        try app.model_cache.menu.items.append(alloc, .{
-            .id = try alloc.dupe(u8, id),
-            .provider = "provider",
-            .capabilities = .{},
-        });
-    }
-    app.model_cache.menu.load_state = .ready;
-    app.model_cache.menu.selected_index = 24;
-    try app.shell.initBacking(alloc);
-    try app.shell.enableShadowVt(alloc);
-    try app.shell.writeTranscript(alloc, &app.metrics, "inline menu matrix transcript\n", true);
-
-    const MenuKind = enum { slash, skills, settings, help, sessions, models };
-    const menu_cases = [_]struct {
-        kind: MenuKind,
-        visible_text: []const u8,
-    }{
-        .{ .kind = .slash, .visible_text = "/help" },
-        .{ .kind = .skills, .visible_text = "one" },
-        .{ .kind = .settings, .visible_text = "Status line context" },
-        .{ .kind = .help, .visible_text = "/help" },
-        .{ .kind = .sessions, .visible_text = "Responsive" },
-        .{ .kind = .models, .visible_text = "selected-model" },
-    };
-    const geometries = [_]struct { cols: u16, rows: u16 }{
-        .{ .cols = 40, .rows = 6 },
-        .{ .cols = 60, .rows = 12 },
-        .{ .cols = 100, .rows = 24 },
-        .{ .cols = 140, .rows = 32 },
-        .{ .cols = 220, .rows = 60 },
-        .{ .cols = 60, .rows = 12 },
-        .{ .cols = 100, .rows = 24 },
-    };
-
-    for (menu_cases) |menu_case| {
-        app.skills.closeMenu();
-        app.input_runtime.settings_menu.close();
-        app.input_runtime.help_menu.close();
-        app.session_persistence.session_picker.active = false;
-        app.model_cache.menu.active = false;
-        try app.input_runtime.textReplacementState().replace(alloc, "");
-        switch (menu_case.kind) {
-            .slash => try app.input_runtime.textReplacementState().replace(alloc, "/"),
-            .skills => app.skills.openMenu(),
-            .settings => app.input_runtime.settings_menu.open(),
-            .help => app.input_runtime.help_menu.open(),
-            .sessions => app.session_persistence.session_picker.active = true,
-            .models => app.model_cache.menu.active = true,
-        }
-
-        for (geometries) |geometry| {
-            app.shell.layout = .{
-                .rows = geometry.rows,
-                .cols = geometry.cols,
-                .content_bottom = geometry.rows -| 4,
-                .divider_top_row = geometry.rows -| 3,
-                .input_row = geometry.rows -| 2,
-                .divider_bottom_row = geometry.rows -| 1,
-                .hint_row = geometry.rows,
-            };
-            app.shell.render_requests.request(.resize);
-            try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-
-            try std.testing.expectEqual(geometry.cols, app.shell.shadow_vt.?.cols);
-            try std.testing.expectEqual(geometry.rows, app.shell.shadow_vt.?.rows);
-            try std.testing.expect(!app.terminal.catalogMenuScreenActive());
-            try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, menu_case.visible_text));
-            try std.testing.expect(app.shell.footer_viewport.geometry.top >= 1);
-            try std.testing.expect(app.shell.footer_viewport.geometry.hint <= geometry.rows);
-            if (geometry.rows >= 12) {
-                try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "inline menu matrix transcript"));
-            }
-        }
-    }
-
-    app.skills.closeMenu();
-    app.input_runtime.settings_menu.close();
-    app.input_runtime.help_menu.close();
-    app.session_persistence.session_picker.active = false;
-    app.model_cache.menu.active = false;
-    try app.input_runtime.textReplacementState().replace(alloc, "");
-    app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-    try std.testing.expectEqual(@as(u16, 0), app.shell.extra_input_rows);
-    try std.testing.expect(!(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Responsive session title")));
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "inline menu matrix transcript"));
-
-    var read_offset: u64 = 0;
-    const terminal_bytes = try readCoordinatorFrameBytes(alloc, file, &read_offset);
-    defer alloc.free(terminal_bytes);
-    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, terminal_bytes, "\x1b[?1049h"));
-    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, terminal_bytes, "\x1b[?1049l"));
-}
-
 test "core.app_render_runtime active setup hub stays on the inline transcript surface" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5929,74 +5678,6 @@ test "core.app_render_runtime active setup hub stays on the inline transcript su
     try std.testing.expect(!app.terminal.catalogMenuScreenActive());
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "setup transcript stays behind"));
     try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "test-model"));
-}
-
-test "core.app_render_runtime inline model catalog survives modal preemption and close" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var file = try tmp.dir.createFile(std.testing.io, "models-screen.log", .{ .read = true });
-    defer file.close(io_mod.getIo());
-
-    var app = CoordinatorTestApp{
-        .alloc = alloc,
-        .shell = .{
-            .stdout_file = file,
-            .layout = .{
-                .rows = 14,
-                .cols = 72,
-                .content_bottom = 10,
-                .divider_top_row = 11,
-                .input_row = 12,
-                .divider_bottom_row = 13,
-                .hint_row = 14,
-            },
-            .owned_top_row = 1,
-            .viewport_top_row = 1,
-        },
-    };
-    defer app.deinit();
-    try app.selected_model.appendSlice(alloc, "current/model");
-    app.model_cache.menu.active = true;
-    app.model_cache.menu.load_state = .loading;
-    try app.shell.initBacking(alloc);
-    try app.shell.enableShadowVt(alloc);
-    try app.shell.writeTranscript(alloc, &app.metrics, "model catalog transcript stays behind\n", true);
-
-    app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-
-    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Models 0"));
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Loading models"));
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "model catalog transcript stays behind"));
-
-    try std.testing.expect(try app.approval_prompt.syncRequest(alloc, .{
-        .id = 84,
-        .label = "web_search latest model metadata",
-    }));
-    app.shell.render_requests.request(.modal);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Would you like to allow this action?"));
-
-    app.approval_prompt.clear(alloc);
-    app.shell.render_requests.request(.modal);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "Loading models"));
-
-    app.model_cache.closeMenu();
-    app.shell.render_requests.request(.footer);
-    try Runtime(CoordinatorTestApp).flushRequestedFrame(&app);
-    try std.testing.expect(!app.terminal.catalogMenuScreenActive());
-    try std.testing.expect(try coordinatorGridContains(app.shell.shadow_vt.?.*, "model catalog transcript stays behind"));
-
-    var read_offset: u64 = 0;
-    const terminal_bytes = try readCoordinatorFrameBytes(alloc, file, &read_offset);
-    defer alloc.free(terminal_bytes);
-    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, terminal_bytes, "\x1b[?1049h"));
-    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, terminal_bytes, "\x1b[?1049l"));
 }
 
 test "core.app_render_runtime file approval returns to the preserved inline skills menu" {

@@ -10,6 +10,7 @@ const types = @import("../shared/types.zig");
 
 const Allocator = std.mem.Allocator;
 const Role = model_roles.Role;
+pub const RoleId = model_roles.RoleId;
 
 /// How a provider signs in, which picks what the hub offers for it.
 pub const SignIn = enum {
@@ -37,6 +38,26 @@ pub const Provider = struct {
     /// False for a provider whose catalog only loads once it is active.
     models_known: bool = true,
     model_count: usize = 0,
+    /// A catalog request is in flight; the sidebar keeps the row visible and
+    /// renders a spinner rather than moving focus.
+    refreshing: bool = false,
+    last_attempt_age_ms: ?i64 = null,
+    last_success_age_ms: ?i64 = null,
+    failure_category: ?[]const u8 = null,
+    failure_status: ?u16 = null,
+    credential_source: ?[]const u8 = null,
+};
+
+pub const ModelCost = struct {
+    /// Prices per million tokens, as displayed by the model catalog.
+    input: f64 = 0,
+    output: f64 = 0,
+    cache_read: f64 = 0,
+    cache_write: f64 = 0,
+
+    pub fn isFree(self: ModelCost) bool {
+        return self.input == 0 and self.output == 0;
+    }
 };
 
 pub const Model = struct {
@@ -45,12 +66,27 @@ pub const Model = struct {
     id: []const u8,
     /// The name shown: the catalog's name, else the ID.
     name: []const u8,
+    description: []const u8 = "",
     context_window: ?u32 = null,
+    max_tokens: ?u32 = null,
+    cost: ?ModelCost = null,
+    intelligence: ?f64 = null,
+    /// Catalog lifecycle and product badges.
+    is_new: bool = false,
+    is_beta: bool = false,
+    is_recommended: bool = false,
+    released: i64 = 0,
+    catalog_priority: ?u32 = null,
+    mru_index: ?usize = null,
+    ttft_ms: ?u32 = null,
+    tokens_per_second: ?f64 = null,
+    has_reasoning: bool = false,
+    has_vision: bool = false,
     /// `auto` is always offered; these follow it.
     efforts: []const types.ReasoningEffort = &.{},
     current: bool = false,
     /// Roles that pick this model, in table order.
-    roles: []const Role = &.{},
+    roles: []const RoleId = &.{},
 };
 
 /// Whether a role's chain entry can be used now (D250).
@@ -80,7 +116,11 @@ pub const EntryRow = struct {
 };
 
 pub const RoleRow = struct {
-    role: Role,
+    role: RoleId,
+    /// Optional configured display metadata for custom roles.
+    label: []const u8 = "",
+    summary: []const u8 = "",
+    hidden: bool = false,
     /// The model the profile assigns, as shown; null when unset.
     assigned: ?[]const u8 = null,
     /// The role's chain; empty when unset.
@@ -111,13 +151,16 @@ pub const Snapshot = struct {
     providers: []Provider = &.{},
     models: []Model = &.{},
     roles: []RoleRow = &.{},
-    cycle: []Role = &.{},
+    cycle: []RoleId = &.{},
     web_search: []WebSearchRow = &.{},
     /// The session's reasoning effort; null when the session does not
     /// report it, as a detached one does not.
     effort: ?types.ReasoningEffort = null,
     /// The active provider's catalog is still loading.
     loading: bool = false,
+    /// Prompt tokens used by the current turn, when the host reports them.
+    /// Used only to mark models that need compaction before switching.
+    current_context_tokens: ?u32 = null,
 
     pub fn init(alloc: Allocator) Snapshot {
         return .{ .arena = .init(alloc) };
@@ -137,8 +180,8 @@ pub const Snapshot = struct {
         return null;
     }
 
-    pub fn roleRow(self: *const Snapshot, role: Role) ?*const RoleRow {
-        for (self.roles) |*row| if (row.role == role) return row;
+    pub fn roleRow(self: *const Snapshot, role: RoleId) ?*const RoleRow {
+        for (self.roles) |*row| if (row.role.eql(role)) return row;
         return null;
     }
 };
@@ -157,6 +200,15 @@ pub fn roleName(role: Role) []const u8 {
         .designer => "Designer",
         .commit => "Commit",
         .advisor => "Advisor",
+    };
+}
+
+/// Label for a dynamic role identity. Configured tag/name overrides are
+/// carried on RoleRow; this helper is the stable fallback for chips/badges.
+pub fn roleNameId(role: RoleId) []const u8 {
+    return switch (role) {
+        .builtin => |builtin| roleName(builtin),
+        .custom => |name| name,
     };
 }
 
@@ -199,14 +251,40 @@ pub const Builder = struct {
 
     /// Adds a model unless its provider already lists that ID.
     pub fn addModel(self: *Builder, model: Model) !void {
-        for (self.models.items) |existing| {
-            if (existing.provider == model.provider and std.mem.eql(u8, existing.id, model.id)) return;
+        for (self.models.items) |*existing| {
+            if (existing.provider != model.provider or !std.mem.eql(u8, existing.id, model.id)) continue;
+            // Catalog and configured declarations often describe the same
+            // model. Keep the first non-empty display values while filling
+            // fields the first source did not know.
+            if (existing.name.len == 0 or std.mem.eql(u8, existing.name, existing.id)) {
+                if (model.name.len > 0) existing.name = try self.dupe(model.name);
+            }
+            if (existing.description.len == 0 and model.description.len > 0) existing.description = try self.dupe(model.description);
+            if (existing.context_window == null) existing.context_window = model.context_window;
+            if (existing.max_tokens == null) existing.max_tokens = model.max_tokens;
+            if (existing.cost == null) existing.cost = model.cost;
+            if (existing.intelligence == null) existing.intelligence = model.intelligence;
+            if (existing.released == 0) existing.released = model.released;
+            if (existing.catalog_priority == null) existing.catalog_priority = model.catalog_priority;
+            if (existing.mru_index == null) existing.mru_index = model.mru_index;
+            if (existing.ttft_ms == null) existing.ttft_ms = model.ttft_ms;
+            if (existing.tokens_per_second == null) existing.tokens_per_second = model.tokens_per_second;
+            existing.is_new = existing.is_new or model.is_new;
+            existing.is_beta = existing.is_beta or model.is_beta;
+            existing.is_recommended = existing.is_recommended or model.is_recommended;
+            existing.has_reasoning = existing.has_reasoning or model.has_reasoning;
+            existing.has_vision = existing.has_vision or model.has_vision;
+            existing.current = existing.current or model.current;
+            if (existing.efforts.len == 0 and model.efforts.len > 0) existing.efforts = try self.arena().dupe(types.ReasoningEffort, model.efforts);
+            if (existing.roles.len == 0 and model.roles.len > 0) existing.roles = try self.arena().dupe(RoleId, model.roles);
+            return;
         }
         var copy = model;
         copy.id = try self.dupe(model.id);
         copy.name = try self.dupe(if (model.name.len > 0) model.name else model.id);
+        copy.description = try self.dupe(model.description);
         copy.efforts = try self.arena().dupe(types.ReasoningEffort, model.efforts);
-        copy.roles = try self.arena().dupe(Role, model.roles);
+        copy.roles = try self.arena().dupe(RoleId, model.roles);
         try self.models.append(self.arena(), copy);
         self.providers.items[model.provider].model_count += 1;
     }
@@ -215,6 +293,8 @@ pub const Builder = struct {
         var copy = row;
         if (row.assigned) |text| copy.assigned = try self.dupe(text);
         if (row.resolved) |text| copy.resolved = try self.dupe(text);
+        copy.label = try self.dupe(row.label);
+        copy.summary = try self.dupe(row.summary);
         copy.chain = try self.dupe(row.chain);
         const entries = try self.arena().alloc(EntryRow, row.entries.len);
         for (row.entries, entries) |entry, *out| {
@@ -236,7 +316,7 @@ pub const Builder = struct {
 
     /// Orders providers signed in first, then by name, and models by
     /// provider and name, then hands the snapshot over.
-    pub fn finish(self: *Builder, cycle: []const Role) !Snapshot {
+    pub fn finish(self: *Builder, cycle: []const RoleId) !Snapshot {
         const a = self.arena();
         const count = self.providers.items.len;
         const order = try a.alloc(u16, count);
@@ -255,7 +335,7 @@ pub const Builder = struct {
         self.snapshot.models = self.models.items;
         self.snapshot.roles = self.roles.items;
         self.snapshot.web_search = self.web_search.items;
-        self.snapshot.cycle = try a.dupe(Role, cycle);
+        self.snapshot.cycle = try a.dupe(RoleId, cycle);
         const result = self.snapshot;
         self.* = .{ .snapshot = .init(result.arena.child_allocator) };
         return result;
@@ -270,12 +350,21 @@ fn providerBefore(providers: []const Provider, a: u16, b: u16) bool {
 }
 
 fn modelBefore(providers: []const Provider, a: Model, b: Model) bool {
-    // Models holding a role lead, as in proto's browser.
+    // Proto's browser keeps role models first, then recent use, provider, and
+    // catalog/version recency. The final ID comparison makes ties stable and
+    // deterministic without depending on fetch order.
     const a_roles = a.roles.len > 0;
     const b_roles = b.roles.len > 0;
     if (a_roles != b_roles) return a_roles;
+    const a_mru = a.mru_index orelse std.math.maxInt(usize);
+    const b_mru = b.mru_index orelse std.math.maxInt(usize);
+    if (a_mru != b_mru) return a_mru < b_mru;
     if (a.provider != b.provider) return std.ascii.lessThanIgnoreCase(providers[a.provider].name, providers[b.provider].name);
-    return std.ascii.lessThanIgnoreCase(a.name, b.name);
+    const a_priority = a.catalog_priority orelse std.math.maxInt(u32);
+    const b_priority = b.catalog_priority orelse std.math.maxInt(u32);
+    if (a_priority != b_priority) return a_priority < b_priority;
+    if (a.released != b.released) return a.released > b.released;
+    return std.ascii.lessThanIgnoreCase(a.id, b.id);
 }
 
 /// A fuzzy match score for `query` against `text`, or null when the query's
@@ -330,8 +419,11 @@ pub fn modelSearchScore(snapshot: *const Snapshot, model: Model, query: []const 
         if (fuzzyScore(text, trimmed)) |score| best = @max(best orelse 0, score + 16);
     }
     var buf: [256]u8 = undefined;
-    const joined = std.mem.print(&buf, "{s} {s}", .{ snapshot.providerName(model.provider), model.name }) catch model.name;
+    const joined = std.mem.print(&buf, "{s}/{s}", .{ snapshot.providerName(model.provider), model.id }) catch model.id;
     if (fuzzyScore(joined, trimmed)) |score| best = @max(best orelse 0, score);
+    if (model.cost == null or model.cost.?.isFree()) {
+        if (fuzzyScore("free", trimmed)) |score| best = @max(best orelse 0, score);
+    }
     return best;
 }
 
@@ -350,9 +442,9 @@ test "the builder orders signed-in providers first and remaps their models" {
     const zen = try builder.addProvider(.{ .key = "opencode-zen", .name = "OpenCode Zen", .detail = "", .signed_in = false, .active = false, .sign_in = .login, .can_sign_out = false });
     const cento = try builder.addProvider(.{ .key = "cento", .name = "cento", .detail = "", .signed_in = true, .active = true, .sign_in = .settings, .can_sign_out = false });
     try builder.addModel(.{ .provider = zen, .id = "glm", .name = "" });
-    try builder.addModel(.{ .provider = cento, .id = "claude-cento", .name = "Claude Cento", .roles = &.{.default} });
+    try builder.addModel(.{ .provider = cento, .id = "claude-cento", .name = "Claude Cento", .roles = &.{.{ .builtin = .default }} });
     try builder.addModel(.{ .provider = cento, .id = "claude-cento", .name = "dupe" });
-    var snapshot = try builder.finish(&.{ .deep, .default });
+    var snapshot = try builder.finish(&.{ .{ .builtin = .deep }, .{ .builtin = .default } });
     defer snapshot.deinit();
     try std.testing.expectEqualStrings("cento", snapshot.providers[0].name);
     try std.testing.expectEqual(@as(usize, 1), snapshot.providers[0].model_count);
@@ -361,5 +453,5 @@ test "the builder orders signed-in providers first and remaps their models" {
     try std.testing.expectEqual(@as(u16, 0), snapshot.models[0].provider);
     try std.testing.expectEqualStrings("glm", snapshot.models[1].name);
     try std.testing.expectEqual(@as(u16, 1), snapshot.models[1].provider);
-    try std.testing.expectEqualSlices(Role, &.{ .deep, .default }, snapshot.cycle);
+    try std.testing.expectEqualSlices(RoleId, &.{ .{ .builtin = .deep }, .{ .builtin = .default } }, snapshot.cycle);
 }

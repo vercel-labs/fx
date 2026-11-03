@@ -266,7 +266,10 @@ pub fn streamPrepared(
     if (request.cancel_flag.load(.seq_cst)) return stream_provider.failResult(error.Cancelled);
     var auth_headers = try requestAuthHeaders(alloc, request.credential);
     defer auth_headers.deinit(alloc);
-    const request_endpoint = responsesEndpoint() catch |err| return stream_provider.failResult(err);
+    const metadata = request.provider_options.model_metadata;
+    const request_endpoint = if (metadata) |value| value.base_url orelse try responsesEndpoint() else try responsesEndpoint();
+    var model_headers = try @import("configured_request.zig").resolveHeaderValues(alloc, if (metadata) |value| value.headers else &.{});
+    defer model_headers.deinit(alloc);
     const uri = try std.Uri.parse(request_endpoint);
     const compatibility = if (auth_headers.include_subscription_headers)
         try version_lookup.resolve(alloc, .grok, request.cancel_flag, request.deadline)
@@ -274,13 +277,15 @@ pub fn streamPrepared(
         null;
 
     var extra_headers_buf: [max_extra_headers]std.http.Header = undefined;
-    const extra_headers = extraHeaders(&extra_headers_buf, .{
+    const default_headers = extraHeaders(&extra_headers_buf, .{
         .subscription = auth_headers.include_subscription_headers,
         .client_version = if (compatibility) |*version| version.slice() else null,
         .account_id = auth_headers.account_id,
         .model = request.model,
         .session_id = request.session_id,
     });
+    const extra_headers = try @import("configured_request.zig").mergeHeaders(alloc, default_headers, model_headers.items);
+    defer alloc.free(extra_headers);
 
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();

@@ -337,7 +337,12 @@ pub fn boundOwnLog() void {
 pub fn socketPath(alloc: Allocator) ![]u8 {
     const root = try stateDir(alloc);
     defer alloc.free(root);
-    return std.Io.Dir.path.join(alloc, &.{ root, "control.sock" });
+    const path = try std.Io.Dir.path.join(alloc, &.{ root, "control.sock" });
+    errdefer alloc.free(path);
+    // UnixAddress uses a platform-independent capacity, but Darwin's sockaddr
+    // path is shorter. Reject it before std.Io copies into the native buffer.
+    if (path.len >= @sizeOf(@FieldType(std.c.sockaddr.un, "path"))) return error.NameTooLong;
+    return path;
 }
 
 fn writeFrame(stream: std.Io.net.Stream, json: []const u8) !void {

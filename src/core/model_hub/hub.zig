@@ -14,7 +14,9 @@ pub const edits = @import("edits.zig");
 
 const Allocator = std.mem.Allocator;
 pub const Role = model_roles.Role;
+pub const RoleId = model_roles.RoleId;
 pub const Snapshot = catalog.Snapshot;
+pub const RoleScope = enum { global, workspace };
 
 pub const Focus = enum { scope, list };
 
@@ -38,12 +40,25 @@ pub const Strip = union(enum) {
     none,
     /// Roles to assign the highlighted model to.
     roles: usize,
+    /// Chooses where role assignments are persisted before role chips open.
+    role_scope: usize,
     /// Reasoning efforts to use the highlighted model with: `auto` first.
     thinking: usize,
     /// The thinking level of the highlighted role entry: `auto` first (D251).
     entry_thinking: usize,
     /// Confirms signing out of a provider.
     sign_out: u16,
+};
+
+pub const MouseKind = enum { press, motion, release };
+pub const Mouse = struct {
+    kind: MouseKind,
+    row: u16,
+    column: u16,
+    /// Wheel reports are translated by the input decoder before they reach
+    /// the hub; this is reserved for terminals that report them as pointer
+    /// events.
+    wheel: i8 = 0,
 };
 
 pub const Key = union(enum) {
@@ -64,6 +79,8 @@ pub const Key = union(enum) {
     clear_query,
     role_strip,
     thinking_strip,
+    force_refresh,
+    mouse: Mouse,
     char: u8,
 };
 
@@ -74,10 +91,17 @@ pub const Effect = union(enum) {
     /// Use this model for the session, with this effort when given.
     select_model: struct { model: usize, effort: ?types.ReasoningEffort = null },
     /// Changes one role's chain (D250).
-    edit_role: struct { role: Role, edit: RoleEdit },
-    clear_role: Role,
-    toggle_cycle: Role,
-    move_cycle: struct { role: Role, later: bool },
+    edit_role: struct { role: RoleId, edit: RoleEdit, scope: RoleScope = .global },
+    clear_role: RoleId,
+    create_role: struct { name: []const u8 },
+    rename_role: struct { role: RoleId, name: []const u8 },
+    delete_role: RoleId,
+    edit_tag: struct { role: RoleId, edit: TagEdit },
+    edit_bank: struct { role: RoleId, selectors: []const []const u8 },
+    edit_fallback: struct { selector: []const u8, chain: ?[]const u8 },
+    refresh_provider: u16,
+    toggle_cycle: RoleId,
+    move_cycle: struct { role: RoleId, later: bool },
     sign_in: u16,
     sign_out: u16,
     /// Make a signed-in provider active so its catalog loads.
@@ -85,6 +109,14 @@ pub const Effect = union(enum) {
     /// Move a web search provider earlier or later.
     move_web_search: struct { index: usize, later: bool },
     toggle_web_search: usize,
+};
+
+pub const TagEdit = struct {
+    tag: ?[]const u8 = null,
+    display_name: ?[]const u8 = null,
+    color: ?[]const u8 = null,
+    hidden: ?bool = null,
+    clear: bool = false,
 };
 
 /// A change to one role's chain, by entry: 0 is the assignment, later
@@ -100,7 +132,7 @@ pub const RoleEdit = union(enum) {
 
 /// What Enter on a model does while a role waits for one.
 pub const Assigning = struct {
-    role: Role,
+    role: RoleId,
     /// The entry the model replaces; null appends a fallback.
     entry: ?usize,
 };
@@ -135,6 +167,16 @@ pub const State = struct {
     scope: Scope = .{ .kind = .all_models },
     query_buf: [max_query_bytes]u8 = undefined,
     query_len: usize = 0,
+    role_name_buf: [model_roles.max_role_bytes]u8 = undefined,
+    role_name_len: usize = 0,
+    role_name_mode: enum { none, create, rename, tag } = .none,
+    bank_buf: [model_roles.max_chain][]const u8 = undefined,
+    bank_len: usize = 0,
+    fallback_selector_buf: [model_roles.max_selector_bytes]u8 = undefined,
+    fallback_chain_buf: [model_roles.max_ref_bytes]u8 = undefined,
+    selected_role_scope: RoleScope = .workspace,
+    hovered: ?usize = null,
+    hovered_scope: ?Scope = null,
     strip: Strip = .none,
     /// The role Enter on a model assigns, from the Roles list.
     assigning: ?Assigning = null,
@@ -147,6 +189,13 @@ pub const State = struct {
     /// The screen size of the last frame; a change repaints from blank.
     painted_rows: u16 = 0,
     painted_cols: u16 = 0,
+    /// Geometry of the last frame, used by native SGR mouse routing.
+    layout_rows: u16 = 0,
+    layout_cols: u16 = 0,
+    layout_sidebar_width: u16 = 0,
+    layout_content_rows: u16 = 0,
+    layout_body_offset: u16 = 0,
+    layout_compact: bool = false,
     /// Indices into the snapshot for the current list, rebuilt on change.
     rows: std.ArrayList(usize) = .empty,
     /// One line the hub shows after an action, such as what a role is now.
@@ -167,7 +216,7 @@ pub const State = struct {
         switch (start) {
             .models => {
                 self.scope = .{ .kind = .all_models };
-                self.focus = .list;
+                self.focus = .scope;
             },
             .providers => {
                 self.scope = .{ .kind = .provider, .provider = activeProvider(&self.snapshot.?) orelse 0 };
@@ -186,11 +235,21 @@ pub const State = struct {
         self.strip = .none;
         self.assigning = null;
         self.query_len = 0;
+        self.role_name_len = 0;
+        self.role_name_mode = .none;
+        self.hovered = null;
+        self.hovered_scope = null;
         self.selected = 0;
         self.window_start = 0;
         self.notice_len = 0;
         self.painted_rows = 0;
         self.painted_cols = 0;
+        self.layout_rows = 0;
+        self.layout_cols = 0;
+        self.layout_sidebar_width = 0;
+        self.layout_content_rows = 0;
+        self.layout_body_offset = 0;
+        self.layout_compact = false;
         self.rows.clearRetainingCapacity();
         _ = alloc;
     }
@@ -255,10 +314,6 @@ pub const State = struct {
             out[count] = .{ .kind = .provider, .provider = @intCast(index) };
             count += 1;
         }
-        if (count < out.len) {
-            out[count] = .{ .kind = .web_search };
-            count += 1;
-        }
         return out[0..@min(count, out.len)];
     }
 
@@ -290,6 +345,7 @@ pub const State = struct {
         const snapshot = &(self.snapshot orelse return);
         switch (self.scope.kind) {
             .roles => for (snapshot.roles, 0..) |role_row, index| {
+                if (role_row.hidden) continue;
                 try self.rows.append(alloc, (RoleCursor{ .role_index = index, .entry = 0 }).encode());
                 for (1..@max(role_row.entries.len, 1)) |entry| try self.rows.append(alloc, (RoleCursor{ .role_index = index, .entry = entry }).encode());
             },
@@ -338,10 +394,108 @@ pub const State = struct {
         }
     }
 
+    /// Handles one SGR mouse event using the last painted frame. A click is
+    /// intentionally select-then-activate, matching the browser and roles
+    /// pane; motion only records the geometry for a future repaint.
+    pub fn handleMouse(self: *State, alloc: Allocator, mouse: Mouse) !Effect {
+        if (!self.active) return .none;
+        if (mouse.wheel != 0) {
+            const sidebar = self.layout_compact or mouse.column < self.layout_sidebar_width;
+            if (sidebar) return self.handle(alloc, if (mouse.wheel < 0) .up else .down);
+            return self.handle(alloc, if (mouse.wheel < 0) .up else .down);
+        }
+        if (mouse.kind == .motion) {
+            self.updateHover(mouse);
+            return .redraw;
+        }
+        if (mouse.kind == .release) return .redraw;
+        if (self.strip != .none and self.layout_rows > 0 and mouse.row + 1 >= self.layout_rows) {
+            const count = self.stripCount();
+            if (count == 0) return .redraw;
+            const col = @as(usize, mouse.column);
+            const slot = @min(count - 1, col * count / @max(@as(usize, self.layout_cols), 1));
+            switch (self.strip) {
+                .role_scope => |*selected| selected.* = slot,
+                .roles => |*selected| selected.* = slot,
+                .thinking => |*selected| selected.* = slot,
+                .entry_thinking => |*selected| selected.* = slot,
+                .sign_out => {},
+                .none => unreachable,
+            }
+            return self.handle(alloc, .enter);
+        }
+        if (self.layout_compact and mouse.row == 0) {
+            self.focus = .scope;
+            return .redraw;
+        }
+        const content_row = if (mouse.row >= 2) mouse.row - 2 else return .none;
+        if (content_row >= self.layout_content_rows) return .none;
+        if (!self.layout_compact and mouse.column <= self.layout_sidebar_width) {
+            var scopes_buf: [64]Scope = undefined;
+            const list = self.scopes(&scopes_buf);
+            var row: usize = 0;
+            for (list, 0..) |scope, index| {
+                if (scope.kind == .provider and index > 0 and list[index - 1].kind != .provider) row += 1;
+                if (row == content_row) {
+                    if (Scope.eql(scope, self.scope)) {
+                        self.focus = .list;
+                        return .redraw;
+                    }
+                    try self.setScope(alloc, scope);
+                    self.focus = .scope;
+                    return .redraw;
+                }
+                row += 1;
+            }
+            return .none;
+        }
+        // Compact mode alternates panes; a body click is a list click only
+        // while the list is visible.
+        if (self.layout_compact and self.focus != .list) return .none;
+        var header: usize = 1; // status line
+        if (self.listsModels() or self.layout_content_rows >= 8) header += 1; // search line
+        if (self.layout_content_rows >= 8) header += 1; // breathing row
+        if (content_row < header) return .none;
+        const list_row = content_row - header;
+        if (list_row >= self.rows.items.len) return .none;
+        const selected = self.selected;
+        self.selected = @min(self.rows.items.len - 1, self.window_start + list_row);
+        if (self.selected == selected) return self.handle(alloc, .enter);
+        return .redraw;
+    }
+
+    fn updateHover(self: *State, mouse: Mouse) void {
+        self.hovered = null;
+        self.hovered_scope = null;
+        const content_row = if (mouse.row >= 2) mouse.row - 2 else return;
+        if (!self.layout_compact and mouse.column <= self.layout_sidebar_width) {
+            var scopes_buf: [64]Scope = undefined;
+            const list = self.scopes(&scopes_buf);
+            var row: usize = 0;
+            for (list, 0..) |scope, index| {
+                if (scope.kind == .provider and index > 0 and list[index - 1].kind != .provider) row += 1;
+                if (row == content_row) {
+                    self.hovered_scope = scope;
+                    return;
+                }
+                row += 1;
+            }
+            return;
+        }
+        if (self.layout_compact and self.focus != .list) return;
+        var header: usize = 1;
+        if (self.listsModels() or self.layout_content_rows >= 8) header += 1;
+        if (self.layout_content_rows >= 8) header += 1;
+        if (content_row < header) return;
+        const row = self.window_start + content_row - header;
+        if (row < self.rows.items.len) self.hovered = row;
+    }
+
     /// Handles one key. The caller carries out the effect, then refreshes
     /// the snapshot with `replaceSnapshot` when the effect changed the app.
     pub fn handle(self: *State, alloc: Allocator, key: Key) !Effect {
         if (!self.active) return .none;
+        if (self.role_name_mode != .none) return self.handleRoleName(key);
         if (self.strip != .none) return self.handleStrip(key);
         switch (key) {
             .escape => return self.escape(alloc),
@@ -352,6 +506,15 @@ pub const State = struct {
             else => {},
         }
         self.notice_len = 0;
+        if (key == .force_refresh) {
+            const provider = switch (self.scope.kind) {
+                .provider => self.scope.provider,
+                .all_models => if (self.selectedModel()) |model| self.snapshot.?.models[model].provider else return .none,
+                else => return .none,
+            };
+            if (provider >= self.snapshot.?.providers.len or !self.snapshot.?.providers[provider].signed_in) return .none;
+            return .{ .refresh_provider = provider };
+        }
         return switch (self.focus) {
             .scope => self.handleScope(alloc, key),
             .list => self.handleList(alloc, key),
@@ -384,11 +547,11 @@ pub const State = struct {
     }
 
     /// Highlights `role`'s row for `entry`, else the role's own row.
-    fn selectRole(self: *State, role: Role, entry: usize) void {
+    fn selectRole(self: *State, role: RoleId, entry: usize) void {
         const snapshot = self.snapshot orelse return;
         for (self.rows.items, 0..) |id, row| {
             const cursor = RoleCursor.decode(id);
-            if (snapshot.roles[cursor.role_index].role != role) continue;
+            if (!snapshot.roles[cursor.role_index].role.eql(role)) continue;
             if (cursor.entry == 0) self.selected = row;
             if (cursor.entry == entry) {
                 self.selected = row;
@@ -513,7 +676,7 @@ pub const State = struct {
             },
             .role_strip => {
                 if (self.selectedModel() == null or self.assigning != null) return .none;
-                self.strip = .{ .roles = 0 };
+                self.strip = .{ .role_scope = 0 };
                 return .redraw;
             },
             .thinking_strip => {
@@ -538,9 +701,29 @@ pub const State = struct {
                 self.query_len = 0;
                 return self.requery(alloc);
             },
-            .char => |byte| return self.typeChar(alloc, byte),
+            .char => |byte| switch (byte) {
+                'F' => return self.startFallback(.model),
+                'P' => return self.startFallback(.provider),
+                'R' => return self.startFallback(.generic),
+                else => return self.typeChar(alloc, byte),
+            },
             else => return .none,
         }
+    }
+
+    const FallbackKind = enum { model, provider, generic };
+
+    fn startFallback(self: *State, kind: FallbackKind) Effect {
+        const model_index = self.selectedModel() orelse return .none;
+        const model = self.snapshot.?.models[model_index];
+        const provider = self.snapshot.?.providers[model.provider].key;
+        const selector = switch (kind) {
+            .model => std.mem.print(&self.fallback_selector_buf, "{s}/{s}", .{ provider, model.id }) catch return .none,
+            .provider => std.mem.print(&self.fallback_selector_buf, "{s}/*", .{provider}) catch return .none,
+            .generic => std.mem.print(&self.fallback_selector_buf, "*", .{}) catch return .none,
+        };
+        const chain = std.mem.print(&self.fallback_chain_buf, "{s}/{s}", .{ provider, model.id }) catch return .none;
+        return .{ .edit_fallback = .{ .selector = selector, .chain = chain } };
     }
 
     fn typeChar(self: *State, alloc: Allocator, byte: u8) !Effect {
@@ -590,6 +773,11 @@ pub const State = struct {
                     return .redraw;
                 },
                 'c' => return .{ .toggle_cycle = role },
+                'n' => return self.beginRoleName(.create, role),
+                'r' => return if (role == .custom) self.beginRoleName(.rename, role) else .none,
+                'd' => return if (role == .custom) .{ .delete_role = role } else .{ .clear_role = role },
+                'T' => return self.beginRoleName(.tag, role),
+                'b' => return self.editBank(role),
                 '[', ']' => {
                     const later = byte == ']';
                     if (own_row and role_row.entries.len < 2) {
@@ -608,7 +796,72 @@ pub const State = struct {
         }
     }
 
-    fn startAssign(self: *State, alloc: Allocator, role: Role, entry: ?usize) !Effect {
+    fn beginRoleName(self: *State, mode: @TypeOf(self.role_name_mode), role: RoleId) Effect {
+        self.role_name_mode = mode;
+        self.role_name_len = 0;
+        if (mode == .rename) {
+            const name = role.label();
+            const len = @min(name.len, self.role_name_buf.len);
+            @memcpy(self.role_name_buf[0..len], name[0..len]);
+            self.role_name_len = len;
+        }
+        self.setNotice(switch (mode) {
+            .create => "Type a role name, then Enter",
+            .rename => "Rename role, then Enter",
+            .tag => "Type a role tag, then Enter",
+            .none => "",
+        });
+        return .redraw;
+    }
+
+    fn handleRoleName(self: *State, key: Key) Effect {
+        switch (key) {
+            .escape => {
+                self.role_name_mode = .none;
+                self.role_name_len = 0;
+                return .redraw;
+            },
+            .backspace => {
+                if (self.role_name_len > 0) self.role_name_len -= 1;
+                return .redraw;
+            },
+            .enter => {
+                const name = self.role_name_buf[0..self.role_name_len];
+                const mode = self.role_name_mode;
+                self.role_name_mode = .none;
+                self.role_name_len = 0;
+                if (name.len == 0) return .redraw;
+                const cursor = self.roleCursor();
+                return switch (mode) {
+                    .create => .{ .create_role = .{ .name = name } },
+                    .rename => if (cursor) |selected| .{ .rename_role = .{ .role = self.snapshot.?.roles[selected.role_index].role, .name = name } } else .redraw,
+                    .tag => if (cursor) |selected| .{ .edit_tag = .{ .role = self.snapshot.?.roles[selected.role_index].role, .edit = .{ .tag = name } } } else .redraw,
+                    .none => .redraw,
+                };
+            },
+            .char => |byte| {
+                if (byte >= 0x20 and byte != 0x7f and self.role_name_len < self.role_name_buf.len) {
+                    self.role_name_buf[self.role_name_len] = byte;
+                    self.role_name_len += 1;
+                }
+                return .redraw;
+            },
+            else => return .redraw,
+        }
+    }
+
+    fn editBank(self: *State, role: RoleId) Effect {
+        const row = self.snapshot.?.roleRow(role) orelse return .none;
+        self.bank_len = 0;
+        for (row.entries) |entry| {
+            if (self.bank_len == self.bank_buf.len) break;
+            self.bank_buf[self.bank_len] = entry.ref;
+            self.bank_len += 1;
+        }
+        return .{ .edit_bank = .{ .role = role, .selectors = self.bank_buf[0..self.bank_len] } };
+    }
+
+    fn startAssign(self: *State, alloc: Allocator, role: RoleId, entry: ?usize) !Effect {
         self.assigning = .{ .role = role, .entry = entry };
         self.query_len = 0;
         try self.setScope(alloc, .{ .kind = .all_models });
@@ -617,7 +870,7 @@ pub const State = struct {
     }
 
     /// x on a role clears it; on a fallback, removes that model.
-    fn removeEntry(self: *State, role: Role, own_row: bool, entry: usize) Effect {
+    fn removeEntry(self: *State, role: RoleId, own_row: bool, entry: usize) Effect {
         if (own_row) return .{ .clear_role = role };
         self.selected -|= 1;
         return .{ .edit_role = .{ .role = role, .edit = .{ .remove = entry } } };
@@ -644,11 +897,28 @@ pub const State = struct {
         }
     }
 
+    fn visibleRole(self: *const State, visible_index: usize) ?RoleId {
+        const snapshot = self.snapshot orelse return null;
+        var index: usize = 0;
+        for (snapshot.roles) |role_row| {
+            if (role_row.hidden) continue;
+            if (index == visible_index) return role_row.role;
+            index += 1;
+        }
+        return null;
+    }
+
     /// The chips of the open strip, as roles or efforts.
     pub fn stripCount(self: *const State) usize {
         return switch (self.strip) {
             .none => 0,
-            .roles => catalog.role_order.len,
+            .role_scope => 2,
+            .roles => blk: {
+                const snapshot = self.snapshot orelse break :blk 0;
+                var count: usize = 0;
+                for (snapshot.roles) |role_row| count += @intFromBool(!role_row.hidden);
+                break :blk count;
+            },
             .thinking => if (self.selectedModel()) |model| self.snapshot.?.models[model].efforts.len + 1 else 1,
             .entry_thinking => if (self.selectedEntry()) |entry| entry.efforts.len + 1 else 1,
             .sign_out => 2,
@@ -670,6 +940,7 @@ pub const State = struct {
     fn handleStrip(self: *State, key: Key) Effect {
         const count = self.stripCount();
         const selected: *usize = switch (self.strip) {
+            .role_scope => |*value| value,
             .roles => |*value| value,
             .thinking => |*value| value,
             .entry_thinking => |*value| value,
@@ -702,6 +973,11 @@ pub const State = struct {
                 return .redraw;
             },
             .enter => {
+                if (self.strip == .role_scope) {
+                    self.selected_role_scope = if (selected.* == 0) .workspace else .global;
+                    self.strip = .{ .roles = 0 };
+                    return .redraw;
+                }
                 if (self.strip == .entry_thinking) {
                     const index = selected.*;
                     const effort: ?types.ReasoningEffort = if (index == 0) null else self.stripEffort(index);
@@ -718,10 +994,14 @@ pub const State = struct {
                 const strip = self.strip;
                 self.strip = .none;
                 return switch (strip) {
+                    .role_scope => .redraw,
                     .roles => blk: {
-                        const role = catalog.role_order[index];
-                        const holds = std.mem.findScalar(Role, self.snapshot.?.models[model].roles, role) != null;
-                        break :blk if (holds) .{ .clear_role = role } else .{ .edit_role = .{ .role = role, .edit = .{ .put = .{ .entry = 0, .model = model } } } };
+                        const role = self.visibleRole(index) orelse break :blk .redraw;
+                        var holds = false;
+                        for (self.snapshot.?.models[model].roles) |candidate| {
+                            if (candidate.eql(role)) holds = true;
+                        }
+                        break :blk if (holds) .{ .clear_role = role } else .{ .edit_role = .{ .role = role, .scope = self.selected_role_scope, .edit = .{ .put = .{ .entry = 0, .model = model } } } };
                     },
                     .thinking => .{ .select_model = .{ .model = model, .effort = self.stripEffort(index) } },
                     else => .redraw,

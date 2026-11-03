@@ -9,6 +9,7 @@ const question_answer = @import("../agent/question_answer.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
+const provider_set = @import("../gateway/provider_set.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const tool_admission = @import("../agent/runtime/tool_admission.zig");
 const tool_presentation = @import("../agent/runtime/tool_presentation.zig");
@@ -20,6 +21,10 @@ const host_target = @import("../hosts/target.zig");
 const diff = @import("../output/diff.zig");
 const diagnostics = @import("../workspace/diagnostics.zig");
 const app_lifecycle = @import("app_lifecycle.zig");
+const model_role_runtime = @import("model_role_runtime.zig");
+const model_roles = @import("../config/model_roles.zig");
+const auth_runtime = @import("../auth/auth_runtime.zig");
+const credentials = @import("../auth/credentials.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const input_completion_runtime = @import("input_completion_runtime.zig");
 const image_attachments = @import("../images/image_attachments.zig");
@@ -1443,6 +1448,15 @@ pub const OlderHistoryProjection = struct {
         self.* = undefined;
     }
 };
+
+fn titleSelection(comptime App: type, app: *App) ?model_roles.Selection {
+    if (comptime @hasField(App, "model_roles")) return model_role_runtime.titleSelection(app);
+    if (comptime @hasDecl(App, "sessionTitleModel")) {
+        const model = app.sessionTitleModel() orelse return null;
+        return .{ .provider = provider_runtime.provider(app), .model = model, .source = .{ .builtin = .title } };
+    }
+    return null;
+}
 
 pub fn Runtime(comptime App: type) type {
     return struct {
@@ -3213,37 +3227,106 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "session")) return;
             if (comptime !@hasField(App, "auth")) return;
             if (comptime !@hasDecl(App, "agentStreamProvider")) return;
-            if (comptime !@hasDecl(App, "sessionTitleModel")) return;
 
             const excerpt = session_title_generation.promptExcerpt(prompt) orelse return;
-            const title_model = app.sessionTitleModel();
+            const selection = titleSelection(App, app) orelse return;
             if (!session_title_generation.shouldGenerate(.{
                 .setting_enabled = app.session_title_generation,
-                .provider_supports_titles = title_model != null,
+                .provider_supports_titles = selection.model.len > 0,
                 .session_untitled = app.session_title.items.len == 0 and
                     app.session.agent.history.items.len == 0,
                 .recovery_replay = false,
                 .task_running = app.session_persistence.title_generation.task != null,
             })) return;
             const session_id = activeSessionId(app) orelse return;
-            const credential = app.auth.gatewayCredential() orelse return;
 
+            var owned_credential: ?credentials.Credential = null;
+            defer if (owned_credential) |*value| value.deinit(app.alloc);
+            const active_provider = provider_runtime.provider(app);
+            const credential = if (selection.provider.eql(active_provider)) blk: {
+                const value = app.auth.gatewayCredential() orelse return;
+                break :blk session_title_generation.CredentialInput{
+                    .api_key = value.api_key,
+                    .gateway_team = value.gateway_team,
+                    .account_id = value.account,
+                    .credential_source = value.source,
+                };
+            } else blk: {
+                if (comptime !@hasDecl(@TypeOf(app.auth), "oauthTransport") or !@hasDecl(@TypeOf(app.auth), "secretStore")) return;
+                owned_credential = auth_runtime.prepareCredential(
+                    app.alloc,
+                    app.auth.oauthTransport(),
+                    app.auth.secretStore(),
+                    selection.provider,
+                    null,
+                ) catch return;
+                const value = owned_credential orelse return;
+                break :blk session_title_generation.CredentialInput{
+                    .api_key = value.token,
+                    .gateway_team = value.gatewayTeam(),
+                    .account_id = value.accountId(),
+                    .credential_source = value.source,
+                };
+            };
+            const provider_bundle: ?provider_set.Bundle = if (comptime @hasDecl(App, "providerSet")) app.providerSet().select(selection.provider) else null;
+            const stream = if (provider_bundle) |bundle| bundle.agent_stream_or_unavailable() else app.agentStreamProvider();
+            const provider_options: model_capabilities.ResolvedProviderOptions = if (provider_bundle) |bundle|
+                model_capabilities.resolveProviderOptionsForCapabilities(
+                    bundle.fallbackModelCapabilities(selection.model),
+                    selection.effort orelse .auto,
+                    false,
+                )
+            else
+                .{};
+            var title_fallbacks: [64]session_title_generation.Fallback = undefined;
+            var title_fallback_count: usize = 0;
+            if (comptime @hasField(App, "model_roles")) {
+                var chain: [64]model_roles.Selection = undefined;
+                const chain_count = model_role_runtime.selectionChain(app, .{ .builtin = .title }, &chain);
+                var primary_seen = false;
+                for (chain[0..chain_count]) |candidate| {
+                    if (!primary_seen) {
+                        if (candidate.provider.eql(selection.provider) and std.mem.eql(u8, candidate.model, selection.model)) primary_seen = true;
+                        continue;
+                    }
+                    if (title_fallback_count == title_fallbacks.len) break;
+                    const binding = model_role_runtime.bindSelection(app, app.alloc, candidate) catch null orelse continue;
+                    title_fallbacks[title_fallback_count] = .{
+                        .stream_provider = binding.stream_provider,
+                        .provider = binding.selection.provider,
+                        .model = binding.selection.model,
+                        .effort = binding.selection.effort orelse .auto,
+                        .provider_options = binding.provider_options,
+                        .credential = .{
+                            .api_key = binding.credential.secret(),
+                            .gateway_team = binding.credential.tenant(),
+                            .account_id = binding.credential.accountId(),
+                            .credential_source = binding.credential.credentialSource(),
+                        },
+                    };
+                    title_fallback_count += 1;
+                }
+            }
             const task = session_title_generation.Task.create(.{
                 .session_id = session_id,
-                .model = title_model.?,
+                .provider = selection.provider,
+                .model = selection.model,
+                .effort = selection.effort orelse .auto,
+                .provider_options = provider_options,
                 .prompt_excerpt = excerpt,
                 .api_key = credential.api_key,
                 .gateway_team = credential.gateway_team,
-                .account_id = app.auth.accountId(),
-                .credential_source = credential.source,
-                .stream_provider = app.agentStreamProvider(),
+                .account_id = credential.account_id,
+                .credential_source = credential.credential_source,
+                .stream_provider = stream,
+                .fallbacks = title_fallbacks[0..title_fallback_count],
             }) catch |err| {
-                app.session_persistence.title_generation.recordSpawnFailure(session_id, title_model.?, err);
+                app.session_persistence.title_generation.recordSpawnFailure(session_id, selection.model, err);
                 return;
             };
             task.spawn() catch |err| {
                 debug_trace.logf("session", "event=title_generation result=unavailable reason=spawn err={s}", .{@errorName(err)});
-                app.session_persistence.title_generation.recordSpawnFailure(session_id, title_model.?, err);
+                app.session_persistence.title_generation.recordSpawnFailure(session_id, selection.model, err);
                 task.destroy();
                 return;
             };

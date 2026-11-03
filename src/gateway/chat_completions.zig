@@ -7,6 +7,7 @@ const provider_set = @import("../core/gateway/provider_set.zig");
 const catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
+const tokenizer = @import("../core/tokenizer/tokenizer.zig");
 const model_catalog_metadata = @import("../core/gateway/model_catalog_metadata.zig");
 const classifier = @import("../core/permissions/auto_classifier.zig");
 const gateway_step = @import("../core/agent/runtime/gateway_step.zig");
@@ -19,6 +20,8 @@ const debug_trace = @import("../core/shared/debug_trace.zig");
 const sse = @import("sse.zig");
 const configured_request = @import("configured_request.zig");
 const openrouter_catalog = @import("openrouter_catalog.zig");
+const configured_discovery = @import("configured_discovery.zig");
+const google_generative = @import("google_generative.zig");
 const Allocator = std.mem.Allocator;
 
 /// Every callback borrows the immutable definition from the owning profile runtime.
@@ -56,6 +59,7 @@ pub fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) !
 /// The request body for `definition`, omitting replay parts recorded for
 /// another endpoint. Caller owns the result.
 pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, request: streams.RequestData) ![]u8 {
+    if (definition.protocolFor(request.model) == .@"google-generative-ai") return google_generative.build_for(definition, alloc, request);
     const identity = bound_identity(definition);
     for (request.messages) |message| if (message.provider_replay) |replay| {
         if (!replay.matches(.{ .provider = identity, .model = request.model })) {
@@ -63,7 +67,20 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
             break;
         }
     };
-    return codec.build_request(alloc, request, .{ .tool_choice_mode = definition.tool_choice_mode, .reasoning_format = definition.reasoning_format, .provider = &identity });
+    const metadata = request.provider_options.model_metadata orelse definition.model(request.model);
+    const base_url = definition.baseUrlFor(request.model);
+    const openrouter_host = std.mem.find(u8, base_url, "openrouter.ai") != null;
+    const vercel_gateway_host = std.mem.find(u8, base_url, "ai-gateway.vercel.sh") != null or
+        std.mem.find(u8, base_url, "gateway.ai.vercel.sh") != null;
+    return codec.build_request(alloc, request, .{
+        .tool_choice_mode = definition.tool_choice_mode,
+        .reasoning_format = definition.reasoning_format,
+        .provider = &identity,
+        .compatibility = if (metadata) |value| &value.compat else null,
+        .default_max_output_tokens = if (metadata) |value| value.max_output_tokens else null,
+        .openrouter_host = openrouter_host,
+        .vercel_gateway_host = vercel_gateway_host,
+    });
 }
 
 pub fn project_replay(alloc: Allocator, replay: ?types.ProviderReplay, calls: []const types.ToolCall, text: bool, reasoning: bool) !?types.ProviderReplay {
@@ -111,6 +128,7 @@ test "chat completions adapter binds replay to endpoint authority and wires proj
 pub fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !streams.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
     const definition = definition_at(raw);
+    if (definition.protocolFor(request.model) == .@"google-generative-ai") return google_generative.stream(raw, alloc, request);
     if (request.credential.credentialSource() != .configured) return error.ConfiguredProviderCredentialRequired;
     const token = request.credential.secret();
     try configured_request.checkToken(definition, token);
@@ -134,25 +152,46 @@ fn phase_deadline(milliseconds: i64, caller: ?std.Io.Clock.Timestamp) std.Io.Clo
     return phase;
 }
 
+fn body_stall_timeout_ms(definition: *const definitions.Definition, request: streams.ModelRequest) i64 {
+    if (request.deadline != null) return std.math.maxInt(i64);
+    const metadata = request.provider_options.model_metadata orelse definition.model(request.model) orelse return client_mod.ConnectionWatch.bodyStallTimeoutMs(null);
+    const configured = metadata.compat.stream_idle_timeout_ms orelse return client_mod.ConnectionWatch.bodyStallTimeoutMs(null);
+    if (configured == 0) return std.math.maxInt(i64);
+    return @intCast(@min(configured, @as(u64, @intCast(std.math.maxInt(i64)))));
+}
+
 fn post(alloc: Allocator, definition: *const definitions.Definition, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8) !streams.Result {
-    const url = try definition.chat_url(alloc);
+    const url = try definition.chat_url(alloc, request.model);
     defer alloc.free(url);
     return post_url(alloc, definition, url, request, token, payload, consume);
 }
 
 pub const ConsumeFn = *const fn (Allocator, *std.Io.Reader, streams.ModelRequest, ?sse.Progress) anyerror!streams.Result;
 
-/// Posts `payload` to `url` with the definition's bearer key and headers and
-/// parses the streamed reply with `consume_fn`. Shared with the Responses
-/// transport for configured providers.
+/// The configured credential header used by a native protocol. Bearer remains
+/// the default for OpenAI-compatible endpoints; Google-compatible Zen routes
+/// use x-api-key without changing the shared HTTP lifecycle.
+pub const AuthStyle = enum { bearer, x_api_key, none };
+
+/// Posts `payload` with a bearer key and parses a streamed reply. Shared with
+/// the Responses transport for configured providers.
 pub fn post_url(alloc: Allocator, definition: *const definitions.Definition, url: []const u8, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8, consume_fn: ConsumeFn) !streams.Result {
-    const authorization = if (token) |value| if (value.len != 0) try alloc.print("Bearer {s}", .{value}) else null else null;
+    return post_url_auth(alloc, definition, url, request, token, payload, consume_fn, .bearer);
+}
+
+/// The same bounded POST as `post_url`, with an explicit credential style for
+/// native protocols that do not use HTTP Authorization.
+pub fn post_url_auth(alloc: Allocator, definition: *const definitions.Definition, url: []const u8, request: streams.ModelRequest, token: ?[]const u8, payload: []const u8, consume_fn: ConsumeFn, auth_style: AuthStyle) !streams.Result {
+    const authorization = if (auth_style == .bearer) if (token) |value| if (value.len != 0) try alloc.print("Bearer {s}", .{value}) else null else null else null;
     defer if (authorization) |value| secret.zeroAndFree(alloc, value);
-    var extra = try configured_request.resolveHeaders(alloc, definition);
+    var extra = try configured_request.resolveHeaders(alloc, definition, request.model);
     defer extra.deinit(alloc);
     var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(alloc);
     try headers.append(alloc, .{ .name = "accept", .value = "text/event-stream" });
+    if (auth_style == .x_api_key) if (token) |value| if (value.len != 0) {
+        try headers.append(alloc, .{ .name = "x-api-key", .value = value });
+    };
     try headers.appendSlice(alloc, extra.items);
     var client: std.http.Client = .{ .allocator = alloc, .io = io.getIo() };
     defer client.deinit();
@@ -170,7 +209,7 @@ pub fn post_url(alloc: Allocator, definition: *const definitions.Definition, url
     const http = &opened.request.?;
     var watch: client_mod.ConnectionWatch = .init(.{
         .timeout_ms = 120_000,
-        .stall_timeout_ms = client_mod.ConnectionWatch.bodyStallTimeoutMs(request.deadline),
+        .stall_timeout_ms = body_stall_timeout_ms(definition, request),
     });
     defer watch.stop();
     if (http.connection) |connection| try watch.start(request.cancel_flag, request.deadline, connection.stream_writer.stream);
@@ -214,9 +253,107 @@ pub fn post_url(alloc: Allocator, definition: *const definitions.Definition, url
 
         return .{ .failed = .{ .kind = client_mod.httpFailureKind(alloc, .fromHttpStatus(response.head.status), detail), .detail = detail, .retry_after_seconds = retry_after, .ownership = .owned } };
     }
-    var result = consume_fn(alloc, reader, request, watch.progress()) catch |err| return watch.failure(err);
+    var stream_request = request;
+    stream_request.compatibility = if (request.provider_options.model_metadata orelse definition.model(request.model)) |metadata| &metadata.compat else null;
+    var result = consume_fn(alloc, reader, stream_request, watch.progress()) catch |err| return watch.failure(err);
     if (watch.finish()) |err| {
         result.deinit(alloc);
+        return err;
+    }
+    return result;
+}
+
+/// Parses a successful non-streaming JSON reply after the same bounded POST
+/// lifecycle used by the streaming transports. The callback owns the returned
+/// bytes and may parse them before returning its provider result.
+pub const JsonConsumeFn = *const fn (Allocator, *std.Io.Reader, streams.ModelRequest, ?sse.Progress) anyerror![]u8;
+
+pub fn post_json_url(
+    alloc: Allocator,
+    definition: *const definitions.Definition,
+    url: []const u8,
+    request: streams.ModelRequest,
+    token: ?[]const u8,
+    payload: []const u8,
+    consume_fn: JsonConsumeFn,
+) ![]u8 {
+    return post_json_url_auth(alloc, definition, url, request, token, payload, consume_fn, .bearer);
+}
+
+pub fn post_json_url_auth(
+    alloc: Allocator,
+    definition: *const definitions.Definition,
+    url: []const u8,
+    request: streams.ModelRequest,
+    token: ?[]const u8,
+    payload: []const u8,
+    consume_fn: JsonConsumeFn,
+    auth_style: AuthStyle,
+) ![]u8 {
+    const authorization = if (auth_style == .bearer)
+        if (token) |value| if (value.len != 0) try alloc.print("Bearer {s}", .{value}) else null else null
+    else
+        null;
+    defer if (authorization) |value| secret.zeroAndFree(alloc, value);
+    var extra = try configured_request.resolveHeaders(alloc, definition, request.model);
+    defer extra.deinit(alloc);
+    var headers: std.ArrayList(std.http.Header) = .empty;
+    defer headers.deinit(alloc);
+    try headers.append(alloc, .{ .name = "accept", .value = "application/json" });
+    try headers.append(alloc, .{ .name = "content-type", .value = "application/json" });
+    if (auth_style == .x_api_key) if (token) |value| if (value.len != 0) {
+        try headers.append(alloc, .{ .name = "x-api-key", .value = value });
+    };
+    try headers.appendSlice(alloc, extra.items);
+    var client: std.http.Client = .{ .allocator = alloc, .io = io.getIo() };
+    defer client.deinit();
+    var uri = try std.Uri.parse(url);
+    uri.scheme = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) "https" else if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) "http" else return error.UnsupportedUriScheme;
+    var operation = client_mod.PostOperation{
+        .client = &client,
+        .uri = uri,
+        .authorization = authorization,
+        .extra_headers = headers.items,
+    };
+    try request.admission.admit();
+    var opened = try client_mod.openBoundedPost(alloc, request.cancel_flag, phase_deadline(30_000, request.deadline), &operation);
+    defer opened.deinit(alloc);
+    const http = &opened.request.?;
+    var watch: client_mod.ConnectionWatch = .init(.{
+        .timeout_ms = 120_000,
+        .stall_timeout_ms = body_stall_timeout_ms(definition, request),
+    });
+    defer watch.stop();
+    if (http.connection) |connection| try watch.start(request.cancel_flag, request.deadline, connection.stream_writer.stream);
+    if (watch.armHead()) |err| return err;
+    http.transfer_encoding = .{ .content_length = payload.len };
+    var buffer: [8192]u8 = undefined;
+    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    request.delivery.markPossiblySent();
+    var body = try http.sendBodyUnflushed(&buffer);
+    try body.writer.writeAll(payload);
+    try body.end();
+    if (http.connection) |connection| try connection.flush();
+    var response = http.receiveHead(&.{}) catch |err| return watch.failure(err);
+    if (watch.commitHead()) |err| return err;
+    if (response.head.status != .ok) {
+        watch.stop();
+        watch = .init(.{ .patient = true, .stall_timeout_ms = std.math.maxInt(i64) });
+        if (http.connection) |connection| try watch.start(request.cancel_flag, phase_deadline(30_000, request.deadline), connection.stream_writer.stream);
+    }
+    var transfer: [64 * 1024]u8 = undefined;
+    const reader = response.reader(&transfer);
+    if (response.head.status != .ok) {
+        const detail = reader.allocRemaining(alloc, .limited(64 * 1024)) catch |err| switch (err) {
+            error.StreamTooLong => return error.ProviderHttpFailure,
+            else => return err,
+        };
+        defer alloc.free(detail);
+        return error.ProviderHttpFailure;
+    }
+    const result = consume_fn(alloc, reader, request, watch.progress()) catch |err| return watch.failure(err);
+    if (watch.finish()) |err| {
+        alloc.free(result);
         return err;
     }
     return result;
@@ -225,17 +362,25 @@ pub fn post_url(alloc: Allocator, definition: *const definitions.Definition, url
 /// Parses a successful streamed reply from `reader`, telling `progress` about
 /// each event when it is set.
 pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress) anyerror!streams.Result {
-    var limits: codec.Limits = .{};
+    var limits: codec.Limits = .{ .compatibility = request.compatibility };
     if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
     return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress);
 }
 
 /// The returned entry borrows its strings; fetch_catalog replaces them with owned copies.
-fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry {
+pub fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry {
     const vision = metadata.supports_vision orelse false;
     return .{
         .id = @constCast(metadata.id),
+        .name = if (metadata.name) |name| @constCast(name) else null,
+        .description = if (metadata.description) |description| @constCast(description) else null,
+        .cost = metadata.cost,
+        .intelligence = metadata.intelligence,
+        .recommended = metadata.recommended,
+        .beta = metadata.beta,
+        .released = metadata.released,
         .model_type = @constCast("language"),
+        .tokenizer = if (metadata.tokenizer) |name| tokenizer.Encoding.parse(name) else tokenizer.resolveModel(metadata.id),
         .has_tool_use = metadata.supports_tool_use orelse false,
         // Chat completions sends images as inline base64 content parts, so
         // vision support implies file input through the same path.
@@ -243,6 +388,9 @@ fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry
         .has_file_input = vision,
         .context_window = metadata.context_window orelse 0,
         .max_tokens = metadata.max_output_tokens orelse 0,
+        .max_context_window = metadata.max_context_window,
+        .omit_max_output_tokens = metadata.omit_max_output_tokens,
+        .prefer_websockets = metadata.prefer_websockets,
         // Only Messages definitions declare efforts; the list stays borrowed.
         .has_reasoning = metadata.reasoning_efforts.len != 0,
         .reasoning_efforts = .fromOwnedSlice(@constCast(metadata.reasoning_efforts)),
@@ -251,12 +399,7 @@ fn metadata_entry(metadata: definitions.ModelMetadata) catalog.ModelCatalogEntry
 
 pub fn lookup_capabilities(raw: ?*anyopaque, model: []const u8) model_capabilities.Capabilities {
     const definition = definition_at(raw);
-    const metadata = definition.model(model) orelse {
-        if (definition.catalog == .openrouter) if (openrouter_catalog.lookup(model)) |entry| {
-            return model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(metadata_entry(entry)));
-        };
-        return .{};
-    };
+    const metadata = definition.model(model) orelse return .{};
     return model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(metadata_entry(metadata.*)));
 }
 
@@ -269,15 +412,20 @@ pub fn fetch_catalog(raw: ?*anyopaque, alloc: Allocator, input: catalog.FetchInp
     // OpenRouter catalog when the definition uses it.
     var live = if (definition.catalog == .openrouter) openrouter_catalog.fetch(alloc, definition.base_url, input.cancel_flag) else openrouter_catalog.Fetched{};
     defer live.deinit(alloc);
-    for ([_][]const definitions.ModelMetadata{ definition.model_metadata, definition.builtin_models, live.models }) |list| for (list) |metadata| {
-        if (listed(entries.items, metadata.id)) continue;
-        var entry = metadata_entry(metadata);
-        entry.id = try alloc.dupe(u8, entry.id);
-        errdefer alloc.free(entry.id);
-        entry.model_type = try alloc.dupe(u8, entry.model_type);
-        errdefer alloc.free(entry.model_type);
-        entry.reasoning_efforts = .fromOwnedSlice(try alloc.dupe(types.ReasoningEffort, metadata.reasoning_efforts));
-        errdefer entry.reasoning_efforts.deinit(alloc);
+    var discovered = if (definition.discovery != null) try configured_discovery.fetch(alloc, definition, input) else configured_discovery.Fetched{};
+    defer discovered.deinit(alloc);
+    if (discovered.failure) |failure| return .{ .failure = failure };
+    // Live metadata is the base; parsed overrides replace only supplied fields.
+    for ([_][]const definitions.ModelMetadata{ live.models, discovered.models, definition.model_metadata, definition.builtin_models }) |list| for (list) |base| {
+        if (listed(entries.items, base.id)) continue;
+        var metadata = base;
+        if (definition.model_defaults) |defaults| metadata = definitions.overlayMetadata(metadata, defaults.*);
+        for (definition.model_metadata) |override| if (std.mem.eql(u8, override.id, base.id)) {
+            metadata = definitions.overlayMetadata(metadata, override);
+            break;
+        };
+        const entry = try catalog.cloneModelCatalogEntry(alloc, metadata_entry(metadata));
+        errdefer catalog.freeModelCatalogEntry(alloc, entry);
         try entries.append(alloc, entry);
     };
     return .{ .catalog = entries };
@@ -291,7 +439,7 @@ fn listed(entries: []const catalog.ModelCatalogEntry, id: []const u8) bool {
 test "configured capability lookup matches catalog projection and preserves unknowns" {
     const alloc = std.testing.allocator;
     var registry = try definitions.Registry.parse_json(alloc,
-        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"model_metadata":{"small":{"context_window":8192,"max_output_tokens":512,"supports_tool_use":true,"supports_vision":true},"large":{"context_window":32768,"max_output_tokens":1024,"supports_tool_use":false},"partial":{"max_output_tokens":128},"unknown":{}}}}
+        \\{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:1234/v1","auth":{"type":"none"},"model_metadata":{"small":{"context_window":8192,"max_output_tokens":512,"supports_tool_use":true,"supports_vision":true},"large":{"context_window":32768,"max_output_tokens":1024,"supports_tool_use":false,"tokenizer":"qwen3"},"partial":{"max_output_tokens":128},"unknown":{}}}}
     );
     defer registry.deinit(alloc);
     const provider = bundle(registry.get("local").?).model_catalog.?;
@@ -309,6 +457,7 @@ test "configured capability lookup matches catalog projection and preserves unkn
     }
     try std.testing.expectEqual(@as(?u32, 512), provider.lookupCapabilities("small").?.max_output_tokens);
     try std.testing.expectEqual(@as(?u32, 1024), provider.lookupCapabilities("large").?.max_output_tokens);
+    try std.testing.expectEqual(@as(?tokenizer.Encoding, .qwen3), provider.lookupCapabilities("large").?.tokenizer);
     try std.testing.expect(provider.lookupCapabilities("partial").?.context_window == null);
     try std.testing.expect(provider.lookupCapabilities("unknown").?.max_output_tokens == null);
     try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, provider.lookupCapabilities("missing-fast").?);
@@ -427,6 +576,7 @@ fn reviewErrorOutcome(err: anyerror) classifier.TransportOutcome {
     return switch (err) {
         error.Cancelled => .cancelled,
         error.Timeout => .timed_out,
+        error.Refused, error.ContentFiltered, error.IncompleteStream => .permanent_failure,
         else => .transient_failure,
     };
 }

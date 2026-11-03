@@ -2,15 +2,46 @@ const std = @import("std");
 const types = @import("../shared/types.zig");
 const model_provider = @import("model_provider.zig");
 const image_route = @import("../images/image_route.zig");
+const tokenizer = @import("../tokenizer/tokenizer.zig");
 
 /// The provider syntax for the cache markers on messages flagged with
 /// `ChatMessage.cache_breakpoint`.
 pub const CacheMarkers = enum { none, anthropic, openai };
 
+/// Anthropic Messages task budget sent in `output_config.task_budget` and
+/// Claude Code's SDK `taskBudget` option. Slices in provider options borrow
+/// the request's backing storage.
+pub const TaskBudget = struct {
+    total: u32,
+    remaining: ?u32 = null,
+};
+
+/// Anthropic server-side context compaction request. The provider emits this
+/// as a `compact_20260112` context-management edit when the model advertises
+/// context management support.
+pub const AnthropicCompaction = struct {
+    trigger_input_tokens: ?u32 = null,
+    pause_after_compaction: bool = false,
+    instructions: ?[]const u8 = null,
+};
+
 pub const ResolvedProviderOptions = struct {
+    /// Borrowed from the host-owned provider registry for this request.
+    model_metadata: ?*const @import("configured_provider.zig").ModelMetadata = null,
+    /// Native tokenizer selected during model capability resolution. The enum owns no catalog bytes.
+    tokenizer: ?tokenizer.Encoding = null,
     reasoning: ?types.ReasoningEffort = null,
     fast: bool = false,
     ultrafast: bool = false,
+    /// Anthropic's per-request task budget, shared by Messages and Claude Code.
+    task_budget: ?TaskBudget = null,
+    /// Claude Code's native fallback model. This is distinct from fx's
+    /// model-role retry/fallback chain.
+    fallback_model: ?[]const u8 = null,
+    /// Anthropic server-side context compaction controls.
+    anthropic_compaction: ?AnthropicCompaction = null,
+    /// Codex transport preference; null leaves the provider default unchanged.
+    prefer_websockets: ?bool = null,
     parallel_tool_calls: ?bool = null,
     prompt_caching: bool = false,
     /// Marker syntax for flagged messages; written only with
@@ -52,6 +83,7 @@ pub const ReasoningEffortOptions = struct {
 pub const ImageInputSupport = image_route.Support;
 
 pub const GatewayMetadata = struct {
+    tokenizer: ?tokenizer.Encoding = null,
     supports_reasoning: bool = false,
     reasoning_efforts: ReasoningEffortOptions = .{},
     supports_fast_mode: bool = false,
@@ -64,9 +96,14 @@ pub const GatewayMetadata = struct {
     supports_implicit_caching: bool = false,
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
+    max_context_window: ?u32 = null,
+    omit_max_output_tokens: bool = false,
+    prefer_websockets: ?bool = null,
 };
 
 pub const Capabilities = struct {
+    model_metadata: ?*const @import("configured_provider.zig").ModelMetadata = null,
+    tokenizer: ?tokenizer.Encoding = null,
     supports_reasoning: bool = false,
     reasoning_efforts: ReasoningEffortOptions = .{},
     supports_fast_mode: bool = false,
@@ -82,6 +119,9 @@ pub const Capabilities = struct {
     parallel_tool_calls: ?bool = null,
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
+    max_context_window: ?u32 = null,
+    omit_max_output_tokens: bool = false,
+    prefer_websockets: ?bool = null,
 };
 
 pub const ResolveError = error{Cancelled};
@@ -102,6 +142,7 @@ pub const Resolver = struct {
 pub fn mergeCapabilities(capabilities_value: Capabilities, gateway_metadata: ?GatewayMetadata) Capabilities {
     var capabilities = capabilities_value;
     if (gateway_metadata) |metadata| {
+        if (metadata.tokenizer) |encoding| capabilities.tokenizer = encoding;
         capabilities.supports_reasoning = metadata.supports_reasoning or metadata.reasoning_efforts.len > 0;
         capabilities.reasoning_efforts = metadata.reasoning_efforts;
         capabilities.supports_fast_mode = metadata.supports_fast_mode;
@@ -118,6 +159,9 @@ pub fn mergeCapabilities(capabilities_value: Capabilities, gateway_metadata: ?Ga
         capabilities.supports_implicit_caching = metadata.supports_implicit_caching;
         if (metadata.context_window) |window| capabilities.context_window = window;
         if (metadata.max_output_tokens) |tokens| capabilities.max_output_tokens = tokens;
+        if (metadata.max_context_window) |window| capabilities.max_context_window = window;
+        capabilities.omit_max_output_tokens = metadata.omit_max_output_tokens;
+        if (metadata.prefer_websockets) |preferred| capabilities.prefer_websockets = preferred;
     }
     return capabilities;
 }
@@ -127,7 +171,10 @@ pub fn resolveCapabilities(model: []const u8, gateway_metadata: ?GatewayMetadata
 }
 
 pub fn capabilitiesForModel(model: []const u8) Capabilities {
-    return .{ .intrinsic_fast = std.mem.endsWith(u8, model, "-fast") };
+    return .{
+        .tokenizer = tokenizer.resolveModel(model),
+        .intrinsic_fast = std.mem.endsWith(u8, model, "-fast"),
+    };
 }
 
 pub fn resolveForApp(comptime App: type, app: *App, model: []const u8) Capabilities {
@@ -211,6 +258,7 @@ test "length resend lowers effort to low only when that reasons less" {
 
 /// Output tokens to request and reserve for one model call, or null to leave the limit unset.
 pub fn requestOutputTokens(capabilities: Capabilities) ?u32 {
+    if (capabilities.omit_max_output_tokens) return null;
     const advertised = capabilities.max_output_tokens orelse return null;
     const window = capabilities.context_window orelse return advertised;
     if (advertised < window) return advertised;
@@ -271,6 +319,9 @@ pub fn resolveProviderOptionsForCapabilities(
     fast_mode: bool,
 ) ResolvedProviderOptions {
     var resolved: ResolvedProviderOptions = .{
+        .model_metadata = capabilities.model_metadata,
+        .tokenizer = capabilities.tokenizer,
+        .prefer_websockets = capabilities.prefer_websockets,
         .parallel_tool_calls = capabilities.parallel_tool_calls,
     };
     if (!effort.isDefault() and reasoningEffortSupported(capabilities, effort)) {

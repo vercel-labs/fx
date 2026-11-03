@@ -22,8 +22,11 @@ const secret = @import("../core/auth/secret.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
 const model_provider = @import("../core/config/model_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
-const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
+const openai_codex = @import("../gateway/openai_codex.zig");
+const model_cache_runtime = @import("../core/app/model_cache_runtime.zig");
+const model_performance = @import("../core/model_hub/performance.zig");
+const profile_paths = @import("../core/shared/profile_paths.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const hooks = @import("../core/hooks/hooks.zig");
 const mcp_host = @import("../core/mcp_host/host.zig");
@@ -387,6 +390,7 @@ pub const ServerState = struct {
     agent_step_limit: usize = 0,
     max_tool_result_bytes: usize = 64 * 1024,
     auto_compact_percent: u8 = compactor.default_percent,
+    context_promotion_enabled: bool = false,
     context_limits: config_runtime.context_limits.Values = .{},
     fast_mode: bool = false,
     ultrafast_mode: bool = false,
@@ -416,7 +420,12 @@ pub const ServerState = struct {
     /// Open for the whole connection on native hosts; the wasm host keeps
     /// its sessions in the JS host's snapshot store (D63).
     sessions_v2: ?session_adapter.Store = null,
-    capability_resolver: gateway_provider.CapabilityResolver = .{},
+    /// The one provider-keyed catalog owner for this long-lived ACP host.
+    model_cache: ?model_cache_runtime.Runtime = null,
+    model_performance: model_performance.State = .{ .allocator = std.heap.c_allocator },
+    /// Reusable Codex Responses/WebSocket state, scoped to this ACP host.
+    /// The stream provider receives this context only for Codex requests.
+    codex_transport: ?openai_codex.TransportState = null,
     terminate_connection: bool = false,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
     web_search_runtime: web_search_runtime.Runtime = web_search_runtime.Runtime.init(.{}),
@@ -467,7 +476,9 @@ pub const ServerState = struct {
         self.lifecycle_runtime.deinit();
         self.host_tools.deinit();
         if (self.host_instructions.len > 0) self.alloc.free(self.host_instructions);
-        self.capability_resolver.deinit(self.alloc);
+        if (self.model_cache) |*cache| cache.deinit();
+        self.model_performance.deinit();
+        if (self.codex_transport) |*transport| transport.deinit();
         var pending = self.pending_outbound.valueIterator();
         while (pending.next()) |entry| {
             if (entry.response) |*response| response.deinit(self.alloc);
@@ -481,6 +492,131 @@ pub const ServerState = struct {
     }
 };
 
+fn catalogAccessForProvider(state: *ServerState, provider: model_provider.ProviderId) !credentials.CatalogAccess {
+    if (state.cfg.auth_mode == .host_managed or hostManagesRoute(state.cfg, provider)) return .host_managed;
+    const now_ms = io_mod.milliTimestamp();
+    if (credentialMatchesProvider(state.credential_source, provider) and
+        credentialReadyAt(state.credential_source, state.api_key, state.credential_refresh_after_ms, now_ms))
+    {
+        return credentials.catalogAccessForCredentialAndAccount(
+            state.credential_source,
+            state.api_key,
+            state.gateway_team,
+            state.account_id,
+        );
+    }
+    var prepared = prepareCredentialForProvider(state, provider) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        debug_trace.logf("auth", "acp_model_catalog_access_unavailable provider={t} err={s}", .{ provider, @errorName(err) });
+        return .{ .public_only = .no_credential };
+    };
+    defer if (prepared) |*credential| credential.deinit(state.alloc);
+    if (prepared) |*credential| {
+        return credentials.catalogAccessForCredentialAndAccount(
+            credential.source,
+            credential.token,
+            credential.gatewayTeam(),
+            credential.accountId(),
+        );
+    }
+    return .{ .public_only = .no_credential };
+}
+
+fn modelCatalogCachePath(state: *ServerState, alloc: Allocator, provider: model_provider.ProviderId) !?[]u8 {
+    const home = state.cfg.home_override orelse io_mod.homeDir() orelse return null;
+    return try profile_paths.modelCatalogCachePath(alloc, home, provider.label());
+}
+
+fn syncModelCatalog(state: *ServerState) !void {
+    return syncModelCatalogWithAccess(state, null, null);
+}
+
+fn syncModelCatalogWithAccess(
+    state: *ServerState,
+    override_provider: ?model_provider.ProviderId,
+    override_access: ?credentials.CatalogAccess,
+) !void {
+    const cache = &(state.model_cache orelse return);
+    var configs: std.ArrayList(model_cache_runtime.ProviderConfig) = .empty;
+    defer configs.deinit(state.alloc);
+    var cache_paths: std.ArrayList([]u8) = .empty;
+    defer {
+        for (cache_paths.items) |path| state.alloc.free(path);
+        cache_paths.deinit(state.alloc);
+    }
+    var seeds: std.ArrayList(std.ArrayList(model_catalog.ModelCatalogEntry)) = .empty;
+    defer {
+        for (seeds.items) |*seed| model_catalog.freeModelCatalog(state.alloc, seed);
+        seeds.deinit(state.alloc);
+    }
+    var providers = state.cfg.provider_set;
+    providers.definitions = state.configured_providers.definitions;
+    providers.native_overrides = state.configured_providers.native_overrides;
+    const active = state.provider;
+
+    for ([_]model_provider.ProviderId{ .gateway, .codex, .grok }) |provider| {
+        const source = providers.select(provider).model_catalog orelse continue;
+        const cache_path = try modelCatalogCachePath(state, state.alloc, provider);
+        if (cache_path) |path| try cache_paths.append(state.alloc, path);
+        const native_overrides = for (providers.native_overrides) |*overrides| {
+            if (std.mem.eql(u8, overrides.id, provider.label())) break overrides;
+        } else null;
+        try configs.append(state.alloc, .{
+            .provider = provider,
+            .catalog = source,
+            .native_overrides = native_overrides,
+            .endpoint = if (provider == .gateway) state.cfg.gateway_models_path else "",
+            .access = if (override_provider) |overridden| if (overridden.eql(provider))
+                override_access.?
+            else
+                try catalogAccessForProvider(state, provider) else try catalogAccessForProvider(state, provider),
+            .cache_path = cache_path,
+        });
+    }
+    for (providers.definitions) |definition| {
+        var provider = model_provider.parse(definition.id) orelse continue;
+        provider.configured.binding = definition.binding_identity();
+        const source = providers.select(provider).model_catalog orelse continue;
+        const cache_path = try modelCatalogCachePath(state, state.alloc, provider);
+        if (cache_path) |path| try cache_paths.append(state.alloc, path);
+        const native_overrides = for (providers.native_overrides) |*overrides| {
+            if (std.mem.eql(u8, overrides.id, provider.label())) break overrides;
+        } else null;
+        var seed = try model_cache_runtime.metadataSeed(
+            state.alloc,
+            &.{ definition.model_metadata, definition.builtin_models },
+            definition.model_defaults,
+        );
+        errdefer model_catalog.freeModelCatalog(state.alloc, &seed);
+        try seeds.append(state.alloc, seed);
+        try configs.append(state.alloc, .{
+            .provider = provider,
+            .catalog = source,
+            .native_overrides = native_overrides,
+            .refresh_on_seed = definition.discovery != null or definition.catalog == .openrouter,
+            .endpoint = definition.base_url,
+            .access = if (override_provider) |overridden| if (overridden.eql(provider))
+                override_access.?
+            else
+                try catalogAccessForProvider(state, provider) else try catalogAccessForProvider(state, provider),
+            .from_profile_settings = true,
+            .cache_path = cache_path,
+        });
+    }
+    try cache.syncProviders(configs.items, active);
+}
+
+fn warmModelCatalog(state: *ServerState, trigger: model_cache_runtime.LoadTrigger) void {
+    const cache = &(state.model_cache orelse return);
+    if (comptime host_target.is_wasm) {
+        const source = state.cfg.provider_set.select(state.provider).model_catalog orelse return;
+        const access = catalogAccessForProvider(state, state.provider) catch return;
+        cache.loadCooperative(source, access);
+    } else {
+        cache.warmupAll(trigger);
+    }
+}
+
 /// The model-role host for `session`.
 pub fn roleHost(state: *ServerState, session: *const ActiveSessionState) model_role_runtime.Host {
     return .{
@@ -489,14 +625,16 @@ pub fn roleHost(state: *ServerState, session: *const ActiveSessionState) model_r
         .current_model = session.model,
         .set = state.cfg.provider_set,
         .review_model = state.review_model,
-        // A prompt reads the catalog; refreshes run only between prompts.
-        .known = .{ .context = @ptrCast(&state.capability_resolver), .known_fn = catalogKnows },
+        // A prompt reads the provider-keyed registry; refreshes run only between prompts.
+        .known = .{ .context = @ptrCast(state), .known_fn = catalogKnows },
     };
 }
 
 fn catalogKnows(raw: ?*anyopaque, model: []const u8) bool {
-    const resolver: *const gateway_provider.CapabilityResolver = @ptrCast(@alignCast(raw.?));
-    return resolver.knows(model);
+    const state: *ServerState = @ptrCast(@alignCast(raw.?));
+    const provider = if (state.active_session) |session| session.provider else state.provider;
+    if (state.model_cache) |*cache| return cache.knowsModelFor(provider, model);
+    return true;
 }
 
 /// Rereads the profile's model roles; a failure keeps the current ones.
@@ -713,14 +851,11 @@ pub fn streamProviderFor(
     state: *const ServerState,
     provider: model_provider.ProviderId,
 ) @import("../core/agent/stream_provider.zig").Provider {
-    return state.cfg.provider_set.select(provider).agent_stream_or_unavailable();
-}
-
-pub fn catalogProviderFor(
-    state: *const ServerState,
-    provider: model_provider.ProviderId,
-) ?@import("../core/gateway/model_catalog.zig").Provider {
-    return state.cfg.provider_set.select(provider).model_catalog;
+    var stream = state.cfg.provider_set.select(provider).agent_stream_or_unavailable();
+    if (provider == .codex) if (state.codex_transport) |*transport| {
+        stream.context = @ptrCast(@constCast(transport));
+    };
+    return stream;
 }
 
 pub fn refreshModelCredential(
@@ -969,6 +1104,9 @@ pub const PersistentHost = struct {
         self.* = .{ .state = .{
             .alloc = alloc,
             .cfg = cfg,
+            .model_cache = model_cache_runtime.Runtime.init(alloc, cfg.gateway_models_path),
+            .model_performance = model_performance.State.init(alloc, cfg.home_override orelse io_mod.homeDir()),
+            .codex_transport = openai_codex.TransportState.init(alloc),
             .presentation = .native,
             .writer = jsonrpc.Writer.initCallback(context, write),
             .web_search_runtime = web_search_runtime.Runtime.init(.{ .provider = cfg.provider_set.webSearchProvider() orelse cfg.provider_set.gateway.fx_search }),
@@ -992,6 +1130,7 @@ pub const PersistentHost = struct {
 
     pub fn dispatchFrame(self: *PersistentHost, frame: []const u8) !void {
         const state = &self.state;
+        if (state.model_cache) |*cache| _ = cache.pollLoadTransitions() catch |err| debug_trace.logf("catalog", "acp_model_cache_poll_failed err={s}", .{@errorName(err)});
         reapActivePrompt(state, false);
         var message = try jsonrpc.parseMessage(state.alloc, frame);
         defer jsonrpc.freeMessage(state.alloc, &message);
@@ -1181,6 +1320,9 @@ pub fn runWithTransport(
     var state = ServerState{
         .alloc = alloc,
         .cfg = cfg,
+        .model_cache = model_cache_runtime.Runtime.init(alloc, cfg.gateway_models_path),
+        .model_performance = model_performance.State.init(alloc, cfg.home_override orelse io_mod.homeDir()),
+        .codex_transport = openai_codex.TransportState.init(alloc),
         .writer = writer_value,
         .web_search_runtime = web_search_runtime.Runtime.init(.{
             .provider = cfg.provider_set.webSearchProvider() orelse cfg.provider_set.gateway.fx_search,
@@ -1206,6 +1348,7 @@ pub fn runWithTransport(
 
     var reader = reader_value;
     while (!state.terminate_connection) {
+        if (state.model_cache) |*cache| _ = cache.pollLoadTransitions() catch |err| debug_trace.logf("catalog", "acp_model_cache_poll_failed err={s}", .{@errorName(err)});
         reapActivePrompt(&state, false);
         const line_result = reader.readLine(alloc) catch break;
         if (line_result == null) break;
@@ -3151,6 +3294,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.configured_providers = startup.configured_providers;
     startup.configured_providers = .{};
     state.cfg.provider_set.definitions = state.configured_providers.definitions;
+    state.cfg.provider_set.native_overrides = state.configured_providers.native_overrides;
     state.gateway_source_preference = startup.credential_source_preference;
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
 
@@ -3219,6 +3363,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.agent_step_limit = startup.agent_step_limit;
     state.max_tool_result_bytes = startup.max_tool_result_bytes;
     state.auto_compact_percent = startup.auto_compact_percent;
+    state.context_promotion_enabled = startup.context_promotion_enabled;
     if (state.model_roles.default_provider.len == 0) {
         var startup_provider = startup.provider;
         try state.model_roles.init(alloc, startup.takeModelRoles(), startup_provider.label(), startup.configured_model);
@@ -3234,6 +3379,12 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.context_enabled = startup.context_enabled;
     state.session_titles = startup.session_title_generation;
 
+    syncModelCatalog(state) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        debug_trace.logf("catalog", "acp_model_provider_sync_failed err={s}", .{@errorName(err)});
+    };
+    warmModelCatalog(state, .activity);
+
     if (comptime !host_target.is_wasm) {
         if (!state.cfg.minimal_kernel) {
             var loaded_skills = try app_runtime_setup.loadSkills(alloc, state.workspace_root, builtin_skills.root_policy);
@@ -3246,30 +3397,12 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 
     if (!state.cfg.minimal_kernel) {
         var catalog_cancel_flag = std.atomic.Value(bool).init(false);
-        const startup_catalog = catalogProviderFor(state, state.provider) orelse
-            return state.writer.writeError(alloc, msg.id, .{
-                .code = ErrorCode.invalid_request,
-                .message = "Selected provider is unavailable in this host",
-            });
-        _ = try state.capability_resolver.resolve(
-            state.alloc,
-            startup_catalog,
-            .{
-                .access = if (state.cfg.auth_mode == .host_managed)
-                    .host_managed
-                else
-                    credentials.catalogAccessForCredentialAndAccount(
-                        state.credential_source,
-                        state.api_key,
-                        state.gateway_team,
-                        state.account_id,
-                    ),
-                .endpoint = state.cfg.gateway_models_path,
-                .cancel_flag = &catalog_cancel_flag,
-            },
-            state.selected_model,
-            state.cfg.provider_set.select(state.provider).fallbackModelCapabilities(state.selected_model),
-        );
+        if (state.model_cache) |*cache| {
+            _ = try cache.resolveForRequestFor(state.provider, state.selected_model, &catalog_cancel_flag);
+        } else return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_request,
+            .message = "Selected provider is unavailable in this host",
+        });
     }
 
     if (state.cfg.effort_override) |raw| {
@@ -3324,37 +3457,74 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
 /// advertised efforts whenever the catalog resolves; a catalog outage leaves
 /// the override in place, matching turn-time capability fallback. Returns
 /// false after writing the rejection response.
+/// Merges the provider-keyed Runtime catalog metadata over the provider's
+/// static fallback capabilities. Runtime owns the only live catalog; callers
+/// never borrow a legacy resolver snapshot.
+pub fn modelCapabilitiesFor(
+    state: *ServerState,
+    provider: model_provider.ProviderId,
+    model: []const u8,
+    fallback: model_capabilities.Capabilities,
+) model_capabilities.Capabilities {
+    if (state.model_cache) |*cache| {
+        return model_capabilities.mergeCapabilities(
+            fallback,
+            cache.metadataForModelFor(provider, model),
+        );
+    }
+    return fallback;
+}
+
+/// Resolves one request through the provider-keyed Runtime, retaining the
+/// provider bundle's fallback capabilities when the catalog is unavailable.
+pub fn resolveModelCapabilitiesFor(
+    state: *ServerState,
+    provider: model_provider.ProviderId,
+    model: []const u8,
+    cancel_flag: *std.atomic.Value(bool),
+) model_capabilities.ResolveError!model_capabilities.Capabilities {
+    const fallback = state.cfg.provider_set.select(provider).fallbackModelCapabilities(model);
+    if (state.model_cache) |*cache| {
+        _ = try cache.resolveForRequestFor(provider, model, cancel_flag);
+        return modelCapabilitiesFor(state, provider, model, fallback);
+    }
+    return fallback;
+}
+
+/// Returns an owned Runtime catalog snapshot for a provider. The caller must
+/// free a non-null result with `model_catalog.freeModelCatalog`.
+pub fn snapshotModelCatalogFor(
+    state: *ServerState,
+    provider: model_provider.ProviderId,
+    alloc: Allocator,
+) !?std.ArrayList(model_catalog.ModelCatalogEntry) {
+    if (state.model_cache) |*cache| return cache.snapshotCatalogFor(provider, alloc);
+    return null;
+}
+
+pub fn catalogReadyFor(state: *const ServerState, provider: model_provider.ProviderId) bool {
+    const cache = &(state.model_cache orelse return false);
+    return @constCast(cache).providerSnapshot(provider).status == .ready;
+}
+
+fn runtimeCapabilitiesForModel(
+    state: *ServerState,
+    provider: model_provider.ProviderId,
+    model: []const u8,
+    fallback: model_capabilities.Capabilities,
+) ?model_capabilities.Capabilities {
+    const cache = &(state.model_cache orelse return null);
+    if (cache.providerSnapshot(provider).status != .ready) return null;
+    return modelCapabilitiesFor(state, provider, model, fallback);
+}
+
 fn applyEffortOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message, effort: types.ReasoningEffort) !bool {
     state.effort = effort;
     if (effort.isDefault()) return true;
 
     const bundle = state.cfg.provider_set.select(state.provider);
     const fallback = bundle.fallbackModelCapabilities(state.selected_model);
-    var capabilities: model_capabilities.Capabilities = undefined;
-    if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
-        // libfx cores skip the startup catalog resolve; explicit effort and
-        // fast overrides are the creation-time consumers that need it.
-        const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
-        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
-        capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
-            .access = if (state.cfg.auth_mode == .host_managed)
-                .host_managed
-            else
-                credentials.catalogAccessForCredentialAndAccount(
-                    state.credential_source,
-                    state.api_key,
-                    state.gateway_team,
-                    state.account_id,
-                ),
-            .endpoint = state.cfg.gateway_models_path,
-            .cancel_flag = &catalog_cancel_flag,
-        }, state.selected_model, fallback);
-    } else {
-        capabilities = state.capability_resolver.available(state.selected_model, fallback);
-    }
-    // A failed catalog lookup cannot name the supported set; the turn-time
-    // capability check remains the backstop.
-    if (state.capability_resolver.state == .failed) return true;
+    const capabilities = runtimeCapabilitiesForModel(state, state.provider, state.selected_model, fallback) orelse return true;
 
     const rejection = effortOverrideRejection(alloc, capabilities, effort, state.selected_model) catch {
         try state.writer.writeError(alloc, msg.id, .{
@@ -3449,31 +3619,7 @@ fn applyFastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messag
 
     const bundle = state.cfg.provider_set.select(state.provider);
     const fallback = bundle.fallbackModelCapabilities(state.selected_model);
-    var capabilities: model_capabilities.Capabilities = undefined;
-    if (state.cfg.minimal_kernel and state.capability_resolver.state == .idle) {
-        // Shares the effort override's one-shot catalog resolve: creation is
-        // the only point that can reject before any turn runs.
-        const catalog_provider = catalogProviderFor(state, state.provider) orelse return true;
-        var catalog_cancel_flag = std.atomic.Value(bool).init(false);
-        capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
-            .access = if (state.cfg.auth_mode == .host_managed)
-                .host_managed
-            else
-                credentials.catalogAccessForCredentialAndAccount(
-                    state.credential_source,
-                    state.api_key,
-                    state.gateway_team,
-                    state.account_id,
-                ),
-            .endpoint = state.cfg.gateway_models_path,
-            .cancel_flag = &catalog_cancel_flag,
-        }, state.selected_model, fallback);
-    } else {
-        capabilities = state.capability_resolver.available(state.selected_model, fallback);
-    }
-    // A failed catalog lookup cannot confirm a fast path; the turn-time
-    // capability gate remains the backstop.
-    if (state.capability_resolver.state == .failed) return true;
+    const capabilities = runtimeCapabilitiesForModel(state, state.provider, state.selected_model, fallback) orelse return true;
 
     const rejection = fastOverrideRejection(alloc, capabilities, state.selected_model) catch {
         try state.writer.writeError(alloc, msg.id, .{
@@ -3535,26 +3681,13 @@ fn applyUltrafastOverride(state: *ServerState, alloc: Allocator, msg: *jsonrpc.M
     if (state.provider != .gateway) {
         return writeUltrafastOverrideFailure(state, alloc, msg, "Ultrafast mode is unavailable for the selected provider");
     }
-    const catalog_provider = catalogProviderFor(state, state.provider) orelse
-        return writeUltrafastOverrideFailure(state, alloc, msg, "Ultrafast mode is unavailable for the selected provider");
-    var catalog_cancel_flag = std.atomic.Value(bool).init(false);
     const bundle = state.cfg.provider_set.select(state.provider);
-    const capabilities = try state.capability_resolver.resolve(alloc, catalog_provider, .{
-        .access = if (state.cfg.auth_mode == .host_managed)
-            .host_managed
-        else
-            credentials.catalogAccessForCredentialAndAccount(
-                state.credential_source,
-                state.api_key,
-                state.gateway_team,
-                state.account_id,
-            ),
-        .endpoint = state.cfg.gateway_models_path,
-        .cancel_flag = &catalog_cancel_flag,
-    }, state.selected_model, bundle.fallbackModelCapabilities(state.selected_model));
-    if (state.capability_resolver.state == .failed) {
-        return writeUltrafastOverrideFailure(state, alloc, msg, "Ultrafast mode requires a verified Gateway model catalog");
-    }
+    const capabilities = runtimeCapabilitiesForModel(
+        state,
+        state.provider,
+        state.selected_model,
+        bundle.fallbackModelCapabilities(state.selected_model),
+    ) orelse return writeUltrafastOverrideFailure(state, alloc, msg, "Ultrafast mode requires a verified Gateway model catalog");
     const rejection = try ultrafastOverrideRejection(alloc, state.provider, capabilities, state.selected_model);
     if (rejection) |message| {
         defer alloc.free(message);
@@ -3711,15 +3844,10 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             if (session.provider != .gateway) {
                 if (session.provider != .configured) {
                     try refreshModelCatalogForOptions(state);
-                    var model_available = false;
-                    if (state.capability_resolver.catalogEntries()) |entries| {
-                        for (entries) |entry| {
-                            if (std.mem.eql(u8, entry.id, value)) {
-                                model_available = true;
-                                break;
-                            }
-                        }
-                    }
+                    const model_available = if (state.model_cache) |*cache|
+                        cache.knowsModelFor(session.provider, value)
+                    else
+                        true;
                     if (!model_available) {
                         return state.writer.writeError(alloc, msg.id, .{
                             .code = ErrorCode.invalid_params,
@@ -3831,60 +3959,64 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .message = "Credential cannot authorize the selected provider",
                 });
             };
-            const catalog_provider = catalogProviderFor(state, target) orelse
+            const staged_access: credentials.CatalogAccess = if (staged_credential) |credential|
+                credentials.catalogAccessForCredentialAndAccount(
+                    credential.source,
+                    credential.token,
+                    credential.gatewayTeam(),
+                    credential.accountId(),
+                )
+            else
+                .host_managed;
+            syncModelCatalogWithAccess(state, target, staged_access) catch |err| {
+                if (err == error.OutOfMemory) return err;
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
                     .message = "Selected provider is unavailable in this host",
                 });
-            const access: credentials.CatalogAccess = if (state.cfg.auth_mode == .host_managed)
-                .host_managed
-            else
-                credentials.catalogAccessForCredentialAndAccount(
-                    staged_credential.?.source,
-                    staged_credential.?.token,
-                    staged_credential.?.gatewayTeam(),
-                    staged_credential.?.accountId(),
-                );
-            // Provider selection is independent of earlier prompt cancellation.
-            var catalog_cancel_flag = std.atomic.Value(bool).init(false);
-            const fetched = try catalog_provider.fetch(alloc, .{
-                .access = access,
-                .endpoint = state.cfg.gateway_models_path,
-                .cancel_flag = &catalog_cancel_flag,
-                .view = .picker,
-            });
-            var catalog = switch (fetched) {
-                .catalog => |catalog| catalog,
-                .failure => return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.invalid_request,
-                    .message = "Failed to load provider model catalog",
-                }),
             };
+            const cache = &(state.model_cache orelse return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = "Selected provider is unavailable in this host",
+            }));
+            cache.loadCooperativeFor(target, .force);
+            _ = cache.pollLoadTransitions() catch |err| {
+                if (err == error.OutOfMemory) return err;
+                debug_trace.logf("catalog", "acp_provider_switch_cache_poll_failed err={s}", .{@errorName(err)});
+            };
+            var catalog = (cache.snapshotCatalogFor(target, alloc) catch |err| failed: {
+                if (err == error.OutOfMemory) return err;
+                break :failed null;
+            }) orelse return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.invalid_request,
+                .message = "Failed to load provider model catalog",
+            });
             defer model_catalog.freeModelCatalog(alloc, &catalog);
-            if (target != .configured and catalog.items.len == 0) {
-                return state.writer.writeError(alloc, msg.id, .{
-                    .code = ErrorCode.invalid_request,
-                    .message = "Provider returned no supported models",
-                });
-            }
             var settings = if (state.cfg.home_override) |home|
                 try config_runtime.loadMergedSettingsFromHome(alloc, home, state.workspace_root)
             else
                 try config_runtime.loadMergedSettings(alloc, state.workspace_root);
             defer settings.deinit(alloc);
             const saved_model = settings.models.get(target);
-            var selected_model = if (target == .configured)
-                saved_model orelse (if (state.configured_providers.get(target.label())) |definition| definition.default_model else null) orelse return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_request, .message = "Configure a model for the selected provider" })
+            const native_default = if (state.configured_providers.native(target.label())) |overrides|
+                overrides.default_model
             else
-                catalog.items[0].id;
-            if (target != .configured) if (saved_model) |saved| {
-                for (catalog.items) |entry| {
-                    if (std.mem.eql(u8, entry.id, saved)) {
-                        selected_model = entry.id;
-                        break;
-                    }
-                }
-            };
+                null;
+            const configured_default = if (state.configured_providers.get(target.label())) |definition|
+                definition.default_model
+            else
+                null;
+            if (target == .configured and saved_model == null and native_default == null and configured_default == null) {
+                return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = "Configure a model for the selected provider",
+                });
+            }
+            const selected_model = saved_model orelse native_default orelse configured_default orelse
+                if (catalog.items.len > 0) catalog.items[0].id else return state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_request,
+                    .message = "Provider returned no supported models",
+                });
             commitActiveSessionProvider(
                 alloc,
                 session,
@@ -3896,7 +4028,6 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                     .message = "Failed to persist session provider",
                 });
             };
-            state.capability_resolver.adoptOwnedCatalog(alloc, catalog_provider, access, &catalog);
             if (staged_credential) |*credential| {
                 adoptServerCredential(state, credential);
             } else {
@@ -3905,6 +4036,14 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 session.api_key = &.{};
                 session.account_id = null;
             }
+            const selected_copy = try alloc.dupe(u8, selected_model);
+            if (state.selected_model.len > 0) alloc.free(state.selected_model);
+            state.selected_model = selected_copy;
+            state.provider = target;
+            syncModelCatalog(state) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                debug_trace.logf("catalog", "acp_provider_switch_resync_failed err={s}", .{@errorName(err)});
+            };
             if (!try dropUnsupportedSpeeds(state, alloc, msg, session)) return;
         }
     } else if (std.mem.eql(u8, config_id, "mode")) {
@@ -3971,7 +4110,16 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
 
     try refreshModelCatalogForOptions(state);
     const current_model = if (state.active_session) |s| s.model else state.selected_model;
+    const current_provider = if (state.active_session) |s| s.provider else state.provider;
     const current_mode: []const u8 = if (state.active_session) |s| s.mode else state.cfg.mode_registry.default_mode_id;
+    var option_catalog: std.ArrayList(model_catalog.ModelCatalogEntry) = .empty;
+    defer model_catalog.freeModelCatalog(alloc, &option_catalog);
+    if (state.model_cache) |*cache| {
+        if (cache.snapshotCatalogFor(current_provider, alloc) catch |err| blk: {
+            if (err == error.OutOfMemory) return err;
+            break :blk null;
+        }) |entries| option_catalog = entries;
+    }
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -3987,7 +4135,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
     try sessions.writeModelConfigOption(
         &out.writer,
         current_model,
-        state.capability_resolver.catalogEntries(),
+        option_catalog.items,
     );
     try out.writer.writeAll(",");
     try sessions.writeModeConfigOption(&out.writer, state.cfg.mode_registry, current_mode);
@@ -4009,25 +4157,14 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
 
 pub fn refreshModelCatalogForOptions(state: *ServerState) !void {
     if (comptime host_target.is_wasm) return;
-    if (state.cfg.minimal_kernel) return;
     const active = if (state.active_session) |*session| session else return;
-    const provider = catalogProviderFor(state, active.provider) orelse return;
+    const cache = &(state.model_cache orelse return);
     std.debug.assert(state.active_prompt == null);
-    // Restoring the same session can leave its previous cancellation flag set.
-    var cancel_flag = std.atomic.Value(bool).init(false);
-    try state.capability_resolver.refreshIfDue(state.alloc, provider, .{
-        .access = if (state.cfg.auth_mode == .host_managed)
-            .host_managed
-        else
-            credentials.catalogAccessForCredentialAndAccount(
-                active.credential_source,
-                active.api_key,
-                state.gateway_team,
-                active.account_id,
-            ),
-        .endpoint = state.cfg.gateway_models_path,
-        .cancel_flag = &cancel_flag,
-    });
+    _ = cache.refresh(active.provider, .picker_open);
+    _ = cache.pollLoadTransitions() catch |err| {
+        if (err == error.OutOfMemory) return err;
+        debug_trace.logf("catalog", "acp_options_cache_poll_failed err={s}", .{@errorName(err)});
+    };
 }
 
 fn commitActiveSessionProvider(
@@ -4123,10 +4260,12 @@ fn applyActiveSessionUltrafast(
 ) !bool {
     if (ultrafast) {
         const bundle = state.cfg.provider_set.select(session.provider);
-        const capabilities = state.capability_resolver.available(
+        const capabilities = runtimeCapabilitiesForModel(
+            state,
+            session.provider,
             session.model,
             bundle.fallbackModelCapabilities(session.model),
-        );
+        ) orelse return writeUltrafastOverrideFailure(state, alloc, msg, "Ultrafast mode requires a verified Gateway model catalog");
         const rejection = try ultrafastOverrideRejection(alloc, session.provider, capabilities, session.model);
         if (rejection) |message| {
             defer alloc.free(message);
@@ -4245,7 +4384,7 @@ fn commitActiveSessionFast(alloc: Allocator, session: *ActiveSessionState, fast:
 
 fn activeSessionCapabilities(state: *ServerState, session: *const ActiveSessionState) model_capabilities.Capabilities {
     const bundle = state.cfg.provider_set.select(session.provider);
-    return state.capability_resolver.available(session.model, bundle.fallbackModelCapabilities(session.model));
+    return runtimeCapabilitiesForModel(state, session.provider, session.model, bundle.fallbackModelCapabilities(session.model)) orelse bundle.fallbackModelCapabilities(session.model);
 }
 
 const SessionSpeed = struct {

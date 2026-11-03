@@ -11,8 +11,11 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const secret = @import("../auth/secret.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
-const input_completion_runtime = @import("input_completion_runtime.zig");
-const composer_stash = @import("../input/composer_stash.zig");
+const configured_provider = @import("../config/configured_provider.zig");
+const model_roles = @import("../config/model_roles.zig");
+const model_provider = @import("../config/model_provider.zig");
+const provider_set = @import("../gateway/provider_set.zig");
+const model_hub_runtime = @import("model_hub_runtime.zig");
 const app_permission_runtime = @import("app_permission_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const model_role_runtime = @import("model_role_runtime.zig");
@@ -292,6 +295,7 @@ pub fn Bindings(comptime App: type) type {
                     app.agentStreamProvider()
                 else
                     agent_stream_provider.unavailable_provider,
+                .performance = if (comptime @hasField(App, "model_performance")) &app.model_performance else null,
                 .cooperative_transport_pulse = if (comptime @hasDecl(App, "cooperativeTransportPulse")) .{
                     .ctx = @ptrCast(app),
                     .run = cooperativeTransportPulse,
@@ -379,6 +383,9 @@ pub fn Bindings(comptime App: type) type {
                     null,
                 .available_model_capabilities = agentAvailableModelCapabilities,
                 .resolve_model_capabilities = agentResolveModelCapabilities,
+                .bind_model = if (comptime @hasField(App, "auth")) agentBindModel else null,
+                .promote_context_model = if (comptime @hasField(App, "auth")) agentPromoteContextModel else null,
+                .resolve_role_chain = if (comptime @hasField(App, "model_roles")) agentResolveRoleChain else null,
                 .model_catalog_unavailable = agentModelCatalogUnavailable,
                 .format_tool_execution_error = agentFormatToolExecutionError,
                 .record_tool_call_rejected = agentRecordToolCallRejected,
@@ -387,7 +394,6 @@ pub fn Bindings(comptime App: type) type {
                 // Stream rules run for real sessions; unit tests stay hermetic.
                 .ttsr_enabled = !@import("builtin").is_test,
                 .checklist = if (comptime @hasField(App, "session") and @hasField(@FieldType(App, "session"), "checklist")) &app.session.checklist else null,
-                .resolve_judge_model = if (comptime @hasField(App, "model_roles")) agentResolveJudgeModel else null,
                 .report_inner_tool_usage = agentReportInnerToolUsage,
                 .diff_marker_styles = .{
                     .added = ui_render.diff_added_marker_style,
@@ -920,6 +926,32 @@ pub fn Bindings(comptime App: type) type {
             return model_capabilities.capabilitiesForModel(model);
         }
 
+        fn agentBindModel(
+            raw_ctx: *anyopaque,
+            arena: Allocator,
+            selection: model_roles.Selection,
+        ) anyerror!?agent_runtime.ModelBinding {
+            const app: *App = @ptrCast(@alignCast(raw_ctx));
+            return model_role_runtime.bindSelection(app, arena, selection);
+        }
+
+        fn agentPromoteContextModel(
+            raw_ctx: *anyopaque,
+            _: Allocator,
+            current: model_roles.Selection,
+        ) anyerror!?model_roles.Selection {
+            const app: *App = @ptrCast(@alignCast(raw_ctx));
+            if (comptime !@hasDecl(App, "providerSet")) return null;
+            if (!app.worker.effectiveAgentTurnSettings().context_promotion_enabled) return null;
+            const set = app.providerSet();
+            return set.contextPromotionTarget(current);
+        }
+
+        fn agentResolveRoleChain(raw_ctx: *anyopaque, role: model_roles.RoleId, out: []model_roles.Selection) usize {
+            const app: *App = @ptrCast(@alignCast(raw_ctx));
+            return model_role_runtime.selectionChain(app, role, out);
+        }
+
         fn agentAvailableModelCapabilities(ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities {
             const app: *App = @ptrCast(@alignCast(ctx));
             if (comptime @hasDecl(App, "resolvedModelCapabilities")) {
@@ -1321,13 +1353,6 @@ pub fn Bindings(comptime App: type) type {
             try app_worker_runtime.Runtime(App).pushCommandOutputComplete(app, lifecycle_id);
         }
 
-        /// A stream rule judge's model: the first of the rule's roles that
-        /// resolves (D207). Null keeps the session's model.
-        fn agentResolveJudgeModel(ctx: *anyopaque, roles: []const []const u8) ?[]const u8 {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            return model_role_runtime.host(app).judgeModel(roles);
-        }
-
         fn agentPushHttpError(ctx: *anyopaque, status: std.http.Status, detail: []const u8, credential_source: ?types.CredentialSource) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
             var auth_failure = auth_runtime.FailureSnapshot.fromHttp(status, credential_source);
@@ -1477,18 +1502,8 @@ pub fn Bindings(comptime App: type) type {
 
         fn workerBridgeOpenModelPicker(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime @hasField(App, "input_runtime") and
-                provider_runtime.supported(App) and
-                @hasDecl(App, "modelCompletions"))
-            {
-                // The Ctrl+P picker owns the borrowed composer while a draft
-                // is stashed; seeding the inline "/model " flow there would
-                // overwrite the catalog query or the effort and fast stages.
-                const InputRuntime = @TypeOf(app.input_runtime);
-                if (comptime @hasField(InputRuntime, "model_picker_draft")) {
-                    if (app.input_runtime.model_picker_draft != null) return;
-                }
-                try input_completion_runtime.CompletionRuntime(App).openCurrentModelPicker(app);
+            if (comptime model_hub_runtime.supported(App)) {
+                try model_hub_runtime.Runtime(App).open(app, .models, "");
             }
         }
 
@@ -2373,6 +2388,25 @@ test "worker credential publication adopts secret rotation on the app owner" {
     try std.testing.expectEqualStrings("team_123", app.auth.gatewayTeam().?);
 }
 
+test "context promotion resolves provider metadata target with effective windows" {
+    const alloc = std.testing.allocator;
+    var registry = try configured_provider.Registry.parse_json(alloc,
+        \\{"small":{"protocol":"openai-responses","base_url":"http://localhost:12001/v1","auth":{"type":"none"},"model_metadata":{"source":{"context_window":32000,"context_promotion_target":"large/target"}}},"large":{"protocol":"openai-responses","base_url":"http://localhost:12002/v1","auth":{"type":"none"},"model_metadata":{"target":{"context_window":64000}}}}
+    );
+    defer registry.deinit(alloc);
+    const set: provider_set.Set = .{ .gateway = .{}, .codex = .{}, .grok = .{}, .definitions = registry.definitions };
+    const current_provider = model_provider.parse("small").?;
+    const current: model_roles.Selection = .{ .provider = current_provider, .model = "source", .source = .{ .builtin = .default } };
+    const target = set.contextPromotionTarget(current).?;
+    try std.testing.expectEqualStrings("large", target.provider.label());
+    try std.testing.expectEqualStrings("target", target.model);
+    const current_caps = set.modelCapabilities(current.provider, current.model);
+    const target_caps = set.modelCapabilities(target.provider, target.model);
+    try std.testing.expectEqual(@as(?u32, 32000), current_caps.context_window);
+    try std.testing.expectEqual(@as(?u32, 64000), target_caps.context_window);
+    try std.testing.expect((target_caps.context_window orelse 0) > (current_caps.context_window orelse 0));
+}
+
 test "agent deps forward app callbacks through core types" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
@@ -2980,53 +3014,6 @@ test "worker bridge deps forward UI operations" {
     try std.testing.expectEqualStrings("system", app.last_notice_topic.items);
     try std.testing.expectEqual(types.NoticeTone.@"error", app.last_notice_tone);
     try std.testing.expectEqual(types.NoticeVisibility.compact_and_full, app.last_notice_visibility);
-}
-
-test "worker bridge binds model picker callback to current completion selection" {
-    const current_model = "anthropic/claude-opus-4.8";
-    const completions = [_][]const u8{
-        "provider/model-0",
-        current_model,
-    };
-    var app = FakeApp.init(std.testing.allocator);
-    defer app.deinit();
-    app.model_completion_values = &completions;
-    try app.selected_model.appendSlice(app.alloc, current_model);
-    const deps = Bindings(FakeApp).workerEventHandlers(&app);
-
-    try deps.open_model_picker(deps.ctx);
-
-    try std.testing.expectEqualStrings("/model ", app.input_runtime.edit_state.input.items);
-    var projected: [32][]const u8 = undefined;
-    const projected_count = input_completion_runtime.CompletionRuntime(FakeApp).modelPickerCompletions(&app, "", &projected);
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        input_completion_runtime.CompletionRuntime(FakeApp).modelPickerIndex(&app, projected[0..projected_count]),
-    );
-    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
-}
-
-test "worker bridge model picker callback stays out of the borrowed composer" {
-    const current_model = "anthropic/claude-opus-4.8";
-    const completions = [_][]const u8{
-        "provider/model-0",
-        current_model,
-    };
-    var app = FakeApp.init(std.testing.allocator);
-    defer app.deinit();
-    app.model_completion_values = &completions;
-    try app.selected_model.appendSlice(app.alloc, current_model);
-    try app.input_runtime.textReplacementState().replace(app.alloc, "typed draft");
-    app.input_runtime.model_picker_draft = composer_stash.State.capture(
-        app.input_runtime.composerStashView(),
-    );
-    const deps = Bindings(FakeApp).workerEventHandlers(&app);
-
-    try deps.open_model_picker(deps.ctx);
-
-    // The borrowed composer stays empty for the catalog menu's query box.
-    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
-    try std.testing.expect(app.input_runtime.model_picker_draft != null);
 }
 
 test "workerBridgeAppendText enqueues text without producer-owned gap mutation" {

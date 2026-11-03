@@ -586,6 +586,7 @@ pub const ApiKeySaveOutcome = union(enum) {
 const ApiKeySaveDeps = struct {
     ctx: ?*anyopaque = null,
     validator: api_key_validator.Provider = api_key_validator.unavailable_provider,
+    oauth_transport: oauth_transport.Provider = oauth_transport.unavailable_provider,
     store: StoredKeyStoreFn = storeUnavailableSecret,
     loader: CredentialLoaderFn = loadCredentialSource,
     /// Saves the key for this configured provider instead of the gateway.
@@ -598,6 +599,16 @@ fn performApiKeySave(alloc: Allocator, key: []const u8, deps: ApiKeySaveDeps) Ap
     if (deps.provider) |provider| {
         const trimmed = std.mem.trim(u8, key, " \t\r\n");
         if (!provider_keys.validKey(trimmed)) return .gateway_refused;
+        if (provider.eqlName("openrouter")) {
+            openrouter_oauth.validateApiKey(alloc, deps.oauth_transport, trimmed, null, null) catch |err| {
+                debug_trace.logf("auth", "OpenRouter key validation failed err={s}", .{@errorName(err)});
+                return switch (err) {
+                    error.OAuthTransportUnavailable => .gateway_unavailable,
+                    error.OutOfMemory => .store_failed,
+                    else => .gateway_refused,
+                };
+            };
+        }
         provider_keys.save(alloc, provider.label(), trimmed) catch |err| {
             debug_trace.logf("auth", "provider key save failed provider={s} err={s}", .{ provider.label(), @errorName(err) });
             return .store_failed;
@@ -2612,6 +2623,7 @@ pub const Runtime = struct {
         return self.beginApiKeySaveWithDeps(alloc, .{
             .ctx = self,
             .validator = self.api_key_validator,
+            .oauth_transport = self.oauth_transport,
             .store = storeRuntimeSecret,
             .loader = loadRuntimeCredentialSource,
         });

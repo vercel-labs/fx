@@ -97,6 +97,19 @@ pub fn recordingsDir(alloc: Allocator, home: []const u8) ![]u8 {
     return std.Io.Dir.path.join(alloc, &.{ home, root_dir_name, recordings_dir_name });
 }
 
+pub fn modelPerformancePath(alloc: Allocator, home: []const u8) ![]u8 {
+    return std.Io.Dir.path.join(alloc, &.{ home, root_dir_name, "model-performance.json" });
+}
+
+pub fn modelCatalogCachePath(alloc: Allocator, home: []const u8, provider: []const u8) ![]u8 {
+    const filename = if (std.mem.eql(u8, provider, "openrouter"))
+        try alloc.dupe(u8, "openrouter-models.json")
+    else
+        try std.fmt.allocPrint(alloc, "model-catalog-{s}.json", .{provider});
+    defer alloc.free(filename);
+    return std.Io.Dir.path.join(alloc, &.{ home, root_dir_name, filename });
+}
+
 test "profile path helpers preserve current default locations" {
     const alloc = std.testing.allocator;
 
@@ -165,4 +178,16 @@ test "profile path helpers preserve current default locations" {
     const recordings = try recordingsDir(alloc, "/tmp/fake-home");
     defer alloc.free(recordings);
     try std.testing.expectEqualStrings("/tmp/fake-home/.proto-fx/recordings", recordings);
+
+    const catalog = try modelCatalogCachePath(alloc, "/tmp/fake-home", "openrouter");
+    defer alloc.free(catalog);
+    try std.testing.expectEqualStrings("/tmp/fake-home/.proto-fx/openrouter-models.json", catalog);
+
+    const codex_catalog = try modelCatalogCachePath(alloc, "/tmp/fake-home", "codex");
+    defer alloc.free(codex_catalog);
+    try std.testing.expectEqualStrings("/tmp/fake-home/.proto-fx/model-catalog-codex.json", codex_catalog);
+
+    const configured_catalog = try modelCatalogCachePath(alloc, "/tmp/fake-home", "local");
+    defer alloc.free(configured_catalog);
+    try std.testing.expectEqualStrings("/tmp/fake-home/.proto-fx/model-catalog-local.json", configured_catalog);
 }

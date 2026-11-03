@@ -329,6 +329,7 @@ pub const State = struct {
             .id = token.id,
             .path = path,
             .media_type = media_type,
+            .detail = attachment.detail,
             .snapshot_path = snapshot_path,
             .snapshot_sha256 = snapshot_sha256,
         });

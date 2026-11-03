@@ -21,8 +21,10 @@ const Allocator = std.mem.Allocator;
 pub const provider_id = "openrouter";
 const authorize_url = "https://openrouter.ai/auth";
 const keys_url = "https://openrouter.ai/api/v1/auth/keys";
+const key_info_url = "https://openrouter.ai/api/v1/auth/key";
 const e2e_authorize_url_env = "FX_E2E_OPENROUTER_AUTH_URL";
 const e2e_keys_url_env = "FX_E2E_OPENROUTER_KEYS_URL";
+const e2e_key_info_url_env = "FX_E2E_OPENROUTER_KEY_INFO_URL";
 pub const callback_port: u16 = 54549;
 pub const key_prefix = "sk-or-";
 const login_timeout_seconds: i64 = 5 * 60;
@@ -180,8 +182,15 @@ fn poll(
     const context: *Context = @ptrCast(@alignCast(raw.?));
     const manual = context.takeManual();
     defer if (manual) |value| secret.zeroAndFree(alloc, value);
-    // A pasted key needs no exchange.
-    if (manual) |value| if (std.mem.startsWith(u8, value, key_prefix)) return keyResult(alloc, value);
+    // A pasted key skips PKCE, but OpenRouter's models endpoint accepts any
+    // bearer and is not an authentication check. The key endpoint must accept
+    // it before the sign-in can complete.
+    if (manual) |value| {
+        if (std.mem.startsWith(u8, value, key_prefix)) {
+            try validateApiKey(alloc, transport, value, cancel_flag, deadline);
+            return keyResult(alloc, value);
+        }
+    }
     var accepted: ?browser_callback.Accepted(Callback) = null;
     defer if (accepted) |*callback| {
         callback.callback.deinit(alloc);
@@ -200,6 +209,33 @@ fn poll(
     context.pending_callback = accepted;
     accepted = null;
     return result;
+}
+
+pub fn validateApiKey(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    key: []const u8,
+    cancel_flag: ?*std.atomic.Value(bool),
+    deadline: ?std.Io.Clock.Timestamp,
+) !void {
+    if (cancel_flag) |flag| if (flag.load(.seq_cst)) return error.Cancelled;
+    const endpoint = oauth.configuredEndpoint(alloc, e2e_key_info_url_env, key_info_url) catch |err|
+        return endpointError(err);
+    defer alloc.free(endpoint);
+    const authorization = try alloc.print("Bearer {s}", .{key});
+    defer secret.zeroAndFree(alloc, authorization);
+    var response = try transport.execute(alloc, .{
+        .method = .get,
+        .url = endpoint,
+        .authorization = authorization,
+        .cancel_flag = cancel_flag,
+        .deadline = deadline,
+    });
+    defer response.deinit(alloc);
+    if (response.disposition != .accepted) {
+        debug_trace.logf("auth", "OpenRouter key validation rejected", .{});
+        return error.OpenRouterKeyValidationFailed;
+    }
 }
 
 fn keyResult(alloc: Allocator, key: []const u8) !oauth.PollResult {
@@ -376,6 +412,49 @@ test "OpenRouter code exchange posts the verifier and returns the minted key" {
     var refused: ExchangeFixture = .{ .body = "{\"key\":\"sk-or-x\"}", .accepted = false };
     defer if (refused.seen) |seen| std.testing.allocator.free(seen);
     try std.testing.expectError(error.OpenRouterKeyExchangeFailed, exchangeCode(alloc, .{ .context = &refused, .execute_fn = ExchangeFixture.execute }, keys_url, "c", "v", null, null));
+}
+
+const KeyValidationFixture = struct {
+    accepted: bool = true,
+    authorization: ?[]u8 = null,
+
+    fn execute(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) anyerror!oauth_transport.Response {
+        const self: *KeyValidationFixture = @ptrCast(@alignCast(raw.?));
+        try std.testing.expectEqual(oauth_transport.Method.get, request.method);
+        try std.testing.expectEqualStrings(key_info_url, request.url);
+        if (self.authorization) |authorization| alloc.free(authorization);
+        self.authorization = try alloc.dupe(u8, request.authorization orelse "");
+        return .{
+            .disposition = if (self.accepted) .accepted else .rejected,
+            .body = try alloc.dupe(u8, "{}"),
+        };
+    }
+};
+
+test "OpenRouter existing keys are checked against the key endpoint" {
+    const alloc = std.testing.allocator;
+    var fixture = KeyValidationFixture{};
+    defer if (fixture.authorization) |authorization| alloc.free(authorization);
+    try validateApiKey(
+        alloc,
+        .{ .context = &fixture, .execute_fn = KeyValidationFixture.execute },
+        "sk-or-v1-existing",
+        null,
+        null,
+    );
+    try std.testing.expectEqualStrings("Bearer sk-or-v1-existing", fixture.authorization.?);
+
+    fixture.accepted = false;
+    try std.testing.expectError(
+        error.OpenRouterKeyValidationFailed,
+        validateApiKey(
+            alloc,
+            .{ .context = &fixture, .execute_fn = KeyValidationFixture.execute },
+            "sk-or-v1-rejected",
+            null,
+            null,
+        ),
+    );
 }
 
 test "OpenRouter callback parsing takes the code and ignores other paths" {

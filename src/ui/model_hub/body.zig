@@ -78,7 +78,7 @@ pub fn compose(alloc: Allocator, state: *const hub.State, width: u16, height: u1
     var row = start;
     while (row < count and row < start + list_rows) : (row += 1) {
         const line = try lines.next();
-        const highlighted = row == selected;
+        const highlighted = row == selected or (state.hovered != null and state.hovered.? == row);
         switch (state.scope.kind) {
             .roles => try roles_body.row(line, state, state.rows.items[row], highlighted),
             .web_search => try providers_body.webRow(line, state, state.rows.items[row], highlighted, row),

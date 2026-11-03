@@ -14,6 +14,7 @@ const session_adapter = @import("../session/session_adapter.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
+const model_roles = @import("../config/model_roles.zig");
 const types = @import("../shared/types.zig");
 
 const slot_pool = @import("slot_pool.zig");
@@ -951,6 +952,7 @@ fn turnPreferencesForDurable(
         .provider = preferences.provider,
         .model = preferences.model,
         .effort = preferences.effort,
+        .role = if (preferences.role) |role| model_roles.parseRoleId(role) else null,
         .ultrafast_mode = preferences.ultrafast_mode,
     };
 }

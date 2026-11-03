@@ -27,7 +27,8 @@ import {
 } from "./tmux-helpers";
 
 const ENABLED = process.env.FX_TUI_PERFORMANCE === "1";
-const LIVE_ENABLED = process.env.FX_E2E_REAL_API === "1" &&
+const LIVE_ENABLED =
+  process.env.FX_E2E_REAL_API === "1" &&
   typeof process.env.AI_GATEWAY_API_KEY === "string" &&
   process.env.AI_GATEWAY_API_KEY.length > 0;
 const WARMUPS = 5;
@@ -42,7 +43,7 @@ const TIMEOUT = 60_000;
 const LOCAL_MENU_ACTIONS = [
   { name: "helpOpen", command: "/help", marker: "Commands " },
   { name: "settingsOpen", command: "/settings", marker: "Settings" },
-  { name: "modelOpen", command: "/model", marker: "Models " },
+  { name: "modelOpen", command: "/model", marker: "All models" },
   { name: "resumeOpen", command: "/resume", marker: "Sessions " },
   { name: "mcpOpen", command: "/mcp", marker: "MCP servers" },
   { name: "usageOpen", command: "/usage", marker: "usage: API key" },
@@ -112,7 +113,9 @@ function findSessionId(value: unknown): string | undefined {
 
 function percentile(values: readonly number[], fraction: number): number {
   const sorted = [...values].sort((left, right) => left - right);
-  return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)]!;
+  return sorted[
+    Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)
+  ]!;
 }
 
 function summary(values: readonly number[]) {
@@ -143,10 +146,11 @@ function frameLatency(
   fromIndex: number,
   contentMarker?: string,
 ): { firstPaint: number; contentReady: number } {
-  const inputIndex = frames.findIndex((frame, index) =>
-    index >= fromIndex && frame.kind === 2
+  const inputIndex = frames.findIndex(
+    (frame, index) => index >= fromIndex && frame.kind === 2,
   );
-  if (inputIndex < 0) throw new Error("recording did not contain the measured stdin frame");
+  if (inputIndex < 0)
+    throw new Error("recording did not contain the measured stdin frame");
 
   let elapsed = 0;
   let firstPaint: number | undefined;
@@ -202,7 +206,7 @@ async function waitForPaneChange(
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (await session.capturePane() !== before) return;
+    if ((await session.capturePane()) !== before) return;
     await Bun.sleep(1);
   }
   throw new Error("terminal pane did not change after input");
@@ -252,7 +256,7 @@ async function waitForEscapedPaneChange(
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (await session.capturePaneEscapes() !== before) return;
+    if ((await session.capturePaneEscapes()) !== before) return;
     await Bun.sleep(2);
   }
   throw new Error(`${label} did not produce a changed escaped pane`);
@@ -270,27 +274,38 @@ async function closeSurface(
   );
 }
 
-function appendMeasured(samples: Samples, value: { firstPaint: number; contentReady: number }) {
+function appendMeasured(
+  samples: Samples,
+  value: { firstPaint: number; contentReady: number },
+) {
   samples.firstPaint.push(value.firstPaint);
   samples.contentReady.push(value.contentReady);
 }
 
 function resourceSnapshot(pid: number): ResourceSnapshot {
   const rssKib = Number.parseInt(
-    execFileSync("ps", ["-o", "rss=", "-p", String(pid)], { encoding: "utf8" }).trim(),
+    execFileSync("ps", ["-o", "rss=", "-p", String(pid)], {
+      encoding: "utf8",
+    }).trim(),
     10,
   );
-  const threads = process.platform === "linux"
-    ? Number.parseInt(
-      readFileSync(`/proc/${pid}/status`, "utf8").match(/^Threads:\s+(\d+)$/m)?.[1] ?? "0",
-      10,
-    )
-    : execFileSync("ps", ["-M", "-p", String(pid)], { encoding: "utf8" })
-      .trim().split("\n").length - 1;
-  const descriptors = process.platform === "linux"
-    ? readdirSync(`/proc/${pid}/fd`).length
-    : execFileSync("lsof", ["-p", String(pid), "-Fn"], { encoding: "utf8" })
-      .split("\n").filter((line) => line.startsWith("n")).length;
+  const threads =
+    process.platform === "linux"
+      ? Number.parseInt(
+          readFileSync(`/proc/${pid}/status`, "utf8").match(
+            /^Threads:\s+(\d+)$/m,
+          )?.[1] ?? "0",
+          10,
+        )
+      : execFileSync("ps", ["-M", "-p", String(pid)], { encoding: "utf8" })
+          .trim()
+          .split("\n").length - 1;
+  const descriptors =
+    process.platform === "linux"
+      ? readdirSync(`/proc/${pid}/fd`).length
+      : execFileSync("lsof", ["-p", String(pid), "-Fn"], { encoding: "utf8" })
+          .split("\n")
+          .filter((line) => line.startsWith("n")).length;
   return { rssKib, threads, descriptors };
 }
 
@@ -327,7 +342,8 @@ async function waitForResourceQuiescence(
     if (
       current.threads === expected.threads &&
       current.descriptors === expected.descriptors
-    ) return current;
+    )
+      return current;
     await Bun.sleep(25);
     current = resourceSnapshot(pid);
   }
@@ -369,7 +385,10 @@ function longTranscript(): string {
     if (index === 0) rows.push("PERF_TRANSCRIPT_HEAD");
     else if (index === 1_050) rows.push("PERF_TRANSCRIPT_MIDDLE");
     else if (index === 2_099) rows.push("PERF_TRANSCRIPT_TAIL");
-    else if (index % 17 === 0) rows.push(`| ${index} | wide unicode 𝒇x 漢字 | wrapped ${"x".repeat(96)} |`);
+    else if (index % 17 === 0)
+      rows.push(
+        `| ${index} | wide unicode 𝒇x 漢字 | wrapped ${"x".repeat(96)} |`,
+      );
     else if (index % 11 === 0) rows.push("");
     else rows.push(`transcript row ${String(index).padStart(4, "0")}`);
   }
@@ -386,11 +405,12 @@ function createFixture() {
   const hash = createHash("sha256");
   let generationSkillPath = "";
   for (let index = 0; index < 289; index += 1) {
-    const name = index === 0
-      ? "generation-skill-000"
-      : index % 2 === 0
-      ? `needle-skill-${String(index).padStart(3, "0")}`
-      : `other-skill-${String(index).padStart(3, "0")}`;
+    const name =
+      index === 0
+        ? "generation-skill-000"
+        : index % 2 === 0
+          ? `needle-skill-${String(index).padStart(3, "0")}`
+          : `other-skill-${String(index).padStart(3, "0")}`;
     const body = `---\nname: ${name}\ndescription: performance fixture ${index}\n---\nbody ${index}\n`;
     const dir = join(skillsRoot, name);
     mkdirSync(dir, { recursive: true });
@@ -428,11 +448,29 @@ function sendOverlappingSkillCommands(
   newestSkill: string,
 ): void {
   execFileSync("tmux", [
-    "send-keys", "-t", session.name, "-l", "--", "/skills",
-    ";", "send-keys", "-t", session.name, "Enter",
-    ";", "send-keys", "-t", session.name, "-l", "--",
+    "send-keys",
+    "-t",
+    session.name,
+    "-l",
+    "--",
+    "/skills",
+    ";",
+    "send-keys",
+    "-t",
+    session.name,
+    "Enter",
+    ";",
+    "send-keys",
+    "-t",
+    session.name,
+    "-l",
+    "--",
     `/skills show ${newestSkill}`,
-    ";", "send-keys", "-t", session.name, "Enter",
+    ";",
+    "send-keys",
+    "-t",
+    session.name,
+    "Enter",
   ]);
 }
 
@@ -574,12 +612,7 @@ test.skipIf(!tmuxAvailable())(
   async () => {
     const fixture = createFixture();
     const linkedHome = join(fixture.root, "linked-home");
-    const globalSkill = join(
-      fixture.home,
-      ".agents",
-      "skills",
-      "global-skill",
-    );
+    const globalSkill = join(fixture.home, ".agents", "skills", "global-skill");
     mkdirSync(globalSkill, { recursive: true });
     writeFileSync(
       join(globalSkill, "SKILL.md"),
@@ -646,13 +679,15 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
     const gateway = startFakeGateway([
       fakeGatewayFinalText(fixture.transcript),
       fakeGatewayToolCall("performance-question", "ask_user_question", {
-        questions: [{
-          question: "Which performance path should I use?",
-          options: [
-            { label: "Alpha path", description: "Use the first path." },
-            { label: "Beta path", description: "Use the second path." },
-          ],
-        }],
+        questions: [
+          {
+            question: "Which performance path should I use?",
+            options: [
+              { label: "Alpha path", description: "Use the first path." },
+              { label: "Beta path", description: "Use the second path." },
+            ],
+          },
+        ],
       }),
       fakeGatewayFinalText("PERF_QUESTION_DONE"),
       fakeGatewayToolCall("performance-approval", "shell", {
@@ -669,8 +704,7 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
           action: "run",
           cwd: fixture.workspace,
           command:
-            "printf 'PERF_TERMINAL_READY\\n'; " +
-            "while :; do sleep 1; done",
+            "printf 'PERF_TERMINAL_READY\\n'; " + "while :; do sleep 1; done",
           profile: "clean",
           tty: true,
           yield_time_ms: 0,
@@ -683,13 +717,14 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         }
         return fakeGatewayFinalText("PERF_TERMINAL_AGENT_READY");
       },
-      () => fakeGatewayToolCall("performance-terminal-close", "shell", {
-        request: {
-          action: "stop",
-          session_id: hostedTerminalSessionId,
-          force: true,
-        },
-      }),
+      () =>
+        fakeGatewayToolCall("performance-terminal-close", "shell", {
+          request: {
+            action: "stop",
+            session_id: hostedTerminalSessionId,
+            force: true,
+          },
+        }),
       fakeGatewayFinalText("PERF_TERMINAL_CLOSED"),
       fakeGatewayFinalText(secondTranscript),
     ]);
@@ -724,7 +759,9 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       // One correctness cycle also fences the inline prewarm before timing.
       session.sendKeysImmediate(["C-o"]);
       await session.waitForText("full detail · ctrl+o close", TIMEOUT);
-      expect(await session.captureFullScrollback()).toContain("PERF_TRANSCRIPT_HEAD");
+      expect(await session.captureFullScrollback()).toContain(
+        "PERF_TRANSCRIPT_HEAD",
+      );
       session.sendKeysImmediate(["Escape"]);
       await session.waitForComposer(TIMEOUT);
 
@@ -748,10 +785,11 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         const scroll = await measureAction(
           fixture.tapePath,
           () => session!.sendKeysImmediate(["Up"]),
-          () => session!.waitForPane(
-            (pane) => pane !== beforeScroll && pane.includes("full detail"),
-            TIMEOUT,
-          ),
+          () =>
+            session!.waitForPane(
+              (pane) => pane !== beforeScroll && pane.includes("full detail"),
+              TIMEOUT,
+            ),
         );
         session.sendKeysImmediate(["Escape"]);
         await session.waitForComposer(TIMEOUT);
@@ -786,10 +824,11 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         const cacheMiss = await measureAction(
           fixture.tapePath,
           () => session!.sendKeysImmediate([key]),
-          () => session!.waitForPane(
-            (pane) => pane !== beforeMiss && pane.includes("full detail"),
-            TIMEOUT,
-          ),
+          () =>
+            session!.waitForPane(
+              (pane) => pane !== beforeMiss && pane.includes("full detail"),
+              TIMEOUT,
+            ),
         );
         if (cycle >= WARMUPS) {
           appendMeasured(samples.fullScrollCacheMiss, cacheMiss);
@@ -830,10 +869,14 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         const open = await measureAction(
           fixture.tapePath,
           () => session!.sendLiteralImmediate("/login "),
-          () => session!.waitForPane(
-            (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
-            TIMEOUT,
-          ),
+          () =>
+            session!.waitForPane(
+              (pane) =>
+                pane.includes("vercel") &&
+                pane.includes("codex") &&
+                pane.includes("grok"),
+              TIMEOUT,
+            ),
           "vercel",
         );
         if (cycle >= WARMUPS) appendMeasured(samples.loginOpen, open);
@@ -864,11 +907,13 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         const slashQuery = await measureAction(
           fixture.tapePath,
           () => session!.sendLiteralImmediate("he"),
-          () => session!.waitForPane(
-            (pane) => composerContains(pane, "/he") &&
-              pane.includes("show available slash commands"),
-            TIMEOUT,
-          ),
+          () =>
+            session!.waitForPane(
+              (pane) =>
+                composerContains(pane, "/he") &&
+                pane.includes("show available slash commands"),
+              TIMEOUT,
+            ),
           "┃ /he",
         );
         await closeSurface(session, "Results ");
@@ -923,16 +968,25 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       }
 
       await session.sendText("Open the performance question.");
-      await session.waitForText("Which performance path should I use?", TIMEOUT);
+      await session.waitForText(
+        "Which performance path should I use?",
+        TIMEOUT,
+      );
       for (let cycle = 0; cycle < WARMUPS + SAMPLES; cycle += 1) {
         const before = await session.capturePaneEscapes();
         const key = cycle % 2 === 0 ? "Down" : "Up";
         const navigation = await measureAction(
           fixture.tapePath,
           () => session!.sendKeysImmediate([key]),
-          () => waitForEscapedPaneChange(session!, before, `questionNavigate.${cycle}`),
+          () =>
+            waitForEscapedPaneChange(
+              session!,
+              before,
+              `questionNavigate.${cycle}`,
+            ),
         );
-        if (cycle >= WARMUPS) appendMeasured(samples.questionNavigate, navigation);
+        if (cycle >= WARMUPS)
+          appendMeasured(samples.questionNavigate, navigation);
       }
       session.sendKeysImmediate(["2"]);
       await session.waitForText("PERF_QUESTION_DONE", TIMEOUT);
@@ -946,9 +1000,15 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         const navigation = await measureAction(
           fixture.tapePath,
           () => session!.sendKeysImmediate([key]),
-          () => waitForEscapedPaneChange(session!, before, `approvalNavigate.${cycle}`),
+          () =>
+            waitForEscapedPaneChange(
+              session!,
+              before,
+              `approvalNavigate.${cycle}`,
+            ),
         );
-        if (cycle >= WARMUPS) appendMeasured(samples.approvalNavigate, navigation);
+        if (cycle >= WARMUPS)
+          appendMeasured(samples.approvalNavigate, navigation);
       }
       session.sendKeysImmediate(["3"]);
       await session.waitForText("PERF_APPROVAL_DONE", TIMEOUT);
@@ -965,17 +1025,26 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       await session.waitForText("PERF_TERMINAL_CLOSED", TIMEOUT);
       await session.waitForComposer(TIMEOUT);
       const resourcesBefore = await waitForResourceStability(pid);
-      expect(resourcesBefore.threads - preFeatureResources.threads).toBeLessThanOrEqual(2);
+      expect(
+        resourcesBefore.threads - preFeatureResources.threads,
+      ).toBeLessThanOrEqual(2);
       // Three terminal routes, the in-process terminal store's profile and
       // sessions folders, plus command-replay logs, commands, and tool-results routes.
-      expect(resourcesBefore.descriptors - preFeatureResources.descriptors).toBeLessThanOrEqual(8);
-      expect(resourcesBefore.rssKib - preFeatureResources.rssKib).toBeLessThan(16 * 1024);
+      expect(
+        resourcesBefore.descriptors - preFeatureResources.descriptors,
+      ).toBeLessThanOrEqual(8);
+      expect(resourcesBefore.rssKib - preFeatureResources.rssKib).toBeLessThan(
+        16 * 1024,
+      );
 
       const peakResources = await peakResourcesWhile(pid, async () => {
         await session!.sendText("Build the second performance transcript.");
         await session!.waitForText("PERF_SECOND_TRANSCRIPT_TAIL", TIMEOUT);
       });
-      const resourcesAfter = await waitForResourceQuiescence(pid, resourcesBefore);
+      const resourcesAfter = await waitForResourceQuiescence(
+        pid,
+        resourcesBefore,
+      );
       const report = {
         boundary: "recorded application stdin frame to recorded stdout frame",
         boundaryExceptions: {
@@ -1000,10 +1069,13 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         },
         informationalActions: [...INFORMATIONAL_PANE_ACTION_NAMES],
         results: Object.fromEntries(
-          Object.entries(samples).map(([name, values]) => [name, {
-            firstPaint: summary(values.firstPaint),
-            contentReady: summary(values.contentReady),
-          }]),
+          Object.entries(samples).map(([name, values]) => [
+            name,
+            {
+              firstPaint: summary(values.firstPaint),
+              contentReady: summary(values.contentReady),
+            },
+          ]),
         ),
         resources: {
           preFeature: preFeatureResources,
@@ -1013,29 +1085,34 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
         },
       };
       const reportPath = process.env.FX_TUI_PERFORMANCE_REPORT;
-      if (reportPath) writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+      if (reportPath)
+        writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
 
       for (const [name, values] of Object.entries(samples)) {
         const actionBudget = APP_PANE_ACTION_NAMES.has(name)
           ? APP_PANE_BUDGETS_MS
           : name === "skillsOpen" || name === "loginOpen"
-          ? EXTERNAL_REFRESH_BUDGETS_MS
-          : name === "fullScrollCacheMiss"
-          ? BACKGROUND_WORK_BUDGETS_MS
-          : LOCAL_BUDGETS_MS;
+            ? EXTERNAL_REFRESH_BUDGETS_MS
+            : name === "fullScrollCacheMiss"
+              ? BACKGROUND_WORK_BUDGETS_MS
+              : LOCAL_BUDGETS_MS;
         for (const distribution of [values.firstPaint, values.contentReady]) {
           const measured = summary(distribution);
           expect(measured.count).toBe(SAMPLES);
           if (INFORMATIONAL_PANE_ACTION_NAMES.has(name)) continue;
-          const budget = APP_PANE_ACTION_NAMES.has(name) || name === "fullScrollCacheMiss"
-            ? actionBudget
-            : distribution === values.firstPaint
-            ? LOCAL_BUDGETS_MS
-            : actionBudget;
-          const phase = distribution === values.firstPaint ? "firstPaint" : "contentReady";
-          if (measured.p50 > budget.p50 ||
-              measured.p90 > budget.p90 ||
-              measured.p95 > budget.p95) {
+          const budget =
+            APP_PANE_ACTION_NAMES.has(name) || name === "fullScrollCacheMiss"
+              ? actionBudget
+              : distribution === values.firstPaint
+                ? LOCAL_BUDGETS_MS
+                : actionBudget;
+          const phase =
+            distribution === values.firstPaint ? "firstPaint" : "contentReady";
+          if (
+            measured.p50 > budget.p50 ||
+            measured.p90 > budget.p90 ||
+            measured.p95 > budget.p95
+          ) {
             throw new Error(
               `${name}.${phase} exceeded budget: ` +
                 `measured=${measured.p50}/${measured.p90}/${measured.p95}ms ` +
@@ -1046,12 +1123,18 @@ test.skipIf(!ENABLED || !tmuxAvailable())(
       }
       expect(resourcesAfter.threads).toBe(resourcesBefore.threads);
       expect(resourcesAfter.descriptors).toBe(resourcesBefore.descriptors);
-      expect(resourcesAfter.rssKib - resourcesBefore.rssKib).toBeLessThan(16 * 1024);
-      expect(peakResources.threads - resourcesBefore.threads).toBeLessThanOrEqual(3);
-      expect(peakResources.descriptors - resourcesBefore.descriptors).toBeLessThanOrEqual(
-        ACTIVE_TURN_DESCRIPTOR_BUDGET,
+      expect(resourcesAfter.rssKib - resourcesBefore.rssKib).toBeLessThan(
+        16 * 1024,
       );
-      expect(peakResources.rssKib - resourcesBefore.rssKib).toBeLessThan(32 * 1024);
+      expect(
+        peakResources.threads - resourcesBefore.threads,
+      ).toBeLessThanOrEqual(3);
+      expect(
+        peakResources.descriptors - resourcesBefore.descriptors,
+      ).toBeLessThanOrEqual(ACTIVE_TURN_DESCRIPTOR_BUDGET);
+      expect(peakResources.rssKib - resourcesBefore.rssKib).toBeLessThan(
+        32 * 1024,
+      );
       expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
     } finally {
       await session?.kill();
@@ -1110,7 +1193,10 @@ test.skipIf(!LIVE_ENABLED || !tmuxAvailable())(
       await session.waitForComposer(TIMEOUT);
       await session.sendLiteralText("/login ");
       await session.waitForPane(
-        (pane) => pane.includes("vercel") && pane.includes("codex") && pane.includes("grok"),
+        (pane) =>
+          pane.includes("vercel") &&
+          pane.includes("codex") &&
+          pane.includes("grok"),
         TIMEOUT,
       );
       session.sendKeysImmediate(["Escape"]);

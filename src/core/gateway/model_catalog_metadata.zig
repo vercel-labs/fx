@@ -2,6 +2,7 @@ const std = @import("std");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_catalog = @import("model_catalog.zig");
 const types = @import("../shared/types.zig");
+const tokenizer = @import("../tokenizer/tokenizer.zig");
 
 fn optionalPositiveU32(value: u32) ?u32 {
     return if (value == 0) null else value;
@@ -9,6 +10,7 @@ fn optionalPositiveU32(value: u32) ?u32 {
 
 pub fn fromCatalogEntry(entry: model_catalog.ModelCatalogEntry) model_capabilities.GatewayMetadata {
     return .{
+        .tokenizer = entry.tokenizer orelse tokenizer.resolveModel(entry.id),
         .supports_reasoning = entry.has_reasoning,
         .reasoning_efforts = .fromSlice(entry.reasoning_efforts.items),
         .supports_fast_mode = entry.supports_fast_mode,
@@ -21,6 +23,9 @@ pub fn fromCatalogEntry(entry: model_catalog.ModelCatalogEntry) model_capabiliti
         .supports_implicit_caching = entry.has_implicit_caching,
         .context_window = optionalPositiveU32(entry.context_window),
         .max_output_tokens = optionalPositiveU32(entry.max_tokens),
+        .max_context_window = entry.max_context_window,
+        .omit_max_output_tokens = entry.omit_max_output_tokens,
+        .prefer_websockets = entry.prefer_websockets,
     };
 }
 
@@ -31,6 +36,7 @@ test "fromCatalogEntry preserves catalog capability metadata" {
     const metadata = fromCatalogEntry(.{
         .id = @constCast("provider/model"),
         .model_type = @constCast("language"),
+        .tokenizer = .qwen3,
         .has_reasoning = true,
         .reasoning_efforts = .fromOwnedSlice(@constCast(efforts[0..])),
         .supports_fast_mode = true,
@@ -44,6 +50,7 @@ test "fromCatalogEntry preserves catalog capability metadata" {
         .max_tokens = 32_000,
     });
 
+    try std.testing.expectEqual(@as(?tokenizer.Encoding, .qwen3), metadata.tokenizer);
     try std.testing.expect(metadata.supports_reasoning);
     try std.testing.expectEqualStrings("future-tier", metadata.reasoning_efforts.values[0].label());
     try std.testing.expect(metadata.supports_fast_mode);

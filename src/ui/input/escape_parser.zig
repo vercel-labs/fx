@@ -186,6 +186,7 @@ fn kittyUnicodeKeyAction(keycode: u16, modifiers: u16, meta_prefixed: bool) Inpu
     // Strip Caps Lock (bit 6) and Num Lock (bit 7) — lock states, not modifiers.
     const mods = modifiers & 0x3F;
     if (keycode == 27 and mods == 0) return .escape;
+    if (keycode == 15 and mods == 0) return .refresh_model_catalog;
     // Hyper and Meta survive the lock-state mask, so a keypad key held with one
     // of them keeps today's behavior instead of typing text or moving the caret.
     if ((mods & ~keypad_supported_modifiers) == 0) {
@@ -641,6 +642,7 @@ pub fn consumeInputEscapeByteWithMouse(
                 4, 8 => .end,
                 5 => .page_up,
                 6 => .page_down,
+                15 => .refresh_model_catalog,
                 else => .ignore,
             };
         },
@@ -724,6 +726,7 @@ pub fn consumeInputEscapeByteWithMouse(
                     4, 8 => .end,
                     5 => .page_up,
                     6 => .page_down,
+                    15 => .refresh_model_catalog,
                     else => .ignore,
                 };
             }

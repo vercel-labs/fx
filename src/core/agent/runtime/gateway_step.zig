@@ -8,6 +8,7 @@ const io_mod = @import("../../shared/io.zig");
 const runtime_telemetry = @import("telemetry.zig");
 const runtime_tool_contracts = @import("tool_contracts.zig");
 const observation = @import("observation.zig");
+const model_performance = @import("../../model_hub/performance.zig");
 
 const Allocator = std.mem.Allocator;
 const TraceContext = debug_trace.TraceContext;
@@ -46,6 +47,42 @@ const InvocationAdmission = struct {
     }
 };
 
+/// Native compaction uses the same host-owned admission boundary as completions.
+pub fn compactModelContext(
+    provider: agent_stream_provider.CompactionProvider,
+    alloc: Allocator,
+    request_value: agent_stream_provider.CompactionRequest,
+) !agent_stream_provider.CompactionResult {
+    if (request_value.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    const instructions = [_]types.ChatMessage{.{ .role = .system, .content = request_value.instructions }};
+    var observed = if (request_value.observer) |observer| observer.beginModelForTool(.{
+        .model = request_value.model,
+        .instructions = if (request_value.instructions.len == 0) &.{} else &instructions,
+        .messages = request_value.messages,
+        .tools = request_value.tools,
+        .tool_choice = .none,
+        .provider_options = request_value.provider_options,
+    }, .compaction, null) else null;
+    var evidence: AttemptEvidence = .{};
+    var admission = InvocationAdmission{
+        .attempt_evidence = &evidence,
+        .trace_ctx = request_value.trace_ctx,
+        .model = request_value.model,
+        .caller_admission = request_value.admission,
+        .observed = if (observed) |*call| call else null,
+    };
+    var request = request_value;
+    request.admission = .{ .context = &admission, .admit_fn = InvocationAdmission.admit };
+    var result = provider.compact(alloc, request) catch |err| {
+        if (observed) |call| call.emit(.{ .model_end = .{ .id = call.id, .error_name = @errorName(err), .cancelled = request.cancel_flag.load(.seq_cst) } });
+        return err;
+    };
+    errdefer result.deinit(alloc);
+    if (!admission.admitted) return error.ProviderAdmissionMissing;
+    if (observed) |call| call.emit(.{ .model_end = .{ .id = call.id, .completion = .{ .usage = result.usage } } });
+    return result;
+}
+
 pub fn streamModelCompletion(
     provider: agent_stream_provider.Provider,
     alloc: Allocator,
@@ -56,7 +93,7 @@ pub fn streamModelCompletion(
     }
     const started_at_ms = io_mod.milliTimestamp();
     var observed = if (request_value.observer) |observer| observer.beginModelForTool(request_value.data(), request_value.purpose, request_value.parent_call_id) else null;
-    var observed_events = ObservedEvents{ .upstream = request_value.events, .observed = if (observed) |*call| call else null };
+    var observed_events = ObservedEvents{ .upstream = request_value.events, .observed = if (observed) |*call| call else null, .model = request_value.model, .started_at_ms = started_at_ms, .performance = request_value.performance };
     var admission = InvocationAdmission{
         .attempt_evidence = request_value.attempt_evidence,
         .trace_ctx = request_value.trace_ctx,
@@ -65,7 +102,7 @@ pub fn streamModelCompletion(
         .observed = if (observed) |*call| call else null,
     };
     var request = request_value;
-    if (observed != null) request.events = .{ .context = &observed_events, .emit_fn = ObservedEvents.emit };
+    if (observed != null or request_value.performance != null) request.events = .{ .context = &observed_events, .emit_fn = ObservedEvents.emit };
     request.admission = .{ .context = &admission, .admit_fn = InvocationAdmission.admit };
     // Only the owned result escapes. HTTP and parser scratch is released after
     // every attempt, including transport failure and cancellation.
@@ -87,7 +124,7 @@ pub fn streamModelCompletion(
         .failed => |value| .{ .id = call.id, .error_name = @tagName(value.kind), .cancelled = request.cancel_flag.load(.seq_cst) },
     } });
 
-    recordProviderResultMetric(request.model, started_at_ms, result, request.trace_ctx);
+    recordProviderResultMetric(request.performance, request.model, started_at_ms, result, request.trace_ctx);
     return switch (result) {
         .completed => |value| if (value.ownership == .borrowed) result else try result.dupe(alloc),
         .failed => |value| if (value.ownership == .borrowed) result else try result.dupe(alloc),
@@ -97,20 +134,38 @@ pub fn streamModelCompletion(
 const ObservedEvents = struct {
     upstream: agent_stream_provider.EventSink,
     observed: ?*observation.ModelCall,
+    model: []const u8,
+    started_at_ms: i64,
+    performance: ?*model_performance.State,
+    output_started: bool = false,
+
+    fn recordFirstOutput(self: *@This()) void {
+        if (self.output_started) return;
+        self.output_started = true;
+        if (self.performance) |performance| performance.recordFirstOutput(self.model, self.started_at_ms, io_mod.milliTimestamp());
+    }
+
     fn emit(raw: *anyopaque, event: agent_stream_provider.Event) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        if (self.observed) |call| switch (event) {
+        switch (event) {
             .content_delta, .reasoning_delta => |chunk| if (chunk.len > 0) {
-                call.output();
+                // Performance is provider telemetry, not semantic observation;
+                // normal requests still record TTFT when no observer is attached.
+                self.recordFirstOutput();
+                if (self.observed) |call| call.output();
             },
-            .tool_started => call.output(),
+            .tool_started => {
+                self.recordFirstOutput();
+                if (self.observed) |call| call.output();
+            },
             .tool_input_delta => {},
-        };
+        }
         self.upstream.emit(event);
     }
 };
 
 fn recordProviderResultMetric(
+    performance: ?*model_performance.State,
     model: []const u8,
     started_at_ms: i64,
     result: agent_stream_provider.Result,
@@ -156,6 +211,8 @@ fn recordProviderResultMetric(
             .request_shape = if (failure) |value| value.diagnostics.request_shape orelse "" else "",
         },
     );
+    const finished_at_ms = io_mod.milliTimestamp();
+    if (performance) |tracker| tracker.recordCompletion(model, if (finished_at_ms > started_at_ms) finished_at_ms - started_at_ms else 0, output_tokens, if (failure) |value| failureMetricCode(value.kind) else 200);
 }
 
 test "gateway request scratch is released across success failure cancellation and retries" {
@@ -232,6 +289,26 @@ test "gateway request scratch is released across success failure cancellation an
     }
     try std.testing.expectEqual(@as(usize, 1000), fake.observed_starts);
     try std.testing.expectEqual(fake.observed_starts, fake.observed_ends);
+}
+
+test "gateway telemetry records first output without semantic observer" {
+    const Sink = struct {
+        fn emit(_: *anyopaque, _: agent_stream_provider.Event) void {}
+    };
+    var context: u8 = 0;
+    var tracker = model_performance.State.init(std.testing.allocator, null);
+    defer tracker.deinit();
+    const model = "gateway-step-no-observer-ttft";
+    var events = ObservedEvents{
+        .upstream = .{ .context = &context, .emit_fn = Sink.emit },
+        .observed = null,
+        .model = model,
+        .started_at_ms = io_mod.milliTimestamp() - 1_000,
+        .performance = &tracker,
+    };
+    ObservedEvents.emit(@ptrCast(&events), .{ .content_delta = "first chunk" });
+    const metrics = tracker.snapshot(model);
+    try std.testing.expect(metrics.ttft_ms != null);
 }
 
 fn failureMetricCode(kind: agent_stream_provider.FailureKind) u16 {

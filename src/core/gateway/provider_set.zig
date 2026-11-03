@@ -1,6 +1,7 @@
 const std = @import("std");
 const stream_provider = @import("../agent/stream_provider.zig");
 const model_provider = @import("../config/model_provider.zig");
+const model_roles = @import("../config/model_roles.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const gateway_provider = @import("gateway_provider.zig");
@@ -58,6 +59,7 @@ pub const Set = struct {
     codex: Bundle,
     grok: Bundle,
     definitions: []const @import("../config/configured_provider.zig").Definition = &.{},
+    native_overrides: []const @import("../config/configured_provider.zig").NativeOverrides = &.{},
     /// Builds a configured provider's bundle; `configured_context` is passed through.
     configured_fn: ?*const fn (?*anyopaque, *const @import("../config/configured_provider.zig").Definition) Bundle = null,
     configured_context: ?*anyopaque = null,
@@ -69,6 +71,53 @@ pub const Set = struct {
     pub fn webSearchProvider(self: Set) ?web_search_provider.Provider {
         const bank = self.web_search orelse return null;
         return bank.provider();
+    }
+
+    pub fn modelMetadata(self: Set, provider: model_provider.ProviderId, model: []const u8) ?*const @import("../config/configured_provider.zig").ModelMetadata {
+        const registry = @import("../config/configured_provider.zig").Registry{
+            .definitions = self.definitions,
+            .native_overrides = self.native_overrides,
+        };
+        return registry.model(provider.label(), model);
+    }
+
+    /// Resolves a declared promotion target; the runtime checks its effective capacity.
+    pub fn contextPromotionTarget(set: Set, current: model_roles.Selection) ?model_roles.Selection {
+        const metadata = set.modelMetadata(current.provider, current.model) orelse return null;
+        const target_text = metadata.context_promotion_target orelse return null;
+        const ref = model_roles.parseRefId(target_text, current.source, set.definitions);
+        if (ref.model.len == 0) return null;
+        const target_provider = model_provider.parse(ref.provider orelse current.provider.label()) orelse return null;
+        if (target_provider.eql(current.provider) and std.mem.eql(u8, ref.model, current.model)) return null;
+        return .{
+            .provider = target_provider,
+            .model = ref.model,
+            .effort = current.effort,
+            .routing = ref.routing orelse current.routing,
+            .source = current.source,
+        };
+    }
+
+    pub fn modelCapabilities(self: Set, provider: model_provider.ProviderId, model: []const u8) model_capabilities.Capabilities {
+        var caps = self.select(provider).fallbackModelCapabilities(model);
+        const metadata = self.modelMetadata(provider, model) orelse return caps;
+        caps.model_metadata = metadata;
+        if (metadata.context_window) |value| caps.context_window = value;
+        if (metadata.max_output_tokens) |value| caps.max_output_tokens = value;
+        if (metadata.max_context_window) |value| caps.max_context_window = value;
+        if (metadata.supports_tool_use) |value| caps.supports_tool_use = value;
+        if (metadata.supports_vision) |value| {
+            caps.supports_vision = value;
+            caps.image_input_support = if (value) .native else .non_native;
+        }
+        if (metadata.prefer_websockets) |value| caps.prefer_websockets = value;
+        caps.omit_max_output_tokens = metadata.omit_max_output_tokens;
+        if (metadata.tokenizer) |value| caps.tokenizer = @import("../tokenizer/tokenizer.zig").Encoding.parse(value);
+        if (metadata.reasoning_efforts.len > 0) {
+            caps.reasoning_efforts = .fromSlice(metadata.reasoning_efforts);
+            caps.supports_reasoning = true;
+        }
+        return caps;
     }
 
     pub fn select(self: Set, provider: model_provider.ProviderId) Bundle {

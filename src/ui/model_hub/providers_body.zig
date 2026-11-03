@@ -14,13 +14,32 @@ pub fn lockedView(lines: *Lines, state: *const hub.State, height: u16) !void {
     {
         const line = try lines.next();
         try line.spaces(3);
-        if (provider.signed_in) {
+        if (provider.refreshing) {
+            try line.put(ui_render.selected_completion_style, "⟳ refreshing model list…");
+        } else if (provider.failure_category) |failure| {
+            try line.put(ui_render.dim_style, "last refresh failed: ");
+            try line.putUntrusted(ui_render.red_style, failure, line.remaining());
+        } else if (provider.signed_in) {
             try line.put(ui_render.selected_completion_style, "› Enter switches the session to it to list its models");
         } else switch (provider.sign_in) {
             .login => try line.put(ui_render.selected_completion_style, "› Enter signs in"),
             .settings => try line.put(ui_render.dim_style, "Its endpoint and key come from settings."),
             .external => try line.put(ui_render.dim_style, "Sign in to it outside proto-fx."),
         }
+    }
+    if (provider.credential_source) |source| {
+        const line = try lines.next();
+        try line.spaces(3);
+        try line.put(ui_render.dim_style, "credentials: ");
+        try line.putUntrusted(ui_render.dim_style, source, line.remaining());
+    }
+    if (provider.last_success_age_ms) |age| {
+        const line = try lines.next();
+        try line.spaces(3);
+        var age_buf: [64]u8 = undefined;
+        const age_text = if (age < 1_000) "just now" else if (age < 60_000) std.mem.print(&age_buf, "{d}s ago", .{@divTrunc(age, 1_000)}) catch "" else std.mem.print(&age_buf, "{d}m ago", .{@divTrunc(age, 60_000)}) catch "";
+        try line.put(ui_render.dim_style, "catalog: ");
+        try line.putUntrusted(ui_render.dim_style, age_text, line.remaining());
     }
     if (provider.model_count == 0) return;
     _ = try lines.next();

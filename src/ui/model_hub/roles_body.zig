@@ -19,10 +19,14 @@ pub fn status(line: *Line, state: *const hub.State) !void {
         return;
     }
     const highlighted = if (state.roleCursor()) |cursor| snapshot.roles[cursor.role_index].role else null;
-    for (snapshot.cycle, 0..) |role, index| {
-        if (index > 0) try line.put(ui_render.dim_style, " → ");
-        const style = if (highlighted != null and highlighted.? == role) ui_render.selected_completion_style else ui_render.tag_style;
-        try line.put(style, catalog.roleName(role));
+    var shown: usize = 0;
+    for (snapshot.cycle) |role| {
+        const hidden = if (snapshot.roleRow(role)) |role_row| role_row.hidden else false;
+        if (hidden) continue;
+        if (shown > 0) try line.put(ui_render.dim_style, " → ");
+        const style = if (highlighted != null and highlighted.?.eql(role)) ui_render.selected_completion_style else ui_render.tag_style;
+        try line.put(style, catalog.roleNameId(role));
+        shown += 1;
     }
 }
 
@@ -34,7 +38,8 @@ pub fn row(line: *Line, state: *const hub.State, id: usize, highlighted: bool) !
     if (cursor.entry > 0) return fallbackRow(line, role_row, cursor.entry, highlighted);
 
     if (role_row.assigned != null) try line.put(ui_render.green_style, "▪ ") else try line.put(ui_render.dim_style, "▫ ");
-    try line.put(if (highlighted) ui_render.selected_completion_style else "", catalog.roleName(role_row.role));
+    const role_label = if (role_row.label.len > 0) role_row.label else catalog.roleNameId(role_row.role);
+    try line.put(if (highlighted) ui_render.selected_completion_style else "", role_label);
     try line.padTo(name_column + 5);
 
     var cycle_buf: [8]u8 = undefined;
@@ -97,7 +102,7 @@ pub fn detail(line: *Line, state: *const hub.State, id: usize) !void {
         return;
     }
     try line.put(ui_render.dim_style, "For ");
-    try line.put(ui_render.dim_style, role_row.role.summary());
+    try line.put(ui_render.dim_style, if (role_row.summary.len > 0) role_row.summary else catalog.roleNameId(role_row.role));
     if (role_row.assigned != null) {
         try line.put(ui_render.dim_style, if (role_row.entries.len > 1) " · the first available model is used" else " · f adds a fallback");
         return;

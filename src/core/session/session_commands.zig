@@ -6,10 +6,8 @@ const auth_runtime = @import("../auth/auth_runtime.zig");
 const collections = @import("../shared/collections.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
-const fuzzy_match = @import("../shared/fuzzy_match.zig");
 const host = @import("../hosts/host.zig");
 const io_mod = @import("../shared/io.zig");
-const model_cache_runtime = @import("../app/model_cache_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const output_contracts = @import("../output/output_contracts.zig");
@@ -451,17 +449,6 @@ pub fn Commands(comptime App: type) type {
             defer settings.deinit(app.alloc);
 
             try saveStartupScrollbackSetting(app, !(settings.startup_scrollback orelse true));
-        }
-
-        pub fn handleModel(app: *App, query: []const u8) !void {
-            if (query.len == 0) {
-                try app.writeDomainNotice(.{ .topic = "model", .tone = .neutral, .body = provider_runtime.model(app) }, true);
-                return;
-            }
-
-            const resolved = try resolveModelQuery(app, query);
-            defer app.alloc.free(resolved);
-            try setResolvedModel(app, resolved, true);
         }
 
         /// `/permissions` with a mode or `reset`. Bare `/permissions` opens its
@@ -1299,31 +1286,6 @@ pub fn Commands(comptime App: type) type {
             try app.writeDomainNotice(.{ .topic = "settings", .tone = .@"error", .body = msg }, true);
         }
 
-        fn fetchModelIds(app: *App) !std.ArrayList([]u8) {
-            return app.fetchModelIds();
-        }
-
-        fn resolveModelQuery(app: *App, query: []const u8) ![]u8 {
-            if (try app.snapshotCachedModelIds(app.alloc)) |snapshot| {
-                var ids = snapshot;
-                defer freeStringList(app.alloc, &ids);
-                if (try resolveModelQueryFromIds(app.alloc, ids.items, query)) |resolved| {
-                    return resolved;
-                }
-            }
-
-            var ids = fetchModelIds(app) catch {
-                return app.alloc.dupe(u8, query);
-            };
-            defer freeStringList(app.alloc, &ids);
-
-            if (try resolveModelQueryFromIds(app.alloc, ids.items, query)) |resolved| {
-                return resolved;
-            }
-
-            return app.alloc.dupe(u8, query);
-        }
-
         fn setResolvedModel(app: *App, resolved: []const u8, announce: bool) !void {
             const model_changed = !std.mem.eql(u8, provider_runtime.model(app), resolved);
             try setResolvedModelRuntime(app, resolved);
@@ -1437,30 +1399,8 @@ pub fn Commands(comptime App: type) type {
             try app.writeDomainNotice(.{ .topic = "", .tone = .neutral, .body = line }, true);
             if (comptime @hasDecl(App, "playInteractionSound")) app.playInteractionSound();
         }
-
-        /// The model `/model <query>` switches to: the one the Models menu
-        /// and the inline suggestions list first for the same query.
-        fn resolveModelQueryFromIds(alloc: std.mem.Allocator, ids: []const []u8, query: []const u8) !?[]u8 {
-            if (std.mem.trim(u8, query, " \t\r\n").len == 0) return null;
-            const ranking: fuzzy_match.Ranking(ModelIdMatches) = .{
-                .context = .{ .ids = ids, .query = query },
-                .len = ids.len,
-            };
-            const position = ranking.at(0) orelse return null;
-            return try alloc.dupe(u8, ids[position]);
-        }
     };
 }
-
-/// Model ids in catalog order, matched as the Models menu matches them.
-const ModelIdMatches = struct {
-    ids: []const []u8,
-    query: []const u8,
-
-    pub fn matchAt(self: ModelIdMatches, position: usize) ?fuzzy_match.Match {
-        return model_cache_runtime.modelIdMatch(self.query, self.ids[position]);
-    }
-};
 
 fn startsWithWord(text: []const u8, word: []const u8) bool {
     if (!std.ascii.startsWithIgnoreCase(text, word)) return false;
@@ -2470,81 +2410,6 @@ test "session_commands handleSettings reports usage and save failures" {
     try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
 }
 
-test "session_commands handleModel reports current model for empty query" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
-    defer app.deinit();
-
-    try Commands(FakeApp).handleModel(&app, "");
-
-    try std.testing.expectEqualStrings("* model: anthropic/claude-opus-4.6\n", app.text());
-    try std.testing.expect(app.worker.synced_model == null);
-    try std.testing.expectEqualStrings("", app.terminalTitleLabelText());
-}
-
-test "session_commands handleModel resolves fuzzy cached model and syncs queued prompts" {
-    const alloc = std.testing.allocator;
-    const ids = [_][]const u8{
-        "openai/gpt-4o-mini",
-        "anthropic/claude-sonnet-4-20250514",
-    };
-    var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-4o");
-    defer app.deinit();
-    app.cached_ids = &ids;
-    app.selected_provider = .codex;
-
-    try Commands(FakeApp).handleModel(&app, "claude sonnet");
-
-    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.selected_model.items);
-    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4-20250514", app.worker.synced_model.?);
-    try std.testing.expectEqual(model_provider.ProviderId.codex, app.last_preference_provider.?);
-    try std.testing.expectEqualStrings(
-        "proto-fx v" ++ build_options.app_version ++ " | workspace",
-        app.terminalTitleLabelText(),
-    );
-    try expectTranscriptContains(&app, "* Switched to anthropic/claude-sonnet-4-20250514");
-}
-
-test "session_commands handleModel picks the model the Models menu lists first" {
-    const alloc = std.testing.allocator;
-    const ids = [_][]const u8{
-        "openai/gpt-4o-mini",
-        "openai/gpt-4o",
-        "anthropic/claude-sonnet-4.5",
-    };
-    var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-sonnet-4.5");
-    defer app.deinit();
-    app.cached_ids = &ids;
-
-    // The model's own name ranks it above a longer id listed earlier.
-    try Commands(FakeApp).handleModel(&app, "GPT-4o");
-    try std.testing.expectEqualStrings("openai/gpt-4o", app.selected_model.items);
-
-    try Commands(FakeApp).handleModel(&app, "cs45");
-    try std.testing.expectEqualStrings("anthropic/claude-sonnet-4.5", app.selected_model.items);
-
-    // Every word must match, so a query no model matches is used as typed.
-    app.fail_fetch = true;
-    try Commands(FakeApp).handleModel(&app, "openai/gpt-9");
-    try std.testing.expectEqualStrings("openai/gpt-9", app.selected_model.items);
-}
-
-test "session_commands handleModel falls back to raw query when model fetch fails" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-4o");
-    defer app.deinit();
-    app.fail_fetch = true;
-
-    try Commands(FakeApp).handleModel(&app, "custom/provider-model");
-
-    try std.testing.expectEqualStrings("custom/provider-model", app.selected_model.items);
-    try std.testing.expectEqualStrings("custom/provider-model", app.worker.synced_model.?);
-    try std.testing.expectEqualStrings(
-        "proto-fx v" ++ build_options.app_version ++ " | workspace",
-        app.terminalTitleLabelText(),
-    );
-}
-
 test "session_commands handlePermissions persists modes and reset clears session grants" {
     const alloc = std.testing.allocator;
     var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
@@ -3201,17 +3066,6 @@ test "model switch notice reports the final chosen effort and Ultrafast speed" {
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
 }
 
-test "plain model switch notice does not report the previous model's speed" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc, "/tmp/workspace", "openai/gpt-4o");
-    defer app.deinit();
-    app.worker.agent_turn_settings.ultrafast_mode = true;
-    app.fail_fetch = true;
-    try Commands(FakeApp).handleModel(&app, "openai/gpt-6-astra");
-    try expectTranscriptContains(&app, "Switched to openai/gpt-6-astra (effort: default, speed: normal)");
-    try std.testing.expect(!app.worker.agent_turn_settings.ultrafast_mode);
-}
-
 test "session_commands model picker emits one combined preference transaction" {
     const alloc = std.testing.allocator;
     var app = try FakeApp.init(
@@ -3243,104 +3097,6 @@ test "session_commands model picker emits one combined preference transaction" {
         app.last_preference_effort.?,
     );
     try std.testing.expectEqual(true, app.last_preference_fast_mode.?);
-}
-
-test "session_commands user save notice uses one post-commit load after legacy cleanup" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home_root);
-    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
-    defer std.testing.allocator.free(workspace_root);
-    const fixture = try std.testing.allocator.print(
-        "{{\"model\":\"user/old\",\"workspaces\":{{\"{s}\":{{\"model\":\"legacy/local\"}}}}}}\n",
-        .{workspace_root},
-    );
-    defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.proto-fx/settings.json", fixture);
-    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"model\":\"project/model\"}\n");
-
-    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
-    defer home.deinit();
-    var app = try FakeApp.init(std.testing.allocator, workspace_root, "old/runtime");
-    defer app.deinit();
-    app.fail_fetch = true;
-
-    try Commands(FakeApp).handleModel(&app, "user/new");
-
-    try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
-    try expectTranscriptContains(&app, "* model: saved to user settings (scope=user)");
-    try std.testing.expect(std.mem.find(u8, app.text(), "model=project") == null);
-    try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
-    try expectTranscriptContains(&app, "settings.json.preference-migration.model.");
-}
-
-test "session_commands durable user save survives post-commit resolver failure" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home_root);
-    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
-    defer std.testing.allocator.free(workspace_root);
-    const fixture = try std.testing.allocator.print(
-        "{{\"workspaces\":{{\"{s}\":{{\"model\":\"legacy/local\"}}}}}}\n",
-        .{workspace_root},
-    );
-    defer std.testing.allocator.free(fixture);
-    try writeFixtureFile(tmp.dir, "home/.proto-fx/settings.json", fixture);
-
-    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
-    defer home.deinit();
-    var app = try FakeApp.init(std.testing.allocator, workspace_root, "old/runtime");
-    defer app.deinit();
-    app.fail_fetch = true;
-    app.post_commit_resolution_error = error.InjectedPostCommitResolutionFailure;
-
-    try Commands(FakeApp).handleModel(&app, "user/new");
-
-    try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
-    try expectTranscriptContains(&app, "! model: saved to user settings (scope=user)");
-    try expectTranscriptContains(&app, "next-startup source unknown");
-    try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
-    try expectTranscriptContains(&app, "settings.json.preference-migration.model.");
-
-    var settings = try config_runtime.loadMergedSettings(
-        std.testing.allocator,
-        workspace_root,
-    );
-    defer settings.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("user/new", settings.models.get(.gateway).?);
-}
-
-test "session_commands durable user save survives post-commit resolver diagnostic" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "home/.proto-fx");
-    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
-    const home_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "home");
-    defer std.testing.allocator.free(home_root);
-    const workspace_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "workspace");
-    defer std.testing.allocator.free(workspace_root);
-
-    const home = try SessionCommandTestHome.install(std.testing.allocator, home_root);
-    defer home.deinit();
-    var app = try FakeApp.init(std.testing.allocator, workspace_root, "old/runtime");
-    defer app.deinit();
-    app.fail_fetch = true;
-    app.post_commit_resolution_diagnostic = .durable_path_unsafe;
-
-    try Commands(FakeApp).handleModel(&app, "user/new");
-
-    try std.testing.expectEqual(@as(usize, 1), app.post_commit_resolution_count);
-    try expectTranscriptContains(&app, "! model: saved to user settings (scope=user)");
-    try expectTranscriptContains(&app, "next-startup source unknown (DurablePathUnsafe)");
 }
 
 test "session_commands allowlist failures retain explicit scope and error" {
@@ -3390,67 +3146,6 @@ test "session_commands allowlist durable save survives post-commit resolver diag
         "saved but effective source unknown and runtime reload failed (DurablePathUnsafe)",
     );
     try std.testing.expectEqual(types.NoticeTone.warning, app.last_tone.?);
-}
-
-test "session_commands runtime-first model keeps runtime state when both durable targets fail" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc, "/tmp/workspace", "old/model");
-    defer app.deinit();
-    app.fail_fetch = true;
-    app.preference_settings_error = error.SettingsWriteFailed;
-    app.preference_session_error = error.SessionPersistenceDegraded;
-
-    try Commands(FakeApp).handleModel(&app, "new/model");
-
-    try std.testing.expectEqualStrings("new/model", app.selected_model.items);
-    try std.testing.expectEqualStrings("new/model", app.worker.synced_model.?);
-    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
-    try expectTranscriptContains(
-        &app,
-        "✗ model: active for this process but not saved to user settings",
-    );
-    try expectTranscriptContains(
-        &app,
-        "✗ model: failed to persist current session",
-    );
-}
-
-test "session_commands report indeterminate settings and session failures independently" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc, "/tmp/workspace", "old/model");
-    defer app.deinit();
-    app.fail_fetch = true;
-    app.preference_settings_error = error.SettingsCommitIndeterminate;
-    app.preference_session_error = error.SessionPersistenceDegraded;
-    const recovery_paths = try alloc.alloc([]const u8, 1);
-    recovery_paths[0] = try alloc.dupe(u8, "/tmp/settings.json.preference-migration.model.json");
-    app.preference_failure_cleanup = .{
-        .fields_removed = 1,
-        .workspaces_changed = 1,
-        .recovery_paths = recovery_paths,
-    };
-
-    try Commands(FakeApp).handleModel(&app, "new/model");
-
-    try expectTranscriptContains(&app, "user settings persistence uncertain");
-    try expectTranscriptContains(&app, "normalized 1 legacy value across 1 workspace");
-    try expectTranscriptContains(&app, "recovery=/tmp/settings.json.preference-migration.model.json");
-    try expectTranscriptContains(&app, "✗ model: failed to persist current session");
-}
-
-test "session_commands no-op model still attempts its durable targets" {
-    const alloc = std.testing.allocator;
-    var app = try FakeApp.init(alloc, "/tmp/workspace", "same/model");
-    defer app.deinit();
-    app.fail_fetch = true;
-
-    try Commands(FakeApp).handleModel(&app, "same/model");
-
-    try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
-    try std.testing.expectEqualStrings(
-        "same/model",
-        app.last_preference_model.items,
-    );
 }
 
 test "session_commands model controls remain catalog validated and clear unsupported fast state" {

@@ -16,6 +16,8 @@ const io_mod = @import("../shared/io.zig");
 const mcp_access = @import("../mcp/access_policy.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const model_provider = @import("../config/model_provider.zig");
+const model_roles = @import("../config/model_roles.zig");
+const runtime_deps = @import("../agent/runtime/deps.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session = @import("../session/session.zig");
 const session_codec = @import("../session/session_codec.zig");
@@ -43,6 +45,9 @@ pub const Defaults = struct {
     provider: model_provider.ProviderId,
     model: []const u8,
     effort: types.ReasoningEffort,
+    /// Source role for this child selection. Explicit model IDs leave this
+    /// unset; implicit fleet workers use the worker role.
+    role: ?model_roles.RoleId = null,
     fast_mode: bool = false,
     ultrafast_mode: bool = false,
     conversation_language: session.ConversationLanguage,
@@ -125,7 +130,7 @@ pub const ModelOverrideResolver = struct {
 pub const ModelRoleResolver = struct {
     pub const Lookup = union(enum) {
         /// The role's model and the thinking level its entry names (D251).
-        model: struct { id: []const u8, effort: ?types.ReasoningEffort = null },
+        model: struct { id: []const u8, effort: ?types.ReasoningEffort = null, provider: ?model_provider.ProviderId = null },
         unknown_role,
         /// The role picks no model on this provider; the worker inherits.
         unavailable,
@@ -152,6 +157,11 @@ pub const ExecuteOptions = struct {
     model_capability_resolver: ?model_capabilities.Resolver = null,
     model_override_resolver: ?ModelOverrideResolver = null,
     model_role_resolver: ?ModelRoleResolver = null,
+    /// Provider-qualified role callbacks are forwarded into child agent
+    /// turns so request failures can retry with matching credentials.
+    model_binding_context: ?*anyopaque = null,
+    model_binder: ?*const fn (*anyopaque, Allocator, model_roles.Selection) anyerror!?runtime_deps.ModelBinding = null,
+    role_chain_resolver: ?*const fn (*anyopaque, model_roles.RoleId, []model_roles.Selection) usize = null,
     /// The caller is this node's own turn, whose run slots its wait lends
     /// back (D92). A person's message from the frontend runs outside any
     /// turn and holds none, so it lends nothing.
@@ -598,7 +608,14 @@ pub const Runtime = struct {
         var raw_model = override.model orelse return .{ .accepted = .{} };
         var from_role = false;
         var role_effort: ?types.ReasoningEffort = null;
+        var role_provider: ?model_provider.ProviderId = null;
+        var role_id: ?model_roles.RoleId = null;
         if (raw_model[0] == '@') {
+            role_id = model_roles.parseRoleId(raw_model[1..]) orelse return .{ .rejected = .{
+                .ok = false,
+                .error_code = "unknown_model_role",
+                .result = try alloc.print("unknown model role '{s}'.", .{raw_model}),
+            } };
             const roles = options.model_role_resolver orelse return .{ .rejected = .{
                 .ok = false,
                 .error_code = "unknown_model_role",
@@ -609,6 +626,7 @@ pub const Runtime = struct {
                     debug_trace.logf("subagent", "model role resolved raw={s} model={s}", .{ raw_model, picked.id });
                     raw_model = picked.id;
                     role_effort = picked.effort;
+                    role_provider = picked.provider;
                     from_role = true;
                 },
                 .unknown_role => return .{ .rejected = .{
@@ -618,27 +636,34 @@ pub const Runtime = struct {
                 } },
                 .unavailable => {
                     debug_trace.logf("subagent", "model role unset raw={s}; inheriting model={s}", .{ raw_model, options.defaults.model });
-                    return .{ .accepted = .{ .model = options.defaults.model } };
+                    return .{ .accepted = .{ .model = options.defaults.model, .provider = options.defaults.provider, .role = role_id } };
                 },
             }
         }
         // A role's model is used as given unless the catalog resolves it.
         const passthrough: ?[]const u8 = if (from_role) raw_model else null;
+        // A provider-qualified role already selected the catalog that owns its
+        // model. Do not validate that model against the parent's active
+        // Gateway catalog, or a cross-provider @role would be rejected before
+        // admission can carry its provider identity.
+        if (from_role) if (role_provider) |provider| if (!provider.eql(options.defaults.provider)) {
+            return .{ .accepted = .{ .model = passthrough, .effort = role_effort, .provider = role_provider, .role = role_id } };
+        };
         // Only the gateway catalog is an authoritative model list. Configured
         // providers (OpenAI-compatible endpoints) accept arbitrary model IDs,
         // so overrides for those children pass through to the provider.
         if (options.defaults.provider != .gateway) {
             debug_trace.logf("subagent", "model override resolution skipped raw={s} reason=non_gateway_provider", .{raw_model});
-            return .{ .accepted = .{ .model = passthrough, .effort = role_effort } };
+            return .{ .accepted = .{ .model = passthrough, .effort = role_effort, .provider = role_provider, .role = role_id } };
         }
         const resolver = options.model_override_resolver orelse {
             debug_trace.logf("subagent", "model override resolution skipped raw={s} reason=no_resolver", .{raw_model});
-            return .{ .accepted = .{ .model = passthrough, .effort = role_effort } };
+            return .{ .accepted = .{ .model = passthrough, .effort = role_effort, .provider = role_provider, .role = role_id } };
         };
         switch (try resolver.resolve(alloc, raw_model)) {
             .no_catalog => {
                 debug_trace.logf("subagent", "model override resolution skipped raw={s} reason=no_catalog", .{raw_model});
-                return .{ .accepted = .{ .model = passthrough, .effort = role_effort } };
+                return .{ .accepted = .{ .model = passthrough, .effort = role_effort, .provider = role_provider, .role = role_id } };
             },
             .matched => |id| {
                 if (!std.mem.eql(u8, id, raw_model)) {
@@ -648,7 +673,7 @@ pub const Runtime = struct {
                         .{ raw_model, id },
                     );
                 }
-                return .{ .accepted = .{ .model = id, .effort = role_effort } };
+                return .{ .accepted = .{ .model = id, .effort = role_effort, .provider = role_provider, .role = role_id } };
             },
             .ambiguous => |candidates| {
                 debug_trace.logf(
@@ -959,6 +984,7 @@ pub const Runtime = struct {
                 .effort = defaults.effort,
                 .fast_mode = defaults.fast_mode,
                 .ultrafast_mode = defaults.ultrafast_mode,
+                .role = if (defaults.role) |role| @constCast(role.label()) else null,
             },
             .language = defaults.conversation_language,
         });
@@ -2162,7 +2188,16 @@ pub fn effectiveDefaults(
     resolved_model: Resolved,
 ) Defaults {
     var resolved = defaults;
-    if (override.model) |model| resolved.model = resolved_model.model orelse model;
+    if (override.model) |model| {
+        resolved.model = resolved_model.model orelse model;
+        // An explicit model ID is not a role selection. A parsed @role carries
+        // its identity in resolved_model; plain model text clears the implicit
+        // worker role instead of reverse-inheriting it.
+        resolved.role = resolved_model.role;
+    } else if (resolved_model.role) |role| {
+        resolved.role = role;
+    }
+    if (resolved_model.provider) |provider| resolved.provider = provider;
     // An effort the request names outranks the one its role names.
     if (override.effort orelse resolved_model.effort) |effort| resolved.effort = effort;
     return resolved;
@@ -2174,6 +2209,8 @@ pub fn effectiveDefaults(
 pub const Resolved = struct {
     model: ?[]const u8 = null,
     effort: ?types.ReasoningEffort = null,
+    provider: ?model_provider.ProviderId = null,
+    role: ?model_roles.RoleId = null,
 };
 
 fn captureAdmission(
@@ -2191,6 +2228,7 @@ fn captureAdmission(
         .model = request.preferences.model,
         .provider = request.preferences.provider,
         .effort = request.preferences.effort,
+        .role = request.preferences.role,
         .ultrafast_mode = request.preferences.ultrafast_mode,
         .permission_mode = snapshot.permission_mode,
         .tool_names = snapshot.tools,
