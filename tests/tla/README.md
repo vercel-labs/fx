@@ -61,6 +61,7 @@ npm ci --prefix sdk/durable
 CI's `TLA+ MCP models and drivers` job runs each engine model's smoke config (`mcp/run.py check`), `mcp_host/check.sh`, and both MCP drivers, on `main` and on pull requests that change MCP code, these models, their drivers, or the files the drivers load. The engine models' planted bugs (`mcp/check.sh`) run only by hand: they measure the checks, not the code.
 
 `.github/workflows/tla-mcp-call.yml` runs `mcp_call/check.sh`, planted bugs included, on every push to `main` and on pull requests labeled `ci:tla-mcp-call`.
+
 ## Transcript window in CI
 
 CI's `TLA+ transcript window model` job runs `transcript_window/check.sh --ci` on `main` and on pull requests that change the window's code, its model, its drivers, or the driver code they share. `--ci` leaves out the planted bugs and the run of a built fx along the model, which run only by hand with `transcript_window/check.sh`.
