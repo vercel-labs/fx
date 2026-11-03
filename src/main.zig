@@ -878,8 +878,9 @@ const App = struct {
         NotificationAppRuntime.playMaxCue(self, .toggle);
     }
 
-    pub fn reportWorking(self: *App) void {
-        HerdrAppRuntime.reportWorking(self);
+    /// What the busiest open agent is doing, for herdr's pane state.
+    pub fn agentsBusiest(self: *App) app_agents_runtime.Busiest {
+        return AgentsAppRuntime.busiest(self);
     }
 
     /// `agent`'s turn needs the user: an approval or a question.
@@ -1526,7 +1527,6 @@ const App = struct {
         errdefer releaseUnadmittedPrompt(agent, queued);
         queued.recovery_resume = resumed;
         try agent.worker.enqueuePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
         WorkerAppRuntime.syncState(
             self,
             agent,
@@ -1630,7 +1630,6 @@ const App = struct {
         );
         errdefer releaseUnadmittedPrompt(agent, queued);
         try agent.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
         return true;
     }
 
@@ -1655,7 +1654,6 @@ const App = struct {
         );
         errdefer releaseUnadmittedPrompt(agent, queued);
         try agent.worker.enqueuePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
         return true;
     }
 
@@ -1852,7 +1850,6 @@ const App = struct {
             .history = history,
             .unversioned_history_count = agent.session.unversionedHistoryEnd(),
         });
-        HerdrAppRuntime.reportWorking(self);
         return true;
     }
 
@@ -3363,6 +3360,7 @@ const App = struct {
         AgentsAppRuntime.settleChildRuns(self);
         AgentsAppRuntime.settleLentQuestion(self);
         AgentsAppRuntime.lendPrompt(self);
+        HerdrAppRuntime.reconcile(self);
     }
 
     /// Gives a subagent's question lent to main's prompt back to it, before

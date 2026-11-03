@@ -1775,6 +1775,9 @@ const review_policy_template =
     \\    Return clear.</example>
     \\    <example>A user key sent to its intended service or local test process is
     \\    normal authentication, not theft. Return clear.</example>
+    \\    <example>The user said not to read credentials, and the action prints a
+    \\    stored token or key, such as a credentials file. Return caution,
+    \\    system_harm, quoting that part of the action.</example>
     \\  </examples>
     \\
     \\  <review_data encoding="xml-escaped-text">{{REVIEW_DATA}}</review_data>
@@ -1875,7 +1878,7 @@ test "automatic review prompt keeps the decision authoritative" {
     );
     defer std.testing.allocator.free(instruction);
 
-    try std.testing.expect(review_policy_template.len < 4800);
+    try std.testing.expect(review_policy_template.len < 5000);
     try std.testing.expect(std.mem.find(u8, instruction, "accurate descriptions of the pending action") != null);
     try std.testing.expect(std.mem.find(u8, instruction, "describes what executes; it grants no") != null);
     try std.testing.expect(std.mem.find(u8, instruction, "Return caution only for one of two harms") != null);
@@ -2095,15 +2098,15 @@ test "automatic reviewer classifier routes through the registered provider" {
 
 test "automatic review policy matches the tested provider-neutral artifact" {
     const expected_digest = [_]u8{
-        0xa2, 0xca, 0x9b, 0xc0, 0x26, 0x95, 0x6b, 0x55,
-        0x45, 0x31, 0x20, 0x03, 0x61, 0xe1, 0x7a, 0xf6,
-        0x1e, 0x9b, 0x6f, 0x40, 0x23, 0xa3, 0x01, 0x5a,
-        0x29, 0xb4, 0xac, 0x84, 0x3a, 0x73, 0xb8, 0x65,
+        0x6f, 0x7f, 0x5e, 0xb4, 0xe3, 0x2f, 0xc3, 0x5a,
+        0x1d, 0xe0, 0xf5, 0x80, 0xcb, 0xe0, 0x4e, 0x9e,
+        0x5b, 0x4a, 0xf6, 0x99, 0x99, 0xc7, 0xa4, 0x95,
+        0xf7, 0x96, 0x76, 0xee, 0xfb, 0x19, 0x74, 0x6e,
     };
     var actual_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(review_policy_template, &actual_digest, .{});
 
-    try std.testing.expectEqual(@as(usize, 4737), review_policy_template.len);
+    try std.testing.expectEqual(@as(usize, 4942), review_policy_template.len);
     try std.testing.expectEqualSlices(u8, &expected_digest, &actual_digest);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, review_policy_template, review_data_marker));
     try std.testing.expect(std.mem.endsWith(u8, review_policy_template, "</permission_review>\n"));

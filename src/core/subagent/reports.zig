@@ -173,15 +173,23 @@ pub const Message = struct {
 };
 
 /// The text the parent receives for a subagent's message, framed as a
-/// report is. Caller owns the result.
-pub fn messageText(alloc: Allocator, agent: []const u8, child_id: []const u8, text: []const u8, max_output_bytes: usize) error{OutOfMemory}![]u8 {
+/// report is. `started_by` is who started the sender's turn that sent it,
+/// when the host knows. Caller owns the result.
+pub fn messageText(alloc: Allocator, agent: []const u8, child_id: []const u8, text: []const u8, max_output_bytes: usize, started_by: ?StartedBy) error{OutOfMemory}![]u8 {
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const body = try tool_result_limits.prepareModelOutput(scratch.allocator(), "subagent", text, max_output_bytes);
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     out.writer.writeAll(message_header) catch return error.OutOfMemory;
-    std.json.Stringify.value(.{ .agent = agent, .child_id = child_id, .message = body }, .{}, &out.writer) catch return error.OutOfMemory;
+    std.json.Stringify.value(.{
+        .agent = agent,
+        .child_id = child_id,
+        .message = body,
+        // As in a report, only the user's turns are named. The words are
+        // still the sender's, not the user's.
+        .started_by = if (started_by == .user) @as(?[]const u8, "user") else null,
+    }, .{ .emit_null_optional_fields = false }, &out.writer) catch return error.OutOfMemory;
     out.writer.writeByte('\n') catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
@@ -261,7 +269,7 @@ test "a report's sender is read back from its frame, and other text has none" {
     try std.testing.expect(std.mem.find(u8, notice, "\"dropped\":2") != null);
     try std.testing.expect((try agent_frame.reportSender(alloc, notice)) == null);
 
-    const note = try messageText(alloc, "reviewer", "c1", "a question", 4096);
+    const note = try messageText(alloc, "reviewer", "c1", "a question", 4096, null);
     defer alloc.free(note);
     try std.testing.expect(agent_frame.isFrame(note));
     try std.testing.expect((try agent_frame.reportSender(alloc, note)) == null);
@@ -352,7 +360,7 @@ test "a card names who sent a report or message, and how the work ended" {
     defer alloc.free(report_title);
     try std.testing.expectEqualStrings("Report from reviewer: failed", report_title);
 
-    const sent = try messageText(alloc, "reviewer", "c1", "need the schema", 4096);
+    const sent = try messageText(alloc, "reviewer", "c1", "need the schema", 4096, null);
     defer alloc.free(sent);
     const message_title = (try cardTitle(alloc, sent)).?;
     defer alloc.free(message_title);
@@ -426,11 +434,32 @@ test "a report's output stays inside its JSON line" {
 
 test "a subagent's message to its parent is framed as its own" {
     const alloc = std.testing.allocator;
-    const text = try messageText(alloc, "reviewer", "child-1", "found it\n\"}", 4096);
+    const text = try messageText(alloc, "reviewer", "child-1", "found it\n\"}", 4096, null);
     defer alloc.free(text);
     try std.testing.expect(std.mem.startsWith(u8, text, message_header));
     const line = text[message_header.len .. text.len - 1];
     try std.testing.expect(std.mem.findScalar(u8, line, '\n') == null);
+}
+
+test "a message from a turn the user typed on the sender's screen says so" {
+    const alloc = std.testing.allocator;
+    const Parsed = struct { agent: []const u8, child_id: []const u8, message: []const u8, started_by: ?[]const u8 = null };
+    for ([_]?StartedBy{ null, .parent, .child, .user }) |started_by| {
+        const text = try messageText(alloc, "reviewer", "child-1", "found it", 4096, started_by);
+        defer alloc.free(text);
+        const parsed = try std.json.parseFromSlice(Parsed, alloc, text[message_header.len .. text.len - 1], .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("found it", parsed.value.message);
+        if (started_by == .user) {
+            try std.testing.expectEqualStrings("user", parsed.value.started_by.?);
+        } else {
+            try std.testing.expect(parsed.value.started_by == null);
+        }
+        // The card is the same either way: the words are the sender's.
+        const title = (try cardTitle(alloc, text)).?;
+        defer alloc.free(title);
+        try std.testing.expectEqualStrings("Message from reviewer", title);
+    }
 }
 
 test "a report's output is capped like a tool result" {

@@ -13,6 +13,12 @@ pub const Client = herdr.Client;
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        /// An app that can say what its busiest agent is doing reports the
+        /// pane's state from its main loop through `reconcile`, so one
+        /// agent's turn ending can't mark the pane idle while another works.
+        /// The lifecycle hooks below serve an app with one agent.
+        const reconciles = @hasDecl(App, "agentsBusiest");
+
         /// Must run before the lifecycle runtime is frozen (currently the
         /// notification runtime performs the sole freeze right after this).
         pub fn configure(app: *App, active_session_id: ?[]const u8) !void {
@@ -25,7 +31,25 @@ pub fn Runtime(comptime App: type) type {
             app.herdr.reportState(.idle, null);
             app.herdr.announce();
 
+            if (comptime reconciles) return;
             try register(app);
+        }
+
+        /// Reports the busiest agent's state when it changed: blocked over
+        /// working, and working over idle. The main loop runs it after each
+        /// pass, since it owns every agent's prompts.
+        pub fn reconcile(app: *App) void {
+            if (comptime !reconciles) return;
+            if (!app.herdr.enabled) return;
+            const Report = struct { state: herdr.State, status: ?[]const u8 = null };
+            const report: Report = switch (app.agentsBusiest()) {
+                .needs_approval => .{ .state = .blocked, .status = attentionStatus(.permission) },
+                .has_question => .{ .state = .blocked, .status = attentionStatus(.question) },
+                .needs_you => .{ .state = .blocked, .status = attentionStatus(.route_recovery) },
+                .working => .{ .state = .working },
+                .idle => .{ .state = .idle },
+            };
+            app.herdr.reportStateIfChanged(report.state, report.status);
         }
 
         fn register(app: *App) !void {
@@ -86,6 +110,7 @@ const RecordingClient = struct {
     initialized: bool = false,
     announced: bool = false,
     session_id: ?[]const u8 = null,
+    last: herdr.LastReport = .{},
 
     fn initFromEnv(self: *RecordingClient, _: std.mem.Allocator) void {
         self.initialized = true;
@@ -101,10 +126,67 @@ const RecordingClient = struct {
     }
 
     fn reportState(self: *RecordingClient, state: herdr.State, status: ?[]const u8) void {
+        _ = self.last.changed(state, status);
+        self.reports[self.report_count] = .{ .state = state, .status = status };
+        self.report_count += 1;
+    }
+
+    fn reportStateIfChanged(self: *RecordingClient, state: herdr.State, status: ?[]const u8) void {
+        if (!self.last.changed(state, status)) return;
         self.reports[self.report_count] = .{ .state = state, .status = status };
         self.report_count += 1;
     }
 };
+
+test "an app that knows its busiest agent reports the pane state only on a change" {
+    // The tags of `app_agents_runtime.Busiest`.
+    const Busiest = enum { needs_approval, has_question, needs_you, working, idle };
+    const TestApp = struct {
+        alloc: std.mem.Allocator,
+        lifecycle_runtime: hooks.Runtime,
+        herdr: RecordingClient = .{},
+        busiest: Busiest = .idle,
+
+        pub fn agentsBusiest(self: *@This()) Busiest {
+            return self.busiest;
+        }
+    };
+    const Provider = Runtime(TestApp);
+
+    var app = TestApp{
+        .alloc = std.testing.allocator,
+        .lifecycle_runtime = hooks.Runtime.init(std.testing.allocator),
+    };
+    defer app.lifecycle_runtime.deinit();
+
+    try Provider.configure(&app, null);
+    const view = app.lifecycle_runtime.freeze();
+    // One agent's turn ending says nothing about the others, so no
+    // lifecycle hook reports.
+    try std.testing.expect(!view.hasPostTurnEnd());
+    try std.testing.expect(!view.hasAttentionRequired());
+
+    Provider.reconcile(&app);
+    app.busiest = .working;
+    Provider.reconcile(&app);
+    Provider.reconcile(&app);
+    app.busiest = .has_question;
+    Provider.reconcile(&app);
+    app.busiest = .needs_approval;
+    Provider.reconcile(&app);
+    app.busiest = .needs_you;
+    Provider.reconcile(&app);
+    app.busiest = .idle;
+    Provider.reconcile(&app);
+
+    try std.testing.expectEqual(@as(usize, 6), app.herdr.report_count);
+    try expectReport(app.herdr.reports[0], .idle, null);
+    try expectReport(app.herdr.reports[1], .working, null);
+    try expectReport(app.herdr.reports[2], .blocked, "question");
+    try expectReport(app.herdr.reports[3], .blocked, "permission");
+    try expectReport(app.herdr.reports[4], .blocked, "recovery");
+    try expectReport(app.herdr.reports[5], .idle, null);
+}
 
 test "built-in Herdr hooks report only interactive lifecycle state" {
     const TestApp = struct {

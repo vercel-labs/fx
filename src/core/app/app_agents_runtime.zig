@@ -157,6 +157,16 @@ const InstanceState = enum {
     }
 };
 
+/// What the busiest open agent is doing (`Runtime.busiest`), most urgent
+/// first. A finished turn counts as idle.
+pub const Busiest = enum { needs_approval, has_question, needs_you, working, idle };
+
+/// The more urgent of `a` and `b`; `InstanceState` lists the most urgent
+/// first.
+fn moreUrgent(a: InstanceState, b: InstanceState) InstanceState {
+    return if (@backingInt(a) <= @backingInt(b)) a else b;
+}
+
 /// `request_waits` is whether the agent's status row shows a request that
 /// waits for the user.
 fn instanceState(agent: *agents.Agent, request_waits: bool) InstanceState {
@@ -962,6 +972,24 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
+        /// What the busiest open agent, instance or subagent, is doing, for
+        /// a state that stands for the whole process, such as herdr's pane.
+        /// Main loop only: it reads every agent's prompts.
+        pub fn busiest(app: *App) Busiest {
+            var most: InstanceState = .idle;
+            if (firstOpen(app)) most = moreUrgent(most, instanceState(&app.main_agent, requestWaitsForUser(app, null)));
+            for (app.child_agents.items) |child| {
+                most = moreUrgent(most, instanceState(&child.agent, requestWaitsForUser(app, child)));
+            }
+            return switch (most) {
+                .needs_approval => .needs_approval,
+                .has_question => .has_question,
+                .needs_you => .needs_you,
+                .working => .working,
+                .finished, .idle => .idle,
+            };
+        }
+
         fn targetAgent(app: *App, target: ?*ChildAgent) *AppAgent {
             return if (target) |child| &child.agent else &app.main_agent;
         }
@@ -1483,11 +1511,20 @@ pub fn Runtime(comptime App: type) type {
             const message = post.kind == .message;
             const target = receiverOf(app, post.host, message and post.from_owner) orelse return error.AgentGone;
             // A message sent by the owner names the owner, its own subagent.
-            const sender = if (message and post.from_owner) blk: {
+            const owner_child: ?*ChildAgent = if (message and post.from_owner) blk: {
                 const owner = ownerOf(app, post.host) orelse return error.AgentGone;
-                const child = hostedOf(app, owner) orelse return error.AgentGone;
-                break :blk if (child.name.len > 0) child.name else child.id;
-            } else post.agent;
+                break :blk hostedOf(app, owner) orelse return error.AgentGone;
+            } else null;
+            const sender = if (owner_child) |child| (if (child.name.len > 0) child.name else child.id) else post.agent;
+            // Who started the turn that sent a message, from the host that
+            // runs the sender. That turn is still going: posts are taken
+            // each pass before the children's events, its end among them.
+            const started_by: ?subagent_reports.StartedBy = if (!message)
+                null
+            else if (owner_child) |child|
+                if (hostOf(app, child)) |host| host.turnStartedBy(child.id) else null
+            else
+                post.host.turnStartedBy(post.child_id);
             const limit = target.worker.effectiveAgentTurnSettings().max_tool_result_bytes;
             const text = switch (post.kind) {
                 .report => try subagent_reports.message(app.alloc, .{
@@ -1499,7 +1536,7 @@ pub fn Runtime(comptime App: type) type {
                     .dropped = post.dropped,
                     .end = post.end,
                 }, limit),
-                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit) catch |err| {
+                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit, started_by) catch |err| {
                     target.worker.releaseAgentMessage();
                     return err;
                 },
