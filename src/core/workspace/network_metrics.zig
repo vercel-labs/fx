@@ -38,6 +38,10 @@ pub const NetworkCall = struct {
     error_len: u8 = 0,
     stop_reason_buf: [max_stop_reason_len]u8 = @splat(0),
     stop_reason_len: u8 = 0,
+    /// The provider's own reason behind the unified stop reason, such as
+    /// Gemini's UNEXPECTED_TOOL_CALL behind `other`.
+    provider_stop_reason_buf: [max_stop_reason_len]u8 = @splat(0),
+    provider_stop_reason_len: u8 = 0,
     gateway_schema_diagnostic_buf: [max_gateway_schema_diagnostic_len]u8 = @splat(0),
     gateway_schema_diagnostic_len: u16 = 0,
     gateway_request_shape_buf: [max_gateway_request_shape_len]u8 = @splat(0),
@@ -53,6 +57,10 @@ pub const NetworkCall = struct {
 
     pub fn terminalStopReason(self: *const NetworkCall) []const u8 {
         return self.stop_reason_buf[0..self.stop_reason_len];
+    }
+
+    pub fn providerStopReason(self: *const NetworkCall) []const u8 {
+        return self.provider_stop_reason_buf[0..self.provider_stop_reason_len];
     }
 
     pub fn gatewaySchemaDiagnostic(self: *const NetworkCall) []const u8 {
@@ -79,6 +87,12 @@ pub const NetworkCall = struct {
         const n = @min(reason.len, max_stop_reason_len);
         @memcpy(self.stop_reason_buf[0..n], reason[0..n]);
         self.stop_reason_len = @intCast(n);
+    }
+
+    pub fn setProviderStopReason(self: *NetworkCall, reason: []const u8) void {
+        const n = @min(reason.len, max_stop_reason_len);
+        @memcpy(self.provider_stop_reason_buf[0..n], reason[0..n]);
+        self.provider_stop_reason_len = @intCast(n);
     }
 
     pub fn setGatewaySchemaDiagnostic(self: *NetworkCall, diagnostic: []const u8) void {

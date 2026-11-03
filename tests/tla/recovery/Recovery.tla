@@ -34,7 +34,7 @@ CONSTANTS
 Bugs == {"none", "stall_stop", "no_wake", "stale_socket", "frozen_status",
          "no_closing", "never_ask", "hot_retry", "send_without_save",
          \* Planted in RecoveryTimed.tla.
-         "unbounded_wait", "frozen_countdown"}
+         "unbounded_wait", "frozen_countdown", "no_handoff"}
 
 ASSUME /\ MaxFaults \in Nat /\ Ladder \in 1..4 /\ Bug \in Bugs
 
@@ -167,6 +167,17 @@ Responding ==
     /\ flowing' = TRUE
     /\ status' = IF Bug = "frozen_status" THEN status ELSE "clear"
     /\ UNCHANGED <<phase, inflight, attempt, sameFail, lastSendWaited,
+                   savedInflight, savedClean, seenDeaths, deaths, cleanExit,
+                   net, gateway, needUser, faults, alive, cancelled>>
+
+\* `tick` after a resend has shown its retry status for the hand-off time
+\* (recovery.zig handoff_ms): fx's thinking row takes the status line back
+\* while the model works, since a model can think for a minute before its
+\* first byte. RecoveryTimed.tla says when.
+HandOff ==
+    /\ alive /\ phase = "working" /\ inflight /\ ~flowing /\ status = "retrying"
+    /\ status' = "clear"
+    /\ UNCHANGED <<phase, inflight, flowing, attempt, sameFail, lastSendWaited,
                    savedInflight, savedClean, seenDeaths, deaths, cleanExit,
                    net, gateway, needUser, faults, alive, cancelled>>
 
@@ -323,7 +334,7 @@ Finished ==
     /\ UNCHANGED vars
 
 Next ==
-    \/ Responding \/ Respond \/ Drop \/ StaleSocket \/ TimerFires
+    \/ Responding \/ HandOff \/ Respond \/ Drop \/ StaleSocket \/ TimerFires
     \/ NetDown \/ NetUp \/ GatewayBreak \/ GatewayHeal \/ NeedUserFault
     \/ Crash \/ Close \/ Relaunch
     \/ UserCancels \/ UserActs
@@ -352,14 +363,15 @@ Heals == <>(phase \in {"done_ok", "done_cancel"})
 \* On a world that never misbehaved, nothing alarming is shown.
 NoFalseAlarm == (status \in Alarms) => faults > 0
 
-\* The status says what is really happening, and a retry status
-\* clears once the answer flows.
+\* The status says what is really happening. A retry status clears once
+\* the answer flows, or earlier, when fx's thinking row takes the line back
+\* from a resend that has not failed (HandOff).
 StatusHonest ==
     alive =>
         /\ (phase = "waiting" => status = "waiting")
         /\ (phase = "need_user" => status = "need_user")
         /\ (phase = "working" /\ inflight /\ ~flowing =>
-                status = IF attempt > 1 THEN "retrying" ELSE "clear")
+                status \in IF attempt > 1 THEN {"retrying", "clear"} ELSE {"clear"})
         /\ (phase = "working" /\ flowing => status = "clear")
 
 \* After SIGHUP or SIGTERM, the request resumes without asking.

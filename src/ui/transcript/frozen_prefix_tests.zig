@@ -36,11 +36,11 @@ fn expectSameAsFull(alloc: Allocator, runtime: *TranscriptRuntime) !bool {
     const store = runtime.borrowedFrozenPrefix();
     const resumable = store.valid(
         .prepared,
-        runtime.entries.items,
+        runtime.notebook.entries.items,
         &.{},
         runtime.layout.cols,
         runtime.command_output_render.styles,
-        frozen_prefix.boundary(runtime.entries.items),
+        frozen_prefix.boundary(runtime.notebook.entries.items),
     ) != null or store.slots[@backingInt(frozen_prefix.Mode.prepared)] != null;
     var resumed = try source_preparation.prepareTranscriptSource(runtime, alloc, null);
     defer resumed.deinit(alloc);
@@ -56,7 +56,7 @@ fn expectSameAsFull(alloc: Allocator, runtime: *TranscriptRuntime) !bool {
     defer full.deinit(alloc);
     const plain_full = try transcript_blocks.renderEntriesToBytes(
         alloc,
-        runtime.entries.items,
+        runtime.notebook.entries.items,
         runtime.layout.cols,
         runtime.command_output_render.styles,
     );
@@ -70,7 +70,7 @@ fn expectSameAsFull(alloc: Allocator, runtime: *TranscriptRuntime) !bool {
 fn finishTurn(alloc: Allocator, runtime: *TranscriptRuntime, metrics: *types.Metrics, prompt: []const u8, answer: []const u8) !void {
     const text = try alloc.dupe(u8, prompt);
     defer alloc.free(text);
-    _ = try runtime.writeUserPromptCard(alloc, metrics, .{ .text = text }, runtime.entries.items.len > 0, &.{});
+    _ = try runtime.writeUserPromptCard(alloc, metrics, .{ .text = text }, runtime.notebook.entries.items.len > 0, &.{});
     _ = try expectSameAsFull(alloc, runtime);
     _ = try runtime.appendRawTranscriptEntryClassified(alloc, "● Read notes.txt\n", .tool_status);
     _ = try expectSameAsFull(alloc, runtime);
@@ -88,13 +88,13 @@ test "a runtime resuming after its frozen prefix prepares what a full render pre
     var metrics: types.Metrics = .{};
     _ = try runtime.appendRawTranscriptEntryClassified(alloc, "fx v0 · Run /help for commands\n", .welcome);
     try finishTurn(alloc, &runtime, &metrics, "Read the notes", "Here is **a** summary of the notes.");
-    const first_tool = runtime.entries.items[2].id();
+    const first_tool = runtime.notebook.entries.items[2].id();
     try finishTurn(alloc, &runtime, &metrics, "Run a command", "TURN_TWO_DONE with a line long enough to wrap at sixty columns.");
     try finishTurn(alloc, &runtime, &metrics, "Say the final words", "TURN_THREE_DONE");
 
     // The prefix covers the finished turns, and the next preparation resumes.
     const slot = runtime.frozen_prefix.slots[@backingInt(frozen_prefix.Mode.prepared)] orelse return error.NoPrefix;
-    try std.testing.expectEqual(frozen_prefix.boundary(runtime.entries.items), slot.state.entry_count);
+    try std.testing.expectEqual(frozen_prefix.boundary(runtime.notebook.entries.items), slot.state.entry_count);
     try std.testing.expect(runtime.frozen_prefix.slots[@backingInt(frozen_prefix.Mode.plain)] != null);
     try std.testing.expect(runtime.frozen_prefix.lines(.prepared) != null);
     const hits = runtime.frozen_prefix.hits;
@@ -142,7 +142,7 @@ fn driveRuntime(alloc: Allocator, draws: anytype) !void {
                 const text = try std.mem.print(&line_buffer, "Prompt number {d}", .{step});
                 const owned = try alloc.dupe(u8, text);
                 defer alloc.free(owned);
-                _ = try runtime.writeUserPromptCard(alloc, &metrics, .{ .text = owned }, runtime.entries.items.len > 0, &.{});
+                _ = try runtime.writeUserPromptCard(alloc, &metrics, .{ .text = owned }, runtime.notebook.entries.items.len > 0, &.{});
                 assistant_open = false;
             },
             1, 2 => {

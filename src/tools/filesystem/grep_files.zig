@@ -8,6 +8,7 @@ const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 
 const Allocator = std.mem.Allocator;
@@ -52,62 +53,40 @@ pub const Input = struct {
 
 /// Decodes grep_files JSON into an owned Input released by ToolInput.deinit.
 pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return .{ .failure = try ctx.allocator.dupe(u8, "grep_files arguments must be valid JSON") };
-    };
+    var args: tool_args.ArgsDecoder = .{ .alloc = ctx.allocator, .tool = "grep_files" };
+    var parsed = args.parse(args_json) catch |err| return .{ .failure = try args.takeFailure(err) };
     defer parsed.deinit();
-
-    if (parsed.value != .object) {
-        return .{ .failure = try ctx.allocator.dupe(u8, "grep_files arguments must be an object") };
-    }
-
-    const pattern_value = parsed.value.object.get("pattern") orelse {
-        return .{ .failure = try ctx.allocator.dupe(u8, "grep_files requires string field \"pattern\"") };
-    };
-    if (pattern_value != .string) {
-        return .{ .failure = try ctx.allocator.dupe(u8, "grep_files field \"pattern\" must be a string") };
-    }
-
-    const path_string = switch (try parseOptionalString(ctx.allocator, parsed.value.object, "path")) {
-        .missing => null,
-        .value => |value| value,
-        .failure => |body| return .{ .failure = body },
-    };
-    const include_string = switch (try parseOptionalString(ctx.allocator, parsed.value.object, "include")) {
-        .missing => null,
-        .value => |value| value,
-        .failure => |body| return .{ .failure = body },
-    };
-    const case_insensitive = if (parsed.value.object.get("case_insensitive")) |value| switch (value) {
+    const object = parsed.value.object;
+    const pattern = args.requiredString(object, "pattern") catch |err| return .{ .failure = try args.takeFailure(err) };
+    const path_string = args.optionalString(object, "path") catch |err| return .{ .failure = try args.takeFailure(err) };
+    const include_string = args.optionalString(object, "include") catch |err| return .{ .failure = try args.takeFailure(err) };
+    const case_insensitive = if (object.get("case_insensitive")) |value| switch (value) {
         .null => false,
         .bool => |enabled| enabled,
         else => return .{ .failure = try ctx.allocator.dupe(u8, "grep_files field \"case_insensitive\" must be a boolean") },
     } else false;
-    const mode: OutputMode = switch (try parseOptionalString(ctx.allocator, parsed.value.object, "mode")) {
-        .missing => .matches,
-        .value => |raw| std.meta.stringToEnum(OutputMode, raw) orelse {
-            return .{ .failure = try ctx.allocator.dupe(u8, "grep_files field \"mode\" must be one of matches, files_with_matches, count") };
-        },
-        .failure => |body| return .{ .failure = body },
-    };
+    const raw_mode = args.optionalString(object, "mode") catch |err| return .{ .failure = try args.takeFailure(err) };
+    const mode: OutputMode = if (raw_mode) |raw| std.meta.stringToEnum(OutputMode, raw) orelse {
+        return .{ .failure = try ctx.allocator.dupe(u8, "grep_files field \"mode\" must be one of matches, files_with_matches, count") };
+    } else .matches;
 
-    const head_limit = switch (try parseOptionalInteger(ctx.allocator, parsed.value.object, "head_limit", 1, "positive")) {
+    const head_limit = switch (try parseOptionalInteger(ctx.allocator, object, "head_limit", 1, "positive")) {
         .missing => output_cap,
         .value => |value| @min(value, output_cap),
         .failure => |body| return .{ .failure = body },
     };
-    const offset = switch (try parseOptionalInteger(ctx.allocator, parsed.value.object, "offset", 0, "non-negative")) {
+    const offset = switch (try parseOptionalInteger(ctx.allocator, object, "offset", 0, "non-negative")) {
         .missing => 0,
         .value => |value| value,
         .failure => |body| return .{ .failure = body },
     };
-    const context_lines = switch (try parseOptionalInteger(ctx.allocator, parsed.value.object, "context_lines", 0, "non-negative")) {
+    const context_lines = switch (try parseOptionalInteger(ctx.allocator, object, "context_lines", 0, "non-negative")) {
         .missing => 0,
         .value => |value| @min(value, context_lines_cap),
         .failure => |body| return .{ .failure = body },
     };
 
-    const owned_pattern = try ctx.allocator.dupe(u8, pattern_value.string);
+    const owned_pattern = try ctx.allocator.dupe(u8, pattern);
     errdefer ctx.allocator.free(owned_pattern);
     const effective_path = if (path_string) |path|
         if (path.len == 0) "." else path
@@ -138,26 +117,6 @@ fn inputDeinit(ptr: *anyopaque, alloc: Allocator) void {
     const input: *Input = @ptrCast(@alignCast(ptr));
     input.deinit(alloc);
     alloc.destroy(input);
-}
-
-const OptionalStringParse = union(enum) {
-    missing,
-    value: []const u8,
-    failure: []u8,
-};
-
-/// A missing field and JSON null both read as not given.
-fn parseOptionalString(
-    alloc: Allocator,
-    object: std.json.ObjectMap,
-    key: []const u8,
-) tool_dispatch.DispatchError!OptionalStringParse {
-    const value = object.get(key) orelse return .missing;
-    return switch (value) {
-        .null => .missing,
-        .string => |text| .{ .value = text },
-        else => .{ .failure = try alloc.print("grep_files field \"{s}\" must be a string", .{key}) },
-    };
 }
 
 const OptionalIntegerParse = union(enum) {

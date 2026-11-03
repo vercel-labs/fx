@@ -40,8 +40,10 @@ const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const auto_classifier_context = @import("../../permissions/auto_classifier_context.zig");
 const subagent_model_contract = @import("../../subagent/model_contract.zig");
+const subagent_reports = @import("../../subagent/reports.zig");
 
 const runtime_config = @import("config.zig");
+const cache_warming = @import("cache_warming.zig");
 const runtime_finalization = @import("finalization.zig");
 const runtime_deps = @import("deps.zig");
 const runtime_lifecycle = @import("lifecycle.zig");
@@ -86,6 +88,58 @@ const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 
 const http_error_detail_max_bytes: usize = 4096;
 const empty_length_limited_reply = "The reply ran out of output tokens before any text.";
+// The AI SDK folds the stop reasons it does not list, such as Gemini's
+// UNEXPECTED_TOOL_CALL, into `other`. A reply that stops that way with no text
+// and no tool call has stalled mid-task, so the turn asks once for the next step
+// (`tests/tla/agent_runtime/EmptyReply.tla` EverySeparateEmptyNudged).
+const empty_reply_nudge_prompt =
+    "Your last reply had no text and no tool call. Continue the task: call the next tool you need, or give your final answer.";
+
+// What the empty-reply notice says happens next: fx asks the model again, or
+// the turn has failed and the next step is the user's.
+const empty_reply_asking = "Asking it to continue.";
+const empty_reply_follow_up = "Continue with a follow-up prompt if needed.";
+
+/// What fx shows for a reply that stopped for `other` with no text and no tool
+/// call: the provider's own reason when it sent one, then `next_step`.
+fn emptyReplyNotice(arena: Allocator, provider_reason: []const u8, next_step: []const u8) ![]const u8 {
+    if (provider_reason.len == 0) return try arena.print("The model stopped without a reply (finish reason: other). {s}", .{next_step});
+    return try arena.print("The model stopped without a reply (provider reason: {s}). {s}", .{ provider_reason, next_step });
+}
+
+test "empty reply notice names the provider's reason and the next step" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings(
+        "The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Asking it to continue.",
+        try emptyReplyNotice(arena, "UNEXPECTED_TOOL_CALL", empty_reply_asking),
+    );
+    try std.testing.expectEqualStrings(
+        "The model stopped without a reply (finish reason: other). Continue with a follow-up prompt if needed.",
+        try emptyReplyNotice(arena, "", empty_reply_follow_up),
+    );
+}
+
+/// Asks the model to go on after a step with no tool call: the reply's
+/// provider state, when it has any, stays in the turn so the provider can
+/// resume from it, then `prompt` follows as the next user message.
+fn appendContinuationPrompt(
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    content: ?[]const u8,
+    provider_replay: ?types.ProviderReplay,
+    prompt: []const u8,
+) !void {
+    if (provider_replay) |state| {
+        try within_turn_suffix.append(arena, .{
+            .role = .assistant,
+            .content = content,
+            .provider_replay = state,
+        });
+    }
+    try within_turn_suffix.append(arena, .{ .role = .user, .content = prompt });
+}
 
 fn lengthResendNotice(raised_limit: bool, lowered_effort: bool) []const u8 {
     const prefix = empty_length_limited_reply ++ " Retrying with";
@@ -178,13 +232,12 @@ fn observe_steering_boundary(
     result_alloc: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),
     turn_id: u64,
-    origin: runtime_config.TurnOrigin,
     kind: worker_runtime.SteeringBoundaryKind,
 ) !SteeringBoundaryAction {
     const boundary = try take_steering_boundary(deps, result_alloc, turn_id, kind);
     switch (boundary) {
         .continue_turn => |guidance| {
-            try append_steering_guidance(arena, within_turn_suffix, guidance, origin);
+            try append_steering_guidance(arena, within_turn_suffix, guidance);
             return .continued;
         },
         .handoff => return .handoff,
@@ -192,39 +245,22 @@ fn observe_steering_boundary(
     }
 }
 
+/// Adds each boundary message to the turn, framed by who wrote it: the
+/// user's as a live user update, a parent agent's as that agent's feedback,
+/// and a subagent's as the untrusted report it already is, never the
+/// user's.
 fn append_steering_guidance(
     arena: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),
-    guidance: []const []const u8,
-    origin: runtime_config.TurnOrigin,
+    guidance: []const worker_runtime.SteeringMessage,
 ) !void {
-    for (guidance) |text| {
+    for (guidance) |message| {
         try within_turn_suffix.append(arena, .{
             .role = .user,
-            .content = if (origin == .subagent)
-                try runtime_execution_memory.parentSteeringMessage(arena, text)
-            else
-                try runtime_execution_memory.steeringMessage(arena, text),
+            .content = try framedMessage(arena, message.author, message.text),
         });
+        if (message.author == .child) subagent_reports.traceTaken(arena, .{}, message.text);
     }
-}
-
-fn continue_pending_subagent(
-    deps: *const AgentRuntimeDeps,
-    arena: Allocator,
-    suffix: *std.ArrayList(ChatMessage),
-    turn_id: u64,
-    step_id: u64,
-    text: []const u8,
-    replay: ?types.ProviderReplay,
-) !bool {
-    const wait = deps.wait_for_subagent orelse return false;
-    if (!try wait(deps.ctx, turn_id, step_id)) return false;
-    try suffix.append(arena, .{ .role = .assistant, .content = try arena.dupe(u8, text), .provider_replay = replay, .standalone_response = true });
-    const steered = try append_immediate_steering_after_cancel(deps, arena, suffix, turn_id, "");
-    debug_trace.eventf("agent", "subagent_parent_continuation", .{ .turn_id = turn_id }, "steering_consumed={} retained_messages={d}", .{ steered, suffix.items.len });
-    try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
-    return true;
 }
 
 fn append_pending_steering_after_assistant(
@@ -234,7 +270,6 @@ fn append_pending_steering_after_assistant(
     turn_id: u64,
     assistant_text: []const u8,
     provider_replay: ?types.ProviderReplay,
-    origin: runtime_config.TurnOrigin,
     boundary_kind: worker_runtime.SteeringBoundaryKind,
 ) !bool {
     const boundary = try take_steering_boundary(deps, arena, turn_id, boundary_kind);
@@ -243,13 +278,27 @@ fn append_pending_steering_after_assistant(
         .none, .handoff, .interrupt => return false,
     };
 
-    try within_turn_suffix.append(arena, .{
-        .role = .assistant,
-        .content = assistant_text,
-        .provider_replay = provider_replay,
-    });
-    try append_steering_guidance(arena, within_turn_suffix, guidance, origin);
+    // A reply with no text and nothing to replay adds no assistant message, as
+    // after a cancel (append_immediate_steering_after_cancel).
+    if (assistant_text.len > 0 or provider_replay != null) {
+        try within_turn_suffix.append(arena, .{
+            .role = .assistant,
+            .content = assistant_text,
+            .provider_replay = provider_replay,
+        });
+    }
+    try append_steering_guidance(arena, within_turn_suffix, guidance);
     return true;
+}
+
+/// A message an agent receives mid-turn, framed by its author.
+fn framedMessage(arena: Allocator, author: worker_runtime.MessageAuthor, text: []const u8) ![]u8 {
+    return switch (author) {
+        .user => runtime_execution_memory.steeringMessage(arena, text),
+        .parent => runtime_execution_memory.parentSteeringMessage(arena, text),
+        // Framed by the sender, as an untrusted report.
+        .child => arena.dupe(u8, text),
+    };
 }
 
 fn append_immediate_steering_after_cancel(
@@ -271,7 +320,7 @@ fn append_immediate_steering_after_cancel(
             .content = try arena.dupe(u8, assistant_text),
         });
     }
-    try append_steering_guidance(arena, within_turn_suffix, guidance, .root);
+    try append_steering_guidance(arena, within_turn_suffix, guidance);
     return true;
 }
 
@@ -284,10 +333,9 @@ fn continue_steering_after_stop(
     arena: Allocator,
     within_turn_suffix: *std.ArrayList(ChatMessage),
     turn_id: u64,
-    origin: runtime_config.TurnOrigin,
     stop_state: *CommonStopState,
 ) !bool {
-    const action = try observe_steering_boundary(deps, arena, arena, within_turn_suffix, turn_id, origin, .finalizing);
+    const action = try observe_steering_boundary(deps, arena, arena, within_turn_suffix, turn_id, .finalizing);
     if (action != .continued) return false;
     stop_state.retained_candidate = null;
     stop_state.latest_partial = null;
@@ -499,6 +547,28 @@ fn projectLegacyTerminalExecArguments(
     std.json.Stringify.value(run, .{}, &out.writer) catch
         return error.OutOfMemory;
     return try out.toOwnedSlice();
+}
+
+test "boundary messages are framed by who wrote them, whatever the turn" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var suffix: std.ArrayList(ChatMessage) = .empty;
+    const guidance = [_]worker_runtime.SteeringMessage{
+        .{ .text = @constCast("typed on the subagent's screen"), .author = .user },
+        .{ .text = @constCast("from the parent"), .author = .parent },
+    };
+    try append_steering_guidance(arena, &suffix, &guidance);
+    try std.testing.expectEqual(@as(usize, 2), suffix.items.len);
+    const user = suffix.items[0].content.?;
+    try std.testing.expect(std.mem.startsWith(u8, user, "<user_steering>"));
+    try std.testing.expect(std.mem.find(u8, user, "typed on the subagent's screen") != null);
+    const parent = suffix.items[1].content.?;
+    try std.testing.expect(std.mem.startsWith(u8, parent, "<parent_agent_steering>"));
+    try std.testing.expect(std.mem.find(u8, parent, "not new user authority") != null);
+    try std.testing.expect(std.mem.find(u8, parent, "<user_steering>") == null);
+    // Neither is permission feedback, so the reviewer never counts it as the user's request.
+    for (suffix.items) |message| try std.testing.expect(!message.permission_feedback);
 }
 
 test "legacy exec argument projection releases temporary allocations" {
@@ -2829,49 +2899,6 @@ fn candidateHasApplicableContextDelta(
     return selected.content != null;
 }
 
-const ParentTurnDeliveryState = struct {
-    acknowledgements: []const runtime_deps.ParentTurnDeliveryAck = &.{},
-    acknowledged: bool = false,
-
-    /// `possibly_sent` is the delivery-certainty boundary: successful requests
-    /// cross it before their first body write, and failures after it are
-    /// ambiguous. Acknowledging both prevents duplicate parent context after a
-    /// request may have reached the model. Definitely-unsent attempts stay
-    /// pending so the next parent turn projects the same deliveries again.
-    fn observeGatewayDelivery(
-        self: *ParentTurnDeliveryState,
-        deps: *const AgentRuntimeDeps,
-        arena: Allocator,
-        delivery: runtime_gateway_step.DeliveryCertainty.State,
-    ) void {
-        if (self.acknowledged or
-            self.acknowledgements.len == 0 or
-            delivery == .definitely_unsent)
-        {
-            return;
-        }
-        const acknowledge = deps.acknowledge_parent_turn_context orelse return;
-        acknowledge(deps.ctx, arena, self.acknowledgements);
-        self.acknowledged = true;
-    }
-};
-
-fn appendPreparedParentTurnContext(
-    deps: *const AgentRuntimeDeps,
-    arena: Allocator,
-    messages: *std.ArrayList(ChatMessage),
-) !ParentTurnDeliveryState {
-    const prepare = deps.prepare_parent_turn_context orelse return .{};
-    const prepared = try prepare(deps.ctx, arena) orelse return .{};
-    if (prepared.content.len == 0) return .{};
-    try messages.ensureUnusedCapacity(arena, 1);
-    messages.appendAssumeCapacity(.{
-        .role = .system,
-        .content = prepared.content,
-    });
-    return .{ .acknowledgements = prepared.acknowledgements };
-}
-
 fn appendNotExecutedToolResult(
     deps: *const AgentRuntimeDeps,
     provisional_statuses: *runtime_tool_presentation.ProvisionalToolStatuses,
@@ -3819,7 +3846,7 @@ fn appendRunningToolCalls(
     const issuing = current_turn_messages[current_turn_messages.len - 1];
     std.debug.assert(issuing.role == .assistant and issuing.tool_calls.len == calls.len);
     try append(deps.ctx, .{
-        .user = .{ .text = @constCast(job.prompt), .images = job.images },
+        .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
         .execution = try finalization.persistedExecution(arena, execution),
         .running_calls = running,
         .running_assistant = issuing.content,
@@ -3830,6 +3857,60 @@ fn appendRunningToolCalls(
 /// owns the session, so no tool call runs in a session another process
 /// took over. A lost writer fails like the stream itself, through the same
 /// recovery path; other check failures are only traced.
+/// A real request is about to go out, so the warmer stops pinging the last
+/// one (`tests/tla/cache_warming/CacheWarming.tla` NoPingWhileSending), and
+/// the usage of its pings is saved with the session's.
+fn disarmCacheWarming(deps: *const AgentRuntimeDeps) void {
+    const warmer = deps.cache_warmer orelse return;
+    warmer.disarm("request");
+    const usage = warmer.takeUsage() orelse return;
+    const record = deps.record_usage orelse {
+        debug_trace.logf("cache_warming", "event=usage_not_saved reason=no_session read={d} write={d}", .{
+            usage.cache_read_tokens orelse 0, usage.cache_write_tokens orelse 0,
+        });
+        return;
+    };
+    record(deps.ctx, usage) catch |err| {
+        debug_trace.logf("cache_warming", "event=usage_not_saved err={s}", .{@errorName(err)});
+    };
+}
+
+const CacheWarmingRequest = struct {
+    candidate: cache_warming.Candidate,
+    provider: agent_stream_provider.Provider,
+    body: ?[]const u8,
+    session_id: ?[]const u8,
+    api_key: []const u8,
+    credential_source: ?types.CredentialSource,
+    account_id: ?[]const u8,
+    gateway_team: ?[]const u8,
+    started_ms: i64,
+};
+
+/// A main request completed: keep its cache entry warm until the next one.
+fn armCacheWarming(deps: *const AgentRuntimeDeps, request: CacheWarmingRequest) void {
+    const warmer = deps.cache_warmer orelse return;
+    if (cache_warming.skipReason(request.candidate)) |reason| {
+        if (reason != .not_claude) debug_trace.logf("cache_warming", "event=skipped reason={s} model={s}", .{ @tagName(reason), request.candidate.model });
+        return;
+    }
+    const body = request.body orelse {
+        debug_trace.logf("cache_warming", "event=skipped reason=no_prepared_body model={s}", .{request.candidate.model});
+        return;
+    };
+    warmer.arm(.{
+        .provider = request.provider,
+        .model = request.candidate.model,
+        .session_id = request.session_id,
+        .body = body,
+        .api_key = request.api_key,
+        .credential_source = request.credential_source,
+        .account_id = request.account_id,
+        .gateway_team = request.gateway_team,
+        .started_ms = request.started_ms,
+    });
+}
+
 fn streamMainCompletion(
     deps: *const AgentRuntimeDeps,
     arena: Allocator,
@@ -3922,7 +4003,7 @@ fn persistRecoveryCheckpointWithAction(
         current_turn_messages,
     );
     const projected = try finalization.persistedExecution(arena, execution);
-    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images };
+    const user: types.UserTurn = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author };
     // Every completed piece reaches the session before the next request.
     if (deps.append_turn_piece) |append| try append(deps.ctx, .{ .user = user, .execution = projected, .recovery_record = record });
     const effect = deps.recovery_checkpoint orelse return;
@@ -4043,7 +4124,7 @@ const CompactionSource = struct {
         const execution = try runtime_execution_memory.buildExecutionMemory(self.arena, self.current_turn_messages);
         try effect.set(deps.ctx, .{
             .turn_id = job.turn_id,
-            .user = .{ .text = @constCast(job.prompt), .images = job.images },
+            .user = .{ .text = @constCast(job.prompt), .images = job.images, .work_id = job.work_id, .author = job.author },
             .assistant_source = @constCast(""),
             .execution = try self.finalization.persistedExecution(self.arena, execution),
             .cause = .compaction_prepared,
@@ -4678,6 +4759,122 @@ fn fitRequestImages(
         request.* = smaller;
         body = rebuilt;
     }
+}
+
+/// Rounds the images left out of `request` up to the end of a block
+/// (`request_image_budget.blockCut`), so a session past its image limit keeps
+/// the same images in its cached prompt until the cut reaches the next block.
+/// `sizes` holds every image the request had before any was left out. Returns
+/// the body to send: `body` itself when nothing more is left out, or when the
+/// rounded request would not fit.
+fn holdImagesToBlocks(
+    arena: Allocator,
+    provider: agent_stream_provider.Provider,
+    request: *agent_stream_provider.RequestData,
+    body: []const u8,
+    sizes: []const usize,
+    limits: request_image_budget.Limits,
+    tool_text_limit: usize,
+    trace_ctx: TraceContext,
+) ![]const u8 {
+    const kept = (try request_image_budget.imageSizes(arena, request.messages)).len;
+    const cut = sizes.len -| kept;
+    const rounded_cut = request_image_budget.blockCut(sizes, cut, limits);
+    if (rounded_cut <= cut) return body;
+    const projection = try request_image_budget.withhold(arena, request.messages, rounded_cut - cut, tool_text_limit);
+    var rounded = request.*;
+    rounded.messages = projection.messages;
+    const rebuilt = (try provider.buildRequest(arena, rounded)) orelse return body;
+    if (rebuilt.len > limits.max_request_bytes) {
+        debug_trace.eventf("images", "request_images_block_skipped", trace_ctx, "cut={d} block_cut={d} request_bytes={d} limit_bytes={d}", .{
+            cut,
+            rounded_cut,
+            rebuilt.len,
+            limits.max_request_bytes,
+        });
+        return body;
+    }
+    debug_trace.eventf("images", "request_images_withheld_to_block", trace_ctx, "cut={d} block_cut={d} request_bytes_before={d} request_bytes_after={d}", .{
+        cut,
+        rounded_cut,
+        body.len,
+        rebuilt.len,
+    });
+    request.* = rounded;
+    return rebuilt;
+}
+
+test "a session past its size limit leaves images out a block at a time" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A body as long as the request's text and images.
+    const Builder = struct {
+        fn build(_: ?*anyopaque, alloc: Allocator, request: agent_stream_provider.RequestData) anyerror![]u8 {
+            var len: usize = 100;
+            for (request.messages) |message| {
+                const text: []const u8 = message.content orelse "";
+                len += text.len;
+                if (message.tool_result_memory) |memory| {
+                    for (memory.tool_images) |image| len += image.data.len;
+                }
+            }
+            const body = try alloc.alloc(u8, len);
+            @memset(body, 'x');
+            return body;
+        }
+        fn stream(_: ?*anyopaque, _: Allocator, _: agent_stream_provider.ModelRequest) anyerror!agent_stream_provider.Result {
+            return error.TestUnexpectedStream;
+        }
+    };
+    const provider = agent_stream_provider.Provider{ .stream_fn = Builder.stream, .build_request_fn = Builder.build };
+    const limits = request_image_budget.Limits{ .max_request_bytes = 100_000 };
+
+    var messages: [40]types.ChatMessage = undefined;
+    for (&messages, 0..) |*message, index| {
+        const data = try arena.alloc(u8, 4000);
+        @memset(data, 'A');
+        const images = try arena.alloc(types.ToolImage, 1);
+        images[0] = .{ .data = data, .mime_type = try arena.dupe(u8, "image/png") };
+        message.* = .{
+            .role = .tool,
+            .content = try arena.print("<path>shot-{d}.png</path>", .{index}),
+            .tool_result_memory = .{ .tool_images = images, .tool_image_handle = try arena.print("image-result-{d}", .{index}) },
+        };
+    }
+
+    var previous_cut: usize = 0;
+    var cut_changes: usize = 0;
+    var minimal_changes: usize = 0;
+    var previous_minimal: usize = 0;
+    for (1..messages.len + 1) |count| {
+        var request: agent_stream_provider.RequestData = .{
+            .model = "test/model",
+            .messages = messages[0..count],
+            .tool_choice = .auto,
+            .provider_options = .{},
+        };
+        const sizes = try request_image_budget.imageSizes(arena, request.messages);
+        const first = (try provider.buildRequest(arena, request)).?;
+        const fitted = try fitRequestImages(arena, provider, &request, first, limits, 4096, .{});
+        const minimal = sizes.len - (try request_image_budget.imageSizes(arena, request.messages)).len;
+        const body = try holdImagesToBlocks(arena, provider, &request, fitted, sizes, limits, 4096, .{});
+        const cut = sizes.len - (try request_image_budget.imageSizes(arena, request.messages)).len;
+
+        try std.testing.expect(body.len <= limits.max_request_bytes);
+        try std.testing.expect(cut >= minimal and cut >= previous_cut);
+        // The newest image is always sent.
+        try std.testing.expectEqual(@as(usize, 1), request.messages[count - 1].tool_result_memory.?.tool_images.len);
+        if (cut != previous_cut) cut_changes += 1;
+        if (minimal != previous_minimal) minimal_changes += 1;
+        previous_cut = cut;
+        previous_minimal = minimal;
+    }
+    // Leaving out one more image per request would change the cached prompt
+    // on every request past the limit. A block ends at a quarter of the
+    // limit, seven of these images, so the cut changes every seventh.
+    try std.testing.expect(minimal_changes >= 10);
+    try std.testing.expect(cut_changes * 4 <= minimal_changes);
 }
 
 test "size rejections retry with fewer images only while images remain" {
@@ -5597,6 +5794,7 @@ fn processQueuedPromptInner(
     var interrupted_persisted = false;
 
     debug_trace.eventf("agent", "prompt_start", finish_trace.ctx, "prompt_bytes={d} model={s}", .{ job.prompt.len, job.model });
+    if (job.author == .child) subagent_reports.traceTaken(arena, finish_trace.ctx, job.prompt);
 
     const vision_fallback_available = config.provider_capabilities.vision_fallback and
         deps.tool_registry.lookup("vision") != null;
@@ -5774,7 +5972,7 @@ fn processQueuedPromptInner(
     const current_user_message: ChatMessage = .{
         .role = .user,
         .content = if (job.delivery.isContinuation())
-            try runtime_execution_memory.steeringMessage(arena, job.prompt)
+            try framedMessage(arena, job.author, job.prompt)
         else
             job.prompt,
         .images = job.images,
@@ -6811,6 +7009,10 @@ fn processQueuedPromptLoop(
     defer interrupted_persisted_ptr.* = interrupted_persisted;
     var silent_tool_steps: usize = 0;
     var continuation_injected = false;
+    // The last reply stopped for `other` with nothing in it and was answered
+    // with the empty-reply nudge. A step that shows text or calls a tool clears
+    // it, so each separate stall in a long turn gets one nudge.
+    var empty_reply_nudged = false;
     // The limit the turn's one retry of an empty, cut-short reply set. Later
     // steps keep it until the catalog names a limit of its own.
     var length_retry_output_tokens: ?u32 = null;
@@ -6954,15 +7156,7 @@ fn processQueuedPromptLoop(
             try within_turn_suffix.append(arena, .{ .role = .system, .content = note, .context_note = true });
             debug_trace.logf("context", "runtime context update queued step={d} bytes={d}", .{ current_step_index, note.len });
         }
-        const steering_action = try observe_steering_boundary(
-            deps,
-            arena,
-            overlay_arena,
-            &within_turn_suffix,
-            turn_id,
-            config.origin,
-            .model,
-        );
+        const steering_action = try observe_steering_boundary(deps, arena, overlay_arena, &within_turn_suffix, turn_id, .model);
         if (steering_action == .handoff) {
             try finish_steering_handoff(
                 deps,
@@ -6979,11 +7173,6 @@ fn processQueuedPromptLoop(
         }
         var ephemeral_overlay: std.ArrayList(ChatMessage) = .empty;
         try ephemeral_overlay.appendSlice(overlay_arena, runtime_context.messages());
-        var parent_turn_delivery = try appendPreparedParentTurnContext(
-            deps,
-            overlay_arena,
-            &ephemeral_overlay,
-        );
         var provider_prompt = try build_provider_prompt_with_response_language_control(
             overlay_arena,
             stable_prefix,
@@ -7410,7 +7599,9 @@ fn processQueuedPromptLoop(
             // The request re-sends every image the session keeps, and
             // building it whole would hold all of them, encoded, at once.
             // Images that pass every limit by their own size leave before the
-            // build; `fitRequestImages` fits the rest to this model's limit.
+            // build; `fitRequestImages` fits the rest to this model's limit,
+            // and `holdImagesToBlocks` rounds what it left out to a block.
+            const request_image_sizes = try request_image_budget.imageSizes(overlay_arena, request_data.messages);
             const past_limit = try request_image_budget.withholdImagesPastLimit(
                 overlay_arena,
                 request_data.messages,
@@ -7428,15 +7619,26 @@ fn processQueuedPromptLoop(
                 overlay_arena,
                 request_data,
             )) |built_request_body| {
-                const request_body = try fitRequestImages(
+                const image_limits: request_image_budget.Limits = .{ .max_request_bytes = request_image_budget.maxRequestBytes(
+                    agent.requestByteLimit(gateway_model),
+                    deps.agent_stream_provider.max_request_bytes,
+                ) };
+                const fitted_body = try fitRequestImages(
                     overlay_arena,
                     deps.agent_stream_provider,
                     &request_data,
                     built_request_body,
-                    .{ .max_request_bytes = request_image_budget.maxRequestBytes(
-                        agent.requestByteLimit(gateway_model),
-                        deps.agent_stream_provider.max_request_bytes,
-                    ) },
+                    image_limits,
+                    config.max_tool_result_bytes,
+                    step_ctx,
+                );
+                const request_body = try holdImagesToBlocks(
+                    overlay_arena,
+                    deps.agent_stream_provider,
+                    &request_data,
+                    fitted_body,
+                    request_image_sizes,
+                    image_limits,
                     config.max_tool_result_bytes,
                     step_ctx,
                 );
@@ -7505,7 +7707,7 @@ fn processQueuedPromptLoop(
                 } else {
                     // The pending user is source too, even before the first tool.
                     const active_prefix: types.AssistantHistoryTurn = .{
-                        .user = .{ .text = job.prompt, .images = job.images },
+                        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
                         .assistant = @constCast(""),
                         .execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items[compacted_suffix_len..]),
                     };
@@ -7618,15 +7820,7 @@ fn processQueuedPromptLoop(
                         skip_next_preflight_refresh = true;
                         // A message queued while the compaction ran must ride the
                         // rebuilt request, not wait for the reply after it.
-                        const post_compaction_action = try observe_steering_boundary(
-                            deps,
-                            arena,
-                            overlay_arena,
-                            &within_turn_suffix,
-                            turn_id,
-                            config.origin,
-                            .model,
-                        );
+                        const post_compaction_action = try observe_steering_boundary(deps, arena, overlay_arena, &within_turn_suffix, turn_id, .model);
                         if (post_compaction_action == .handoff) {
                             try finish_steering_handoff(
                                 deps,
@@ -7680,7 +7874,11 @@ fn processQueuedPromptLoop(
                 request_recovery.flushRecord();
             }
 
+            disarmCacheWarming(deps);
             const gateway_wait_started_ms = io_mod.milliTimestamp();
+            // When the answered request started: the provider keeps its cache
+            // entry for its lifetime from then.
+            var request_started_ms = gateway_wait_started_ms;
             var gateway_delivery = runtime_gateway_step.DeliveryCertainty.init();
             var gateway_attempt_evidence: runtime_gateway_step.AttemptEvidence = .{};
             var provider_events = ProviderEventContext{
@@ -7728,11 +7926,6 @@ fn processQueuedPromptLoop(
             const streamed = streamMainCompletion(deps, arena, model_request);
             request_recovery.endSend();
             stream_result = streamed catch |err| {
-                parent_turn_delivery.observeGatewayDelivery(
-                    deps,
-                    overlay_arena,
-                    gateway_delivery.load(),
-                );
                 runtime_assistant_stream.pushTokenProgressUpdate(&stream_ctx, summary_accumulator.finishTokenRequestWithoutUsage(gateway_delivery.load() == .possibly_sent)) catch |progress_err| {
                     debug_trace.logf("agent", "token progress publication failed source=gateway_error err={s}", .{@errorName(progress_err)});
                 };
@@ -7926,11 +8119,6 @@ fn processQueuedPromptLoop(
                 }
                 return err;
             };
-            parent_turn_delivery.observeGatewayDelivery(
-                deps,
-                overlay_arena,
-                gateway_delivery.load(),
-            );
             stream_result_set = true;
             pushNetworkRecord(deps, job.provider, gateway_model, gateway_wait_started_ms, &stream_result);
             const first_failure = streamFailure(stream_result);
@@ -7959,13 +8147,9 @@ fn processQueuedPromptLoop(
                     model_request.delivery = &replay_delivery;
                     model_request.attempt_evidence = &replay_evidence;
                     const replay_wait_started_ms = io_mod.milliTimestamp();
+                    request_started_ms = replay_wait_started_ms;
                     stream_result = try streamMainCompletion(deps, arena, model_request);
                     pushNetworkRecord(deps, job.provider, gateway_model, replay_wait_started_ms, &stream_result);
-                    parent_turn_delivery.observeGatewayDelivery(
-                        deps,
-                        overlay_arena,
-                        replay_delivery.load(),
-                    );
                     debug_trace.eventf(
                         "auth",
                         "authenticated_request_replayed",
@@ -7987,6 +8171,25 @@ fn processQueuedPromptLoop(
                 if (deps.record_usage) |record| record(deps.ctx, completion.usage) catch |err| {
                     debug_trace.logf("agent", "event=usage_not_saved err={s}", .{@errorName(err)});
                 };
+                armCacheWarming(deps, .{
+                    .candidate = .{
+                        .gateway_with_direct_credential = job.provider == .gateway and
+                            job.credential_source != .host_managed and active_api_key.len > 0,
+                        .model = gateway_model,
+                        .root_turn = config.origin == .root,
+                        .prompt_caching = request_data.provider_options.prompt_caching,
+                        .reasoning = request_data.provider_options.reasoning != null,
+                        .model_has_efforts = request_capabilities.reasoning_efforts.len > 0,
+                    },
+                    .provider = deps.agent_stream_provider,
+                    .body = prepared_request_body,
+                    .session_id = lifecycle.scope.session_id,
+                    .api_key = active_api_key,
+                    .credential_source = job.credential_source,
+                    .account_id = job.account_id,
+                    .gateway_team = job.gateway_team,
+                    .started_ms = request_started_ms,
+                });
                 // The completion buffer is step-scoped, so no cross-step
                 // dedupe: each completion reports its serving provider once.
                 // The push_event callback takes ownership of the payload on
@@ -8888,11 +9091,12 @@ fn processQueuedPromptLoop(
             "agent",
             "assistant_completion",
             step_ctx,
-            "content_bytes={d} tool_call_count={d} finish_reason={s}",
+            "content_bytes={d} tool_call_count={d} finish_reason={s} provider_finish_reason={s}",
             .{
                 if (completion.content) |content| content.len else 0,
                 completion.tool_calls.len,
                 finish_reason.label(),
+                completion.finish_reason_raw.slice(),
             },
         );
         try runtime_telemetry.traceReturnedToolCalls(arena, step_ctx, completion.tool_calls);
@@ -8948,16 +9152,7 @@ fn processQueuedPromptLoop(
                 completion.tool_calls.len,
             });
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try append_pending_steering_after_assistant(
-                    deps,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    assistant_text,
-                    provider_replay,
-                    config.origin,
-                    .finalizing,
-                ))
+                try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, assistant_text, provider_replay, .finalizing))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue :agent_steps_loop;
@@ -8988,7 +9183,7 @@ fn processQueuedPromptLoop(
             const finish_execution = try runtime_execution_memory.buildExecutionMemory(arena, within_turn_suffix.items);
             const completed_summary = summary_accumulator.finish();
             var turn: HistoryTurn = .{ .assistant = .{
-                .user = .{ .text = job.prompt, .images = job.images },
+                .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
                 .assistant = @constCast(assistant_text),
                 .execution = try finalization.persistedExecution(arena, finish_execution),
             } };
@@ -9005,8 +9200,11 @@ fn processQueuedPromptLoop(
         if (completion.tool_calls.len == 0) {
             const has_content =
                 std.mem.trim(u8, partial_assistant, " \t\r\n").len > 0;
+            const empty_other = finish_reason == .other and !has_content;
+            if (!empty_other) empty_reply_nudged = false;
             const needs_continuation =
                 disposition == .completed and
+                !empty_other and
                 !continuation_injected and
                 silent_tool_steps >= 2 and
                 !has_content;
@@ -9019,42 +9217,62 @@ fn processQueuedPromptLoop(
                     if (completion.content) |content| content.len else 0,
                     if (completion.provider_state_json != null) "true" else "false",
                 });
-                if (provider_replay) |state| {
-                    try within_turn_suffix.append(arena, .{
-                        .role = .assistant,
-                        .content = completion.content,
-                        .provider_replay = state,
-                    });
-                }
-                try within_turn_suffix.append(arena, .{ .role = .user, .content = continuation_prompt });
+                try appendContinuationPrompt(arena, &within_turn_suffix, completion.content, provider_replay, continuation_prompt);
                 continue;
             }
 
             const empty_final: []const u8 = if (disposition == .length_limited) empty_length_limited_reply else "Done.";
-            const raw_final = if (has_content) partial_assistant else empty_final;
+            // A stalled reply keeps no stand-in text, so steering or a subagent's
+            // report that continues the turn below never saves "Done." for it
+            // (`tests/e2e/gateway-stream-lifecycle.test.ts` "an empty reply that
+            // stops for another reason gives way to a subagent's report, with no
+            // Done.").
+            const raw_final = if (has_content) partial_assistant else if (empty_other) "" else empty_final;
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
             const rendered = if (final_text.len > 0) final_text else empty_final;
             const history_text = try arena.dupe(u8, raw_final);
             const history_replay = if (has_content) final_provider_replay else try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
 
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try append_pending_steering_after_assistant(
-                    deps,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    history_text,
-                    history_replay,
-                    config.origin,
-                    if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
-                ))
+                try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, history_text, history_replay, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue;
             }
 
-            if (disposition == .completed and agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, history_text, history_replay)) continue;
+            if (empty_other) {
+                const provider_reason = completion.finish_reason_raw.slice();
+                // One nudge per stall, and never past the step limit
+                // (`tests/tla/agent_runtime/EmptyReply.tla` NoDoubleNudge, StepsBounded).
+                const nudge = !empty_reply_nudged and agent_steps.allowsStep(config.agent_step_limit, step + 1);
+                debug_trace.eventf("agent", if (nudge) "empty_reply_nudge" else "empty_reply_failed", step_ctx, "provider_finish_reason={s} after_nudge={s}", .{
+                    provider_reason,
+                    if (empty_reply_nudged) "true" else "false",
+                });
+                if (nudge) {
+                    empty_reply_nudged = true;
+                    try deps.push_text(deps.ctx, .{ .operational = try emptyReplyNotice(arena, provider_reason, empty_reply_asking) });
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                    try appendContinuationPrompt(arena, &within_turn_suffix, completion.content, provider_replay, empty_reply_nudge_prompt);
+                    continue;
+                }
+                // A second empty reply in a row, or one with no step left:
+                // the turn failed, and the notice says why instead of "Done."
+                // (`tests/tla/agent_runtime/EmptyReply.tla` NoPlaceholder).
+                try finishFailedTurnWithNotice(
+                    deps,
+                    finalization,
+                    arena,
+                    job,
+                    within_turn_suffix.items,
+                    &summary_accumulator,
+                    stop_state,
+                    &finish_trace,
+                    try emptyReplyNotice(arena, provider_reason, empty_reply_follow_up),
+                    "empty_reply",
+                );
+                return;
+            }
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 if (!has_content) {
@@ -9162,7 +9380,7 @@ fn processQueuedPromptLoop(
             switch (stop_outcome) {
                 .allow => {
                     if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, config.origin, stop_state))
+                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, stop_state))
                         continue :agent_steps_loop;
                     stop_state.terminal_materializing = true;
                     try finishCommonAssistantTerminal(
@@ -9563,6 +9781,7 @@ fn processQueuedPromptLoop(
         try appendRunningToolCalls(deps, finalization, job, within_turn_suffix.items, effective_tool_calls);
 
         const step_has_content = !terminal_provider_completion and completion.content != null and completion.content.?.len > 0;
+        empty_reply_nudged = false;
         if (step_has_content) {
             const first_tool_is_ask = effective_tool_calls.len > 0 and
                 runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, effective_tool_calls[0]) == .ask;
@@ -9993,6 +10212,7 @@ fn processQueuedPromptLoop(
                         .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                         .max_tool_result_bytes = config.max_tool_result_bytes,
                         .classification_complete = executable_classification_complete.items,
+                        .presentation_group_id = stream_ctx.provisional_statuses.presentation_group_id,
                     };
                     var completion_publisher = ParallelSubagentCompletionPublisher{
                         .deps = deps,
@@ -11354,6 +11574,7 @@ fn processQueuedPromptLoop(
                 else
                     false,
                 .lifecycle_id = execution_lifecycle_id,
+                .presentation_group_id = stream_ctx.provisional_statuses.presentation_group_id,
             }) catch |err| blk: {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 if (err == error.Cancelled and config.cancel_flag.load(.seq_cst)) {
@@ -11753,15 +11974,7 @@ fn processQueuedPromptLoop(
         );
         if (malformed_arguments_retry.finishBatch()) {
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
-                const terminal_action = try observe_steering_boundary(
-                    deps,
-                    arena,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    config.origin,
-                    .finalizing,
-                );
+                const terminal_action = try observe_steering_boundary(deps, arena, arena, &within_turn_suffix, turn_id, .finalizing);
                 switch (terminal_action) {
                     // The turn is already ending; an ineligible prompt runs as
                     // the next turn after the normal terminal finish.
@@ -11792,15 +12005,7 @@ fn processQueuedPromptLoop(
         }
         if (terminal_validation_retry.finishBatch()) {
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
-                const terminal_action = try observe_steering_boundary(
-                    deps,
-                    arena,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    config.origin,
-                    .finalizing,
-                );
+                const terminal_action = try observe_steering_boundary(deps, arena, arena, &within_turn_suffix, turn_id, .finalizing);
                 switch (terminal_action) {
                     .handoff, .none => {},
                     .continued => continue :agent_steps_loop,
@@ -11837,15 +12042,7 @@ fn processQueuedPromptLoop(
         }
         if (shell_execution_failure_retry.finishBatch()) {
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
-                const terminal_action = try observe_steering_boundary(
-                    deps,
-                    arena,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    config.origin,
-                    .finalizing,
-                );
+                const terminal_action = try observe_steering_boundary(deps, arena, arena, &within_turn_suffix, turn_id, .finalizing);
                 switch (terminal_action) {
                     .handoff, .none => {},
                     .continued => continue :agent_steps_loop,
@@ -11878,23 +12075,11 @@ fn processQueuedPromptLoop(
             const rendered = if (final_text.len > 0) final_text else "Done.";
 
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try append_pending_steering_after_assistant(
-                    deps,
-                    arena,
-                    &within_turn_suffix,
-                    turn_id,
-                    raw_final,
-                    final_provider_replay,
-                    config.origin,
-                    if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model,
-                ))
+                try append_pending_steering_after_assistant(deps, arena, &within_turn_suffix, turn_id, raw_final, final_provider_replay, if (!lifecycle.view.hasStop() or stop_state.dispatched) .finalizing else .model))
             {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 continue;
             }
-
-            if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                try continue_pending_subagent(deps, arena, &within_turn_suffix, turn_id, step_ctx.step_id, raw_final, final_provider_replay)) continue;
 
             if (!lifecycle.view.hasStop() or stop_state.dispatched) {
                 try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
@@ -11995,7 +12180,7 @@ fn processQueuedPromptLoop(
             switch (stop_outcome) {
                 .allow => {
                     if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
-                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, config.origin, stop_state))
+                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, stop_state))
                         continue :agent_steps_loop;
                     stop_state.terminal_materializing = true;
                     try finishCommonAssistantTerminal(
@@ -12095,7 +12280,7 @@ fn finishFailedTurnWithNotice(
     );
     const completed_summary = summary_accumulator.finish();
     var turn: HistoryTurn = .{ .assistant = .{
-        .user = .{ .text = job.prompt, .images = job.images },
+        .user = .{ .text = job.prompt, .images = job.images, .work_id = job.work_id, .author = job.author },
         .assistant = @constCast(notice),
         .execution = try finalization.persistedExecution(arena, execution_memory),
     } };

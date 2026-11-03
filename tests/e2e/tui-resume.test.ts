@@ -8361,7 +8361,7 @@ test.skipIf(!tmuxAvailable())(
   async () => {
     const fixture = resumeFixture("fx-auto-resume-hint-");
     const { gateway, heldAtLeast, held } = holdingGateway("Map the route.");
-    const hint = "Interrupted turn · fx -c to continue";
+    const hint = "Interrupted turn · /resume to continue";
     const sessions: TmuxSession[] = [];
     try {
       const first = (await launchFx(fixture, gateway, "", "first")).session;
@@ -8396,6 +8396,41 @@ test.skipIf(!tmuxAvailable())(
     }
   },
   TIMEOUT * 4,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "the interrupted-turn hint's /resume sends the turn again without quitting",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-hint-picker-");
+    const { gateway, heldAtLeast, held } = holdingGateway("Chart the course.");
+    const sessions: TmuxSession[] = [];
+    try {
+      const first = (await launchFx(fixture, gateway, "", "first")).session;
+      sessions.push(first);
+      await first.sendText("Chart the course.");
+      await heldAtLeast(1);
+      await endFx(first, "SIGKILL");
+
+      // The hint's own advice works from the fresh session: /resume, pick the turn.
+      const plain = await launchFx(fixture, gateway, "", "plain");
+      sessions.push(plain.session);
+      await plain.session.waitForText("Interrupted turn · /resume to continue", TIMEOUT);
+      expect(held()).toBe(1);
+      await plain.session.sendText("/resume");
+      await waitForSessionPicker(plain.session);
+      // The interrupted session is the only one listed; the held request proves which one resumed.
+      await plain.session.waitForPane((pane) => SESSION_PICKER_META_RE.test(stripAnsi(pane)), TIMEOUT);
+      await plain.session.sendKeys("Enter");
+      await heldAtLeast(2);
+      expect(held()).toBe(2);
+      expect(readFileSync(plain.stderrPath, "utf8")).toBe("");
+    } finally {
+      for (const session of sessions) await session.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
 );
 
 test.skipIf(!tmuxAvailable())(

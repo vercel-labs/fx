@@ -425,7 +425,7 @@ test.skipIf(!tmuxAvailable())(
       "shell_stubborn_stop",
     );
     expect(stopResult).toContain('\\"state\\":\\"stopped\\"');
-    expect(stopResult).toContain('\\"termination_indeterminate\\":false');
+    expect(stopResult).not.toContain("termination_indeterminate");
     expect(toolResultEnvelope(
       gateway.requests[3]!.body,
       "shell_after_stop",
@@ -1054,7 +1054,7 @@ test.skipIf(!tmuxAvailable())(
     );
     expect(waitResult).toContain('\\"state\\":\\"completed\\"');
     expect(waitResult).toContain('\\"error\\":\\"TimeoutExpired\\"');
-    expect(waitResult).toContain('\\"termination_indeterminate\\":false');
+    expect(waitResult).not.toContain("termination_indeterminate");
     const record = terminalRecords(fixture.home).find((candidate) =>
       candidate.session_id === sessionId
     );

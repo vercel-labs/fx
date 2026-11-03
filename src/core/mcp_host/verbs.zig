@@ -15,6 +15,7 @@ const credentials = @import("credentials.zig");
 const secret = @import("../auth/secret.zig");
 const slack = @import("slack.zig");
 const runtime_mod = @import("runtime.zig");
+const mcp_call_client = @import("mcp_call_client.zig");
 const Host = @import("host.zig").Host;
 
 const Allocator = std.mem.Allocator;
@@ -39,7 +40,7 @@ pub const Surface = enum {
     }
 };
 
-pub const Verb = enum { list, show, add, remove, login, logout, approve, reject };
+pub const Verb = enum { list, show, add, remove, login, logout, approve, reject, call };
 const verb_names = names: {
     var names: [@typeInfo(Verb).@"enum".field_names.len][]const u8 = undefined;
     for (@typeInfo(Verb).@"enum".field_names, &names) |name, *slot| slot.* = name;
@@ -51,14 +52,16 @@ pub const Command = union(enum) {
     help: ?Verb,
     list: struct { json: bool = false },
     show: struct { name: []const u8, json: bool = false },
+    /// `login`: sign in to a new HTTP server that needs a login.
     /// `old_profile`: the older `--profile` named the file, so fx warns.
-    add: struct { name: []const u8, file: config_file.File, entry: config_file.Entry, old_profile: bool = false },
+    add: struct { name: []const u8, file: config_file.File, entry: config_file.Entry, login: bool = true, old_profile: bool = false },
     remove: struct { name: []const u8, file: ?config_file.File, old_profile: bool = false },
     login: struct { name: []const u8, browser: bool },
     logout: []const u8,
     /// Null approves every project server.
     approve: ?[]const u8,
     reject: []const u8,
+    call: mcp_call_client.Command,
 };
 
 pub const Parsed = union(enum) {
@@ -79,7 +82,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
         if (std.mem.eql(u8, old, "auth")) return moved(arena, "{s} auth is now {s} login NAME.", .{ p, p });
         if (std.mem.eql(u8, old, "trust")) return moved(arena, "{s} trust is now {s} approve NAME and {s} reject NAME.", .{ p, p, p });
         if (std.mem.eql(u8, old, "path")) return moved(arena, "{s} path is gone: {s} list shows each server's file.", .{ p, p });
-        if (std.mem.eql(u8, old, "reload")) return moved(arena, "{s} reload is gone: fx reloads after add, remove, approve, and reject.", .{p});
+        if (std.mem.eql(u8, old, "reload")) return moved(arena, "{s} reload is gone: fx loads MCP config changes at your next prompt or /mcp command.", .{p});
         if (std.mem.eql(u8, old, "resource") or std.mem.eql(u8, old, "prompt"))
             return moved(arena, "{s} {s} is gone: fx doesn't support MCP resources and prompts yet.", .{ p, old });
         if (settings_messages.closest(old, &verb_names)) |near|
@@ -108,6 +111,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
     var old_profile = false;
     var all = false;
     var no_browser = false;
+    var no_login = false;
     while (true) {
         const item = parser.next() catch {
             var text: Writer.Allocating = .init(arena);
@@ -132,6 +136,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
             },
             .all => all = true,
             .no_browser => no_browser = true,
+            .no_login => no_login = true,
             .env, .header => |id| {
                 if (pair_flag) |f| if (f != id) return usage(arena, verb, "--env is for stdio servers and --header for HTTP ones.", .{});
                 pair_flag = id;
@@ -172,7 +177,26 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
             if (!std.mem.startsWith(u8, url, "https://") and !std.mem.startsWith(u8, url, "http://"))
                 return usage(arena, verb, "'{s}' isn't a URL. A stdio server's command goes after --.", .{url});
             if (pair_flag == .env) return usage(arena, verb, "--env is for stdio servers; use --header for HTTP.", .{});
-            return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .http = .{ .url = url, .headers = pairs.items } }, .old_profile = old_profile } } };
+            return .{ .command = .{ .add = .{ .name = name, .file = file, .entry = .{ .http = .{ .url = url, .headers = pairs.items } }, .login = !no_login, .old_profile = old_profile } } };
+        },
+        .call => {
+            if (surface == .shell) return usage(arena, verb, "/mcp call runs only in a command that fx's shell tool runs: fx mcp call TOOL [JSON].", .{});
+            if (n.len == 0) return usage(arena, verb, "{s} call needs a TOOL, or list, search, or help.", .{p});
+            const first = n[0];
+            const rest_names = n[1..];
+            if (std.mem.eql(u8, first, "list") or std.mem.eql(u8, first, "help")) {
+                if (rest_names.len != 1 or rest_names[0].len == 0) {
+                    return usage(arena, verb, "{s} call {s} needs one {s}.", .{ p, first, if (first[0] == 'l') "server NAME" else "TOOL" });
+                }
+                return .{ .command = .{ .call = if (first[0] == 'l') .{ .list = rest_names[0] } else .{ .help = rest_names[0] } } };
+            }
+            if (std.mem.eql(u8, first, "search")) {
+                const query = std.mem.trim(u8, try std.mem.join(arena, " ", rest_names), " ");
+                if (query.len == 0) return usage(arena, verb, "{s} call search needs a QUERY.", .{p});
+                return .{ .command = .{ .call = .{ .search = query } } };
+            }
+            if (n.len > 2) return usage(arena, verb, "{s} call needs a TOOL and at most one JSON argument.", .{p});
+            return .{ .command = .{ .call = .{ .call = .{ .tool = first, .arguments = if (n.len == 2) n[1] else null } } } };
         },
         .approve => {
             if (all and n.len > 0) return usage(arena, verb, "{s} approve takes a NAME or --all, not both.", .{p});
@@ -192,7 +216,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
         .logout => .{ .logout = name },
         .approve => .{ .approve = name },
         .reject => .{ .reject = name },
-        .list, .add => unreachable,
+        .list, .add, .call => unreachable,
     } };
 }
 
@@ -200,7 +224,7 @@ fn isHelp(a: []const u8) bool {
     return std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help");
 }
 
-const Flag = enum { json, connect, global, profile, project, env, header, no_browser, all };
+const Flag = enum { json, connect, global, profile, project, env, header, no_browser, no_login, all };
 
 // Each verb's flags, from the lists `fx mcp --help` and shell completion
 // show. `--global` picks ~/.fx/mcp.json; the older `--profile` still works.
@@ -239,7 +263,7 @@ fn verbFlags(verb: Verb, surface: Surface) VerbFlags {
         .remove => verbFlagsFor(&scope_options),
         .login => verbFlagsFor(&login_options),
         .approve => verbFlagsFor(&approve_options),
-        .logout, .reject => verbFlagsFor(&.{}),
+        .logout, .reject, .call => verbFlagsFor(&.{}),
     };
 }
 
@@ -262,6 +286,8 @@ const overview = [_][2][]const u8{
     .{ "logout NAME", "sign out and delete the login" },
     .{ "approve NAME | --all", "approve project servers from .mcp.json" },
     .{ "reject NAME", "reject a project server" },
+    .{ "call TOOL [JSON | -]", "run an MCP tool from a command fx runs" },
+    .{ "call list | search | help", "find MCP tools and their arguments" },
 };
 
 /// The usage of one verb, or of every verb.
@@ -281,11 +307,12 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
         .list => try w.print("usage: {s} list{s}\n", .{ p, json }),
         .show => try w.print("usage: {s} show NAME{s}\n", .{ p, json }),
         .add => try w.print(
-            \\usage: {s} add [--global | --project] [--header K=V]... NAME URL
+            \\usage: {s} add [--global | --project] [--no-login] [--header K=V]... NAME URL
             \\       {s} add [--global | --project] [--env K=V]... NAME -- COMMAND [ARGS...]
-            \\       {s} add [--global | --project] slack
-            \\  --global   write ~/.fx/mcp.json, the default
-            \\  --project  write ./.mcp.json
+            \\       {s} add [--global | --project] [--no-login] slack
+            \\  --global    write ~/.fx/mcp.json, the default
+            \\  --project   write ./.mcp.json
+            \\  --no-login  don't sign in to an HTTP server that needs a login
             \\
         , .{ p, p, p }),
         .remove => try w.print("usage: {s} remove [--global | --project] NAME\n", .{p}),
@@ -293,6 +320,28 @@ pub fn writeUsage(w: *Writer, surface: Surface, verb: ?Verb) Writer.Error!void {
         .logout => try w.print("usage: {s} logout NAME\n", .{p}),
         .approve => try w.print("usage: {s} approve NAME | --all\n", .{p}),
         .reject => try w.print("usage: {s} reject NAME\n", .{p}),
+        .call => try w.print(
+            \\usage: {s} call TOOL [JSON | -]
+            \\       {s} call list SERVER
+            \\       {s} call search QUERY...
+            \\       {s} call help TOOL
+            \\  Runs the MCP tool TOOL, such as mcp_linear_list_issues, with the JSON
+            \\  object of arguments, or with the object on stdin for -. Prints just
+            \\  the tool's data, so a command can save it to a file or filter it.
+            \\  When stdout is not a terminal, one line on stderr gives the data's
+            \\  size and shape, with the values of short fields that repeat.
+            \\  list prints every tool of SERVER and search the tools that best
+            \\  match QUERY, one per line: the name, a tab, and the description.
+            \\  help prints the arguments TOOL takes and what it does.
+            \\  Works only in a command that fx's shell tool runs, while it runs, and
+            \\  asks permission as a direct call of TOOL would; list, search, and
+            \\  help need none and show only the tools that agent may use.
+            \\  Exits 0 on success, 1 when the call fails, 2 for a usage mistake,
+            \\  3 outside a running fx shell call, 4 when too many calls are
+            \\  running, 5 when permission is not granted, and 6 when the tool
+            \\  returns an error.
+            \\
+        , .{ p, p, p, p }),
     }
 }
 
@@ -306,6 +355,10 @@ pub const Hosts = struct {
     release: *const fn (context: *anyopaque, host: *Host) void,
     /// Config or trust changed, so a live host should reload.
     changed: *const fn (context: *anyopaque) void,
+    /// `add` wrote an HTTP server that may need a login, for a surface whose
+    /// live host loads it after `changed` and signs in once it asks for one.
+    /// Null: `add` connects and signs in itself.
+    sign_in_when_loaded: ?*const fn (context: *anyopaque, name: []const u8) void = null,
 };
 
 pub const Context = struct {
@@ -322,7 +375,8 @@ pub const Context = struct {
 };
 
 /// Runs `fx mcp ARGS` or `/mcp ARGS` and returns the exit code: 0 for
-/// success, 1 for a failure, 2 for a usage mistake.
+/// success, 1 for a failure, 2 for a usage mistake. `call` has more; see
+/// `mcp_call_client.exit`.
 pub fn run(c: Context, args: []const []const u8) u8 {
     var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
     defer arena_state.deinit();
@@ -400,12 +454,13 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
         },
         .list => |l| list(c, arena, l.json),
         .show => |s| show(c, arena, s.name, s.json),
-        .add => |a| add(c, arena, a.name, a.file, a.entry),
+        .add => |a| add(c, arena, a.name, a.file, a.entry, a.login),
         .remove => |r| remove(c, arena, r.name, r.file),
         .login => |l| login(c, arena, l.name, l.browser),
         .logout => |name| logout(c, arena, name),
         .approve => |name| trust(c, arena, if (name) |n| .{ .approve = n } else .approve_all),
         .reject => |name| trust(c, arena, .{ .reject = name }),
+        .call => |asked| mcp_call_client.run(arena, io_mod.getIo(), c.out, c.err, asked),
     };
 }
 
@@ -420,7 +475,7 @@ fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
 }
 
 /// fx's words for an error, never its name.
-fn describe(err: anyerror) []const u8 {
+pub fn describe(err: anyerror) []const u8 {
     return switch (err) {
         error.OutOfMemory => "out of memory",
         error.Exists => "that name is already in the file; remove it first",
@@ -684,7 +739,7 @@ pub fn toolDescription(arena: Allocator, raw: []const u8) !?[]const u8 {
     return line;
 }
 
-fn add(c: Context, arena: Allocator, name: []const u8, file: config_file.File, entry: config_file.Entry) !u8 {
+fn add(c: Context, arena: Allocator, name: []const u8, file: config_file.File, entry: config_file.Entry, login_after: bool) !u8 {
     const p = try paths(c, arena);
     const path = if (file == .project) p.project else p.profile;
     _ = config_file.update(c.gpa, p.profile, file, path, .{ .add = .{ .name = name, .entry = entry } }) catch |err| {
@@ -697,7 +752,44 @@ fn add(c: Context, arena: Allocator, name: []const u8, file: config_file.File, e
     if (try defines(c, arena, other, if (other == .project) p.project else p.profile, name)) {
         try c.out.print("{s} is also in {s}; the one in {s}/mcp.json is used.\n", .{ name, fileLabel(other), profile_paths.displayRoot() });
     }
+    // A project server waits for approval before it can ask for a login.
+    if (login_after and file == .profile and entry == .http) {
+        if (c.hosts.sign_in_when_loaded) |later| {
+            later(c.hosts.context, name);
+            return 0;
+        }
+        signInAfterAdd(c, arena, name) catch |err| {
+            debug_trace.logf("mcp", "MCP sign-in after add failed server={s} err={s}", .{ name, @errorName(err) });
+            try c.err.print("Couldn't check whether {s} needs a login: {s}. {s} login {s} signs in.\n", .{ name, describe(err), c.surface.prog(), name });
+        };
+    }
     return 0;
+}
+
+/// After `fx mcp add`: connects to the new server and, when it needs a
+/// login, signs in the way `login` does, waiting for the browser. Without a
+/// browser to open, it names the command instead, since taking a pasted
+/// address back is `login`'s. The server stays added whatever happens here.
+fn signInAfterAdd(c: Context, arena: Allocator, name: []const u8) !void {
+    var waiter: Waiter = .{ .gpa = c.gpa, .name = name };
+    defer waiter.deinit();
+    const host = (try c.hosts.get(c.hosts.context, waiter.notify())) orelse return;
+    defer c.hosts.release(c.hosts.context, host);
+    const server = findServer(host, name) orelse return;
+    const listed = host.runtime.tools(arena, name, c.cancel) catch |err| switch (err) {
+        // Such as by a variable a header names that isn't set; `show` says why.
+        error.Held => return,
+        else => return err,
+    };
+    if (listed != .needs_login) return;
+    if (!canOpenBrowser()) {
+        try c.out.print("{s} needs a login. Sign in with: {s} login {s}\n", .{ name, c.surface.prog(), name });
+        return;
+    }
+    try c.out.print("{s} needs a login.\n", .{name});
+    try c.out.flush();
+    const code = (try beginLogin(c, arena, host, server, name, true)) orelse try waitForLogin(c, arena, host, &waiter, true);
+    if (code != 0) try c.err.print("{s} is added. Sign in later with: {s} login {s}\n", .{ name, c.surface.prog(), name });
 }
 
 fn defines(c: Context, arena: Allocator, file: config_file.File, path: []const u8, name: []const u8) !bool {
@@ -872,10 +964,15 @@ const Waiter = struct {
     }
 };
 
+/// Whether fx can open a browser here: not over SSH or with
+/// FX_NO_OPEN_BROWSER set, and off macOS only with a display.
+pub fn canOpenBrowser() bool {
+    if (io_mod.getenv("FX_NO_OPEN_BROWSER") != null or io_mod.getenv("SSH_CONNECTION") != null) return false;
+    return @import("builtin").target.os.tag == .macos or io_mod.getenv("DISPLAY") != null or io_mod.getenv("WAYLAND_DISPLAY") != null;
+}
+
 fn login(c: Context, arena: Allocator, name: []const u8, browser: bool) !u8 {
-    const no_display = io_mod.getenv("FX_NO_OPEN_BROWSER") != null or io_mod.getenv("SSH_CONNECTION") != null or
-        (@import("builtin").target.os.tag != .macos and io_mod.getenv("DISPLAY") == null and io_mod.getenv("WAYLAND_DISPLAY") == null);
-    const open = browser and !no_display;
+    const open = browser and canOpenBrowser();
     var waiter: Waiter = .{ .gpa = c.gpa, .name = name };
     defer waiter.deinit();
     const host = (try c.hosts.get(c.hosts.context, if (c.surface == .cli) waiter.notify() else null)) orelse return missing(c, arena, name);
@@ -885,24 +982,31 @@ fn login(c: Context, arena: Allocator, name: []const u8, browser: bool) !u8 {
         try c.err.print("{s} runs a command, so it has no login.\n", .{try safe(arena, name)});
         return 1;
     }
+    if (try beginLogin(c, arena, host, server, name, open)) |code| return code;
+    // The shell's host reports the address and the outcome in the transcript.
+    if (c.surface == .shell) return 0;
+    return waitForLogin(c, arena, host, &waiter, open);
+}
+
+/// Starts signing in to `server`. Null once it has started; else the exit
+/// code, having said why it couldn't.
+fn beginLogin(c: Context, arena: Allocator, host: *Host, server: @import("config.zig").Server, name: []const u8, open: bool) !?u8 {
     host.runtime.login(name, open) catch |err| switch (err) {
         error.Held => {
-            const status = findStatus(try host.runtime.statuses(arena), name) orelse return missing(c, arena, name);
+            const status = findStatus(try host.runtime.statuses(arena), name) orelse return try missing(c, arena, name);
             try c.err.print("{s} is {s}", .{ try safe(arena, name), try statusText(arena, status) });
             if (status.state == .waiting_for_approval) try c.err.print(": {s} approve {s}", .{ c.surface.prog(), try safe(arena, name) });
             try c.err.writeAll(".\n");
             return 1;
         },
-        error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign in to", name),
+        error.CredentialStoreUnreadable => return try unreadableLogins(c, arena, "sign in to", name),
         error.CallbackPortInUse => {
             try c.err.print("Couldn't sign in to {s}: port {d} is in use, maybe by another app signing in. Try again once it's free.\n", .{ try safe(arena, name), server.callback_port.? });
             return 1;
         },
         else => return err,
     };
-    // The shell's host reports the address and the outcome in the transcript.
-    if (c.surface == .shell) return 0;
-    return waitForLogin(c, arena, host, &waiter, open);
+    return null;
 }
 
 fn waitForLogin(c: Context, arena: Allocator, host: *Host, waiter: *Waiter, open: bool) !u8 {
@@ -1015,6 +1119,10 @@ test "parse reads every verb, with flags before --" {
     try testing.expectEqualStrings("https://w/mcp", http.entry.http.url);
     try testing.expectEqualStrings("X-Key", http.entry.http.headers[0].key);
     try testing.expectEqualStrings("${K}", http.entry.http.headers[0].value);
+    // An HTTP server is signed in to when it needs a login, unless --no-login.
+    try testing.expect(http.login);
+    try testing.expect(!(try parseCli(a, &.{ "add", "--no-login", "web", "https://w/mcp" })).command.add.login);
+    try testing.expect(!(try parse(a, .shell, &.{ "add", "slack", "--no-login" })).command.add.login);
 
     // Slack needs no URL; any other server does.
     try testing.expectEqualStrings("https://mcp.slack.com/mcp", (try parseCli(a, &.{ "add", "slack" })).command.add.entry.http.url);
@@ -1039,6 +1147,33 @@ test "parse reads every verb, with flags before --" {
     try testing.expectEqualStrings("x", (try parseCli(a, &.{ "reject", "x" })).command.reject);
     try testing.expectEqual(@as(?Verb, .add), (try parseCli(a, &.{ "add", "-h" })).command.help);
     try testing.expectEqual(@as(?Verb, null), (try parseCli(a, &.{})).command.help);
+
+    const call = (try parseCli(a, &.{ "call", "mcp_linear_list_issues", "-" })).command.call.call;
+    try testing.expectEqualStrings("mcp_linear_list_issues", call.tool);
+    try testing.expectEqualStrings("-", call.arguments.?);
+    try testing.expect((try parseCli(a, &.{ "call", "mcp_linear_list_issues" })).command.call.call.arguments == null);
+    try testing.expectEqualStrings("linear", (try parseCli(a, &.{ "call", "list", "linear" })).command.call.list);
+    try testing.expectEqualStrings("mcp_linear_list_issues", (try parseCli(a, &.{ "call", "help", "mcp_linear_list_issues" })).command.call.help);
+    // A search's words join into one query.
+    try testing.expectEqualStrings("open issues", (try parseCli(a, &.{ "call", "search", "open", "issues" })).command.call.search);
+    try testing.expectEqual(@as(?Verb, .call), (try parseCli(a, &.{ "call", "-h" })).command.help);
+}
+
+test "parse turns fx mcp call mistakes into usage" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cases = [_]struct { args: []const []const u8, message: []const u8 }{
+        .{ .args = &.{"call"}, .message = "fx mcp call needs a TOOL, or list, search, or help." },
+        .{ .args = &.{ "call", "t", "{}", "{}" }, .message = "fx mcp call needs a TOOL and at most one JSON argument." },
+        .{ .args = &.{ "call", "list" }, .message = "fx mcp call list needs one server NAME." },
+        .{ .args = &.{ "call", "list", "a", "b" }, .message = "fx mcp call list needs one server NAME." },
+        .{ .args = &.{ "call", "help" }, .message = "fx mcp call help needs one TOOL." },
+        .{ .args = &.{ "call", "help", "" }, .message = "fx mcp call help needs one TOOL." },
+        .{ .args = &.{ "call", "search", " " }, .message = "fx mcp call search needs a QUERY." },
+    };
+    for (cases) |case| try testing.expectEqualStrings(case.message, (try parseCli(a, case.args)).usage.message);
+    try testing.expect((try parse(a, .shell, &.{ "call", "list", "linear" })).usage.message.len > 0);
 }
 
 test "list and show report a usage error as JSON only when the line asks for it" {
@@ -1083,7 +1218,7 @@ test "parse turns mistakes into usage, and old verbs into pointers" {
         try testing.expectEqualStrings(case.message, parsed.usage.message);
     }
     try testing.expectEqualStrings("fx mcp auth is now fx mcp login NAME.", (try parseCli(a, &.{ "auth", "x" })).moved);
-    try testing.expectEqualStrings("/mcp reload is gone: fx reloads after add, remove, approve, and reject.", (try parse(a, .shell, &.{"reload"})).moved);
+    try testing.expectEqualStrings("/mcp reload is gone: fx loads MCP config changes at your next prompt or /mcp command.", (try parse(a, .shell, &.{"reload"})).moved);
     try testing.expectEqualStrings("/mcp list: unknown flag --json", (try parse(a, .shell, &.{ "list", "--json" })).usage.message);
 }
 

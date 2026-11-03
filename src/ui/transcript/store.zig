@@ -1,20 +1,21 @@
 // Host contract:
-// - fields: transcript, entries, next_entry_id, last_rendered_cols,
-//   transcript_cache_origin_untrimmed,
-//   max_transcript_bytes,
+// - one field, `notebook`, holding the transcript content the store edits:
+//   transcript, entries, next_entry_id, last_rendered_cols,
+//   transcript_cache_origin_untrimmed, max_transcript_bytes,
 //   folded_command_blocks, command_output_blocks, command_output_display,
-//   tool_details,
-//   full_transcript, replaceable_last_line, replaceable_start,
-//   replaceable_row, transcript_band_dirty, layout, cursor_row, cursor_col,
-//   owned_top_row, viewport_top_row, pending_scroll_compact,
-//   has_painted_transcript, last_viewport_selection,
-//   last_visible_transcript_top_row, last_visible_transcript_start_line,
-//   last_visible_transcript_partial_skip_rows, last_visible_transcript_split_active,
-//   last_visible_transcript_split_prefix_lines,
-//   last_visible_transcript_split_suffix_start_line
+//   tool_details, full_transcript_content_revision, pending_resume_source,
+//   replaceable_last_line, replaceable_start, transcript_release
 // - methods: assertCanMutateTranscript, advanceCursor, invalidateTranscriptAnchor,
 //   recomputeCursorFromTranscript, writeTranscriptBytes,
-//   writeTranscriptClassified
+//   writeTranscriptClassified, transcriptWrapCols, resetTranscriptViewport,
+//   resetPaintedTranscriptView, adoptTranscriptView, adoptCommittedTranscriptView,
+//   transcriptCursorRow, transcriptCursorCol, replaceableRow, setReplaceableRow,
+//   committedTranscriptFlow, committedPublicationLimit, commandOutputRender
+// - screen state (layout, cursor, viewport, painted rows, replaceable row,
+//   commit anchor, render styles, the Ctrl+O view, tool-call collapsing, and
+//   the paint band) is reached only through these methods, never as fields.
+//   The one exception is requestTranscriptPaint's fallback for hosts without
+//   markTranscriptContentDirty, which sets transcript_band_dirty itself.
 
 const std = @import("std");
 const testing_allocator = @import("../../core/shared/testing_allocator.zig");
@@ -43,6 +44,12 @@ const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const SkillTokenSpan = input_visual_layout.SkillTokenSpan;
 
+/// The host's wrap width, or 80 columns before the first layout is known.
+fn wrapCols(self: anytype) u16 {
+    const cols = self.transcriptWrapCols();
+    return if (cols > 0) cols else 80;
+}
+
 pub const TranscriptSourceRewriteMode = enum {
     strict,
     preserve_same_epoch,
@@ -52,6 +59,13 @@ pub const LifecycleEntryUpdate = struct {
     entry_id: u32,
     bytes: []const u8,
 };
+
+/// True when `Shell` keeps its transcript content in a `notebook` field that
+/// has `name`.
+fn hasNotebookField(comptime Shell: type, comptime name: []const u8) bool {
+    if (!@hasField(Shell, "notebook")) return false;
+    return @hasField(@FieldType(Shell, "notebook"), name);
+}
 
 noinline fn requestTranscriptPaint(self: anytype) void {
     const Runtime = @TypeOf(self.*);
@@ -81,7 +95,7 @@ fn reconcileTranscriptAnchorAfterSourceChange(
 ) void {
     reconcileTranscriptAnchorAfterSourceChangeUsingSource(
         self,
-        self.transcript.items,
+        self.notebook.transcript.items,
         force_rebase,
         reason,
         mode,
@@ -142,33 +156,33 @@ pub fn reconcileDetachedInstallSource(
 }
 
 pub fn initBacking(self: anytype, alloc: Allocator) !void {
-    try self.transcript.ensureTotalCapacity(alloc, self.max_transcript_bytes);
+    try self.notebook.transcript.ensureTotalCapacity(alloc, self.notebook.max_transcript_bytes);
 }
 
 pub fn ensurePaintReservation(self: anytype, alloc: Allocator) !void {
-    if (self.transcript.capacity < self.max_transcript_bytes) {
-        try self.transcript.ensureTotalCapacity(alloc, self.max_transcript_bytes);
+    if (self.notebook.transcript.capacity < self.notebook.max_transcript_bytes) {
+        try self.notebook.transcript.ensureTotalCapacity(alloc, self.notebook.max_transcript_bytes);
     }
 }
 
 pub fn rebuildTranscriptFromRendered(self: anytype, alloc: Allocator, bytes: []const u8, label: []const u8) !void {
-    const start = cappedTailStart(bytes, self.max_transcript_bytes);
-    try self.transcript.ensureTotalCapacity(alloc, bytes.len - start);
-    self.transcript_cache_origin_untrimmed = false;
-    self.transcript.clearRetainingCapacity();
+    const start = cappedTailStart(bytes, self.notebook.max_transcript_bytes);
+    try self.notebook.transcript.ensureTotalCapacity(alloc, bytes.len - start);
+    self.notebook.transcript_cache_origin_untrimmed = false;
+    self.notebook.transcript.clearRetainingCapacity();
     if (start > 0) {
-        debug_trace.logf("transcript_cap", "{s} trimmed {d} leading bytes (bytes.len={d} cap={d})", .{ label, start, bytes.len, self.max_transcript_bytes });
+        debug_trace.logf("transcript_cap", "{s} trimmed {d} leading bytes (bytes.len={d} cap={d})", .{ label, start, bytes.len, self.notebook.max_transcript_bytes });
     }
-    self.transcript.appendSliceAssumeCapacity(bytes[start..]);
-    self.transcript_cache_origin_untrimmed = start == 0;
-    self.last_rendered_cols = if (self.layout.cols > 0) self.layout.cols else 80;
+    self.notebook.transcript.appendSliceAssumeCapacity(bytes[start..]);
+    self.notebook.transcript_cache_origin_untrimmed = start == 0;
+    self.notebook.last_rendered_cols = wrapCols(self);
 }
 
 pub fn retainedStructuredBytes(self: anytype) usize {
     var total: usize = 0;
-    for (self.entries.items) |entry| total += entryRetainedBytes(entry);
-    for (self.folded_command_blocks.items) |block| total += command_output_runtime.foldedBlockRetainedBytes(block);
-    for (self.command_output_blocks.items) |block| total += command_output_runtime.commandOutputBlockRetainedBytes(block);
+    for (self.notebook.entries.items) |entry| total += entryRetainedBytes(entry);
+    for (self.notebook.folded_command_blocks.items) |block| total += command_output_runtime.foldedBlockRetainedBytes(block);
+    for (self.notebook.command_output_blocks.items) |block| total += command_output_runtime.commandOutputBlockRetainedBytes(block);
     return total;
 }
 
@@ -243,8 +257,8 @@ fn tableRetainedBytes(table: assistant_presentation.TablePayload) usize {
 }
 
 pub fn replaceableEntryId(self: anytype) ?u32 {
-    if (!self.replaceable_last_line or self.entries.items.len == 0) return null;
-    const tail = self.entries.items[self.entries.items.len - 1];
+    if (!self.notebook.replaceable_last_line or self.notebook.entries.items.len == 0) return null;
+    const tail = self.notebook.entries.items[self.notebook.entries.items.len - 1];
     return switch (tail) {
         .raw_bytes => |e| e.id,
         else => null,
@@ -252,7 +266,7 @@ pub fn replaceableEntryId(self: anytype) ?u32 {
 }
 
 pub fn isLifecyclePinned(self: anytype, entry_id: u32) bool {
-    for (self.entries.items) |entry| {
+    for (self.notebook.entries.items) |entry| {
         if (entry != .raw_bytes or entry.raw_bytes.id != entry_id) continue;
         return entry.raw_bytes.lifecycle_pinned;
     }
@@ -260,7 +274,7 @@ pub fn isLifecyclePinned(self: anytype, entry_id: u32) bool {
 }
 
 pub fn toolStatusEntryLabel(self: anytype, entry_id: u32) ?[]const u8 {
-    for (self.entries.items) |entry| {
+    for (self.notebook.entries.items) |entry| {
         if (entry != .raw_bytes or entry.raw_bytes.id != entry_id) continue;
         return std.mem.trimEnd(u8, entry.raw_bytes.bytes, "\r\n");
     }
@@ -269,7 +283,7 @@ pub fn toolStatusEntryLabel(self: anytype, entry_id: u32) ?[]const u8 {
 
 pub fn lifecyclePinCount(self: anytype) usize {
     var count: usize = 0;
-    for (self.entries.items) |entry| {
+    for (self.notebook.entries.items) |entry| {
         if (entry == .raw_bytes and entry.raw_bytes.lifecycle_pinned) count += 1;
     }
     return count;
@@ -279,7 +293,7 @@ pub const EntryIdSet = std.AutoHashMapUnmanaged(u32, void);
 
 fn rebuildEntryIdSet(self: anytype, alloc: Allocator, entry_ids: *EntryIdSet) !void {
     entry_ids.clearRetainingCapacity();
-    for (self.entries.items) |entry| {
+    for (self.notebook.entries.items) |entry| {
         try entry_ids.put(alloc, entry.id(), {});
     }
 }
@@ -290,18 +304,18 @@ fn compactEntriesToRetainedSet(
     retained_entry_ids: *const EntryIdSet,
 ) void {
     var write_index: usize = 0;
-    for (self.entries.items, 0..) |entry, read_index| {
+    for (self.notebook.entries.items, 0..) |entry, read_index| {
         if (!retained_entry_ids.contains(entry.id())) {
             var removed = entry;
             removed.deinit(alloc);
             continue;
         }
         if (write_index != read_index) {
-            self.entries.items[write_index] = entry;
+            self.notebook.entries.items[write_index] = entry;
         }
         write_index += 1;
     }
-    self.entries.items.len = write_index;
+    self.notebook.entries.items.len = write_index;
 }
 
 fn pruneOrphanedFoldedCommandBlocks(
@@ -311,8 +325,8 @@ fn pruneOrphanedFoldedCommandBlocks(
 ) bool {
     var changed = false;
     var i: usize = 0;
-    while (i < self.folded_command_blocks.items.len) {
-        const summary_id = self.folded_command_blocks.items[i].summary_entry_id;
+    while (i < self.notebook.folded_command_blocks.items.len) {
+        const summary_id = self.notebook.folded_command_blocks.items[i].summary_entry_id;
         if (summary_id) |id| {
             if (!entry_ids.contains(id)) {
                 command_output_runtime.removeFoldedCommandBlock(self, alloc, i);
@@ -339,8 +353,8 @@ fn firstExistingCommandOutputSourceEntryId(
 }
 
 fn retargetCommandOutputDetails(self: anytype, old_entry_id: u32, new_entry_id: u32) void {
-    if (comptime !@hasField(@TypeOf(self.*), "tool_details")) return;
-    for (self.tool_details.items) |*detail| {
+    if (comptime !hasNotebookField(@TypeOf(self.*), "tool_details")) return;
+    for (self.notebook.tool_details.items) |*detail| {
         if (detail.command_output_entry_id == old_entry_id) {
             detail.command_output_entry_id = new_entry_id;
         }
@@ -351,8 +365,8 @@ fn commandOutputBlockHasDetail(
     self: anytype,
     block: command_output_runtime.CommandOutputBlock,
 ) bool {
-    if (comptime !@hasField(@TypeOf(self.*), "tool_details")) return false;
-    for (self.tool_details.items) |detail| {
+    if (comptime !hasNotebookField(@TypeOf(self.*), "tool_details")) return false;
+    for (self.notebook.tool_details.items) |detail| {
         if (detail.command_output_entry_id) |entry_id| {
             if (command_output_runtime.commandBlockOwnsEntry(block, entry_id)) {
                 return true;
@@ -374,13 +388,13 @@ fn removePrunedRangeAnchorEntries(
     entry_ids: *EntryIdSet,
 ) void {
     var entry_index: usize = 0;
-    while (entry_index < self.entries.items.len) {
-        const entry_id = self.entries.items[entry_index].id();
+    while (entry_index < self.notebook.entries.items.len) {
+        const entry_id = self.notebook.entries.items[entry_index].id();
         if (!command_output_runtime.isPrunedRangeAnchor(block, entry_id)) {
             entry_index += 1;
             continue;
         }
-        var removed = self.entries.orderedRemove(entry_index);
+        var removed = self.notebook.entries.orderedRemove(entry_index);
         _ = entry_ids.remove(entry_id);
         removed.deinit(alloc);
     }
@@ -393,26 +407,26 @@ fn pruneOrphanedCommandOutputBlocks(
 ) bool {
     var changed = false;
     var i: usize = 0;
-    while (i < self.command_output_blocks.items.len) {
-        if (self.command_output_blocks.items[i].live_entry_ids.items.len != 0) {
+    while (i < self.notebook.command_output_blocks.items.len) {
+        if (self.notebook.command_output_blocks.items[i].live_entry_ids.items.len != 0) {
             i += 1;
             continue;
         }
-        if (self.command_output_display.open_command_block) |open| {
+        if (self.notebook.command_output_display.open_command_block) |open| {
             if (open == i) {
                 i += 1;
                 continue;
             }
         }
 
-        if (self.command_output_blocks.items[i].lines.items.len == 0 and
-            self.command_output_blocks.items[i].pruned_ranges.items.len > 0 and
-            !commandOutputBlockHasDetail(self, self.command_output_blocks.items[i]))
+        if (self.notebook.command_output_blocks.items[i].lines.items.len == 0 and
+            self.notebook.command_output_blocks.items[i].pruned_ranges.items.len > 0 and
+            !commandOutputBlockHasDetail(self, self.notebook.command_output_blocks.items[i]))
         {
             removePrunedRangeAnchorEntries(
                 self,
                 alloc,
-                self.command_output_blocks.items[i],
+                self.notebook.command_output_blocks.items[i],
                 entry_ids,
             );
             command_output_runtime.removeCommandOutputBlock(self, alloc, i);
@@ -420,11 +434,11 @@ fn pruneOrphanedCommandOutputBlocks(
             continue;
         }
 
-        const entry_id = self.command_output_blocks.items[i].entry_id;
+        const entry_id = self.notebook.command_output_blocks.items[i].entry_id;
         if (entry_id) |id| {
             if (!entry_ids.contains(id)) {
-                if (firstExistingCommandOutputSourceEntryId(entry_ids, self.command_output_blocks.items[i])) |replacement| {
-                    self.command_output_blocks.items[i].entry_id = replacement;
+                if (firstExistingCommandOutputSourceEntryId(entry_ids, self.notebook.command_output_blocks.items[i])) |replacement| {
+                    self.notebook.command_output_blocks.items[i].entry_id = replacement;
                     retargetCommandOutputDetails(self, id, replacement);
                     changed = true;
                     i += 1;
@@ -435,8 +449,8 @@ fn pruneOrphanedCommandOutputBlocks(
                 continue;
             }
         } else {
-            if (firstExistingCommandOutputSourceEntryId(entry_ids, self.command_output_blocks.items[i])) |replacement| {
-                self.command_output_blocks.items[i].entry_id = replacement;
+            if (firstExistingCommandOutputSourceEntryId(entry_ids, self.notebook.command_output_blocks.items[i])) |replacement| {
+                self.notebook.command_output_blocks.items[i].entry_id = replacement;
                 changed = true;
                 i += 1;
                 continue;
@@ -452,7 +466,7 @@ fn pruneOrphanedCommandOutputBlocks(
 
 fn coalesceCommandOutputPrunedRanges(self: anytype, alloc: Allocator) bool {
     var changed = false;
-    for (0..self.command_output_blocks.items.len) |block_index| {
+    for (0..self.notebook.command_output_blocks.items.len) |block_index| {
         if (command_output_runtime.coalesceCommandOutputPrunedRanges(
             self,
             alloc,
@@ -478,7 +492,7 @@ test "retention rebase compact group cutoff follows surviving children" {
         defer retained.deinit(alloc);
         var ids: EntryIdSet = .empty;
         defer ids.deinit(alloc);
-        for (runtime.entries.items, 0..) |entry, index| if (index != removed_index) {
+        for (runtime.notebook.entries.items, 0..) |entry, index| if (index != removed_index) {
             try ids.put(alloc, entry.id(), {});
         };
         compactEntriesToRetainedSet(&retained, alloc, &ids);
@@ -498,49 +512,49 @@ test "retention rebase compact group cutoff follows surviving children" {
 }
 
 pub fn refreshFoldedCommandSummaryIndices(self: anytype, alloc: Allocator) !void {
-    const cols: u16 = if (self.layout.cols > 0) self.layout.cols else 80;
-    const summary_entry_ids = try alloc.alloc(?u32, self.folded_command_blocks.items.len);
+    const cols: u16 = wrapCols(self);
+    const summary_entry_ids = try alloc.alloc(?u32, self.notebook.folded_command_blocks.items.len);
     defer alloc.free(summary_entry_ids);
-    for (self.folded_command_blocks.items, summary_entry_ids) |block, *entry_id| {
+    for (self.notebook.folded_command_blocks.items, summary_entry_ids) |block, *entry_id| {
         entry_id.* = block.summary_entry_id;
     }
 
     var prepared = try transcript_blocks.renderEntriesForPreparation(
         alloc,
-        self.entries.items,
+        self.notebook.entries.items,
         cols,
-        self.command_output_render.styles,
+        self.commandOutputRender().styles,
         .{ .folded_summary_entry_ids = summary_entry_ids },
     );
     defer prepared.deinit(alloc);
-    for (self.folded_command_blocks.items, prepared.folded_summary_indices) |*block, index| {
+    for (self.notebook.folded_command_blocks.items, prepared.folded_summary_indices) |*block, index| {
         block.summary_transcript_index = index;
     }
 }
 
 fn refreshReplaceableStateAfterEntriesRebuild(self: anytype) void {
-    if (!self.replaceable_last_line) return;
-    if (self.entries.items.len == 0) {
-        self.replaceable_last_line = false;
-        self.replaceable_start = 0;
+    if (!self.notebook.replaceable_last_line) return;
+    if (self.notebook.entries.items.len == 0) {
+        self.notebook.replaceable_last_line = false;
+        self.notebook.replaceable_start = 0;
         return;
     }
 
-    const tail = self.entries.items[self.entries.items.len - 1];
+    const tail = self.notebook.entries.items[self.notebook.entries.items.len - 1];
     switch (tail) {
         .raw_bytes => |e| {
-            if (e.bytes.len <= self.transcript.items.len) {
-                self.replaceable_start = self.transcript.items.len - e.bytes.len;
+            if (e.bytes.len <= self.notebook.transcript.items.len) {
+                self.notebook.replaceable_start = self.notebook.transcript.items.len - e.bytes.len;
             } else {
-                debug_trace.logf("transcript.replaceable_flip", "retention: tail_bytes>transcript, tail={d} transcript={d}", .{ e.bytes.len, self.transcript.items.len });
-                self.replaceable_last_line = false;
-                self.replaceable_start = 0;
+                debug_trace.logf("transcript.replaceable_flip", "retention: tail_bytes>transcript, tail={d} transcript={d}", .{ e.bytes.len, self.notebook.transcript.items.len });
+                self.notebook.replaceable_last_line = false;
+                self.notebook.replaceable_start = 0;
             }
         },
         else => {
-            debug_trace.logf("transcript.replaceable_flip", "retention: tail is {s}, entries={d}", .{ @tagName(tail), self.entries.items.len });
-            self.replaceable_last_line = false;
-            self.replaceable_start = 0;
+            debug_trace.logf("transcript.replaceable_flip", "retention: tail is {s}, entries={d}", .{ @tagName(tail), self.notebook.entries.items.len });
+            self.notebook.replaceable_last_line = false;
+            self.notebook.replaceable_start = 0;
         },
     }
 }
@@ -555,7 +569,7 @@ pub fn renderPlainEntries(self: anytype, alloc: Allocator, cols: u16) ![]u8 {
     defer if (captured) |*value| value.deinit(alloc);
     const bytes = try transcript_blocks.renderEntriesToBytesResumable(
         alloc,
-        self.entries.items,
+        self.notebook.entries.items,
         cols,
         styles,
         plan.resume_from,
@@ -564,13 +578,13 @@ pub fn renderPlainEntries(self: anytype, alloc: Allocator, cols: u16) ![]u8 {
     );
     errdefer alloc.free(bytes);
     if (source_preparation.prefix_oracle and plan.resume_from != null) {
-        const full = try transcript_blocks.renderEntriesToBytes(alloc, self.entries.items, cols, styles);
+        const full = try transcript_blocks.renderEntriesToBytes(alloc, self.notebook.entries.items, cols, styles);
         defer alloc.free(full);
         if (!std.mem.eql(u8, full, bytes)) {
             debug_trace.logf(
                 "frozen_prefix",
                 "oracle mismatch plain entries={d} full_bytes={d} resumed_bytes={d}",
-                .{ self.entries.items.len, full.len, bytes.len },
+                .{ self.notebook.entries.items.len, full.len, bytes.len },
             );
             return error.TranscriptOracleMismatch;
         }
@@ -588,7 +602,7 @@ fn rebuildTranscriptCacheFromEntriesMode(
     label: []const u8,
     mode: TranscriptSourceRewriteMode,
 ) !void {
-    const cols: u16 = if (self.layout.cols > 0) self.layout.cols else 80;
+    const cols: u16 = wrapCols(self);
     const fresh = try renderPlainEntries(
         self,
         alloc,
@@ -645,12 +659,8 @@ pub fn pruneOrphanedCommandStateAndReport(self: anytype, alloc: Allocator) !bool
 }
 
 fn committedFlowPrefix(self: anytype, bytes: []const u8) bool {
-    if (comptime @hasField(@TypeOf(self.*), "transcript_commit_state")) {
-        const flow = switch (self.transcript_commit_state) {
-            .invalid => return true,
-            .stable => |anchor| anchor.flow,
-            .recovering => |receipt| receipt.flow,
-        };
+    if (comptime @hasDecl(@TypeOf(self.*), "committedTranscriptFlow")) {
+        const flow = self.committedTranscriptFlow() orelse return true;
         return std.mem.startsWith(u8, bytes, flow);
     }
     return true;
@@ -701,7 +711,7 @@ fn dropEntries(self: anytype, alloc: Allocator, ids: []const u32) !bool {
     try rebuildEntryIdSet(self, alloc, &entry_ids);
     var pinned: EntryIdSet = .empty;
     defer pinned.deinit(alloc);
-    for (self.entries.items) |entry| switch (entry) {
+    for (self.notebook.entries.items) |entry| switch (entry) {
         .raw_bytes => |raw| if (raw.lifecycle_pinned) try pinned.put(alloc, raw.id, {}),
         else => {},
     };
@@ -716,7 +726,7 @@ fn dropEntries(self: anytype, alloc: Allocator, ids: []const u32) !bool {
         removed += 1;
     }
     if (removed == 0) return false;
-    for (self.entries.items) |entry| {
+    for (self.notebook.entries.items) |entry| {
         if (!entry_ids.contains(entry.id())) removed_bytes += entryRetainedBytes(entry);
     }
     compactEntriesToRetainedSet(self, alloc, &entry_ids);
@@ -736,8 +746,8 @@ fn dropEntries(self: anytype, alloc: Allocator, ids: []const u32) !bool {
 }
 
 pub fn clearTranscript(self: anytype, alloc: Allocator) void {
-    if (self.replaceable_last_line) {
-        debug_trace.logf("transcript.replaceable_flip", "clearTranscript wipe, entries={d} transcript_bytes={d}", .{ self.entries.items.len, self.transcript.items.len });
+    if (self.notebook.replaceable_last_line) {
+        debug_trace.logf("transcript.replaceable_flip", "clearTranscript wipe, entries={d} transcript_bytes={d}", .{ self.notebook.entries.items.len, self.notebook.transcript.items.len });
     }
     const pin_count = lifecyclePinCount(self);
     if (pin_count > 0) {
@@ -747,42 +757,31 @@ pub fn clearTranscript(self: anytype, alloc: Allocator) void {
             .{pin_count},
         );
     }
-    self.transcript.clearRetainingCapacity();
-    self.transcript_cache_origin_untrimmed = false;
+    self.notebook.transcript.clearRetainingCapacity();
+    self.notebook.transcript_cache_origin_untrimmed = false;
     if (comptime @hasDecl(@TypeOf(self.*), "clearFullTranscriptDetails")) {
         self.clearFullTranscriptDetails(alloc);
     } else if (comptime @hasDecl(@TypeOf(self.*), "closeFullTranscriptState")) {
         self.closeFullTranscriptState();
     }
-    for (self.entries.items) |*entry| entry.deinit(alloc);
-    self.entries.clearRetainingCapacity();
+    for (self.notebook.entries.items) |*entry| entry.deinit(alloc);
+    self.notebook.entries.clearRetainingCapacity();
     if (comptime @hasField(@TypeOf(self.*), "transcript_window")) {
         if (self.transcript_window) |*window| window.reset(alloc);
         if (comptime @hasDecl(@TypeOf(self.*), "discardTranscriptArchive")) self.discardTranscriptArchive();
     }
-    for (self.folded_command_blocks.items) |*block| block.deinit(alloc);
-    self.folded_command_blocks.clearRetainingCapacity();
-    for (self.command_output_blocks.items) |*block| block.deinit(alloc);
-    self.command_output_blocks.clearRetainingCapacity();
-    const owned_top = self.owned_top_row;
-    self.cursor_row = owned_top;
-    self.cursor_col = 1;
-    self.viewport_top_row = owned_top;
-    self.pending_scroll_compact = false;
+    for (self.notebook.folded_command_blocks.items) |*block| block.deinit(alloc);
+    self.notebook.folded_command_blocks.clearRetainingCapacity();
+    for (self.notebook.command_output_blocks.items) |*block| block.deinit(alloc);
+    self.notebook.command_output_blocks.clearRetainingCapacity();
+    const owned_top = self.resetTranscriptViewport();
     if (comptime @hasDecl(@TypeOf(self.*), "invalidateTranscriptAnchor")) {
         if (comptime @hasDecl(@TypeOf(self.*), "resetTranscriptAnchor")) self.resetTranscriptAnchor("clear_transcript_state") else self.invalidateTranscriptAnchor("clear_transcript_state");
     }
-    self.has_painted_transcript = false;
-    self.command_output_display = .{};
-    self.replaceable_last_line = false;
-    self.replaceable_start = 0;
-    self.last_visible_transcript_top_row = owned_top;
-    self.last_visible_transcript_start_line = 0;
-    self.last_visible_transcript_partial_skip_rows = 0;
-    self.last_visible_transcript_split_active = false;
-    self.last_visible_transcript_split_prefix_lines = 0;
-    self.last_visible_transcript_split_suffix_start_line = 0;
-    self.last_viewport_selection = null;
+    self.notebook.command_output_display = .{};
+    self.notebook.replaceable_last_line = false;
+    self.notebook.replaceable_start = 0;
+    self.resetPaintedTranscriptView(owned_top);
     requestTranscriptPaint(self);
 }
 
@@ -792,7 +791,7 @@ pub fn resetVisualEpoch(self: anytype, alloc: Allocator, welcome: []const u8) !v
 
     var replacement_entries: std.ArrayList(TranscriptEntry) = .empty;
     errdefer replacement_entries.deinit(alloc);
-    try replacement_entries.ensureTotalCapacity(alloc, self.entries.items.len + 1);
+    try replacement_entries.ensureTotalCapacity(alloc, self.notebook.entries.items.len + 1);
 
     // Staging borrows retained payloads until publication; only the new welcome
     // belongs to this scope on failure.
@@ -801,7 +800,7 @@ pub fn resetVisualEpoch(self: anytype, alloc: Allocator, welcome: []const u8) !v
     var replaced_welcome = false;
     var hidden_count: usize = 0;
     var pinned_count: usize = 0;
-    for (self.entries.items) |entry| {
+    for (self.notebook.entries.items) |entry| {
         if (entry == .raw_bytes and entry.raw_bytes.class == .welcome) {
             if (!replaced_welcome) {
                 replacement_entries.appendAssumeCapacity(.{ .raw_bytes = .{
@@ -830,34 +829,34 @@ pub fn resetVisualEpoch(self: anytype, alloc: Allocator, welcome: []const u8) !v
     }
     if (!replaced_welcome) {
         replacement_entries.appendAssumeCapacity(.{ .raw_bytes = .{
-            .id = self.next_entry_id,
+            .id = self.notebook.next_entry_id,
             .created_at_ms = io_mod.milliTimestamp(),
             .bytes = welcome_copy,
             .class = .welcome,
         } });
     }
 
-    const cols: u16 = if (self.layout.cols > 0) self.layout.cols else 80;
+    const cols: u16 = wrapCols(self);
     const rendered = try transcript_blocks.renderEntriesToBytes(
         alloc,
         replacement_entries.items,
         cols,
-        self.command_output_render.styles,
+        self.commandOutputRender().styles,
     );
     defer alloc.free(rendered);
-    const rendered_start = cappedTailStart(rendered, self.max_transcript_bytes);
+    const rendered_start = cappedTailStart(rendered, self.notebook.max_transcript_bytes);
 
     var replacement_transcript: std.ArrayList(u8) = .empty;
     errdefer replacement_transcript.deinit(alloc);
     try replacement_transcript.appendSlice(alloc, rendered[rendered_start..]);
 
-    var old_entries = self.entries;
-    self.entries = replacement_entries;
+    var old_entries = self.notebook.entries;
+    self.notebook.entries = replacement_entries;
     replacement_entries = .empty;
-    var old_transcript = self.transcript;
-    self.transcript = replacement_transcript;
+    var old_transcript = self.notebook.transcript;
+    self.notebook.transcript = replacement_transcript;
     replacement_transcript = .empty;
-    self.transcript_cache_origin_untrimmed = rendered_start == 0;
+    self.notebook.transcript_cache_origin_untrimmed = rendered_start == 0;
 
     for (old_entries.items) |*entry| {
         if (entry.* == .raw_bytes and entry.raw_bytes.class == .welcome) entry.deinit(alloc);
@@ -867,26 +866,18 @@ pub fn resetVisualEpoch(self: anytype, alloc: Allocator, welcome: []const u8) !v
     debug_trace.logf(
         "transcript.visual_epoch_reset",
         "clear display retained={d} hidden={d} pinned={d}",
-        .{ self.entries.items.len - 1, hidden_count, pinned_count },
+        .{ self.notebook.entries.items.len - 1, hidden_count, pinned_count },
     );
 
-    if (!replaced_welcome) self.next_entry_id +%= 1;
-    self.last_rendered_cols = cols;
+    if (!replaced_welcome) self.notebook.next_entry_id +%= 1;
+    self.notebook.last_rendered_cols = cols;
     if (comptime @hasDecl(@TypeOf(self.*), "closeFullTranscriptState")) {
         self.closeFullTranscriptState();
     }
-    self.command_output_display = .{};
-    self.replaceable_last_line = false;
-    self.replaceable_start = 0;
-    self.pending_scroll_compact = false;
-    self.has_painted_transcript = false;
-    self.last_visible_transcript_top_row = self.owned_top_row;
-    self.last_visible_transcript_start_line = 0;
-    self.last_visible_transcript_partial_skip_rows = 0;
-    self.last_visible_transcript_split_active = false;
-    self.last_visible_transcript_split_prefix_lines = 0;
-    self.last_visible_transcript_split_suffix_start_line = 0;
-    self.last_viewport_selection = null;
+    self.notebook.command_output_display = .{};
+    self.notebook.replaceable_last_line = false;
+    self.notebook.replaceable_start = 0;
+    self.resetPaintedTranscriptView(null);
     self.recomputeCursorFromTranscript();
     if (comptime @hasDecl(@TypeOf(self.*), "invalidateTranscriptAnchor")) {
         if (comptime @hasDecl(@TypeOf(self.*), "resetTranscriptAnchor")) self.resetTranscriptAnchor("visual_epoch_reset") else self.invalidateTranscriptAnchor("visual_epoch_reset");
@@ -917,7 +908,7 @@ pub fn appendPinnedToolStatusAtomic(
     handed_off = true;
     const entry_index = rawEntryIndex(&shadow, entry_id) orelse
         return error.MissingLifecycleTranscriptEntry;
-    shadow.entries.items[entry_index].raw_bytes.lifecycle_pinned = true;
+    shadow.notebook.entries.items[entry_index].raw_bytes.lifecycle_pinned = true;
     try pruneOrphanedCommandState(&shadow, alloc);
     try rebuildTranscriptCacheFromEntries(
         &shadow,
@@ -947,8 +938,8 @@ fn appendSemanticNoticeEntry(
 
     const owned = try types.dupeSemanticNotice(alloc, notice);
     errdefer types.freeSemanticNotice(alloc, owned);
-    const entry_id = self.next_entry_id;
-    try self.entries.append(alloc, .{ .semantic_notice = .{
+    const entry_id = self.notebook.next_entry_id;
+    try self.notebook.entries.append(alloc, .{ .semantic_notice = .{
         .id = entry_id,
         .created_at_ms = io_mod.milliTimestamp(),
         .topic = owned.topic,
@@ -957,7 +948,7 @@ fn appendSemanticNoticeEntry(
         .visibility = owned.visibility,
         .pending_replacement = pending_replacement,
     } });
-    self.next_entry_id +%= 1;
+    self.notebook.next_entry_id +%= 1;
     return entry_id;
 }
 
@@ -1018,7 +1009,7 @@ fn appendSemanticNoticeAtomicPinned(
 }
 
 fn semanticNoticeIndex(self: anytype, entry_id: u32) ?usize {
-    for (self.entries.items, 0..) |entry, index| {
+    for (self.notebook.entries.items, 0..) |entry, index| {
         if (entry == .semantic_notice and entry.semantic_notice.id == entry_id) return index;
     }
     return null;
@@ -1040,15 +1031,15 @@ pub fn replaceSemanticNoticeAtomic(
     // In-place replacement requires the producer-owned pin, mirroring the
     // raw-bytes lifecycle pin: an unpinned notice is immutable history and
     // may already be released into terminal scrollback.
-    if (!shadow.entries.items[entry_index].semantic_notice.pending_replacement) {
+    if (!shadow.notebook.entries.items[entry_index].semantic_notice.pending_replacement) {
         return error.MissingNoticeReplacementPin;
     }
-    const created_at_ms = shadow.entries.items[entry_index].semantic_notice.created_at_ms;
+    const created_at_ms = shadow.notebook.entries.items[entry_index].semantic_notice.created_at_ms;
     const owned = try types.dupeSemanticNotice(alloc, notice);
     var handed_off = false;
     errdefer if (!handed_off) types.freeSemanticNotice(alloc, owned);
-    var previous = shadow.entries.items[entry_index];
-    shadow.entries.items[entry_index] = .{ .semantic_notice = .{
+    var previous = shadow.notebook.entries.items[entry_index];
+    shadow.notebook.entries.items[entry_index] = .{ .semantic_notice = .{
         .id = entry_id,
         .created_at_ms = created_at_ms,
         .inline_hidden = previous.semantic_notice.inline_hidden,
@@ -1313,14 +1304,14 @@ fn replacePinnedToolStatusAtomicInternal(
 ) !bool {
     try self.assertCanMutateTranscript();
     const entry_index = rawEntryIndex(self, entry_id) orelse return false;
-    if (!self.entries.items[entry_index].raw_bytes.lifecycle_pinned) {
+    if (!self.notebook.entries.items[entry_index].raw_bytes.lifecycle_pinned) {
         return error.MissingLifecycleTranscriptPin;
     }
-    const reposition = place_at_end and entry_index + 1 < self.entries.items.len;
+    const reposition = place_at_end and entry_index + 1 < self.notebook.entries.items.len;
 
     const published_identity = if (comptime @hasDecl(@TypeOf(self.*), "committedRetentionIdentity")) self.committedRetentionIdentity() else null;
     const published_rewrite = if (published_identity) |identity|
-        identity.lines.len > 0 and !statusGeometryUnchanged(self.layout.cols, self.entries.items[entry_index].raw_bytes.bytes, new_bytes)
+        identity.lines.len > 0 and !statusGeometryUnchanged(self.transcriptWrapCols(), self.notebook.entries.items[entry_index].raw_bytes.bytes, new_bytes)
     else
         false;
     if (reservations.empty() and
@@ -1337,25 +1328,25 @@ fn replacePinnedToolStatusAtomicInternal(
 
     var shadow = try cloneMutationState(self, alloc);
     defer shadow.deinit(alloc);
-    try shadow.tool_details.ensureUnusedCapacity(alloc, reservations.tool_details);
-    try shadow.entries.ensureUnusedCapacity(
+    try shadow.notebook.tool_details.ensureUnusedCapacity(alloc, reservations.tool_details);
+    try shadow.notebook.entries.ensureUnusedCapacity(
         alloc,
         reservations.command_output_entries +
             @intFromBool(reservations.turn_cancellation_line != null),
     );
-    try shadow.command_output_blocks.ensureUnusedCapacity(
+    try shadow.notebook.command_output_blocks.ensureUnusedCapacity(
         alloc,
         reservations.command_output_entries,
     );
     const shadow_index = rawEntryIndex(&shadow, entry_id) orelse
         return error.MissingLifecycleTranscriptEntry;
     const replacement = try alloc.dupe(u8, new_bytes);
-    alloc.free(shadow.entries.items[shadow_index].raw_bytes.bytes);
-    shadow.entries.items[shadow_index].raw_bytes.bytes = replacement;
-    shadow.entries.items[shadow_index].raw_bytes.class = .tool_status;
+    alloc.free(shadow.notebook.entries.items[shadow_index].raw_bytes.bytes);
+    shadow.notebook.entries.items[shadow_index].raw_bytes.bytes = replacement;
+    shadow.notebook.entries.items[shadow_index].raw_bytes.class = .tool_status;
     if (reposition) {
-        const entry = shadow.entries.orderedRemove(shadow_index);
-        shadow.entries.appendAssumeCapacity(entry);
+        const entry = shadow.notebook.entries.orderedRemove(shadow_index);
+        shadow.notebook.entries.appendAssumeCapacity(entry);
     }
     var retention_anchor = entry_id;
     if (reservations.turn_cancellation_line) |cancellation_line| {
@@ -1437,24 +1428,24 @@ fn replacePinnedToolStatusesAtomicWithRewriteMode(
 
     var shadow = try cloneMutationState(self, alloc);
     defer shadow.deinit(alloc);
-    try shadow.tool_details.ensureUnusedCapacity(
+    try shadow.notebook.tool_details.ensureUnusedCapacity(
         alloc,
         additional_tool_detail_capacity,
     );
-    try shadow.entries.ensureUnusedCapacity(
+    try shadow.notebook.entries.ensureUnusedCapacity(
         alloc,
         @intFromBool(turn_cancellation_line != null),
     );
     for (updates) |update| {
         const entry_index = rawEntryIndex(&shadow, update.entry_id) orelse
             return error.MissingLifecycleTranscriptEntry;
-        if (!shadow.entries.items[entry_index].raw_bytes.lifecycle_pinned) {
+        if (!shadow.notebook.entries.items[entry_index].raw_bytes.lifecycle_pinned) {
             return error.MissingLifecycleTranscriptPin;
         }
         const replacement = try alloc.dupe(u8, update.bytes);
-        alloc.free(shadow.entries.items[entry_index].raw_bytes.bytes);
-        shadow.entries.items[entry_index].raw_bytes.bytes = replacement;
-        shadow.entries.items[entry_index].raw_bytes.class = .tool_status;
+        alloc.free(shadow.notebook.entries.items[entry_index].raw_bytes.bytes);
+        shadow.notebook.entries.items[entry_index].raw_bytes.bytes = replacement;
+        shadow.notebook.entries.items[entry_index].raw_bytes.class = .tool_status;
     }
     var turn_cancellation_entry_id: ?u32 = null;
     if (turn_cancellation_line) |line| {
@@ -1489,7 +1480,7 @@ fn replacePinnedToolStatusesAtomicWithRewriteMode(
                     return error.MissingLifecycleTranscriptEntry,
             );
         }
-        dirty_entry_id = shadow.entries.items[dirty_entry_index].id();
+        dirty_entry_id = shadow.notebook.entries.items[dirty_entry_index].id();
     } else {
         dirty_entry_id = turn_cancellation_entry_id.?;
     }
@@ -1516,10 +1507,10 @@ pub fn clearLifecyclePinsAtomic(
     for (entry_ids) |entry_id| {
         const entry_index = rawEntryIndex(&shadow, entry_id) orelse
             return error.MissingLifecycleTranscriptEntry;
-        if (!shadow.entries.items[entry_index].raw_bytes.lifecycle_pinned) {
+        if (!shadow.notebook.entries.items[entry_index].raw_bytes.lifecycle_pinned) {
             return error.MissingLifecycleTranscriptPin;
         }
-        shadow.entries.items[entry_index].raw_bytes.lifecycle_pinned = false;
+        shadow.notebook.entries.items[entry_index].raw_bytes.lifecycle_pinned = false;
     }
     var dirty_entry_index = rawEntryIndex(&shadow, entry_ids[0]) orelse
         return error.MissingLifecycleTranscriptEntry;
@@ -1530,7 +1521,7 @@ pub fn clearLifecyclePinsAtomic(
                 return error.MissingLifecycleTranscriptEntry,
         );
     }
-    const dirty_entry_id = shadow.entries.items[dirty_entry_index].id();
+    const dirty_entry_id = shadow.notebook.entries.items[dirty_entry_index].id();
     const retention_changed = try pruneOrphanedCommandStateAndReport(&shadow, alloc);
     try rebuildTranscriptCacheFromEntries(
         &shadow,
@@ -1551,7 +1542,7 @@ pub fn clearLifecyclePinsAtomic(
 }
 
 noinline fn rawEntryIndex(self: anytype, entry_id: u32) ?usize {
-    for (self.entries.items, 0..) |entry, index| {
+    for (self.notebook.entries.items, 0..) |entry, index| {
         if (entry == .raw_bytes and entry.raw_bytes.id == entry_id) return index;
     }
     return null;
@@ -1563,18 +1554,18 @@ fn replacePinnedToolStatusFast(
     entry_index: usize,
     new_bytes: []const u8,
 ) !bool {
-    const cols: u16 = if (self.layout.cols > 0) self.layout.cols else 80;
-    const previous_origin_untrimmed = self.transcript_cache_origin_untrimmed and
-        self.last_rendered_cols == cols;
+    const cols: u16 = wrapCols(self);
+    const previous_origin_untrimmed = self.notebook.transcript_cache_origin_untrimmed and
+        self.notebook.last_rendered_cols == cols;
 
     const replacement = try alloc.dupe(u8, new_bytes);
     var replacement_owned = true;
     errdefer if (replacement_owned) alloc.free(replacement);
 
-    const old_bytes = self.entries.items[entry_index].raw_bytes.bytes;
-    self.entries.items[entry_index].raw_bytes.bytes = replacement;
+    const old_bytes = self.notebook.entries.items[entry_index].raw_bytes.bytes;
+    self.notebook.entries.items[entry_index].raw_bytes.bytes = replacement;
     defer if (replacement_owned) {
-        self.entries.items[entry_index].raw_bytes.bytes = old_bytes;
+        self.notebook.entries.items[entry_index].raw_bytes.bytes = old_bytes;
     };
 
     const rendered = try renderPlainEntries(
@@ -1583,17 +1574,17 @@ fn replacePinnedToolStatusFast(
         cols,
     );
     defer alloc.free(rendered);
-    const start = cappedTailStart(rendered, self.max_transcript_bytes);
-    try self.transcript.ensureTotalCapacity(alloc, rendered.len - start);
+    const start = cappedTailStart(rendered, self.notebook.max_transcript_bytes);
+    try self.notebook.transcript.ensureTotalCapacity(alloc, rendered.len - start);
 
-    self.entries.items[entry_index].raw_bytes.class = .tool_status;
-    self.transcript.clearRetainingCapacity();
-    self.transcript.appendSliceAssumeCapacity(rendered[start..]);
-    self.transcript_cache_origin_untrimmed = start == 0;
+    self.notebook.entries.items[entry_index].raw_bytes.class = .tool_status;
+    self.notebook.transcript.clearRetainingCapacity();
+    self.notebook.transcript.appendSliceAssumeCapacity(rendered[start..]);
+    self.notebook.transcript_cache_origin_untrimmed = start == 0;
     refreshReplaceableStateAfterEntriesRebuild(self);
-    self.last_rendered_cols = cols;
+    self.notebook.last_rendered_cols = cols;
     self.recomputeCursorFromTranscript();
-    requestTranscriptPaintFrom(self, self.entries.items[entry_index].raw_bytes.id);
+    requestTranscriptPaintFrom(self, self.notebook.entries.items[entry_index].raw_bytes.id);
     replacement_owned = false;
     alloc.free(old_bytes);
     if (!previous_origin_untrimmed or start != 0) {
@@ -1613,10 +1604,10 @@ fn replacePinnedToolStatusFast(
 fn cloneRecordedMutationState(self: anytype, alloc: Allocator) !@TypeOf(self.*) {
     var shadow = try cloneMutationState(self, alloc);
     errdefer shadow.deinit(alloc);
-    const transcript_storage = try alloc.alloc(u8, self.transcript.capacity);
-    @memcpy(transcript_storage[0..self.transcript.items.len], self.transcript.items);
-    shadow.transcript = .fromOwnedSlice(transcript_storage);
-    shadow.transcript.items.len = self.transcript.items.len;
+    const transcript_storage = try alloc.alloc(u8, self.notebook.transcript.capacity);
+    @memcpy(transcript_storage[0..self.notebook.transcript.items.len], self.notebook.transcript.items);
+    shadow.notebook.transcript = .fromOwnedSlice(transcript_storage);
+    shadow.notebook.transcript.items.len = self.notebook.transcript.items.len;
     return shadow;
 }
 
@@ -1633,45 +1624,38 @@ pub fn cloneDetachedPresentationState(self: anytype, alloc: Allocator) !@TypeOf(
 
 fn cloneMutationState(self: anytype, alloc: Allocator) !@TypeOf(self.*) {
     const Runtime = @TypeOf(self.*);
-    var shadow: Runtime = .{
-        .layout = self.layout,
-        .cursor_row = self.cursor_row,
-        .cursor_col = self.cursor_col,
-        .owned_top_row = self.owned_top_row,
-        .viewport_top_row = self.viewport_top_row,
+    var shadow: Runtime = .{ .notebook = .{
         .entries = .empty,
         .folded_command_blocks = .empty,
         .command_output_blocks = .empty,
         .tool_details = .empty,
         .transcript = .empty,
-        .next_entry_id = self.next_entry_id,
-        .last_rendered_cols = self.last_rendered_cols,
-        .transcript_cache_origin_untrimmed = self.transcript_cache_origin_untrimmed,
-        .max_transcript_bytes = self.max_transcript_bytes,
-        .command_output_display = self.command_output_display,
-        .command_output_render = self.command_output_render,
-        .collapse_tool_calls = self.collapse_tool_calls,
-        .full_transcript = self.full_transcript,
-        .replaceable_last_line = self.replaceable_last_line,
-        .replaceable_row = self.replaceable_row,
-        .replaceable_start = self.replaceable_start,
-        .transcript_band_dirty = self.transcript_band_dirty,
-    };
+        .next_entry_id = self.notebook.next_entry_id,
+        .last_rendered_cols = self.notebook.last_rendered_cols,
+        .transcript_cache_origin_untrimmed = self.notebook.transcript_cache_origin_untrimmed,
+        .max_transcript_bytes = self.notebook.max_transcript_bytes,
+        .command_output_display = self.notebook.command_output_display,
+        .replaceable_last_line = self.notebook.replaceable_last_line,
+        .replaceable_start = self.notebook.replaceable_start,
+    } };
+    shadow.adoptTranscriptView(self);
     errdefer shadow.deinit(alloc);
-    if (comptime @hasField(Runtime, "command_output_block_cap")) shadow.command_output_block_cap = self.command_output_block_cap;
+    if (comptime hasNotebookField(Runtime, "command_output_block_cap")) {
+        shadow.notebook.command_output_block_cap = self.notebook.command_output_block_cap;
+    }
     if (comptime @hasDecl(Runtime, "borrowedFrozenPrefix")) {
         shadow.frozen_prefix_source = self.borrowedFrozenPrefix();
     }
 
-    shadow.entries = try cloneEntries(alloc, self.entries.items);
-    shadow.tool_details = try cloneToolDetails(alloc, self.tool_details);
-    shadow.folded_command_blocks = try cloneFoldedCommandBlocks(
+    shadow.notebook.entries = try cloneEntries(alloc, self.notebook.entries.items);
+    shadow.notebook.tool_details = try cloneToolDetails(alloc, self.notebook.tool_details);
+    shadow.notebook.folded_command_blocks = try cloneFoldedCommandBlocks(
         alloc,
-        self.folded_command_blocks.items,
+        self.notebook.folded_command_blocks.items,
     );
-    shadow.command_output_blocks = try cloneCommandOutputBlocks(
+    shadow.notebook.command_output_blocks = try cloneCommandOutputBlocks(
         alloc,
-        self.command_output_blocks.items,
+        self.notebook.command_output_blocks.items,
     );
     return shadow;
 }
@@ -1732,7 +1716,7 @@ fn commitAuthoritativeRecordedMutationStateKeepingSource(
     );
     var source_kept = false;
     defer if (!source_kept) authoritative_source.deinit(alloc);
-    const unchanged_prefix = entryIdsPreservePrefix(self.entries.items, shadow.entries.items) and committedFlowPrefix(self, authoritative_source.bytes);
+    const unchanged_prefix = entryIdsPreservePrefix(self.notebook.entries.items, shadow.notebook.entries.items) and committedFlowPrefix(self, authoritative_source.bytes);
     const rebased = if (unchanged_prefix) false else try rebaseTranscriptRewrite(self, shadow, alloc, null);
     if (rebased) debug_trace.logf("scroll", "transcript_source_publication_rebased reason={s}", .{reason});
     commitMutationStateWithReconciliationSource(
@@ -1761,38 +1745,33 @@ fn commitMutationStateWithReconciliationSource(
 ) void {
     const Runtime = @TypeOf(shadow.*);
     const preserves_entry_prefix = entryIdsPreservePrefix(
-        self.entries.items,
-        shadow.entries.items,
+        self.notebook.entries.items,
+        shadow.notebook.entries.items,
     );
     const requested = if (comptime @hasField(Runtime, "render_requests"))
         shadow.render_requests.hasReason(.transcript)
     else
         shadow.transcript_band_dirty;
-    std.mem.swap(@TypeOf(self.entries), &self.entries, &shadow.entries);
-    std.mem.swap(@TypeOf(self.tool_details), &self.tool_details, &shadow.tool_details);
+    std.mem.swap(@TypeOf(self.notebook.entries), &self.notebook.entries, &shadow.notebook.entries);
+    std.mem.swap(@TypeOf(self.notebook.tool_details), &self.notebook.tool_details, &shadow.notebook.tool_details);
     std.mem.swap(
-        @TypeOf(self.folded_command_blocks),
-        &self.folded_command_blocks,
-        &shadow.folded_command_blocks,
+        @TypeOf(self.notebook.folded_command_blocks),
+        &self.notebook.folded_command_blocks,
+        &shadow.notebook.folded_command_blocks,
     );
     std.mem.swap(
-        @TypeOf(self.command_output_blocks),
-        &self.command_output_blocks,
-        &shadow.command_output_blocks,
+        @TypeOf(self.notebook.command_output_blocks),
+        &self.notebook.command_output_blocks,
+        &shadow.notebook.command_output_blocks,
     );
-    std.mem.swap(@TypeOf(self.transcript), &self.transcript, &shadow.transcript);
-    self.next_entry_id = shadow.next_entry_id;
-    self.last_rendered_cols = shadow.last_rendered_cols;
-    self.transcript_cache_origin_untrimmed = shadow.transcript_cache_origin_untrimmed;
-    self.command_output_display = shadow.command_output_display;
-    self.command_output_render = shadow.command_output_render;
-    self.full_transcript = shadow.full_transcript;
-    self.replaceable_last_line = shadow.replaceable_last_line;
-    self.replaceable_row = shadow.replaceable_row;
-    self.replaceable_start = shadow.replaceable_start;
-    self.cursor_row = shadow.cursor_row;
-    self.cursor_col = shadow.cursor_col;
-    self.transcript_band_dirty = shadow.transcript_band_dirty;
+    std.mem.swap(@TypeOf(self.notebook.transcript), &self.notebook.transcript, &shadow.notebook.transcript);
+    self.notebook.next_entry_id = shadow.notebook.next_entry_id;
+    self.notebook.last_rendered_cols = shadow.notebook.last_rendered_cols;
+    self.notebook.transcript_cache_origin_untrimmed = shadow.notebook.transcript_cache_origin_untrimmed;
+    self.notebook.command_output_display = shadow.notebook.command_output_display;
+    self.notebook.replaceable_last_line = shadow.notebook.replaceable_last_line;
+    self.notebook.replaceable_start = shadow.notebook.replaceable_start;
+    self.adoptCommittedTranscriptView(shadow);
     if (requested) {
         if (!preserves_entry_prefix) {
             if (comptime @hasDecl(Runtime, "markTranscriptStructureDirty")) {
@@ -2147,9 +2126,9 @@ pub fn appendRawBytesEntryClassifiedAt(
     class: RawEntryClass,
     created_at_ms: i64,
 ) !u32 {
-    const entry_id = self.next_entry_id;
-    self.next_entry_id +%= 1;
-    try self.entries.append(alloc, .{ .raw_bytes = .{ .id = entry_id, .created_at_ms = created_at_ms, .bytes = bytes, .class = class } });
+    const entry_id = self.notebook.next_entry_id;
+    self.notebook.next_entry_id +%= 1;
+    try self.notebook.entries.append(alloc, .{ .raw_bytes = .{ .id = entry_id, .created_at_ms = created_at_ms, .bytes = bytes, .class = class } });
     return entry_id;
 }
 
@@ -2161,8 +2140,8 @@ pub fn insertRawBytesEntryClassifiedAfter(
     class: RawEntryClass,
 ) !?u32 {
     const anchor_index = rawEntryIndex(self, after_entry_id) orelse return null;
-    const entry_id = self.next_entry_id;
-    self.next_entry_id +%= 1;
+    const entry_id = self.notebook.next_entry_id;
+    self.notebook.next_entry_id +%= 1;
     const entry: TranscriptEntry = .{
         .raw_bytes = .{
             .id = entry_id,
@@ -2171,7 +2150,7 @@ pub fn insertRawBytesEntryClassifiedAfter(
             .class = class,
         },
     };
-    try self.entries.insert(alloc, anchor_index + 1, entry);
+    try self.notebook.entries.insert(alloc, anchor_index + 1, entry);
     return entry_id;
 }
 
@@ -2182,7 +2161,7 @@ pub fn insertRawBytesEntryClassifiedAt(
     bytes: []const u8,
     class: RawEntryClass,
 ) !u32 {
-    const entry_id = self.next_entry_id;
+    const entry_id = self.notebook.next_entry_id;
     const entry: TranscriptEntry = .{
         .raw_bytes = .{
             .id = entry_id,
@@ -2191,18 +2170,18 @@ pub fn insertRawBytesEntryClassifiedAt(
             .class = class,
         },
     };
-    try self.entries.insert(alloc, @min(index, self.entries.items.len), entry);
-    self.next_entry_id +%= 1;
+    try self.notebook.entries.insert(alloc, @min(index, self.notebook.entries.items.len), entry);
+    self.notebook.next_entry_id +%= 1;
     return entry_id;
 }
 
 pub fn trimTrailingBlankLines(self: anytype) void {
-    while (self.transcript.items.len >= 2 and
-        self.transcript.items[self.transcript.items.len - 1] == '\n' and
-        self.transcript.items[self.transcript.items.len - 2] == '\n')
+    while (self.notebook.transcript.items.len >= 2 and
+        self.notebook.transcript.items[self.notebook.transcript.items.len - 1] == '\n' and
+        self.notebook.transcript.items[self.notebook.transcript.items.len - 2] == '\n')
     {
-        self.transcript.items.len -= 1;
-        self.transcript_cache_origin_untrimmed = false;
+        self.notebook.transcript.items.len -= 1;
+        self.notebook.transcript_cache_origin_untrimmed = false;
     }
 }
 
@@ -2223,27 +2202,27 @@ pub fn appendRawTranscriptEntryClassified(
     var entry_owns_dup = false;
     errdefer if (!entry_owns_dup) alloc.free(dup);
 
-    const entry_id = self.next_entry_id;
-    self.next_entry_id +%= 1;
-    try self.entries.append(alloc, .{ .raw_bytes = .{ .id = entry_id, .created_at_ms = io_mod.milliTimestamp(), .bytes = dup, .class = class } });
+    const entry_id = self.notebook.next_entry_id;
+    self.notebook.next_entry_id +%= 1;
+    try self.notebook.entries.append(alloc, .{ .raw_bytes = .{ .id = entry_id, .created_at_ms = io_mod.milliTimestamp(), .bytes = dup, .class = class } });
     entry_owns_dup = true;
     var rollback_entry = true;
     errdefer if (rollback_entry) {
-        var removed = self.entries.orderedRemove(self.entries.items.len - 1);
+        var removed = self.notebook.entries.orderedRemove(self.notebook.entries.items.len - 1);
         removed.deinit(alloc);
-        self.next_entry_id -%= 1;
+        self.notebook.next_entry_id -%= 1;
     };
 
-    self.transcript_cache_origin_untrimmed = false;
+    self.notebook.transcript_cache_origin_untrimmed = false;
     _ = try appendCappedWithinCapacity(
-        &self.transcript,
+        &self.notebook.transcript,
         alloc,
         text,
-        self.max_transcript_bytes,
-        &self.replaceable_last_line,
-        &self.replaceable_start,
+        self.notebook.max_transcript_bytes,
+        &self.notebook.replaceable_last_line,
+        &self.notebook.replaceable_start,
     );
-    self.replaceable_last_line = false;
+    self.notebook.replaceable_last_line = false;
     _ = self.advanceCursor(text);
     requestTranscriptPaintFrom(self, entry_id);
     rollback_entry = false;
@@ -2258,7 +2237,7 @@ pub fn updateRawBytesEntry(
     new_bytes: []const u8,
 ) !bool {
     var match_idx: ?usize = null;
-    for (self.entries.items, 0..) |entry, i| {
+    for (self.notebook.entries.items, 0..) |entry, i| {
         if (entry == .raw_bytes and entry.raw_bytes.id == entry_id) {
             match_idx = i;
             break;
@@ -2275,16 +2254,16 @@ pub fn updateRawBytesEntry(
     // Swap the pointer so renderEntriesToBytes sees the new content.
     // The paired errdefer restores the pointer on any later failure so
     // the entry keeps owning `old_bytes` (still alive until commit).
-    const old_bytes = self.entries.items[idx].raw_bytes.bytes;
-    self.entries.items[idx].raw_bytes.bytes = new_dup;
+    const old_bytes = self.notebook.entries.items[idx].raw_bytes.bytes;
+    self.notebook.entries.items[idx].raw_bytes.bytes = new_dup;
     errdefer if (!committed) {
-        self.entries.items[idx].raw_bytes.bytes = old_bytes;
+        self.notebook.entries.items[idx].raw_bytes.bytes = old_bytes;
     };
 
     const new_buffer = try renderPlainEntries(
         self,
         alloc,
-        self.layout.cols,
+        self.transcriptWrapCols(),
     );
     defer alloc.free(new_buffer);
 
@@ -2295,11 +2274,11 @@ pub fn updateRawBytesEntry(
     alloc.free(old_bytes);
     committed = true;
 
-    if (idx == self.entries.items.len - 1) {
-        self.replaceable_start = self.transcript.items.len - new_bytes.len;
-        self.replaceable_last_line = true;
+    if (idx == self.notebook.entries.items.len - 1) {
+        self.notebook.replaceable_start = self.notebook.transcript.items.len - new_bytes.len;
+        self.notebook.replaceable_last_line = true;
     } else {
-        self.replaceable_last_line = false;
+        self.notebook.replaceable_last_line = false;
     }
     try pruneOrphanedCommandState(self, alloc);
     self.recomputeCursorFromTranscript();
@@ -2314,7 +2293,7 @@ pub fn updateRawBytesEntry(
 }
 
 pub fn setRawEntryClass(self: anytype, entry_id: u32, class: RawEntryClass) bool {
-    for (self.entries.items) |*entry| {
+    for (self.notebook.entries.items) |*entry| {
         if (entry.* == .raw_bytes and entry.raw_bytes.id == entry_id) {
             entry.raw_bytes.class = class;
             return true;
@@ -2324,7 +2303,7 @@ pub fn setRawEntryClass(self: anytype, entry_id: u32, class: RawEntryClass) bool
 }
 
 pub fn rawEntryClass(self: anytype, entry_id: u32) ?RawEntryClass {
-    for (self.entries.items) |entry| {
+    for (self.notebook.entries.items) |entry| {
         if (entry == .raw_bytes and entry.raw_bytes.id == entry_id) return entry.raw_bytes.class;
     }
     return null;
@@ -2372,7 +2351,7 @@ pub fn writeUserPromptCard(
 
     const Runtime = @TypeOf(self.*);
     const reuses_source = comptime @hasDecl(Runtime, "adoptCommittedTranscriptSource");
-    const revision_before: u64 = if (comptime reuses_source) self.full_transcript_content_revision else 0;
+    const revision_before: u64 = if (comptime reuses_source) self.notebook.full_transcript_content_revision else 0;
     var committed_source: ?source_preparation.TranscriptPreparationSource = null;
     try commitAuthoritativeRecordedMutationStateKeepingSource(
         self,
@@ -2433,9 +2412,9 @@ fn appendUserTurnOwnedWithSkillTokensAndRetention(
         freeSkillTokenSpans(alloc, owned_skill_tokens);
     };
     owned_skill_tokens = try dupeSkillTokenSpans(alloc, skill_tokens);
-    const entry_id = self.next_entry_id;
-    self.next_entry_id +%= 1;
-    try self.entries.append(alloc, .{ .user_turn = .{
+    const entry_id = self.notebook.next_entry_id;
+    self.notebook.next_entry_id +%= 1;
+    try self.notebook.entries.append(alloc, .{ .user_turn = .{
         .id = entry_id,
         .created_at_ms = io_mod.milliTimestamp(),
         .turn = turn,
@@ -2450,9 +2429,9 @@ fn appendUserTurnOwnedWithSkillTokensAndRetention(
 }
 
 pub fn appendAssistantTurnEntry(self: anytype, alloc: Allocator) !u32 {
-    const entry_id = self.next_entry_id;
-    self.next_entry_id +%= 1;
-    try self.entries.append(alloc, .{ .assistant_turn = .{ .id = entry_id, .created_at_ms = io_mod.milliTimestamp(), .segments = .{} } });
+    const entry_id = self.notebook.next_entry_id;
+    self.notebook.next_entry_id +%= 1;
+    try self.notebook.entries.append(alloc, .{ .assistant_turn = .{ .id = entry_id, .created_at_ms = io_mod.milliTimestamp(), .segments = .{} } });
     try pruneOrphanedCommandState(self, alloc);
     return entry_id;
 }
@@ -2468,32 +2447,32 @@ pub fn appendAssistantTableOwned(
         defer shadow.deinit(alloc);
         const id = try appendAssistantTableOwned(&shadow, alloc, table);
         errdefer {
-            _ = shadow.entries.pop();
+            _ = shadow.notebook.entries.pop();
         }
         try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "assistant_table_append", .preserve_same_epoch);
         return id;
     }
-    const entry_id = self.next_entry_id;
-    try self.entries.append(alloc, .{ .assistant_table = .{
+    const entry_id = self.notebook.next_entry_id;
+    try self.notebook.entries.append(alloc, .{ .assistant_table = .{
         .id = entry_id,
         .created_at_ms = io_mod.milliTimestamp(),
         .table = table,
     } });
     errdefer {
-        _ = self.entries.pop();
+        _ = self.notebook.entries.pop();
     }
 
     const rendered = try renderPlainEntries(
         self,
         alloc,
-        self.layout.cols,
+        self.transcriptWrapCols(),
     );
     defer alloc.free(rendered);
     try ensurePaintReservation(self, alloc);
     try rebuildTranscriptFromRendered(self, alloc, rendered, "append_assistant_table");
     try pruneOrphanedCommandState(self, alloc);
     requestTranscriptPaint(self);
-    self.next_entry_id +%= 1;
+    self.notebook.next_entry_id +%= 1;
     return entry_id;
 }
 
@@ -2508,32 +2487,32 @@ pub fn appendAssistantCodeBlockOwned(
         defer shadow.deinit(alloc);
         const id = try appendAssistantCodeBlockOwned(&shadow, alloc, block);
         errdefer {
-            _ = shadow.entries.pop();
+            _ = shadow.notebook.entries.pop();
         }
         try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "assistant_code_append", .preserve_same_epoch);
         return id;
     }
-    const entry_id = self.next_entry_id;
-    try self.entries.append(alloc, .{ .assistant_code_block = .{
+    const entry_id = self.notebook.next_entry_id;
+    try self.notebook.entries.append(alloc, .{ .assistant_code_block = .{
         .id = entry_id,
         .created_at_ms = io_mod.milliTimestamp(),
         .block = block,
     } });
     errdefer {
-        _ = self.entries.pop();
+        _ = self.notebook.entries.pop();
     }
 
     const rendered = try renderPlainEntries(
         self,
         alloc,
-        self.layout.cols,
+        self.transcriptWrapCols(),
     );
     defer alloc.free(rendered);
     try ensurePaintReservation(self, alloc);
     try rebuildTranscriptFromRendered(self, alloc, rendered, "append_assistant_code_block");
     try pruneOrphanedCommandState(self, alloc);
     requestTranscriptPaint(self);
-    self.next_entry_id +%= 1;
+    self.notebook.next_entry_id +%= 1;
     return entry_id;
 }
 
@@ -2545,31 +2524,31 @@ pub fn appendAssistantThematicRule(self: anytype, alloc: Allocator) !u32 {
         try commitAuthoritativeRecordedMutationState(self, &shadow, alloc, "assistant_rule_append", .preserve_same_epoch);
         return id;
     }
-    const entry_id = self.next_entry_id;
-    try self.entries.append(alloc, .{ .assistant_thematic_rule = .{
+    const entry_id = self.notebook.next_entry_id;
+    try self.notebook.entries.append(alloc, .{ .assistant_thematic_rule = .{
         .id = entry_id,
         .created_at_ms = io_mod.milliTimestamp(),
     } });
     errdefer {
-        _ = self.entries.pop();
+        _ = self.notebook.entries.pop();
     }
 
     const rendered = try renderPlainEntries(
         self,
         alloc,
-        self.layout.cols,
+        self.transcriptWrapCols(),
     );
     defer alloc.free(rendered);
     try ensurePaintReservation(self, alloc);
     try rebuildTranscriptFromRendered(self, alloc, rendered, "append_assistant_thematic_rule");
     try pruneOrphanedCommandState(self, alloc);
     requestTranscriptPaint(self);
-    self.next_entry_id +%= 1;
+    self.notebook.next_entry_id +%= 1;
     return entry_id;
 }
 
 pub fn lookupAssistantSegments(self: anytype, id: u32) ?*AssistantTurnSegments {
-    for (self.entries.items) |*entry| {
+    for (self.notebook.entries.items) |*entry| {
         switch (entry.*) {
             .assistant_turn => |*e| if (e.id == id) return &e.segments,
             else => {},
@@ -2579,8 +2558,8 @@ pub fn lookupAssistantSegments(self: anytype, id: u32) ?*AssistantTurnSegments {
 }
 
 pub fn tailAssistantSegments(self: anytype) ?*AssistantTurnSegments {
-    if (self.entries.items.len == 0) return null;
-    const last = &self.entries.items[self.entries.items.len - 1];
+    if (self.notebook.entries.items.len == 0) return null;
+    const last = &self.notebook.entries.items[self.notebook.entries.items.len - 1];
     return switch (last.*) {
         .assistant_turn => |*e| if (e.inline_hidden) null else &e.segments,
         else => null,
@@ -2600,9 +2579,9 @@ fn commitAssistantStreamChunkFast(
 ) !AssistantStreamAdmission {
     const tail_segments = tailAssistantSegments(self);
     const entry_id = if (tail_segments != null)
-        self.entries.items[self.entries.items.len - 1].id()
+        self.notebook.entries.items[self.notebook.entries.items.len - 1].id()
     else
-        self.next_entry_id;
+        self.notebook.next_entry_id;
 
     var pending_segments: AssistantTurnSegments = .{};
     defer pending_segments.deinit(alloc);
@@ -2610,26 +2589,26 @@ fn commitAssistantStreamChunkFast(
         try segments.text.ensureUnusedCapacity(alloc, text.len);
     } else {
         try pending_segments.text.appendSlice(alloc, text);
-        try self.entries.ensureUnusedCapacity(alloc, 1);
+        try self.notebook.entries.ensureUnusedCapacity(alloc, 1);
     }
 
     const transcript_capacity = @min(
-        self.max_transcript_bytes,
-        self.transcript.items.len +| text.len,
+        self.notebook.max_transcript_bytes,
+        self.notebook.transcript.items.len +| text.len,
     );
-    try self.transcript.ensureTotalCapacity(alloc, transcript_capacity);
+    try self.notebook.transcript.ensureTotalCapacity(alloc, transcript_capacity);
     try self.writeTranscriptBytesFrom(alloc, metrics, text, true, entry_id);
 
     if (tail_segments) |segments| {
         segments.text.appendSliceAssumeCapacity(text);
     } else {
-        self.entries.appendAssumeCapacity(.{ .assistant_turn = .{
+        self.notebook.entries.appendAssumeCapacity(.{ .assistant_turn = .{
             .id = entry_id,
             .created_at_ms = io_mod.milliTimestamp(),
             .segments = pending_segments,
         } });
         pending_segments = .{};
-        self.next_entry_id +%= 1;
+        self.notebook.next_entry_id +%= 1;
     }
 
     return .{
@@ -2738,23 +2717,23 @@ fn checkRewritePublicationContinuation(command: bool, retire: bool) !void {
     defer next.deinit(alloc);
     try std.testing.expect(before.bytes.len > 0 and before.line_provenance.len > 0);
     if (retire) {
-        var entry = next.entries.pop().?;
+        var entry = next.notebook.entries.pop().?;
         entry.deinit(alloc);
-        next.transcript.clearRetainingCapacity();
+        next.notebook.transcript.clearRetainingCapacity();
     } else if (command) {
-        const line = &next.command_output_blocks.items[0].lines.items[0];
+        const line = &next.notebook.command_output_blocks.items[0].lines.items[0];
         const text = try std.mem.concat(alloc, u8, &.{ line.text, "_UNPAINTED_APPEND" });
         alloc.free(line.text);
         line.text = text;
-        next.command_output_blocks.items[0].retained_text_bytes += "_UNPAINTED_APPEND".len;
+        next.notebook.command_output_blocks.items[0].retained_text_bytes += "_UNPAINTED_APPEND".len;
         var appended = try source_preparation.prepareRetentionSource(&next, alloc);
         defer appended.deinit(alloc);
         try std.testing.expect(std.mem.find(u8, line.text, "_UNPAINTED_APPEND") != null);
         try std.testing.expect(std.mem.find(u8, appended.bytes, "_UNPAINTED_APPEND") == null);
     } else {
         const replacement = try alloc.dupe(u8, "COMMITTED_RAW_UNPAINTED_APPEND");
-        alloc.free(next.entries.items[0].raw_bytes.bytes);
-        next.entries.items[0].raw_bytes.bytes = replacement;
+        alloc.free(next.notebook.entries.items[0].raw_bytes.bytes);
+        next.notebook.entries.items[0].raw_bytes.bytes = replacement;
     }
     const diagnostic = runtime.transcriptCommitDiagnostic();
     const flow_ptr = runtime.transcript_commit_state.stable.flow.ptr;
@@ -2796,7 +2775,7 @@ fn checkRewritePublicationContinuation(command: bool, retire: bool) !void {
 pub fn settleTranscriptPublication(self: anytype, alloc: Allocator, checkpoint: ?*build_checkpoint.BuildCheckpoint) !bool {
     try build_checkpoint.poll(checkpoint);
     const identity = self.committedRetentionIdentity() orelse return false;
-    if (identity.publication_entries.len == 0 or self.fullTranscriptActive() or self.pending_resume_source != null) return false;
+    if (identity.publication_entries.len == 0 or self.fullTranscriptActive() or self.notebook.pending_resume_source != null) return false;
     if (self.transcriptCommitDiagnostic().history_visual_offset < identity.publication_release_floor) return false;
     var before = (try self.prepareCommittedRetentionSourceInterruptible(alloc, checkpoint)) orelse return false;
     defer before.deinit(alloc);
@@ -2825,7 +2804,7 @@ fn finalizedPublicationEntry(self: anytype, next: anytype, entry: TranscriptEntr
         },
         .semantic_notice => |notice| !notice.inline_hidden and !notice.pending_replacement,
         .assistant_turn => |assistant| !assistant.inline_hidden and
-            (next.entries.items.len == 0 or next.entries.items[next.entries.items.len - 1].id() != entry.id() or !self.transcript_release.assistant_tail_writable),
+            (next.notebook.entries.items.len == 0 or next.notebook.entries.items[next.notebook.entries.items.len - 1].id() != entry.id() or !self.notebook.transcript_release.assistant_tail_writable),
         .user_turn => |user| !user.inline_hidden,
         .assistant_table, .assistant_code_block, .assistant_thematic_rule => true,
     };
@@ -2859,18 +2838,18 @@ fn rebaseTranscriptRewrite(self: anytype, next: anytype, alloc: Allocator, check
         try previous_ids.put(alloc, extent.entry_id, {});
         try committed_texts.put(alloc, extent.entry_id, .{ .bytes = extent.bytes });
     }
-    for (self.entries.items, 0..) |entry, index| {
+    for (self.notebook.entries.items, 0..) |entry, index| {
         if (committed_texts.getPtr(entry.id())) |text| text.index = index;
     }
     compactEntriesToRetainedSet(&retained, alloc, &previous_ids);
-    for (retained.entries.items) |*entry| {
+    for (retained.notebook.entries.items) |*entry| {
         try build_checkpoint.consume(checkpoint, entryRetainedBytes(entry.*));
         // Lifecycle status replaces an existing presentation. Other raw entries
         // may have grown since the last frame and must retain its byte extent.
         if (entry.* == .raw_bytes and entry.raw_bytes.class != .tool_status) {
             const committed = committed_texts.get(entry.id()) orelse continue;
             const old_index = committed.index orelse continue;
-            const old_bytes = self.entries.items[old_index].raw_bytes.bytes;
+            const old_bytes = self.notebook.entries.items[old_index].raw_bytes.bytes;
             const bytes = try alloc.dupe(u8, old_bytes[0..@min(committed.bytes, old_bytes.len)]);
             alloc.free(entry.raw_bytes.bytes);
             entry.raw_bytes.bytes = bytes;
@@ -2878,7 +2857,7 @@ fn rebaseTranscriptRewrite(self: anytype, next: anytype, alloc: Allocator, check
         if (entry.* != .assistant_turn) continue;
         const committed = committed_texts.get(entry.id()) orelse continue;
         const old_index = committed.index orelse continue;
-        const old = &self.entries.items[old_index].assistant_turn.segments;
+        const old = &self.notebook.entries.items[old_index].assistant_turn.segments;
         const bytes = old.text.items[0..@min(committed.bytes, old.text.items.len)];
         try entry.assistant_turn.segments.text.resize(alloc, bytes.len);
         @memcpy(entry.assistant_turn.segments.text.items, bytes);
@@ -2893,11 +2872,8 @@ fn rebaseTranscriptRewrite(self: anytype, next: anytype, alloc: Allocator, check
     defer retiring.deinit(alloc);
     for (committed_identity.publication_entries) |id| try retiring.put(alloc, id, {});
     const history = self.transcriptCommitDiagnostic().history_visual_offset;
-    const publication_limit: ?usize = switch (self.transcript_commit_state) {
-        .recovering => |receipt| receipt.materialized_flow_len,
-        .stable, .invalid => null,
-    };
-    for (self.entries.items) |entry| {
+    const publication_limit: ?usize = self.committedPublicationLimit();
+    for (self.notebook.entries.items) |entry| {
         if (!finalizedPublicationEntry(self, next, entry)) continue;
         if (publication_limit) |limit| {
             const start = for (before.line_provenance, 0..) |line, index| {
@@ -2935,10 +2911,10 @@ pub fn streamAssistantChunk(
 ) !u32 {
     if (text.len > 0) try self.assertCanMutateTranscript();
 
-    const prior_entry_count = self.entries.items.len;
+    const prior_entry_count = self.notebook.entries.items.len;
     const prior_tail_kind: []const u8 = if (prior_entry_count == 0)
         "empty"
-    else switch (self.entries.items[prior_entry_count - 1]) {
+    else switch (self.notebook.entries.items[prior_entry_count - 1]) {
         .raw_bytes => "raw_bytes",
         .semantic_notice => "semantic_notice",
         .user_turn => "user_turn",
@@ -2975,7 +2951,7 @@ pub fn retintEntriesForTheme(
     var shadow = try cloneMutationState(self, alloc);
     defer shadow.deinit(alloc);
 
-    for (shadow.entries.items) |*entry| {
+    for (shadow.notebook.entries.items) |*entry| {
         switch (entry.*) {
             .raw_bytes => |*raw| {
                 if (!themeOwnsRawEntry(raw.class)) continue;
@@ -3161,17 +3137,17 @@ pub fn appendReplaceableTranscriptLine(self: anytype, alloc: Allocator, metrics:
     _ = metrics;
     if (text.len == 0) return 0;
 
-    const start_row = self.cursor_row;
-    debug_trace.logf("replace", "append start_row={d} text_bytes={d} transcript_len_before={d} cols={d}", .{ start_row, text.len, self.transcript.items.len, self.layout.cols });
+    const start_row = self.transcriptCursorRow();
+    debug_trace.logf("replace", "append start_row={d} text_bytes={d} transcript_len_before={d} cols={d}", .{ start_row, text.len, self.notebook.transcript.items.len, self.transcriptWrapCols() });
 
     const entry_id = try appendReplaceableTranscriptLineSilent(self, alloc, text);
     // Buffer-only — no terminal emit here, so no natural scroll
-    // to track. `advanceCursor` still updates `self.cursor_row`
-    // (capped) and `self.cursor_col` for between-tick heuristics
+    // to track. `advanceCursor` still updates the host's cursor
+    // (row capped, and column) for between-tick heuristics
     // in `main.zig`; the paint pass owns the authoritative cursor
     // state after the next render.
     _ = self.advanceCursor(text);
-    self.replaceable_row = start_row;
+    self.setReplaceableRow(start_row);
     requestTranscriptPaint(self);
     return entry_id;
 }
@@ -3190,33 +3166,33 @@ pub fn appendReplaceableTranscriptLineClassified(
 
 pub fn replaceTrailingTranscriptLine(self: anytype, alloc: Allocator, metrics: *Metrics, text: []const u8) !bool {
     _ = metrics;
-    if (!self.replaceable_last_line or text.len == 0) return false;
-    if (self.replaceable_start > self.transcript.items.len) return false;
+    if (!self.notebook.replaceable_last_line or text.len == 0) return false;
+    if (self.notebook.replaceable_start > self.notebook.transcript.items.len) return false;
 
-    debug_trace.logf("replace", "enter replaceable_row={d} replaceable_start={d} old_bytes={d} new_bytes={d} cols={d}", .{ self.replaceable_row, self.replaceable_start, self.transcript.items.len - self.replaceable_start, text.len, self.layout.cols });
+    debug_trace.logf("replace", "enter replaceable_row={d} replaceable_start={d} old_bytes={d} new_bytes={d} cols={d}", .{ self.replaceableRow(), self.notebook.replaceable_start, self.notebook.transcript.items.len - self.notebook.replaceable_start, text.len, self.transcriptWrapCols() });
 
     if (!try replaceTrailingTranscriptLineSilent(self, alloc, text)) return false;
     self.recomputeCursorFromTranscript();
     requestTranscriptPaint(self);
 
-    debug_trace.logf("replace", "exit new_cursor={d},{d}", .{ self.cursor_row, self.cursor_col });
+    debug_trace.logf("replace", "exit new_cursor={d},{d}", .{ self.transcriptCursorRow(), self.transcriptCursorCol() });
     return true;
 }
 
 pub fn appendReplaceableTranscriptLineSilent(self: anytype, alloc: Allocator, text: []const u8) !u32 {
     if (text.len == 0) return 0;
     try self.assertCanMutateTranscript();
-    self.transcript_cache_origin_untrimmed = false;
+    self.notebook.transcript_cache_origin_untrimmed = false;
     const appended = try appendCappedWithinCapacity(
-        &self.transcript,
+        &self.notebook.transcript,
         alloc,
         text,
-        self.max_transcript_bytes,
-        &self.replaceable_last_line,
-        &self.replaceable_start,
+        self.notebook.max_transcript_bytes,
+        &self.notebook.replaceable_last_line,
+        &self.notebook.replaceable_start,
     );
-    self.replaceable_start = self.transcript.items.len - appended;
-    self.replaceable_last_line = true;
+    self.notebook.replaceable_start = self.notebook.transcript.items.len - appended;
+    self.notebook.replaceable_last_line = true;
 
     // Mirror the replaceable line into the entries list as its own
     // raw_bytes entry. Subsequent replaces target this trailing
@@ -3239,27 +3215,27 @@ pub fn appendReplaceableTranscriptLineSilentClassified(self: anytype, alloc: All
 }
 
 pub fn replaceTrailingTranscriptLineSilent(self: anytype, alloc: Allocator, text: []const u8) !bool {
-    if (!self.replaceable_last_line or text.len == 0) return false;
+    if (!self.notebook.replaceable_last_line or text.len == 0) return false;
 
-    if (self.replaceable_start > self.transcript.items.len) return false;
+    if (self.notebook.replaceable_start > self.notebook.transcript.items.len) return false;
     try self.assertCanMutateTranscript();
-    self.transcript_cache_origin_untrimmed = false;
-    self.transcript.items.len = self.replaceable_start;
+    self.notebook.transcript_cache_origin_untrimmed = false;
+    self.notebook.transcript.items.len = self.notebook.replaceable_start;
     _ = try appendCappedWithinCapacity(
-        &self.transcript,
+        &self.notebook.transcript,
         alloc,
         text,
-        self.max_transcript_bytes,
-        &self.replaceable_last_line,
-        &self.replaceable_start,
+        self.notebook.max_transcript_bytes,
+        &self.notebook.replaceable_last_line,
+        &self.notebook.replaceable_start,
     );
 
     // Mirror: while replaceable is active, the trailing raw_bytes
     // entry represents the replaceable content. Swap its bytes in
     // place so the entry count stays stable across ticks and the
     // spinner remains a single logical entry.
-    if (self.entries.items.len > 0) {
-        const tail = &self.entries.items[self.entries.items.len - 1];
+    if (self.notebook.entries.items.len > 0) {
+        const tail = &self.notebook.entries.items[self.notebook.entries.items.len - 1];
         if (tail.* == .raw_bytes) {
             const old = tail.raw_bytes.bytes;
             const new_bytes = try alloc.dupe(u8, text);
@@ -3290,11 +3266,11 @@ pub fn writeNotice(
         return;
     }
 
-    const cols: u16 = if (self.layout.cols > 0) self.layout.cols else 80;
+    const cols: u16 = wrapCols(self);
     const rendered = try transcript_blocks.renderSemanticNotice(
         alloc,
         notice,
-        self.command_output_render.styles,
+        self.commandOutputRender().styles,
         cols,
     );
     defer alloc.free(rendered);
@@ -3430,26 +3406,35 @@ test "refreshFoldedCommandSummaryIndices uses final preparation indices" {
     };
     const Runtime = struct {
         layout: struct { cols: u16 },
-        entries: std.ArrayList(TranscriptEntry),
-        folded_command_blocks: std.ArrayList(FoldedBlock),
+        notebook: struct {
+            entries: std.ArrayList(TranscriptEntry),
+            folded_command_blocks: std.ArrayList(FoldedBlock),
+        },
         command_output_render: command_output_runtime.CommandOutputRenderPolicy = .{},
+
+        fn commandOutputRender(self: *const @This()) command_output_runtime.CommandOutputRenderPolicy {
+            return self.command_output_render;
+        }
+
+        fn transcriptWrapCols(self: *const @This()) u16 {
+            return self.layout.cols;
+        }
     };
 
     var runtime = Runtime{
         .layout = .{ .cols = 20 },
-        .entries = .empty,
-        .folded_command_blocks = .empty,
+        .notebook = .{ .entries = .empty, .folded_command_blocks = .empty },
     };
     defer {
-        for (runtime.entries.items) |*entry| entry.deinit(alloc);
-        runtime.entries.deinit(alloc);
-        runtime.folded_command_blocks.deinit(alloc);
+        for (runtime.notebook.entries.items) |*entry| entry.deinit(alloc);
+        runtime.notebook.entries.deinit(alloc);
+        runtime.notebook.folded_command_blocks.deinit(alloc);
     }
 
     var segments: AssistantTurnSegments = .{};
     try segments.text.appendSlice(alloc, "assistant prose");
-    try runtime.entries.append(alloc, .{ .assistant_turn = .{ .id = 1, .segments = segments } });
-    try runtime.entries.append(alloc, .{ .raw_bytes = .{
+    try runtime.notebook.entries.append(alloc, .{ .assistant_turn = .{ .id = 1, .segments = segments } });
+    try runtime.notebook.entries.append(alloc, .{ .raw_bytes = .{
         .id = 2,
         .bytes = try alloc.dupe(u8, "first summary\n"),
         .class = .tool_status,
@@ -3461,21 +3446,21 @@ test "refreshFoldedCommandSummaryIndices uses final preparation indices" {
             "|------|--------|\n" ++
             "| api | Complete |\n",
     );
-    try runtime.entries.append(alloc, .{ .assistant_table = .{ .id = 3, .table = table } });
-    try runtime.entries.append(alloc, .{ .raw_bytes = .{
+    try runtime.notebook.entries.append(alloc, .{ .assistant_table = .{ .id = 3, .table = table } });
+    try runtime.notebook.entries.append(alloc, .{ .raw_bytes = .{
         .id = 4,
         .bytes = try alloc.dupe(u8, "second summary\n"),
         .class = .tool_status,
     } });
 
-    try runtime.entries.append(alloc, .{ .assistant_code_block = .{
+    try runtime.notebook.entries.append(alloc, .{ .assistant_code_block = .{
         .id = 5,
         .block = .{
             .language = try alloc.dupe(u8, "zig"),
             .code = try alloc.dupe(u8, "const value = 1;"),
         },
     } });
-    try runtime.entries.append(alloc, .{ .raw_bytes = .{
+    try runtime.notebook.entries.append(alloc, .{ .raw_bytes = .{
         .id = 6,
         .bytes = try alloc.dupe(u8, "third summary\n"),
         .class = .tool_status,
@@ -3484,21 +3469,21 @@ test "refreshFoldedCommandSummaryIndices uses final preparation indices" {
     const summary_ids = [_]?u32{ 2, 4, 6 };
     var expected = try transcript_blocks.renderEntriesForPreparation(
         alloc,
-        runtime.entries.items,
+        runtime.notebook.entries.items,
         runtime.layout.cols,
         .{},
         .{ .folded_summary_entry_ids = &summary_ids },
     );
     defer expected.deinit(alloc);
 
-    try runtime.folded_command_blocks.appendSlice(alloc, &.{
+    try runtime.notebook.folded_command_blocks.appendSlice(alloc, &.{
         .{ .summary_entry_id = 2 },
         .{ .summary_entry_id = 4 },
         .{ .summary_entry_id = 6 },
     });
     try refreshFoldedCommandSummaryIndices(&runtime, alloc);
 
-    for (runtime.folded_command_blocks.items, expected.folded_summary_indices) |block, index| {
+    for (runtime.notebook.folded_command_blocks.items, expected.folded_summary_indices) |block, index| {
         try std.testing.expectEqual(index, block.summary_transcript_index);
     }
 }

@@ -92,6 +92,9 @@ pub const Action = union(enum) {
     toggle_permission_mode,
     open_all_sessions,
     open_model_catalog,
+    /// Ctrl+X: opens the agent list whatever the composer holds, or goes
+    /// back from it while it is open.
+    open_agent_list,
     insert_newline,
     paste_start,
     paste_end,

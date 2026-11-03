@@ -64,6 +64,8 @@ pub const CreditsLookupInput = struct {
     credential: ?[]const u8,
     credential_source: ?credentials.Source = null,
     tenant: ?[]const u8,
+    /// Setting it ends an in-flight lookup early with an error snapshot.
+    cancel_flag: ?*std.atomic.Value(bool) = null,
 };
 
 pub const FetchCreditsFn = *const fn (

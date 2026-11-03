@@ -55,6 +55,9 @@ jobs:
       - name: Check indexer boundary
         run: ./scripts/check-indexer-boundary.sh
 
+      - name: Check agents boundary
+        run: ./scripts/check-agents-boundary.sh
+
       - name: Check recovery boundary
         run: ./scripts/check-recovery-boundary.sh
 
@@ -65,6 +68,9 @@ jobs:
           curl -fsSL -o "$jar" https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
           echo "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  $jar" | sha256sum -c -
           TLA2TOOLS_JAR="$jar" tests/tla/recovery/check.sh
+
+      - name: Model-check the empty-reply nudge
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/agent_runtime/check.sh
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -82,6 +88,9 @@ jobs:
 
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
+
+      - name: Walk fx ask turns along the empty-reply model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/agent_runtime/driver.ts --self-check
 
       # The zsh user profile tests in src/core/execution/command_runner.zig
       # skip without /bin/zsh. They start interactive zsh with no terminal,
@@ -103,7 +112,7 @@ jobs:
         run: |
           started_at=$SECONDS
           trap 'printf "Unit tests elapsed: %ss\n" "$((SECONDS - started_at))"' EXIT
-          timeout "${TEST_TIMEOUT_SECONDS}s" zig build test -Doptimize=${{ matrix.optimize }}
+          timeout "${TEST_TIMEOUT_SECONDS}s" zig build test -Doptimize=${{ matrix.optimize }} --summary all
 
       - name: Save Zig cache
         uses: ./.github/actions/save-zig-cache
@@ -930,6 +939,7 @@ jobs:
         run: |
           scripts=(
             benchmarks/startup.sh
+            scripts/check-agents-boundary.sh
             scripts/check-compactor-boundary.sh
             scripts/check-indexer-boundary.sh
             scripts/check-public-surface.sh

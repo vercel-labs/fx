@@ -8,6 +8,9 @@ pub const ParsedCommand = union(enum) {
     quit,
     clear_screen,
     new_session,
+    launch_instance: []const u8,
+    close_instance,
+    show_agents,
     reset_session,
     resume_session,
     rename_session: []const u8,
@@ -33,7 +36,6 @@ pub const ParsedCommand = union(enum) {
     trace,
     compact,
     settings: []const u8,
-    alias: []const u8,
     credits,
     paste,
     fast: []const u8,
@@ -51,6 +53,9 @@ pub const CommandHandlers = struct {
     quit: *const fn (ctx: *anyopaque) anyerror!void,
     clear_screen: *const fn (ctx: *anyopaque) anyerror!void,
     new_session: *const fn (ctx: *anyopaque) anyerror!void,
+    launch_instance: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
+    close_instance: *const fn (ctx: *anyopaque) anyerror!void,
+    show_agents: *const fn (ctx: *anyopaque) anyerror!void,
     reset_session: *const fn (ctx: *anyopaque) anyerror!void,
     resume_session: *const fn (ctx: *anyopaque) anyerror!void,
     fork_session: *const fn (ctx: *anyopaque) anyerror!void,
@@ -77,7 +82,6 @@ pub const CommandHandlers = struct {
     create_trace: *const fn (ctx: *anyopaque) anyerror!void,
     compact_history: *const fn (ctx: *anyopaque) anyerror!void,
     handle_settings: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
-    handle_alias: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
     show_credits: *const fn (ctx: *anyopaque) anyerror!void,
     paste_clipboard: *const fn (ctx: *anyopaque) anyerror!void,
     handle_fast: *const fn (ctx: *anyopaque, rest: []const u8) anyerror!void,
@@ -100,6 +104,9 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .quit => .quit,
         .clear_screen => .clear_screen,
         .new_session => .new_session,
+        .launch_instance => .{ .launch_instance = payload },
+        .close_instance => .close_instance,
+        .show_agents => .show_agents,
         .reset_session => .reset_session,
         .resume_session => .resume_session,
         .rename_session => .{ .rename_session = payload },
@@ -125,7 +132,6 @@ fn parsedCommand(kind: SlashKind, payload: []const u8) ParsedCommand {
         .trace => .trace,
         .compact => .compact,
         .settings => .{ .settings = payload },
-        .alias => .{ .alias = payload },
         .credits => .credits,
         .paste => .paste,
         .fast => .{ .fast = payload },
@@ -165,6 +171,9 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .quit => try handlers.quit(handlers.ctx),
         .clear_screen => try handlers.clear_screen(handlers.ctx),
         .new_session => try handlers.new_session(handlers.ctx),
+        .launch_instance => |rest| try handlers.launch_instance(handlers.ctx, rest),
+        .close_instance => try handlers.close_instance(handlers.ctx),
+        .show_agents => try handlers.show_agents(handlers.ctx),
         .reset_session => try handlers.reset_session(handlers.ctx),
         .resume_session => try handlers.resume_session(handlers.ctx),
         .rename_session => |rest| try handlers.rename_session(handlers.ctx, rest),
@@ -193,7 +202,6 @@ pub fn route(registry: SlashRegistry, handlers: *const CommandHandlers, cmd: []c
         .trace => try handlers.create_trace(handlers.ctx),
         .compact => try handlers.compact_history(handlers.ctx),
         .settings => |rest| try handlers.handle_settings(handlers.ctx, rest),
-        .alias => |rest| try handlers.handle_alias(handlers.ctx, rest),
         .credits => try handlers.show_credits(handlers.ctx),
         .paste => try handlers.paste_clipboard(handlers.ctx),
         .fast => |rest| try handlers.handle_fast(handlers.ctx, rest),
@@ -282,6 +290,7 @@ test "parse rejects removed slash commands" {
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/history"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/rules"));
     try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/background"));
+    try std.testing.expectEqual(ParsedCommand.unknown, parse(testSlashRegistry(), "/alias build zig build"));
 }
 
 test "parse extracts image commands" {
@@ -350,13 +359,6 @@ test "parse extracts settings command payload" {
     }
     switch (parse(testSlashRegistry(), "/settings startup-scrollback off")) {
         .settings => |rest| try std.testing.expectEqualStrings("startup-scrollback off", rest),
-        else => return error.TestExpectedEqual,
-    }
-}
-
-test "parse extracts alias payload" {
-    switch (parse(testSlashRegistry(), "/alias build zig build")) {
-        .alias => |rest| try std.testing.expectEqualStrings("build zig build", rest),
         else => return error.TestExpectedEqual,
     }
 }
@@ -515,6 +517,9 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .quit = unexpectedNoPayload,
         .clear_screen = unexpectedNoPayload,
         .new_session = unexpectedNoPayload,
+        .launch_instance = unexpectedPayload,
+        .close_instance = unexpectedNoPayload,
+        .show_agents = unexpectedNoPayload,
         .reset_session = unexpectedNoPayload,
         .resume_session = unexpectedNoPayload,
         .fork_session = unexpectedNoPayload,
@@ -540,7 +545,6 @@ fn testHandlers(ctx: *TestContext) CommandHandlers {
         .create_trace = unexpectedNoPayload,
         .compact_history = unexpectedNoPayload,
         .handle_settings = unexpectedPayload,
-        .handle_alias = unexpectedPayload,
         .show_credits = unexpectedNoPayload,
         .paste_clipboard = unexpectedNoPayload,
         .handle_fast = unexpectedPayload,

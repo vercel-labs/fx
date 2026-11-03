@@ -158,6 +158,8 @@ function startAuthFixture(
     /** The code exchange waits for this file, after writing the other. */
     codeBarrierStartedPath?: string;
     codeBarrierReleasePath?: string;
+    /** Lists a registration endpoint, so a server added without a client ID can sign in. */
+    registration?: boolean;
   } = {},
 ) {
   const resourcePath = "/mcp";
@@ -184,6 +186,7 @@ function startAuthFixture(
   };
   let refreshCancellations = 0;
   let revocations = 0;
+  let registrations = 0;
   let protectedToolCalls = 0;
   let expectedChallenge = "";
   let expectedScope = "tools.read offline_access";
@@ -266,6 +269,7 @@ function startAuthFixture(
           token_endpoint_auth_methods_supported: ["none"],
           code_challenge_methods_supported: ["S256"],
           authorization_response_iss_parameter_supported: true,
+          ...(options.registration ? { registration_endpoint: `${origin}/register` } : {}),
         };
         if (options.authorizationMetadataContentType) {
           return new Response(JSON.stringify(metadata), {
@@ -389,6 +393,11 @@ function startAuthFixture(
         if (options.revokeDelayMs) await Bun.sleep(options.revokeDelayMs);
         return new Response("", { status: 200 });
       }
+      if (url.pathname === "/register" && options.registration && request.method === "POST") {
+        registrations += 1;
+        const asked = JSON.parse(body) as { redirect_uris?: string[] };
+        return Response.json({ client_id: "fx-mcp-auth-test", token_endpoint_auth_method: "none", redirect_uris: asked.redirect_uris ?? [] }, { status: 201 });
+      }
       return new Response("not found", { status: 404 });
     },
   });
@@ -404,6 +413,9 @@ function startAuthFixture(
     },
     get tokenExchanges() {
       return tokenExchanges;
+    },
+    get registrations() {
+      return registrations;
     },
     get refreshes() {
       return refreshes;
@@ -1164,6 +1176,56 @@ describe("MCP login", () => {
     await tui.waitForText("signed in", 10_000);
     const pane = await tui.captureFullScrollback();
     expect(pane).not.toContain(ACCESS_INITIAL);
+  }, 60_000);
+
+  test("fx mcp add signs in to a new server that needs a login, --no-login skips it, and without a browser it names the command", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { registration: true });
+    const root = createRoot(auth);
+    writeFileSync(join(root.home, ".fx", "mcp.json"), JSON.stringify({ mcp: {} }));
+    const env = v2Env(root);
+
+    const added = await runFx(["mcp", "add", "web", auth.url], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expect(added.stderr).toBe("");
+    expectExit0(added);
+    expect(added.stdout).toStartWith("Added web to ~/.fx/mcp.json.\nweb needs a login.\nApprove in your browser.");
+    expect(added.stdout).toEndWith("Signed in to web.\n");
+    expect(added.stdout).not.toContain(ACCESS_INITIAL);
+    expect(new URL(readFileSync(root.openLog, "utf8").trim()).pathname).toBe("/authorize");
+    expect(auth.registrations).toBe(1);
+    expect(auth.tokenExchanges).toBe(1);
+
+    const skipped = await runFx(["mcp", "add", "--no-login", "quiet", auth.url], { cwd: root.workspace, env, timeoutMs: 30_000 });
+    expectExit0(skipped);
+    expect(skipped.stdout).toBe("Added quiet to ~/.fx/mcp.json.\n");
+    // Without a browser, taking the address pasted back is `fx mcp login`'s.
+    const headless = await runFx(["mcp", "add", "later", auth.url], { cwd: root.workspace, env: { ...env, FX_NO_OPEN_BROWSER: "1" }, timeoutMs: 30_000 });
+    expectExit0(headless);
+    expect(headless.stdout).toBe("Added later to ~/.fx/mcp.json.\nlater needs a login. Sign in with: fx mcp login later\n");
+    expect(auth.tokenExchanges).toBe(1);
+  }, 90_000);
+
+  test.skipIf(!tmuxAvailable())("/mcp add signs in to a new server that needs a login once the shell loads it, and --no-login leaves it on the status line", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { registration: true });
+    const root = createRoot(auth);
+    writeFileSync(join(root.home, ".fx", "mcp.json"), JSON.stringify({ mcp: {} }));
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 140, height: 36,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText(`/mcp add web ${auth.url}`);
+    await tui.waitForText("Added web to ~/.fx/mcp.json.", 10_000);
+    // The shell loads it, sees it needs a login, and signs in as a typed /mcp login would.
+    await tui.waitForText("Sign in to web in your browser.", 15_000);
+    await tui.waitForText("Signed in to web.", 15_000);
+    expect(auth.tokenExchanges).toBe(1);
+    await tui.sendText(`/mcp add --no-login quiet ${auth.url}`);
+    await tui.waitForText("Added quiet to ~/.fx/mcp.json.", 10_000);
+    await tui.waitForText("quiet needs login · /mcp", 15_000);
+    expect(auth.tokenExchanges).toBe(1);
   }, 60_000);
 
   test.skipIf(!tmuxAvailable())("/mcp login NAME --no-browser links the address and prints the outcome in the transcript", async () => {
