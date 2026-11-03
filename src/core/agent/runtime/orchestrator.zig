@@ -11943,7 +11943,7 @@ fn processQueuedPromptLoop(
             );
             return;
         }
-        if (shell_execution_failure_retry.finishBatch()) {
+        if (shell_execution_failure_retry.finishBatch(step_batch.step_changed_files)) {
             if (agent_steps.allowsStep(config.agent_step_limit, step + 1)) {
                 const terminal_action = try observe_steering_boundary(deps, arena, arena, &within_turn_suffix, turn_id, .finalizing);
                 switch (terminal_action) {
