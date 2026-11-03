@@ -424,11 +424,11 @@ pub const State = struct {
             }
             return self.handle(alloc, .enter);
         }
-        if (self.layout_compact and mouse.row == 0) {
+        if (self.layout_compact and mouse.row == 1) {
             self.focus = .scope;
             return .redraw;
         }
-        const content_row = if (mouse.row >= 2) mouse.row - 2 else return .none;
+        const content_row = contentRow(mouse.row) orelse return .none;
         if (content_row >= self.layout_content_rows) return .none;
         if (!self.layout_compact and mouse.column <= self.layout_sidebar_width) {
             var scopes_buf: [64]Scope = undefined;
@@ -464,10 +464,17 @@ pub const State = struct {
         return .redraw;
     }
 
+    fn contentRow(row: u16) ?u16 {
+        // The renderer writes the first content line at terminal row 3; SGR
+        // mouse coordinates are one-based, so row 3 maps to content row 0.
+        if (row < 3) return null;
+        return row - 3;
+    }
+
     fn updateHover(self: *State, mouse: Mouse) void {
         self.hovered = null;
         self.hovered_scope = null;
-        const content_row = if (mouse.row >= 2) mouse.row - 2 else return;
+        const content_row = contentRow(mouse.row) orelse return;
         if (!self.layout_compact and mouse.column <= self.layout_sidebar_width) {
             var scopes_buf: [64]Scope = undefined;
             const list = self.scopes(&scopes_buf);
@@ -1021,6 +1028,12 @@ fn copyInto(buf: []u8, text: []const u8) ?[]const u8 {
     if (text.len > buf.len) return null;
     @memcpy(buf[0..text.len], text);
     return buf[0..text.len];
+}
+
+test "mouse rows map to rendered content rows" {
+    try std.testing.expectEqual(@as(?u16, null), State.contentRow(2));
+    try std.testing.expectEqual(@as(?u16, 0), State.contentRow(3));
+    try std.testing.expectEqual(@as(?u16, 4), State.contentRow(7));
 }
 
 test {

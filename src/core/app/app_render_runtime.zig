@@ -2057,6 +2057,12 @@ pub fn Runtime(comptime App: type) type {
                 app.model_hub.close(app.alloc);
                 return err;
             };
+            if (entering) try app_lifecycle.setCatalogMenuScreenMouseTracking(
+                &app.terminal,
+                &app.shell,
+                &app.metrics,
+                true,
+            );
             const layout = app.shell.layout;
             if (app.shell.shadow_vt) |grid| {
                 if (grid.cols != layout.cols or grid.rows != layout.rows) try grid.resize(layout.cols, layout.rows);

@@ -42,14 +42,14 @@ pub const default_permission_mode = config_runtime.default_permission_mode;
 /// Compile-time terminal restoration for one async-signal-safe `write(2)` call.
 /// Resets terminal modes, clears fx's program status, and ends with a newline
 /// before the next shell prompt.
-const abnormal_exit_restore_prefix = "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l\x1b[?1l\x1b>\x1b[?1049l\x1b[?7h\x1b[4l\x1b[?6l\x1b[0m\x1b[?25h\x1b[?2031l\x1b[?2004l" ++ program_status.clear_sequence;
+const abnormal_exit_restore_prefix = "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1l\x1b>\x1b[?1049l\x1b[?7h\x1b[4l\x1b[?6l\x1b[0m\x1b[?25h\x1b[?2031l\x1b[?2004l" ++ program_status.clear_sequence;
 const abnormal_exit_restore = abnormal_exit_restore_prefix ++ "\x1b[<u\x1b[>4;0m\n";
 const tmux_abnormal_exit_restore = abnormal_exit_restore_prefix ++ "\x1b[>4;0m\n";
-const normal_exit_restore_prefix = ui_terminal.theme_notification_disable_sequence ++ "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1004l\x1b[?1006l\x1b[?1l\x1b>\x1b[4l\x1b[?6l\x1b[?2004l" ++ program_status.clear_sequence;
+const normal_exit_restore_prefix = ui_terminal.theme_notification_disable_sequence ++ "\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1l\x1b>\x1b[4l\x1b[?6l\x1b[?2004l" ++ program_status.clear_sequence;
 const normal_exit_restore = normal_exit_restore_prefix ++ "\x1b[<u\x1b[>4;0m";
 const tmux_normal_exit_restore = normal_exit_restore_prefix ++ "\x1b[>4;0m";
 const alternate_screen_enter = "\x1b[?1049h";
-const alternate_mouse_tracking_enter = "\x1b[?1000h\x1b[?1006h";
+const alternate_mouse_tracking_enter = "\x1b[?1000h\x1b[?1003h\x1b[?1006h";
 
 /// Original handlers, written at bootstrap and restored at shutdown.
 /// Signal context never mutates them.
@@ -1482,6 +1482,15 @@ pub fn enterCatalogMenuScreen(terminal: *TerminalState, shell: *TranscriptRuntim
 
 pub fn leaveCatalogMenuScreen(terminal: *TerminalState, shell: *TranscriptRuntime, metrics: *Metrics) !void {
     try leaveAlternateScreen(terminal, shell, metrics, .catalog_menu);
+}
+
+pub fn setCatalogMenuScreenMouseTracking(
+    terminal: *TerminalState,
+    shell: *TranscriptRuntime,
+    metrics: *Metrics,
+    enabled: bool,
+) !void {
+    try setAlternateScreenMouseTracking(terminal, shell, metrics, .catalog_menu, enabled);
 }
 
 pub fn openFullTranscript(

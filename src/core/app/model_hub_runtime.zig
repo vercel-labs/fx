@@ -575,6 +575,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn buildSnapshot(app: *App) !hub.Snapshot {
+            if (comptime @hasField(App, "model_performance")) app.model_performance.reload();
             var builder: catalog.Builder = .init(app.alloc);
             errdefer builder.deinit();
             const arena = builder.arena();

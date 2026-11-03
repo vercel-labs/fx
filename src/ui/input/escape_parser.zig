@@ -459,11 +459,15 @@ fn sgrMouseAction(button: u16, column: u16, row: u16, terminator: u8) InputEscap
             else => .ignore,
         };
     }
-    if ((button & 0b11) != 0) return .ignore;
+    const motion = (button & 32) != 0;
+    // SGR 1003 reports motion with button 3 (35) when no button is held;
+    // retain the low button bits for modifier/button identity but do not
+    // reject that ordinary-motion report as an invalid press.
+    if (!motion and (button & 0b11) != 0) return .ignore;
 
-    const kind: MousePointerKind = if (terminator == 'm')
+    const kind: MousePointerKind = if (terminator == 'm' and !motion)
         .release
-    else if (terminator == 'M' and (button & 32) != 0)
+    else if (terminator == 'M' and motion)
         .drag
     else if (terminator == 'M')
         .press

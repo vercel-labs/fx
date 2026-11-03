@@ -41,6 +41,7 @@ const reducer_mod = @import("cursor_stream.zig");
 const cursor_models = @import("cursor_models.zig");
 const cursor_catalog = @import("cursor_catalog.zig");
 const chat_completions = @import("chat_completions.zig");
+const chat_protocol = @import("chat_completions_protocol.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const client_mod = @import("client.zig");
 const wire = @import("claude_agent_wire.zig");
@@ -54,6 +55,10 @@ const cursor_oauth = @import("../core/auth/cursor_oauth.zig");
 const secret = @import("../core/auth/secret.zig");
 const io_mod = @import("../core/shared/io.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
+const model_tool_schema = @import("../core/tooling/model_tool_schema.zig");
+const token_estimate = @import("../core/shared/token_estimate.zig");
+const tokenizer = @import("../core/tokenizer/tokenizer.zig");
+const types = @import("../core/shared/types.zig");
 const Allocator = std.mem.Allocator;
 
 pub const provider_id = cursor_oauth.provider_id;
@@ -82,7 +87,12 @@ pub fn bundle(definition: *const definitions.Definition) provider_set.Bundle {
     const context: *anyopaque = @ptrCast(@constCast(definition));
     return .{
         .title_model = definition.reviewer_model orelse cursor_models.small_model,
-        .agent_stream = .{ .context = context, .stream_fn = stream, .build_request_fn = build },
+        .agent_stream = .{
+            .context = context,
+            .stream_fn = stream,
+            .build_request_fn = build,
+            .measure_request_fn = measureRequest,
+        },
         .model_catalog = model_catalog_provider(definition),
         .cli_model_catalog = .{ .context = context, .fetch_fn = chat_completions.fetch_cli_catalog },
         .permission_reviewer = .{ .context = context, .review_fn = review },
@@ -126,6 +136,142 @@ pub fn build(_: ?*anyopaque, alloc: Allocator, request: streams.RequestData) any
         .conversation_id = &conversationId(request.session_id),
     });
     return cursor_request.pack(alloc, built);
+}
+
+/// Measures Cursor's typed input rather than treating its protobuf envelope as
+/// prompt text. The packed body still supplies the serialized-size signal used
+/// for capacity and calibration, while text tokens cover only content and tool
+/// definitions. Image bytes are transport data; their digest is retained as a
+/// calibration identity so changed current or historical images never reuse an
+/// old visual-cost sample.
+fn measureRequest(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    body: []const u8,
+    request: streams.RequestData,
+) anyerror!streams.RequestCost {
+    var text_tokens: usize = 0;
+    const encoding = request.provider_options.tokenizer;
+    const consume = struct {
+        fn text(total: *usize, value: []const u8, encoding_: ?tokenizer.Encoding) void {
+            total.* +|= token_estimate.textTokensWithEncoding(value, encoding_);
+        }
+    }.text;
+
+    for (request.instructions) |instruction| {
+        if (instruction.content) |content| consume(&text_tokens, content, encoding);
+    }
+    if (request.instructions.len == 0) consume(&text_tokens, "You are a helpful assistant.", encoding);
+    if (request.tool_choice == .required) consume(&text_tokens, "Respond only by calling one of the available tools, exactly once.", encoding);
+    for (request.messages) |message| {
+        if (message.content) |content| consume(&text_tokens, content, encoding);
+        if (message.tool_call_id) |id| consume(&text_tokens, id, encoding);
+        if (message.tool_name) |name| consume(&text_tokens, name, encoding);
+        for (message.tool_calls) |call| {
+            consume(&text_tokens, call.id, encoding);
+            consume(&text_tokens, call.name, encoding);
+            consume(&text_tokens, call.arguments_json, encoding);
+        }
+    }
+
+    var functions = try chat_protocol.select_functions(alloc, request.tools, request.tool_choice);
+    defer functions.deinit(alloc);
+    for (functions.items) |function| {
+        consume(&text_tokens, function.name, encoding);
+        consume(&text_tokens, function.description, encoding);
+        var schema: std.Io.Writer.Allocating = .init(alloc);
+        defer schema.deinit();
+        switch (function.schema) {
+            .builtin => |object| try model_tool_schema.writeObjectSchema(alloc, &schema.writer, object),
+            .dynamic => |value| try std.json.Stringify.value(value, .{}, &schema.writer),
+        }
+        consume(&text_tokens, schema.written(), encoding);
+    }
+
+    var image_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var found_image = false;
+    const update_identity = struct {
+        fn field(hasher: *std.crypto.hash.sha2.Sha256, tag: []const u8, value: []const u8) void {
+            const tag_len = tag.len;
+            const value_len = value.len;
+            hasher.update(std.mem.asBytes(&tag_len));
+            hasher.update(tag);
+            hasher.update(std.mem.asBytes(&value_len));
+            hasher.update(value);
+        }
+    }.field;
+    const mark_attachment = struct {
+        fn run(
+            hasher: *std.crypto.hash.sha2.Sha256,
+            found: *bool,
+            attachment: types.ImageAttachment,
+            update: *const fn (*std.crypto.hash.sha2.Sha256, []const u8, []const u8) void,
+        ) void {
+            found.* = true;
+            update(hasher, "media", attachment.media_type);
+            if (attachment.snapshot_sha256) |digest| {
+                update(hasher, "digest", digest);
+            } else if (attachment.inline_data) |bytes| {
+                update(hasher, "bytes", bytes);
+            } else {
+                update(hasher, "path", attachment.path);
+            }
+        }
+    }.run;
+    for (request.messages) |message| {
+        for (message.images) |attachment| mark_attachment(&image_hash, &found_image, attachment, update_identity);
+        if (message.tool_result_memory) |memory| for (memory.tool_images) |image| {
+            found_image = true;
+            update_identity(&image_hash, "media", image.mime_type);
+            if (image.data.len != 0) {
+                update_identity(&image_hash, "bytes", image.data);
+            } else if (image.name) |name| {
+                update_identity(&image_hash, "name", &name);
+            } else if (image.source_ref) |source| {
+                update_identity(&image_hash, "source", source);
+            }
+        };
+    }
+    if (request.verified_images) |snapshots| for (snapshots) |snapshot| {
+        found_image = true;
+        update_identity(&image_hash, "media", snapshot.media_type);
+        update_identity(&image_hash, "bytes", snapshot.bytes);
+    };
+
+    return .{
+        .serialized_bytes = body.len,
+        .text_tokens = text_tokens,
+        .image_identity = if (found_image) image_hash.finalResult() else null,
+        .estimated_input_tokens = text_tokens,
+    };
+}
+
+test "Cursor request measurement separates logical text from image identity" {
+    const image_a = types.ImageAttachment{
+        .path = @constCast(""),
+        .media_type = @constCast("image/png"),
+        .inline_data = @constCast(&[_]u8{ 1, 2, 3 }),
+    };
+    var image_b = image_a;
+    image_b.inline_data = @constCast(&[_]u8{ 4, 5, 6 });
+    const messages_a = [_]types.ChatMessage{.{ .role = .user, .content = "describe", .images = &.{image_a} }};
+    const messages_b = [_]types.ChatMessage{.{ .role = .user, .content = "describe", .images = &.{image_b} }};
+    const request_a: streams.RequestData = .{
+        .model = "composer-2.5",
+        .messages = &messages_a,
+        .tool_choice = .none,
+        .provider_options = .{},
+    };
+    const request_b = request_a;
+    const cost_a = try measureRequest(null, std.testing.allocator, "packed", request_a);
+    const cost_b = try measureRequest(null, std.testing.allocator, "packed", .{ .model = request_b.model, .messages = &messages_b, .tool_choice = request_b.tool_choice, .provider_options = request_b.provider_options });
+    try std.testing.expectEqual(@as(usize, 6), cost_a.serialized_bytes);
+    try std.testing.expect(cost_a.text_tokens > 0);
+    try std.testing.expectEqual(cost_a.text_tokens, cost_a.estimated_input_tokens);
+    try std.testing.expect(cost_a.image_identity != null);
+    try std.testing.expect(cost_b.image_identity != null);
+    try std.testing.expect(!std.mem.eql(u8, &cost_a.image_identity.?, &cost_b.image_identity.?));
+    try std.testing.expectEqual(cost_a.text_tokens, cost_b.text_tokens);
 }
 
 fn wireModel(request: streams.RequestData) cursor_request.Model {
@@ -351,9 +497,7 @@ pub fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest)
     var arena_state: std.heap.ArenaAllocator = .init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    debug_trace.logf("gateway", "cursor_payload_received len={d} magic={}", .{ payload.len, std.mem.startsWith(u8, payload, "proto-fx-cursor-run/1\n") });
     var built = try cursor_request.unpack(arena, payload);
-    debug_trace.logf("gateway", "cursor_payload_unpacked run_len={d}", .{built.run_message.len});
 
     // A prepared body can outlive a zero-token rotation. Rebuild from the
     // current request context rather than migrating its mid-turn state/blob
@@ -363,7 +507,6 @@ pub fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest)
         const desired = conversationId(request.session_id);
         const current = try packedConversationId(built.run_message);
         if (current == null or !std.mem.eql(u8, current.?, &desired)) {
-            debug_trace.logf("gateway", "cursor_payload_rewrite current_present={} current_len={d} desired_len={d} prepared={}", .{ current != null, if (current) |value| value.len else 0, desired.len, request.prepared_request_body != null });
             if (request.prepared_request_body != null) {
                 const fresh = try build(raw, alloc, request.data());
                 payload_owned = fresh;

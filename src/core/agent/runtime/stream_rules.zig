@@ -148,7 +148,14 @@ fn completeJudge(raw: *anyopaque, alloc: Allocator, roles: []const []const u8, p
     };
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        const fallback = if (attempt < fallbacks.len) fallbacks[attempt].stream_provider else null;
+        // Attempt zero is the bound primary. Only later attempts consume the
+        // ordered fallback slice; retrying a failed judge must never skip the
+        // primary request or call the alternate first.
+        const fallback_index = attempt -| 1;
+        const fallback = if (attempt > 0 and fallback_index < fallbacks.len)
+            fallbacks[fallback_index].stream_provider
+        else
+            null;
         const attempt_credential = if (fallback) |value| value.credential else credential;
         const attempt_stream_provider = if (fallback) |value| value.stream_provider else stream_provider;
         const attempt_model = if (fallback) |value| value.selection.model else model;
@@ -295,6 +302,7 @@ const TinyJudgeFixture = struct {
     fallback_credential: ?[]const u8 = null,
 
     fn stream(raw_ctx: ?*anyopaque, _: Allocator, request: agent_stream_provider.ModelRequest) anyerror!agent_stream_provider.Result {
+        try request.admission.admit();
         const self: *TinyJudgeFixture = @ptrCast(@alignCast(raw_ctx.?));
         if (std.mem.eql(u8, request.model, "tiny-primary")) {
             self.primary_calls += 1;

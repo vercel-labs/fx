@@ -2666,6 +2666,14 @@ test "input escape parser preserves SGR left pointer actions" {
             } },
         },
         .{
+            .sequence = "\x1b[<35;15;8M",
+            .expected = .{ .mouse_pointer = .{
+                .kind = .drag,
+                .column = 15,
+                .row = 8,
+            } },
+        },
+        .{
             .sequence = "\x1b[<0;15;8m",
             .expected = .{ .mouse_pointer = .{
                 .kind = .release,

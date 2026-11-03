@@ -98,6 +98,19 @@ pub const State = struct {
         return victim;
     }
 
+    /// Re-reads the profile file so a frontend host sees metrics written by
+    /// its detached supervisor since the last hub open. Hosted/no-profile
+    /// states remain in-memory and are deliberately not reset.
+    pub fn reload(self: *State) void {
+        if (self.path == null) return;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        self.slots = @splat(.{});
+        self.next_use = 0;
+        self.loaded = false;
+        self.loadLocked();
+    }
+
     fn loadLocked(self: *State) void {
         if (self.loaded) return;
         self.loaded = true;
@@ -171,10 +184,16 @@ pub const State = struct {
         if (output_at_ms <= started_at_ms) return;
         self.mutex.lockUncancelable(io_mod.getIo());
         self.loadLocked();
-        defer self.mutex.unlock(io_mod.getIo());
-        const slot = self.getOrCreateLocked(model) orelse return;
+        const slot = self.getOrCreateLocked(model) orelse {
+            self.mutex.unlock(io_mod.getIo());
+            return;
+        };
         slot.first_output_total_ms +|= @intCast(@min(output_at_ms - started_at_ms, std.math.maxInt(u32)));
         slot.first_output_samples +|= 1;
+        self.mutex.unlock(io_mod.getIo());
+        // TTFT is part of the durable observed metric, not merely a live
+        // stream hint; persist it so a detached frontend can reload it.
+        self.persist();
     }
 
     /// Records a model selection in the durable MRU order.

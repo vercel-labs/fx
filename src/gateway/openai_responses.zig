@@ -41,7 +41,6 @@ fn definition_at(raw: ?*anyopaque) *const definitions.Definition {
 }
 
 pub fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) anyerror![]u8 {
-    std.debug.print("TRACE_RESP_BUILD_START model={s} messages={d}\n", .{ request.model, request.messages.len });
     const definition = definition_at(raw);
     const metadata = request.provider_options.model_metadata orelse definition.model(request.model);
     const base_url = definition.baseUrlFor(request.model);
@@ -49,7 +48,6 @@ pub fn build(raw: ?*anyopaque, alloc: Allocator, request: streams.RequestData) a
     const vercel_gateway_host = std.mem.find(u8, base_url, "ai-gateway.vercel.sh") != null or
         std.mem.find(u8, base_url, "gateway.ai.vercel.sh") != null;
     const body = try build_request(alloc, request, chat_completions.bound_identity(definition), if (metadata) |value| &value.compat else null, metadata, openrouter_host, vercel_gateway_host);
-    std.debug.print("TRACE_RESP_BUILD_DONE model={s} bytes={d}\n", .{ request.model, body.len });
     return body;
 }
 
@@ -571,14 +569,14 @@ fn buildV2ReplacementHistory(
     var index = parsed.value.array.items.len;
     while (index > 0) {
         index -= 1;
-        const value = parsed.value.array.items[index];
-        if (value != .object) continue;
+        const value = &parsed.value.array.items[index];
+        if (value.* != .object) continue;
         const role = value.object.get("role") orelse continue;
         if (role != .string or (!std.mem.eql(u8, role.string, "user") and !std.mem.eql(u8, role.string, "system") and !std.mem.eql(u8, role.string, "developer"))) continue;
         if (!value.object.contains("type")) try value.object.put(alloc, "type", .{ .string = "message" });
-        const estimate = @max(1, try v2JsonTokenEstimate(value));
+        const estimate = @max(1, try v2JsonTokenEstimate(value.*));
         if (tokens +| estimate > budget) break;
-        try kept.append(alloc, value);
+        try kept.append(alloc, value.*);
         tokens += estimate;
     }
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -893,26 +891,18 @@ test "configured Responses V2 compaction streams configured endpoint and model" 
         .parts_json = replay,
     } }};
     var direct_wire: std.Io.Writer.Allocating = .init(work);
-    (responses_protocol.writeInputWith(&direct_wire.writer, work, &next_messages, null, .{
+    try responses_protocol.writeInputWith(&direct_wire.writer, work, &next_messages, null, .{
         .tool_calls = 128,
         .tool_identity_bytes = 256,
         .tool_arguments_bytes = 1024 * 1024,
         .provider_state_bytes = types.ProviderReplay.max_bytes,
-    }, .{}, .{}) catch |err| {
-        std.debug.print("DIRECT REPLAY ERROR {s}\n", .{@errorName(err)});
-        return err;
-    });
-    std.debug.print("DIRECT REPLAY {s}\n", .{direct_wire.written()});
-    const next_payload = build(@ptrCast(@constCast(definition)), work, .{
+    }, .{}, .{});
+    const next_payload = try build(@ptrCast(@constCast(definition)), work, .{
         .model = "source",
         .messages = &next_messages,
         .tool_choice = .none,
         .provider_options = .{},
-    }) catch |err| {
-        std.debug.print("NEXT BUILD ERROR {s}\n", .{@errorName(err)});
-        return err;
-    };
-    std.debug.print("NEXT {s}\n", .{next_payload});
+    });
     try std.testing.expect(std.mem.find(u8, next_payload, "compaction") != null);
 }
 
