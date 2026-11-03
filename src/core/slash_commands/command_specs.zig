@@ -40,6 +40,9 @@ pub const SlashKind = enum {
     quit,
     clear_screen,
     new_session,
+    launch_instance,
+    close_instance,
+    show_agents,
     reset_session,
     resume_session,
     rename_session,
@@ -65,7 +68,6 @@ pub const SlashKind = enum {
     trace,
     compact,
     settings,
-    alias,
     credits,
     paste,
     fast,
@@ -80,7 +82,7 @@ pub const SlashKind = enum {
 /// The release that drops every old spelling fx still reads with a warning,
 /// such as `fx setup`, `--sessions-v2`, and `/allowlist user`. The CLI shape
 /// check fails once fx's version reaches it, so they come out on time.
-pub const old_spelling_removal = "0.0.17";
+pub const old_spelling_removal = "0.0.18";
 /// What every warning about an old spelling says.
 pub const deprecated_until = "is deprecated and stops working in fx " ++ old_spelling_removal;
 
@@ -1952,7 +1954,7 @@ test "slash completion categories follow canonical entries" {
 test "help catalog groups visible commands and searches all command metadata" {
     const registry = testSlashRegistry();
 
-    try std.testing.expectEqual(@as(usize, 38), helpCatalogCount(registry, ""));
+    try std.testing.expectEqual(@as(usize, 40), helpCatalogCount(registry, ""));
     try std.testing.expectEqualStrings("/help", helpCatalogSpecAt(registry, "", 0).?.command);
     try std.testing.expectEqual(@as(usize, 5), helpCatalogCategoryCount(registry, "", .general));
     try std.testing.expectEqual(@as(usize, 3), helpCatalogCount(registry, "appearance"));
@@ -2071,7 +2073,7 @@ test "a deprecated command warns with its replacement and a current one does not
     const alloc = std.testing.allocator;
     const warning = (try deprecationWarning(alloc, testTopLevelRegistry(), .setup)).?;
     defer alloc.free(warning);
-    try std.testing.expectEqualStrings("fx setup is deprecated and stops working in fx 0.0.17; use fx login vercel --api-key\n", warning);
+    try std.testing.expectEqualStrings("fx setup is deprecated and stops working in fx 0.0.18; use fx login vercel --api-key\n", warning);
     try std.testing.expect((try deprecationWarning(alloc, testTopLevelRegistry(), .login)) == null);
 }
 
@@ -2278,7 +2280,6 @@ test "slash completion descriptions follow completion matches" {
     try std.testing.expectEqualStrings("open the fx feedback form", nthSlashCompletionDescription(testSlashRegistry(), "/fee", 0).?);
     try std.testing.expectEqualStrings("copy a private diagnostic trace", nthSlashCompletionDescription(testSlashRegistry(), "/tr", 0).?);
     try std.testing.expectEqualStrings("summarize context into a fresh window", nthSlashCompletionDescription(testSlashRegistry(), "/comp", 0).?);
-    try std.testing.expectEqualStrings("show alias availability", nthSlashCompletionDescription(testSlashRegistry(), "/ali", 0).?);
     try std.testing.expectEqualStrings("toggle Fast mode when supported", nthSlashCompletionDescription(testSlashRegistry(), "/fa", 0).?);
 }
 

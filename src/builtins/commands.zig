@@ -130,6 +130,15 @@ const mcp_subcommands = [_]command_specs.SubcommandDoc{
     .{ .usage = "logout NAME", .description = "Sign out and delete the login" },
     .{ .usage = "approve NAME", .description = "Approve a project server from .mcp.json", .options = &mcp_approve_options },
     .{ .usage = "reject NAME", .description = "Reject a project server" },
+    .{
+        .usage = "call TOOL [JSON | -]",
+        .description = "Run an MCP tool from a command fx's shell tool runs",
+        .subcommands = &.{
+            .{ .usage = "list SERVER", .description = "List a server's tools" },
+            .{ .usage = "search QUERY...", .description = "Find the tools that match QUERY" },
+            .{ .usage = "help TOOL", .description = "Show a tool's arguments" },
+        },
+    },
 };
 
 // The flags of the `fx mcp` and `/mcp` verbs, which `src/core/mcp_host/verbs.zig`
@@ -145,6 +154,7 @@ pub const mcp_scope_options = [_]command_specs.OptionDoc{
 pub const mcp_add_options = mcp_scope_options ++ [_]command_specs.OptionDoc{
     .{ .flag = "--env <KEY=VALUE>", .description = "Set an environment variable for a command server" },
     .{ .flag = "--header <KEY=VALUE>", .description = "Send a header to an HTTP server" },
+    .{ .flag = "--no-login", .description = "Don't sign in to an HTTP server that needs a login" },
 };
 /// `list --connect` moved to `show NAME`; it is read to say so.
 const mcp_connect_option: command_specs.OptionDoc = .{ .flag = "--connect", .description = "Moved to show NAME", .hidden = true };
@@ -524,6 +534,8 @@ pub const launch_options = launch_wide_options ++ [_]command_specs.OptionDoc{
     .{ .flag = "--auto", .description = "" },
     .{ .flag = "--full-access", .description = "" },
     .{ .flag = "--yolo", .description = "" },
+    .{ .flag = "--profile <name>", .description = "" },
+    .{ .flag = "--instances <n>", .description = "" },
 };
 
 /// `usage: fx [--context-limit <spec>] ... <command>`, from `launch_options`,
@@ -578,6 +590,14 @@ pub const top_level_flags = [_]TopLevelFlag{
     .{
         .usage = "--effort <level>",
         .description = "Override the reasoning effort for an interactive session",
+    },
+    .{
+        .usage = "--profile <name>",
+        .description = "Run an interactive session in an agent profile from ~/.fx/agents or the repository's .fx/agents",
+    },
+    .{
+        .usage = "--instances <n>",
+        .description = "Start n fx instances in one interactive session, each with its own conversation; Down on an empty composer, Ctrl+X, or /agents lists them to switch",
     },
     .{
         .usage = "--fast, --no-fast",
@@ -673,6 +693,9 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .reset_session, .command = "/reset", .help_entry = "/reset", .completion_description = "reset the current session context", .presentation_category = .session },
     .{ .kind = .resume_session, .command = "/resume", .help_entry = "/resume", .completion_description = "resume a saved session", .presentation_category = .session },
 
+    .{ .kind = .launch_instance, .command = "/launch", .help_entry = "/launch [profile]", .completion_description = "start another fx instance on this host", .presentation_category = .session, .has_args = true, .accepts_payload = true },
+    .{ .kind = .close_instance, .command = "/close", .help_entry = "/close", .completion_description = "close the fx instance on screen", .presentation_category = .session },
+    .{ .kind = .show_agents, .command = "/agents", .help_entry = "/agents", .completion_description = "list the open agents and switch to one", .presentation_category = .session },
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
     .{ .kind = .fork_session, .command = "/fork", .help_entry = "/fork", .completion_description = "fork the session before a prompt", .presentation_category = .session },
     .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose the model provider and how it signs in", .presentation_category = .account, .has_args = true },
@@ -695,7 +718,6 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .trace, .command = "/trace", .help_entry = "/trace", .completion_description = "copy a private diagnostic trace", .presentation_category = .product },
     .{ .kind = .compact, .command = "/compact", .help_entry = "/compact", .completion_description = "summarize context into a fresh window", .presentation_category = .session },
     .{ .kind = .settings, .command = "/settings", .help_entry = "/settings [startup-scrollback [on|off]]", .completion_description = "browse and update settings", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
-    .{ .kind = .alias, .command = "/alias", .aliases = &.{}, .help_entry = "/alias [name] [command]", .completion_description = "show alias availability", .presentation_category = .extensions, .has_args = true, .accepts_payload = true },
     .{ .kind = .credits, .command = "/credits", .aliases = &.{"/balance"}, .help_entry = "/credits (/balance)", .completion_description = "show gateway credits balance", .presentation_category = .account, .requires_prompt_credential = true },
     .{ .kind = .paste, .command = "/paste", .help_entry = "/paste", .completion_description = "attach an image from the clipboard when supported", .presentation_category = .media },
     .{ .kind = .fast, .command = "/fast", .help_entry = "/fast [on|off]", .completion_description = "toggle Fast mode when supported", .presentation_category = .model, .has_args = true, .accepts_payload = true },
@@ -785,6 +807,9 @@ test "built-in slash commands register exact active order" {
         "/new",
         "/reset",
         "/resume",
+        "/launch",
+        "/close",
+        "/agents",
         "/rename",
         "/fork",
         "/login",
@@ -807,7 +832,6 @@ test "built-in slash commands register exact active order" {
         "/trace",
         "/compact",
         "/settings",
-        "/alias",
         "/credits",
         "/paste",
         "/fast",

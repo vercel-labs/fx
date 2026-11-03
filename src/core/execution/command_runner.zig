@@ -40,6 +40,14 @@ pub const Config = struct {
     /// Shell snapshot epoch of the remembered grant that admitted a `user`
     /// profile command, or null when it was not admitted by a grant.
     shell_grant_epoch: ?u64 = null,
+    /// Variables added to the command's environment after `AI_AGENT`,
+    /// such as the `fx mcp call` bridge's address. Borrowed for the run.
+    extra_environment: []const EnvironmentVariable = &.{},
+};
+
+pub const EnvironmentVariable = struct {
+    name: []const u8,
+    value: []const u8,
 };
 
 const ai_agent_env = "AI_AGENT";
@@ -47,6 +55,11 @@ const ai_agent_name = "fx";
 
 pub fn applyAgentEnvironment(environment: *std.process.Environ.Map) !void {
     try environment.put(ai_agent_env, ai_agent_name);
+}
+
+fn applyCommandEnvironment(environment: *std.process.Environ.Map, cfg: Config) !void {
+    try applyAgentEnvironment(environment);
+    for (cfg.extra_environment) |variable| try environment.put(variable.name, variable.value);
 }
 
 pub const CallbackProjection = enum {
@@ -1420,7 +1433,7 @@ fn executeProcessWithInput(
     const started_ms = io_mod.milliTimestamp();
     var environment = try io_mod.cloneEnvironMap(scratch);
     defer environment.deinit();
-    try applyAgentEnvironment(&environment);
+    try applyCommandEnvironment(&environment, cfg);
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = argv,
         .stdin = if (closed_input) .pipe else .ignore,
@@ -1482,7 +1495,7 @@ fn executeProcessWithScript(
     else
         try io_mod.cloneEnvironMap(scratch);
     defer environment.deinit();
-    try applyAgentEnvironment(&environment);
+    try applyCommandEnvironment(&environment, cfg);
     if (comptime supports_foreground_session) {
         return executeProcessWithDetachedSession(
             scratch,

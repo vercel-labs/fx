@@ -15,6 +15,9 @@ const start_ms: u64 = 1_000_000;
 const tick_ms: u64 = 1_000;
 /// A wait never passes 30 s, so a deadline is always within this many ticks.
 const max_wait_ticks: u32 = 120;
+/// A resend hands its status line back within a few seconds; a module that
+/// still holds it after this many ticks never will.
+const max_handoff_ticks: u32 = 10;
 
 const Op = struct {
     op: []const u8,
@@ -80,6 +83,22 @@ const Lab = struct {
             if (plan.send) |send| {
                 merged.send = send;
                 return merged;
+            }
+        }
+        return merged;
+    }
+
+    /// Ticks once a second until the module clears a resend's status line.
+    fn handOff(lab: *Lab) recovery.Plan {
+        var merged: recovery.Plan = .{};
+        for (0..max_handoff_ticks) |_| {
+            lab.now_ms += tick_ms;
+            const plan = lab.step(.tick);
+            if (plan.save) |save| merged.save = save;
+            if (plan.send) |send| merged.send = send;
+            if (plan.status) |status| {
+                merged.status = status;
+                if (status.kind == .clear) return merged;
             }
         }
         return merged;
@@ -166,6 +185,8 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
         result.plan = planOut(lab.step(.{ .failed = .{ .kind = kind } }));
     } else if (is(op.op, "wait")) {
         result.plan = planOut(lab.wait());
+    } else if (is(op.op, "handoff")) {
+        result.plan = planOut(lab.handOff());
     } else if (is(op.op, "exit")) {
         // The process ends, by a crash or after `closing`; the record stays.
         lab.state = .{};

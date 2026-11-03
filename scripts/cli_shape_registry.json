@@ -7,7 +7,7 @@
     },
     "FX_AUTO_COMPACT_PERCENT": {
       "job": "setting-override",
-      "stability": "internal"
+      "stability": "stable"
     },
     "FX_AUTO_UPGRADE": {
       "job": "setting-override",
@@ -60,6 +60,14 @@
     "FX_MAX_AGENT_STEPS": {
       "job": "setting-override",
       "stability": "stable"
+    },
+    "FX_MCP_CALL_SOCKET": {
+      "job": "internal",
+      "stability": "internal"
+    },
+    "FX_MCP_CALL_TOKEN": {
+      "job": "internal",
+      "stability": "internal"
     },
     "FX_MODEL": {
       "job": "setting-override",
@@ -130,6 +138,10 @@
       "stability": "internal"
     },
     "FX_TEST_C04_STREAM_ANSI_OSC8_FIXTURE": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_CACHE_WARMING_TTL_MS": {
       "job": "test",
       "stability": "internal"
     },
@@ -206,6 +218,14 @@
       "stability": "internal"
     },
     "FX_TEST_GROK_VERSION_URL": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_INPUT_LOOP_NETWORK_GUARD": {
+      "job": "test",
+      "stability": "internal"
+    },
+    "FX_TEST_INSTANCES": {
       "job": "test",
       "stability": "internal"
     },

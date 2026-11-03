@@ -5,8 +5,9 @@
 (* waitForSend, and its ticker while a send is on the wire). The constants *)
 (* are small: Ceiling stands for the 30-second cap on every wait,          *)
 (* SendTicks for how long an answer may take once a send is on the wire,   *)
-(* and HealTicks for how soon a request must end once the world is         *)
-(* healthy.                                                                *)
+(* HandoffTicks for how long a resend shows its retry status before fx's   *)
+(* thinking row takes the line back, and HealTicks for how soon a request  *)
+(* must end once the world is healthy.                                     *)
 (*                                                                         *)
 (* Carrying out a plan takes no time, so no tick falls between a save and  *)
 (* its send. Time while no fx process runs is not modeled: a relaunch      *)
@@ -19,9 +20,11 @@ EXTENDS Recovery
 CONSTANTS
     Ceiling,     \* the longest wait, in ticks (recovery.zig backoff_ms cap)
     SendTicks,   \* ticks a send may stay on the wire before its answer
+    HandoffTicks,\* ticks a resend shows its retry status (recovery.zig handoff_ms)
     HealTicks    \* ticks of a healthy world within which the request ends
 
-ASSUME /\ Ceiling \in 1..10 /\ SendTicks \in 1..5 /\ HealTicks \in Nat
+ASSUME /\ Ceiling \in 1..10 /\ SendTicks \in 1..5 /\ HandoffTicks \in 1..SendTicks
+       /\ HealTicks \in Nat
 
 VARIABLES
     waitLeft,    \* ticks until the wait's deadline; 0 when not waiting
@@ -68,13 +71,16 @@ Follow(A, hinted) ==
     /\ sendAge' = IF inflight' /\ inflight THEN sendAge ELSE 0
     /\ healAge' = IF faults' > faults \/ ~alive' THEN 0 ELSE healAge
 
-\* The status line must change at this tick: the countdown while waiting,
-\* the elapsed time while a retry is on the wire (recovery.zig onTick).
-\* Every retrying status shows the elapsed time, a resumed request's and a
-\* compacted send's included (recovery.zig retryingStatus).
-MustRefresh ==
-    \/ phase = "waiting"
-    \/ phase = "working" /\ inflight /\ ~flowing /\ status = "retrying"
+\* The status line must change at this tick: the countdown while waiting
+\* (recovery.zig onTick). A resend's retry status holds still, and its
+\* bullet blinks like the thinking row's until HandOff.
+MustRefresh == phase = "waiting"
+
+\* This tick ends a resend's retry status: it has shown for HandoffTicks
+\* and nothing has flowed or failed.
+HandOffDue ==
+    /\ phase = "working" /\ inflight /\ ~flowing /\ status = "retrying"
+    /\ sendAge + 1 >= HandoffTicks
 
 \* One second passes while fx runs the request. The answer to a send comes
 \* within SendTicks.
@@ -88,7 +94,12 @@ Tick ==
           \* `tick` reaches the deadline: save, send, status retrying.
           THEN /\ TimerFires
                /\ waitLeft' = 0 /\ fresh' = TRUE
-          \* Planted defect frozen_countdown: the status is not redrawn.
+          \* `tick` past the hand-off time: the thinking row takes the line
+          \* back. Planted defect no_handoff: the retry status stays.
+          ELSE IF HandOffDue /\ Bug # "no_handoff"
+          THEN /\ HandOff
+               /\ waitLeft' = 0 /\ fresh' = TRUE
+          \* Planted defect frozen_countdown: the countdown is not redrawn.
           ELSE /\ UNCHANGED vars
                /\ waitLeft' = IF phase = "waiting" THEN waitLeft - 1 ELSE 0
                /\ fresh' = (MustRefresh /\ Bug # "frozen_countdown")
@@ -97,8 +108,9 @@ TInit ==
     /\ Init
     /\ waitLeft = 0 /\ fresh = TRUE /\ sendAge = 0 /\ healAge = 0
 
-\* Every Recovery.tla step except TimerFires, which only a Tick may take. A
-\* broken gateway's answer is the one failure that may carry Retry-After.
+\* Every Recovery.tla step except TimerFires and HandOff, which only a Tick
+\* may take. A broken gateway's answer is the one failure that may carry
+\* Retry-After.
 TNext ==
     \/ Follow(Responding, FALSE)
     \/ Follow(Respond, net = "up" /\ ~needUser /\ gateway = "broken")
@@ -120,10 +132,16 @@ TSpec == TInit /\ [][TNext]_tvars
 \* included (recovery.zig transientDelay).
 WaitBounded == waitLeft <= Ceiling
 
-\* While a status is shown and nothing is flowing, it changes every tick:
-\* the countdown while waiting, the elapsed time while a retry is on the
-\* wire, so the row never looks dead (recovery.zig onTick).
+\* While fx waits to resend, the countdown changes every tick, so the row
+\* never looks dead (recovery.zig onTick).
 StatusFresh == (alive /\ ~flowing /\ MustRefresh) => fresh
+
+\* A resend's retry status gives way to fx's thinking row within
+\* HandoffTicks, so a model thinking in silence never sits under
+\* "Connection lost" (recovery.zig handoff_ms).
+HandsOff ==
+    (alive /\ phase = "working" /\ inflight /\ ~flowing /\ status = "retrying")
+        => sendAge < HandoffTicks
 
 \* Once the world is healthy, with fx running and nobody asked, the request
 \* ends within HealTicks: at most one wait at the ceiling, then one send.

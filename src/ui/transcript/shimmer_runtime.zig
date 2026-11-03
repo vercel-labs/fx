@@ -218,12 +218,11 @@ fn paintPlannedActivityRow(
     defer preview.deinit(surface.alloc);
     var buf: [4096]u8 = undefined;
     const text = switch (input.style) {
-        .thinking => writeThinkingBlinkText(
+        .thinking, .live => writeThinkingBlinkText(
             &buf,
             preview.bytes,
             input.thinking_blink orelse markerBlinkVisible(input.shimmer_pos),
         ),
-        .live => writeThinkingBlinkText(&buf, preview.bytes, true),
         .tool_marker => writeToolMarkerBlinkText(&buf, preview.bytes, input.shimmer_pos),
         .neutral => writeStaticStyledText(&buf, preview.bytes, ui_render.dim_style),
         .warning => writeStaticStyledText(&buf, preview.bytes, ui_render.warning_style),
@@ -798,25 +797,36 @@ test "activity surface painter honors the thinking blink override" {
     try std.testing.expectEqual(@as(u21, '•'), visible.surface.cellAt(4, 1).?.codepoint);
 }
 
-test "activity surface painter holds the live bullet still" {
+test "activity surface painter blinks the live bullet with the thinking row" {
     const plan = testPlan(
         .{ .transient_row = .{ .row = 4, .gap_above_rows = 0 } },
         .{ .top = 4, .bottom = 4, .owner = .activity },
     );
-    var painted = try testSurface(plan);
-    defer painted.surface.deinit();
-    defer painted.shadow.deinit();
+    var hidden = try testSurface(plan);
+    defer hidden.surface.deinit();
+    defer hidden.shadow.deinit();
+    var visible = try testSurface(plan);
+    defer visible.surface.deinit();
+    defer visible.shadow.deinit();
 
-    // The frame phase and blink override that hide the thinking bullet leave
-    // the live one showing; animating it belongs to the status line.
-    _ = try paintActivityIntoSurface(&painted.surface, .{
-        .label = "• Gateway error · retrying · attempt 2 · 3s",
+    // A retry status blinks its bullet in step with the thinking row, and
+    // its text holds still.
+    _ = try paintActivityIntoSurface(&hidden.surface, .{
+        .label = "• Gateway error · retrying · attempt 2",
         .style = .live,
         .shimmer_pos = -render_request.animation_padding,
         .thinking_blink = false,
     });
-    try std.testing.expectEqual(@as(u21, '•'), painted.surface.cellAt(4, 1).?.codepoint);
-    try std.testing.expectEqual(@as(u21, 'G'), painted.surface.cellAt(4, 3).?.codepoint);
+    _ = try paintActivityIntoSurface(&visible.surface, .{
+        .label = "• Gateway error · retrying · attempt 2",
+        .style = .live,
+        .shimmer_pos = 4,
+        .thinking_blink = true,
+    });
+    try std.testing.expectEqual(@as(u21, ' '), hidden.surface.cellAt(4, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, '•'), visible.surface.cellAt(4, 1).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 'G'), hidden.surface.cellAt(4, 3).?.codepoint);
+    try std.testing.expectEqual(@as(u21, 'G'), visible.surface.cellAt(4, 3).?.codepoint);
 }
 
 test "activity surface painter rejects activity over footer" {

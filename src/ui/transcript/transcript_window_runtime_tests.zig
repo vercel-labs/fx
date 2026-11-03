@@ -33,7 +33,7 @@ fn testRuntime(alloc: Allocator) TranscriptRuntime {
 fn runTurn(alloc: Allocator, runtime: *TranscriptRuntime, metrics: *types.Metrics, prompt: []const u8, answer: []const u8) !void {
     const text = try alloc.dupe(u8, prompt);
     defer alloc.free(text);
-    _ = try runtime.writeUserPromptCard(alloc, metrics, .{ .text = text }, runtime.entries.items.len > 0, &.{});
+    _ = try runtime.writeUserPromptCard(alloc, metrics, .{ .text = text }, runtime.notebook.entries.items.len > 0, &.{});
     _ = try runtime.appendRawTranscriptEntryClassified(alloc, "● Read notes.txt\n", .tool_status);
     _ = try runtime.appendAssistantTurnEntry(alloc);
     _ = try runtime.streamAssistantChunk(alloc, metrics, answer);
@@ -41,7 +41,7 @@ fn runTurn(alloc: Allocator, runtime: *TranscriptRuntime, metrics: *types.Metric
 }
 
 fn holds(runtime: *const TranscriptRuntime, needle: []const u8) bool {
-    for (runtime.entries.items) |entry| switch (entry) {
+    for (runtime.notebook.entries.items) |entry| switch (entry) {
         .user_turn => |value| if (std.mem.find(u8, value.turn.text, needle) != null) return true,
         .assistant_turn => |value| if (std.mem.find(u8, value.segments.text.items, needle) != null) return true,
         .raw_bytes => |value| if (std.mem.find(u8, value.bytes, needle) != null) return true,
@@ -67,9 +67,9 @@ fn expectPreparedMatchesFull(alloc: Allocator, runtime: *TranscriptRuntime) !voi
 /// The window and the runtime agree on what is held.
 fn expectWindowMatchesEntries(runtime: *const TranscriptRuntime) !void {
     const window = &runtime.transcript_window.?;
-    try std.testing.expectEqual(runtime.entries.items.len, window.finished.items.len + window.pending_drops.items.len);
+    try std.testing.expectEqual(runtime.notebook.entries.items.len, window.finished.items.len + window.pending_drops.items.len);
     var index: usize = 0;
-    for (runtime.entries.items) |entry| {
+    for (runtime.notebook.entries.items) |entry| {
         if (std.mem.findScalar(u32, window.pending_drops.items, entry.id()) != null) continue;
         try std.testing.expectEqual(window.finished.items[index], entry.id());
         index += 1;
@@ -122,13 +122,13 @@ test "the transcript window removes a compaction's closed cycle once the session
     // Between turns, with both turns saved and nothing on screen, the closed
     // cycle leaves at the compaction itself.
     try runtime.transcriptWindowCompacted(alloc);
-    try std.testing.expectEqual(@as(usize, 0), runtime.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), runtime.notebook.entries.items.len);
 
     try runTurn(alloc, &runtime, &metrics, "THIRD_PROMPT", "THIRD_ANSWER\n");
     try std.testing.expect(!holds(&runtime, "FIRST_PROMPT") and !holds(&runtime, "SECOND_ANSWER"));
     try std.testing.expect(holds(&runtime, "THIRD_PROMPT") and holds(&runtime, "THIRD_ANSWER"));
-    try std.testing.expect(std.mem.find(u8, runtime.transcript.items, "FIRST_ANSWER") == null);
-    try std.testing.expect(std.mem.find(u8, runtime.transcript.items, "THIRD_ANSWER") != null);
+    try std.testing.expect(std.mem.find(u8, runtime.notebook.transcript.items, "FIRST_ANSWER") == null);
+    try std.testing.expect(std.mem.find(u8, runtime.notebook.transcript.items, "THIRD_ANSWER") != null);
     try expectPreparedMatchesFull(alloc, &runtime);
     try expectWindowMatchesEntries(&runtime);
 }
@@ -144,7 +144,7 @@ test "the transcript window keeps a dropped entry while a row of it is still on 
 
     try runtime.transcriptWindowCompacted(alloc);
     try std.testing.expect(holds(&runtime, "ON_SCREEN_PROMPT") and holds(&runtime, "ON_SCREEN_ANSWER"));
-    try std.testing.expectEqual(runtime.entries.items.len, runtime.transcript_window.?.pending_drops.items.len);
+    try std.testing.expectEqual(runtime.notebook.entries.items.len, runtime.transcript_window.?.pending_drops.items.len);
     try expectWindowMatchesEntries(&runtime);
 
     // The rows scroll into terminal history: the next sync removes them.
@@ -180,7 +180,7 @@ test "a transcript window drop never removes a pinned tool line" {
     defer runtime.deinit(alloc);
     const done = try runtime.appendRawTranscriptEntryClassified(alloc, "● Read done.txt\n", .tool_status);
     const pinned = try runtime.appendRawTranscriptEntryClassified(alloc, "● Running\n", .tool_status);
-    for (runtime.entries.items) |*entry| {
+    for (runtime.notebook.entries.items) |*entry| {
         if (entry.id() == pinned) entry.raw_bytes.lifecycle_pinned = true;
     }
     try std.testing.expect(try transcript_store.dropEntriesAtomic(&runtime, alloc, &.{ done, pinned }));
@@ -213,7 +213,7 @@ fn rawEntries(alloc: Allocator, runtime: *TranscriptRuntime, texts: []const []co
 
 fn archivedCycle(alloc: Allocator, back: u32, texts: []const []const u8) !TranscriptRuntime {
     var archived = testRuntime(alloc);
-    archived.next_entry_id = runtime_mod.archiveEntryIdBase(back);
+    archived.notebook.next_entry_id = runtime_mod.archiveEntryIdBase(back);
     try rawEntries(alloc, &archived, texts);
     return archived;
 }
@@ -319,11 +319,11 @@ test "transcript window: Ctrl+O pages leave out entries still held only for the 
     try runtime.enableTranscriptWindow(alloc, true);
     try rawEntries(alloc, &runtime, &.{ "older cycle\n", "newer cycle\n" });
     const window = &runtime.transcript_window.?;
-    try window.pending_drops.append(alloc, runtime.entries.items[0].id());
+    try window.pending_drops.append(alloc, runtime.notebook.entries.items[0].id());
     var source = try runtime.snapshotFullTranscriptPage(.{ .anchor = .tail, .content_revision = 0, .cols = 80 }, null, null);
     defer source.deinit(std.heap.c_allocator);
     try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
-    try std.testing.expectEqual(runtime.entries.items[1].id(), source.entries.items[0].id());
+    try std.testing.expectEqual(runtime.notebook.entries.items[1].id(), source.entries.items[0].id());
 }
 
 const io_mod = @import("../../core/shared/io.zig");
@@ -339,8 +339,7 @@ test "transcript window: each command's output is bounded on its own" {
     var runtime = TranscriptRuntime{
         .stdout_file = sink,
         .layout = .{ .rows = 24, .cols = 80, .content_bottom = 21, .divider_top_row = 22, .input_row = 23, .divider_bottom_row = 24, .hint_row = 22 },
-        .max_transcript_bytes = 4096,
-        .command_output_block_cap = cap,
+        .notebook = .{ .max_transcript_bytes = 4096, .command_output_block_cap = cap },
     };
     defer runtime.deinit(alloc);
     try runtime.enableTranscriptWindow(alloc, true);
@@ -358,7 +357,7 @@ test "transcript window: each command's output is bounded on its own" {
         try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, try std.fmt.bufPrint(&line, "line-{d:0>2}\n", .{index}), true);
     }
     try runtime.flushCommandOutputSummary(alloc, &metrics, styles, true);
-    const first = runtime.command_output_blocks.items[0];
+    const first = runtime.notebook.command_output_blocks.items[0];
     try std.testing.expectEqual(@as(usize, 40), first.total_lines);
     try std.testing.expect(first.retention_overflow);
     try std.testing.expect(first.lines.items.len < first.total_lines);
@@ -369,8 +368,8 @@ test "transcript window: each command's output is bounded on its own" {
         try runtime.writeCommandOutputChunk(alloc, &metrics, styles, .stdout, try std.fmt.bufPrint(&line, "next-{d}\n", .{index}), true);
     }
     try runtime.flushCommandOutputSummary(alloc, &metrics, styles, true);
-    try std.testing.expectEqual(@as(usize, 2), runtime.command_output_blocks.items.len);
-    const second = runtime.command_output_blocks.items[1];
+    try std.testing.expectEqual(@as(usize, 2), runtime.notebook.command_output_blocks.items.len);
+    const second = runtime.notebook.command_output_blocks.items[1];
     try std.testing.expect(!second.retention_overflow);
     try std.testing.expectEqual(@as(usize, 3), second.total_lines);
     try std.testing.expect(transcript_store.retainedStructuredBytes(&runtime) > cap);
@@ -409,7 +408,7 @@ test "a transcript window drop that runs out of memory leaves the transcript as 
         defer runtime.deinit(alloc);
         var metrics: types.Metrics = .{};
         try runTurn(alloc, &runtime, &metrics, "DROPPED_PROMPT", "DROPPED_ANSWER\n");
-        const dropped_count = runtime.entries.items.len;
+        const dropped_count = runtime.notebook.entries.items.len;
         try runTurn(alloc, &runtime, &metrics, "KEPT_PROMPT", "KEPT_ANSWER\n");
         try commitStableFrame(alloc, &runtime);
         // The drop takes the atomic path: a copy, then one commit.
@@ -418,8 +417,8 @@ test "a transcript window drop that runs out of memory leaves the transcript as 
 
         var ids: std.ArrayList(u32) = .empty;
         defer ids.deinit(backing);
-        for (runtime.entries.items) |entry| try ids.append(backing, entry.id());
-        const transcript_before = try backing.dupe(u8, runtime.transcript.items);
+        for (runtime.notebook.entries.items) |entry| try ids.append(backing, entry.id());
+        const transcript_before = try backing.dupe(u8, runtime.notebook.transcript.items);
         defer backing.free(transcript_before);
 
         failing.fail_index = failing.alloc_index + fail_after;
@@ -430,16 +429,16 @@ test "a transcript window drop that runs out of memory leaves the transcript as 
             try std.testing.expect(!induced);
             try std.testing.expect(changed);
             try std.testing.expect(!holds(&runtime, "DROPPED_PROMPT") and holds(&runtime, "KEPT_PROMPT"));
-            try std.testing.expectEqual(ids.items.len - dropped_count, runtime.entries.items.len);
+            try std.testing.expectEqual(ids.items.len - dropped_count, runtime.notebook.entries.items.len);
             break;
         } else |err| {
             // A writer over a growing buffer reports a failed allocation as
             // WriteFailed.
             try std.testing.expect(induced);
             try std.testing.expect(err == error.OutOfMemory or err == error.WriteFailed);
-            try std.testing.expectEqualStrings(transcript_before, runtime.transcript.items);
-            try std.testing.expectEqual(ids.items.len, runtime.entries.items.len);
-            for (ids.items, runtime.entries.items) |id, entry| try std.testing.expectEqual(id, entry.id());
+            try std.testing.expectEqualStrings(transcript_before, runtime.notebook.transcript.items);
+            try std.testing.expectEqual(ids.items.len, runtime.notebook.entries.items.len);
+            for (ids.items, runtime.notebook.entries.items) |id, entry| try std.testing.expectEqual(id, entry.id());
         }
     }
     // The drop allocates, so some of the runs above failed inside it.
@@ -455,10 +454,10 @@ test "a resume that brings back the cycle before the newest compaction keeps it 
     try runTurn(alloc, &runtime, &metrics, "BEFORE_COMPACT", "ANSWER\n");
     // As the resume path leaves it: the replayed entries, prepared and not
     // painted yet.
-    runtime.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
+    runtime.notebook.pending_resume_source = try source_preparation.prepareFullTranscriptViewportSource(
         &runtime,
         alloc,
-        try alloc.dupe(u8, runtime.transcript.items),
+        try alloc.dupe(u8, runtime.notebook.transcript.items),
     );
     try runtime.transcriptWindowResumed(alloc, true);
     // The compaction applied as a live one: the window lets the cycle go, and
@@ -466,8 +465,8 @@ test "a resume that brings back the cycle before the newest compaction keeps it 
     try std.testing.expect(!runtime.transcriptWindowHoldsPreviousCycle());
     try std.testing.expect(holds(&runtime, "BEFORE_COMPACT"));
     // Painted, then scrolled into terminal history: the next sync drops it.
-    if (runtime.pending_resume_source) |*source| source.deinit(alloc);
-    runtime.pending_resume_source = null;
+    if (runtime.notebook.pending_resume_source) |*source| source.deinit(alloc);
+    runtime.notebook.pending_resume_source = null;
     try commitStableFrame(alloc, &runtime);
     const anchor = &runtime.transcript_commit_state.stable;
     anchor.history_visual_offset = anchor.total_visual_rows;

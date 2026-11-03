@@ -583,6 +583,26 @@ With --prompt-permissions, JSON and quiet requests may prompt on stderr only whe
   );
 });
 
+describe("cli: launch flags", () => {
+  test("--instances says it applies only to interactive sessions", async () => {
+    for (const args of [["--instances", "2", "ask", "hi"], ["--instances=1", "ask", "hi"]]) {
+      const result = await runFx(args);
+      expect(result.code).toBe(2);
+      expect(result.stderr).toBe("fx: --instances applies to interactive sessions\n");
+      expect(result.stdout).toBe("");
+    }
+  });
+
+  test("--profile says it applies only to interactive sessions", async () => {
+    for (const args of [["--profile", "reviewer", "ask", "hi"], ["--profile=reviewer", "status"]]) {
+      const result = await runFx(args);
+      expect(result.code).toBe(2);
+      expect(result.stderr).toBe("fx: --profile applies to interactive sessions\n");
+      expect(result.stdout).toBe("");
+    }
+  });
+});
+
 describe("cli: version", () => {
   for (const alias of ["--version", "-v"]) {
     test(
@@ -2516,7 +2536,7 @@ describe("cli: setup", () => {
       expect(r.code).toBe(1);
       expect(r.stdout).toBe("");
       expect(r.stderr).toBe(
-        "fx setup is deprecated and stops working in fx 0.0.17; use fx login vercel --api-key\n" +
+        "fx setup is deprecated and stops working in fx 0.0.18; use fx login vercel --api-key\n" +
           "fx setup: stored API keys are disabled by FX_DISABLE_KEYCHAIN\n",
       );
     },
@@ -2582,7 +2602,7 @@ exit 99
         });
         expect(r.code).toBe(1);
         expect(r.stdout).toBe("");
-        expect(r.stderr).toContain("fx setup is deprecated and stops working in fx 0.0.17; use fx login vercel --api-key\n");
+        expect(r.stderr).toContain("fx setup is deprecated and stops working in fx 0.0.18; use fx login vercel --api-key\n");
         expect(r.stderr).toContain("interactive terminal is required");
         expect(existsSync(invocationLog)).toBe(false);
       } finally {
@@ -6038,7 +6058,7 @@ describe("cli: completion", () => {
     [["fx", "config", "get", "theme", ""], ""],
     [["fx", "ask", "--permission-mode", ""], "ask auto full-access"],
     [["fx", "--model", "gpt-5", "ask", "--permission-m"], "--permission-mode"],
-    [["fx", "mcp", ""], "list show add remove login logout approve reject"],
+    [["fx", "mcp", ""], "list show add remove login logout approve reject call"],
     [["fx", "mcp", "add", "--g"], "--global"],
     [["fx", "usage", "--period", ""], "today 7d month"],
     [["fx", "login", ""], "vercel codex grok"],

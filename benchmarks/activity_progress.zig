@@ -173,11 +173,11 @@ const GrowthObservation = struct {
         return .{
             .initial_p95_ns = initial,
             .final_p95_ns = final,
-            .entries = transcript.entries.items.len,
             .records = transcript.toolActivityRecordCount(),
             .active = transcript.activeToolActivityCount(),
             .pins = transcript.lifecyclePinCount(),
-            .details = transcript.tool_details.items.len,
+            .entries = transcript.notebook.entries.items.len,
+            .details = transcript.notebook.tool_details.items.len,
             .retained_bytes = transcript_store.retainedStructuredBytes(transcript),
         };
     }

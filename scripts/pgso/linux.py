@@ -1,4 +1,4 @@
-"""The Linux arm64 PGSO platform: ld.lld links of the static musl fx, and ELF checks.
+"""The Linux PGSO platforms: ld.lld links of the static musl fx, and ELF checks.
 
 Zig links the static musl control with its own ld.lld. A `zig cc` link of the
 same object picks different inputs and flags, so the control build records
@@ -7,7 +7,9 @@ and candidate links reuse it with only the Zig object swapped. That keeps the
 candidate's ELF layout identical to the control's, which `inspect_candidate`
 checks.
 
-The shared pipeline reaches this module through `Toolchain.platform`; see
+`ARM64` and `X86_64` are the platforms. Only the host check, the profile
+runtime, and `zig cc` depend on the architecture; every other step is shared.
+The shared pipeline reaches a platform through `Toolchain.platform`; see
 scripts/pgso/platforms.py for the functions every platform provides.
 """
 from __future__ import annotations
@@ -20,6 +22,7 @@ import platform
 import re
 import shlex
 from collections.abc import Mapping, Sequence
+from typing import ClassVar
 
 from scripts.pgso.model import PgsoError, sha256_file
 from scripts.pgso.pipeline import (
@@ -33,9 +36,6 @@ from scripts.pgso.pipeline import (
 from scripts.pgso.runner import CommandResult, run_checked
 from scripts.pgso.toolchain import Toolchain, _capture
 
-TARGET = "aarch64-linux"
-DISPLAY_NAME = "Linux arm64"
-HOST_ARCH = "aarch64"
 LIBLLVM_NAME = "libLLVM.so"
 # Record Zig's own link of the control, which the other links reuse.
 CONTROL_BUILD_FLAGS = ("--verbose-link",)
@@ -56,7 +56,6 @@ def external_control_strip_argv(
 ) -> tuple[str, ...]:
     # The link's `-s` already removes every symbol.
     return ()
-PROFILE_RUNTIME_TRIPLE = "aarch64-unknown-linux-gnu"
 PROFILE_SECTIONS = ("__llvm_prf_cnts", "__llvm_prf_data")
 # The whole fx object's symbol table and the linker's removed-section list
 # exceed the default capture limit.
@@ -88,17 +87,21 @@ class CandidateMetadata:
     layout: dict[str, object]
 
 
-def check_host() -> str:
+def check_host(host_arch: str) -> str:
     """The host architecture, after checking the host can build and run the target."""
     if platform.system() != "Linux":
         raise PgsoError("Linux PGSO requires a Linux host")
-    host_arch = platform.machine()
-    if host_arch != HOST_ARCH:
-        raise PgsoError("Linux PGSO requires an aarch64 host")
-    return host_arch
+    found = platform.machine()
+    if found != host_arch:
+        raise PgsoError(f"Linux PGSO for {host_arch} requires an {host_arch} host, not {found}")
+    return found
 
 
-def discover_tools(zig_path: pathlib.Path, clang: pathlib.Path) -> tuple[Tools, pathlib.Path]:
+def discover_tools(
+    zig_path: pathlib.Path,
+    clang: pathlib.Path,
+    profile_runtime_triple: str,
+) -> tuple[Tools, pathlib.Path]:
     """LLVM's linker and ELF reader from the configured root, and the profile runtime."""
     llvm_root = clang.resolve().parent
     found: dict[str, pathlib.Path] = {}
@@ -117,7 +120,7 @@ def discover_tools(zig_path: pathlib.Path, clang: pathlib.Path) -> tuple[Tools, 
     ).expanduser().resolve()
     # LLVM's release build of the runtime targets glibc; it has no libc
     # dependency the static musl link cannot satisfy.
-    profile_runtime = resource_dir / "lib" / PROFILE_RUNTIME_TRIPLE / "libclang_rt.profile.a"
+    profile_runtime = resource_dir / "lib" / profile_runtime_triple / "libclang_rt.profile.a"
     if not profile_runtime.is_file() or profile_runtime.stat().st_size == 0:
         raise PgsoError(f"missing LLVM profile runtime: {profile_runtime}")
     return Tools(ld_lld=found["ld.lld"], readelf=found["llvm-readelf"]), profile_runtime
@@ -215,7 +218,7 @@ def _zig_cc_argv(
         str(toolchain.zig),
         "cc",
         "-target",
-        TARGET,
+        toolchain.target,
         "-O2",
         *ZIG_CC_LINK_FLAGS,
         *flags,
@@ -622,3 +625,58 @@ def inspect_candidate(
 
 def candidate_evidence(metadata: CandidateMetadata) -> dict[str, object]:
     return {"elf_layout": metadata.layout}
+
+
+@dataclasses.dataclass(frozen=True)
+class Platform:
+    """One Linux architecture, with the names scripts/pgso/platforms.py lists."""
+
+    TARGET: str
+    DISPLAY_NAME: str
+    HOST_ARCH: str
+    # The architecture of LLVM's release build of the profile runtime.
+    PROFILE_RUNTIME_TRIPLE: str
+    SIZE_CEILING_MIB: float
+
+    LIBLLVM_NAME: ClassVar[str] = LIBLLVM_NAME
+    CONTROL_BUILD_FLAGS: ClassVar[tuple[str, ...]] = CONTROL_BUILD_FLAGS
+    STARTUP_SCENARIOS: ClassVar[tuple[str, ...]] = STARTUP_SCENARIOS
+    ZIG_CC_LINK_FLAGS: ClassVar[tuple[str, ...]] = ZIG_CC_LINK_FLAGS
+
+    os_versions = staticmethod(os_versions)
+    record_control_build = staticmethod(record_control_build)
+    external_control_strip_argv = staticmethod(external_control_strip_argv)
+    read_control_identity = staticmethod(read_control_identity)
+    control_identity_from_evidence = staticmethod(control_identity_from_evidence)
+    link_instrumented = staticmethod(link_instrumented)
+    public_api_flags = staticmethod(public_api_flags)
+    candidate_object_flags = staticmethod(candidate_object_flags)
+    link_candidate_binary = staticmethod(link_candidate_binary)
+    inspect_candidate = staticmethod(inspect_candidate)
+    candidate_evidence = staticmethod(candidate_evidence)
+
+    def check_host(self) -> str:
+        return check_host(self.HOST_ARCH)
+
+    def discover_tools(
+        self, zig_path: pathlib.Path, clang: pathlib.Path
+    ) -> tuple[Tools, pathlib.Path]:
+        return discover_tools(zig_path, clang, self.PROFILE_RUNTIME_TRIPLE)
+
+
+ARM64 = Platform(
+    TARGET="aarch64-linux",
+    DISPLAY_NAME="Linux arm64",
+    HOST_ARCH="aarch64",
+    PROFILE_RUNTIME_TRIPLE="aarch64-unknown-linux-gnu",
+    SIZE_CEILING_MIB=7.000,
+)
+X86_64 = Platform(
+    TARGET="x86_64-linux",
+    DISPLAY_NAME="Linux x86_64",
+    HOST_ARCH="x86_64",
+    PROFILE_RUNTIME_TRIPLE="x86_64-unknown-linux-gnu",
+    # x86_64 code is larger: candidates have measured 7.654 to 7.804 MiB, and
+    # the 0.250 MiB preferred headroom needs a ceiling of at least 8.054 MiB.
+    SIZE_CEILING_MIB=8.250,
+)

@@ -387,8 +387,19 @@ describe("modern MCP Streamable HTTP", () => {
       },
     );
     expect(added.code).toBe(0);
-    expect(added.stdout).toContain("Added fixture to ~/.fx/mcp.json.");
-    expect(fixture.requests).toHaveLength(0);
+    expect(added.stdout).toBe("Added fixture to ~/.fx/mcp.json.\n");
+    const methods = (from: number) => fixture!.requests.slice(from).map((entry) => entry.message.method).filter((method) => method !== "subscriptions/listen");
+    // add connects once to see whether the server needs a login; this one doesn't.
+    expect(methods(0)).toEqual(["server/discover", "tools/list"]);
+    // --no-login adds without contacting the server.
+    const atAdd = fixture.requests.length;
+    const quiet = await runFx(
+      ["mcp", "add", "--no-login", "quiet", fixture.url],
+      { cwd: root.workspace, env: { HOME: root.home, AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined, FX_AUTO_UPGRADE: "0" } },
+    );
+    expect(quiet.code).toBe(0);
+    expect(fixture.requests).toHaveLength(atAdd);
+    expect((await runFx(["mcp", "remove", "quiet"], { cwd: root.workspace, env: { HOME: root.home, FX_AUTO_UPGRADE: "0" } })).code).toBe(0);
 
     gateway = startFakeGateway([
       fakeGatewayToolCall("top_level_select", "mcp_select_tool", { name: TOOL_NAME }),
@@ -403,7 +414,7 @@ describe("modern MCP Streamable HTTP", () => {
     );
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("TOP_LEVEL_HTTP_MCP_READY");
-    expect(fixture.requests.map((entry) => entry.message.method).filter((method) => method !== "subscriptions/listen")).toEqual([
+    expect(methods(atAdd)).toEqual([
       "server/discover",
       "tools/list",
       "tools/call",

@@ -438,15 +438,16 @@ pub const Effective = union(enum) {
 /// The keys `fx config` reads from the resolved state instead of the files.
 /// A test checks that each plain key is here or in `files_only_keys`.
 pub const resolved_keys = [_][]const u8{
-    "auto_compact_percent",   "auto_upgrade",           "collapse_tool_calls",
-    "context",                "effort",                 "fast_mode",
-    "first_call_tool_choice", "max_agent_steps",        "max_tool_result_bytes",
-    "permission_mode",        "prompt_history.enabled", "provider",
-    "provider_order",         "provider_strict",        "review_model",
-    "session_titles",         "slash_menu_categories",  "sound.attention_required",
-    "sound.max",              "sound.turn_end",         "startup_scrollback",
-    "status_line.context",    "status_line.session",    "status_line.workspace",
-    "theme",                  "ultrafast_mode",         "update_channel",
+    "auto_compact_percent",     "auto_upgrade",           "cache_warming",
+    "collapse_tool_calls",      "context",                "effort",
+    "fast_mode",                "first_call_tool_choice", "max_agent_steps",
+    "max_tool_result_bytes",    "permission_mode",        "prompt_history.enabled",
+    "provider",                 "provider_order",         "provider_strict",
+    "review_model",             "session_titles",         "slash_menu_categories",
+    "sound.attention_required", "sound.max",              "sound.turn_end",
+    "startup_scrollback",       "status_line.context",    "status_line.session",
+    "status_line.workspace",    "theme",                  "ultrafast_mode",
+    "update_channel",
 };
 
 /// Keys `fx config` shows as the files set them: objects fx checks with its
@@ -491,6 +492,7 @@ pub fn effectiveValue(
     if (eql(u8, key, "provider_strict")) return boolean(state.provider_strict);
     if (eql(u8, key, "review_model")) return if (state.review_model.len == 0) .none else string(state.review_model);
     if (eql(u8, key, "session_titles")) return boolean(state.session_title_generation);
+    if (eql(u8, key, "cache_warming")) return boolean(state.cache_warming);
     if (eql(u8, key, "slash_menu_categories")) return boolean(state.slash_menu_categories);
     if (eql(u8, key, "sound.attention_required")) return boolean(state.notification_attention_required);
     if (eql(u8, key, "sound.max")) return boolean(state.notification_max);
