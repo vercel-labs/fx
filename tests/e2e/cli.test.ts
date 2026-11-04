@@ -1133,6 +1133,17 @@ describe("cli: status", () => {
       });
       expect(relativeHome.code).toBe(0);
       expect(JSON.parse(relativeHome.stdout).fx_home).toBeUndefined();
+
+      // With FX_HOME set, a relative HOME counts as unset the same way, so
+      // FX_HOME still holds fx's files.
+      const relativeWithFxHome = { ...options, env: { ...options.env, HOME: "relative/home" } };
+      const statusWithFxHome = await runFx(["status", "--json"], relativeWithFxHome);
+      expect(statusWithFxHome.code).toBe(0);
+      expect(JSON.parse(statusWithFxHome.stdout).fx_home).toBe(fxHome);
+      const added = await runFx(["mcp", "add", "probe", "--", "/bin/echo", "hi"], relativeWithFxHome);
+      expect(added.code).toBe(0);
+      expect(added.stdout).toBe("Added probe to $FX_HOME/mcp.json.\n");
+      expect(existsSync(join(workspace, "relative"))).toBe(false);
     } finally {
       gateway.stop();
       rmSync(root, { recursive: true, force: true });
