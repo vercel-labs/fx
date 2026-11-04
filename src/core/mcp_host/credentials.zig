@@ -17,8 +17,10 @@
 //! server signs in once.
 //!
 //! TLA+ models: `tests/tla/mcp_host/Credentials.tla`; for logins shared between
-//! processes, `tests/tla/mcp_host/SharedLogins.tla`; and for processes running
-//! older builds beside this one, `tests/tla/mcp_host/MixedBuilds.tla`.
+//! processes, `tests/tla/mcp_host/SharedLogins.tla`; for processes running
+//! older builds beside this one, `tests/tla/mcp_host/MixedBuilds.tla`; and for
+//! how long the Keychain store's lock is held and waited for,
+//! `tests/tla/mcp_host/StoreLockBudget.tla`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -35,7 +37,14 @@ const file_name = "credentials-v3.json";
 /// Not `credentials.lock`, which older builds hold while they read and
 /// rewrite their own stores: nothing here waits on them.
 const lock_file_name = "credentials-v3.lock";
+/// How long the file store waits for its lock: its work under it takes
+/// milliseconds.
 const lock_deadline_ms: u64 = 2_000;
+/// The Keychain store's lock is leased (`Store.lock`): every Keychain call an
+/// fx makes holding it ends within `hold_budget_ms` of taking it, and a
+/// waiting fx gives up only `hold_slack_ms` after that.
+const hold_budget_ms: i64 = 10_000;
+const hold_slack_ms: i64 = 2_000;
 const max_store_bytes: usize = 1024 * 1024;
 
 pub const Backend = enum { keychain, file };
@@ -88,7 +97,7 @@ pub const Store = struct {
     pub fn lookup(s: Store, alloc: Allocator, key: Key) !?[]u8 {
         var locked = try s.lock();
         defer locked.release();
-        var doc = try s.read(alloc, &locked.dir);
+        var doc = try s.read(alloc, &locked);
         defer doc.deinit(alloc);
         const i = doc.find(key) orelse return null;
         return try alloc.dupe(u8, doc.entries.items[i].credential);
@@ -100,7 +109,7 @@ pub const Store = struct {
     pub fn snapshot(s: Store, alloc: Allocator) !Snapshot {
         var locked = try s.lock();
         defer locked.release();
-        return .{ .doc = try s.read(alloc, &locked.dir) };
+        return .{ .doc = try s.read(alloc, &locked) };
     }
 
     /// Fails with `error.CredentialStoreUnreadable` when the store can't be
@@ -108,7 +117,7 @@ pub const Store = struct {
     pub fn check(s: Store, alloc: Allocator) !void {
         var locked = try s.lock();
         defer locked.release();
-        var doc = try s.read(alloc, &locked.dir);
+        var doc = try s.read(alloc, &locked);
         doc.deinit(alloc);
     }
 
@@ -117,7 +126,7 @@ pub const Store = struct {
     pub fn put(s: Store, alloc: Allocator, key: Key, credential: []const u8) !void {
         var locked = try s.lock();
         defer locked.release();
-        var doc = try s.read(alloc, &locked.dir);
+        var doc = try s.read(alloc, &locked);
         defer doc.deinit(alloc);
         if (doc.find(key)) |i| {
             const entry = &doc.entries.items[i];
@@ -128,7 +137,7 @@ pub const Store = struct {
             try doc.entries.ensureUnusedCapacity(alloc, 1);
             doc.entries.appendAssumeCapacity(try Entry.of(alloc, key, credential));
         }
-        try s.write(alloc, &locked.dir, doc);
+        try s.write(alloc, &locked, doc);
     }
 
     /// Deletes the credential saved under `key`; false when there was none.
@@ -136,12 +145,12 @@ pub const Store = struct {
     pub fn remove(s: Store, alloc: Allocator, key: Key) !bool {
         var locked = try s.lock();
         defer locked.release();
-        var doc = try s.read(alloc, &locked.dir);
+        var doc = try s.read(alloc, &locked);
         defer doc.deinit(alloc);
         const i = doc.find(key) orelse return false;
         var entry = doc.entries.orderedRemove(i);
         entry.deinit(alloc);
-        try s.write(alloc, &locked.dir, doc);
+        try s.write(alloc, &locked, doc);
         return true;
     }
 
@@ -151,13 +160,13 @@ pub const Store = struct {
     pub fn removeIfSame(s: Store, alloc: Allocator, key: Key, own: [32]u8) !bool {
         var locked = try s.lock();
         defer locked.release();
-        var doc = try s.read(alloc, &locked.dir);
+        var doc = try s.read(alloc, &locked);
         defer doc.deinit(alloc);
         const i = doc.find(key) orelse return false;
         if (!std.mem.eql(u8, &digest(doc.entries.items[i].credential), &own)) return false;
         var entry = doc.entries.orderedRemove(i);
         entry.deinit(alloc);
-        try s.write(alloc, &locked.dir, doc);
+        try s.write(alloc, &locked, doc);
         return true;
     }
 
@@ -181,8 +190,16 @@ pub const Store = struct {
     pub const Locked = struct {
         dir: io_mod.VerifiedDir,
         lock: io_mod.TimedAdvisoryLock,
+        /// When this hold's Keychain calls must end, on the awake clock: set
+        /// for the Keychain store's lock, null for the file store's and for
+        /// refresh locks.
+        deadline_ms: ?i64 = null,
 
         pub fn release(l: *Locked) void {
+            if (l.deadline_ms) |deadline| debug_trace.logf("mcp", "MCP store lock released stamp={d} at={d}", .{
+                deadline - hold_budget_ms,
+                io_mod.awakeMilliTimestamp(),
+            });
             l.lock.release();
             l.dir.close();
         }
@@ -196,22 +213,59 @@ pub const Store = struct {
         return io_mod.openOrCreateVerifiedPrivateDir(&root, profile_paths.mcp_credentials_dir_name);
     }
 
+    /// The file store's lock waits `lock_deadline_ms`. The Keychain store's
+    /// work under its lock is two calls to `osascript` that can each take
+    /// seconds, so that lock is leased (`StoreLockBudget.tla`): the fx that
+    /// takes it writes when, on the awake clock, into the lock file, and its
+    /// Keychain calls end within `hold_budget_ms` of then. A waiting fx gives
+    /// up only when that stamp, or its own start if later, is
+    /// `hold_budget_ms + hold_slack_ms` old, so a holder within its budget is
+    /// never given up on however many fx take the lock in turn; one frozen
+    /// holding it (ctrl+z) costs a waiter 12 s. A stamp from the future, a
+    /// damaged one, or none, as from an older fx, counts as the waiter's start.
     fn lock(s: Store) !Locked {
         var dir = try s.openDir();
         errdefer dir.close();
-        const advisory = try io_mod.acquireTimedAdvisoryLock(&dir, lock_file_name, lock_deadline_ms);
-        return .{ .dir = dir, .lock = advisory };
+        if (s.backend == .file) return .{
+            .dir = dir,
+            .lock = try io_mod.acquireTimedAdvisoryLock(&dir, lock_file_name, lock_deadline_ms),
+        };
+        const lease = try acquireLease(&dir, io_mod.awakeMilliTimestamp());
+        return .{ .dir = dir, .lock = lease.lock, .deadline_ms = lease.deadline_ms };
+    }
+
+    const Lease = struct { lock: io_mod.TimedAdvisoryLock, deadline_ms: i64 };
+
+    /// The Keychain store's lock for a waiter that started at `started_ms`,
+    /// or `error.LockBusy` once `waitExpired`.
+    fn acquireLease(dir: *io_mod.VerifiedDir, started_ms: i64) !Lease {
+        while (true) {
+            if (io_mod.acquireTimedAdvisoryLock(dir, lock_file_name, 0)) |advisory| {
+                const now = io_mod.awakeMilliTimestamp();
+                writeStamp(advisory.file, now);
+                debug_trace.logf("mcp", "MCP store lock taken stamp={d} started={d}", .{ now, started_ms });
+                return .{ .lock = advisory, .deadline_ms = now + hold_budget_ms };
+            } else |err| if (err != error.LockBusy) return err;
+            const stamp = readStamp(dir);
+            const now = io_mod.awakeMilliTimestamp();
+            if (waitExpired(stamp, started_ms, now)) {
+                debug_trace.logf("mcp", "MCP store lock given up stamp={?d} started={d} at={d}", .{ stamp, started_ms, now });
+                return error.LockBusy;
+            }
+            io_mod.sleep(10 * std.time.ns_per_ms);
+        }
     }
 
     /// The store as saved, empty when there is none. One that doesn't parse or
     /// has another version fails with `error.CredentialStoreUnreadable`.
-    fn read(s: Store, alloc: Allocator, dir: *io_mod.VerifiedDir) !Doc {
+    fn read(s: Store, alloc: Allocator, locked: *Locked) !Doc {
         const bytes = (switch (s.backend) {
-            .keychain => native_keychain.loadMcpHostCredentials(alloc) catch |err| switch (err) {
+            // `lock` sets a Keychain store's deadline.
+            .keychain => native_keychain.loadMcpHostCredentialsBy(alloc, locked.deadline_ms.?) catch |err| switch (err) {
                 error.KeychainItemNotFound => null,
                 else => return err,
             },
-            .file => try readFile(alloc, dir),
+            .file => try readFile(alloc, &locked.dir),
         }) orelse return .{};
         defer secret.zeroAndFree(alloc, bytes);
         return Doc.parse(alloc, bytes) catch |err| switch (err) {
@@ -223,7 +277,7 @@ pub const Store = struct {
         };
     }
 
-    fn write(s: Store, alloc: Allocator, dir: *io_mod.VerifiedDir, doc: Doc) !void {
+    fn write(s: Store, alloc: Allocator, locked: *Locked, doc: Doc) !void {
         var out: std.Io.Writer.Allocating = .init(alloc);
         defer {
             std.crypto.secureZero(u8, out.writer.buffer);
@@ -231,11 +285,46 @@ pub const Store = struct {
         }
         try doc.encode(&out.writer);
         switch (s.backend) {
-            .keychain => try native_keychain.storeMcpHostCredentials(out.written()),
-            .file => try io_mod.durableReplaceVerified(alloc, dir, file_name, out.written()),
+            .keychain => try native_keychain.storeMcpHostCredentialsBy(out.written(), locked.deadline_ms.?),
+            .file => try io_mod.durableReplaceVerified(alloc, &locked.dir, file_name, out.written()),
         }
     }
 };
+
+/// Writes the lease's stamp over the lock file's first 8 bytes. A holder whose
+/// stamp didn't land still holds the lock; its waiters time it from an older
+/// stamp or their own start, as with an older fx.
+fn writeStamp(file: std.Io.File, now_ms: i64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(i64, &bytes, now_ms, .little);
+    file.writePositionalAll(io_mod.getIo(), &bytes, 0) catch |err|
+        debug_trace.logf("mcp", "MCP store lock stamp not written err={s}", .{@errorName(err)});
+}
+
+/// The stamp the lock's holder wrote, or null when there is none to read.
+fn readStamp(dir: *io_mod.VerifiedDir) ?i64 {
+    const io = io_mod.getIo();
+    var file = dir.dir.openFile(io, lock_file_name, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = false,
+        .resolve_beneath = true,
+    }) catch return null;
+    defer file.close(io);
+    var bytes: [8]u8 = undefined;
+    const n = file.readPositionalAll(io, &bytes, 0) catch return null;
+    if (n != bytes.len) return null;
+    return std.mem.readInt(i64, &bytes, .little);
+}
+
+/// Pure: whether a waiter that started at `started_ms` gives up at `now_ms`
+/// behind a holder whose stamp reads `stamp_ms`. A stamp from before the
+/// waiter started, or from the future (damaged, or from before a reboot),
+/// counts as its start.
+fn waitExpired(stamp_ms: ?i64, started_ms: i64, now_ms: i64) bool {
+    const from = if (stamp_ms) |t| (if (t > started_ms and t <= now_ms) t else started_ms) else started_ms;
+    return now_ms -| from >= hold_budget_ms + hold_slack_ms;
+}
 
 /// What tells two saved credentials apart, without keeping either.
 pub fn digest(bytes: []const u8) [32]u8 {
@@ -601,6 +690,108 @@ test "one fx holds a login's refresh lock at a time, and each login has its own"
     held.release();
     var again = (try store.tryRefreshLock(plain)) orelse return error.TestUnexpectedResult;
     again.release();
+}
+
+test "a waiter gives up only once the holder's stamp, or its own start if later, is 12 s old" {
+    const started: i64 = 1_000_000;
+    const wait = hold_budget_ms + hold_slack_ms;
+    // No stamp: timed from its own start.
+    try testing.expect(!waitExpired(null, started, started + wait - 1));
+    try testing.expect(waitExpired(null, started, started + wait));
+    // A holder that took the lock after the waiter started gets its own 12 s.
+    const taken = started + 9_000;
+    try testing.expect(!waitExpired(taken, started, taken + wait - 1));
+    try testing.expect(waitExpired(taken, started, taken + wait));
+    // A stamp from before the waiter started, or from the future, counts as its start.
+    try testing.expect(waitExpired(started - 60_000, started, started + wait));
+    try testing.expect(!waitExpired(started - 60_000, started, started + wait - 1));
+    try testing.expect(!waitExpired(started + wait + 5, started, started + wait - 1));
+    try testing.expect(waitExpired(std.math.maxInt(i64), started, started + wait));
+    try testing.expect(waitExpired(std.math.minInt(i64), started, started + wait));
+}
+
+/// For any stamp in the lock file and any time a waiter checks, it gives up
+/// no sooner than 12 s after its start, never within 12 s of a stamp written
+/// since it started, and always once both are 12 s old.
+fn fuzzLockWait(_: void, smith: *std.testing.Smith) !void {
+    const started = smith.valueRangeAtMost(i64, 0, 1 << 40);
+    const now = started + smith.valueRangeAtMost(i64, 0, 4 * (hold_budget_ms + hold_slack_ms));
+    const stamp: ?i64 = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+        0 => null,
+        1 => smith.value(i64),
+        2 => started + smith.valueRangeAtMost(i64, -2 * hold_budget_ms, 4 * hold_budget_ms),
+        else => now - smith.valueRangeAtMost(i64, 0, 2 * (hold_budget_ms + hold_slack_ms)),
+    };
+    // The stamp as the lock file holds it, read back.
+    var bytes: [8]u8 = undefined;
+    if (stamp) |t| std.mem.writeInt(i64, &bytes, t, .little);
+    const read_back: ?i64 = if (stamp != null) std.mem.readInt(i64, &bytes, .little) else null;
+    try testing.expectEqual(stamp, read_back);
+
+    const wait = hold_budget_ms + hold_slack_ms;
+    const expired = waitExpired(read_back, started, now);
+    if (expired) try testing.expect(now - started >= wait);
+    const live = if (read_back) |t| t > started and t <= now else false;
+    if (live and now - read_back.? < wait) try testing.expect(!expired);
+    const from = if (live) read_back.? else started;
+    if (now - from >= wait) try testing.expect(expired);
+}
+
+test "the store lock's wait rule holds for fuzzed stamps and times" {
+    try std.testing.fuzz({}, fuzzLockWait, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "",
+            "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+            "garbage!garbage!garbage!",
+        }) ++ @import("fuzz_corpus").mcp_store_lock_wait.*),
+    });
+}
+
+test "the Keychain store's lock writes its stamp, and a waiter that has waited 12 s behind a frozen holder gives up" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    // `lock` itself makes no Keychain call.
+    const store: Store = .{ .home = home, .backend = .keychain };
+    const before = io_mod.awakeMilliTimestamp();
+    var held = try store.lock();
+    const after = io_mod.awakeMilliTimestamp();
+    const stamp = readStamp(&held.dir) orelse return error.TestUnexpectedResult;
+    try testing.expect(stamp >= before and stamp <= after);
+    try testing.expectEqual(stamp + hold_budget_ms, held.deadline_ms.?);
+
+    // A holder frozen with the lock for 13 s, and a waiter that has waited
+    // as long: it gives up without waiting more.
+    writeStamp(held.lock.file, after - 13_000);
+    {
+        var dir = try store.openDir();
+        defer dir.close();
+        const asked = io_mod.awakeMilliTimestamp();
+        try testing.expectError(error.LockBusy, Store.acquireLease(&dir, asked - 13_000));
+        try testing.expect(io_mod.awakeMilliTimestamp() - asked < 1_000);
+        // One that started 1 s ago keeps waiting, for its own 12 s.
+        try testing.expect(!waitExpired(readStamp(&dir), asked - 1_000, io_mod.awakeMilliTimestamp()));
+    }
+    held.release();
+
+    // Once it is free, the next holder stamps it again.
+    var next = try store.lock();
+    defer next.release();
+    try testing.expect(readStamp(&next.dir).? >= after);
+}
+
+test "the file store's lock writes no stamp and has no deadline" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    const store: Store = .{ .home = home, .backend = .file };
+    var held = try store.lock();
+    defer held.release();
+    try testing.expectEqual(@as(?i64, null), held.deadline_ms);
+    try testing.expectEqual(@as(?i64, null), readStamp(&held.dir));
 }
 
 const test_path = ".fx/" ++ profile_paths.mcp_credentials_dir_name ++ "/" ++ file_name;

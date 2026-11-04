@@ -382,11 +382,49 @@ pub fn loadMcpHostCredentials(alloc: std.mem.Allocator) Error!?[]u8 {
     return loadMcpValueMacControlled(alloc, mcp_host_credentials_service_name, null);
 }
 
+/// `loadMcpHostCredentials` for a caller holding the store's lock: the call
+/// ends by `deadline_ms` on the awake clock (`io_mod.awakeMilliTimestamp`)
+/// when that comes before its own timeout, and fails at once when it has
+/// passed.
+pub fn loadMcpHostCredentialsBy(alloc: std.mem.Allocator, deadline_ms: i64) Error!?[]u8 {
+    if (!isAvailable()) return error.UnsupportedPlatform;
+    const timeout = callTimeout(deadline_ms, io_mod.awakeMilliTimestamp()) orelse {
+        debug_trace.logf("keychain", "load failed step=budget err=HoldDeadlinePassed", .{});
+        return error.KeychainReadFailed;
+    };
+    return loadMcpValueMacFor(alloc, mcp_host_credentials_service_name, null, timeout);
+}
+
 pub fn storeMcpHostCredentials(value: []const u8) Error!void {
     if (!isAvailable()) return error.UnsupportedPlatform;
     if (value.len == 0 or value.len > max_mcp_credentials_bytes) return error.KeychainWriteFailed;
     if (comptime builtin.target.os.tag == .macos) return storeMcpValueMac(mcp_host_credentials_service_name, value);
     return error.UnsupportedPlatform;
+}
+
+/// `storeMcpHostCredentials` that ends by `deadline_ms`, as
+/// `loadMcpHostCredentialsBy` does.
+pub fn storeMcpHostCredentialsBy(value: []const u8, deadline_ms: i64) Error!void {
+    if (!isAvailable()) return error.UnsupportedPlatform;
+    if (value.len == 0 or value.len > max_mcp_credentials_bytes) return error.KeychainWriteFailed;
+    const timeout = callTimeout(deadline_ms, io_mod.awakeMilliTimestamp()) orelse
+        return writeFailed("budget", error.HoldDeadlinePassed);
+    if (comptime builtin.target.os.tag == .macos) return storeMcpValueMacFor(mcp_host_credentials_service_name, value, null, timeout.duration);
+    return error.UnsupportedPlatform;
+}
+
+/// Pure: a Keychain call's timeout when it must end by `deadline_ms`, both
+/// on the awake clock: its own, or what is left before then if that is
+/// sooner; null when nothing is left.
+fn callTimeout(deadline_ms: i64, now_ms: i64) ?std.Io.Timeout {
+    const left_ms = deadline_ms - now_ms;
+    if (left_ms <= 0) return null;
+    const own_ms: i64 = @intCast(@divFloor(keychain_process_timeout.duration.raw.nanoseconds, std.time.ns_per_ms));
+    if (left_ms >= own_ms) return keychain_process_timeout;
+    return .{ .duration = .{
+        .raw = .{ .nanoseconds = @as(i96, left_ms) * std.time.ns_per_ms },
+        .clock = keychain_process_timeout.duration.clock,
+    } };
 }
 
 pub fn deleteMcpHostCredentials(alloc: std.mem.Allocator) Error!bool {
@@ -466,16 +504,26 @@ fn loadMcpValueMacControlled(
     service: []const u8,
     cancel_flag: ?*const std.atomic.Value(bool),
 ) Error!?[]u8 {
+    return loadMcpValueMacFor(alloc, service, cancel_flag, keychain_process_timeout);
+}
+
+fn loadMcpValueMacFor(
+    alloc: std.mem.Allocator,
+    service: []const u8,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    timeout: std.Io.Timeout,
+) Error!?[]u8 {
     if (!isAvailable()) return error.UnsupportedPlatform;
 
     var account_buf: AccountBuffer = undefined;
     const account = try accountName(&account_buf);
     const argv = mcpScriptArgv("load", account, service);
-    const result = runMcpKeychainProcess(
+    const result = runMcpKeychainProcessFor(
         alloc,
         &argv,
         cancel_flag,
         .limited(max_mcp_credentials_bytes + 1),
+        timeout,
     ) catch |err| {
         if (err == error.Cancelled) return error.Cancelled;
         debug_trace.logf("keychain", "load failed step=native err={s}", .{@errorName(err)});
@@ -502,6 +550,7 @@ const McpKeychainRunContext = struct {
     alloc: std.mem.Allocator,
     argv: []const []const u8,
     stdout_limit: std.Io.Limit,
+    timeout: std.Io.Timeout = keychain_process_timeout,
 };
 
 const McpKeychainRunEvent = union(enum) {
@@ -516,7 +565,7 @@ fn runMcpKeychainChild(
         .argv = context.argv,
         .stdout_limit = context.stdout_limit,
         .stderr_limit = .limited(4096),
-        .timeout = keychain_process_timeout,
+        .timeout = context.timeout,
     });
 }
 
@@ -564,15 +613,27 @@ fn runMcpKeychainProcess(
     cancel_flag: ?*const std.atomic.Value(bool),
     stdout_limit: std.Io.Limit,
 ) anyerror!std.process.RunResult {
+    return runMcpKeychainProcessFor(alloc, argv, cancel_flag, stdout_limit, keychain_process_timeout);
+}
+
+fn runMcpKeychainProcessFor(
+    alloc: std.mem.Allocator,
+    argv: []const []const u8,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    stdout_limit: std.Io.Limit,
+    timeout: std.Io.Timeout,
+) anyerror!std.process.RunResult {
     const flag = cancel_flag orelse return runMcpKeychainChild(&.{
         .alloc = alloc,
         .argv = argv,
         .stdout_limit = stdout_limit,
+        .timeout = timeout,
     });
     var context = McpKeychainRunContext{
         .alloc = alloc,
         .argv = argv,
         .stdout_limit = stdout_limit,
+        .timeout = timeout,
     };
     var watch: KeychainWatch = .{};
     var select_buffer: [2]McpKeychainRunEvent = undefined;
@@ -643,9 +704,17 @@ fn waitForMcpStore(
     child: *std.process.Child,
     cancel_flag: ?*const std.atomic.Value(bool),
 ) Error!std.process.Child.Term {
+    return waitForMcpStoreFor(child, cancel_flag, keychain_process_timeout.duration);
+}
+
+fn waitForMcpStoreFor(
+    child: *std.process.Child,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    duration: std.Io.Clock.Duration,
+) Error!std.process.Child.Term {
     const pid = child.id orelse return writeFailed("native_wait_start", error.ProcessNotFound);
     const io = io_mod.getIo();
-    const deadline = std.Io.Clock.Timestamp.fromNow(io, keychain_process_timeout.duration);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io, duration);
     var watch: KeychainWatch = .{};
     var select_buffer: [2]McpStoreEvent = undefined;
     var select: std.Io.Select(McpStoreEvent) = .init(io, &select_buffer);
@@ -685,6 +754,15 @@ fn storeMcpValueMacControlled(
     value: []const u8,
     cancel_flag: ?*const std.atomic.Value(bool),
 ) Error!void {
+    return storeMcpValueMacFor(service, value, cancel_flag, keychain_process_timeout.duration);
+}
+
+fn storeMcpValueMacFor(
+    service: []const u8,
+    value: []const u8,
+    cancel_flag: ?*const std.atomic.Value(bool),
+    duration: std.Io.Clock.Duration,
+) Error!void {
     var account_buf: AccountBuffer = undefined;
     const account = try accountName(&account_buf);
     const argv = mcpScriptArgv("store", account, service);
@@ -705,7 +783,7 @@ fn storeMcpValueMacControlled(
     input.close(io_mod.getIo());
     input_open = false;
 
-    const term = try waitForMcpStore(&child, cancel_flag);
+    const term = try waitForMcpStoreFor(&child, cancel_flag, duration);
     if (term != .exited or term.exited != 0) {
         return writeFailedTerm("native_exit", term);
     }
@@ -940,4 +1018,19 @@ test "Keychain value store uses a bounded PTY bridge without a secret argument" 
     for (argv) |arg| {
         try std.testing.expect(!std.mem.eql(u8, arg, "vca_secret_value"));
     }
+}
+
+test "a Keychain call made under a hold deadline ends by it, and none starts after it" {
+    const own_ms: i64 = 10_000;
+    // Plenty left: the call keeps its own timeout.
+    try std.testing.expectEqual(keychain_process_timeout, callTimeout(50_000, 30_000).?);
+    try std.testing.expectEqual(keychain_process_timeout, callTimeout(30_000 + own_ms, 30_000).?);
+    // Less left than its own: it ends at the deadline.
+    const short = callTimeout(30_000 + own_ms - 1, 30_000).?;
+    try std.testing.expectEqual(@as(i96, (own_ms - 1) * std.time.ns_per_ms), short.duration.raw.nanoseconds);
+    try std.testing.expectEqual(keychain_process_timeout.duration.clock, short.duration.clock);
+    try std.testing.expectEqual(@as(i96, std.time.ns_per_ms), callTimeout(30_001, 30_000).?.duration.raw.nanoseconds);
+    // At or past it: no call.
+    try std.testing.expect(callTimeout(30_000, 30_000) == null);
+    try std.testing.expect(callTimeout(29_000, 30_000) == null);
 }
