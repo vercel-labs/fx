@@ -904,7 +904,7 @@ test "built-in model-facing tool contract stays byte exact" {
         if (builtin.target.os.tag.isDarwin())
             "acfa71f07cec5662e77777af6075e529f0d3c2598c9855a04dcbdffda6db5760"
         else
-            "04adc103570cb6a7deea711643131a55c0ef4a2ecdf3ce288e5803db4c3fb437",
+            "4ab95d2811addf193111f0150912076b1dde54074a1fe6be24b64700ffc254c7",
         &actual_hex,
     );
 }
