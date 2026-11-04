@@ -3304,4 +3304,43 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "a herdr socket that never answers leaves fx running",
+    async () => {
+      const socketRoot = createIsolatedRoot();
+      const socketPath = join(socketRoot.root, "herdr.sock");
+      const requests: string[] = [];
+      const sockets = new Set<Socket>();
+      // Takes every connection and reads its request, but never replies.
+      const server = createServer((socket) => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+        socket.on("data", (chunk) => requests.push(chunk.toString()));
+      });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(socketPath, resolve);
+        });
+        const ctx = await launchScenario(
+          [outerText("silent herdr handled")],
+          "input",
+          { FX_HERDR: "1", HERDR_SOCKET_PATH: socketPath, HERDR_PANE_ID: "w1:p1" },
+        );
+        await ctx.session.sendText("Answer while herdr stays silent.");
+        await ctx.session.waitForText("silent herdr handled", TIMEOUT);
+        expect(requests.some((request) => request.includes("pane.report_agent"))).toBe(true);
+        await assertProcessAliveAndClean(ctx);
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        for (const socket of sockets) socket.destroy();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    },
+    TIMEOUT,
+  );
 });
