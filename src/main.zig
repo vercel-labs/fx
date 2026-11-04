@@ -5541,6 +5541,40 @@ test {
     _ = @import("gateway/host_chat_completions.zig");
 }
 
+test "the busiest agent wins herdr's state: an approval over work, work over idle, and a closed first instance not at all" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const Busiest = app_agents_runtime.Busiest;
+    const asking = try addTestChildAgent(&app, "asking");
+    const working = try addTestChildAgent(&app, "working");
+    try std.testing.expectEqual(Busiest.idle, runtime.busiest(&app));
+
+    working.agent.worker.worker_processing = true;
+    try std.testing.expectEqual(Busiest.working, runtime.busiest(&app));
+    try std.testing.expect(try asking.agent.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
+    try std.testing.expectEqual(Busiest.needs_approval, runtime.busiest(&app));
+    asking.agent.approval_prompt.clear(alloc);
+    try std.testing.expectEqual(Busiest.working, runtime.busiest(&app));
+
+    // A turn that ended unseen leaves its agent idle for herdr.
+    working.agent.worker.worker_processing = false;
+    working.agent.finished_unseen = true;
+    try std.testing.expectEqual(Busiest.idle, runtime.busiest(&app));
+
+    // Once the first instance is closed, main's agent no longer counts.
+    app.main_agent.worker.worker_processing = true;
+    try std.testing.expectEqual(Busiest.working, runtime.busiest(&app));
+    app.instances.first_open = false;
+    try std.testing.expectEqual(Busiest.idle, runtime.busiest(&app));
+    app.main_agent.worker.worker_processing = false;
+}
+
 fn addTestChildAgent(app: *App, id: []const u8) !*app_agents_runtime.ChildAgent {
     const child = try app.alloc.create(app_agents_runtime.ChildAgent);
     errdefer app.alloc.destroy(child);

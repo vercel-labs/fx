@@ -13,14 +13,9 @@ pub const Client = herdr.Client;
 
 pub fn Runtime(comptime App: type) type {
     return struct {
-        /// An app that can say what its busiest agent is doing reports the
-        /// pane's state from its main loop through `reconcile`, so one
-        /// agent's turn ending can't mark the pane idle while another works.
-        /// The lifecycle hooks below serve an app with one agent.
-        const reconciles = @hasDecl(App, "agentsBusiest");
-
-        /// Must run before the lifecycle runtime is frozen (currently the
-        /// notification runtime performs the sole freeze right after this).
+        /// Turns herdr on from the environment and reports the session and
+        /// an idle pane. Later changes come from `reconcile`, so one agent's
+        /// turn ending can't mark the pane idle while another works.
         pub fn configure(app: *App, active_session_id: ?[]const u8) !void {
             app.herdr.initFromEnv(app.alloc);
             if (!app.herdr.enabled) return;
@@ -30,16 +25,12 @@ pub fn Runtime(comptime App: type) type {
             }
             app.herdr.reportState(.idle, null);
             app.herdr.announce();
-
-            if (comptime reconciles) return;
-            try register(app);
         }
 
         /// Reports the busiest agent's state when it changed: blocked over
         /// working, and working over idle. The main loop runs it after each
         /// pass, since it owns every agent's prompts.
         pub fn reconcile(app: *App) void {
-            if (comptime !reconciles) return;
             if (!app.herdr.enabled) return;
             const Report = struct { state: herdr.State, status: ?[]const u8 = null };
             const report: Report = switch (app.agentsBusiest()) {
@@ -50,41 +41,6 @@ pub fn Runtime(comptime App: type) type {
                 .idle => .{ .state = .idle },
             };
             app.herdr.reportStateIfChanged(report.state, report.status);
-        }
-
-        fn register(app: *App) !void {
-            try app.lifecycle_runtime.registerPostTurnEnd(.{
-                .name = "fx.herdr.turn_end",
-                .ctx = app,
-                .run = postTurnEndHandler,
-            });
-            try app.lifecycle_runtime.registerAttentionRequired(.{
-                .name = "fx.herdr.attention_required",
-                .ctx = app,
-                .run = attentionRequiredHandler,
-            });
-        }
-
-        pub fn reportWorking(app: *App) void {
-            app.herdr.reportState(.working, null);
-        }
-
-        fn postTurnEndHandler(
-            raw: *anyopaque,
-            input: hooks.PostTurnEndInput,
-        ) hooks.HandlerError!void {
-            const app: *App = @ptrCast(@alignCast(raw));
-            if (input.invocation.scope.kind != .interactive) return;
-            app.herdr.reportState(.idle, null);
-        }
-
-        fn attentionRequiredHandler(
-            raw: *anyopaque,
-            input: hooks.AttentionRequiredInput,
-        ) hooks.HandlerError!void {
-            const app: *App = @ptrCast(@alignCast(raw));
-            if (input.invocation.scope.kind != .interactive) return;
-            app.herdr.reportState(.blocked, attentionStatus(input.kind));
         }
 
         fn attentionStatus(kind: hooks.AttentionKind) []const u8 {
@@ -188,63 +144,6 @@ test "an app that knows its busiest agent reports the pane state only on a chang
     try expectReport(app.herdr.reports[5], .idle, null);
 }
 
-test "built-in Herdr hooks report only interactive lifecycle state" {
-    const TestApp = struct {
-        alloc: std.mem.Allocator,
-        lifecycle_runtime: hooks.Runtime,
-        herdr: RecordingClient = .{},
-    };
-    const Provider = Runtime(TestApp);
-
-    var app = TestApp{
-        .alloc = std.testing.allocator,
-        .lifecycle_runtime = hooks.Runtime.init(std.testing.allocator),
-    };
-    defer app.lifecycle_runtime.deinit();
-
-    try Provider.configure(&app, "session-42");
-    const view = app.lifecycle_runtime.freeze();
-    try std.testing.expect(app.herdr.initialized);
-    try std.testing.expect(app.herdr.announced);
-    try std.testing.expectEqualStrings("session-42", app.herdr.session_id orelse return error.TestExpectedEqual);
-    try std.testing.expect(view.hasPostTurnEnd());
-    try std.testing.expect(view.hasAttentionRequired());
-
-    Provider.reportWorking(&app);
-    view.runPostTurnEnd(.{
-        .invocation = testInvocation(.ask),
-        .outcome = .completed,
-    });
-    view.runPostTurnEnd(.{
-        .invocation = testInvocation(.interactive),
-        .outcome = .completed,
-    });
-    view.runAttentionRequired(.{
-        .invocation = testInvocation(.acp),
-        .kind = .permission,
-    });
-    view.runAttentionRequired(.{
-        .invocation = testInvocation(.interactive),
-        .kind = .permission,
-    });
-    view.runAttentionRequired(.{
-        .invocation = testInvocation(.interactive),
-        .kind = .question,
-    });
-    view.runAttentionRequired(.{
-        .invocation = testInvocation(.interactive),
-        .kind = .route_recovery,
-    });
-
-    try std.testing.expectEqual(@as(usize, 6), app.herdr.report_count);
-    try expectReport(app.herdr.reports[0], .idle, null);
-    try expectReport(app.herdr.reports[1], .working, null);
-    try expectReport(app.herdr.reports[2], .idle, null);
-    try expectReport(app.herdr.reports[3], .blocked, "permission");
-    try expectReport(app.herdr.reports[4], .blocked, "question");
-    try expectReport(app.herdr.reports[5], .blocked, "recovery");
-}
-
 test "disabled built-in Herdr provider registers no lifecycle hooks" {
     const TestApp = struct {
         alloc: std.mem.Allocator,
@@ -266,17 +165,6 @@ test "disabled built-in Herdr provider registers no lifecycle hooks" {
     try std.testing.expectEqual(@as(usize, 0), app.herdr.report_count);
     try std.testing.expect(!view.hasPostTurnEnd());
     try std.testing.expect(!view.hasAttentionRequired());
-}
-
-fn testInvocation(kind: hooks.ScopeKind) hooks.Invocation {
-    return .{
-        .scope = .{
-            .kind = kind,
-            .workspace_root = "/tmp/workspace",
-            .session_id = "session",
-        },
-        .turn_id = 42,
-    };
 }
 
 fn expectReport(actual: RecordingClient.Report, state: herdr.State, status: ?[]const u8) !void {

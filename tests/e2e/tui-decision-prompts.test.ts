@@ -390,6 +390,50 @@ function outerText(text: string) {
   ]);
 }
 
+/// A herdr socket that answers every request and keeps the pane states fx
+/// reports, with the environment that points fx at it.
+async function startFakeHerdr() {
+  const socketRoot = createIsolatedRoot();
+  const socketPath = join(socketRoot.root, "herdr.sock");
+  const reports: string[] = [];
+  const sockets = new Set<Socket>();
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    let input = "";
+    socket.on("data", (chunk) => {
+      input += chunk.toString();
+      const newline = input.indexOf("\n");
+      if (newline < 0) return;
+      const request = JSON.parse(input.slice(0, newline));
+      if (request.method === "pane.report_agent") {
+        expect(request.params.source).toBe("custom:fx");
+        expect(request.params.agent).toBe("fx");
+        expect(request.params.pane_id).toBe("w1:p1");
+        reports.push(request.params.state);
+      }
+      socket.end(`${JSON.stringify({ id: request.id, result: {} })}\n`);
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, resolve);
+  });
+  return {
+    reports,
+    env: { FX_HERDR: "1", HERDR_SOCKET_PATH: socketPath, HERDR_PANE_ID: "w1:p1" },
+    waitForReports: async (expected: string[]) => {
+      const deadline = Date.now() + 5_000;
+      while (reports.length < expected.length && Date.now() < deadline) await sleep(25);
+      expect(reports).toEqual(expected);
+    },
+    close: async () => {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
 function controlledGatewayResponse(response: Response) {
   let signalRequested!: () => void;
   let releaseResponse!: () => void;
@@ -2337,44 +2381,11 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
   test.each(["option", "freeform", "immediate"] as const)(
     "Herdr returns to working after a question's %s answer before the turn ends",
     async (answerKind) => {
-      const socketRoot = createIsolatedRoot();
-      const socketPath = join(socketRoot.root, "herdr.sock");
-      const reports: string[] = [];
-      const sockets = new Set<Socket>();
-      const server = createServer((socket) => {
-        sockets.add(socket);
-        socket.on("close", () => sockets.delete(socket));
-        let input = "";
-        socket.on("data", (chunk) => {
-          input += chunk.toString();
-          const newline = input.indexOf("\n");
-          if (newline < 0) return;
-          const request = JSON.parse(input.slice(0, newline));
-          if (request.method === "pane.report_agent") {
-            expect(request.params.source).toBe("custom:fx");
-            expect(request.params.agent).toBe("fx");
-            expect(request.params.pane_id).toBe("w1:p1");
-            reports.push(request.params.state);
-          }
-          socket.end(`${JSON.stringify({ id: request.id, result: {} })}\n`);
-        });
-      });
+      const herdr = await startFakeHerdr();
+      const { reports, waitForReports } = herdr;
       const continuation = controlledGatewayResponse(outerText("Herdr question continued"));
       try {
-        await new Promise<void>((resolve, reject) => {
-          server.once("error", reject);
-          server.listen(socketPath, resolve);
-        });
-        const ctx = await launchScenario(
-          [outerQuestionCall(), continuation.next],
-          "input",
-          { FX_HERDR: "1", HERDR_SOCKET_PATH: socketPath, HERDR_PANE_ID: "w1:p1" },
-        );
-        const waitForReports = async (expected: string[]) => {
-          const deadline = Date.now() + 5_000;
-          while (reports.length < expected.length && Date.now() < deadline) await sleep(25);
-          expect(reports).toEqual(expected);
-        };
+        const ctx = await launchScenario([outerQuestionCall(), continuation.next], "input", herdr.env);
 
         await ctx.session.sendText("Ask me which path to take.");
         await ctx.session.waitForText(QUESTION_PROMPT, TIMEOUT);
@@ -2404,8 +2415,44 @@ describe.skipIf(SKIP)("tui: decision prompt input isolation", () => {
           await session.kill();
           session = null;
         }
-        for (const socket of sockets) socket.destroy();
-        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await herdr.close();
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "Herdr stays working when one instance's turn ends while another's still runs",
+    async () => {
+      const herdr = await startFakeHerdr();
+      const first = controlledGatewayResponse(outerText("HERDR_FIRST_DONE"));
+      try {
+        const ctx = await launchScenario([first.next, outerText("HERDR_SECOND_DONE")], "input", herdr.env);
+        await ctx.session.sendText("Take your time on this.");
+        await first.requested;
+        await herdr.waitForReports(["idle", "working"]);
+
+        // fx 2 answers at once while fx 1's turn is still out.
+        await ctx.session.sendText("/launch");
+        await ctx.session.waitForPane((pane) => pane.includes("fx 2/2"), TIMEOUT);
+        await ctx.session.waitForComposer(TIMEOUT);
+        await ctx.session.sendText("Answer right away.");
+        await ctx.session.waitForText("HERDR_SECOND_DONE", TIMEOUT);
+        await ctx.session.waitForComposer(TIMEOUT);
+        await sleep(500);
+        expect(herdr.reports).toEqual(["idle", "working"]);
+
+        // The pane goes idle only once fx 1 is done too.
+        first.release();
+        await herdr.waitForReports(["idle", "working", "idle"]);
+        await assertProcessAliveAndClean(ctx);
+      } finally {
+        first.release();
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        await herdr.close();
       }
     },
     TIMEOUT,

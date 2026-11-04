@@ -958,10 +958,14 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     "a subagent without a profile copies its instance, and one with a profile gets what the profile says",
     async () => {
       let home = "";
+      let builderAsked = false;
       const bodies = await withHost((body) => {
         const texts = userTexts(body).join("\n");
         if (texts.includes("TREE_PLAIN_TASK")) return text("plain_done", "TREE_PLAIN_DONE");
-        if (texts.includes("TREE_BUILDER_TASK")) return text("builder_done", "TREE_BUILDER_DONE");
+        if (texts.includes("TREE_BUILDER_TASK")) {
+          builderAsked = true;
+          return text("builder_done", "TREE_BUILDER_DONE");
+        }
         const last = userTexts(body).at(-1) ?? "";
         if (last.includes("TREE_USER_PLAIN")) {
           if (answered(body)) return text("plain_final", "TREE_PLAIN_FINAL");
@@ -984,6 +988,10 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForComposer(15_000);
         await session.sendText("TREE_USER_BUILDER start a builder");
         await session.waitForText("TREE_BUILDER_FINAL", 45_000);
+        // Main answers as soon as its call returns, which can be before the
+        // builder's own request is out.
+        const deadline = Date.now() + 15_000;
+        while (!builderAsked && Date.now() < deadline) await Bun.sleep(25);
       });
       const holding = (marker: string) => bodies.filter((body) => userTexts(body).join("\n").includes(marker));
       // fx 2 runs in its profile, without the shell.
