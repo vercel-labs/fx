@@ -1545,8 +1545,7 @@ pub fn Runtime(comptime App: type) type {
                     .projection = &projection,
                     .labels = &historical_labels,
                 };
-                try writeResumeNotice(app, agent, &sink, display, notice);
-                const holds_previous = try replayResumedHistoryToSink(app, agent, &sink, state.history, &historical_labels);
+                const holds_previous = try replayWithResumeNotice(app, agent, &sink, display, notice, state.history, &historical_labels);
                 const projection_finished_ns = io_mod.nanoTimestamp();
                 try projection.finalize();
                 const finalization_finished_ns = io_mod.nanoTimestamp();
@@ -1564,8 +1563,7 @@ pub fn Runtime(comptime App: type) type {
                 );
             } else {
                 var sink = LiveHistorySink(App){ .app = app };
-                try writeResumeNotice(app, agent, &sink, display, notice);
-                _ = try replayResumedHistoryToSink(app, agent, &sink, state.history, &historical_labels);
+                _ = try replayWithResumeNotice(app, agent, &sink, display, notice, state.history, &historical_labels);
             }
             if (comptime @hasDecl(App, "restoreSessionCredential")) {
                 try app.restoreSessionCredential(previous_provider);
@@ -3445,17 +3443,36 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
-        fn writeResumeNotice(
+        /// Replays `history` to `sink` with the resume notice. A fork's notice
+        /// names the command that reopens its source, so it follows the
+        /// replay, where it stays in view however long the session is; the
+        /// other notices open it. Returns what `replayResumedHistoryToSink`
+        /// returns.
+        fn replayWithResumeNotice(
             app: *App,
             agent: *AppAgent,
             sink: anytype,
             display: *const session_display_metadata.DisplayMetadata,
             notice: ResumeNotice,
-        ) !void {
+            history: []const types.HistoryTurn,
+            labels: *HistoricalSessionLabels,
+        ) !bool {
             // Only a real title enters the cache: the fallback placeholder must
             // not count as an existing title, or background title generation
             // would consider the session already named and never run.
             if (display.present) try setCachedSessionTitle(app, agent, display.title);
+            if (notice != .fork) try writeResumeNotice(app, sink, display, notice);
+            const holds_previous = try replayResumedHistoryToSink(app, agent, sink, history, labels);
+            if (notice == .fork) try writeResumeNotice(app, sink, display, notice);
+            return holds_previous;
+        }
+
+        fn writeResumeNotice(
+            app: *App,
+            sink: anytype,
+            display: *const session_display_metadata.DisplayMetadata,
+            notice: ResumeNotice,
+        ) !void {
             switch (notice) {
                 .session => try sink.appendNotice(.{
                     .topic = "session resumed",
@@ -3480,10 +3497,13 @@ pub fn Runtime(comptime App: type) type {
                         .tone = .neutral,
                         .body = display.title,
                     });
-                    // A plain line, so the command copies as it is.
-                    const line = try app.alloc.print("original session fx --resume {s}\n", .{source_id});
-                    defer app.alloc.free(line);
-                    try sink.appendRaw(line);
+                    // Plain lines, and the command alone on its own, so
+                    // selecting that line copies only the command. The blank
+                    // line keeps a row between it and the input box while it
+                    // is the newest entry.
+                    const lines = try app.alloc.print("Resume the original session with:\nfx --resume {s}\n\n", .{source_id});
+                    defer app.alloc.free(lines);
+                    try sink.appendRaw(lines);
                 },
             }
         }
