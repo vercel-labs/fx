@@ -14,6 +14,9 @@ pub const Options = struct {
     permission_mode: types.PermissionMode = .auto,
     permission_rules: types.PermissionRuleSet = .{},
     subagent_available: bool = false,
+    /// Whether `execute` is offered: `experimental.code_mode` is on and the
+    /// build can run code mode.
+    code_mode_available: bool = false,
     /// Profiles main can start a subagent in, listed beside the `subagent` tool.
     subagent_profiles: []const profiles.Entry = &.{},
     /// Built-in tools fx lists in the toolbox menu instead of sending.
@@ -524,6 +527,7 @@ fn appendBuiltinTool(
     // (`tests/tla/toolbox/Toolbox.tla` ToolsFixed), and with toolbox denied
     // they're denied too.
     if (toolNameInSet(options.behind_toolbox, tool.name)) return;
+    if (std.mem.eql(u8, tool.name, "execute") and !options.code_mode_available) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
     if (options.permission_mode != .yolo) {
         if (tool.provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;

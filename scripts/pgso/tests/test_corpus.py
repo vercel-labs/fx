@@ -59,6 +59,7 @@ VERIFICATION_E2E_TESTS = (
     "auto-mode-reliability.test.ts",
     "sessions.test.ts",
     "review-model-override.test.ts",
+    "code-mode-fake-gateway.test.ts",
     "configured-providers.test.ts",
     "oauth-keychain-migration.test.ts",
     "mcp-verbs.test.ts",

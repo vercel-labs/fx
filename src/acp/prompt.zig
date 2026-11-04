@@ -95,6 +95,7 @@ const test_builtin_gateway = if (std_builtin.is_test)
 else
     struct {};
 const types = @import("../core/shared/types.zig");
+const code_mode_sandbox = @import("../core/code_mode/sandbox.zig");
 const history_range = @import("../core/shared/history_range.zig");
 const worker_runtime = @import("../core/agent/worker_runtime.zig");
 const agent_stream_provider = @import("../core/agent/stream_provider.zig");
@@ -1330,6 +1331,7 @@ pub fn handlePrompt(
         .permission_rules = session.permission_rules,
         .subagent_available = state.subagent_host != null,
         .behind_toolbox = state.toolbox_behind.slice(),
+        .code_mode_available = state.code_mode_enabled and code_mode_sandbox.available,
     });
     defer tool_projection.deinit(alloc);
 
