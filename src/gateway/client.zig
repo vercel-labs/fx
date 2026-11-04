@@ -79,6 +79,9 @@ fn isRetryableAgentNetworkError(err: anyerror) bool {
         err == error.WriteFailed or
         err == error.ReadFailed or
         err == error.MalformedGatewaySseEvent or
+        err == error.MalformedOpenAICodexSseEvent or
+        err == error.MalformedXaiGrokSseEvent or
+        err == error.MalformedChatCompletionsChunk or
         isRetryableGatewayError(err);
 }
 
@@ -4583,6 +4586,9 @@ fn consumeSseStreamTraced(
         }
         const root = std.json.parseFromSliceLeaky(std.json.Value, event_arena.allocator(), json_text, .{}) catch |err| {
             if (err == error.OutOfMemory) return err;
+            // A duplicate key is valid JSON that fx refuses, so resending
+            // would get the same event back.
+            if (err == error.DuplicateField) return error.InvalidGatewaySseEvent;
             traceMalformedSseEvent(json_text.len);
             return error.MalformedGatewaySseEvent;
         };
@@ -11113,7 +11119,7 @@ test "host-managed Gateway chat omits authentication-owned headers" {
     try std.testing.expectEqualStrings(user_agent, fixture.capturedHeaderValue("user-agent").?);
 }
 
-test "a stream event that is not JSON is a dropped connection, and a too-deep one still ends" {
+test "a stream event that is not JSON is a dropped connection, and a too-deep or duplicate-key one still ends" {
     const Noop = struct {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
@@ -11136,6 +11142,27 @@ test "a stream event that is not JSON is a dropped connection, and a too-deep on
     } else |err| err;
     try std.testing.expectEqual(error.InvalidGatewaySseEvent, too_deep);
     try std.testing.expect(networkFailureEvidence(too_deep, .possibly_sent) == null);
+
+    var duplicate_reader = std.Io.Reader.fixed("data: {\"type\":\"text-delta\",\"type\":\"finish\"}\n\n");
+    const duplicate = if (consumeSseStream(std.testing.allocator, &duplicate_reader, undefined, Noop.chunk, null, &cancel_flag)) |completion| blk: {
+        var owned = completion;
+        deinitGatewayCompletion(std.testing.allocator, &owned);
+        break :blk error.TestExpectedStreamError;
+    } else |err| err;
+    try std.testing.expectEqual(error.InvalidGatewaySseEvent, duplicate);
+    try std.testing.expect(networkFailureEvidence(duplicate, .possibly_sent) == null);
+}
+
+test "an unreadable stream event from any provider is a dropped connection" {
+    for ([_]anyerror{
+        error.MalformedGatewaySseEvent,
+        error.MalformedOpenAICodexSseEvent,
+        error.MalformedXaiGrokSseEvent,
+        error.MalformedChatCompletionsChunk,
+    }) |err| {
+        const evidence = networkFailureEvidence(err, .possibly_sent) orelse return error.TestExpectedNetworkFailureEvidence;
+        try std.testing.expectEqual(agent_stream_provider.NetworkFailureCause.transport_interrupted, evidence.cause);
+    }
 }
 
 test "a connection that timed out before opening is offline" {

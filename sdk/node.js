@@ -30,6 +30,15 @@ const fetchOperationStale = 0;
 const fetchOperationApplied = 1;
 const fetchOperationBackpressure = 2;
 
+// A response's Retry-After in whole seconds, read as native fx reads it
+// (digits only), or -1 when it has none. `streamRetryAfter` in
+// wasm-runtime.js reads it the same way for the WebAssembly host.
+function retryAfterSeconds(headers) {
+  const value = headers.get("retry-after")?.trim();
+  if (!value || !/^\d+$/.test(value)) return -1;
+  return Math.min(Number(value), 0x7fffffff);
+}
+
 const nodeRequire = createRequire(import.meta.url);
 let nativeBackendPromise;
 
@@ -471,7 +480,11 @@ function createNativeCoreRuntime(addon, options) {
       });
       const response = await wait(responseTask);
       if (settled && !state.consumed) throw new DOMException("Aborted", "AbortError");
-      const started = settled ? fetchOperationStale : addon.startCoreFetchResponse(core, state.handle, response.status);
+      const started = settled
+        ? fetchOperationStale
+        : typeof addon.startCoreFetchResponseWithRetryAfter === "function"
+          ? addon.startCoreFetchResponseWithRetryAfter(core, state.handle, response.status, retryAfterSeconds(response.headers))
+          : addon.startCoreFetchResponse(core, state.handle, response.status);
       if (started !== fetchOperationApplied && started !== fetchOperationStale) throw new Error(`invalid native fetch start result ${started}`);
       state.active = started === fetchOperationApplied;
       reader = response.body?.getReader();

@@ -438,6 +438,7 @@ fn mapReducerError(err: anyerror) anyerror {
     return switch (err) {
         error.EventTooLarge => error.OpenAICodexSseEventTooLarge,
         error.InvalidEvent => error.InvalidOpenAICodexSseEvent,
+        error.MalformedEvent => error.MalformedOpenAICodexSseEvent,
         error.StreamIncomplete => error.OpenAICodexStreamIncomplete,
         error.ToolCallLimitExceeded => error.OpenAICodexToolCallLimitExceeded,
         error.ToolArgumentsTooLarge => error.OpenAICodexToolArgumentsTooLarge,
@@ -952,4 +953,12 @@ test "Responses streams give the same result however they are cut into events an
     try std.testing.fuzz({}, fuzzResponsesChunkedStream, .{
         .corpus = &(.{""} ++ @import("fuzz_corpus").responses_stream.*),
     });
+}
+
+test "a Codex event that is not JSON resends, and a duplicate key still ends the turn" {
+    const partial = "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial\"}\n\n";
+    try expectOpenAICodexSseError(error.MalformedOpenAICodexSseEvent, partial ++ "data: {not-json}\n\n", .{});
+    try std.testing.expect(gateway_client.networkFailureEvidence(error.MalformedOpenAICodexSseEvent, .possibly_sent) != null);
+    try expectOpenAICodexSseError(error.InvalidOpenAICodexSseEvent, partial ++ "data: {\"type\":\"a\",\"type\":\"b\"}\n\n", .{});
+    try std.testing.expect(gateway_client.networkFailureEvidence(error.InvalidOpenAICodexSseEvent, .possibly_sent) == null);
 }

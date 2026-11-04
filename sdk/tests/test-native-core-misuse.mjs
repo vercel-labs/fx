@@ -19,6 +19,7 @@ if (!ambientTraceChild) {
 }
 const addon = require(addonPath);
 assert.equal(typeof addon.coreFetchDisposition, "function", "rebuild libfx.node with coreFetchDisposition before running this suite");
+assert.equal(typeof addon.startCoreFetchResponseWithRetryAfter, "function", "rebuild libfx.node with startCoreFetchResponseWithRetryAfter before running this suite");
 
 if (ambientTraceChild) {
   const traceCore = addon.createCore({
@@ -50,6 +51,7 @@ for (const [name, args] of [
   ["coreFetchActive", []],
   ["coreFetchDisposition", []],
   ["startCoreFetchResponse", []],
+  ["startCoreFetchResponseWithRetryAfter", []],
   ["pushCoreFetchResponse", []],
   ["finishCoreFetch", []],
   ["failCoreFetch", []],
@@ -248,7 +250,17 @@ try {
   assert.equal(addon.coreFetchActive(lifecycleCore, secondHandle), true, "stale operations must not mutate the newer handle");
   assert.equal(addon.coreFetchDisposition(lifecycleCore, secondHandle), 1, "the next handle must not inherit earlier consumption");
   assert.equal(addon.coreFetchDisposition(lifecycleCore, firstHandle), 2, "the previous exact consumed identity must survive until replaced");
-  assert.equal(addon.startCoreFetchResponse(lifecycleCore, secondHandle, 200), 1);
+  assert.equal(addon.startCoreFetchResponseWithRetryAfter(lifecycleCore, firstHandle, 503, 3), 0, "a stale start with Retry-After must not apply");
+  assert.throws(() => addon.startCoreFetchResponseWithRetryAfter(lifecycleCore, secondHandle, 200), {
+    name: "TypeError", code: "LIBFX_INVALID_ARGUMENT", message: "missing required argument",
+  });
+  for (const invalidSeconds of [-2, 1.5, NaN, Infinity, -Infinity, 0x80000000, null, undefined, {}, "3", 3n]) {
+    assert.throws(() => addon.startCoreFetchResponseWithRetryAfter(lifecycleCore, secondHandle, 200, invalidSeconds), {
+      name: "TypeError", code: "LIBFX_INVALID_ARGUMENT",
+    });
+  }
+  assert.equal(addon.coreFetchActive(lifecycleCore, secondHandle), true, "a rejected start must not mutate the active handle");
+  assert.equal(addon.startCoreFetchResponseWithRetryAfter(lifecycleCore, secondHandle, 200, -1), 1);
   assert.equal(addon.pushCoreFetchResponse(lifecycleCore, secondHandle, responseBytes("second")), 1);
   assert.equal(addon.finishCoreFetch(lifecycleCore, secondHandle), 1);
   assert.equal((await Promise.race([waitForResponse(secondPrompt), timeout("second prompt result")])).result.stopReason, "end_turn");
@@ -260,6 +272,7 @@ try {
     ["coreFetchActive", [lifecycleCore, 0]],
     ["coreFetchDisposition", [lifecycleCore, 0]],
     ["startCoreFetchResponse", [lifecycleCore, 0, 200]],
+    ["startCoreFetchResponseWithRetryAfter", [lifecycleCore, 0, 200, -1]],
     ["pushCoreFetchResponse", [lifecycleCore, 0, Buffer.alloc(0)]],
     ["finishCoreFetch", [lifecycleCore, 0]],
     ["failCoreFetch", [lifecycleCore, 0]],
