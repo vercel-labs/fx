@@ -12784,6 +12784,37 @@ test "composer shortcut line delete joins at non-final line end and rejects unkn
     try std.testing.expectEqualStrings("alphabeta", app.input_runtime.edit_state.input.items);
 }
 
+test "composer shortcut line delete joins at non-first line start" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+
+    try app.input_runtime.edit_state.input.appendSlice(alloc, "alpha\nbeta");
+    try app.input_runtime.kill_ring.text.appendSlice(alloc, "existing kill");
+    app.input_runtime.edit_state.cursor = "alpha\n".len;
+
+    _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(
+        &app,
+        .delete_to_line_start,
+        .delete_to_line_start,
+        null,
+        null,
+        false,
+        4096,
+    );
+    try std.testing.expectEqualStrings("alphabeta", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, "alpha".len), app.input_runtime.edit_state.cursor);
+    try std.testing.expectEqualStrings("\n", app.input_runtime.kill_ring.text.items);
+    try std.testing.expect(app.shell.render_requests.hasReason(.footer));
+
+    app.shell.render_requests.clearReason(.footer);
+    app.input_runtime.edit_state.cursor = 0;
+    try Runtime(RoutingFakeApp).handleByte(&app, 21, 4096, 100);
+    try std.testing.expectEqualStrings("alphabeta", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("\n", app.input_runtime.kill_ring.text.items);
+    try std.testing.expect(!app.shell.render_requests.hasReason(.footer));
+}
+
 test "composer shortcut yank commits fresh image ids only after insertion" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

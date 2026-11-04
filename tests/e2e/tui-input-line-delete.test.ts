@@ -214,6 +214,98 @@ describe.skipIf(SKIP)("tui: logical-line deletion", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "repeated line-start deletion joins the previous logical line",
+    async () => {
+      const lineStartRoutes = routes.filter(
+        (route) => route.expectedVisible === "alpha\nright\ngamma",
+      );
+      for (const route of lineStartRoutes) {
+        const workDir = mkdtempSync(join(tmpdir(), "fx-line-delete-"));
+        workDirs.push(workDir);
+        const stderrPath = join(workDir, "stderr.log");
+        writeFileSync(stderrPath, "");
+
+        testHome = createIsolatedTestHome();
+        session = await TmuxSession.create({
+          cmd: FX_BIN,
+          cwd: workDir,
+          env: { HOME: testHome },
+          stderrPath,
+          width: 120,
+          height: 40,
+        });
+        await session.waitForComposer(10_000);
+
+        await session.sendLiteralText("alpha");
+        await session.sendHexBytes(["0a"]);
+        await session.sendLiteralText("beta");
+        await session.sendHexBytes(["0a"]);
+        await session.sendLiteralText("gamma");
+        await waitForLatestFooterState(
+          route.label,
+          session,
+          stderrPath,
+          "alpha\nbeta\ngamma",
+          null,
+        );
+
+        await session.sendHexBytes(route.hex);
+        await waitForLatestFooterState(
+          route.label,
+          session,
+          stderrPath,
+          "alpha\nbeta",
+          "gamma",
+        );
+
+        // At the start of the now empty line, the next press removes the
+        // line break, so typed text lands at the end of the line above.
+        await session.sendHexBytes(route.hex);
+        await session.sendLiteralText("X");
+        const finalGrid = await waitForLatestFooterState(
+          route.label,
+          session,
+          stderrPath,
+          "alpha\nbetaX",
+          "gamma",
+        );
+
+        const failures: string[] = [];
+        const footer = assertSingleFooter(finalGrid, failures, route.label);
+        if (footer === null) {
+          failures.push(`${route.label}: latest footer is unavailable`);
+        } else {
+          assertFooterLogicalRows(
+            finalGrid,
+            footer,
+            ["alpha", "betaX"],
+            failures,
+            route.label,
+          );
+        }
+        if (!session.isAlive()) {
+          failures.push(`${route.label}: fx process is not alive`);
+        }
+        const stderr = readFileSync(stderrPath, "utf8");
+        if (stderr.length !== 0) {
+          failures.push(`${route.label}: stderr is not empty`);
+        }
+        if (failures.length !== 0) {
+          throw new Error(
+            `${failures.join("\n")}\nFinal grid:\n${finalGrid.join("\n")}\nstderr:\n${stderr}`,
+          );
+        }
+
+        await session.kill();
+        session = null;
+        cleanupIsolatedTestHome(testHome);
+        testHome = null;
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe.skipIf(SKIP)("tui: backward word deletion", () => {
