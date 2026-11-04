@@ -51,15 +51,21 @@ USE_FLAGS = (
     f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc",
 )
 
-# Each outliner input first goes through `ir_size.py expand-constant-exprs`
-# and `ir_size.py swap-compares`, and each output through `ir_size.py
-# check-outlined`: the outliner can fold a constant nested in a constant
-# expression into a parameter that carries a different constant, and it can
-# pass a greater-than comparison's operands in the wrong order (see
-# ir_size.py).
+# Each outliner input first goes through `ir_size.py expand-constant-exprs`,
+# `ir_size.py swap-compares`, and `ir_size.py widen-constants`, and each
+# output through `ir_size.py check-outlined`: the outliner can fold a constant
+# nested in a constant expression into a parameter that carries a different
+# constant, pass a greater-than comparison's operands in the wrong order, and
+# replace the constant an exit returns with a parameter (see ir_size.py).
 IR_OUTLINER_FLAGS = (
     "-passes=iroutliner",
 )
+
+# The outliner can also leave an outlined function's output stores where
+# nothing reaches them (`ir_size.py dropped-outputs`). Each round marks the
+# callers of such functions `nooutline` and outlines again from the same
+# input; a function still found after this many rounds fails the build.
+IR_OUTLINER_ROUNDS = 4
 
 # The platform adds the symbols that stay external (`public_api_flags`).
 OUTLINE_CLEANUP_FLAGS = (
@@ -401,6 +407,20 @@ def check_outlined_argv(
         "--libllvm",
         str(toolchain.libllvm),
         "check-outlined",
+        str(source),
+    )
+
+
+def dropped_outputs_argv(
+    toolchain: Toolchain,
+    source: pathlib.Path,
+) -> tuple[str, ...]:
+    return (
+        sys.executable,
+        str(toolchain.ir_size),
+        "--libllvm",
+        str(toolchain.libllvm),
+        "dropped-outputs",
         str(source),
     )
 
@@ -1230,15 +1250,17 @@ def _outline_without_folded_constants(
         require_empty_stderr=True,
     )
     _require_bitcode_header(swapped)
+    widened = source.with_name(source.name + ".widened.bc")
     run_checked(
-        outline_ir_argv(toolchain, swapped, output),
+        ir_size_argv(toolchain, "widen-constants", swapped, widened),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,
-        log_path=paths.logs / f"outline-{name}.json",
+        log_path=paths.logs / f"widen-constants-{name}.json",
         require_empty_stderr=True,
     )
-    _require_nonempty_file(output, "outlined IR")
+    _require_bitcode_header(widened)
+    _outline_excluding_dropped_outputs(toolchain, paths, widened, output, name)
     run_checked(
         check_outlined_argv(toolchain, output),
         cwd=paths.root,
@@ -1246,6 +1268,73 @@ def _outline_without_folded_constants(
         timeout_s=900,
         log_path=paths.logs / f"check-outlined-{name}.json",
         require_empty_stderr=True,
+    )
+
+
+def _outline_excluding_dropped_outputs(
+    toolchain: Toolchain,
+    paths: PipelinePaths,
+    source: pathlib.Path,
+    output: pathlib.Path,
+    name: str,
+) -> None:
+    """Outline `source` into `output`, and while the outliner drops an
+    outlined function's output stores, mark that function's callers
+    `nooutline` and outline `source` again.
+
+    Each round is logged in `outline-rounds-{name}.json`. The caller's
+    check-outlined fails on anything still dropped after the last round.
+    """
+    excluded: list[str] = []
+    excluded_list = paths.logs / f"outline-excluded-{name}.txt"
+    marked = source.with_name(source.name + ".excluded.bc")
+    rounds = []
+    candidate = source
+    for number in range(1, IR_OUTLINER_ROUNDS + 1):
+        run_checked(
+            outline_ir_argv(toolchain, candidate, output),
+            cwd=paths.root,
+            env=os.environ.copy(),
+            timeout_s=900,
+            log_path=paths.logs / f"outline-{name}-round-{number}.json",
+            require_empty_stderr=True,
+        )
+        _require_nonempty_file(output, "outlined IR")
+        result = run_checked(
+            dropped_outputs_argv(toolchain, output),
+            cwd=paths.root,
+            env=os.environ.copy(),
+            timeout_s=900,
+            log_path=paths.logs / f"dropped-outputs-{name}-round-{number}.json",
+            require_empty_stderr=True,
+        )
+        summary = json.loads(result.stdout)
+        if not isinstance(summary.get("instances"), list) or not isinstance(summary.get("callers"), list):
+            raise PgsoError(f"dropped-outputs printed no instance list: {result.stdout!r}")
+        added = [caller for caller in summary["callers"] if caller not in excluded]
+        rounds.append({
+            "round": number,
+            "outlined_functions": summary.get("outlined_functions"),
+            "dropped_outputs": summary["instances"],
+            "excluded": added if number < IR_OUTLINER_ROUNDS else [],
+        })
+        if not summary["instances"] or not added or number == IR_OUTLINER_ROUNDS:
+            break
+        excluded.extend(added)
+        excluded_list.write_text("".join(f"{caller}\n" for caller in excluded), encoding="utf-8")
+        run_checked(
+            ir_size_argv(toolchain, "no-outline", source, marked, ("--functions", str(excluded_list))),
+            cwd=paths.root,
+            env=os.environ.copy(),
+            timeout_s=900,
+            log_path=paths.logs / f"no-outline-{name}-round-{number}.json",
+            require_empty_stderr=True,
+        )
+        _require_bitcode_header(marked)
+        candidate = marked
+    (paths.logs / f"outline-rounds-{name}.json").write_text(
+        json.dumps({"rounds": rounds, "excluded": excluded}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
 
 

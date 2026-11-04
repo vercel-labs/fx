@@ -30,11 +30,13 @@ from scripts.pgso.pipeline import (
     FX_CODEGEN_FLAGS,
     GENERATION_FLAGS,
     IR_OUTLINER_FLAGS,
+    IR_OUTLINER_ROUNDS,
     OUTLINE_CLEANUP_FLAGS,
     PROFILE_PREPARATION_PASSES,
     USE_FLAGS,
     ArtifactSpec,
     PipelinePaths,
+    _outline_without_folded_constants,
     apply_profile,
     cleanup_outlined_ir_argv,
     candidate_object_argv,
@@ -302,6 +304,9 @@ class PgsoPipelineTests(unittest.TestCase):
             f"""import pathlib,sys
 with pathlib.Path({str(actions)!r}).open('a') as stream:
     stream.write('ir_size ' + ' '.join(sys.argv[1:]) + '\\n')
+if 'dropped-outputs' in sys.argv:
+    print('{{"callers": [], "instances": [], "outlined_functions": 0}}')
+    sys.exit(0)
 if 'check-outlined' not in sys.argv:
     pathlib.Path(sys.argv[-1]).write_bytes({output!r})
 print('{{}}')""",
@@ -399,25 +404,28 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
 
         self.assertEqual(paths.profile_use_bitcode, result)
         lines = actions.read_text().splitlines()
-        self.assertEqual(10, len(lines))
+        self.assertEqual(12, len(lines))
         self.assertIn(f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc ", lines[0])
         self.assertTrue(lines[0].endswith(f"-o {paths.profile_use_base_bitcode}"))
         base = paths.profile_use_base_bitcode
         expanded = base.with_name(base.name + ".expanded.bc")
         swapped = base.with_name(base.name + ".swapped.bc")
+        widened = base.with_name(base.name + ".widened.bc")
         self.assertIn(f"expand-constant-exprs {base} {expanded}", lines[1])
         self.assertIn(f"swap-compares {expanded} {swapped}", lines[2])
-        self.assertIn(f"-passes=iroutliner {swapped} -o {paths.profile_use_bitcode}", lines[3])
-        self.assertTrue(lines[4].endswith(f"check-outlined {paths.profile_use_bitcode}"))
-        self.assertIn(f"sparse-constants {paths.profile_use_bitcode} ", lines[5])
+        self.assertIn(f"widen-constants {swapped} {widened}", lines[3])
+        self.assertIn(f"-passes=iroutliner {widened} -o {paths.profile_use_bitcode}", lines[4])
+        self.assertTrue(lines[5].endswith(f"dropped-outputs {paths.profile_use_bitcode}"))
+        self.assertTrue(lines[6].endswith(f"check-outlined {paths.profile_use_bitcode}"))
+        self.assertIn(f"sparse-constants {paths.profile_use_bitcode} ", lines[7])
         sparse = paths.profile_use_bitcode.with_name(paths.profile_use_bitcode.name + ".sparse")
         overlaid = paths.profile_use_bitcode.with_name(paths.profile_use_bitcode.name + ".overlaid")
         zero_filled = paths.profile_use_bitcode.with_name(paths.profile_use_bitcode.name + ".zero-filled")
         compacted = paths.profile_use_bitcode.with_name(paths.profile_use_bitcode.name + ".compacted")
-        self.assertIn(f"overlay-constants {sparse} {overlaid}", lines[6])
-        self.assertIn(f"zero-fill-globals {overlaid} {zero_filled}", lines[7])
-        self.assertIn(f"compact-error-names {zero_filled} {compacted}", lines[8])
-        self.assertIn(f"-passes=globaldce,verify {compacted} -o {paths.profile_use_bitcode}", lines[9])
+        self.assertIn(f"overlay-constants {sparse} {overlaid}", lines[8])
+        self.assertIn(f"zero-fill-globals {overlaid} {zero_filled}", lines[9])
+        self.assertIn(f"compact-error-names {zero_filled} {compacted}", lines[10])
+        self.assertIn(f"-passes=globaldce,verify {compacted} -o {paths.profile_use_bitcode}", lines[11])
 
     def test_profile_use_stops_when_the_outliner_folds_a_nested_constant(self) -> None:
         actions = self.root / "folded-actions"
@@ -431,6 +439,9 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
             f"""import pathlib,sys
 with pathlib.Path({str(actions)!r}).open('a') as stream:
     stream.write('ir_size ' + ' '.join(sys.argv[1:]) + '\\n')
+if 'dropped-outputs' in sys.argv:
+    print('{{"callers": [], "instances": [], "outlined_functions": 0}}')
+    sys.exit(0)
 if 'check-outlined' in sys.argv:
     sys.stderr.write('ir_size: IR outliner folded a nested constant into a parameter')
     sys.exit(1)
@@ -445,6 +456,89 @@ print('{{}}')""",
         with self.assertRaisesRegex(PgsoError, "failed with exit code 1"):
             apply_profile(toolchain, paths, sha256_file(paths.bitcode))
         self.assertNotIn("sparse-constants", actions.read_text())
+
+    def outline_with_drops(self, drops: list[list[str]]) -> tuple[list[str], pathlib.Path]:
+        """Run the outlining path with a fake outliner whose nth result drops
+        the outputs of a function called from `drops[n]`."""
+        actions = self.root / "drop-actions"
+        state = self.root / "drop-state"
+        opt = self.write_executable(
+            "drop-opt",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('opt ' + ' '.join(sys.argv[1:]) + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'BC\\xc0\\xdeoutlined')""",
+        )
+        ir_size = self.write_executable(
+            "drop-ir-size",
+            f"""import json,pathlib,sys
+args = sys.argv[3:]
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('ir_size ' + ' '.join(args) + '\\n')
+    if 'no-outline' in args:
+        stream.write('excluded ' + pathlib.Path(args[args.index('--functions') + 1]).read_text().replace('\\n', ' ') + '\\n')
+state = pathlib.Path({str(state)!r})
+seen = int(state.read_text()) if state.exists() else 0
+drops = {drops!r}
+if 'dropped-outputs' in args:
+    callers = drops[seen] if seen < len(drops) else []
+    state.write_text(str(seen + 1))
+    instances = [{{'function': 'outlined_ir_func_7', 'blocks': ['output_block_1_0'], 'stores_to_parameter': True, 'callers': callers}}] if callers else []
+    print(json.dumps({{'callers': callers, 'instances': instances, 'outlined_functions': 3}}))
+    sys.exit(0)
+if 'check-outlined' in args:
+    if drops[seen - 1] if seen <= len(drops) else []:
+        sys.stderr.write('ir_size: IR outliner miscompiled an outlined function: outlined_ir_func_7')
+        sys.exit(1)
+    print('{{}}')
+    sys.exit(0)
+pathlib.Path(args[-1]).write_bytes(b'BC\\xc0\\xdestaged')
+print('{{}}')""",
+        )
+        toolchain = dataclasses.replace(self.toolchain, opt=opt, ir_size=ir_size)
+        source = self.paths.profile_use_base_bitcode
+        source.write_bytes(b"BC\xc0\xdebase")
+        try:
+            _outline_without_folded_constants(toolchain, self.paths, source, self.paths.outlined_bitcode, "drops")
+        finally:
+            lines = actions.read_text().splitlines()
+        return lines, source.with_name(source.name + ".widened.bc")
+
+    def test_outlining_excludes_callers_of_dropped_outputs_and_outlines_again(self) -> None:
+        lines, widened = self.outline_with_drops([["caller.b", "caller.a"], []])
+
+        outlines = [line for line in lines if line.startswith("opt ")]
+        self.assertEqual(2, len(outlines))
+        self.assertIn(f"-passes=iroutliner {widened} -o ", outlines[0])
+        excluded = widened.with_name(widened.name + ".excluded.bc")
+        self.assertIn(f"-passes=iroutliner {excluded} -o ", outlines[1])
+        self.assertIn("excluded caller.b caller.a ", lines)
+        no_outline = next(line for line in lines if " no-outline " in line)
+        self.assertTrue(no_outline.endswith(f"no-outline {widened} {excluded}"))
+        self.assertTrue(lines[-1].endswith(f"check-outlined {self.paths.outlined_bitcode}"))
+        rounds = json.loads((self.paths.logs / "outline-rounds-drops.json").read_text())
+        self.assertEqual(["caller.b", "caller.a"], rounds["excluded"])
+        self.assertEqual([1, 2], [entry["round"] for entry in rounds["rounds"]])
+        self.assertEqual(["caller.b", "caller.a"], rounds["rounds"][0]["excluded"])
+        self.assertEqual("outlined_ir_func_7", rounds["rounds"][0]["dropped_outputs"][0]["function"])
+        self.assertEqual([], rounds["rounds"][1]["dropped_outputs"])
+        for log in ("outline-drops-round-2", "dropped-outputs-drops-round-2", "no-outline-drops-round-1"):
+            self.assertTrue((self.paths.logs / f"{log}.json").is_file(), log)
+
+    def test_outlining_fails_closed_when_outputs_are_still_dropped_after_the_last_round(self) -> None:
+        drops = [[f"caller.{number}"] for number in range(IR_OUTLINER_ROUNDS)]
+
+        with self.assertRaisesRegex(PgsoError, "failed with exit code 1"):
+            self.outline_with_drops(drops)
+
+        lines = (self.root / "drop-actions").read_text().splitlines()
+        self.assertEqual(IR_OUTLINER_ROUNDS, sum(line.startswith("opt ") for line in lines))
+        self.assertEqual(IR_OUTLINER_ROUNDS - 1, sum(" no-outline " in line for line in lines))
+        self.assertTrue(lines[-1].endswith(f"check-outlined {self.paths.outlined_bitcode}"))
+        rounds = json.loads((self.paths.logs / "outline-rounds-drops.json").read_text())
+        self.assertEqual([f"caller.{number}" for number in range(IR_OUTLINER_ROUNDS - 1)], rounds["excluded"])
+        self.assertEqual([], rounds["rounds"][-1]["excluded"])
+        self.assertEqual(["caller.3"], rounds["rounds"][-1]["dropped_outputs"][0]["callers"])
 
     def test_profile_pipelines_use_the_exact_accepted_flags(self) -> None:
         self.assertEqual(
@@ -1146,7 +1240,7 @@ print('_main T ---------------- 0')""",
         )
 
         lines = actions.read_text().splitlines()
-        self.assertEqual(14, len(lines))
+        self.assertEqual(16, len(lines))
         self.assertTrue(lines[0].startswith("opt "))
         marked = self.paths.profile_use_base_bitcode.with_name(
             self.paths.profile_use_base_bitcode.name + ".no-outline.bc"
@@ -1175,7 +1269,7 @@ print('_main T ---------------- 0')""",
         self.assertEqual(self.paths.profile_use_bitcode, result)
         self.assertEqual(b"bitcode", result.read_bytes())
         lines = actions.read_text().splitlines()
-        self.assertEqual(13, len(lines))
+        self.assertEqual(15, len(lines))
         self.assertIn("-passes=function(sroa,instcombine<no-verify-fixpoint>,loop-unroll-full,instcombine<no-verify-fixpoint>,simplifycfg),default<O2>,mergefunc", lines[0])
         self.assertNotIn("iroutliner", lines[0])
         self.assertEqual("nm", lines[1])
@@ -1183,22 +1277,28 @@ print('_main T ---------------- 0')""",
         outlined = self.paths.outlined_bitcode
         expanded = source.with_name(source.name + ".expanded.bc")
         swapped = source.with_name(source.name + ".swapped.bc")
+        widened = source.with_name(source.name + ".widened.bc")
         self.assertIn(f"expand-constant-exprs {source} {expanded}", lines[2])
         self.assertIn(f"swap-compares {expanded} {swapped}", lines[3])
-        self.assertIn(f"-passes=iroutliner {swapped} -o {outlined}", lines[4])
-        self.assertTrue(lines[5].endswith(f"check-outlined {outlined}"))
+        self.assertIn(f"widen-constants {swapped} {widened}", lines[4])
+        self.assertIn(f"-passes=iroutliner {widened} -o {outlined}", lines[5])
+        self.assertTrue(lines[6].endswith(f"dropped-outputs {outlined}"))
+        self.assertTrue(lines[7].endswith(f"check-outlined {outlined}"))
         self.assertTrue((self.paths.logs / "swap-compares-profile-use.json").is_file())
+        self.assertTrue((self.paths.logs / "widen-constants-profile-use.json").is_file())
         self.assertTrue((self.paths.logs / "check-outlined-profile-use.json").is_file())
-        self.assertIn("-passes=internalize,constmerge,globaldce,mergefunc,verify", lines[6])
-        self.assertIn(f"{outlined} -o {self.paths.profile_use_bitcode}", lines[6])
-        self.assertTrue(lines[7].startswith("ir_size --libllvm "))
-        self.assertIn(f"sparse-constants {self.paths.profile_use_bitcode} ", lines[7])
-        self.assertIn("overlay-constants ", lines[8])
-        self.assertIn("zero-fill-globals ", lines[9])
-        self.assertIn("compact-error-names ", lines[10])
-        self.assertIn("-passes=globaldce,verify", lines[11])
-        self.assertTrue(lines[11].endswith(f"-o {self.paths.profile_use_bitcode}"))
-        self.assertEqual("nm", lines[12])
+        rounds = json.loads((self.paths.logs / "outline-rounds-profile-use.json").read_text())
+        self.assertEqual({"excluded": [], "rounds": [{"dropped_outputs": [], "excluded": [], "outlined_functions": 0, "round": 1}]}, rounds)
+        self.assertIn("-passes=internalize,constmerge,globaldce,mergefunc,verify", lines[8])
+        self.assertIn(f"{outlined} -o {self.paths.profile_use_bitcode}", lines[8])
+        self.assertTrue(lines[9].startswith("ir_size --libllvm "))
+        self.assertIn(f"sparse-constants {self.paths.profile_use_bitcode} ", lines[9])
+        self.assertIn("overlay-constants ", lines[10])
+        self.assertIn("zero-fill-globals ", lines[11])
+        self.assertIn("compact-error-names ", lines[12])
+        self.assertIn("-passes=globaldce,verify", lines[13])
+        self.assertTrue(lines[13].endswith(f"-o {self.paths.profile_use_bitcode}"))
+        self.assertEqual("nm", lines[14])
         for suffix in (".sparse", ".overlaid", ".zero-filled", ".compacted"):
             self.assertFalse(
                 self.paths.profile_use_bitcode.with_name(
