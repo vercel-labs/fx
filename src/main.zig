@@ -878,8 +878,9 @@ const App = struct {
         NotificationAppRuntime.playMaxCue(self, .toggle);
     }
 
-    pub fn reportWorking(self: *App) void {
-        HerdrAppRuntime.reportWorking(self);
+    /// What the busiest open agent is doing, for herdr's pane state.
+    pub fn agentsBusiest(self: *App) app_agents_runtime.Busiest {
+        return AgentsAppRuntime.busiest(self);
     }
 
     /// `agent`'s turn needs the user: an approval or a question.
@@ -1528,7 +1529,6 @@ const App = struct {
         errdefer releaseUnadmittedPrompt(agent, queued);
         queued.recovery_resume = resumed;
         try agent.worker.enqueuePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
         WorkerAppRuntime.syncState(
             self,
             agent,
@@ -1632,7 +1632,6 @@ const App = struct {
         );
         errdefer releaseUnadmittedPrompt(agent, queued);
         try agent.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
         return true;
     }
 
@@ -1657,7 +1656,6 @@ const App = struct {
         );
         errdefer releaseUnadmittedPrompt(agent, queued);
         try agent.worker.enqueuePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
         return true;
     }
 
@@ -1854,7 +1852,6 @@ const App = struct {
             .history = history,
             .unversioned_history_count = agent.session.unversionedHistoryEnd(),
         });
-        HerdrAppRuntime.reportWorking(self);
         return true;
     }
 
@@ -3365,6 +3362,7 @@ const App = struct {
         AgentsAppRuntime.settleChildRuns(self);
         AgentsAppRuntime.settleLentQuestion(self);
         AgentsAppRuntime.lendPrompt(self);
+        HerdrAppRuntime.reconcile(self);
     }
 
     /// Gives a subagent's question lent to main's prompt back to it, before
@@ -5543,6 +5541,40 @@ test {
     _ = @import("gateway/host_openai_codex.zig");
     _ = @import("gateway/host_xai_grok.zig");
     _ = @import("gateway/host_chat_completions.zig");
+}
+
+test "the busiest agent wins herdr's state: an approval over work, work over idle, and a closed first instance not at all" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const Busiest = app_agents_runtime.Busiest;
+    const asking = try addTestChildAgent(&app, "asking");
+    const working = try addTestChildAgent(&app, "working");
+    try std.testing.expectEqual(Busiest.idle, runtime.busiest(&app));
+
+    working.agent.worker.worker_processing = true;
+    try std.testing.expectEqual(Busiest.working, runtime.busiest(&app));
+    try std.testing.expect(try asking.agent.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
+    try std.testing.expectEqual(Busiest.needs_approval, runtime.busiest(&app));
+    asking.agent.approval_prompt.clear(alloc);
+    try std.testing.expectEqual(Busiest.working, runtime.busiest(&app));
+
+    // A turn that ended unseen leaves its agent idle for herdr.
+    working.agent.worker.worker_processing = false;
+    working.agent.finished_unseen = true;
+    try std.testing.expectEqual(Busiest.idle, runtime.busiest(&app));
+
+    // Once the first instance is closed, main's agent no longer counts.
+    app.main_agent.worker.worker_processing = true;
+    try std.testing.expectEqual(Busiest.working, runtime.busiest(&app));
+    app.instances.first_open = false;
+    try std.testing.expectEqual(Busiest.idle, runtime.busiest(&app));
+    app.main_agent.worker.worker_processing = false;
 }
 
 fn addTestChildAgent(app: *App, id: []const u8) !*app_agents_runtime.ChildAgent {

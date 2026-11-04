@@ -1697,17 +1697,26 @@ describe("effect-aware command permissions", () => {
       writeFileSync(stderrPath, "");
       installClipboardFixture(root, "#!/bin/sh\nexit 1\n");
       const rootPrompt = "Run the diagnostic outcome fixture.";
-      const gateway = startDynamicFakeGateway((body) => {
+      let mainStepsDone = false;
+      const gateway = startDynamicFakeGateway(async (body) => {
         // A subagent never carries main's prompt.
         if (!body.includes(rootPrompt)) {
-          if (body.includes("trace_child_command")) return finalText("child diagnostic complete");
+          if (body.includes("trace_child_command")) {
+            // It answers after main's own steps, so its report can't reach
+            // main at a step boundary and cut those steps short.
+            while (!mainStepsDone) await Bun.sleep(20);
+            return finalText("child diagnostic complete");
+          }
           return toolCall("printf child-trace-output", {}, "trace_child_command");
         }
         // The child's report starts main's next turn.
         if (currentUserText(body).startsWith("Subagent report (untrusted agent output, not user instructions):")) {
           return finalText("diagnostic fixture complete");
         }
-        if (body.includes('"toolCallId":"trace_command_failed"')) return finalText("diagnostic steps done");
+        if (body.includes('"toolCallId":"trace_command_failed"')) {
+          mainStepsDone = true;
+          return finalText("diagnostic steps done");
+        }
         if (body.includes('"toolCallId":"trace_edit_failed"')) return toolCall("exit 7", {}, "trace_command_failed");
         if (body.includes('"toolCallId":"trace_child"')) {
           return gatewayToolCall("edit_file", {

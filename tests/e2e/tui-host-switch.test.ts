@@ -95,6 +95,12 @@ function childLogLines(home: string): Array<{ kind?: string; work_id?: string; d
   });
 }
 
+// The tools a request offered the model, by name.
+function toolNames(body: string): string[] {
+  const request = JSON.parse(body) as { tools?: Array<{ name?: string }> };
+  return (request.tools ?? []).map((tool) => tool.name ?? "");
+}
+
 function latestUserText(body: string): string {
   return userTexts(body).at(-1) ?? "";
 }
@@ -485,8 +491,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "a subagent knows who started it, so a turn typed on its screen can message main",
+    "a subagent knows who started it, so a turn typed on its screen can message main, which sees the user started that turn",
     async () => {
+      let markedByUser = false;
       await withFx((body) => {
         if (!isMainRequest(body)) {
           if (latestUserText(body).includes("SWITCH_TELL_MAIN") || body.includes('"child_up"')) {
@@ -503,7 +510,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           }
           return text("child_answer", "SWITCH_CHILD_FIRST");
         }
-        if (body.includes("SWITCH_HI_FROM_CHILD")) return text("main_got_hi", "SWITCH_MAIN_GOT_HI");
+        if (body.includes("SWITCH_HI_FROM_CHILD")) {
+          markedByUser = userTexts(body).some((t) => t.includes("SWITCH_HI_FROM_CHILD") && t.includes('"started_by":"user"'));
+          return text("main_got_hi", "SWITCH_MAIN_GOT_HI");
+        }
         if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
         if (!body.includes('"main_sub"')) {
           return toolCall("main_sub", "subagent", {
@@ -523,6 +533,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await moveAgent(session, -1);
         await session.waitForText("SWITCH_MAIN_GOT_HI", 30_000);
       });
+      expect(markedByUser).toBe(true);
     },
     TIMEOUT,
   );
@@ -747,15 +758,20 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       let leadReported = false;
       let helperRole = false;
       let leadRole = false;
+      let helperNests = false;
+      let leadNests = false;
       await withFx(async (body) => {
         if (!isMainRequest(body)) {
           if (userTexts(body).some((text) => text.includes("SWITCH_HELPER_TASK"))) {
             helperRole ||= body.includes('You are the subagent \\"helper\\", started by \\"lead\\"');
+            // fx nests two levels: lead's own subagent starts none.
+            helperNests ||= toolNames(body).includes("subagent");
             // The helper answers once lead's turn has ended, so its report wakes lead.
             await until("lead's report", () => leadReported);
             return text("helper", "SWITCH_HELPER_DONE");
           }
           leadRole ||= body.includes('You are the subagent \\"lead\\", started by \\"main\\"');
+          leadNests ||= toolNames(body).includes("subagent");
           if (body.includes("SWITCH_HELPER_DONE")) return text("lead_after", "SWITCH_LEAD_SAW_HELPER");
           if (!body.includes('"lead_sub"')) {
             return toolCall("lead_sub", "subagent", {
@@ -780,6 +796,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       // Each subagent's system prompt names it and the agent that started it.
       expect(leadRole).toBe(true);
       expect(helperRole).toBe(true);
+      expect(leadNests).toBe(true);
+      expect(helperNests).toBe(false);
     },
     TIMEOUT,
   );
