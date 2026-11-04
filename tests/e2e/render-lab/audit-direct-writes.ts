@@ -78,6 +78,7 @@ const allowlist: AllowRule[] = [
   rule("src/core/indexer/scan.zig", "expectEntries", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/indexer/wildmatch.zig", "expectCases", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/shell_command/safe_git.zig", "(?:plainOutput|ready)", /debug_print/, "tests", "test diagnostics"),
+  rule("src/js/engine.zig", "(?:expectReturned|expectThrew)", /debug_print/, "tests", "test diagnostics"),
 ];
 
 function rule(
