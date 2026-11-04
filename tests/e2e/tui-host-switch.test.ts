@@ -361,6 +361,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           });
         }
         if (mainCalls === 2) {
+          // Sent once the subagent's request is out, so the message waits in
+          // its turn. Sent sooner, the turn takes it into that request, and
+          // the stop then drops nothing.
+          await until("the subagent's turn", () => childCalls >= 1);
           return toolCall("main_more", "subagent", {
             request: { action: "message", agent: "worker", message: "SWITCH_MORE one more thing" },
           });
