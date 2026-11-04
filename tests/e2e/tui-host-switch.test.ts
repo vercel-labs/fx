@@ -55,6 +55,46 @@ function userTexts(body: string): string[] {
   });
 }
 
+// The tab title once it has held still for half a second.
+async function stablePaneTitle(session: TmuxSession, ms = 15_000): Promise<string> {
+  const deadline = Date.now() + ms;
+  let last = await session.paneTitle();
+  let since = Date.now();
+  while (Date.now() < deadline) {
+    await Bun.sleep(100);
+    const now = await session.paneTitle();
+    if (now !== last) {
+      last = now;
+      since = Date.now();
+    } else if (Date.now() - since >= 500) {
+      return now;
+    }
+  }
+  return last;
+}
+
+async function waitForPaneTitle(session: TmuxSession, done: (title: string) => boolean, ms = 15_000): Promise<string> {
+  const deadline = Date.now() + ms;
+  let title = "";
+  while (Date.now() < deadline) {
+    title = await session.paneTitle();
+    if (done(title)) return title;
+    await Bun.sleep(50);
+  }
+  throw new Error(`pane title never matched; last saw ${JSON.stringify(title)}`);
+}
+
+// Every child line in the profile's saved session logs.
+function childLogLines(home: string): Array<{ kind?: string; work_id?: string; data?: { by?: string } }> {
+  const sessions = join(home, ".fx", "sessions", "v2");
+  if (!existsSync(sessions)) return [];
+  return readdirSync(sessions).flatMap((id) => {
+    const log = join(sessions, id, "log.jsonl");
+    if (!existsSync(log)) return [];
+    return readFileSync(log, "utf8").split("\n").filter((line) => line.includes('"child_')).map((line) => JSON.parse(line));
+  });
+}
+
 function latestUserText(body: string): string {
   return userTexts(body).at(-1) ?? "";
 }
@@ -479,6 +519,139 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await moveAgent(session, -1);
         await session.waitForText("SWITCH_MAIN_GOT_HI", 30_000);
       });
+    },
+    TIMEOUT,
+  );
+  test(
+    "the tab title names the agent on screen, and a subagent's title never takes over main's",
+    async () => {
+      await withFx((body) => {
+        if (!isMainRequest(body)) return text("child_answer", "SWITCH_CHILD_FIRST");
+        if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "reviewer", message: "SWITCH_TASK look for nothing" },
+          });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
+        await session.waitForComposer(15_000);
+        // The subagent's title arrived after main's, and main is still on screen.
+        const mainTitle = await stablePaneTitle(session);
+        expect(mainTitle).not.toBe("");
+        await moveAgent(session, 1);
+        await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
+        const childTitle = await waitForPaneTitle(session, (title) => title !== "" && title !== mainTitle);
+        await moveAgent(session, -1);
+        await waitForPaneTitle(session, (title) => title === mainTitle);
+        expect(childTitle).not.toBe(mainTitle);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an Enter with nothing typed on a subagent's screen opens no turn there",
+    async () => {
+      await withFx((body) => {
+        if (!isMainRequest(body)) {
+          if (latestUserText(body).includes("SWITCH_TYPED")) return text("child_typed", "SWITCH_CHILD_TYPED");
+          return text("child_answer", "SWITCH_CHILD_FIRST");
+        }
+        if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "reviewer", message: "SWITCH_TASK look for nothing" },
+          });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session, { home }) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
+        await session.waitForComposer(15_000);
+        await moveAgent(session, 1);
+        await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendKeys("Enter");
+        await session.sendText("SWITCH_TYPED a real turn");
+        await session.waitForText("SWITCH_CHILD_TYPED", 30_000);
+        // Only the turn that ran opened a work in main's log, and it says the
+        // user started it, so a restart can still tell.
+        const spawns = childLogLines(home).filter((line) => line.kind === "child_spawned" && line.work_id?.startsWith("fxuser:"));
+        expect(spawns).toHaveLength(1);
+        expect(spawns[0]!.data?.by).toBe("user");
+      });
+    },
+    TIMEOUT,
+  );
+  test(
+    "a turn typed on a subagent's screen that fx dies during reaches main after a resume as the user's",
+    async () => {
+      const typed = held();
+      let typedReached = false;
+      let reports: string[] = [];
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            if (latestUserText(body).includes("SWITCH_TYPED")) {
+              typedReached = true;
+              await typed.promise;
+              return text("child_typed", "SWITCH_CHILD_TYPED");
+            }
+            return text("child_answer", "SWITCH_CHILD_FIRST");
+          }
+          const interrupted = userTexts(body).filter((t) => t.includes('"child_id"') && t.includes('"outcome":"interrupted"'));
+          if (interrupted.length > 0) {
+            reports = interrupted;
+            return text("main_saw_report", "SWITCH_MAIN_SAW_REPORT");
+          }
+          if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", { request: { action: "message", agent: "reviewer", message: "SWITCH_TASK look for nothing" } });
+          }
+          return text("main_done", "SWITCH_MAIN_DONE");
+        }, async (session, { home, launch }) => {
+          await session.sendText("SWITCH_USER");
+          await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
+          await session.waitForComposer(15_000);
+          await moveAgent(session, 1);
+          await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("SWITCH_TYPED a turn the crash cuts off");
+          await until("the typed turn's request", () => typedReached);
+
+          // Kill fx while that turn's request is out, as a crash would.
+          const pid = session.processPid();
+          process.kill(pid, "SIGKILL");
+          const deadline = Date.now() + 10_000;
+          while (Date.now() < deadline) {
+            try { process.kill(pid, 0); } catch { break; }
+            await Bun.sleep(25);
+          }
+          await session.kill();
+
+          const sessions = join(home, ".fx", "sessions", "v2");
+          const holds = (path: string, marker: string): boolean => readdirSync(path).some((entry) => {
+            const full = join(path, entry);
+            return statSync(full).isDirectory() ? holds(full, marker) : readFileSync(full, "latin1").includes(marker);
+          });
+          const parents = readdirSync(sessions).filter((id) =>
+            !id.startsWith(".") && statSync(join(sessions, id)).isDirectory() && holds(join(sessions, id), "SWITCH_MAIN_SAW_FIRST"));
+          expect(parents).toHaveLength(1);
+          const resumed = await launch(`--resume ${parents[0]}`);
+          await resumed.waitForText("SWITCH_MAIN_SAW_REPORT", 30_000);
+          await resumed.waitForComposer(15_000);
+          await resumed.sendText("/quit");
+          expect(await resumed.waitForSessionEnd(15_000)).toBe(true);
+        });
+      } finally {
+        typed.release();
+      }
+      // Main hears of the cut-off turn once, as the user's, not its own.
+      expect(reports).toHaveLength(1);
+      expect(reports[0]).toContain('"started_by":"user"');
     },
     TIMEOUT,
   );

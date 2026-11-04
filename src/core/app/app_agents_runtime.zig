@@ -512,15 +512,31 @@ pub fn Runtime(comptime App: type) type {
         /// for the user's turn, so its profile and main's live permissions
         /// limit that turn as they limit main's runs. While one is going, the
         /// text steers or follows it under that turn's run, as typing does on
-        /// main. A subagent never runs a turn without a run.
-        pub fn prepareOwnTurn(app: *App, agent: *AppAgent) !void {
-            const child = app.agent_on_screen orelse return;
+        /// main. A subagent never runs a turn without a run. True when it
+        /// admitted a run, whose work `openOwnTurnWork` opens once the text
+        /// is queued.
+        pub fn prepareOwnTurn(app: *App, agent: *AppAgent) !bool {
+            const child = app.agent_on_screen orelse return false;
             // An instance takes its own turns as the first one does.
-            if (child.agent.role == .instance) return;
+            if (child.agent.role == .instance) return false;
             if (child.agent.worker_thread == null) _ = try ensureChild(app, child.id);
             if (!child.session_attached) try attachSession(app, agent, child);
-            if (child.agent.child_run == null or !turnGoing(app, child)) try admitOwnTurn(app, agent, child);
+            const admitted = child.agent.child_run == null or !turnGoing(app, child);
+            if (admitted) try admitOwnTurn(app, agent, child);
             debug_trace.eventf("host", "input_routed", .{}, "agent={s}", .{child.id});
+            return admitted;
+        }
+
+        /// Opens the work in the parent's log for the turn `prepareOwnTurn`
+        /// admitted, once the user's text is queued for it. A submit that
+        /// queues nothing, such as an empty Enter or a refused image, opens
+        /// none, so no work waits for a turn that never comes.
+        pub fn openOwnTurnWork(app: *App) void {
+            const child = app.agent_on_screen orelse return;
+            const run = if (child.agent.child_run) |*value| value else return;
+            if (run.inFlight() or run.turn_work_id.len > 0) return;
+            const host = hostOf(app, child) orelse return;
+            if (host.beginUserWork(app.alloc, child.id, &child.agent.worker)) |work_id| run.turn_work_id = work_id;
         }
 
         /// Gives `run` the user's earlier requests to the subagent in context,
@@ -565,8 +581,6 @@ pub fn Runtime(comptime App: type) type {
             try setUserRequests(app, agent, &run);
             // A user turn the last run opened and never saw end ends now.
             if (child.agent.child_run) |*previous| endUserWork(app.alloc, host, previous, .cancelled, "");
-            // The turn is a work in the parent's log, as every child turn is.
-            if (host.beginUserWork(app.alloc, child.id, &child.agent.worker)) |work_id| run.turn_work_id = work_id;
             installChildRun(app, child, run);
             debug_trace.eventf("host", "own_turn_admitted", .{}, "agent={s} model={s} permission_mode={s}", .{
                 child.id,
@@ -1247,6 +1261,8 @@ pub fn Runtime(comptime App: type) type {
                 };
             }
             debug_trace.eventf("host", "agent_switched", .{}, "agent={s} from={s}", .{ nameOf(target), nameOf(from) });
+            // The tab names the agent on screen, as a second fx's would.
+            app_session_runtime.Runtime(App).syncTerminalTitle(app, agents.screenAgentOf(app));
             try app.shell.requestTerminalReset(&app.metrics);
             app.shell.render_requests.request(.footer);
             debug_trace.eventf("host", "screen_reprinted", .{}, "agent={s} entries={d}", .{

@@ -67,7 +67,7 @@ pub const PendingFold = struct {
     started: std.ArrayList(Key) = .empty,
     pending: std.ArrayList(Pending) = .empty,
 
-    const Key = struct { child_id: []const u8, work_id: []const u8 };
+    const Key = struct { child_id: []const u8, work_id: []const u8, started_by: StartedBy };
 
     pub fn deinit(self: *PendingFold, alloc: Allocator) void {
         self.started.deinit(alloc);
@@ -78,17 +78,27 @@ pub const PendingFold = struct {
     pub fn step(self: *PendingFold, alloc: Allocator, line: session_adapter.ReportLine) error{OutOfMemory}!void {
         switch (line) {
             .spawned => |spawned| if (child_state.spawnNamesRule(spawned.data)) {
-                try self.started.append(alloc, .{ .child_id = spawned.child, .work_id = spawned.work_id });
+                try self.started.append(alloc, .{
+                    .child_id = spawned.child,
+                    .work_id = spawned.work_id,
+                    .started_by = child_state.spawnStartedBy(spawned.data),
+                });
             },
             .finished => |finished| {
                 const started = self.takeStarted(finished.child, finished.work_id);
                 const repaired = finished.outcome == .interrupted or finished.outcome == .lost;
-                const owed = child_state.finishOwesFlag(finished.data) orelse (started and repaired);
+                const owed = child_state.finishOwesFlag(finished.data) orelse (started != null and repaired);
+                var end = child_state.finishEndFacts(finished.data);
+                // Repair writes no fx data, so who started the work is read
+                // from its spawn, and the report still names the user's turn.
+                if (finished.data == null) if (started) |by| {
+                    end.started_by = by;
+                };
                 if (owed and self.findPending(finished.child, finished.work_id) == null) try self.pending.append(alloc, .{
                     .child_id = finished.child,
                     .work_id = finished.work_id,
                     .outcome = child_state.fxOutcome(finished.outcome),
-                    .end = child_state.finishEndFacts(finished.data),
+                    .end = end,
                 });
             },
             .taken => |taken| if (self.findPending(taken.child, taken.work_id)) |index| {
@@ -97,14 +107,15 @@ pub const PendingFold = struct {
         }
     }
 
-    fn takeStarted(self: *PendingFold, child_id: []const u8, work_id: []const u8) bool {
+    /// Who started the work this fx opened, forgotten once taken; null for
+    /// one it didn't open.
+    fn takeStarted(self: *PendingFold, child_id: []const u8, work_id: []const u8) ?StartedBy {
         for (self.started.items, 0..) |key, index| {
             if (std.mem.eql(u8, key.child_id, child_id) and std.mem.eql(u8, key.work_id, work_id)) {
-                _ = self.started.swapRemove(index);
-                return true;
+                return self.started.swapRemove(index).started_by;
             }
         }
-        return false;
+        return null;
     }
 
     fn findPending(self: *const PendingFold, child_id: []const u8, work_id: []const u8) ?usize {
@@ -314,6 +325,23 @@ test "a pending report keeps who started its work and why it was cancelled" {
     try std.testing.expectEqual(@as(usize, 2), pending.len);
     try std.testing.expectEqual(child_state.EndFacts{ .started_by = .user, .cause = .fx_quit }, pending[0].end);
     try std.testing.expectEqual(child_state.EndFacts{}, pending[1].end);
+}
+
+test "a work crash repair closes still says who started it" {
+    const alloc = std.testing.allocator;
+    const L = session_adapter.ReportLine;
+    // Repair's finish carries no fx data; the spawn says the user started w1.
+    var lines = [_]L{
+        .{ .spawned = .{ .child = "c1", .work_id = "w1", .data = "{\"fingerprint\":\"ab\",\"report\":\"final\",\"by\":\"user\"}" } },
+        .{ .finished = .{ .child = "c1", .work_id = "w1", .outcome = .interrupted, .data = null } },
+        .{ .spawned = .{ .child = "c1", .work_id = "w2", .data = marked_spawn } },
+        .{ .finished = .{ .child = "c1", .work_id = "w2", .outcome = .interrupted, .data = null } },
+    };
+    const pending = try pendingReports(alloc, &lines);
+    defer alloc.free(pending);
+    try std.testing.expectEqual(@as(usize, 2), pending.len);
+    try std.testing.expectEqual(StartedBy.user, pending[0].end.started_by);
+    try std.testing.expectEqual(StartedBy.parent, pending[1].end.started_by);
 }
 
 test "a card names who sent a report or message, and how the work ended" {

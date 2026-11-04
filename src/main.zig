@@ -3383,9 +3383,15 @@ const App = struct {
     }
 
     /// Readies the subagent on screen, if any, for a turn the user starts
-    /// there, which then runs as main's does.
-    pub fn prepareSubagentOnScreen(self: *App, agent: *agents.Agent) !void {
+    /// there, which then runs as main's does. True when it admitted one.
+    pub fn prepareSubagentOnScreen(self: *App, agent: *agents.Agent) !bool {
         return AgentsAppRuntime.prepareOwnTurn(self, agent);
+    }
+
+    /// Opens the work for the turn `prepareSubagentOnScreen` admitted, once
+    /// the user's text is queued.
+    pub fn openSubagentTurnWork(self: *App) void {
+        AgentsAppRuntime.openOwnTurnWork(self);
     }
 
     /// `/launch`: another instance on the host, shown.
@@ -5609,7 +5615,10 @@ test "the tick visits only the child agents with work waiting" {
 
 test "the agent list previews each agent by switching, keeps every draft where it was typed, and Esc goes back" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5671,7 +5680,10 @@ test "the agent list previews each agent by switching, keeps every draft where i
 
 test "the footer indicator names the agent on screen and the key that opens the list" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5690,7 +5702,10 @@ test "the footer indicator names the agent on screen and the key that opens the 
 
 test "while a subagent is on screen, the tick visits main and the other hidden agents" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5728,7 +5743,10 @@ test "while a subagent is on screen, the tick visits main and the other hidden a
 
 test "the footer notes a hidden agent waiting on an approval, never the one on screen" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5760,7 +5778,10 @@ test "the footer notes a hidden agent waiting on an approval, never the one on s
 
 test "the footer notes a hidden agent whose request waits for the user" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5789,7 +5810,10 @@ test "the footer notes a hidden agent whose request waits for the user" {
 
 test "a hidden subagent's approval is lent to main's screen, answered on its worker, and goes back" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5889,7 +5913,10 @@ test "an approval answered on main's screen goes back, so the next one of the tr
 
 test "main's screen shows its tree's oldest prompt first, approval or question" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5935,7 +5962,10 @@ test "main's screen shows its tree's oldest prompt first, approval or question" 
 
 test "a hidden subagent's question is lent to main's screen and goes back on a switch" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
