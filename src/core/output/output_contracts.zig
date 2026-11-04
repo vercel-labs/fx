@@ -1,4 +1,5 @@
 const std = @import("std");
+const profile_paths = @import("../shared/profile_paths.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const credentials = @import("../auth/credentials.zig");
 const doctor_runtime = @import("../cli/doctor_runtime.zig");
@@ -22,6 +23,8 @@ const update_notes = @import("../upgrade/update_notes.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const workspace_commands = @import("../workspace/workspace_commands.zig");
+const settings_entries = @import("../config/settings_entries.zig");
+const settings_keys = @import("../config/settings_keys.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -37,6 +40,11 @@ pub const OutputFormat = enum {
     text,
     json,
 };
+
+/// Process exit status when the command line itself is wrong: an unknown
+/// command, an unknown or invalid flag, or a missing or bad argument. Work
+/// that fails after the command line is accepted exits 1.
+pub const usage_exit_code: u8 = 2;
 
 pub const CommandFailureSnapshot = struct {
     kind: []const u8,
@@ -422,6 +430,160 @@ pub fn workspaceErrorMessage(err: anyerror) ?[]const u8 {
     };
 }
 
+pub const ConfigUnknownSetting = struct {
+    key: settings_keys.UnknownKey,
+    /// Where the key is: `~/.fx/settings.json` or `.fx.json`.
+    file: []const u8,
+    suggestion: ?[]const u8 = null,
+};
+
+/// `fx config list` and `fx config get` in git's format: one `key=value`
+/// per line, lowest precedence first, with the origin first and a tab when
+/// asked.
+pub const ConfigSnapshot = struct {
+    entries: []const settings_entries.Entry,
+    /// Keys fx doesn't know. The JSON form lists them; the text form leaves
+    /// them to the warnings on stderr.
+    unknown: []const ConfigUnknownSetting = &.{},
+    workspace_root: []const u8,
+    show_origin: bool = false,
+    /// `fx config get` of one plain key prints the value alone.
+    value_only: bool = false,
+
+    pub fn render(self: ConfigSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        return switch (format) {
+            .text => self.renderText(alloc),
+            .json => self.renderJson(alloc),
+        };
+    }
+
+    fn renderText(self: ConfigSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        for (self.entries) |entry| {
+            if (self.show_origin) {
+                switch (entry.origin) {
+                    .project => try out.writer.writeAll("file:.fx.json"),
+                    .global => try out.writer.writeAll(profile_paths.displayText("file:~/.fx/settings.json")),
+                    .workspace => {
+                        try out.writer.writeAll("workspace:");
+                        try writeTerminalSafe(&out.writer, alloc, self.workspace_root);
+                    },
+                    .env => try out.writer.print("env:{s}", .{entry.variable.?}),
+                    .default => try out.writer.writeAll("default"),
+                }
+                try out.writer.writeByte('\t');
+            }
+            if (!self.value_only) {
+                try writeTerminalSafe(&out.writer, alloc, entry.key);
+                try out.writer.writeByte('=');
+            }
+            try writeConfigValue(&out.writer, alloc, entry.value);
+            try out.writer.writeByte('\n');
+        }
+        return try out.toOwnedSlice();
+    }
+
+    fn renderJson(self: ConfigSnapshot, alloc: Allocator) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"kind\":\"config\",\"entries\":[");
+        for (self.entries, 0..) |entry, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"key\":");
+            try std.json.Stringify.value(entry.key, .{}, &out.writer);
+            try out.writer.writeAll(",\"value\":");
+            try std.json.Stringify.value(entry.value, .{}, &out.writer);
+            try out.writer.print(",\"origin\":\"{s}\"", .{@tagName(entry.origin)});
+            if (entry.origin == .env) {
+                try out.writer.writeAll(",\"variable\":");
+                try std.json.Stringify.value(entry.variable.?, .{}, &out.writer);
+            } else if (entry.origin != .default) {
+                try out.writer.writeAll(",\"file\":");
+                try std.json.Stringify.value(if (entry.origin == .project) ".fx.json" else profile_paths.displayText("~/.fx/settings.json"), .{}, &out.writer);
+            }
+            if (entry.origin == .workspace) {
+                try out.writer.writeAll(",\"workspace\":");
+                try std.json.Stringify.value(self.workspace_root, .{}, &out.writer);
+            }
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeAll("],\"unknown\":[");
+        for (self.unknown, 0..) |unknown, index| {
+            if (index > 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("{\"key\":\"");
+            if (unknown.key.parent) |parent| try std.json.Stringify.encodeJsonStringChars(parent, .{}, &out.writer);
+            if (unknown.key.parent != null) try out.writer.writeByte('.');
+            try std.json.Stringify.encodeJsonStringChars(unknown.key.name, .{}, &out.writer);
+            try out.writer.writeAll("\",\"file\":");
+            try std.json.Stringify.value(unknown.file, .{}, &out.writer);
+            try out.writer.writeAll(",\"workspace\":");
+            try std.json.Stringify.value(unknown.key.workspace, .{}, &out.writer);
+            try out.writer.writeAll(",\"suggestion\":");
+            try std.json.Stringify.value(unknown.suggestion, .{}, &out.writer);
+            try out.writer.writeByte('}');
+        }
+        try out.writer.writeAll("]}");
+        return try out.toOwnedSlice();
+    }
+};
+
+/// What `fx config set` or `fx config unset` did to the profile settings, as
+/// one line naming the key, the value, and the file, like other setters.
+pub const ConfigChangeSnapshot = struct {
+    unset: bool,
+    key: []const u8,
+    /// The saved value; null for `unset`.
+    value: ?std.json.Value = null,
+    changed: bool,
+
+    pub fn render(self: ConfigChangeSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        switch (format) {
+            .text => {
+                try writeTerminalSafe(&out.writer, alloc, self.key);
+                if (self.unset) {
+                    try out.writer.writeAll(if (self.changed) profile_paths.displayText(" removed from ~/.fx/settings.json.\n") else profile_paths.displayText(" isn't set in ~/.fx/settings.json.\n"));
+                } else {
+                    try out.writer.writeAll(if (self.changed) " set to " else " is already ");
+                    try writeConfigValue(&out.writer, alloc, self.value orelse .null);
+                    try out.writer.writeAll(if (self.changed) profile_paths.displayText(" in ~/.fx/settings.json.\n") else ".\n");
+                }
+            },
+            .json => {
+                try out.writer.print("{{\"kind\":\"config\",\"action\":\"{s}\",\"key\":", .{if (self.unset) "unset" else "set"});
+                try std.json.Stringify.value(self.key, .{}, &out.writer);
+                try out.writer.writeAll(",\"value\":");
+                try std.json.Stringify.value(self.value orelse .null, .{}, &out.writer);
+                try out.writer.print(",\"changed\":{},\"file\":", .{self.changed});
+                try std.json.Stringify.value(profile_paths.displayText("~/.fx/settings.json"), .{}, &out.writer);
+                try out.writer.writeByte('}');
+            },
+        }
+        return try out.toOwnedSlice();
+    }
+};
+
+/// A settings value as `fx config` prints it: text and numbers as they are,
+/// lists and objects as compact JSON.
+fn writeConfigValue(writer: *std.Io.Writer, alloc: Allocator, value: std.json.Value) !void {
+    switch (value) {
+        .string => |text| try writeTerminalSafe(writer, alloc, text),
+        .number_string => |text| try writeTerminalSafe(writer, alloc, text),
+        .bool => |flag| try writer.writeAll(if (flag) "true" else "false"),
+        .integer => |number| try writer.print("{d}", .{number}),
+        .float => |number| try writer.print("{d}", .{number}),
+        .null => try writer.writeAll("null"),
+        .array, .object => {
+            var json: std.Io.Writer.Allocating = .init(alloc);
+            defer json.deinit();
+            try std.json.Stringify.value(value, .{}, &json.writer);
+            try writeTerminalSafe(writer, alloc, json.written());
+        },
+    }
+}
+
 pub const WorkspaceSnapshot = struct {
     primary_directory: []const u8,
     saved_suppressed: bool,
@@ -705,6 +867,8 @@ pub const StatusSnapshot = struct {
     /// Why the profile settings could not be read, for the `/status` panel.
     /// The credential they select is then unknown, so no auth row is shown.
     settings_error: ?[]const u8 = null,
+    /// fx's folder: `$FX_HOME`, or `~/.fx` expanded. Shown when set.
+    fx_home: ?[]const u8 = null,
     history_turns: usize,
     session_permission_grants: usize,
     agent_step_limit: usize,
@@ -838,6 +1002,7 @@ pub const StatusSnapshot = struct {
         }
         try out.writer.print("[status] permission_mode={s}\n", .{permissions.permissionModeDisplayLabel(self.permission_mode)});
         try out.writer.print("[status] workspace={s}\n", .{self.workspace_root});
+        if (self.fx_home) |path| try out.writer.print("[status] fx_home={s}\n", .{path});
         try out.writer.print("[status] history_turns={d}\n", .{self.history_turns});
         try out.writer.print("[status] session_permission_grants={d}\n", .{self.session_permission_grants});
         try out.writer.print("[status] agent_step_limit={d}\n", .{self.agent_step_limit});
@@ -961,6 +1126,10 @@ pub const StatusSnapshot = struct {
         }
         try writer.writeAll(",\"workspace\":");
         try std.json.Stringify.value(self.workspace_root, .{}, writer);
+        if (self.fx_home) |path| {
+            try writer.writeAll(",\"fx_home\":");
+            try std.json.Stringify.value(path, .{}, writer);
+        }
         try writer.print(",\"history_turns\":{d}", .{self.history_turns});
         try writer.print(",\"session_permission_grants\":{d}", .{self.session_permission_grants});
         try writer.print(",\"agent_step_limit\":{d}", .{self.agent_step_limit});
@@ -2357,7 +2526,7 @@ test "command failure snapshot renders stable escaped json" {
 test "core status snapshot text and json stay stable" {
     const snapshot = StatusSnapshot{
         .model = "alpha",
-        .auth_help = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.",
+        .auth_help = "fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.",
         .permission_mode = .ask,
         .workspace_root = "/tmp/fx",
         .history_turns = 3,
@@ -2368,14 +2537,14 @@ test "core status snapshot text and json stay stable" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=missing\n[status] auth_refreshable=false\n[status] auth_help=fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=3\n[status] session_permission_grants=1\n[status] agent_step_limit=24\n[status] ultrafast_requested=false\n",
+        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=missing\n[status] auth_refreshable=false\n[status] auth_help=fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=3\n[status] session_permission_grants=1\n[status] agent_step_limit=24\n[status] ultrafast_requested=false\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24,\"ultrafast_requested\":false}",
+        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"fx needs access to Vercel AI Gateway. Run fx login to sign in, fx login vercel --api-key to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24,\"ultrafast_requested\":false}",
         json,
     );
 }
@@ -2498,7 +2667,7 @@ test "status JSON lists the session modes after the permission mode" {
     try std.testing.expect(std.mem.find(
         u8,
         json,
-        "\"permission_mode\":\"yolo\",\"mode\":\"open\",\"modes\":[{\"id\":\"careful\",\"name\":\"Careful\",\"description\":\"Asks first\"},{\"id\":\"open\",\"name\":\"Open\",\"description\":\"\"}],\"workspace\":",
+        "\"permission_mode\":\"full-access\",\"mode\":\"open\",\"modes\":[{\"id\":\"careful\",\"name\":\"Careful\",\"description\":\"Asks first\"},{\"id\":\"open\",\"name\":\"Open\",\"description\":\"\"}],\"workspace\":",
     ) != null);
 
     const text = try snapshot.renderText(std.testing.allocator);
@@ -2509,6 +2678,22 @@ test "status JSON lists the session modes after the permission mode" {
     const plain = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(plain);
     try std.testing.expect(std.mem.find(u8, plain, "\"modes\"") == null);
+}
+
+test "config entries from the environment name their variable" {
+    const alloc = std.testing.allocator;
+    const entries = [_]settings_entries.Entry{
+        .{ .key = "max_agent_steps", .value = .{ .integer = 5 }, .origin = .global },
+        .{ .key = "max_agent_steps", .value = .{ .integer = 20 }, .origin = .env, .variable = "FX_MAX_AGENT_STEPS" },
+    };
+    const snapshot: ConfigSnapshot = .{ .entries = &entries, .workspace_root = "/w", .show_origin = true };
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("file:~/.fx/settings.json\tmax_agent_steps=5\nenv:FX_MAX_AGENT_STEPS\tmax_agent_steps=20\n", text);
+    const json = try snapshot.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "{\"key\":\"max_agent_steps\",\"value\":20,\"origin\":\"env\",\"variable\":\"FX_MAX_AGENT_STEPS\"}") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"origin\":\"global\",\"file\":\"~/.fx/settings.json\"") != null);
 }
 
 test "MCP config diagnostic renders in status text and JSON but not interactive body" {

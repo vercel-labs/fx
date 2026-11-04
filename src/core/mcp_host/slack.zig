@@ -29,9 +29,9 @@ pub fn isSlack(url: ?[]const u8) bool {
 }
 
 /// A stand-in for Slack's server in tests, on 127.0.0.1
-/// (`FX_E2E_SLACK_ORIGIN`), as v1 takes it; null otherwise.
+/// (`FX_TEST_SLACK_ORIGIN`), as v1 takes it; null otherwise.
 fn standIn() ?[]const u8 {
-    const configured = io_mod.getenv("FX_E2E_SLACK_ORIGIN") orelse return null;
+    const configured = io_mod.getenv("FX_TEST_SLACK_ORIGIN") orelse return null;
     return if (loopbackOrigin(configured)) configured else null;
 }
 

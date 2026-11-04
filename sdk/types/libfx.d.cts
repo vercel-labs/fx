@@ -423,7 +423,7 @@ export type FxHookEvent = FxHookEnvelope & (
   | { type: "mcp.start"; data: { operationId: number | string; callId: string | null; server: string | null; tool: string; transport: string | null } }
   | { type: "mcp.request"; data: { operationId: number | string; requestId: number | string; requestIdKind: "jsonrpc" | "engine" | "correlation" } }
   | { type: "mcp.end"; data: { operationId: number | string; status: "success" | "failure" | "cancelled" | "input_required" | "unavailable" | "unknown"; error: string | null } }
-  | { type: "delegation"; data: { callId: string; childSessionId: string; workId: string; operationId: string | null; phase: "dispatched" | "completed" | "yielded" | "replayed" | "failed" | "cancelled" | "feedback_queued" | "feedback_applied" | "feedback_not_applied" } }
+  | { type: "delegation"; data: { callId: string; childSessionId: string; workId: string; operationId: string | null; phase: "dispatched" | "completed" | "replayed" | "failed" | "cancelled" | "feedback_queued" | "feedback_applied" | "feedback_not_applied" } }
   /** Emitted only after append resolves and its cursor validates. */
   | { type: "journal.commit"; data: { cursor: string; firstSeq: number | null; lastSeq: number | null; eventCount: number } }
   | { type: "journal.restore"; data: { cursor: string | null; lastSeq: number; resumable: boolean; openTurnId: string | null; lastTurnId: string | null } }

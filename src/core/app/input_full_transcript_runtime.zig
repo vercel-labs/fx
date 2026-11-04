@@ -13,6 +13,7 @@ const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 
 pub fn Runtime(comptime App: type) type {
     return struct {
+        const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
         const FullTranscriptKey = union(enum) {
             toggle,
             navigate: transcript_presentation.Event,
@@ -27,34 +28,34 @@ pub fn Runtime(comptime App: type) type {
             app_render_runtime.Runtime(App).requestActiveSurfaceFrame(app, .modal);
         }
 
-        fn screenOwnsInput(app: *App) bool {
+        fn screenOwnsInput(app: *App, agent: *AppAgent) bool {
             if (comptime !@hasField(App, "terminal")) return false;
-            if (approvalOwnsCurrentSurface(app)) return false;
+            if (approvalOwnsCurrentSurface(app, agent)) return false;
             return app.terminal.fullTranscriptScreenActive();
         }
 
-        fn approvalOwnsCurrentSurface(app: *const App) bool {
-            return app.approval_prompt.isActive();
+        fn approvalOwnsCurrentSurface(_: *const App, agent: *const AppAgent) bool {
+            return agent.approval_prompt.isActive();
         }
 
-        pub fn routeByte(app: *App, byte: u8) !bool {
+        pub fn routeByte(app: *App, agent: *AppAgent, byte: u8) !bool {
             const key = keyForByte(byte) orelse return false;
-            if (!screenOwnsInput(app)) return false;
-            try routeKey(app, key);
+            if (!screenOwnsInput(app, agent)) return false;
+            try routeKey(app, agent, key);
             return true;
         }
 
-        pub fn routeAction(app: *App, resolved: input_action.Action) !bool {
+        pub fn routeAction(app: *App, agent: *AppAgent, resolved: input_action.Action) !bool {
             const key = keyForAction(resolved) orelse return false;
-            if (!screenOwnsInput(app)) return false;
-            try routeKey(app, key);
+            if (!screenOwnsInput(app, agent)) return false;
+            try routeKey(app, agent, key);
             return true;
         }
 
-        pub fn routeComposerAction(app: *App, resolved: input_action.Action) !bool {
+        pub fn routeComposerAction(app: *App, agent: *AppAgent, resolved: input_action.Action) !bool {
             return switch (keyForAction(resolved) orelse return false) {
                 .toggle => {
-                    try transitionScreen(app, .toggle);
+                    try transitionScreen(app, agent, .toggle);
                     return true;
                 },
                 .close => {
@@ -82,6 +83,7 @@ pub fn Runtime(comptime App: type) type {
 
         fn transitionScreen(
             app: *App,
+            agent: *AppAgent,
             event: transcript_presentation.Event,
         ) !void {
             if (comptime !@hasField(App, "terminal")) {
@@ -95,7 +97,7 @@ pub fn Runtime(comptime App: type) type {
             if (from == .inline_mode) {
                 std.debug.assert(to == .full);
                 if (app.terminal.alternate_screen_owner != .none) return;
-                if (app.approval_prompt.isActive()) return;
+                if (agent.approval_prompt.isActive()) return;
                 if (comptime @hasDecl(
                     @TypeOf(app.shell),
                     "requestFullTranscriptOpen",
@@ -178,10 +180,10 @@ pub fn Runtime(comptime App: type) type {
             };
         }
 
-        fn routeKey(app: *App, key: FullTranscriptKey) !void {
+        fn routeKey(app: *App, agent: *AppAgent, key: FullTranscriptKey) !void {
             switch (key) {
-                .toggle => try transitionScreen(app, .toggle),
-                .navigate => |event| try transitionScreen(app, event),
+                .toggle => try transitionScreen(app, agent, .toggle),
+                .navigate => |event| try transitionScreen(app, agent, event),
                 .close => try closeScreen(app, .escape),
                 .interrupt => try closeScreen(app, .ctrl_c),
                 .redraw => {},

@@ -100,9 +100,9 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
       fakeGatewayFinalText("SHUTDOWN_RESUMED_281"),
     ]);
     const env = { HOME: home, AI_GATEWAY_API_KEY: "fake-shutdown-save", VERCEL_OIDC_TOKEN: undefined,
-      FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0",
+      FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0",
       FX_MODEL: FAKE_GATEWAY_MODEL, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-      FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models` };
+      FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models` };
     try {
       const seeded = await runFx(["ask", "--json", "Save the first fact."], { cwd: workspace, env, timeoutMs: TIMEOUT });
       expect(seeded.code).toBe(0); expect(seeded.stderr).toBe("");
@@ -134,7 +134,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
         expect(output + stderr).toMatch(/save.*fail|fail.*sav|could not.*sav|couldn.t.*sav|unable to.*sav/i);
       } else { expect(session.paneStatus().status).toBe(0); expect(stderr).toBe(""); }
       expect(readFileSync(eventPath).subarray(0, saved.length).equals(saved)).toBe(true);
-      const resumed = await runFx(["ask", "--json", "--resume-id", id, "Continue without repeating work."], {
+      const resumed = await runFx(["ask", "--json", "--resume", id, "Continue without repeating work."], {
         cwd: workspace, env, timeoutMs: TIMEOUT });
       expect(resumed.code).toBe(0); expect(resumed.stderr).toBe("");
       expect(JSON.parse(resumed.stdout).session_id).toBe(id);
@@ -171,7 +171,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: `${TRACE_SCOPES},input`,
           FX_TRACE_LOG: tracePath,
@@ -250,7 +250,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: `${TRACE_SCOPES},input`,
           FX_TRACE_LOG: tracePath,
@@ -340,7 +340,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: TRACE_SCOPES,
           FX_TRACE_LOG: tracePath,
@@ -445,7 +445,7 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
           FX_PERMISSION_MODE: "yolo",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: TRACE_SCOPES,
           FX_TRACE_LOG: tracePath,
@@ -529,8 +529,8 @@ describe.skipIf(SKIP)("tui: interrupt recovery", () => {
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_TRACE_SCOPES: TRACE_SCOPES,
           FX_TRACE_LOG: tracePath,
         },
@@ -707,7 +707,7 @@ while :; do sleep 1; done
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: `${TRACE_SCOPES},core`,
           FX_TRACE_LOG: tracePath,
@@ -834,7 +834,7 @@ while :; do sleep 1; done
           FX_PERMISSION_MODE: "full-access",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: `${TRACE_SCOPES},core,shutdown`,
           FX_TRACE_LOG: tracePath,
@@ -900,13 +900,13 @@ while :; do sleep 1; done
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: `${TRACE_SCOPES},tool,ui_activity`,
           FX_TRACE_LOG: tracePath,
           // The search holds its result until this file exists, so it is
           // still running when the turn is cancelled.
-          FX_E2E_GREP_RELEASE: releasePath,
+          FX_TEST_GREP_RELEASE: releasePath,
         },
       });
       await session.waitForComposer(TIMEOUT);
@@ -990,7 +990,7 @@ while :; do sleep 1; done
           FX_AUTO_UPGRADE: "0",
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TRACE_SCOPES: TRACE_SCOPES,
           FX_TRACE_LOG: tracePath,

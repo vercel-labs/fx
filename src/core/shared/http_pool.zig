@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const debug_trace = @import("debug_trace.zig");
 const io_mod = @import("io.zig");
+const local_address = @import("local_address.zig");
 
 /// Long-lived HTTP client wrapper that keeps std's ConnectionPool alive
 /// across requests to one product origin. std already implements acquire,
@@ -187,7 +188,8 @@ pub const HttpPool = struct {
 
     /// Takes an idle pooled connection to the URI's origin. Returns null when
     /// none is free or a proxy carries the request, in which case std connects
-    /// as usual.
+    /// as usual. A connection whose local address left the machine, after a
+    /// network change, can never answer again, so it is closed instead.
     fn takeIdleConnection(self: *HttpPool, uri: std.Uri) ?*std.http.Client.Connection {
         var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
         const criteria = originCriteria(uri, &host_buf) orelse return null;
@@ -197,12 +199,31 @@ pub const HttpPool = struct {
         };
         if (proxy != null) return null;
         const io = self.client.io;
-        return self.client.connection_pool.findConnection(io, criteria) catch |err| switch (err) {
-            error.Canceled => {
-                io.recancel();
-                return null;
-            },
-        };
+        while (true) {
+            const connection = (self.client.connection_pool.findConnection(io, criteria) catch |err| switch (err) {
+                error.Canceled => {
+                    io.recancel();
+                    return null;
+                },
+            }) orelse return null;
+            if (!addressGone(connection)) return connection;
+            self.destroyTaken(io, connection);
+            debug_trace.logf("gateway", "event=pool_drop_address_gone dropped=idle connection reason=its local address left the machine", .{});
+        }
+    }
+
+    fn addressGone(connection: *std.http.Client.Connection) bool {
+        const address = local_address.of(connection.stream_writer.stream.socket.handle) orelse return false;
+        return local_address.missing(address);
+    }
+
+    /// Destroys a connection `findConnection` returned, which sits on the
+    /// used list; destroy does not touch the lists.
+    fn destroyTaken(self: *HttpPool, io: std.Io, connection: *std.http.Client.Connection) void {
+        self.client.connection_pool.mutex.lockUncancelable(io);
+        self.client.connection_pool.used.remove(&connection.pool_node);
+        self.client.connection_pool.mutex.unlock(io);
+        connection.destroy(io);
     }
 
     /// std sets `client.now` once, when the CA bundle first loads, so a
@@ -251,12 +272,7 @@ pub const HttpPool = struct {
                     break;
                 },
             }) orelse break;
-            // findConnection moves the connection to the used list; unlink it
-            // there before destroying, since destroy does not touch the lists.
-            self.client.connection_pool.mutex.lockUncancelable(io);
-            self.client.connection_pool.used.remove(&conn.pool_node);
-            self.client.connection_pool.mutex.unlock(io);
-            conn.destroy(io);
+            self.destroyTaken(io, conn);
             closed += 1;
         }
         return closed;
@@ -408,4 +424,33 @@ test "drain evicts a real parked connection past the TTL" {
     pool.last_activity_ms.store(io_mod.milliTimestamp() - 1000, .release);
     _ = pool.clientFor(url);
     try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
+}
+
+test "openRequest closes an idle connection whose local address left the machine" {
+    if (comptime !local_address.supported) return error.SkipZigTest;
+    const zio = io_mod.getIo();
+    var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(zio, .{ .reuse_address = true });
+    defer server.deinit(zio);
+    const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
+    defer std.testing.allocator.free(url);
+    const uri = try std.Uri.parse(url);
+
+    var pool = HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+    // The listen backlog completes the connect without any server accept.
+    pool.warm(url);
+    try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
+
+    local_address.test_missing = true;
+    var opened = pool.openRequest(.POST, uri, .{}) catch |err| {
+        local_address.test_missing = false;
+        return err;
+    };
+    local_address.test_missing = false;
+    // The idle connection was closed, and the request dialed a fresh one.
+    try std.testing.expect(!opened.reused);
+    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
+    opened.request.deinit();
+    try std.testing.expectEqual(@as(usize, 1), pool.freeConnectionCount());
 }

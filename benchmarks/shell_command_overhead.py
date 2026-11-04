@@ -177,7 +177,7 @@ def main():
     for key in ("ZDOTDIR", "BASH_ENV", "ENV"):
         env.pop(key, None)
     base_url = f"http://127.0.0.1:{server.server_port}"
-    env.update(HOME=str(home), AI_GATEWAY_API_KEY="fixture-key", FX_GATEWAY_BASE_URL=base_url, FX_E2E_GATEWAY_CHAT_URL=base_url + "/chat", FX_E2E_GATEWAY_MODELS_URL=base_url + "/coding-agent/v1/models", FX_MODEL="openai/gpt-5.5", FX_MAX_AGENT_STEPS="0")
+    env.update(HOME=str(home), AI_GATEWAY_API_KEY="fixture-key", FX_GATEWAY_BASE_URL=base_url, FX_TEST_GATEWAY_CHAT_URL=base_url + "/chat", FX_TEST_GATEWAY_MODELS_URL=base_url + "/coding-agent/v1/models", FX_MODEL="openai/gpt-5.5", FX_MAX_AGENT_STEPS="0")
 
     timed_out = False
     with (root / "stdout.json").open("w") as out, (root / "stderr.log").open("w") as err:

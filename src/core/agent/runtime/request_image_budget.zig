@@ -66,6 +66,35 @@ pub fn withholdOldestImages(
     return withhold(arena, messages, oldestImagesToWithhold(sizes, request_bytes, limits), tool_text_limit);
 }
 
+/// The number of oldest images to leave out when the fewest that fit is
+/// `minimal`, rounded up to the end of a block. Leaving out one more image
+/// for each new one would change the cached prompt at its oldest image on
+/// every request. Blocks count from the oldest image: each holds a quarter of
+/// `limits.max_images` images, or ends sooner at the image that brings it to
+/// a quarter of `limits.max_request_bytes`. A new image never moves an
+/// earlier block, so as a session grows the cut moves only forward, about
+/// once per block. The newest block is never left out to round, and a
+/// request that needs nothing left out leaves nothing out. `sizes` holds
+/// every image's serialized size, oldest first.
+pub fn blockCut(sizes: []const usize, minimal: usize, limits: Limits) usize {
+    if (minimal == 0 or minimal >= sizes.len) return minimal;
+    const block_images = @max(1, limits.max_images / 4);
+    const block_bytes = @max(1, limits.max_request_bytes / 4);
+    var count: usize = 0;
+    var bytes: usize = 0;
+    for (sizes, 0..) |size, index| {
+        count += 1;
+        bytes +|= size;
+        if (count < block_images and bytes < block_bytes) continue;
+        const end = index + 1;
+        if (end >= sizes.len) return minimal;
+        if (end >= minimal) return end;
+        count = 0;
+        bytes = 0;
+    }
+    return minimal;
+}
+
 /// A size no request is fit below: the default, or a larger limit learned
 /// from a provider's rejection. A transport may lower either, never raise it.
 pub fn largestRequestBytes(learned: ?usize) usize {
@@ -92,7 +121,7 @@ pub fn withholdImagesPastLimit(
 }
 
 /// Each image's serialized size, oldest first, allocated in `arena`.
-fn imageSizes(arena: Allocator, messages: []const ChatMessage) Allocator.Error![]const usize {
+pub fn imageSizes(arena: Allocator, messages: []const ChatMessage) Allocator.Error![]const usize {
     var sizes: std.ArrayList(usize) = .empty;
     for (messages) |message| {
         for (message.images) |image| {
@@ -108,7 +137,7 @@ fn imageSizes(arena: Allocator, messages: []const ChatMessage) Allocator.Error![
 }
 
 /// `messages` with its `withheld` oldest images replaced by notes.
-fn withhold(arena: Allocator, messages: []const ChatMessage, withheld: usize, tool_text_limit: usize) Allocator.Error!Projection {
+pub fn withhold(arena: Allocator, messages: []const ChatMessage, withheld: usize, tool_text_limit: usize) Allocator.Error!Projection {
     if (withheld == 0) return .{ .messages = messages };
 
     const projected = try arena.dupe(ChatMessage, messages);
@@ -182,6 +211,98 @@ test "oldest images leave when a request carries too many" {
     const sizes = [_]usize{ 10, 10, 10, 10 };
     try std.testing.expectEqual(@as(usize, 2), oldestImagesToWithhold(&sizes, 100, limits));
     try std.testing.expectEqual(@as(usize, 0), oldestImagesToWithhold(sizes[0..2], 100, limits));
+}
+
+test "a session past the image limit leaves images out a block at a time" {
+    const limits = Limits{ .max_request_bytes = 1_000_000, .max_images = 100 };
+    const sizes: [130]usize = @splat(10);
+    // The fewest that fit is one per image past 100; blocks hold 25.
+    try std.testing.expectEqual(@as(usize, 0), blockCut(sizes[0..100], 0, limits));
+    try std.testing.expectEqual(@as(usize, 25), blockCut(sizes[0..101], 1, limits));
+    try std.testing.expectEqual(@as(usize, 25), blockCut(sizes[0..125], 25, limits));
+    try std.testing.expectEqual(@as(usize, 50), blockCut(sizes[0..126], 26, limits));
+    // Rounding never leaves out the newest block.
+    try std.testing.expectEqual(@as(usize, 26), blockCut(sizes[0..30], 26, limits));
+    // Large images end a block sooner: a quarter of the byte limit each.
+    const large = [_]usize{ 300_000, 300_000, 300_000, 300_000 };
+    try std.testing.expectEqual(@as(usize, 1), blockCut(&large, 1, limits));
+    try std.testing.expectEqual(@as(usize, 3), blockCut(&large, 3, limits));
+}
+
+fn blockEnds(sizes: []const usize, limits: Limits, ends: *std.bit_set.Static(16)) void {
+    const block_images = @max(1, limits.max_images / 4);
+    const block_bytes = @max(1, limits.max_request_bytes / 4);
+    var count: usize = 0;
+    var bytes: usize = 0;
+    for (sizes, 0..) |size, index| {
+        count += 1;
+        bytes += size;
+        if (count < block_images and bytes < block_bytes) continue;
+        ends.set(index + 1);
+        count = 0;
+        bytes = 0;
+    }
+}
+
+test "a block cut covers the fewest that fit, keeps the newest block, and only grows" {
+    const limits = Limits{ .max_request_bytes = 40, .max_images = 8 };
+    const alphabet = [_]usize{ 1, 4, 9 };
+    var sizes: [8]usize = undefined;
+    var len: usize = 0;
+    while (len <= 7) : (len += 1) {
+        var combos: usize = 1;
+        for (0..len) |_| combos *= alphabet.len;
+        for (0..combos) |combo| {
+            var rest = combo;
+            for (sizes[0..len]) |*size| {
+                size.* = alphabet[rest % alphabet.len];
+                rest /= alphabet.len;
+            }
+            const seq = sizes[0..len];
+            var ends: std.bit_set.Static(16) = .empty;
+            blockEnds(seq, limits, &ends);
+            var previous: usize = 0;
+            for (0..len + 1) |minimal| {
+                const cut = blockCut(seq, minimal, limits);
+                try std.testing.expect(cut >= minimal and cut <= len);
+                if (minimal == 0) try std.testing.expectEqual(@as(usize, 0), cut);
+                if (minimal < len) try std.testing.expect(cut < len);
+                if (cut != minimal) try std.testing.expect(ends.isSet(cut));
+                try std.testing.expect(cut >= previous);
+                previous = cut;
+                // A new image never pulls the cut back.
+                for (alphabet) |next| {
+                    sizes[len] = next;
+                    try std.testing.expect(blockCut(sizes[0 .. len + 1], minimal, limits) >= cut);
+                }
+            }
+        }
+    }
+}
+
+test "a growing session moves its cut forward and rarely" {
+    const limits = Limits{ .max_request_bytes = 100_000, .max_images = 20 };
+    var sizes: [80]usize = undefined;
+    var previous: usize = 0;
+    var minimal_changes: usize = 0;
+    var cut_changes: usize = 0;
+    var previous_minimal: usize = 0;
+    for (0..sizes.len) |index| {
+        sizes[index] = 2_000 + (index * 7_919) % 3_000;
+        const seq = sizes[0 .. index + 1];
+        var image_bytes: usize = 0;
+        for (seq) |size| image_bytes += size;
+        const text_bytes = 10_000 + index * 400;
+        const minimal = oldestImagesToWithhold(seq, text_bytes + image_bytes, limits);
+        const cut = blockCut(seq, minimal, limits);
+        try std.testing.expect(cut >= previous);
+        if (minimal != previous_minimal) minimal_changes += 1;
+        if (cut != previous) cut_changes += 1;
+        previous = cut;
+        previous_minimal = minimal;
+    }
+    try std.testing.expect(minimal_changes > 40);
+    try std.testing.expect(cut_changes * 3 <= minimal_changes);
 }
 
 fn testToolImage(arena: Allocator, encoded_len: usize) !types.ToolImage {

@@ -21,8 +21,8 @@ const randomUrlSafeSecret = oauth.randomUrlSafeSecret;
 pub const client_id = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const token_url = "https://auth.openai.com/oauth/token";
 pub const issuer_url = "https://auth.openai.com";
-const e2e_token_url_env = "FX_E2E_CHATGPT_TOKEN_URL";
-const e2e_issuer_url_env = "FX_E2E_CHATGPT_ISSUER_URL";
+const e2e_token_url_env = "FX_TEST_CHATGPT_TOKEN_URL";
+const e2e_issuer_url_env = "FX_TEST_CHATGPT_ISSUER_URL";
 const jwt_auth_claim = "https://api.openai.com/auth";
 const browser_scope = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const browser_callback_ports = [_]u16{ 1455, 1457 };
@@ -278,6 +278,7 @@ fn classifyBrowserCallback(
 fn completeSignIn(
     _: ?*anyopaque,
     alloc: Allocator,
+    _: oauth_transport.Provider,
     _: []const u8,
     _: []const u8,
     token: *oauth.TokenSet,
@@ -796,11 +797,11 @@ test "ChatGPT sign-in refuses an account id unsafe for HTTP headers before savin
 
     var unsafe = try makeToken(alloc, "acct\\r\\ninjected");
     defer unsafe.deinit(alloc);
-    try std.testing.expectError(error.InvalidChatGptAccessToken, completeSignIn(null, alloc, "", "", &unsafe));
+    try std.testing.expectError(error.InvalidChatGptAccessToken, completeSignIn(null, alloc, oauth_transport.unavailable_provider, "", "", &unsafe));
 
     var safe = try makeToken(alloc, "acct_test");
     defer safe.deinit(alloc);
-    var completion = try completeSignIn(null, alloc, "", "", &safe);
+    var completion = try completeSignIn(null, alloc, oauth_transport.unavailable_provider, "", "", &safe);
     defer completion.deinit(alloc);
     try std.testing.expectEqualStrings("acct_test", completion.chatgpt.account_id);
 }

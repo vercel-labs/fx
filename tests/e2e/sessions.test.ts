@@ -61,7 +61,7 @@ function env(fixture: Fixture, gateway: { baseUrl: string; chatUrl: string }) {
     VERCEL_OIDC_TOKEN: undefined,
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_MODEL: FAKE_GATEWAY_MODEL,
     FX_AUTO_UPGRADE: "0",
   };
@@ -167,6 +167,22 @@ async function waitForLog(fixture: Fixture, id: string, needle: string, timeoutM
     await Bun.sleep(50);
   }
   throw new Error(`log never contained ${needle}`);
+}
+
+/// Waits until the parent's log holds `children` child finishes, a commit
+/// after the last of them, and no open turn: a child's report starts a turn
+/// of its own or joins a running one, so the parent is idle only then.
+async function waitForSettledChild(fixture: Fixture, id: string, children: number, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  let kinds: string[] = [];
+  while (Date.now() < deadline) {
+    kinds = logLines(fixture.home, id).map((line) => line.kind);
+    const finished = kinds.lastIndexOf("child_finished");
+    const count = (kind: string) => kinds.filter((value) => value === kind).length;
+    if (count("child_finished") >= children && kinds.lastIndexOf("turn_committed") > finished && count("turn_started") === count("turn_committed")) return;
+    await Bun.sleep(25);
+  }
+  throw new Error(`the parent never settled after its child: ${kinds.join(",")}`);
 }
 
 function spawnAsk(fixture: Fixture, gateway: any, args: string[]) {
@@ -294,7 +310,7 @@ test("fx ask saves to v2, resumes by id and by last, and never writes v1", async
     expect(statSync(storeRoot(fixture.home)).mode & 0o777).toBe(0o700);
     expect(statSync(join(storeRoot(fixture.home), id, "log.jsonl")).mode & 0o777).toBe(0o600);
 
-    const byId = await ask(fixture, gateway, ["--resume-id", id, "Second v2 question."]);
+    const byId = await ask(fixture, gateway, ["--resume", id, "Second v2 question."]);
     expect(byId.code).toBe(0);
     expect(byId.stderr).toBe("");
     expect(JSON.parse(byId.stdout).session_id).toBe(id);
@@ -357,7 +373,7 @@ test("fx ask keeps the conversation language when a resumed turn has no language
     const seededLanguages = languages();
     expect(seededLanguages.at(-1)).toBe("ja");
 
-    const resumed = await ask(fixture, gateway, ["--resume-id", id, "👍"]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "👍"]);
     expect(resumed.code).toBe(0);
     expect(resumed.stderr).toBe("");
     // The language is written only when it changes, so the resumed turn
@@ -400,7 +416,7 @@ for (const userHeavy of [false, true]) {
       }
       return fakeGatewayFinalText(phase === "seed" ? assistant : "CONTINUED_FROM_COMMITTED_MEMORY");
     }, { models: [{ id: model, type: "language", tags: ["tool-use"], context_window: userHeavy ? 256_000 : 128_000, max_tokens: 8192 }] });
-    const compactEnv = { ...env(fixture, gateway), FX_MODEL: model, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models` };
+    const compactEnv = { ...env(fixture, gateway), FX_MODEL: model, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models` };
     const run = (args: string[], stdin?: string) =>
       runFx(["ask", "--json", ...args], { cwd: fixture.workspace, env: compactEnv, stdin, timeoutMs: TIMEOUT });
     try {
@@ -413,7 +429,7 @@ for (const userHeavy of [false, true]) {
       const before = readFileSync(logPath);
 
       phase = "continue";
-      const continued = await run(["--resume-id", id, "Continue the saved task without losing its pending check."]);
+      const continued = await run(["--resume", id, "Continue the saved task without losing its pending check."]);
       expect(continued.code).toBe(0);
       expect(continued.stderr).toBe("");
       expect(JSON.parse(continued.stdout).output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
@@ -455,7 +471,7 @@ for (const userHeavy of [false, true]) {
 
       // A fresh process resumes from the summary: it sends the summary, not
       // the turns it replaced, and has nothing left to summarize.
-      const reopened = await run(["--resume-id", id, "Continue after this fresh process restart."]);
+      const reopened = await run(["--resume", id, "Continue after this fresh process restart."]);
       expect(reopened.code).toBe(0);
       expect(reopened.stderr).toBe("");
       expect(JSON.parse(reopened.stdout).output).toBe("CONTINUED_FROM_COMMITTED_MEMORY");
@@ -469,7 +485,7 @@ for (const userHeavy of [false, true]) {
       // Another fresh process reads the saved turn by its ID, through the
       // records the session keeps as blobs (D50).
       phase = "read";
-      const read = await run(["--resume-id", id, "Read the saved turn."]);
+      const read = await run(["--resume", id, "Read the saved turn."]);
       expect(read.code).toBe(0);
       // Tool progress goes to stderr.
       expect(read.stderr).not.toContain("panic");
@@ -565,7 +581,7 @@ test("a long command output is kept as one read-only blob, and the model pages i
     }
     expect(Buffer.concat(stdout).toString("utf8")).toBe(expected);
 
-    const resumed = await ask(fixture, gateway, ["--resume-id", id, "Page the output again."]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "Page the output again."]);
     expect(resumed.code).toBe(0);
     expect(resumed.stderr).not.toContain("panic");
     expect(JSON.parse(resumed.stdout).output).toBe("REPLAY_PAGED_DONE");
@@ -604,7 +620,7 @@ test("fx ask killed in the middle of a turn resumes with that turn interrupted",
     expect(created.code).toBe(0);
     const id = JSON.parse(created.stdout).session_id;
 
-    const child = spawn(FX_BIN, ["ask", "--json", "--auto", "--resume-id", id, "This turn is killed."], {
+    const child = spawn(FX_BIN, ["ask", "--json", "--auto", "--resume", id, "This turn is killed."], {
       cwd: fixture.workspace,
       env: { ...process.env, ...env(fixture, gateway) } as Record<string, string>,
       stdio: "ignore",
@@ -614,7 +630,7 @@ test("fx ask killed in the middle of a turn resumes with that turn interrupted",
     child.kill("SIGKILL");
     await exited;
 
-    const resumed = await ask(fixture, gateway, ["--resume-id", id, "After the kill."]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "After the kill."]);
     expect(resumed.code).toBe(0);
     expect(resumed.stderr).toBe("");
     expect(JSON.parse(resumed.stdout).output).toBe("AFTER_KILL_ANSWER");
@@ -655,14 +671,14 @@ test("a kill while a tool runs keeps the finished tool and answers the running o
     expect(created.code).toBe(0);
     const id = JSON.parse(created.stdout).session_id;
 
-    const run = spawnAsk(fixture, gateway, ["--resume-id", id, "Run two tools."]);
+    const run = spawnAsk(fixture, gateway, ["--resume", id, "Run two tools."]);
     await slowStarted;
     // The call is saved before it runs (D28).
     await waitForLog(fixture, id, "v2-slow-2");
     run.child.kill("SIGKILL");
     await run.exited;
 
-    const resumed = await ask(fixture, gateway, ["--resume-id", id, "After the tool kill."]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "After the tool kill."]);
     expect(resumed.code).toBe(0);
     expect(resumed.stderr).toBe("");
     expect(JSON.parse(resumed.stdout).output).toBe("AFTER_TOOL_KILL");
@@ -709,7 +725,7 @@ test("a kill while a tool runs keeps the text of the message that issued it", as
     expect(created.code).toBe(0);
     const id = JSON.parse(created.stdout).session_id;
 
-    const run = spawnAsk(fixture, gateway, ["--resume-id", id, "Run the build."]);
+    const run = spawnAsk(fixture, gateway, ["--resume", id, "Run the build."]);
     await slowStarted;
     await waitForLog(fixture, id, "v2-slow-2");
     run.child.kill("SIGKILL");
@@ -719,7 +735,7 @@ test("a kill while a tool runs keeps the text of the message that issued it", as
     expect(running.length).toBe(2);
     expect(JSON.stringify(running.at(-1))).toContain("RUNNING_PLAN_7731");
 
-    const resumed = await ask(fixture, gateway, ["--resume-id", id, "After the text kill."]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "After the text kill."]);
     expect(resumed.code).toBe(0);
     expect(resumed.stderr).toBe("");
     expect(JSON.parse(resumed.stdout).output).toBe("AFTER_TEXT_KILL");
@@ -762,7 +778,7 @@ test("a session whose first turn was killed takes its first prompt as title", as
     await run.exited;
     expect(storedTitles(fixture, id)).toEqual([]);
 
-    const resumed = await ask(fixture, gateway, ["--resume-id", id, "After the first-turn kill."]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "After the first-turn kill."]);
     expect(resumed.code).toBe(0);
     expect(resumed.stderr).toBe("");
     // The title comes from the first prompt, which the crashed turn kept (D52).
@@ -772,7 +788,7 @@ test("a session whose first turn was killed takes its first prompt as title", as
     const summary = JSON.parse(listed.stdout).sessions.find((entry: any) => entry.id === id);
     expect(summary.title).toBe("Why is the sky orange at dusk?");
     // Later turns leave it.
-    expect((await ask(fixture, gateway, ["--resume-id", id, "After the first-turn kill. Again."])).code).toBe(0);
+    expect((await ask(fixture, gateway, ["--resume", id, "After the first-turn kill. Again."])).code).toBe(0);
     expect(storedTitles(fixture, id)).toEqual(["Why is the sky orange at dusk?"]);
     expectWholeLog(fixture, id);
   } finally {
@@ -794,7 +810,7 @@ test("a torn tail is cut on resume and the session goes on", async () => {
     // A write cut short by a power loss: part of a line, no newline.
     appendFileSync(join(storeRoot(fixture.home), id, "log.jsonl"), '{"v":1,"seq":99,"ts":1,"kind":"item","ty');
 
-    const resumed = await ask(fixture, gateway, ["--resume-id", id, "After the torn tail."]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "After the torn tail."]);
     expect(resumed.code).toBe(0);
     expect(resumed.stderr).toBe("");
     expect(JSON.parse(resumed.stdout).output).toBe("AFTER_TORN_TAIL");
@@ -818,13 +834,13 @@ test("a flipped byte inside the log stops resume and leaves the file as it was",
     const created = await ask(fixture, gateway, ["Flip question one."]);
     expect(created.code).toBe(0);
     const id = JSON.parse(created.stdout).session_id;
-    expect((await ask(fixture, gateway, ["--resume-id", id, "Flip question two."])).code).toBe(0);
+    expect((await ask(fixture, gateway, ["--resume", id, "Flip question two."])).code).toBe(0);
     const path = join(storeRoot(fixture.home), id, "log.jsonl");
     const damaged = readFileSync(path, "utf8").replace("Flip question one.", "Flip question 0ne.");
     writeFileSync(path, damaged);
     const requests = gateway.requests.length;
 
-    const resumed = await ask(fixture, gateway, ["--resume-id", id, "Flip question three."]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "Flip question three."]);
     expect(resumed.code).toBe(1);
     expect(resumed.stdout + resumed.stderr).toContain("InvalidSessionFormat");
     // No request was made, and the damaged file is left for recovery.
@@ -847,7 +863,7 @@ test("a blob that went missing stops resume as damage, not as a missing session"
     const referenced = (logLines(fixture.home, id) as any[]).find((line) => Array.isArray(line.blobs) && line.blobs.length === 1);
     rmSync(join(storeRoot(fixture.home), id, "blobs", referenced.blobs[0]));
 
-    const resumed = await ask(fixture, gateway, ["--resume-id", id, "Continue after the lost blob."]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "Continue after the lost blob."]);
     expect(resumed.code).toBe(1);
     expect(resumed.stdout + resumed.stderr).toContain("InvalidSessionFormat");
     expect(resumed.stdout + resumed.stderr).not.toContain("NotFound");
@@ -875,16 +891,16 @@ test("a second process on an open session is refused and writes nothing", async 
     expect(created.code).toBe(0);
     const id = JSON.parse(created.stdout).session_id;
 
-    const holder = spawnAsk(fixture, gateway, ["--resume-id", id, "Hold the session."]);
+    const holder = spawnAsk(fixture, gateway, ["--resume", id, "Hold the session."]);
     await reachedStall;
-    const second = await ask(fixture, gateway, ["--resume-id", id, "A second process."]);
+    const second = await ask(fixture, gateway, ["--resume", id, "A second process."]);
     expect(second.code).toBe(1);
     expect(second.stdout + second.stderr).toContain("SessionBusy");
     expect(readFileSync(join(storeRoot(fixture.home), id, "log.jsonl"), "utf8")).not.toContain("A second process.");
     holder.child.kill("SIGKILL");
     await holder.exited;
 
-    const resumed = await ask(fixture, gateway, ["--resume-id", id, "After the busy session."]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "After the busy session."]);
     expect(resumed.code).toBe(0);
     expect(JSON.parse(resumed.stdout).output).toBe("AFTER_BUSY");
     expectWholeLog(fixture, id);
@@ -910,7 +926,7 @@ test("a read-only session folder fails cleanly and resumes once writable", async
     chmodSync(join(folder(), "log.jsonl"), 0o400);
     chmodSync(folder(), 0o500);
 
-    const refused = await ask(fixture, gateway, ["--resume-id", id, "While read-only."]);
+    const refused = await ask(fixture, gateway, ["--resume", id, "While read-only."]);
     expect(refused.code).toBe(1);
     // The OS cause, not a bare `Io` (D29).
     expect(JSON.parse(refused.stdout).error).toBe("AccessDenied");
@@ -919,7 +935,7 @@ test("a read-only session folder fails cleanly and resumes once writable", async
 
     chmodSync(folder(), 0o700);
     chmodSync(join(folder(), "log.jsonl"), 0o600);
-    const resumed = await ask(fixture, gateway, ["--resume-id", id, "After the read-only folder."]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "After the read-only folder."]);
     expect(resumed.code).toBe(0);
     expect(JSON.parse(resumed.stdout).output).toBe("AFTER_READ_ONLY");
     expectWholeLog(fixture, id);
@@ -948,12 +964,12 @@ test("a full disk fails the turn cleanly and the session resumes after", async (
     // A file-size limit just above the log, with SIGXFSZ ignored: the next
     // growing write fails with EFBIG, as a full disk fails with ENOSPC.
     const blocks = blocksJustPast(path);
-    const full = await askWithSizeLimit(fixture, gateway, blocks, ["--resume-id", id, "The disk is full."]);
+    const full = await askWithSizeLimit(fixture, gateway, blocks, ["--resume", id, "The disk is full."]);
     // The answer was shown, but the turn could not be saved.
     expect(full.code).toBe(1);
     expect(JSON.parse(full.stdout).error).toBe("FileTooBig");
 
-    const resumed = await ask(fixture, gateway, ["--resume-id", id, "After the full disk."]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "After the full disk."]);
     expect(resumed.code).toBe(0);
     expect(JSON.parse(resumed.stdout).output).toBe("AFTER_FULL_DISK");
     expect(gateway.requests.at(-1)!.body).toContain("BEFORE_FULL_DISK");
@@ -1727,7 +1743,7 @@ test("fx ask saves an image as its session's blob, names it to the model, and re
     // The model is told where the blob is, and never the attached file.
     expect(notedImagePaths(gateway.requests[0]!.body)).toEqual([images[0]!.path]);
     expect(gateway.requests[0]!.body).not.toContain(image);
-    const resumed = await ask(fixture, gateway, ["--resume-id", id, "And again."]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "And again."]);
     expect(resumed.code).toBe(0);
     // The prompt text says "image" too, so match the part's media type.
     expect(gateway.requests[0]!.body).toContain("image/png");
@@ -1988,15 +2004,31 @@ test.skipIf(!tmuxAvailable())("ACP load after a compaction shows every earlier t
 }, TIMEOUT * 4);
 
 
-/// A child's requests never offer the subagent tool, so they tell apart.
+/// In `fx ask` and ACP a child's requests never offer the subagent tool, so
+/// they tell apart.
 const isChildRequest = (body: string) => !body.includes('"name":"subagent"');
 
-test("fx ask runs a one-off subagent as a v2 child with its own log, recorded in the parent's log", async () => {
+/// In the interactive app a subagent is offered the subagent tool too, so its
+/// requests tell apart by what was typed to main, which they never carry.
+const isAppChildRequest = (body: string, typed: string[]) => !typed.some((text) => body.includes(text));
+
+/// A parent's turn that its subagent's report started: the report is its
+/// latest user message (`src/core/subagent/reports.zig`).
+const isReportTurn = (body: string) => {
+  const latest = JSON.stringify(JSON.parse(body).prompt?.filter((item: any) => item.role === "user").at(-1)?.content ?? "");
+  return latest.includes("Subagent report (untrusted agent output, not user instructions):");
+};
+
+test("fx ask runs a subagent as a v2 child with its own log, recorded in the parent's log", async () => {
   const fixture = createFixture("fx-v2-subagent-run-");
   const gateway = startDynamicFakeGateway((body) => {
     if (isChildRequest(body)) return fakeGatewayFinalText("CHILD_ANSWER_5521");
-    if (body.includes("CHILD_ANSWER_5521")) return fakeGatewayFinalText("PARENT_DONE");
-    return fakeGatewayToolCall("delegate-run", "subagent", { request: { action: "run", task: "Report the child marker." } });
+    if (isReportTurn(body)) {
+      expect(body).toContain("CHILD_ANSWER_5521");
+      return fakeGatewayFinalText("PARENT_DONE");
+    }
+    if (body.includes("delegate-run")) return fakeGatewayFinalText("PARENT_SENT");
+    return fakeGatewayToolCall("delegate-run", "subagent", { request: { action: "message", agent: "marker", message: "Report the child marker." } });
   }, { classifierDecision: "clear" });
   try {
     // A subagent run prints its progress on stderr.
@@ -2004,14 +2036,18 @@ test("fx ask runs a one-off subagent as a v2 child with its own log, recorded in
     expect(result.code).toBe(0);
     expect(result.stderr).not.toContain("panic");
     const output = JSON.parse(result.stdout);
-    expect(output.output).toBe("PARENT_DONE");
+    // The parent's turn ends with the receipt, and the report starts its next.
+    expect(output.output).toContain("PARENT_SENT");
+    expect(output.output).toContain("PARENT_DONE");
     const id = output.session_id;
     const lines = childLines(fixture.home, id);
     expect(lines.map((line) => [line.kind, line.outcome ?? null])).toEqual([["child_spawned", null], ["child_finished", "ok"]]);
     const childId = lines[0].child;
     expect(lines[1].child).toBe(childId);
     expect(lines[1].work_id).toBe(lines[0].work_id);
-    expect(lines[0].data.agent ?? null).toBe(null);
+    expect(lines[0].data.agent).toBe("marker");
+    // The finish line records that the work owed its parent a report.
+    expect(lines[1].data.report).toBe(true);
     expect(lines[0].data.fingerprint).toMatch(/^[0-9a-f]{64}$/);
 
     // The child's own log names its parent and holds its answer.
@@ -2042,31 +2078,31 @@ test("fx ask runs a one-off subagent as a v2 child with its own log, recorded in
 test("a named subagent keeps its id, history and instructions across fx ask runs", async () => {
   const fixture = createFixture("fx-v2-subagent-named-");
   const childBodies: string[] = [];
-  let parentRequests = 0;
+  let round: 1 | 2 = 1;
   const gateway = startDynamicFakeGateway((body) => {
     if (isChildRequest(body)) {
       childBodies.push(body);
       return fakeGatewayFinalText(childBodies.length === 1 ? "REVIEW_ONE" : "REVIEW_TWO");
     }
-    parentRequests += 1;
-    switch (parentRequests) {
-      case 1:
-        return fakeGatewayToolCall("delegate-one", "subagent", { request: { action: "message", agent: "reviewer", message: "Review round one.", instructions: "Follow REVIEWER_RULES." } });
-      case 3:
-        return fakeGatewayToolCall("delegate-two", "subagent", { request: { action: "message", agent: "reviewer", message: "Review round two." } });
-      default:
-        return fakeGatewayFinalText(parentRequests === 2 ? "FIRST_DONE" : "SECOND_DONE");
-    }
+    if (isReportTurn(body)) return fakeGatewayFinalText(round === 1 ? "FIRST_REPORT_READ" : "SECOND_REPORT_READ");
+    const call = round === 1 ? "delegate-one" : "delegate-two";
+    if (body.includes(call)) return fakeGatewayFinalText(round === 1 ? "FIRST_DONE" : "SECOND_DONE");
+    return round === 1
+      ? fakeGatewayToolCall(call, "subagent", { request: { action: "message", agent: "reviewer", message: "Review round one.", instructions: "Follow REVIEWER_RULES." } })
+      : fakeGatewayToolCall(call, "subagent", { request: { action: "message", agent: "reviewer", message: "Review round two." } });
   }, { classifierDecision: "clear" });
   try {
     const first = await ask(fixture, gateway, ["First review."]);
     expect(first.code).toBe(0);
-    expect(JSON.parse(first.stdout).output).toBe("FIRST_DONE");
+    expect(JSON.parse(first.stdout).output).toContain("FIRST_DONE");
+    expect(JSON.parse(first.stdout).output).toContain("FIRST_REPORT_READ");
     const id = JSON.parse(first.stdout).session_id;
-    const second = await ask(fixture, gateway, ["--resume-id", id, "Second review."]);
+    round = 2;
+    const second = await ask(fixture, gateway, ["--resume", id, "Second review."]);
     expect(second.code).toBe(0);
     expect(second.stderr).not.toContain("panic");
-    expect(JSON.parse(second.stdout).output).toBe("SECOND_DONE");
+    expect(JSON.parse(second.stdout).output).toContain("SECOND_DONE");
+    expect(JSON.parse(second.stdout).output).toContain("SECOND_REPORT_READ");
 
     const lines = childLines(fixture.home, id);
     expect(lines.map((line) => [line.kind, line.outcome ?? null])).toEqual([
@@ -2108,7 +2144,8 @@ test("a crash while a named subagent works records it interrupted, and its next 
       }
       return fakeGatewayFinalText("FRESH_CHILD_ANSWER");
     }
-    if (body.includes("FRESH_CHILD_ANSWER")) return fakeGatewayFinalText("AFTER_LOST_DONE");
+    if (isReportTurn(body)) return fakeGatewayFinalText("AFTER_LOST_DONE");
+    if (body.includes(phase === "crash" ? "delegate-lost" : "delegate-again")) return fakeGatewayFinalText("PARENT_SENT");
     return fakeGatewayToolCall(phase === "crash" ? "delegate-lost" : "delegate-again", "subagent", {
       request: { action: "message", agent: "worker", message: phase === "crash" ? "Start the long job." : "Start it again." },
     });
@@ -2126,10 +2163,10 @@ test("a crash while a named subagent works records it interrupted, and its next 
     await exited;
 
     phase = "again";
-    const resumed = await ask(fixture, gateway, ["--resume-id", id, "Try the job again."]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "Try the job again."]);
     expect(resumed.code).toBe(0);
     expect(resumed.stderr).not.toContain("panic");
-    expect(JSON.parse(resumed.stdout).output).toBe("AFTER_LOST_DONE");
+    expect(JSON.parse(resumed.stdout).output).toContain("AFTER_LOST_DONE");
 
     // The reopen recorded the started work as interrupted, as
     // `tests/tla/session_manager/Subagents.tla` repairs a child with a
@@ -2157,9 +2194,10 @@ test("a crash while a named subagent works records it interrupted, and its next 
 test.skipIf(!tmuxAvailable())("the interactive app runs a subagent on v2 and records it in the session's log", async () => {
   const fixture = createFixture("fx-v2-app-subagent-");
   const gateway = startDynamicFakeGateway((body) => {
-    if (isChildRequest(body)) return fakeGatewayFinalText("APP_CHILD_ANSWER");
-    if (body.includes("APP_CHILD_ANSWER")) return fakeGatewayFinalText("APP_PARENT_DONE");
-    return fakeGatewayToolCall("app-delegate", "subagent", { request: { action: "run", task: "Report from the app child." } });
+    if (isAppChildRequest(body, ["Delegate from the app."])) return fakeGatewayFinalText("APP_CHILD_ANSWER");
+    if (isReportTurn(body)) return fakeGatewayFinalText("APP_PARENT_DONE");
+    if (body.includes("app-delegate")) return fakeGatewayFinalText("APP_PARENT_SENT");
+    return fakeGatewayToolCall("app-delegate", "subagent", { request: { action: "message", agent: "reporter", message: "Report from the app child." } });
   }, { classifierDecision: "clear" });
   try {
     const app = await startApp(fixture, gateway, [], true, { FX_PERMISSION_MODE: "auto" });
@@ -2191,8 +2229,9 @@ test("ACP runs a subagent on v2, and load replays the delegation", async () => {
   const fixture = createFixture("fx-v2-acp-subagent-");
   const gateway = startDynamicFakeGateway((body) => {
     if (isChildRequest(body)) return fakeGatewayFinalText("ACP_CHILD_ANSWER");
-    if (body.includes("ACP_CHILD_ANSWER")) return fakeGatewayFinalText("ACP_PARENT_DONE");
-    return fakeGatewayToolCall("acp-delegate", "subagent", { request: { action: "run", task: "Report from the ACP child." } });
+    if (isReportTurn(body)) return fakeGatewayFinalText("ACP_PARENT_DONE");
+    if (body.includes("acp-delegate")) return fakeGatewayFinalText("ACP_PARENT_SENT");
+    return fakeGatewayToolCall("acp-delegate", "subagent", { request: { action: "message", agent: "reporter", message: "Report from the ACP child." } });
   }, { classifierDecision: "clear" });
   let client: AcpRpc | undefined;
   try {
@@ -2211,9 +2250,11 @@ test("ACP runs a subagent on v2, and load replays the delegation", async () => {
 
     client = await AcpRpc.start(fixture, gateway);
     await client.ok("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
-    const replay = JSON.stringify(client.updates);
-    expect(replay).toContain("ACP_CHILD_ANSWER");
-    expect(client.texts("agent_message_chunk")).toEqual(["ACP_PARENT_DONE"]);
+    // The report turn's reply replays; the report never replays as the
+    // user's. The saved turn names no call to show the report on, so the
+    // report itself is not replayed.
+    expect(client.texts("agent_message_chunk")).toEqual(["ACP_PARENT_SENT", "ACP_PARENT_DONE"]);
+    expect(client.texts("user_message_chunk")).toEqual(["Delegate over ACP."]);
     // Children stay out of the list.
     const listed = await client.ok("session/list", { cwd: fixture.workspace });
     expect(listed.sessions.map((s: any) => s.sessionId)).toEqual([id]);
@@ -2252,7 +2293,7 @@ test("fx sessions and fx session show sessions by workspace and page them", asyn
   ]);
   try {
     const a = JSON.parse((await ask(fixture, gateway, ["List question A."])).stdout).session_id;
-    expect((await ask(fixture, gateway, ["--resume-id", a, "List question A two."])).code).toBe(0);
+    expect((await ask(fixture, gateway, ["--resume", a, "List question A two."])).code).toBe(0);
     const inOther = await runFx(["ask", "--json", "--auto", "List question B."], { cwd: other, env: env(fixture, gateway), timeoutMs: TIMEOUT });
     const b = JSON.parse(inOther.stdout).session_id;
     const c = JSON.parse((await ask(fixture, gateway, ["List question C."])).stdout).session_id;
@@ -2419,7 +2460,7 @@ test("fx session reads a session another process holds, and reads past a torn ta
   });
   try {
     const id = JSON.parse((await ask(fixture, gateway, ["Before the held read."])).stdout).session_id;
-    const holder = spawnAsk(fixture, gateway, ["--resume-id", id, "Hold the session for reading."]);
+    const holder = spawnAsk(fixture, gateway, ["--resume", id, "Hold the session for reading."]);
     await reachedStall;
     const path = join(storeRoot(fixture.home), id, "log.jsonl");
     const held = readFileSync(path);
@@ -2458,8 +2499,8 @@ test("fx session recover copies the good turns and side files of a damaged sessi
   ]);
   try {
     const id = JSON.parse((await ask(fixture, gateway, ["Recover question one."])).stdout).session_id;
-    expect((await ask(fixture, gateway, ["--resume-id", id, "Recover question two."])).code).toBe(0);
-    expect((await ask(fixture, gateway, ["--resume-id", id, "Recover question three."])).code).toBe(0);
+    expect((await ask(fixture, gateway, ["--resume", id, "Recover question two."])).code).toBe(0);
+    expect((await ask(fixture, gateway, ["--resume", id, "Recover question three."])).code).toBe(0);
     const path = join(storeRoot(fixture.home), id, "log.jsonl");
     writeFileSync(path, readFileSync(path, "utf8").replace("Recover question three.", "Recover question thr3e."));
     const damaged = readFileSync(path);
@@ -2483,7 +2524,7 @@ test("fx session recover copies the good turns and side files of a damaged sessi
     expect(shown.code).toBe(0);
     expect(JSON.parse(shown.stdout).history_len).toBe(2);
     expect(shown.stdout).toContain("RECOVER_TOOL_OUTPUT_4410");
-    const resumed = await ask(fixture, gateway, ["--resume-id", copy, "After the recovery."]);
+    const resumed = await ask(fixture, gateway, ["--resume", copy, "After the recovery."]);
     expect(resumed.code).toBe(0);
     expect(JSON.parse(resumed.stdout).output).toBe("RECOVER_LOST");
     const sent = gateway.requests.at(-1)!.body;
@@ -2530,7 +2571,7 @@ test("an older session moves off its side folder on its next open, and the model
     mkdirSync(join(side, "terminal", "state"), { recursive: true, mode: 0o700 });
     writeFileSync(join(side, "terminal", "state", "note.json"), "{}", { mode: 0o600 });
 
-    const resumed = await ask(fixture, gateway, ["--resume-id", id, "Read the old result."]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "Read the old result."]);
     expect(resumed.code).toBe(0);
     expect(JSON.parse(resumed.stdout).output).toBe("MOVE_READ_DONE");
     // The old name resolved through the map to the moved body.
@@ -2544,7 +2585,7 @@ test("an older session moves off its side folder on its next open, and the model
     expectWholeLog(fixture, id);
 
     // Opened again, nothing moves twice.
-    const again = await ask(fixture, gateway, ["--resume-id", id, "Once more."]);
+    const again = await ask(fixture, gateway, ["--resume", id, "Once more."]);
     expect(again.code).toBe(0);
     expect(logLines(fixture.home, id).filter((line) => line.kind === "set" && line.key === "moved_files")).toHaveLength(1);
   } finally {
@@ -2618,8 +2659,8 @@ test("doctor reports a session whose blob went missing, and recover copies the t
   ]);
   try {
     const id = JSON.parse((await ask(fixture, gateway, ["Recover question one."])).stdout).session_id;
-    expect((await ask(fixture, gateway, ["--resume-id", id, "Recover question two."])).code).toBe(0);
-    expect((await ask(fixture, gateway, ["--resume-id", id, "Recover question three."])).code).toBe(0);
+    expect((await ask(fixture, gateway, ["--resume", id, "Recover question two."])).code).toBe(0);
+    expect((await ask(fixture, gateway, ["--resume", id, "Recover question three."])).code).toBe(0);
     const referenced = (logLines(fixture.home, id) as any[]).find((line) => Array.isArray(line.blobs) && line.blobs.length === 1);
     rmSync(join(storeRoot(fixture.home), id, "blobs", referenced.blobs[0]));
     const logPath = join(storeRoot(fixture.home), id, "log.jsonl");
@@ -2638,7 +2679,7 @@ test("doctor reports a session whose blob went missing, and recover copies the t
     const recovered = JSON.parse(result.stdout);
     expect(recovered).toMatchObject({ kind: "session_recovery", source_id: id, status: "recovered", history_turns: 1 });
     const copy: string = recovered.recovered_id;
-    const resumed = await ask(fixture, gateway, ["--resume-id", copy, "Continue in the copy."]);
+    const resumed = await ask(fixture, gateway, ["--resume", copy, "Continue in the copy."]);
     expect(resumed.code).toBe(0);
     expect(JSON.parse(resumed.stdout).output).toBe("AFTER_RECOVER");
     const last = gateway.requests.at(-1)!.body;
@@ -2678,7 +2719,7 @@ test("fx ask keeps a piece over 256 KB as a blob, and resume sends it whole", as
     expect(sha256(readFileSync(blobPath))).toBe(hash);
     expect(readFileSync(blobPath, "utf8")).toContain("BLOB_PIECE_END");
 
-    const resumed = await ask(fixture, gateway, ["--resume-id", id, "Continue after the long answer."]);
+    const resumed = await ask(fixture, gateway, ["--resume", id, "Continue after the long answer."]);
     expect(resumed.code).toBe(0);
     expect(resumed.stderr).toBe("");
     expect(JSON.parse(resumed.stdout).output).toBe("AFTER_BLOB_RESUME");
@@ -2900,8 +2941,8 @@ test("a parent killed while a named child runs a tool records that work interrup
       if (phase === "crash") return fakeShellRun("child-crash-shell", `echo $$ > '${started}'; exec sleep 300`);
       return fakeGatewayFinalText("CHILD_AGAIN_DONE");
     }
-    if (phase === "first" && body.includes("CHILD_FIRST_DONE")) return fakeGatewayFinalText("PARENT_FIRST_DONE");
-    if (phase === "again" && body.includes("CHILD_AGAIN_DONE")) return fakeGatewayFinalText("PARENT_AGAIN_DONE");
+    if (isReportTurn(body)) return fakeGatewayFinalText(phase === "first" ? "PARENT_FIRST_DONE" : "PARENT_AGAIN_DONE");
+    if (body.includes(`delegate-${phase}`)) return fakeGatewayFinalText(`PARENT_${phase.toUpperCase()}_SENT`);
     return fakeGatewayToolCall(`delegate-${phase}`, "subagent", {
       request: { action: "message", agent: "worker", message: `Child work ${phase}.` },
     });
@@ -2909,13 +2950,13 @@ test("a parent killed while a named child runs a tool records that work interrup
   try {
     const first = await ask(fixture, gateway, ["Start the worker."]);
     expect(first.code).toBe(0);
-    expect(JSON.parse(first.stdout).output).toBe("PARENT_FIRST_DONE");
+    expect(JSON.parse(first.stdout).output).toContain("PARENT_FIRST_DONE");
     const id = JSON.parse(first.stdout).session_id;
     const childId = childLines(fixture.home, id)[0].child;
     const childBefore = readFileSync(join(storeRoot(fixture.home), childId, "log.jsonl"));
 
     phase = "crash";
-    const { child, exited } = spawnAsk(fixture, gateway, ["--resume-id", id, "Give the worker a long job."]);
+    const { child, exited } = spawnAsk(fixture, gateway, ["--resume", id, "Give the worker a long job."]);
     await until(() => existsSync(started) && readFileSync(started, "utf8").trim() !== "", "the child's tool to start");
     const toolPid = Number(readFileSync(started, "utf8").trim());
     child.kill("SIGKILL");
@@ -2934,10 +2975,10 @@ test("a parent killed while a named child runs a tool records that work interrup
     expect(added.map((line) => line.kind)).toEqual(["turn_started"]);
 
     phase = "again";
-    const again = await ask(fixture, gateway, ["--resume-id", id, "Ask the worker again."]);
+    const again = await ask(fixture, gateway, ["--resume", id, "Ask the worker again."]);
     expect(again.code).toBe(0);
     expect(again.stderr).not.toContain("panic");
-    expect(JSON.parse(again.stdout).output).toBe("PARENT_AGAIN_DONE");
+    expect(JSON.parse(again.stdout).output).toContain("PARENT_AGAIN_DONE");
     const lines = childLines(fixture.home, id);
     expect(lines.map((line) => [line.kind, line.outcome ?? null])).toEqual([
       ["child_spawned", null], ["child_finished", "ok"],
@@ -2958,117 +2999,101 @@ test("a parent killed while a named child runs a tool records that work interrup
 }, TIMEOUT * 4);
 
 
-// v1's steering test: the user keeps talking to the parent while its child
-// runs, and the child's result arrives later.
-for (const action of ["run", "message"] as const) {
-  test.skipIf(!tmuxAvailable())(`the app talks to the user while a child runs, and records it done, ${action}`, async () => {
-    const fixture = createFixture("fx-v2-app-child-steering-");
-    const held = heldFakeGatewayFinalText();
-    const parentReply = heldFakeGatewayFinalText();
-    const activity = (pane: string) => pane.match(/^[• ] (?:Thinking|Generating|Running) \([^\n]+$/gm)?.at(-1)?.slice(2) ?? "";
-    const requests: string[] = [];
-    let childRequests = 0;
-    let delegated = false;
-    let afterChildTool = false;
-    writeFileSync(join(fixture.workspace, "after-child.txt"), "AFTER_CHILD_TOOL_OK");
-    const gateway = startDynamicFakeGateway((raw) => {
-      const body = JSON.parse(raw);
-      const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
-      if (latest.includes("STEERING_CHILD")) {
-        childRequests++;
-        return held.response;
-      }
-      requests.push(raw);
-      if (!delegated) {
-        delegated = true;
-        return fakeGatewayToolCall("steering-delegation", "subagent", { request: action === "run"
-          ? { action, task: "STEERING_CHILD" }
-          : { action, agent: "worker", message: "STEERING_CHILD" } });
-      }
-      if (latest.includes("STEERING_LATER")) return fakeGatewayFinalText("LATER_OK");
-      if (raw.includes("HELD_CHILD_RESULT")) {
-        if (!afterChildTool) {
-          afterChildTool = true;
-          return fakeGatewayToolCall("after-child", "read_file", { path: "after-child.txt" });
-        }
-        return fakeGatewayFinalText("CHILD_COMPLETE");
-      }
-      if (latest.includes("STEERING_SECOND")) return fakeGatewayFinalText("SECOND_ACCEPTED");
-      return new Response(parentReply.response.body!.pipeThrough(new TransformStream({
-        start(controller) {
-          controller.enqueue(new TextEncoder().encode(
-            'data: {"type":"text-start","id":"answer_1"}\n\n' +
-              `data: ${JSON.stringify({ type: "text-delta", id: "answer_1", delta: "FIRST_STREAMING\n\nStill composing the first reply. " })}\n\n`,
-          ));
-        },
-      })), { headers: parentReply.response.headers });
-    }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }] });
-    const tracePath = join(fixture.root, "trace.log");
-    const stderrPath = join(fixture.root, "stderr.log");
-    let tui: TmuxSession | undefined;
-    try {
-      tui = await TmuxSession.create({
-        cmd: JSON.stringify(FX_BIN), cwd: fixture.workspace, isolated: true, remainOnExit: true, stderrPath,
-        env: {
-          ...env(fixture, gateway), NO_COLOR: "1", FX_PERMISSION_MODE: "full-access", FX_MAX_AGENT_STEPS: "5",
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
-          FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "subagent,worker,agent,tool",
-        },
-      });
-      await tui.waitForStableComposer(15000);
-      await tui.sendText("STEERING_START");
-      await tui.waitForPane(() => childRequests === 1, 10000);
-      const parent = rootSessionIds(fixture.home)[0]!;
-      await until(() => childWork(fixture.home, parent).spawns === 1, "the child's spawn in the parent's log");
-      const original = childWork(fixture.home, parent);
-      expect(original.outcome).toBeNull();
-
-      await tui.sendText("STEERING_FIRST");
-      const streaming = await tui.waitForText("FIRST_STREAMING", 10000);
-      expect(activity(streaming)).toMatch(/^Generating \(/);
-      parentReply.release("FIRST_ACCEPTED");
-      await tui.waitForText("FIRST_ACCEPTED", 10000);
-      await tui.waitForPane((pane) => activity(pane).startsWith("Running ("), 10000);
-      await tui.sendText("STEERING_SECOND");
-      await tui.waitForText("SECOND_ACCEPTED", 10000);
-      expect(childRequests).toBe(1);
-      // Still the one piece of work, still running.
-      expect(childWork(fixture.home, parent)).toEqual(original);
-      expect(requests.some((raw) => raw.includes(original.child!) && raw.includes(original.work!))).toBe(true);
-      expect(await tui.captureFullScrollback()).toContain("still running");
-
-      held.release("HELD_CHILD_RESULT");
-      await tui.waitForText("CHILD_COMPLETE", 10000);
-      expect(requests.filter((raw) => raw.includes("HELD_CHILD_RESULT"))).toHaveLength(2);
-      await until(() => childWork(fixture.home, parent).outcome === "ok", "the child's work to be recorded done");
-      await tui.waitForStableComposer(10000);
-      await tui.sendText("STEERING_LATER");
-      await tui.waitForText("LATER_OK", 10000);
-      expect(childRequests).toBe(1);
-      await tui.sendText("/quit");
-      await tui.waitForPane(() => tui!.paneStatus().dead, 10000);
-      expect(tui.paneStatus().status).toBe(0);
-      expect(readFileSync(stderrPath, "utf8")).toBe("");
-
-      // One result for the delegation, and the child's work ends once.
-      const results = logLines(fixture.home, parent).filter((line: any) =>
-        line.kind === "item" && line.type === "tool_result" && JSON.stringify(line).includes("steering-delegation"));
-      expect(results).toHaveLength(1);
-      expect(childLines(fixture.home, parent).filter((line) => line.kind === "child_finished")).toHaveLength(1);
-      expect(childWork(fixture.home, parent)).toEqual({ ...original, outcome: "ok" });
-      const trace = readFileSync(tracePath, "utf8");
-      expect(trace).toContain("event=steering_wait_yielded ");
-      expect(trace.split("\n").filter((line) => line.includes("event=steering_result_delivered "))).toHaveLength(1);
-      expectWholeLog(fixture, parent);
-    } finally {
-      parentReply.dispose();
-      held.dispose();
-      await tui?.kill();
-      gateway.stop();
-      rmSync(fixture.root, { recursive: true, force: true });
+// The user keeps talking to the parent while its child works, and the
+// child's report arrives on its own when the work ends.
+test.skipIf(!tmuxAvailable())("the app talks to the user while a child runs, and its report arrives after", async () => {
+  const fixture = createFixture("fx-v2-app-child-steering-");
+  const held = heldFakeGatewayFinalText();
+  const requests: string[] = [];
+  let childRequests = 0;
+  let afterChildTool = false;
+  writeFileSync(join(fixture.workspace, "after-child.txt"), "AFTER_CHILD_TOOL_OK");
+  const gateway = startDynamicFakeGateway((raw) => {
+    const body = JSON.parse(raw);
+    const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
+    if (latest.includes("STEERING_CHILD")) {
+      childRequests++;
+      return held.response;
     }
-  }, 60000);
-}
+    requests.push(raw);
+    // The report's turn may use tools, as any turn does.
+    if (isReportTurn(raw)) {
+      if (!afterChildTool) {
+        afterChildTool = true;
+        return fakeGatewayToolCall("after-child", "read_file", { path: "after-child.txt" });
+      }
+      return fakeGatewayFinalText("CHILD_COMPLETE");
+    }
+    if (latest.includes("STEERING_LATER")) return fakeGatewayFinalText("LATER_OK");
+    if (latest.includes("STEERING_FIRST")) return fakeGatewayFinalText("FIRST_ACCEPTED");
+    if (raw.includes("steering-delegation")) return fakeGatewayFinalText("START_SENT");
+    return fakeGatewayToolCall("steering-delegation", "subagent", { request: { action: "message", agent: "worker", message: "STEERING_CHILD" } });
+  }, { models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"] }] });
+  const tracePath = join(fixture.root, "trace.log");
+  const stderrPath = join(fixture.root, "stderr.log");
+  let tui: TmuxSession | undefined;
+  try {
+    tui = await TmuxSession.create({
+      cmd: JSON.stringify(FX_BIN), cwd: fixture.workspace, isolated: true, remainOnExit: true, stderrPath,
+      env: {
+        ...env(fixture, gateway), NO_COLOR: "1", FX_PERMISSION_MODE: "full-access", FX_MAX_AGENT_STEPS: "5",
+        FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+        FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "subagent,worker,agent,tool,mailbox",
+      },
+    });
+    await tui.waitForStableComposer(15000);
+    await tui.sendText("STEERING_START");
+    await tui.waitForPane(() => childRequests === 1, 10000);
+    // The parent's turn ends with the receipt while its child works.
+    await tui.waitForText("START_SENT", 10000);
+    const parent = rootSessionIds(fixture.home)[0]!;
+    await until(() => childWork(fixture.home, parent).spawns === 1, "the child's spawn in the parent's log");
+    const original = childWork(fixture.home, parent);
+    expect(original.outcome).toBeNull();
+
+    await tui.waitForStableComposer(10000);
+    await tui.sendText("STEERING_FIRST");
+    await tui.waitForText("FIRST_ACCEPTED", 10000);
+    expect(childRequests).toBe(1);
+    // Still the one piece of work, still running.
+    expect(childWork(fixture.home, parent)).toEqual(original);
+
+    held.release("HELD_CHILD_RESULT");
+    const reported = await tui.waitForText("CHILD_COMPLETE", 10000);
+    // The report shows as a finished subagent row, not as the user's prompt.
+    expect(reported).toContain("worker completed");
+    expect(reported).not.toContain("Subagent report (untrusted");
+    // The report's turn: its tool call, then its reply.
+    expect(requests.filter((raw) => isReportTurn(raw) && raw.includes("HELD_CHILD_RESULT"))).toHaveLength(2);
+    await until(() => childWork(fixture.home, parent).outcome === "ok", "the child's work to be recorded done");
+    await tui.waitForStableComposer(10000);
+    await tui.sendText("STEERING_LATER");
+    await tui.waitForText("LATER_OK", 10000);
+    expect(childRequests).toBe(1);
+    await tui.sendText("/quit");
+    await tui.waitForPane(() => tui!.paneStatus().dead, 10000);
+    expect(tui.paneStatus().status).toBe(0);
+    expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+    // One result for the delegation, and the child's work ends once.
+    const results = logLines(fixture.home, parent).filter((line: any) =>
+      line.kind === "item" && line.type === "tool_result" && JSON.stringify(line).includes("steering-delegation"));
+    expect(results).toHaveLength(1);
+    expect(childLines(fixture.home, parent).filter((line) => line.kind === "child_finished")).toHaveLength(1);
+    expect(childWork(fixture.home, parent)).toEqual({ ...original, outcome: "ok" });
+    // The report turn is saved as the child's, never the user's.
+    expect(logLines(fixture.home, parent).filter((line: any) => line.kind === "item" && line.type === "author")).toHaveLength(1);
+    const trace = readFileSync(tracePath, "utf8");
+    // Traced when main takes the report into its history.
+    expect(trace).toMatch(/\[mailbox\] event=deliver (?:turn_id=\d+ )?from=\S+ kind=report /);
+    expectWholeLog(fixture, parent);
+  } finally {
+    held.dispose();
+    await tui?.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, 60000);
 
 // ---------------------------------------------------------------------------
 // The fault matrix beyond fx ask: kills between turns, a damaged or missing
@@ -3092,7 +3117,7 @@ async function savedTwoTurns(fixture: Fixture, gateway: any) {
   const first = await ask(fixture, gateway, ["Fault question one."]);
   expect(first.code).toBe(0);
   const id = JSON.parse(first.stdout).session_id;
-  expect((await ask(fixture, gateway, ["--resume-id", id, "Fault question two."])).code).toBe(0);
+  expect((await ask(fixture, gateway, ["--resume", id, "Fault question two."])).code).toBe(0);
   return { id, log: join(storeRoot(fixture.home), id, "log.jsonl") };
 }
 
@@ -3427,7 +3452,7 @@ test.skipIf(!tmuxAvailable())("an app killed after a named child finished resume
   const fixture = createFixture("fx-v2-app-kill-after-child-");
   let phase = 1;
   const gateway = startDynamicFakeGateway((body) => {
-    if (isChildRequest(body)) {
+    if (isAppChildRequest(body, ["Start the worker.", "Ask the worker again."])) {
       if (phase === 1) return fakeGatewayFinalText("CHILD_FIRST_ANSWER");
       return fakeGatewayFinalText(body.includes("CHILD_FIRST_ANSWER") ? "CHILD_REMEMBERED" : "CHILD_FORGOT");
     }
@@ -3442,7 +3467,8 @@ test.skipIf(!tmuxAvailable())("an app killed after a named child finished resume
     const roots = rootSessionIds(fixture.home);
     expect(roots).toHaveLength(1);
     const id = roots[0]!;
-    await waitForLog(fixture, id, "turn_committed");
+    // The child's report runs on main too; kill once that is saved.
+    await waitForSettledChild(fixture, id, 1);
     Bun.spawnSync(["kill", "-9", String(app.session.processPid())]);
     await app.session.kill();
 
@@ -3450,6 +3476,7 @@ test.skipIf(!tmuxAvailable())("an app killed after a named child finished resume
     const resumed = await startApp(fixture, gateway, ["--resume", id], true, { FX_PERMISSION_MODE: "auto" });
     await resumed.session.sendText("Ask the worker again.");
     await scrollbackContains(resumed.session, "PARENT_2_DONE");
+    await waitForSettledChild(fixture, id, 2);
     await resumed.session.waitForComposer(TIMEOUT);
     await quitApp(resumed);
 
@@ -3714,13 +3741,13 @@ test("a named child whose log is damaged fails that message, and the parent turn
   let phase = 1;
   const gateway = startDynamicFakeGateway(async (body) => {
     if (isChildRequest(body)) return fakeGatewayFinalText(`CHILD_ANSWER_${phase}`);
-    if (phase === 1 && body.includes("CHILD_ANSWER_1")) return fakeGatewayFinalText("PARENT_FIRST_DONE");
-    if (phase === 2 && body.includes("delegate-2")) return fakeGatewayFinalText("PARENT_AFTER_CHILD_FAILED");
+    if (isReportTurn(body)) return fakeGatewayFinalText(phase === 1 ? "PARENT_FIRST_DONE" : "PARENT_AFTER_CHILD_FAILED");
+    if (body.includes(`delegate-${phase}`)) return fakeGatewayFinalText(phase === 1 ? "PARENT_FIRST_SENT" : "PARENT_SECOND_SENT");
     return fakeGatewayToolCall(`delegate-${phase}`, "subagent", { request: { action: "message", agent: "worker", message: `Child work ${phase}.` } });
   }, { classifierDecision: "clear" });
   try {
     const first = await ask(fixture, gateway, ["Start the worker."]);
-    expect(JSON.parse(first.stdout).output).toBe("PARENT_FIRST_DONE");
+    expect(JSON.parse(first.stdout).output).toContain("PARENT_FIRST_DONE");
     const id = JSON.parse(first.stdout).session_id;
     const childId = childLines(fixture.home, id)[0].child;
     const childLog = join(storeRoot(fixture.home), childId, "log.jsonl");
@@ -3728,10 +3755,12 @@ test("a named child whose log is damaged fails that message, and the parent turn
     const damaged = readFileSync(childLog);
 
     phase = 2;
-    const again = await ask(fixture, gateway, ["--resume-id", id, "Ask the worker again."]);
+    const again = await ask(fixture, gateway, ["--resume", id, "Ask the worker again."]);
     expect(again.code).toBe(0);
-    expect(JSON.parse(again.stdout).output).toBe("PARENT_AFTER_CHILD_FAILED");
-    expect(JSON.parse(again.stdout).tool_calls).toEqual([{ name: "subagent", status: "error" }]);
+    // The message is sent; the child fails as it opens its log, and the
+    // failure reaches the parent as a report that starts its next turn.
+    expect(JSON.parse(again.stdout).output).toContain("PARENT_AFTER_CHILD_FAILED");
+    expect(JSON.parse(again.stdout).tool_calls).toEqual([{ name: "subagent", status: "success" }]);
     const lines = childLines(fixture.home, id);
     expect(lines.map((line) => [line.kind, line.outcome ?? null])).toEqual([
       ["child_spawned", null], ["child_finished", "ok"], ["child_spawned", null], ["child_finished", "failed"],
@@ -3817,9 +3846,9 @@ async function makeGridBase(exit: GridExit, by: "ask" | "app") {
     expect(first.code, `${exit} base by ${by}: signal ${first.signal}: ${first.stderr}`).toBe(0);
     const id: string = JSON.parse(first.stdout).session_id;
     if (by === "ask" && exit === "committed") {
-      expect((await ask(fixture, gateway, ["--resume-id", id, "Grid second."])).code).toBe(0);
+      expect((await ask(fixture, gateway, ["--resume", id, "Grid second."])).code).toBe(0);
     } else if (by === "ask") {
-      const run = spawnAsk(fixture, gateway, ["--resume-id", id, "Grid second."]);
+      const run = spawnAsk(fixture, gateway, ["--resume", id, "Grid second."]);
       await stalled;
       if (exit === "crashed-mid-tool") await waitForLog(fixture, id, "grid-slow-2");
       run.child.kill(exit === "cancelled" ? "SIGINT" : "SIGKILL");
@@ -3937,7 +3966,7 @@ async function gridEnter(entry: GridEntry, c: GridCase, gateway: any, token: str
   const answer = `GRID_ANSWER_${token}`;
   switch (gridHost(entry)) {
     case "ask": {
-      const args = entry === "ask-id" ? ["--resume-id", c.id, prompt] : entry === "ask-last" ? ["--resume", "last", prompt] : [prompt];
+      const args = entry === "ask-id" ? ["--resume", c.id, prompt] : entry === "ask-last" ? ["--resume", "last", prompt] : [prompt];
       const result = limit === undefined ? await ask(c.fixture, gateway, args) : await askWithSizeLimit(c.fixture, gateway, limit, args);
       let json: any;
       try {
@@ -4098,7 +4127,7 @@ async function gridRow(exit: GridExit, entry: GridEntry) {
           break;
         case "busy": {
           const held = hold(`H${token}`);
-          holder = spawnAsk(c.fixture, gateway, ["--resume-id", c.id, `Grid token H${token}.`]);
+          holder = spawnAsk(c.fixture, gateway, ["--resume", c.id, `Grid token H${token}.`]);
           await held.reached;
           clear = async () => {
             held.release();
