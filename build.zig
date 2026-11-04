@@ -157,10 +157,16 @@ pub fn build(b: *std.Build) void {
     session_manager_test_step.dependOn(&run_session_manager_tests.step);
     session_manager_test_step.dependOn(&run_session_manager_hook_tests.step);
 
+    const js_engine_tests = b.addTest(.{ .root_module = jsEngineModule(b, target, optimize) });
+    const run_js_engine_tests = b.addRunArtifact(js_engine_tests);
+    const js_engine_test_step = b.step("test-js", "Run the JavaScript engine's tests");
+    js_engine_test_step.dependOn(&run_js_engine_tests.step);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_session_manager_tests.step);
     test_step.dependOn(&run_session_manager_hook_tests.step);
+    test_step.dependOn(&run_js_engine_tests.step);
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fuzz_seed })).step);
 
     const fuzz_step = b.step(
@@ -559,6 +565,31 @@ fn sessionManagerModule(
         .single_threaded = single_threaded,
     });
     module.addImport("build_options", options.createModule());
+    return module;
+}
+
+/// The embedded JavaScript engine, rooted at `src/js/engine.zig`, with fx's
+/// fork of quickjs-ng from `src/js/quickjs/`. The C keeps its
+/// undefined-behavior checks in every mode: a bug in the engine traps instead
+/// of corrupting memory, and the cost falls on short programs, not hot loops.
+fn jsEngineModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/js/engine.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .sanitize_c = if (optimize == .debug) .full else .trap,
+    });
+    module.addCSourceFiles(.{
+        .root = b.path("src/js/quickjs"),
+        .files = &.{ "quickjs.c", "libregexp.c", "libunicode.c", "dtoa.c" },
+        // Upstream's own build settings; the warnings are upstream's to fix.
+        .flags = &.{ "-std=gnu11", "-funsigned-char", "-DQUICKJS_NG_BUILD", "-D_GNU_SOURCE", "-w" },
+    });
     return module;
 }
 
