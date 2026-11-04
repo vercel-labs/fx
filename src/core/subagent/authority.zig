@@ -295,6 +295,11 @@ pub const Resolver = struct {
     /// no cache gets no authority.
     profiles: ?*ProfileCache = null,
 
+    /// Whether these children may start subagents of their own. fx nests
+    /// two levels, an agent's subagents and theirs, so a subagent's own
+    /// host clears it and its children are never given `subagent`.
+    children_nest: bool = true,
+
     /// The authority of the work main started on child `child_id`, which
     /// must still be active.
     pub fn resolve(
@@ -440,7 +445,7 @@ pub const Resolver = struct {
         errdefer alloc.free(owned_child_id);
         const owned_root_id = try alloc.dupe(u8, self.root_id);
         errdefer alloc.free(owned_root_id);
-        const tools = try cloneKeptTools(alloc, tool_source, current.profile);
+        const tools = try cloneKeptTools(alloc, tool_source, current.profile, self.children_nest);
         errdefer freeStrings(alloc, tools);
         const integrations = try cloneIntegrations(alloc, integration_source, current.profile, view_source);
         errdefer freeStrings(alloc, integrations);
@@ -609,14 +614,20 @@ fn cloneStrings(alloc: Allocator, values: []const []const u8) ![][]u8 {
     return out;
 }
 
-/// The host's tools a child may use: all of them, `subagent` included, or with
-/// a profile only those it allows.
+/// The host's tools a child may use: all of them, or with a profile only
+/// those it allows. `subagent` is among them only when the child `nests`.
 fn cloneKeptTools(
     alloc: Allocator,
     values: []const []const u8,
     profile: ?*const profiles.Profile,
+    nests: bool,
 ) ![][]u8 {
-    return cloneKept(alloc, values, profile, keepTool);
+    if (nests) return cloneKept(alloc, values, profile, keepTool);
+    return cloneKept(alloc, values, profile, keepToolButSubagent);
+}
+
+fn keepToolButSubagent(profile: ?*const profiles.Profile, name: []const u8) bool {
+    return !std.mem.eql(u8, name, "subagent") and keepTool(profile, name);
 }
 
 /// The host's MCP integrations a child may use: with a profile, only the
@@ -905,6 +916,47 @@ test "authority capture permits registry access and rejects changed work" {
             },
         }
         try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    }
+}
+
+test "a subagent's own children are never given subagent, so fx nests two levels" {
+    const Fixture = struct {
+        fn resolve(_: ?*anyopaque, alloc: Allocator, _: []const u8) HostResolveError!HostAuthority {
+            return HostAuthority.capture(alloc, &.{ "read_file", "subagent" }, &.{}, .{}, &.{}) catch
+                return error.OutOfMemory;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    const store = parent.stateStore();
+    var registry = try child_state.Registry.init(alloc, parent.parent.id());
+    defer registry.deinit(alloc);
+    var work = child_state.ActiveWork{
+        .id = try alloc.dupe(u8, "work-one"),
+        .message = try alloc.dupe(u8, "original"),
+        .permission_mode = .ask,
+        .created_at_ms = 1,
+    };
+    defer work.deinit(alloc);
+    try registry.appendPersistent(alloc, "authority-child", "worker", "", work);
+    try store.save(alloc, registry);
+    var resolver = Resolver{
+        .children = &parent.children,
+        .root_id = parent.parent.id(),
+        .host = .{ .resolve_fn = Fixture.resolve },
+        .children_nest = false,
+    };
+    // Neither the work its parent sent nor a turn typed on its screen.
+    for ([_]bool{ false, true }) |typed| {
+        var snapshot = if (typed)
+            try resolver.resolveForUser(alloc, "authority-child", .ask)
+        else
+            try resolver.resolve(alloc, "authority-child");
+        defer snapshot.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), snapshot.tools.len);
+        try std.testing.expectEqualStrings("read_file", snapshot.tools[0]);
     }
 }
 

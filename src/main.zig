@@ -878,8 +878,9 @@ const App = struct {
         NotificationAppRuntime.playMaxCue(self, .toggle);
     }
 
-    pub fn reportWorking(self: *App) void {
-        HerdrAppRuntime.reportWorking(self);
+    /// What the busiest open agent is doing, for herdr's pane state.
+    pub fn agentsBusiest(self: *App) app_agents_runtime.Busiest {
+        return AgentsAppRuntime.busiest(self);
     }
 
     /// `agent`'s turn needs the user: an approval or a question.
@@ -1467,10 +1468,12 @@ const App = struct {
         skill_tokens: []const registered_entities.SkillTokenSpan,
     ) !void {
         // A turn a subagent's report or message started is not the user's
-        // words, so it shows as a short card rather than as a prompt.
-        if (try subagent_reports.card(self.alloc, user)) |shown| {
+        // words, so it shows as a finished subagent call, as the parent's
+        // own calls do.
+        if (try subagent_reports.row(self.alloc, user)) |shown| {
             defer shown.deinit(self.alloc);
-            for (shown.notices()) |notice| try self.writeDomainNotice(notice, true);
+            const entry_id = try self.writeCompletedToolStatusReturningEntryId(shown.outcome, shown.status, true);
+            try self.shell.attachHistoricalToolDetail(self.alloc, entry_id, subagent_reports.Row.call, .subagent, shown.result(io_mod.milliTimestamp()));
             return;
         }
         _ = try self.shell.writeUserPromptCard(
@@ -1526,7 +1529,6 @@ const App = struct {
         errdefer releaseUnadmittedPrompt(agent, queued);
         queued.recovery_resume = resumed;
         try agent.worker.enqueuePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
         WorkerAppRuntime.syncState(
             self,
             agent,
@@ -1630,7 +1632,6 @@ const App = struct {
         );
         errdefer releaseUnadmittedPrompt(agent, queued);
         try agent.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
         return true;
     }
 
@@ -1655,7 +1656,6 @@ const App = struct {
         );
         errdefer releaseUnadmittedPrompt(agent, queued);
         try agent.worker.enqueuePrompt(std.heap.c_allocator, queued);
-        HerdrAppRuntime.reportWorking(self);
         return true;
     }
 
@@ -1852,7 +1852,6 @@ const App = struct {
             .history = history,
             .unversioned_history_count = agent.session.unversionedHistoryEnd(),
         });
-        HerdrAppRuntime.reportWorking(self);
         return true;
     }
 
@@ -3363,6 +3362,7 @@ const App = struct {
         AgentsAppRuntime.settleChildRuns(self);
         AgentsAppRuntime.settleLentQuestion(self);
         AgentsAppRuntime.lendPrompt(self);
+        HerdrAppRuntime.reconcile(self);
     }
 
     /// Gives a subagent's question lent to main's prompt back to it, before
@@ -3383,9 +3383,15 @@ const App = struct {
     }
 
     /// Readies the subagent on screen, if any, for a turn the user starts
-    /// there, which then runs as main's does.
-    pub fn prepareSubagentOnScreen(self: *App, agent: *agents.Agent) !void {
+    /// there, which then runs as main's does. True when it admitted one.
+    pub fn prepareSubagentOnScreen(self: *App, agent: *agents.Agent) !bool {
         return AgentsAppRuntime.prepareOwnTurn(self, agent);
+    }
+
+    /// Opens the work for the turn `prepareSubagentOnScreen` admitted, once
+    /// the user's text is queued.
+    pub fn openSubagentTurnWork(self: *App) void {
+        AgentsAppRuntime.openOwnTurnWork(self);
     }
 
     /// `/launch`: another instance on the host, shown.
@@ -5537,6 +5543,40 @@ test {
     _ = @import("gateway/host_chat_completions.zig");
 }
 
+test "the busiest agent wins herdr's state: an approval over work, work over idle, and a closed first instance not at all" {
+    const alloc = std.testing.allocator;
+    var app = App{ .alloc = alloc };
+    defer app.shell.deinit(alloc);
+    defer app.pacer.deinit(alloc);
+    defer app.input_runtime.deinit(alloc);
+    defer App.AgentsAppRuntime.deinitChildren(&app);
+    defer app.instances.agents_menu.deinit(alloc);
+    const runtime = App.AgentsAppRuntime;
+    const Busiest = app_agents_runtime.Busiest;
+    const asking = try addTestChildAgent(&app, "asking");
+    const working = try addTestChildAgent(&app, "working");
+    try std.testing.expectEqual(Busiest.idle, runtime.busiest(&app));
+
+    working.agent.worker.worker_processing = true;
+    try std.testing.expectEqual(Busiest.working, runtime.busiest(&app));
+    try std.testing.expect(try asking.agent.approval_prompt.syncRequest(alloc, .{ .label = "shell.run npm test" }));
+    try std.testing.expectEqual(Busiest.needs_approval, runtime.busiest(&app));
+    asking.agent.approval_prompt.clear(alloc);
+    try std.testing.expectEqual(Busiest.working, runtime.busiest(&app));
+
+    // A turn that ended unseen leaves its agent idle for herdr.
+    working.agent.worker.worker_processing = false;
+    working.agent.finished_unseen = true;
+    try std.testing.expectEqual(Busiest.idle, runtime.busiest(&app));
+
+    // Once the first instance is closed, main's agent no longer counts.
+    app.main_agent.worker.worker_processing = true;
+    try std.testing.expectEqual(Busiest.working, runtime.busiest(&app));
+    app.instances.first_open = false;
+    try std.testing.expectEqual(Busiest.idle, runtime.busiest(&app));
+    app.main_agent.worker.worker_processing = false;
+}
+
 fn addTestChildAgent(app: *App, id: []const u8) !*app_agents_runtime.ChildAgent {
     const child = try app.alloc.create(app_agents_runtime.ChildAgent);
     errdefer app.alloc.destroy(child);
@@ -5609,7 +5649,10 @@ test "the tick visits only the child agents with work waiting" {
 
 test "the agent list previews each agent by switching, keeps every draft where it was typed, and Esc goes back" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5671,7 +5714,10 @@ test "the agent list previews each agent by switching, keeps every draft where i
 
 test "the footer indicator names the agent on screen and the key that opens the list" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5690,7 +5736,10 @@ test "the footer indicator names the agent on screen and the key that opens the 
 
 test "while a subagent is on screen, the tick visits main and the other hidden agents" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5728,7 +5777,10 @@ test "while a subagent is on screen, the tick visits main and the other hidden a
 
 test "the footer notes a hidden agent waiting on an approval, never the one on screen" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5760,7 +5812,10 @@ test "the footer notes a hidden agent waiting on an approval, never the one on s
 
 test "the footer notes a hidden agent whose request waits for the user" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5789,7 +5844,10 @@ test "the footer notes a hidden agent whose request waits for the user" {
 
 test "a hidden subagent's approval is lent to main's screen, answered on its worker, and goes back" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5889,7 +5947,10 @@ test "an approval answered on main's screen goes back, so the next one of the tr
 
 test "main's screen shows its tree's oldest prompt first, approval or question" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5935,7 +5996,10 @@ test "main's screen shows its tree's oldest prompt first, approval or question" 
 
 test "a hidden subagent's question is lent to main's screen and goes back on a switch" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);

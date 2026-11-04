@@ -1102,6 +1102,16 @@ pub const Runtime = struct {
         };
     }
 
+    /// Who started `child_id`'s turn going now, when its parent didn't: the
+    /// user on its screen, or its own child's report. Null when no such
+    /// turn is going, as while it does work its parent sent.
+    pub fn turnStartedBy(self: *Runtime, child_id: []const u8) ?reports.StartedBy {
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        const index = self.findTurnWorkLocked(child_id) orelse return null;
+        return self.turn_works.items[index].started_by;
+    }
+
     fn openTurnWorkLocked(
         self: *Runtime,
         alloc: Allocator,
@@ -1114,7 +1124,7 @@ pub const Runtime = struct {
         defer self.alloc.free(suffix);
         const work_id = try alloc.print("{s}:{s}", .{ if (started_by == .user) "fxuser" else "fxwake", suffix });
         errdefer alloc.free(work_id);
-        if (open_now) try self.startTurnWorkInLog(child_id, work_id);
+        if (open_now) try self.startTurnWorkInLog(child_id, work_id, started_by);
         var work: TurnWork = .{
             .child_id = try self.alloc.dupe(u8, child_id),
             .work_id = undefined,
@@ -1132,8 +1142,9 @@ pub const Runtime = struct {
         return work_id;
     }
 
-    /// Starts `work_id` as the child's work in the parent's log.
-    fn startTurnWorkInLog(self: *Runtime, child_id: []const u8, work_id: []const u8) !void {
+    /// Starts `work_id` as the child's work in the parent's log, saying who
+    /// started it.
+    fn startTurnWorkInLog(self: *Runtime, child_id: []const u8, work_id: []const u8, started_by: reports.StartedBy) !void {
         var lock = self.managed.state_store.acquireLock();
         defer lock.release();
         var registry = try self.managed.state_store.load(self.alloc);
@@ -1144,6 +1155,7 @@ pub const Runtime = struct {
             .id = @constCast(work_id),
             .message = @constCast(""),
             .created_at_ms = io_mod.milliTimestamp(),
+            .started_by = started_by,
         });
         try self.managed.state_store.save(self.alloc, registry);
     }
@@ -1155,7 +1167,7 @@ pub const Runtime = struct {
         const index = self.findTurnWorkLocked(child_id) orelse return .none;
         const work = &self.turn_works.items[index];
         if (work.opened) return .none;
-        self.startTurnWorkInLog(child_id, work.work_id) catch |err| {
+        self.startTurnWorkInLog(child_id, work.work_id, work.started_by) catch |err| {
             debug_trace.eventf("mailbox", "turn_work_failed", .{}, "child={s} work_id={s} err={s}", .{ child_id, work.work_id, @errorName(err) });
             var dropped = self.turn_works.swapRemove(index);
             dropped.deinit(self.alloc);
@@ -2095,8 +2107,11 @@ test "a turn the user starts on an idle subagent is a work, and reports its repl
     try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
     const child_id = try reviewerId(runtime, arena);
 
+    try std.testing.expectEqual(@as(?reports.StartedBy, null), runtime.turnStartedBy(child_id));
     const work_id = runtime.beginUserWork(alloc, child_id, null).?;
     defer alloc.free(work_id);
+    // A message the child sends now comes from the user's turn.
+    try std.testing.expectEqual(@as(?reports.StartedBy, .user), runtime.turnStartedBy(child_id));
     {
         var lock = runtime.managed.state_store.acquireLock();
         defer lock.release();
@@ -2108,6 +2123,7 @@ test "a turn the user starts on an idle subagent is a work, and reports its repl
     // A second turn can't open while this one is open.
     try std.testing.expect(runtime.beginUserWork(alloc, child_id, null) == null);
     runtime.endUserWork(child_id, work_id, .completed, "USER_TURN_REPLY");
+    try std.testing.expectEqual(@as(?reports.StartedBy, null), runtime.turnStartedBy(child_id));
     try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
     const line = fixture.reports.items[1];
     try std.testing.expect(std.mem.find(u8, line, work_id) != null);

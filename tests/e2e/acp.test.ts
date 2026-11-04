@@ -817,12 +817,12 @@ class AcpClient {
     return message;
   }
 
-  async request(method: string, params?: object, id?: number): Promise<object> {
+  async request(method: string, params?: object, id?: number, timeoutMs?: number): Promise<object> {
     const reqId = id ?? Math.floor(Math.random() * 100000);
     this.send({ jsonrpc: "2.0", id: reqId, method, params: params ?? {} });
     let resp: any;
     do {
-      resp = await this.readLine() as any;
+      resp = await this.readLine(timeoutMs) as any;
     } while (resp.id !== reqId);
     if (resp.error === undefined) {
       if (method === "session/new" && typeof resp.result?.sessionId === "string") {
@@ -8363,10 +8363,13 @@ describe("acp: model-independent", () => {
           env: fakeGatewayEnv(root, gateway),
         });
         await client.request("initialize", { protocolVersion: 1 }, 3);
+        // fx waits for the owner's lock before it says the session is busy:
+        // about 3 s here, and past 10 s on a slow PGSO runner.
         const contendedLoad = await client.request(
           "session/load",
           { sessionId, mcpServers: [] },
           4,
+          20_000,
         ) as any;
         expect(contendedLoad.error).toEqual({
           code: -32603,

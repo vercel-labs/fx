@@ -157,6 +157,16 @@ const InstanceState = enum {
     }
 };
 
+/// What the busiest open agent is doing (`Runtime.busiest`), most urgent
+/// first. A finished turn counts as idle.
+pub const Busiest = enum { needs_approval, has_question, needs_you, working, idle };
+
+/// The more urgent of `a` and `b`; `InstanceState` lists the most urgent
+/// first.
+fn moreUrgent(a: InstanceState, b: InstanceState) InstanceState {
+    return if (@backingInt(a) <= @backingInt(b)) a else b;
+}
+
 /// `request_waits` is whether the agent's status row shows a request that
 /// waits for the user.
 fn instanceState(agent: *agents.Agent, request_waits: bool) InstanceState {
@@ -512,15 +522,31 @@ pub fn Runtime(comptime App: type) type {
         /// for the user's turn, so its profile and main's live permissions
         /// limit that turn as they limit main's runs. While one is going, the
         /// text steers or follows it under that turn's run, as typing does on
-        /// main. A subagent never runs a turn without a run.
-        pub fn prepareOwnTurn(app: *App, agent: *AppAgent) !void {
-            const child = app.agent_on_screen orelse return;
+        /// main. A subagent never runs a turn without a run. True when it
+        /// admitted a run, whose work `openOwnTurnWork` opens once the text
+        /// is queued.
+        pub fn prepareOwnTurn(app: *App, agent: *AppAgent) !bool {
+            const child = app.agent_on_screen orelse return false;
             // An instance takes its own turns as the first one does.
-            if (child.agent.role == .instance) return;
+            if (child.agent.role == .instance) return false;
             if (child.agent.worker_thread == null) _ = try ensureChild(app, child.id);
             if (!child.session_attached) try attachSession(app, agent, child);
-            if (child.agent.child_run == null or !turnGoing(app, child)) try admitOwnTurn(app, agent, child);
+            const admitted = child.agent.child_run == null or !turnGoing(app, child);
+            if (admitted) try admitOwnTurn(app, agent, child);
             debug_trace.eventf("host", "input_routed", .{}, "agent={s}", .{child.id});
+            return admitted;
+        }
+
+        /// Opens the work in the parent's log for the turn `prepareOwnTurn`
+        /// admitted, once the user's text is queued for it. A submit that
+        /// queues nothing, such as an empty Enter or a refused image, opens
+        /// none, so no work waits for a turn that never comes.
+        pub fn openOwnTurnWork(app: *App) void {
+            const child = app.agent_on_screen orelse return;
+            const run = if (child.agent.child_run) |*value| value else return;
+            if (run.inFlight() or run.turn_work_id.len > 0) return;
+            const host = hostOf(app, child) orelse return;
+            if (host.beginUserWork(app.alloc, child.id, &child.agent.worker)) |work_id| run.turn_work_id = work_id;
         }
 
         /// Gives `run` the user's earlier requests to the subagent in context,
@@ -565,8 +591,6 @@ pub fn Runtime(comptime App: type) type {
             try setUserRequests(app, agent, &run);
             // A user turn the last run opened and never saw end ends now.
             if (child.agent.child_run) |*previous| endUserWork(app.alloc, host, previous, .cancelled, "");
-            // The turn is a work in the parent's log, as every child turn is.
-            if (host.beginUserWork(app.alloc, child.id, &child.agent.worker)) |work_id| run.turn_work_id = work_id;
             installChildRun(app, child, run);
             debug_trace.eventf("host", "own_turn_admitted", .{}, "agent={s} model={s} permission_mode={s}", .{
                 child.id,
@@ -948,6 +972,24 @@ pub fn Runtime(comptime App: type) type {
             return false;
         }
 
+        /// What the busiest open agent, instance or subagent, is doing, for
+        /// a state that stands for the whole process, such as herdr's pane.
+        /// Main loop only: it reads every agent's prompts.
+        pub fn busiest(app: *App) Busiest {
+            var most: InstanceState = .idle;
+            if (firstOpen(app)) most = moreUrgent(most, instanceState(&app.main_agent, requestWaitsForUser(app, null)));
+            for (app.child_agents.items) |child| {
+                most = moreUrgent(most, instanceState(&child.agent, requestWaitsForUser(app, child)));
+            }
+            return switch (most) {
+                .needs_approval => .needs_approval,
+                .has_question => .has_question,
+                .needs_you => .needs_you,
+                .working => .working,
+                .finished, .idle => .idle,
+            };
+        }
+
         fn targetAgent(app: *App, target: ?*ChildAgent) *AppAgent {
             return if (target) |child| &child.agent else &app.main_agent;
         }
@@ -1247,6 +1289,8 @@ pub fn Runtime(comptime App: type) type {
                 };
             }
             debug_trace.eventf("host", "agent_switched", .{}, "agent={s} from={s}", .{ nameOf(target), nameOf(from) });
+            // The tab names the agent on screen, as a second fx's would.
+            app_session_runtime.Runtime(App).syncTerminalTitle(app, agents.screenAgentOf(app));
             try app.shell.requestTerminalReset(&app.metrics);
             app.shell.render_requests.request(.footer);
             debug_trace.eventf("host", "screen_reprinted", .{}, "agent={s} entries={d}", .{
@@ -1467,11 +1511,20 @@ pub fn Runtime(comptime App: type) type {
             const message = post.kind == .message;
             const target = receiverOf(app, post.host, message and post.from_owner) orelse return error.AgentGone;
             // A message sent by the owner names the owner, its own subagent.
-            const sender = if (message and post.from_owner) blk: {
+            const owner_child: ?*ChildAgent = if (message and post.from_owner) blk: {
                 const owner = ownerOf(app, post.host) orelse return error.AgentGone;
-                const child = hostedOf(app, owner) orelse return error.AgentGone;
-                break :blk if (child.name.len > 0) child.name else child.id;
-            } else post.agent;
+                break :blk hostedOf(app, owner) orelse return error.AgentGone;
+            } else null;
+            const sender = if (owner_child) |child| (if (child.name.len > 0) child.name else child.id) else post.agent;
+            // Who started the turn that sent a message, from the host that
+            // runs the sender. That turn is still going: posts are taken
+            // each pass before the children's events, its end among them.
+            const started_by: ?subagent_reports.StartedBy = if (!message)
+                null
+            else if (owner_child) |child|
+                if (hostOf(app, child)) |host| host.turnStartedBy(child.id) else null
+            else
+                post.host.turnStartedBy(post.child_id);
             const limit = target.worker.effectiveAgentTurnSettings().max_tool_result_bytes;
             const text = switch (post.kind) {
                 .report => try subagent_reports.message(app.alloc, .{
@@ -1483,7 +1536,7 @@ pub fn Runtime(comptime App: type) type {
                     .dropped = post.dropped,
                     .end = post.end,
                 }, limit),
-                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit) catch |err| {
+                .message => subagent_reports.messageText(app.alloc, sender, post.child_id, post.text, limit, started_by) catch |err| {
                     target.worker.releaseAgentMessage();
                     return err;
                 },

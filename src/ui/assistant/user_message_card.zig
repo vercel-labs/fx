@@ -5,6 +5,7 @@ const display_width = @import("../../core/shared/display_width.zig");
 const types = @import("../../core/shared/types.zig");
 const image_attachments = @import("../../core/images/image_attachments.zig");
 const visual_layout = @import("../input/visual_layout.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const vt_emulator = @import("../../core/terminal/engine.zig");
 
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
@@ -211,11 +212,16 @@ fn buildUserPromptCardWithSkillTokensAndLinksInterruptible(
         return out.toOwnedSlice();
     }
 
-    const token_text = if (skill_tokens.len > 0)
-        try renderSkillTokensForCard(alloc, text, skill_tokens)
+    // A prompt can carry another agent's words, such as a parent's task for
+    // a subagent, so its own control bytes show as escapes instead of
+    // reaching the terminal.
+    const safe = try terminalSafePrompt(alloc, text, skill_tokens);
+    defer safe.deinit(alloc);
+    const token_text = if (safe.tokens.len > 0)
+        try renderSkillTokensForCard(alloc, safe.text, safe.tokens)
     else
-        text;
-    defer if (skill_tokens.len > 0) alloc.free(token_text);
+        safe.text;
+    defer if (safe.tokens.len > 0) alloc.free(token_text);
 
     var expanded_buf: std.Io.Writer.Allocating = .init(alloc);
     defer expanded_buf.deinit();
@@ -265,6 +271,52 @@ fn buildUserPromptCardWithSkillTokensAndLinksInterruptible(
     }
 
     return out.toOwnedSlice();
+}
+
+/// A prompt's text ready to draw, with its skill tokens moved to match.
+const SafePrompt = struct {
+    text: []const u8,
+    tokens: []const visual_layout.SkillTokenSpan,
+    owned: bool = false,
+
+    fn deinit(self: SafePrompt, alloc: std.mem.Allocator) void {
+        if (!self.owned) return;
+        alloc.free(self.text);
+        alloc.free(self.tokens);
+    }
+};
+
+/// `text` with every control byte but line breaks and tabs shown as its
+/// escape, by `text_utils.appendTerminalSafeText`, and each of `tokens`
+/// moved onto the same characters. Borrows both when nothing needs escaping.
+fn terminalSafePrompt(
+    alloc: std.mem.Allocator,
+    text: []const u8,
+    tokens: []const visual_layout.SkillTokenSpan,
+) !SafePrompt {
+    if (text_utils.isTerminalSafeText(text)) return .{ .text = text, .tokens = tokens };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    const moved = try alloc.alloc(visual_layout.SkillTokenSpan, tokens.len);
+    errdefer alloc.free(moved);
+    var pos: usize = 0;
+    for (tokens, moved) |token, *slot| {
+        slot.* = token;
+        // renderSkillTokensForCard skips a span out of order or out of
+        // range; an empty span keeps it skipped.
+        if (token.raw_start < pos or token.raw_end > text.len or token.raw_start >= token.raw_end) {
+            slot.raw_start = 0;
+            slot.raw_end = 0;
+            continue;
+        }
+        try text_utils.appendTerminalSafeText(alloc, &out, text[pos..token.raw_start]);
+        slot.raw_start = out.items.len;
+        try text_utils.appendTerminalSafeText(alloc, &out, text[token.raw_start..token.raw_end]);
+        slot.raw_end = out.items.len;
+        pos = token.raw_end;
+    }
+    try text_utils.appendTerminalSafeText(alloc, &out, text[pos..]);
+    return .{ .text = try out.toOwnedSlice(alloc), .tokens = moved, .owned = true };
 }
 
 fn renderSkillTokensForCard(
@@ -500,6 +552,41 @@ test "current presentation restores bold prompt text after skill tokens" {
 
     try std.testing.expect(std.mem.find(u8, card, "\x1b[38;5;252mreview\x1b[0m\x1b[1m now") != null);
     try std.testing.expect(std.mem.endsWith(u8, card, "\x1b[0m\n"));
+}
+
+test "a prompt's control bytes show as escapes and never reach the terminal" {
+    const alloc = std.testing.allocator;
+    defer setStyle(false, null);
+    setStyle(false, null);
+    const tokens = [_]visual_layout.SkillTokenSpan{.{
+        .raw_start = 16,
+        .raw_end = 23,
+        .name = "review",
+        .path = "/tmp/review",
+    }};
+    // A task as a parent might send it, with a title change, a color, a C1
+    // control, and a skill token after them.
+    const text = "task \x1b]2;pwned\x07 $review \x1b[31mred\xc2\x9b2J\nline two";
+    try std.testing.expectEqualStrings("$review", text[tokens[0].raw_start..tokens[0].raw_end]);
+    const card = try buildUserPromptCardWithSkillTokensForTerminalPresentation(alloc, text, &.{}, 80, &tokens);
+    defer alloc.free(card);
+
+    try std.testing.expect(std.mem.find(u8, card, "\x1b]2;") == null);
+    try std.testing.expect(std.mem.find(u8, card, "\x07") == null);
+    try std.testing.expect(std.mem.find(u8, card, "\x1b[31m") == null);
+    try std.testing.expect(std.mem.find(u8, card, "\xc2\x9b") == null);
+    try std.testing.expect(std.mem.find(u8, card, "task \\x1b]2;pwned\\x07 ") != null);
+    try std.testing.expect(std.mem.find(u8, card, "\x1b[38;5;252mreview\x1b[0m\x1b[1m \\x1b[31mred\\u{009b}2J") != null);
+    try std.testing.expect(std.mem.find(u8, card, "line two") != null);
+    try std.testing.expectEqual(@as(usize, 2), countRows(card));
+}
+
+test "a prompt with nothing to escape draws as it did" {
+    const alloc = std.testing.allocator;
+    const plain = try buildUserPromptCardWithSkillTokensForTerminalPresentation(alloc, "hello\tthere\nline two", &.{}, 80, &.{});
+    defer alloc.free(plain);
+    try std.testing.expect(std.mem.find(u8, plain, "hello\tthere") != null);
+    try std.testing.expect(std.mem.find(u8, plain, "\\x") == null);
 }
 
 test "buildUserPromptCard row content width hugs message" {

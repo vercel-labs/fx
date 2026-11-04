@@ -2310,10 +2310,17 @@ pub fn Runtime(comptime App: type) type {
             @compileError("interactive session runtime requires a terminal title host capability");
         }
 
-        /// Terminal tabs show the session title once one exists; before the
-        /// first prompt they identify the running build and workspace.
+        /// Terminal tabs show the agent on screen: its session title once one
+        /// exists, before its first prompt the running build and workspace.
+        /// Another agent's title leaves the tab alone until it is on screen.
         pub fn syncTerminalTitle(app: *App, agent: *AppAgent) void {
             if (comptime !provider_runtime.supported(App)) return;
+            // The agent the user sees, not a hidden one the loop is visiting,
+            // as the terminal's program status does.
+            if (comptime @hasField(App, "agent_on_screen")) {
+                const on_screen: *const AppAgent = if (app.agent_on_screen) |child| &child.agent else &app.main_agent;
+                if (agent != on_screen) return;
+            }
             syncTerminalTitleWith(app, agent, terminalTitle(app));
         }
 
@@ -2939,10 +2946,12 @@ pub fn Runtime(comptime App: type) type {
                 }
 
                 fn appendUserTurn(self: *Self, user: types.UserTurn, _: bool) !void {
-                    // A report's turn comes back as its card, as it showed live.
-                    if (try subagent_reports.card(self.projection.alloc, user)) |shown| {
+                    // A report's turn comes back as its subagent row, as it
+                    // showed live.
+                    if (try subagent_reports.row(self.projection.alloc, user)) |shown| {
                         defer shown.deinit(self.projection.alloc);
-                        for (shown.notices()) |notice| _ = try self.projection.appendNotice(notice);
+                        const entry_id = try self.projection.appendToolStatus(shown.outcome, shown.status);
+                        try self.projection.attachHistoricalToolDetail(entry_id, subagent_reports.Row.call, .subagent, shown.result(self.projection.created_at_ms));
                         return;
                     }
                     _ = try self.projection.appendUserTurn(user);
@@ -4411,8 +4420,10 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "postSubagentReport")) {
                 const host = agent.session_persistence.subagent_host.?;
                 host.report_sink = .{ .context = app, .post_fn = App.postSubagentReport };
-                // A subagent's own host can message the subagent's parent.
+                // A subagent's own host can message the subagent's parent,
+                // and its children are as deep as fx nests.
                 host.owner_has_parent = agent.role == .subagent;
+                host.authority_resolver.children_nest = agent.role != .subagent;
                 // What a restart left owed reaches this agent now.
                 host.resumeReports(v2);
             }

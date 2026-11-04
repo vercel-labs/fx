@@ -3591,7 +3591,6 @@ const RoutingFakeApp = struct {
     file_index_refresh_count: usize = 0,
     file_index_loading: bool = false,
     file_index_failed: bool = false,
-    working_report_count: usize = 0,
     submitted_prompt_count: usize = 0,
     submitted_prompt: [128]u8 = undefined,
     submitted_prompt_len: usize = 0,
@@ -3611,10 +3610,6 @@ const RoutingFakeApp = struct {
     upgrade_denied_count: usize = 0,
     suspend_count: usize = 0,
     workspace_access: app_workspace_runtime.Access = .{},
-
-    pub fn reportWorking(self: *RoutingFakeApp) void {
-        self.working_report_count += 1;
-    }
 
     pub fn slashRegistry(_: *const RoutingFakeApp) command_specs.SlashRegistry {
         return routing_test_slash_registry;
@@ -12050,7 +12045,7 @@ test "question resolution append does not add a second gap after prompt card" {
     try std.testing.expect(std.mem.find(u8, app.shell.transcript.items, "     Inspect repo state") != null);
 }
 
-test "question submission reports working only after the worker accepts the answers" {
+test "a question submission the worker refuses keeps the question open" {
     const alloc = std.testing.allocator;
     const opts = [_]types.QuestionOption{
         .{ .label = "Continue", .description = null },
@@ -12071,12 +12066,10 @@ test "question submission reports working only after the worker accepts the answ
 
         try std.testing.expectError(error.OutOfMemory, Runtime(RoutingFakeApp).submitQuestionBatch(&app, (&app).agent()));
         try std.testing.expect(app.agent().question_prompt.isActive());
-        try std.testing.expectEqual(@as(usize, 0), app.working_report_count);
 
         app.agent().worker.question_submission_fails = false;
         try Runtime(RoutingFakeApp).submitQuestionBatch(&app, (&app).agent());
         try std.testing.expect(!app.agent().question_prompt.isActive());
-        try std.testing.expectEqual(@as(usize, 1), app.working_report_count);
     }
 }
 
@@ -12156,10 +12149,8 @@ test "app_input_runtime submits multi-question answers in entry order" {
 
     try feedRoutingBytes(&app, "\r");
     try std.testing.expect(app.agent().question_prompt.isActive());
-    try std.testing.expectEqual(@as(usize, 0), app.working_report_count);
     try feedRoutingBytes(&app, "2");
 
-    try std.testing.expectEqual(@as(usize, 1), app.working_report_count);
     try std.testing.expectEqual(@as(usize, 2), app.agent().worker.submitted_question_count);
     try std.testing.expectEqualStrings(
         "First",
@@ -12322,9 +12313,26 @@ const FakeSubmitApp = struct {
     fail_pending_finalization: bool = false,
     fail_command_after_pending_clear: bool = false,
     snapshot_dir: ?[]const u8 = null,
+    /// Submits land on a subagent's screen, whose turns open a work in the
+    /// parent's log.
+    on_subagent_screen: bool = false,
+    /// Works those submits opened.
+    opened_turn_works: usize = 0,
 
     pub fn slashRegistry(_: *const FakeSubmitApp) command_specs.SlashRegistry {
         return routing_test_slash_registry;
+    }
+
+    pub fn prepareSubagentOnScreen(self: *FakeSubmitApp, _: anytype) !bool {
+        return self.on_subagent_screen;
+    }
+
+    pub fn openSubagentTurnWork(self: *FakeSubmitApp) void {
+        self.opened_turn_works += 1;
+    }
+
+    pub fn screenAgentId(self: *const FakeSubmitApp) []const u8 {
+        return if (self.on_subagent_screen) "reviewer" else "main";
     }
 
     fn deinit(self: *FakeSubmitApp) void {
@@ -13376,6 +13384,48 @@ test "app_input_runtime submits one prompt carrying every image attached by repe
     try std.testing.expectEqual(@as(usize, 2), app.last_images[1].id);
     try std.testing.expectEqual(@as(usize, 0), app.agent().pending_images.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.input_runtime.edit_state.input.items.len);
+}
+test "a submit on a subagent's screen opens its turn's work only once the prompt is queued" {
+    const alloc = std.testing.allocator;
+    const Submit = struct { text: bool, image: bool, credential: bool = true, queue: bool = true };
+    const cases = [_]struct { submit: Submit, opened: usize }{
+        // Text, or an image with no text, is queued and opens one work.
+        .{ .submit = .{ .text = true, .image = false }, .opened = 1 },
+        .{ .submit = .{ .text = false, .image = true }, .opened = 1 },
+        // A prompt that isn't queued, for want of a credential or because
+        // the queue refused it, opens none.
+        .{ .submit = .{ .text = true, .image = false, .credential = false }, .opened = 0 },
+        .{ .submit = .{ .text = false, .image = true, .credential = false }, .opened = 0 },
+        .{ .submit = .{ .text = true, .image = false, .queue = false }, .opened = 0 },
+        .{ .submit = .{ .text = false, .image = true, .queue = false }, .opened = 0 },
+        // Nothing to send opens none.
+        .{ .submit = .{ .text = false, .image = false }, .opened = 0 },
+    };
+    for (cases) |case| {
+        var app = FakeSubmitApp{
+            .alloc = alloc,
+            .on_subagent_screen = true,
+            .prompt_admitted = case.submit.credential,
+            .queue_admitted = case.submit.queue,
+        };
+        defer app.deinit();
+        if (case.submit.text) try app.input_runtime.edit_state.input.appendSlice(alloc, "check the parser");
+        if (case.submit.image) {
+            try appendOwnedPendingImage(&app, 1, "/tmp/only.png");
+            app.next_image_id_counter = 2;
+        }
+        try Runtime(FakeSubmitApp).submit(&app, 100);
+        try std.testing.expectEqual(case.opened, app.queue_accept_count);
+        try std.testing.expectEqual(case.opened, app.opened_turn_works);
+    }
+
+    // On main's screen a queued prompt opens no subagent work.
+    var main_screen = FakeSubmitApp{ .alloc = alloc };
+    defer main_screen.deinit();
+    try main_screen.input_runtime.edit_state.input.appendSlice(alloc, "check the parser");
+    try Runtime(FakeSubmitApp).submit(&main_screen, 100);
+    try std.testing.expectEqual(@as(usize, 1), main_screen.queue_accept_count);
+    try std.testing.expectEqual(@as(usize, 0), main_screen.opened_turn_works);
 }
 
 test "app_input_runtime rejected second image keeps the first pending image and its snapshot" {

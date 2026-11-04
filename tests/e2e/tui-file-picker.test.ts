@@ -970,7 +970,10 @@ describe("@ file picker", () => {
           ),
         );
       }
-      expect(steadyRssGrowthKb).toBeLessThan(4 * 1024);
+      // A leak climbs every cycle, so check the trend across all of them. The
+      // last sample minus the first swings by about 2 MB on Linux, where one
+      // cycle's RSS moves that much without growing.
+      expect(steadyRssSlopeKbPerCycle * (cycleRssSamples.length - 1)).toBeLessThan(4 * 1024);
       expect(rssPeakKb - rssStartedKb).toBeLessThan(32 * 1024);
       if (PART4_STRESS) {
         expect(latency.count).toBeGreaterThanOrEqual(100);
