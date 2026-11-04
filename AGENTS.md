@@ -82,6 +82,8 @@ Key rules:
 
 * `src/js/` is the embedded JavaScript engine. Its front door, `engine.zig`, runs one program in a fresh runtime with limits on its heap, time, and native stack, and outside code imports only that file. The module imports only the standard library and its own files, plus `build_options` for its fuzz targets' saved inputs. `src/js/quickjs/` is fx's copy of quickjs-ng, and its `FORK.md` records the upstream release; a change to a file there updates `FORK.md` in the same change. `zig build test-js` runs the engine's tests.
 
+* `src/core/code_mode/` runs model-written JavaScript in a confined child process. Its front door, `sandbox.zig`, starts the hidden `fx __fx_sandbox__` child, which confines itself through `confine.zig` before it reads the program: a seccomp allowlist on Linux, a deny-all `sandbox_init` profile on macOS, and resource limits on both. When confinement is unavailable or fails, the program does not run. The child is the only code that runs the engine.
+
 * `src/tools/` owns built-in tool implementations. Generic tool contracts and dispatch live in `src/core/tooling/`. Default tool specs are centralized in `src/core/tooling/tool_specs.zig` or `src/builtins/tools.zig`, not in individual tool files.
 
 * `src/ui/` owns terminal rendering, event loop, input, transcript. It must not own product state.
