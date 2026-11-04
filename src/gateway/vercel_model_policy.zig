@@ -91,14 +91,25 @@ pub fn contextWindowSize(model: []const u8) ?u32 {
     }
     if (std.mem.startsWith(u8, model, "openai/")) {
         if (ascii_case.hasMajorVersionAtLeast(model, "gpt-", 5)) return 256_000;
-        if (ascii_case.containsIgnoreCase(model, "o3") or
-            ascii_case.containsIgnoreCase(model, "o4") or
-            ascii_case.containsIgnoreCase(model, "o1")) return 200_000;
+        if (containsIgnoreCase(model, "o3") or
+            containsIgnoreCase(model, "o4") or
+            containsIgnoreCase(model, "o1")) return 200_000;
         return 128_000;
     }
     if (std.mem.startsWith(u8, model, "xai/")) return 131_072;
     if (std.mem.startsWith(u8, model, "google/")) return 1_000_000;
     return null;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    const last_start = haystack.len - needle.len;
+    var index: usize = 0;
+    while (index <= last_start) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return true;
+    }
+    return false;
 }
 
 test "Vercel fallback policy owns vendor model heuristics" {
