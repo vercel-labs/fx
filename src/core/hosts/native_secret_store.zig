@@ -72,10 +72,10 @@ fn presenceCallback(_: ?*anyopaque) host.SecretStorePresence {
 
 fn presenceInProfile() host.SecretStorePresence {
     const home = io_mod.homeDir() orelse return .unavailable;
-    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{}) catch
+    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{}) catch
         return .unavailable;
     defer home_dir.close(io_mod.getIo());
-    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.rootName(), .{
         .follow_symlinks = false,
     }) catch |err| return if (err == error.FileNotFound) .missing else .unavailable;
     defer fx_dir.close(io_mod.getIo());
@@ -115,13 +115,13 @@ fn loadFromProfile(alloc: Allocator) LoadError!?[]u8 {
         debug_trace.logf("stored_key", "load failed step=home err=HomeNotSet", .{});
         return error.StoredKeyUnreadable;
     };
-    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
+    var home_dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }) catch |err| {
         debug_trace.logf("stored_key", "load failed step=open_home err={s}", .{@errorName(err)});
         return error.StoredKeyUnreadable;
     };
     defer home_dir.close(io_mod.getIo());
 
-    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.root_dir_name, .{
+    var fx_dir = home_dir.openDir(io_mod.getIo(), profile_paths.rootName(), .{
         .iterate = true,
         .follow_symlinks = false,
     }) catch |err| switch (err) {
@@ -182,13 +182,13 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) LoadError!?[]u8 {
 fn storeInProfile(alloc: Allocator, value: []const u8) StoreError!void {
     const home = io_mod.homeDir() orelse return writeFailed("home", error.HomeNotSet);
     var home_dir = io_mod.VerifiedDir{
-        .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) catch |err| {
+        .dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), profile_paths.rootParent(home), .{ .iterate = true }) catch |err| {
             return writeFailed("open_home", err);
         },
     };
     defer home_dir.close();
 
-    var fx_dir = io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.root_dir_name) catch |err| {
+    var fx_dir = io_mod.openOrCreateVerifiedPrivateDir(&home_dir, profile_paths.rootName()) catch |err| {
         return writeFailed("open_profile", err);
     };
     defer fx_dir.close();

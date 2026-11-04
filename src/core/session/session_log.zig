@@ -1278,6 +1278,13 @@ pub const ConversationTurnBuilder = struct {
         });
     }
 
+    /// Marks who wrote the message that opened the turn being built.
+    pub fn setUserAuthor(self: *ConversationTurnBuilder, author: types.MessageAuthor) !void {
+        if (self.user) |*user| {
+            user.author = author;
+        } else return error.InvalidConversationFrame;
+    }
+
     pub fn appendAssistant(self: *ConversationTurnBuilder, value: session_event.ConversationAssistant) !void {
         if (self.calls.items.len == 0 and self.results.items.len == 0) try self.finishStandalone();
         if (self.user == null or self.pending_assistant != null or self.calls.items.len != 0) {
@@ -1983,29 +1990,29 @@ pub const Root = struct {
         mode: OpenMode,
     ) !Root {
         const zio = io_mod.getIo();
-        var home = std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true }) catch |err| switch (err) {
+        var home = std.Io.Dir.openDirAbsolute(zio, profile_paths.rootParent(home_path), .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => blk: {
                 if (mode == .read_only) {
                     return .{
                         .sessions = null,
                         .display_root = try std.Io.Dir.path.join(
                             alloc,
-                            &.{ home_path, profile_paths.root_dir_name, profile_paths.sessions_dir_name },
+                            &.{ profile_paths.rootParent(home_path), profile_paths.rootName(), profile_paths.sessions_dir_name },
                         ),
                         .mode = mode,
                     };
                 }
-                std.Io.Dir.createDirAbsolute(zio, home_path, private_dir_permissions) catch |create_err| switch (create_err) {
+                std.Io.Dir.createDirAbsolute(zio, profile_paths.rootParent(home_path), private_dir_permissions) catch |create_err| switch (create_err) {
                     error.PathAlreadyExists => {},
                     else => return create_err,
                 };
-                break :blk try std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true });
+                break :blk try std.Io.Dir.openDirAbsolute(zio, profile_paths.rootParent(home_path), .{ .iterate = true });
             },
             else => return err,
         };
         defer home.close(zio);
 
-        var durable_home = home.openDir(zio, profile_paths.root_dir_name, .{
+        var durable_home = home.openDir(zio, profile_paths.rootName(), .{
             .iterate = true,
             .follow_symlinks = false,
         }) catch |err| switch (err) {
@@ -2015,20 +2022,20 @@ pub const Root = struct {
                         .sessions = null,
                         .display_root = try std.Io.Dir.path.join(
                             alloc,
-                            &.{ home_path, profile_paths.root_dir_name, profile_paths.sessions_dir_name },
+                            &.{ profile_paths.rootParent(home_path), profile_paths.rootName(), profile_paths.sessions_dir_name },
                         ),
                         .mode = mode,
                     };
                 }
                 var verified_home = io_mod.VerifiedDir{
-                    .dir = try std.Io.Dir.openDirAbsolute(zio, home_path, .{
+                    .dir = try std.Io.Dir.openDirAbsolute(zio, profile_paths.rootParent(home_path), .{
                         .iterate = true,
                     }),
                 };
                 defer verified_home.close();
                 const created = try io_mod.openOrCreateVerifiedPrivateDir(
                     &verified_home,
-                    profile_paths.root_dir_name,
+                    profile_paths.rootName(),
                 );
                 break :blk created.dir;
             },
@@ -2052,7 +2059,7 @@ pub const Root = struct {
                         .sessions = null,
                         .display_root = try std.Io.Dir.path.join(
                             alloc,
-                            &.{ home_path, profile_paths.root_dir_name, profile_paths.sessions_dir_name },
+                            &.{ profile_paths.rootParent(home_path), profile_paths.rootName(), profile_paths.sessions_dir_name },
                         ),
                         .mode = mode,
                     };

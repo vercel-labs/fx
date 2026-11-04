@@ -1,6 +1,9 @@
 const std = @import("std");
+const agent_frame = @import("../shared/agent_frame.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const kernel_agent = @import("../agent/runtime/agent.zig");
+const cache_warmer = @import("../agent/runtime/cache_warmer.zig");
+const host_target = @import("../hosts/target.zig");
 const core_types = @import("../shared/types.zig");
 const history_range = @import("../shared/history_range.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -1410,6 +1413,10 @@ fn collectShellIdsWithKey(alloc: Allocator, text: []const u8, key: []const u8, o
 
 pub const SessionRuntime = struct {
     agent: kernel_agent.Agent = .{},
+    /// Keeps this conversation's Claude prompt cache warm while it waits;
+    /// created by its first use. Every history rewrite disarms it, since
+    /// the next request no longer starts with the armed one.
+    cache_warmer: ?*cache_warmer.Warmer = null,
     context_notice_hashes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     context_notice_lock: std.Io.Mutex = .init,
     web_fetch_artifacts: WebFetchArtifactState = .none,
@@ -1444,6 +1451,7 @@ pub const SessionRuntime = struct {
     }
 
     pub fn deinit(self: *SessionRuntime, alloc: Allocator) void {
+        self.closeCacheWarmer();
         self.clearWebFetchArtifacts();
         self.permission_state.deinit(alloc);
         self.agent.deinit(alloc);
@@ -1464,6 +1472,33 @@ pub const SessionRuntime = struct {
     pub fn returnStaleShellHandles(self: *SessionRuntime, turn_id: u64) void {
         self.has_stale_shell_handles = true;
         debug_trace.logf("session", "stale shell handles note returned from dropped prompt turn_id={d}", .{turn_id});
+    }
+
+    /// The conversation's cache warmer, created on first use. Null on
+    /// WebAssembly, which has no threads, or when it cannot be created.
+    pub fn cacheWarmer(self: *SessionRuntime) ?*cache_warmer.Warmer {
+        if (comptime host_target.is_wasm) return null;
+        if (self.cache_warmer == null) {
+            self.cache_warmer = cache_warmer.Warmer.create() catch |err| {
+                debug_trace.logf("cache_warming", "event=unavailable err={s}", .{@errorName(err)});
+                return null;
+            };
+        }
+        return self.cache_warmer;
+    }
+
+    /// Stops the warmer and its pings. The warmer is created again if the
+    /// conversation is used after this.
+    pub fn closeCacheWarmer(self: *SessionRuntime) void {
+        if (comptime host_target.is_wasm) return;
+        const warmer = self.cache_warmer orelse return;
+        self.cache_warmer = null;
+        warmer.destroy();
+    }
+
+    fn disarmCacheWarming(self: *SessionRuntime, why: []const u8) void {
+        if (comptime host_target.is_wasm) return;
+        if (self.cache_warmer) |warmer| warmer.disarm(why);
     }
 
     pub fn reset(self: *SessionRuntime, alloc: Allocator) void {
@@ -1621,6 +1656,7 @@ pub const SessionRuntime = struct {
     }
 
     pub fn clearHistory(self: *SessionRuntime, alloc: Allocator) void {
+        self.disarmCacheWarming("history_cleared");
         self.agent.clearHistory(alloc);
         self.unversioned_history_len = 0;
     }
@@ -1697,6 +1733,7 @@ pub const SessionRuntime = struct {
         turn: HistoryTurn,
     ) void {
         if (isCurrentCompactionCheckpoint(turn)) {
+            self.disarmCacheWarming("history_compacted");
             self.agent.clearHistory(alloc);
             self.unversioned_history_len = 0;
         }
@@ -1710,6 +1747,7 @@ pub const SessionRuntime = struct {
     /// Takes ownership of a fully prepared replacement only after durable commit.
     pub fn commitCompactedHistory(self: *SessionRuntime, alloc: Allocator, history: []HistoryTurn) void {
         const uncertain = self.unversioned_history_len != 0;
+        self.disarmCacheWarming("history_compacted");
         self.agent.clearHistory(alloc);
         self.agent.history.deinit(alloc);
         self.agent.history = std.ArrayList(HistoryTurn).fromOwnedSlice(history);
@@ -2420,15 +2458,22 @@ fn appendContextNoteChatMessages(
 }
 
 /// Steering comes from whoever drives this session, so compaction keeps it as
-/// user text rather than a generated notice. Empty entries only mark a
-/// checkpoint boundary. Borrows `text`.
+/// user text rather than a generated notice. A subagent's report or message
+/// a boundary took is not the user's, so it stays ordinary text in its own
+/// frame. Empty entries only mark a checkpoint boundary. Borrows `text`.
 fn restoredSteeringChatMessage(text: []const u8) core_types.ChatMessage {
     return .{
         .role = .user,
         .content = text,
         .restored_steering = true,
-        .context_origin = if (text.len > 0) .user_turn else .ordinary,
+        .context_origin = if (text.len > 0 and !agent_frame.isFrame(text)) .user_turn else .ordinary,
     };
+}
+
+test "a restored subagent frame is never the user's text" {
+    const report = agent_frame.report_header ++ "{\"child_id\":\"c1\",\"work_id\":\"w1\"}\n";
+    try std.testing.expect(restoredSteeringChatMessage(report).context_origin == .ordinary);
+    try std.testing.expect(restoredSteeringChatMessage("focus on rendering").context_origin == .user_turn);
 }
 
 fn toolResultMemory(result: core_types.PersistedToolResult) core_types.ToolResultMemory {

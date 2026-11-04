@@ -56,7 +56,7 @@ async function launch(
   const tracePath = join(workDir, "trace.log");
 
   const s = await TmuxSession.create({
-    cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_SKIP_ONBOARDING=1 ${FX_BIN}`,
+    cmd: `env -u AI_GATEWAY_API_KEY -u VERCEL_OIDC_TOKEN FX_DISABLE_KEYCHAIN=1 FX_TEST_SKIP_ONBOARDING=1 ${FX_BIN}`,
     cwd: workDir,
     width,
     height,
@@ -114,7 +114,7 @@ describe.skipIf(SKIP)("tui: render stress", () => {
 
         await session.sendKeys("C-u");
         await session.sendText("/help");
-        await session.waitForText("Commands 38", 5_000);
+        await session.waitForText("Commands 40", 5_000);
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes("enter open"), 5_000);
         await session.sendText("/allowlist");

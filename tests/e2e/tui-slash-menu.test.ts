@@ -181,13 +181,13 @@ async function waitForStatuslineValue(
   let latest: unknown;
   while (Date.now() < deadline) {
     if (existsSync(settingsPath)) {
-      latest = JSON.parse(readFileSync(settingsPath, "utf8")).statusLine?.[key];
+      latest = JSON.parse(readFileSync(settingsPath, "utf8")).status_line?.[key];
       if (latest === expected) return;
     }
     await Bun.sleep(100);
   }
   throw new Error(
-    `Timed out waiting for statusLine.${key}=${expected}; last=${JSON.stringify(latest)}`,
+    `Timed out waiting for status_line.${key}=${expected}; last=${JSON.stringify(latest)}`,
   );
 }
 
@@ -934,7 +934,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       gateway.stop();
       gateway = startFakeGateway([]);
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} resume ${sessionIds[0]}`,
+        cmd: `${FX_BIN} --resume ${sessionIds[0]}`,
         cwd: resumedWorkspace,
         env: {
           ...env,
@@ -1023,7 +1023,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       gateway.stop();
       gateway = startFakeGateway([]);
       session = await TmuxSession.create({
-        cmd: `${FX_BIN} resume ${sessionIds[0]}`,
+        cmd: `${FX_BIN} --resume ${sessionIds[0]}`,
         cwd: workspace,
         env: {
           HOME: home,
@@ -1081,7 +1081,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       ).toBe(69);
       expect(closedComposerRow).toBe(73);
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 38", 5_000);
+      await session.waitForText("Commands 40", 5_000);
       const afterSlash = await capture("after-slash");
       expect(visibleTranscriptTailRow(afterSlash)).toBe(60);
       expect(composerRow(afterSlash)).toBe(64);
@@ -1606,7 +1606,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let grid = await waitForHelpMenu(session, 38);
+      let grid = await waitForHelpMenu(session, 40);
       let pane = grid.join("\n");
       expect(pane).toContain("𝒇x");
       expect(pane).toContain("Run /help for commands");
@@ -1622,7 +1622,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       grid = await waitForHelpMenu(session, 5);
       expect(grid.join("\n")).toContain("[General]");
       await session.sendKeys("BTab");
-      grid = await waitForHelpMenu(session, 38);
+      grid = await waitForHelpMenu(session, 40);
       expect(grid.join("\n")).toContain("[All]");
 
       await session.sendLiteralText("clipboard");
@@ -1633,11 +1633,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("/clear");
 
       await session.sendKeys("C-u");
-      await waitForHelpMenu(session, 38);
+      await waitForHelpMenu(session, 40);
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Commands 38"),
+        (current) => hasEmptyComposer(current) && !current.includes("Commands 40"),
         5_000,
       );
       expect(composerContains(pane, "/clear")).toBe(false);
@@ -1646,7 +1646,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 38);
+      await waitForHelpMenu(session, 40);
       await session.sendLiteralText("additional directories");
       await waitForHelpMenu(session, 1);
       await session.sendKeys("Enter");
@@ -1663,7 +1663,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 38);
+      await waitForHelpMenu(session, 40);
       await session.sendLiteralText("no command can match this query");
       await session.waitForText("No commands found.", 5_000);
       await session.sendKeys("Escape");
@@ -1857,7 +1857,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Right");
       grid = await waitForStatuslineMenu(session, "Context");
       pane = grid.join("\n");
-      expect(pane).not.toContain("saved to user settings");
+      expect(pane).not.toContain("saved to global settings");
       expect(pane).not.toMatch(/[*✓!✗⊘i] statusline:/);
       await waitForStatuslineValue(settingsPath, "session", true);
 
@@ -1865,7 +1865,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Right");
       grid = await waitForStatuslineMenu(session, "Workspace");
       pane = grid.join("\n");
-      expect(pane).not.toContain("saved to user settings");
+      expect(pane).not.toContain("saved to global settings");
       await waitForStatuslineValue(settingsPath, "workspace", true);
 
       await session.sendKeys("Escape");
@@ -2241,7 +2241,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
 
       await session.sendText("/help");
-      grid = await waitForHelpMenu(session, 38);
+      grid = await waitForHelpMenu(session, 40);
       expect(grid.join("\n")).toContain("Run /help for commands");
       expect(alternateCount("\x1b[?1049h")).toBe(entersBeforeSkills);
       expect(alternateCount("\x1b[?1049l")).toBe(leavesBeforeSkills);
@@ -2404,7 +2404,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: currentModel,
           FX_AUTO_UPGRADE: "0",
           FX_RECORD: fixture.tapePath,
@@ -2580,7 +2580,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: currentModel,
           FX_AUTO_UPGRADE: "0",
         },
@@ -2706,7 +2706,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: currentModel,
           FX_AUTO_UPGRADE: "0",
         },
@@ -2777,7 +2777,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: modelIds[0],
           FX_AUTO_UPGRADE: "0",
         },
@@ -2828,7 +2828,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
           VERCEL_OIDC_TOKEN: undefined,
           FX_GATEWAY_BASE_URL: gateway.baseUrl,
           FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-          FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
           FX_MODEL: "openai/gpt-4o",
           FX_AUTO_UPGRADE: "0",
         },
@@ -2900,7 +2900,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
             VERCEL_OIDC_TOKEN: undefined,
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+            FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
             FX_MODEL: currentModel,
             FX_AUTO_UPGRADE: "0",
           },
@@ -3440,7 +3440,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 38", 5_000);
+      await session.waitForText("Commands 40", 5_000);
 
       for (let i = 0; i < 5; i += 1) {
         await session.sendKeys("Down");
