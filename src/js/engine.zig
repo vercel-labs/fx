@@ -9,6 +9,7 @@
 //! only the standard library and its own files.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const qjs = @import("quickjs.zig");
 const CappedHeap = @import("capped_heap.zig").CappedHeap;
 
@@ -21,7 +22,7 @@ pub const Limits = struct {
     /// Native stack the engine may use below the caller of `run`. The calling
     /// thread needs at least this much free stack. Deeper recursion gets a
     /// catchable `RangeError`.
-    stack_bytes: usize = 512 * 1024,
+    stack_bytes: usize = default_stack_bytes,
     /// Time the whole run may take, including promise jobs. Past it the
     /// program is stopped, and nothing it does can catch that.
     time_ms: u32 = 30_000,
@@ -51,6 +52,12 @@ pub const Outcome = union(enum) {
 };
 
 pub const RunError = error{OutOfMemory};
+
+/// About 880 nested JavaScript calls in a release build. A Debug build
+/// compiles the engine's C unoptimized with full checks, and each call there
+/// takes about 75 times the stack, so the limit is larger to leave room for
+/// the built-ins that call back into JavaScript, such as `String.match`.
+const default_stack_bytes: usize = if (builtin.optimize == .debug) 4 * 1024 * 1024 else 1024 * 1024;
 
 /// Runs `source` as the body of an async function, so it may `await` and
 /// `return`, and waits for every promise job it queues. The engine's heap
@@ -338,6 +345,25 @@ test "deep recursion and deep nesting throw instead of overflowing the stack" {
     , .{depth}), .{});
     try expectThrew("Error", std.fmt.comptimePrint("return new RegExp('('.repeat({d}) + 'a' + ')'.repeat({d})).test('a');", .{ depth, depth }), .{});
     try expectThrew("Error", std.fmt.comptimePrint("return eval('('.repeat({d}) + '1' + ')'.repeat({d}));", .{ depth, depth }), .{});
+}
+
+test "built-ins that call back into JavaScript fit in the default stack" {
+    try expectReturned("[true,\"1\",2,\"xb\",2,1,\"1,2\"]",
+        \\return [
+        \\  /1/.test("1"),
+        \\  "x1".match(/1/)[0],
+        \\  "a,b".split(/,/).length,
+        \\  "ab".replace(/a/, () => "x"),
+        \\  [..."a1b2".matchAll(/\d/g)].length,
+        \\  [3, 1, 2].sort((a, b) => a - b)[0],
+        \\  [1, 2].map(String).join(),
+        \\];
+    , .{});
+    const depth = if (builtin.optimize == .debug) 30 else 500;
+    try expectReturned(std.fmt.comptimePrint("{d}", .{depth}), std.fmt.comptimePrint(
+        \\function down(n) {{ return n === 0 ? 0 : 1 + down(n - 1); }}
+        \\return down({d});
+    , .{depth}), .{});
 }
 
 test "each run starts from a fresh runtime" {
