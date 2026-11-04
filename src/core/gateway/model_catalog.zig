@@ -443,31 +443,16 @@ fn modelTierRank(id: []const u8) u8 {
     if (text_utils.containsIgnoreCase(id, "flash")) return 2;
     if (text_utils.containsIgnoreCase(id, "opus") or
         text_utils.containsIgnoreCase(id, "sonnet") or
-        hasMajorVersionAtLeast(id, "gpt-", 5) or
+        text_utils.hasMajorVersionAtLeast(id, "gpt-", 5) or
         text_utils.containsIgnoreCase(id, "o1") or
         text_utils.containsIgnoreCase(id, "o3") or
         text_utils.containsIgnoreCase(id, "o4") or
         text_utils.containsIgnoreCase(id, "pro") or
-        hasMajorVersionAtLeast(id, "grok-", 4))
+        text_utils.hasMajorVersionAtLeast(id, "grok-", 4))
     {
         return 0;
     }
     return 1;
-}
-
-/// Whether `id` names `family` at major version `min_major` or later, such
-/// as `gpt-6.1-sol` for `gpt-` at 5, so a new major release keeps its
-/// family's tier instead of sorting below the older versions.
-fn hasMajorVersionAtLeast(id: []const u8, family: []const u8, min_major: u32) bool {
-    var start: usize = 0;
-    while (std.ascii.findIgnoreCasePos(id, start, family)) |found| {
-        start = found + family.len;
-        var end = start;
-        while (end < id.len and std.ascii.isDigit(id[end])) end += 1;
-        const major = std.fmt.parseUnsigned(u32, id[start..end], 10) catch continue;
-        if (major >= min_major) return true;
-    }
-    return false;
 }
 
 const picker_provider_limit: usize = 2;
