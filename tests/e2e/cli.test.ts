@@ -1124,6 +1124,15 @@ describe("cli: status", () => {
       const relative = await runFx(["status"], { ...options, env: { ...options.env, FX_HOME: "profile" } });
       expect(relative.code).toBe(1);
       expect(relative.stderr).toBe("fx: FX_HOME must be an absolute path\n");
+
+      // A relative HOME counts as unset, so with FX_HOME unset fx has no
+      // folder of its own, and status names none.
+      const relativeHome = await runFx(["status", "--json"], {
+        ...options,
+        env: { ...options.env, HOME: "relative/home", FX_HOME: undefined },
+      });
+      expect(relativeHome.code).toBe(0);
+      expect(JSON.parse(relativeHome.stdout).fx_home).toBeUndefined();
     } finally {
       gateway.stop();
       rmSync(root, { recursive: true, force: true });
