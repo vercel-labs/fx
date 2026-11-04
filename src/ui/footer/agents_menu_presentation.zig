@@ -6,6 +6,7 @@ const std = @import("std");
 const picker_presentation = @import("picker_presentation.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const ui_render = @import("../render.zig");
 
 const Allocator = std.mem.Allocator;
@@ -35,20 +36,22 @@ pub fn windowStart(projection: AgentsMenuProjection, row_budget: u16) usize {
     );
 }
 
-/// The text of `row`, before it is clipped to the footer's width. The caller
-/// owns it.
+/// The text of `row`, before it is clipped to the footer's width. A title
+/// comes from a prompt, which another agent may have written, so it and the
+/// names show their control bytes as escapes. The caller owns it.
 pub fn rowText(alloc: Allocator, row: render_input.AgentsMenuRow) ![]u8 {
     const tag = if (row.on_screen) " (on screen)" else "";
-    const title = if (row.title.len > 0) row.title else untitled;
+    const title = text_utils.terminalSafe(if (row.title.len > 0) row.title else untitled);
+    const profile = text_utils.terminalSafe(row.profile);
     // A subagent's row sits under its instance's, indented one step.
-    if (row.subagent_name.len > 0) return alloc.print("  {s}{s} · {s} · {s} · {s}", .{
-        row.subagent_name,
+    if (row.subagent_name.len > 0) return alloc.print("  {f}{s} · {f} · {f} · {s}", .{
+        text_utils.terminalSafe(row.subagent_name),
         tag,
         title,
-        row.profile,
+        profile,
         row.state,
     });
-    return alloc.print("fx {d}{s} · {s} · {s} · {s}", .{ row.number, tag, title, row.profile, row.state });
+    return alloc.print("fx {d}{s} · {f} · {f} · {s}", .{ row.number, tag, title, profile, row.state });
 }
 
 pub fn composeAgentsMenuRow(
@@ -79,6 +82,21 @@ pub const hint_variants = [_][]const u8{
     "↑↓ preview  enter  esc",
     "enter switch  esc back",
 };
+
+test "an agent's row shows its title's control bytes as escapes" {
+    const alloc = std.testing.allocator;
+    const text = try rowText(alloc, .{
+        .number = 1,
+        .subagent_name = "reviewer",
+        .title = "task \x1b]2;pwned\x07 \xc2\x9b2J",
+        .profile = "main",
+        .state = "idle",
+        .on_screen = false,
+    });
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("  reviewer · task \\x1b]2;pwned\\x07 \\u{009b}2J · main · idle", text);
+    try std.testing.expect(text_utils.isTerminalSafe(text));
+}
 
 /// The visible text of row `row_index`, and whether it is selected. Caller owns the text.
 fn testRow(projection: AgentsMenuProjection, row_index: u16, width: u16, row_budget: u16) !struct { text: []u8, selected: bool } {

@@ -527,6 +527,39 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     TIMEOUT,
   );
   test(
+    "a task with terminal escapes shows them as text on the subagent's screen and never sends them",
+    async () => {
+      // A parent model's message could carry these: a title change, a color,
+      // and a C1 control that clears the screen.
+      const HOSTILE = "SWITCH_TASK \u001b]2;pwned\u0007 \u001b[31mred\u001b[0m \u009b2J tail";
+      await withFx((body) => {
+        if (!isMainRequest(body)) return text("child_answer", "SWITCH_CHILD_FIRST");
+        if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", { request: { action: "message", agent: "reviewer", message: HOSTILE } });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session, { tape }) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
+        await session.waitForComposer(15_000);
+        await moveAgent(session, 1);
+        const pane = await session.waitForPane((value) => value.includes("SWITCH_CHILD_FIRST"), 15_000);
+        // The subagent's screen shows the task with its escapes as text.
+        expect(pane).toContain("SWITCH_TASK \\x1b]2;pwned\\x07 \\x1b[31mred\\x1b[0m \\u{009b}2J tail");
+        expect(await session.paneTitle()).not.toBe("pwned");
+        await moveAgent(session, -1);
+        await session.waitForComposer(15_000);
+        // fx never wrote the sequences themselves to the terminal.
+        const written = readFileSync(tape).toString("latin1");
+        expect(written).not.toContain("\u001b]2;pwned");
+        expect(written).not.toContain("\u001b[31mred");
+        expect(written).not.toContain("\u00c2\u009b2J");
+      }, () => {}, true);
+    },
+    TIMEOUT,
+  );
+  test(
     "the tab title names the agent on screen, and a subagent's title never takes over main's",
     async () => {
       await withFx((body) => {
