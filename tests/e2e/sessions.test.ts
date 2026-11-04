@@ -852,6 +852,94 @@ test("a flipped byte inside the log stops resume and leaves the file as it was",
   }
 }, TIMEOUT * 3);
 
+test.skipIf(!tmuxAvailable())("a flipped byte in a turn the newest compaction kept stops resume and ACP load as damage, and recover still salvages it", async () => {
+  const fixture = createFixture("fx-v2-kept-flip-");
+  // Compaction's requests carry the whole conversation, so they get the
+  // newest turn's answer.
+  const gateway = replyToLatest([
+    ["Kept flip first request.", "KEPT_FLIP_FIRST"],
+    ["Kept flip second request.", "KEPT_FLIP_SECOND"],
+    ["Kept flip third request.", "KEPT_FLIP_THIRD"],
+    ["Kept flip after the recovery.", "KEPT_FLIP_RECOVERED"],
+  ]);
+  let client: AcpRpc | undefined;
+  try {
+    const app = await startApp(fixture, gateway, []);
+    for (const [prompt, answer] of [
+      ["Kept flip first request.", "KEPT_FLIP_FIRST"],
+      ["Kept flip second request.", "KEPT_FLIP_SECOND"],
+      ["Kept flip third request.", "KEPT_FLIP_THIRD"],
+    ]) {
+      await app.session.sendText(prompt!);
+      await scrollbackContains(app.session, answer!);
+      await app.session.waitForComposer(TIMEOUT);
+    }
+    const id = onlySessionId(fixture.home);
+    await app.session.sendText("/compact");
+    await waitForLog(fixture, id, '"kind":"compacted"', TIMEOUT);
+    await app.session.waitForPane((pane) => !/Preparing compaction|Compacting|Stopping compaction/.test(pane), TIMEOUT);
+    await app.session.waitForComposer(TIMEOUT);
+    await quitApp(app);
+
+    // The compaction kept turns, so a resume reads back from it to the start
+    // of the oldest one. One byte of that turn's prompt changes.
+    const lines = logLines(fixture.home, id) as any[];
+    const compaction = lines.findLast((line) => line.kind === "compacted");
+    const data = typeof compaction.data === "string" ? JSON.parse(compaction.data) : compaction.data;
+    const kept = data.keep_from_turn;
+    expect(typeof kept).toBe("number");
+    const path = join(storeRoot(fixture.home), id, "log.jsonl");
+    const raw = readFileSync(path, "utf8").split("\n");
+    const at = raw.findIndex((line) => {
+      if (!line) return false;
+      const parsed = JSON.parse(line);
+      return parsed.kind === "item" && parsed.type === "user" && parsed.turn === kept;
+    });
+    expect(at).toBeGreaterThan(0);
+    raw[at] = raw[at]!.replace("request.", "requast.");
+    const damaged = raw.join("\n");
+    writeFileSync(path, damaged);
+    const requests = gateway.requests.length;
+
+    // fx ask refuses it as a damaged session.
+    const asked = await ask(fixture, gateway, ["--resume", id, "Kept flip after the damage."]);
+    expect(asked.code).toBe(1);
+    expect(asked.stdout + asked.stderr).toContain("InvalidSessionFormat");
+
+    // The interactive app says what to do.
+    const resumed = await startApp(fixture, gateway, ["--resume", id], false);
+    expect(await resumed.session.waitForSessionEnd(TIMEOUT)).toBe(true);
+    await resumed.session.kill();
+    expect(readFileSync(resumed.stderrPath, "utf8")).toBe(
+      "fx: saved session is unreadable. Run `fx doctor`; if it is recoverable, use `fx session recover <id>`.\n",
+    );
+
+    // An ACP client hears the session couldn't be loaded, not that it is missing.
+    client = await AcpRpc.start(fixture, gateway);
+    const loaded = await client.request("session/load", { sessionId: id, cwd: fixture.workspace, mcpServers: [] });
+    expect(loaded.error?.message).toBe("Session could not be loaded");
+    expect(await client.close()).toBe(0);
+    client = undefined;
+
+    // Nothing was sent, and the damaged lines are left for recovery.
+    expect(gateway.requests.length).toBe(requests);
+    expect(readFileSync(path, "utf8").startsWith(damaged)).toBe(true);
+
+    // fx session recover still copies the good turns, and the copy resumes.
+    const result = await command(fixture, gateway, ["session", "recover", id, "--json"]);
+    expect(result.code).toBe(0);
+    const copy: string = JSON.parse(result.stdout).recovered_id;
+    expect(copy).not.toBe(id);
+    const after = await ask(fixture, gateway, ["--resume", copy, "Kept flip after the recovery."]);
+    expect(after.code).toBe(0);
+    expect(JSON.parse(after.stdout).output).toBe("KEPT_FLIP_RECOVERED");
+  } finally {
+    if (client) await client.kill();
+    gateway.stop();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+}, TIMEOUT * 4);
+
 test("a blob that went missing stops resume as damage, not as a missing session", async () => {
   const fixture = createFixture("fx-v2-lost-blob-");
   const big = "LOST_BLOB_START " + "blob-body ".repeat(30_000) + "LOST_BLOB_END";

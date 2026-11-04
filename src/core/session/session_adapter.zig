@@ -3137,7 +3137,16 @@ const Source = struct {
                 const body = entry.body orelse continue;
                 if (body == .turn_started and body.turn_started.turn == turn) return .{ .offset = entry.offset, .seq = entry.seq };
             }
-            from = .{ .at = page.next orelse return error.InvalidConversationFrame };
+            const next = page.next orelse {
+                // A damaged line hides the turn's start: the session is
+                // damaged, which a resume refuses (D39).
+                if (page.damaged) {
+                    debug_trace.logf("session", "event=sessions_v2_kept_turn_unreadable session={s} turn={d} reason=damaged_line", .{ src.id, turn });
+                    return error.InvalidSessionFormat;
+                }
+                return error.InvalidConversationFrame;
+            };
+            from = .{ .at = next };
         }
     }
 
