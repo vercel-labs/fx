@@ -1430,6 +1430,69 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
     90_000,
   );
 
+  test.skipIf(!tmuxAvailable())(
+    "grouped edit rows keep diff counts when a long path is clipped",
+    async () => {
+      const width = 80;
+      const root = createIsolatedRoot();
+      const relativePath =
+        "packages/render-pipeline/transcript-projection/grouped-rows/edit-row-fixture.txt";
+      const target = join(root.workspace, relativePath);
+      mkdirSync(join(target, ".."), { recursive: true });
+      writeFileSync(target, "one\ntwo\n");
+      const gateway = startFakeGateway([
+        toolCall("first_long_edit", "edit_file", {
+          path: relativePath,
+          old_string: "one\n",
+          new_string: "uno\n",
+        }),
+        toolCall("second_long_edit", "edit_file", {
+          path: relativePath,
+          old_string: "two\n",
+          new_string: "dos\n",
+        }),
+        finalText("long path edits complete"),
+      ]);
+      const { session, stderrPath } = await launch(root, gateway, { width }, {
+        FX_PERMISSION_MODE: "full-access",
+        FX_THEME: "dark",
+        NO_COLOR: undefined,
+        COLORTERM: undefined,
+        TERM_PROGRAM: "Apple_Terminal",
+        COLORFGBG: "15;0",
+      });
+
+      await session.sendText("Edit the long path fixture twice.");
+      await session.waitForPane(
+        (pane) =>
+          pane.includes("long path edits complete") &&
+          pane.includes("● 2 tool calls · 2 edit"),
+        TIMEOUT,
+      );
+      expect(readFileSync(target, "utf8")).toBe("uno\ndos\n");
+
+      const grid = await session.capturePaneGrid();
+      const rows = grid.filter((line) => line.includes("Edited packages/"));
+      expect(rows).toHaveLength(2);
+      for (const row of rows) {
+        expect([...row.trimEnd()].length).toBeLessThanOrEqual(width);
+        expect(row.trimEnd()).toMatch(/^[├└] Edited packages\/\S*… \+1 \/ -1$/);
+      }
+
+      const escapes = await session.capturePaneEscapes();
+      const styledRows = escapes.split("\n").filter((line) => line.includes("Edited packages/"));
+      expect(styledRows).toHaveLength(2);
+      for (const row of styledRows) {
+        expect(row).toContain("\x1b[38;5;71m+1");
+        expect(row).toContain("\x1b[38;5;167m-1");
+      }
+      expectCleanStderr(stderrPath);
+      await session.kill();
+      activeSession = null;
+    },
+    60_000,
+  );
+
   test(
     "file session grant reuses the canonical target without a second prompt",
     async () => {
