@@ -491,6 +491,25 @@ pub fn open(
 /// the model is told the session was interrupted; then it sees the inputs
 /// the turn accepted and never placed, and the attempt budget starts over,
 /// so repeated crashes never turn into a refusal to resume.
+///
+/// A store that has been in place carries at most one resume notice at a
+/// time. Re-resuming the same checkpoint (which a queue hand-off does, in
+/// the queue's implementation) would otherwise stack notices on every hop,
+/// so before the new notice is appended, any notice already present in
+/// `pending.execution.steering` is removed. The cap is exactly one new
+/// notice per resume of a checkpoint that already had the notice.
+///
+/// One correction needs a careful read: the leading notice that tells the
+/// model the recovery is happening must stay on the steering list. Removing
+/// old ones when the checkpoint was never saved is correct only because the
+/// checkpoint itself is still its own source of truth: on the transition
+/// that matters (a queue hop that carries the saved checkpoint) the copy
+/// is made from saved recovery state, never from drum scrollback.
+///
+/// By contrast, a store never seen before skips the translation: there is
+/// no prior steering, so no notice is added and nothing is removed.
+/// `yielded == false` (found no crash) matches not adding the notice at
+/// all; a real friendly interruption avoids the notice too.
 pub fn resumeCheckpoint(
     alloc: Allocator,
     pending: session_codec.RecoveryCheckpoint,
@@ -501,12 +520,28 @@ pub fn resumeCheckpoint(
     defer scratch.deinit();
     var view = pending;
     const old = view.execution.steering;
+
+    // Drop any resume notices that a previous resume already appended.
+    var kept: usize = 0;
+    for (old) |entry| {
+        if (std.mem.eql(u8, entry.text, resume_notice)) continue;
+        kept += 1;
+    }
+    // Include the fresh notice only when it is meaningful.
     const notices: usize = if (yielded) 0 else 1;
-    const steering = try scratch.allocator().alloc(types.PersistedSteering, old.len + notices + inputs.len);
-    @memcpy(steering[0..old.len], old);
+    const steering = try scratch.allocator().alloc(types.PersistedSteering, kept + notices + inputs.len);
+    var write: usize = 0;
+    for (old) |entry| {
+        if (std.mem.eql(u8, entry.text, resume_notice)) continue;
+        steering[write] = entry;
+        write += 1;
+    }
     const after = view.execution.tool_steps.len;
-    if (!yielded) steering[old.len] = .{ .text = @constCast(resume_notice), .after_tool_step_count = after };
-    for (inputs, steering[old.len + notices ..]) |input, *entry| {
+    if (!yielded) {
+        steering[write] = .{ .text = @constCast(resume_notice), .after_tool_step_count = after };
+        write += 1;
+    }
+    for (inputs, steering[write..]) |input, *entry| {
         entry.* = .{ .text = input.text, .after_tool_step_count = after };
     }
     view.execution.steering = steering;
@@ -882,4 +917,50 @@ test "a resume cancelled during a rerun keeps that call and the later ones answe
     try std.testing.expectEqualStrings(session_adapter.unfinished_tool_output, results[2].output);
     // A step index past the turn's steps runs nothing.
     try std.testing.expectEqual(@as(usize, 0), try rerunCalls(alloc, &answered, 5, TestRerunner{ .ids = &ids, .ran = &ran }, null));
+}
+
+fn countNotices(checkpoint: session_codec.RecoveryCheckpoint) usize {
+    var notices: usize = 0;
+    for (checkpoint.execution.steering) |entry| {
+        if (std.mem.eql(u8, entry.text, resume_notice)) notices += 1;
+    }
+    return notices;
+}
+
+test "resuming the same checkpoint twice adds one notice, not two" {
+    const alloc = std.testing.allocator;
+    var pending = try testProgress(alloc);
+    defer pending.deinit(alloc);
+
+    // The first resume appends exactly one notice.
+    var resumed = try resumeCheckpoint(alloc, pending, &.{}, false);
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), countNotices(resumed));
+
+    // A second resume of that checkpoint replaces the earlier notice: still one.
+    var again = try resumeCheckpoint(alloc, resumed, &.{}, false);
+    defer again.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), countNotices(again));
+
+    // A resumed checkpoint with other steering keeps it; only notices are removed.
+    var other_pending = try testProgress(alloc);
+    defer other_pending.deinit(alloc);
+    const other_steering = [_]types.PersistedSteering{
+        .{ .text = @constCast(resume_notice), .after_tool_step_count = 0 },
+        .{ .text = @constCast("use the third argument"), .after_tool_step_count = 0 },
+    };
+    other_pending.execution.steering = try other_steering[0..].dupe(alloc);
+    var with_other = pending;
+    try alloc.free(with_other.execution.steering);
+    with_other.execution.steering = try other_pending.execution.steering.dupe(alloc);
+    var resumed2 = try resumeCheckpoint(alloc, with_other, &.{}, false);
+    defer resumed2.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), countNotices(resumed2));
+    try std.testing.expectEqual(@as(usize, 2), resumed2.execution.steering.len);
+    try std.testing.expectEqualStrings("use the third argument", resumed2.execution.steering[0].text);
+
+    // A yielded resume never carries the notice, even when the checkpoint already has one.
+    var yielded_resume = try resumeCheckpoint(alloc, resumed, &.{}, true);
+    defer yielded_resume.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), countNotices(yielded_resume));
 }
