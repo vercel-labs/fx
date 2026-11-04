@@ -329,6 +329,9 @@ pub const Runtime = struct {
         id: []u8,
         /// The name its parent gave it, or empty for a one-off.
         name: []u8,
+        /// The profile it runs in. One started before subagents had a
+        /// profile of their own runs as main.
+        profile: []u8,
     };
 
     /// The root's subagents in the order they started, after a restart too.
@@ -349,28 +352,30 @@ pub const Runtime = struct {
         const listing = try alloc.alloc(ChildListing, count);
         var filled: usize = 0;
         errdefer {
-            for (listing[0..filled]) |entry| {
-                alloc.free(entry.id);
-                alloc.free(entry.name);
-            }
+            for (listing[0..filled]) |entry| freeListed(alloc, entry);
             alloc.free(listing);
         }
         for (registry.children) |child| {
             if (self.closingIndexLocked(child.id) != null) continue;
             const id = try alloc.dupe(u8, child.id);
             errdefer alloc.free(id);
-            listing[filled] = .{ .id = id, .name = try alloc.dupe(u8, child.agentName() orelse "") };
+            const name = try alloc.dupe(u8, child.agentName() orelse "");
+            errdefer alloc.free(name);
+            listing[filled] = .{ .id = id, .name = name, .profile = try alloc.dupe(u8, child.profile orelse profiles.main_name) };
             filled += 1;
         }
         return listing;
     }
 
     pub fn freeChildListing(alloc: Allocator, listing: []ChildListing) void {
-        for (listing) |entry| {
-            alloc.free(entry.id);
-            alloc.free(entry.name);
-        }
+        for (listing) |entry| freeListed(alloc, entry);
         alloc.free(listing);
+    }
+
+    fn freeListed(alloc: Allocator, entry: ChildListing) void {
+        alloc.free(entry.id);
+        alloc.free(entry.name);
+        alloc.free(entry.profile);
     }
 
     /// A child's saved conversation, read without opening it. The caller
@@ -487,12 +492,15 @@ pub const Runtime = struct {
 
         // A new child's profile sets its model and effort unless the
         // request names them. Loading it here refuses an unknown profile, or
-        // one that would nest subagents, before any child exists.
+        // one that would nest subagents, before any child exists. A new child
+        // without one named starts in main, as fx does without --profile.
         var profile_arena = std.heap.ArenaAllocator.init(alloc);
         defer profile_arena.deinit();
         var profiled = options;
         var model_override = request.override();
-        if (model_override.profile) |name| {
+        const profile_name: ?[]const u8 = model_override.profile orelse
+            if (try self.startsChild(profile_arena.allocator(), request.message.agent)) profiles.main_name else null;
+        if (profile_name) |name| {
             const profile = switch (try loadChildProfile(profile_arena.allocator(), name)) {
                 .rejected => |failure| return self.encodeManaged(alloc, failure),
                 .loaded => |value| value,
@@ -1556,6 +1564,16 @@ pub const Runtime = struct {
     /// Loads the profile a new child asks for, from the fx home and the
     /// current directory, as `fx --profile` does. The result and any message
     /// belong to `arena`.
+    /// Whether no subagent has `agent`'s name yet, so a message to it starts
+    /// one. Read before admission, which decides again.
+    fn startsChild(self: *Runtime, alloc: Allocator, agent: []const u8) !bool {
+        var lock = self.managed.state_store.acquireLock();
+        defer lock.release();
+        var registry = try self.managed.state_store.load(alloc);
+        defer registry.deinit(alloc);
+        return registry.findPersistent(agent) == null;
+    }
+
     fn loadChildProfile(arena: Allocator, name: []const u8) !ChildProfile {
         const workspace_root = io_mod.realpathAlloc(arena, ".") catch null;
         const roots = try profiles.Roots.init(arena, io_mod.homeDir(), workspace_root);
@@ -1853,7 +1871,7 @@ pub const Runtime = struct {
                     message.instructions orelse "",
                     active,
                 );
-                if (request.override().profile) |name| try registry.setProfile(alloc, child_id, name);
+                try registry.setProfile(alloc, child_id, request.override().profile orelse profiles.main_name);
                 if (message.report) |rule| try registry.setReportRule(child_id, rule);
                 try self.managed.state_store.save(alloc, registry);
                 try self.ensureManagedChildSession(child_id, active.id, defaults);
@@ -2727,6 +2745,35 @@ test "an idle subagent closes at once, and its name then starts a new one" {
         alloc.free(taken);
     }
     try std.testing.expectEqual(@as(usize, 1), taken.len);
+}
+
+test "a new subagent starts in the main profile unless its message names one, and the list says which" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var parent: child_state.TestParent = undefined;
+    try parent.init(alloc);
+    defer parent.deinit();
+    var fixture = MailboxFixture{};
+    defer fixture.deinit();
+    const runtime = try mailboxRuntime(alloc, &fixture, &parent);
+    defer runtime.deinit();
+
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "reviewer", .message = "look" } }, "call-1", null);
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "copier", .message = "copy", .profile = "agent" } }, "call-2", null);
+    try waitUntilQuiet(runtime);
+    // A later message names no profile and changes none.
+    _ = try callTool(runtime, arena, .{ .message = .{ .agent = "copier", .message = "again" } }, "call-3", null);
+    try waitUntilQuiet(runtime);
+
+    const listing = try runtime.listChildren(alloc);
+    defer Runtime.freeChildListing(alloc, listing);
+    try std.testing.expectEqual(@as(usize, 2), listing.len);
+    try std.testing.expectEqualStrings("reviewer", listing[0].name);
+    try std.testing.expectEqualStrings("main", listing[0].profile);
+    try std.testing.expectEqualStrings("copier", listing[1].name);
+    try std.testing.expectEqualStrings("agent", listing[1].profile);
 }
 
 test "wait returns at once when nothing works, and when a report arrives" {

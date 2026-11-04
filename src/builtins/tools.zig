@@ -164,7 +164,7 @@ const subagent_properties = [_]model_tool_schema.Property{
     .{ .name = "report", .json_type = .string, .shape = &.{ .enum_values = &.{ "final", "every_turn", "never" } }, .description = "For message: when it reports back. final, the default, when your work ends; every_turn after each turn; never only on failure." },
     .{ .name = "model", .json_type = .string, .description = "Model ID for a new child. Defaults to yours." },
     .{ .name = "effort", .json_type = .string, .description = "Reasoning effort for a new child." },
-    .{ .name = "profile", .json_type = .string, .description = "Agent profile for a new child, from the subagent guidance. Without one, it gets yours." },
+    .{ .name = "profile", .json_type = .string, .description = "Agent profile for a new child, from the subagent guidance. Without one, it starts in the main profile." },
 };
 const vision_description =
     "Look at images and return what is visible. Pass exactly one source, image_ids for images the user attached or paths for image files the user named, plus focus.";
@@ -902,7 +902,7 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "4b6c2fff3615b013a9d36f81fe29f4b9c33aa233995c14bcc009aa0f46ce5c3e"
+            "acfa71f07cec5662e77777af6075e529f0d3c2598c9855a04dcbdffda6db5760"
         else
             "04adc103570cb6a7deea711643131a55c0ef4a2ecdf3ce288e5803db4c3fb437",
         &actual_hex,

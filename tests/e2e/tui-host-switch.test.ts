@@ -900,6 +900,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("C-x");
         const over = await session.waitForText(LIST_HINT, 10_000);
         expect(over).not.toContain("Apply this change?");
+        // Its row names the profile it runs in.
+        expect(over).toMatch(/writer · [^\n]* · writer · /);
         await session.sendKeys("1");
         await session.sendKeys("Escape");
         const back = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("Apply this change?"), 10_000);

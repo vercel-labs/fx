@@ -22,6 +22,7 @@ const app_worker_runtime = @import("app_worker_runtime.zig");
 const app_process_runtime = @import("app_process_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
+const profiles = @import("../profiles/profiles.zig");
 const subagent_execution = @import("../subagent/execution.zig");
 const subagent_tool_host = @import("../subagent/tool_host.zig");
 const subagent_authority = @import("../subagent/authority.zig");
@@ -81,6 +82,9 @@ pub const ChildAgent = struct {
     /// The name its parent gave it, such as `reviewer`, from its first run.
     /// Empty for a one-off. Owned.
     name: []u8 = &.{},
+    /// The profile it runs in, from its host's list. Empty until the list is
+    /// read. Owned.
+    profile: []u8 = &.{},
     /// Where its current approval and question come in the order its tree's
     /// prompts were asked (`App.prompt_order`), so the instance's screen
     /// shows the oldest first. Meaningful only while that prompt is active.
@@ -820,6 +824,7 @@ pub fn Runtime(comptime App: type) type {
                 for (listing) |entry| {
                     const child = findChild(app, entry.id) orelse try addChild(app, entry.id);
                     if (child.name.len == 0 and entry.name.len > 0) child.name = try app.alloc.dupe(u8, entry.name);
+                    if (child.profile.len == 0) child.profile = try app.alloc.dupe(u8, entry.profile);
                     if (child.parent_host == null) setParentHost(app, child, host);
                     try order.append(app.alloc, .{ .id = entry.id });
                 }
@@ -1190,7 +1195,9 @@ pub fn Runtime(comptime App: type) type {
                     .number = if (subagent == null) number else 0,
                     .subagent_name = if (subagent) |child| child.displayName() else "",
                     .title = agent.session_title.items,
-                    .profile = agent.profile.profile.name,
+                    // A subagent's own agent never loads its profile; its
+                    // host's list says which one it runs in.
+                    .profile = if (subagent) |child| (if (child.profile.len > 0) child.profile else profiles.main_name) else agent.profile.profile.name,
                     .state = instanceState(agent, requestWaitsForUser(app, target)).label(),
                     .on_screen = target == menu.origin,
                     .model = model,
@@ -2100,6 +2107,7 @@ pub fn Runtime(comptime App: type) type {
             if (!released) return;
             child.screen.deinit(app.alloc);
             if (child.name.len > 0) app.alloc.free(child.name);
+            if (child.profile.len > 0) app.alloc.free(child.profile);
             app.alloc.free(child.id);
             app.alloc.destroy(child);
         }
@@ -2354,6 +2362,7 @@ pub fn Runtime(comptime App: type) type {
             for (app.child_agents.items) |child| {
                 child.screen.deinit(app.alloc);
                 if (child.name.len > 0) app.alloc.free(child.name);
+                if (child.profile.len > 0) app.alloc.free(child.profile);
                 app.alloc.free(child.id);
                 app.alloc.destroy(child);
             }
