@@ -31,7 +31,7 @@ pub const State = struct {
     active: kill_ring.ActiveComposer,
 
     pub fn delete(self: State, alloc: Allocator, kind: DeleteKind) !bool {
-        if (kind == .whitespace_word_left) {
+        if (kind == .whitespace_word_left or kind == .line_start) {
             self.active.vertical_navigation.reset();
         }
         const request = deleteRequest(
@@ -320,6 +320,19 @@ test "repeated line start deletes walk back through every line" {
         try std.testing.expectEqualStrings(step.killed, fixture.ring.text.items);
     }
     try std.testing.expect(!try fixture.state().delete(alloc, .line_start));
+}
+
+test "line start delete clears the sticky vertical column" {
+    const alloc = std.testing.allocator;
+    var fixture: Fixture = .{};
+    defer fixture.deinit(alloc);
+    try fixture.edit.setText(alloc, "alpha\nbeta");
+    fixture.edit.cursor = "alpha\n".len;
+    fixture.vertical_navigation.preferred_column = 3;
+
+    try std.testing.expect(try fixture.state().delete(alloc, .line_start));
+    try std.testing.expectEqualStrings("alphabeta", fixture.edit.input.items);
+    try std.testing.expectEqual(@as(?usize, null), fixture.vertical_navigation.preferredColumn());
 }
 
 test "plain kill and yank each record one edit history delta" {
