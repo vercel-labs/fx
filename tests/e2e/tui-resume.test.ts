@@ -6043,6 +6043,7 @@ test.skipIf(!tmuxAvailable())(
       "scrollback \u001b[3J erase",
       "title \u001b]0;CONTROL_TITLE_OWNED\u0007 set",
       "c1 \u009b31m csi",
+      "joined \u{1f469}\u200d\u{1f4bb} emoji",
       "CONTROL_REPLY_END \u001b[2J",
     ].join("\n\n");
     const shownAsText = [
@@ -6071,6 +6072,8 @@ test.skipIf(!tmuxAvailable())(
       expect(countOccurrences(scrollback, "CONTROL_FIRST_TURN_DONE"), label).toBe(1);
       expect(countOccurrences(scrollback, "CONTROL_REPLY_START"), label).toBe(1);
       for (const text of shownAsText) expect(scrollback, label).toContain(text);
+      // The prompt's and the reply's joined emoji keep their joiner.
+      expect(scrollback, label).not.toContain("\\u{200d}");
       expect(await session.paneTitle(), label).not.toContain("CONTROL_TITLE_OWNED");
       expect(readFileSync(stderrPath, "utf8"), label).toBe("");
     };
@@ -6086,7 +6089,7 @@ test.skipIf(!tmuxAvailable())(
         height: 40,
       });
       await active.waitForComposer(TIMEOUT);
-      await active.sendText("First turn before the control sequences.");
+      await active.sendText("First turn before the control sequences, team \u{1f469}\u200d\u{1f4bb}.");
       await active.waitForText("CONTROL_FIRST_TURN_DONE", TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       await active.sendText("Reply with control sequences.");

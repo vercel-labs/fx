@@ -303,7 +303,7 @@ pub const MarkdownProcessor = struct {
         completions: payload.MarkdownCompletions,
     ) !void {
         self.safe_line.clearRetainingCapacity();
-        try text_utils.appendTerminalControlSafeLine(alloc, &self.safe_line, line);
+        try text_utils.appendTerminalSafeText(alloc, &self.safe_line, line);
         try self.handleLine(alloc, self.safe_line.items, line_has_lf, out, completions);
     }
 
