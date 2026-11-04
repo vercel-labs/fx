@@ -2946,7 +2946,7 @@ fn dupePersistedContextNotes(
     const copy = try alloc.alloc(PersistedContextNote, notes.len);
     errdefer alloc.free(copy);
     var copied: usize = 0;
-    errdefer for (copy[0..copied]) |item| alloc.free(item.text);
+    errdefer for (copy[0..copied]) |item| freePersistedContextNote(alloc, item);
     for (notes, copy) |item, *dest| {
         const text = try alloc.dupe(u8, item.text);
         errdefer alloc.free(text);
@@ -4133,4 +4133,24 @@ test "public types remain constructible" {
     _ = decision;
     _ = action;
     _ = resolve_mode;
+}
+
+fn dupeThenFreeContextNotes(alloc: std.mem.Allocator, notes: []const PersistedContextNote) !void {
+    freePersistedContextNotes(alloc, try dupePersistedContextNotes(alloc, notes));
+}
+
+test "dupePersistedContextNotes leaves nothing behind when a later note fails to copy" {
+    var first_sources = [_]ContextNoteSource{.{ .path = "AGENTS.md", .stamp = 1 }};
+    var second_sources = [_]ContextNoteSource{.{ .path = "src/AGENTS.md", .stamp = 2 }};
+    var first_text = "first".*;
+    var second_text = "second".*;
+    const notes = [_]PersistedContextNote{
+        .{ .text = &first_text, .after_tool_step_count = 1, .sources = &first_sources },
+        .{ .text = &second_text, .after_tool_step_count = 2, .sources = &second_sources },
+    };
+    try std.testing.checkAllAllocationFailures(
+        testing_allocator.no_resize,
+        dupeThenFreeContextNotes,
+        .{@as([]const PersistedContextNote, &notes)},
+    );
 }
