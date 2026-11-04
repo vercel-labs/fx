@@ -71,11 +71,12 @@ Zig unit tests sit in `test` blocks inside the source file they cover, and `zig 
 
 ### Add an end-to-end test file
 
-Every root `tests/e2e/*.test.ts` file needs an entry in the first two files below, and in the third only when it branches on the platform. CI fails when a required entry is missing or stale:
+Every root `tests/e2e/*.test.ts` file needs an entry in the first three files below, and in the fourth only when it branches on the platform. CI fails when a required entry is missing or stale:
 
 | File | Entry |
 | --- | --- |
 | `scripts/pgso/corpus.json` | Exactly one classification: training, verification-only, or intentional exclusion |
+| `scripts/pgso/tests/test_corpus.py` | The same file in the matching training, verification, or exclusion list, in `corpus.json` order |
 | `tests/e2e/ci-shard-weights.json` | A weight that balances the four CI shards |
 | `tests/e2e/macos-platform-tests.json` | Needed only when the file branches on `process.platform` or `platform()` being `darwin` or `linux` |
 

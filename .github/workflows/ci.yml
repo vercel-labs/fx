@@ -44,7 +44,9 @@ jobs:
         run: zig fmt --check src/
 
       - name: Validate PGSO corpus classification
-        run: python3 -m scripts.pgso.corpus --manifest scripts/pgso/corpus.json --list
+        run: |
+          python3 -m scripts.pgso.corpus --manifest scripts/pgso/corpus.json --list
+          python3 -m unittest scripts.pgso.tests.test_corpus
 
       - name: Audit public surface
         run: ./scripts/check-public-surface.sh
