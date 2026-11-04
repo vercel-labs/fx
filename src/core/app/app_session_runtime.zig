@@ -1145,6 +1145,7 @@ pub fn Runtime(comptime App: type) type {
         /// conversation from the top, as a resize does, instead of drawing a
         /// second copy below the old one.
         fn requestUpgradeRelaunchRedraw(app: *App) !void {
+            debug_trace.logf("session", "event=upgrade_relaunch_redraw dropped=terminal_screen_and_scrollback reason=relaunched_build_redraws_conversation", .{});
             try app.shell.requestTerminalReset(&app.metrics);
         }
 
