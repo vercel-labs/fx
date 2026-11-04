@@ -2484,20 +2484,35 @@ pub fn Runtime(comptime App: type) type {
             EmptyTitle,
             TitleTooLong,
             InvalidTitle,
+            MultilineTitle,
             NoActiveSession,
         };
 
         /// Validates a user-supplied session title. Returns the trimmed slice,
-        /// which borrows from `raw`.
+        /// without one pair of quotes wrapped around the whole title, which
+        /// borrows from `raw`.
         pub fn validateSessionTitle(raw: []const u8) RenameError![]const u8 {
-            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-            if (trimmed.len == 0) return error.EmptyTitle;
-            if (trimmed.len > session_display_metadata.max_title_bytes) return error.TitleTooLong;
-            if (!std.unicode.utf8ValidateSlice(trimmed)) return error.InvalidTitle;
-            for (trimmed) |byte| {
+            const title = std.mem.trim(u8, withoutWrappingQuotes(std.mem.trim(u8, raw, " \t\r\n")), " \t");
+            if (title.len == 0) return error.EmptyTitle;
+            if (title.len > session_display_metadata.max_title_bytes) return error.TitleTooLong;
+            if (!std.unicode.utf8ValidateSlice(title)) return error.InvalidTitle;
+            if (std.mem.findAny(u8, title, "\r\n") != null) return error.MultilineTitle;
+            for (title) |byte| {
                 if (byte < 0x20 or byte == 0x7f) return error.InvalidTitle;
             }
-            return trimmed;
+            return title;
+        }
+
+        /// `"deploy fix"` names the session `deploy fix`; a quote that only
+        /// opens, or one inside the title, stays.
+        fn withoutWrappingQuotes(text: []const u8) []const u8 {
+            if (text.len < 2) return text;
+            const quote = text[0];
+            if (quote != '"' and quote != '\'') return text;
+            if (text[text.len - 1] != quote) return text;
+            const inner = text[1 .. text.len - 1];
+            if (std.mem.findScalar(u8, inner, quote) != null) return text;
+            return inner;
         }
 
         /// Renames the active session in memory and in session metadata.
@@ -10257,9 +10272,58 @@ test "validateSessionTitle accepts printable text and rejects malformed input" {
     try std.testing.expectError(error.EmptyTitle, V("   "));
     try std.testing.expectError(error.InvalidTitle, V("bad\ttitle"));
     try std.testing.expectError(error.InvalidTitle, V("bad\x07title"));
+    try std.testing.expectError(error.MultilineTitle, V("line one\nline two"));
+    try std.testing.expectEqualStrings("quoted title", try V("\"quoted title\""));
+    try std.testing.expectEqualStrings("single", try V("'single'"));
+    try std.testing.expectEqualStrings("padded", try V("\" padded \""));
+    try std.testing.expectEqualStrings("\"unbalanced", try V("\"unbalanced"));
+    try std.testing.expectEqualStrings("\"a\" and \"b\"", try V("\"a\" and \"b\""));
+    try std.testing.expectError(error.EmptyTitle, V("\"\""));
 
     const long = text_utils.repeat("x", session_display_metadata.max_title_bytes + 1);
     try std.testing.expectError(error.TitleTooLong, V(long));
+}
+
+test "session titles keep their rules on fuzzed input" {
+    try std.testing.fuzz({}, fuzzSessionTitle, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "  hello world \n",
+            "\"quoted title\"",
+            "'single quoted'",
+            "\"\"",
+            "\"unbalanced",
+            "\"a\" and \"b\"",
+            "\" padded \"",
+            "line one\nline two",
+            "bad\ttitle",
+            "héllo ✓",
+            "\xff\xfe",
+        }) ++ @import("fuzz_corpus").session_title.*),
+    });
+}
+
+fn fuzzSessionTitle(_: void, smith: *std.testing.Smith) !void {
+    var bytes: [512]u8 = undefined;
+    const raw = bytes[0..@intCast(smith.slice(&bytes))];
+    const title = Runtime(TestApp).validateSessionTitle(raw) catch |err| switch (err) {
+        error.EmptyTitle, error.TitleTooLong, error.InvalidTitle, error.MultilineTitle => return,
+        error.NoActiveSession => return error.TestUnexpectedResult,
+    };
+    // The title borrows from the input.
+    try std.testing.expect(@intFromPtr(title.ptr) >= @intFromPtr(raw.ptr));
+    try std.testing.expect(@intFromPtr(title.ptr) - @intFromPtr(raw.ptr) + title.len <= raw.len);
+    try std.testing.expect(title.len > 0 and title.len <= session_display_metadata.max_title_bytes);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(title));
+    try std.testing.expectEqual(title.len, std.mem.trim(u8, title, " \t\r\n").len);
+    for (title) |byte| try std.testing.expect(byte >= 0x20 and byte != 0x7f);
+    // Either the trimmed input, or the trimmed text inside one pair of quotes.
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (!std.mem.eql(u8, trimmed, title)) {
+        try std.testing.expect(trimmed.len >= 2);
+        try std.testing.expect(trimmed[0] == '"' or trimmed[0] == '\'');
+        try std.testing.expectEqual(trimmed[0], trimmed[trimmed.len - 1]);
+        try std.testing.expectEqualStrings(std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t"), title);
+    }
 }
 
 test "renameActiveSession requires an active session" {
