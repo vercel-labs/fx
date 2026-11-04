@@ -607,6 +607,7 @@ pub fn Runtime(comptime App: type) type {
             app.statusline_session = startup.statusline_session;
             if (comptime @hasField(App, "session_title_generation")) {
                 app.session_title_generation = startup.session_title_generation;
+                if (comptime @hasField(App, "code_mode_enabled")) app.code_mode_enabled = startup.code_mode_enabled;
                 if (comptime @hasField(App, "cache_warming")) app.cache_warming = startup.cache_warming;
             }
             if (comptime @hasField(App, "workspace_identity")) {

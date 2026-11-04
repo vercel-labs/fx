@@ -6,6 +6,7 @@ const command_admission = @import("../permissions/command_admission.zig");
 const agent_runtime = @import("../agent/agent_runtime.zig");
 const agent_stream_provider = @import("../agent/stream_provider.zig");
 const app_lifecycle = @import("../app/app_lifecycle.zig");
+const code_mode_sandbox = @import("../code_mode/sandbox.zig");
 const shared_theme = @import("../shared/theme.zig");
 const ui_render = @import("../../ui/render.zig");
 const app_runtime_setup = @import("../app/app_runtime_setup.zig");
@@ -1846,6 +1847,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
+        .code_mode_available = startup.code_mode_enabled and code_mode_sandbox.available,
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 

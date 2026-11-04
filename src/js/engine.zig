@@ -6,8 +6,9 @@
 //! records where it came from and what fx changed. Programs get only the
 //! ECMAScript built-ins: no `std` or `os` module, files, network, processes,
 //! or timers. `newContext` also leaves out the built-ins code mode doesn't
-//! need. Outside code imports only this file, and the module imports only
-//! the standard library and its own files.
+//! need. A `Host` gives a program `tools` and `console`, and nothing else
+//! reaches outside the engine. Outside code imports only this file, and the
+//! module imports only the standard library and its own files.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,10 +25,35 @@ pub const Limits = struct {
     /// thread needs at least this much free stack. Deeper recursion gets a
     /// catchable `RangeError`.
     stack_bytes: usize = default_stack_bytes,
-    /// Time the whole run may take, including promise jobs. Past it the
-    /// program is stopped, and nothing it does can catch that.
+    /// JavaScript time the run may take, including promise jobs. Time spent
+    /// in `Host.call_fn` doesn't count. Past it the program is stopped, and
+    /// nothing it does can catch that.
     time_ms: u32 = 30_000,
+    /// Tool calls one program may make. Past it each call throws a
+    /// catchable `RangeError`.
+    max_calls: u32 = 256,
 };
+
+/// What a program's `tools` and `console` reach. A program run without one
+/// has neither.
+pub const Host = struct {
+    context: *anyopaque,
+    /// Runs one tool call, `await tools.<name>(args)`. Any name reaches it,
+    /// so the host answers an unknown one. `args_json` is the program's
+    /// argument as JSON.
+    call_fn: *const fn (context: *anyopaque, name: []const u8, args_json: []const u8) CallError!CallResult,
+    /// Receives one `console` line.
+    log_fn: *const fn (context: *anyopaque, line: []const u8) void,
+};
+
+/// A tool call's output, borrowed until the host's next call. The program
+/// receives `text`, or, when `ok` is false, an `Error` whose message is
+/// `text`.
+pub const CallResult = struct { ok: bool, text: []const u8 };
+
+/// `Stopped` ends the program with an error it cannot catch, such as when
+/// the run is cancelled.
+pub const CallError = error{ OutOfMemory, Stopped };
 
 /// What a program produced. Text is owned by the allocator passed to `run`.
 pub const Outcome = union(enum) {
@@ -65,7 +91,7 @@ const default_stack_bytes: usize = if (builtin.optimize == .debug) 4 * 1024 * 10
 /// comes from `gpa` and is gone when `run` returns; `io` is used only to
 /// read the clock. Fails only when the engine cannot start or the outcome's
 /// text cannot be copied.
-pub fn run(gpa: std.mem.Allocator, io: std.Io, source: []const u8, limits: Limits) RunError!Outcome {
+pub fn run(gpa: std.mem.Allocator, io: std.Io, source: []const u8, limits: Limits, host: ?Host) RunError!Outcome {
     // QuickJS reads 0 as no limit at all.
     std.debug.assert(limits.heap_bytes > 0);
     std.debug.assert(limits.stack_bytes > 0);
@@ -92,6 +118,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, source: []const u8, limits: Limit
 
     const ctx = try newContext(rt);
     defer qjs.JS_FreeContext(ctx);
+    var bridge: Bridge = undefined;
+    if (host) |connected| {
+        bridge = .{ .host = connected, .deadline = &deadline, .calls_left = limits.max_calls, .max_calls = limits.max_calls };
+        try installHost(rt, ctx, &bridge);
+    }
 
     const completion = qjs.JS_Eval(ctx, program.ptr, program.len, "<program>", qjs.eval_type_global);
     defer qjs.JS_FreeValue(ctx, completion);
@@ -223,6 +254,154 @@ const cut_prelude =
     \\})();
 ;
 
+/// What the native functions behind `tools` and `console` need, reached
+/// through the context's opaque pointer.
+const Bridge = struct {
+    host: Host,
+    deadline: *Deadline,
+    calls_left: u32,
+    max_calls: u32,
+};
+
+/// Takes the two host objects from the global object, where `installHost`
+/// leaves them, and gives the program `tools` and `console`. Both names end
+/// up neither writable nor configurable, and no program can add to `tools`.
+const host_prelude =
+    \\(() => {
+    \\  "use strict";
+    \\  const tools = globalThis.__fx_tools;
+    \\  const log = globalThis.__fx_log;
+    \\  delete globalThis.__fx_tools;
+    \\  delete globalThis.__fx_log;
+    \\  Object.preventExtensions(tools);
+    \\  const text = (value) => {
+    \\    if (typeof value === "string") return value;
+    \\    try {
+    \\      const json = JSON.stringify(value);
+    \\      if (json !== undefined) return json;
+    \\      return String(value);
+    \\    } catch {
+    \\      return "[a value that cannot be turned into text]";
+    \\    }
+    \\  };
+    \\  const line = (...values) => log(values.map(text).join(" "));
+    \\  const console = Object.freeze({ log: line, info: line, warn: line, error: line, debug: line });
+    \\  Object.defineProperty(globalThis, "tools", { value: tools });
+    \\  Object.defineProperty(globalThis, "console", { value: console });
+    \\})();
+;
+
+/// `tools` answers every property name with a function that calls that
+/// tool, so a program can reach any tool, including an MCP tool the model
+/// hasn't loaded, without the engine knowing the names. It has no prototype.
+const tools_class: qjs.ClassDef = .{ .class_name = "Tools", .exotic = &tools_methods };
+const tools_methods: qjs.ClassExoticMethods = .{ .get_property = toolFunction };
+
+/// Names the language itself looks up, as `await`, `JSON.stringify`, and
+/// string conversion do. They read as missing, so none of those calls a tool.
+const protocol_names = [_][]const u8{ "then", "toJSON", "toString", "valueOf", "constructor" };
+
+fn installHost(rt: *qjs.Runtime, ctx: *qjs.Context, bridge: *Bridge) error{OutOfMemory}!void {
+    qjs.JS_SetContextOpaque(ctx, bridge);
+    var class_id: qjs.ClassId = 0;
+    _ = qjs.JS_NewClassID(rt, &class_id);
+    if (qjs.JS_NewClass(rt, class_id, &tools_class) != 0) return error.OutOfMemory;
+
+    const global = qjs.JS_GetGlobalObject(ctx);
+    defer qjs.JS_FreeValue(ctx, global);
+    if (qjs.JS_SetPropertyStr(ctx, global, "__fx_tools", qjs.JS_NewObjectClass(ctx, class_id)) < 0 or
+        qjs.JS_SetPropertyStr(ctx, global, "__fx_log", qjs.JS_NewCFunction2(ctx, logLine, "log", 1, qjs.cfunc_generic, 0)) < 0)
+    {
+        qjs.JS_FreeValue(ctx, qjs.JS_GetException(ctx));
+        return error.OutOfMemory;
+    }
+    const done = qjs.JS_Eval(ctx, host_prelude, host_prelude.len, "<code mode host>", qjs.eval_type_global);
+    defer qjs.JS_FreeValue(ctx, done);
+    if (done.isException()) {
+        // The prelude throws nothing of its own, so only memory can fail it.
+        qjs.JS_FreeValue(ctx, qjs.JS_GetException(ctx));
+        return error.OutOfMemory;
+    }
+}
+
+/// `tools.<name>`: a function bound to the name, or undefined for a symbol
+/// or one of `protocol_names`.
+fn toolFunction(ctx_arg: ?*qjs.Context, _: qjs.Value, atom: qjs.Atom, _: qjs.Value) callconv(.c) qjs.Value {
+    const ctx = ctx_arg.?;
+    const key = qjs.JS_AtomToValue(ctx, atom);
+    defer qjs.JS_FreeValue(ctx, key);
+    if (key.isException()) return key;
+    if (key.isSymbol()) return qjs.undefined_value;
+    const name = jsText(ctx, key) orelse return qjs.exception_value;
+    defer qjs.JS_FreeCString(ctx, name.ptr);
+    for (protocol_names) |protocol| {
+        if (std.mem.eql(u8, name, protocol)) return qjs.undefined_value;
+    }
+    const data = [_]qjs.Value{key};
+    return qjs.JS_NewCFunctionData(ctx, callTool, 1, 0, data.len, &data);
+}
+
+fn bridgeOf(ctx: *qjs.Context) *Bridge {
+    return @ptrCast(@alignCast(qjs.JS_GetContextOpaque(ctx).?));
+}
+
+/// A `tools.<name>(args)` call: `func_data[0]` is the name.
+fn callTool(ctx_arg: ?*qjs.Context, _: qjs.Value, argc: c_int, argv: ?[*]const qjs.Value, _: c_int, func_data: ?[*]const qjs.Value) callconv(.c) qjs.Value {
+    const ctx = ctx_arg.?;
+    const bridge = bridgeOf(ctx);
+    if (bridge.calls_left == 0) {
+        return qjs.JS_ThrowRangeError(ctx, "This program reached its limit of %u tool calls.", @as(c_uint, bridge.max_calls));
+    }
+    const name = jsText(ctx, func_data.?[0]) orelse return qjs.exception_value;
+    defer qjs.JS_FreeCString(ctx, name.ptr);
+
+    const argument = if (argc > 0) argv.?[0] else qjs.undefined_value;
+    const json = if (argument.isUndefined())
+        qjs.JS_NewStringLen(ctx, "{}", 2)
+    else
+        qjs.JS_JSONStringify(ctx, argument, qjs.undefined_value, qjs.undefined_value);
+    defer qjs.JS_FreeValue(ctx, json);
+    if (json.isException()) return json;
+    if (json.isUndefined()) return qjs.JS_ThrowTypeError(ctx, "A tool's arguments must be a value JSON can hold, such as an object.");
+    const args = jsText(ctx, json) orelse return qjs.exception_value;
+    defer qjs.JS_FreeCString(ctx, args.ptr);
+
+    bridge.calls_left -= 1;
+    const started = bridge.deadline.nowNs();
+    const result = bridge.host.call_fn(bridge.host.context, name, args);
+    bridge.deadline.excludeSince(started);
+    const output = result catch |err| return switch (err) {
+        error.Stopped => qjs.JS_ThrowInternalError(ctx, "the program was stopped"),
+        error.OutOfMemory => qjs.JS_ThrowInternalError(ctx, "out of memory"),
+    };
+
+    const text = qjs.JS_NewStringLen(ctx, output.text.ptr, output.text.len);
+    if (text.isException() or output.ok) return text;
+    // Set the message directly: QuickJS's formatted throws keep only the
+    // first 255 bytes, and a tool's error is often longer.
+    const thrown = qjs.JS_NewError(ctx);
+    if (thrown.isException()) {
+        qjs.JS_FreeValue(ctx, text);
+        return thrown;
+    }
+    if (qjs.JS_SetPropertyStr(ctx, thrown, "message", text) < 0) {
+        qjs.JS_FreeValue(ctx, thrown);
+        return qjs.exception_value;
+    }
+    return qjs.JS_Throw(ctx, thrown);
+}
+
+/// `log(line)`: hands one `console` line to the host.
+fn logLine(ctx_arg: ?*qjs.Context, _: qjs.Value, argc: c_int, argv: ?[*]const qjs.Value) callconv(.c) qjs.Value {
+    const ctx = ctx_arg.?;
+    if (argc < 1) return qjs.undefined_value;
+    const line = jsText(ctx, argv.?[0]) orelse return qjs.exception_value;
+    defer qjs.JS_FreeCString(ctx, line.ptr);
+    const bridge = bridgeOf(ctx);
+    bridge.host.log_fn(bridge.host.context, line);
+    return qjs.undefined_value;
+}
+
 /// The program as the body of an async arrow function, NUL-terminated as
 /// `JS_Eval` requires. The body starts on the first line, so error positions
 /// keep the program's own line numbers; columns on that line include the
@@ -240,6 +419,16 @@ const Deadline = struct {
     fn start(io: std.Io, time_ms: u32) Deadline {
         const now = std.Io.Clock.awake.now(io).toNanoseconds();
         return .{ .io = io, .at_ns = now + @as(i96, time_ms) * std.time.ns_per_ms };
+    }
+
+    /// Moves the deadline later by the time since `since_ns`, so time spent
+    /// outside JavaScript doesn't count.
+    fn excludeSince(deadline: *Deadline, since_ns: i96) void {
+        deadline.at_ns += std.Io.Clock.awake.now(deadline.io).toNanoseconds() - since_ns;
+    }
+
+    fn nowNs(deadline: *const Deadline) i96 {
+        return std.Io.Clock.awake.now(deadline.io).toNanoseconds();
     }
 
     fn expired(deadline: *Deadline) bool {
@@ -332,7 +521,7 @@ fn jsText(ctx: *qjs.Context, value: qjs.Value) ?[]const u8 {
 const testing = std.testing;
 
 fn expectReturned(expected_json: ?[]const u8, source: []const u8, limits: Limits) !void {
-    const outcome = try run(testing.allocator, testing.io, source, limits);
+    const outcome = try run(testing.allocator, testing.io, source, limits, null);
     defer outcome.deinit(testing.allocator);
     switch (outcome) {
         .returned => |json| if (expected_json) |want| {
@@ -350,7 +539,7 @@ fn expectReturned(expected_json: ?[]const u8, source: []const u8, limits: Limits
 
 /// Runs `source` and expects it to throw text that contains `needle`.
 fn expectThrew(needle: []const u8, source: []const u8, limits: Limits) !void {
-    const outcome = try run(testing.allocator, testing.io, source, limits);
+    const outcome = try run(testing.allocator, testing.io, source, limits, null);
     defer outcome.deinit(testing.allocator);
     switch (outcome) {
         .threw => |text| if (std.mem.find(u8, text, needle) == null) {
@@ -365,7 +554,7 @@ fn expectThrew(needle: []const u8, source: []const u8, limits: Limits) !void {
 }
 
 fn expectOutcome(expected: std.meta.Tag(Outcome), source: []const u8, limits: Limits) !void {
-    const outcome = try run(testing.allocator, testing.io, source, limits);
+    const outcome = try run(testing.allocator, testing.io, source, limits, null);
     defer outcome.deinit(testing.allocator);
     try testing.expectEqual(expected, std.meta.activeTag(outcome));
 }
@@ -403,7 +592,7 @@ test "a thrown error names what went wrong and where" {
 
 test "thrown text stays valid UTF-8 when the program throws a lone surrogate" {
     for ([_][]const u8{ "throw '\\ud800';", "throw new Error('half \\udc00 a pair');" }) |source| {
-        const outcome = try run(testing.allocator, testing.io, source, .{});
+        const outcome = try run(testing.allocator, testing.io, source, .{}, null);
         defer outcome.deinit(testing.allocator);
         try testing.expect(outcome == .threw);
         try testing.expect(std.unicode.utf8ValidateSlice(outcome.threw));
@@ -592,28 +781,202 @@ test "code mode keeps the built-ins programs use" {
     , .{});
 }
 
-test "the models' eval programs run with the cut built-ins" {
-    // Stand-ins for what the `execute` tool will provide: the tools the
-    // programs call, with results shaped like the real ones, and `console`.
-    const fake_tools =
-        \\const console = { log() {} };
-        \\const tools = {
-        \\  read_file: async ({ path }) => path.endsWith(".json") ? JSON.stringify({ name: "svc", port: 8080, owner: "infra" }) : "line one\nTODO: two\nline three",
-        \\  glob_files: async () => "services/a/service.json\nservices/b/service.json",
-        \\  write_file: async () => "written",
-        \\  shell: async () => "ok",
-        \\  mcp_tracker_get_issue: async ({ id }) => JSON.stringify({ id, status: "blocked", priority: "P0", comments: [] }),
-        \\  mcp_tracker_search_logs: async () => "ERROR payment-gateway timeout\nINFO ok",
-        \\};
-        \\
-    ;
+/// A host for tests. It answers each tool by name, records every call, and
+/// collects `console` lines.
+const FakeHost = struct {
+    io: std.Io,
+    answer_fn: *const fn (name: []const u8, args_json: []const u8) CallResult = answerHello,
+    /// Time each call takes, spent before it answers.
+    delay_ms: u32 = 0,
+    stopped: bool = false,
+    calls: std.ArrayList(u8) = .empty,
+    logs: std.ArrayList(u8) = .empty,
+
+    fn host(fake: *FakeHost) Host {
+        return .{ .context = fake, .call_fn = call, .log_fn = log };
+    }
+
+    fn deinit(fake: *FakeHost) void {
+        fake.calls.deinit(testing.allocator);
+        fake.logs.deinit(testing.allocator);
+    }
+
+    fn call(context: *anyopaque, name: []const u8, args_json: []const u8) CallError!CallResult {
+        const fake: *FakeHost = @ptrCast(@alignCast(context));
+        if (fake.stopped) return error.Stopped;
+        const until = std.Io.Clock.awake.now(fake.io).toNanoseconds() + @as(i96, fake.delay_ms) * std.time.ns_per_ms;
+        while (std.Io.Clock.awake.now(fake.io).toNanoseconds() < until) {}
+        fake.calls.print(testing.allocator, "{s} {s}\n", .{ name, args_json }) catch return error.OutOfMemory;
+        return fake.answer_fn(name, args_json);
+    }
+
+    fn log(context: *anyopaque, line: []const u8) void {
+        const fake: *FakeHost = @ptrCast(@alignCast(context));
+        fake.logs.print(testing.allocator, "{s}\n", .{line}) catch {};
+    }
+};
+
+fn runWithHost(fake: *FakeHost, source: []const u8, limits: Limits) !Outcome {
+    return run(testing.allocator, testing.io, source, limits, fake.host());
+}
+
+fn answerHello(_: []const u8, _: []const u8) CallResult {
+    return .{ .ok = true, .text = "hello" };
+}
+
+test "a program calls its tools and gets their text back" {
+    var fake: FakeHost = .{ .io = testing.io };
+    defer fake.deinit();
+    const outcome = try runWithHost(&fake, "return [await tools.read_file({ path: 'a' }), await tools.read_file()];", .{});
+    defer outcome.deinit(testing.allocator);
+    try testing.expectEqualStrings("[\"hello\",\"hello\"]", outcome.returned.?);
+    try testing.expectEqualStrings("read_file {\"path\":\"a\"}\nread_file {}\n", fake.calls.items);
+}
+
+test "a failed tool call throws an Error with the tool's whole message" {
+    const answer = struct {
+        const message: [400]u8 = @splat('x');
+        fn answer(_: []const u8, _: []const u8) CallResult {
+            return .{ .ok = false, .text = &message };
+        }
+    }.answer;
+    var fake: FakeHost = .{ .io = testing.io, .answer_fn = answer };
+    defer fake.deinit();
+    const outcome = try runWithHost(&fake,
+        \\try { await tools.shell({ command: "false" }); } catch (e) { return [e instanceof Error, e.message.length]; }
+    , .{});
+    defer outcome.deinit(testing.allocator);
+    try testing.expectEqualStrings("[true,400]", outcome.returned.?);
+}
+
+test "tools reaches any tool name and the program can't change it" {
+    var fake: FakeHost = .{ .io = testing.io };
+    defer fake.deinit();
+    const outcome = try runWithHost(&fake,
+        \\tools = null;
+        \\tools.read_file = null;
+        \\tools.added = 1;
+        \\return [
+        \\  typeof tools.read_file,
+        \\  typeof tools.mcp_server_anything,
+        \\  Object.isExtensible(tools),
+        \\  Object.getPrototypeOf(tools),
+        \\  await tools['mcp_a"b']({}),
+        \\  typeof __fx_tools,
+        \\  typeof __fx_log,
+        \\];
+    , .{});
+    defer outcome.deinit(testing.allocator);
+    try testing.expectEqualStrings(
+        \\["function","function",false,null,"hello","undefined","undefined"]
+    , outcome.returned.?);
+    try testing.expectEqualStrings("mcp_a\"b {}\n", fake.calls.items);
+}
+
+test "the language's own lookups on tools never call a tool" {
+    var fake: FakeHost = .{ .io = testing.io };
+    defer fake.deinit();
+    const outcome = try runWithHost(&fake,
+        \\const awaited = await tools;
+        \\return [
+        \\  awaited === tools,
+        \\  JSON.stringify(tools),
+        \\  JSON.stringify({ tools }),
+        \\  (() => { try { return `${tools}`; } catch (e) { return e.name; } })(),
+        \\  typeof tools.then,
+        \\  typeof tools[Symbol.iterator],
+        \\];
+    , .{});
+    defer outcome.deinit(testing.allocator);
+    try testing.expectEqualStrings(
+        \\[true,"{}","{\"tools\":{}}","TypeError","undefined","undefined"]
+    , outcome.returned.?);
+    try testing.expectEqualStrings("", fake.calls.items);
+}
+
+test "a tool's arguments must have a JSON form" {
+    var fake: FakeHost = .{ .io = testing.io };
+    defer fake.deinit();
+    const outcome = try runWithHost(&fake,
+        \\try { await tools.read_file(() => 1); } catch (e) { return [e.name, e.message]; }
+    , .{});
+    defer outcome.deinit(testing.allocator);
+    try testing.expectEqualStrings(
+        \\["TypeError","A tool's arguments must be a value JSON can hold, such as an object."]
+    , outcome.returned.?);
+    try testing.expectEqualStrings("", fake.calls.items);
+}
+
+test "a program's tool calls stop at the call limit with a catchable RangeError" {
+    var fake: FakeHost = .{ .io = testing.io };
+    defer fake.deinit();
+    const outcome = try runWithHost(&fake,
+        \\let made = 0;
+        \\try { for (;;) { await tools.read_file({}); made++; } } catch (e) { return [made, e.name]; }
+    , .{ .max_calls = 3 });
+    defer outcome.deinit(testing.allocator);
+    try testing.expectEqualStrings("[3,\"RangeError\"]", outcome.returned.?);
+}
+
+test "time spent in a tool call doesn't count against the time limit" {
+    var fake: FakeHost = .{ .io = testing.io, .delay_ms = 150 };
+    defer fake.deinit();
+    const outcome = try runWithHost(&fake, "for (let i = 0; i < 3; i++) await tools.read_file({}); return 'done';", .{ .time_ms = 100 });
+    defer outcome.deinit(testing.allocator);
+    try testing.expectEqualStrings("\"done\"", outcome.returned.?);
+}
+
+test "a stopped run ends the program with an error it cannot catch" {
+    var fake: FakeHost = .{ .io = testing.io, .stopped = true };
+    defer fake.deinit();
+    const outcome = try runWithHost(&fake, "try { await tools.read_file({}); } catch { return 'caught'; } finally { return 'finally'; }", .{});
+    defer outcome.deinit(testing.allocator);
+    try testing.expect(std.mem.startsWith(u8, outcome.threw, "InternalError: the program was stopped"));
+}
+
+test "console lines reach the host" {
+    var fake: FakeHost = .{ .io = testing.io };
+    defer fake.deinit();
+    const outcome = try runWithHost(&fake,
+        \\console.log("a", 1, { b: [2] }, undefined);
+        \\console.error("e");
+        \\const loop = {}; loop.self = loop;
+        \\console.log(loop);
+    , .{});
+    defer outcome.deinit(testing.allocator);
+    try testing.expectEqualStrings("a 1 {\"b\":[2]} undefined\ne\n[a value that cannot be turned into text]\n", fake.logs.items);
+}
+
+test "a program run without a host has no tools or console" {
+    try expectReturned("[\"undefined\",\"undefined\"]", "return [typeof tools, typeof console];", .{});
+}
+
+/// Answers shaped like the real tools' results for the models' programs.
+fn answerEvalTool(name: []const u8, args_json: []const u8) CallResult {
+    const eql = std.mem.eql;
+    if (eql(u8, name, "read_file")) return .{ .ok = true, .text = if (std.mem.find(u8, args_json, ".json\"") != null)
+        \\{"name":"svc","port":8080,"owner":"infra"}
+    else
+        "line one\nTODO: two\nline three" };
+    if (eql(u8, name, "glob_files")) return .{ .ok = true, .text = "services/a/service.json\nservices/b/service.json" };
+    if (eql(u8, name, "mcp_tracker_get_issue")) return .{ .ok = true, .text =
+    \\{"id":"T-1","status":"blocked","priority":"P0","comments":[]}
+    };
+    if (eql(u8, name, "mcp_tracker_search_logs")) return .{ .ok = true, .text = "ERROR payment-gateway timeout\nINFO ok" };
+    return .{ .ok = true, .text = "ok" };
+}
+
+test "the models' eval programs run against the host" {
     var programs = std.mem.splitSequence(u8, @embedFile("testdata/eval_programs.js"), "\n// ----\n");
     var count: usize = 0;
     while (programs.next()) |program| {
         count += 1;
-        const source = try std.mem.concat(testing.allocator, u8, &.{ fake_tools, program });
-        defer testing.allocator.free(source);
-        const outcome = try run(testing.allocator, testing.io, source, .{ .time_ms = 5_000 });
+        var fake: FakeHost = .{
+            .io = testing.io,
+            .answer_fn = answerEvalTool,
+        };
+        defer fake.deinit();
+        const outcome = try runWithHost(&fake, program, .{ .time_ms = 5_000 });
         defer outcome.deinit(testing.allocator);
         switch (outcome) {
             .returned => {},
@@ -628,10 +991,11 @@ test "the models' eval programs run with the cut built-ins" {
                 }
             },
             .timed_out, .unsettled => {
-                std.debug.print("program {d}: {s}\n", .{ count, @tagName(outcome) });
+                std.debug.print("program {d}: {t}\n", .{ count, outcome });
                 return error.TestUnexpectedResult;
             },
         }
+        try testing.expect(fake.calls.items.len > 0);
     }
     try testing.expectEqual(@as(usize, 30), count);
 }
@@ -684,7 +1048,7 @@ test "fuzzed programs end in an outcome and free every byte" {
 fn fuzzProgram(_: void, smith: *testing.Smith) anyerror!void {
     var buffer: [4096]u8 = undefined;
     const source = buffer[0..smith.slice(&buffer)];
-    const outcome = try run(testing.allocator, testing.io, source, fuzz_limits);
+    const outcome = try run(testing.allocator, testing.io, source, fuzz_limits, null);
     outcome.deinit(testing.allocator);
 }
 
@@ -716,7 +1080,7 @@ fn fuzzRegExp(_: void, smith: *testing.Smith) anyerror!void {
     try writeJsString(w, subject);
     try w.writeAll(";\nreturn [re.exec(s), s.replace(re, \"<$&>\"), s.split(re).length, re.test(s)];");
 
-    const outcome = try run(testing.allocator, testing.io, program.written(), fuzz_limits);
+    const outcome = try run(testing.allocator, testing.io, program.written(), fuzz_limits, null);
     outcome.deinit(testing.allocator);
 }
 
@@ -741,7 +1105,7 @@ fn fuzzJson(_: void, smith: *testing.Smith) anyerror!void {
         \\return printed === JSON.stringify(JSON.parse(printed)) ? "stable" : "unstable: " + printed;
     );
 
-    const outcome = try run(testing.allocator, testing.io, program.written(), fuzz_limits);
+    const outcome = try run(testing.allocator, testing.io, program.written(), fuzz_limits, null);
     defer outcome.deinit(testing.allocator);
     switch (outcome) {
         .returned => |json| {

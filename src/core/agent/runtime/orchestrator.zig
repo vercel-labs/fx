@@ -11768,6 +11768,8 @@ fn processQueuedPromptLoop(
                 .root_user_evidence_complete = true,
                 .authorized_image_catalog = job.authorized_image_catalog,
                 .current_turn_messages = within_turn_suffix.items,
+                .review_turn = review_context,
+                .review_ledger = turn_review_cache.ledger(arena),
                 .session_grants = execution_grants,
                 .live_authority = if (live_authority) |resolved| resolved.authority else null,
                 .advertised_dynamic_tool_names = advertised_dynamic_tool_names,

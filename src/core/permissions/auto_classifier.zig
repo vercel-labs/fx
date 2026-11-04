@@ -248,6 +248,8 @@ pub const ProvenBindings = struct {
 pub const ReviewOrigin = enum {
     root,
     subagent,
+    /// A tool call an `execute` program made.
+    code_mode,
 };
 
 const ReviewView = enum {
@@ -1453,7 +1455,9 @@ test "prepared mutations serialize exact action without operational packet field
 }
 
 fn selectReviewView(request: ReviewRequest) ReviewView {
-    if (request.review_turn.origin == .subagent) return .contextual;
+    // A subagent's or a program's action carries no direct user request, so
+    // the reviewer always sees what the root user asked for.
+    if (request.review_turn.origin != .root) return .contextual;
     return switch (request.action) {
         .command, .shell_input => .contextual,
         .file_mutation => .normal,

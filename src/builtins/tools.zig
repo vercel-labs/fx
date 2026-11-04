@@ -16,6 +16,7 @@ const ask_user_question_impl = @import("../tools/agent/ask_user_question.zig");
 const question_answer = @import("../core/agent/question_answer.zig");
 const subagent_impl = @import("../tools/agent/subagent.zig");
 const vision_impl = @import("../tools/agent/vision.zig");
+const execute_impl = @import("../tools/agent/execute.zig");
 const edit_file_impl = @import("../tools/filesystem/edit_file.zig");
 const glob_files_impl = @import("../tools/filesystem/glob_files.zig");
 const grep_files_impl = @import("../tools/filesystem/grep_files.zig");
@@ -688,6 +689,42 @@ pub const vision = ToolSpec{
     .irreversible_fn = vision_impl.isIrreversible,
 };
 
+const execute_description =
+    \\Run JavaScript (the body of an async function) that calls your tools. `await tools.<name>(args)` takes the same arguments as a direct call, including MCP tools by full name, returns the output as a string (an MCP tool's text content), and throws on failure. Use it to fan out over many items or filter large outputs in code; only the return value and console.log output come back. No filesystem, network, or timers. Limits: 256 calls, 30 s, 64 MiB.
+;
+
+/// Offered only when `experimental.code_mode` is on and the build can run
+/// code mode; see `tool_projection.Options.code_mode_available`.
+pub const execute = ToolSpec{
+    .name = "execute",
+    .description = execute_description,
+    .model_schema = .{
+        .name = "execute",
+        .description = execute_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "code", .json_type = .string, .description = "Async function body." },
+            },
+            .required = &.{"code"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .execute,
+    .activity_kind = .command,
+    .requires_approval = false,
+    .action_label = "Executing",
+    .completed_action_label = "Executed",
+    .label_arg_kind = .none,
+    .label_arg_default = "program",
+    .permission_target_kind = .none,
+    .decode = execute_impl.decode,
+    .validate = execute_impl.validate,
+    .call = execute_impl.call,
+    .runtime_provider = .code_mode,
+    .reads_only_fn = execute_impl.readsOnly,
+    .irreversible_fn = execute_impl.isIrreversible,
+};
+
 const read_tool_result_properties = [_]model_tool_schema.Property{
     .{ .name = "handle", .json_type = .string, .description = "From a truncated result, or a saved ID such as T12." },
     .{ .name = "query", .json_type = .string, .description = "Text to find in the handle's output." },
@@ -746,6 +783,7 @@ pub const all = [_]tool_dispatch.Tool{
     ask_user_question,
     vision,
     read_tool_result,
+    execute,
 };
 
 /// fx's own tools. libfx's Node-API addon never runs them, because its agents
@@ -902,9 +940,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "acfa71f07cec5662e77777af6075e529f0d3c2598c9855a04dcbdffda6db5760"
+            "60705293dc8c075e64cc246e56943085319e9fb74577dba4e858fe0bc969d52b"
         else
-            "4ab95d2811addf193111f0150912076b1dde54074a1fe6be24b64700ffc254c7",
+            "5858bb71b8db0e7d10444b106aff34b0a8682d55e6cfec678f346d1ce7c253a7",
         &actual_hex,
     );
 }
@@ -970,6 +1008,7 @@ test "built-in tools register exact active local order" {
         "ask_user_question",
         "vision",
         "read_tool_result",
+        "execute",
     };
 
     try std.testing.expectEqual(expected_names.len, all.len);

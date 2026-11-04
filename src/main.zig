@@ -638,6 +638,8 @@ const App = struct {
     /// Resolved `session_titles` preference: generate a model-written session
     /// title from the first prompt of a fresh session.
     session_title_generation: bool = true,
+    /// Resolved `experimental.code_mode` preference: offer the `execute` tool.
+    code_mode_enabled: bool = false,
     /// Resolved `cache_warming` preference: ping a waiting Claude
     /// conversation's prompt cache so it stays alive.
     cache_warming: bool = true,
@@ -2048,6 +2050,7 @@ const App = struct {
             .permission_mode = permission_mode,
             .permission_rules = permission_rules,
             .subagent_available = subagent_available,
+            .code_mode_available = self.code_mode_enabled and code_mode_sandbox.available,
             .subagent_profiles = subagent_profiles,
         });
     }
