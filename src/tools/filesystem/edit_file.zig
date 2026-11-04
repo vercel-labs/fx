@@ -1,6 +1,7 @@
 const std = @import("std");
 const file_mutation_contract = @import("../../core/tooling/file_mutation_contract.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const tool_args = @import("../../core/tooling/tool_args.zig");
 
 const Allocator = std.mem.Allocator;
 const max_content_bytes: usize = 4 * 1024 * 1024;
@@ -24,72 +25,20 @@ pub fn decode(
     ctx: tool_dispatch.DispatchContext,
     args_json: []const u8,
 ) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    var parsed = std.json.parseFromSlice(
-        std.json.Value,
-        ctx.allocator,
-        args_json,
-        .{},
-    ) catch {
-        return .{ .failure = try ctx.allocator.dupe(
-            u8,
-            "edit_file arguments must be valid JSON",
-        ) };
-    };
+    var args: tool_args.ArgsDecoder = .{ .alloc = ctx.allocator, .tool = "edit_file" };
+    var parsed = args.parse(args_json) catch |err| return .{ .failure = try args.takeFailure(err) };
     defer parsed.deinit();
-
-    if (parsed.value != .object) {
-        return .{ .failure = try ctx.allocator.dupe(
-            u8,
-            "edit_file arguments must be an object",
-        ) };
-    }
-
-    const path_value = parsed.value.object.get("path") orelse {
-        return .{ .failure = try ctx.allocator.dupe(
-            u8,
-            "edit_file requires string field \"path\"",
-        ) };
-    };
-    if (path_value != .string) {
-        return .{ .failure = try ctx.allocator.dupe(
-            u8,
-            "edit_file field \"path\" must be a string",
-        ) };
-    }
-
-    const old_value = parsed.value.object.get("old_string") orelse {
-        return .{ .failure = try ctx.allocator.dupe(
-            u8,
-            "edit_file requires string field \"old_string\"",
-        ) };
-    };
-    if (old_value != .string) {
-        return .{ .failure = try ctx.allocator.dupe(
-            u8,
-            "edit_file field \"old_string\" must be a string",
-        ) };
-    }
-
-    const new_value = parsed.value.object.get("new_string") orelse {
-        return .{ .failure = try ctx.allocator.dupe(
-            u8,
-            "edit_file requires string field \"new_string\"",
-        ) };
-    };
-    if (new_value != .string) {
-        return .{ .failure = try ctx.allocator.dupe(
-            u8,
-            "edit_file field \"new_string\" must be a string",
-        ) };
-    }
+    const path = args.requiredString(parsed.value.object, "path") catch |err| return .{ .failure = try args.takeFailure(err) };
+    const old = args.requiredString(parsed.value.object, "old_string") catch |err| return .{ .failure = try args.takeFailure(err) };
+    const new = args.requiredString(parsed.value.object, "new_string") catch |err| return .{ .failure = try args.takeFailure(err) };
 
     const input = try ctx.allocator.create(Input);
     errdefer ctx.allocator.destroy(input);
-    const owned_path = try ctx.allocator.dupe(u8, path_value.string);
+    const owned_path = try ctx.allocator.dupe(u8, path);
     errdefer ctx.allocator.free(owned_path);
-    const owned_old = try ctx.allocator.dupe(u8, old_value.string);
+    const owned_old = try ctx.allocator.dupe(u8, old);
     errdefer ctx.allocator.free(owned_old);
-    const owned_new = try ctx.allocator.dupe(u8, new_value.string);
+    const owned_new = try ctx.allocator.dupe(u8, new);
     errdefer ctx.allocator.free(owned_new);
     input.* = .{
         .path = owned_path,

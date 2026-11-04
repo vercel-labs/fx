@@ -219,6 +219,10 @@ class MeasurementResult:
     errors: tuple[str, ...]
     comparison: Comparison | None
     passed: bool
+    # The failed comparison from the first attempt, when the speed comparison
+    # was measured a second time. This result's own fields describe the second
+    # attempt, which decides.
+    first_attempt: Comparison | None = None
 
 
 class EvidenceRecorder:
@@ -515,6 +519,30 @@ def measure_alternating(
         comparison=comparison,
         passed=passed,
     )
+
+
+def measure_with_one_retry(
+    measure: Callable[[pathlib.Path], MeasurementResult],
+    logs: pathlib.Path,
+) -> MeasurementResult:
+    """Measure into `logs`, and again into `logs/retry` if only the speed comparison failed.
+
+    Shared CI runners have slow moments, and a few of them can push one
+    attempt's p95 past the limit while its median is faster. A real
+    regression fails the second attempt too, so the second attempt decides,
+    and the failed comparison stays in its result as `first_attempt`. A
+    result without a comparison, because a command failed, is final.
+    """
+    first = measure(logs)
+    if first.passed or first.comparison is None:
+        return first
+    emit_progress(
+        f"measuring again after a speed failure: {first.name} "
+        f"(p50 {first.comparison.p50_change:+.1%}, "
+        f"p95 {first.comparison.p95_change:+.1%})"
+    )
+    second = measure(logs / "retry")
+    return dataclasses.replace(second, first_attempt=first.comparison)
 
 
 def _external_control_link_argv(
@@ -855,10 +883,9 @@ def _measurement_environment(home: pathlib.Path) -> dict[str, str]:
         {
             "FX_AUTO_UPGRADE": "0",
             "FX_DISABLE_KEYCHAIN": "1",
-            "FX_SKIP_ONBOARDING": "1",
+            "FX_TEST_SKIP_ONBOARDING": "1",
             "FX_SOUND": "0",
             "HOME": str(home),
-            "NO_COLOR": "1",
         }
     )
     return environment
@@ -874,6 +901,7 @@ def measure_startup(
     samples: int,
     timeout_s: float,
     command_names: Sequence[str] | None = None,
+    retry_speed_failures: bool = True,
 ) -> tuple[MeasurementResult, ...]:
     home = output_dir / "home"
     logs = output_dir / "logs"
@@ -909,65 +937,68 @@ def measure_startup(
             if not result.stdout.strip():
                 raise PgsoError(f"startup command produced empty stdout: {command_name}")
 
-        samples_by_label: dict[str, list[float]] = {
-            "control": [],
-            "candidate": [],
-        }
-        for round_index, count in enumerate(round_samples, start=1):
-            order = (
-                (
-                    ("control", control_binary),
-                    ("candidate", candidate_binary),
-                )
-                if round_index % 2 == 1
-                else (
-                    ("candidate", candidate_binary),
-                    ("control", control_binary),
-                )
-            )
-            export_path = logs / f"{command_name}-round-{round_index}-samples.json"
-            benchmark_argv: list[str] = [
-                str(hyperfine_binary),
-                "--shell=none",
-                "--style",
-                "none",
-                "--warmup",
-                str(STARTUP_WARMUP_RUNS),
-                "--runs",
-                str(count),
-                "--export-json",
-                str(export_path),
-            ]
-            for label, binary in order:
-                benchmark_argv.extend(
+        def measure_command(attempt_logs: pathlib.Path) -> MeasurementResult:
+            attempt_logs.mkdir(parents=True, exist_ok=True)
+            samples_by_label: dict[str, list[float]] = {
+                "control": [],
+                "candidate": [],
+            }
+            for round_index, count in enumerate(round_samples, start=1):
+                order = (
                     (
-                        "--command-name",
-                        label,
-                        shlex.join((str(binary), *command_argv)),
+                        ("control", control_binary),
+                        ("candidate", candidate_binary),
+                    )
+                    if round_index % 2 == 1
+                    else (
+                        ("candidate", candidate_binary),
+                        ("control", control_binary),
                     )
                 )
-            run_checked(
-                benchmark_argv,
-                cwd=repo_root,
-                env=_measurement_environment(home),
-                timeout_s=timeout_s,
-                log_path=logs / f"{command_name}-round-{round_index}.json",
-                require_empty_stderr=False,
-            )
-            round_results = _read_hyperfine_samples(
-                export_path,
-                expected_samples=count,
-            )
-            for label, measured in round_results.items():
-                samples_by_label[label].extend(measured)
+                export_path = (
+                    attempt_logs / f"{command_name}-round-{round_index}-samples.json"
+                )
+                benchmark_argv: list[str] = [
+                    str(hyperfine_binary),
+                    "--shell=none",
+                    "--style",
+                    "none",
+                    "--warmup",
+                    str(STARTUP_WARMUP_RUNS),
+                    "--runs",
+                    str(count),
+                    "--export-json",
+                    str(export_path),
+                ]
+                for label, binary in order:
+                    benchmark_argv.extend(
+                        (
+                            "--command-name",
+                            label,
+                            shlex.join((str(binary), *command_argv)),
+                        )
+                    )
+                run_checked(
+                    benchmark_argv,
+                    cwd=repo_root,
+                    env=_measurement_environment(home),
+                    timeout_s=timeout_s,
+                    log_path=attempt_logs / f"{command_name}-round-{round_index}.json",
+                    require_empty_stderr=False,
+                )
+                round_results = _read_hyperfine_samples(
+                    export_path,
+                    expected_samples=count,
+                )
+                for label, measured in round_results.items():
+                    samples_by_label[label].extend(measured)
 
-        comparison = compare_samples(
-            samples_by_label["control"],
-            samples_by_label["candidate"],
-            minimum_samples=startup_samples,
-        )
-        results.append(
-            MeasurementResult(
+            comparison = compare_samples(
+                samples_by_label["control"],
+                samples_by_label["candidate"],
+                minimum_samples=startup_samples,
+            )
+            return MeasurementResult(
                 name=f"startup-{command_name}",
                 argv=command_argv,
                 requested_samples=startup_samples,
@@ -979,6 +1010,11 @@ def measure_startup(
                 comparison=comparison,
                 passed=comparison.passed,
             )
+
+        results.append(
+            measure_with_one_retry(measure_command, logs)
+            if retry_speed_failures
+            else measure_command(logs)
         )
     return tuple(results)
 
@@ -1133,52 +1169,46 @@ def measure_heavy_workloads(
                     raise PgsoError(
                         f"prebuilt benchmark {label} is missing: {binary}"
                     )
+        if plan.microbenchmark and hyperfine_binary is None:
+            raise PgsoError(
+                f"microbenchmark measurement requires Hyperfine: {plan.selector}"
+            )
         for workload in plan.workloads:
-            workload_logs = logs / workload.name
 
-            def sample_runner(
-                label: str,
-                binary: pathlib.Path,
-                argv: tuple[str, ...],
-                sample_index: int,
-            ) -> float:
-                result = run_checked(
-                    (str(binary), *argv),
-                    cwd=repo_root,
-                    env=_measurement_environment(home),
-                    timeout_s=timeout_s,
-                    log_path=(
-                        workload_logs
-                        / f"{sample_index:03d}-{label}.json"
-                    ),
-                    require_empty_stderr=True,
-                )
-                if not result.stdout.strip():
-                    raise PgsoError(
-                        f"heavy workload produced empty stdout: {workload.name}"
-                    )
-                return result.elapsed_seconds
-
-            if plan.microbenchmark:
-                if hyperfine_binary is None:
-                    raise PgsoError(
-                        f"microbenchmark measurement requires Hyperfine: {plan.selector}"
-                    )
-                results.append(
-                    _measure_microbenchmark(
+            def measure_workload(attempt_logs: pathlib.Path) -> MeasurementResult:
+                if plan.microbenchmark:
+                    return _measure_microbenchmark(
                         workload.name,
                         pair.control_binary,
                         pair.candidate_binary,
                         hyperfine_binary,
                         repo_root,
-                        workload_logs,
+                        attempt_logs,
                         samples,
                         timeout_s,
                     )
-                )
-                continue
-            results.append(
-                measure_alternating(
+
+                def sample_runner(
+                    label: str,
+                    binary: pathlib.Path,
+                    argv: tuple[str, ...],
+                    sample_index: int,
+                ) -> float:
+                    result = run_checked(
+                        (str(binary), *argv),
+                        cwd=repo_root,
+                        env=_measurement_environment(home),
+                        timeout_s=timeout_s,
+                        log_path=attempt_logs / f"{sample_index:03d}-{label}.json",
+                        require_empty_stderr=True,
+                    )
+                    if not result.stdout.strip():
+                        raise PgsoError(
+                            f"heavy workload produced empty stdout: {workload.name}"
+                        )
+                    return result.elapsed_seconds
+
+                return measure_alternating(
                     name=workload.name,
                     control_binary=pair.control_binary,
                     candidate_binary=pair.candidate_binary,
@@ -1186,7 +1216,8 @@ def measure_heavy_workloads(
                     samples=samples,
                     sample_runner=sample_runner,
                 )
-            )
+
+            results.append(measure_with_one_retry(measure_workload, logs / workload.name))
     return tuple(results)
 
 

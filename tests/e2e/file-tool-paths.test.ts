@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { EVAL_MODEL, HAS_API_KEY, runFx } from "../evals/eval-helpers";
 import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import { sessionDir } from "./saved-sessions";
-import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
+import { confirmationReplay, fakeGatewayHeldDecision, fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
 const TIMEOUT = 20_000;
 const MODEL = "openai/gpt-5";
@@ -174,6 +174,8 @@ function startFakeGateway(
 ) {
   const requests: GatewayRequest[] = [];
   const classifierRequests: GatewayRequest[] = [];
+  const confirmationRequests: GatewayRequest[] = [];
+  const confirmations = confirmationReplay();
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -186,8 +188,15 @@ function startFakeGateway(
       if (req.method !== "POST") return new Response("not found", { status: 404 });
       const body = await req.text();
       if (body.includes("\"permission_decision\"")) {
+        const confirmation = confirmations.replay(body);
+        if (confirmation) {
+          confirmationRequests.push({ body });
+          return confirmation;
+        }
         classifierRequests.push({ body });
-        return permissionDecision(options.classifierDecision);
+        return confirmations.record(body, options.classifierDecision === "caution"
+          ? fakeGatewayHeldDecision()(body)
+          : permissionDecision(options.classifierDecision));
       }
       if (body.includes(TITLE_GENERATION_MARKER)) return fakeGatewayTitleDefault();
       requests.push({ body });
@@ -204,6 +213,7 @@ function startFakeGateway(
     chatUrl: `http://127.0.0.1:${server.port}/v4/ai/language-model`,
     requests,
     classifierRequests,
+    confirmationRequests,
     remainingResponseCount() {
       return responses.length;
     },
@@ -242,8 +252,8 @@ function gatewayEnv(
     VERCEL_OIDC_TOKEN: undefined,
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
     FX_MODEL: MODEL,
     FX_AUTO_UPGRADE: "0",
     ...extra,

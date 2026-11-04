@@ -1,5 +1,6 @@
 const std = @import("std");
 const observation = @import("observation.zig");
+const cache_warmer = @import("cache_warmer.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
 const agent_stream_provider = @import("../stream_provider.zig");
 const auth_runtime = @import("../../auth/auth_runtime.zig");
@@ -159,24 +160,6 @@ pub const OutOfCreditsChoice = enum {
     cancel,
 };
 
-pub const ParentTurnDeliveryAck = struct {
-    child_id: []const u8,
-    target_session_id: []const u8,
-    through_sequence: u64,
-    delivery_id: []const u8,
-    start_offset: u64,
-    total_bytes: u64,
-};
-
-/// Slices are owned by the allocator passed to `prepare_parent_turn_context`
-/// and remain valid until that allocator is reset or deinitialized. The caller
-/// must finish every acknowledgement callback before ending that lifetime;
-/// acknowledgement callbacks borrow these slices only for the callback.
-pub const PreparedParentTurnContext = struct {
-    content: []const u8,
-    acknowledgements: []const ParentTurnDeliveryAck,
-};
-
 pub const CredentialRefreshMode = auth_runtime.CredentialRefreshMode;
 
 /// Ordered text emitted by the agent runtime. Payloads are borrowed for the
@@ -220,9 +203,6 @@ pub const AgentRuntimeDeps = struct {
         kind: worker_runtime.SteeringBoundaryKind,
     ) anyerror!worker_runtime.SteeringBoundaryResult = null,
     release_agent_terminal_lease: *const fn (ctx: *anyopaque, session_id: []const u8) anyerror!void = terminalLeaseCleanupUnavailable,
-    wait_for_subagent: ?*const fn (ctx: *anyopaque, turn_id: u64, step_id: u64) anyerror!bool = null,
-    prepare_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator) anyerror!?PreparedParentTurnContext = null,
-    acknowledge_parent_turn_context: ?*const fn (ctx: *anyopaque, arena: Allocator, acknowledgements: []const ParentTurnDeliveryAck) void = null,
     append_runtime_context: *const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void,
     append_static_context: ?*const fn (ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) anyerror!void = null,
     validate_tool_call: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall) anyerror!ToolCallValidationResult = null,
@@ -264,6 +244,10 @@ pub const AgentRuntimeDeps = struct {
     /// as it arrives, so a saved session keeps the usage of every reply even
     /// when the turn never ends. A failure is traced and never fails the turn.
     record_usage: ?*const fn (ctx: *anyopaque, usage: types.Usage) anyerror!void = null,
+    /// Keeps the conversation's Claude prompt cache warm between requests.
+    /// Owned by the conversation's `SessionRuntime`; null where no one waits
+    /// on the conversation, as in `fx ask` and subagents.
+    cache_warmer: ?*cache_warmer.Warmer = null,
     /// Saves the turn's prompt images in the session before its first
     /// request is built, so the note naming each saved file is true when
     /// that request is sent (D89). It sets `blob_path`, allocated with
