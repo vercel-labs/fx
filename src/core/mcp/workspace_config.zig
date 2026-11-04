@@ -5,28 +5,40 @@ const project_config = @import("project_config.zig");
 
 const max_config_bytes: usize = 1024 * 1024;
 
+/// The workspace's `.mcp.json` bytes: a regular file of at most 1 MiB, never
+/// through a symlink or a hard link, so a FIFO or a device in a cloned repo
+/// can't block the read. Null when there is none, and
+/// `error.UnreadableConfig` when it exists but fx won't read it. Caller owns
+/// the bytes.
+pub fn readFile(alloc: std.mem.Allocator, workspace_root: []const u8) !?[]u8 {
+    var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), workspace_root, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return err,
+    };
+    defer dir.close(io_mod.getIo());
+    var file = io_mod.openExistingRegularFile(dir, ".mcp.json", .read_only) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return error.UnreadableConfig,
+    };
+    defer file.close(io_mod.getIo());
+    const stat = try file.stat(io_mod.getIo());
+    if (stat.size > max_config_bytes) return error.UnreadableConfig;
+    return io_mod.readFileToEnd(alloc, &file, max_config_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.UnreadableConfig,
+    };
+}
+
 pub fn load(
     alloc: std.mem.Allocator,
     workspace_root: []const u8,
     scope: mcp_contract.ConfigScope,
     choices: project_config.ProjectMcpChoices,
 ) !project_config.WorkspaceParseResult {
-    var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), workspace_root, .{}) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => return .{},
-        else => return err,
-    };
-    defer dir.close(io_mod.getIo());
-    var file = io_mod.openExistingRegularFile(dir, ".mcp.json", .read_only) catch |err| switch (err) {
-        error.FileNotFound => return .{},
-        else => return invalidResult(alloc),
-    };
-    defer file.close(io_mod.getIo());
-    const stat = try file.stat(io_mod.getIo());
-    if (stat.size > max_config_bytes) return invalidResult(alloc);
-    const bytes = io_mod.readFileToEnd(alloc, &file, max_config_bytes) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return invalidResult(alloc),
-    };
+    const bytes = (readFile(alloc, workspace_root) catch |err| switch (err) {
+        error.UnreadableConfig => return invalidResult(alloc),
+        else => |e| return e,
+    }) orelse return .{};
     defer alloc.free(bytes);
     var result = try project_config.parseWorkspaceJson(
         alloc,

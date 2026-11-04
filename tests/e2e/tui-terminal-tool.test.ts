@@ -171,7 +171,7 @@ function askEnv(
     AI_GATEWAY_API_KEY: "fake-shell-tool-key",
     VERCEL_OIDC_TOKEN: undefined,
     FX_DISABLE_KEYCHAIN: "1",
-    FX_SKIP_ONBOARDING: "1",
+    FX_TEST_SKIP_ONBOARDING: "1",
     FX_AUTO_UPGRADE: "0",
     FX_PERMISSION_MODE: "yolo",
     FX_MODEL: FAKE_GATEWAY_MODEL,
@@ -425,7 +425,7 @@ test.skipIf(!tmuxAvailable())(
       "shell_stubborn_stop",
     );
     expect(stopResult).toContain('\\"state\\":\\"stopped\\"');
-    expect(stopResult).toContain('\\"termination_indeterminate\\":false');
+    expect(stopResult).not.toContain("termination_indeterminate");
     expect(toolResultEnvelope(
       gateway.requests[3]!.body,
       "shell_after_stop",
@@ -1054,7 +1054,7 @@ test.skipIf(!tmuxAvailable())(
     );
     expect(waitResult).toContain('\\"state\\":\\"completed\\"');
     expect(waitResult).toContain('\\"error\\":\\"TimeoutExpired\\"');
-    expect(waitResult).toContain('\\"termination_indeterminate\\":false');
+    expect(waitResult).not.toContain("termination_indeterminate");
     const record = terminalRecords(fixture.home).find((candidate) =>
       candidate.session_id === sessionId
     );
@@ -1135,7 +1135,7 @@ test.skipIf(!tmuxAvailable())(
     const resumed = await launch(
       fixture,
       gateway,
-      `${FX_BIN} --resume-last`,
+      `${FX_BIN} --resume last`,
     );
     await resumed.sendText("Use the earlier managed TTY.");
     await resumed.waitForText("SHELL_TTY_RESUME_OK", TIMEOUT);

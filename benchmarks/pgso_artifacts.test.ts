@@ -189,10 +189,10 @@ async function runCohort(inputs: Inputs, cohort: Cohort): Promise<Record<Scenari
             const result = await runCommand(argv, { cwd: workspace, env: {
               PATH: process.env.PATH ?? "", TMPDIR: fixture, LANG: "en_US.UTF-8", TZ: "UTC", HOME: home,
               AI_GATEWAY_API_KEY: "synthetic-memory-fixture", VERCEL_OIDC_TOKEN: "",
-              FX_DISABLE_KEYCHAIN: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_SKIP_ONBOARDING: "1",
+              FX_DISABLE_KEYCHAIN: "1", FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_TEST_SKIP_ONBOARDING: "1",
               FX_E2E_DISABLE_DOTENV: "1", FX_MODEL: FAKE_GATEWAY_MODEL,
               FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-              FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+              FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
             } });
             const requests = gateway.requests.map((request) => request.body);
             const { resources, resourceError } = cohort.kind === "memory" ? resourceOutput(resourcePath) : { resources: null, resourceError: null };

@@ -1,5 +1,7 @@
 const std = @import("std");
 const domain = @import("domain.zig");
+const profiles = @import("../profiles/profiles.zig");
+const reports = @import("reports.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const session_adapter = @import("../session/session_adapter.zig");
@@ -49,6 +51,18 @@ pub const Phase = enum { idle, running, awaiting_approval, interrupted, finished
 /// v2 parent's reopen repair records it (D33).
 pub const Outcome = enum { completed, failed, cancelled, interrupted, lost };
 
+/// Why a work ended cancelled, when fx knows: the user stopped its turn,
+/// or fx quit while it ran.
+pub const Cause = enum { user_stop, fx_quit };
+
+/// Who started a finished work and why it was cancelled. A finish that
+/// owes a report saves them, so a report posted after a restart still
+/// says so.
+pub const EndFacts = struct {
+    started_by: reports.StartedBy = .parent,
+    cause: ?Cause = null,
+};
+
 pub const ActiveWork = struct {
     id: []u8,
     request_fingerprint: [32]u8 = @splat(0),
@@ -58,6 +72,9 @@ pub const ActiveWork = struct {
     root_user_evidence_complete: bool = false,
     permission_mode: types.PermissionMode = .yolo,
     created_at_ms: i64,
+    /// Who started the work: its parent's message, or a turn the user typed
+    /// on the child's screen or its own child's report woke.
+    started_by: reports.StartedBy = .parent,
 
     pub fn deinit(self: *ActiveWork, alloc: Allocator) void {
         alloc.free(self.id);
@@ -85,6 +102,7 @@ pub const ActiveWork = struct {
             .root_user_evidence_complete = self.root_user_evidence_complete,
             .permission_mode = self.permission_mode,
             .created_at_ms = self.created_at_ms,
+            .started_by = self.started_by,
         };
     }
 
@@ -130,9 +148,22 @@ pub const Child = struct {
     last_request_fingerprint: ?[32]u8 = null,
     last_outcome: ?Outcome = null,
     last_failure: ?types.ModelFailureDiagnostic = null,
+    /// Whether the last finished work owes the parent a report, recorded
+    /// on its `child_finished` line.
+    last_report_owed: bool = false,
+    /// Who started the last finished work and why it was cancelled, kept
+    /// only when it owes a report.
+    last_end: EndFacts = .{},
+    /// When the child reports back on its own. Set by its parent's
+    /// messages, and recorded on each spawn line.
+    report_rule: reports.Rule = .final,
+    /// The agent profile the child started in, or null for fx's `agent`.
+    /// Fixed when the child is created. Owned.
+    profile: ?[]u8 = null,
 
     pub fn deinit(self: *Child, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.profile) |name| alloc.free(name);
         switch (self.kind) {
             .one_off => {},
             .persistent => |*persistent| persistent.deinit(alloc),
@@ -155,16 +186,22 @@ pub const Child = struct {
         };
         var active = if (self.active) |value| try value.clone(alloc) else null;
         errdefer if (active) |*value| value.deinit(alloc);
+        const profile = if (self.profile) |name| try alloc.dupe(u8, name) else null;
+        errdefer if (profile) |name| alloc.free(name);
         return .{
             .id = id,
             .kind = kind,
             .phase = self.phase,
+            .profile = profile,
             .work_generation = self.work_generation,
             .active = active,
             .last_work_id = if (self.last_work_id) |value| try alloc.dupe(u8, value) else null,
             .last_request_fingerprint = self.last_request_fingerprint,
             .last_outcome = self.last_outcome,
             .last_failure = self.last_failure,
+            .last_report_owed = self.last_report_owed,
+            .last_end = self.last_end,
+            .report_rule = self.report_rule,
         };
     }
 
@@ -225,6 +262,21 @@ pub const Registry = struct {
             if (std.mem.eql(u8, child.id, child_id)) return child;
         }
         return null;
+    }
+
+    /// Records the profile a new child started in. A child keeps it for life.
+    pub fn setProfile(self: *Registry, alloc: Allocator, child_id: []const u8, name: []const u8) !void {
+        if (!profiles.validName(name)) return error.InvalidState;
+        const child = self.findById(child_id) orelse return error.InvalidState;
+        if (child.profile != null) return error.InvalidState;
+        child.profile = try alloc.dupe(u8, name);
+    }
+
+    pub fn setReportRule(self: *Registry, child_id: []const u8, rule: reports.Rule) !void {
+        const child = self.findById(child_id) orelse return error.InvalidState;
+        if (child.report_rule == rule) return;
+        child.report_rule = rule;
+        self.generation +|= 1;
     }
 
     pub fn findPersistent(self: *Registry, agent: []const u8) ?*Child {
@@ -372,6 +424,21 @@ pub const Registry = struct {
         outcome: Outcome,
         failure: ?types.ModelFailureDiagnostic,
     ) !void {
+        return self.finishWithReport(alloc, child_id, work_id, outcome, failure, false, .{});
+    }
+
+    /// Finishes `work_id`, recording whether its end owes the parent a
+    /// report (`reports.reportable`), and for one that does, `end`.
+    pub fn finishWithReport(
+        self: *Registry,
+        alloc: Allocator,
+        child_id: []const u8,
+        work_id: []const u8,
+        outcome: Outcome,
+        failure: ?types.ModelFailureDiagnostic,
+        report_owed: bool,
+        end: EndFacts,
+    ) !void {
         const child = self.findById(child_id) orelse return error.ChildNotFound;
         const active = child.active orelse return error.StaleWork;
         if (!std.mem.eql(u8, active.id, work_id)) return error.StaleWork;
@@ -382,6 +449,8 @@ pub const Registry = struct {
         child.last_request_fingerprint = active.request_fingerprint;
         child.last_outcome = outcome;
         child.last_failure = failure;
+        child.last_report_owed = report_owed;
+        child.last_end = if (report_owed) end else .{};
         child.active.?.deinit(alloc);
         child.active = null;
         child.phase = switch (child.kind) {
@@ -600,12 +669,146 @@ const SpawnData = struct {
     /// A named child's name; null for a one-off.
     agent: ?[]const u8 = null,
     fingerprint: []const u8,
+    /// The agent profile the child started in; null for fx's `agent`.
+    profile: ?[]const u8 = null,
+    /// Its report rule. This fx writes it on every spawn, which also marks
+    /// the work as one whose end owes its parent a report, so a crash that
+    /// repair closes as interrupted still reports (`spawnNamesRule`). Older
+    /// fx and converted v1 sessions never write it; a name this fx does not
+    /// know reads as `final`.
+    report: ?[]const u8 = null,
+    /// Who started a work its parent didn't: `user` or `child`. Crash
+    /// repair's finish carries no fx data, so its report reads this.
+    by: ?[]const u8 = null,
 };
 
-/// fx's data on a `child_finished` line.
+/// A spawn line's data. `rule` is null only for a converted v1 session,
+/// whose works owe no report, and then the line is written as before
+/// report rules existed.
+fn spawnData(arena: Allocator, agent: ?[]const u8, fingerprint: []const u8, profile: ?[]const u8, rule: ?reports.Rule, by: reports.StartedBy) ![]const u8 {
+    return stringifyAlloc(arena, SpawnData{
+        .agent = agent,
+        .fingerprint = fingerprint,
+        .profile = profile,
+        .report = if (rule) |value| @tagName(value) else null,
+        .by = if (by == .parent) null else @tagName(by),
+    });
+}
+
+/// Pure: who started the work a `child_spawned` line's `data` opens. A
+/// line without `by`, or one this fx can't read, is the parent's.
+pub fn spawnStartedBy(data: ?[]const u8) reports.StartedBy {
+    const bytes = data orelse return .parent;
+    var buf: [256]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const Wire = struct { by: ?[]const u8 = null };
+    const wire = json_decode.parseFromSliceLeaky(Wire, fba.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return .parent;
+    return endFactsOf(wire.by, null).started_by;
+}
+
+/// Whether a `child_spawned` line's data names a report rule: the work was
+/// started by fx that owes reports. Unreadable data names none.
+pub fn spawnNamesRule(data: ?[]const u8) bool {
+    const bytes = data orelse return false;
+    var buf: [256]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const Wire = struct { report: ?[]const u8 = null };
+    const wire = std.json.parseFromSliceLeaky(Wire, fba.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return false;
+    return wire.report != null;
+}
+
+/// A `child_finished` line's `report` flag: true when its work owes a
+/// report, false when the line says it owes none, and null when the line
+/// carries no fx data, as a finish the manager's crash repair writes.
+pub fn finishOwesFlag(data: ?[]const u8) ?bool {
+    const bytes = data orelse return null;
+    var buf: [256]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const Wire = struct { report: ?bool = null };
+    const wire = std.json.parseFromSliceLeaky(Wire, fba.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return false;
+    return wire.report orelse false;
+}
+
+/// fx's data on a `child_finished` line. Older fx skips `report`, and a
+/// line without it owes nothing, so an upgrade wakes no parent. `by` names
+/// who started a work the parent didn't, and `cause` why it was
+/// cancelled; a line that owes no report has neither.
 const FinishData = struct {
     failure: ?[]const u8 = null,
+    report: ?bool = null,
+    by: ?[]const u8 = null,
+    cause: ?[]const u8 = null,
 };
+
+/// Pure: the facts a finish line's `by` and `cause` name. A value this fx
+/// doesn't know reads as the default.
+fn endFactsOf(by: ?[]const u8, cause: ?[]const u8) EndFacts {
+    return .{
+        .started_by = if (by) |name| std.meta.stringToEnum(reports.StartedBy, name) orelse .parent else .parent,
+        .cause = if (cause) |name| std.meta.stringToEnum(Cause, name) else null,
+    };
+}
+
+/// Pure: who started the work a `child_finished` line's `data` ends, and
+/// why it was cancelled.
+pub fn finishEndFacts(data: ?[]const u8) EndFacts {
+    const bytes = data orelse return .{};
+    var buf: [256]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const Wire = struct { by: ?[]const u8 = null, cause: ?[]const u8 = null };
+    const wire = std.json.parseFromSliceLeaky(Wire, fba.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return .{};
+    return endFactsOf(wire.by, wire.cause);
+}
+
+/// The data for a finish with `failure` and `report_owed`, or null when it
+/// has neither, so a finish that owes nothing is written as before.
+fn finishData(arena: Allocator, failure: ?[]const u8, report_owed: bool, end: EndFacts) !?[]const u8 {
+    if (failure == null and !report_owed) return null;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(
+        FinishData{
+            .failure = failure,
+            .report = if (report_owed) true else null,
+            .by = if (report_owed and end.started_by != .parent) @tagName(end.started_by) else null,
+            .cause = if (!report_owed) null else if (end.cause) |cause| @tagName(cause) else null,
+        },
+        .{ .emit_null_optional_fields = false },
+        &out.writer,
+    );
+    return out.written();
+}
+
+test "a finish that owes a report saves who started its work and why it was cancelled" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const end: EndFacts = .{ .started_by = .user, .cause = .fx_quit };
+    try std.testing.expectEqual(end, finishEndFacts((try finishData(arena, null, true, end)).?));
+    // A finish that owes nothing is written as before, and saves neither.
+    try std.testing.expect((try finishData(arena, null, false, end)) == null);
+    try std.testing.expectEqual(EndFacts{}, finishEndFacts((try finishData(arena, "boom", false, end)).?));
+    // The parent's own work writes no `by`.
+    try std.testing.expect(std.mem.find(u8, (try finishData(arena, null, true, .{})).?, "by") == null);
+    // An older fx's line, a value this fx doesn't know, and no data read as unknown.
+    try std.testing.expectEqual(EndFacts{}, finishEndFacts("{\"report\":true}"));
+    try std.testing.expectEqual(EndFacts{}, finishEndFacts("{\"report\":true,\"by\":\"robot\",\"cause\":\"meteor\"}"));
+    try std.testing.expectEqual(EndFacts{}, finishEndFacts(null));
+}
+
+test "a spawn saves who started a work its parent didn't" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_]reports.StartedBy{ .user, .child, .parent }) |by| {
+        try std.testing.expectEqual(by, spawnStartedBy(try spawnData(arena, "reviewer", "ab", null, .final, by)));
+    }
+    // The parent's own work names no one in `by`.
+    try std.testing.expect(std.mem.find(u8, try spawnData(arena, "reviewer", "ab", null, .final, .parent), "\"by\":\"") == null);
+    // An older fx's line, a value this fx doesn't know, and no data read as the parent's.
+    try std.testing.expectEqual(reports.StartedBy.parent, spawnStartedBy("{\"fingerprint\":\"ab\",\"report\":\"final\"}"));
+    try std.testing.expectEqual(reports.StartedBy.parent, spawnStartedBy("{\"by\":\"robot\"}"));
+    try std.testing.expectEqual(reports.StartedBy.parent, spawnStartedBy(null));
+}
 
 /// Pure: the registry a v2 parent's folded children describe. The
 /// manager's reopen repair has finished every open item, so an open one
@@ -658,9 +861,16 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
         if (!domain.validAgentName(agent)) return error.InvalidState;
         kind = .{ .persistent = .{ .agent = try alloc.dupe(u8, agent), .instructions = &.{} } };
     }
+    errdefer switch (kind) {
+        .one_off => {},
+        .persistent => |*persistent| persistent.deinit(alloc),
+    };
+    if (spawn.profile) |name| if (!profiles.validName(name)) return error.InvalidState;
+    const profile = if (spawn.profile) |name| try alloc.dupe(u8, name) else null;
     return .{
         .id = id,
         .kind = kind,
+        .profile = profile,
         .phase = switch (last_outcome) {
             .interrupted, .lost => .interrupted,
             .completed, .failed, .cancelled => switch (kind) {
@@ -673,6 +883,9 @@ fn childFromFolded(alloc: Allocator, entry: session_adapter.Child) !Child {
         .last_request_fingerprint = fingerprint,
         .last_outcome = last_outcome,
         .last_failure = if (finish.failure) |text| types.ModelFailureDiagnostic.init(text) else null,
+        .last_report_owed = finish.report orelse false,
+        .last_end = if (finish.report orelse false) endFactsOf(finish.by, finish.cause) else .{},
+        .report_rule = if (spawn.report) |name| std.meta.stringToEnum(reports.Rule, name) orelse .final else .final,
     };
 }
 
@@ -695,7 +908,7 @@ fn planLines(arena: Allocator, old: Registry, next: Registry) ![]session_adapter
                     .child = after.id,
                     .work_id = work_id,
                     .outcome = try v2Outcome(after.last_outcome orelse return error.InvalidState),
-                    .data = if (after.last_failure) |failure| try stringifyAlloc(arena, FinishData{ .failure = failure.view() }) else null,
+                    .data = try finishData(arena, if (after.last_failure) |failure| failure.view() else null, after.last_report_owed, after.last_end),
                 } });
             }
         }
@@ -705,7 +918,7 @@ fn planLines(arena: Allocator, old: Registry, next: Registry) ![]session_adapter
                 try lines.append(arena, .{ .spawned = .{
                     .child = after.id,
                     .work_id = work_id,
-                    .data = try stringifyAlloc(arena, SpawnData{ .agent = after.agentName(), .fingerprint = &fingerprint }),
+                    .data = try spawnData(arena, after.agentName(), &fingerprint, after.profile, after.report_rule, after.active.?.started_by),
                 } });
             }
         }
@@ -739,13 +952,13 @@ pub fn v1ImportLines(arena: Allocator, registry: Registry, has_log: []const bool
         try lines.append(arena, .{ .spawned = .{
             .child = child.id,
             .work_id = work_id,
-            .data = try stringifyAlloc(arena, SpawnData{ .agent = child.agentName(), .fingerprint = fingerprint }),
+            .data = try spawnData(arena, child.agentName(), fingerprint, null, null, .parent),
         } });
         try lines.append(arena, .{ .finished = .{
             .child = child.id,
             .work_id = work_id,
             .outcome = outcome,
-            .data = if (failure) |text| try stringifyAlloc(arena, FinishData{ .failure = text }) else null,
+            .data = try finishData(arena, failure, false, .{}),
         } });
     }
     return lines.toOwnedSlice(arena);
@@ -768,7 +981,7 @@ fn stringifyAlloc(arena: Allocator, value: anytype) ![]const u8 {
     return out.written();
 }
 
-fn fxOutcome(outcome: session_adapter.ChildOutcome) Outcome {
+pub fn fxOutcome(outcome: session_adapter.ChildOutcome) Outcome {
     return switch (outcome) {
         .ok => .completed,
         .failed => .failed,
@@ -1372,6 +1585,74 @@ test "a v2 registry change writes only the child lines it implies (D22)" {
     try std.testing.expectError(error.InvalidState, planLines(a, old, lost));
 }
 
+test "a finish that owes a report says so on its line, and the fold reads it back" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parent_id = "01J00000000000000000000000";
+    const named = "01J00000000000000000000002";
+    var old = try Registry.init(alloc, parent_id);
+    defer old.deinit(alloc);
+    var next = try old.clone(alloc);
+    var first = try testWork(alloc, "work-1", 0xab);
+    defer first.deinit(alloc);
+    try next.appendPersistent(alloc, named, "reviewer", "", first);
+    advance(alloc, &old, next);
+
+    // Owed, with and without a failure; a failure alone is written as before.
+    const cases = [_]struct { failure: ?[]const u8, owed: bool, data: ?[]const u8 }{
+        .{ .failure = null, .owed = true, .data = "{\"report\":true}" },
+        .{ .failure = "boom", .owed = true, .data = "{\"failure\":\"boom\",\"report\":true}" },
+        .{ .failure = "boom", .owed = false, .data = "{\"failure\":\"boom\"}" },
+        .{ .failure = null, .owed = false, .data = null },
+    };
+    for (cases, 0..) |case, index| {
+        const work_id = try a.print("work-{d}", .{index + 1});
+        next = try old.clone(alloc);
+        const outcome: Outcome = if (case.failure != null) .failed else .completed;
+        const failure: ?types.ModelFailureDiagnostic = if (case.failure) |text| types.ModelFailureDiagnostic.init(text) else null;
+        try next.finishWithReport(alloc, named, work_id, outcome, failure, case.owed, .{});
+        var copy = try next.children[0].clone(alloc);
+        defer copy.deinit(alloc);
+        try std.testing.expectEqual(case.owed, copy.last_report_owed);
+        var later = try testWork(alloc, try a.print("work-{d}", .{index + 2}), 0xcd);
+        defer later.deinit(alloc);
+        _ = try next.startPersistentWork(alloc, "reviewer", null, later);
+        const lines = try planLines(a, old, next);
+        if (case.data) |data| {
+            try std.testing.expectEqualStrings(data, lines[0].finished.data.?);
+        } else {
+            try std.testing.expect(lines[0].finished.data == null);
+        }
+        advance(alloc, &old, next);
+    }
+
+    // The fold reads the flag back; a line older fx wrote owes nothing.
+    const fingerprint = text_utils.repeat("ab", 32);
+    const spawn = "{\"agent\":\"reviewer\",\"fingerprint\":\"" ++ fingerprint ++ "\"}";
+    const folds = [_]struct { outcome: session_adapter.ChildOutcome, data: ?[]const u8, owed: bool }{
+        .{ .outcome = .ok, .data = "{\"report\":true}", .owed = true },
+        .{ .outcome = .failed, .data = "{\"failure\":\"boom\",\"report\":true}", .owed = true },
+        .{ .outcome = .failed, .data = "{\"failure\":\"boom\"}", .owed = false },
+        .{ .outcome = .ok, .data = null, .owed = false },
+    };
+    for (folds) |fold| {
+        const entry = session_adapter.Child{
+            .id = @constCast(named),
+            .work_id = @constCast("w1"),
+            .open = false,
+            .outcome = fold.outcome,
+            .spawn_data = @constCast(spawn),
+            .finish_data = if (fold.data) |data| @constCast(data) else null,
+            .seq = 3,
+        };
+        var registry = try registryFromChildren(alloc, parent_id, &.{entry});
+        defer registry.deinit(alloc);
+        try std.testing.expectEqual(fold.owed, registry.children[0].last_report_owed);
+    }
+}
+
 test "a v2 parent's folded children rebuild the registry v1 would hold (D22)" {
     const alloc = std.testing.allocator;
     const parent_id = "01J00000000000000000000000";
@@ -1479,4 +1760,58 @@ test "v2 children live in the parent's log and come back after a reopen (D22)" {
     try std.testing.expectEqualStrings("work-1", child.last_work_id.?);
     try std.testing.expectEqual(Outcome.completed, child.last_outcome.?);
     try std.testing.expectEqual(@as([32]u8, @splat(0x11)), child.last_request_fingerprint.?);
+}
+
+test "a v2 child keeps the profile it started in after a reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var store = try session_adapter.Store.open(alloc, home);
+    defer store.deinit(alloc);
+    var model = "test-model".*;
+    const seed: session_adapter.Seed = .{
+        .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
+        .language = types.ConversationLanguage.default(),
+        .permission_state = .{},
+    };
+    const parent = try session_adapter.Session.create(alloc, &store, "/w", .ask, seed);
+    var parent_open = true;
+    defer if (parent_open) parent.close();
+    try parent.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("delegate") }, .assistant = @constCast("ok") } }, types.ConversationLanguage.default());
+    const parent_id = try alloc.dupe(u8, parent.id());
+    defer alloc.free(parent_id);
+    const child_id = "1786460757753-kid";
+    {
+        var children = V2Children.init(alloc, parent, "/w");
+        defer children.deinit();
+        const state_store = Store{ .children = &children, .parent_id = parent_id };
+        var lock = state_store.acquireLock();
+        defer lock.release();
+        var registry = try state_store.load(alloc);
+        defer registry.deinit(alloc);
+        var work = try testWork(alloc, "work-1", 0x11);
+        defer work.deinit(alloc);
+        try registry.appendPersistent(alloc, child_id, "reviewer", "", work);
+        try std.testing.expectError(error.InvalidState, registry.setProfile(alloc, child_id, "Bad Name"));
+        try registry.setProfile(alloc, child_id, "reviewer");
+        try std.testing.expectError(error.InvalidState, registry.setProfile(alloc, child_id, "other"));
+        var copy = try registry.children[0].clone(alloc);
+        defer copy.deinit(alloc);
+        try std.testing.expectEqualStrings("reviewer", copy.profile.?);
+        try state_store.save(alloc, registry);
+    }
+    parent.close();
+    parent_open = false;
+
+    const reopened = try session_adapter.Session.resumeSession(alloc, &store, .{ .id = parent_id }, "/w", .ask);
+    defer reopened.close();
+    var children = V2Children.init(alloc, reopened, "/w");
+    defer children.deinit();
+    const state_store = Store{ .children = &children, .parent_id = parent_id };
+    var registry = try state_store.load(alloc);
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), registry.children.len);
+    try std.testing.expectEqualStrings("reviewer", registry.children[0].profile.?);
 }

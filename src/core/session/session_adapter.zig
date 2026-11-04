@@ -38,9 +38,12 @@ const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const builtin = @import("builtin");
 const sm = @import("session_manager");
+/// A line boundary in a session log, for hosts that walk it.
+pub const LogCursor = sm.Cursor;
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
+const agent_frame = @import("../shared/agent_frame.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const image_data = @import("../images/image_data.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -113,6 +116,14 @@ fn freeChild(alloc: Allocator, child: Child) void {
     if (child.finish_data) |data| alloc.free(data);
 }
 
+/// One fact about a subagent's report in its parent's log (`reportLines`).
+pub const ReportLine = union(enum) {
+    spawned: struct { child: []const u8, work_id: []const u8, data: ?[]const u8 },
+    finished: struct { child: []const u8, work_id: []const u8, outcome: ChildOutcome, data: ?[]const u8 },
+    /// The parent took the report for this work into its history.
+    taken: struct { child: []const u8, work_id: []const u8 },
+};
+
 /// A line about a child, appended through its parent.
 pub const ChildLine = union(enum) {
     spawned: struct { child: []const u8, work_id: []const u8, data: ?[]const u8 = null },
@@ -172,12 +183,7 @@ pub const Store = struct {
         };
         errdefer alloc.free(owned_home);
         try checkSessionsPath(owned_home);
-        const root = try std.Io.Dir.path.join(alloc, &.{
-            home,
-            profile_paths.root_dir_name,
-            profile_paths.sessions_dir_name,
-            session_layout.sessions_v2_dir,
-        });
+        const root = try profile_paths.rootPath(alloc, home, &.{ profile_paths.sessions_dir_name, session_layout.sessions_v2_dir });
         defer alloc.free(root);
         const manager = try sm.Manager.init(alloc, io_mod.getIo(), .{
             .root = root,
@@ -193,12 +199,13 @@ pub const Store = struct {
     /// (D67): every write would fail on it. One that is missing is made by
     /// the first write; one that others can read converts (D61).
     fn checkSessionsPath(home: []const u8) !void {
-        var parent = openHome(home) catch |err| switch (err) {
+        // Start from the folder that holds fx's folder, so FX_HOME is checked.
+        var parent = openHome(profile_paths.rootParent(home)) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
         defer parent.close();
-        for ([_][]const u8{ profile_paths.root_dir_name, profile_paths.sessions_dir_name, session_layout.sessions_v2_dir }) |name| {
+        for ([_][]const u8{ profile_paths.rootName(), profile_paths.sessions_dir_name, session_layout.sessions_v2_dir }) |name| {
             const next = (io_mod.openRealDirIfPresent(&parent, name) catch |err| switch (err) {
                 error.DurablePathUnsafe => return error.SessionPathUnsafe,
                 else => return err,
@@ -227,13 +234,13 @@ pub const Store = struct {
     /// install script keeps the default mode, and refusing it would refuse
     /// every resume.
     fn openProfileFolder(store: *Store, name: []const u8) !?io_mod.VerifiedDir {
-        var home = try openHome(store.home);
+        var home = try openHome(profile_paths.rootParent(store.home));
         defer home.close();
-        _ = home.dir.statFile(io_mod.getIo(), profile_paths.root_dir_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        _ = home.dir.statFile(io_mod.getIo(), profile_paths.rootName(), .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
-        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name);
+        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.rootName());
         defer fx.close();
         return io_mod.openVerifiedPrivateDirIfPresent(&fx, name);
     }
@@ -241,9 +248,9 @@ pub const Store = struct {
     /// `~/.fx/{name}`, made `0700` when missing; `~/.fx` too, as v1's
     /// writable root makes it.
     fn makeProfileFolder(store: *Store, name: []const u8) !io_mod.VerifiedDir {
-        var home = try openHome(store.home);
+        var home = try openHome(profile_paths.rootParent(store.home));
         defer home.close();
-        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.root_dir_name);
+        var fx = try io_mod.openOrCreateVerifiedPrivateDir(&home, profile_paths.rootName());
         defer fx.close();
         return io_mod.openOrCreateVerifiedPrivateDir(&fx, name);
     }
@@ -1257,6 +1264,8 @@ pub const Session = struct {
     /// only these.
     root: bool = true,
     titled: bool = false,
+    /// Set once this open handed out its owed reports (`pendingReportLines`).
+    reports_handed_out: bool = false,
     /// A resumed session with no title: the title its first prompt gives,
     /// owned, written with its next turn end (D52).
     first_title: ?[]u8 = null,
@@ -1460,7 +1469,7 @@ pub const Session = struct {
     }
 
     fn init(alloc: Allocator, store: *Store, handle: sm.Session, fresh: bool) !*Session {
-        const files_path = try std.Io.Dir.path.join(alloc, &.{ store.home, profile_paths.root_dir_name, files_dir_name, handle.id() });
+        const files_path = try profile_paths.rootPath(alloc, store.home, &.{ files_dir_name, handle.id() });
         errdefer alloc.free(files_path);
         const host = try BlobHost.create(alloc, store, handle);
         errdefer BlobHost.release(host);
@@ -1529,13 +1538,7 @@ pub const Session = struct {
 
     /// The session's folder under `~/.fx/sessions/v2`, for display. Caller owns it.
     pub fn folderPath(self: *const Session, alloc: Allocator) ![]u8 {
-        return std.Io.Dir.path.join(alloc, &.{
-            self.store.home,
-            profile_paths.root_dir_name,
-            profile_paths.sessions_dir_name,
-            session_layout.sessions_v2_dir,
-            self.id(),
-        });
+        return profile_paths.rootPath(alloc, self.store.home, &.{ profile_paths.sessions_dir_name, session_layout.sessions_v2_dir, self.id() });
     }
 
     /// Closes the session and frees the adapter. Every child thread of this
@@ -1621,7 +1624,7 @@ pub const Session = struct {
 
     fn capabilityLocked(self: *Session) !*session_child_store.SessionChildCapability {
         if (self.capability) |*capability| return capability;
-        const terminal_path = try std.Io.Dir.path.join(self.alloc, &.{ self.store.home, profile_paths.root_dir_name, terminal_dir_name, self.id() });
+        const terminal_path = try profile_paths.rootPath(self.alloc, self.store.home, &.{ terminal_dir_name, self.id() });
         defer self.alloc.free(terminal_path);
         self.capability = try session_child_store.SessionChildCapability.initBlobs(self.alloc, self.host.blobs(), terminal_path, .writable);
         return &self.capability.?;
@@ -1733,7 +1736,7 @@ pub const Session = struct {
             null;
         if (derived_title) |title| try tail.append(a, .{ .set = .{ .key = .title, .value = try jsonString(a, title) } });
 
-        try self.writePieces(a, all[start..], encoded[start..], tail.items);
+        try self.writePieces(a, all[start..], encoded[start..], tail.items, openingAuthor(turn));
         try self.turn_numbers.append(self.alloc, self.last_turn);
         self.turn_open = false;
         self.clearStreamed();
@@ -1886,7 +1889,7 @@ pub const Session = struct {
         var tail: std.ArrayList(sm.Event) = .empty;
         if (try self.recoveryItem(a, record)) |piece| try tail.append(a, .{ .item = piece });
         if (!self.turn_open or start < encoded.len) {
-            try self.writePieces(a, events.items[start..], encoded[start..], tail.items);
+            try self.writePieces(a, events.items[start..], encoded[start..], tail.items, user.author);
             try self.streamed.ensureUnusedCapacity(self.alloc, encoded.len - start);
             for (encoded[start..]) |bytes| self.streamed.appendAssumeCapacity(try self.alloc.dupe(u8, bytes));
         } else if (tail.items.len > 0) {
@@ -2036,7 +2039,11 @@ pub const Session = struct {
     /// Appends `events` (already encoded) as items, then `tail`, starting
     /// the turn first if none is open. One durable batch, except that a
     /// blob needs a published session with an open turn before it.
-    fn writePieces(self: *Session, a: Allocator, events: []const Event, encoded: []const []u8, tail: []const sm.Event) !void {
+    /// Writes `events` as the open turn's items, opening it first if it is
+    /// not open. When the user piece is among them and someone other than
+    /// the user wrote it, an `author` item follows it, once: a stream writes
+    /// each piece once, and a superseded turn is written afresh.
+    fn writePieces(self: *Session, a: Allocator, events: []const Event, encoded: []const []u8, tail: []const sm.Event, author: types.MessageAuthor) !void {
         const reviews = try a.alloc(?[]u8, events.len);
         for (events, reviews) |event, *review| review.* = try encodeFileReview(a, event);
         var batch: std.ArrayList(sm.Event) = .empty;
@@ -2055,6 +2062,12 @@ pub const Session = struct {
         for (events, encoded, reviews) |event, bytes, review| {
             try batch.append(a, .{ .item = try self.item(a, std.meta.activeTag(event), bytes) });
             if (review) |data| try batch.append(a, .{ .item = try self.itemAs(a, file_review_type, data) });
+            if (event == .user and author != .user) {
+                try batch.append(a, .{ .item = try self.itemAs(a, author_type, try encodeAuthor(a, author)) });
+            }
+            if (try takenReportData(a, event, author)) |data| {
+                try batch.append(a, .{ .item = try self.itemAs(a, child_report_type, data) });
+            }
         }
         try batch.appendSlice(a, tail);
         if (batch.items.len == 0) return;
@@ -2074,7 +2087,8 @@ pub const Session = struct {
     /// interruption.
     fn importFramed(self: *Session, a: Allocator, events: []const Event, open: bool) !void {
         const all = if (open) try std.mem.concat(a, Event, &.{ events, &.{.{ .interrupted = .{ .reason = .failed } }} }) else events;
-        try self.importTurn(a, all);
+        // v1 had subagent results only as tool results: every turn is the user's.
+        try self.importTurn(a, all, .user);
     }
 
     /// Writes a whole turn with its bodies as blobs, as a commit does.
@@ -2091,7 +2105,7 @@ pub const Session = struct {
         try session_log.externalizeConversationTurnResults(a, &copy, try self.capabilityLocked());
         var events: std.ArrayList(Event) = .empty;
         try session_event.appendHistoryTurnConversationEvents(a, &events, copy);
-        try self.importTurn(a, events.items);
+        try self.importTurn(a, events.items, openingAuthor(copy));
     }
 
     /// Saves each image of `events`' user items as this session's blob, as
@@ -2114,7 +2128,7 @@ pub const Session = struct {
     }
 
     /// `events`, a turn's pieces, ended by the last one.
-    fn importTurn(self: *Session, a: Allocator, turn_events: []const Event) !void {
+    fn importTurn(self: *Session, a: Allocator, turn_events: []const Event, author: types.MessageAuthor) !void {
         if (turn_events.len < 2) return error.InvalidConversationFrame;
         const events = try a.dupe(Event, turn_events);
         try self.saveImportedImages(events);
@@ -2128,7 +2142,7 @@ pub const Session = struct {
             } },
             else => return error.InvalidConversationFrame,
         };
-        try self.writePieces(a, events, encoded, &.{end});
+        try self.writePieces(a, events, encoded, &.{end}, author);
         self.turn_open = false;
     }
 
@@ -2472,20 +2486,181 @@ pub const Session = struct {
     /// takes no lock: a visitor may call back into this session, as the app
     /// does to read a command replay's side file while it draws a turn.
     pub fn visitHistory(self: *Session, alloc: Allocator, visitor: anytype) !void {
-        const Sink = struct {
+        var sink: VisitorSink(@TypeOf(visitor), .skip) = .{ .alloc = alloc, .visitor = visitor };
+        try replay(self.source(), alloc, alloc, .start, null, ReplaySink.init(&sink));
+    }
+
+    /// What a `visitHistory` reader does at a compaction summary. The
+    /// transcript shows turns only, as v1's does, so a summary is never handed
+    /// to the visitor.
+    const AtSummary = enum {
+        /// Replay on past it.
+        skip,
+        /// End the replay with `error.CycleEnd`: one cycle has been read.
+        end_cycle,
+    };
+
+    /// The replay sink behind the `visitHistory` readers: hands each turn to
+    /// the visitor, frees it, and counts it.
+    fn VisitorSink(comptime Visitor: type, comptime at_summary: AtSummary) type {
+        return struct {
             alloc: Allocator,
-            visitor: @TypeOf(visitor),
+            visitor: Visitor,
+            turns: usize = 0,
 
             fn turn(sink: *@This(), value: types.HistoryTurn, _: ?u64) !void {
                 defer types.freeHistoryTurn(sink.alloc, value);
+                sink.turns += 1;
                 try sink.visitor.append(value);
             }
 
-            /// The transcript shows turns only, as v1's does.
-            fn summary(_: *@This(), _: []const u8) !void {}
+            fn summary(_: *@This(), _: []const u8) !void {
+                switch (at_summary) {
+                    .skip => {},
+                    .end_cycle => return error.CycleEnd,
+                }
+            }
         };
-        var sink: Sink = .{ .alloc = alloc, .visitor = visitor };
-        try replay(self.source(), alloc, alloc, .start, null, ReplaySink.init(&sink));
+    }
+
+    /// `visitHistory` from the newest compaction on: the turns the transcript
+    /// window holds after a resume (`transcript_window_shell.zig`), which are
+    /// the blocks that finished after that compaction. Ctrl+O reads the older
+    /// cycles from the log. Without a compaction it visits every turn. When no
+    /// turn finished after the newest compaction, it visits the cycle before
+    /// it instead and returns true: the window holds that cycle until the next
+    /// turn ends, as it does live.
+    pub fn visitHistorySinceCompaction(self: *Session, alloc: Allocator, visitor: anytype) !bool {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        const state = try self.handle.state(scratch.allocator());
+        var sink: VisitorSink(@TypeOf(visitor), .skip) = .{ .alloc = alloc, .visitor = visitor };
+        const offset = state.compaction_offset orelse {
+            try replay(self.source(), alloc, alloc, .start, null, ReplaySink.init(&sink));
+            return false;
+        };
+        const compaction: sm.Cursor = .{ .offset = offset, .seq = state.last_compaction_seq orelse return error.InvalidSessionFormat };
+        try replay(self.source(), alloc, alloc, .{ .at = try self.source().cycleStart(scratch.allocator(), compaction) }, offset, ReplaySink.init(&sink));
+        if (sink.turns > 0) return false;
+        // The newest cycle has no turn yet: the cycle before it, read across
+        // the newest compaction line, whose summary this sink ignores.
+        const previous = (try self.previousCompactionCursor(alloc, compaction)).cursor;
+        const from: sm.From = if (previous) |cursor| .{ .at = try self.source().cycleStart(scratch.allocator(), cursor) } else .start;
+        try replay(self.source(), alloc, alloc, from, if (previous) |cursor| cursor.offset else null, ReplaySink.init(&sink));
+        return sink.turns > 0;
+    }
+
+    /// What `previousCompactionCursor` found before a compaction line.
+    pub const PreviousCompaction = struct {
+        /// The compaction line, or null when the log starts first.
+        cursor: ?sm.Cursor,
+        /// The backward read stopped at a damaged line first: `cursor` is
+        /// null, and the cycles from the damage back cannot be found.
+        damaged: bool = false,
+    };
+
+    /// Where the cycle that ends at the compaction line `before` starts: the
+    /// compaction line before it, read backward a page at a time, or none
+    /// when the log starts first. With `before` null, the newest compaction
+    /// line, from the folded state. Ctrl+O walks older cycles this way, so it
+    /// reads only as much of the log as the cycles it shows.
+    pub fn previousCompactionCursor(self: *Session, alloc: Allocator, before: ?sm.Cursor) !PreviousCompaction {
+        const end = before orelse {
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const state = try self.handle.state(scratch.allocator());
+            const offset = state.compaction_offset orelse return .{ .cursor = null };
+            return .{ .cursor = .{ .offset = offset, .seq = state.last_compaction_seq orelse return error.InvalidSessionFormat } };
+        };
+        const src = self.source();
+        var from: sm.From = .{ .at = end };
+        while (true) {
+            var page = try src.readTo(alloc, from, .backward, replay_page_lines);
+            defer page.deinit();
+            for (page.entries) |entry| {
+                if (entry.offset >= end.offset) continue;
+                if (entry.kind == .compacted) return .{ .cursor = .{ .offset = entry.offset, .seq = entry.seq } };
+            }
+            if (page.damaged) {
+                debug_trace.logf("session", "event=sessions_v2_cycle_scan_damaged session={s} before={d} dropped=older_cycles", .{ src.id, end.offset });
+                return .{ .cursor = null, .damaged = true };
+            }
+            from = .{ .at = page.next orelse return .{ .cursor = null } };
+        }
+    }
+
+    /// `visitHistory` over one compaction cycle: the turns after the
+    /// compaction line at `start`, or from the log's start when null, up to
+    /// the next compaction line. A turn the next compaction splits is not
+    /// visited; the next cycle shows it whole (`cycleStart`). Returns true
+    /// when reading stopped at a damaged line, so turns are missing.
+    pub fn visitHistoryCycle(self: *Session, alloc: Allocator, start: ?sm.Cursor, visitor: anytype) !bool {
+        var sink: VisitorSink(@TypeOf(visitor), .end_cycle) = .{ .alloc = alloc, .visitor = visitor };
+        const from: sm.From = if (start) |cursor| .{ .at = try self.source().cycleStart(alloc, cursor) } else .start;
+        const skip_offset: ?u64 = if (start) |cursor| cursor.offset else null;
+        var damaged = false;
+        var replay_sink = ReplaySink.init(&sink);
+        replay_sink.damaged = &damaged;
+        replay(self.source(), alloc, alloc, from, skip_offset, replay_sink) catch |err| switch (err) {
+            error.CycleEnd => {},
+            else => |other| return other,
+        };
+        return damaged;
+    }
+
+    /// This open's report lines, the first time it is asked, so the reports
+    /// a restart left owed are posted once however often its subagent host
+    /// is enabled again. Null after that, and when the session has no
+    /// subagents. Strings live in `arena`.
+    pub fn pendingReportLines(self: *Session, arena: Allocator) !?[]ReportLine {
+        if (self.reports_handed_out) return null;
+        self.reports_handed_out = true;
+        const folded = try self.children(arena);
+        if (folded.len == 0) return null;
+        return try self.reportLines(arena);
+    }
+
+    /// What this session's log says about its subagents' reports, oldest
+    /// first: every work spawned and finished, with fx's data, and every
+    /// report it took (`child_report`). Read from the start, past any
+    /// compaction, since a report can stay owed across one. Strings live in
+    /// `arena`.
+    pub fn reportLines(self: *Session, arena: Allocator) ![]ReportLine {
+        const src = self.source();
+        var lines: std.ArrayList(ReportLine) = .empty;
+        var from: sm.From = .start;
+        while (true) {
+            var page = try src.read(arena, from, replay_page_lines);
+            defer page.deinit();
+            for (page.entries) |entry| {
+                const body = entry.body orelse continue;
+                switch (body) {
+                    .child_spawned => |line| try lines.append(arena, .{ .spawned = .{
+                        .child = try arena.dupe(u8, line.child),
+                        .work_id = try arena.dupe(u8, line.work_id),
+                        .data = if (line.data) |data| try arena.dupe(u8, data) else null,
+                    } }),
+                    .child_finished => |line| try lines.append(arena, .{ .finished = .{
+                        .child = try arena.dupe(u8, line.child),
+                        .work_id = try arena.dupe(u8, line.work_id),
+                        .outcome = line.outcome,
+                        .data = if (line.data) |data| try arena.dupe(u8, data) else null,
+                    } }),
+                    .item => |piece| {
+                        if (!std.mem.eql(u8, piece.type, child_report_type)) continue;
+                        const data = try src.pieceData(arena, piece);
+                        const taken = std.json.parseFromSliceLeaky(ChildReportData, arena, data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch {
+                            debug_trace.logf("session", "event=sessions_v2_child_report_unreadable session={s}", .{src.id});
+                            continue;
+                        };
+                        try lines.append(arena, .{ .taken = .{ .child = taken.child, .work_id = taken.work_id } });
+                    },
+                    else => {},
+                }
+            }
+            from = .{ .at = page.next orelse break };
+        }
+        return lines.toOwnedSlice(arena);
     }
 
     /// A prompt a fork can start before: the turn it opened and its text.
@@ -2928,6 +3103,28 @@ const Source = struct {
     fn readTo(src: Source, sa: Allocator, from: sm.From, direction: sm.Direction, limit: usize) !sm.Page {
         if (src.handle) |handle| return handle.read(sa, from, direction, limit);
         return src.store.manager.read(sa, src.id, from, direction, limit);
+    }
+
+    /// Where the display cycle opened by the compaction line `compaction`
+    /// starts: the `turn_started` of a turn still open at that line, so a turn
+    /// the compaction splits (an overflow compacts after the prompt) shows
+    /// whole, or the compaction line itself.
+    fn cycleStart(src: Source, sa: Allocator, compaction: sm.Cursor) !sm.Cursor {
+        var from: sm.From = .{ .at = compaction };
+        while (true) {
+            var page = try src.readTo(sa, from, .backward, replay_page_lines);
+            defer page.deinit();
+            for (page.entries) |entry| {
+                if (entry.offset >= compaction.offset) continue;
+                const body = entry.body orelse continue;
+                switch (body) {
+                    .turn_started => return .{ .offset = entry.offset, .seq = entry.seq },
+                    .turn_committed, .turn_interrupted => return compaction,
+                    else => {},
+                }
+            }
+            from = .{ .at = page.next orelse return compaction };
+        }
     }
 
     /// The cursor of `turn`'s `turn_started`, reading back from `before`.
@@ -4333,6 +4530,9 @@ const ReplaySink = struct {
     context: *anyopaque,
     turn_fn: *const fn (*anyopaque, types.HistoryTurn, ?u64) anyerror!void,
     summary_fn: *const fn (*anyopaque, []const u8) anyerror!void,
+    /// Set when reading stopped at a damaged line, so the turns after it
+    /// are missing. Null when the caller does not need to know.
+    damaged: ?*bool = null,
 
     fn init(sink: anytype) ReplaySink {
         const SinkPtr = @TypeOf(sink);
@@ -4388,7 +4588,6 @@ noinline fn replay(
     while (true) {
         var page = try src.read(sa, from, replay_page_lines);
         defer page.deinit();
-        if (page.damaged) debug_trace.logf("session", "event=sessions_v2_replay_damaged session={s} dropped=lines_after_damage", .{src.id});
         for (page.entries) |entry| {
             _ = piece_arena.reset(.retain_capacity);
             const pa = piece_arena.allocator();
@@ -4426,6 +4625,12 @@ noinline fn replay(
                         try attachFileReview(src, pa, &builder, piece);
                         continue;
                     }
+                    if (std.mem.eql(u8, piece.type, author_type)) {
+                        try builder.setUserAuthor(decodeAuthor(pa, try src.pieceData(pa, piece)));
+                        continue;
+                    }
+                    // A mark for `reportLines`, not part of the conversation.
+                    if (std.mem.eql(u8, piece.type, child_report_type)) continue;
                     const kind = pieceKind(piece.type) orelse {
                         debug_trace.logf("session", "event=sessions_v2_unknown_item session={s} type={s} dropped=item", .{ src.id, piece.type });
                         continue;
@@ -4490,6 +4695,12 @@ noinline fn replay(
                 .compacted => |line| try sink.summary(line.data),
                 .session_created, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed => {},
             }
+        }
+        // Only a replay that reads past the last good line loses lines: one
+        // that ends at a compaction first never reaches the damage.
+        if (page.damaged) {
+            debug_trace.logf("session", "event=sessions_v2_replay_damaged session={s} dropped=lines_after_damage", .{src.id});
+            if (sink.damaged) |flag| flag.* = true;
         }
         from = .{ .at = page.next orelse break };
     }
@@ -4782,6 +4993,61 @@ fn resumeError(err: sm.OpenError, target: Target) ResumeError {
 /// the final turn; resume drops that turn.
 const superseded_type = "superseded";
 /// A tool call saved before it runs (D28); its data is a `tool_call` piece.
+/// The item after a turn's user piece when someone other than the user
+/// wrote that message, such as a subagent's report that woke its parent.
+/// Older fx drops it as an unknown item and reads the turn as before.
+const author_type = "author";
+
+/// The item after a piece that carries a subagent's report into this
+/// session's history, `{"child":…,"work_id":…}`: the opening message of a
+/// turn the report started, or the steering a boundary took. It marks the
+/// report taken (`reportLines`). Older fx drops it as an unknown item.
+const child_report_type = "child_report";
+
+const ChildReportData = struct { child: []const u8, work_id: []const u8 };
+
+/// The `child_report` item's data for `event`, or null when the piece
+/// carries no subagent report.
+fn takenReportData(a: Allocator, event: Event, author: types.MessageAuthor) !?[]u8 {
+    const text = switch (event) {
+        .user => |user| if (author == .child) user.text else return null,
+        .steering => |steering| steering.text,
+        else => return null,
+    };
+    const sender = (try agent_frame.reportSender(a, text)) orelse return null;
+    defer sender.deinit();
+    var out: std.Io.Writer.Allocating = .init(a);
+    try std.json.Stringify.value(ChildReportData{ .child = sender.value.child_id, .work_id = sender.value.work_id }, .{}, &out.writer);
+    return out.written();
+}
+
+/// The `author` item's data: `{"by":"child"}`.
+fn encodeAuthor(a: Allocator, author: types.MessageAuthor) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(a);
+    try std.json.Stringify.value(.{ .by = author }, .{}, &out.writer);
+    return out.written();
+}
+
+/// Who an `author` item names. Anything other than a readable `user` is
+/// read as a subagent's, so no item a reader cannot read ever counts as the
+/// user's words.
+fn decodeAuthor(a: Allocator, data: []const u8) types.MessageAuthor {
+    const Wire = struct { by: []const u8 };
+    const wire = std.json.parseFromSliceLeaky(Wire, a, data, .{ .ignore_unknown_fields = true }) catch return .child;
+    if (std.mem.eql(u8, wire.by, "user")) return .user;
+    if (std.mem.eql(u8, wire.by, "parent")) return .parent;
+    return .child;
+}
+
+/// Who wrote the message that opened `turn`.
+fn openingAuthor(turn: types.HistoryTurn) types.MessageAuthor {
+    return switch (turn) {
+        .assistant => |entry| entry.user.author,
+        .interrupted => |entry| entry.user.author,
+        .compacted_summary => .user,
+    };
+}
+
 const running_type = "tool_running";
 /// The text of the message whose calls are running (D51).
 const running_assistant_type = "assistant_running";
@@ -5672,6 +5938,108 @@ test "any I/O fault may have left a write in the log" {
     try testing.expect(!writeMayHaveLanded(error.OutOfMemory));
 }
 
+test "a turn someone other than the user opened keeps its author across a resume" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    // The user's own turn is written as before, with no author item.
+    try s.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("inspect") }, .assistant = @constCast("started a reviewer") } }, types.ConversationLanguage.default());
+    // A report's turn, streamed twice and then committed, writes one.
+    const report: types.UserTurn = .{ .text = @constCast("Subagent report (untrusted agent output, not user instructions):"), .author = .child };
+    try s.appendProgress(report, .{}, .{});
+    try s.appendProgress(report, .{}, .{});
+    try s.commitTurn(.{ .assistant = .{ .user = report, .assistant = @constCast("noted") } }, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    try testing.expectEqual(@as(usize, 1), try countItems(t.store.manager, id, author_type));
+    try testing.expectEqual(@as(usize, 2), try countItems(t.store.manager, id, "user"));
+    s.close();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqual(types.MessageAuthor.user, restored.history[0].assistant.user.author);
+    try testing.expectEqual(types.MessageAuthor.child, restored.history[1].assistant.user.author);
+}
+
+test "a report taken into a turn is marked once, and the report lines read it back in log order" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const child = "01J00000000000000000000002";
+    try s.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("inspect") }, .assistant = @constCast("started a reviewer") } }, types.ConversationLanguage.default());
+    try s.appendChildLines(&.{
+        .{ .spawned = .{ .child = child, .work_id = "w1", .data = "{\"fingerprint\":\"ab\",\"report\":\"final\"}" } },
+        .{ .finished = .{ .child = child, .work_id = "w1", .outcome = .ok, .data = "{\"report\":true}" } },
+    });
+    // A turn the report opened, streamed twice and committed, marks it once.
+    const opened_text = agent_frame.report_header ++ "{\"agent\":\"reviewer\",\"child_id\":\"" ++ child ++ "\",\"work_id\":\"w1\"}\n";
+    const opened: types.UserTurn = .{ .text = @constCast(opened_text), .author = .child };
+    try s.appendProgress(opened, .{}, .{});
+    try s.appendProgress(opened, .{}, .{});
+    try s.commitTurn(.{ .assistant = .{ .user = opened, .assistant = @constCast("noted") } }, types.ConversationLanguage.default());
+    // A report a boundary took rides in the turn's steering.
+    try s.appendChildLines(&.{
+        .{ .spawned = .{ .child = child, .work_id = "w2", .data = "{\"fingerprint\":\"ab\",\"report\":\"final\"}" } },
+        .{ .finished = .{ .child = child, .work_id = "w2", .outcome = .interrupted } },
+    });
+    var steering = [_]types.PersistedSteering{.{
+        .text = @constCast(agent_frame.report_header ++ "{\"agent\":\"reviewer\",\"child_id\":\"" ++ child ++ "\",\"work_id\":\"w2\"}\n"),
+        .after_tool_step_count = 0,
+    }};
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("keep going") },
+        .assistant = @constCast("both seen"),
+        .execution = .{ .steering = &steering },
+    } }, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    try testing.expectEqual(@as(usize, 2), try countItems(t.store.manager, id, child_report_type));
+
+    const lines = try s.reportLines(a);
+    try testing.expectEqual(@as(usize, 6), lines.len);
+    try testing.expectEqualStrings("w1", lines[0].spawned.work_id);
+    try testing.expectEqualStrings("w1", lines[1].finished.work_id);
+    try testing.expectEqualStrings("w1", lines[2].taken.work_id);
+    try testing.expectEqualStrings(child, lines[2].taken.child);
+    try testing.expectEqualStrings("w2", lines[3].spawned.work_id);
+    try testing.expect(lines[4].finished.data == null);
+    try testing.expectEqualStrings("w2", lines[5].taken.work_id);
+    // Handed out once per open.
+    try testing.expect((try s.pendingReportLines(a)) != null);
+    try testing.expect((try s.pendingReportLines(a)) == null);
+    s.close();
+
+    // The mark is not part of the conversation.
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), restored.history.len);
+    try testing.expectEqual(@as(usize, 1), restored.history[2].assistant.execution.steering.len);
+}
+
+test "an author item a reader cannot read never counts as the user's" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqual(types.MessageAuthor.user, decodeAuthor(a, "{\"by\":\"user\"}"));
+    try testing.expectEqual(types.MessageAuthor.parent, decodeAuthor(a, "{\"by\":\"parent\"}"));
+    try testing.expectEqual(types.MessageAuthor.child, decodeAuthor(a, "{\"by\":\"child\"}"));
+    try testing.expectEqual(types.MessageAuthor.child, decodeAuthor(a, "{\"by\":\"someone_new\"}"));
+    try testing.expectEqual(types.MessageAuthor.child, decodeAuthor(a, "not json"));
+    try testing.expectEqualStrings("{\"by\":\"child\"}", try encodeAuthor(a, .child));
+}
+
 test "a running tool call is saved once, and resume answers it as possibly run" {
     var t: TestHome = undefined;
     try t.init();
@@ -6077,6 +6445,244 @@ test "a finished turn keeps no trace of its running calls" {
     try testing.expectEqual(@as(usize, 1), restored.history.len);
     try testing.expectEqualStrings("answered", restored.history[0].assistant.assistant);
     try testing.expectEqual(@as(usize, 0), restored.history[0].assistant.execution.tool_steps.len);
+}
+
+test "the history splits into compaction cycles that Ctrl+O reads one at a time" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    const language = types.ConversationLanguage.default();
+    try s.commitTurn(assistantTurn("one", "1"), language);
+    try s.commitTurn(assistantTurn("two", "2"), language);
+    var first = "turns one and two".*;
+    try s.commitCompaction(.{ .summary = &first, .removed_turn_count = 2, .compaction_count = 1 }, false, null);
+    try s.commitTurn(assistantTurn("three", "3"), language);
+    // The model keeps turn three after this compaction; the display cycle
+    // still starts at the compaction line.
+    var second = "turn three".*;
+    try s.commitCompaction(.{ .summary = &second, .removed_turn_count = 1, .compaction_count = 2 }, false, .{ .turns = 1 });
+    try s.commitTurn(assistantTurn("four", "4"), language);
+
+    const Visitor = struct {
+        prompts: std.ArrayList([]u8) = .empty,
+
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            try self.prompts.append(testing.allocator, try testing.allocator.dupe(u8, turn.assistant.user.text));
+        }
+
+        fn expectPrompts(self: *@This(), want: []const []const u8) !void {
+            defer {
+                for (self.prompts.items) |prompt| testing.allocator.free(prompt);
+                self.prompts.deinit(testing.allocator);
+                self.* = .{};
+            }
+            try testing.expectEqual(want.len, self.prompts.items.len);
+            for (self.prompts.items, want) |got, expected| try testing.expectEqualStrings(expected, got);
+        }
+    };
+    // Walking back from the newest compaction finds both boundaries.
+    const newest = (try s.previousCompactionCursor(testing.allocator, null)).cursor.?;
+    const older = (try s.previousCompactionCursor(testing.allocator, newest)).cursor.?;
+    try testing.expect(older.offset < newest.offset);
+    try testing.expectEqual(Session.PreviousCompaction{ .cursor = null }, try s.previousCompactionCursor(testing.allocator, older));
+    var visitor: Visitor = .{};
+    try testing.expect(!try s.visitHistoryCycle(testing.allocator, null, &visitor));
+    try visitor.expectPrompts(&.{ "one", "two" });
+    try testing.expect(!try s.visitHistoryCycle(testing.allocator, older, &visitor));
+    try visitor.expectPrompts(&.{"three"});
+    try testing.expect(!try s.visitHistoryCycle(testing.allocator, newest, &visitor));
+    try visitor.expectPrompts(&.{"four"});
+    try testing.expect(!try s.visitHistorySinceCompaction(testing.allocator, &visitor));
+    try visitor.expectPrompts(&.{"four"});
+}
+
+test "a damaged line in a compaction cycle shows that cycle's turns before it and says so" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    const language = types.ConversationLanguage.default();
+    try s.commitTurn(assistantTurn("zero", "0"), language);
+    var first = "turn zero".*;
+    try s.commitCompaction(.{ .summary = &first, .removed_turn_count = 1, .compaction_count = 1 }, false, null);
+    try s.commitTurn(assistantTurn("one-a", "1a"), language);
+    try s.commitTurn(assistantTurn("one-b", "1b"), language);
+    var second = "turns one-a and one-b".*;
+    try s.commitCompaction(.{ .summary = &second, .removed_turn_count = 2, .compaction_count = 2 }, false, null);
+    try s.commitTurn(assistantTurn("two", "2"), language);
+    var third = "turn two".*;
+    try s.commitCompaction(.{ .summary = &third, .removed_turn_count = 1, .compaction_count = 3 }, false, null);
+    try s.commitTurn(assistantTurn("three", "3"), language);
+    // The compaction lines that open cycles 3, 2 and 1.
+    const opens_three = (try s.previousCompactionCursor(testing.allocator, null)).cursor.?;
+    const opens_two = (try s.previousCompactionCursor(testing.allocator, opens_three)).cursor.?;
+    const opens_one = (try s.previousCompactionCursor(testing.allocator, opens_two)).cursor.?;
+
+    // One byte of cycle 1's second prompt changes while the session is open,
+    // so that line's checksum fails.
+    const io = io_mod.getIo();
+    const log_path = try std.Io.Dir.path.join(testing.allocator, &.{ ".fx", "sessions", "v2", s.id(), "log.jsonl" });
+    defer testing.allocator.free(log_path);
+    const bytes = try t.tmp.dir.readFileAlloc(io, log_path, testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(bytes);
+    const at = std.mem.find(u8, bytes, "\"one-b\"").? + 1;
+    var log_file = try t.tmp.dir.openFile(io, log_path, .{ .mode = .read_write });
+    defer log_file.close(io);
+    try log_file.writePositionalAll(io, &.{bytes[at] ^ 0x01}, at);
+
+    const Visitor = struct {
+        prompts: std.ArrayList([]u8) = .empty,
+
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            try self.prompts.append(testing.allocator, try testing.allocator.dupe(u8, turn.assistant.user.text));
+        }
+
+        fn expectPrompts(self: *@This(), want: []const []const u8) !void {
+            defer {
+                for (self.prompts.items) |prompt| testing.allocator.free(prompt);
+                self.prompts.deinit(testing.allocator);
+                self.* = .{};
+            }
+            try testing.expectEqual(want.len, self.prompts.items.len);
+            for (self.prompts.items, want) |got, expected| try testing.expectEqualStrings(expected, got);
+        }
+    };
+    var visitor: Visitor = .{};
+    // Forward, cycle 1 shows its turn before the damage and says the read
+    // stopped there; the other cycles read whole.
+    try testing.expect(try s.visitHistoryCycle(testing.allocator, opens_one, &visitor));
+    try visitor.expectPrompts(&.{"one-a"});
+    try testing.expect(!try s.visitHistoryCycle(testing.allocator, opens_two, &visitor));
+    try visitor.expectPrompts(&.{"two"});
+    try testing.expect(!try s.visitHistoryCycle(testing.allocator, null, &visitor));
+    try visitor.expectPrompts(&.{"zero"});
+    // Backward, the search across cycle 2 still finds the line opening it,
+    // and the search across cycle 1 stops at the damage and says so instead
+    // of calling it the log's start.
+    try testing.expectEqual(Session.PreviousCompaction{ .cursor = opens_two }, try s.previousCompactionCursor(testing.allocator, opens_three));
+    try testing.expectEqual(Session.PreviousCompaction{ .cursor = null, .damaged = true }, try s.previousCompactionCursor(testing.allocator, opens_two));
+}
+
+test "a resume right after a compaction shows the cycle before it" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    defer s.close();
+    const language = types.ConversationLanguage.default();
+    const Visitor = struct {
+        prompts: std.ArrayList([]u8) = .empty,
+
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            try self.prompts.append(testing.allocator, try testing.allocator.dupe(u8, turn.assistant.user.text));
+        }
+
+        fn expectPrompts(self: *@This(), want: []const []const u8) !void {
+            defer {
+                for (self.prompts.items) |prompt| testing.allocator.free(prompt);
+                self.prompts.deinit(testing.allocator);
+                self.* = .{};
+            }
+            try testing.expectEqual(want.len, self.prompts.items.len);
+            for (self.prompts.items, want) |got, expected| try testing.expectEqualStrings(expected, got);
+        }
+    };
+    var visitor: Visitor = .{};
+    try s.commitTurn(assistantTurn("one", "1"), language);
+    try s.commitTurn(assistantTurn("two", "2"), language);
+    var first = "turns one and two".*;
+    try s.commitCompaction(.{ .summary = &first, .removed_turn_count = 2, .compaction_count = 1 }, false, null);
+    // Nothing since the compaction: the cycle before it comes back.
+    try testing.expect(try s.visitHistorySinceCompaction(testing.allocator, &visitor));
+    try visitor.expectPrompts(&.{ "one", "two" });
+    try s.commitTurn(assistantTurn("three", "3"), language);
+    try testing.expect(!try s.visitHistorySinceCompaction(testing.allocator, &visitor));
+    try visitor.expectPrompts(&.{"three"});
+    // A second compaction with nothing after it brings back only the cycle
+    // between the two.
+    var second = "turn three".*;
+    try s.commitCompaction(.{ .summary = &second, .removed_turn_count = 1, .compaction_count = 2 }, false, null);
+    try testing.expect(try s.visitHistorySinceCompaction(testing.allocator, &visitor));
+    try visitor.expectPrompts(&.{"three"});
+}
+
+test "a compaction inside an open turn starts its display cycle at that turn's prompt" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const turn_end = try encodePiece(a, .{ .turn_completed = .{} });
+    const Turn = struct {
+        fn user(alloc: Allocator, text: []const u8) !sm.Event {
+            return .{ .item = .{ .type = "user", .data = try encodePiece(alloc, .{ .user = .{ .text = text } }) } };
+        }
+        fn answer(alloc: Allocator, text: []const u8) !sm.Event {
+            return .{ .item = .{ .type = "assistant", .data = try encodePiece(alloc, .{ .assistant = .{ .text = text } }) } };
+        }
+    };
+    // As an overflow compaction writes it: the request that overflowed is
+    // compacted after its prompt, and the turn goes on after the summary.
+    const id = "1786460757753-split";
+    const imported = try t.store.manager.openImport(.{ .id = id, .workspace = "/w", .host = .ask, .created_ms = 1000 });
+    _ = try imported.appendAt(&.{
+        .turn_started,
+        try Turn.user(a, "first"),
+        try Turn.answer(a, "first answer"),
+        .{ .item = .{ .type = "turn_end", .data = turn_end } },
+        .turn_committed,
+        .turn_started,
+        try Turn.user(a, "split"),
+        .{ .compacted = try jsonValue(a, CompactedData{ .summary = "the first turn", .removed_turn_count = 1, .compaction_count = 1 }) },
+        try Turn.answer(a, "split answer"),
+        .{ .item = .{ .type = "turn_end", .data = turn_end } },
+        .turn_committed,
+        .turn_started,
+        try Turn.user(a, "after"),
+        try Turn.answer(a, "after answer"),
+        .{ .item = .{ .type = "turn_end", .data = turn_end } },
+        .turn_committed,
+    }, 2000);
+    try imported.publishImport();
+    imported.release();
+
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    const Visitor = struct {
+        prompts: std.ArrayList([]u8) = .empty,
+
+        pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+            try self.prompts.append(testing.allocator, try testing.allocator.dupe(u8, turn.assistant.user.text));
+        }
+
+        fn expectPrompts(self: *@This(), want: []const []const u8) !void {
+            defer {
+                for (self.prompts.items) |prompt| testing.allocator.free(prompt);
+                self.prompts.deinit(testing.allocator);
+                self.* = .{};
+            }
+            try testing.expectEqual(want.len, self.prompts.items.len);
+            for (self.prompts.items, want) |got, expected| try testing.expectEqualStrings(expected, got);
+        }
+    };
+    var visitor: Visitor = .{};
+    // Resume holds the split turn whole, from its prompt.
+    try testing.expect(!try r.visitHistorySinceCompaction(testing.allocator, &visitor));
+    try visitor.expectPrompts(&.{ "split", "after" });
+    // Ctrl+O: the cycle before leaves the split turn out, and the one the
+    // compaction opens shows it whole.
+    const compaction = (try r.previousCompactionCursor(testing.allocator, null)).cursor.?;
+    try testing.expect(!try r.visitHistoryCycle(testing.allocator, null, &visitor));
+    try visitor.expectPrompts(&.{"first"});
+    try testing.expect(!try r.visitHistoryCycle(testing.allocator, compaction, &visitor));
+    try visitor.expectPrompts(&.{ "split", "after" });
 }
 
 test "the history visit shows every turn, even those a compaction summarized" {

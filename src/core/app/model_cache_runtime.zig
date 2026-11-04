@@ -22,7 +22,7 @@ else
     struct {};
 
 const Allocator = std.mem.Allocator;
-const e2e_gateway_models_url_env = "FX_E2E_GATEWAY_MODELS_URL";
+const e2e_gateway_models_url_env = "FX_TEST_GATEWAY_MODELS_URL";
 
 /// What asked for a catalog load. Every trigger is user activity, so an idle
 /// session never polls the models endpoint.

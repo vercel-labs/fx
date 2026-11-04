@@ -12,6 +12,8 @@ const model_provider = @import("model_provider.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const sort_utils = @import("../shared/sort_utils.zig");
 const update_target = @import("../upgrade/update_target.zig");
+const settings_keys = @import("settings_keys.zig");
+const theme_mod = @import("../shared/theme.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
@@ -114,6 +116,18 @@ pub const UserSettingsPatch = struct {
     notification_turn_end: ?bool = null,
     notification_attention_required: ?bool = null,
     notification_max: ?bool = null,
+    /// `light`, `dark`, or a theme file name under ~/.fx/themes.
+    theme: ?[]const u8 = null,
+    auto_upgrade: ?bool = null,
+    max_agent_steps: ?u32 = null,
+    max_tool_result_bytes: ?u32 = null,
+    auto_compact_percent: ?u8 = null,
+    provider_strict: ?bool = null,
+    context: ?bool = null,
+    /// Removes a plain setting, such as `fast_mode` or `statusLine.context`,
+    /// so it falls back to its default. Distinct from the fields above, where
+    /// null means "leave unchanged".
+    remove: ?[]const u8 = null,
 
     fn isEmpty(self: UserSettingsPatch) bool {
         return self.model_preference == null and
@@ -134,7 +148,15 @@ pub const UserSettingsPatch = struct {
             self.session_titles == null and
             self.notification_turn_end == null and
             self.notification_attention_required == null and
-            self.notification_max == null;
+            self.notification_max == null and
+            self.theme == null and
+            self.auto_upgrade == null and
+            self.max_agent_steps == null and
+            self.max_tool_result_bytes == null and
+            self.auto_compact_percent == null and
+            self.provider_strict == null and
+            self.context == null and
+            self.remove == null;
     }
 };
 
@@ -367,7 +389,7 @@ pub const Store = struct {
 
     fn openFromHome(alloc: Allocator, home_path: []const u8, mode: OpenMode, tighten: bool) !Store {
         const zio = io_mod.getIo();
-        var home = std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true }) catch |err| switch (err) {
+        var home = std.Io.Dir.openDirAbsolute(zio, profile_paths.rootParent(home_path), .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => {
                 if (mode == .read_only) return initReadOnlyAbsent(alloc, home_path);
                 return err;
@@ -376,7 +398,7 @@ pub const Store = struct {
         };
         defer home.close(zio);
 
-        var durable_home = home.openDir(zio, profile_paths.root_dir_name, .{
+        var durable_home = home.openDir(zio, profile_paths.rootName(), .{
             .iterate = true,
             .follow_symlinks = false,
         }) catch |err| switch (err) {
@@ -384,10 +406,10 @@ pub const Store = struct {
                 if (mode == .read_only) return initReadOnlyAbsent(alloc, home_path);
 
                 var verified_home = io_mod.VerifiedDir{
-                    .dir = try std.Io.Dir.openDirAbsolute(zio, home_path, .{ .iterate = true }),
+                    .dir = try std.Io.Dir.openDirAbsolute(zio, profile_paths.rootParent(home_path), .{ .iterate = true }),
                 };
                 defer verified_home.close();
-                const created = try io_mod.openOrCreateVerifiedPrivateDir(&verified_home, profile_paths.root_dir_name);
+                const created = try io_mod.openOrCreateVerifiedPrivateDir(&verified_home, profile_paths.rootName());
                 break :blk created.dir;
             },
             error.NotDir, error.SymLinkLoop => return error.DurablePathUnsafe,
@@ -967,12 +989,132 @@ pub fn validateProviderSlug(slug: []const u8) bool {
 
 fn validateUserPatch(patch: UserSettingsPatch) !void {
     if (patch.model_preference) |preference| try validateModel(preference.model);
+    if (patch.theme) |theme| {
+        if (theme_mod.classifyValue(theme)) |choice| switch (choice) {
+            .pin_light, .pin_dark => {},
+            .custom => |name| if (!theme_mod.validThemeName(name)) return error.InvalidSettingsFormat,
+        } else return error.InvalidSettingsFormat;
+    }
+    if (patch.max_tool_result_bytes) |bytes| {
+        if (bytes < tool_result_limits.min_configured_tool_result_bytes) return error.InvalidSettingsFormat;
+    }
+    if (patch.auto_compact_percent) |percent| {
+        if (!compactor.isValidPercent(percent)) return error.InvalidSettingsFormat;
+    }
+    if (patch.remove) |path| {
+        if (!removablePath(path)) return error.InvalidSettingsFormat;
+    }
+}
+
+/// A plain setting `remove` may clear: a listed key that isn't a map, or one
+/// fixed child such as `statusLine.context`.
+fn removablePath(path: []const u8) bool {
+    if (settings_keys.unknownPart(path) != null) return false;
+    const dot = std.mem.findScalar(u8, path, '.');
+    const key = settings_keys.find(path[0 .. dot orelse path.len]) orelse return false;
+    if (key.map) return false;
+    return dot == null or key.children.len > 0;
+}
+
+/// Removes `path` and reports whether it was set. A parent object left empty
+/// goes too, and clearing `fast_mode` drops the fx-managed
+/// `fast_mode_model_bound` that belongs to it.
+fn removePath(object: *std.json.ObjectMap, path: []const u8) bool {
+    const dot = std.mem.findScalar(u8, path, '.') orelse {
+        const removed = object.orderedRemove(path);
+        if (removed and std.mem.eql(u8, path, "fast_mode")) _ = object.orderedRemove("fast_mode_model_bound");
+        return removed;
+    };
+    var removed = removeChild(object, path[0..dot], path[dot + 1 ..]);
+    // A renamed group, such as `status_line`, may still hold the value under
+    // its older name, which would otherwise keep applying.
+    for (settings_keys.keys) |key| {
+        const current = key.renamed_to orelse continue;
+        if (std.mem.eql(u8, current, path[0..dot])) removed = removeChild(object, key.name, path[dot + 1 ..]) or removed;
+    }
+    return removed;
+}
+
+fn removeChild(object: *std.json.ObjectMap, parent_key: []const u8, child: []const u8) bool {
+    const parent = object.getPtr(parent_key) orelse return false;
+    if (parent.* != .object) return false;
+    if (!parent.object.orderedRemove(child)) return false;
+    if (parent.object.count() == 0) _ = object.orderedRemove(parent_key);
+    return true;
 }
 
 fn validAdditionalDirectoryPath(path: []const u8) bool {
     return path.len > 0 and path.len <= std.Io.Dir.max_path_bytes and
         std.Io.Dir.path.isAbsolute(path) and std.unicode.utf8ValidateSlice(path) and
         std.mem.findScalar(u8, path, 0) == null;
+}
+
+test "plain preference patches write their keys and report no change when equal" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"theme\":\"dark\"}", .{});
+    const patch: UserSettingsPatch = .{
+        .theme = "dark",
+        .auto_upgrade = false,
+        .max_agent_steps = 40,
+        .max_tool_result_bytes = 4096,
+        .auto_compact_percent = 70,
+        .provider_strict = true,
+        .context = false,
+    };
+    const first = try applyUserPatchToRoot(arena.allocator(), &root, patch);
+    try std.testing.expect(first.changed);
+    try std.testing.expectEqual(false, root.object.get("auto_upgrade").?.bool);
+    try std.testing.expectEqual(@as(i64, 40), root.object.get("max_agent_steps").?.integer);
+    try std.testing.expectEqual(@as(i64, 4096), root.object.get("max_tool_result_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 70), root.object.get("auto_compact_percent").?.integer);
+    try std.testing.expect(root.object.get("provider_strict").?.bool);
+    try std.testing.expect(!root.object.get("context").?.bool);
+
+    const again = try applyUserPatchToRoot(arena.allocator(), &root, patch);
+    try std.testing.expect(!again.changed);
+}
+
+test "removing a plain preference clears it and an emptied parent" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+
+    var root = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena.allocator(),
+        "{\"fast_mode\":true,\"fast_mode_model_bound\":true,\"statusLine\":{\"context\":true},\"notifications\":{\"max\":true,\"turn_end\":true}}",
+        .{},
+    );
+    try std.testing.expect((try applyUserPatchToRoot(arena.allocator(), &root, .{ .remove = "fast_mode" })).changed);
+    try std.testing.expect(!root.object.contains("fast_mode") and !root.object.contains("fast_mode_model_bound"));
+
+    try std.testing.expect((try applyUserPatchToRoot(arena.allocator(), &root, .{ .remove = "statusLine.context" })).changed);
+    try std.testing.expect(!root.object.contains("statusLine"));
+
+    try std.testing.expect((try applyUserPatchToRoot(arena.allocator(), &root, .{ .remove = "notifications.max" })).changed);
+    try std.testing.expect(root.object.get("notifications").?.object.contains("turn_end"));
+
+    try std.testing.expect(!(try applyUserPatchToRoot(arena.allocator(), &root, .{ .remove = "theme" })).changed);
+}
+
+test "plain preference patches reject values the parser would refuse" {
+    try validateUserPatch(.{ .theme = "light" });
+    try validateUserPatch(.{ .theme = "my-theme.v2" });
+    try validateUserPatch(.{ .remove = "statusLine.workspace" });
+    const bad = [_]UserSettingsPatch{
+        .{ .theme = "" },
+        .{ .theme = "../escape" },
+        .{ .max_tool_result_bytes = 10 },
+        .{ .auto_compact_percent = 95 },
+        .{ .remove = "models" },
+        .{ .remove = "models.codex" },
+        .{ .remove = "statusLine.contxt" },
+        .{ .remove = "fast_mdoe" },
+    };
+    for (bad) |patch| try std.testing.expectError(error.InvalidSettingsFormat, validateUserPatch(patch));
 }
 
 test "clearing the credential choice removes the key rather than blanking it" {
@@ -1099,7 +1241,7 @@ fn applyUserPatchToRoot(
         application.changed = try putModelPreference(arena, &root.object, preference) or application.changed;
     }
     if (patch.provider) |value| application.changed = try putString(arena, &root.object, "provider", value.label()) or application.changed;
-    if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", @tagName(value)) or application.changed;
+    if (patch.permission_mode) |value| application.changed = try putString(arena, &root.object, "permission_mode", value.label()) or application.changed;
     if (patch.credential_source) |value| application.changed = try putString(arena, &root.object, "credential_source", @tagName(value)) or application.changed;
     if (patch.clear_credential_source and root.object.contains("credential_source")) {
         _ = root.object.orderedRemove("credential_source");
@@ -1133,37 +1275,33 @@ fn applyUserPatchToRoot(
     }
 
     if (patch.statusline_item) |item_patch| {
-        var statusline = if (root.object.getPtr("statusLine")) |value| blk: {
-            if (value.* != .object) return error.InvalidSettingsFormat;
-            break :blk value;
-        } else blk: {
-            try root.object.put(arena, "statusLine", .{ .object = .empty });
-            break :blk root.object.getPtr("statusLine").?;
-        };
-        application.changed = try putBool(arena, &statusline.object, @tagName(item_patch.item), item_patch.enabled) or application.changed;
+        const statusline = try renamedGroup(arena, &root.object, "statusLine", "status_line", &application.changed);
+        application.changed = try putBool(arena, statusline, @tagName(item_patch.item), item_patch.enabled) or application.changed;
     }
 
     if (patch.notification_turn_end != null or
         patch.notification_attention_required != null or
         patch.notification_max != null)
     {
-        var notifications = if (root.object.getPtr("notifications")) |value| blk: {
-            if (value.* != .object) return error.InvalidSettingsFormat;
-            break :blk value;
-        } else blk: {
-            try root.object.put(arena, "notifications", .{ .object = .empty });
-            break :blk root.object.getPtr("notifications").?;
-        };
+        const notifications = try renamedGroup(arena, &root.object, "notifications", "sound", &application.changed);
         if (patch.notification_turn_end) |enabled| {
-            application.changed = try putBool(arena, &notifications.object, "turn_end", enabled) or application.changed;
+            application.changed = try putBool(arena, notifications, "turn_end", enabled) or application.changed;
         }
         if (patch.notification_attention_required) |enabled| {
-            application.changed = try putBool(arena, &notifications.object, "attention_required", enabled) or application.changed;
+            application.changed = try putBool(arena, notifications, "attention_required", enabled) or application.changed;
         }
         if (patch.notification_max) |enabled| {
-            application.changed = try putBool(arena, &notifications.object, "max", enabled) or application.changed;
+            application.changed = try putBool(arena, notifications, "max", enabled) or application.changed;
         }
     }
+    if (patch.theme) |value| application.changed = try putString(arena, &root.object, "theme", value) or application.changed;
+    if (patch.auto_upgrade) |value| application.changed = try putBool(arena, &root.object, "auto_upgrade", value) or application.changed;
+    if (patch.max_agent_steps) |value| application.changed = try putInteger(arena, &root.object, "max_agent_steps", value) or application.changed;
+    if (patch.max_tool_result_bytes) |value| application.changed = try putInteger(arena, &root.object, "max_tool_result_bytes", value) or application.changed;
+    if (patch.auto_compact_percent) |value| application.changed = try putInteger(arena, &root.object, "auto_compact_percent", value) or application.changed;
+    if (patch.provider_strict) |value| application.changed = try putBool(arena, &root.object, "provider_strict", value) or application.changed;
+    if (patch.context) |value| application.changed = try putBool(arena, &root.object, "context", value) or application.changed;
+    if (patch.remove) |path| application.changed = removePath(&root.object, path) or application.changed;
     try cleanupLegacyWorkspacePreferences(arena, root, patch, &application);
     return application;
 }
@@ -1299,14 +1437,26 @@ fn cleanupLegacyWorkspacePreferences(
                 .workspace => null,
             };
             if (legacy_field) |field| {
-                removeLegacyNestedLeaf(
-                    &entry.value_ptr.object,
-                    "statusLine",
-                    @tagName(item_patch.item),
-                    field,
-                    true,
-                    application,
-                );
+                inline for (.{ "statusLine", "status_line" }) |name| {
+                    removeLegacyNestedLeaf(
+                        &entry.value_ptr.object,
+                        name,
+                        @tagName(item_patch.item),
+                        field,
+                        true,
+                        application,
+                    );
+                }
+            }
+        }
+        // A workspace entry can still hold the keys only fx config set writes,
+        // or the one fx config unset removes. Left there, the older copy
+        // would keep applying in that folder after the save reports success.
+        for (configWrittenPaths(patch)) |maybe_path| {
+            const path = maybe_path orelse continue;
+            if (removePath(&entry.value_ptr.object, path)) {
+                application.changed = true;
+                application.legacy_fields_removed += 1;
             }
         }
         if (application.legacy_fields_removed != removed_before) {
@@ -1319,6 +1469,21 @@ fn cleanupLegacyWorkspacePreferences(
     for (empty_workspaces.items) |workspace_root| {
         _ = workspaces.object.orderedRemove(workspace_root);
     }
+}
+
+/// The settings paths a patch from `fx config set` or `unset` writes that the
+/// `/settings` cleanup above doesn't already cover.
+fn configWrittenPaths(patch: UserSettingsPatch) [8]?[]const u8 {
+    return .{
+        if (patch.theme != null) "theme" else null,
+        if (patch.auto_upgrade != null) "auto_upgrade" else null,
+        if (patch.max_agent_steps != null) "max_agent_steps" else null,
+        if (patch.max_tool_result_bytes != null) "max_tool_result_bytes" else null,
+        if (patch.auto_compact_percent != null) "auto_compact_percent" else null,
+        if (patch.provider_strict != null) "provider_strict" else null,
+        if (patch.context != null) "context" else null,
+        patch.remove,
+    };
 }
 
 fn removeLegacyLeaf(
@@ -1673,6 +1838,57 @@ fn putStringArray(
     return true;
 }
 
+/// The object at `name`, created when missing. A value that isn't an object
+/// was ignored by startup, so saving replaces it and logs what it dropped.
+fn ensureGroup(arena: Allocator, root: *std.json.ObjectMap, name: []const u8, changed: *bool) !*std.json.ObjectMap {
+    const existing = root.get(name);
+    if (existing == null or existing.? != .object) {
+        if (existing != null) {
+            debug_trace.logf("config", "replacing {s}={s} that fx ignored, to save the {s} settings", .{ name, @tagName(existing.?), name });
+            changed.* = true;
+        }
+        try root.put(arena, name, .{ .object = .empty });
+    }
+    return &root.getPtr(name).?.object;
+}
+
+/// The object a renamed settings group is saved under, such as `status_line`
+/// for the older `statusLine`. Values that only the older key sets move into
+/// the current one, and the older key is removed, so the file keeps one
+/// spelling. A value both keys set keeps the current one, which startup
+/// already used, and the older value is dropped with a log line. Sets
+/// `changed` when the older key was there. The current name was an unknown
+/// key before the rename, so a value under it that isn't an object is one fx
+/// never used, and saving replaces it.
+fn renamedGroup(
+    arena: Allocator,
+    root: *std.json.ObjectMap,
+    older: []const u8,
+    current: []const u8,
+    changed: *bool,
+) !*std.json.ObjectMap {
+    _ = try ensureGroup(arena, root, current, changed);
+    if (root.get(older)) |value| {
+        if (value != .object) return error.InvalidSettingsFormat;
+        const group = &root.getPtr(current).?.object;
+        var iterator = value.object.iterator();
+        while (iterator.next()) |entry| {
+            if (group.contains(entry.key_ptr.*)) {
+                debug_trace.logf(
+                    "config",
+                    "dropping {s}.{s} while renaming {s} to {s}: {s}.{s} is also set and wins",
+                    .{ older, entry.key_ptr.*, older, current, current, entry.key_ptr.* },
+                );
+                continue;
+            }
+            try group.put(arena, entry.key_ptr.*, entry.value_ptr.*);
+        }
+        _ = root.orderedRemove(older);
+        changed.* = true;
+    }
+    return &root.getPtr(current).?.object;
+}
+
 fn putModelPreference(
     arena: Allocator,
     root: *std.json.ObjectMap,
@@ -1722,6 +1938,14 @@ test "configured model preference keys survive their producer frame" {
     defer output.deinit();
     try std.json.Stringify.value(std.json.Value{ .object = root }, .{}, &output.writer);
     try std.testing.expectEqualStrings("{\"models\":{\"workspace-only-connection\":\"opaque-model\"}}", output.written());
+}
+
+fn putInteger(arena: Allocator, object: *std.json.ObjectMap, key: []const u8, value: u32) !bool {
+    if (object.get(key)) |existing| {
+        if (existing == .integer and existing.integer == value) return false;
+    }
+    try object.put(arena, key, .{ .integer = value });
+    return true;
 }
 
 fn putBool(arena: Allocator, object: *std.json.ObjectMap, key: []const u8, value: bool) !bool {
@@ -2065,20 +2289,23 @@ fn validateKnownSettingsObject(
             return error.InvalidSettingsFormat;
         }
     }
-    if (object.get("statusLine")) |value| {
-        if (value == .object) {
-            inline for (&.{"context"}) |key| {
-                if (value.object.get(key)) |enabled| {
-                    if (enabled != .bool) return error.InvalidSettingsFormat;
+    inline for (.{ "statusLine", "status_line" }) |name| {
+        if (object.get(name)) |value| {
+            if (value == .object) {
+                inline for (&.{"context"}) |key| {
+                    if (value.object.get(key)) |enabled| {
+                        if (enabled != .bool) return error.InvalidSettingsFormat;
+                    }
                 }
-            }
-            if (!tolerate_non_object_user_containers) {
-                if (value.object.get("workspace")) |enabled| {
-                    if (enabled != .bool) return error.InvalidSettingsFormat;
+                if (!tolerate_non_object_user_containers) {
+                    if (value.object.get("workspace")) |enabled| {
+                        if (enabled != .bool) return error.InvalidSettingsFormat;
+                    }
                 }
+            } else if (!tolerate_non_object_user_containers and comptime std.mem.eql(u8, name, "statusLine")) {
+                // A non-object `status_line` predates the rename; saving replaces it.
+                return error.InvalidSettingsFormat;
             }
-        } else if (!tolerate_non_object_user_containers) {
-            return error.InvalidSettingsFormat;
         }
     }
 }
@@ -2278,7 +2505,7 @@ test "user patch writes user preferences at top level" {
     const bytes = try store.readPrimaryForTest(alloc);
     defer alloc.free(bytes);
     try std.testing.expect(std.mem.find(u8, bytes, "\"models\":{\"gateway\":\"openai/gpt-5.4\"}") != null);
-    try std.testing.expect(std.mem.find(u8, bytes, "\"permission_mode\":\"yolo\"") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"permission_mode\":\"full-access\"") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"yolo_acknowledged\":true") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"effort\":\"high\"") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"fast_mode\":true") != null);
@@ -2286,8 +2513,10 @@ test "user patch writes user preferences at top level" {
     try std.testing.expect(std.mem.find(u8, bytes, "\"update_channel\":\"dev\"") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"startup_scrollback\":false") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"prompt_history\":{\"enabled\":false}") != null);
-    try std.testing.expect(std.mem.find(u8, bytes, "\"statusLine\":{\"context\":true}") != null);
-    try std.testing.expect(std.mem.find(u8, bytes, "\"notifications\":{\"turn_end\":true,\"attention_required\":false}") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"status_line\":{\"context\":true}") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"sound\":{\"turn_end\":true,\"attention_required\":false}") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "statusLine") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "notifications") == null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"future\":{\"nested\":7}") != null);
     try std.testing.expect(std.mem.find(u8, bytes, "\"workspaces\"") == null);
 }
@@ -2350,14 +2579,87 @@ test "workspace statusline patch writes globally and preserves nested leaf" {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();
 
-    const root_statusline = parsed.value.object.get("statusLine").?.object;
+    // Saving moves the older `statusLine` group, unknown children included.
+    try std.testing.expect(parsed.value.object.get("statusLine") == null);
+    const root_statusline = parsed.value.object.get("status_line").?.object;
     try std.testing.expectEqual(true, root_statusline.get("workspace").?.bool);
     try std.testing.expectEqual(@as(i64, 7), root_statusline.get("future").?.integer);
 
+    // A legacy workspace copy keeps its name; workspace preferences aren't saved.
     const nested_statusline = parsed.value.object.get("workspaces").?.object
         .get("/workspace").?.object.get("statusLine").?.object;
     try std.testing.expectEqual(false, nested_statusline.get("workspace").?.bool);
     try std.testing.expectEqual(@as(i64, 8), nested_statusline.get("future").?.integer);
+}
+
+test "saving moves a renamed group, and remove clears either spelling" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeStoreFixture(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"statusLine\":{\"context\":false,\"session\":true},\"status_line\":{\"context\":true},\"notifications\":{\"max\":true}}\n",
+    );
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var moved = try store.applyUserPatch(alloc, .{ .statusline_item = .{ .item = .workspace, .enabled = true } });
+    defer moved.deinit(alloc);
+    try std.testing.expect(moved == .committed);
+    {
+        const bytes = try store.readPrimaryForTest(alloc);
+        defer alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("statusLine") == null);
+        const status = parsed.value.object.get("status_line").?.object;
+        // The current key keeps its own value; the older one only fills gaps.
+        try std.testing.expect(status.get("context").?.bool);
+        try std.testing.expect(status.get("session").?.bool);
+        try std.testing.expect(status.get("workspace").?.bool);
+        // A group nothing saved keeps its older name until it's saved.
+        try std.testing.expect(parsed.value.object.get("notifications").?.object.get("max").?.bool);
+    }
+
+    var removed = try store.applyUserPatch(alloc, .{ .remove = "sound.max" });
+    defer removed.deinit(alloc);
+    try std.testing.expect(removed == .committed);
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, "notifications") == null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"max\"") == null);
+}
+
+test "saving a renamed group replaces a stray value fx ignored under its current name" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeStoreFixture(tmp.dir, "home/.fx/settings.json", "{\"sound\":false,\"status_line\":7,\"notifications\":{\"max\":true}}\n");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var outcome = try store.applyUserPatch(alloc, .{
+        .notification_turn_end = false,
+        .statusline_item = .{ .item = .context, .enabled = true },
+    });
+    defer outcome.deinit(alloc);
+    try std.testing.expect(outcome == .committed);
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    const sound = parsed.value.object.get("sound").?.object;
+    try std.testing.expect(sound.get("max").?.bool);
+    try std.testing.expect(!sound.get("turn_end").?.bool);
+    try std.testing.expect(parsed.value.object.get("status_line").?.object.get("context").?.bool);
+    try std.testing.expect(parsed.value.object.get("notifications") == null);
 }
 
 test "durable validation rejects malformed workspace statusline" {
@@ -2410,7 +2712,9 @@ test "notification user patch preserves sibling fields and valid workspace overr
     defer alloc.free(bytes);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
     defer parsed.deinit();
-    const notifications = parsed.value.object.get("notifications").?.object;
+    // Saving moves the older `notifications` group to `sound`.
+    try std.testing.expect(parsed.value.object.get("notifications") == null);
+    const notifications = parsed.value.object.get("sound").?.object;
     try std.testing.expectEqual(true, notifications.get("turn_end").?.bool);
     try std.testing.expectEqual(true, notifications.get("attention_required").?.bool);
     try std.testing.expectEqual(true, notifications.get("max").?.bool);
@@ -2478,6 +2782,42 @@ test "user patch snapshots and removes legacy workspace copies" {
     const recovered = try io_mod.readFileToEnd(alloc, &recovery, max_settings_bytes + 1);
     defer alloc.free(recovered);
     try std.testing.expectEqualStrings(original, recovered);
+}
+
+test "fx config set and unset remove the workspace copy they would lose to" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try writeStoreFixture(
+        tmp.dir,
+        "home/.fx/settings.json",
+        "{\"effort\":\"high\",\"workspaces\":{\"/workspace\":{\"max_agent_steps\":5,\"effort\":\"low\",\"status_line\":{\"session\":true}}}}\n",
+    );
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    var store = try Store.initFromHome(alloc, home, .writable);
+    defer store.deinit(alloc);
+
+    var set = try store.applyUserPatch(alloc, .{ .max_agent_steps = 12 });
+    defer set.deinit(alloc);
+    try std.testing.expect(set == .committed);
+    var unset_effort = try store.applyUserPatch(alloc, .{ .remove = "effort" });
+    defer unset_effort.deinit(alloc);
+    try std.testing.expect(unset_effort == .committed);
+    var unset_session = try store.applyUserPatch(alloc, .{ .remove = "status_line.session" });
+    defer unset_session.deinit(alloc);
+    try std.testing.expect(unset_session == .committed);
+
+    const bytes = try store.readPrimaryForTest(alloc);
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 12), parsed.value.object.get("max_agent_steps").?.integer);
+    try std.testing.expect(parsed.value.object.get("effort") == null);
+    // Nothing is left in the workspace entry, so it goes.
+    if (parsed.value.object.get("workspaces")) |workspaces| try std.testing.expect(workspaces.object.get("/workspace") == null);
 }
 
 test "update channel patch removes legacy workspace copies" {
@@ -2708,7 +3048,8 @@ test "nested user cleanup preserves siblings and skips non-object containers" {
         return error.TestMissingRootPromptHistoryEnabled).bool);
     try std.testing.expectEqual(@as(i64, 1), (root_prompt_history.object.get("future") orelse
         return error.TestMissingRootPromptHistoryFuture).integer);
-    const root_statusline = parsed.value.object.get("statusLine") orelse
+    try std.testing.expect(parsed.value.object.get("statusLine") == null);
+    const root_statusline = parsed.value.object.get("status_line") orelse
         return error.TestMissingRootStatusline;
     try std.testing.expectEqual(true, (root_statusline.object.get("context") orelse
         return error.TestMissingRootStatuslineContext).bool);

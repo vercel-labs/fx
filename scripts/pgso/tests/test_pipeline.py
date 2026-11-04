@@ -27,7 +27,7 @@ from scripts.pgso.macos import (
 )
 from scripts.pgso.pipeline import (
     BENCHMARK_USE_FLAGS,
-    FX_MACHINE_OUTLINER_FLAGS,
+    FX_CODEGEN_FLAGS,
     GENERATION_FLAGS,
     IR_OUTLINER_FLAGS,
     OUTLINE_CLEANUP_FLAGS,
@@ -491,8 +491,9 @@ print('{{}}')""",
         self.assertEqual(
             (
                 "-machine-outliner-reruns=1",
+                "-homogeneous-prolog-epilog",
             ),
-            FX_MACHINE_OUTLINER_FLAGS,
+            FX_CODEGEN_FLAGS,
         )
         self.assertEqual(
             (
@@ -681,7 +682,7 @@ print('{{}}')""",
             ),
             candidate,
         )
-        for flag in FX_MACHINE_OUTLINER_FLAGS:
+        for flag in FX_CODEGEN_FLAGS:
             self.assertIn(flag, candidate_object)
             self.assertNotIn(flag, benchmark_object)
 
@@ -784,7 +785,7 @@ pathlib.Path(sys.argv[sys.argv.index('-map') + 1]).write_bytes({link_map!r}.enco
                 f"{self.paths.profile_use_bitcode} -o "
                 f"{self.paths.profile_use_ir}",
                 "artifact -filetype=obj -O=2 "
-                "-machine-outliner-reruns=1 "
+                "-machine-outliner-reruns=1 -homogeneous-prolog-epilog "
                 f"{self.paths.profile_use_bitcode} -o "
                 f"{self.paths.profile_use_object}",
                 "probe cc -### -target aarch64-macos -O2 -Wl,-dead_strip -s "
@@ -1414,14 +1415,15 @@ sys.stderr.write('optimizer warning')""",
                         expected_contract=self.good_link_contract(),
                     )
 
-    def test_candidate_size_rejects_more_than_7_000_mib(self) -> None:
+    def test_candidate_size_rejects_more_than_the_platform_ceiling(self) -> None:
         candidate = self.root / "candidate"
         candidate.write_bytes(b"")
         with candidate.open("r+b") as stream:
             stream.truncate(7_340_033)
 
         with self.assertRaisesRegex(PgsoError, "exceeds 7.000 MiB"):
-            validate_candidate_size(candidate)
+            validate_candidate_size(candidate, 7.000)
+        self.assertEqual(8.000, validate_candidate_size(candidate, 8.000).ceiling_mib)
 
     def test_candidate_must_not_create_an_adversarial_profile_file(self) -> None:
         before: set[pathlib.Path] = set()

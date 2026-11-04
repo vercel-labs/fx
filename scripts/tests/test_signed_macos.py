@@ -38,6 +38,7 @@ class SignedMacosComparisonTests(unittest.TestCase):
             for index, call in enumerate(measure.call_args_list):
                 args = call.kwargs
                 self.assertEqual(5000, args["samples"])
+                self.assertIs(False, args["retry_speed_failures"])
                 self.assertEqual(("status",) if index == 2 else None, args["command_names"])
                 self.assertEqual(control.read_bytes(), args["control_binary"].read_bytes())
                 expected = control if index == 2 else candidate
