@@ -2946,10 +2946,12 @@ pub fn Runtime(comptime App: type) type {
                 }
 
                 fn appendUserTurn(self: *Self, user: types.UserTurn, _: bool) !void {
-                    // A report's turn comes back as its card, as it showed live.
-                    if (try subagent_reports.card(self.projection.alloc, user)) |shown| {
+                    // A report's turn comes back as its subagent row, as it
+                    // showed live.
+                    if (try subagent_reports.row(self.projection.alloc, user)) |shown| {
                         defer shown.deinit(self.projection.alloc);
-                        for (shown.notices()) |notice| _ = try self.projection.appendNotice(notice);
+                        const entry_id = try self.projection.appendToolStatus(shown.outcome, shown.status);
+                        try self.projection.attachHistoricalToolDetail(entry_id, subagent_reports.Row.call, .subagent, shown.result(self.projection.created_at_ms));
                         return;
                     }
                     _ = try self.projection.appendUserTurn(user);

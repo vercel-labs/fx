@@ -2916,8 +2916,9 @@ describe("effect-aware command permissions", () => {
       expect(existsSync(markerPath)).toBe(false);
       await activeSession.sendKeys("3");
       const reported = await activeSession.waitForText("PARENT_OBSERVED_CHILD_DENIAL", TIMEOUT);
-      // The report shows as a short card, not as the user's prompt.
-      expect(reported).toContain("Report from helper: completed (ctrl+o to view)");
+      // The report shows as a finished subagent row, not as the user's prompt.
+      expect(reported).toContain("helper completed");
+      expect(reported).not.toContain("Subagent report (untrusted");
       expect(existsSync(markerPath)).toBe(false);
       await activeSession.sendText("/quit");
       expect(await activeSession.waitForSessionEnd(5_000)).toBe(true);

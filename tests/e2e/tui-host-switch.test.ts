@@ -240,8 +240,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(main).not.toContain("SWITCH_CHILD_REPLY");
         // The footer names main, not the subagent.
         expect(main).not.toMatch(/^reviewer \u00b7 /m);
-        // The subagent's report of main's message shows as a card.
-        expect(main).toContain("Report from reviewer: completed (ctrl+o to view)");
+        // The subagent's report of main's message shows as a subagent row.
+        expect(main).toContain("reviewer completed");
       });
 
       // Main's model never sees the answer to a message it did not send: its
@@ -968,7 +968,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         first.release();
         // Main's turn ended with the receipt; the report comes once the
         // subagent's write is done.
-        await session.waitForText("Report from follower: completed", 30_000);
+        await session.waitForText("follower completed", 30_000);
         expect(readFileSync(join(workspace, "followed.txt"), "utf8")).toBe("FOLLOWED\n");
         expect(await session.captureFullScrollback()).not.toContain("needs permission");
 
@@ -1231,7 +1231,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendLiteral("Y");
         const stayed = await session.waitForPane((pane) => pane.includes("Yhello Zworld"), 10_000);
         expect(stayed).toContain("main \u00b7 ctrl+x");
-        expect(stayed).not.toContain("EDGE_CHILD_ANSWER");
+        // Main's screen holds the user's prompt; the subagent's opens with
+        // main's task as its prompt.
+        expect(stayed).toMatch(/^┃ SWITCH_USER_EDGE/m);
+        expect(stayed).not.toMatch(/^┃ EDGE_TASK/m);
         expect(stayed).not.toContain(LIST_HINT);
       });
     },

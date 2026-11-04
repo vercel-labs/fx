@@ -1467,10 +1467,12 @@ const App = struct {
         skill_tokens: []const registered_entities.SkillTokenSpan,
     ) !void {
         // A turn a subagent's report or message started is not the user's
-        // words, so it shows as a short card rather than as a prompt.
-        if (try subagent_reports.card(self.alloc, user)) |shown| {
+        // words, so it shows as a finished subagent call, as the parent's
+        // own calls do.
+        if (try subagent_reports.row(self.alloc, user)) |shown| {
             defer shown.deinit(self.alloc);
-            for (shown.notices()) |notice| try self.writeDomainNotice(notice, true);
+            const entry_id = try self.writeCompletedToolStatusReturningEntryId(shown.outcome, shown.status, true);
+            try self.shell.attachHistoricalToolDetail(self.alloc, entry_id, subagent_reports.Row.call, .subagent, shown.result(io_mod.milliTimestamp()));
             return;
         }
         _ = try self.shell.writeUserPromptCard(
