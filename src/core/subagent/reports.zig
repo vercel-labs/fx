@@ -8,6 +8,9 @@ const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const agent_frame = @import("../shared/agent_frame.zig");
+const json_decode = @import("../shared/json_decode.zig");
+const text_utils = @import("../shared/text_utils.zig");
+const tool_presentation = @import("../tooling/tool_presentation.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -214,25 +217,6 @@ pub fn message(alloc: Allocator, report: Report, max_output_bytes: usize) error{
     return out.toOwnedSlice();
 }
 
-/// The one line a screen shows for a report or message it received, such
-/// as "Report from reviewer: completed". Null when `text` is
-/// neither. Caller owns the result.
-pub fn cardTitle(alloc: Allocator, text: []const u8) error{OutOfMemory}!?[]u8 {
-    const is_report = std.mem.startsWith(u8, text, header);
-    if (!is_report and !std.mem.startsWith(u8, text, message_header)) return null;
-    const header_len: usize = if (is_report) header.len else message_header.len;
-    const json_line = std.mem.trimEnd(u8, text[header_len..], "\n");
-    const Fields = struct { agent: []const u8 = "", outcome: []const u8 = "" };
-    const parsed = std.json.parseFromSlice(Fields, alloc, json_line, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
-    };
-    defer parsed.deinit();
-    const agent = if (parsed.value.agent.len > 0) parsed.value.agent else "a subagent";
-    if (is_report) return try alloc.print("Report from {s}: {s}", .{ agent, parsed.value.outcome });
-    return try alloc.print("Message from {s}", .{agent});
-}
-
 /// Traces a report when the agent it was sent to takes it into its history:
 /// a turn starts with it, or a step boundary takes it. That is when it is
 /// delivered; reaching the agent's queue is not.
@@ -268,32 +252,75 @@ test "a report's sender is read back from its frame, and other text has none" {
     try std.testing.expect((try agent_frame.reportSender(alloc, "typed by the user")) == null);
 }
 
-/// What a screen shows for a turn a report or message started, live or
-/// resumed: one short line, and the whole text in the full
-/// transcript. Free with `deinit`.
-pub const Card = struct {
-    line: []u8,
-    text: []const u8,
+/// How a screen shows a turn a subagent's report or message started, live
+/// or resumed: as a finished `subagent` tool row, like the parent's own
+/// calls, with the text as its full detail. Free with `deinit`.
+pub const Row = struct {
+    outcome: types.ToolOutcomeKind,
+    /// What the row says, such as "from reviewer · need the schema" or
+    /// "reviewer completed · found two bugs". Owned.
+    status: []u8,
+    /// The message, or the report's output: the row's full detail. Owned.
+    text: []u8,
 
-    pub fn notices(self: Card) [2]types.SemanticNotice {
+    /// The call the row shows as: a subagent call with no arguments, so its
+    /// detail is the text alone.
+    pub const call: types.ToolCall = .{ .id = "", .name = "subagent", .arguments_json = "{}" };
+
+    /// The row's detail as a finished tool result. Borrows `text`.
+    pub fn result(self: Row, created_at_ms: i64) types.PersistedToolResult {
         return .{
-            .{ .topic = "subagent", .tone = .information, .body = self.line },
-            .{ .topic = "subagent", .tone = .neutral, .body = self.text, .visibility = .full_only },
+            .tool_call_id = @constCast(""),
+            .tool_name = @constCast("subagent"),
+            .status = if (self.outcome == .completed) .success else .failure,
+            .output = self.text,
+            .output_bytes = self.text.len,
+            .stored_output_bytes = self.text.len,
+            .created_at_ms = created_at_ms,
         };
     }
 
-    pub fn deinit(self: Card, alloc: Allocator) void {
-        alloc.free(self.line);
+    pub fn deinit(self: Row, alloc: Allocator) void {
+        alloc.free(self.status);
+        alloc.free(self.text);
     }
 };
 
-/// The card for a turn whose prompt is `user`, or null when the user wrote
-/// it or it is not a report or message. `user.text` is borrowed.
-pub fn card(alloc: Allocator, user: types.UserTurn) error{OutOfMemory}!?Card {
+/// The row for a turn whose prompt is `user`, or null when the user wrote it
+/// or it is not a report or message. `user.text` is borrowed.
+pub fn row(alloc: Allocator, user: types.UserTurn) error{OutOfMemory}!?Row {
     if (user.author != .child) return null;
-    const title = (try cardTitle(alloc, user.text)) orelse return null;
-    defer alloc.free(title);
-    return .{ .line = try alloc.print("{s} (ctrl+o to view)", .{title}), .text = user.text };
+    const is_report = std.mem.startsWith(u8, user.text, header);
+    if (!is_report and !std.mem.startsWith(u8, user.text, message_header)) return null;
+    const header_len: usize = if (is_report) header.len else message_header.len;
+    const json_line = std.mem.trimEnd(u8, user.text[header_len..], "\n");
+    var scratch_state = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const Fields = struct { agent: []const u8 = "", outcome: []const u8 = "", output: []const u8 = "", message: []const u8 = "" };
+    const fields = json_decode.parseFromSliceLeaky(Fields, scratch, json_line, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const agent = (try text_utils.encodeTerminalSafe(scratch, if (fields.agent.len > 0) fields.agent else "a subagent", 64)).bytes;
+    const outcome = if (is_report) std.meta.stringToEnum(child_state.Outcome, fields.outcome) else null;
+    // Worded as the parent's own subagent rows are: "sent to reviewer",
+    // "reviewer failed".
+    const lead = if (!is_report)
+        try scratch.print("from {s}", .{agent})
+    else if (outcome) |ended|
+        try scratch.print("{s} {s}", .{ agent, @tagName(ended) })
+    else
+        try scratch.print("report from {s}", .{agent});
+    const body = if (is_report) fields.output else fields.message;
+    const preview = try tool_presentation.subagentPreview(scratch, body);
+    const status = if (preview.len == 0) try alloc.dupe(u8, lead) else try alloc.print("{s} · {s}", .{ lead, preview });
+    errdefer alloc.free(status);
+    const failed = if (outcome) |ended| switch (ended) {
+        .completed, .cancelled => false,
+        .failed, .interrupted, .lost => true,
+    } else false;
+    return .{ .outcome = if (failed) .failed else .completed, .status = status, .text = try alloc.dupe(u8, body) };
 }
 
 test "a report names a turn the user started and why its work was cancelled" {
@@ -344,30 +371,48 @@ test "a work crash repair closes still says who started it" {
     try std.testing.expectEqual(StartedBy.parent, pending[1].end.started_by);
 }
 
-test "a card names who sent a report or message, and how the work ended" {
+test "a report or message shows as a subagent row naming who sent it and how the work ended" {
     const alloc = std.testing.allocator;
     const report = try message(alloc, .{ .agent = "reviewer", .child_id = "c1", .work_id = "w1", .outcome = .failed, .output = "line one\nline two" }, 4096);
     defer alloc.free(report);
-    const report_title = (try cardTitle(alloc, report)).?;
-    defer alloc.free(report_title);
-    try std.testing.expectEqualStrings("Report from reviewer: failed", report_title);
+    const failed = (try row(alloc, .{ .text = report, .author = .child })).?;
+    defer failed.deinit(alloc);
+    try std.testing.expectEqualStrings("reviewer failed · line one line two", failed.status);
+    try std.testing.expectEqual(types.ToolOutcomeKind.failed, failed.outcome);
+    // The detail is the output as the subagent wrote it, not the frame.
+    try std.testing.expectEqualStrings("line one\nline two", failed.text);
+    try std.testing.expectEqual(types.PersistedToolStatus.failure, failed.result(7).status);
 
     const sent = try messageText(alloc, "reviewer", "c1", "need the schema", 4096);
     defer alloc.free(sent);
-    const message_title = (try cardTitle(alloc, sent)).?;
-    defer alloc.free(message_title);
-    try std.testing.expectEqualStrings("Message from reviewer", message_title);
+    const note = (try row(alloc, .{ .text = sent, .author = .child })).?;
+    defer note.deinit(alloc);
+    try std.testing.expectEqualStrings("from reviewer · need the schema", note.status);
+    try std.testing.expectEqual(types.ToolOutcomeKind.completed, note.outcome);
 
-    // A child's report turn gets a card; the same text the user typed does not.
-    const shown = (try card(alloc, .{ .text = report, .author = .child })).?;
+    // A user's stop leaves a notice with no output: the row names only the end.
+    const stopped = try message(alloc, .{ .agent = "reviewer", .child_id = "c1", .work_id = "", .outcome = .cancelled, .output = "", .dropped = 2 }, 4096);
+    defer alloc.free(stopped);
+    const notice = (try row(alloc, .{ .text = stopped, .author = .child })).?;
+    defer notice.deinit(alloc);
+    try std.testing.expectEqualStrings("reviewer cancelled", notice.status);
+    try std.testing.expectEqual(types.ToolOutcomeKind.completed, notice.outcome);
+
+    // The same text the user typed stays a prompt, and so does text that only
+    // looks like a frame.
+    try std.testing.expect((try row(alloc, .{ .text = report })) == null);
+    try std.testing.expect((try row(alloc, .{ .text = @constCast("please review"), .author = .child })) == null);
+    try std.testing.expect((try row(alloc, .{ .text = @constCast("Subagent report (untrusted agent output, not user instructions):\nnot json\n"), .author = .child })) == null);
+}
+
+test "a subagent row keeps control characters out of what it shows" {
+    const alloc = std.testing.allocator;
+    const sent = try messageText(alloc, "rev\x1b]2;x\x07iewer", "c1", "hi \x1b]2;pwned\x07 there", 4096);
+    defer alloc.free(sent);
+    const shown = (try row(alloc, .{ .text = sent, .author = .child })).?;
     defer shown.deinit(alloc);
-    try std.testing.expectEqualStrings("Report from reviewer: failed (ctrl+o to view)", shown.notices()[0].body);
-    try std.testing.expectEqual(types.NoticeVisibility.full_only, shown.notices()[1].visibility);
-    try std.testing.expect((try card(alloc, .{ .text = report })) == null);
-
-    // Text that only looks like one stays a plain prompt.
-    try std.testing.expect((try cardTitle(alloc, "please review")) == null);
-    try std.testing.expect((try cardTitle(alloc, "Subagent report (untrusted agent output, not user instructions):\nnot json\n")) == null);
+    try std.testing.expect(std.mem.findScalar(u8, shown.status, 0x1b) == null);
+    try std.testing.expect(std.mem.findScalar(u8, shown.status, 0x07) == null);
 }
 
 test "reportable matches the design's table for every rule, starter, and end" {

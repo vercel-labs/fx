@@ -104,7 +104,10 @@ pub fn subagentAction(
     return .{ .label = label, .detail = detail };
 }
 
-fn subagentPreview(alloc: Allocator, raw: []const u8) Allocator.Error![]u8 {
+/// The preview a subagent row shows for `raw`: runs of whitespace, line
+/// breaks included, become one space, made terminal-safe and cut to 120
+/// bytes. Caller owns the result.
+pub fn subagentPreview(alloc: Allocator, raw: []const u8) Allocator.Error![]u8 {
     var buffer: [124]u8 = undefined;
     var len: usize = 0;
     var pending_space = false;
