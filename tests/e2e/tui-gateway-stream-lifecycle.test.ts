@@ -455,8 +455,10 @@ function retryAfterUnavailable(seconds: number): Response {
 // A finish with an empty reason: fx cannot tell how the response ended, so
 // the request fails with no retry.
 // A stream fx cannot read at all ends the turn with no resend.
-function malformedEventResponse(): Response {
-  return new Response("data: {not json}\n\n", { headers: { "content-type": "text/event-stream" } });
+/// An event nested deeper than fx reads, which no resend can fix. An event
+/// that is not JSON at all is resent like a dropped stream instead.
+function tooDeepEventResponse(): Response {
+  return new Response(`data: ${"[".repeat(300)}${"]".repeat(300)}\n\n`, { headers: { "content-type": "text/event-stream" } });
 }
 
 function partialEofResponse(text: string): Response {
@@ -3355,7 +3357,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "fx-tui-recovery-terminal-restore-",
         [
           () => new Response("", { headers: { "content-type": "text/event-stream" } }),
-          () => malformedEventResponse(),
+          () => tooDeepEventResponse(),
         ],
       );
 
@@ -3388,7 +3390,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         "fx-tui-recovery-terminal-keeps-draft-",
         [
           () => new Response("", { headers: { "content-type": "text/event-stream" } }),
-          () => malformedEventResponse(),
+          () => tooDeepEventResponse(),
         ],
       );
 

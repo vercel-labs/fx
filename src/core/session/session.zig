@@ -72,6 +72,47 @@ pub const resumed_request_prompt =
     "and continue the previous request.\n" ++
     "</session_resumed>";
 
+/// What the model reads in place of `resumed_request_prompt` when the turn fx
+/// stopped ran no tool: that turn is projected as the user's own message, so
+/// there is nothing to check and nothing to say no to.
+pub const resumed_request_note_no_tool =
+    "<session_resumed>\n" ++
+    "fx stopped before it answered the message above, because it crashed or its window was closed. " ++
+    "Nothing ran. Answer that message now.\n" ++
+    "</session_resumed>";
+
+/// Whether an interrupted turn ran no tool at all. A tool fx stopped in the
+/// middle of is not `tool_call`: the session repairs it into a step of its
+/// own, answered as possibly run.
+fn ranNothing(entry: core_types.InterruptedHistoryTurn) bool {
+    return entry.tool_call == null and entry.completed_tool_names.len == 0 and entry.execution.tool_steps.len == 0;
+}
+
+/// Drops trailing interrupted turns that were themselves resumes and ran
+/// nothing, so a request closed twice continues the turn fx stopped first.
+pub fn withoutSupersededResumes(history: []const HistoryTurn) []const HistoryTurn {
+    var end = history.len;
+    while (end > 0) : (end -= 1) {
+        switch (history[end - 1]) {
+            .interrupted => |entry| if (ranNothing(entry) and std.mem.eql(u8, entry.user.text, resumed_request_prompt)) continue,
+            else => {},
+        }
+        break;
+    }
+    return history[0..end];
+}
+
+/// The note a resumed request sends. A stopped turn that ran a tool keeps
+/// the caveat that it may have partly run; one that ran nothing is the
+/// user's message, still to answer.
+pub fn resumedRequestNote(history: []const HistoryTurn) []const u8 {
+    if (history.len == 0) return resumed_request_note_no_tool;
+    return switch (history[history.len - 1]) {
+        .interrupted => |entry| if (ranNothing(entry)) resumed_request_note_no_tool else resumed_request_prompt,
+        else => resumed_request_note_no_tool,
+    };
+}
+
 /// What the transcript shows in place of `resumed_request_prompt`, live and
 /// when the session is replayed.
 pub const resumed_request_notice: core_types.SemanticNotice = .{
@@ -4802,4 +4843,41 @@ test "image catalog merges a retained recovery image and rejects changed identit
     try std.testing.expectEqual(@as(usize, 7), merged[0].id);
     images[0].snapshot_sha256 = @constCast(text_utils.repeat("b", 64));
     try std.testing.expectError(error.StaleImageCatalog, merge_image_catalog_history_turn(alloc, catalog, turn));
+}
+
+test "a resumed request's note names a tool only when the stopped turn ran one" {
+    const prompt = @constCast("Name the capital.");
+    try std.testing.expectEqualStrings(resumed_request_note_no_tool, resumedRequestNote(&.{}));
+    const plain = [_]HistoryTurn{.{ .interrupted = .{ .user = .{ .text = prompt } } }};
+    try std.testing.expectEqualStrings(resumed_request_note_no_tool, resumedRequestNote(&plain));
+    // A tool fx stopped in the middle of comes back as a step of its own.
+    var repaired = [_]core_types.ToolExecutionStep{.{}};
+    const running = [_]HistoryTurn{.{ .interrupted = .{ .user = .{ .text = prompt }, .execution = .{ .tool_steps = &repaired } } }};
+    try std.testing.expectEqualStrings(resumed_request_prompt, resumedRequestNote(&running));
+    var completed = [_][]u8{@constCast("read_file")};
+    const ran = [_]HistoryTurn{.{ .interrupted = .{ .user = .{ .text = prompt }, .completed_tool_names = &completed } }};
+    try std.testing.expectEqualStrings(resumed_request_prompt, resumedRequestNote(&ran));
+    const answered = [_]HistoryTurn{.{ .assistant = .{ .user = .{ .text = prompt }, .assistant = @constCast("Paris") } }};
+    try std.testing.expectEqualStrings(resumed_request_note_no_tool, resumedRequestNote(&answered));
+}
+
+test "resume turns that ran nothing are dropped, however many stacked up" {
+    const prompt = @constCast("List the planets.");
+    const resume_text = @constCast(resumed_request_prompt);
+    var history: [51]HistoryTurn = undefined;
+    history[0] = .{ .interrupted = .{ .user = .{ .text = prompt } } };
+    for (history[1..]) |*turn| turn.* = .{ .interrupted = .{ .user = .{ .text = resume_text } } };
+    const kept = withoutSupersededResumes(&history);
+    try std.testing.expectEqual(@as(usize, 1), kept.len);
+    try std.testing.expectEqualStrings("List the planets.", kept[0].interrupted.user.text);
+    try std.testing.expectEqual(@as(usize, 0), withoutSupersededResumes(history[1..]).len);
+
+    // A resume that ran a tool did something, so it stays, and so does
+    // everything before it.
+    var repaired = [_]core_types.ToolExecutionStep{.{}};
+    var with_tool = history;
+    with_tool[25] = .{ .interrupted = .{ .user = .{ .text = resume_text }, .execution = .{ .tool_steps = &repaired } } };
+    try std.testing.expectEqual(@as(usize, 26), withoutSupersededResumes(&with_tool).len);
+    // A stopped turn the user wrote is never dropped.
+    try std.testing.expectEqual(@as(usize, 1), withoutSupersededResumes(history[0..1]).len);
 }

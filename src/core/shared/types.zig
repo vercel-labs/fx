@@ -420,6 +420,7 @@ pub fn plainErrorText(raw: []const u8, buf: []u8) []const u8 {
         .{ "NetworkInterrupted", "network interrupted" },
         .{ "StreamInterrupted", "stream interrupted" },
         .{ "InvalidGatewaySseEvent", "unreadable reply" },
+        .{ "MalformedGatewaySseEvent", "unreadable reply" },
         .{ "InvalidProviderFinishReason", "unreadable reply" },
         .{ "GatewaySseEventTooLarge", "reply too large to read" },
         .{ "XaiGrokSseEventTooLarge", "reply too large to read" },

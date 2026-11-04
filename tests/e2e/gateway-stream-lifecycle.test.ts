@@ -31,6 +31,7 @@ import {
   type GatewayRequest,
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
+import { completion as configuredCompletion, createConfiguredProviderFixture } from "./fixtures/chat-completions";
 import { childLines, childWork, compactionRecordPath, copyV1Fixture, logLines, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, withoutConversionNotice } from "./saved-sessions";
 import { stdoutFrames } from "./render-lab/tape";
 import {
@@ -11661,6 +11662,129 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+});
+
+// Statuses and streams the request-recovery campaign found ending turns that a
+// resend outlives: every 5xx retries like 503, a failure fx does not retry
+// names its own status, and a stream event that is not JSON is resent like a
+// dropped stream (src/core/agent/stream_provider.zig FailureKind.fromHttpStatus,
+// src/gateway/client.zig consumeSseStreamTraced).
+describe("request recovery across statuses and garbled streams", () => {
+  function statusResponse(status: number, body: string, contentType = "application/json"): Response {
+    return new Response(body, { status, headers: { "content-type": contentType, "retry-after": "0" } });
+  }
+
+  test("fx ask retries 529, 520 and 524 like 503 and answers once", async () => {
+    const root = createFixtureRoot("every-5xx-retries");
+    const tracePath = join(root.root, "trace.log");
+    const responses = [
+      statusResponse(529, JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } })),
+      statusResponse(520, "error code: 520", "text/plain"),
+      statusResponse(524, "error code: 524", "text/plain"),
+      fakeGatewayFinalText("Recovered after every server error."),
+    ];
+    const gateway = startGateway(() => responses.shift() ?? new Response("unexpected request", { status: 500 }));
+    try {
+      const result = await runFx(["ask", "--auto", "Recover after server errors."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("Recovered after every server error.");
+      expect(gateway.requestCount()).toBe(4);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · next try in 1s · attempt 1$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Gateway error · retrying · attempt 4$/m);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("fx ask names the status of a failure it does not retry", async () => {
+    const root = createFixtureRoot("named-status");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => statusResponse(404, JSON.stringify({ error: { message: "no such route" } })));
+    try {
+      const result = await runFx(["ask", "--auto", "Reach a missing route."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 20_000,
+      });
+      expect(result.code).not.toBe(0);
+      expect(gateway.requestCount()).toBe(1);
+      expect(result.stderr).toContain("HTTP 404");
+      expect(result.stderr).not.toContain("HTTP 502");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("fx ask resends after a stream event that is not JSON", async () => {
+    const root = createFixtureRoot("garbled-event-resend");
+    const tracePath = join(root.root, "trace.log");
+    const garbled =
+      'data: {"type":"text-start","id":"t1"}\n\n' +
+      'data: {"type":"text-delta","id":"t1","delta":"Partial "}\n\n' +
+      'data: {"type":"text-delta","id":"t1","delta":"\u0001broken\n\n';
+    const responses = [sse(garbled), fakeGatewayFinalText("Recovered after a garbled event.")];
+    const gateway = startGateway(() => responses.shift() ?? new Response("unexpected request", { status: 500 }));
+    try {
+      const result = await runFx(["ask", "--auto", "Recover after a garbled event."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 20_000,
+      });
+      expect(result.code).toBe(0);
+      expect(gateway.requestCount()).toBe(2);
+      expect(result.stdout).toContain("Recovered after a garbled event.");
+      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1$/m);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a stream event nested past the depth limit still ends the turn", async () => {
+    const root = createFixtureRoot("too-deep-event");
+    const tracePath = join(root.root, "trace.log");
+    const deep = `data: ${"[".repeat(300)}${"]".repeat(300)}\n\n`;
+    const gateway = startGateway(() => sse(deep));
+    try {
+      const result = await runFx(["ask", "--auto", "Read a deep event."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 20_000,
+      });
+      expect(result.code).not.toBe(0);
+      expect(gateway.requestCount()).toBe(1);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a configured chat-completions provider retries a 529", async () => {
+    let calls = 0;
+    const fixture = createConfiguredProviderFixture((body) => {
+      calls += 1;
+      if (calls === 1) return statusResponse(529, JSON.stringify({ error: { message: "overloaded" } }));
+      return configuredCompletion(body.model, "LOCAL_RECOVERED_529");
+    });
+    try {
+      const result = await runFx(["ask", "--auto", "Recover through the local provider."], {
+        cwd: fixture.workspace,
+        env: fixture.env,
+        timeoutMs: 20_000,
+      });
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("LOCAL_RECOVERED_529");
+      expect(fixture.requests.filter((request) => request.path === "/v1/chat/completions").length).toBe(2);
+    } finally {
+      fixture.close();
     }
   });
 });

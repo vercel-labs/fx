@@ -490,7 +490,9 @@ pub const FailureKind = enum {
             .bad_gateway => .bad_gateway,
             .service_unavailable => .unavailable,
             .gateway_timeout => .gateway_timeout,
-            else => .provider_error,
+            // 529 (overloaded), 520-524 (Cloudflare) and every other 5xx are
+            // server failures a resend can outlive.
+            else => if (@backingInt(status) >= 500 and @backingInt(status) <= 599) .server_error else .provider_error,
         };
     }
 };
@@ -510,6 +512,8 @@ pub const Failure = struct {
     detail: ?[]u8 = null,
     diagnostics: FailureDiagnostics = .{},
     retry_after_seconds: ?u64 = null,
+    /// The response's own status, so messages name the code it sent.
+    http_status: ?std.http.Status = null,
     ownership: ResultOwnership = .borrowed,
 };
 
@@ -806,6 +810,10 @@ test "provider HTTP statuses classify into failure kinds" {
         .{ .bad_gateway, .bad_gateway },
         .{ .service_unavailable, .unavailable },
         .{ .gateway_timeout, .gateway_timeout },
+        .{ @as(std.http.Status, @fromBackingInt(507)), .server_error },
+        .{ @as(std.http.Status, @fromBackingInt(520)), .server_error },
+        .{ @as(std.http.Status, @fromBackingInt(524)), .server_error },
+        .{ @as(std.http.Status, @fromBackingInt(529)), .server_error },
         .{ .not_found, .provider_error },
         .{ .conflict, .provider_error },
         .{ .ok, .provider_error },

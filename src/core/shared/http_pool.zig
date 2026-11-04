@@ -33,6 +33,10 @@ pub const HttpPool = struct {
     last_activity_ms: std.atomic.Value(i64) = .init(0),
     warm_started: std.atomic.Value(bool) = .init(false),
     warm_done: std.atomic.Value(bool) = .init(false),
+    /// Connection opens running on their own threads (src/gateway/client.zig
+    /// PooledOpenJob). One a request walked away from may still be inside a
+    /// DNS lookup that never returns.
+    open_jobs: std.atomic.Value(u32) = .init(0),
     deinitialized: bool = false,
 
     pub const DestroyDisposition = enum {
@@ -42,13 +46,17 @@ pub const HttpPool = struct {
         /// pool is intentionally leaked; only reachable while a process is
         /// exiting or abandoning state, so the memory dies with the process.
         abandoned_warm_flight,
+        /// A connection open a request walked away from still owns the
+        /// client; the pool is leaked the same way.
+        abandoned_open_job,
     };
 
     pub fn init(alloc: std.mem.Allocator) HttpPool {
         return .{ .client = .{ .allocator = alloc, .io = io_mod.getIo() } };
     }
 
-    /// Tears the pool down. When a warm flight is still inside connect, waits
+    /// Tears the pool down. When a warm flight is still inside connect, or a
+    /// connection open a request walked away from is still running, waits
     /// briefly for it, then abandons rather than freeing memory the thread is
     /// using (only reachable on process-abandon paths).
     pub fn deinit(self: *HttpPool) DestroyDisposition {
@@ -64,8 +72,25 @@ pub const HttpPool = struct {
                 return .abandoned_warm_flight;
             }
         }
+        var waited_ms: u64 = 0;
+        while (self.open_jobs.load(.acquire) != 0 and waited_ms < 500) : (waited_ms += 10) {
+            io_mod.sleep(10 * std.time.ns_per_ms);
+        }
+        if (self.open_jobs.load(.acquire) != 0) {
+            debug_trace.logf("gateway", "pool_deinit result=abandoned_open_job jobs={d}", .{self.open_jobs.load(.acquire)});
+            return .abandoned_open_job;
+        }
         self.client.deinit();
         return .destroyed;
+    }
+
+    pub fn beginOpenJob(self: *HttpPool) void {
+        _ = self.open_jobs.fetchAdd(1, .acq_rel);
+    }
+
+    /// A job's last touch of the pool.
+    pub fn endOpenJob(self: *HttpPool) void {
+        _ = self.open_jobs.fetchSub(1, .acq_rel);
     }
 
     pub fn noteActivity(self: *HttpPool) void {

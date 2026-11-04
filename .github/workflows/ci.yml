@@ -72,6 +72,9 @@ jobs:
       - name: Model-check the empty-reply nudge
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/agent_runtime/check.sh
 
+      - name: Model-check the connection open hand-off
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" tests/tla/gateway_open/check.sh
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -79,6 +82,9 @@ jobs:
 
       - name: Walk the recovery module along its model
         run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/recovery/driver.ts --self-check
+
+      - name: Walk the connection open hand-off along its model
+        run: TLA2TOOLS_JAR="$RUNNER_TEMP/tla2tools.jar" bun tests/tla/drivers/gateway_open/driver.ts --self-check
 
       - name: Check CLI shape
         run: python3 -m scripts.check_cli_shape

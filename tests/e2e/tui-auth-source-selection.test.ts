@@ -5622,10 +5622,17 @@ test("provider SSE framing preserves saved and resumed answers", async () => {
       const first = await runFx(["ask", "--json", "--auto", "Report the supplied answer."], { cwd: profile, env, timeoutMs: TIMEOUT });
       const output = JSON.parse(first.stdout);
       expect(first.signal).toBeNull();
-      expect(direct ? direct.bodies.length : gateway.requests.length).toBe(1);
-      if (mode === "invalid") {
+      // A Gateway event that is not JSON is resent like a dropped stream.
+      const resent = mode === "invalid" && provider === "gateway";
+      expect(direct ? direct.bodies.length : gateway.requests.length).toBe(resent ? 2 : 1);
+      if (resent) {
+        expect(first.code, first.stdout + first.stderr).toBe(0);
+        expect(output.output).toContain("RESUME_OK");
+        // The tool the broken stream named never runs.
+        expect(output.tool_calls).toEqual([]);
+      } else if (mode === "invalid") {
         expect(first.code, first.stdout + first.stderr).toBe(1);
-        expect(output.error).toBe(provider === "gateway" ? "InvalidGatewaySseEvent" : provider === "codex" ? "InvalidOpenAICodexSseEvent" : "InvalidXaiGrokSseEvent");
+        expect(output.error).toBe(provider === "codex" ? "InvalidOpenAICodexSseEvent" : "InvalidXaiGrokSseEvent");
         expect(output.tool_calls).toEqual([]);
       } else {
         expect(first.code, first.stdout + first.stderr).toBe(0);

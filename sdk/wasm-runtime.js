@@ -352,6 +352,14 @@ function createRuntime(options) {
       ready ? settled() : 0);
   }
 
+  // A response's Retry-After in whole seconds, read as native fx reads it
+  // (digits only), or -1 when it has none.
+  function streamRetryAfter(handle) {
+    const value = streams.get(handle)?.response?.headers.get("retry-after")?.trim();
+    if (!value || !/^\d+$/.test(value)) return -1;
+    return Math.min(Number(value), 0x7fffffff);
+  }
+
   function streamNext(handle, outPtr, outCap) {
     const state = streams.get(handle);
     if (!state) return -1;
@@ -930,6 +938,7 @@ function createRuntime(options) {
     fx_http_stream_status: new WebAssembly.Suspending(streamStatus),
     fx_http_stream_next: new WebAssembly.Suspending(streamNext),
     fx_http_stream_close(handle) { const state = streams.get(handle); state?.controller.abort(abortReason); streams.delete(handle); },
+    fx_http_stream_retry_after: streamRetryAfter,
     fx_http_request: new WebAssembly.Suspending(httpRequest),
     fx_host_tool_call: new WebAssembly.Suspending(hostToolCall),
     fx_journal_flush: new WebAssembly.Suspending(journalFlush),

@@ -4493,6 +4493,16 @@ fn isRetryableModelFailure(kind: agent_stream_provider.FailureKind) bool {
     };
 }
 
+test "every HTTP status retries exactly when it is 429 or a 5xx, and its failure names that status" {
+    var code: u16 = 100;
+    while (code <= 999) : (code += 1) {
+        const status: std.http.Status = @fromBackingInt(@intCast(code));
+        const kind = agent_stream_provider.FailureKind.fromHttpStatus(status);
+        try std.testing.expectEqual(code == 429 or (code >= 500 and code <= 599), isRetryableModelFailure(kind));
+        try std.testing.expectEqual(status, failureStatus(.{ .kind = kind, .http_status = status }));
+    }
+}
+
 /// The module takes Retry-After in milliseconds. Absurd hints saturate; the
 /// module caps every hint, a rate limit's included, at its 30 second ceiling.
 fn retryAfterMs(seconds: ?u64) ?u32 {
@@ -4504,6 +4514,10 @@ test "retry after converts to milliseconds and saturates" {
     try std.testing.expectEqual(@as(?u32, null), retryAfterMs(null));
     try std.testing.expectEqual(@as(?u32, 3_000), retryAfterMs(3));
     try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), retryAfterMs(std.math.maxInt(u64)));
+}
+
+fn failureStatus(failure: agent_stream_provider.Failure) std.http.Status {
+    return failure.http_status orelse failureHttpStatus(failure.kind);
 }
 
 fn failureHttpStatus(kind: agent_stream_provider.FailureKind) std.http.Status {
@@ -4566,7 +4580,7 @@ fn httpFailureDetail(
     const clipped = detail[0..@min(detail.len, http_error_detail_max_bytes)];
     return runtime_gateway_step.gatewayHttpErrorDetail(
         arena,
-        failureHttpStatus(failure.kind),
+        failureStatus(failure),
         clipped,
         job.model,
         request_capabilities,
@@ -4583,7 +4597,7 @@ fn pushWaitingHttpFailureReason(
     request_capabilities: model_capabilities.Capabilities,
 ) !void {
     const detail = try httpFailureDetail(arena, failure, job, request_capabilities);
-    const message = try gateway_error_format.formatHttpErrorMessage(arena, failureHttpStatus(failure.kind), detail);
+    const message = try gateway_error_format.formatHttpErrorMessage(arena, failureStatus(failure), detail);
     if (deps.push_interactive_notice) |push| {
         try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
     } else {
@@ -5928,11 +5942,16 @@ fn processQueuedPromptInner(
         "history_turns={d} gateway_messages_before={d} interrupted_turns={d} history_turn_kinds={s}",
         .{ active_history.len, history_messages_before, interrupted_turns, history_turn_kinds },
     );
-    if (job.delivery.isContinuation()) {
+    // A resumed request continues the turn fx stopped: superseded resume
+    // turns are dropped and the stopped turn is projected without its abort
+    // note, as a steering continuation is.
+    const resumed_request = job.recovery_resume != null;
+    const resumed_history = if (resumed_request) session_runtime.withoutSupersededResumes(job.history) else job.history;
+    if (job.delivery.isContinuation() or resumed_request) {
         try session_runtime.appendSteeringActiveContextHistoryChatMessages(
             arena,
             &history_messages,
-            job.history,
+            resumed_history,
             0,
         );
     } else {
@@ -5973,6 +5992,8 @@ fn processQueuedPromptInner(
         .role = .user,
         .content = if (job.delivery.isContinuation())
             try framedMessage(arena, job.author, job.prompt)
+        else if (resumed_request)
+            session_runtime.resumedRequestNote(resumed_history)
         else
             job.prompt,
         .images = job.images,
@@ -8377,7 +8398,7 @@ fn processQueuedPromptLoop(
             const prefill_tool_name: ?[]const u8 = if (!assistant_prefill_recovery_used and
                 streamReplaySafe(&stream_ctx))
                 postToolAssistantPrefillRejection(
-                    if (response_failure) |failure| failureHttpStatus(failure.kind) else .ok,
+                    if (response_failure) |failure| failureStatus(failure) else .ok,
                     if (response_failure) |failure| failure.detail orelse "" else "",
                     request_messages,
                 )
@@ -8848,7 +8869,7 @@ fn processQueuedPromptLoop(
             request_recovery.endWithError();
             if (!http_failure_notice_shown) {
                 const http_detail = try httpFailureDetail(arena, failure, job, request_capabilities);
-                try deps.push_http_error(deps.ctx, failureHttpStatus(failure.kind), http_detail, job.credential_source);
+                try deps.push_http_error(deps.ctx, failureStatus(failure), http_detail, job.credential_source);
             }
             if (stop_state.retained_candidate != null) {
                 stop_state.terminal_materializing = true;

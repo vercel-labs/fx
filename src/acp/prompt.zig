@@ -258,6 +258,12 @@ const AcpContext = struct {
     captured_permission_mode: ?PermissionMode = null,
     current_prompt_input: ?*ParsedPromptInput = null,
     observer: ?*observation.Observer = null,
+    /// The web host's steering as this turn saw it: open at least once, and
+    /// closed by the turn itself at its finalizing boundary. Steering that
+    /// was open and that the host closed is the user's cancel; a host that
+    /// never opened steering cancels nothing this way.
+    saw_host_steering_open: bool = false,
+    closed_host_steering: bool = false,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
         var keys = self.published_tool_calls.keyIterator();
@@ -2026,7 +2032,10 @@ fn takeSteeringBoundary(
             return .{ .continue_turn = messages };
         }
         if (steered) return .{ .continue_turn = &.{} };
-        if (close_if_empty) js_host_steering.close();
+        if (close_if_empty) {
+            ctx.closed_host_steering = true;
+            js_host_steering.close();
+        }
         return if (kind == .cancelled) .interrupt else .none;
     }
     const kernel = ctx.state.cfg.minimal_kernel;
@@ -2067,11 +2076,24 @@ fn takeSteeringBoundary(
 fn pulseHostSteering(raw_ctx: *anyopaque) anyerror!void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     switch (js_host_steering.state()) {
-        .closed => {},
-        .open => |open| if (open.handoff) {
-            server.noteHostSteeringHandoff(ctx.state);
-        } else if (server.claimHostSteeringInterrupt(ctx.state, open.queued)) {
-            debug_trace.logf("acp", "host steering interrupts the streaming reply queued={d}", .{open.queued});
+        // The host closes steering when the user cancels the turn, and the
+        // `session/cancel` it also sends waits on stdin until the prompt
+        // returns. Between sends nothing else carries the cancel, so a retry
+        // wait would sit it out.
+        .closed => if (ctx.saw_host_steering_open and !ctx.closed_host_steering) {
+            if (ctx.state.active_session) |*session| {
+                if (!session.cancel_flag.swap(true, .seq_cst)) {
+                    debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=host_steering_closed", .{});
+                }
+            }
+        },
+        .open => |open| {
+            ctx.saw_host_steering_open = true;
+            if (open.handoff) {
+                server.noteHostSteeringHandoff(ctx.state);
+            } else if (server.claimHostSteeringInterrupt(ctx.state, open.queued)) {
+                debug_trace.logf("acp", "host steering interrupts the streaming reply queued={d}", .{open.queued});
+            }
         },
     }
 }
