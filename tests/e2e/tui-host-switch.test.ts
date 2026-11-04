@@ -1430,6 +1430,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         // Main is on screen again, and the reviewer's turn ended with the close.
         expect(closed).toContain("SWITCH_USER review it");
         await session.sendKeys("Escape");
+        // The list takes every key until it closes, /quit below included.
+        await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
         await session.waitForText("CLOSE_MAIN_TOLD", 30_000);
         expect(await session.capturePane()).not.toContain("subagent working");
         reviewer.release();
