@@ -4,23 +4,7 @@ const display_width = @import("display_width.zig");
 const ascii_case = @import("ascii_case.zig");
 
 pub const containsIgnoreCase = ascii_case.containsIgnoreCase;
-
-/// Whether `text` holds `family`, ignoring case, followed by a version whose
-/// major number is `min_major` or more, such as `openai/gpt-6.1-sol` for
-/// `gpt-` at 5. A model check written this way keeps matching each new major
-/// release. `family` must not be empty.
-pub fn hasMajorVersionAtLeast(text: []const u8, family: []const u8, min_major: u32) bool {
-    std.debug.assert(family.len > 0);
-    var start: usize = 0;
-    while (std.ascii.findIgnoreCasePos(text, start, family)) |found| {
-        start = found + family.len;
-        var end = start;
-        while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
-        const major = std.fmt.parseUnsigned(u32, text[start..end], 10) catch continue;
-        if (major >= min_major) return true;
-    }
-    return false;
-}
+pub const hasMajorVersionAtLeast = ascii_case.hasMajorVersionAtLeast;
 
 /// Returns `text` repeated `count` times as a comptime string literal.
 pub inline fn repeat(comptime text: []const u8, comptime count: usize) *const [text.len * count:0]u8 {
@@ -1128,17 +1112,6 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
         if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
     }
     return true;
-}
-
-test "hasMajorVersionAtLeast reads the major version after the family" {
-    for ([_][]const u8{ "openai/gpt-5", "openai/gpt-5.4-mini", "openai/gpt-6.1-sol", "openai/GPT-10" }) |text| {
-        try std.testing.expect(hasMajorVersionAtLeast(text, "gpt-", 5));
-    }
-    for ([_][]const u8{ "openai/gpt-4.1", "openai/gpt-4o", "openai/gpt-oss-120b", "openai/gpt-", "openai/o3" }) |text| {
-        try std.testing.expect(!hasMajorVersionAtLeast(text, "gpt-", 5));
-    }
-    try std.testing.expect(hasMajorVersionAtLeast("xai/grok-4.20-reasoning", "grok-", 4));
-    try std.testing.expect(!hasMajorVersionAtLeast("xai/grok-code-fast-1", "grok-", 4));
 }
 
 test "containsIgnoreCase handles empty needles and oversized needles" {
