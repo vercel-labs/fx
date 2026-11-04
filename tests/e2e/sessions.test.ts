@@ -1358,6 +1358,18 @@ function keepRunForOfflineCheck(fixture: Fixture, name: string, traces: string[]
 /// The line above the command that reopens a fork's source.
 const FORK_RESUME_LABEL = "Resume the original session with:";
 
+/// The pane once the fork notice has settled at its end: the label, the
+/// command alone on the next line, and a blank row above the composer, which
+/// holds `prompt`. A long replay draws in steps, so earlier frames can lack
+/// the blank row.
+async function waitForForkNotice(session: TmuxSession, source: string, prompt: string) {
+  return session.waitForPane((pane) => {
+    const lines = pane.split("\n");
+    const label = lines.lastIndexOf(FORK_RESUME_LABEL);
+    return label >= 0 && lines[label + 1] === `fx --resume ${source}` && lines[label + 2] === "" && composerContains(pane, prompt);
+  }, TIMEOUT);
+}
+
 /// Checks that the fork notice follows the replayed turns, the newest of
 /// which holds `lastReplayed`: the notice names the fork, then the label,
 /// then the command alone on its line, so selecting that line copies it.
@@ -1421,8 +1433,8 @@ test.skipIf(!tmuxAvailable())(forkTest, async () => {
     expect((await forkMenuRows(app.session)).map((row) => row.selected)).toEqual([false, true, false]);
     await app.session.sendKeys("Enter");
 
-    const forked = (await scrollbackContains(app.session, FORK_RESUME_LABEL)).split("\n");
-    expectForkNoticeAfterReplay(forked, "FORK_ONE", "Fork source (fork)", source);
+    await waitForForkNotice(app.session, source, "Fork prompt two.");
+    expectForkNoticeAfterReplay((await app.session.captureFullScrollback()).split("\n"), "FORK_ONE", "Fork source (fork)", source);
     await app.session.waitForPane((pane) => composerContains(pane, "Fork prompt two.") && !pane.includes("enter fork"), TIMEOUT);
     const ids = savedSessionIds(fixture.home);
     expect(ids.length).toBe(2);
@@ -1486,8 +1498,8 @@ test.skipIf(!tmuxAvailable())("a fork of a long session ends with its notice and
     await app.session.sendText("/fork");
     await app.session.waitForPane((pane) => pane.includes("enter fork"), TIMEOUT);
     await app.session.sendKeys("Enter");
-    const pane = await app.session.waitForPane((value) => composerContains(value, "Long fork prompt two.") && value.includes(FORK_RESUME_LABEL), TIMEOUT);
-    expect(pane.split("\n")).toContain(`fx --resume ${source}`);
+    // The notice and the command are on screen, not only in the scrollback.
+    await waitForForkNotice(app.session, source, "Long fork prompt two.");
     expectForkNoticeAfterReplay((await app.session.captureFullScrollback()).split("\n"), lastLine, "Long fork prompt one. (fork)", source);
     await app.session.sendKeys("C-u");
     await quitApp(app);
