@@ -114,6 +114,8 @@ pub fn build(b: *std.Build) void {
     test_paths.addOptionPathUntracked("source_root", b.path("src"));
     const test_paths_module = test_paths.createModule();
     exe.root_module.addImport("test_paths", test_paths_module);
+    // The code-mode sandbox child runs the engine.
+    exe.root_module.addImport("js_engine", jsEngineModule(b, target, optimize, fuzz_corpora));
     // The unit tests for the Linux PGSO step that relinks them from
     // transformed code. It builds them position independent: a test there
     // defines the wasm host's `extern "fx"` functions itself, and Zig rejects
