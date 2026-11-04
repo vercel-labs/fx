@@ -7,6 +7,7 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewaySse,
   startDynamicFakeGateway,
+  fakeGatewayFinalText,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -133,6 +134,23 @@ function held() {
 // subagent tool can't tell them apart, because a subagent is offered it too.
 const isMainRequest = (body: string) => userTexts(body).some((text) => text.includes("SWITCH_USER"));
 
+// Titles the title model gives: the reviewer's task gets its own, so the
+// agent list shows a subagent titled as main is.
+const subagentTitles = {
+  titleResponses: Array.from({ length: 8 }, () => (body: string) =>
+    fakeGatewayFinalText(body.includes("src/parser.zig") ? "Review the parser" : "Plan the parser work")),
+};
+
+// The saved sessions in `home` whose files hold `marker`.
+function sessionsHolding(home: string, marker: string): string[] {
+  const sessions = join(home, ".fx", "sessions", "v2");
+  const holds = (path: string): boolean => readdirSync(path).some((entry) => {
+    const full = join(path, entry);
+    return statSync(full).isDirectory() ? holds(full) : readFileSync(full, "latin1").includes(marker);
+  });
+  return readdirSync(sessions).filter((id) => !id.startsWith(".") && statSync(join(sessions, id)).isDirectory() && holds(join(sessions, id)));
+}
+
 interface Run {
   workspace: string;
   home: string;
@@ -148,8 +166,9 @@ async function withFx(
   setupHome: (home: string) => void = () => {},
   record = false,
   env: Record<string, string> = {},
+  gatewayOptions: Parameters<typeof startDynamicFakeGateway>[1] = {},
 ) {
-  const gateway = startDynamicFakeGateway(respond);
+  const gateway = startDynamicFakeGateway(respond, gatewayOptions);
   const home = createIsolatedTestHome();
   const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-switch-")));
   mkdirSync(join(home, ".fx"), { recursive: true });
@@ -1332,6 +1351,126 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         const main = await session.waitForPane((pane) => pane.includes("\u2503 EDGE_KEEP_ME"), 10_000);
         expect(main).not.toContain("EDGE_KEEP_MEq");
         expect(main).toContain("main \u00b7 ctrl+x");
+      });
+    },
+    TIMEOUT,
+  );
+  test(
+    "the agent list names each agent by its title, profile, state, and model, and main's footer counts the subagents working",
+    async () => {
+      const reviewer = held();
+      let childCalls = 0;
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          await reviewer.promise;
+          return text("child_answer", "LIST_CHILD_DONE");
+        }
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", { request: { action: "message", agent: "reviewer", message: "Review src/parser.zig for bugs" } });
+        }
+        return text("main_wait", "LIST_MAIN_WAITING");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER plan it");
+        await session.waitForText("LIST_MAIN_WAITING", 30_000);
+        await until("the reviewer's turn", () => childCalls >= 1);
+        // Main shows that work goes on elsewhere, beside the list's key.
+        await session.waitForText("1 subagent working \u00b7 main \u2193", 15_000);
+        await session.sendKeys("Down");
+        // The reviewer's title is the title model's, from its task, as main's is.
+        const list = await session.waitForPane((pane) => / {4}reviewer \u00b7 Review the parser \u00b7 main \u00b7 working \u00b7 \S/.test(pane), 15_000);
+        expect(list).toMatch(/fx 1 \(on screen\) \u00b7 Plan the parser work \u00b7 main \u00b7 idle \u00b7 \S/);
+        expect(list).toContain("\u2191\u2193 preview     enter switch     esc back");
+        await session.sendKeys("Escape");
+        reviewer.release();
+        await session.waitForPane((pane) => !pane.includes("subagent working"), 30_000);
+      }, () => {}, false, {}, subagentTitles);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "x, then x again, in the agent list closes a working subagent for good: main hears the user closed it, and a resume doesn't bring it back",
+    async () => {
+      const reviewer = held();
+      let childCalls = 0;
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          await reviewer.promise;
+          return text("child_answer", "CLOSE_CHILD_DONE");
+        }
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", { request: { action: "message", agent: "reviewer", message: "Review src/parser.zig for bugs" } });
+        }
+        if (body.includes('\\"cause\\":\\"user_close\\"')) return text("main_told", "CLOSE_MAIN_TOLD");
+        return text("main_wait", "CLOSE_MAIN_WAITING");
+      }, async (session, { home, launch }) => {
+        await session.sendText("SWITCH_USER review it");
+        await session.waitForText("CLOSE_MAIN_WAITING", 30_000);
+        await until("the reviewer's turn", () => childCalls >= 1);
+        await session.sendKeys("Down");
+        await session.waitForText("esc back", 10_000);
+        // On main's row, x does nothing: an instance closes with /close.
+        await session.sendKeys("x");
+        await Bun.sleep(300);
+        expect(await session.capturePane()).not.toContain("x again to close");
+        await session.sendKeys("Down");
+        await session.waitForText("enter switch     x close     esc back", 10_000);
+        await session.sendKeys("x");
+        await session.waitForText("x again to close it for good", 10_000);
+        // Any other key keeps it.
+        await session.sendKeys("Up");
+        await session.waitForPane((pane) => !pane.includes("x again to close"), 10_000);
+        await session.sendKeys("Down");
+        await session.sendKeys("x");
+        await session.waitForText("x again to close it for good", 10_000);
+        await session.sendKeys("x");
+        const closed = await session.waitForPane((pane) => !/^ {4}reviewer \u00b7 /m.test(pane) && pane.includes("esc back"), 15_000);
+        // Main is on screen again, and the reviewer's turn ended with the close.
+        expect(closed).toContain("SWITCH_USER review it");
+        await session.sendKeys("Escape");
+        await session.waitForText("CLOSE_MAIN_TOLD", 30_000);
+        expect(await session.capturePane()).not.toContain("subagent working");
+        reviewer.release();
+        expect(childCalls).toBe(1);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+
+        const parents = sessionsHolding(home, "CLOSE_MAIN_TOLD");
+        expect(parents.length).toBe(1);
+        const resumed = await launch(`--resume ${parents[0]}`);
+        await resumed.waitForText("CLOSE_MAIN_TOLD", 30_000);
+        // Main alone: no agent indicator, and ↓ opens no list.
+        expect(await resumed.capturePane()).not.toContain("main \u2193");
+        await resumed.sendKeys("Down");
+        await Bun.sleep(500);
+        expect(await resumed.capturePane()).not.toContain("esc back");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's close removes an idle subagent from the agent list, and its row says closed",
+    async () => {
+      let mainCalls = 0;
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) return text("child_answer", "MAIN_CLOSE_TESTS_PASS");
+        mainCalls += 1;
+        if (mainCalls === 1) return toolCall("main_sub", "subagent", { request: { action: "message", agent: "tester", message: "Run the auth tests" } });
+        if (body.includes("Closed tester.")) return text("main_done", "MAIN_CLOSE_DONE");
+        if (body.includes("MAIN_CLOSE_TESTS_PASS")) return toolCall("main_close", "subagent", { request: { action: "close", agent: "tester" } });
+        return text("main_wait", "MAIN_CLOSE_WAITING");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER run them");
+        const pane = await session.waitForText("MAIN_CLOSE_DONE", 60_000);
+        expect(pane).toContain("\u2514 closed tester");
+        // Main alone again: no agent indicator, and ↓ opens no list.
+        await session.waitForPane((value) => !value.includes("main \u2193"), 10_000);
+        await session.sendKeys("Down");
+        await Bun.sleep(500);
+        expect(await session.capturePane()).not.toContain("esc back");
       });
     },
     TIMEOUT,

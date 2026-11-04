@@ -1007,7 +1007,7 @@ pub fn composeFooterFrame(
     else if (input.show_picker and input.picker_kind == .fork)
         try input_presentation.composeForkMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .agents)
-        try input_presentation.composeVariantHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending, &agents_menu_presentation.hint_variants)
+        try input_presentation.composeVariantHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending, agents_menu_presentation.hintVariants(ctx.agents_menu))
     else if (input.show_picker and input.picker_kind == .models)
         try input_presentation.composeModelsMenuHintRow(alloc, shell.layout.cols, ctx.ctrl_c_pending)
     else if (input.show_picker and input.picker_kind == .effort)

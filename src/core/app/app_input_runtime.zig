@@ -1743,6 +1743,17 @@ pub fn Runtime(comptime App: type) type {
             return app_agents_runtime.Runtime(App).backMenu(app);
         }
 
+        /// x in the agent list: arms, then closes, the selected subagent.
+        fn pressAgentsMenuClose(app: *App) !bool {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return false;
+            return app_agents_runtime.Runtime(App).pressCloseKey(app);
+        }
+
+        fn disarmAgentsMenuClose(app: *App) void {
+            if (comptime !@hasDecl(App, "openAgentsMenu")) return;
+            app_agents_runtime.Runtime(App).disarmClose(app);
+        }
+
         /// While the agent list is open it takes every key, ahead of the
         /// prompts and composer of the agent it shows, which is a preview:
         /// ↑ and ↓ move and preview, Enter keeps the agent shown, and Esc,
@@ -1754,11 +1765,17 @@ pub fn Runtime(comptime App: type) type {
         fn routeAgentsMenuInput(app: *App, event: input_action.TerminalInputEvent) !bool {
             if (!agentsMenuActive(app)) return false;
             const agent = agents.screenAgentOf(app);
+            const close_key = switch (event) {
+                .raw => |raw| raw.byte == 'x',
+                else => false,
+            };
+            if (!close_key) disarmAgentsMenuClose(app);
             switch (event) {
                 // A paste closes the list before its bytes arrive.
                 .paste_byte => return false,
                 .raw => |raw| switch (raw.byte) {
                     '\r' => _ = try submitAgentsMenuSelection(app),
+                    'x' => _ = try pressAgentsMenuClose(app),
                     3, 24 => _ = try backAgentsMenu(app),
                     10 => _ = try completion_rt.routeAgentsMenuMove(app, agent, 1),
                     11 => _ = try completion_rt.routeAgentsMenuMove(app, agent, -1),

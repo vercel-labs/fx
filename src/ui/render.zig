@@ -204,7 +204,9 @@ pub const StatuslineItems = struct {
 /// upstream, so this only bounds pathological single-word titles.
 const max_session_title_cells: usize = 32;
 
-fn compactModelLabel(model: []const u8, out: []u8) []const u8 {
+/// A model id as the status line names it: without its provider, and
+/// a Claude model as "opus 4-7". May use `out`.
+pub fn compactModelLabel(model: []const u8, out: []u8) []const u8 {
     var start: usize = 0;
     for (model, 0..) |byte, i| {
         if (byte == '/') start = i + 1;

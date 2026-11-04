@@ -104,7 +104,7 @@ fn collectScoredMatches(
     return out.toOwnedSlice(alloc);
 }
 
-pub const Action = enum { message, wait, status, stop };
+pub const Action = enum { message, wait, status, stop, close };
 
 /// The name a subagent gives its own parent in `message{agent}`. No child
 /// can be named it.
@@ -124,6 +124,7 @@ pub const RequestInput = union(Action) {
     wait,
     status: struct { agent: ?[]const u8 = null },
     stop: struct { agent: []const u8 },
+    close: struct { agent: []const u8 },
 };
 
 /// Creation-time overrides carried by a request. Model and effort default to
@@ -159,6 +160,8 @@ pub const Request = union(Action) {
     status: struct { agent: ?[]u8 = null },
     /// Ends a subagent's running turn and drops what waits for it.
     stop: struct { agent: []u8 },
+    /// Stops a subagent and removes it for good, with its conversation.
+    close: struct { agent: []u8 },
 
     pub fn deinit(self: *Request, alloc: Allocator) void {
         switch (self.*) {
@@ -172,6 +175,7 @@ pub const Request = union(Action) {
             .wait => {},
             .status => |value| if (value.agent) |agent| alloc.free(agent),
             .stop => |value| alloc.free(value.agent),
+            .close => |value| alloc.free(value.agent),
         }
         self.* = undefined;
     }
@@ -186,6 +190,7 @@ pub const Request = union(Action) {
             .wait => null,
             .status => |value| value.agent,
             .stop => |value| value.agent,
+            .close => |value| value.agent,
         };
     }
 
@@ -198,7 +203,7 @@ pub const Request = union(Action) {
     pub fn override(self: Request) Override {
         return switch (self) {
             .message => |value| .{ .model = value.model, .effort = value.effort, .profile = value.profile },
-            .wait, .status, .stop => .{},
+            .wait, .status, .stop, .close => .{},
         };
     }
 };
@@ -271,6 +276,10 @@ pub fn validateRequest(
         .stop => |value| blk: {
             if (!domain.validAgentName(value.agent) or std.mem.eql(u8, value.agent, parent_agent)) return error.InvalidAgent;
             break :blk .{ .stop = .{ .agent = try alloc.dupe(u8, value.agent) } };
+        },
+        .close => |value| blk: {
+            if (!domain.validAgentName(value.agent) or std.mem.eql(u8, value.agent, parent_agent)) return error.InvalidAgent;
+            break :blk .{ .close = .{ .agent = try alloc.dupe(u8, value.agent) } };
         },
     };
 }
@@ -355,7 +364,7 @@ pub fn requestFingerprint(request: Request) [32]u8 {
     hash.update(@tagName(request.action()));
     hash.update("\x00");
     switch (request) {
-        .wait, .status, .stop => return hash.finalResult(),
+        .wait, .status, .stop, .close => return hash.finalResult(),
         .message => |value| {
             hash.update(value.agent);
             hash.update("\x00");
@@ -454,7 +463,7 @@ fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
 
 test "minimal request validation owns each action's intent" {
     const alloc = std.testing.allocator;
-    try std.testing.expectEqual(@as(usize, 4), @typeInfo(Action).@"enum".field_names.len);
+    try std.testing.expectEqual(@as(usize, 5), @typeInfo(Action).@"enum".field_names.len);
     var wait = try validateRequest(alloc, .wait);
     defer wait.deinit(alloc);
     try std.testing.expectEqual(Action.wait, wait.action());
@@ -465,6 +474,10 @@ test "minimal request validation owns each action's intent" {
     defer stop.deinit(alloc);
     try std.testing.expectEqualStrings("reviewer", stop.agentName().?);
     try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .stop = .{ .agent = "parent" } }));
+    var close = try validateRequest(alloc, .{ .close = .{ .agent = "reviewer" } });
+    defer close.deinit(alloc);
+    try std.testing.expectEqualStrings("reviewer", close.agentName().?);
+    try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .close = .{ .agent = "parent" } }));
     try std.testing.expectError(error.InvalidAgent, validateRequest(alloc, .{ .status = .{ .agent = "Bad Name" } }));
 
     var message = try validateRequest(alloc, .{ .message = .{

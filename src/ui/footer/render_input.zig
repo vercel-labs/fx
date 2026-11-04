@@ -182,6 +182,12 @@ pub const AgentsMenuRow = struct {
     state: []const u8,
     /// The agent the list opened on, where Esc goes back to.
     on_screen: bool,
+    /// The model its turns use, as the agent's settings name it, such as
+    /// "anthropic/claude-opus-4-7"; empty when unknown.
+    model: []const u8 = "",
+    /// Its reasoning effort, such as "high", when the model takes one and
+    /// it is not the default; else empty.
+    effort: []const u8 = "",
 };
 
 /// The agent list ↓ and Ctrl+X open: every open agent in switch order.
@@ -189,6 +195,10 @@ pub const AgentsMenuProjection = struct {
     rows: []const AgentsMenuRow = &.{},
     selected: usize = 0,
     window_start: usize = 0,
+    /// The selected row is a subagent's, which x closes.
+    selected_closable: bool = false,
+    /// The first x armed the selected subagent's close.
+    close_armed: bool = false,
 
     pub fn active(self: AgentsMenuProjection) bool {
         return self.rows.len > 0;
