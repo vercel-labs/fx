@@ -451,6 +451,30 @@ pub fn appendTerminalSafeLine(
     out: *std.ArrayList(u8),
     raw: []const u8,
 ) error{OutOfMemory}!void {
+    return appendEscapedLine(alloc, out, raw, .non_printing);
+}
+
+/// Appends one line of prose, such as a model's reply, ready to draw. It
+/// escapes only what a terminal acts on: control bytes other than tab, DEL,
+/// C1 controls, and invalid UTF-8 become the escapes `encodeTerminalSafe`
+/// writes. Unlike `appendTerminalSafeLine`, it keeps zero-width joiners,
+/// direction marks, and other invisible format characters, which emoji
+/// sequences and some scripts need. A trailing carriage return from a CRLF
+/// line ending is dropped.
+pub fn appendTerminalControlSafeLine(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    raw: []const u8,
+) error{OutOfMemory}!void {
+    return appendEscapedLine(alloc, out, raw, .controls);
+}
+
+fn appendEscapedLine(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    raw: []const u8,
+    comptime codepoints: EscapedCodepoints,
+) error{OutOfMemory}!void {
     const line = if (raw.len > 0 and raw[raw.len - 1] == '\r') raw[0 .. raw.len - 1] else raw;
     var index: usize = 0;
     while (index < line.len) {
@@ -460,7 +484,7 @@ pub fn appendTerminalSafeLine(
             continue;
         }
         var token_buf: [12]u8 = undefined;
-        const token = terminalSafeToken(line, index, &token_buf);
+        const token = escapedToken(line, index, &token_buf, codepoints);
         try out.appendSlice(alloc, token.bytes);
         index += token.source_len;
     }
@@ -665,7 +689,20 @@ const TerminalSafeToken = struct {
     bytes: []const u8,
 };
 
+/// The code points a token writes as an escape: every non-printing one, or
+/// only the C1 controls a terminal acts on.
+const EscapedCodepoints = enum { non_printing, controls };
+
 fn terminalSafeToken(raw: []const u8, index: usize, buf: *[12]u8) TerminalSafeToken {
+    return escapedToken(raw, index, buf, .non_printing);
+}
+
+fn escapedToken(
+    raw: []const u8,
+    index: usize,
+    buf: *[12]u8,
+    comptime codepoints: EscapedCodepoints,
+) TerminalSafeToken {
     const byte = raw[index];
     if (byte < 0x20 or byte == 0x7f) {
         return .{ .source_len = 1, .bytes = writeByteEscape(buf, byte) };
@@ -685,7 +722,11 @@ fn terminalSafeToken(raw: []const u8, index: usize, buf: *[12]u8) TerminalSafeTo
     const codepoint = display_width.decodeUtf8Sequence(sequence) catch {
         return .{ .source_len = 1, .bytes = writeByteEscape(buf, byte) };
     };
-    if (isNonPrintingCodepoint(codepoint)) {
+    const escape = switch (codepoints) {
+        .non_printing => isNonPrintingCodepoint(codepoint),
+        .controls => codepoint >= 0x80 and codepoint <= 0x9f,
+    };
+    if (escape) {
         return .{ .source_len = sequence_len, .bytes = writeCodepointEscape(buf, codepoint) };
     }
     return .{ .source_len = sequence_len, .bytes = sequence };
@@ -1617,6 +1658,27 @@ test "appendTerminalSafeLine keeps tabs and shows a file's control sequences as 
     // to the start of the row and draw over its gutter.
     out.clearRetainingCapacity();
     try appendTerminalSafeLine(alloc, &out, "good\rbad\r");
+    try std.testing.expectEqualStrings("good\\x0dbad", out.items);
+}
+
+test "appendTerminalControlSafeLine escapes only what a terminal acts on" {
+    const alloc = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // A joined emoji, a zero-width non-joiner, and a right-to-left mark stay.
+    try appendTerminalControlSafeLine(
+        alloc,
+        &out,
+        "a\tb\x1b[2Jc\u{9b}31md\x7fe\xffz \u{1f469}\u{200d}\u{1f4bb} \u{200c}\u{200f}\r",
+    );
+    try std.testing.expectEqualStrings(
+        "a\tb\\x1b[2Jc\\u{009b}31md\\x7fe\\xffz \u{1f469}\u{200d}\u{1f4bb} \u{200c}\u{200f}",
+        out.items,
+    );
+
+    out.clearRetainingCapacity();
+    try appendTerminalControlSafeLine(alloc, &out, "good\rbad\r");
     try std.testing.expectEqualStrings("good\\x0dbad", out.items);
 }
 

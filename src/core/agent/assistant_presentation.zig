@@ -3,6 +3,7 @@ const testing_allocator = @import("../shared/testing_allocator.zig");
 const Allocator = std.mem.Allocator;
 
 const display_width = @import("../shared/display_width.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const ansi = @import("presentation/ansi.zig");
 const tu = @import("presentation/text_util.zig");
 const bp = @import("presentation/block_parse.zig");
@@ -161,6 +162,8 @@ const OpenOrderedItem = struct {
 
 pub const MarkdownProcessor = struct {
     line_buf: std.ArrayList(u8) = .empty,
+    /// The current line with its control sequences written as visible text.
+    safe_line: std.ArrayList(u8) = .empty,
     pending_top_level_line: std.ArrayList(u8) = .empty,
     pipe_buf: std.ArrayList(u8) = .empty,
     code_buf: std.ArrayList(u8) = .empty,
@@ -181,6 +184,7 @@ pub const MarkdownProcessor = struct {
 
     pub fn deinit(self: *MarkdownProcessor, alloc: Allocator) void {
         self.line_buf.deinit(alloc);
+        self.safe_line.deinit(alloc);
         self.pending_top_level_line.deinit(alloc);
         self.pipe_buf.deinit(alloc);
         self.code_buf.deinit(alloc);
@@ -191,6 +195,7 @@ pub const MarkdownProcessor = struct {
 
     pub fn reset(self: *MarkdownProcessor, alloc: Allocator) void {
         self.line_buf.clearAndFree(alloc);
+        self.safe_line.clearAndFree(alloc);
         self.pending_top_level_line.clearAndFree(alloc);
         self.pipe_buf.clearAndFree(alloc);
         self.code_buf.clearAndFree(alloc);
@@ -234,7 +239,7 @@ pub const MarkdownProcessor = struct {
                 const line_end = self.line_buf.items.len - @intFromBool(
                     self.line_buf.items.len > 0 and self.line_buf.items[self.line_buf.items.len - 1] == '\r',
                 );
-                try self.handleLine(alloc, self.line_buf.items[0..line_end], true, out, completions);
+                try self.handleModelLine(alloc, self.line_buf.items[0..line_end], true, out, completions);
                 self.line_buf.clearRetainingCapacity();
             } else {
                 try self.line_buf.append(alloc, byte);
@@ -268,7 +273,7 @@ pub const MarkdownProcessor = struct {
         const had_partial_line = self.line_buf.items.len > 0;
         const len_before = out.items.len;
         if (self.line_buf.items.len > 0) {
-            try self.handleLine(alloc, self.line_buf.items, false, out, completions);
+            try self.handleModelLine(alloc, self.line_buf.items, false, out, completions);
             self.line_buf.clearRetainingCapacity();
         }
         try self.flushPendingTopLevelLine(alloc, out);
@@ -282,6 +287,24 @@ pub const MarkdownProcessor = struct {
             self.code_fence = null;
         }
         try self.flushFootnotes(alloc, out);
+    }
+
+    /// Renders one line of model text. Control bytes, C1 controls, and invalid
+    /// UTF-8 become visible text such as `\x1b[2J` first, so a reply can never
+    /// clear the screen, erase scrollback, or switch the terminal's screen.
+    /// Joiners and other invisible format characters stay, since emoji
+    /// sequences and some scripts need them.
+    fn handleModelLine(
+        self: *MarkdownProcessor,
+        alloc: Allocator,
+        line: []const u8,
+        line_has_lf: bool,
+        out: *std.ArrayList(u8),
+        completions: payload.MarkdownCompletions,
+    ) !void {
+        self.safe_line.clearRetainingCapacity();
+        try text_utils.appendTerminalControlSafeLine(alloc, &self.safe_line, line);
+        try self.handleLine(alloc, self.safe_line.items, line_has_lf, out, completions);
     }
 
     fn handleLine(
@@ -821,11 +844,6 @@ test "escaped and malformed markdown images remain literal without OSC 8" {
     try std.testing.expectEqualStrings("![alt](https://example.com/diagram.png\n", out.items);
     try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
 
-    out.clearRetainingCapacity();
-    try processor.push(alloc, "![alt](https://example.com/\x1bdiagram.png)\n", &out);
-    try std.testing.expectEqualStrings("![alt](https://example.com/\x1bdiagram.png)\n", out.items);
-    try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
-
     var oversized_url: [max_link_url_bytes + 1]u8 = undefined;
     @memset(&oversized_url, 'a');
     var input_buf: [max_link_url_bytes + 16]u8 = undefined;
@@ -834,6 +852,46 @@ test "escaped and malformed markdown images remain literal without OSC 8" {
     try processor.push(alloc, oversized, &out);
     try std.testing.expectEqualStrings(oversized, out.items);
     try std.testing.expect(std.mem.find(u8, out.items, "\x1b]8;") == null);
+}
+
+test "model control sequences render as visible text while markdown keeps its own styling" {
+    const alloc = std.testing.allocator;
+    var processor = MarkdownProcessor{};
+    defer processor.deinit(alloc);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // A stream can split an escape sequence and a UTF-8 C1 control across chunks.
+    try processor.push(alloc, "**bold** \x1b[2J \x1b[?10", &out);
+    try processor.push(alloc, "49h \xc2", &out);
+    try processor.push(alloc, "\x9b31m \x1b[3J end\n", &out);
+    try std.testing.expectEqualStrings(
+        "\x1b[1mbold\x1b[22m \\x1b[2J \\x1b[?1049h \\u{009b}31m \\x1b[3J end\n",
+        out.items,
+    );
+
+    // A control byte inside a link target becomes text before the link is
+    // parsed, so the OSC 8 hyperlink fx writes carries no raw control byte.
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "![alt](https://example.com/\x1bdiagram.png)\n", &out);
+    try std.testing.expect(std.mem.find(u8, out.items, "https://example.com/\\x1bdiagram.png") != null);
+    try std.testing.expect(std.mem.find(u8, out.items, "example.com/\x1b") == null);
+
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "`https://example.com\x07`\n", &out);
+    try std.testing.expect(std.mem.find(u8, out.items, "https://example.com\\x07") != null);
+    try std.testing.expect(std.mem.findScalar(u8, out.items, 0x07) == null);
+
+    // Joined emoji keep their zero-width joiner.
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "team \u{1f469}\u{200d}\u{1f4bb}\n", &out);
+    try std.testing.expectEqualStrings("team \u{1f469}\u{200d}\u{1f4bb}\n", out.items);
+
+    // The last line has no newline and reaches the output through flush.
+    out.clearRetainingCapacity();
+    try processor.push(alloc, "last \x1b]0;title\x07 line", &out);
+    try processor.flush(alloc, &out);
+    try std.testing.expectEqualStrings("last \\x1b]0;title\\x07 line", out.items);
 }
 
 test "markdown images preserve code isolation, chunk buffering, and heading underline" {
@@ -1109,7 +1167,6 @@ test "non-URL and unsafe inline code stays literal" {
         "`curl https://example.com`\n",
         "`https://example.com more`\n",
         "`http://`\n",
-        "`https://example.com\x07`\n",
         "`<https://example.com>`\n",
     };
     for (cases) |input| {
@@ -3455,7 +3512,7 @@ test "markdown completion flushes an unterminated code fence" {
     try std.testing.expectEqualStrings("last line\n", block.code);
 }
 
-test "line intake buffers partial lines and preserves standalone carriage returns" {
+test "line intake buffers partial lines and shows standalone carriage returns as text" {
     const alloc = std.testing.allocator;
     var processor = MarkdownProcessor{};
     defer processor.deinit(alloc);
@@ -3481,8 +3538,10 @@ test "line intake buffers partial lines and preserves standalone carriage return
     try std.testing.expectEqualStrings("run \x1b[38;5;255mzig build\x1b[39m now\n", out.items);
 
     out.clearRetainingCapacity();
+    // Only a line feed ends a line. A carriage return inside one would move the
+    // cursor back over the line's gutter, so it shows as text.
     try processor.push(alloc, "left\rright\n", &out);
-    try std.testing.expectEqualStrings("left\rright\n", out.items);
+    try std.testing.expectEqualStrings("left\\x0dright\n", out.items);
 }
 
 test "flush emits pending line without newline" {

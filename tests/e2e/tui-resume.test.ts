@@ -6022,6 +6022,108 @@ test.skipIf(!tmuxAvailable())(
 );
 
 test.skipIf(!tmuxAvailable())(
+  "control sequences in a model reply show as text, live and after resume",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-model-control-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    const workspaceRoot = realpathSync(workspace);
+    // Each line carries a sequence a terminal would act on: erase the screen,
+    // erase below the cursor, switch to the alternate screen, erase the
+    // scrollback, set the title, and a C1 CSI. The last line has no newline,
+    // so it reaches the screen through the final flush.
+    const reply = [
+      "CONTROL_REPLY_START",
+      "erase \u001b[2J screen",
+      "erase below \u001b[J here",
+      "alternate \u001b[?1049h screen",
+      "scrollback \u001b[3J erase",
+      "title \u001b]0;CONTROL_TITLE_OWNED\u0007 set",
+      "c1 \u009b31m csi",
+      "CONTROL_REPLY_END \u001b[2J",
+    ].join("\n\n");
+    const shownAsText = [
+      "erase \\x1b[2J screen",
+      "erase below \\x1b[J here",
+      "alternate \\x1b[?1049h screen",
+      "scrollback \\x1b[3J erase",
+      "title \\x1b]0;CONTROL_TITLE_OWNED\\x07 set",
+      "c1 \\u{009b}31m csi",
+      "CONTROL_REPLY_END \\x1b[2J",
+    ];
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("CONTROL_FIRST_TURN_DONE"),
+      fakeGatewayFinalText(reply),
+    ]);
+    let active: TmuxSession | null = null;
+
+    const expectReplyShownAsText = async (session: TmuxSession, label: string) => {
+      const scrollback = await session.waitForStableScrollback(
+        (text) => text.includes("CONTROL_REPLY_START") && text.includes("CONTROL_FIRST_TURN_DONE"),
+        TIMEOUT,
+        250,
+      );
+      // The earlier turn is still above the reply: no sequence erased the
+      // screen or scrollback or hid them behind the alternate screen.
+      expect(countOccurrences(scrollback, "CONTROL_FIRST_TURN_DONE"), label).toBe(1);
+      expect(countOccurrences(scrollback, "CONTROL_REPLY_START"), label).toBe(1);
+      for (const text of shownAsText) expect(scrollback, label).toContain(text);
+      expect(await session.paneTitle(), label).not.toContain("CONTROL_TITLE_OWNED");
+      expect(readFileSync(stderrPath, "utf8"), label).toBe("");
+    };
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(FX_BIN),
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 40,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("First turn before the control sequences.");
+      await active.waitForText("CONTROL_FIRST_TURN_DONE", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Reply with control sequences.");
+      await active.waitForText("CONTROL_REPLY_END", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      await expectReplyShownAsText(active, "live turn");
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+
+      const sessionId = sessionIdFromHome(home);
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: `${shellQuote(FX_BIN)} --resume ${sessionId}`,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 40,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await expectReplyShownAsText(active, "resumed session");
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 4,
+);
+
+test.skipIf(!tmuxAvailable())(
   "answered question cards survive flag and picker resume",
   async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-resume-question-")));
