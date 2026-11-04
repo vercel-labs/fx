@@ -157,7 +157,7 @@ pub fn build(b: *std.Build) void {
     session_manager_test_step.dependOn(&run_session_manager_tests.step);
     session_manager_test_step.dependOn(&run_session_manager_hook_tests.step);
 
-    const js_engine_tests = b.addTest(.{ .root_module = jsEngineModule(b, target, optimize) });
+    const js_engine_tests = b.addTest(.{ .root_module = jsEngineModule(b, target, optimize, fuzz_corpora) });
     const run_js_engine_tests = b.addRunArtifact(js_engine_tests);
     const js_engine_test_step = b.step("test-js", "Run the JavaScript engine's tests");
     js_engine_test_step.dependOn(&run_js_engine_tests.step);
@@ -192,6 +192,7 @@ pub fn build(b: *std.Build) void {
     addFuzzStep(b, fuzz_step, fuzz_corpora, fuzz_target, .{
         .fx = fuzz_root,
         .session_manager = session_manager,
+        .js = jsEngineModule(b, target, optimize, fuzz_corpora),
     });
 
     if (wasm_surface != .none) {
@@ -572,11 +573,23 @@ fn sessionManagerModule(
 /// fork of quickjs-ng from `src/js/quickjs/`. The C keeps its
 /// undefined-behavior checks in every mode: a bug in the engine traps instead
 /// of corrupting memory, and the cost falls on short programs, not hot loops.
+/// Like the session manager, it imports nothing from fx, so its fuzz targets'
+/// saved inputs travel in its options as `fuzz_corpus_<target>`.
 fn jsEngineModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.lang.Optimize,
+    fuzz_corpora: []const FuzzCorpus,
 ) *std.Build.Module {
+    const options = b.addOptions();
+    for (fuzz_corpora) |corpus| {
+        if (corpus.target.module != .js) continue;
+        options.addOption(
+            []const []const u8,
+            b.fmt("fuzz_corpus_{s}", .{corpus.target.name}),
+            corpus.inputs,
+        );
+    }
     const module = b.createModule(.{
         .root_source_file = b.path("src/js/engine.zig"),
         .target = target,
@@ -590,9 +603,15 @@ fn jsEngineModule(
         // Upstream's own build settings; the warnings are upstream's to fix.
         // Zig's sanitizer runtime has no handler for the check that an
         // indirect call matches the function's type, so Debug's full checks
-        // would leave it out; trapping on it keeps it in every mode.
-        .flags = &.{ "-std=gnu11", "-funsigned-char", "-DQUICKJS_NG_BUILD", "-D_GNU_SOURCE", "-w", "-fsanitize=function", "-fsanitize-trap=function" },
+        // would leave it out; trapping on it keeps it in every mode. A fuzz
+        // build adds coverage instrumentation to the C that Zig 0.17's fuzzer
+        // can't use: it reads counter locations only from the table Zig's own
+        // code emits, and it has no hooks for comparison tracing. So the C is
+        // left uninstrumented, and the fuzzer follows the Zig code's coverage.
+        // Outside a fuzz build, this flag has no effect.
+        .flags = &.{ "-std=gnu11", "-funsigned-char", "-DQUICKJS_NG_BUILD", "-D_GNU_SOURCE", "-w", "-fsanitize=function", "-fsanitize-trap=function", "-fno-sanitize-coverage=inline-8bit-counters,trace-cmp" },
     });
+    module.addImport("build_options", options.createModule());
     return module;
 }
 
@@ -618,7 +637,7 @@ const fuzz_corpus_dir = "tests/fuzz/corpus";
 /// artifact copied into a corpus folder.
 const max_fuzz_input_bytes = 1024 * 1024;
 
-const FuzzModule = enum { fx, session_manager };
+const FuzzModule = enum { fx, session_manager, js };
 
 /// One entry in `tests/fuzz/targets.json`.
 const FuzzTarget = struct {
@@ -645,6 +664,7 @@ const FuzzCorpus = struct {
 const FuzzRoots = struct {
     fx: *std.Build.Module,
     session_manager: *std.Build.Module,
+    js: *std.Build.Module,
 };
 
 /// Reads the fuzz registry and each target's saved inputs. Configuration
@@ -779,6 +799,7 @@ fn addFuzzStep(
 ) void {
     var fx_filters: std.ArrayList([]const u8) = .empty;
     var session_manager_filters: std.ArrayList([]const u8) = .empty;
+    var js_filters: std.ArrayList([]const u8) = .empty;
     for (corpora) |corpus| {
         if (selected) |name| {
             if (!std.mem.eql(u8, name, corpus.target.name)) continue;
@@ -786,11 +807,12 @@ fn addFuzzStep(
         const filters = switch (corpus.target.module) {
             .fx => &fx_filters,
             .session_manager => &session_manager_filters,
+            .js => &js_filters,
         };
         filters.append(b.allocator, corpus.target.@"test") catch |err|
             std.process.fatal("could not select the fuzz tests: {t}", .{err});
     }
-    if (fx_filters.items.len == 0 and session_manager_filters.items.len == 0) {
+    if (fx_filters.items.len == 0 and session_manager_filters.items.len == 0 and js_filters.items.len == 0) {
         const message = if (selected) |name|
             b.fmt("unknown fuzz target '{s}'; the targets are listed in {s}", .{ name, fuzz_registry_path })
         else
@@ -806,6 +828,7 @@ fn addFuzzStep(
     }{
         .{ .name = "fuzz", .root = roots.fx, .filters = fx_filters.items },
         .{ .name = "fuzz-session-manager", .root = roots.session_manager, .filters = session_manager_filters.items },
+        .{ .name = "fuzz-js", .root = roots.js, .filters = js_filters.items },
     };
     for (binaries) |binary| {
         if (binary.filters.len == 0) continue;
