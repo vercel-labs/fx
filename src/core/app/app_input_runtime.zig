@@ -1383,13 +1383,11 @@ pub fn Runtime(comptime App: type) type {
                                 app.shell.render_requests.request(.footer);
                             } else if (command_specs.nthSlashCompletion(app.slashRegistry(), prefix, idx)) |completion| {
                                 if (command_specs.slashCompletionHasArgs(app.slashRegistry(), completion)) {
-                                    var buf: [128]u8 = undefined;
-                                    const with_space = std.mem.print(&buf, "{s} ", .{completion}) catch completion;
-                                    try app.input_runtime.textReplacementState().replace(app.alloc, with_space);
+                                    try typeCommandAwaitingArgument(app, completion);
                                 } else {
                                     try app.input_runtime.textReplacementState().replace(app.alloc, completion);
+                                    app.shell.render_requests.request(.footer);
                                 }
-                                app.shell.render_requests.request(.footer);
                             }
                         }
                     }
@@ -2503,8 +2501,16 @@ pub fn Runtime(comptime App: type) type {
                 app.slashRegistry(),
                 items,
             ) orelse return false;
-            if (app.slashRegistry().matchExact(prefix) != null) return false;
             const count = completion_rt.visibleSlashCompletionCount(app, agent);
+            if (app.slashRegistry().matchExact(prefix)) |exact| {
+                // `/rename` typed in full waits for its title, as when it is
+                // picked from a prefix below. `/rename ` with nothing after
+                // it is sent on purpose, so it runs and says how to use it.
+                if (count == 0 or !exact.command.requires_args) return false;
+                if (std.mem.trimEnd(u8, prefix, " \t").len != prefix.len) return false;
+                try typeCommandAwaitingArgument(app, prefix);
+                return true;
+            }
             if (count == 0) return false;
             const idx = app.input_runtime.picker.slash_completion_index % count;
             if (!picker_presentation.mixedSlashCompletionIsSkill(
@@ -2520,11 +2526,27 @@ pub fn Runtime(comptime App: type) type {
                     idx,
                 ) orelse return false;
                 const spec = app.slashRegistry().matchExact(selected) orelse return false;
+                if (spec.command.requires_args) {
+                    // Only while the name is still being typed: text after it
+                    // is the argument, and Enter sends it as it is.
+                    if (std.mem.findAny(u8, prefix, " \t") != null) return false;
+                    try typeCommandAwaitingArgument(app, selected);
+                    return true;
+                }
                 if (spec.command.kind != .model) return false;
                 try openModelBrowseCatalog(app);
                 return true;
             }
             return try bindSelectedSlashSkill(app, idx);
+        }
+
+        /// Replaces the composer text with `command` and a space, so the
+        /// command waits for its argument.
+        fn typeCommandAwaitingArgument(app: *App, command: []const u8) !void {
+            var buf: [128]u8 = undefined;
+            const with_space = std.mem.print(&buf, "{s} ", .{command}) catch command;
+            try app.input_runtime.textReplacementState().replace(app.alloc, with_space);
+            app.shell.render_requests.request(.footer);
         }
 
         fn nonSlashPickerOwnsEnter(app: *App, agent: *AppAgent) bool {
@@ -2596,6 +2618,11 @@ pub fn Runtime(comptime App: type) type {
                 selected_index,
             ) orelse return false;
             const leading_ws = items.len - prefix.len;
+            debug_trace.logf(
+                "skills",
+                "slash menu replaced composer text with skill={s} dropped_bytes={d}",
+                .{ skill.name, prefix.len },
+            );
             try app.input_runtime.skillBindingState().bindSkillToken(
                 app.alloc,
                 leading_ws,

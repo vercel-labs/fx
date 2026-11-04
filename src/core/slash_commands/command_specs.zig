@@ -227,6 +227,10 @@ pub const SlashSpec = struct {
     presentation_category: ?SlashPresentationCategory = null,
     show_in_welcome: bool = false,
     has_args: bool = false,
+    /// The command does nothing useful without an argument, so choosing it
+    /// from the slash menu with Enter types it and waits for the argument
+    /// instead of running it bare.
+    requires_args: bool = false,
     accepts_payload: bool = false,
     requires_prompt_credential: bool = false,
 };
