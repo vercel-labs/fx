@@ -5,8 +5,8 @@
 // against HostLifecycle.tla through HostLifecycleTrace.tla.
 import { expect, test } from "bun:test";
 import { join } from "node:path";
-import { artifacts } from "../lib/context";
-import { BUN, FIXTURE, fixture, merge, save, serverEvents, stdioServer, waitFor, writeProfile, writeProject, type Fixture } from "./driver";
+import { artifacts, binary } from "../lib/context";
+import { BUN, FIXTURE, fixture, fxEnv, merge, runFx, save, serverEvents, stdioServer, waitFor, writeProfile, writeProject, type Fixture } from "./driver";
 import { serverRecords, Shell } from "./shell";
 import { checkTrace } from "./trace";
 
@@ -145,6 +145,38 @@ test("a removed server added back runs one process at a time: the new one starts
     // By the servers' own log: the second s started after the first exited, and a never restarted.
     expect(firstExit).toBeDefined();
     expect(runs[1]!.t).toBeGreaterThanOrEqual(firstExit!.t);
+    expect(started(shell.f, "a").length).toBe(1);
+    expect(verdict.verdict).toBe("ACCEPTED");
+  } finally { await shell.stop(); }
+}, 150_000);
+
+test("a change fx mcp makes outside the session waits for the next check: a removed server runs until /mcp, and added back starts there (trace ACCEPTED)", async () => {
+  const shell = new Shell(setup("hl-outside", ["a", "s"], []));
+  const outside = async (change: string, args: string[]) => {
+    // Recorded first: the file changes before anything the fixture logs.
+    shell.records.push({ event: "edit", data: { server: "s", change }, at: Date.now() });
+    expect((await runFx(binary, shell.f, ["mcp", ...args], fxEnv(shell.f))).code).toBe(0);
+  };
+  try {
+    await shell.start();
+    await waitFor("a and s listed", () => listed(shell.f, "a").length && listed(shell.f, "s").length, 20_000);
+    // Only the file changes: nothing watches it, so s keeps running.
+    await outside("removed", ["remove", "s"]);
+    await Bun.sleep(1_500);
+    expect(stopped(shell.f, "s")).toEqual([]);
+    // A `/mcp` command is a check: the host loads the change, and s stops.
+    await shell.type("/mcp list");
+    await waitFor("s stopped", () => stopped(shell.f, "s").length, 10_000);
+    const env = { FIXTURE_NAME: "s", FIXTURE_LOG: shell.f.serverLog, FIXTURE_CONTROL: shell.f.control };
+    await outside("ok", ["add", ...Object.entries(env).flatMap(([k, v]) => ["--env", `${k}=${v}`]), "s", "--", BUN, FIXTURE]);
+    await Bun.sleep(1_500);
+    expect(started(shell.f, "s").length).toBe(1);
+    await shell.type("/mcp list");
+    await waitFor("a second s listed", () => started(shell.f, "s").length === 2 && listed(shell.f, "s").length === 2, 20_000);
+    expect(await shell.status({ k: "none" })).toEqual({ k: "none", who: "", why: "", r: 0, e: 0 });
+    await shell.quit();
+    await Bun.sleep(500);
+    const { verdict } = await finish(shell, { ObsServers: ["a", "s"], ObsProject: [], ObsReachable: ["a", "s"], ObsNeedsAuth: [], ObsMaxReloads: 2, ObsMaxLeases: 1 });
     expect(started(shell.f, "a").length).toBe(1);
     expect(verdict.verdict).toBe("ACCEPTED");
   } finally { await shell.stop(); }

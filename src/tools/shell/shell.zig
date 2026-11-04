@@ -7,6 +7,7 @@ const command_environment = @import("../../core/execution/command_environment.zi
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const managed_execution = @import("../../core/execution/managed_execution.zig");
 const managed_contract = @import("../../core/execution/managed_execution_contract.zig");
+const mcp_call_bridge = @import("../../core/mcp_host/mcp_call_bridge.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
@@ -650,12 +651,24 @@ fn callRun(
     var execution_id_buffer: [64]u8 = undefined;
     const execution_id = runtime.generatedId(&execution_id_buffer) catch |err|
         return runtimeFailure(ctx, err);
+    // While this call runs, its command can reach the session's MCP tools
+    // with `fx mcp call`, as this agent (`mcp_call_bridge.zig`).
+    const bridge_registration: ?*mcp_call_bridge.Registration = if (comptime mcp_call_bridge.supported) registration: {
+        const capability = ctx.mcp_call_capability orelse break :registration null;
+        break :registration mcp_call_bridge.register(capability) catch |err| {
+            debug_trace.logf("mcp-call", "shell call not registered with the bridge err={s}", .{@errorName(err)});
+            break :registration null;
+        };
+    } else null;
+    defer if (comptime mcp_call_bridge.supported) if (bridge_registration) |registration| mcp_call_bridge.unregister(registration);
     var prepared = runtime.startCaptured(ctx.allocator, .{
         .execution_id = execution_id,
         .command = command,
         .cwd = cwd,
         .environment = environment,
         .authority = authority,
+        .extra_environment = if (bridge_registration) |registration| registration.environment() else &.{},
+        .yield_hold = if (bridge_registration) |registration| &registration.hold else null,
         .max_output_bytes = ctx.max_command_output_bytes,
         .timeout_ms = if (input.timeout_ms) |value|
             std.math.cast(usize, value) orelse return unavailable(ctx)
@@ -1679,6 +1692,7 @@ fn formatSnapshotWithLimit(
         accepted_bytes,
         "",
         true,
+        false,
     );
 }
 
@@ -1697,6 +1711,7 @@ fn formatModelSafeSnapshotRaw(
             accepted_bytes,
             output_delta,
             output_truncated,
+            false,
         );
     }
     var encoded = try text_utils.encodeTerminalSafe(
@@ -1712,6 +1727,7 @@ fn formatModelSafeSnapshotRaw(
         accepted_bytes,
         encoded.bytes,
         output_truncated,
+        true,
     );
 }
 
@@ -1800,12 +1816,22 @@ fn hasUsageBannerOutput(output: []const u8) bool {
     return false;
 }
 
+/// The shell result the model reads, which every later request of the
+/// session sends again. It holds only the fields that say something: one that
+/// is null or false is left out, so a command that printed nothing reads
+/// `{"state":"completed","exit_code":0,"duration_ms":12,"output_delta":""}`.
+/// `backend` and `persistence` come with the `session_id` of a session the
+/// model can still use, and otherwise only when they are not the default
+/// `captured` and `process`, such as a command that ran on a terminal.
+/// `output_terminal_safe` marks output whose unsafe bytes were written as
+/// escapes (`escaped`).
 fn formatSnapshotRaw(
     alloc: Allocator,
     snapshot: managed_execution.Snapshot,
     accepted_bytes: ?u32,
     output_delta: []const u8,
     output_truncated: bool,
+    escaped: bool,
 ) ![]u8 {
     const status = switch (snapshot.state) {
         .completed => |value| value,
@@ -1834,25 +1860,31 @@ fn formatSnapshotRaw(
     };
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
+    const retained = snapshot.retained;
     try std.json.Stringify.value(.{
-        .session_id = if (snapshot.retained) snapshot.execution_id else null,
+        .session_id = if (retained) snapshot.execution_id else null,
         .state = snapshotStateName(snapshot.state),
-        .backend = @tagName(snapshot.backend),
-        .persistence = @tagName(snapshot.persistence),
-        .output_truncated = output_truncated,
-        .output_incomplete = snapshot.output_incomplete,
-        .output_terminal_safe = true,
+        .backend = if (retained or snapshot.backend != .captured) @tagName(snapshot.backend) else null,
+        .persistence = if (retained or snapshot.persistence != .process) @tagName(snapshot.persistence) else null,
+        .output_truncated = presentFlag(output_truncated),
+        .output_incomplete = presentFlag(snapshot.output_incomplete),
+        .output_terminal_safe = presentFlag(escaped),
         .full_output_handle = snapshot.output_file,
         .exit_code = projection.exit_code,
         .signal = projection.signal,
-        .termination_indeterminate = projection.termination_indeterminate,
+        .termination_indeterminate = presentFlag(projection.termination_indeterminate),
         .duration_ms = snapshot.duration_ms,
         .accepted_bytes = accepted_bytes,
         .@"error" = snapshot.error_name,
         .retry_guidance = retry_guidance,
         .output_delta = output_delta,
-    }, .{}, &out.writer);
+    }, .{ .emit_null_optional_fields = false }, &out.writer);
     return try out.toOwnedSlice();
+}
+
+/// A flag the result writes only when it is set.
+fn presentFlag(value: bool) ?bool {
+    return if (value) true else null;
 }
 
 fn snapshotStateName(state: managed_execution.SnapshotState) []const u8 {
@@ -2487,6 +2519,62 @@ test "lost shell snapshot preserves indeterminate execution guidance" {
     ) != null);
 }
 
+test "a finished command that printed nothing reads as its status alone" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-quiet"),
+        .command = @constCast("true"),
+        .cwd = @constCast("/tmp"),
+        .retained = false,
+        .state = .{ .completed = .{ .exit_code = 0 } },
+        .output_delta = @constCast(""),
+        .output_truncated = false,
+        .duration_ms = 12,
+    }, null);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"state\":\"completed\",\"exit_code\":0,\"duration_ms\":12,\"output_delta\":\"\"}",
+        body,
+    );
+}
+
+test "a finished terminal run still names its backend" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-tty"),
+        .command = @constCast("tty"),
+        .cwd = @constCast("/tmp"),
+        .retained = false,
+        .state = .{ .completed = .{ .exit_code = 7 } },
+        .backend = .tty,
+        .output_delta = @constCast("/dev/ttys001\n"),
+        .output_truncated = false,
+    }, null);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"state\":\"completed\",\"backend\":\"tty\",\"exit_code\":7,\"output_delta\":\"/dev/ttys001\\n\"}",
+        body,
+    );
+}
+
+test "a command still running names its session with the backend and persistence" {
+    const alloc = std.testing.allocator;
+    const body = try formatSnapshot(alloc, .{
+        .execution_id = @constCast("shell-live"),
+        .command = @constCast("sleep 30"),
+        .cwd = @constCast("/tmp"),
+        .retained = true,
+        .state = .running,
+        .output_delta = @constCast("partial\n"),
+        .output_truncated = false,
+    }, null);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"session_id\":\"shell-live\",\"state\":\"running\",\"backend\":\"captured\",\"persistence\":\"process\",\"output_delta\":\"partial\\n\"}",
+        body,
+    );
+}
+
 test "completed shell snapshot reports incomplete output without losing status" {
     const alloc = std.testing.allocator;
     const body = try formatSnapshot(alloc, .{
@@ -2558,7 +2646,7 @@ test "completed zsh parse error after earlier delivered output carries no guidan
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
-    try std.testing.expect(parsed.value.object.get("retry_guidance").? == .null);
+    try std.testing.expect(parsed.value.object.get("retry_guidance") == null);
 }
 
 test "completed shell snapshot with usage error carries argument guidance" {
@@ -2599,7 +2687,7 @@ test "completed shell snapshot with ordinary failure has no retry guidance" {
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
-    try std.testing.expect(parsed.value.object.get("retry_guidance").? == .null);
+    try std.testing.expect(parsed.value.object.get("retry_guidance") == null);
 }
 
 test "failure guidance detects signatures in raw output when emitted text is encoded" {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const agents = @import("../agents/agents.zig");
 const auto_upgrade = @import("../upgrade/auto_upgrade.zig");
 const types = @import("../shared/types.zig");
 const upgrade_helpers = @import("../upgrade/upgrade_helpers.zig");
@@ -23,8 +24,9 @@ pub const Deps = struct {
 
 pub fn Runtime(comptime App: type) type {
     return struct {
-        pub fn applyReadyUpgrade(app: *App) !void {
-            _ = try applyReadyUpgradeWithDeps(app, .{});
+        const AppAgent = if (@hasField(App, "main_agent")) @FieldType(App, "main_agent") else struct {};
+        pub fn applyReadyUpgrade(app: *App, agent: *AppAgent) !void {
+            _ = try applyReadyUpgradeWithDeps(app, agent, .{});
         }
 
         pub fn collectUpgradeFacts(app: *App) void {
@@ -39,9 +41,10 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn applyReadyUpgradeWithDeps(
             app: *App,
+            agent: *AppAgent,
             deps: Deps,
         ) !ApplyOutcome {
-            if (upgradeUnavailableNotice(app)) |notice| {
+            if (upgradeUnavailableNotice(app, agent)) |notice| {
                 try writeUpgradeNotice(app, .neutral, notice);
                 return .unavailable;
             }
@@ -58,7 +61,7 @@ pub fn Runtime(comptime App: type) type {
                 }
             }
 
-            app.prepareResumeHandoffForUpgrade() catch |err| {
+            app.prepareResumeHandoffForUpgrade(agent) catch |err| {
                 const notice = try app.alloc.print(
                     "upgrade paused because this conversation is not safely resumable: {s}; run `fx doctor` for recovery guidance",
                     .{@errorName(err)},
@@ -91,27 +94,27 @@ pub fn Runtime(comptime App: type) type {
                 try writeUpgradeNotice(app, .@"error", notice);
                 return .unavailable;
             };
-            app.requestResumeHandoffForUpgrade();
+            app.requestResumeHandoffForUpgrade(agent);
             if (comptime @hasField(App, "should_exit")) app.should_exit = true;
             return .relaunch_requested;
         }
 
-        fn upgradeUnavailableNotice(app: *App) ?[]const u8 {
-            if (comptime @hasField(App, "stream")) {
-                if (app.stream.active) return "upgrade is unavailable until the response finishes";
+        fn upgradeUnavailableNotice(app: *App, agent: *AppAgent) ?[]const u8 {
+            if (comptime agents.hasAgentField(App, "stream")) {
+                if (agent.stream.active) return "upgrade is unavailable until the response finishes";
             }
-            if (comptime @hasField(App, "worker")) {
-                if (comptime @hasDecl(@TypeOf(app.worker), "queuedPromptCount")) {
-                    if (app.worker.queuedPromptCount() > 0) {
+            if (comptime agents.hasAgentField(App, "worker")) {
+                if (comptime @hasDecl(@TypeOf(agent.worker), "queuedPromptCount")) {
+                    if (agent.worker.queuedPromptCount() > 0) {
                         return "upgrade is unavailable while prompts are queued";
                     }
                 }
             }
-            if (comptime @hasField(App, "question_prompt")) {
-                if (app.question_prompt.isActive()) return "upgrade is unavailable while a question is open";
+            if (comptime agents.hasAgentField(App, "question_prompt")) {
+                if (agent.question_prompt.isActive()) return "upgrade is unavailable while a question is open";
             }
-            if (comptime @hasField(App, "approval_prompt")) {
-                if (app.approval_prompt.isActive()) return "upgrade is unavailable while an approval is open";
+            if (comptime agents.hasAgentField(App, "approval_prompt")) {
+                if (agent.approval_prompt.isActive()) return "upgrade is unavailable while an approval is open";
             }
             if (comptime @hasField(App, "auth") and
                 @hasDecl(@TypeOf(app.auth), "apiKeyEntryActive"))
@@ -121,8 +124,8 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasField(App, "subagents")) {
                 if (app.subagents.isViewActive()) return "close the subagent view before upgrading";
             }
-            if (comptime @hasField(App, "session_persistence")) {
-                if (app.session_persistence.session_picker.active) return "close the session picker before upgrading";
+            if (comptime agents.hasAgentField(App, "session_persistence")) {
+                if (agent.session_persistence.session_picker.active) return "close the session picker before upgrading";
             }
             if (comptime @hasField(App, "terminal")) {
                 if (app.terminal.fullTranscriptScreenActive()) return "close the transcript view before upgrading";
@@ -131,8 +134,8 @@ pub fn Runtime(comptime App: type) type {
                 if (app.input_runtime.paste.active()) return "finish the paste before upgrading";
                 if (app.input_runtime.edit_state.input.items.len > 0) return "submit or clear the current prompt before upgrading";
             }
-            if (comptime @hasField(App, "pending_images")) {
-                if (app.pending_images.items.len > 0) return "submit or clear pending images before upgrading";
+            if (comptime agents.hasAgentField(App, "pending_images")) {
+                if (agent.pending_images.items.len > 0) return "submit or clear pending images before upgrading";
             }
             if (comptime @hasField(App, "terminal_input_runtime")) {
                 if (app.terminal_input_runtime.hasPendingTerminalAction()) return "finish the key sequence before upgrading";
@@ -231,11 +234,13 @@ const TestApp = struct {
     alloc: std.mem.Allocator,
     auto_upgrade_enabled: bool = true,
     upgrader: TestUpgrader = .{},
-    worker: TestWorker = .{},
+    main_agent: struct {
+        worker: TestWorker = .{},
+        stream: struct { active: bool = false } = .{},
+    } = .{},
     input_runtime: TestInputRuntime = .{},
     terminal_input_runtime: TestTerminalInputRuntime = .{},
     shell: TestShell = .{},
-    stream: struct { active: bool = false } = .{},
     should_exit: bool = false,
     session_id: ?[]const u8 = "session-123",
     notices: std.ArrayList(u8) = .empty,
@@ -251,7 +256,7 @@ const TestApp = struct {
         self.notices.deinit(self.alloc);
     }
 
-    fn prepareResumeHandoffForUpgrade(self: *TestApp) !void {
+    fn prepareResumeHandoffForUpgrade(self: *TestApp, _: anytype) !void {
         self.prepare_count += 1;
         if (self.session_id == null) return error.SessionPersistenceUnavailable;
         if (self.prepare_error) |err| return err;
@@ -264,12 +269,16 @@ const TestApp = struct {
         self.relaunch_path_len = executable_path.len;
     }
 
-    fn requestResumeHandoffForUpgrade(self: *TestApp) void {
+    fn requestResumeHandoffForUpgrade(self: *TestApp, _: anytype) void {
         self.request_handoff_count += 1;
     }
 
     fn writeDomainNotice(self: *TestApp, notice: types.SemanticNotice, _: bool) !void {
         try self.notices.appendSlice(self.alloc, notice.body);
+    }
+
+    pub fn agent(self: anytype) @TypeOf(&self.main_agent) {
+        return &self.main_agent;
     }
 };
 
@@ -303,7 +312,7 @@ test "app_upgrade_runtime validates then requests normal relaunch handoff" {
     defer app.deinit();
     app.upgrader.state = .ready;
     var deps_state = TestDepsState{};
-    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, deps_state.deps());
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
 
     try std.testing.expectEqual(ApplyOutcome.relaunch_requested, outcome);
     try std.testing.expectEqual(@as(usize, 1), app.prepare_count);
@@ -324,6 +333,7 @@ test "app_upgrade_runtime keeps running when the executable path is unavailable"
 
     const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(
         &app,
+        (&app).agent(),
         deps_state.deps(),
     );
 
@@ -349,7 +359,7 @@ test "app_upgrade_runtime keeps running when relaunch preparation fails" {
     app.upgrader.state = .ready;
     var deps_state = TestDepsState{};
 
-    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, deps_state.deps());
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
 
     try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
     try std.testing.expectEqual(@as(usize, 1), deps_state.path_count);
@@ -373,6 +383,7 @@ test "app_upgrade_runtime keeps the app alive when the resume boundary is invali
 
     const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(
         &app,
+        (&app).agent(),
         deps_state.deps(),
     );
 
@@ -418,7 +429,7 @@ test "app_upgrade_runtime rejects ctrl+g while upgrade is not ready" {
     defer app.deinit();
     var deps_state = TestDepsState{};
 
-    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, deps_state.deps());
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
 
     try std.testing.expectEqual(ApplyOutcome.not_ready, outcome);
     try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
@@ -431,7 +442,7 @@ test "app_upgrade_runtime requires an active session before reload" {
     app.upgrader.state = .ready;
     var deps_state = TestDepsState{};
 
-    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, deps_state.deps());
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps_state.deps());
 
     try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
     try std.testing.expectEqual(@as(usize, 0), deps_state.path_count);
@@ -446,10 +457,10 @@ test "app_upgrade_runtime rejects busy app state before reload" {
     var stream_app = TestApp{ .alloc = std.testing.allocator };
     defer stream_app.deinit();
     stream_app.upgrader.state = .ready;
-    stream_app.stream.active = true;
+    stream_app.agent().stream.active = true;
     var stream_deps = TestDepsState{};
 
-    const stream_outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&stream_app, stream_deps.deps());
+    const stream_outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&stream_app, (&stream_app).agent(), stream_deps.deps());
     try std.testing.expectEqual(ApplyOutcome.unavailable, stream_outcome);
     try std.testing.expectEqual(@as(usize, 0), stream_deps.path_count);
     try std.testing.expect(std.mem.find(u8, stream_app.notices.items, "response finishes") != null);
@@ -460,7 +471,7 @@ test "app_upgrade_runtime rejects busy app state before reload" {
     try composer_app.input_runtime.edit_state.input.appendSlice(std.testing.allocator, "draft prompt");
     var composer_deps = TestDepsState{};
 
-    const composer_outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&composer_app, composer_deps.deps());
+    const composer_outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&composer_app, (&composer_app).agent(), composer_deps.deps());
     try std.testing.expectEqual(ApplyOutcome.unavailable, composer_outcome);
     try std.testing.expectEqual(@as(usize, 0), composer_deps.path_count);
     try std.testing.expect(std.mem.find(u8, composer_app.notices.items, "current prompt") != null);
@@ -473,7 +484,7 @@ test "app_upgrade_runtime rejects mid key sequence before reload" {
     app.terminal_input_runtime.terminal_action_pending = true;
     var deps = TestDepsState{};
 
-    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, deps.deps());
+    const outcome = try Runtime(TestApp).applyReadyUpgradeWithDeps(&app, (&app).agent(), deps.deps());
     try std.testing.expectEqual(ApplyOutcome.unavailable, outcome);
     try std.testing.expectEqual(@as(usize, 0), deps.path_count);
     try std.testing.expect(std.mem.find(u8, app.notices.items, "finish the key sequence") != null);

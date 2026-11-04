@@ -29,6 +29,9 @@ pub const StepBatchState = struct {
     step_error_count: usize = 0,
     step_total_count: usize = 0,
     step_had_writes: bool = false,
+    /// Whether a write or edit in this step changed a file. Unlike
+    /// `step_had_writes`, a write or edit that failed does not count.
+    step_changed_files: bool = false,
     pending_user_suffix: std.ArrayList(ChatMessage) = .empty,
     /// Turn-scoped identical-failure tracker owned by the orchestrator step
     /// loop. Null disables escalation (tests and non-turn callers).
@@ -492,6 +495,7 @@ pub fn processCommittedFileResult(
     );
     batch.step_total_count += 1;
     batch.step_had_writes = true;
+    batch.step_changed_files = true;
     completed_tool_names.appendAssumeCapacity(committed_file_tool_name);
 }
 
@@ -507,6 +511,9 @@ pub fn appendOrdinaryExecutedResult(
     execution: ToolExecutionResult,
 ) !void {
     const activity = runtime_tool_presentation.activityKindForCall(arena, tool_registry, tool_call);
+    const is_write = activity == .write or activity == .edit;
+    const failed = execution.status == .failure or tool_result_errors.isToolOutputError(model_output);
+    if (is_write and !failed) batch.step_changed_files = true;
     try appendToolResultContent(
         arena,
         within_turn_suffix,
@@ -516,9 +523,9 @@ pub fn appendOrdinaryExecutedResult(
         model_output,
         memory,
         .{
-            .increment_error = execution.status == .failure or tool_result_errors.isToolOutputError(model_output),
+            .increment_error = failed,
             .record_completion = true,
-            .mark_write = activity == .write or activity == .edit,
+            .mark_write = is_write,
             .status = runtime_execution_memory.persistedStatusForCurrentFxLocalResult(
                 execution.status,
                 model_output,

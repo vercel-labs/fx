@@ -6,11 +6,13 @@
 \*   stop {server}     it exited at stdin's end
 \*   term {server}     it exited after fx quit (SIGTERM; its log says which)
 \*   reload {server, change}  `/mcp approve|reject|remove|add` typed
+\*   edit {server, change}    `fx mcp add|remove` run outside the session
 \*   lease {}, release {}     `/mcp show NAME` started, and printed its answer
 \*   status {k, who, why, r, e}  the status line, read once it stopped changing
 \*   quit {}           Ctrl+C twice
-\* The first frame, a need, and a server the engine gives up on are hidden
-\* steps: they may happen between records without advancing `i`.
+\* Both kinds of change are an Edit of the files. The first frame, a need, a
+\* server the engine gives up on, and the host's reload at a check are
+\* hidden steps: they may happen between records without advancing `i`.
 \* `bad` collects the stated safety properties broken on the way; trace.ts
 \* asks whether some complete match keeps them all.
 EXTENDS HostLifecycle, TraceObs, Sequences
@@ -32,7 +34,7 @@ Step(rec) ==
       [] rec.event = "ready" -> \E h \in Hosts : Answer(h, rec.data.server)
       [] rec.event = "stop" -> \E h \in Hosts : Exit(h, rec.data.server)
       [] rec.event = "term" -> \E h \in Hosts : TermExit(h, rec.data.server)
-      [] rec.event = "reload" -> Reload(rec.data.server, rec.data.change)
+      [] rec.event \in {"reload", "edit"} -> Edit(rec.data.server, rec.data.change)
       [] rec.event = "lease" -> Lease
       [] rec.event = "release" -> \E h \in Hosts : Release(h)
       [] rec.event = "status" -> RefreshStatus /\ shown' = AsLine(rec.data)
@@ -43,6 +45,7 @@ Hidden ==
     \/ FirstFrame
     \/ \E s \in Servers : Need(s)
     \/ \E h \in Hosts, s \in Servers : GiveUp(h, s)
+    \/ Reload
 
 TraceInit == Init /\ i = 0 /\ bad = Viol
 

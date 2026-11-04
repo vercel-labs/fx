@@ -102,6 +102,8 @@ export function fixture(label: string, at?: string, models?: object[]) {
       PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: homeDir, TMPDIR: root,
       AI_GATEWAY_API_KEY: "synthetic-conversion-fixture", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
       FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+      // The older releases that write v1 read these names for the same hooks.
       FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
       FX_MODEL: FAKE_GATEWAY_MODEL, FX_PERMISSION_MODE: "full-access", FX_AUTO_UPGRADE: "0", FX_SOUND: "0", NO_COLOR: "1",
       // A v1 writer build that still has the store switch writes v1 even when
@@ -272,7 +274,7 @@ export class Acp {
 export async function openVia(f: Fixture, id: string, via: Via, prompt = "CONV_NEXT", firstPrompt = "CONV_FIRST"): Promise<Answer> {
   f.said = "";
   if (via === "ask") {
-    const run = await f.fx(true, ["ask", "--json", "--auto", "--resume-id", id, prompt]);
+    const run = await f.fx(true, ["ask", "--json", "--auto", "--resume", id, prompt]);
     f.said = run.stdout + run.stderr;
     return askAnswer(run, id);
   }
@@ -618,7 +620,7 @@ export async function compareContinuations(f: Fixture, snapshot: string, rootId:
     // that quotes its title or review instruction lands in those lists.
     const lists = [f.gateway.requests, f.gateway.classifierRequests, f.gateway.titleRequests];
     const marks = lists.map(list => list.length);
-    const run = await f.fx(v2, ["ask", "--json", "--auto", "--resume-id", rootId, "CONV_ORACLE"], home);
+    const run = await f.fx(v2, ["ask", "--json", "--auto", v2 ? "--resume" : "--resume-id", rootId, "CONV_ORACLE"], home);
     const bodies: string[] = lists.flatMap((list, i) => list.slice(marks[i])).map((r: any) => r.body);
     const root = bodies.find(b => b.includes("CONV_ORACLE") && !b.includes("CONV_ORACLE_CHILD"));
     const child = bodies.find(b => b.includes("CONV_ORACLE_CHILD") && !b.includes("CONV_ORACLE_CHILD_ANSWER"));
@@ -670,7 +672,7 @@ export function familyReplies(f: Fixture) {
 // there: a crash at exactly that point.
 export async function crashAtRename(f: Fixture, o: ReturnType<typeof observer>, id: string, path: string) {
   const fault = f.faultPaths("pause", [path]);
-  const pending = f.start(true, ["ask", "--json", "--auto", "--resume-id", id, "CONV_NEXT"]);
+  const pending = f.start(true, ["ask", "--json", "--auto", "--resume", id, "CONV_NEXT"]);
   let done = false;
   pending.finished.then(() => { done = true; });
   const reached = await waitUntil(() => done || fault.reached(), 15_000) && fault.reached();

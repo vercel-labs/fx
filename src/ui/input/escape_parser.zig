@@ -257,8 +257,8 @@ fn kittyUnicodeKeyAction(keycode: u16, modifiers: u16, meta_prefixed: bool) Inpu
         if (keycode >= 'a' and keycode <= 'z') return .{ .remapped_byte = @intCast(keycode - 96) };
         if (keycode >= 'A' and keycode <= 'Z') return .{ .remapped_byte = @intCast(keycode - 64) };
     }
-    if (keycode == 127 and (mods & 0x08) != 0) return .delete_to_line_start;
-    if (keycode == 127 and (mods & 0x02) != 0) return .delete_word_left;
+    if (keycode == 127 and (mods & super_modifier) != 0) return .delete_to_line_start;
+    if (keycode == 127 and (mods & (alt_modifier | ctrl_modifier)) != 0) return .delete_word_left;
     if (keycode == 13) return .{ .remapped_byte = '\r' };
     if (keycode == 9) return .{ .remapped_byte = '\t' };
     if (keycode == 127) return .{ .remapped_byte = 127 };
@@ -269,6 +269,7 @@ pub fn controlByteFeatureAction(byte: u8) ?InputEscapeAction {
     return switch (byte) {
         15 => .toggle_full_transcript,
         16 => .open_model_catalog,
+        24 => .open_agent_list,
         else => null,
     };
 }

@@ -5,6 +5,7 @@ const io_mod = @import("../../core/shared/io.zig");
 const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
+const tool_args = @import("../../core/tooling/tool_args.zig");
 const tool_result_errors = @import("../../core/tooling/tool_result_errors.zig");
 const tool_files = @import("../../core/workspace/tool_files.zig");
 const sort_utils = @import("../../core/shared/sort_utils.zig");
@@ -31,38 +32,18 @@ pub const Input = struct {
 
 /// Decodes glob_files JSON into an owned Input released by ToolInput.deinit.
 pub fn decode(ctx: tool_dispatch.DispatchContext, args_json: []const u8) tool_dispatch.DispatchError!tool_dispatch.DecodeResult {
-    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, args_json, .{}) catch {
-        return .{ .failure = try ctx.allocator.dupe(u8, "glob_files arguments must be valid JSON") };
-    };
+    var args: tool_args.ArgsDecoder = .{ .alloc = ctx.allocator, .tool = "glob_files" };
+    var parsed = args.parse(args_json) catch |err| return .{ .failure = try args.takeFailure(err) };
     defer parsed.deinit();
-
-    if (parsed.value != .object) {
-        return .{ .failure = try ctx.allocator.dupe(u8, "glob_files arguments must be an object") };
-    }
-
-    const pattern_value = parsed.value.object.get("pattern") orelse {
-        return .{ .failure = try ctx.allocator.dupe(u8, "glob_files requires string field \"pattern\"") };
-    };
-    if (pattern_value != .string) {
-        return .{ .failure = try ctx.allocator.dupe(u8, "glob_files field \"pattern\" must be a string") };
-    }
-
-    // A missing field and JSON null both read as not given.
-    const path_string: ?[]const u8 = if (parsed.value.object.get("path")) |value| switch (value) {
-        .null => null,
-        .string => |path| path,
-        else => return .{ .failure = try ctx.allocator.dupe(u8, "glob_files field \"path\" must be a string") },
-    } else null;
-
-    const mode: OutputMode = if (parsed.value.object.get("mode")) |value| switch (value) {
-        .null => .matches,
-        .string => |raw| std.meta.stringToEnum(OutputMode, raw) orelse {
-            return .{ .failure = try ctx.allocator.dupe(u8, "glob_files field \"mode\" must be one of matches, count") };
-        },
-        else => return .{ .failure = try ctx.allocator.dupe(u8, "glob_files field \"mode\" must be a string") },
+    const object = parsed.value.object;
+    const pattern = args.requiredString(object, "pattern") catch |err| return .{ .failure = try args.takeFailure(err) };
+    const path_string = args.optionalString(object, "path") catch |err| return .{ .failure = try args.takeFailure(err) };
+    const raw_mode = args.optionalString(object, "mode") catch |err| return .{ .failure = try args.takeFailure(err) };
+    const mode: OutputMode = if (raw_mode) |raw| std.meta.stringToEnum(OutputMode, raw) orelse {
+        return .{ .failure = try ctx.allocator.dupe(u8, "glob_files field \"mode\" must be one of matches, count") };
     } else .matches;
 
-    const owned_pattern = try ctx.allocator.dupe(u8, pattern_value.string);
+    const owned_pattern = try ctx.allocator.dupe(u8, pattern);
     errdefer ctx.allocator.free(owned_pattern);
     const effective_path = if (path_string) |path|
         if (path.len == 0) "." else path
