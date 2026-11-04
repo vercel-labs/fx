@@ -5911,8 +5911,20 @@ test.skipIf(!tmuxAvailable())(
 
     let active: TmuxSession | null = null;
     let fresh: TmuxSession | null = null;
+    const prompt = "Save a turn before upgrade handoff.";
+    // Taller than the pane, so part of the conversation sits in scrollback.
+    const initialReply = [
+      "UPGRADE_CTRL_G_FIRST_LINE",
+      ...Array.from({ length: 24 }, (_, index) => `upgrade filler paragraph ${index + 1}`),
+      "UPGRADE_CTRL_G_INITIAL_DONE",
+    ].join("\n\n");
+    const conversationMarkers = [
+      prompt,
+      "UPGRADE_CTRL_G_FIRST_LINE",
+      "UPGRADE_CTRL_G_INITIAL_DONE",
+    ];
     const gateway = startFakeGateway([
-      fakeGatewayFinalText("UPGRADE_CTRL_G_INITIAL_DONE"),
+      fakeGatewayFinalText(initialReply),
       fakeGatewayFinalText("UPGRADE_CTRL_G_FOLLOWUP_DONE"),
     ]);
     const release = startUpgradeServer(root, argvLogPath);
@@ -5936,10 +5948,14 @@ test.skipIf(!tmuxAvailable())(
         height: 32,
       });
       await active.waitForComposer(TIMEOUT);
-      await active.sendText("Save a turn before upgrade handoff.");
+      await active.sendText(prompt);
       await active.waitForText("UPGRADE_CTRL_G_INITIAL_DONE", TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       const sessionId = sessionIdFromHome(home);
+      const beforeUpgrade = await active.captureFullScrollback();
+      for (const marker of conversationMarkers) {
+        expect(countOccurrences(beforeUpgrade, marker)).toBe(1);
+      }
 
       await active.waitForText(
         "update ready: ctrl+g to reload",
@@ -5970,16 +5986,28 @@ test.skipIf(!tmuxAvailable())(
       await active.sendHexBytes(["07"]);
 
       const updatedNotice = `✓ fx has been updated to v${version} (notes)`;
-      await active.waitForText(updatedNotice, TIMEOUT);
+      // The notice comes before the replayed conversation, which is taller
+      // than the pane, so it is in the scrollback rather than on screen.
+      await waitForScrollback(active, updatedNotice);
       await active.waitForComposer(TIMEOUT);
       const postUpgradeTrace = readFileSync(tracePath, "utf8");
       expect(postUpgradeTrace.slice(traceBeforeUpgrade.length)).not.toContain(
         "session picker completion",
       );
-      const resumed = await waitForScrollback(active, "UPGRADE_CTRL_G_INITIAL_DONE");
-      expect(resumed).toContain("UPGRADE_CTRL_G_INITIAL_DONE");
-      expect(resumed).toContain(updatedNotice);
-      const noticeEscapes = await active.capturePaneEscapes();
+      const resumed = await active.waitForStableScrollback(
+        (scrollback) =>
+          scrollback.includes(updatedNotice) &&
+          scrollback.includes("UPGRADE_CTRL_G_INITIAL_DONE"),
+        TIMEOUT,
+        250,
+      );
+      // The new build clears the terminal and draws the conversation again
+      // from the top, the way a resize does, so the old screen leaves no copy.
+      for (const marker of conversationMarkers) {
+        expect(countOccurrences(resumed, marker)).toBe(1);
+      }
+      expect(countOccurrences(resumed, updatedNotice)).toBe(1);
+      const noticeEscapes = await active.captureFullScrollbackEscapes();
       expect(noticeEscapes).toContain(
         `(\x1b[4m\x1b]8;;https://fx.sh/changelog#v${version}\x1b\\notes\x1b[0m`,
       );
@@ -6007,6 +6035,86 @@ test.skipIf(!tmuxAvailable())(
       active = null;
     } finally {
       if (fresh) await fresh.kill();
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g without a saved turn reopens on a cleared terminal",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-fresh-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    const welcome = "Run /help for commands";
+    let active: TmuxSession | null = null;
+    const gateway = startFakeGateway([]);
+    const release = startUpgradeServer(root, argvLogPath);
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+      expect(countOccurrences(await active.captureFullScrollback(), welcome)).toBe(1);
+
+      const version = (await runFx(["--version"])).stdout.trim();
+      const updatedNotice = `✓ fx has been updated to v${version} (notes)`;
+      await active.sendHexBytes(["07"]);
+      await active.waitForText(updatedNotice, TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+
+      // The session saved nothing, so the new build opens a fresh one (D81),
+      // drawn from the top of a cleared terminal like a resize redraw.
+      const reopened = await active.waitForStableScrollback(
+        (scrollback) => scrollback.includes(updatedNotice),
+        TIMEOUT,
+        250,
+      );
+      expect(countOccurrences(reopened, welcome)).toBe(1);
+      expect(countOccurrences(reopened, updatedNotice)).toBe(1);
+      expect(
+        readFileSync(argvLogPath, "utf8").trim().split("\n")
+          .some((line) => line.startsWith(`${installedFx}\tresume\t`) && line.includes("\t--upgrade-relaunch")),
+      ).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).not.toContain("relaunch failed");
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
       if (active) {
         try {
           await active.sendText("/quit");
