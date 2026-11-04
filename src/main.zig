@@ -1005,16 +1005,8 @@ const App = struct {
         return .{ .handoff = resume_handoff, .failure = shutdown_failure };
     }
 
-    pub fn resumeHandoffColumns(self: *const App) u16 {
-        return self.shell.layout.cols;
-    }
-
-    pub fn formatResumeHandoff(
-        buffer: []u8,
-        session_id: []const u8,
-        terminal_cols: u16,
-    ) ![]const u8 {
-        return ui_render.formatResumeHandoff(buffer, session_id, terminal_cols);
+    pub fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
+        return ui_render.formatResumeHandoff(buffer, session_id);
     }
 
     /// Full teardown for hosts that keep running after the shell ends, such as

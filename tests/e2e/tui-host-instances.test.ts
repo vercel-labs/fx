@@ -564,7 +564,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         const printed = await quitWith(session, "/exit");
         const second = sessionHolding(home, "HOST_ANSWER_B");
         expect(second).not.toBeNull();
-        expect(printed).toContain(`Continue session with: fx --resume ${second}`);
+        expect(printed).toContain(`Resume this session with:\nfx --resume ${second}\n`);
         expect(printed).not.toContain(`fx --resume ${sessionHolding(home, "HOST_ANSWER_A")}`);
       });
     },
@@ -592,7 +592,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         });
         const saved = sessionHolding(home, "HOST_ANSWER_A");
         expect(saved).not.toBeNull();
-        expect(printed).toContain(`Continue session with: fx --resume ${saved}`);
+        expect(printed).toContain(`Resume this session with:\nfx --resume ${saved}\n`);
         // Resuming it brings back fx 1 alone, with no notice about the others.
         await withHost(answerByLetter, { args: `--resume ${saved}`, reuse: { home, workspace } }, async ({ session }) => {
           const pane = await session.waitForPane((value) => value.includes("HOST_ANSWER_A"), 30_000);
@@ -619,7 +619,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         const printed = await quitWith(session, "/close");
         const last = sessionHolding(home, "HOST_ANSWER_B");
         expect(last).not.toBeNull();
-        expect(printed).toContain(`Continue session with: fx --resume ${last}`);
+        expect(printed).toContain(`Resume this session with:\nfx --resume ${last}\n`);
       });
     },
     TIMEOUT,

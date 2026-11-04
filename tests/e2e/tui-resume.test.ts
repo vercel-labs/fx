@@ -73,6 +73,8 @@ function fakeShellStop(callId: string, sessionId: string): Response {
   });
 }
 
+/// The line fx prints above the resume command when it exits.
+const RESUME_LABEL = "Resume this session with:";
 /// The command fx prints to continue a session.
 const RESUME_COMMAND = "fx --resume";
 
@@ -5277,21 +5279,24 @@ test.skipIf(!tmuxAvailable())(
       expect(paneExitMatches(active.paneStatus(), 0)).toBe(true);
       const scrollback = stripAnsi(await active.captureFullScrollback());
       const ansiScrollback = await active.captureFullScrollbackEscapes();
-      const expected = `Continue session with: ${RESUME_COMMAND} ${sessionId}`;
+      const command = `${RESUME_COMMAND} ${sessionId}`;
+      const expected = `${RESUME_LABEL}\n${command}`;
       expect(scrollback).toContain(expected);
+      expect(scrollback).not.toContain("Continue session with:");
       expect(scrollback).not.toContain("To continue this session, run:");
-      expect(ansiScrollback).toContain(`\x1b[38;5;245m${expected}\x1b[39m`);
+      expect(ansiScrollback).toContain(
+        `\x1b[38;5;245m${RESUME_LABEL}\x1b[39m\n\x1b[38;5;245m${command}\x1b[39m`,
+      );
       expect(countOccurrences(scrollback, expected)).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(readFileSync(tapePath).includes(Buffer.from(expected))).toBe(
+      expect(readFileSync(tapePath).includes(Buffer.from(RESUME_LABEL))).toBe(
         false,
       );
-      const handoffLine = scrollback
-        .split("\n")
-        .map((line) => line.trim())
-        .find((line) => line === expected);
-      const printedCommand = handoffLine?.slice("Continue session with: ".length);
-      expect(printedCommand).toBe(`${RESUME_COMMAND} ${sessionId}`);
+      // The command fills the line below the label by itself, untrimmed, so
+      // selecting that one line copies exactly the command.
+      const lines = scrollback.split("\n");
+      const printedCommand = lines[lines.indexOf(RESUME_LABEL) + 1];
+      expect(printedCommand).toBe(command);
 
       await active.kill();
       active = await TmuxSession.create({
@@ -5323,6 +5328,66 @@ test.skipIf(!tmuxAvailable())(
         rmSync(root, { recursive: true, force: true });
       } else {
         console.error(`retained exit handoff artifacts at ${root}`);
+      }
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a narrow terminal keeps the resume command alone on its own line",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-exit-narrow-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    const marker = "NARROW_EXIT_SAVED";
+    mkdirSync(home);
+    mkdirSync(workspace);
+    writeFileSync(stderrPath, "");
+    const gateway = startFakeGateway([fakeGatewayFinalText(marker)]);
+    let active: TmuxSession | null = null;
+    let passed = false;
+
+    try {
+      // At 40 columns a label and command on one row do not fit, which is
+      // where fx used to indent the command on a second row.
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 40,
+        height: 24,
+        remainOnExit: true,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Save this narrow conversation.");
+      await active.waitForText(marker, TIMEOUT);
+      const sessionId = sessionIdFromHome(home);
+
+      await active.sendText("/quit");
+      await waitForCondition(
+        () => active?.paneStatus().dead === true,
+        "the narrow exit pane to stop",
+      );
+      const scrollback = stripAnsi(await active.captureFullScrollback());
+      const lines = scrollback.split("\n");
+      const labelIndex = lines.indexOf(RESUME_LABEL);
+      expect(labelIndex).toBeGreaterThanOrEqual(0);
+      expect(lines[labelIndex + 1]).toBe(`${RESUME_COMMAND} ${sessionId}`);
+      expect(countOccurrences(scrollback, RESUME_LABEL)).toBe(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await active.kill();
+      active = null;
+      passed = true;
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      if (passed) {
+        rmSync(root, { recursive: true, force: true });
+      } else {
+        console.error(`retained narrow exit artifacts at ${root}`);
       }
     }
   },
@@ -5381,7 +5446,7 @@ test.skipIf(!tmuxAvailable())(
         "the rapid Ctrl-C exit pane to stop",
       );
       const scrollback = stripAnsi(await active.captureFullScrollback());
-      const expected = `Continue session with: ${RESUME_COMMAND} ${sessionId}`;
+      const expected = `${RESUME_LABEL}\n${RESUME_COMMAND} ${sessionId}`;
       expect(countOccurrences(scrollback, expected)).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       await active.kill();
