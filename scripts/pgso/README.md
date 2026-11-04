@@ -89,6 +89,13 @@ inline prologues. fx builds without frame pointers or unwind tables, so the
 helpers change no stack walking. Benchmark candidates keep the default code
 generation.
 
+LLVM runs the machine outliner by default only on AArch64, where it outlines
+the functions profile use compiled for size. Linux x86_64 asks for it with
+`-enable-machine-outliner=conservative-pgo` on every candidate object, fx and
+benchmark alike, so it outlines only code the profile marks cold. Code without
+profile data counts as hot, and the startup functions are `nooutline`, so
+neither moves into shared helpers.
+
 LLVM's IR outliner does not compare constants nested inside a constant
 expression. Two regions that differ only in an instruction's constant can share
 one parameter that also replaces a nested constant, so one of them reads the
