@@ -500,10 +500,10 @@ test "a message from a turn the user typed on the sender's screen says so" {
         } else {
             try std.testing.expect(parsed.value.started_by == null);
         }
-        // The card is the same either way: the words are the sender's.
-        const title = (try cardTitle(alloc, text)).?;
-        defer alloc.free(title);
-        try std.testing.expectEqualStrings("Message from reviewer", title);
+        // The row is the same either way: the words are the sender's.
+        const shown = (try row(alloc, .{ .text = text, .author = .child })).?;
+        defer shown.deinit(alloc);
+        try std.testing.expectEqualStrings("from reviewer · found it", shown.status);
     }
 }
 
