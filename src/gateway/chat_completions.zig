@@ -268,7 +268,7 @@ test "configured capability lookup matches catalog projection and preserves unkn
     defer catalog.freeModelCatalog(alloc, &fetched.catalog);
     for (fetched.catalog.items) |entry| {
         const actual = provider.lookupCapabilities(entry.id).?;
-        try std.testing.expectEqualDeep(model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(entry)), actual);
+        try model_capabilities.expectCapabilitiesEqualForTest(model_capabilities.mergeCapabilities(.{}, model_catalog_metadata.fromCatalogEntry(entry)), actual);
         const declared_vision = std.mem.eql(u8, entry.id, "small");
         try std.testing.expectEqual(declared_vision, actual.supports_vision);
         try std.testing.expectEqual(
@@ -280,7 +280,7 @@ test "configured capability lookup matches catalog projection and preserves unkn
     try std.testing.expectEqual(@as(?u32, 1024), provider.lookupCapabilities("large").?.max_output_tokens);
     try std.testing.expect(provider.lookupCapabilities("partial").?.context_window == null);
     try std.testing.expect(provider.lookupCapabilities("unknown").?.max_output_tokens == null);
-    try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, provider.lookupCapabilities("missing-fast").?);
+    try model_capabilities.expectCapabilitiesEqualForTest(.{}, provider.lookupCapabilities("missing-fast").?);
 }
 
 fn fetch_cli_catalog(raw: ?*anyopaque, alloc: Allocator, input: gateway_provider.CliModelCatalogInput) gateway_provider.CliModelCatalogResult {

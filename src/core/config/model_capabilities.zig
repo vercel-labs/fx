@@ -84,6 +84,18 @@ pub const Capabilities = struct {
     max_output_tokens: ?u32 = null,
 };
 
+/// Compares two capabilities in a test. `reasoning_efforts.values` is
+/// undefined past `len`, and `expectEqualDeep` on whole capabilities would
+/// read it, so both copies get `.auto` there first.
+pub fn expectCapabilitiesEqualForTest(expected: Capabilities, actual: Capabilities) !void {
+    var defined = [2]Capabilities{ expected, actual };
+    for (&defined) |*capabilities| {
+        const efforts = &capabilities.reasoning_efforts;
+        @memset(efforts.values[efforts.len..], .auto);
+    }
+    try std.testing.expectEqualDeep(defined[0], defined[1]);
+}
+
 pub const ResolveError = error{Cancelled};
 
 pub const Resolver = struct {
