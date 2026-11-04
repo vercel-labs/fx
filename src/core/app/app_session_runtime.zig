@@ -933,6 +933,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn finishLiveSessionResume(app: *App) !void {
+            debug_trace.logf("session", "event=live_session_resume_redraw dropped=terminal_screen_and_scrollback reason=switched_session_redraws_conversation", .{});
             try app.shell.requestTerminalReset(&app.metrics);
             app.shell.render_requests.request(.footer);
         }
