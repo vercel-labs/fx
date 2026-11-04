@@ -4420,8 +4420,10 @@ pub fn Runtime(comptime App: type) type {
             if (comptime @hasDecl(App, "postSubagentReport")) {
                 const host = agent.session_persistence.subagent_host.?;
                 host.report_sink = .{ .context = app, .post_fn = App.postSubagentReport };
-                // A subagent's own host can message the subagent's parent.
+                // A subagent's own host can message the subagent's parent,
+                // and its children are as deep as fx nests.
                 host.owner_has_parent = agent.role == .subagent;
+                host.authority_resolver.children_nest = agent.role != .subagent;
                 // What a restart left owed reaches this agent now.
                 host.resumeReports(v2);
             }

@@ -6684,8 +6684,11 @@ test "runtime cancellation observed at the timeout deadline stays graceful" {
         defer alloc.free(term_path);
         const quoted_term = try shellQuote(alloc, term_path);
         defer alloc.free(quoted_term);
+        // `wait` lets the trap run as soon as TERM arrives. A shell defers it
+        // while a foreground `sleep` runs, and a `sleep` that starts after
+        // fx's last look at the process tree outlasts the grace period.
         const command = try alloc.print(
-            "trap 'printf TERM > {s}; sleep 3; exit 130' TERM; printf 'TIE-READY\n'; while :; do sleep 1; done",
+            "trap 'printf TERM > {s}; sleep 3; exit 130' TERM; printf 'TIE-READY\n'; while :; do sleep 1 & wait $!; done",
             .{quoted_term},
         );
         defer alloc.free(command);

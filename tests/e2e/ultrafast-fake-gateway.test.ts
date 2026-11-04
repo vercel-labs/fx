@@ -1020,7 +1020,8 @@ describe("ultrafast fake Gateway", () => {
             await session.sendText("/ultrafast status");
             await session.waitForText(`requested: ${scenario.ultrafast ? "on" : "off"}`, TIMEOUT);
             expect(gateway.requests).toEqual([]);
-            await session.sendText("Return the interactive launch response.");
+            // The prompt doesn't contain the reply, so the wait can't match the typed text.
+            await session.sendText("Answer the launch check.");
             await session.waitForText("interactive launch response", TIMEOUT);
             await session.waitForStableComposer(TIMEOUT);
             expect((await session.capturePaneEscapes()).includes("\x1b[38;2;255;204;0m⚡︎")).toBe(scenario.ultrafast);

@@ -1102,6 +1102,16 @@ pub const Runtime = struct {
         };
     }
 
+    /// Who started `child_id`'s turn going now, when its parent didn't: the
+    /// user on its screen, or its own child's report. Null when no such
+    /// turn is going, as while it does work its parent sent.
+    pub fn turnStartedBy(self: *Runtime, child_id: []const u8) ?reports.StartedBy {
+        self.admission_mutex.lockUncancelable(io_mod.getIo());
+        defer self.admission_mutex.unlock(io_mod.getIo());
+        const index = self.findTurnWorkLocked(child_id) orelse return null;
+        return self.turn_works.items[index].started_by;
+    }
+
     fn openTurnWorkLocked(
         self: *Runtime,
         alloc: Allocator,
@@ -2097,8 +2107,11 @@ test "a turn the user starts on an idle subagent is a work, and reports its repl
     try std.testing.expectEqual(@as(usize, 1), fixture.reportCount());
     const child_id = try reviewerId(runtime, arena);
 
+    try std.testing.expectEqual(@as(?reports.StartedBy, null), runtime.turnStartedBy(child_id));
     const work_id = runtime.beginUserWork(alloc, child_id, null).?;
     defer alloc.free(work_id);
+    // A message the child sends now comes from the user's turn.
+    try std.testing.expectEqual(@as(?reports.StartedBy, .user), runtime.turnStartedBy(child_id));
     {
         var lock = runtime.managed.state_store.acquireLock();
         defer lock.release();
@@ -2110,6 +2123,7 @@ test "a turn the user starts on an idle subagent is a work, and reports its repl
     // A second turn can't open while this one is open.
     try std.testing.expect(runtime.beginUserWork(alloc, child_id, null) == null);
     runtime.endUserWork(child_id, work_id, .completed, "USER_TURN_REPLY");
+    try std.testing.expectEqual(@as(?reports.StartedBy, null), runtime.turnStartedBy(child_id));
     try std.testing.expectEqual(@as(usize, 2), fixture.reportCount());
     const line = fixture.reports.items[1];
     try std.testing.expect(std.mem.find(u8, line, work_id) != null);

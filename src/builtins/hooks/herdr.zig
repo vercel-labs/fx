@@ -31,6 +31,31 @@ const Request = union(enum) {
     clear_authority,
 };
 
+/// The last state reported and its status, so a caller that reports on every
+/// main-loop pass sends only changes.
+pub const LastReport = struct {
+    state: ?State = null,
+    status_buf: [custom_status_max]u8 = undefined,
+    status_len: ?usize = null,
+
+    /// Records `state` and `status`, already clamped, and returns whether
+    /// they differ from the last record.
+    pub fn changed(self: *LastReport, state: State, status: ?[]const u8) bool {
+        const last_status: ?[]const u8 = if (self.status_len) |len| self.status_buf[0..len] else null;
+        const same_status = if (status) |value|
+            last_status != null and std.mem.eql(u8, value, last_status.?)
+        else
+            last_status == null;
+        if (self.state == state and same_status) return false;
+        self.state = state;
+        if (status) |value| {
+            @memcpy(self.status_buf[0..value.len], value);
+            self.status_len = value.len;
+        } else self.status_len = null;
+        return true;
+    }
+};
+
 pub const Client = struct {
     enabled: bool = false,
     mutex: std.Io.Mutex = .init,
@@ -38,6 +63,8 @@ pub const Client = struct {
     socket_path: []u8 = &.{},
     pane_id: []u8 = &.{},
     next_id: u64 = 1,
+    /// Guarded by `mutex`.
+    last_report: LastReport = .{},
 
     pub fn shouldEnable(
         fx_herdr: ?[]const u8,
@@ -97,7 +124,27 @@ pub const Client = struct {
     /// Report a semantic lifecycle state. `custom_status` is a short (<=32 byte)
     /// activity label shown in herdr's UI; pass null to omit it.
     pub fn reportState(self: *Client, state: State, custom_status: ?[]const u8) void {
-        self.send(.{ .report = .{ .state = state, .custom_status = clampStatus(custom_status) } });
+        self.sendReport(state, clampStatus(custom_status), false);
+    }
+
+    /// Like `reportState`, but sends nothing when `state` and `custom_status`
+    /// match the last report. A report that fails to send still counts, so
+    /// a caller on every main-loop pass does not retry an absent herdr.
+    pub fn reportStateIfChanged(self: *Client, state: State, custom_status: ?[]const u8) void {
+        self.sendReport(state, clampStatus(custom_status), true);
+    }
+
+    fn sendReport(self: *Client, state: State, status: ?[]const u8, only_changes: bool) void {
+        if (comptime host_target.is_wasm) return;
+        if (!self.enabled) return;
+        const io = io_mod.getIo();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (!self.last_report.changed(state, status) and only_changes) return;
+        const request: Request = .{ .report = .{ .state = state, .custom_status = status } };
+        self.sendLocked(request) catch |err| {
+            debug_trace.logf("herdr", "send failed kind={s} err={s}", .{ @tagName(request), @errorName(err) });
+        };
     }
 
     /// Report fx's session id so herdr can associate the pane with a resumable
@@ -410,6 +457,19 @@ test "report_agent_session serializes session identity" {
             "\"source\":\"custom:fx\",\"agent\":\"fx\",\"agent_session_id\":\"session-42\"}}\n",
         out.written(),
     );
+}
+
+test "a last report counts only a change of state or status" {
+    var last: LastReport = .{};
+    try std.testing.expect(last.changed(.idle, null));
+    try std.testing.expect(!last.changed(.idle, null));
+    try std.testing.expect(last.changed(.working, null));
+    try std.testing.expect(last.changed(.blocked, "permission"));
+    try std.testing.expect(!last.changed(.blocked, "permission"));
+    try std.testing.expect(last.changed(.blocked, "question"));
+    try std.testing.expect(last.changed(.blocked, null));
+    try std.testing.expect(last.changed(.blocked, "question"));
+    try std.testing.expect(last.changed(.idle, null));
 }
 
 test "clampStatus caps to 32 bytes and normalizes empty" {

@@ -3591,7 +3591,6 @@ const RoutingFakeApp = struct {
     file_index_refresh_count: usize = 0,
     file_index_loading: bool = false,
     file_index_failed: bool = false,
-    working_report_count: usize = 0,
     submitted_prompt_count: usize = 0,
     submitted_prompt: [128]u8 = undefined,
     submitted_prompt_len: usize = 0,
@@ -3611,10 +3610,6 @@ const RoutingFakeApp = struct {
     upgrade_denied_count: usize = 0,
     suspend_count: usize = 0,
     workspace_access: app_workspace_runtime.Access = .{},
-
-    pub fn reportWorking(self: *RoutingFakeApp) void {
-        self.working_report_count += 1;
-    }
 
     pub fn slashRegistry(_: *const RoutingFakeApp) command_specs.SlashRegistry {
         return routing_test_slash_registry;
@@ -12050,7 +12045,7 @@ test "question resolution append does not add a second gap after prompt card" {
     try std.testing.expect(std.mem.find(u8, app.shell.transcript.items, "     Inspect repo state") != null);
 }
 
-test "question submission reports working only after the worker accepts the answers" {
+test "a question submission the worker refuses keeps the question open" {
     const alloc = std.testing.allocator;
     const opts = [_]types.QuestionOption{
         .{ .label = "Continue", .description = null },
@@ -12071,12 +12066,10 @@ test "question submission reports working only after the worker accepts the answ
 
         try std.testing.expectError(error.OutOfMemory, Runtime(RoutingFakeApp).submitQuestionBatch(&app, (&app).agent()));
         try std.testing.expect(app.agent().question_prompt.isActive());
-        try std.testing.expectEqual(@as(usize, 0), app.working_report_count);
 
         app.agent().worker.question_submission_fails = false;
         try Runtime(RoutingFakeApp).submitQuestionBatch(&app, (&app).agent());
         try std.testing.expect(!app.agent().question_prompt.isActive());
-        try std.testing.expectEqual(@as(usize, 1), app.working_report_count);
     }
 }
 
@@ -12156,10 +12149,8 @@ test "app_input_runtime submits multi-question answers in entry order" {
 
     try feedRoutingBytes(&app, "\r");
     try std.testing.expect(app.agent().question_prompt.isActive());
-    try std.testing.expectEqual(@as(usize, 0), app.working_report_count);
     try feedRoutingBytes(&app, "2");
 
-    try std.testing.expectEqual(@as(usize, 1), app.working_report_count);
     try std.testing.expectEqual(@as(usize, 2), app.agent().worker.submitted_question_count);
     try std.testing.expectEqualStrings(
         "First",

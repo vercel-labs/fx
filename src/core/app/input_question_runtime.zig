@@ -108,18 +108,10 @@ pub fn QuestionRuntime(comptime App: type) type {
             if (!isRouteRecoveryPrompt(agent) and !isMcpElicitationPrompt(agent)) {
                 try finalizeQuestionTranscript(app, agent, false);
             }
-            try agent.worker.submitQuestionBatchAnswer(std.heap.c_allocator, labels.items, if (comptime @hasDecl(App, "reportWorking")) .{
-                .ctx = app,
-                .run = reportQuestionResume,
-            } else null);
+            try agent.worker.submitQuestionBatchAnswer(std.heap.c_allocator, labels.items, null);
             agent.question_prompt.resetAfterSubmission(app.alloc);
             app.input_runtime.input_limit_rejection = input_limit_rejection.clear();
             app.shell.render_requests.request(.modal);
-        }
-
-        fn reportQuestionResume(raw: *anyopaque) void {
-            const app: *App = @ptrCast(@alignCast(raw));
-            app.reportWorking();
         }
 
         pub fn rerenderQuestionBlock(app: *App) !void {
