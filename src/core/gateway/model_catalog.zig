@@ -443,16 +443,31 @@ fn modelTierRank(id: []const u8) u8 {
     if (text_utils.containsIgnoreCase(id, "flash")) return 2;
     if (text_utils.containsIgnoreCase(id, "opus") or
         text_utils.containsIgnoreCase(id, "sonnet") or
-        text_utils.containsIgnoreCase(id, "gpt-5") or
+        hasMajorVersionAtLeast(id, "gpt-", 5) or
         text_utils.containsIgnoreCase(id, "o1") or
         text_utils.containsIgnoreCase(id, "o3") or
         text_utils.containsIgnoreCase(id, "o4") or
         text_utils.containsIgnoreCase(id, "pro") or
-        text_utils.containsIgnoreCase(id, "grok-4"))
+        hasMajorVersionAtLeast(id, "grok-", 4))
     {
         return 0;
     }
     return 1;
+}
+
+/// Whether `id` names `family` at major version `min_major` or later, such
+/// as `gpt-6.1-sol` for `gpt-` at 5, so a new major release keeps its
+/// family's tier instead of sorting below the older versions.
+fn hasMajorVersionAtLeast(id: []const u8, family: []const u8, min_major: u32) bool {
+    var start: usize = 0;
+    while (std.ascii.findIgnoreCasePos(id, start, family)) |found| {
+        start = found + family.len;
+        var end = start;
+        while (end < id.len and std.ascii.isDigit(id[end])) end += 1;
+        const major = std.fmt.parseUnsigned(u32, id[start..end], 10) catch continue;
+        if (major >= min_major) return true;
+    }
+    return false;
 }
 
 const picker_provider_limit: usize = 2;
@@ -923,6 +938,34 @@ test "catalog order prefers tool use, tier, provider, then recency" {
     try std.testing.expectEqualStrings("xai/grok-flash", entries[3].id);
     try std.testing.expectEqualStrings("anthropic/claude-haiku-4.5", entries[4].id);
     try std.testing.expectEqualStrings("mistral/large-x", entries[5].id);
+}
+
+test "catalog order lists newer gpt and grok majors before older ones" {
+    // The Gateway lists models oldest first.
+    var entries = [_]ModelCatalogEntry{
+        .{ .id = @constCast("openai/gpt-4.1"), .model_type = @constCast("language"), .released = 5, .has_tool_use = true },
+        .{ .id = @constCast("openai/gpt-5.6-sol"), .model_type = @constCast("language"), .released = 10, .has_tool_use = true },
+        .{ .id = @constCast("openai/gpt-5.6-sol-fast"), .model_type = @constCast("language"), .released = 10, .has_tool_use = true },
+        .{ .id = @constCast("xai/grok-4.7"), .model_type = @constCast("language"), .released = 20, .has_tool_use = true },
+        .{ .id = @constCast("openai/gpt-6-sol"), .model_type = @constCast("language"), .released = 30, .has_tool_use = true },
+        .{ .id = @constCast("openai/gpt-6.1-sol"), .model_type = @constCast("language"), .released = 40, .has_tool_use = true },
+        .{ .id = @constCast("openai/gpt-6.1-sol-fast"), .model_type = @constCast("language"), .released = 40, .has_tool_use = true },
+        .{ .id = @constCast("xai/grok-5"), .model_type = @constCast("language"), .released = 50, .has_tool_use = true },
+    };
+
+    sort_utils.sort(ModelCatalogEntry, &entries, {}, compareModelCatalogEntries);
+
+    const expected = [_][]const u8{
+        "openai/gpt-6.1-sol",
+        "openai/gpt-6.1-sol-fast",
+        "openai/gpt-6-sol",
+        "openai/gpt-5.6-sol",
+        "openai/gpt-5.6-sol-fast",
+        "xai/grok-5",
+        "xai/grok-4.7",
+        "openai/gpt-4.1",
+    };
+    for (expected, entries) |id, entry| try std.testing.expectEqualStrings(id, entry.id);
 }
 
 test "featured deepseek slot prefers the pro variant at equal recency" {

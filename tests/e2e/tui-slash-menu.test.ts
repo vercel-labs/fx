@@ -2861,6 +2861,82 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
   );
 
   test(
+    "model completion lists newer model versions first",
+    async () => {
+      const fixture = createModelsMenuFixture();
+      // The Gateway lists models oldest first. The newest models fill the
+      // picker's highlight slots, so the sol models keep the catalog's order.
+      const catalog: Array<[string, number]> = [
+        ["openai/gpt-5.6-sol", 100],
+        ["openai/gpt-5.6-sol-fast", 100],
+        ["openai/gpt-6-sol", 200],
+        ["openai/gpt-6-sol-fast", 200],
+        ["openai/gpt-6.1-sol", 300],
+        ["openai/gpt-6.1-sol-fast", 300],
+        ["openai/gpt-6.1-terra", 400],
+        ["openai/gpt-6.1-terra-fast", 400],
+      ];
+      gateway = startFakeGateway([], {
+        models: catalog.map(([id, released]) => ({
+          id,
+          type: "language",
+          released,
+          tags: ["tool-use"],
+          context_window: 400_000,
+        })),
+      });
+      session = await TmuxSession.create({
+        cwd: fixture.workspace,
+        stderrPath: fixture.stderrPath,
+        env: {
+          HOME: fixture.home,
+          AI_GATEWAY_API_KEY: "fake-model-order-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_GATEWAY_BASE_URL: gateway.baseUrl,
+          FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_MODEL: "openai/gpt-6.1-terra",
+          FX_AUTO_UPGRADE: "0",
+        },
+        width: 120,
+        height: 32,
+      });
+      await session.waitForComposer(10_000);
+
+      const solRows = (pane: string) =>
+        pane
+          .split("\n")
+          .filter((line) => !isComposerLine(line))
+          .map((line) => line.trim().split(/\s+/)[0] ?? "")
+          .filter((id) => /^openai\/gpt-[\d.]+-sol/.test(id));
+
+      await session.sendLiteralText("/model sol");
+      const pane = await session.waitForPane((current) => solRows(current).length === 6, 10_000);
+      expect(solRows(pane)).toEqual([
+        "openai/gpt-6.1-sol",
+        "openai/gpt-6.1-sol-fast",
+        "openai/gpt-6-sol",
+        "openai/gpt-6-sol-fast",
+        "openai/gpt-5.6-sol",
+        "openai/gpt-5.6-sol-fast",
+      ]);
+
+      await session.sendKeys("C-u");
+      await session.waitForPane(
+        (current) => hasEmptyComposer(current) && solRows(current).length === 0,
+        5_000,
+      );
+      expect(session.isAlive()).toBe(true);
+      expect(readFileSync(fixture.stderrPath, "utf8")).toBe("");
+
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      session = null;
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "model picker completes every stage while a turn is in flight",
     async () => {
       const fixture = createModelsMenuFixture();
