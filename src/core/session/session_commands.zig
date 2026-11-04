@@ -313,7 +313,7 @@ pub fn Commands(comptime App: type) type {
         fn statusSnapshot(app: *App, agent: *AppAgent, preferred: ?types.CredentialSource, settings_error: ?[]const u8) !info_panel.Snapshot {
             const provider = provider_runtime.providerOf(app, agent);
             const auth = app.auth.statusSnapshot(provider, preferred);
-            const fx_home = try profile_paths.activeRoot(app.alloc, io_mod.getenv("HOME"));
+            const fx_home = try profile_paths.activeRoot(app.alloc, io_mod.homeDir());
             defer if (fx_home) |path| app.alloc.free(path);
             const session = shellSession(agent);
             const status: output_contracts.StatusSnapshot = .{

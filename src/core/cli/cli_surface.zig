@@ -1766,7 +1766,7 @@ fn runNonInteractiveWithDeps(
             snapshot.mcp = localMcpView(&mcp_inspection);
             snapshot.provider_endpoint = startup.provider_endpoint;
             snapshot.modes = statusModes(cfg.mode_registry, snapshot.permission_mode);
-            const fx_home = try profile_paths.activeRoot(alloc, io_mod.getenv("HOME"));
+            const fx_home = try profile_paths.activeRoot(alloc, io_mod.homeDir());
             defer if (fx_home) |path| alloc.free(path);
             snapshot.fx_home = fx_home;
             if (opts.format == .json) {
