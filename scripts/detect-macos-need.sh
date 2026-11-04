@@ -5,8 +5,9 @@
 #
 # macOS runs only when a change touches behavior that can differ on macOS: a
 # Zig file with a macOS, BSD, or Linux code path before or after the change,
-# build.zig, the macOS signing script, the native SDK addon, an E2E file listed
-# in tests/e2e/macos-platform-tests.json, a shared E2E helper that reads the
+# build.zig, the JavaScript engine's C source in src/js/quickjs/, the macOS
+# signing script, the native SDK addon, an E2E file listed in
+# tests/e2e/macos-platform-tests.json, a shared E2E helper that reads the
 # platform before or after the change, or the macOS checks themselves. A Linux
 # branch counts because macOS takes its other path. A Windows-only branch does
 # not, because macOS and Linux share its other path. Set MACOS_REQUESTED to a
@@ -89,6 +90,8 @@ while IFS= read -r path; do
       require "$path: the macOS checks changed" ;;
     build.zig | build.zig.zon)
       require "$path: build configuration changed" ;;
+    src/js/quickjs/*)
+      require "$path: the JavaScript engine's C source changed" ;;
     scripts/sign-and-notarize-macos.sh)
       require "$path: macOS signing changed" ;;
     src/napi_*.zig | sdk/node.js | sdk/tests/test-node-napi.mjs)

@@ -80,6 +80,8 @@ Key rules:
 
 * `src/mcp/` is the MCP engine. Its files import only `std` and each other, and the host passes in `std.Io` and every other service through `src/mcp/host.zig`. fx connects to it through `src/core/mcp_host/`. `src/core/mcp/` holds the MCP types, config parsing, schema checks, search, and tool naming that the host, the tools, ACP, and the UI share.
 
+* `src/js/` is the embedded JavaScript engine. Its front door, `engine.zig`, runs one program in a fresh runtime with limits on its heap, time, and native stack, and outside code imports only that file. The module imports only the standard library and its own files. `src/js/quickjs/` is fx's copy of quickjs-ng, and its `FORK.md` records the upstream release; a change to a file there updates `FORK.md` in the same change. `zig build test-js` runs the engine's tests.
+
 * `src/tools/` owns built-in tool implementations. Generic tool contracts and dispatch live in `src/core/tooling/`. Default tool specs are centralized in `src/core/tooling/tool_specs.zig` or `src/builtins/tools.zig`, not in individual tool files.
 
 * `src/ui/` owns terminal rendering, event loop, input, transcript. It must not own product state.
