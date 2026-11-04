@@ -6003,6 +6003,34 @@ describe("cli: MCP profile", () => {
     }
   });
 
+  test.skipIf(platform() === "win32")("status, list, and add finish when ~/.fx/mcp.json is a fifo", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-fifo-")));
+    const home = join(root, "home");
+    const profilePath = join(home, ".fx", "mcp.json");
+    mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+    // Opening a fifo for reading waits for a writer, and nothing writes here.
+    expect(spawnSync("mkfifo", [profilePath]).status).toBe(0);
+    const env = { HOME: home, ...NO_GATEWAY_AUTH };
+    try {
+      const status = await runFx(["status", "--json"], { cwd: root, env });
+      expect(status.code).toBe(0);
+      expect(JSON.parse(status.stdout.trim()).mcp.inspection_error).toBe("DurablePathUnsafe");
+
+      const list = await runFx(["mcp", "list"], { cwd: root, env });
+      expect(list.code).toBe(1);
+      expect(list.stderr).toBe("fx mcp: an MCP config file isn't a plain file; replace it with one\n");
+
+      const add = await runFx(["mcp", "add", "probe", "--", "/bin/echo", "hi"], { cwd: root, env });
+      expect(add.code).toBe(1);
+      expect(add.stderr).toBe(
+        "Couldn't add probe to ~/.fx/mcp.json: it isn't a plain file; replace it with one.\n",
+      );
+      expect(lstatSync(profilePath).isFIFO()).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("concurrent adds of different names keep both", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-race-")));
     const home = join(root, "home");

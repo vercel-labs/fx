@@ -469,7 +469,13 @@ fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
     // The profile's replace refuses a link itself (DurablePathUnsafe).
     if (err != error.Linked and err != error.DurablePathUnsafe) return describe(err);
     var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const n = std.Io.Dir.readLinkAbsolute(io_mod.getIo(), path, &buffer) catch return "it has another hard link, and fx edits only a plain file; edit it by hand";
+    const n = std.Io.Dir.readLinkAbsolute(io_mod.getIo(), path, &buffer) catch {
+        // Not a link: a regular file with another hard link, or a special
+        // file such as a fifo.
+        const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = false }) catch return describe(err);
+        if (stat.kind != .file) return "it isn't a plain file; replace it with one";
+        return "it has another hard link, and fx edits only a plain file; edit it by hand";
+    };
     const target = try safe(arena, buffer[0..n]);
     return try arena.print("it's a link to {s}, and fx edits only a plain file; edit {s} by hand", .{ target, target });
 }
@@ -484,6 +490,7 @@ pub fn describe(err: anyerror) []const u8 {
         error.NotAnObject => "the file's servers aren't a JSON object; fix it by hand first",
         error.HomeNotSet => "HOME isn't set",
         error.AccessDenied => "permission denied",
+        error.DurablePathUnsafe => "an MCP config file isn't a plain file; replace it with one",
         error.Timeout, error.LockTimeout => "another fx is changing the MCP config; try again",
         error.McpConfigInvalidJson => profile_paths.displayText("~/.fx/mcp.json isn't valid JSON"),
         error.McpConfigInvalidHeaders, error.McpConfigAuthorizationHeader => profile_paths.displayText("a server in ~/.fx/mcp.json has headers fx won't send; put a token in bearer_token_env, or sign in with login"),
