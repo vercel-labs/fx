@@ -872,7 +872,7 @@ pub const StatusSnapshot = struct {
     history_turns: usize,
     session_permission_grants: usize,
     agent_step_limit: usize,
-    /// Requested Ultra mode. The serving provider may still fall back.
+    /// Requested Ultrafast mode. The serving provider may still fall back.
     ultrafast_requested: bool = false,
 
     pub const SessionModes = struct {

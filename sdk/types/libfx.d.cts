@@ -46,7 +46,7 @@ export interface FxModelOptions {
   effort?: FxEffort;
   /** Enables the fast lane for models that advertise one. */
   fast?: boolean;
-  /** Requests Ultra mode, the higher-cost service tier, for models whose metadata advertises it. Disables Fast. */
+  /** Requests Ultrafast mode, the higher-cost service tier, for models whose metadata advertises it. Disables Fast. */
   ultrafast?: boolean;
 }
 
