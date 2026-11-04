@@ -1188,6 +1188,35 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
+    "fx --profile <name> uses the profile's model unless the process chose one",
+    async () => {
+      for (const [args, fxModel, expected] of [
+        ["--profile chooser", undefined, "profile/model"],
+        ["--profile chooser", "openai/gpt-5", "openai/gpt-5"],
+        ["--profile chooser --model other/model", "openai/gpt-5", "other/model"],
+      ] as const) {
+        const label = `${args} FX_MODEL=${fxModel}`;
+        const home = createIsolatedTestHome();
+        const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-profile-model-")));
+        try {
+          writeProfile(home, "chooser", { description: "Chooses a model", model: "profile/model", effort: "high" });
+          const requests: Array<{ body: string; headers: Headers }> = [];
+          await withHost(echoMarker, { args, env: { FX_MODEL: fxModel }, models: PREFERENCE_MODELS, requests, reuse: { home, workspace } }, async ({ session }) => {
+            await promptMarker(session, "PROFILE_START");
+          });
+          const started = preferencesOf(requests, "PROFILE_START");
+          expect(started?.model, label).toBe(expected);
+          expect(started?.reasoning, label).toBe("high");
+        } finally {
+          cleanupIsolatedTestHome(home);
+          rmSync(workspace, { recursive: true, force: true });
+        }
+      }
+    },
+    TIMEOUT * 3,
+  );
+
+  test(
     "a subagent calls the MCP tool it selected, and is offered only what its profile admits",
     async () => {
       const fixture = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");

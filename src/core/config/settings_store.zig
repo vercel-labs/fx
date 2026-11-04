@@ -124,6 +124,7 @@ pub const UserSettingsPatch = struct {
     auto_compact_percent: ?u8 = null,
     provider_strict: ?bool = null,
     context: ?bool = null,
+    cache_warming: ?bool = null,
     /// Removes a plain setting, such as `fast_mode` or `statusLine.context`,
     /// so it falls back to its default. Distinct from the fields above, where
     /// null means "leave unchanged".
@@ -156,6 +157,7 @@ pub const UserSettingsPatch = struct {
             self.auto_compact_percent == null and
             self.provider_strict == null and
             self.context == null and
+            self.cache_warming == null and
             self.remove == null;
     }
 };
@@ -1063,9 +1065,11 @@ test "plain preference patches write their keys and report no change when equal"
         .auto_compact_percent = 70,
         .provider_strict = true,
         .context = false,
+        .cache_warming = false,
     };
     const first = try applyUserPatchToRoot(arena.allocator(), &root, patch);
     try std.testing.expect(first.changed);
+    try std.testing.expect(!root.object.get("cache_warming").?.bool);
     try std.testing.expectEqual(false, root.object.get("auto_upgrade").?.bool);
     try std.testing.expectEqual(@as(i64, 40), root.object.get("max_agent_steps").?.integer);
     try std.testing.expectEqual(@as(i64, 4096), root.object.get("max_tool_result_bytes").?.integer);
@@ -1301,6 +1305,7 @@ fn applyUserPatchToRoot(
     if (patch.auto_compact_percent) |value| application.changed = try putInteger(arena, &root.object, "auto_compact_percent", value) or application.changed;
     if (patch.provider_strict) |value| application.changed = try putBool(arena, &root.object, "provider_strict", value) or application.changed;
     if (patch.context) |value| application.changed = try putBool(arena, &root.object, "context", value) or application.changed;
+    if (patch.cache_warming) |value| application.changed = try putBool(arena, &root.object, "cache_warming", value) or application.changed;
     if (patch.remove) |path| application.changed = removePath(&root.object, path) or application.changed;
     try cleanupLegacyWorkspacePreferences(arena, root, patch, &application);
     return application;
@@ -1473,7 +1478,7 @@ fn cleanupLegacyWorkspacePreferences(
 
 /// The settings paths a patch from `fx config set` or `unset` writes that the
 /// `/settings` cleanup above doesn't already cover.
-fn configWrittenPaths(patch: UserSettingsPatch) [8]?[]const u8 {
+fn configWrittenPaths(patch: UserSettingsPatch) [9]?[]const u8 {
     return .{
         if (patch.theme != null) "theme" else null,
         if (patch.auto_upgrade != null) "auto_upgrade" else null,
@@ -1482,6 +1487,7 @@ fn configWrittenPaths(patch: UserSettingsPatch) [8]?[]const u8 {
         if (patch.auto_compact_percent != null) "auto_compact_percent" else null,
         if (patch.provider_strict != null) "provider_strict" else null,
         if (patch.context != null) "context" else null,
+        if (patch.cache_warming != null) "cache_warming" else null,
         patch.remove,
     };
 }

@@ -423,8 +423,8 @@ Options:
   --effort <level>            Override the reasoning effort for this request
   --fast                      Enable Fast mode for this request when the model supports it
   --no-fast                   Disable Fast mode for this request
-  --ultrafast                 Request Ultra mode for this request when the model supports it
-  --no-ultrafast              Disable Ultra mode for this request
+  --ultrafast                 Request Ultrafast mode for this request when the model supports it
+  --no-ultrafast              Disable Ultrafast mode for this request
   --provider-order <a,b,...>  Prefer these gateway providers in order for this request
   --provider-strict           Restrict this request to only the providers in --provider-order
   --no-provider-strict        Clear the provider restriction for this request

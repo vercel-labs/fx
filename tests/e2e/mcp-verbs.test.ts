@@ -375,7 +375,7 @@ describe("fx mcp", () => {
 
     const unknownVerb = await mcp(root, "nope");
     expect(unknownVerb.code).toBe(2);
-    expect(unknownVerb.stderr).toStartWith("'nope' isn't a fx mcp command.\nusage: fx mcp COMMAND\n");
+    expect(unknownVerb.stderr).toStartWith("'nope' isn't an fx mcp command.\nusage: fx mcp COMMAND\n");
     const badFlag = await mcp(root, "logout", "--json", "x");
     expect(badFlag.code).toBe(2);
     expect(badFlag.stderr).toBe("fx mcp logout: unknown flag --json\nusage: fx mcp logout NAME\n");

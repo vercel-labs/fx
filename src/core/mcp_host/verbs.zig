@@ -38,6 +38,14 @@ pub const Surface = enum {
             .shell => "/mcp",
         };
     }
+
+    /// `prog` after its article, as said aloud: "an fx mcp", "a /mcp".
+    fn progWithArticle(s: Surface) []const u8 {
+        return switch (s) {
+            .cli => "an fx mcp",
+            .shell => "a /mcp",
+        };
+    }
 };
 
 pub const Verb = enum { list, show, add, remove, login, logout, approve, reject, call };
@@ -85,9 +93,10 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
         if (std.mem.eql(u8, old, "reload")) return moved(arena, "{s} reload is gone: fx loads MCP config changes at your next prompt or /mcp command.", .{p});
         if (std.mem.eql(u8, old, "resource") or std.mem.eql(u8, old, "prompt"))
             return moved(arena, "{s} {s} is gone: fx doesn't support MCP resources and prompts yet.", .{ p, old });
+        const command = surface.progWithArticle();
         if (settings_messages.closest(old, &verb_names)) |near|
-            return usage(arena, null, "'{f}' isn't a {s} command; did you mean {s}?", .{ text_utils.terminalSafe(old), p, near });
-        return usage(arena, null, "'{f}' isn't a {s} command.", .{ text_utils.terminalSafe(old), p });
+            return usage(arena, null, "'{f}' isn't {s} command; did you mean {s}?", .{ text_utils.terminalSafe(old), command, near });
+        return usage(arena, null, "'{f}' isn't {s} command.", .{ text_utils.terminalSafe(old), command });
     };
 
     // Flags come before `--`; everything after it is a stdio server's command.
@@ -1196,8 +1205,8 @@ test "parse turns mistakes into usage, and old verbs into pointers" {
     const a = arena_state.allocator();
 
     const cases = [_]struct { args: []const []const u8, message: []const u8 }{
-        .{ .args = &.{"nope"}, .message = "'nope' isn't a fx mcp command." },
-        .{ .args = &.{"lsit"}, .message = "'lsit' isn't a fx mcp command; did you mean list?" },
+        .{ .args = &.{"nope"}, .message = "'nope' isn't an fx mcp command." },
+        .{ .args = &.{"lsit"}, .message = "'lsit' isn't an fx mcp command; did you mean list?" },
         .{ .args = &.{"show"}, .message = "fx mcp show needs one server NAME." },
         .{ .args = &.{ "show", "a", "b" }, .message = "fx mcp show needs one server NAME." },
         .{ .args = &.{ "add", "bad name", "https://w" }, .message = "'bad name' can't be a server name: use letters, digits, '-' and '_'." },
@@ -1220,6 +1229,7 @@ test "parse turns mistakes into usage, and old verbs into pointers" {
     try testing.expectEqualStrings("fx mcp auth is now fx mcp login NAME.", (try parseCli(a, &.{ "auth", "x" })).moved);
     try testing.expectEqualStrings("/mcp reload is gone: fx loads MCP config changes at your next prompt or /mcp command.", (try parse(a, .shell, &.{"reload"})).moved);
     try testing.expectEqualStrings("/mcp list: unknown flag --json", (try parse(a, .shell, &.{ "list", "--json" })).usage.message);
+    try testing.expectEqualStrings("'nope' isn't a /mcp command.", (try parse(a, .shell, &.{"nope"})).usage.message);
 }
 
 test "status words follow commands.md, held states first" {
