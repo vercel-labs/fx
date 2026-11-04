@@ -86,8 +86,12 @@ profile use compiled for size then saves and restores its callee-saved
 registers by calling one of a few dozen shared frame helpers instead of
 repeating those loads and stores inline. Functions compiled for speed keep
 inline prologues. fx builds without frame pointers or unwind tables, so the
-helpers change no stack walking. Benchmark candidates keep the default code
-generation.
+helpers change no stack walking. The measured heavy benchmark candidates use
+the same profile-use flags and code generation as the fx candidate, so the
+heavy gates measure the code fx ships. A benchmark trained on its own workload
+keeps the default code generation and a higher cold cutoff, because its
+profile-use IR only selects the functions to transfer into the production
+profile.
 
 LLVM's IR outliner does not compare constants nested inside a constant
 expression. Two regions that differ only in an instruction's constant can share
@@ -202,9 +206,10 @@ into each benchmark module. Exact function-hash and counter-layout matches keep
 their real benchmark names; every unmatched record receives an inert name so
 LLVM sees the same global count distribution without applying unrelated counts.
 Each measured benchmark candidate is rebuilt from that mapped production
-profile, and the transferred functions must again be speed-shaped or optimized
-away. Heavy measurement manifests retain the production, training, mapped,
-supplement, and binary hashes, and aggregation rejects any mismatch.
+profile with the production profile-use flags and code generation, and the
+transferred functions must again be speed-shaped or optimized away. Heavy
+measurement manifests retain the production, training, mapped, supplement, and
+binary hashes, and aggregation rejects any mismatch.
 
 ## Output and failure behavior
 

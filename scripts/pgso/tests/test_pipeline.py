@@ -532,6 +532,21 @@ print('{{}}')""",
             ),
             profile_use_argv(self.toolchain, benchmark_paths),
         )
+        self.assertEqual(
+            (
+                str(self.toolchain.opt),
+                *USE_FLAGS,
+                f"-profile-file={benchmark_paths.merged_profile}",
+                str(benchmark_paths.bitcode),
+                "-o",
+                str(benchmark_paths.profile_use_base_bitcode),
+            ),
+            profile_use_argv(
+                self.toolchain,
+                benchmark_paths,
+                production_flags=True,
+            ),
+        )
         mapped_profile = self.paths.profiles / "production.profdata"
         self.assertEqual(
             f"-profile-file={mapped_profile}",
@@ -660,6 +675,11 @@ print('{{}}')""",
             selector="file_index",
         )
         benchmark_object = candidate_object_argv(self.toolchain, benchmark_paths)
+        measured_benchmark_object = candidate_object_argv(
+            self.toolchain,
+            benchmark_paths,
+            production_flags=True,
+        )
 
         for alignment in PROFILE_SECTION_ALIGNMENTS:
             self.assertIn(alignment, instrumented)
@@ -685,6 +705,7 @@ print('{{}}')""",
         for flag in FX_CODEGEN_FLAGS:
             self.assertIn(flag, candidate_object)
             self.assertNotIn(flag, benchmark_object)
+            self.assertIn(flag, measured_benchmark_object)
 
     def test_candidate_object_and_signing_contract(self) -> None:
         actions = self.root / "candidate-actions.txt"
@@ -841,6 +862,69 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')""",
         ))
         self.assertFalse((paths.logs / "candidate-runtime-probe.json").exists())
         self.assertFalse((paths.logs / "candidate-layout.json").exists())
+
+    def test_measured_benchmark_candidate_builds_with_the_production_flags(self) -> None:
+        for production_flags, use_flags, codegen_flags in (
+            (False, BENCHMARK_USE_FLAGS, ()),
+            (True, USE_FLAGS, FX_CODEGEN_FLAGS),
+        ):
+            with self.subTest(production_flags=production_flags):
+                actions = self.root / f"measured-actions-{production_flags}"
+                artifact = self.write_executable(
+                    f"measured-tool-{production_flags}",
+                    f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write(' '.join(sys.argv[1:]) + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')""",
+                )
+                noop = self.write_executable("noop", "pass")
+                toolchain = self.replace_toolchain(
+                    zig=artifact, opt=artifact, llc=artifact,
+                    strip=noop, codesign=noop,
+                    ir_size=self.write_ir_size(actions),
+                )
+                paths = PipelinePaths.create(
+                    self.root / f"measured-{production_flags}",
+                    selector="file_index",
+                )
+                paths.bitcode.write_bytes(b"same bitcode")
+                paths.merged_profile.write_bytes(b"profile")
+
+                apply_profile(
+                    toolchain,
+                    paths,
+                    sha256_file(paths.bitcode),
+                    production_flags=production_flags,
+                )
+                link_candidate(
+                    toolchain,
+                    paths,
+                    require_release_safe_evidence=False,
+                    production_flags=production_flags,
+                )
+
+                lines = actions.read_text().splitlines()
+                self.assertEqual(
+                    " ".join((
+                        *use_flags,
+                        f"-profile-file={paths.merged_profile}",
+                        str(paths.bitcode),
+                        "-o",
+                        str(paths.profile_use_base_bitcode),
+                    )),
+                    lines[0],
+                )
+                self.assertIn(
+                    " ".join((
+                        "-filetype=obj",
+                        "-O=2",
+                        *codegen_flags,
+                        str(paths.profile_use_bitcode),
+                        "-o",
+                        str(paths.profile_use_object),
+                    )),
+                    lines,
+                )
 
     def test_bitcode_hash_must_match_the_original(self) -> None:
         bitcode = self.root / "fx.bc"

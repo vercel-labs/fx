@@ -792,11 +792,13 @@ def relink_profile_linked_benchmarks(
             pair_paths,
             pair.bitcode_sha256,
             profile_path=mapped_profile_path,
+            production_flags=True,
         )
         candidate = link_candidate(
             toolchain,
             pair_paths,
             require_release_safe_evidence=False,
+            production_flags=True,
         )
         relinked[plan.selector] = dataclasses.replace(
             linked,
