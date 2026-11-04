@@ -187,6 +187,8 @@ Do not bypass the permission system for new tools.
 
 * When a function returns allocated memory, document who owns it (caller or callee).
 
+* To deep-copy or free a value that owns its slices, use `dupe`, `dupeSlice`, and `free` from `src/core/shared/owned_copy.zig` instead of writing a copy and free pair by hand. They share one walker across types. A struct lists borrowed fields that copies leave out in `pub const copy_omits`. A type that holds any other pointer, such as a handle it retains and releases, keeps hand-written functions.
+
 * Return errors rather than panicking. `@panic` is for programmer bugs, not runtime conditions.
 
 ### Strings and JSON

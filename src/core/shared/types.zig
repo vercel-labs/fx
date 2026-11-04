@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing_allocator = @import("testing_allocator.zig");
 const text_utils = @import("text_utils.zig");
+const owned_copy = @import("owned_copy.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const recovery = @import("../recovery/recovery.zig");
 
@@ -62,19 +63,11 @@ pub fn noticeGlyph(tone: NoticeTone) []const u8 {
 /// Returns a duplicate with owned topic and body bytes. The caller frees it
 /// with `freeSemanticNotice` using the same allocator.
 pub fn dupeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) std.mem.Allocator.Error!SemanticNotice {
-    const topic = try alloc.dupe(u8, notice.topic);
-    errdefer alloc.free(topic);
-    return .{
-        .topic = topic,
-        .tone = notice.tone,
-        .body = try alloc.dupe(u8, notice.body),
-        .visibility = notice.visibility,
-    };
+    return owned_copy.dupe(SemanticNotice, alloc, notice);
 }
 
 pub fn freeSemanticNotice(alloc: std.mem.Allocator, notice: SemanticNotice) void {
-    alloc.free(notice.topic);
-    alloc.free(notice.body);
+    owned_copy.free(SemanticNotice, alloc, notice);
 }
 
 /// Converts legacy context-notice text into a semantic notice body while
@@ -969,6 +962,9 @@ pub const ToolCall = struct {
     /// command whose saved output a `read_tool_result` call reads. Borrowed
     /// only for this action. Copies and durable/provider encodings omit it.
     resolved_display_target: ?[]const u8 = null,
+
+    /// The borrowed fields that `owned_copy` leaves out of a copy.
+    pub const copy_omits = [_][]const u8{ "resolved_skill", "resolved_display_target" };
 };
 
 pub const WebSearchProgress = union(enum) {
@@ -1395,39 +1391,11 @@ pub const ToolImage = struct {
 };
 
 pub fn freeToolImages(alloc: std.mem.Allocator, images: []const ToolImage) void {
-    for (images) |image| {
-        alloc.free(image.data);
-        alloc.free(image.mime_type);
-        if (image.source_ref) |source_ref| alloc.free(source_ref);
-    }
-    alloc.free(images);
+    owned_copy.free([]const ToolImage, alloc, images);
 }
 
 pub fn dupeToolImages(alloc: std.mem.Allocator, images: []const ToolImage) ![]ToolImage {
-    const copies = try alloc.alloc(ToolImage, images.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (copies[0..initialized]) |image| {
-            alloc.free(image.data);
-            alloc.free(image.mime_type);
-            if (image.source_ref) |source_ref| alloc.free(source_ref);
-        }
-        alloc.free(copies);
-    }
-    for (images, 0..) |image, index| {
-        const data = try alloc.dupe(u8, image.data);
-        errdefer alloc.free(data);
-        const mime_type = try alloc.dupe(u8, image.mime_type);
-        errdefer alloc.free(mime_type);
-        copies[index] = .{
-            .data = data,
-            .mime_type = mime_type,
-            .source_ref = if (image.source_ref) |source_ref| try alloc.dupe(u8, source_ref) else null,
-            .name = image.name,
-        };
-        initialized += 1;
-    }
-    return copies;
+    return owned_copy.dupeSlice(ToolImage, alloc, images);
 }
 
 /// Deep-copies every slice-bearing field of a ToolResultMemory so the caller's
@@ -1435,50 +1403,13 @@ pub fn dupeToolImages(alloc: std.mem.Allocator, images: []const ToolImage) ![]To
 /// source memory is owned by a shorter-lived scope (for example a parallel
 /// tool attempt whose run result is deinitialized after assembly).
 pub fn dupeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) !ToolResultMemory {
-    const tool_images = try dupeToolImages(alloc, memory.tool_images);
-    errdefer freeToolImages(alloc, tool_images);
-    const tool_image_handle = if (memory.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null;
-    errdefer if (tool_image_handle) |handle| alloc.free(handle);
-    const output_handle = if (memory.output_handle) |handle| try alloc.dupe(u8, handle) else null;
-    errdefer if (output_handle) |handle| alloc.free(handle);
-    const preview = if (memory.preview) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (preview) |value| alloc.free(value);
-    const committed_file_presentation = if (memory.committed_file_presentation) |presentation|
-        try dupeCommittedFilePresentation(alloc, presentation)
-    else
-        null;
-    errdefer if (committed_file_presentation) |presentation| freeCommittedFilePresentation(alloc, presentation);
-    const command_output_replay = if (memory.command_output_replay) |replay|
-        try dupeCommandOutputReplay(alloc, replay)
-    else
-        null;
-    errdefer if (command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
-    return .{
-        .review_feedback = memory.review_feedback,
-        .tool_images = tool_images,
-        .tool_image_handle = tool_image_handle,
-        .output_handle = output_handle,
-        .preview = preview,
-        .output_bytes = memory.output_bytes,
-        .stored_output_bytes = memory.stored_output_bytes,
-        .truncated = memory.truncated,
-        .model_view_covers_full_file = memory.model_view_covers_full_file,
-        .committed_file_presentation = committed_file_presentation,
-        .command_output_replay = command_output_replay,
-        .command_process_presentation = memory.command_process_presentation,
-        .terminal_action_presentation = memory.terminal_action_presentation,
-    };
+    return owned_copy.dupe(ToolResultMemory, alloc, memory);
 }
 
 /// Frees the slice-bearing fields of a ToolResultMemory owned by the caller,
 /// as produced by dupeToolResultMemory.
 pub fn freeToolResultMemory(alloc: std.mem.Allocator, memory: ToolResultMemory) void {
-    freeToolImages(alloc, memory.tool_images);
-    if (memory.tool_image_handle) |handle| alloc.free(handle);
-    if (memory.output_handle) |handle| alloc.free(handle);
-    if (memory.preview) |value| alloc.free(value);
-    if (memory.committed_file_presentation) |presentation| freeCommittedFilePresentation(alloc, presentation);
-    if (memory.command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    owned_copy.free(ToolResultMemory, alloc, memory);
 }
 
 test "dupeToolResultMemory copies survive teardown of every source allocation" {
@@ -1630,15 +1561,11 @@ pub const ProviderReplay = struct {
 };
 
 pub fn dupeProviderReplay(alloc: std.mem.Allocator, value: ProviderReplay) !ProviderReplay {
-    const model = try alloc.dupe(u8, value.source.model);
-    errdefer alloc.free(model);
-    const parts = try alloc.dupe(u8, value.parts_json);
-    return .{ .source = .{ .provider = value.source.provider, .model = model }, .parts_json = parts };
+    return owned_copy.dupe(ProviderReplay, alloc, value);
 }
 
 pub fn freeProviderReplay(alloc: std.mem.Allocator, value: ProviderReplay) void {
-    alloc.free(value.source.model);
-    alloc.free(value.parts_json);
+    owned_copy.free(ProviderReplay, alloc, value);
 }
 
 pub const ChatMessage = struct {
@@ -2706,36 +2633,11 @@ pub const ResolveMode = enum {
 };
 
 pub fn freeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) void {
-    switch (turn) {
-        .compacted_summary => |entry| {
-            alloc.free(entry.summary);
-            freeCompletedToolNames(alloc, entry.root_user_messages);
-            freePermissionFeedback(alloc, entry.permission_feedback);
-        },
-        .assistant => |entry| {
-            freeUserTurn(alloc, entry.user);
-            alloc.free(entry.assistant);
-            if (entry.provider_replay) |replay| freeProviderReplay(alloc, replay);
-            freeExecutionMemory(alloc, entry.execution);
-        },
-        .interrupted => |entry| {
-            freeUserTurn(alloc, entry.user);
-            if (entry.assistant) |assistant| alloc.free(assistant);
-            if (entry.tool_call) |tool_call| freeToolCall(alloc, tool_call);
-            freeCompletedToolNames(alloc, entry.completed_tool_names);
-            freeExecutionMemory(alloc, entry.execution);
-            if (entry.cancelled_command) |presentation| {
-                freeCancelledCommandPresentation(alloc, presentation);
-            }
-        },
-    }
+    owned_copy.free(HistoryTurn, alloc, turn);
 }
 
 pub fn freeHistoryTurnSlice(alloc: std.mem.Allocator, turns: []HistoryTurn) void {
-    for (turns) |turn| {
-        freeHistoryTurn(alloc, turn);
-    }
-    alloc.free(turns);
+    owned_copy.free([]HistoryTurn, alloc, turns);
 }
 
 pub fn freeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) void {
@@ -2745,107 +2647,21 @@ pub fn freeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) vo
 }
 
 pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn {
-    return switch (turn) {
-        .compacted_summary => |entry| blk: {
-            const summary = try alloc.dupe(u8, entry.summary);
-            errdefer alloc.free(summary);
-            const root_user_messages = try dupeCompletedToolNames(
-                alloc,
-                entry.root_user_messages,
-            );
-            errdefer freeCompletedToolNames(alloc, root_user_messages);
-            const permission_feedback = try dupePermissionFeedback(
-                alloc,
-                entry.permission_feedback,
-            );
-            break :blk .{ .compacted_summary = .{
-                .summary = summary,
-                .removed_turn_count = entry.removed_turn_count,
-                .compaction_count = entry.compaction_count,
-                .root_user_messages = root_user_messages,
-                .root_user_messages_complete = entry.root_user_messages_complete,
-                .permission_feedback = permission_feedback,
-                .permission_feedback_complete = entry.permission_feedback_complete,
-            } };
-        },
-        .assistant => |entry| blk: {
-            const user = try dupeUserTurn(alloc, entry.user);
-            errdefer freeUserTurn(alloc, user);
-
-            const assistant = try alloc.dupe(u8, entry.assistant);
-            errdefer alloc.free(assistant);
-
-            const execution = try dupeExecutionMemory(alloc, entry.execution);
-            errdefer freeExecutionMemory(alloc, execution);
-            const replay = if (entry.provider_replay) |value| try dupeProviderReplay(alloc, value) else null;
-            break :blk .{ .assistant = .{
-                .user = user,
-                .assistant = assistant,
-                .execution = execution,
-                .provider_replay = replay,
-            } };
-        },
-        .interrupted => |entry| blk: {
-            const user = try dupeUserTurn(alloc, entry.user);
-            errdefer freeUserTurn(alloc, user);
-
-            const assistant = if (entry.assistant) |text| try alloc.dupe(u8, text) else null;
-            errdefer if (assistant) |text| alloc.free(text);
-
-            const tool_call = if (entry.tool_call) |call| try dupeToolCall(alloc, call) else null;
-            errdefer if (tool_call) |call| freeToolCall(alloc, call);
-
-            const completed_tool_names = try dupeCompletedToolNames(alloc, entry.completed_tool_names);
-            errdefer freeCompletedToolNames(alloc, completed_tool_names);
-
-            const cancelled_command = if (entry.cancelled_command) |presentation|
-                try dupeCancelledCommandPresentation(alloc, presentation)
-            else
-                null;
-            errdefer if (cancelled_command) |presentation| {
-                freeCancelledCommandPresentation(alloc, presentation);
-            };
-
-            const execution = try dupeExecutionMemory(alloc, entry.execution);
-
-            break :blk .{ .interrupted = .{
-                .user = user,
-                .assistant = assistant,
-                .tool_call = tool_call,
-                .completed_tool_names = completed_tool_names,
-                .execution = execution,
-                .cancelled_command = cancelled_command,
-                .terminal_reason = entry.terminal_reason,
-                .cancellation_origin = entry.cancellation_origin,
-            } };
-        },
-    };
+    return owned_copy.dupe(HistoryTurn, alloc, turn);
 }
 
 pub fn dupeCancelledCommandPresentation(
     alloc: std.mem.Allocator,
     presentation: CancelledCommandPresentation,
 ) !CancelledCommandPresentation {
-    const output_replay = if (presentation.output_replay) |replay|
-        try dupeCommandOutputReplay(alloc, replay)
-    else
-        null;
-    errdefer if (output_replay) |replay| freeCommandOutputReplay(alloc, replay);
-    return .{
-        .output_replay = output_replay,
-        .command_artifact_handle = if (presentation.command_artifact_handle) |handle|
-            try alloc.dupe(u8, handle)
-        else
-            null,
-    };
+    return owned_copy.dupe(CancelledCommandPresentation, alloc, presentation);
 }
 
 pub fn freeCancelledCommandPresentation(
     alloc: std.mem.Allocator,
     presentation: CancelledCommandPresentation,
 ) void {
-    if (presentation.output_replay) |replay| freeCommandOutputReplay(alloc, replay);
-    if (presentation.command_artifact_handle) |handle| alloc.free(@constCast(handle));
+    owned_copy.free(CancelledCommandPresentation, alloc, presentation);
 }
 
 pub fn dupeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) !FinishedPrompt {
@@ -2864,77 +2680,29 @@ pub fn dupeFinishedPrompt(alloc: std.mem.Allocator, finished: FinishedPrompt) !F
 }
 
 pub fn dupeCompletedToolNames(alloc: std.mem.Allocator, items: []const []u8) ![][]u8 {
-    if (items.len == 0) return &.{};
-
-    const copy = try alloc.alloc([]u8, items.len);
-    errdefer alloc.free(copy);
-
-    var copied: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < copied) : (i += 1) {
-            alloc.free(copy[i]);
-        }
-    }
-
-    for (items, 0..) |item, i| {
-        copy[i] = try alloc.dupe(u8, item);
-        copied += 1;
-    }
-    return copy;
+    return owned_copy.dupeSlice([]u8, alloc, items);
 }
 
 pub fn freeCompletedToolNames(alloc: std.mem.Allocator, items: [][]u8) void {
-    for (items) |item| alloc.free(item);
-    if (items.len > 0) alloc.free(items);
+    owned_copy.free([][]u8, alloc, items);
 }
 
 pub fn dupeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) !ExecutionMemory {
-    const tool_steps = try dupeToolExecutionSteps(alloc, memory.tool_steps);
-    errdefer freeToolExecutionSteps(alloc, tool_steps);
-    const files = try dupeFileEvidenceSlice(alloc, memory.files);
-    errdefer freeFileEvidenceSlice(alloc, files);
-    const steering = try dupePersistedSteering(alloc, memory.steering);
-    errdefer freePersistedSteering(alloc, steering);
-    const context_notes = try dupePersistedContextNotes(alloc, memory.context_notes);
-    errdefer freePersistedContextNotes(alloc, context_notes);
-    const runtime_context = if (memory.runtime_context) |texts| try dupeRuntimeContext(alloc, texts) else null;
-    return .{
-        .tool_steps = tool_steps,
-        .files = files,
-        .steering = steering,
-        .context_notes = context_notes,
-        .runtime_context = runtime_context,
-        .turn_summary = memory.turn_summary,
-    };
+    return owned_copy.dupe(ExecutionMemory, alloc, memory);
 }
 
 pub fn freeExecutionMemory(alloc: std.mem.Allocator, memory: ExecutionMemory) void {
-    freeToolExecutionSteps(alloc, memory.tool_steps);
-    freeFileEvidenceSlice(alloc, memory.files);
-    freePersistedSteering(alloc, memory.steering);
-    freePersistedContextNotes(alloc, memory.context_notes);
-    if (memory.runtime_context) |texts| freeRuntimeContext(alloc, texts);
+    owned_copy.free(ExecutionMemory, alloc, memory);
 }
 
 /// Caller owns the result; free it with `freeRuntimeContext`.
 pub fn dupeRuntimeContext(alloc: std.mem.Allocator, texts: []const []const u8) ![][]u8 {
-    const copies = try alloc.alloc([]u8, texts.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (copies[0..initialized]) |text| alloc.free(text);
-        alloc.free(copies);
-    }
-    for (texts, copies) |text, *copy| {
-        copy.* = try alloc.dupe(u8, text);
-        initialized += 1;
-    }
-    return copies;
+    // A copy only reads its source, so viewing the strings as mutable is safe.
+    return owned_copy.dupeSlice([]u8, alloc, @ptrCast(texts));
 }
 
 pub fn freeRuntimeContext(alloc: std.mem.Allocator, texts: []const []u8) void {
-    for (texts) |text| alloc.free(text);
-    alloc.free(texts);
+    owned_copy.free([]const []u8, alloc, texts);
 }
 
 /// Caller owns the result; free it with `freePersistedContextNotes`.
@@ -2942,185 +2710,59 @@ fn dupePersistedContextNotes(
     alloc: std.mem.Allocator,
     notes: []const PersistedContextNote,
 ) ![]PersistedContextNote {
-    if (notes.len == 0) return &.{};
-    const copy = try alloc.alloc(PersistedContextNote, notes.len);
-    errdefer alloc.free(copy);
-    var copied: usize = 0;
-    errdefer for (copy[0..copied]) |item| alloc.free(item.text);
-    for (notes, copy) |item, *dest| {
-        const text = try alloc.dupe(u8, item.text);
-        errdefer alloc.free(text);
-        dest.* = .{
-            .text = text,
-            .after_tool_step_count = item.after_tool_step_count,
-            .sources = try dupeNoteSources(alloc, item.sources),
-        };
-        copied += 1;
-    }
-    return copy;
+    return owned_copy.dupeSlice(PersistedContextNote, alloc, notes);
 }
 
 /// Caller owns the result; free it with `freeNoteSources`.
 pub fn dupeNoteSources(alloc: std.mem.Allocator, sources: []const ContextNoteSource) ![]ContextNoteSource {
-    if (sources.len == 0) return &.{};
-    const copy = try alloc.alloc(ContextNoteSource, sources.len);
-    errdefer alloc.free(copy);
-    var copied: usize = 0;
-    errdefer for (copy[0..copied]) |source| alloc.free(source.path);
-    for (sources, copy) |source, *dest| {
-        dest.* = .{ .path = try alloc.dupe(u8, source.path), .stamp = source.stamp };
-        copied += 1;
-    }
-    return copy;
+    return owned_copy.dupeSlice(ContextNoteSource, alloc, sources);
 }
 
 pub fn freeNoteSources(alloc: std.mem.Allocator, sources: []const ContextNoteSource) void {
-    for (sources) |source| alloc.free(source.path);
-    if (sources.len > 0) alloc.free(sources);
+    owned_copy.free([]const ContextNoteSource, alloc, sources);
 }
 
 pub fn freePersistedContextNotes(alloc: std.mem.Allocator, notes: []PersistedContextNote) void {
-    for (notes) |item| freePersistedContextNote(alloc, item);
-    if (notes.len > 0) alloc.free(notes);
+    owned_copy.free([]PersistedContextNote, alloc, notes);
 }
 
 pub fn freePersistedContextNote(alloc: std.mem.Allocator, note: PersistedContextNote) void {
-    alloc.free(note.text);
-    freeNoteSources(alloc, note.sources);
+    owned_copy.free(PersistedContextNote, alloc, note);
 }
 
 pub fn dupePersistedSteering(
     alloc: std.mem.Allocator,
     steering: []const PersistedSteering,
 ) ![]PersistedSteering {
-    if (steering.len == 0) return &.{};
-    const copy = try alloc.alloc(PersistedSteering, steering.len);
-    errdefer alloc.free(copy);
-    var copied: usize = 0;
-    errdefer for (copy[0..copied]) |item| {
-        alloc.free(item.text);
-        if (item.assistant_prefix) |prefix| alloc.free(prefix);
-    };
-    for (steering, copy) |item, *dest| {
-        const text = try alloc.dupe(u8, item.text);
-        errdefer alloc.free(text);
-        const assistant_prefix = if (item.assistant_prefix) |prefix|
-            try alloc.dupe(u8, prefix)
-        else
-            null;
-        errdefer if (assistant_prefix) |prefix| alloc.free(prefix);
-        dest.* = .{
-            .text = text,
-            .assistant_prefix = assistant_prefix,
-            .after_tool_step_count = item.after_tool_step_count,
-        };
-        copied += 1;
-    }
-    return copy;
+    return owned_copy.dupeSlice(PersistedSteering, alloc, steering);
 }
 
 pub fn freePersistedSteering(alloc: std.mem.Allocator, steering: []PersistedSteering) void {
-    for (steering) |item| {
-        alloc.free(item.text);
-        if (item.assistant_prefix) |prefix| alloc.free(prefix);
-    }
-    if (steering.len > 0) alloc.free(steering);
+    owned_copy.free([]PersistedSteering, alloc, steering);
 }
 
 pub fn dupeToolExecutionSteps(alloc: std.mem.Allocator, steps: []const ToolExecutionStep) ![]ToolExecutionStep {
-    if (steps.len == 0) return &.{};
-
-    const copy = try alloc.alloc(ToolExecutionStep, steps.len);
-    errdefer alloc.free(copy);
-
-    var copied: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < copied) : (i += 1) freeToolExecutionStep(alloc, copy[i]);
-    }
-
-    for (steps, 0..) |step, i| {
-        copy[i] = try dupeToolExecutionStep(alloc, step);
-        copied += 1;
-    }
-    return copy;
+    return owned_copy.dupeSlice(ToolExecutionStep, alloc, steps);
 }
 
 pub fn freeToolExecutionSteps(alloc: std.mem.Allocator, steps: []ToolExecutionStep) void {
-    for (steps) |step| freeToolExecutionStep(alloc, step);
-    if (steps.len > 0) alloc.free(steps);
-}
-
-fn dupeToolExecutionStep(alloc: std.mem.Allocator, step: ToolExecutionStep) !ToolExecutionStep {
-    const assistant = if (step.assistant) |text| try alloc.dupe(u8, text) else null;
-    errdefer if (assistant) |text| alloc.free(text);
-    const tool_calls = try dupeToolCallSlice(alloc, step.tool_calls);
-    errdefer freeToolCallSlice(alloc, tool_calls);
-    const tool_results = try dupePersistedToolResults(alloc, step.tool_results);
-    errdefer freePersistedToolResults(alloc, tool_results);
-    const replay = if (step.provider_replay) |value| try dupeProviderReplay(alloc, value) else null;
-
-    return .{
-        .assistant = assistant,
-        .provider_replay = replay,
-        .tool_calls = tool_calls,
-        .tool_results = tool_results,
-    };
-}
-
-fn freeToolExecutionStep(alloc: std.mem.Allocator, step: ToolExecutionStep) void {
-    if (step.assistant) |assistant| alloc.free(assistant);
-    if (step.provider_replay) |replay| freeProviderReplay(alloc, replay);
-    freeToolCallSlice(alloc, step.tool_calls);
-    freePersistedToolResults(alloc, step.tool_results);
+    owned_copy.free([]ToolExecutionStep, alloc, steps);
 }
 
 pub fn dupeToolCallSlice(alloc: std.mem.Allocator, calls: []const ToolCall) ![]ToolCall {
-    if (calls.len == 0) return &.{};
-
-    const copy = try alloc.alloc(ToolCall, calls.len);
-    errdefer alloc.free(copy);
-
-    var copied: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < copied) : (i += 1) freeToolCall(alloc, copy[i]);
-    }
-
-    for (calls, 0..) |call, i| {
-        copy[i] = try dupeToolCall(alloc, call);
-        copied += 1;
-    }
-    return copy;
+    return owned_copy.dupeSlice(ToolCall, alloc, calls);
 }
 
 pub fn freeToolCallSlice(alloc: std.mem.Allocator, calls: []ToolCall) void {
-    for (calls) |call| freeToolCall(alloc, call);
-    if (calls.len > 0) alloc.free(calls);
+    owned_copy.free([]ToolCall, alloc, calls);
 }
 
 pub fn dupePersistedToolResults(alloc: std.mem.Allocator, results: []const PersistedToolResult) ![]PersistedToolResult {
-    if (results.len == 0) return &.{};
-
-    const copy = try alloc.alloc(PersistedToolResult, results.len);
-    errdefer alloc.free(copy);
-
-    var copied: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < copied) : (i += 1) freePersistedToolResult(alloc, copy[i]);
-    }
-
-    for (results, 0..) |result, i| {
-        copy[i] = try dupePersistedToolResult(alloc, result);
-        copied += 1;
-    }
-    return copy;
+    return owned_copy.dupeSlice(PersistedToolResult, alloc, results);
 }
 
 pub fn freePersistedToolResults(alloc: std.mem.Allocator, results: []PersistedToolResult) void {
-    for (results) |result| freePersistedToolResult(alloc, result);
-    if (results.len > 0) alloc.free(results);
+    owned_copy.free([]PersistedToolResult, alloc, results);
 }
 
 /// Copies `lines` and every line's text. Caller owns the result; release it
@@ -3129,286 +2771,79 @@ pub fn dupeCommittedFilePresentationLines(
     alloc: std.mem.Allocator,
     lines: []const CommittedFilePresentationLine,
 ) ![]CommittedFilePresentationLine {
-    const copy = try alloc.alloc(CommittedFilePresentationLine, lines.len);
-    errdefer alloc.free(copy);
-    var copied_lines: usize = 0;
-    errdefer {
-        for (copy[0..copied_lines]) |line| alloc.free(@constCast(line.text));
-    }
-    for (lines, 0..) |line, index| {
-        copy[index] = .{
-            .kind = line.kind,
-            .old_line = line.old_line,
-            .new_line = line.new_line,
-            .text = try alloc.dupe(u8, line.text),
-        };
-        copied_lines += 1;
-    }
-    return copy;
+    return owned_copy.dupeSlice(CommittedFilePresentationLine, alloc, lines);
 }
 
 pub fn freeCommittedFilePresentationLines(
     alloc: std.mem.Allocator,
     lines: []const CommittedFilePresentationLine,
 ) void {
-    for (lines) |line| alloc.free(@constCast(line.text));
-    if (lines.len > 0) alloc.free(@constCast(lines));
+    owned_copy.free([]const CommittedFilePresentationLine, alloc, lines);
 }
 
 pub fn dupeCommittedFilePresentation(
     alloc: std.mem.Allocator,
     presentation: CommittedFilePresentation,
 ) !CommittedFilePresentation {
-    const path = try alloc.dupe(u8, presentation.path);
-    errdefer alloc.free(path);
-    const lines = try dupeCommittedFilePresentationLines(alloc, presentation.lines);
-    errdefer freeCommittedFilePresentationLines(alloc, lines);
-    const previous_content = if (presentation.previous_content) |content|
-        try alloc.dupe(u8, content)
-    else
-        null;
-    errdefer if (previous_content) |content| alloc.free(content);
-    const after_content = if (presentation.after_content) |content|
-        try alloc.dupe(u8, content)
-    else
-        null;
-    errdefer if (after_content) |content| alloc.free(content);
-    const lifecycle_id: ?ToolLifecycleId = if (presentation.lifecycle_id) |id| .{
-        .turn_id = id.turn_id,
-        .call_id = try alloc.dupe(u8, id.call_id),
-    } else null;
-    errdefer if (lifecycle_id) |id| alloc.free(@constCast(id.call_id));
-    const content_handle = if (presentation.content_handle) |handle|
-        try alloc.dupe(u8, handle)
-    else
-        null;
-    errdefer if (content_handle) |handle| alloc.free(handle);
-    const review_lines = if (presentation.review_lines) |rows|
-        try dupeCommittedFilePresentationLines(alloc, rows)
-    else
-        null;
-    return .{
-        .path = path,
-        .kind = presentation.kind,
-        .lines = lines,
-        .additions = presentation.additions,
-        .deletions = presentation.deletions,
-        .truncated = presentation.truncated,
-        .previous_content = previous_content,
-        .after_content = after_content,
-        .lifecycle_id = lifecycle_id,
-        .content_handle = content_handle,
-        .review_lines = review_lines,
-    };
+    return owned_copy.dupe(CommittedFilePresentation, alloc, presentation);
 }
 
 pub fn freeCommittedFilePresentation(
     alloc: std.mem.Allocator,
     presentation: CommittedFilePresentation,
 ) void {
-    alloc.free(@constCast(presentation.path));
-    freeCommittedFilePresentationLines(alloc, presentation.lines);
-    if (presentation.previous_content) |content| alloc.free(@constCast(content));
-    if (presentation.after_content) |content| alloc.free(@constCast(content));
-    if (presentation.lifecycle_id) |id| alloc.free(@constCast(id.call_id));
-    if (presentation.content_handle) |handle| alloc.free(@constCast(handle));
-    if (presentation.review_lines) |rows| freeCommittedFilePresentationLines(alloc, rows);
-}
-
-fn dupePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult) !PersistedToolResult {
-    const tool_call_id = try alloc.dupe(u8, result.tool_call_id);
-    errdefer alloc.free(tool_call_id);
-    const tool_name = try alloc.dupe(u8, result.tool_name);
-    errdefer alloc.free(tool_name);
-    const output = try alloc.dupe(u8, result.output);
-    errdefer alloc.free(output);
-    const output_handle = if (result.output_handle) |handle| try alloc.dupe(u8, handle) else null;
-    errdefer if (output_handle) |handle| alloc.free(handle);
-    const preview = if (result.preview) |text| try alloc.dupe(u8, text) else null;
-    errdefer if (preview) |text| alloc.free(text);
-    const permission_feedback = try dupePermissionFeedback(alloc, result.permission_feedback);
-    errdefer freePermissionFeedback(alloc, permission_feedback);
-    const committed_file_presentation = if (result.committed_file_presentation) |presentation|
-        try dupeCommittedFilePresentation(alloc, presentation)
-    else
-        null;
-    errdefer if (committed_file_presentation) |presentation| freeCommittedFilePresentation(alloc, presentation);
-    const command_output_replay = if (result.command_output_replay) |replay|
-        try dupeCommandOutputReplay(alloc, replay)
-    else
-        null;
-    errdefer if (command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
-    const tool_image_handle = if (result.tool_image_handle) |handle| try alloc.dupe(u8, handle) else null;
-    errdefer if (tool_image_handle) |handle| alloc.free(handle);
-    const tool_images = try dupeToolImages(alloc, result.tool_images);
-    return .{
-        .tool_images = tool_images,
-        .tool_image_handle = tool_image_handle,
-        .tool_call_id = tool_call_id,
-        .tool_name = tool_name,
-        .status = result.status,
-        .output = output,
-        .output_handle = output_handle,
-        .preview = preview,
-        .output_bytes = result.output_bytes,
-        .stored_output_bytes = result.stored_output_bytes,
-        .truncated = result.truncated,
-        .provider_native = result.provider_native,
-        .review_feedback = result.review_feedback,
-        .created_at_ms = result.created_at_ms,
-        .permission_feedback = permission_feedback,
-        .committed_file_presentation = committed_file_presentation,
-        .command_output_replay = command_output_replay,
-        .command_process_presentation = result.command_process_presentation,
-        .terminal_action_presentation = result.terminal_action_presentation,
-    };
+    owned_copy.free(CommittedFilePresentation, alloc, presentation);
 }
 
 pub fn freePersistedToolResult(alloc: std.mem.Allocator, result: PersistedToolResult) void {
-    alloc.free(result.tool_call_id);
-    alloc.free(result.tool_name);
-    alloc.free(result.output);
-    freeToolImages(alloc, result.tool_images);
-    if (result.tool_image_handle) |handle| alloc.free(handle);
-    if (result.output_handle) |handle| alloc.free(handle);
-    if (result.preview) |preview| alloc.free(preview);
-    freePermissionFeedback(alloc, result.permission_feedback);
-    if (result.committed_file_presentation) |presentation| {
-        freeCommittedFilePresentation(alloc, presentation);
-    }
-    if (result.command_output_replay) |replay| freeCommandOutputReplay(alloc, replay);
+    owned_copy.free(PersistedToolResult, alloc, result);
 }
 
 pub fn dupeCommandOutputReplay(
     alloc: std.mem.Allocator,
     replay: CommandOutputReplay,
 ) !CommandOutputReplay {
-    return switch (replay) {
-        .available => |descriptor| .{ .available = .{
-            .handle = try alloc.dupe(u8, descriptor.handle),
-            .framed_bytes = descriptor.framed_bytes,
-        } },
-        .unavailable => .unavailable,
-    };
+    return owned_copy.dupe(CommandOutputReplay, alloc, replay);
 }
 
 pub fn freeCommandOutputReplay(
     alloc: std.mem.Allocator,
     replay: CommandOutputReplay,
 ) void {
-    switch (replay) {
-        .available => |descriptor| alloc.free(@constCast(descriptor.handle)),
-        .unavailable => {},
-    }
+    owned_copy.free(CommandOutputReplay, alloc, replay);
 }
 
 pub fn dupePermissionFeedback(
     alloc: std.mem.Allocator,
     feedback: []const []const u8,
 ) ![][]u8 {
-    if (feedback.len == 0) return &.{};
-
-    const copy = try alloc.alloc([]u8, feedback.len);
-    errdefer alloc.free(copy);
-
-    var copied: usize = 0;
-    errdefer {
-        for (copy[0..copied]) |text| alloc.free(text);
-    }
-    for (feedback, 0..) |text, i| {
-        copy[i] = try alloc.dupe(u8, text);
-        copied += 1;
-    }
-    return copy;
+    // A copy only reads its source, so viewing the strings as mutable is safe.
+    return owned_copy.dupeSlice([]u8, alloc, @ptrCast(feedback));
 }
 
 pub fn freePermissionFeedback(alloc: std.mem.Allocator, feedback: [][]u8) void {
-    for (feedback) |text| alloc.free(text);
-    if (feedback.len > 0) alloc.free(feedback);
+    owned_copy.free([][]u8, alloc, feedback);
 }
 
 pub fn dupeFileEvidenceSlice(alloc: std.mem.Allocator, files: []const FileEvidence) ![]FileEvidence {
-    if (files.len == 0) return &.{};
-
-    const copy = try alloc.alloc(FileEvidence, files.len);
-    errdefer alloc.free(copy);
-
-    var copied: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < copied) : (i += 1) freeFileEvidence(alloc, copy[i]);
-    }
-
-    for (files, 0..) |file, i| {
-        copy[i] = try dupeFileEvidence(alloc, file);
-        copied += 1;
-    }
-    return copy;
+    return owned_copy.dupeSlice(FileEvidence, alloc, files);
 }
 
 pub fn freeFileEvidenceSlice(alloc: std.mem.Allocator, files: []FileEvidence) void {
-    for (files) |file| freeFileEvidence(alloc, file);
-    if (files.len > 0) alloc.free(files);
-}
-
-fn dupeFileEvidence(alloc: std.mem.Allocator, file: FileEvidence) !FileEvidence {
-    const path = try alloc.dupe(u8, file.path);
-    errdefer alloc.free(path);
-    const new_path = if (file.new_path) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (new_path) |value| alloc.free(value);
-    const tool_call_id = try alloc.dupe(u8, file.tool_call_id);
-    errdefer alloc.free(tool_call_id);
-    const tool_name = try alloc.dupe(u8, file.tool_name);
-    return .{
-        .path = path,
-        .new_path = new_path,
-        .tool_call_id = tool_call_id,
-        .tool_name = tool_name,
-        .action = file.action,
-        .status = file.status,
-        .model_view_covers_full_file = file.model_view_covers_full_file,
-        .stale = file.stale,
-    };
+    owned_copy.free([]FileEvidence, alloc, files);
 }
 
 /// Frees one entry's owned strings, not its containing slice.
 pub fn freeFileEvidence(alloc: std.mem.Allocator, file: FileEvidence) void {
-    alloc.free(file.path);
-    if (file.new_path) |new_path| alloc.free(new_path);
-    alloc.free(file.tool_call_id);
-    alloc.free(file.tool_name);
+    owned_copy.free(FileEvidence, alloc, file);
 }
 
 pub fn dupeToolCall(alloc: std.mem.Allocator, call: ToolCall) !ToolCall {
-    const id = try alloc.dupe(u8, call.id);
-    errdefer alloc.free(id);
-    const name = try alloc.dupe(u8, call.name);
-    errdefer alloc.free(name);
-    const arguments_json = try alloc.dupe(u8, call.arguments_json);
-    errdefer alloc.free(arguments_json);
-    const provisional_id = if (call.provisional_id) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (provisional_id) |value| alloc.free(value);
-    const provider_result = if (call.provider_result) |result| try alloc.dupe(u8, result) else null;
-    errdefer if (provider_result) |result| alloc.free(result);
-    return .{
-        .id = id,
-        .name = name,
-        .arguments_json = arguments_json,
-        .argument_integrity = call.argument_integrity,
-        .argument_diagnostic = call.argument_diagnostic,
-        .provisional_id = provisional_id,
-        .provider_result = provider_result,
-        .final_identity = call.final_identity,
-        .provenance = call.provenance,
-    };
+    return owned_copy.dupe(ToolCall, alloc, call);
 }
 
 pub fn freeToolCall(alloc: std.mem.Allocator, call: ToolCall) void {
-    alloc.free(call.id);
-    alloc.free(call.name);
-    alloc.free(call.arguments_json);
-    if (call.provisional_id) |provisional_id| alloc.free(provisional_id);
-    if (call.provider_result) |provider_result| alloc.free(provider_result);
+    owned_copy.free(ToolCall, alloc, call);
 }
 
 test "dupeToolCall preserves argument integrity" {
@@ -3579,193 +3014,50 @@ test "fuzz tool argument diagnostic" {
 }
 
 pub fn freeUserTurn(alloc: std.mem.Allocator, user: UserTurn) void {
-    alloc.free(user.text);
-    freeImageAttachmentSlice(alloc, user.images);
-    if (user.work_id) |work_id| alloc.free(work_id);
+    owned_copy.free(UserTurn, alloc, user);
 }
 
 pub fn dupeUserTurn(alloc: std.mem.Allocator, user: UserTurn) !UserTurn {
-    const text = try alloc.dupe(u8, user.text);
-    errdefer alloc.free(text);
-
-    const images = try dupeImageAttachmentSlice(alloc, user.images);
-    errdefer freeImageAttachmentSlice(alloc, images);
-
-    const work_id = if (user.work_id) |value| try alloc.dupe(u8, value) else null;
-
-    return .{
-        .text = text,
-        .images = images,
-        .work_id = work_id,
-        .author = user.author,
-    };
+    return owned_copy.dupe(UserTurn, alloc, user);
 }
 
 pub fn dupeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []const ImageAttachment) ![]ImageAttachment {
-    if (attachments.len == 0) return &.{};
-
-    const copy = try alloc.alloc(ImageAttachment, attachments.len);
-    errdefer alloc.free(copy);
-
-    var copied: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < copied) : (i += 1) {
-            freeImageAttachment(alloc, copy[i]);
-        }
-    }
-
-    for (attachments, 0..) |attachment, i| {
-        copy[i] = try dupeImageAttachment(alloc, attachment);
-        copied += 1;
-    }
-    return copy;
+    return owned_copy.dupeSlice(ImageAttachment, alloc, attachments);
 }
 
 /// A copy of `attachment` that owns every field it has; free it with
 /// `freeImageAttachment`.
 pub fn dupeImageAttachment(alloc: std.mem.Allocator, attachment: ImageAttachment) !ImageAttachment {
-    const path = try alloc.dupe(u8, attachment.path);
-    errdefer alloc.free(path);
-
-    const media_type = try alloc.dupe(u8, attachment.media_type);
-    errdefer alloc.free(media_type);
-
-    const snapshot_path = if (attachment.snapshot_path) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    errdefer if (snapshot_path) |value| alloc.free(value);
-
-    const snapshot_sha256 = if (attachment.snapshot_sha256) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    errdefer if (snapshot_sha256) |value| alloc.free(value);
-
-    const inline_data = if (attachment.inline_data) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    errdefer if (inline_data) |value| alloc.free(value);
-    const source_ref = if (attachment.source_ref) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    errdefer if (source_ref) |value| alloc.free(value);
-    const blob_path = if (attachment.blob_path) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    return .{
-        .id = attachment.id,
-        .path = path,
-        .media_type = media_type,
-        .snapshot_path = snapshot_path,
-        .snapshot_sha256 = snapshot_sha256,
-        .inline_data = inline_data,
-        .source_ref = source_ref,
-        .blob_path = blob_path,
-    };
+    return owned_copy.dupe(ImageAttachment, alloc, attachment);
 }
 
 /// Frees the owned fields in one attachment; caller owns any containing storage.
 pub fn freeImageAttachment(alloc: std.mem.Allocator, attachment: ImageAttachment) void {
-    alloc.free(attachment.path);
-    alloc.free(attachment.media_type);
-    if (attachment.snapshot_path) |path| alloc.free(path);
-    if (attachment.snapshot_sha256) |sha256| alloc.free(sha256);
-    if (attachment.inline_data) |data| alloc.free(data);
-    if (attachment.source_ref) |source_ref| alloc.free(source_ref);
-    if (attachment.blob_path) |path| alloc.free(path);
+    owned_copy.free(ImageAttachment, alloc, attachment);
 }
 
 pub fn freeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []ImageAttachment) void {
-    if (attachments.len == 0) return;
-    for (attachments) |attachment| freeImageAttachment(alloc, attachment);
-    alloc.free(attachments);
+    owned_copy.free([]ImageAttachment, alloc, attachments);
 }
 
 pub fn dupePermissionGrantSlice(alloc: std.mem.Allocator, grants: []const PermissionGrant) ![]PermissionGrant {
-    const copy = try alloc.alloc(PermissionGrant, grants.len);
-    errdefer alloc.free(copy);
-
-    var copied: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < copied) : (i += 1) {
-            alloc.free(copy[i].tool_name);
-            alloc.free(copy[i].target_path);
-        }
-    }
-
-    for (grants, 0..) |grant, i| {
-        const tool_name = try alloc.dupe(u8, grant.tool_name);
-        errdefer alloc.free(tool_name);
-
-        const target_path = try alloc.dupe(u8, grant.target_path);
-        copy[i] = .{
-            .tool_name = tool_name,
-            .target_path = target_path,
-        };
-        copied += 1;
-    }
-
-    return copy;
+    return owned_copy.dupeSlice(PermissionGrant, alloc, grants);
 }
 
 pub fn freePermissionGrantSlice(alloc: std.mem.Allocator, grants: []PermissionGrant) void {
-    for (grants) |grant| {
-        alloc.free(grant.tool_name);
-        alloc.free(grant.target_path);
-    }
-    alloc.free(grants);
+    owned_copy.free([]PermissionGrant, alloc, grants);
 }
 
 pub fn dupePermissionRuleSlice(alloc: std.mem.Allocator, rules: []const PermissionRule) ![]PermissionRule {
-    if (rules.len == 0) return &.{};
-
-    const copy = try alloc.alloc(PermissionRule, rules.len);
-    errdefer alloc.free(copy);
-
-    var copied: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < copied) : (i += 1) {
-            alloc.free(copy[i].permission);
-            alloc.free(copy[i].pattern);
-        }
-    }
-
-    for (rules, 0..) |rule, i| {
-        const permission = try alloc.dupe(u8, rule.permission);
-        errdefer alloc.free(permission);
-
-        const pattern = try alloc.dupe(u8, rule.pattern);
-        copy[i] = .{
-            .permission = permission,
-            .pattern = pattern,
-            .action = rule.action,
-        };
-        copied += 1;
-    }
-
-    return copy;
+    return owned_copy.dupeSlice(PermissionRule, alloc, rules);
 }
 
 pub fn freePermissionRuleSlice(alloc: std.mem.Allocator, rules: []PermissionRule) void {
-    if (rules.len == 0) return;
-    for (rules) |rule| {
-        alloc.free(rule.permission);
-        alloc.free(rule.pattern);
-    }
-    alloc.free(rules);
+    owned_copy.free([]PermissionRule, alloc, rules);
 }
 
 pub fn dupePermissionRuleSet(alloc: std.mem.Allocator, rules: PermissionRuleSet) !PermissionRuleSet {
-    return .{
-        .rules = try dupePermissionRuleSlice(alloc, rules.rules),
-    };
+    return owned_copy.dupe(PermissionRuleSet, alloc, rules);
 }
 
 test "ConversationLanguage preserves core constructors" {
@@ -4133,4 +3425,206 @@ test "public types remain constructible" {
     _ = decision;
     _ = action;
     _ = resolve_mode;
+}
+
+/// History turns with every owned field set, for the copy tests below. The
+/// arena owns everything they point to.
+fn testFullHistoryTurns(arena: std.mem.Allocator) ![3]HistoryTurn {
+    const text = struct {
+        fn of(a: std.mem.Allocator, value: []const u8) ![]u8 {
+            return a.dupe(u8, value);
+        }
+    }.of;
+    const strings = try arena.dupe([]u8, &.{ try text(arena, "first"), try text(arena, "") });
+    const lines = try arena.dupe(CommittedFilePresentationLine, &.{
+        .{ .kind = .deletion, .old_line = 1, .new_line = null, .text = try text(arena, "old") },
+        .{ .kind = .addition, .old_line = null, .new_line = 1, .text = try text(arena, "new") },
+    });
+    const presentation: CommittedFilePresentation = .{
+        .path = try text(arena, "src/a.zig"),
+        .kind = .edited,
+        .lines = lines,
+        .additions = 1,
+        .deletions = 1,
+        .truncated = false,
+        .previous_content = try text(arena, "old\n"),
+        .after_content = try text(arena, "new\n"),
+        .lifecycle_id = .{ .turn_id = 4, .call_id = try text(arena, "call-1") },
+        .content_handle = try text(arena, "handle-1"),
+        .review_lines = lines,
+    };
+    const replay: CommandOutputReplay = .{ .available = .{ .handle = try text(arena, "replay-1"), .framed_bytes = 12 } };
+    const image: ImageAttachment = .{
+        .id = 3,
+        .path = try text(arena, "shot.png"),
+        .media_type = try text(arena, "image/png"),
+        .snapshot_path = try text(arena, "snap.png"),
+        .snapshot_sha256 = try text(arena, "abc"),
+        .inline_data = try text(arena, "data"),
+        .source_ref = try text(arena, "ref"),
+        .blob_path = try text(arena, "blob"),
+    };
+    const user: UserTurn = .{
+        .text = try text(arena, "do it"),
+        .images = try arena.dupe(ImageAttachment, &.{image}),
+        .work_id = try text(arena, "work-1"),
+    };
+    const call: ToolCall = .{
+        .id = try text(arena, "call-1"),
+        .name = try text(arena, "edit_file"),
+        .arguments_json = try text(arena, "{}"),
+        .provisional_id = try text(arena, "provisional"),
+        .provider_result = try text(arena, "result"),
+        .resolved_display_target = try text(arena, "borrowed"),
+    };
+    const provider_replay: ProviderReplay = .{
+        .source = .{ .provider = .gateway, .model = try text(arena, "model") },
+        .parts_json = try text(arena, "[]"),
+    };
+    const result: PersistedToolResult = .{
+        .tool_images = try arena.dupe(ToolImage, &.{.{
+            .data = try text(arena, "pixels"),
+            .mime_type = try text(arena, "image/png"),
+            .source_ref = try text(arena, "image-ref"),
+        }}),
+        .tool_image_handle = try text(arena, "image-handle"),
+        .tool_call_id = try text(arena, "call-1"),
+        .tool_name = try text(arena, "edit_file"),
+        .status = .failure,
+        .output = try text(arena, "output"),
+        .output_handle = try text(arena, "output-handle"),
+        .preview = try text(arena, "preview"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+        .permission_feedback = strings,
+        .committed_file_presentation = presentation,
+        .command_output_replay = replay,
+    };
+    const execution: ExecutionMemory = .{
+        .tool_steps = try arena.dupe(ToolExecutionStep, &.{.{
+            .assistant = try text(arena, "thinking"),
+            .tool_calls = try arena.dupe(ToolCall, &.{call}),
+            .tool_results = try arena.dupe(PersistedToolResult, &.{result}),
+            .provider_replay = provider_replay,
+        }}),
+        .files = try arena.dupe(FileEvidence, &.{.{
+            .path = try text(arena, "src/a.zig"),
+            .new_path = try text(arena, "src/b.zig"),
+            .tool_call_id = try text(arena, "call-1"),
+            .tool_name = try text(arena, "edit_file"),
+            .action = .edit,
+            .status = .success,
+        }}),
+        .steering = try arena.dupe(PersistedSteering, &.{.{
+            .text = try text(arena, "steer"),
+            .assistant_prefix = try text(arena, "prefix"),
+            .after_tool_step_count = 1,
+        }}),
+        .context_notes = try arena.dupe(PersistedContextNote, &.{
+            .{
+                .text = try text(arena, "note"),
+                .after_tool_step_count = 1,
+                .sources = try arena.dupe(ContextNoteSource, &.{.{ .path = try text(arena, "AGENTS.md"), .stamp = 9 }}),
+            },
+            .{
+                .text = try text(arena, "second note"),
+                .after_tool_step_count = 2,
+                .sources = try arena.dupe(ContextNoteSource, &.{.{ .path = try text(arena, "src/AGENTS.md"), .stamp = 10 }}),
+            },
+        }),
+        .runtime_context = strings,
+    };
+    return .{
+        .{ .compacted_summary = .{
+            .summary = try text(arena, "summary"),
+            .removed_turn_count = 2,
+            .compaction_count = 1,
+            .root_user_messages = strings,
+            .root_user_messages_complete = true,
+            .permission_feedback = strings,
+            .permission_feedback_complete = false,
+        } },
+        .{ .assistant = .{
+            .user = user,
+            .assistant = try text(arena, "done"),
+            .execution = execution,
+            .provider_replay = provider_replay,
+        } },
+        .{ .interrupted = .{
+            .user = user,
+            .assistant = try text(arena, "partial"),
+            .tool_call = call,
+            .completed_tool_names = strings,
+            .execution = execution,
+            .cancelled_command = .{ .output_replay = replay, .command_artifact_handle = try text(arena, "artifact") },
+            .terminal_reason = .failed,
+            .cancellation_origin = .turn,
+            .stopped_by_exit = true,
+        } },
+    };
+}
+
+test "dupeHistoryTurn copies every owned field of every turn kind and leaves out borrowed ones" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const turns = try testFullHistoryTurns(arena_state.allocator());
+
+    for (turns) |turn| {
+        const copy = try dupeHistoryTurn(std.testing.allocator, turn);
+        defer freeHistoryTurn(std.testing.allocator, copy);
+
+        var expected = turn;
+        switch (expected) {
+            .interrupted => |*entry| {
+                const step_call = &entry.execution.tool_steps[0].tool_calls[0];
+                try std.testing.expectEqual(null, copy.interrupted.tool_call.?.resolved_display_target);
+                try std.testing.expectEqual(null, copy.interrupted.execution.tool_steps[0].tool_calls[0].resolved_display_target);
+                try std.testing.expect(copy.interrupted.execution.tool_steps[0].tool_calls[0].id.ptr != step_call.id.ptr);
+                try std.testing.expect(copy.interrupted.user.images[0].blob_path.?.ptr != entry.user.images[0].blob_path.?.ptr);
+                // The source's steps live in the arena; compare against a
+                // version with the borrowed fields cleared.
+                var steps = entry.execution.tool_steps[0];
+                var calls = [_]ToolCall{steps.tool_calls[0]};
+                calls[0].resolved_display_target = null;
+                steps.tool_calls = &calls;
+                var step_list = [_]ToolExecutionStep{steps};
+                entry.execution.tool_steps = &step_list;
+                entry.tool_call.?.resolved_display_target = null;
+                try std.testing.expectEqualDeep(expected, copy);
+            },
+            .assistant => |*entry| {
+                const step = entry.execution.tool_steps[0];
+                const copied_step = copy.assistant.execution.tool_steps[0];
+                try std.testing.expect(copied_step.tool_results[0].committed_file_presentation.?.lines.ptr !=
+                    step.tool_results[0].committed_file_presentation.?.lines.ptr);
+                try std.testing.expect(copied_step.tool_results[0].command_output_replay.?.available.handle.ptr !=
+                    step.tool_results[0].command_output_replay.?.available.handle.ptr);
+                var calls = [_]ToolCall{step.tool_calls[0]};
+                calls[0].resolved_display_target = null;
+                var cleared_step = step;
+                cleared_step.tool_calls = &calls;
+                var step_list = [_]ToolExecutionStep{cleared_step};
+                entry.execution.tool_steps = &step_list;
+                try std.testing.expectEqualDeep(expected, copy);
+            },
+            .compacted_summary => |entry| {
+                try std.testing.expect(copy.compacted_summary.root_user_messages[0].ptr != entry.root_user_messages[0].ptr);
+                try std.testing.expectEqualDeep(expected, copy);
+            },
+        }
+    }
+}
+
+fn dupeThenFreeHistoryTurns(alloc: std.mem.Allocator, turns: [3]HistoryTurn) !void {
+    for (turns) |turn| freeHistoryTurn(alloc, try dupeHistoryTurn(alloc, turn));
+}
+
+test "dupeHistoryTurn leaves nothing behind when any allocation fails" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    try std.testing.checkAllAllocationFailures(
+        testing_allocator.no_resize,
+        dupeThenFreeHistoryTurns,
+        .{try testFullHistoryTurns(arena_state.allocator())},
+    );
 }
