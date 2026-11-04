@@ -2817,6 +2817,7 @@ pub fn dupeHistoryTurn(alloc: std.mem.Allocator, turn: HistoryTurn) !HistoryTurn
                 .cancelled_command = cancelled_command,
                 .terminal_reason = entry.terminal_reason,
                 .cancellation_origin = entry.cancellation_origin,
+                .stopped_by_exit = entry.stopped_by_exit,
             } };
         },
     };
@@ -3409,6 +3410,19 @@ pub fn freeToolCall(alloc: std.mem.Allocator, call: ToolCall) void {
     alloc.free(call.arguments_json);
     if (call.provisional_id) |provisional_id| alloc.free(provisional_id);
     if (call.provider_result) |provider_result| alloc.free(provider_result);
+}
+
+test "dupeHistoryTurn keeps a turn fx stopped as stopped" {
+    const alloc = std.testing.allocator;
+    const source: HistoryTurn = .{ .interrupted = .{
+        .user = .{ .text = @constCast("go") },
+        .terminal_reason = .failed,
+        .stopped_by_exit = true,
+    } };
+    const copy = try dupeHistoryTurn(alloc, source);
+    defer freeHistoryTurn(alloc, copy);
+    try std.testing.expect(copy.interrupted.stopped_by_exit);
+    try std.testing.expectEqual(InterruptedTerminalReason.failed, copy.interrupted.terminal_reason);
 }
 
 test "dupeToolCall preserves argument integrity" {
