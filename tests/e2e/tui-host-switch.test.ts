@@ -586,6 +586,75 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
     },
     TIMEOUT,
   );
+  test(
+    "a turn typed on a subagent's screen that fx dies during reaches main after a resume as the user's",
+    async () => {
+      const typed = held();
+      let typedReached = false;
+      let reports: string[] = [];
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            if (latestUserText(body).includes("SWITCH_TYPED")) {
+              typedReached = true;
+              await typed.promise;
+              return text("child_typed", "SWITCH_CHILD_TYPED");
+            }
+            return text("child_answer", "SWITCH_CHILD_FIRST");
+          }
+          const interrupted = userTexts(body).filter((t) => t.includes('"child_id"') && t.includes('"outcome":"interrupted"'));
+          if (interrupted.length > 0) {
+            reports = interrupted;
+            return text("main_saw_report", "SWITCH_MAIN_SAW_REPORT");
+          }
+          if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", { request: { action: "message", agent: "reviewer", message: "SWITCH_TASK look for nothing" } });
+          }
+          return text("main_done", "SWITCH_MAIN_DONE");
+        }, async (session, { home, launch }) => {
+          await session.sendText("SWITCH_USER");
+          await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
+          await session.waitForComposer(15_000);
+          await moveAgent(session, 1);
+          await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("SWITCH_TYPED a turn the crash cuts off");
+          await until("the typed turn's request", () => typedReached);
+
+          // Kill fx while that turn's request is out, as a crash would.
+          const pid = session.processPid();
+          process.kill(pid, "SIGKILL");
+          const deadline = Date.now() + 10_000;
+          while (Date.now() < deadline) {
+            try { process.kill(pid, 0); } catch { break; }
+            await Bun.sleep(25);
+          }
+          await session.kill();
+
+          const sessions = join(home, ".fx", "sessions", "v2");
+          const holds = (path: string, marker: string): boolean => readdirSync(path).some((entry) => {
+            const full = join(path, entry);
+            return statSync(full).isDirectory() ? holds(full, marker) : readFileSync(full, "latin1").includes(marker);
+          });
+          const parents = readdirSync(sessions).filter((id) =>
+            !id.startsWith(".") && statSync(join(sessions, id)).isDirectory() && holds(join(sessions, id), "SWITCH_MAIN_SAW_FIRST"));
+          expect(parents).toHaveLength(1);
+          const resumed = await launch(`--resume ${parents[0]}`);
+          await resumed.waitForText("SWITCH_MAIN_SAW_REPORT", 30_000);
+          await resumed.waitForComposer(15_000);
+          await resumed.sendText("/quit");
+          expect(await resumed.waitForSessionEnd(15_000)).toBe(true);
+        });
+      } finally {
+        typed.release();
+      }
+      // Main hears of the cut-off turn once, as the user's, not its own.
+      expect(reports).toHaveLength(1);
+      expect(reports[0]).toContain('"started_by":"user"');
+    },
+    TIMEOUT,
+  );
 
   test(
     "a message main sent into a subagent's turn whose request fails still reaches the subagent",

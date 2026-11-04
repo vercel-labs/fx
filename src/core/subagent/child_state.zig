@@ -702,9 +702,8 @@ pub fn spawnStartedBy(data: ?[]const u8) reports.StartedBy {
     var buf: [256]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const Wire = struct { by: ?[]const u8 = null };
-    const wire = std.json.parseFromSliceLeaky(Wire, fba.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return .parent;
-    const name = wire.by orelse return .parent;
-    return std.meta.stringToEnum(reports.StartedBy, name) orelse .parent;
+    const wire = json_decode.parseFromSliceLeaky(Wire, fba.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return .parent;
+    return endFactsOf(wire.by, null).started_by;
 }
 
 /// Whether a `child_spawned` line's data names a report rule: the work was
