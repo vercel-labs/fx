@@ -51,6 +51,9 @@
     {"name": "transcript_window", "module": "fx", "test": "the transcript window keeps the model's laws on arbitrary event sequences", "iterations": 2000000},
     {"name": "frozen_prefix", "module": "fx", "test": "a runtime resuming after its frozen prefix matches a full render on arbitrary edits", "iterations": 1500},
     {"name": "session_title", "module": "fx", "test": "session titles keep their rules on fuzzed input", "iterations": 5000000},
-    {"name": "session_records_listing", "module": "fx", "test": "fuzzed puts and writes list each compactor record once (D50)", "iterations": 2000}
+    {"name": "session_records_listing", "module": "fx", "test": "fuzzed puts and writes list each compactor record once (D50)", "iterations": 2000},
+    {"name": "js_program", "module": "js", "test": "fuzzed programs end in an outcome and free every byte", "iterations": 2500},
+    {"name": "js_regexp", "module": "js", "test": "fuzzed regular expressions end in an outcome and free every byte", "iterations": 2000},
+    {"name": "js_json", "module": "js", "test": "fuzzed JSON prints back to text that parses to the same value", "iterations": 2800}
   ]
 }

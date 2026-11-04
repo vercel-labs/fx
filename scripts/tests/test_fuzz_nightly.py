@@ -85,6 +85,7 @@ class RegistryTests(unittest.TestCase):
         src = fuzz_nightly.REPO_ROOT / "src"
         fuzz_root = (src / "fuzz_targets.zig").read_text()
         session_manager = src / "core" / "session_manager"
+        js_engine = src / "js"
         sources = {path: path.read_text() for path in src.rglob("*.zig")}
         for target in load_targets():
             with self.subTest(target=target.name):
@@ -95,6 +96,7 @@ class RegistryTests(unittest.TestCase):
                 self.assertIn("testing.fuzz(", body)
                 in_session_manager = files[0].is_relative_to(session_manager)
                 self.assertEqual(target.module == "session_manager", in_session_manager)
+                self.assertEqual(target.module == "js", files[0].is_relative_to(js_engine))
                 if target.module == "fx":
                     self.assertIn(f'@import("{files[0].relative_to(src).as_posix()}")', fuzz_root)
 
