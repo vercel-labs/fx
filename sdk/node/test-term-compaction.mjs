@@ -182,7 +182,7 @@ async function runScenario(name) {
       },
       env: {
         AI_GATEWAY_API_KEY: "synthetic-host-compaction-key", FX_MODEL: "fixture/test-model",
-        FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1", FX_SKIP_ONBOARDING: "1",
+        FX_SOUND: "0", FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1", FX_TEST_SKIP_ONBOARDING: "1",
       },
       fetch, sessionStore,
       configStore: { get(id) { return id === "model" ? "fixture/test-model" : null; }, set() {} },

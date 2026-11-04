@@ -13,7 +13,14 @@
 # design breaks, and each mutant-*.cfg plants a bug that its property must
 # catch.
 #
-# Run the real binary through every modeled shell call and have TLC replay it:
+# FailureStreak (src/core/agent/runtime/tool_admission.zig
+# ShellExecutionFailureRetryState): when repeated shell failures end a turn.
+# failure-streak.cfg must pass. failure-streak-current.cfg is fx before the
+# streak restarted on a file change, which breaks EditedRetryContinues, and
+# each failure-streak-mutant-*.cfg plants a bug that its property must catch.
+#
+# Run the real binary through every modeled shell call and every failure
+# streak, and have TLC replay what it did:
 #   bun test ../drivers/shell_command/
 #
 # Needs Java 11+ and tla2tools.jar, as ../README.md describes.
@@ -33,4 +40,9 @@ ShellContract current-history HistoryFidelity
 ShellContract current-zsh ZshForgiving
 ShellContract mutant-admission-raw AdmissionConsistency
 ShellContract mutant-guess Exactness
+FailureStreak failure-streak - -deadlock
+FailureStreak failure-streak-current EditedRetryContinues -deadlock
+FailureStreak failure-streak-mutant-any-write BlindLoopBounded -deadlock
+FailureStreak failure-streak-mutant-late BlindLoopBounded -deadlock
+FailureStreak failure-streak-mutant-early StopsOnlyAfterLimit -deadlock
 EOF

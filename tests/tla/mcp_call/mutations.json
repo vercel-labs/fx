@@ -1,0 +1,259 @@
+{
+  "about": "Planted bugs. Each one breaks one guard, and the named property must fail. Spec mutations edit spec/McpCall.tla and run TLC on MCMcpCall.cfg, once with only the named property and once with all of it. Code mutations edit a copy of src/core/mcp_host/mcp_call.zig, rebuild the harness from it, and run both driver directions. Each find string must occur exactly once.",
+  "spec": [
+    {
+      "id": "S1",
+      "breaks": "A revoked token is still accepted: only a forged one is refused.",
+      "find": "[] t \\notin InUse -> \"unauthorized\"",
+      "replace": "[] t = \"forged\" -> \"unauthorized\"",
+      "expect": "AdmitOnlyValid"
+    },
+    {
+      "id": "S2",
+      "breaks": "A client of another protocol version is admitted.",
+      "find": "[] v # 1 -> \"unsupported_version\"",
+      "replace": "[] FALSE -> \"unsupported_version\"",
+      "expect": "AdmitOnlyValid"
+    },
+    {
+      "id": "S3",
+      "breaks": "The capacity check is off by one.",
+      "find": "[] Cardinality(entries) >= MaxInFlight -> \"busy\"",
+      "replace": "[] Cardinality(entries) > MaxInFlight -> \"busy\"",
+      "expect": "Bounded"
+    },
+    {
+      "id": "S4",
+      "breaks": "Load is checked before the token, so a client without one learns the bridge is busy.",
+      "find": "[] t \\notin InUse -> \"unauthorized\"\n      [] v # 1 -> \"unsupported_version\"\n      [] Cardinality(entries) >= MaxInFlight -> \"busy\"",
+      "replace": "[] Cardinality(entries) >= MaxInFlight -> \"busy\"\n      [] t \\notin InUse -> \"unauthorized\"\n      [] v # 1 -> \"unsupported_version\"",
+      "expect": "RefusalsAreQuiet"
+    },
+    {
+      "id": "S5",
+      "breaks": "An admission does not advance the next id, so ids repeat.",
+      "find": "            /\\ next' = next + 1\n",
+      "replace": "            /\\ next' = next\n",
+      "expect": "FreshIds"
+    },
+    {
+      "id": "S6",
+      "breaks": "A late allow for a withdrawn prompt still runs the call.",
+      "find": "[] Holds(i, {\"abandoned_auth\"}) ->\n              /\\ entries' = Remove(i)\n              /\\ out' = {}",
+      "replace": "[] Holds(i, {\"abandoned_auth\"}) ->\n              /\\ entries' = Remove(i)\n              /\\ out' = {[kind |-> \"call\", id |-> i, owner |-> Entry(i).owner]}",
+      "expect": "CallOnlyFromAuthorizing"
+    },
+    {
+      "id": "S7",
+      "breaks": "A duplicated allow runs the call again.",
+      "find": "/\\ CASE Holds(i, {\"authorizing\"}) ->",
+      "replace": "/\\ CASE Holds(i, {\"authorizing\", \"calling\"}) ->",
+      "expect": "StaleIsQuiet"
+    },
+    {
+      "id": "S8",
+      "breaks": "Letting go of work leaves a running call running.",
+      "find": "[] e.stage = \"calling\" -> [e EXCEPT !.stage = \"abandoned_call\"]",
+      "replace": "[] FALSE -> [e EXCEPT !.stage = \"abandoned_call\"]",
+      "expect": "LiveWorkHasOwner"
+    },
+    {
+      "id": "S9",
+      "breaks": "A subagent's end leaves its prompts and calls running.",
+      "find": "/\\ AbandonAll({e \\in entries : e.owner = o})",
+      "replace": "/\\ AbandonAll({})",
+      "expect": "LiveWorkHasOwner"
+    },
+    {
+      "id": "S10",
+      "breaks": "Stopping the session keeps its tokens.",
+      "find": "/\\ registered' = {}\n            /\\ AbandonAll(entries)",
+      "replace": "/\\ UNCHANGED registered\n            /\\ AbandonAll(entries)",
+      "expect": "ClosedIsQuiet"
+    },
+    {
+      "id": "S11",
+      "breaks": "A result whose client left is dropped without a log.",
+      "find": "/\\ out' = IF o = \"failed\" THEN {} ELSE {Log(i, \"result_dropped\")}",
+      "replace": "/\\ out' = {}",
+      "expect": "DroppedStateIsLogged"
+    },
+    {
+      "id": "S12",
+      "breaks": "A reply reports success whatever the call's outcome.",
+      "find": "/\\ out' = {[kind |-> \"reply\", id |-> i, outcome |-> o]}",
+      "replace": "/\\ out' = {[kind |-> \"reply\", id |-> i, outcome |-> \"ok\"]}",
+      "expect": "ReplyMatchesOutcome"
+    },
+    {
+      "id": "S13",
+      "breaks": "A subagent's call runs with the session's access.",
+      "find": "/\\ out' = {[kind |-> \"call\", id |-> i, owner |-> Entry(i).owner]}",
+      "replace": "/\\ out' = {[kind |-> \"call\", id |-> i, owner |-> \"main\"]}",
+      "expect": "EffectsCarryEntryOwner"
+    },
+    {
+      "id": "S14",
+      "breaks": "A duplicated call end writes a second reply.",
+      "find": "/\\ CASE Holds(i, {\"calling\"}) ->",
+      "replace": "/\\ CASE Holds(i, {\"calling\", \"replying\"}) ->",
+      "expect": "OneReplyPerRequest"
+    },
+    {
+      "id": "S15",
+      "breaks": "A disconnect frees the slot while the prompt or call it started still runs.",
+      "find": "THEN /\\ entries' = {IF e.id = i THEN Abandon(e) ELSE e : e \\in entries}",
+      "replace": "THEN /\\ entries' = Remove(i)",
+      "expect": "StagesOnlyAdvance"
+    },
+    {
+      "id": "S16",
+      "breaks": "A new process continues the old one's ids.",
+      "find": "/\\ next' = 0",
+      "replace": "/\\ next' = next",
+      "expect": "CrashResets"
+    },
+    {
+      "id": "S17",
+      "breaks": "An admission takes an id past the next one.",
+      "find": "LET e == [id |-> next, owner",
+      "replace": "LET e == [id |-> next + 1, owner",
+      "expect": "IdsBelowNext"
+    },
+    {
+      "id": "S18",
+      "breaks": "A withdrawn prompt's answer never frees its slot.",
+      "find": "[] Holds(i, {\"abandoned_auth\"}) ->\n              /\\ entries' = Remove(i)",
+      "replace": "[] Holds(i, {\"abandoned_auth\"}) ->\n              /\\ entries' = entries",
+      "expect": "Drained"
+    }
+  ],
+  "code": [
+    {
+      "id": "C1",
+      "breaks": "While the bridge is open, any token is admitted, as the session.",
+      "find": "    const owner = ownerOf(state, token);\n",
+      "replace": "    const owner: ?OwnerId = if (state.open) OwnerId.main else ownerOf(state, token);\n",
+      "expect": "AdmitOnlyValid"
+    },
+    {
+      "id": "C2",
+      "breaks": "A client of another protocol version is admitted.",
+      "find": "if (version != protocol_version) return .unsupported_version;",
+      "replace": "if (version == 0) return .unsupported_version;",
+      "expect": "AdmitOnlyValid"
+    },
+    {
+      "id": "C3",
+      "breaks": "The capacity check is off by one.",
+      "find": "if (held(state) >= state.capacity) return .busy;",
+      "replace": "if (held(state) > state.capacity) return .busy;",
+      "expect": "Bounded"
+    },
+    {
+      "id": "C4",
+      "breaks": "Load is checked before the token, so a client without one learns the bridge is busy.",
+      "find": "    if (owner == null) return .unauthorized;\n    if (version != protocol_version) return .unsupported_version;\n    if (held(state) >= state.capacity) return .busy;\n",
+      "replace": "    if (held(state) >= state.capacity) return .busy;\n    if (owner == null) return .unauthorized;\n    if (version != protocol_version) return .unsupported_version;\n",
+      "expect": "RefusalsAreQuiet"
+    },
+    {
+      "id": "C5",
+      "breaks": "An admission does not advance the next id, so ids repeat.",
+      "find": "out.state.next = state.next + 1;",
+      "replace": "out.state.next = state.next;",
+      "expect": "FreshIds"
+    },
+    {
+      "id": "C6",
+      "breaks": "A late allow for a withdrawn prompt still runs the call.",
+      "find": "        .abandoned_auth => out.state.slots[index] = null,\n",
+      "replace": "        .abandoned_auth => {\n            out.state.slots[index] = null;\n            if (decision == .allow) out.push(.{ .call = .{ .id = id, .owner = entry.owner } });\n        },\n",
+      "expect": "CallOnlyFromAuthorizing"
+    },
+    {
+      "id": "C7",
+      "breaks": "A duplicated allow runs the call again.",
+      "find": "        .calling, .replying, .abandoned_call => return logged(state, id, .stale),\n",
+      "replace": "        .calling => out.push(.{ .call = .{ .id = id, .owner = entry.owner } }),\n        .replying, .abandoned_call => return logged(state, id, .stale),\n",
+      "expect": "StaleIsQuiet"
+    },
+    {
+      "id": "C8",
+      "breaks": "Stopping the session leaves prompts and calls running.",
+      "find": "    abandonWhere(&out, null);\n",
+      "replace": "",
+      "expect": "LiveWorkHasOwner"
+    },
+    {
+      "id": "C9",
+      "breaks": "Stopping the session keeps its tokens.",
+      "find": "    out.state.owners = @splat(null);\n",
+      "replace": "",
+      "expect": "ClosedIsQuiet"
+    },
+    {
+      "id": "C10",
+      "breaks": "A result whose client left is dropped without a log.",
+      "find": "            if (outcome != .failed) out.push(.{ .log = .{ .id = id, .drop = .result_dropped } });\n",
+      "replace": "",
+      "expect": "DroppedStateIsLogged"
+    },
+    {
+      "id": "C11",
+      "breaks": "A reply reports success whatever the call's outcome.",
+      "find": "            out.push(.{ .reply = .{ .id = id, .outcome = replyOutcome(outcome) } });\n",
+      "replace": "            out.push(.{ .reply = .{ .id = id, .outcome = .ok } });\n",
+      "expect": "ReplyMatchesOutcome"
+    },
+    {
+      "id": "C12",
+      "breaks": "A subagent's call runs with the session's access.",
+      "find": "                out.push(.{ .call = .{ .id = id, .owner = entry.owner } });\n",
+      "replace": "                out.push(.{ .call = .{ .id = id, .owner = .main } });\n",
+      "expect": "EffectsCarryEntryOwner"
+    },
+    {
+      "id": "C13",
+      "breaks": "A duplicated call end writes a second reply.",
+      "find": "        .authorizing, .replying, .abandoned_auth => return logged(state, id, .stale),\n",
+      "replace": "        .replying => out.push(.{ .reply = .{ .id = id, .outcome = replyOutcome(outcome) } }),\n        .authorizing, .abandoned_auth => return logged(state, id, .stale),\n",
+      "expect": "OneReplyPerRequest"
+    },
+    {
+      "id": "C14",
+      "breaks": "A disconnect frees the slot while the prompt or call it started still runs.",
+      "find": "    var out: Output = .{ .state = state };\n    letGo(&out, index);\n    return out;\n",
+      "replace": "    var out: Output = .{ .state = state };\n    letGo(&out, index);\n    out.state.slots[index] = null;\n    return out;\n",
+      "expect": "StagesOnlyAdvance"
+    },
+    {
+      "id": "C15",
+      "breaks": "A subagent's end leaves its prompts and calls running.",
+      "find": "    abandonWhere(&out, owner);\n",
+      "replace": "",
+      "expect": "LiveWorkHasOwner"
+    },
+    {
+      "id": "C16",
+      "breaks": "A reply that could not be written is dropped without a log.",
+      "find": "    if (delivery == .lost) out.push(.{ .log = .{ .id = id, .drop = .reply_lost } });\n",
+      "replace": "    _ = delivery;\n",
+      "expect": "DroppedStateIsLogged"
+    },
+    {
+      "id": "C17",
+      "breaks": "A new process does not start its ids at zero.",
+      "find": "    next: u64 = 0,\n",
+      "replace": "    next: u64 = 1,\n",
+      "expect": "CrashResets"
+    },
+    {
+      "id": "C18",
+      "breaks": "An admission takes an id past the next one.",
+      "find": "    const id: RequestId = @fromBackingInt(state.next);\n",
+      "replace": "    const id: RequestId = @fromBackingInt(state.next + 1);\n",
+      "expect": "IdsBelowNext"
+    }
+  ]
+}

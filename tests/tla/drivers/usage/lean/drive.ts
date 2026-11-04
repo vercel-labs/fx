@@ -7,7 +7,7 @@
 // that share one HOME, so one ~/.fx/usage-cache. Identity a and b are two
 // AI Gateway API keys; each process has its own fake gateway that holds every
 // /v1/report request until the behavior says the fetch completes or fails.
-// The usage clock seam (FX_E2E_USAGE_CLOCK_FILE) maps model time to real time:
+// The usage clock seam (FX_TEST_USAGE_CLOCK_FILE) maps model time to real time:
 // tick n is 23:40 UTC + 5n minutes, so the 60 s floor is one tick, the
 // 15-minute timer three, and UTC midnight falls between ticks 3 and 4.
 //
@@ -167,8 +167,8 @@ class Process {
         HOME: home,
         AI_GATEWAY_API_KEY: KEYS[this.ident],
         VERCEL_OIDC_TOKEN: undefined,
-        FX_E2E_GATEWAY_CHAT_URL: this.gateway.chatUrl,
-        FX_E2E_GATEWAY_MODELS_URL: `${this.gateway.baseUrl}/coding-agent/v1/models`,
+        FX_TEST_GATEWAY_CHAT_URL: this.gateway.chatUrl,
+        FX_TEST_GATEWAY_MODELS_URL: `${this.gateway.baseUrl}/coding-agent/v1/models`,
         FX_AUTO_UPGRADE: "0",
         FX_SOUND: "0",
         FX_DEBUG_RECORD: undefined,

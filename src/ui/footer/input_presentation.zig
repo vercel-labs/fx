@@ -27,7 +27,7 @@ pub const composeDividerRow = row_text.composeDividerRow;
 pub const appendClipped = row_text.appendClipped;
 pub const appendAbsoluteColumn = row_text.appendAbsoluteColumn;
 
-pub const PickerKind = enum { model_stage, provider_stage, models, effort, file, slash, skills, help, settings, sessions, fork, mcp, auth };
+pub const PickerKind = enum { model_stage, provider_stage, models, effort, file, slash, skills, help, settings, sessions, fork, agents, mcp, auth };
 pub const CappedInputRows = struct {
     row_limit: usize,
     total_lines: u16,
@@ -226,14 +226,24 @@ fn questionInteractionHint(
     }
 
     // Batch progress rides the hint row, right-aligned like the rest of the
-    // footer chrome; a lone question needs no counter.
-    if (projection.entry_count > 1) {
-        var counter_buf: [32]u8 = undefined;
-        const counter = std.mem.print(
-            &counter_buf,
-            "Question {d} of {d}",
-            .{ projection.current_index + 1, projection.entry_count },
-        ) catch "";
+    // footer chrome; a lone question needs no counter. A subagent's question
+    // on main's screen names the subagent there.
+    if (projection.entry_count > 1 or projection.asker.len > 0) {
+        var counter_buf: [96]u8 = undefined;
+        const counter = if (projection.asker.len > 0 and projection.entry_count > 1)
+            std.mem.print(&counter_buf, "{s} asks · Question {d} of {d}", .{
+                projection.asker,
+                projection.current_index + 1,
+                projection.entry_count,
+            }) catch ""
+        else if (projection.asker.len > 0)
+            std.mem.print(&counter_buf, "{s} asks", .{projection.asker}) catch ""
+        else
+            std.mem.print(
+                &counter_buf,
+                "Question {d} of {d}",
+                .{ projection.current_index + 1, projection.entry_count },
+            ) catch "";
         const base_width = display_width.visibleWidth(base);
         const counter_width = display_width.visibleWidth(counter);
         if (counter.len > 0 and base_width + counter_width + 2 <= width) {
@@ -532,6 +542,21 @@ pub fn composeHintRow(
         }
         if (esc_interrupt_hint.len == 0) hint_line = "esc esc to interrupt";
     }
+    // The agent indicator, such as "fx 2/3 ↓", follows whatever status
+    // shows on the right, as in "fx 3 finished · fx 1/3 ↓".
+    const status_text = if (ctx.waiting_note.len > 0)
+        ctx.waiting_note
+    else if (ctx.upgrade_status.len > 0)
+        ctx.upgrade_status
+    else
+        ctx.mcp_status;
+    var indicated_buf: [max_status_line_len + 192]u8 = undefined;
+    const indicated_text = if (ctx.agent_label.len == 0)
+        status_text
+    else if (status_text.len == 0)
+        ctx.agent_label
+    else
+        std.mem.print(&indicated_buf, "{s} · {s}", .{ status_text, ctx.agent_label }) catch ctx.agent_label;
     // The armed clear indicator outranks the question suppression: a
     // freeform draft mid-question uses the same double-Esc contract as the
     // composer and needs the same cue. The armed interrupt indicator outranks
@@ -544,10 +569,8 @@ pub fn composeHintRow(
         ""
     else if (danger_text.len > 0)
         danger_text
-    else if (ctx.upgrade_status.len > 0)
-        ctx.upgrade_status
     else
-        ctx.mcp_status;
+        indicated_text;
     const right_width = display_width.visibleWidth(right_text);
     const danger_visible = danger_text.len > 0 and right_text.ptr == danger_text.ptr;
     const left_width: u16 = if (!danger_visible and right_width > 0 and width_usize > right_width)

@@ -17,11 +17,11 @@ export const REPO_ROOT = resolve(import.meta.dirname, "../..");
 
 export function providerVersionTestEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
   const result = { ...env };
-  if (env.FX_E2E_OPENAI_CODEX_MODELS_URL && !env.FX_E2E_CODEX_VERSION_URL && !env.FX_E2E_CODEX_CLIENT_VERSION) {
-    result.FX_E2E_CODEX_CLIENT_VERSION = "0.153.0";
+  if (env.FX_TEST_OPENAI_CODEX_MODELS_URL && !env.FX_TEST_CODEX_VERSION_URL && !env.FX_TEST_CODEX_CLIENT_VERSION) {
+    result.FX_TEST_CODEX_CLIENT_VERSION = "0.153.0";
   }
-  if ((env.FX_E2E_XAI_GROK_MODELS_URL || env.FX_E2E_XAI_GROK_RESPONSES_URL) && !env.FX_E2E_GROK_VERSION_URL && !env.FX_E2E_GROK_CLIENT_VERSION) {
-    result.FX_E2E_GROK_CLIENT_VERSION = "1.0.6";
+  if ((env.FX_TEST_XAI_GROK_MODELS_URL || env.FX_TEST_XAI_GROK_RESPONSES_URL) && !env.FX_TEST_GROK_VERSION_URL && !env.FX_TEST_GROK_CLIENT_VERSION) {
+    result.FX_TEST_GROK_CLIENT_VERSION = "1.0.6";
   }
   return result;
 }

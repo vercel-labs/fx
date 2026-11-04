@@ -143,7 +143,7 @@ const fxEnv = {
       }
     : {}),
   FX_MODEL: FAKE_GATEWAY_MODEL,
-  FX_SKIP_ONBOARDING: "1",
+  FX_TEST_SKIP_ONBOARDING: "1",
   FX_SOUND: "0",
   NO_COLOR: "1",
 };

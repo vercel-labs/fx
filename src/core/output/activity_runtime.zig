@@ -34,8 +34,8 @@ pub const ToolPresentationRecord = struct {
 pub const ActivityProjection = union(enum) {
     pub const Tone = enum {
         thinking,
-        /// The thinking row's bullet and color without its blink, for a
-        /// status that is not the thinking row itself.
+        /// The thinking row's bullet, color, and blink with a still label,
+        /// for a status that is not the thinking row itself.
         live,
         neutral,
         warning,

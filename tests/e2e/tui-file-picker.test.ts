@@ -970,7 +970,10 @@ describe("@ file picker", () => {
           ),
         );
       }
-      expect(steadyRssGrowthKb).toBeLessThan(4 * 1024);
+      // A leak climbs every cycle, so check the trend across all of them. The
+      // last sample minus the first swings by about 2 MB on Linux, where one
+      // cycle's RSS moves that much without growing.
+      expect(steadyRssSlopeKbPerCycle * (cycleRssSamples.length - 1)).toBeLessThan(4 * 1024);
       expect(rssPeakKb - rssStartedKb).toBeLessThan(32 * 1024);
       if (PART4_STRESS) {
         expect(latency.count).toBeGreaterThanOrEqual(100);
@@ -2298,7 +2301,7 @@ describe("@ file picker", () => {
         writeFileSync(current.stderrPath, "");
         const activeGateway = gateway!;
         session = await TmuxSession.create({
-          cmd: `${FX_BIN} --resume-last`,
+          cmd: `${FX_BIN} --resume last`,
           cwd: current.workspace,
           env: mockFxEnvironment(current, activeGateway, {
             FX_RECORD: join(current.root, `resume-${cycle}.fxtape`),

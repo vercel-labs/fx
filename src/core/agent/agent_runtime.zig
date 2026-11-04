@@ -26,8 +26,6 @@ pub const ToolCallValidationResult = runtime_tool_contracts.ToolCallValidationRe
 pub const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 pub const TurnProgress = runtime_deps.TurnProgress;
 pub const TextEmission = runtime_deps.TextEmission;
-pub const ParentTurnDeliveryAck = runtime_deps.ParentTurnDeliveryAck;
-pub const PreparedParentTurnContext = runtime_deps.PreparedParentTurnContext;
 pub const OutOfCreditsChoice = runtime_deps.OutOfCreditsChoice;
 pub const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 pub const SemanticPresentationSink = runtime_assistant_stream.SemanticPresentationSink;
@@ -56,6 +54,8 @@ test {
     _ = @import("runtime/tests/interruption_flow.zig");
     _ = @import("runtime/tests/finalization_flow.zig");
     _ = @import("runtime/agent.zig");
+    _ = @import("runtime/cache_warming.zig");
+    _ = @import("runtime/cache_warmer.zig");
     _ = @import("runtime/orchestrator.zig");
     _ = @import("runtime/resend_strategy.zig");
     _ = @import("runtime/request_recovery.zig");

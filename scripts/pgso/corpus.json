@@ -19,8 +19,7 @@
     "cwd": "tests/e2e",
     "env_set": {
       "FX_AUTO_UPGRADE": "0",
-      "FX_SOUND": "0",
-      "NO_COLOR": "1"
+      "FX_SOUND": "0"
     },
     "env_unset": [
       "AI_GATEWAY_API_KEY",
@@ -34,7 +33,7 @@
       "name": "direct-help",
       "argv": ["{binary}", "help"],
       "cwd": ".",
-      "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "env_set": {"FX_TEST_SKIP_ONBOARDING": "1"},
       "profile_runs": 100,
       "timeout_seconds": 60,
       "requires_tmux": false
@@ -43,7 +42,7 @@
       "name": "direct-version",
       "argv": ["{binary}", "--version"],
       "cwd": ".",
-      "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "env_set": {"FX_TEST_SKIP_ONBOARDING": "1"},
       "timeout_seconds": 60,
       "requires_tmux": false
     },
@@ -51,7 +50,7 @@
       "name": "direct-status",
       "argv": ["{binary}", "status", "--json"],
       "cwd": ".",
-      "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "env_set": {"FX_TEST_SKIP_ONBOARDING": "1"},
       "profile_runs": 100,
       "timeout_seconds": 60,
       "requires_tmux": false
@@ -60,7 +59,7 @@
       "name": "direct-doctor",
       "argv": ["{binary}", "doctor", "--json"],
       "cwd": ".",
-      "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "env_set": {"FX_TEST_SKIP_ONBOARDING": "1"},
       "timeout_seconds": 60,
       "requires_tmux": false
     },
@@ -68,7 +67,7 @@
       "name": "direct-sessions",
       "argv": ["{binary}", "sessions", "--json"],
       "cwd": ".",
-      "env_set": {"FX_SKIP_ONBOARDING": "1"},
+      "env_set": {"FX_TEST_SKIP_ONBOARDING": "1"},
       "profile_runs": 100,
       "timeout_seconds": 60,
       "requires_tmux": false
@@ -114,6 +113,7 @@
     {"name": "verify-mcp-verbs", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-verbs.test.ts"], "test_file": "mcp-verbs.test.ts"},
     {"name": "verify-tui-auth-source-selection", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-auth-source-selection.test.ts"], "test_file": "tui-auth-source-selection.test.ts"},
     {"name": "verify-tui-compaction-activity", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-compaction-activity.test.ts"], "test_file": "tui-compaction-activity.test.ts"},
+    {"name": "verify-tui-transcript-window", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-transcript-window.test.ts"], "test_file": "tui-transcript-window.test.ts"},
     {"name": "verify-compaction-policy", "argv": ["bun", "test", "--max-concurrency", "1", "./compaction-policy.test.ts"], "test_file": "compaction-policy.test.ts", "requires_tmux": false},
     {"name": "verify-tui-composer-edit-contracts", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-composer-edit-contracts.test.ts"], "test_file": "tui-composer-edit-contracts.test.ts"},
     {"name": "verify-tui-permissions-panel", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-permissions-panel.test.ts"], "test_file": "tui-permissions-panel.test.ts"},
@@ -122,8 +122,10 @@
     {"name": "verify-tui-decision-prompts", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-decision-prompts.test.ts"], "test_file": "tui-decision-prompts.test.ts"},
     {"name": "verify-poisoned-repository", "argv": ["bun", "test", "--max-concurrency", "1", "./poisoned-repository.test.ts"], "test_file": "poisoned-repository.test.ts"},
     {"name": "verify-tui-file-picker", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-file-picker.test.ts"], "test_file": "tui-file-picker.test.ts"},
+    {"name": "verify-tui-host-instances", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-host-instances.test.ts"], "test_file": "tui-host-instances.test.ts"},
     {"name": "verify-tui-input-line-delete", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-input-line-delete.test.ts"], "test_file": "tui-input-line-delete.test.ts"},
     {"name": "verify-tui-input-navigation", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-input-navigation.test.ts"], "test_file": "tui-input-navigation.test.ts"},
+    {"name": "verify-tui-host-switch", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-host-switch.test.ts"], "test_file": "tui-host-switch.test.ts"},
     {"name": "verify-tui-render-replay", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-render-replay.test.ts"], "test_file": "tui-render-replay.test.ts"},
     {"name": "verify-tui-resume", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-resume.test.ts"], "test_file": "tui-resume.test.ts"},
     {"name": "verify-tui-slash-commands", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-slash-commands.test.ts"], "test_file": "tui-slash-commands.test.ts"},

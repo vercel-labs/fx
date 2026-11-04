@@ -134,6 +134,7 @@ async function loadGraph(out: string): Promise<Graph> {
 function opsFor(label: string, s: Model): Op[] {
   switch (label) {
     case "Responding": return [{ op: "event", name: "responding" }];
+    case "HandOff": return [{ op: "handoff" }];
     case "Respond":
       if (s.net === "down") return [{ op: "failed", kind: "offline" }];
       if (s.needUser) return [{ op: "failed", kind: "sign_in" }];
@@ -328,6 +329,11 @@ if (options.selfCheck) {
       name: "resends at once after a failure",
       target: ".offline, .dropped, .server, .rate_limited => waitAfter(state, failure, now_ms),",
       planted: ".offline, .dropped, .server, .rate_limited => sendNow(state, now_ms, .{}),",
+    },
+    {
+      name: "never hands a resend's status back to the thinking row",
+      target: ".sending => if (state.shown != 0 and !state.flowing and now_ms -| state.sent_ms >= handoff_ms)",
+      planted: ".sending => if (state.shown != 0 and !state.flowing and now_ms -| state.sent_ms >= handoff_ms and false)",
     },
     {
       name: "forgets its crashes when the user signs in",

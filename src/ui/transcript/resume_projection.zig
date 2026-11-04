@@ -18,7 +18,6 @@ pub const ResumeProjection = struct {
     runtime: TranscriptRuntime,
     alloc: Allocator,
     created_at_ms: i64,
-    retention_cap: usize,
     publication_source: ?transcript_runtime.TranscriptPreparationSource = null,
     pending_diffs: std.ArrayList(diff.DiffEntry) = .empty,
     next_diff_id: u32,
@@ -31,14 +30,10 @@ pub const ResumeProjection = struct {
         created_at_ms: i64,
         next_diff_id: u32,
     ) !ResumeProjection {
-        var detached = try transcript_store.cloneDetachedPresentationState(source, alloc);
-        const retention_cap = detached.max_retained_transcript_bytes;
-        detached.max_retained_transcript_bytes = std.math.maxInt(usize);
         return .{
-            .runtime = detached,
+            .runtime = try transcript_store.cloneDetachedPresentationState(source, alloc),
             .alloc = alloc,
             .created_at_ms = created_at_ms,
-            .retention_cap = retention_cap,
             .next_diff_id = next_diff_id,
         };
     }
@@ -53,7 +48,7 @@ pub const ResumeProjection = struct {
     ) !ResumeProjection {
         var projection = try init(alloc, source, created_at_ms, next_diff_id);
         projection.runtime.clearTranscript(alloc);
-        projection.runtime.next_entry_id = 1;
+        projection.runtime.notebook.next_entry_id = 1;
         return projection;
     }
 
@@ -67,10 +62,10 @@ pub const ResumeProjection = struct {
 
     fn appendEntry(self: *ResumeProjection, entry: transcript_runtime.TranscriptEntry) !u32 {
         const entry_id = entry.id();
-        try self.runtime.entries.append(self.alloc, entry);
-        self.runtime.next_entry_id +%= 1;
-        self.runtime.replaceable_last_line = false;
-        self.runtime.replaceable_start = 0;
+        try self.runtime.notebook.entries.append(self.alloc, entry);
+        self.runtime.notebook.next_entry_id +%= 1;
+        self.runtime.notebook.replaceable_last_line = false;
+        self.runtime.notebook.replaceable_start = 0;
         return entry_id;
     }
 
@@ -82,7 +77,7 @@ pub const ResumeProjection = struct {
         const owned = try types.dupeSemanticNotice(self.alloc, notice);
         errdefer types.freeSemanticNotice(self.alloc, owned);
         return self.appendEntry(.{ .semantic_notice = .{
-            .id = self.runtime.next_entry_id,
+            .id = self.runtime.notebook.next_entry_id,
             .created_at_ms = self.created_at_ms,
             .topic = owned.topic,
             .tone = owned.tone,
@@ -97,7 +92,7 @@ pub const ResumeProjection = struct {
             types.freeUserTurn(self.alloc, owned);
         }
         return self.appendEntry(.{ .user_turn = .{
-            .id = self.runtime.next_entry_id,
+            .id = self.runtime.notebook.next_entry_id,
             .created_at_ms = self.created_at_ms,
             .turn = owned,
         } });
@@ -121,7 +116,7 @@ pub const ResumeProjection = struct {
     ) !u32 {
         errdefer self.alloc.free(owned);
         return self.appendEntry(.{ .raw_bytes = .{
-            .id = self.runtime.next_entry_id,
+            .id = self.runtime.notebook.next_entry_id,
             .created_at_ms = self.created_at_ms,
             .bytes = owned,
             .class = class,
@@ -130,7 +125,7 @@ pub const ResumeProjection = struct {
 
     pub fn appendReplaceableLine(self: *ResumeProjection, text: []const u8) !u32 {
         const entry_id = try self.appendRawClassified(text, .unknown_raw);
-        if (entry_id != 0) self.runtime.replaceable_last_line = true;
+        if (entry_id != 0) self.runtime.notebook.replaceable_last_line = true;
         return entry_id;
     }
 
@@ -157,7 +152,7 @@ pub const ResumeProjection = struct {
         errdefer segments.deinit(self.alloc);
         try segments.text.appendSlice(self.alloc, text);
         _ = try self.appendEntry(.{ .assistant_turn = .{
-            .id = self.runtime.next_entry_id,
+            .id = self.runtime.notebook.next_entry_id,
             .created_at_ms = self.created_at_ms,
             .segments = segments,
         } });
@@ -168,7 +163,7 @@ pub const ResumeProjection = struct {
         table: assistant_presentation.TablePayload,
     ) !void {
         _ = try self.appendEntry(.{ .assistant_table = .{
-            .id = self.runtime.next_entry_id,
+            .id = self.runtime.notebook.next_entry_id,
             .created_at_ms = self.created_at_ms,
             .table = table,
         } });
@@ -179,7 +174,7 @@ pub const ResumeProjection = struct {
         block: assistant_presentation.CodeBlockPayload,
     ) !void {
         _ = try self.appendEntry(.{ .assistant_code_block = .{
-            .id = self.runtime.next_entry_id,
+            .id = self.runtime.notebook.next_entry_id,
             .created_at_ms = self.created_at_ms,
             .block = block,
         } });
@@ -187,7 +182,7 @@ pub const ResumeProjection = struct {
 
     pub fn appendAssistantThematicRule(self: *ResumeProjection) !void {
         _ = try self.appendEntry(.{ .assistant_thematic_rule = .{
-            .id = self.runtime.next_entry_id,
+            .id = self.runtime.notebook.next_entry_id,
             .created_at_ms = self.created_at_ms,
         } });
     }
@@ -371,7 +366,7 @@ pub const ResumeProjection = struct {
         std.debug.assert(!self.consumed);
         std.debug.assert(
             allow_open_command_block or
-                self.runtime.command_output_display.open_command_block == null,
+                self.runtime.notebook.command_output_display.open_command_block == null,
         );
 
         _ = try command_output_runtime.syncCommandOutputBlockEntries(
@@ -392,26 +387,22 @@ pub const ResumeProjection = struct {
             full_flow,
         );
 
-        self.runtime.max_retained_transcript_bytes = self.retention_cap;
-        const retention_changed = try self.runtime.enforceStructuredRetentionAndReport(
-            self.alloc,
-            null,
-        );
+        const retention_changed = try self.runtime.pruneOrphanedCommandStateAndReport(self.alloc);
         if (!retention_changed) {
-            self.runtime.transcript.clearRetainingCapacity();
-            self.runtime.replaceable_last_line = false;
-            self.runtime.replaceable_start = 0;
+            self.runtime.notebook.transcript.clearRetainingCapacity();
+            self.runtime.notebook.replaceable_last_line = false;
+            self.runtime.notebook.replaceable_start = 0;
             _ = try transcript_store.appendCappedWithinCapacity(
-                &self.runtime.transcript,
+                &self.runtime.notebook.transcript,
                 self.alloc,
                 self.publication_source.?.bytes,
-                self.runtime.max_transcript_bytes,
-                &self.runtime.replaceable_last_line,
-                &self.runtime.replaceable_start,
+                self.runtime.notebook.max_transcript_bytes,
+                &self.runtime.notebook.replaceable_last_line,
+                &self.runtime.notebook.replaceable_start,
             );
-            self.runtime.last_rendered_cols = self.runtime.layout.cols;
-            self.runtime.transcript_cache_origin_untrimmed =
-                self.runtime.transcript.items.len == self.publication_source.?.bytes.len;
+            self.runtime.notebook.last_rendered_cols = self.runtime.layout.cols;
+            self.runtime.notebook.transcript_cache_origin_untrimmed =
+                self.runtime.notebook.transcript.items.len == self.publication_source.?.bytes.len;
         }
         self.runtime.recomputeCursorFromTranscript();
         self.finalized = true;
@@ -420,31 +411,31 @@ pub const ResumeProjection = struct {
     pub fn install(self: *ResumeProjection, target: *TranscriptRuntime) void {
         std.debug.assert(self.finalized);
         std.debug.assert(!self.consumed);
-        std.debug.assert(target.pending_resume_source == null);
+        std.debug.assert(target.notebook.pending_resume_source == null);
 
-        std.mem.swap(@TypeOf(target.entries), &target.entries, &self.runtime.entries);
-        std.mem.swap(@TypeOf(target.tool_details), &target.tool_details, &self.runtime.tool_details);
+        std.mem.swap(@TypeOf(target.notebook.entries), &target.notebook.entries, &self.runtime.notebook.entries);
+        std.mem.swap(@TypeOf(target.notebook.tool_details), &target.notebook.tool_details, &self.runtime.notebook.tool_details);
         std.mem.swap(
-            @TypeOf(target.folded_command_blocks),
-            &target.folded_command_blocks,
-            &self.runtime.folded_command_blocks,
+            @TypeOf(target.notebook.folded_command_blocks),
+            &target.notebook.folded_command_blocks,
+            &self.runtime.notebook.folded_command_blocks,
         );
         std.mem.swap(
-            @TypeOf(target.command_output_blocks),
-            &target.command_output_blocks,
-            &self.runtime.command_output_blocks,
+            @TypeOf(target.notebook.command_output_blocks),
+            &target.notebook.command_output_blocks,
+            &self.runtime.notebook.command_output_blocks,
         );
-        std.mem.swap(@TypeOf(target.transcript), &target.transcript, &self.runtime.transcript);
-        target.next_entry_id = self.runtime.next_entry_id;
-        target.last_rendered_cols = self.runtime.last_rendered_cols;
-        target.transcript_cache_origin_untrimmed =
-            self.runtime.transcript_cache_origin_untrimmed;
-        target.command_output_display = self.runtime.command_output_display;
+        std.mem.swap(@TypeOf(target.notebook.transcript), &target.notebook.transcript, &self.runtime.notebook.transcript);
+        target.notebook.next_entry_id = self.runtime.notebook.next_entry_id;
+        target.notebook.last_rendered_cols = self.runtime.notebook.last_rendered_cols;
+        target.notebook.transcript_cache_origin_untrimmed =
+            self.runtime.notebook.transcript_cache_origin_untrimmed;
+        target.notebook.command_output_display = self.runtime.notebook.command_output_display;
         target.command_output_render = self.runtime.command_output_render;
-        target.replaceable_last_line = self.runtime.replaceable_last_line;
+        target.notebook.replaceable_last_line = self.runtime.notebook.replaceable_last_line;
         target.replaceable_row = self.runtime.replaceable_row;
-        target.replaceable_start = self.runtime.replaceable_start;
-        target.pending_resume_source = self.publication_source;
+        target.notebook.replaceable_start = self.runtime.notebook.replaceable_start;
+        target.notebook.pending_resume_source = self.publication_source;
         self.publication_source = null;
         target.recomputeCursorFromTranscript();
         target.reconcileDetachedInstallSource(target.pendingResumeFlow());
@@ -454,15 +445,28 @@ pub const ResumeProjection = struct {
         self.runtime.deinit(self.alloc);
     }
 
+    /// Transfers a replayed older cycle into a standalone runtime for Ctrl+O,
+    /// which pages over its entries: no main-screen source is prepared, so a
+    /// large cycle costs its replay only. The caller owns the returned runtime
+    /// and must deinitialize it with the same allocator.
+    pub fn intoArchivedRuntime(self: *ResumeProjection) !TranscriptRuntime {
+        std.debug.assert(!self.finalized);
+        std.debug.assert(!self.consumed);
+        _ = try command_output_runtime.syncCommandOutputBlockEntries(&self.runtime, self.alloc);
+        self.finalized = true;
+        self.consumed = true;
+        return self.runtime;
+    }
+
     /// Transfers a finalized detached projection into a standalone transcript
     /// runtime. The caller owns the returned runtime and must deinitialize it
     /// with the same allocator.
     pub fn intoRuntime(self: *ResumeProjection) TranscriptRuntime {
         std.debug.assert(self.finalized);
         std.debug.assert(!self.consumed);
-        std.debug.assert(self.runtime.pending_resume_source == null);
+        std.debug.assert(self.runtime.notebook.pending_resume_source == null);
 
-        self.runtime.pending_resume_source = self.publication_source;
+        self.runtime.notebook.pending_resume_source = self.publication_source;
         self.publication_source = null;
         self.runtime.reconcileDetachedInstallSource(
             self.runtime.pendingResumeFlow(),
@@ -487,7 +491,7 @@ pub const ResumeProjection = struct {
     }
 };
 
-test "resume projection finalizes complete flow before one retained-tail pass" {
+test "resume projection finalizes the complete flow and keeps every entry" {
     const alloc = std.testing.allocator;
     var source: TranscriptRuntime = .{};
     source.layout = .{
@@ -499,7 +503,6 @@ test "resume projection finalizes complete flow before one retained-tail pass" {
         .divider_bottom_row = 39,
         .hint_row = 40,
     };
-    source.max_retained_transcript_bytes = 96;
     defer source.deinit(alloc);
 
     var projection = try ResumeProjection.init(alloc, &source, 42, 1);
@@ -518,7 +521,39 @@ test "resume projection finalizes complete flow before one retained-tail pass" {
 
     try std.testing.expect(std.mem.find(u8, projection.publication_source.?.bytes, "historical marker 0") != null);
     try std.testing.expect(std.mem.find(u8, projection.publication_source.?.bytes, "historical marker 11") != null);
-    try std.testing.expect(projection.runtime.entries.items.len < 13);
+    // The resumed cycle is held whole: the notice and the twelve lines.
+    try std.testing.expectEqual(@as(usize, 13), projection.runtime.notebook.entries.items.len);
+}
+
+test "resume projection hands Ctrl+O an older cycle whole, without a screen source" {
+    const alloc = std.testing.allocator;
+    var source: TranscriptRuntime = .{};
+    source.layout = .{
+        .rows = 40,
+        .cols = 80,
+        .content_bottom = 36,
+        .divider_top_row = 37,
+        .input_row = 38,
+        .divider_bottom_row = 39,
+        .hint_row = 40,
+    };
+    defer source.deinit(alloc);
+
+    var projection = try ResumeProjection.initEmpty(alloc, &source, 42, 1);
+    defer projection.deinit();
+    for (0..12) |index| {
+        var text: [64]u8 = undefined;
+        const line = try std.mem.print(&text, "historical marker {d}\n", .{index});
+        _ = try projection.appendRawClassified(line, .unknown_raw);
+    }
+    var archived = try projection.intoArchivedRuntime();
+    defer archived.deinit(alloc);
+    // Every entry of the cycle, and nothing rendered for a screen that never
+    // shows it.
+    try std.testing.expectEqual(@as(usize, 12), archived.notebook.entries.items.len);
+    try std.testing.expect(projection.publication_source == null);
+    try std.testing.expectEqual(@as(usize, 0), archived.notebook.transcript.items.len);
+    try std.testing.expect(archived.notebook.pending_resume_source == null);
 }
 
 test "empty resume projection keeps layout without source conversation" {
@@ -539,14 +574,14 @@ test "empty resume projection keeps layout without source conversation" {
     var projection = try ResumeProjection.initEmpty(alloc, &source, 42, 1);
     defer projection.deinit();
     try std.testing.expectEqual(source.layout.cols, projection.runtime.layout.cols);
-    try std.testing.expectEqual(@as(usize, 0), projection.runtime.entries.items.len);
-    try std.testing.expectEqual(@as(usize, 0), projection.runtime.transcript.items.len);
+    try std.testing.expectEqual(@as(usize, 0), projection.runtime.notebook.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), projection.runtime.notebook.transcript.items.len);
 
     _ = try projection.appendRawClassified("child-only marker\n", .unknown_raw);
     try projection.finalize();
     try std.testing.expect(std.mem.find(u8, projection.publication_source.?.bytes, "main-only marker") == null);
     try std.testing.expect(std.mem.find(u8, projection.publication_source.?.bytes, "child-only marker") != null);
-    try std.testing.expectEqual(@as(usize, 1), source.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), source.notebook.entries.items.len);
 }
 
 test "resume projection installs complete publication and retained continuation together" {
@@ -561,12 +596,10 @@ test "resume projection installs complete publication and retained continuation 
         .divider_bottom_row = 39,
         .hint_row = 40,
     };
-    source.max_retained_transcript_bytes = 96;
     defer source.deinit(alloc);
 
     var target: TranscriptRuntime = .{};
     target.layout = source.layout;
-    target.max_retained_transcript_bytes = source.max_retained_transcript_bytes;
     defer target.deinit(alloc);
 
     var projection = try ResumeProjection.init(alloc, &source, 42, 1);
@@ -581,7 +614,7 @@ test "resume projection installs complete publication and retained continuation 
 
     try std.testing.expect(std.mem.find(u8, target.pendingResumeFlow(), "publication marker 0") != null);
     try std.testing.expect(std.mem.find(u8, target.pendingResumeFlow(), "publication marker 11") != null);
-    try std.testing.expect(target.entries.items.len < 12);
+    try std.testing.expectEqual(@as(usize, 12), target.notebook.entries.items.len);
     var prepared = try target.prepareTranscriptSource(alloc, null);
     defer prepared.deinit(alloc);
     try std.testing.expectEqualStrings(target.pendingResumeFlow(), prepared.bytes);
@@ -683,7 +716,7 @@ test "resume projection uses its explicit timestamp for command output" {
     try projection.finishCommandOutput(null);
 
     var command_entries: usize = 0;
-    for (projection.runtime.entries.items) |entry| {
+    for (projection.runtime.notebook.entries.items) |entry| {
         if (entry != .raw_bytes or entry.raw_bytes.class != .command_output) continue;
         try std.testing.expectEqual(@as(i64, 42), entry.raw_bytes.created_at_ms);
         command_entries += 1;
@@ -711,12 +744,12 @@ test "resume projection preserves turn timestamps and usage rows" {
     };
     try projection.appendTurnSummary(summary);
 
-    try std.testing.expectEqual(@as(i64, 100), projection.runtime.entries.items[0].createdAtMs());
-    try std.testing.expectEqual(@as(i64, 250), projection.runtime.entries.items[1].createdAtMs());
-    try std.testing.expectEqual(@as(i64, 250), projection.runtime.entries.items[2].createdAtMs());
+    try std.testing.expectEqual(@as(i64, 100), projection.runtime.notebook.entries.items[0].createdAtMs());
+    try std.testing.expectEqual(@as(i64, 250), projection.runtime.notebook.entries.items[1].createdAtMs());
+    try std.testing.expectEqual(@as(i64, 250), projection.runtime.notebook.entries.items[2].createdAtMs());
     try std.testing.expectEqual(
         transcript_runtime.RawEntryClass.turn_summary,
-        projection.runtime.entries.items[2].raw_bytes.class,
+        projection.runtime.notebook.entries.items[2].raw_bytes.class,
     );
 }
 
@@ -739,14 +772,14 @@ test "live resume projection preserves an incomplete command block" {
     );
     try projection.finalizeLivePresentation();
     try std.testing.expect(
-        projection.runtime.command_output_display.open_command_block != null,
+        projection.runtime.notebook.command_output_display.open_command_block != null,
     );
     try std.testing.expect(
         std.mem.find(u8, projection.publication_source.?.bytes, "partial output") == null,
     );
     try std.testing.expectEqualStrings(
         "partial output",
-        projection.runtime.command_output_blocks.items[0].lines.items[0].text,
+        projection.runtime.notebook.command_output_blocks.items[0].lines.items[0].text,
     );
 
     var runtime = projection.intoRuntime();
@@ -771,7 +804,7 @@ test "live resume projection preserves an incomplete command block" {
         44,
     );
     try std.testing.expect(
-        runtime.command_output_display.open_command_block == null,
+        runtime.notebook.command_output_display.open_command_block == null,
     );
 }
 

@@ -174,6 +174,8 @@ pub const State = struct {
     // The rest is never saved.
     fast: bool = false,
     flowing: bool = false,
+    /// When the latest resend went out.
+    sent_ms: u64 = 0,
     retry_label: RetryLabel = .after_failure,
     /// Key of the status line fx is showing; 0 means clear.
     shown: u32 = 0,
@@ -202,6 +204,14 @@ const offline_ms = [_]u32{ 1_000, 2_000, 5_000 };
 /// Waits keep 80 to 100 percent of their table value, so retries from many
 /// processes spread out without ever passing the 30-second cap.
 const jitter_floor_percent: u32 = 80;
+/// How long a resend shows its retry status before fx's thinking row takes
+/// the line back. A model can think for a minute before its first byte, and
+/// the gateway sends no headers until then, so holding the status until the
+/// first byte would keep "Connection lost" on screen over a healthy
+/// connection. Two seconds still lets a quick refusal go straight to its
+/// countdown without a flash of the thinking row
+/// (`tests/tla/recovery/RecoveryTimed.tla` HandsOff).
+const handoff_ms: u64 = 2_000;
 /// Consecutive same-kind failures before trying another way. Public so a
 /// host that asks a copy of `State` how it would send next can look this far
 /// ahead.
@@ -286,16 +296,17 @@ fn onFailed(state: *State, failure: Failure, now_ms: u64) Plan {
     };
 }
 
-/// While recovering, the status changes every second: the countdown while
-/// waiting, the elapsed time while a retry is on the wire.
+/// While waiting, the countdown changes every second. A resend keeps its
+/// retry status for `handoff_ms`, then clears it so fx shows its thinking
+/// row until the answer arrives.
 fn onTick(state: *State, now_ms: u64) Plan {
     return switch (state.phase) {
         .waiting => if (now_ms >= state.wait_until_ms)
             sendNow(state, now_ms, .{})
         else
             refresh(state, waitingStatus(state, now_ms)),
-        .sending => if (state.shown != 0 and !state.flowing)
-            refresh(state, retryingStatus(state, now_ms))
+        .sending => if (state.shown != 0 and !state.flowing and now_ms -| state.sent_ms >= handoff_ms)
+            .{ .status = show(state, .{ .kind = .clear }) }
         else
             .{},
         .idle, .need_user => .{},
@@ -339,6 +350,7 @@ fn onClosing(state: *State, now_ms: u64) Plan {
 fn sendNow(state: *State, now_ms: u64, extra: Send) Plan {
     state.phase = .sending;
     state.flowing = false;
+    state.sent_ms = now_ms;
     state.attempt +|= 1;
     const send: Send = .{
         .compact_first = extra.compact_first,
@@ -347,7 +359,7 @@ fn sendNow(state: *State, now_ms: u64, extra: Send) Plan {
     return .{
         .save = encode(state, now_ms),
         .send = send,
-        .status = show(state, retryingStatus(state, now_ms)),
+        .status = show(state, retryingStatus(state)),
     };
 }
 
@@ -468,27 +480,23 @@ fn reasonText(state: *const State) []const u8 {
 fn waitingStatus(state: *const State, now_ms: u64) Status {
     const remaining_ms = state.wait_until_ms -| now_ms;
     const next = Clock.of(@max(1, (remaining_ms +| 999) / 1000));
-    const elapsed = Clock.of(elapsedMs(state, now_ms) / 1000);
     const text = if (state.cause == .offline)
-        textOf("Offline · next try in {s} · {s}", .{ next.slice(), elapsed.slice() })
+        textOf("Offline · next try in {s}", .{next.slice()})
     else
-        textOf("{s} · next try in {s} · attempt {d} · {s}", .{
-            reasonText(state), next.slice(), state.attempt, elapsed.slice(),
-        });
+        textOf("{s} · next try in {s} · attempt {d}", .{ reasonText(state), next.slice(), state.attempt });
     return .{ .kind = .waiting, .text = text };
 }
 
-fn retryingStatus(state: *const State, now_ms: u64) Status {
-    const elapsed = Clock.of(elapsedMs(state, now_ms) / 1000);
+fn retryingStatus(state: *const State) Status {
     const text = switch (state.retry_label) {
-        .compacting => textOf("Conversation too long · compacting, then retrying · {s}", .{elapsed.slice()}),
-        .resuming => textOf("Resuming the interrupted request · attempt {d} · {s}", .{ state.attempt, elapsed.slice() }),
-        .after_sign_in => textOf("Signed in · retrying · attempt {d} · {s}", .{ state.attempt, elapsed.slice() }),
-        .after_user => textOf("Retrying · attempt {d} · {s}", .{ state.attempt, elapsed.slice() }),
+        .compacting => constText("Conversation too long · compacting, then retrying"),
+        .resuming => textOf("Resuming the interrupted request · attempt {d}", .{state.attempt}),
+        .after_sign_in => textOf("Signed in · retrying · attempt {d}", .{state.attempt}),
+        .after_user => textOf("Retrying · attempt {d}", .{state.attempt}),
         .after_failure => if (state.cause == .server and state.flags.no_fast)
-            textOf("Gateway error · retrying without Fast · attempt {d} · {s}", .{ state.attempt, elapsed.slice() })
+            textOf("Gateway error · retrying without Fast · attempt {d}", .{state.attempt})
         else
-            textOf("{s} · retrying · attempt {d} · {s}", .{ reasonText(state), state.attempt, elapsed.slice() }),
+            textOf("{s} · retrying · attempt {d}", .{ reasonText(state), state.attempt }),
     };
     return .{ .kind = .retrying, .text = text };
 }
@@ -712,12 +720,12 @@ test "a dropped connection waits, retries, and clears at the first byte" {
     try testing.expect(failed.save != null);
     try testing.expect(failed.send == null);
     try testing.expectEqual(Status.Kind.waiting, failed.status.?.kind);
-    try testing.expectEqualStrings("Connection lost · next try in 1s · attempt 1 · 9s", failed.status.?.text.slice());
+    try testing.expectEqualStrings("Connection lost · next try in 1s · attempt 1", failed.status.?.text.slice());
 
     const retry = tickUntilSend(&state, 19_000);
     try testing.expect(retry.plan.save != null);
     try testing.expectEqual(Send{}, retry.plan.send.?);
-    try testing.expectEqualStrings("Connection lost · retrying · attempt 2 · 10s", retry.plan.status.?.text.slice());
+    try testing.expectEqualStrings("Connection lost · retrying · attempt 2", retry.plan.status.?.text.slice());
 
     const flowing = step(&state, .responding, retry.at_ms + 300);
     try testing.expectEqual(Status.Kind.clear, flowing.status.?.kind);
@@ -733,21 +741,53 @@ test "the countdown updates once a second while waiting" {
     var state: State = .{};
     _ = startNew(&state, 0, false);
     const failed = step(&state, .{ .failed = .{ .kind = .rate_limited, .retry_after_ms = 5_000 } }, 1_000);
-    try testing.expectEqualStrings("Rate limited · next try in 5s · attempt 1 · 1s", failed.status.?.text.slice());
+    try testing.expectEqualStrings("Rate limited · next try in 5s · attempt 1", failed.status.?.text.slice());
     // The same second shows the same text, so there is nothing to redraw.
     try testing.expectEqual(Plan{}, step(&state, .tick, 1_000));
     const later = step(&state, .tick, 2_000);
-    try testing.expectEqualStrings("Rate limited · next try in 4s · attempt 1 · 2s", later.status.?.text.slice());
+    try testing.expectEqualStrings("Rate limited · next try in 4s · attempt 1", later.status.?.text.slice());
 }
 
-test "a retry on the wire keeps counting until the first byte" {
+test "a resend hands the line back to the thinking row after two seconds" {
     var state: State = .{};
     _ = startNew(&state, 0, false);
-    _ = fail(&state, .server, 1_000);
+    _ = fail(&state, .dropped, 1_000);
     const retry = tickUntilSend(&state, 1_000);
-    const later = step(&state, .tick, retry.at_ms + 1_000);
-    try testing.expectEqual(Status.Kind.retrying, later.status.?.kind);
-    try testing.expect(!std.mem.eql(u8, retry.plan.status.?.text.slice(), later.status.?.text.slice()));
+    try testing.expectEqual(Status.Kind.retrying, retry.plan.status.?.kind);
+    // The retry status holds still for the first second.
+    try testing.expectEqual(Plan{}, step(&state, .tick, retry.at_ms + 1_000));
+
+    const handed = step(&state, .tick, retry.at_ms + handoff_ms);
+    try testing.expectEqual(Status.Kind.clear, handed.status.?.kind);
+    try testing.expectEqual(Plan{}, step(&state, .tick, retry.at_ms + 30_000));
+    // Nothing is left to clear when the answer starts or finishes.
+    try testing.expectEqual(Plan{}, step(&state, .responding, retry.at_ms + 50_000));
+    const done = step(&state, .succeeded, retry.at_ms + 51_000);
+    try testing.expectEqual(Plan{ .finish = .succeeded }, done);
+}
+
+test "a quick refusal goes from the retry status straight to its countdown" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    _ = step(&state, .{ .failed = .{ .kind = .rate_limited, .retry_after_ms = 2_000 } }, 1_000);
+    const retry = tickUntilSend(&state, 1_000);
+    try testing.expectEqual(Plan{}, step(&state, .tick, retry.at_ms + 1_000));
+    const refused = step(&state, .{ .failed = .{ .kind = .rate_limited, .retry_after_ms = 2_000 } }, retry.at_ms + 1_500);
+    try testing.expectEqual(Status.Kind.waiting, refused.status.?.kind);
+    try testing.expectEqualStrings("Rate limited · next try in 2s · attempt 2", refused.status.?.text.slice());
+}
+
+test "a resend that fails after the hand-off shows its countdown again" {
+    var state: State = .{};
+    _ = startNew(&state, 0, false);
+    _ = fail(&state, .dropped, 1_000);
+    const retry = tickUntilSend(&state, 1_000);
+    _ = step(&state, .tick, retry.at_ms + handoff_ms);
+    // The dead-peer probes fail a silent connection after 45 seconds.
+    const failed = fail(&state, .dropped, retry.at_ms + 45_000);
+    try testing.expectEqual(Status.Kind.waiting, failed.status.?.kind);
+    try testing.expect(startsWith(failed.status.?.text.slice(), "Connection lost · next try in "));
+    try testing.expect(std.mem.endsWith(u8, failed.status.?.text.slice(), " · attempt 2"));
 }
 
 test "a healthy request shows nothing" {
@@ -867,7 +907,7 @@ test "too long compacts once at once, then waits for the user" {
     const compact = fail(&state, .too_long, 1_000);
     try testing.expect(compact.save != null);
     try testing.expectEqual(Send{ .compact_first = true }, compact.send.?);
-    try testing.expectEqualStrings("Conversation too long · compacting, then retrying · 1s", compact.status.?.text.slice());
+    try testing.expectEqualStrings("Conversation too long · compacting, then retrying", compact.status.?.text.slice());
 
     const ask = fail(&state, .too_long, 2_000);
     try testing.expect(ask.send == null);
@@ -886,7 +926,7 @@ test "out of credits waits for the user and continues after Enter" {
     const resumed = step(&state, .user_continue, 64_000);
     try testing.expect(resumed.save != null);
     try testing.expectEqual(Send{}, resumed.send.?);
-    try testing.expectEqualStrings("Retrying · attempt 2 · 1m 04s", resumed.status.?.text.slice());
+    try testing.expectEqualStrings("Retrying · attempt 2", resumed.status.?.text.slice());
 }
 
 test "sign-in waits, then names the retry" {
@@ -896,7 +936,7 @@ test "sign-in waits, then names the retry" {
     try testing.expectEqualStrings("Sign-in expired · opening /login", ask.status.?.text.slice());
     try testing.expectEqual(@as(u8, 0), ask.status.?.short.len);
     const resumed = step(&state, .user_continue, 64_000);
-    try testing.expectEqualStrings("Signed in · retrying · attempt 2 · 1m 04s", resumed.status.?.text.slice());
+    try testing.expectEqualStrings("Signed in · retrying · attempt 2", resumed.status.?.text.slice());
 }
 
 test "Esc ends the request from every active phase" {
@@ -1097,9 +1137,9 @@ test "every status fits, and every short form fits 46 columns" {
         .wait_until_ms = std.math.maxInt(u64),
     };
     try testing.expect(!std.mem.eql(u8, "Recovering", waitingStatus(&state, 0).text.slice()));
-    try testing.expect(!std.mem.eql(u8, "Recovering", retryingStatus(&state, 0).text.slice()));
+    try testing.expect(!std.mem.eql(u8, "Recovering", retryingStatus(&state).text.slice()));
     state.retry_label = .after_sign_in;
-    try testing.expect(!std.mem.eql(u8, "Recovering", retryingStatus(&state, 0).text.slice()));
+    try testing.expect(!std.mem.eql(u8, "Recovering", retryingStatus(&state).text.slice()));
 }
 
 test "durations read 12s, 1m 12s, and 1h 02m" {
@@ -1147,6 +1187,8 @@ const SimHost = struct {
     inflight_deaths: u8 = 0,
     /// When the latest transient failure happened; a retry must wait after it.
     transient_failure_ms: ?u64 = null,
+    /// When the outstanding send went out.
+    sent_ms: ?u64 = null,
 
     fn deliver(host: *SimHost, event: Event) !void {
         const was_outstanding = host.outstanding;
@@ -1204,6 +1246,7 @@ const SimHost = struct {
             host.outstanding = true;
             host.flowing = false;
             host.transient_failure_ms = null;
+            host.sent_ms = host.now_ms;
         }
         if (plan.status) |status| {
             host.status = status.kind;
@@ -1216,6 +1259,15 @@ const SimHost = struct {
         }
         if (event == .responding and was_outstanding and !was_flowing) {
             try testing.expectEqual(Status.Kind.clear, host.status);
+        }
+        // A resend's retry status gives the line back to the thinking row
+        // after `handoff_ms`, and not before.
+        if (event == .tick and host.outstanding and !host.flowing) {
+            const age = host.now_ms - (host.sent_ms orelse return error.TestUnexpectedResult);
+            if (age >= handoff_ms) try testing.expect(host.status != .retrying);
+            if (plan.status) |status| {
+                if (status.kind == .clear) try testing.expect(age >= handoff_ms);
+            }
         }
     }
 
@@ -1237,6 +1289,7 @@ const SimHost = struct {
         host.status = .clear;
         host.need = null;
         host.transient_failure_ms = null;
+        host.sent_ms = null;
         host.now_ms += 5_000;
         const record = host.saved orelse return;
         try host.deliver(.{ .start = .{ .resume_from = record, .fast = host.fast } });

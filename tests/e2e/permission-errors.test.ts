@@ -14,6 +14,7 @@ import { FX_BIN, runFx } from "../evals/eval-helpers";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
+  fakeGatewayHeldDecision,
   fakeGatewayPermissionDecision,
   fakeShellRun,
   startFakeGateway,
@@ -79,7 +80,7 @@ function permissionEnv(
     VERCEL_OIDC_TOKEN: undefined,
     FX_GATEWAY_BASE_URL: gateway.baseUrl,
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-    FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+    FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_MODEL: FAKE_GATEWAY_MODEL,
     FX_AUTO_UPGRADE: "0",
     NO_COLOR: "1",
@@ -198,7 +199,7 @@ describe("generic permission typed errors", () => {
             VERCEL_OIDC_TOKEN: undefined,
             FX_GATEWAY_BASE_URL: gateway.baseUrl,
             FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-            FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
             FX_MODEL: FAKE_GATEWAY_MODEL,
             FX_AUTO_UPGRADE: "0",
           },
@@ -274,10 +275,7 @@ describe("generic permission typed errors", () => {
         {
           classifierResponses: Array.from(
             { length: 4 },
-            (_, index) => fakeGatewayPermissionDecision(
-              "caution",
-              `auto_review_${index + 1}`,
-            ),
+            (_, index) => fakeGatewayHeldDecision(`auto_review_${index + 1}`),
           ),
         },
       );
