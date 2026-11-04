@@ -619,14 +619,14 @@ test "child runtime capability callbacks preserve fallback and child cancellatio
     };
     const deps = runtimeDeps(&context);
     const fallback = model_capabilities.capabilitiesForModel("legacy-fast");
-    try std.testing.expectEqualDeep(fallback, deps.available_model_capabilities(deps.ctx, "legacy-fast"));
-    try std.testing.expectEqualDeep(fallback, try deps.resolve_model_capabilities(deps.ctx, alloc, "legacy-fast"));
+    try model_capabilities.expectCapabilitiesEqualForTest(fallback, deps.available_model_capabilities(deps.ctx, "legacy-fast"));
+    try model_capabilities.expectCapabilitiesEqualForTest(fallback, try deps.resolve_model_capabilities(deps.ctx, alloc, "legacy-fast"));
     context.config.provider_set.gateway.model_catalog.?.lookup_capabilities_fn = Fixture.lookup;
     const available = deps.available_model_capabilities(deps.ctx, "child-model");
     try std.testing.expectEqual(@as(?u32, 512), available.max_output_tokens);
     try std.testing.expectEqual(@as(?u32, 32768), available.context_window);
-    try std.testing.expectEqualDeep(available, try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
-    try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, deps.available_model_capabilities(deps.ctx, "unknown-fast"));
+    try model_capabilities.expectCapabilitiesEqualForTest(available, try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model"));
+    try model_capabilities.expectCapabilitiesEqualForTest(.{}, deps.available_model_capabilities(deps.ctx, "unknown-fast"));
     context.config.tool_context.model_capability_resolver = .{ .ctx = &fixture, .resolve_fn = Fixture.resolveCapabilities };
     const resolved = try deps.resolve_model_capabilities(deps.ctx, alloc, "child-model");
     try std.testing.expectEqual(model_capabilities.ImageInputSupport.native, resolved.image_input_support);

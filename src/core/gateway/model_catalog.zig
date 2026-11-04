@@ -187,7 +187,7 @@ test "catalog capability lookup distinguishes unsupported and unknown without fe
     try std.testing.expect(provider.lookupCapabilities("known") == null);
     provider.lookup_capabilities_fn = Fixture.lookup;
     try std.testing.expectEqual(@as(?u32, 512), provider.lookupCapabilities("known").?.max_output_tokens);
-    try std.testing.expectEqualDeep(model_capabilities.Capabilities{}, provider.lookupCapabilities("unknown").?);
+    try model_capabilities.expectCapabilitiesEqualForTest(.{}, provider.lookupCapabilities("unknown").?);
     try std.testing.expectEqual(@as(usize, 0), fixture.fetches);
 }
 
