@@ -21,6 +21,7 @@ fx took the engine and nothing around it: `quickjs.c`, `libregexp.c`, `libunicod
 Every file here except this one and the files listed below matches the release archive byte for byte. Record each change here when it lands: the file, what changed, and why. A fix from upstream can then be ported by comparing this folder with the next release.
 
 - `quickjs.c`: the loops in `js_array_join`, `js_array_reverse`, `js_array_slice`, `js_array_concat`, `js_array_sort`, `JS_CopySubArray`, `JS_FlattenIntoArray`, `js_string_raw`, the array case of `js_json_to_str`, and the replacer-array loop of `JS_JSONStringify` call `js_poll_interrupts` on each pass, as `js_array_includes` already does. Each walks an object up to its `length`, which a program can set as high as 2^53 - 1, without allocating or calling back into JavaScript, so nothing else stops it. Without the check, `join`, `reverse`, `shift`, `unshift`, `splice`, `copyWithin`, `slice`, `concat`, `flat`, `sort`, `String.raw`, and `JSON.stringify` ran past fx's deadline for as long as the length allowed.
+- `quickjs.c`: `String.prototype.localeCompare` and `String.prototype.normalize` passed `js_realloc` and `js_realloc_rt` to `unicode_normalize` cast to `DynBufReallocFunc`. Calling a function through a pointer of another type fails the function-type check that `build.zig` turns on, so a program that called either method trapped. The fork adds `fx_dbuf_realloc_ctx` and `fx_dbuf_realloc_rt`, which have the exact `DynBufReallocFunc` type, and passes those instead.
 
 ## Compare the copy with upstream
 

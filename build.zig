@@ -588,7 +588,10 @@ fn jsEngineModule(
         .root = b.path("src/js/quickjs"),
         .files = &.{ "quickjs.c", "libregexp.c", "libunicode.c", "dtoa.c" },
         // Upstream's own build settings; the warnings are upstream's to fix.
-        .flags = &.{ "-std=gnu11", "-funsigned-char", "-DQUICKJS_NG_BUILD", "-D_GNU_SOURCE", "-w" },
+        // Zig's sanitizer runtime has no handler for the check that an
+        // indirect call matches the function's type, so Debug's full checks
+        // would leave it out; trapping on it keeps it in every mode.
+        .flags = &.{ "-std=gnu11", "-funsigned-char", "-DQUICKJS_NG_BUILD", "-D_GNU_SOURCE", "-w", "-fsanitize=function", "-fsanitize-trap=function" },
     });
     return module;
 }

@@ -655,6 +655,19 @@ test "built-ins that call back into JavaScript fit in the default stack" {
     , .{depth}), .{});
 }
 
+test "built-ins that grow buffers through QuickJS's allocator keep the function-type check" {
+    // `normalize` and `localeCompare` reach `unicode_normalize`, whose
+    // realloc callback the fork wraps (see quickjs/FORK.md).
+    try expectReturned("[2,1,-1,0]",
+        \\return [
+        \\  "\u00e9".normalize("NFD").length,
+        \\  "e\u0301".normalize("NFC").length,
+        \\  "a".localeCompare("b"),
+        \\  "\u00e9".localeCompare("e\u0301"),
+        \\];
+    , .{});
+}
+
 test "import() is refused with an error that says so" {
     try expectThrew("TypeError: import() is not available in code mode", "return await import('fs');", .{});
     try expectThrew("SyntaxError", "import fs from 'fs';", .{});
