@@ -197,6 +197,8 @@ Do not bypass the permission system for new tools.
 
 * To parse JSON into a typed value, use `parseFromSlice` or `parseFromSliceLeaky` from `src/core/shared/json_decode.zig`. They match `std.json`'s, but share one parser across types instead of generating one per type. Parse into `std.json.Value` with `std.json` itself.
 
+* To sort, use `sort` from `src/core/shared/sort_utils.zig` in place of `std.mem.sort`. It takes the same arguments and is also stable, but shares one implementation across element types instead of generating a block sort for each. Code that cannot import it, such as `src/core/indexer/`, `src/core/session_manager/`, and files that import only `std`, keeps `std.mem.sort`.
+
 * For JSON string escaping (writing raw JSON), use the project's `writeJsonStr` helper in `src/acp/jsonrpc.zig` rather than assuming `std.json.encodeJsonString` exists.
 
 * Zig 0.17 uses `std.Io.File.stdin()` / `.stdout()` / `.stderr()`, not `std.io.getStdIn()`.
@@ -323,7 +325,7 @@ Do not run the complete deterministic test suite locally as the default developm
 
 After the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. Linux is the gate for every change because most fx behavior is identical on every platform:
 
-* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the agents, compactor, indexer, and recovery boundaries, model-checks request recovery, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
+* `.github/workflows/ci.yml` runs on Linux x86_64. It checks formatting, the PGSO corpus, the public surface, and the agents, compactor, indexer, and recovery boundaries, model-checks request recovery and the empty-reply nudge, runs the ReleaseSafe unit tests, runs the E2E files in four weighted shards plus the MCP conformance baseline, and qualifies the SDK packages. A failed E2E file is retried once. A file that passes only on retry gets a warning annotation; investigate it as a possible race. `Build & Test` fails when any SDK job fails.
 * `.github/workflows/binary-size.yml` builds each release target on its native runner, reports the size change, and smoke-tests every target's binary. See **Binary Size Observability**.
 * `.github/workflows/bench.yml` enforces the startup latency budget. See **Benchmarks**.
 
@@ -334,6 +336,8 @@ macOS runs only when `scripts/detect-macos-need.sh` finds a change that can beha
 The durable-session model check in the `SDK (Bun + N-API/WASM)` job takes about 40 minutes, so a pull request runs it only when `scripts/detect-ci-need.sh` finds a change to code libfx owns: `sdk/`, `tests/tla/sdk/`, the drivers in `tests/tla/drivers/*.mjs`, the Node-API and WebAssembly core entry points, `src/acp/`, `src/core/hosts/`, `src/core/session_manager/`, `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. Every push to `main` runs it, which catches a durable-session regression in shared code such as the agent loop after it merges. To run it for any other change, run `gh workflow run ci.yml --ref <branch>`. If the detector cannot read the change, `Build & Test` fails instead of passing.
 
 The `TLA+ MCP models and drivers` job takes about 20 minutes, so a pull request runs its model checks and drivers only when the same detector finds a change to `src/mcp/`, `src/core/mcp_host/`, `src/core/mcp/`, the models in `tests/tla/mcp/` and `tests/tla/mcp_host/`, their drivers in `tests/tla/drivers/mcp/`, `tests/tla/drivers/mcp_host/`, and `tests/tla/drivers/lib/`, the `tests/e2e/fixtures/mcp-*` servers, the helpers those drivers load (`tests/e2e/tmux-helpers.ts`, `tests/evals/eval-helpers.ts`, and `tests/e2e/render-lab/tape.ts`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. Every push to `main` runs them, and the same `gh workflow run ci.yml --ref <branch>` runs them for any other change.
+
+The `TLA+ transcript window model` job takes about 4 minutes, so a pull request runs it only when the same detector finds a change to `src/ui/transcript/transcript_window*`, the model in `tests/tla/transcript_window/`, its drivers in `tests/tla/drivers/transcript_window/`, the driver code they share (`tests/tla/drivers/lib/` and `tests/tla/drivers/graph.mjs`), `build.zig`, `build.zig.zon`, or `.github/workflows/ci.yml`. It runs `tests/tla/transcript_window/check.sh --ci`, which leaves out the planted bugs and the run of a built fx along the model; run `tests/tla/transcript_window/check.sh` without `--ci` before you change the window.
 
 The `fx mcp call` model check, `.github/workflows/tla-mcp-call.yml`, runs `tests/tla/mcp_call/check.sh`: TLC on the bridge model, the core's tests, both drivers against the real core, and every planted bug. Every push to `main` runs it. A pull request runs it only with the `ci:tla-mcp-call` label, and `gh workflow run tla-mcp-call.yml --ref <branch>` runs it on any branch. Like `ci:macos`, the label needs triage access.
 
@@ -423,8 +427,8 @@ Each platform check is informational. An increase of at least 52,429 bytes
 investigation, but does not reject the pull request. Investigate notable
 unexplained growth before changing the threshold. The full macOS arm64, Linux
 arm64, and Linux x86_64 PGSO release qualifications remain authoritative for the
-production ceilings (7.000 MiB, and 8.250 MiB for Linux x86_64) and performance
-gates.
+production ceilings (6.500 MiB for macOS arm64, 6.750 MiB for Linux arm64, and
+8.750 MiB for Linux x86_64) and performance gates.
 
 ## Documentation
 

@@ -5059,6 +5059,107 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  // The repeated shell failure guard (`ShellExecutionFailureRetryState` in
+  // src/core/agent/runtime/tool_admission.zig) ends a turn only when the same
+  // command fails in three steps in a row with no file change in between.
+  const SHELL_FAILURE_STOP = "Repeated identical shell failures stopped the tool loop.";
+  const FAILING_SCRIPT = "echo 'label is 84 chars, max 80' >&2\nexit 1\n";
+  const RERUN = { action: "run", command: "sh check.sh", profile: "clean" };
+
+  function toolCallStep(...calls: Array<[id: string, name: string, input: object]>): Response {
+    return fakeGatewaySse([
+      ...calls.map(([toolCallId, toolName, input]) => ({ type: "tool-call", toolCallId, toolName, input })),
+      { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+    ]);
+  }
+
+  async function runScriptedSteps(label: string, steps: Array<() => Response>, script?: string) {
+    const root = createFixtureRoot(label);
+    const tracePath = join(root.root, "trace.log");
+    if (script) writeFileSync(join(root.workspace, "check.sh"), script);
+    const bodies: string[] = [];
+    const gateway = startGateway(((body: string) => {
+      bodies.push(body);
+      const step = steps[bodies.length - 1];
+      return step ? step() : fakeGatewayFinalText("UNEXPECTED_EXTRA_STEP");
+    }) as () => Response);
+    try {
+      const result = await runFx(["ask", "--json", "--yolo", "Fix the diagram script and run it."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,tool", FX_SOUND: "0" },
+        timeoutMs: 30_000,
+      });
+      return { result, bodies, trace: readFileSync(tracePath, "utf8") };
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }
+
+  test("shell failure after a file change goes back to the model instead of ending the turn", async () => {
+    // A user's session: write a script, run it, edit it, run the same command
+    // again. A third edit and rerun shows the edit restarts the count, not
+    // just a higher limit.
+    const { result, bodies, trace } = await runScriptedSteps("shell-failure-after-edit", [
+      () => toolCallStep(
+        ["write_1", "write_file", { path: "check.sh", content: FAILING_SCRIPT }],
+        ["run_1", "shell", RERUN],
+      ),
+      () => toolCallStep(
+        ["edit_2", "edit_file", { path: "check.sh", old_string: "84 chars", new_string: "82 chars" }],
+        ["run_2", "shell", RERUN],
+      ),
+      () => toolCallStep(
+        ["edit_3", "edit_file", { path: "check.sh", old_string: "82 chars", new_string: "81 chars" }],
+        ["run_3", "shell", RERUN],
+      ),
+      () => fakeGatewayFinalText("SPEC_WRITTEN"),
+    ]);
+    expect(result.stderr).not.toContain(SHELL_FAILURE_STOP);
+    expect(bodies).toHaveLength(4);
+    expect(toolResultOutput(bodies[2]!, "run_2")).toContain("82 chars");
+    expect(toolResultOutput(bodies[3]!, "run_3")).toContain("81 chars");
+    expect(result.code).toBe(0);
+    const json = parseAskJson(result.stdout);
+    expect(json.final_output).toContain("SPEC_WRITTEN");
+    expect(json.tool_calls.filter((call) => call.name === "shell" && call.status === "error")).toHaveLength(3);
+    expect(trace).not.toContain("repeated_shell_execution_failure");
+  });
+
+  test("unchanged shell failures end the turn on the third step in a row", async () => {
+    const rerun = (id: string) => () => toolCallStep([id, "shell", RERUN]);
+    const { result, bodies, trace } = await runScriptedSteps(
+      "shell-failure-unchanged",
+      [rerun("run_1"), rerun("run_2"), rerun("run_3")],
+      FAILING_SCRIPT,
+    );
+    expect(bodies).toHaveLength(3);
+    // The second failure already told the model not to retry unchanged.
+    expect(toolResultOutput(bodies[2]!, "run_2")).toContain("already failed 2 times");
+    expect(result.stderr).toContain(SHELL_FAILURE_STOP);
+    expect(result.stdout).not.toContain("UNEXPECTED_EXTRA_STEP");
+    expect(trace).toContain("repeated_shell_execution_failure");
+    expect(result.stderr).not.toMatch(/panic/i);
+  });
+
+  test("a failed edit is not a file change for repeated shell failures", async () => {
+    const missingEdit = { path: "check.sh", old_string: "NOT_IN_THE_SCRIPT", new_string: "x" };
+    const { result, bodies, trace } = await runScriptedSteps(
+      "shell-failure-failed-edit",
+      [
+        () => toolCallStep(["run_1", "shell", RERUN]),
+        () => toolCallStep(["edit_2", "edit_file", missingEdit], ["run_2", "shell", RERUN]),
+        () => toolCallStep(["edit_3", "edit_file", missingEdit], ["run_3", "shell", RERUN]),
+      ],
+      FAILING_SCRIPT,
+    );
+    expect(bodies).toHaveLength(3);
+    expect(toolResultOutput(bodies[2]!, "edit_2")).toMatch(/not found|no match|did not match/i);
+    expect(result.stderr).toContain(SHELL_FAILURE_STOP);
+    expect(result.stdout).not.toContain("UNEXPECTED_EXTRA_STEP");
+    expect(trace).toContain("repeated_shell_execution_failure");
+  });
+
   test("no-save shell timeout returns a readable process-scoped replay handle", async () => {
     const root = createFixtureRoot("terminal-timeout-replay");
     const tracePath = join(root.root, "trace.log");
@@ -9513,6 +9614,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     label: string,
     replies: Array<() => Response>,
     model: Record<string, unknown> = {},
+    env: Record<string, string> = {},
   ) {
     const root = createFixtureRoot(label);
     const tracePath = join(root.root, "trace.log");
@@ -9524,13 +9626,13 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     try {
       const result = await runFx(
         ["ask", "--json", "--auto", "--no-save", "Answer briefly."],
-        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 30_000 },
+        { cwd: root.workspace, env: { ...fixtureEnv(root, gateway, tracePath), ...env }, timeoutMs: 30_000 },
       );
       return {
         result,
         json: parseAskJson(result.stdout),
         bodies: gateway.requests.map((request) =>
-          JSON.parse(request.body) as { maxOutputTokens?: number; reasoning?: string }
+          JSON.parse(request.body) as { maxOutputTokens?: number; reasoning?: string; prompt: PromptMessage[] }
         ),
         trace: readFileSync(tracePath, "utf8"),
         cutCallRan: existsSync(join(root.workspace, CUT_CALL_SENTINEL)),
@@ -9670,6 +9772,362 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     expect(result.stderr).not.toContain("preserved above");
     expect(trace).toContain("event=provider_completion_blocked");
   }, 40_000);
+
+  // The AI SDK folds the Gemini stop reasons it does not list, such as
+  // UNEXPECTED_TOOL_CALL, into `other`. This reply has no text and no tool call;
+  // a null raw sends a finish reason without the provider's own reason.
+  const emptyOtherReply = (raw: unknown = "UNEXPECTED_TOOL_CALL", before: object[] = []) => () => fakeGatewaySse([
+    ...before,
+    {
+      type: "finish",
+      finishReason: raw === null ? { unified: "other" } : { unified: "other", raw },
+      usage: { inputTokens: { total: 3 }, outputTokens: { total: 8_621 } },
+    },
+  ]);
+  const otherReplyWithText = (text: string) => () => fakeGatewaySse([
+    { type: "text-delta", id: "answer_1", delta: text },
+    { type: "finish", finishReason: { unified: "other", raw: "OTHER" } },
+  ]);
+  const EMPTY_REPLY_NUDGE = "Your last reply had no text and no tool call.";
+  const lastPrompt = (body: { prompt: PromptMessage[] }) => {
+    const message = body.prompt.at(-1)!;
+    return { role: message.role, text: contentText(message.content) };
+  };
+
+  test("an empty reply that stops for another reason is asked to continue once", async () => {
+    const { result, json, bodies, trace } = await askWithReplies("empty-other-nudge", [
+      emptyOtherReply(),
+      () => fakeGatewayFinalText("continued after the nudge"),
+    ]);
+    const output = `${result.stdout}\n${result.stderr}`;
+
+    expect(result.code).toBe(0);
+    expect(json.final_output).toContain("continued after the nudge");
+    expect(output).not.toContain("Done.");
+    expect(bodies).toHaveLength(2);
+    expect(lastPrompt(bodies[1]!).role).toBe("user");
+    expect(lastPrompt(bodies[1]!).text).toContain(EMPTY_REPLY_NUDGE);
+    expect(output).toContain("The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Asking it to continue.");
+    expect(trace).toContain("provider_finish_reason=UNEXPECTED_TOOL_CALL");
+    expect(trace).toContain("event=empty_reply_nudge");
+  }, 40_000);
+
+  test("a second empty reply in a row that stops for another reason says so instead of Done.", async () => {
+    const { result, bodies } = await askWithReplies("empty-other-twice", [
+      emptyOtherReply(),
+      emptyOtherReply(),
+      () => fakeGatewayFinalText("a third request must not be sent"),
+    ]);
+    const output = `${result.stdout}\n${result.stderr}`;
+
+    expect(result.code).toBe(1);
+    expect(bodies).toHaveLength(2);
+    expect(output).toContain("The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Continue with a follow-up prompt if needed.");
+    // One nudge, then the stop itself.
+    expect(output.split("Asking it to continue.").length - 1).toBe(1);
+    expect(output).not.toContain("Done.");
+    expect(output).not.toContain("a third request must not be sent");
+  }, 40_000);
+
+  test("a reply with text that stops for another reason ends the turn as before", async () => {
+    const { result, json, bodies } = await askWithReplies("other-with-text", [
+      otherReplyWithText("partial answer"),
+      () => fakeGatewayFinalText("a second request must not be sent"),
+    ]);
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(1);
+    expect(json.final_output).toBe("partial answer");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("stopped without a reply");
+  }, 40_000);
+
+  test("whitespace-only text that stops for another reason counts as an empty reply", async () => {
+    const { result, json, bodies } = await askWithReplies("other-whitespace", [
+      otherReplyWithText(" \n\t "),
+      () => fakeGatewayFinalText("answered after the whitespace reply"),
+    ]);
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(2);
+    expect(lastPrompt(bodies[1]!).text).toContain(EMPTY_REPLY_NUDGE);
+    expect(json.final_output).toContain("answered after the whitespace reply");
+  }, 40_000);
+
+  test("a reasoning-only reply that stops for another reason is asked to continue", async () => {
+    const { result, json, bodies } = await askWithReplies("other-reasoning-only", [
+      emptyOtherReply("UNEXPECTED_TOOL_CALL", [
+        { type: "reasoning-start", id: "thought" },
+        { type: "reasoning-delta", id: "thought", delta: "planning the parallel writes" },
+        { type: "reasoning-end", id: "thought" },
+      ]),
+      () => fakeGatewayFinalText("answered after thinking"),
+    ]);
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(2);
+    expect(lastPrompt(bodies[1]!).text).toContain(EMPTY_REPLY_NUDGE);
+    expect(json.final_output).toContain("answered after thinking");
+  }, 40_000);
+
+  test("each separate empty stop in one turn gets its own nudge", async () => {
+    const { result, json, bodies } = await askWithReplies("other-separate-stops", [
+      () => fakeGatewayToolCall("list_1", "glob_files", { pattern: "*" }),
+      emptyOtherReply(),
+      () => fakeGatewayToolCall("list_2", "glob_files", { pattern: "*" }),
+      emptyOtherReply(),
+      () => fakeGatewayFinalText("finished after two nudges"),
+    ]);
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(5);
+    expect(lastPrompt(bodies[1]!).role).toBe("tool");
+    expect(lastPrompt(bodies[2]!).text).toContain(EMPTY_REPLY_NUDGE);
+    expect(lastPrompt(bodies[3]!).role).toBe("tool");
+    expect(lastPrompt(bodies[4]!).text).toContain(EMPTY_REPLY_NUDGE);
+    expect(json.final_output).toContain("finished after two nudges");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
+  }, 40_000);
+
+  test("an empty reply that stops for another reason with no step left says so", async () => {
+    const { result, bodies } = await askWithReplies("other-no-step-left", [
+      emptyOtherReply(),
+      () => fakeGatewayFinalText("a second request must not be sent"),
+    ], {}, { FX_MAX_AGENT_STEPS: "1" });
+    const output = `${result.stdout}\n${result.stderr}`;
+
+    expect(result.code).toBe(1);
+    expect(bodies).toHaveLength(1);
+    expect(output).toContain("The model stopped without a reply (provider reason: UNEXPECTED_TOOL_CALL). Continue with a follow-up prompt if needed.");
+    expect(output).not.toContain("Asking it to continue.");
+    expect(output).not.toContain("Agent step limit reached");
+    expect(output).not.toContain("Done.");
+  }, 40_000);
+
+  test("a missing or unusual provider reason still names the stop, bounded and printable", async () => {
+    const unusual = `BAD\u0007REASON${"X".repeat(200)}`;
+    const { result, bodies, trace } = await askWithReplies("other-unusual-raw", [
+      emptyOtherReply(null),
+      emptyOtherReply(unusual),
+    ]);
+    const output = `${result.stdout}\n${result.stderr}`;
+    const bounded = `BAD?REASON${"X".repeat(38)}`;
+
+    expect(result.code).toBe(1);
+    expect(bodies).toHaveLength(2);
+    expect(output).toContain("The model stopped without a reply (finish reason: other). Asking it to continue.");
+    expect(output).toContain(`The model stopped without a reply (provider reason: ${bounded}). Continue with a follow-up prompt if needed.`);
+    expect(output).not.toContain("X".repeat(39));
+    expect(trace).toContain(`provider_finish_reason=${bounded}`);
+    expect(output).not.toContain("Done.");
+  }, 40_000);
+
+  test("a server error on the nudge request is retried and the turn still finishes", async () => {
+    const { result, json, bodies } = await askWithReplies("other-nudge-503", [
+      emptyOtherReply(),
+      () => unavailableResponse("0"),
+      () => fakeGatewayFinalText("answered after the retried nudge"),
+    ]);
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(3);
+    // The retry resends the same nudge once; it does not stack a second one.
+    for (const body of bodies.slice(1)) {
+      expect(lastPrompt(body).text).toContain(EMPTY_REPLY_NUDGE);
+      expect(JSON.stringify(body.prompt).split(EMPTY_REPLY_NUDGE).length - 1).toBe(1);
+    }
+    expect(json.final_output).toContain("answered after the retried nudge");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
+  }, 40_000);
+
+  test("a provider reason that is not a string counts as missing", async () => {
+    const { result, json, bodies } = await askWithReplies("other-raw-number", [
+      emptyOtherReply(42),
+      () => fakeGatewayFinalText("answered after a numeric reason"),
+    ]);
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(2);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("The model stopped without a reply (finish reason: other). Asking it to continue.");
+    expect(json.final_output).toContain("answered after a numeric reason");
+  }, 40_000);
+
+  test("a 1 MiB provider reason is cut to its bound in the notice and the trace", async () => {
+    const { result, bodies, trace } = await askWithReplies("other-raw-huge", [
+      emptyOtherReply("R".repeat(1 << 20)),
+      () => fakeGatewayFinalText("answered after a huge reason"),
+    ]);
+    const output = `${result.stdout}\n${result.stderr}`;
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(2);
+    expect(output).toContain(`(provider reason: ${"R".repeat(48)}). Asking it to continue.`);
+    expect(output).not.toContain("R".repeat(49));
+    expect(trace).toContain(`provider_finish_reason=${"R".repeat(48)}`);
+    expect(trace).not.toContain("R".repeat(49));
+  }, 40_000);
+
+  test("an empty finish with no closing done marker is still asked to continue", async () => {
+    const { result, json, bodies } = await askWithReplies("other-no-done-marker", [
+      () => new Response(
+        `data: ${JSON.stringify({ type: "finish", finishReason: { unified: "other", raw: "UNEXPECTED_TOOL_CALL" } })}\n\n`,
+        { headers: { "content-type": "text/event-stream" } },
+      ),
+      () => fakeGatewayFinalText("answered after an unterminated stream"),
+    ]);
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(2);
+    expect(lastPrompt(bodies[1]!).text).toContain(EMPTY_REPLY_NUDGE);
+    expect(json.final_output).toContain("answered after an unterminated stream");
+  }, 40_000);
+
+  test("a turn killed while its nudge is in flight resumes once, with one nudge and no Done.", async () => {
+    const root = createFixtureRoot("other-nudge-sigkill");
+    const bodies: string[] = [];
+    const gateway = startDynamicFakeGateway((body) => {
+      bodies.push(body);
+      if (bodies.length === 1) return emptyOtherReply()();
+      // The nudge request never answers: fx is killed while it waits.
+      if (bodies.length === 2) {
+        return new Response(new ReadableStream({ start() {} }), { headers: { "content-type": "text/event-stream" } });
+      }
+      return fakeGatewayFinalText("RESUMED_AFTER_KILL");
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const proc = Bun.spawn([FX_BIN, "ask", "--yolo", "--json", "--", "Move the project and rename it."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    try {
+      const deadline = Date.now() + 15_000;
+      while (bodies.length < 2 && Date.now() < deadline) await Bun.sleep(25);
+      expect(bodies).toHaveLength(2);
+      expect(bodies[1]!.split(EMPTY_REPLY_NUDGE).length - 1).toBe(1);
+      const ids = savedSessionIds(root.home);
+      expect(ids).toHaveLength(1);
+      const id = ids[0]!;
+      proc.kill("SIGKILL");
+      await proc.exited;
+      const killedLog = JSON.stringify(logLines(root.home, id));
+      expect(killedLog).not.toContain("\"Done.\"");
+
+      const resumed = await runFx(["ask", "--yolo", "--json", "--resume", id, "--", "Finish up."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "resume-trace.log")),
+        timeoutMs: 20_000,
+      });
+      const output = `${resumed.stdout}\n${resumed.stderr}`;
+      expect(resumed.code).toBe(0);
+      expect(parseAskJson(resumed.stdout).final_output).toContain("RESUMED_AFTER_KILL");
+      expect(output).not.toContain("Done.");
+      // Every request after the kill carries the nudge at most once.
+      for (const body of bodies.slice(2)) {
+        expect(body.split(EMPTY_REPLY_NUDGE).length - 1).toBeLessThanOrEqual(1);
+      }
+      expect(JSON.stringify(logLines(root.home, id))).not.toContain("\"Done.\"");
+    } finally {
+      if (proc.exitCode === null) proc.kill("SIGKILL");
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test.skipIf(!tmuxAvailable())("an empty reply that stops for another reason gives way to a subagent's report, with no Done.", async () => {
+    const root = createFixtureRoot("other-empty-report");
+    const child = heldFakeGatewayFinalText();
+    const parentHold: { started: boolean; release?: () => void } = { started: false };
+    // Holds the parent's reply open until the child's report is queued, then ends it empty.
+    const heldEmptyOther = () => {
+      const encoder = new TextEncoder();
+      let timer: ReturnType<typeof setInterval> | undefined;
+      return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          parentHold.started = true;
+          timer = setInterval(() => controller.enqueue(encoder.encode(": hold\n\n")), 50);
+          parentHold.release = () => {
+            clearInterval(timer);
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+              type: "finish",
+              finishReason: { unified: "other", raw: "UNEXPECTED_TOOL_CALL" },
+              usage: { inputTokens: { total: 3 }, outputTokens: { total: 8 } },
+            })}\n\ndata: [DONE]\n\n`));
+            controller.close();
+          };
+        },
+        cancel() {
+          clearInterval(timer);
+        },
+      }), { headers: { "content-type": "text/event-stream" } });
+    };
+    const parentBodies: string[] = [];
+    let childRequests = 0;
+    const gateway = startDynamicFakeGateway(raw => {
+      const body = JSON.parse(raw);
+      const latest = JSON.stringify(body.prompt?.filter((item: any) => item.role === "user").at(-1)?.content);
+      if (latest.includes("EMPTY_REPORT_TASK")) {
+        childRequests++;
+        return child.response;
+      }
+      parentBodies.push(raw);
+      if (parentBodies.length === 1) {
+        return fakeGatewayToolCall("empty-report-delegation", "subagent", { request: { action: "message", agent: "reporter", message: "EMPTY_REPORT_TASK" } });
+      }
+      if (parentBodies.length === 2) return heldEmptyOther();
+      return fakeGatewayFinalText("EMPTY_REPORT_ALL_DONE");
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const tracePath = join(root.root, "trace.log");
+    const stderrPath = join(root.root, "stderr.log");
+    const trace = () => existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "";
+    const assistants = (raw: string) => (JSON.parse(raw).prompt as PromptMessage[]).filter(message => message.role === "assistant");
+    let tui: TmuxSession | undefined;
+    try {
+      tui = await TmuxSession.create({
+        cmd: JSON.stringify(FX_BIN), cwd: root.workspace, isolated: true, remainOnExit: true, stderrPath,
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root.home,
+          AI_GATEWAY_API_KEY: "fake-empty-report-key", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1",
+          FX_AUTO_UPGRADE: "0", FX_SOUND: "0", FX_TEST_SKIP_ONBOARDING: "1", FX_MODEL: MODEL, FX_PERMISSION_MODE: "full-access",
+          FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl, FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
+          FX_TRACE_LOG: tracePath, FX_TRACE_SCOPES: "subagent,mailbox,worker,agent,tool",
+        },
+      });
+      await tui.waitForStableComposer(15000);
+      await tui.sendText("EMPTY_REPORT_START");
+      await tui.waitForPane(() => childRequests === 1 && parentBodies.length === 2 && parentHold.started, 10000);
+      // The child finishes while the parent's reply is still open, so its
+      // report waits for the step to end instead of interrupting the model.
+      child.release("CHILD_REPORT_TEXT");
+      await tui.waitForPane(() => trace().includes("event=report_queued "), 10000);
+      parentHold.release!();
+      await tui.waitForText("EMPTY_REPORT_ALL_DONE", 10000);
+
+      expect(childRequests).toBe(1);
+      expect(parentBodies).toHaveLength(3);
+      // The report continues the turn after the empty reply: no nudge, no
+      // "Done." the model never wrote, and no empty assistant message.
+      const next = parentBodies[2]!;
+      expect(next).toContain("CHILD_REPORT_TEXT");
+      expect(next).not.toContain(EMPTY_REPLY_NUDGE);
+      expect(assistants(next).map(message => contentText(message.content))).not.toContain("Done.");
+      expect(assistants(next).filter(message => Array.isArray(message.content) && message.content.length === 0)).toHaveLength(0);
+      const scrollback = await tui.captureFullScrollback();
+      expect(scrollback).not.toMatch(/^\s*Done\.\s*$/m);
+      expect(scrollback).not.toContain("The model stopped without a reply");
+      await tui.sendText("/quit");
+      await tui.waitForPane(() => tui!.paneStatus().dead, 10000);
+      expect(tui.paneStatus().status).toBe(0);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(JSON.stringify(logLines(root.home, rootSessionIds(root.home)[0]!))).not.toContain("\"Done.\"");
+    } finally {
+      child.dispose();
+      await tui?.kill();
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   test("commands with the same output get their own handles, and each reads back after resume", async () => {
     const root = createFixtureRoot("distinct-replay-handles");

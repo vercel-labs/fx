@@ -84,6 +84,7 @@ const TitleGenerationLoad = session_persistence.TitleGenerationLoad;
 const JsHostSessionStore = session_persistence.JsHostSessionStore;
 const PendingCancelledCommand = session_persistence.PendingCancelledCommand;
 pub const Persistence = session_persistence.Persistence;
+pub const TranscriptArchiveBoundaries = session_persistence.TranscriptArchiveBoundaries;
 const optionalStringEql = session_persistence.optionalStringEql;
 const applySessionPickerCatalogPage = session_persistence.applySessionPickerCatalogPage;
 const selectionAfterLoadedPage = session_persistence.selectionAfterLoadedPage;
@@ -631,8 +632,33 @@ pub fn Runtime(comptime App: type) type {
             if (comptime runtime_profile.allows(App, .js_host_sessions)) {
                 try beginFreshJsHostSession(app, agent);
             }
+            defer syncTranscriptWindowSaveMode(app, agent);
+            defer syncTranscriptArchiveAvailable(app, agent);
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
             if (agent.session_persistence.v2_store) |v2_store| try beginFreshV2Session(app, agent, v2_store);
+        }
+
+        /// The transcript window drops entries only once the session log holds
+        /// them, so it follows whether `agent`'s session writes one; only the
+        /// transcript in context is set.
+        pub fn syncTranscriptWindowSaveMode(app: *App, agent: *AppAgent) void {
+            if (comptime !@hasField(App, "shell")) return;
+            if (comptime !@hasDecl(@TypeOf(app.shell), "setTranscriptWindowSaved")) return;
+            if (!transcriptInContext(app, agent)) return;
+            const saved = if (comptime @hasField(@TypeOf(agent.session_persistence), "v2")) agent.session_persistence.v2 != null else false;
+            app.shell.setTranscriptWindowSaved(app.alloc, saved) catch |err| {
+                debug_trace.logf("transcript_window", "save mode not set saved={} err={s}", .{ saved, @errorName(err) });
+            };
+        }
+
+        /// Starts the window of `agent`'s transcript, in context, when it is
+        /// not running: an agent's session can start while another's
+        /// transcript is on screen.
+        pub fn ensureTranscriptWindow(app: *App, agent: *AppAgent) void {
+            if (comptime !@hasField(App, "shell")) return;
+            if (comptime !@hasField(@TypeOf(app.shell), "transcript_window")) return;
+            if (app.shell.transcript_window != null) return;
+            syncTranscriptWindowSaveMode(app, agent);
         }
 
         /// A v2 session starts in memory; its folder appears with the first
@@ -1049,7 +1075,7 @@ pub fn Runtime(comptime App: type) type {
             app.writeDomainNotice(.{
                 .topic = "session",
                 .tone = .neutral,
-                .body = "Interrupted turn · fx -c to continue",
+                .body = "Interrupted turn · /resume to continue",
             }, true) catch |err| {
                 debug_trace.logf("session", "event=interrupted_turn_hint_failed err={s}", .{@errorName(err)});
             };
@@ -1358,8 +1384,12 @@ pub fn Runtime(comptime App: type) type {
             agent.session_persistence.v2 = v2;
             v2_owned = false;
             errdefer closeWritableSession(app, agent);
+            // Before the replay: the resume projection copies the window's
+            // retention, so the whole newest cycle comes back.
+            syncTranscriptWindowSaveMode(app, agent);
             try hydrateResumedSession(app, agent, resumed.state, &display, notice);
             enableSessionStores(app, agent);
+            syncTranscriptArchiveAvailable(app, agent);
             // A fork is a new session: it continues nothing on its own.
             if (notice != .fork) noteInterruptedRequest(agent, v2);
         }
@@ -1514,11 +1544,11 @@ pub fn Runtime(comptime App: type) type {
                     .labels = &historical_labels,
                 };
                 try writeResumeNotice(app, agent, &sink, display, notice);
-                try replayResumedHistoryToSink(app, agent, &sink, state.history, &historical_labels);
+                const holds_previous = try replayResumedHistoryToSink(app, agent, &sink, state.history, &historical_labels);
                 const projection_finished_ns = io_mod.nanoTimestamp();
                 try projection.finalize();
                 const finalization_finished_ns = io_mod.nanoTimestamp();
-                try app.installResumeProjection(agent, &projection);
+                try app.installResumeProjection(agent, &projection, holds_previous);
                 const install_finished_ns = io_mod.nanoTimestamp();
                 debug_trace.logf(
                     "session",
@@ -1533,7 +1563,7 @@ pub fn Runtime(comptime App: type) type {
             } else {
                 var sink = LiveHistorySink(App){ .app = app };
                 try writeResumeNotice(app, agent, &sink, display, notice);
-                try replayResumedHistoryToSink(app, agent, &sink, state.history, &historical_labels);
+                _ = try replayResumedHistoryToSink(app, agent, &sink, state.history, &historical_labels);
             }
             if (comptime @hasDecl(App, "restoreSessionCredential")) {
                 try app.restoreSessionCredential(previous_provider);
@@ -2291,10 +2321,17 @@ pub fn Runtime(comptime App: type) type {
             @compileError("interactive session runtime requires a terminal title host capability");
         }
 
-        /// Terminal tabs show the session title once one exists; before the
-        /// first prompt they identify the running build and workspace.
+        /// Terminal tabs show the agent on screen: its session title once one
+        /// exists, before its first prompt the running build and workspace.
+        /// Another agent's title leaves the tab alone until it is on screen.
         pub fn syncTerminalTitle(app: *App, agent: *AppAgent) void {
             if (comptime !provider_runtime.supported(App)) return;
+            // The agent the user sees, not a hidden one the loop is visiting,
+            // as the terminal's program status does.
+            if (comptime @hasField(App, "agent_on_screen")) {
+                const on_screen: *const AppAgent = if (app.agent_on_screen) |child| &child.agent else &app.main_agent;
+                if (agent != on_screen) return;
+            }
             syncTerminalTitleWith(app, agent, terminalTitle(app));
         }
 
@@ -3240,6 +3277,107 @@ pub fn Runtime(comptime App: type) type {
             gop.value_ptr.* = .{ .label = label, .reflow = reflow };
         }
 
+        /// Replays an older compaction cycle of `agent`, whose transcript is
+        /// on screen, from its session log into a detached transcript for
+        /// Ctrl+O: `back` cycles before the held entries, 1 being the newest.
+        /// Reads only that cycle, after finding its start by walking back
+        /// from the cycles already found.
+        pub fn loadTranscriptArchive(app: *App, agent: *AppAgent, back: u32) !void {
+            if (comptime !@hasField(App, "shell") or !@hasDecl(App, "beginResumeProjection")) return error.TranscriptArchiveUnavailable;
+            if (back == 0) return error.TranscriptArchiveUnavailable;
+            const v2 = agent.session_persistence.v2 orelse return error.SessionPersistenceUnavailable;
+            const started_ns = io_mod.nanoTimestamp();
+            const newest = (try v2.previousCompactionCursor(app.alloc, null)).cursor orelse return error.TranscriptArchiveUnavailable;
+            const holds_previous = app.shell.transcriptWindowHoldsPreviousCycle();
+            const cache = &agent.session_persistence.transcript_archive_boundaries;
+            const stale = if (cache.key) |key| !std.meta.eql(key.newest, newest) or key.holds_previous != holds_previous else true;
+            if (stale) {
+                cache.starts.clearRetainingCapacity();
+                cache.key = .{ .newest = newest, .holds_previous = holds_previous };
+                cache.damaged_from = null;
+                cache.held_start = if (holds_previous) cache.startOf(1, try v2.previousCompactionCursor(app.alloc, newest)) else newest;
+            }
+            // A read that stops at a damaged line still shows what it read.
+            var read_damaged = false;
+            while (true) {
+                while (cache.starts.items.len < back) {
+                    // Below `back`, a u32, so the cast holds.
+                    const next_back: u32 = @intCast(cache.starts.items.len + 1);
+                    const end = (if (next_back == 1) cache.held_start else cache.starts.items[next_back - 2]) orelse
+                        return if (cache.damages(next_back)) error.TranscriptArchiveDamaged else error.TranscriptArchiveUnavailable;
+                    try cache.starts.append(app.alloc, cache.startOf(next_back, try v2.previousCompactionCursor(app.alloc, end)));
+                }
+                const start = cache.starts.items[back - 1];
+
+                var projection = try resume_projection.ResumeProjection.initEmpty(app.alloc, &app.shell, 0, 1);
+                defer projection.deinit();
+                // Apart from the live ids: Ctrl+O joins this cycle to the held entries.
+                projection.runtime.notebook.next_entry_id = transcript_runtime.archiveEntryIdBase(back);
+                var labels = HistoricalSessionLabels{ .workspace_root = app.workspace_root };
+                defer labels.deinit(app.alloc);
+                var sink = DetachedHistorySink(@TypeOf(projection)){
+                    .app = app,
+                    .projection = &projection,
+                    .labels = &labels,
+                };
+                const Visitor = struct {
+                    app: *App,
+                    agent: *AppAgent,
+                    sink: *@TypeOf(sink),
+                    labels: *HistoricalSessionLabels,
+                    has_prior_turns: bool = false,
+
+                    pub fn append(self: *@This(), turn: types.HistoryTurn) !void {
+                        return replayHistoryToSinkIncremental(self.app, self.agent, self.sink, &.{turn}, &self.has_prior_turns, self.labels);
+                    }
+                };
+                var visitor = Visitor{ .app = app, .agent = agent, .sink = &sink, .labels = &labels };
+                if (try v2.visitHistoryCycle(app.alloc, start, &visitor)) read_damaged = true;
+                if (projection.runtime.notebook.entries.items.len == 0) if (start) |empty_start| {
+                    // Two compactions with no turn between leave an empty
+                    // cycle; it is not a page of its own, so the cycle before
+                    // it takes its place. Each skip moves to an older
+                    // compaction line, so this ends.
+                    cache.starts.items[back - 1] = cache.startOf(back, try v2.previousCompactionCursor(app.alloc, empty_start));
+                    cache.starts.shrinkRetainingCapacity(back);
+                    debug_trace.logf("full_transcript_cache", "archive_empty_cycle_skipped back={d}", .{back});
+                    continue;
+                };
+                const archived = try projection.intoArchivedRuntime();
+                const entries = archived.notebook.entries.items.len;
+                const damaged = read_damaged or cache.damages(back);
+                try app.shell.installTranscriptArchive(app.alloc, back, start != null, archived, damaged);
+                debug_trace.logf("full_transcript_cache", "archive_loaded back={d} entries={d} damaged={} us={d}", .{
+                    back,
+                    entries,
+                    damaged,
+                    @divTrunc(io_mod.nanoTimestamp() - started_ns, std.time.ns_per_us),
+                });
+                return;
+            }
+        }
+
+        /// Whether `agent`'s transcript is the one on the screen's slot: the
+        /// agent on screen, or the hidden one a visit put there.
+        fn transcriptInContext(app: *App, agent: *AppAgent) bool {
+            if (comptime @hasDecl(App, "screenAgent")) return app.screenAgent() == agent;
+            return true;
+        }
+
+        /// Whether Ctrl+O can page into older compaction cycles: the window
+        /// holds only the newest cycle, and the log holds the older ones.
+        fn syncTranscriptArchiveAvailable(app: *App, agent: *AppAgent) void {
+            if (comptime !@hasField(App, "shell")) return;
+            if (comptime !@hasField(@TypeOf(app.shell), "transcript_archive_available")) return;
+            if (!transcriptInContext(app, agent)) return;
+            const v2 = agent.session_persistence.v2 orelse {
+                app.shell.transcript_archive_available = false;
+                return;
+            };
+            const newest = v2.previousCompactionCursor(app.alloc, null) catch null;
+            app.shell.transcript_archive_available = if (newest) |found| found.cursor != null else false;
+        }
+
         /// Builds the notebook of the agent in context from `history`, as
         /// resume builds main's: for a subagent's agent the first time this
         /// process shows its conversation. The projection is installed
@@ -3256,27 +3394,33 @@ pub fn Runtime(comptime App: type) type {
                 .projection = &projection,
                 .labels = &labels,
             };
-            try replayResumedHistoryToSink(app, agent, &sink, history, &labels);
+            const holds_previous = try replayResumedHistoryToSink(app, agent, &sink, history, &labels);
             try projection.finalize();
             var scratch: transcript_runtime.TranscriptRuntime = .{};
             defer scratch.deinit(app.alloc);
-            try app.installResumeProjectionInto(agent, &projection, &scratch);
+            // The scratch transcript runs the agent's window before the
+            // replay is installed, as main's resume does.
+            try scratch.setTranscriptWindowSaved(app.alloc, agent.session_persistence.v2 != null);
+            try app.installResumeProjectionInto(agent, &projection, &scratch, holds_previous);
             var slot: transcript_runtime.TranscriptSlot = .{};
             scratch.swapSlot(&slot);
             app.shell.swapSlot(&slot);
             transcript_runtime.TranscriptRuntime.deinitSlot(&slot, app.alloc);
+            syncTranscriptArchiveAvailable(app, agent);
         }
 
+        /// True when the replayed turns are the cycle before the newest
+        /// compaction, because no turn finished after it.
         fn replayResumedHistoryToSink(
             app: *App,
             agent: *AppAgent,
             sink: anytype,
             context_history: []const types.HistoryTurn,
             labels: *HistoricalSessionLabels,
-        ) !void {
+        ) !bool {
             if (comptime runtime_profile.allows(App, .durable_sessions)) {
-                // Every saved turn shows, not only those since the newest
-                // compaction.
+                // The screen holds the newest compaction cycle; Ctrl+O reads
+                // the older ones from the log.
                 if (agent.session_persistence.v2) |v2| {
                     const Visitor = struct {
                         app: *App,
@@ -3290,10 +3434,11 @@ pub fn Runtime(comptime App: type) type {
                         }
                     };
                     var visitor = Visitor{ .app = app, .agent = agent, .sink = sink, .labels = labels };
-                    return v2.visitHistory(app.alloc, &visitor);
+                    return v2.visitHistorySinceCompaction(app.alloc, &visitor);
                 }
             }
-            return replayHistoryToSink(app, agent, sink, context_history, labels);
+            try replayHistoryToSink(app, agent, sink, context_history, labels);
+            return false;
         }
 
         fn writeResumeNotice(
@@ -4533,6 +4678,12 @@ pub fn Runtime(comptime App: type) type {
             }
             agent.session.commitCompactedHistory(app.alloc, prepared);
             prepared_owned = false;
+            if (comptime @hasField(App, "shell")) {
+                if (comptime @hasDecl(@TypeOf(app.shell), "transcriptWindowCompacted")) {
+                    if (transcriptInContext(app, agent)) try app.shell.transcriptWindowCompacted(app.alloc);
+                    syncTranscriptArchiveAvailable(app, agent);
+                }
+            }
         }
 
         pub fn commitPermissionState(

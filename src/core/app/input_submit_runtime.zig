@@ -733,9 +733,17 @@ pub fn SubmitRuntime(comptime App: type) type {
 
             const trimmed = std.mem.trim(u8, expanded.text, " \t\r\n");
 
+            // Nothing to send: no turn is readied for it.
+            if (trimmed.len == 0 and agents.screenAgentOf(app).pending_images.items.len == 0) {
+                app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                app.shell.render_requests.request(.footer);
+                return;
+            }
+
             // On a subagent's screen the text is that subagent's own turn, as
-            // on main, readied first so its profile limits it.
-            if (comptime @hasDecl(App, "prepareSubagentOnScreen")) {
+            // on main, readied first so its profile limits it. Its work opens
+            // only once the text is queued.
+            const own_turn = if (comptime @hasDecl(App, "prepareSubagentOnScreen"))
                 app.prepareSubagentOnScreen(agents.screenAgentOf(app)) catch |err| {
                     debug_trace.logf("host", "own turn refused agent={s} reason={s}", .{ app.screenAgentId(), @errorName(err) });
                     var name_buf: [32]u8 = undefined;
@@ -751,22 +759,19 @@ pub fn SubmitRuntime(comptime App: type) type {
                             "This subagent can't take a message right now, so your message wasn't sent.",
                     }, true);
                     return;
-                };
-            }
+                }
+            else
+                false;
 
             if (trimmed.len == 0) {
-                if (agents.screenAgentOf(app).pending_images.items.len > 0) {
-                    const admission = try enqueuePromptForSubmit(app, agents.screenAgentOf(app), "", &.{});
-                    if (admission == .rejected) return;
-                    releasePendingImages(app, agents.screenAgentOf(app));
-                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                    if (acceptedPromptNeedsImmediateFooter(app, agents.screenAgentOf(app))) {
-                        app.shell.render_requests.request(.footer);
-                    }
-                    return;
-                }
+                const admission = try enqueuePromptForSubmit(app, agents.screenAgentOf(app), "", &.{});
+                if (admission == .rejected) return;
+                if (own_turn) app.openSubagentTurnWork();
+                releasePendingImages(app, agents.screenAgentOf(app));
                 app.input_runtime.inputResetState().clearCurrent(app.alloc);
-                app.shell.render_requests.request(.footer);
+                if (acceptedPromptNeedsImmediateFooter(app, agents.screenAgentOf(app))) {
+                    app.shell.render_requests.request(.footer);
+                }
                 return;
             }
 
@@ -888,6 +893,7 @@ pub fn SubmitRuntime(comptime App: type) type {
                     display_skill_tokens,
                 );
             if (admission == .rejected) return;
+            if (own_turn) app.openSubagentTurnWork();
             commitStableExtractedImageIds(app, agents.screenAgentOf(app), extracted.images);
             commitRemappedImageIds(app, agents.screenAgentOf(app), visual_text.next_image_id);
             if (visual_text.text.len > 0) {

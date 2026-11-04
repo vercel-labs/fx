@@ -1045,7 +1045,15 @@ fn composeTranscriptViewerFooterFrame(
     errdefer frame.deinit(alloc);
     const width = shell.layout.cols;
     const navigation = switch (input.ctx.transcript_depth) {
-        .full => "full detail · ctrl+o close · pgup/pgdn scroll · esc close",
+        .full => if (shell.transcript_archive_failed)
+            "couldn't load older history · pgup to retry · esc close"
+        else if (shell.transcript_archive_damaged)
+            // fx doctor names the session and the command that copies its
+            // good turns; the scroll hint goes, as for a failed read, so it
+            // fits 80 columns.
+            "part of older history couldn't be read · fx doctor · esc close"
+        else
+            "full detail · ctrl+o close · pgup/pgdn scroll · esc close",
         .inline_mode => unreachable,
     };
 
@@ -1374,6 +1382,54 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
         shell.layout.cols,
         "┃ full detail · ctrl+o close · pgup/pgdn scroll · esc close",
     );
+}
+
+test "transcript viewer footer says when older history could not load or is damaged" {
+    const alloc = std.testing.allocator;
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var shell = TranscriptRuntime{
+        .layout = .{
+            .rows = 12,
+            .cols = 80,
+            .content_bottom = 8,
+            .divider_top_row = 9,
+            .input_row = 10,
+            .divider_bottom_row = 11,
+            .hint_row = 12,
+        },
+        .owned_top_row = 1,
+        .viewport_top_row = 1,
+        .cursor_row = 8,
+        .cursor_col = 1,
+    };
+    defer shell.deinit(alloc);
+    var ctx = testContext(&input);
+    ctx.transcript_depth = .full;
+    const planner_input: FooterPlannerInput = .{
+        .active_label = null,
+        .ctx = ctx,
+        .place_mid_line_active = false,
+        .input_extra = 0,
+        .input_visible = false,
+        .composer_top_chrome_rows = 0,
+        .picker_rows = 0,
+        .banner_active = false,
+    };
+    for ([_]struct { failed: bool, damaged: bool, text: []const u8 }{
+        .{ .failed = true, .damaged = false, .text = "┃ couldn't load older history · pgup to retry · esc close" },
+        // A failed read says to retry even when an earlier read hit damage.
+        .{ .failed = true, .damaged = true, .text = "┃ couldn't load older history · pgup to retry · esc close" },
+        .{ .failed = false, .damaged = true, .text = "┃ part of older history couldn't be read · fx doctor · esc close" },
+        .{ .failed = false, .damaged = false, .text = "┃ full detail · ctrl+o close · pgup/pgdn scroll · esc close" },
+    }) |case| {
+        shell.transcript_archive_failed = case.failed;
+        shell.transcript_archive_damaged = case.damaged;
+        const frame_plan = planFooterPaint(&shell, planner_input);
+        var frame = try composeFooterFrame(alloc, &shell, planner_input, frame_plan.paint);
+        defer frame.deinit(alloc);
+        try expectFrameRowTextTrimmed(&frame, frame_plan.paint.footer.top_divider, shell.layout.cols, case.text);
+    }
 }
 
 test "footer paints an inline completion suffix without moving the composer cursor" {

@@ -790,6 +790,39 @@ pub const PendingCancelledCommand = struct {
     }
 };
 
+/// The boundaries of the older compaction cycles, found walking back from
+/// the held one as Ctrl+O reads older, so each cycle is found once.
+pub const TranscriptArchiveBoundaries = struct {
+    /// The newest compaction, and whether the transcript window held the
+    /// cycle before it, when the walk started: a change starts it over.
+    key: ?struct { newest: session_adapter.LogCursor, holds_previous: bool } = null,
+    /// Where the held entries start: the end of cycle 1 back.
+    held_start: ?session_adapter.LogCursor = null,
+    /// `starts[k - 1]` is where cycle `k` back starts, and so where cycle
+    /// `k + 1` ends; null at the log's start.
+    starts: std.ArrayList(?session_adapter.LogCursor) = .empty,
+    /// The first cycle back whose start a damaged log line hid: it and every
+    /// older cycle Ctrl+O shows may be missing turns.
+    damaged_from: ?u32 = null,
+
+    /// Records that finding where cycle `back` starts stopped at a damaged
+    /// line, and returns the start to use: none, the log's start.
+    pub fn startOf(self: *TranscriptArchiveBoundaries, back: u32, found: session_adapter.Session.PreviousCompaction) ?session_adapter.LogCursor {
+        if (found.damaged and self.damaged_from == null) self.damaged_from = back;
+        return found.cursor;
+    }
+
+    pub fn damages(self: *const TranscriptArchiveBoundaries, back: u32) bool {
+        const from = self.damaged_from orelse return false;
+        return back >= from;
+    }
+
+    pub fn deinit(self: *TranscriptArchiveBoundaries, alloc: Allocator) void {
+        self.starts.deinit(alloc);
+        self.* = .{};
+    }
+};
+
 pub const Persistence = struct {
     // Serializes event-log mutations with worker usage callbacks. Usage takes
     // its checkpoint mutex first, so callers must not checkpoint while held.
@@ -815,6 +848,9 @@ pub const Persistence = struct {
     title_generation: TitleGenerationLoad = .{},
     degraded_warning_emitted: bool = false,
     pending_cancelled_command: ?PendingCancelledCommand = null,
+    /// Where the older compaction cycles Ctrl+O read start in the session log
+    /// (`loadTranscriptArchive`).
+    transcript_archive_boundaries: TranscriptArchiveBoundaries = .{},
     image_snapshot_temp_dir: ?[]u8 = null,
     resume_handoff_intent: ResumeHandoffIntent = .none,
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
@@ -835,7 +871,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 29) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 30) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -860,6 +896,7 @@ pub const Persistence = struct {
         storage.title_generation = .{};
         storage.degraded_warning_emitted = false;
         storage.pending_cancelled_command = null;
+        storage.transcript_archive_boundaries = .{};
         storage.image_snapshot_temp_dir = null;
         storage.resume_handoff_intent = .none;
         storage.pending_live_session_policy = null;
@@ -912,6 +949,7 @@ pub const Persistence = struct {
         if (catalog == .free) self.session_picker_cache.deinit();
         self.fork_menu.close(alloc);
         self.title_generation.deinit();
+        self.transcript_archive_boundaries.deinit(alloc);
         // After the picker thread, which lists through it, has joined.
         if (self.v2_store) |store| {
             store.deinit(alloc);

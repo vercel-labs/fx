@@ -2307,6 +2307,7 @@ fn writeNetworkCallCompact(writer: *std.Io.Writer, call: diagnostics.NetworkCall
     if (call.input_tokens > 0 or call.output_tokens > 0) try writer.print(" tokens={d}->{d}", .{ call.input_tokens, call.output_tokens });
     if (call.is_web_search) try writer.print(" web_search_requests={d}", .{call.web_search_requests});
     if (call.terminalStopReason().len > 0) try writer.print(" stop_reason={s}", .{call.terminalStopReason()});
+    if (call.providerStopReason().len > 0) try writer.print(" provider_stop_reason={s}", .{call.providerStopReason()});
     if (call.turn_id != 0) try writer.print(" turn={d}", .{call.turn_id});
     if (call.step_id != 0) try writer.print(" step={d}", .{call.step_id});
     if (call.gatewaySchemaDiagnostic().len > 0) try writer.print(" gateway_schema=\"{s}\"", .{call.gatewaySchemaDiagnostic()});
@@ -4301,6 +4302,30 @@ test "trace renders web search request count without content" {
     try std.testing.expect(std.mem.find(u8, text, "web_search_requests=2") != null);
     try std.testing.expect(std.mem.find(u8, text, "stop_reason=max_tokens") != null);
     try std.testing.expect(std.mem.find(u8, text, "raw result content") == null);
+}
+
+test "trace names the provider's own stop reason beside the unified one" {
+    const alloc = std.testing.allocator;
+    diagnostics.resetForTest();
+    defer diagnostics.resetForTest();
+
+    var call: diagnostics.NetworkCall = .{ .started_at_ms = 3000, .duration_ms = 9, .status = 200 };
+    call.setModel("google/gemini-4-argon");
+    call.setTerminalStopReason("other");
+    call.setProviderStopReason("UNEXPECTED_TOOL_CALL");
+    diagnostics.recordNetworkCall(call);
+    var plain: diagnostics.NetworkCall = .{ .started_at_ms = 4000, .duration_ms = 9, .status = 200 };
+    plain.setModel("openai/gpt-5.5");
+    plain.setTerminalStopReason("stop");
+    diagnostics.recordNetworkCall(plain);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeNetworkCallsSummary(&out.writer);
+    const text = out.written();
+
+    try std.testing.expect(std.mem.find(u8, text, "stop_reason=other provider_stop_reason=UNEXPECTED_TOOL_CALL") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "provider_stop_reason="));
 }
 
 test "trace renders gateway schema diagnostics without raw payload content" {

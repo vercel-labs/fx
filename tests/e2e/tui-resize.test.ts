@@ -1859,7 +1859,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
   );
 
   test(
-    "assistant stream retention preserves visible rows at default cap",
+    "a long assistant stream keeps every row and the collapsed group in order",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-assistant-retention-")));
       if (!KEEP_LARGE_SKILL_ARTIFACTS) tempDirs.push(root);
@@ -1905,11 +1905,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
         })}\n\ndata: [DONE]\n\n`));
         streams[turn].close();
       };
-      // Bounded inert destinations consume the real cap without thousands of rows.
+      // Long inert link destinations make each row large without thousands of rows.
       const inertRow = (marker: string) => Array.from({ length: 14 }, (_, index) =>
         `[${index === 0 ? marker : "."}](https://example.invalid/${"x".repeat(1000)})`
       ).join("") + "\n\n";
-      // Removing the old response must leave the collapsed group through a retention frame.
       const old = (id: number) => id === 0
         ? inertRow("RETAIN_OLD_0000")
         : `RETAIN_OLD_${String(id).padStart(4, "0")} immutable sentinel\n\n`;
@@ -1975,21 +1974,14 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.waitForText("RETAIN_TAIL_0064", 15_000);
       await Bun.sleep(300);
       await assertRows(65);
-      expect(readFileSync(tracePath, "utf8")).not.toContain("pruned entry");
       let tailCount = 65;
-      let retained = false;
       for (let id = 65; id < 81; id++) {
         send(1, tail(id));
         await session.waitForText(`RETAIN_TAIL_${String(id).padStart(4, "0")}`, 10_000);
         await Bun.sleep(150);
         tailCount = id + 1;
         await assertRows(tailCount);
-        if (readFileSync(tracePath, "utf8").includes("trimmed protected entry")) {
-          retained = true;
-          break;
-        }
       }
-      expect(retained).toBe(true);
       finish(1);
       await session.waitForStableComposer(15_000);
       await assertRows(tailCount);
@@ -2005,14 +1997,14 @@ describe.skipIf(SKIP)("tui: resize", () => {
     120_000,
   );
 
-  for (const { label, pressure, viewerCols } of [
-    { label: "no-prune control", pressure: false, viewerCols: 0 },
-    { label: "pressure", pressure: true, viewerCols: 0 },
-    { label: "pressure with Ctrl+O", pressure: true, viewerCols: 80 },
-    { label: "pressure with Ctrl+O resize 80 to 100", pressure: true, viewerCols: 100 },
+  for (const { label, large, viewerCols } of [
+    { label: "small output", large: false, viewerCols: 0 },
+    { label: "large output", large: true, viewerCols: 0 },
+    { label: "large output with Ctrl+O", large: true, viewerCols: 80 },
+    { label: "large output with Ctrl+O resize 80 to 100", large: true, viewerCols: 100 },
   ]) {
     test(
-      `command retention preserves native paragraphs at default cap (${label})`,
+      `command output keeps native paragraphs in history (${label})`,
       async () => {
         const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-command-retention-")));
         const home = join(root, "home");
@@ -2026,7 +2018,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         writeFileSync(join(home, ".fx", "settings.json"), "{}");
         writeFileSync(stderrPath, "");
         // Keep geometry and logical rows identical; only the old retained payload differs.
-        writeFileSync(join(workspace, "old.txt"), "S".repeat(pressure ? 1_040_000 : 8_000) + "\n");
+        writeFileSync(join(workspace, "old.txt"), "S".repeat(large ? 1_040_000 : 8_000) + "\n");
         writeFileSync(join(workspace, "new.txt"), "N".repeat(80_000) + "\n");
         writeFileSync(join(workspace, "probe.sh"), [
           "printf started > started",
@@ -2143,9 +2135,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
           await session.waitForStableComposer(15_000);
           const seeded = await capture("seeded");
           check("seeded history", () => expectHistory(seeded, false));
-          check("seed stays below default cap", () => {
-            expect(readFileSync(tracePath, "utf8")).not.toMatch(/pruned (?:command output|entry)/);
-          });
 
           await session.sendText("Run the new prepared output, then the later response.");
           const deadline = Date.now() + 15_000;
@@ -2160,11 +2149,10 @@ describe.skipIf(SKIP)("tui: resize", () => {
             await session.sendHexBytes(["0f"]);
             await session.waitForText(fullFooter, TIMEOUT);
             await capture("viewer-open-before-output");
-            check("viewer admitted before first retirement", () => {
+            check("viewer opened before the output", () => {
               expect(existsSync(releasePath)).toBe(false);
               expect(existsSync(join(workspace, "finished"))).toBe(false);
               expect(requestCount).toBe(3);
-              expect(readFileSync(tracePath, "utf8")).not.toMatch(/pruned (?:command output|entry)/);
             });
           }
           const traceOffset = readFileSync(tracePath, "utf8").length;
@@ -2186,16 +2174,14 @@ describe.skipIf(SKIP)("tui: resize", () => {
                 .some(record => record.kind === "turn_committed");
               return completed && requestCount === 4 &&
                 existsSync(join(workspace, "finished")) &&
-                existsSync(join(workspace, "sibling-finished")) &&
-                /pruned (?:command output|entry)/.test(readFileSync(tracePath, "utf8").slice(traceOffset));
+                existsSync(join(workspace, "sibling-finished"));
             }, TIMEOUT);
-            checks["viewer turn completed and pruned before close"] = "PASS";
+            checks["viewer turn completed before close"] = "PASS";
             writeFileSync(join(root, "viewer-completed.events.jsonl"), readFileSync(eventsPath));
             const viewerTrace = readFileSync(tracePath, "utf8").slice(traceOffset);
             writeFileSync(join(root, "viewer-completed.trace.log"), viewerTrace);
             await capture("viewer-completed-before-close");
-            check("retirement completed while viewer owns screen", () => {
-              expect(viewerTrace).toMatch(/pruned (?:command output|entry)/);
+            check("turn completed while viewer owns screen", () => {
               expect(readFileSync(join(workspace, "finished"), "utf8")).toBe("finished");
               expect(readFileSync(join(workspace, "sibling-finished"), "utf8")).toBe("finished");
               expect(gateway.requests).toHaveLength(4);
@@ -2221,13 +2207,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
           const afterOutput = await capture("after-output");
           const boundary = readFileSync(tracePath, "utf8").slice(traceOffset);
           writeFileSync(join(root, "output-trace.log"), boundary);
-          // Scheduling can coalesce atomic append/status frames. Require actual pruning,
-          // not a particular frame reason; coordinator tests own those exact boundaries.
-          check("retention boundary", () => {
-            const prunes = boundary.match(/pruned (?:command output|entry)/g) ?? [];
-            if (pressure) expect(prunes.length).toBeGreaterThan(0);
-            else expect(prunes).toHaveLength(0);
-          });
           check("commands finished", () => {
             expect(readFileSync(join(workspace, "finished"), "utf8")).toBe("finished");
             expect(readFileSync(join(workspace, "sibling-finished"), "utf8")).toBe("finished");
@@ -2240,9 +2219,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
           await session.waitForStableComposer(10_000);
           const afterNotice = await capture("after-notice");
           check("native history after a local notice", () => expectHistory(afterNotice, true));
-          if (!pressure) check("control never prunes", () => {
-            expect(readFileSync(tracePath, "utf8")).not.toMatch(/pruned (?:command output|entry)/);
-          });
           await session.sendText("/quit");
           await session.waitForPane(() => session!.paneStatus().dead, 10_000);
           check("clean exit", () => {
@@ -2273,7 +2249,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         } finally {
           writeFileSync(releasePath, "cleanup");
           if (session) await capture("last");
-          writeFileSync(join(root, "checks.json"), JSON.stringify({ pressure, viewerCols, requestCount, checks }, null, 2));
+          writeFileSync(join(root, "checks.json"), JSON.stringify({ large, viewerCols, requestCount, checks }, null, 2));
           if (passed && !KEEP_LARGE_SKILL_ARTIFACTS) tempDirs.push(root);
           else console.error(`command retention evidence retained: ${root}`);
         }

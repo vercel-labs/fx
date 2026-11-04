@@ -1114,7 +1114,7 @@ pub const Runtime = struct {
         defer self.alloc.free(suffix);
         const work_id = try alloc.print("{s}:{s}", .{ if (started_by == .user) "fxuser" else "fxwake", suffix });
         errdefer alloc.free(work_id);
-        if (open_now) try self.startTurnWorkInLog(child_id, work_id);
+        if (open_now) try self.startTurnWorkInLog(child_id, work_id, started_by);
         var work: TurnWork = .{
             .child_id = try self.alloc.dupe(u8, child_id),
             .work_id = undefined,
@@ -1132,8 +1132,9 @@ pub const Runtime = struct {
         return work_id;
     }
 
-    /// Starts `work_id` as the child's work in the parent's log.
-    fn startTurnWorkInLog(self: *Runtime, child_id: []const u8, work_id: []const u8) !void {
+    /// Starts `work_id` as the child's work in the parent's log, saying who
+    /// started it.
+    fn startTurnWorkInLog(self: *Runtime, child_id: []const u8, work_id: []const u8, started_by: reports.StartedBy) !void {
         var lock = self.managed.state_store.acquireLock();
         defer lock.release();
         var registry = try self.managed.state_store.load(self.alloc);
@@ -1144,6 +1145,7 @@ pub const Runtime = struct {
             .id = @constCast(work_id),
             .message = @constCast(""),
             .created_at_ms = io_mod.milliTimestamp(),
+            .started_by = started_by,
         });
         try self.managed.state_store.save(self.alloc, registry);
     }
@@ -1155,7 +1157,7 @@ pub const Runtime = struct {
         const index = self.findTurnWorkLocked(child_id) orelse return .none;
         const work = &self.turn_works.items[index];
         if (work.opened) return .none;
-        self.startTurnWorkInLog(child_id, work.work_id) catch |err| {
+        self.startTurnWorkInLog(child_id, work.work_id, work.started_by) catch |err| {
             debug_trace.eventf("mailbox", "turn_work_failed", .{}, "child={s} work_id={s} err={s}", .{ child_id, work.work_id, @errorName(err) });
             var dropped = self.turn_works.swapRemove(index);
             dropped.deinit(self.alloc);

@@ -209,7 +209,11 @@ fn nativeLoopPollTimeoutMs(
     skills_refresh_active: bool,
     transcript_page_work_active: bool,
     file_listing_hold_pending: bool,
+    /// A time-bounded drain put events back: run the next iteration without
+    /// waiting for input.
+    next_iteration_due: bool,
 ) i32 {
+    if (next_iteration_due) return 0;
     return if (first_frame_pending or
         auth_refresh_active or
         skills_refresh_active or
@@ -1260,9 +1264,20 @@ const App = struct {
                 self.skills.refreshActive(),
                 self.fullTranscriptFocusedWorkActive(),
                 InputAppRuntime.fileListingHoldPending(self, app_permission_runtime.monotonicMillis()),
+                self.takeDrainContinuationDue(),
             );
         }
         return if (self.pacer.hasPending()) default_timeout_ms else idle_wasm_poll_timeout_ms;
+    }
+
+    /// Whether any agent's budgeted drain put events back for the loop's next
+    /// turn, which then polls without waiting. Takes every agent's flag.
+    fn takeDrainContinuationDue(self: *App) bool {
+        var due = self.main_agent.worker.takeDrainContinuationDue();
+        for (self.child_agents.items) |child| {
+            if (child.agent.worker.takeDrainContinuationDue()) due = true;
+        }
+        return due;
     }
 
     fn fullTranscriptFocusedWorkActive(self: *App) bool {
@@ -1552,17 +1567,21 @@ const App = struct {
         self: *App,
         agent: *agents.Agent,
         projection: *ResumeProjection,
+        holds_previous_cycle: bool,
     ) !void {
-        return self.installResumeProjectionInto(agent, projection, &self.shell);
+        return self.installResumeProjectionInto(agent, projection, &self.shell, holds_previous_cycle);
     }
 
     /// `installResumeProjection` into `target`: the agent in context takes
     /// the projection's diffs, and `target` its transcript.
+    /// `holds_previous_cycle` when the replayed turns are the cycle before
+    /// the newest compaction.
     pub fn installResumeProjectionInto(
-        _: *App,
+        self: *App,
         agent: *agents.Agent,
         projection: *ResumeProjection,
         target: *TranscriptRuntime,
+        holds_previous_cycle: bool,
     ) !void {
         const c_alloc = std.heap.c_allocator;
         try agent.diff_entries.ensureUnusedCapacity(
@@ -1575,6 +1594,7 @@ const App = struct {
         projection.pending_diffs.clearRetainingCapacity();
         agent.next_diff_id = projection.next_diff_id;
         projection.install(target);
+        try target.transcriptWindowResumed(self.alloc, holds_previous_cycle);
     }
 
     pub fn historicalToolActivityKind(
@@ -3278,6 +3298,14 @@ const App = struct {
                 RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
             }
         }
+        if (self.shell.transcript_archive_request) |back| {
+            // A Ctrl+O page needs an older compaction cycle from the log.
+            SessionAppRuntime.loadTranscriptArchive(self, self.screenAgent(), back) catch |err| {
+                debug_trace.logf("full_transcript_cache", "archive_load_failed back={d} err={s}", .{ back, @errorName(err) });
+                if (err == error.TranscriptArchiveDamaged) self.shell.damageTranscriptArchive() else self.shell.failTranscriptArchive();
+            };
+            RenderAppRuntime.requestActiveSurfaceFrame(self, .modal);
+        }
         try self.shell.prewarmFullTranscriptPage(
             self.fullTranscriptSidecarCapability(self.screenAgent()),
             self.fullTranscriptDiffResolver(),
@@ -3355,9 +3383,15 @@ const App = struct {
     }
 
     /// Readies the subagent on screen, if any, for a turn the user starts
-    /// there, which then runs as main's does.
-    pub fn prepareSubagentOnScreen(self: *App, agent: *agents.Agent) !void {
+    /// there, which then runs as main's does. True when it admitted one.
+    pub fn prepareSubagentOnScreen(self: *App, agent: *agents.Agent) !bool {
         return AgentsAppRuntime.prepareOwnTurn(self, agent);
+    }
+
+    /// Opens the work for the turn `prepareSubagentOnScreen` admitted, once
+    /// the user's text is queued.
+    pub fn openSubagentTurnWork(self: *App) void {
+        AgentsAppRuntime.openOwnTurnWork(self);
     }
 
     /// `/launch`: another instance on the host, shown.
@@ -3480,7 +3514,17 @@ const App = struct {
 
     /// Handles the events and paced text of the agent in context.
     fn tickAgentInContext(_: void, self: *App, agent: *agents.Agent) anyerror!void {
-        try WorkerAppRuntime.tick(self, agent, app_callbacks.Bindings(App).workerEventHandlers(agent));
+        // An agent's session can start while another's transcript is on
+        // screen; its transcript window starts the first time its own is.
+        SessionAppRuntime.ensureTranscriptWindow(self, agent);
+        const handlers = app_callbacks.Bindings(App).workerEventHandlers(agent);
+        if (comptime host_target.is_wasm) {
+            try WorkerAppRuntime.tick(self, agent, handlers);
+        } else {
+            // Past the budget the drain puts the rest back, so the loop reads
+            // keys and paints before applying them.
+            try WorkerAppRuntime.tickWithinBudget(self, agent, handlers, app_worker_runtime.interactive_drain_budget_ns);
+        }
         const now_ns = io_mod.nanoTimestamp();
         if (!agent.approval_prompt.isActive() and !agent.question_prompt.isActive() and !self.auth.apiKeyEntryActive()) {
             try self.pacer.tick(self.alloc, now_ns, self.pacerCallbacks());
@@ -4334,13 +4378,15 @@ test "process io connects through a reachable address while fx tasks hold every 
 }
 
 test "focused UI workers retain a bounded native poll timeout" {
-    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true, false, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, true, false));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, true));
-    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true, true, true));
+    try std.testing.expectEqual(@as(i32, 8), nativeLoopPollTimeoutMs(8, false, false, false, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, false, false, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, true, false, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, true, false, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, true, false, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, false, false, false, false, true, false));
+    try std.testing.expectEqual(@as(i32, 1), nativeLoopPollTimeoutMs(8, true, true, true, true, true, false));
+    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, false, false, false, false, false, true));
+    try std.testing.expectEqual(@as(i32, 0), nativeLoopPollTimeoutMs(8, true, true, true, true, true, true));
 }
 
 test "footer runtime compatibility facade exports composeFooterFrame" {
@@ -5291,6 +5337,7 @@ test {
     _ = @import("core/app/input_interrupt_runtime.zig");
     _ = @import("ui/footer/render_input.zig");
     _ = @import("ui/footer/surface_frame.zig");
+    _ = @import("ui/footer/paint_plan.zig");
     _ = @import("ui/render_request.zig");
     _ = @import("core/app/app_runtime_setup.zig");
     _ = @import("core/app/app_session_runtime.zig");
@@ -5299,8 +5346,14 @@ test {
     _ = @import("core/app/app_worker_runtime.zig");
     _ = @import("ui/event_loop.zig");
     _ = @import("ui/resize_tests.zig");
+    _ = @import("ui/transcript/transcript_window_fuzz.zig");
+    _ = @import("ui/transcript/frozen_prefix_tests.zig");
+    _ = @import("ui/transcript/transcript_window_shell.zig");
+    _ = @import("ui/transcript/transcript_window_runtime_tests.zig");
+    _ = @import("ui/transcript/frozen_prefix.zig");
     _ = @import("ui/render_engine/assistant_wrap.zig");
     _ = @import("ui/render_engine/transcript_blocks.zig");
+    _ = @import("ui/render_engine/transcript_measure.zig");
     _ = @import("ui/render_engine/viewport_selection.zig");
     _ = @import("core/agent/assistant_presentation.zig");
     _ = @import("core/agent/presentation/inline_render.zig");
@@ -5479,6 +5532,7 @@ test {
     _ = @import("ui/render_engine/terminal_diff.zig");
     _ = @import("ui/transcript/runtime.zig");
     _ = @import("ui/transcript/runtime_tests.zig");
+    _ = @import("ui/transcript/painter.zig");
     _ = @import("core/agent/worker_runtime.zig");
     _ = @import("gateway/client.zig");
     _ = @import("gateway/host_stream_provider.zig");
@@ -5561,7 +5615,10 @@ test "the tick visits only the child agents with work waiting" {
 
 test "the agent list previews each agent by switching, keeps every draft where it was typed, and Esc goes back" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5623,7 +5680,10 @@ test "the agent list previews each agent by switching, keeps every draft where i
 
 test "the footer indicator names the agent on screen and the key that opens the list" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5642,7 +5702,10 @@ test "the footer indicator names the agent on screen and the key that opens the 
 
 test "while a subagent is on screen, the tick visits main and the other hidden agents" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5680,7 +5743,10 @@ test "while a subagent is on screen, the tick visits main and the other hidden a
 
 test "the footer notes a hidden agent waiting on an approval, never the one on screen" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5712,7 +5778,10 @@ test "the footer notes a hidden agent waiting on an approval, never the one on s
 
 test "the footer notes a hidden agent whose request waits for the user" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5741,7 +5810,10 @@ test "the footer notes a hidden agent whose request waits for the user" {
 
 test "a hidden subagent's approval is lent to main's screen, answered on its worker, and goes back" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5841,7 +5913,10 @@ test "an approval answered on main's screen goes back, so the next one of the tr
 
 test "main's screen shows its tree's oldest prompt first, approval or question" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
@@ -5887,7 +5962,10 @@ test "main's screen shows its tree's oldest prompt first, approval or question" 
 
 test "a hidden subagent's question is lent to main's screen and goes back on a switch" {
     const alloc = std.testing.allocator;
-    var app = App{ .alloc = alloc };
+    // A switch writes the tab title, so keep it off the test runner's stdout.
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{ .alloc = alloc, .shell = .{ .stdout_file = sink } };
     defer app.shell.deinit(alloc);
     defer app.pacer.deinit(alloc);
     defer app.input_runtime.deinit(alloc);
