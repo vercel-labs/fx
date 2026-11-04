@@ -415,7 +415,7 @@ test "a report or message shows as a subagent row naming who sent it and how the
 
 test "a subagent row keeps control characters out of what it shows" {
     const alloc = std.testing.allocator;
-    const sent = try messageText(alloc, "rev\x1b]2;x\x07iewer", "c1", "hi \x1b]2;pwned\x07 there", 4096);
+    const sent = try messageText(alloc, "rev\x1b]2;x\x07iewer", "c1", "hi \x1b]2;pwned\x07 there", 4096, null);
     defer alloc.free(sent);
     const shown = (try row(alloc, .{ .text = sent, .author = .child })).?;
     defer shown.deinit(alloc);
