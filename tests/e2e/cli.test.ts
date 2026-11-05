@@ -6052,14 +6052,14 @@ describe("cli: MCP profile", () => {
   });
 
   test.skipIf(platform() === "win32")("list, add, and ask say what's wrong with an ~/.fx/mcp.json fx can't read", async () => {
-    const linkLoop = "~/.fx/mcp.json is a link that leads back to itself; replace it with a plain file";
+    const linkLoop = "~/.fx/mcp.json is a link that loops or passes through too many links; replace it with a plain file";
     const tooLarge = "~/.fx/mcp.json is over 1 MB, the most fx reads; make it smaller";
     const cases = [
       {
         label: "link loop",
         make: (path: string) => symlinkSync("mcp.json", path),
         list: `fx mcp: ${linkLoop}\n`,
-        add: "Couldn't add probe to ~/.fx/mcp.json: it is a link that leads back to itself; replace it with a plain file.\n",
+        add: "Couldn't add probe to ~/.fx/mcp.json: it is a link that loops or passes through too many links; replace it with a plain file.\n",
         ask: `fx ask: ${linkLoop}\n`,
       },
       {

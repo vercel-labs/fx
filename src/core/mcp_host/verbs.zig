@@ -484,7 +484,7 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
 // How fx says an MCP file is unusable, after a subject such as "it" or
 // "~/.fx/mcp.json".
 const not_plain_words = "isn't a plain file; replace it with one";
-const link_loop_words = "is a link that leads back to itself; replace it with a plain file";
+const link_loop_words = "is a link that loops or passes through too many links; replace it with a plain file";
 const too_large_words = std.fmt.comptimePrint("is over {d} MB, the most fx reads; make it smaller", .{config_file.max_read_bytes / (1024 * 1024)});
 
 /// Why a write to `path` failed; a link says what it points to.
@@ -1358,7 +1358,7 @@ test "an MCP file fx can't read gets fx's words, and only mcp.json's own errors 
     defer arena_state.deinit();
     const a = arena_state.allocator();
     try testing.expectEqualStrings(
-        profile_paths.displayText("~/.fx/mcp.json is a link that leads back to itself; replace it with a plain file"),
+        profile_paths.displayText("~/.fx/mcp.json is a link that loops or passes through too many links; replace it with a plain file"),
         profileConfigNotice(error.McpConfigLinkLoop).?,
     );
     try testing.expectEqualStrings(
@@ -1374,8 +1374,8 @@ test "an MCP file fx can't read gets fx's words, and only mcp.json's own errors 
     // .mcp.json, keep their own words.
     try testing.expect(profileConfigNotice(error.SymLinkLoop) == null);
     try testing.expect(profileConfigNotice(error.AccessDenied) == null);
-    try testing.expectEqualStrings("an MCP config file is a link that leads back to itself; replace it with a plain file", describe(error.SymLinkLoop));
+    try testing.expectEqualStrings("an MCP config file is a link that loops or passes through too many links; replace it with a plain file", describe(error.SymLinkLoop));
     try testing.expectEqualStrings("an MCP config file is over 1 MB, the most fx reads; make it smaller", describe(error.StreamTooLong));
-    try testing.expectEqualStrings("it is a link that leads back to itself; replace it with a plain file", try whyNot(a, error.SymLinkLoop, "/example/.mcp.json"));
+    try testing.expectEqualStrings("it is a link that loops or passes through too many links; replace it with a plain file", try whyNot(a, error.SymLinkLoop, "/example/.mcp.json"));
     try testing.expectEqualStrings("it is over 1 MB, the most fx reads; make it smaller", try whyNot(a, error.StreamTooLong, "/example/.mcp.json"));
 }

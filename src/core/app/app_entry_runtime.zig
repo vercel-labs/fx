@@ -1211,7 +1211,7 @@ test "app entry says what's wrong with ~/.fx/mcp.json instead of naming the erro
 
     try std.testing.expectError(error.McpConfigLinkLoop, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
     try std.testing.expectEqualStrings(
-        profile_paths.displayText("fx: ~/.fx/mcp.json is a link that leads back to itself; replace it with a plain file\n"),
+        profile_paths.displayText("fx: ~/.fx/mcp.json is a link that loops or passes through too many links; replace it with a plain file\n"),
         capture.stderr.written(),
     );
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
