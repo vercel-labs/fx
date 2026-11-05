@@ -73,6 +73,35 @@ describe("code mode", () => {
   );
 
   test(
+    "fx ask refuses an execute call while experimental.code_mode is off",
+    async () => {
+      const root = isolatedRoot({});
+      // The model can name a tool fx didn't offer.
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("exec-1", "execute", { code: "return await tools.read_file({ path: 'notes.txt' });" }),
+        fakeGatewayFinalText("Code mode is off."),
+      ]);
+      try {
+        const result = await runFx(["ask", "--auto", "--json", "--no-save", "Read notes.txt."], {
+          cwd: root.workspace,
+          env: env(root.home, gateway),
+          timeoutMs: TIMEOUT,
+        });
+        expect(result.code).toBe(0);
+        expect(gateway.requests).toHaveLength(2);
+        expect(serializedToolNames(parseGatewayRequest(gateway.requests[0]!.body))).not.toContain("execute");
+        const output = toolResultText(gateway.requests[1]!.body, "exec-1");
+        expect(output).toContain("Code mode isn't available here.");
+        expect(output).not.toContain("needle");
+      } finally {
+        gateway.stop();
+        cleanupIsolatedTestHome(root.root);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx ask runs an execute program whose tool calls go through fx",
     async () => {
       const root = isolatedRoot({ experimental: { code_mode: true } });
