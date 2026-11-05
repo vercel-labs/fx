@@ -18,9 +18,9 @@ fx took the engine and nothing around it: `quickjs.c`, `libregexp.c`, `libunicod
 
 ## Changes from upstream
 
-None. Every file here except this one matches the release archive byte for byte.
+Every file here except this one and the files listed below matches the release archive byte for byte. Record each change here when it lands: the file, what changed, and why. A fix from upstream can then be ported by comparing this folder with the next release.
 
-Record each change here when it lands: the file, what changed, and why. A fix from upstream can then be ported by comparing this folder with the next release.
+- `quickjs.c`: the loops in `js_array_join`, `js_array_reverse`, `js_array_slice`, `js_array_concat`, `js_array_sort`, `JS_CopySubArray`, `JS_FlattenIntoArray`, `js_string_raw`, the array case of `js_json_to_str`, and the replacer-array loop of `JS_JSONStringify` call `js_poll_interrupts` on each pass, as `js_array_includes` already does. Each walks an object up to its `length`, which a program can set as high as 2^53 - 1, without allocating or calling back into JavaScript, so nothing else stops it. Without the check, `join`, `reverse`, `shift`, `unshift`, `splice`, `copyWithin`, `slice`, `concat`, `flat`, `sort`, `String.raw`, and `JSON.stringify` ran past fx's deadline for as long as the length allowed.
 
 ## Compare the copy with upstream
 
@@ -36,4 +36,4 @@ for file in src/js/quickjs/*; do
 done
 ```
 
-`cmp` prints nothing when every file matches.
+`cmp` reports each file listed under Changes from upstream and nothing else.
