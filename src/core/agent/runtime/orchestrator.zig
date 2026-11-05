@@ -6352,9 +6352,15 @@ fn catalogDownImageText(chosen: image_route.Decision) []const u8 {
     return "Images from tools aren't reaching the model right now because image support couldn't be confirmed (model catalog unavailable). fx will retry automatically as the catalog recovers.";
 }
 
-/// Who serves the catalog for `provider`, as a catalog notice names it.
-fn catalogService(provider: model_provider.ProviderId) []const u8 {
-    return if (provider == .gateway) "AI Gateway" else "the model provider";
+/// The line that names a failed catalog connection before a turn fails
+/// because it could not confirm image input for an attached image, or null
+/// when the catalog failed some other way. Lives in `arena`.
+fn catalogUnreachableImageLine(arena: Allocator, failure: ?model_catalog.FailureCategory, service: []const u8) Allocator.Error!?[]const u8 {
+    if (failure != .transport) return null;
+    return try arena.print(
+        "fx couldn't connect to {s} to load the model catalog, so it couldn't confirm that this model accepts images. Check your network connection or firewall.",
+        .{service},
+    );
 }
 
 test "catalogDownNotice names a failed connection in one line and keeps the other failures' lines" {
@@ -6410,7 +6416,7 @@ test "catalogDownNotice names a failed connection in one line and keeps the othe
 
     const both = try catalogDownNotice(arena, .{
         .failure = .transport,
-        .service = catalogService(.gateway),
+        .service = model_catalog.serviceName(.gateway),
         .images = .{ .route = .unavailable, .mode = .unavailable, .tool_images = .none, .earlier_images = .withheld_unknown },
         .fast_off = true,
     });
@@ -6418,10 +6424,22 @@ test "catalogDownNotice names a failed connection in one line and keeps the othe
         "fx couldn't connect to AI Gateway to load the model catalog, so earlier images aren't reaching the model and fast mode is off until it loads. Check your network connection or firewall.",
         both.slice()[0],
     );
-    const codex = try catalogDownNotice(arena, .{ .failure = .transport, .service = catalogService(.codex), .fast_off = true });
+    const codex = try catalogDownNotice(arena, .{ .failure = .transport, .service = model_catalog.serviceName(.codex), .fast_off = true });
     try std.testing.expectEqualStrings(
         "fx couldn't connect to the model provider to load the model catalog, so fast mode is off until it loads. Check your network connection or firewall.",
         codex.slice()[0],
+    );
+
+    // An attached image the turn cannot send gets a cause line only for a
+    // failed connection; the host's own error follows it.
+    for (std.enums.values(model_catalog.FailureCategory)) |failure| {
+        const line = try catalogUnreachableImageLine(arena, failure, "AI Gateway");
+        try std.testing.expectEqual(failure == .transport, line != null);
+    }
+    try std.testing.expect(try catalogUnreachableImageLine(arena, null, "AI Gateway") == null);
+    try std.testing.expectEqualStrings(
+        "fx couldn't connect to AI Gateway to load the model catalog, so it couldn't confirm that this model accepts images. Check your network connection or firewall.",
+        (try catalogUnreachableImageLine(arena, .transport, "AI Gateway")).?,
     );
 }
 
@@ -7588,6 +7606,15 @@ fn processQueuedPromptLoop(
             if (image_failure) |reason| switch (reason) {
                 .capability_unknown => {
                     diagnostics.recordModelCatalogEvent(true, .image_gate, "model={s} image_support=unknown err=ModelImageCapabilityUnavailable", .{gateway_model});
+                    // The host's error says the image was not sent. A fresh
+                    // reading, since resolving capabilities may have made the
+                    // first catalog request, says first when the cause is a
+                    // connection fx could not make.
+                    const failure = if (deps.model_catalog_failure) |catalog_failure| catalog_failure(deps.ctx) else null;
+                    if (try catalogUnreachableImageLine(overlay_arena, failure, model_catalog.serviceName(job.provider))) |line| {
+                        try deps.push_text(deps.ctx, .{ .operational = line });
+                        try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                    }
                     return error.ModelImageCapabilityUnavailable;
                 },
                 .no_native_image => {
@@ -7741,7 +7768,7 @@ fn processQueuedPromptLoop(
                     // notify only when the earlier one saw the catalog down
                     // (`tests/tla/image_route/spec/ImageRoute.tla` NotifyOnlyWhenDown).
                     .failure = fast_catalog_failure orelse request_catalog_failure orelse .runtime,
-                    .service = catalogService(job.provider),
+                    .service = model_catalog.serviceName(job.provider),
                     .images = if (notify_catalog_down) image_choice else null,
                     .fast_off = fast_catalog_failure != null,
                 });

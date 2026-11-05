@@ -31,6 +31,10 @@ const CATALOG_CONNECT_IMAGE_NOTICE =
   "fx couldn't connect to AI Gateway to load the model catalog, so earlier images aren't reaching the model until it loads. Check your network connection or firewall.";
 const CATALOG_CONNECT_IMAGE_FAST_NOTICE =
   "fx couldn't connect to AI Gateway to load the model catalog, so earlier images aren't reaching the model and fast mode is off until it loads. Check your network connection or firewall.";
+/** The line before the error for an image attached this turn
+ * (`catalogUnreachableImageLine` in `src/core/agent/runtime/orchestrator.zig`). */
+const CATALOG_CONNECT_ATTACHED_IMAGE_LINE =
+  "fx couldn't connect to AI Gateway to load the model catalog, so it couldn't confirm that this model accepts images. Check your network connection or firewall.";
 const GLM_MODEL = "zai/glm-5.2-fast";
 const GEMINI_MODEL = "google/gemini-2.5-flash";
 const KIMI_MODEL = "moonshotai/kimi-k3";
@@ -1848,6 +1852,43 @@ describe("Vision route fake Gateway", () => {
         );
         expect(result.stderr).not.toContain("ModelImageCapabilityUnavailable");
         expect(gateway.catalogRequests).toBe(1);
+        expect(gateway.chatRequests).toHaveLength(0);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an attached image names the failed connection first when the catalog cannot connect",
+    async () => {
+      const root = createIsolatedRoot();
+      const fixture = createScopedImageFixture(root);
+      const gateway = startImageGateway([]);
+      const env = {
+        ...fakeGatewayEnv(root, gateway, KIMI_MODEL),
+        FX_TEST_GATEWAY_MODELS_URL: await refusedLoopbackUrl("/coding-agent/v1/models"),
+      };
+      try {
+        const text = await runFx(
+          ["ask", "--no-save", "--no-color", "--image", fixture.imagePath, "Describe the attached image."],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(text.code).toBe(1);
+        expect(text.stdout).toBe("");
+        expect(text.stderr).toBe(
+          `${CATALOG_CONNECT_ATTACHED_IMAGE_LINE}\nfx ask: Unable to verify image support for this model, so the image was not sent. Try again later, choose another model, or remove the image.\n`,
+        );
+
+        // JSON output keeps its error code; the cause line stays on stderr.
+        const json = await runFx(
+          ["ask", "--json", "--no-save", "--no-color", "--image", fixture.imagePath, "Describe the attached image."],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(parseFxErrorJson(json).error).toBe("ModelImageCapabilityUnavailable");
+        expect(json.stderr).toBe(`${CATALOG_CONNECT_ATTACHED_IMAGE_LINE}\n`);
         expect(gateway.chatRequests).toHaveLength(0);
       } finally {
         gateway.stop();

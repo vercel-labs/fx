@@ -1344,10 +1344,16 @@ fn activateProviderSelectionFallible(
         },
         .failed => |failure| {
             debug_trace.logf("catalog", "provider selection catalog failed provider={s} category={s}", .{ @tagName(target), @tagName(failure.failure.category) });
-            const detail = try alloc.print(
-                "could not load the target model catalog ({s})",
-                .{@tagName(failure.failure.category)},
-            );
+            const detail = if (failure.failure.category == .transport)
+                try alloc.print(
+                    "couldn't connect to {s} to load the target model catalog; check your network connection or firewall",
+                    .{model_catalog.serviceName(target)},
+                )
+            else
+                try alloc.print(
+                    "could not load the target model catalog ({s})",
+                    .{@tagName(failure.failure.category)},
+                );
             defer alloc.free(detail);
             try writeProviderActivationError(alloc, deps, caller, detail);
             return false;
@@ -1905,10 +1911,7 @@ fn runNonInteractiveWithDeps(
                 .loaded => |loaded| loaded,
                 .failure => |failure| {
                     const error_name = @errorName(failure.failure.asError());
-                    const message = try alloc.print(
-                        "could not list models: {s}",
-                        .{catalogFailureDetail(failure.failure)},
-                    );
+                    const message = try modelListFailureMessage(alloc, failure.failure, startup.provider);
                     defer alloc.free(message);
                     if (opts.format == .json) {
                         try writeJsonCommandFailureCode(
@@ -3172,6 +3175,18 @@ fn modelDetails(
         };
     }
     return details;
+}
+
+/// What `fx models` says when it could not load the catalog. A connection fx
+/// could not make is named as one. The caller owns the text.
+fn modelListFailureMessage(alloc: Allocator, failure: model_catalog.Failure, provider: model_provider.ProviderId) Allocator.Error![]u8 {
+    if (failure.category == .transport) {
+        return alloc.print(
+            "could not list models: couldn't connect to {s}; check your network connection or firewall",
+            .{model_catalog.serviceName(provider)},
+        );
+    }
+    return alloc.print("could not list models: {s}", .{catalogFailureDetail(failure)});
 }
 
 fn catalogFailureDetail(failure: model_catalog.Failure) []const u8 {

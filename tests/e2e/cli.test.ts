@@ -3890,6 +3890,8 @@ describe("cli: models", () => {
         expect(result.code).not.toBe(0);
         expect(result.stderr).toBe("");
         expect(JSON.parse(result.stdout.trim()).code).toBe("GatewayUnavailable");
+        // The catalog answered, so the message does not blame the connection.
+        expect(JSON.parse(result.stdout.trim()).error).toBe("could not list models: Unavailable");
         expect(gateway.modelRequests).toHaveLength(1);
       } finally {
         gateway.stop();
@@ -3909,13 +3911,33 @@ describe("cli: models", () => {
       try {
         const address = server.address();
         if (address === null || typeof address === "string") throw new Error("missing server address");
-        const result = await runFx(["models", "--json"], {
-          env: modelsGatewayEnv(home, `http://127.0.0.1:${address.port}/v1/models`),
-        });
+        const env = modelsGatewayEnv(home, `http://127.0.0.1:${address.port}/v1/models`);
+        const result = await runFx(["models", "--json"], { env });
         expect(result.code).not.toBe(0);
         expect(result.stderr).toBe("");
         expect(JSON.parse(result.stdout.trim()).code).toBe("TransportFailure");
+        expect(JSON.parse(result.stdout.trim()).error).toBe(
+          "could not list models: couldn't connect to AI Gateway; check your network connection or firewall",
+        );
         expect(connections).toBe(1);
+
+        const text = await runFx(["models"], { env });
+        expect(text.code).not.toBe(0);
+        expect(text.stderr).toBe(
+          "fx models: could not list models: couldn't connect to AI Gateway; check your network connection or firewall\n",
+        );
+
+        // Switching to the Gateway from another provider loads its catalog
+        // the same way, and a failed switch keeps the saved provider.
+        const settingsPath = join(home, ".fx", "settings.json");
+        mkdirSync(join(home, ".fx"), { recursive: true });
+        writeFileSync(settingsPath, JSON.stringify({ provider: "codex" }));
+        const selection = await runFx(["provider", "gateway"], { env });
+        expect(selection.code).not.toBe(0);
+        expect(selection.stderr).toBe(
+          "fx provider: couldn't connect to AI Gateway to load the target model catalog; check your network connection or firewall\n",
+        );
+        expect(JSON.parse(readFileSync(settingsPath, "utf8")).provider).toBe("codex");
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
         cleanupIsolatedTestHome(home);
