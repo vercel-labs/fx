@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 
 type Category =
@@ -8,9 +8,7 @@ type Category =
   | "terminal_reset"
   | "crash_recovery"
   | "terminal_probe"
-  | "title_control"
   | "noninteractive_output"
-  | "benchmark_output"
   | "acp_protocol_transport"
   | "subprocess_protocol_transport"
   | "tests";
@@ -42,7 +40,6 @@ const allowlist: AllowRule[] = [
   rule("src/ui/transcript/io.zig", "writeFrameBytes", /stdio_write/, "frame_commit", "normal interactive frame delivery"),
   rule("src/ui/transcript/runtime.zig", "<top-level>", /stdio_acquisition/, "interactive_terminal_owner", "stored interactive stdout handle"),
   rule("src/core/app/app_lifecycle.zig", "writeLifecycleTerminalBytes", /stdio_write/, "initialization_teardown", "interactive startup and teardown control"),
-  rule("src/core/app/app_lifecycle.zig", "bootstrapInteractiveApp", /stdio_acquisition_write/, "initialization_teardown", "pre-raw-mode Keychain onboarding prompt"),
   rule("src/ui/shell_runtime.zig", "clearTmuxScreenAndHistory", /stdio_(?:acquisition|write)/, "terminal_reset", "tmux pane reset before history cleanup"),
   rule("src/ui/shell_runtime.zig", "enableThemeNotifications", /stdio_(?:acquisition|write)/, "initialization_teardown", "terminal theme notification control"),
   rule("src/core/app/app_lifecycle.zig", "abnormalExitHandlerWithRestore", /(?:fixed_descriptor|raw_fd_write)/, "crash_recovery", "async-signal-safe terminal restoration"),
@@ -55,7 +52,6 @@ const allowlist: AllowRule[] = [
   rule("src/ui/ask_presentation.zig", "init", /stdio_acquisition/, "interactive_terminal_owner", "stored ask presenter stdout handle"),
   rule("src/ui/ask_presentation.zig", "refreshGeometry", /fixed_descriptor/, "terminal_probe", "ask stdout geometry refresh"),
   rule("src/ui/ask_presentation.zig", "writeTerminalBytes", /stdio_write/, "initialization_teardown", "ask terminal prepare and restore control"),
-  rule("src/ui/render.zig", "(?:setTerminalTitleLabel|clearTerminalTitleProvider)", /stdio_(?:acquisition|write)/, "title_control", "terminal title control"),
   rule("src/acp/jsonrpc.zig", ".+", /stdio_(?:acquisition|write)/, "acp_protocol_transport", "ACP JSON-RPC transport"),
   rule("src/core/execution/command_runner.zig", "(?:runForegroundSessionBootstrap|writeForegroundSessionReplaceFailure)", /stdio_acquisition_write/, "subprocess_protocol_transport", "foreground command bootstrap protocol"),
   rule("src/core/terminal/native_session.zig", "(?:acceptMarker|runLauncher)", /fixed_descriptor/, "subprocess_protocol_transport", "private native launcher PTY and control descriptors"),
@@ -77,7 +73,6 @@ const allowlist: AllowRule[] = [
   rule("src/core/shared/debug_trace.zig", "(?:writeLine|writeNoninteractiveStderr)", /debug_print/, "noninteractive_output", "opt-in tracing"),
   rule("src/main.zig", "(?:writeStdoutFast|writeStderrFast)", /(?:stdio_acquisition_write|fixed_fd_write|raw_fd_write)/, "noninteractive_output", "top-level help and CLI validation output"),
   rule("src/main.zig", "(?:stdoutIsTerminal|stdoutTerminalColumns)", /fixed_descriptor/, "terminal_probe", "top-level help terminal capability probe"),
-  rule("benchmarks/activity_progress.zig", "main", /stdio_acquisition/, "benchmark_output", "benchmark report output"),
   rule("src/core/shell_command/command_effect.zig", "(?:expectDirect|expectNativePrintfEquivalent)", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/app/app_render_runtime.zig", "checkRewritePublicationRetry", /debug_print/, "tests", "test diagnostics"),
   rule("src/core/indexer/scan.zig", "expectEntries", /debug_print/, "tests", "test diagnostics"),
@@ -219,12 +214,15 @@ function detectPrimitive(
   return null;
 }
 
+const usedRules = new Set<AllowRule>();
+
 function classify(path: string, functionName: string, primitive: string): Pick<Site, "category" | "reason"> {
   const match = allowlist.find((entry) =>
     entry.path === path &&
     entry.functionName.test(functionName) &&
     entry.primitive.test(primitive)
   );
+  if (match) usedRules.add(match);
   return match
     ? { category: match.category, reason: match.reason }
     : { category: "unclassified", reason: "no matching ownership exception" };
@@ -310,6 +308,20 @@ for (const site of failures) {
 }
 if (failures.length > 0) {
   throw new Error(`direct-write audit found ${failures.length} unclassified site(s)`);
+}
+
+// Every rule must classify a site in this repository. A rule left behind by
+// deleted code would otherwise quietly allow a later write in its place.
+// A fixture tree holds only a few files, so this applies to the repository.
+const repositoryRoot = join(import.meta.dir, "..", "..", "..");
+if (realpathSync(root) === realpathSync(repositoryRoot)) {
+  const unused = allowlist.filter((entry) => !usedRules.has(entry));
+  for (const entry of unused) {
+    console.error(`unused_direct_write_rule ${entry.path} function=${entry.functionName.source}`);
+  }
+  if (unused.length > 0) {
+    throw new Error(`direct-write audit found ${unused.length} rule(s) that classify no site`);
+  }
 }
 
 const frameCommits = sites.filter((site) => site.category === "frame_commit");
