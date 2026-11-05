@@ -227,9 +227,12 @@ DEFAULT_VALUE_MAIN = (
     "}\n"
 )
 # Copy only the first 1,048 bytes of the default value, which end inside its
-# zero padding and leave out its i64, over a buffer filled with 0xAB. Copy the
-# same bytes of @reference, an external constant the pass leaves alone, over a
-# second such buffer, and exit 0 only when the two buffers match byte for byte.
+# zero [3 x i32] and leave out its i64, over a buffer filled with 0xAB. Copy
+# the same bytes of @reference, an external constant the pass leaves alone,
+# over a second such buffer, and exit 0 only when the two buffers match byte
+# for byte. The four padding bytes after the i32 (1,028 to 1,031) are
+# undefined in both constants, and the interpreter leaves whatever memory held
+# there, so the comparison skips them.
 PARTIAL_COPY_MAIN = (
     "@reference = constant %Default "
     "{ [128 x i64] zeroinitializer, i32 7, ptr @target, [3 x i32] zeroinitializer, i64 -1 }, align 8\n"
@@ -249,7 +252,11 @@ PARTIAL_COPY_MAIN = (
     "  %got = load i8, ptr %out_byte\n"
     "  %want = load i8, ptr %expected_byte\n"
     "  %equal = icmp eq i8 %got, %want\n"
-    "  br i1 %equal, label %same, label %bad\n"
+    "  %after_code = icmp uge i64 %i, 1028\n"
+    "  %before_pointer = icmp ult i64 %i, 1032\n"
+    "  %padding = and i1 %after_code, %before_pointer\n"
+    "  %matches = or i1 %equal, %padding\n"
+    "  br i1 %matches, label %same, label %bad\n"
     "same:\n"
     "  %next = add i64 %i, 1\n"
     "  %more = icmp ult i64 %next, 1064\n"
