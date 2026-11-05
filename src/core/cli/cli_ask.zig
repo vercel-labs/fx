@@ -2007,11 +2007,13 @@ fn maybeStartAskTitleTask(
     return task;
 }
 
-/// Joins the bounded title task and installs the generated title unless the
-/// session already carries a user-set title.
+/// Gives the title task a short grace after the turn, then installs the
+/// generated title unless the session already carries a user-set title. A
+/// title still pending after the grace is dropped, and the session keeps the
+/// title derived from its first prompt.
 fn completeAskTitleTask(ctx: *AskContext, task: *session_title_generation.Task) void {
     defer task.destroy();
-    task.joinOrCancel(ctx.cancelFlag());
+    task.joinOrCancel(ctx.cancelFlag(), session_title_generation.after_turn_grace_ms);
     const title = task.takeTitle() orelse return;
     defer std.heap.c_allocator.free(title);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
