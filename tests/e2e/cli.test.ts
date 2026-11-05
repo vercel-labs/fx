@@ -1124,6 +1124,26 @@ describe("cli: status", () => {
       const relative = await runFx(["status"], { ...options, env: { ...options.env, FX_HOME: "profile" } });
       expect(relative.code).toBe(1);
       expect(relative.stderr).toBe("fx: FX_HOME must be an absolute path\n");
+
+      // A relative HOME counts as unset, so with FX_HOME unset fx has no
+      // folder of its own, and status names none.
+      const relativeHome = await runFx(["status", "--json"], {
+        ...options,
+        env: { ...options.env, HOME: "relative/home", FX_HOME: undefined },
+      });
+      expect(relativeHome.code).toBe(0);
+      expect(JSON.parse(relativeHome.stdout).fx_home).toBeUndefined();
+
+      // With FX_HOME set, a relative HOME counts as unset the same way, so
+      // FX_HOME still holds fx's files.
+      const relativeWithFxHome = { ...options, env: { ...options.env, HOME: "relative/home" } };
+      const statusWithFxHome = await runFx(["status", "--json"], relativeWithFxHome);
+      expect(statusWithFxHome.code).toBe(0);
+      expect(JSON.parse(statusWithFxHome.stdout).fx_home).toBe(fxHome);
+      const added = await runFx(["mcp", "add", "probe", "--", "/bin/echo", "hi"], relativeWithFxHome);
+      expect(added.code).toBe(0);
+      expect(added.stdout).toBe("Added probe to $FX_HOME/mcp.json.\n");
+      expect(existsSync(join(workspace, "relative"))).toBe(false);
     } finally {
       gateway.stop();
       rmSync(root, { recursive: true, force: true });
@@ -6033,6 +6053,21 @@ describe("cli: MCP profile", () => {
     });
     expect(missingHome.code).toBe(1);
     expect(missingHome.stderr).toBe("fx mcp: HOME isn't set\n");
+
+    // A relative HOME counts as unset: fx fails the same way and saves
+    // nothing under the folder it runs in.
+    const cwd = mkdtempSync(join(tmpdir(), "fx-e2e-mcp-relative-home-"));
+    try {
+      const relativeHome = await runFx(["mcp", "add", "fixture", "--", "node"], {
+        cwd,
+        env: { HOME: "relative/home", ...NO_GATEWAY_AUTH },
+      });
+      expect(relativeHome.code).toBe(1);
+      expect(relativeHome.stderr).toBe("fx mcp: HOME isn't set\n");
+      expect(readdirSync(cwd)).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
 
     const flagged = await runFx(
       ["mcp", "add", "--transport", "sse", "fixture", "https://example.test"],
