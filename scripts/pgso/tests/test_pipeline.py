@@ -712,6 +712,7 @@ print('{{}}')""",
                 "approval-review-bench",
                 "approval-review.bc",
             ),
+            ("unit_tests", "install-test", "fx-test", "unit-tests.bc"),
         )
         for selector, build_step, binary_name, bitcode_name in cases:
             with self.subTest(selector=selector):
