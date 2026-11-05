@@ -26,7 +26,10 @@ into stores of their defined scalar leaves. Zig materializes `return error.X`
 from a function returning a large `E!T` as a constant `{ T undef, code,
 padding undef }` copied into the result. Copying undefined bytes is refined
 by leaving the destination bytes unchanged, so only the defined bytes are
-stored. Run `opt -passes=globaldce,verify` afterwards to drop dead constants.
+stored. A constant with too many defined bytes for that, such as the default
+value of a large struct, whose leaves are almost all zero, is copied instead
+as a zero fill of the copied bytes followed by stores of its nonzero leaves.
+Run `opt -passes=globaldce,verify` afterwards to drop dead constants.
 
 overlay-constants packs the mostly undefined internal constants that are
 still referenced, the same `return error.X` results plus `return null` results
@@ -119,6 +122,12 @@ MAX_DEFINED_BYTES = 128
 MAX_LEAVES = 16
 MEMCPY_SITE_BYTES = 16
 STORE_BYTES = 8
+# sparse-constants: a constant too large for leaf stores alone, such as a
+# struct's default value, is copied as a zero fill plus stores of its nonzero
+# leaves, at most this many and this many bytes.
+ZERO_FILL_COPY_MAX_LEAVES = 64
+ZERO_FILL_COPY_MAX_BYTES = 512
+MEMSET_SITE_BYTES = 16
 # overlay-constants: at most this share of a member's bytes may be defined
 # and nonzero, and members below OVERLAY_GUARD_BYTES (the largest copy
 # AArch64 expands into stores in size-optimized code) keep zeros in their
@@ -206,6 +215,7 @@ class Llvm:
         self.PositionBefore = f("LLVMPositionBuilderBefore", None, P, P)
         self.BuildGEP2 = f("LLVMBuildInBoundsGEP2", P, P, P, P, C.POINTER(P), C.c_uint, C.c_char_p)
         self.BuildStore = f("LLVMBuildStore", P, P, P, P)
+        self.BuildMemSet = f("LLVMBuildMemSet", P, P, P, P, P, C.c_uint)
         self.SetAlignment = f("LLVMSetAlignment", None, P, C.c_uint)
         self.Erase = f("LLVMInstructionEraseFromParent", None, P)
         self.EnumAttrKind = f("LLVMGetEnumAttributeKindForName", C.c_uint, C.c_char_p, C.c_size_t)
@@ -403,7 +413,13 @@ def sparse_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> 
     i8, i64 = llvm.Int8Ty(ctx), llvm.Int64Ty(ctx)
     builder = llvm.CreateBuilder(ctx)
     align_kind = llvm.kind("align")
-    summary = {"pass": "sparse-constants", "rewritten_constants": 0, "rewritten_copies": 0, "constant_bytes": 0}
+    summary = {
+        "pass": "sparse-constants",
+        "rewritten_constants": 0,
+        "zero_filled_constants": 0,
+        "rewritten_copies": 0,
+        "constant_bytes": 0,
+    }
     glob = llvm.FirstGlobal(mod)
     while glob:
         following = llvm.NextGlobal(glob)
@@ -436,13 +452,22 @@ def sparse_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> 
                 copies.append((user, llvm.ConstZExt(length)))
                 use = llvm.NextUse(use)
             leaves: list = []
-            _leaves(llvm, td, init, 0, leaves)
+            zero_fill = False
+            try:
+                _leaves(llvm, td, init, 0, leaves)
+            except _Skip as skip:
+                if str(skip) not in ("too many defined bytes", "too many defined leaves", "large defined array"):
+                    raise
+                leaves = []
+                _nonzero_leaves(llvm, td, init, 0, leaves, ZERO_FILL_COPY_MAX_LEAVES, ZERO_FILL_COPY_MAX_BYTES)
+                zero_fill = True
             extra = 0
             for _, length in copies:
                 if any(offset < length < offset + width for offset, _, width, _ in leaves):
                     raise _Skip("copy splits a defined leaf")
                 inside = sum(1 for offset, _, width, _ in leaves if offset + width <= length)
-                extra += max(0, STORE_BYTES * inside - MEMCPY_SITE_BYTES)
+                fill = MEMSET_SITE_BYTES if zero_fill else 0
+                extra += max(0, fill + STORE_BYTES * inside - MEMCPY_SITE_BYTES)
             if extra >= size:
                 raise _Skip("stores would cost more than the constant")
             for call, length in copies:
@@ -450,6 +475,10 @@ def sparse_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> 
                 attribute = llvm.CallSiteEnumAttr(call, 1, align_kind)
                 destination_align = llvm.EnumAttrValue(attribute) if attribute else 1
                 llvm.PositionBefore(builder, call)
+                if zero_fill:
+                    llvm.BuildMemSet(
+                        builder, destination, llvm.ConstInt(i8, 0, 0), llvm.ConstInt(i64, length, 0), destination_align
+                    )
                 for offset, value, width, natural in leaves:
                     if offset + width > length:
                         continue
@@ -466,6 +495,8 @@ def sparse_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> 
                 summary["rewritten_copies"] += 1
             summary["rewritten_constants"] += 1
             summary["constant_bytes"] += size
+            if zero_fill:
+                summary["zero_filled_constants"] += 1
         except _Skip:
             pass
         glob = following
@@ -678,7 +709,15 @@ def overlay_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) ->
     return summary
 
 
-def _nonzero_leaves(llvm: Llvm, td, value, base: int, out: list) -> None:
+def _nonzero_leaves(
+    llvm: Llvm,
+    td,
+    value,
+    base: int,
+    out: list,
+    max_leaves: int = ZERO_FILL_MAX_STORES,
+    max_bytes: int = ZERO_FILL_MAX_STORED_BYTES,
+) -> None:
     """Collects (offset, constant, size, alignment) for each defined nonzero
     scalar in `value`; undefined and zero parts hold nothing to restore."""
     if llvm.IsUndef(value) or llvm.IsNull(value):
@@ -687,7 +726,9 @@ def _nonzero_leaves(llvm: Llvm, td, value, base: int, out: list) -> None:
     kind = llvm.TypeKind(ty)
     if kind == STRUCT:
         for i in range(llvm.CountStructElems(ty)):
-            _nonzero_leaves(llvm, td, llvm.AggElem(value, i), base + llvm.OffsetOfElement(td, ty, i), out)
+            _nonzero_leaves(
+                llvm, td, llvm.AggElem(value, i), base + llvm.OffsetOfElement(td, ty, i), out, max_leaves, max_bytes
+            )
         return
     if kind == ARRAY:
         element = llvm.ElementType(ty)
@@ -696,7 +737,7 @@ def _nonzero_leaves(llvm: Llvm, td, value, base: int, out: list) -> None:
             item = llvm.AggElem(value, i)
             if not item:
                 raise _Skip("unreadable array element")
-            _nonzero_leaves(llvm, td, item, base + i * stride, out)
+            _nonzero_leaves(llvm, td, item, base + i * stride, out, max_leaves, max_bytes)
         return
     scalar = (
         (kind == INTEGER and llvm.IsAConstantInt(value))
@@ -706,7 +747,7 @@ def _nonzero_leaves(llvm: Llvm, td, value, base: int, out: list) -> None:
     if not scalar:
         raise _Skip(f"unsupported leaf kind {kind}")
     out.append((base, value, llvm.ABISize(td, ty), llvm.ABIAlign(td, ty)))
-    if len(out) > ZERO_FILL_MAX_STORES or sum(leaf[2] for leaf in out) > ZERO_FILL_MAX_STORED_BYTES:
+    if len(out) > max_leaves or sum(leaf[2] for leaf in out) > max_bytes:
         raise _Skip("too many nonzero bytes")
 
 

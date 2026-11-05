@@ -122,8 +122,13 @@ the allocator `free` helper does not match. After profile use and outlining,
 into stores of their defined bytes. Zig emits such a constant for each
 `return error.X` from a function returning a large error union. Undefined
 bytes become "destination unchanged", a refinement of copying undefined
-bytes; explicit values, including zeros, are still stored. The constants it
-cannot rewrite, because a load, a PHI, or a call still reads them, go to
+bytes; explicit values, including zeros, are still stored. A constant with too
+many defined bytes for that, such as the default value of a large struct
+whose fields are almost all zero, is copied instead as a zero fill of the
+copied bytes followed by stores of its nonzero leaves, up to 64 of them.
+Most of them hold a few pointers, which would otherwise keep their mostly
+zero bytes in relocated data. The constants it cannot rewrite, because a load, a PHI, or a call still
+reads them, go to
 `overlay-constants`, along with `return null` results of large optionals. It
 packs them into one constant where they overlap: they are `unnamed_addr`, so
 only their defined bytes matter, and two may share bytes wherever neither
