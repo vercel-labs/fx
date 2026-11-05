@@ -1219,6 +1219,7 @@ test "a command that ends on an error reports it in plain words" {
         .{ .err = error.InvalidGatewaySseEvent, .stderr = "fx: unreadable reply\n" },
         .{ .err = error.NoSpaceLeft, .stderr = "fx: the disk is full\n" },
         .{ .err = error.ProviderRequestLimitReached, .stderr = "fx: provider request limit reached\n" },
+        .{ .err = error.OutputWriteFailed, .stderr = "fx: couldn't write the output\n" },
     };
     for (cases) |case| {
         var capture = TestCapture.init(.{ .interactive = .{} });
