@@ -4493,6 +4493,16 @@ fn isRetryableModelFailure(kind: agent_stream_provider.FailureKind) bool {
     };
 }
 
+test "every HTTP status retries exactly when it is 429 or a 5xx other than 501 and 505, and its failure names that status" {
+    var code: u16 = 100;
+    while (code <= 999) : (code += 1) {
+        const status: std.http.Status = @fromBackingInt(@intCast(code));
+        const kind = agent_stream_provider.FailureKind.fromHttpStatus(status);
+        try std.testing.expectEqual(code == 429 or (code >= 500 and code <= 599 and code != 501 and code != 505), isRetryableModelFailure(kind));
+        try std.testing.expectEqual(status, failureStatus(.{ .kind = kind, .http_status = status }));
+    }
+}
+
 /// The module takes Retry-After in milliseconds. Absurd hints saturate; the
 /// module caps every hint, a rate limit's included, at its 30 second ceiling.
 fn retryAfterMs(seconds: ?u64) ?u32 {
@@ -4504,6 +4514,10 @@ test "retry after converts to milliseconds and saturates" {
     try std.testing.expectEqual(@as(?u32, null), retryAfterMs(null));
     try std.testing.expectEqual(@as(?u32, 3_000), retryAfterMs(3));
     try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), retryAfterMs(std.math.maxInt(u64)));
+}
+
+fn failureStatus(failure: agent_stream_provider.Failure) std.http.Status {
+    return failure.http_status orelse failureHttpStatus(failure.kind);
 }
 
 fn failureHttpStatus(kind: agent_stream_provider.FailureKind) std.http.Status {
@@ -4566,7 +4580,7 @@ fn httpFailureDetail(
     const clipped = detail[0..@min(detail.len, http_error_detail_max_bytes)];
     return runtime_gateway_step.gatewayHttpErrorDetail(
         arena,
-        failureHttpStatus(failure.kind),
+        failureStatus(failure),
         clipped,
         job.model,
         request_capabilities,
@@ -4583,7 +4597,7 @@ fn pushWaitingHttpFailureReason(
     request_capabilities: model_capabilities.Capabilities,
 ) !void {
     const detail = try httpFailureDetail(arena, failure, job, request_capabilities);
-    const message = try gateway_error_format.formatHttpErrorMessage(arena, failureHttpStatus(failure.kind), detail);
+    const message = try gateway_error_format.formatHttpErrorMessage(arena, failureStatus(failure), detail);
     if (deps.push_interactive_notice) |push| {
         try push(deps.ctx, .{ .topic = "system", .tone = .warning, .body = message });
     } else {
@@ -5928,11 +5942,16 @@ fn processQueuedPromptInner(
         "history_turns={d} gateway_messages_before={d} interrupted_turns={d} history_turn_kinds={s}",
         .{ active_history.len, history_messages_before, interrupted_turns, history_turn_kinds },
     );
-    if (job.delivery.isContinuation()) {
+    // A resumed request continues the turn fx stopped: superseded resume
+    // turns are dropped and the stopped turn is projected without its abort
+    // note, as a steering continuation is.
+    const resumed_request = job.recovery_resume != null;
+    const resumed_history = if (resumed_request) session_runtime.withoutSupersededResumes(job.history) else job.history;
+    if (job.delivery.isContinuation() or resumed_request) {
         try session_runtime.appendSteeringActiveContextHistoryChatMessages(
             arena,
             &history_messages,
-            job.history,
+            resumed_history,
             0,
         );
     } else {
@@ -5973,6 +5992,8 @@ fn processQueuedPromptInner(
         .role = .user,
         .content = if (job.delivery.isContinuation())
             try framedMessage(arena, job.author, job.prompt)
+        else if (resumed_request)
+            session_runtime.resumedRequestNote(resumed_history)
         else
             job.prompt,
         .images = job.images,
@@ -7932,10 +7953,17 @@ fn processQueuedPromptLoop(
                 const cancel_requested = config.cancel_flag.load(.seq_cst);
                 const consumed_attempts = (request_recovery.attempt() - 1) +
                     @as(usize, @intFromBool(gateway_attempt_evidence.provider_admitted));
-                const network_failure = gateway_attempt_evidence.network_failure;
+                const network_failure = if (gateway_attempt_evidence.network_failure) |evidence| blk: {
+                    if (evidence.cause == .unreadable_reply and request_recovery.unreadableReplyEndsRequest()) {
+                        debug_trace.logf("recovery", "unreadable reply limit reached, ending the turn err={s}", .{@errorName(err)});
+                        break :blk null;
+                    }
+                    break :blk evidence;
+                } else null;
                 const failure_cause: types.ModelRecoveryCause = if (network_failure) |evidence|
                     switch (evidence.cause) {
-                        .transport_interrupted => .network_interrupted,
+                        // Saved sessions name only causes every version reads.
+                        .transport_interrupted, .unreadable_reply => .network_interrupted,
                         .connectivity_lost => .connectivity_lost,
                         .stream_stalled => .provider_stream_timeout,
                     }
@@ -7964,8 +7992,8 @@ fn processQueuedPromptLoop(
                     recovery_strategy == .reconcile_tool and stream_ctx.saw_tool_start;
                 // Network failures wait and resend through the recovery
                 // module. Any other thrown error keeps its terminal path.
-                const failure_kind: ?runtime_request_recovery.Failure.Kind = if (network_failure != null)
-                    runtime_request_recovery.failureKind(failure_cause)
+                const failure_kind: ?runtime_request_recovery.Failure.Kind = if (network_failure) |evidence|
+                    if (evidence.cause == .unreadable_reply) .unreadable else runtime_request_recovery.failureKind(failure_cause)
                 else
                     null;
                 const retryable = !cancel_requested and
@@ -8377,7 +8405,7 @@ fn processQueuedPromptLoop(
             const prefill_tool_name: ?[]const u8 = if (!assistant_prefill_recovery_used and
                 streamReplaySafe(&stream_ctx))
                 postToolAssistantPrefillRejection(
-                    if (response_failure) |failure| failureHttpStatus(failure.kind) else .ok,
+                    if (response_failure) |failure| failureStatus(failure) else .ok,
                     if (response_failure) |failure| failure.detail orelse "" else "",
                     request_messages,
                 )
@@ -8848,7 +8876,7 @@ fn processQueuedPromptLoop(
             request_recovery.endWithError();
             if (!http_failure_notice_shown) {
                 const http_detail = try httpFailureDetail(arena, failure, job, request_capabilities);
-                try deps.push_http_error(deps.ctx, failureHttpStatus(failure.kind), http_detail, job.credential_source);
+                try deps.push_http_error(deps.ctx, failureStatus(failure), http_detail, job.credential_source);
             }
             if (stop_state.retained_candidate != null) {
                 stop_state.terminal_materializing = true;

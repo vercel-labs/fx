@@ -342,6 +342,7 @@ pub const FakeGateway = struct {
             const failure_request_shape = if (completion.failure_request_shape) |value| try alloc.dupe(u8, value) else null;
             return .{ .failed = .{
                 .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(completion.status), err_body),
+                .http_status = completion.status,
                 .detail = err_body,
                 .retry_after_seconds = completion.retry_after_seconds,
                 .diagnostics = .{

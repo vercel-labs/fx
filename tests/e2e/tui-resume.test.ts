@@ -8822,6 +8822,8 @@ test.skipIf(!tmuxAvailable())(
       // The call that was running is answered as possibly run, so the model
       // decides whether running it again is safe.
       expect(resumed!.body).toContain("fx stopped while this tool was running");
+      // With a tool in flight the note keeps its caveat.
+      expect(resumed!.body).toContain("A tool that was running may have partly run.");
       expect(readFileSync(second.stderrPath, "utf8")).toBe("");
     } finally {
       await active?.kill();
@@ -8830,6 +8832,132 @@ test.skipIf(!tmuxAvailable())(
     }
   },
   TIMEOUT * 3,
+);
+
+/// The model-facing messages of a gateway request, as text.
+function requestMessages(body: string): string[] {
+  const prompt = (JSON.parse(body).prompt ?? []) as Array<{ role: string; content: unknown }>;
+  return prompt.map((message) =>
+    typeof message.content === "string"
+      ? message.content
+      : (message.content as Array<{ text?: string }>).map((part) => part.text ?? "").join(""),
+  );
+}
+
+test.skipIf(!tmuxAvailable())(
+  "a resumed request with no tool running sends the stopped prompt without an abort note, and so does the next message",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-plain-");
+    let reached: () => void = () => {};
+    const inFlight = new Promise<void>((resolve) => (reached = resolve));
+    const gateway = startDynamicFakeGateway(async (body) => {
+      // A later message's history holds the resume too, so match it first.
+      if (body.includes("Name the river.")) return fakeGatewayFinalText("FOLLOW_UP_7310");
+      if (body.includes(RESUME_NOTE)) return fakeGatewayFinalText("PLAIN_RESUMED_5120");
+      if (body.includes("Name the capital.")) {
+        reached();
+        return new Promise<Response>(() => {});
+      }
+      return fakeGatewayFinalText("UNRELATED");
+    });
+    let active: TmuxSession | null = null;
+    try {
+      active = (await launchFx(fixture, gateway, "", "first")).session;
+      await active.sendText("Name the capital.");
+      await inFlight;
+      await endFx(active, "SIGKILL");
+
+      const before = gateway.requests.length;
+      const second = await launchFx(fixture, gateway, "-c", "second");
+      active = second.session;
+      await active.waitForText("PLAIN_RESUMED_5120", TIMEOUT);
+      const resumed = gateway.requests.slice(before).find((request) => request.body.includes(RESUME_NOTE));
+      expect(resumed).toBeTruthy();
+      const messages = requestMessages(resumed!.body);
+      // The stopped turn reads as the user's own request, followed by the note.
+      expect(messages.filter((text) => text.includes("Name the capital.")).length).toBe(1);
+      expect(resumed!.body).not.toContain("<turn_aborted>");
+      expect(resumed!.body).not.toContain("The previous response ended before completion.");
+      // No tool ran, so the note does not ask the model to check one.
+      expect(resumed!.body).not.toContain("A tool that was running may have partly run.");
+      expect(messages.at(-1)).toContain("Nothing ran. Answer that message now.");
+
+      // The next message sees the resume as the resume request did.
+      await active.sendText("Name the river.");
+      await active.waitForText("FOLLOW_UP_7310", TIMEOUT);
+      const followUp = gateway.requests.find((request) => request.body.includes("Name the river."));
+      expect(followUp).toBeTruthy();
+      const later = requestMessages(followUp!.body);
+      expect(later.filter((text) => text.includes("Name the capital.")).length).toBe(1);
+      expect(later.filter((text) => text.includes("Nothing ran. Answer that message now.")).length).toBe(1);
+      expect(followUp!.body).not.toContain("<turn_aborted>");
+      expect(followUp!.body).not.toContain("A tool that was running may have partly run.");
+      expect(readFileSync(second.stderrPath, "utf8")).toBe("");
+    } finally {
+      await active?.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 3,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a request closed twice resumes the first stopped turn once",
+  async () => {
+    const fixture = resumeFixture("fx-auto-resume-twice-");
+    const prompt = "List the planets.";
+    let held = 0;
+    let notify: () => void = () => {};
+    const gateway = startDynamicFakeGateway(async (body) => {
+      if (!body.includes(prompt)) return fakeGatewayFinalText("UNRELATED");
+      held += 1;
+      notify();
+      if (held <= 2) return new Promise<Response>(() => {});
+      return fakeGatewayFinalText("TWICE_RESUMED_6230");
+    });
+    const heldAtLeast = async (count: number) => {
+      const deadline = Date.now() + TIMEOUT;
+      while (held < count) {
+        if (Date.now() > deadline) throw new Error(`expected ${count} held requests, saw ${held}`);
+        await new Promise<void>((resolve) => {
+          notify = resolve;
+          setTimeout(resolve, 100);
+        });
+      }
+    };
+    const sessions: TmuxSession[] = [];
+    try {
+      const first = (await launchFx(fixture, gateway, "", "first")).session;
+      sessions.push(first);
+      await first.sendText(prompt);
+      await heldAtLeast(1);
+      await endFx(first, "SIGHUP");
+
+      const second = (await launchFx(fixture, gateway, "-c", "second")).session;
+      sessions.push(second);
+      await heldAtLeast(2);
+      await endFx(second, "SIGHUP");
+
+      const before = gateway.requests.length;
+      const third = await launchFx(fixture, gateway, "-c", "third");
+      sessions.push(third.session);
+      await third.session.waitForText("TWICE_RESUMED_6230", TIMEOUT);
+      const resumed = gateway.requests.slice(before).find((request) => request.body.includes(prompt));
+      expect(resumed).toBeTruthy();
+      const messages = requestMessages(resumed!.body);
+      // One stopped request, one note: the resume that was itself closed is gone.
+      expect(messages.filter((text) => text.includes(prompt)).length).toBe(1);
+      expect(messages.filter((text) => text.includes(RESUME_NOTE)).length).toBe(1);
+      expect(resumed!.body).not.toContain("<turn_aborted>");
+      expect(readFileSync(third.stderrPath, "utf8")).toBe("");
+    } finally {
+      for (const session of sessions) await session.kill();
+      gateway.stop();
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 4,
 );
 
 // A save cut short. A crash in the middle of writing a log line leaves part

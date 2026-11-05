@@ -162,3 +162,82 @@ try {
 }
 
 console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Agent retry-event cancellation stopped transport retry`);
+
+const unavailable = (seconds) => new Response(JSON.stringify({ error: { message: "provider temporarily unavailable" } }), {
+  status: 503,
+  headers: { "content-type": "application/json", "retry-after": String(seconds) },
+});
+const finalAnswer = (text) => new Response(new ReadableStream({
+  start(controller) {
+    controller.enqueue(encoded.encode(`data: {"type":"text-delta","delta":"${text}"}\n\n`));
+    controller.enqueue(encoded.encode('data: {"type":"finish","finishReason":{"unified":"stop","raw":"stop"},"usage":{"inputTokens":{"total":1},"outputTokens":{"total":2}}}\n\n'));
+    controller.enqueue(encoded.encode("data: [DONE]\n\n"));
+    controller.close();
+  },
+}), { status: 200, headers: { "content-type": "text/event-stream" } });
+
+// The browser host passes a 503's Retry-After to fx, which waits that long
+// rather than its own one-second first step. The Node addon's fetch bridge
+// does not pass the header yet, so this runs on the WebAssembly backend.
+if (backend === "wasm") {
+  const postedAt = [];
+  const retryAfterAgent = await createFxEngine({
+    backend,
+    wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")),
+    fetch: async (_url, init) => {
+      if (init.method === "GET") return catalogResponse();
+      postedAt.push(performance.now());
+      return postedAt.length === 1 ? unavailable(3) : finalAnswer("waited as asked");
+    },
+    apiKey: "transport-retry-after-key",
+    model: "transport-retry/model",
+  });
+  try {
+    const turn = retryAfterAgent.prompt("wait as the gateway asks");
+    let output = "";
+    for await (const event of turn) if (event.type === "text_delta") output += event.delta;
+    assert.equal((await turn.result).stopReason, "end_turn");
+    assert.equal(output, "waited as asked");
+    assert.equal(postedAt.length, 2);
+    const gap = postedAt[1] - postedAt[0];
+    assert.ok(gap >= 2_900, `the resend must wait the 3 s Retry-After asked for, waited ${Math.round(gap)} ms`);
+  } finally {
+    await retryAfterAgent.close();
+  }
+  console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Agent honored Retry-After`);
+}
+
+// Cancel during a retry wait ends the turn at once and sends nothing more,
+// however long the wait was.
+let waitPosts = 0;
+let firstFailure;
+const failedOnce = new Promise((resolveFailed) => { firstFailure = resolveFailed; });
+const waitCancelAgent = await createFxEngine({
+  backend,
+  nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
+  ...(backend === "wasm"
+    ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")) }
+    : {}),
+  fetch: async (_url, init) => {
+    if (init.method === "GET") return catalogResponse();
+    waitPosts += 1;
+    firstFailure();
+    return unavailable(8);
+  },
+  apiKey: "transport-wait-cancel-key",
+  model: "transport-retry/model",
+});
+try {
+  const turn = waitCancelAgent.prompt("cancel while waiting to retry");
+  await failedOnce;
+  await new Promise((resolveWait) => setTimeout(resolveWait, 300));
+  const cancelledAt = performance.now();
+  turn.cancel();
+  assert.equal((await turn.result).stopReason, "cancelled");
+  const settled = performance.now() - cancelledAt;
+  assert.ok(settled < 1_000, `cancel during an 8 s wait must end the turn at once, took ${Math.round(settled)} ms`);
+  assert.equal(waitPosts, 1, "a cancelled wait must not resend");
+} finally {
+  await waitCancelAgent.close();
+}
+console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Agent cancel during a retry wait ended the turn at once`);

@@ -91,10 +91,7 @@ pub fn failureForHttpStatus(status: std.http.Status) Failure {
         return .{
             .category = .gateway_unavailable,
             .http_status = status,
-            .retryable = switch (status) {
-                .internal_server_error, .bad_gateway, .service_unavailable, .gateway_timeout => true,
-                else => false,
-            },
+            .retryable = types.isRetryableServerStatus(code),
         };
     }
     return .{ .category = .http_status, .http_status = status };

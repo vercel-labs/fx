@@ -327,8 +327,8 @@ if (options.selfCheck) {
   const mutants = [
     {
       name: "resends at once after a failure",
-      target: ".offline, .dropped, .server, .rate_limited => waitAfter(state, failure, now_ms),",
-      planted: ".offline, .dropped, .server, .rate_limited => sendNow(state, now_ms, .{}),",
+      target: ".offline, .dropped, .unreadable, .server, .rate_limited => waitAfter(state, failure, now_ms),",
+      planted: ".offline, .dropped, .unreadable, .server, .rate_limited => sendNow(state, now_ms, .{}),",
     },
     {
       name: "never hands a resend's status back to the thinking row",

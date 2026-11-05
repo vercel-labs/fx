@@ -86,7 +86,9 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         const body = try host_stream.readErrorBody(alloc, transport, opened.handle, request);
         return .{ .failed = .{
             .kind = gateway_client.httpFailureKind(alloc, .fromHttpStatus(opened.status), body),
+            .http_status = opened.status,
             .detail = body,
+            .retry_after_seconds = opened.retry_after_seconds,
             .ownership = .owned,
         } };
     }
