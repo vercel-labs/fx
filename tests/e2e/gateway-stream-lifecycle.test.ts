@@ -11703,6 +11703,79 @@ describe("request recovery across statuses and garbled streams", () => {
     }
   }, 30_000);
 
+  test("fx ask goes Offline without waiting out a model catalog that never answers, then recovers", async () => {
+    const root = createFixtureRoot("catalog-never-answers");
+    const tracePath = join(root.root, "trace.log");
+    // The catalog takes its request and never answers, as behind a dead network.
+    let catalogRequests = 0;
+    const catalog = startDynamicFakeGateway(() => new Response("unexpected request", { status: 500 }), {
+      models: () => {
+        catalogRequests++;
+        return new Promise<Response>(() => {});
+      },
+    });
+    // Nothing listens on the chat port until the network returns, so the
+    // first request is refused as it is offline.
+    const reserved = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("reserved") });
+    const port = reserved.port;
+    reserved.stop(true);
+    const chatUrl = `http://127.0.0.1:${port}/v4/ai/language-model`;
+    let chat: ReturnType<typeof Bun.serve> | undefined;
+    const proc = Bun.spawn([FX_BIN, "ask", "--json", "--auto", "--no-save", "Answer once the network returns."], {
+      cwd: root.workspace,
+      env: {
+        ...fixtureEnv(root, catalog, tracePath),
+        FX_GATEWAY_CHAT_URL: chatUrl,
+        FX_TEST_GATEWAY_CHAT_URL: chatUrl,
+        FX_SOUND: "0",
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const kill = setTimeout(() => proc.kill("SIGKILL"), 50_000);
+    try {
+      const started = performance.now();
+      let offlineAfterMs: number | undefined;
+      let stderr = "";
+      const decoder = new TextDecoder();
+      const readStderr = (async () => {
+        for await (const chunk of proc.stderr) {
+          stderr += decoder.decode(chunk, { stream: true });
+          if (offlineAfterMs === undefined && /^\[notice\] Offline · next try in \d+s$/m.test(stderr)) {
+            offlineAfterMs = performance.now() - started;
+            // The network returns.
+            chat = Bun.serve({
+              hostname: "127.0.0.1",
+              port,
+              idleTimeout: 0,
+              fetch: () => fakeGatewayFinalText("Answered once the network returned."),
+            });
+          }
+        }
+      })();
+      const stdout = await new Response(proc.stdout).text();
+      const code = await proc.exited;
+      await readStderr;
+
+      expect(code, stderr).toBe(0);
+      // Without a bound the first request waited out the catalog's 30 second
+      // deadline before it could find the network down.
+      expect(offlineAfterMs).toBeDefined();
+      expect(offlineAfterMs!).toBeLessThan(15_000);
+      const json = parseAskJson(stdout);
+      expect(json.output).toBe("Answered once the network returned.");
+      expect(json.recovery?.state).toBe("recovered");
+      expect(catalogRequests).toBe(1);
+    } finally {
+      clearTimeout(kill);
+      if (proc.exitCode === null) proc.kill("SIGKILL");
+      chat?.stop(true);
+      catalog.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test("fx ask names the status of a failure it does not retry", async () => {
     const root = createFixtureRoot("named-status");
     const tracePath = join(root.root, "trace.log");
