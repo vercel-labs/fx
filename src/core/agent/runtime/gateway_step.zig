@@ -142,7 +142,7 @@ fn recordProviderResultMetric(
     runtime_telemetry.recordGatewayCallMetricWithDiagnostics(
         model,
         started_at_ms,
-        if (failure) |value| failureMetricCode(value.kind) else 200,
+        if (failure) |value| if (value.http_status) |status| @backingInt(status) else failureMetricCode(value.kind) else 200,
         truncated_bytes,
         input_tokens,
         output_tokens,

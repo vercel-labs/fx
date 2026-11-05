@@ -1172,8 +1172,10 @@ Settled for `/fork` (2026-10-02):
   to the end of the previous turn under a new id and hard-links the
   blobs (D5), so the source is never written. The app switches to the
   fork as a resume does, opening it before it closes the source (D41),
-  writes `original session fx --resume` and the source's id in the
-  transcript, and puts the prompt back in the input box. The fork's title
+  writes `Resume the original session with:` and, on the line below,
+  `fx --resume` and the source's id after the replayed turns, so they stay
+  in view however long the session is, and puts the prompt back in the
+  input box. The fork's title
   is the source's with ` (fork)` once. `/fork` waits for a running turn
   to end. (Until D53 removed the switch, the line named `--sessions-v2`
   and `/fork` refused without it.)

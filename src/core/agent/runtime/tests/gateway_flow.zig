@@ -9799,3 +9799,58 @@ fn estimateTextTokens(text: []const u8) usize {
     estimator.consume(text);
     return @intCast(estimator.estimate());
 }
+
+test "every 5xx response retries like 503" {
+    const alloc = std.testing.allocator;
+    for ([_]u10{ 529, 520, 524, 507 }) |code| {
+        const completions = [_]FakeCompletion{
+            .{ .status = @fromBackingInt(@intCast(code)), .retry_after_seconds = 0, .err_body = "{\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}" },
+            .{ .content = "Recovered" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+        try std.testing.expectEqual(@as(usize, 2), gateway.request_models.items.len);
+        try expectRecovered(&hooks, 2);
+    }
+}
+
+test "a status fx does not retry ends naming its own code" {
+    const alloc = std.testing.allocator;
+    const completions = [_]FakeCompletion{
+        .{ .status = .not_found, .err_body = "{\"error\":{\"message\":\"no such route\"}}" },
+        .{ .content = "must not be requested" },
+    };
+    var gateway = FakeGateway.init(alloc, &completions);
+    defer gateway.deinit();
+    var hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer hooks.deinit();
+    var fixture = PromptFixture{};
+
+    try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+    try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+    try std.testing.expectEqual(std.http.Status.not_found, hooks.http_status.?);
+}
+
+test "400 and 422 still end after one request" {
+    const alloc = std.testing.allocator;
+    for ([_]std.http.Status{ .bad_request, .unprocessable_entity }) |status| {
+        const completions = [_]FakeCompletion{
+            .{ .status = status, .err_body = "{\"error\":{\"message\":\"bad input\"}}" },
+            .{ .content = "must not be requested" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
+        try std.testing.expectEqual(@as(usize, 1), gateway.request_models.items.len);
+        try std.testing.expectEqual(types.TurnPresentationOutcome.failed, hooks.finalized_outcome.?);
+    }
+}

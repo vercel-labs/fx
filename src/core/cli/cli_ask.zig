@@ -1710,7 +1710,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     } else if (options.model_override != null and ctx.requested_resume == null and
         startup.ultrafast_mode_source == .compiled_default)
     {
-        // Ultra mode must never follow an explicit model override by default.
+        // Ultrafast mode must never follow an explicit model override by default.
         ctx.ultrafast_mode = false;
     }
     if (options.provider_order_override) |order| {

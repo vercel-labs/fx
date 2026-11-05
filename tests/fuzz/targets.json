@@ -33,6 +33,7 @@
     {"name": "sse_framing", "module": "fx", "test": "provider framing fuzzes chunk-invariant event data", "iterations": 1300000},
     {"name": "responses_stream", "module": "fx", "test": "Responses streams give the same result however they are cut into events and reads", "iterations": 190000},
     {"name": "vercel_stream", "module": "fx", "test": "Gateway streams give the same result however they are cut into events and reads", "iterations": 460000},
+    {"name": "gateway_event_class", "module": "fx", "test": "a Gateway event that is not JSON is resent, a too-deep or duplicate-key one ends the turn, however its bytes arrive", "iterations": 400000},
     {"name": "chat_completions_stream", "module": "fx", "test": "chat completions streams give the same result however they are cut into events and reads", "iterations": 120000},
     {"name": "terminal_grid", "module": "fx", "test": "terminal grid state survives fragmented feeds, checkpoints, and repaints", "iterations": 50000},
     {"name": "transcript_paint", "module": "fx", "test": "transcript painting keeps the shadow terminal in step with the screen", "iterations": 8000},
@@ -47,6 +48,7 @@
     {"name": "cli_flags", "module": "fx", "test": "the flag parser keeps its laws on fuzzed command lines", "iterations": 1200000},
     {"name": "ask_questions_text", "module": "fx", "test": "ask_user_question questions sent as JSON text decode or refuse arbitrary bytes", "iterations": 250000},
     {"name": "transcript_window", "module": "fx", "test": "the transcript window keeps the model's laws on arbitrary event sequences", "iterations": 2000000},
-    {"name": "frozen_prefix", "module": "fx", "test": "a runtime resuming after its frozen prefix matches a full render on arbitrary edits", "iterations": 1500}
+    {"name": "frozen_prefix", "module": "fx", "test": "a runtime resuming after its frozen prefix matches a full render on arbitrary edits", "iterations": 1500},
+    {"name": "session_title", "module": "fx", "test": "session titles keep their rules on fuzzed input", "iterations": 5000000}
   ]
 }

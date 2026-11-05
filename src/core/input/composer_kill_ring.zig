@@ -31,7 +31,7 @@ pub const State = struct {
     active: kill_ring.ActiveComposer,
 
     pub fn delete(self: State, alloc: Allocator, kind: DeleteKind) !bool {
-        if (kind == .whitespace_word_left) {
+        if (kind == .whitespace_word_left or kind == .line_start) {
             self.active.vertical_navigation.reset();
         }
         const request = deleteRequest(
@@ -145,7 +145,10 @@ fn deleteRequest(
             entities,
         ),
         .line_start => kill_ring.DeleteRange{
-            .start = bounds.start,
+            .start = if (bounds.cursor == bounds.start and bounds.start > 0)
+                bounds.start - 1
+            else
+                bounds.start,
             .end = bounds.cursor,
         },
         .line_end => kill_ring.DeleteRange{
@@ -269,6 +272,67 @@ test "delete requests keep selection precedence and logical line ownership pure"
             deleteRequest(&fixture.edit, &fixture.entities, kind).?,
         );
     }
+}
+
+test "line start delete joins the previous line only at a non-first line start" {
+    const alloc = std.testing.allocator;
+    var fixture: Fixture = .{};
+    defer fixture.deinit(alloc);
+    try fixture.edit.setText(alloc, "alpha\nbeta");
+    fixture.edit.cursor = "alpha\n".len;
+
+    try std.testing.expectEqual(
+        DeleteRequest{
+            .bounds = .{
+                .start = "alpha\n".len,
+                .cursor = "alpha\n".len,
+                .end = "alpha\nbeta".len,
+            },
+            .range = .{ .start = "alpha".len, .end = "alpha\n".len },
+        },
+        deleteRequest(&fixture.edit, &fixture.entities, .line_start).?,
+    );
+
+    fixture.edit.cursor = 0;
+    try std.testing.expect(
+        deleteRequest(&fixture.edit, &fixture.entities, .line_start) == null,
+    );
+}
+
+test "repeated line start deletes walk back through every line" {
+    const alloc = std.testing.allocator;
+    var fixture: Fixture = .{};
+    defer fixture.deinit(alloc);
+    try fixture.edit.setText(alloc, "alpha\nbeta\ngamma");
+    fixture.edit.cursor = fixture.edit.input.items.len;
+
+    const steps = [_]struct { input: []const u8, killed: []const u8 }{
+        .{ .input = "alpha\nbeta\n", .killed = "gamma" },
+        .{ .input = "alpha\nbeta", .killed = "\n" },
+        .{ .input = "alpha\n", .killed = "beta" },
+        .{ .input = "alpha", .killed = "\n" },
+        .{ .input = "", .killed = "alpha" },
+    };
+    for (steps) |step| {
+        try std.testing.expect(try fixture.state().delete(alloc, .line_start));
+        try std.testing.expectEqualStrings(step.input, fixture.edit.input.items);
+        try std.testing.expectEqual(step.input.len, fixture.edit.cursor);
+        try std.testing.expectEqualStrings(step.killed, fixture.ring.text.items);
+    }
+    try std.testing.expect(!try fixture.state().delete(alloc, .line_start));
+}
+
+test "line start delete clears the sticky vertical column" {
+    const alloc = std.testing.allocator;
+    var fixture: Fixture = .{};
+    defer fixture.deinit(alloc);
+    try fixture.edit.setText(alloc, "alpha\nbeta");
+    fixture.edit.cursor = "alpha\n".len;
+    fixture.vertical_navigation.preferred_column = 3;
+
+    try std.testing.expect(try fixture.state().delete(alloc, .line_start));
+    try std.testing.expectEqualStrings("alphabeta", fixture.edit.input.items);
+    try std.testing.expectEqual(@as(?usize, null), fixture.vertical_navigation.preferredColumn());
 }
 
 test "plain kill and yank each record one edit history delta" {

@@ -7,6 +7,8 @@ import {
   FAKE_GATEWAY_MODEL,
   fakeGatewaySse,
   startDynamicFakeGateway,
+  fakeGatewayFinalText,
+  composerContains,
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -133,6 +135,23 @@ function held() {
 // subagent tool can't tell them apart, because a subagent is offered it too.
 const isMainRequest = (body: string) => userTexts(body).some((text) => text.includes("SWITCH_USER"));
 
+// Titles the title model gives: the reviewer's task gets its own, so the
+// agent list shows a subagent titled as main is.
+const subagentTitles = {
+  titleResponses: Array.from({ length: 8 }, () => (body: string) =>
+    fakeGatewayFinalText(body.includes("src/parser.zig") ? "Review the parser" : "Plan the parser work")),
+};
+
+// The saved sessions in `home` whose files hold `marker`.
+function sessionsHolding(home: string, marker: string): string[] {
+  const sessions = join(home, ".fx", "sessions", "v2");
+  const holds = (path: string): boolean => readdirSync(path).some((entry) => {
+    const full = join(path, entry);
+    return statSync(full).isDirectory() ? holds(full) : readFileSync(full, "latin1").includes(marker);
+  });
+  return readdirSync(sessions).filter((id) => !id.startsWith(".") && statSync(join(sessions, id)).isDirectory() && holds(join(sessions, id)));
+}
+
 interface Run {
   workspace: string;
   home: string;
@@ -148,8 +167,9 @@ async function withFx(
   setupHome: (home: string) => void = () => {},
   record = false,
   env: Record<string, string> = {},
+  gatewayOptions: Parameters<typeof startDynamicFakeGateway>[1] = {},
 ) {
-  const gateway = startDynamicFakeGateway(respond);
+  const gateway = startDynamicFakeGateway(respond, gatewayOptions);
   const home = createIsolatedTestHome();
   const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-switch-")));
   mkdirSync(join(home, ".fx"), { recursive: true });
@@ -881,6 +901,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendKeys("C-x");
         const over = await session.waitForText(LIST_HINT, 10_000);
         expect(over).not.toContain("Apply this change?");
+        // Its row names the profile it runs in.
+        expect(over).toMatch(/writer · [^\n]* · writer · /);
         await session.sendKeys("1");
         await session.sendKeys("Escape");
         const back = await session.waitForPane((pane) => !pane.includes(LIST_HINT) && pane.includes("Apply this change?"), 10_000);
@@ -1332,6 +1354,185 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         const main = await session.waitForPane((pane) => pane.includes("\u2503 EDGE_KEEP_ME"), 10_000);
         expect(main).not.toContain("EDGE_KEEP_MEq");
         expect(main).toContain("main \u00b7 ctrl+x");
+      });
+    },
+    TIMEOUT,
+  );
+  test(
+    "the agent list names each agent by its title, profile, state, and model, and main's footer counts the subagents working",
+    async () => {
+      const reviewer = held();
+      let childCalls = 0;
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          await reviewer.promise;
+          return text("child_answer", "LIST_CHILD_DONE");
+        }
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", { request: { action: "message", agent: "reviewer", message: "Review src/parser.zig for bugs" } });
+        }
+        return text("main_wait", "LIST_MAIN_WAITING");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER plan it");
+        await session.waitForText("LIST_MAIN_WAITING", 30_000);
+        await until("the reviewer's turn", () => childCalls >= 1);
+        // Main shows that work goes on elsewhere, beside the list's key.
+        await session.waitForText("1 subagent working \u00b7 main \u2193", 15_000);
+        await session.sendKeys("Down");
+        // The reviewer's title is the title model's, from its task, as main's is.
+        const list = await session.waitForPane((pane) => / {4}reviewer \u00b7 Review the parser \u00b7 main \u00b7 working \u00b7 \S/.test(pane), 15_000);
+        expect(list).toMatch(/fx 1 \(on screen\) \u00b7 Plan the parser work \u00b7 main \u00b7 idle \u00b7 \S/);
+        expect(list).toContain("\u2191\u2193 preview     enter switch     esc back");
+        await session.sendKeys("Escape");
+        reviewer.release();
+        await session.waitForPane((pane) => !pane.includes("subagent working"), 30_000);
+      }, () => {}, false, {}, subagentTitles);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "x, then x again, in the agent list closes a working subagent for good: main hears the user closed it, and a resume doesn't bring it back",
+    async () => {
+      const reviewer = held();
+      let childCalls = 0;
+      // The trace lives in the test's home, set before fx starts.
+      const env: Record<string, string> = {};
+      let tracePath = "";
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) {
+          childCalls += 1;
+          await reviewer.promise;
+          return text("child_answer", "CLOSE_CHILD_DONE");
+        }
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", { request: { action: "message", agent: "reviewer", message: "Review src/parser.zig for bugs" } });
+        }
+        if (body.includes('\\"cause\\":\\"user_close\\"')) return text("main_told", "CLOSE_MAIN_TOLD");
+        return text("main_wait", "CLOSE_MAIN_WAITING");
+      }, async (session, { home, launch }) => {
+        await session.sendText("SWITCH_USER review it");
+        await session.waitForText("CLOSE_MAIN_WAITING", 30_000);
+        await until("the reviewer's turn", () => childCalls >= 1);
+        await session.sendKeys("Down");
+        await session.waitForText("esc back", 10_000);
+        // On main's row, x does nothing: an instance closes with /close. The
+        // next key is handled once the hint changes, so by then the trace
+        // shows whether x armed anything.
+        await session.sendKeys("x");
+        await session.sendKeys("Down");
+        await session.waitForText("enter switch     x close     esc back", 10_000);
+        expect(readFileSync(tracePath, "utf8")).not.toContain("agents_menu_close_armed");
+        await session.sendKeys("x");
+        await session.waitForText("x again to close it for good", 10_000);
+        expect(readFileSync(tracePath, "utf8")).toContain("agents_menu_close_armed");
+        // Any other key keeps it.
+        await session.sendKeys("Up");
+        await session.waitForPane((pane) => !pane.includes("x again to close"), 10_000);
+        await session.sendKeys("Down");
+        await session.sendKeys("x");
+        await session.waitForText("x again to close it for good", 10_000);
+        await session.sendKeys("x");
+        const closed = await session.waitForPane((pane) => !/^ {4}reviewer \u00b7 /m.test(pane) && pane.includes("esc back"), 15_000);
+        // Main is on screen again, and the reviewer's turn ended with the close.
+        expect(closed).toContain("SWITCH_USER review it");
+        await session.sendKeys("Escape");
+        // The list takes every key until it closes, /quit below included.
+        await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+        await session.waitForText("CLOSE_MAIN_TOLD", 30_000);
+        expect(await session.capturePane()).not.toContain("subagent working");
+        reviewer.release();
+        expect(childCalls).toBe(1);
+        await session.sendText("/quit");
+        expect(await session.waitForSessionEnd(15_000)).toBe(true);
+
+        const parents = sessionsHolding(home, "CLOSE_MAIN_TOLD");
+        expect(parents.length).toBe(1);
+        const resumed = await launch(`--resume ${parents[0]}`);
+        await resumed.waitForText("CLOSE_MAIN_TOLD", 30_000);
+        // Main alone: no agent indicator, and ↓ opens no list, which would
+        // take the next key; the composer shows it instead.
+        expect(await resumed.capturePane()).not.toContain("main \u2193");
+        await resumed.sendKeys("Down");
+        await resumed.sendLiteral("z");
+        const typed = await resumed.waitForPane((pane) => composerContains(pane, "z"), 10_000);
+        expect(typed).not.toContain("esc back");
+      }, (home) => {
+        tracePath = join(home, "fx-trace.log");
+        env.FX_TRACE_LOG = tracePath;
+      }, false, env);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "closing the middle row of the agent list keeps the highlight on the agent shown, and the first x warns at once",
+    async () => {
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) return text("child_done", "MIDDLE_CHILD_DONE");
+        if (!body.includes('"main_r"')) {
+          return toolCall("main_r", "subagent", { request: { action: "message", agent: "reviewer", message: "MIDDLE_REVIEW" } });
+        }
+        if (!body.includes('"main_t"')) {
+          return toolCall("main_t", "subagent", { request: { action: "message", agent: "tester", message: "MIDDLE_TEST" } });
+        }
+        return text("main_done", "MIDDLE_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER start them");
+        await session.waitForText("MIDDLE_MAIN_DONE", 30_000);
+        await session.waitForPane((pane) => !pane.includes("subagent working"), 30_000);
+        // Rows: fx 1, reviewer, tester. Both subagents are idle, so nothing
+        // on screen animates.
+        await session.sendKeys("Down");
+        await session.waitForText(LIST_HINT, 10_000);
+        await session.sendKeys("Down");
+        await session.waitForText("enter switch     x close     esc back", 10_000);
+        await session.sendKeys("x");
+        await session.waitForText("x again to close it for good", 10_000);
+        // Any other key keeps it, and its warning goes at once.
+        await session.sendKeys("a");
+        await session.waitForText("enter switch     x close     esc back", 10_000);
+        // X closes too, so Caps Lock doesn't get in the way.
+        await session.sendKeys("X");
+        await session.waitForText("x again to close it for good", 10_000);
+        await session.sendKeys("x");
+        // Main is shown, and the highlight is on its row, not on tester's.
+        const closed = await session.waitForPane((pane) => !/^ {4}reviewer \u00b7 /m.test(pane) && pane.includes("esc back"), 15_000);
+        expect(closed).toMatch(/^ {4}tester \u00b7 /m);
+        expect(closed).toContain("\u2191\u2193 preview     enter switch     esc back");
+        expect(closed).not.toContain("x close");
+        await session.sendKeys("Enter");
+        const kept = await session.waitForPane((pane) => !pane.includes("esc back"), 10_000);
+        expect(kept).toContain("MIDDLE_MAIN_DONE");
+        expect(kept).toContain("main \u2193");
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "main's close removes an idle subagent from the agent list, and its row says closed",
+    async () => {
+      let mainCalls = 0;
+      await withFx(async (body) => {
+        if (!isMainRequest(body)) return text("child_answer", "MAIN_CLOSE_TESTS_PASS");
+        mainCalls += 1;
+        if (mainCalls === 1) return toolCall("main_sub", "subagent", { request: { action: "message", agent: "tester", message: "Run the auth tests" } });
+        if (body.includes("Closed tester.")) return text("main_done", "MAIN_CLOSE_DONE");
+        if (body.includes("MAIN_CLOSE_TESTS_PASS")) return toolCall("main_close", "subagent", { request: { action: "close", agent: "tester" } });
+        return text("main_wait", "MAIN_CLOSE_WAITING");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER run them");
+        const pane = await session.waitForText("MAIN_CLOSE_DONE", 60_000);
+        expect(pane).toContain("\u2514 closed tester");
+        // Main alone again: no agent indicator, and ↓ opens no list, which
+        // would take the next key; the composer shows it instead.
+        await session.waitForPane((value) => !value.includes("main \u2193"), 10_000);
+        await session.sendKeys("Down");
+        await session.sendLiteral("z");
+        const typed = await session.waitForPane((pane) => composerContains(pane, "z"), 10_000);
+        expect(typed).not.toContain("esc back");
       });
     },
     TIMEOUT,

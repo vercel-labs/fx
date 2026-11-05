@@ -4855,6 +4855,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
         ...responseFence,
       ]);
       await waitForTraceText(tracePath, "theme_update_settled light=true rgb=terminal");
+      // The redraw in the new theme clears the screen, and the trace says so.
+      await waitForTraceText(tracePath, "event=theme_change_redraw dropped=terminal_screen_and_scrollback");
       await waitForTapeOutputCount(tapePath, "\x1b[3J", resetCountBefore + 1);
 
       const replayed = await session.waitForText(inlineTailMarker, TIMEOUT);

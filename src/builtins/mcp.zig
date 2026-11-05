@@ -346,17 +346,10 @@ pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(Mcp
 
 /// With `skipped`, see `project_config.parseProfileServers`.
 fn readProfile(alloc: Allocator, path: []const u8, skipped: ?*std.ArrayList(project_config.WorkspaceDiagnostic)) !std.ArrayList(McpServerConfig) {
-    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| {
-        if (err == error.FileNotFound) return .empty;
-        logConfigFailure("open", path, err);
-        return err;
-    };
-    defer file.close(io_mod.getIo());
-
-    const json_text = io_mod.readFileToEnd(alloc, &file, 1024 * 1024) catch |err| {
+    const json_text = (config_file.read(alloc, path) catch |err| {
         logConfigFailure("read", path, err);
         return err;
-    };
+    }) orelse return .empty;
     defer alloc.free(json_text);
 
     return project_config.parseProfileServers(alloc, json_text, skipped) catch |err| {
@@ -373,12 +366,7 @@ fn loadProfileDocumentFromPath(
     alloc: Allocator,
     path: []const u8,
 ) !project_config.ProfileParseResult {
-    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| {
-        if (err == error.FileNotFound) return .{};
-        return err;
-    };
-    defer file.close(io_mod.getIo());
-    const json_text = try io_mod.readFileToEnd(alloc, &file, 1024 * 1024);
+    const json_text = (try config_file.read(alloc, path)) orelse return .{};
     defer alloc.free(json_text);
     return project_config.parseProfileDocument(alloc, json_text);
 }

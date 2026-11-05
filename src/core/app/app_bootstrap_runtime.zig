@@ -165,6 +165,12 @@ pub fn Runtime(comptime App: type) type {
             provider: ?model_provider.ProviderId = null,
             model: ?[]const u8 = null,
             effort: ?types.ReasoningEffort = null,
+            /// `model` or `effort` came from the launch profile rather than
+            /// `--model`, `--effort`, or `FX_MODEL`. The first instance starts
+            /// with them, but later instances don't inherit them as the
+            /// process's choice, so `/launch <profile>` applies its own.
+            model_from_profile: bool = false,
+            effort_from_profile: bool = false,
             fast: ?bool = null,
             ultrafast: ?bool = null,
             /// Borrowed from the launch arguments; StartupState dupes on apply.
@@ -436,7 +442,13 @@ pub fn Runtime(comptime App: type) type {
             });
             defer startup.deinit(app.alloc);
 
+            // Later instances start from the selection a launch profile's
+            // model replaced for the first one. Owned.
+            var seed_model: ?[]u8 = null;
+            defer if (seed_model) |model| app.alloc.free(model);
+            const seed_model_source = startup.model_source;
             if (launch_overrides.model) |model| {
+                if (launch_overrides.model_from_profile) seed_model = try app.alloc.dupe(u8, startup.selected_model);
                 try startup.applyLaunchModelOverride(app.alloc, model);
             }
 
@@ -547,14 +559,14 @@ pub fn Runtime(comptime App: type) type {
                     app.alloc,
                     startup.provider,
                     startup.configured_model,
-                    startup.model_source,
-                    active_model,
+                    if (seed_model != null) seed_model_source else startup.model_source,
+                    seed_model orelse active_model,
                     persisted_effort,
                     persisted_fast_mode,
                     startup.fast_mode_model_bound,
                     persisted_ultrafast_mode,
                     startup.ultrafast_process_override,
-                    launch_overrides.effort,
+                    if (launch_overrides.effort_from_profile) null else launch_overrides.effort,
                     launch_overrides.fast,
                     launch_overrides.provider,
                 );
@@ -581,7 +593,10 @@ pub fn Runtime(comptime App: type) type {
             app.auto_upgrade_enabled = startup.auto_upgrade;
             app.upgrader.configure_channel(startup.update_channel);
             agent.effort = startup.effort;
-            if (comptime @hasField(App, "instances")) try app.instances.seed.captureAgent(app.alloc, agent, permission_mode);
+            if (comptime @hasField(App, "instances")) {
+                try app.instances.seed.captureAgent(app.alloc, agent, permission_mode);
+                if (launch_overrides.effort_from_profile) app.instances.seed.agent_effort = persisted_effort;
+            }
             if (comptime @hasField(App, "review_model")) app.review_model = startup.takeReviewModel();
             app.shell.setCommandOutputRenderPolicy(
                 app_render_runtime.Runtime(App).shellStyles(),

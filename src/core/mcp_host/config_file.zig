@@ -118,9 +118,11 @@ pub fn update(alloc: Allocator, profile_path: []const u8, file: File, path: []co
     }
 }
 
-/// The file's text, or null when it doesn't exist; owned by `alloc`.
+/// The file's text, or null when it doesn't exist; owned by `alloc`. A path
+/// that isn't a regular file, such as a fifo, fails with DurablePathUnsafe
+/// instead of waiting for a writer.
 pub fn read(alloc: Allocator, path: []const u8) !?[]u8 {
-    var f = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| switch (err) {
+    var f = io_mod.openExistingReadOnlyRegularFile(std.Io.Dir.cwd(), path, .follow) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -372,6 +374,38 @@ test "a linked config file is never edited, whether a symlink or a hard link" {
     const shared = try tmp.dir.readFileAlloc(io, "shared.json", alloc, .limited(64));
     defer alloc.free(shared);
     try testing.expectEqualStrings("{}", shared);
+}
+
+extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+
+test "read returns a file's text, follows a symlink, and refuses a fifo without blocking" {
+    if (comptime @import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .wasi) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "plain.json", .data = "{\"mcp\":{}}" });
+    try tmp.dir.symLink(io, "plain.json", "soft.json", .{});
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    for ([_][]const u8{ "plain.json", "soft.json" }) |name| {
+        const path = try std.Io.Dir.path.join(alloc, &.{ root, name });
+        defer alloc.free(path);
+        const text = (try read(alloc, path)).?;
+        defer alloc.free(text);
+        try testing.expectEqualStrings("{\"mcp\":{}}", text);
+    }
+
+    const missing = try std.Io.Dir.path.join(alloc, &.{ root, "missing.json" });
+    defer alloc.free(missing);
+    try testing.expect(try read(alloc, missing) == null);
+
+    // Opening a fifo for reading waits for a writer that never comes.
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const fifo = try std.mem.printSentinel(&path_buf, "{s}/{s}", .{ root, "fifo.json" }, 0);
+    if (mkfifo(fifo, 0o600) != 0) return error.SkipZigTest;
+    try testing.expectError(error.DurablePathUnsafe, read(alloc, fifo));
 }
 
 test "the profile's first write creates ~/.fx readable only by its owner" {
