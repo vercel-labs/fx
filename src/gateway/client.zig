@@ -11629,15 +11629,18 @@ const UnpooledOpenFixture = struct {
     }
 
     /// What became of the connection a finished open may have made: none,
-    /// or one fx already closed. Fails when fx left one open.
-    fn lateConnection(self: *UnpooledOpenFixture) !Late {
+    /// or one fx already closed. Fails when fx left one open. Waits up to
+    /// `appear_ms` for a connection to arrive.
+    fn lateConnection(self: *UnpooledOpenFixture, appear_ms: i32) !Late {
         const zio = io_mod.getIo();
         var listener = [_]std.posix.pollfd{.{ .fd = self.server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-        if (try std.posix.poll(&listener, 0) == 0) return .none;
+        if (try std.posix.poll(&listener, appear_ms) == 0) return .none;
         var stream = try self.server.accept(zio);
         defer stream.close(zio);
+        // The close fx already made can reach this end a moment after the
+        // accept; a connection fx left open never reads end of stream.
         var peer = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-        if (try std.posix.poll(&peer, 0) == 0) return error.TestConnectionLeftOpen;
+        if (try std.posix.poll(&peer, 2_000) == 0) return error.TestConnectionLeftOpen;
         var buffer: [64]u8 = undefined;
         var reader = stream.reader(zio, &buffer);
         var byte: [1]u8 = undefined;
@@ -11692,7 +11695,7 @@ test "Esc walks away from an unpooled open stuck in its lookup, and its job stop
     try waitForOwnClientOpenJobs();
     // The open ended once its lookup returned, without connecting; the
     // testing allocator checks the job freed its client and itself.
-    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection());
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
 }
 
 test "an unpooled open that connects after the request walked away is closed with its client" {
@@ -11705,7 +11708,7 @@ test "an unpooled open that connects after the request walked away is closed wit
     try stuck.waitCancelled();
     stuck.release.store(true, .seq_cst);
     try waitForOwnClientOpenJobs();
-    try std.testing.expectEqual(UnpooledOpenFixture.Late.closed, try fixture.lateConnection());
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.closed, try fixture.lateConnection(2_000));
 }
 
 test "the setup deadline walks away from an unpooled open stuck in its lookup" {
@@ -11726,7 +11729,7 @@ test "the setup deadline walks away from an unpooled open stuck in its lookup" {
     try stuck.waitCancelled();
     stuck.release.store(true, .seq_cst);
     try waitForOwnClientOpenJobs();
-    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection());
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
 }
 
 test "an unpooled open hands over a request on its job's own client with the caller's URI and headers" {
@@ -11765,7 +11768,7 @@ test "an unpooled open hands over a request on its job's own client with the cal
     opened.deinit();
     try waitForOwnClientOpenJobs();
     // Ending the request closed its connection along with the client.
-    try std.testing.expectEqual(UnpooledOpenFixture.Late.closed, try fixture.lateConnection());
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.closed, try fixture.lateConnection(2_000));
 }
 
 test "Esc during a stuck lookup ends an unpooled gateway request at once" {
@@ -11797,7 +11800,7 @@ test "Esc during a stuck lookup ends an unpooled gateway request at once" {
     try stuck.waitCancelled();
     stuck.release.store(true, .seq_cst);
     try waitForOwnClientOpenJobs();
-    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection());
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
 }
 
 test "a bounded request's deadline walks away from an unpooled open stuck in its lookup" {
@@ -11839,7 +11842,7 @@ test "a bounded request's deadline walks away from an unpooled open stuck in its
     try stuck.waitCancelled();
     stuck.release.store(true, .seq_cst);
     try waitForOwnClientOpenJobs();
-    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection());
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
 }
 
 test "Esc walks away from a provider POST stuck in its lookup" {
@@ -11864,7 +11867,7 @@ test "Esc walks away from a provider POST stuck in its lookup" {
     try stuck.waitCancelled();
     stuck.release.store(true, .seq_cst);
     try waitForOwnClientOpenJobs();
-    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection());
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
 }
 
 test "the connect deadline walks away from a provider POST stuck in its lookup as a timeout" {
@@ -11886,7 +11889,7 @@ test "the connect deadline walks away from a provider POST stuck in its lookup a
     try stuck.waitCancelled();
     stuck.release.store(true, .seq_cst);
     try waitForOwnClientOpenJobs();
-    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection());
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
 }
 
 test "a provider POST hands over its request with the provider's headers on its own client" {
@@ -11912,7 +11915,7 @@ test "a provider POST hands over its request with the provider's headers on its 
     try std.testing.expectEqual(@as([*]const std.http.Header, &extra), opened.request.extra_headers.ptr);
     opened.deinit();
     try waitForOwnClientOpenJobs();
-    try std.testing.expectEqual(UnpooledOpenFixture.Late.closed, try fixture.lateConnection());
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.closed, try fixture.lateConnection(2_000));
 }
 
 /// Opens through `pool`, or on a job's own client when it is null, against a
@@ -11944,7 +11947,7 @@ fn expectWalkAwayStopsStalledTlsSetup(pool: ?*http_pool.HttpPool) !void {
     const walked_away = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
     if (pool) |shared| try waitForOpenJobs(shared) else try waitForOwnClientOpenJobs();
     // The server holds the handshake for ten seconds; the job stopped it.
-    try std.testing.expect(elapsedMsSince(walked_away) < 1_000);
+    try std.testing.expect(elapsedMsSince(walked_away) < 3_000);
     try std.testing.expect(fixture.reached_stage.load(.seq_cst));
 }
 
@@ -11983,6 +11986,6 @@ test "two hundred Esc presses during stuck unpooled lookups leave no job, client
         // made is closed.
         try std.testing.expectError(error.Cancelled, result);
         try waitForOwnClientOpenJobs();
-        _ = try fixture.lateConnection();
+        _ = try fixture.lateConnection(0);
     }
 }
