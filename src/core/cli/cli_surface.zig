@@ -1045,7 +1045,8 @@ fn topLevelHelpRequest(command_catalog: CommandCatalog, args: []const [:0]const 
 /// Runs the command `args` name. A command that ends because fx couldn't
 /// write its own output, stdout or stderr, returns `error.OutputWriteFailed`
 /// in place of the `error.WriteFailed` a failed write gives, which on its own
-/// reads as a dropped connection.
+/// reads as a dropped connection, and one whose output reader went away, as
+/// `head` does, returns `error.OutputReaderGone`.
 pub fn runIfRequested(alloc: Allocator, args: []const [:0]const u8, cfg: Config) !RunResult {
     var output: OwnOutput = .{};
     return runIfRequestedWithDeps(alloc, args, cfg, .{ .stdout_ctx = &output, .stderr_ctx = &output }) catch |err| {
@@ -1053,17 +1054,28 @@ pub fn runIfRequested(alloc: Allocator, args: []const [:0]const u8, cfg: Config)
     };
 }
 
-/// Whether a write to fx's own stdout or stderr failed during a command.
+/// Whether a write to fx's own stdout or stderr failed during a command, or
+/// found its reader gone.
 const OwnOutput = struct {
     failed: std.atomic.Value(bool) = .init(false),
+    reader_gone: std.atomic.Value(bool) = .init(false),
 
-    fn noteFailure(ctx: ?*anyopaque) void {
+    fn noteFailure(ctx: ?*anyopaque, err: anyerror) void {
         const self: *OwnOutput = @ptrCast(@alignCast(ctx orelse return));
-        self.failed.store(true, .release);
+        if (err == error.BrokenPipe) {
+            self.reader_gone.store(true, .release);
+        } else {
+            self.failed.store(true, .release);
+        }
     }
 
     /// The error the command reports for `err`.
     fn commandError(self: *const OwnOutput, err: anyerror) anyerror {
+        if (err != error.WriteFailed and err != error.BrokenPipe) return err;
+        if (self.reader_gone.load(.acquire)) {
+            debug_trace.logf("core", "command output reader went away err={s}", .{@errorName(err)});
+            return error.OutputReaderGone;
+        }
         if (err != error.WriteFailed or !self.failed.load(.acquire)) return err;
         debug_trace.logf("core", "command output write failed err={s}", .{@errorName(err)});
         return error.OutputWriteFailed;
@@ -1074,8 +1086,17 @@ test "a command that ends because fx couldn't write its output reports that writ
     var output: OwnOutput = .{};
     // A failed write elsewhere, such as to the network, keeps its name.
     try std.testing.expectEqual(@as(anyerror, error.WriteFailed), output.commandError(error.WriteFailed));
-    OwnOutput.noteFailure(&output);
+    OwnOutput.noteFailure(&output, error.WriteFailed);
     try std.testing.expectEqual(@as(anyerror, error.OutputWriteFailed), output.commandError(error.WriteFailed));
+    try std.testing.expectEqual(@as(anyerror, error.NoSpaceLeft), output.commandError(error.NoSpaceLeft));
+}
+
+test "a command whose output reader went away reports that, however the write failed" {
+    var output: OwnOutput = .{};
+    OwnOutput.noteFailure(&output, error.BrokenPipe);
+    // A writer that only reports `WriteFailed`, such as `DepsWriter`, too.
+    try std.testing.expectEqual(@as(anyerror, error.OutputReaderGone), output.commandError(error.WriteFailed));
+    try std.testing.expectEqual(@as(anyerror, error.OutputReaderGone), output.commandError(error.BrokenPipe));
     try std.testing.expectEqual(@as(anyerror, error.NoSpaceLeft), output.commandError(error.NoSpaceLeft));
 }
 
@@ -2715,19 +2736,31 @@ fn doctorSnapshotFromRuntime(snapshot: doctor_runtime.Snapshot) output_contracts
 }
 
 fn writeRealStdout(ctx: ?*anyopaque, text: []const u8) !void {
-    errdefer OwnOutput.noteFailure(ctx);
-    if (comptime builtin.target.os.tag != .windows) {
-        return writeFdAll(std.posix.STDOUT_FILENO, text);
-    }
-    try std.Io.File.stdout().writeStreamingAll(io_mod.getIo(), text);
+    writeRealStream(.stdout, text) catch |err| {
+        OwnOutput.noteFailure(ctx, err);
+        return err;
+    };
 }
 
 fn writeRealStderr(ctx: ?*anyopaque, text: []const u8) !void {
-    errdefer OwnOutput.noteFailure(ctx);
+    writeRealStream(.stderr, text) catch |err| {
+        OwnOutput.noteFailure(ctx, err);
+        return err;
+    };
+}
+
+fn writeRealStream(stream: enum { stdout, stderr }, text: []const u8) !void {
     if (comptime builtin.target.os.tag != .windows) {
-        return writeFdAll(std.posix.STDERR_FILENO, text);
+        return writeFdAll(switch (stream) {
+            .stdout => std.posix.STDOUT_FILENO,
+            .stderr => std.posix.STDERR_FILENO,
+        }, text);
     }
-    try std.Io.File.stderr().writeStreamingAll(io_mod.getIo(), text);
+    const file = switch (stream) {
+        .stdout => std.Io.File.stdout(),
+        .stderr => std.Io.File.stderr(),
+    };
+    try file.writeStreamingAll(io_mod.getIo(), text);
 }
 
 fn writeFdAll(fd: std.posix.fd_t, text: []const u8) !void {
@@ -2735,7 +2768,11 @@ fn writeFdAll(fd: std.posix.fd_t, text: []const u8) !void {
     var remaining = text;
     while (remaining.len > 0) {
         const written = std.c.write(fd, remaining.ptr, remaining.len);
-        if (written <= 0) return error.WriteFailed;
+        if (written <= 0) {
+            // A reader that went away, as `head` does, is told apart.
+            if (written < 0 and std.posix.errno(written) == .PIPE) return error.BrokenPipe;
+            return error.WriteFailed;
+        }
         remaining = remaining[@intCast(written)..];
     }
 }
