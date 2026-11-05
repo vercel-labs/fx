@@ -101,9 +101,17 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, source: []const u8, limits: Limit
             return .{ .failed = message.no_start };
         },
     };
-    // Idempotent, and does nothing once `wait` has returned.
+    // Kills and reaps the child, so a child that keeps running after its
+    // outcome or after a bad frame can't hold the parent. Idempotent, and
+    // does nothing once `wait` has returned.
     defer child.kill(io);
-    sendSource(io, &child, source);
+    return finish(gpa, io, &child, source, limits);
+}
+
+/// Sends `source` to a started child and reads its outcome. The caller kills
+/// the child afterwards.
+fn finish(gpa: std.mem.Allocator, io: std.Io, child: *std.process.Child, source: []const u8, limits: Limits) RunError!Result {
+    sendSource(io, child, source);
     const deadline_ms = std.Io.Clock.awake.now(io).toMilliseconds() + limits.time_ms + grace_ms;
     const frame = awaitFrame(gpa, io, child.stdout.?, deadline_ms) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -111,15 +119,24 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, source: []const u8, limits: Limit
             debug_trace.logf("code_mode", "killed sandbox process still running grace_ms={d} past time_ms={d}", .{ grace_ms, limits.time_ms });
             return .timed_out;
         },
-        error.EndOfStream, error.ReadFailed, error.FrameTooLarge => {
-            const term = child.wait(io) catch return .{ .failed = message.no_outcome };
-            debug_trace.logf("code_mode", "sandbox process stopped without an outcome term={f}", .{term});
-            return .{ .failed = describeExit(term) };
+        error.FrameTooLarge => {
+            debug_trace.logf("code_mode", "stopped sandbox process that sent a frame over max_bytes={d}", .{max_outcome_bytes});
+            return .{ .failed = message.bad_outcome };
         },
+        error.EndOfStream, error.ReadFailed => return .{ .failed = stopAndDescribe(io, child) },
     };
     defer gpa.free(frame);
-    _ = child.wait(io) catch {};
     return parseOutcome(gpa, frame);
+}
+
+/// Why a child that sent no outcome stopped. A child that is still running,
+/// such as one that closed its stdout, would block `wait` forever, so it is
+/// killed first. A child already exiting keeps the status it exited with.
+fn stopAndDescribe(io: std.Io, child: *std.process.Child) []const u8 {
+    if (child.id) |pid| std.posix.kill(pid, .KILL) catch {};
+    const term = child.wait(io) catch return message.no_outcome;
+    debug_trace.logf("code_mode", "sandbox process stopped without an outcome term={f}", .{term});
+    return describeExit(term);
 }
 
 fn startChild(gpa: std.mem.Allocator, io: std.Io, limits: Limits) !std.process.Child {
@@ -360,6 +377,41 @@ test "the parent stops waiting for a sandbox child that never reports" {
     defer child.kill(io);
     const deadline_ms = std.Io.Clock.awake.now(io).toMilliseconds() + 300;
     try std.testing.expectError(error.DeadlinePassed, awaitFrame(std.testing.allocator, io, child.stdout.?, deadline_ms));
+}
+
+test "the parent does not wait on a child that keeps running" {
+    if (!supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    const outcome = "{\"outcome\":\"returned\",\"text\":\"1\"}";
+    var outcome_script_buffer: [128]u8 = undefined;
+    const outcome_script = try std.mem.print(&outcome_script_buffer, "printf '\\{o:0>3}\\000\\000\\000%s' '{s}'; exec sleep 30", .{ outcome.len, outcome });
+    const cases = [_]struct { script: []const u8, returned: bool }{
+        // A frame header over the limit, then no body.
+        .{ .script = "printf '\\377\\377\\377\\177'; exec sleep 30", .returned = false },
+        // No frame at all, with stdout closed.
+        .{ .script = "exec 1>&-; exec sleep 30", .returned = false },
+        // A valid outcome, then no exit.
+        .{ .script = outcome_script, .returned = true },
+    };
+    for (cases) |case| {
+        var child = try std.process.spawn(io, .{
+            .argv = &.{ "/bin/sh", "-c", case.script },
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .ignore,
+        });
+        const started_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+        const result = try finish(std.testing.allocator, io, &child, "return 1;", .{ .time_ms = 20_000 });
+        defer result.deinit(std.testing.allocator);
+        child.kill(io);
+        try std.testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - started_ms < 10_000);
+        if (case.returned) {
+            try std.testing.expect(result == .returned);
+            try std.testing.expectEqualStrings("1", result.returned.?);
+        } else {
+            try std.testing.expect(result == .failed);
+        }
+    }
 }
 
 test "the sandbox child reads its limits only from well-formed arguments" {
