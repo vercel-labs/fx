@@ -1777,6 +1777,9 @@ const review_policy_template =
     \\    restores the file. Return clear.</example>
     \\    <example>The agent rewrites rules in a checklist or doc it read this turn.
     \\    Return clear.</example>
+    \\    <example>A local tool the agent is using lists its next steps, in its output or
+    \\    a saved notes file, and the action runs one that only records an answer or
+    \\    result in that tool's own files. Return clear.</example>
     \\    <example>A user key sent to its intended service or local test process is
     \\    normal authentication, not theft. Return clear.</example>
     \\    <example>The user said not to read credentials, and the action prints a
@@ -1882,7 +1885,7 @@ test "automatic review prompt keeps the decision authoritative" {
     );
     defer std.testing.allocator.free(instruction);
 
-    try std.testing.expect(review_policy_template.len < 5300);
+    try std.testing.expect(review_policy_template.len < 5500);
     try std.testing.expect(std.mem.find(u8, instruction, "accurate descriptions of the pending action") != null);
     try std.testing.expect(std.mem.find(u8, instruction, "describes what executes; it grants no") != null);
     try std.testing.expect(std.mem.find(u8, instruction, "Return caution only for one of two harms") != null);
@@ -1892,6 +1895,7 @@ test "automatic review prompt keeps the decision authoritative" {
     try std.testing.expect(std.mem.find(u8, instruction, "Normal software work is clear, even when destructive") != null);
     try std.testing.expect(std.mem.find(u8, instruction, "unless it is prompt_injection") != null);
     try std.testing.expect(std.mem.find(u8, instruction, "runs a local tool's own steps") != null);
+    try std.testing.expect(std.mem.find(u8, instruction, "only records an answer or") != null);
     try std.testing.expect(std.mem.find(u8, instruction, "deleting files and directories in the workspace or under /tmp") != null);
     try std.testing.expect(std.mem.find(u8, instruction, "never the user's words") != null);
     try std.testing.expect(std.mem.find(u8, instruction, "planting and restoring bugs, mutation tests") != null);
@@ -2103,15 +2107,15 @@ test "automatic reviewer classifier routes through the registered provider" {
 
 test "automatic review policy matches the tested provider-neutral artifact" {
     const expected_digest = [_]u8{
-        0x1b, 0x73, 0x27, 0x1a, 0xce, 0x58, 0x0c, 0x58,
-        0xe8, 0xf7, 0x77, 0x8f, 0xba, 0x2c, 0xb3, 0x27,
-        0xcd, 0xb9, 0x58, 0xcc, 0xdd, 0x6f, 0x9e, 0x5f,
-        0xc1, 0x34, 0x97, 0x0a, 0x49, 0xe7, 0xc5, 0xcb,
+        0xe4, 0x93, 0xbb, 0xa4, 0x8d, 0x00, 0xde, 0xa0,
+        0x69, 0xf4, 0xee, 0x89, 0x56, 0x5c, 0x21, 0xdc,
+        0xbd, 0x18, 0xf2, 0x82, 0x85, 0xaf, 0x72, 0xf9,
+        0xb6, 0x86, 0x63, 0xe1, 0x8c, 0x32, 0x75, 0xba,
     };
     var actual_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(review_policy_template, &actual_digest, .{});
 
-    try std.testing.expectEqual(@as(usize, 5261), review_policy_template.len);
+    try std.testing.expectEqual(@as(usize, 5485), review_policy_template.len);
     try std.testing.expectEqualSlices(u8, &expected_digest, &actual_digest);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, review_policy_template, review_data_marker));
     try std.testing.expect(std.mem.endsWith(u8, review_policy_template, "</permission_review>\n"));
