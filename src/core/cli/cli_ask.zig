@@ -2011,7 +2011,7 @@ fn maybeStartAskTitleTask(
 /// session already carries a user-set title.
 fn completeAskTitleTask(ctx: *AskContext, task: *session_title_generation.Task) void {
     defer task.destroy();
-    task.join();
+    task.joinOrCancel(ctx.cancelFlag());
     const title = task.takeTitle() orelse return;
     defer std.heap.c_allocator.free(title);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
