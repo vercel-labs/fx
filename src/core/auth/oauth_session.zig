@@ -732,6 +732,10 @@ fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) !?Session {
     defer file.close(io_mod.getIo());
 
     const stat = file.stat(io_mod.getIo()) catch |err| return session_presence.storageError(auth_file_name, err);
+    if (session_presence.removedSinceOpen(stat)) {
+        debug_trace.logf("auth", "session load skipped step=stat reason=deleted_after_open", .{});
+        return null;
+    }
     if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
         debug_trace.logf("auth", "session load failed step=permissions err=InsecureAuthFile", .{});
         return error.InsecureAuthFile;
