@@ -559,7 +559,11 @@ pub const QuestionPrompt = struct {
         if (!self.isFreeformSelected()) return;
         var entry = &self.entries.items[self.current_index];
         entry.freeform_preferred_column = null;
-        const start = text_boundaries.logicalLineStart(entry.freeform_buffer.items, entry.freeform_cursor);
+        const line_start = text_boundaries.logicalLineStart(entry.freeform_buffer.items, entry.freeform_cursor);
+        const start = if (entry.freeform_cursor == line_start and line_start > 0)
+            line_start - 1
+        else
+            line_start;
         _ = edit_contract.deleteRange(&entry.freeform_buffer, &entry.freeform_cursor, start, entry.freeform_cursor);
     }
 
@@ -1450,6 +1454,17 @@ test "question freeform applies word and logical line deletions" {
     prompt.freeformDeleteToLineEnd();
     try std.testing.expectEqualStrings("alphabeta", prompt.entries.items[0].freeform_buffer.items);
     try std.testing.expectEqual(@as(usize, "alpha".len), prompt.entries.items[0].freeform_cursor);
+
+    prompt.clearFreeformDraft("test_cleanup");
+    try std.testing.expectEqual(
+        FreeformInsertResult.inserted,
+        try prompt.insertFreeformSlice(std.testing.allocator, "alpha\nbeta", 64),
+    );
+    for ([_][]const u8{ "alpha\n", "alpha", "", "" }) |expected| {
+        prompt.freeformDeleteToLineStart();
+        try std.testing.expectEqualStrings(expected, prompt.entries.items[0].freeform_buffer.items);
+        try std.testing.expectEqual(expected.len, prompt.entries.items[0].freeform_cursor);
+    }
 }
 
 test "question freeform word deletion keeps preceding characters intact" {
