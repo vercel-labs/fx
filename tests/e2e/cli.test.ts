@@ -6088,7 +6088,7 @@ describe("cli: MCP profile", () => {
 
       const list = await runFx(["mcp", "list"], { cwd: root, env });
       expect(list.code).toBe(1);
-      expect(list.stderr).toBe("fx mcp: an MCP config file isn't a plain file; replace it with one\n");
+      expect(list.stderr).toBe("fx mcp: ~/.fx/mcp.json isn't a plain file; replace it with one\n");
 
       const add = await runFx(["mcp", "add", "probe", "--", "/bin/echo", "hi"], { cwd: root, env });
       expect(add.code).toBe(1);
@@ -6100,6 +6100,69 @@ describe("cli: MCP profile", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test.skipIf(platform() === "win32")("list, add, and ask say what's wrong with an ~/.fx/mcp.json fx can't read", async () => {
+    const linkLoop = "~/.fx/mcp.json is a link that loops or passes through too many links; replace it with a plain file";
+    const tooLarge = "~/.fx/mcp.json is over 1 MB, the most fx reads; make it smaller";
+    const cases = [
+      {
+        label: "link loop",
+        make: (path: string) => symlinkSync("mcp.json", path),
+        list: `fx mcp: ${linkLoop}\n`,
+        add: "Couldn't add probe to ~/.fx/mcp.json: it is a link that loops or passes through too many links; replace it with a plain file.\n",
+        ask: `fx ask: ${linkLoop}\n`,
+      },
+      {
+        label: "over 1 MB",
+        make: (path: string) =>
+          writeFileSync(path, JSON.stringify({ mcpServers: {}, pad: "x".repeat(1024 * 1024) }), { mode: 0o600 }),
+        list: `fx mcp: ${tooLarge}\n`,
+        add: "Couldn't add probe to ~/.fx/mcp.json: it is over 1 MB, the most fx reads; make it smaller.\n",
+        ask: `fx ask: ${tooLarge}\n`,
+      },
+      {
+        label: "fifo",
+        // Opening a fifo for reading waits for a writer, and nothing writes here.
+        make: (path: string) => expect(spawnSync("mkfifo", [path]).status).toBe(0),
+        ask: "fx ask: ~/.fx/mcp.json isn't a plain file; replace it with one\n",
+      },
+    ];
+    for (const item of cases) {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-unreadable-")));
+      const home = join(root, "home");
+      const profilePath = join(home, ".fx", "mcp.json");
+      mkdirSync(join(home, ".fx"), { recursive: true, mode: 0o700 });
+      item.make(profilePath);
+      const gateway = startFakeGateway([]);
+      try {
+        const env = { HOME: home, ...NO_GATEWAY_AUTH };
+        if (item.list) {
+          const list = await runFx(["mcp", "list"], { cwd: root, env });
+          expect({ label: item.label, code: list.code, stderr: list.stderr }).toEqual({ label: item.label, code: 1, stderr: item.list });
+        }
+        if (item.add) {
+          const add = await runFx(["mcp", "add", "probe", "--", "/bin/echo", "hi"], { cwd: root, env });
+          expect({ label: item.label, code: add.code, stderr: add.stderr }).toEqual({ label: item.label, code: 1, stderr: item.add });
+        }
+        // fx ask stops in words before it sends any model request.
+        const askEnv = {
+          HOME: home,
+          AI_GATEWAY_API_KEY: "mcp-unreadable-key",
+          VERCEL_OIDC_TOKEN: undefined,
+          FX_DISABLE_KEYCHAIN: "1",
+          FX_AUTO_UPGRADE: "0",
+          FX_MODEL: FAKE_GATEWAY_MODEL,
+          FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+        };
+        const ask = await runFx(["ask", "--no-save", "Do nothing."], { cwd: root, env: askEnv });
+        expect({ label: item.label, code: ask.code, stderr: ask.stderr }).toEqual({ label: item.label, code: 1, stderr: item.ask });
+        expect(gateway.requestCount()).toBe(0);
+      } finally {
+        gateway.stop();
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  }, 30_000);
 
   test("concurrent adds of different names keep both", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-race-")));

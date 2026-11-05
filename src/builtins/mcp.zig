@@ -348,7 +348,14 @@ pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(Mcp
 fn readProfile(alloc: Allocator, path: []const u8, skipped: ?*std.ArrayList(project_config.WorkspaceDiagnostic)) !std.ArrayList(McpServerConfig) {
     const json_text = (config_file.read(alloc, path) catch |err| {
         logConfigFailure("read", path, err);
-        return err;
+        // Named for this file, so a caller that has only the error, such as
+        // `fx ask` at startup, can say what's wrong with ~/.fx/mcp.json.
+        return switch (err) {
+            error.SymLinkLoop => error.McpConfigLinkLoop,
+            error.StreamTooLong => error.McpConfigTooLarge,
+            error.DurablePathUnsafe => error.McpConfigNotPlainFile,
+            else => err,
+        };
     }) orelse return .empty;
     defer alloc.free(json_text);
 
@@ -863,6 +870,27 @@ test "saving MCP config refuses a symlinked target" {
     const untouched = try readFileForTest(alloc, external_path);
     defer alloc.free(untouched);
     try std.testing.expectEqualStrings(external, untouched);
+}
+
+test "a profile config fx can't read fails with an error named for the file" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirPath(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    try tmp.dir.symLink(io_mod.getIo(), "loop.json", "loop.json", .{ .is_directory = false });
+    const loop = try std.Io.Dir.path.join(alloc, &.{ root, "loop.json" });
+    defer alloc.free(loop);
+    try std.testing.expectError(error.McpConfigLinkLoop, loadConfigFromPath(alloc, loop));
+
+    const big = try alloc.alloc(u8, 1024 * 1024 + 1);
+    defer alloc.free(big);
+    @memset(big, ' ');
+    try writeTempFile(&tmp, "big.json", big);
+    const big_path = try std.Io.Dir.path.join(alloc, &.{ root, "big.json" });
+    defer alloc.free(big_path);
+    try std.testing.expectError(error.McpConfigTooLarge, loadConfigFromPath(alloc, big_path));
 }
 
 test "loadConfigFromJson parses canonical local config with command array" {

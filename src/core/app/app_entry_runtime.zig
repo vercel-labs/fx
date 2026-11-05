@@ -29,6 +29,7 @@ const mode_registry = @import("../modes/mode_registry.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mcp_health = @import("../mcp/health.zig");
 const mcp_host = @import("../mcp_host/host.zig");
+const mcp_verbs = @import("../mcp_host/verbs.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const update_target = @import("../upgrade/update_target.zig");
 const test_builtin_gateway = if (builtin.is_test)
@@ -545,7 +546,10 @@ fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
 }
 
 fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
-    return std.mem.print(buffer, "fx: {s}\n", .{config_runtime.modelNotSelectedMessage(err) orelse @errorName(err)});
+    const message = config_runtime.modelNotSelectedMessage(err) orelse
+        mcp_verbs.profileConfigNotice(err) orelse
+        @errorName(err);
+    return std.mem.print(buffer, "fx: {s}\n", .{message});
 }
 
 /// A v2 session that cannot be written at startup, in one sentence; null
@@ -1197,6 +1201,20 @@ test "app entry reports unexpected init errors once and preserves identity" {
     try std.testing.expectEqualStrings("fx: TestInitFailed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     try expectEvents(&.{ "init:none", "stderr-attempt" });
+}
+
+test "app entry says what's wrong with ~/.fx/mcp.json instead of naming the error" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.init_error = error.McpConfigLinkLoop;
+
+    try std.testing.expectError(error.McpConfigLinkLoop, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+    try std.testing.expectEqualStrings(
+        profile_paths.displayText("fx: ~/.fx/mcp.json is a link that loops or passes through too many links; replace it with a plain file\n"),
+        capture.stderr.written(),
+    );
+    try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
 }
 
 test "app entry releases terminal before reporting worker start errors" {

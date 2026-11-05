@@ -3793,27 +3793,12 @@ test "skill refresh publishes one generation and coalesces one latest request" {
         runtime.refresh_pending.?.generation,
     );
 
-    var adopted = false;
-    for (0..100_000) |_| {
-        switch (try runtime.pollRefresh(alloc, home, policy)) {
-            .adopted => adopted = true,
-            .none, .unchanged, .failed => {},
-        }
-        if (adopted and runtime.refresh_task == null) break;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
-    try std.testing.expect(adopted);
+    try std.testing.expect(try waitForAdoptedRefreshForTest(&runtime, alloc, home, policy));
     try std.testing.expectEqual(@as(usize, 1), runtime.items.len);
     try std.testing.expectEqualStrings("refreshable", runtime.items[0].name);
 
-    var terminal: RefreshCompletion = .none;
     _ = try runtime.requestRefresh(alloc, home, home, policy);
-    for (0..100_000) |_| {
-        terminal = try runtime.pollRefresh(alloc, home, policy);
-        if (terminal != .none) break;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
-    try std.testing.expectEqual(RefreshCompletion.unchanged, terminal);
+    try std.testing.expectEqual(RefreshCompletion.unchanged, try waitForRefreshForTest(&runtime, alloc, home, policy));
 
     try writeTempFile(
         &tmp,
@@ -3821,12 +3806,7 @@ test "skill refresh publishes one generation and coalesces one latest request" {
         "---\nname: refreshable-v2\ndescription: one-file delta refresh with a new size\n---\nbody changed\n",
     );
     _ = try runtime.requestRefresh(alloc, home, home, policy);
-    for (0..100_000) |_| {
-        terminal = try runtime.pollRefresh(alloc, home, policy);
-        if (terminal != .none) break;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
-    try std.testing.expectEqual(RefreshCompletion.adopted, terminal);
+    try std.testing.expectEqual(RefreshCompletion.adopted, try waitForRefreshForTest(&runtime, alloc, home, policy));
     try std.testing.expectEqualStrings("refreshable-v2", runtime.items[0].name);
 
     try writeTempFile(
@@ -3835,12 +3815,7 @@ test "skill refresh publishes one generation and coalesces one latest request" {
         "---\nname: added\ndescription: root manifest changed\n---\nbody\n",
     );
     _ = try runtime.requestRefresh(alloc, home, home, policy);
-    for (0..100_000) |_| {
-        terminal = try runtime.pollRefresh(alloc, home, policy);
-        if (terminal != .none) break;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
-    try std.testing.expectEqual(RefreshCompletion.adopted, terminal);
+    try std.testing.expectEqual(RefreshCompletion.adopted, try waitForRefreshForTest(&runtime, alloc, home, policy));
     try std.testing.expectEqual(@as(usize, 2), runtime.items.len);
 }
 
@@ -3866,13 +3841,7 @@ test "an empty launch catalog fills from a refresh before its startup notice is 
     try std.testing.expectEqual(@as(usize, 0), runtime.items.len);
     try std.testing.expect(runtime.takeReadyRefreshAction() == null);
 
-    var adopted = false;
-    for (0..100_000) |_| {
-        if (try runtime.pollRefresh(alloc, home, policy) == .adopted) adopted = true;
-        if (adopted and runtime.refresh_task == null) break;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
-    try std.testing.expect(adopted);
+    try std.testing.expect(try waitForAdoptedRefreshForTest(&runtime, alloc, home, policy));
     try std.testing.expectEqual(@as(usize, 1), runtime.items.len);
     try std.testing.expectEqualStrings("launch", runtime.items[0].name);
 
@@ -4092,6 +4061,45 @@ test "skill menu focus refuses an ambiguous duplicate name" {
 
     try std.testing.expect(!runtime.openMenuFocusedByName("review"));
     try std.testing.expect(!runtime.menu.active);
+}
+
+/// How long a test waits for a background refresh. A busy machine can leave
+/// the refresh thread unscheduled for a long time, so this is a time limit,
+/// not a count of polls; a refresh that lands returns at once.
+const test_refresh_wait_ms: i64 = 10_000;
+
+/// Polls until the requested refresh finishes and returns how it ended, or
+/// `.none` if it does not finish within `test_refresh_wait_ms`.
+fn waitForRefreshForTest(
+    runtime: *Runtime,
+    alloc: Allocator,
+    home: []const u8,
+    policy: skill_contract.RootPolicy,
+) !RefreshCompletion {
+    const deadline_ms = io_mod.milliTimestamp() + test_refresh_wait_ms;
+    while (true) {
+        const completion = try runtime.pollRefresh(alloc, home, policy);
+        if (completion != .none or io_mod.milliTimestamp() >= deadline_ms) return completion;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
+/// Polls until some refresh has been adopted and none is still running, or
+/// `test_refresh_wait_ms` passes. Returns whether a refresh was adopted.
+fn waitForAdoptedRefreshForTest(
+    runtime: *Runtime,
+    alloc: Allocator,
+    home: []const u8,
+    policy: skill_contract.RootPolicy,
+) !bool {
+    const deadline_ms = io_mod.milliTimestamp() + test_refresh_wait_ms;
+    var adopted = false;
+    while (true) {
+        if (try runtime.pollRefresh(alloc, home, policy) == .adopted) adopted = true;
+        if (adopted and runtime.refresh_task == null) return true;
+        if (io_mod.milliTimestamp() >= deadline_ms) return adopted;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
 }
 
 fn writeTempFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) !void {

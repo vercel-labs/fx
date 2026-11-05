@@ -872,6 +872,10 @@ def record_control_build(toolchain: Toolchain, result: CommandResult, paths: Pip
     """Nothing to record: the macOS links rebuild their own commands."""
 
 
+def prepare_candidate_bitcode(toolchain: Toolchain, paths: PipelinePaths) -> None:
+    """The Apple link orders sections, so private functions need no symbol."""
+
+
 def candidate_object_flags(paths: PipelinePaths) -> tuple[str, ...]:
     return ()
 

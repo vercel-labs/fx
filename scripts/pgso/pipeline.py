@@ -51,15 +51,21 @@ USE_FLAGS = (
     f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc",
 )
 
-# Each outliner input first goes through `ir_size.py expand-constant-exprs`
-# and `ir_size.py swap-compares`, and each output through `ir_size.py
-# check-outlined`: the outliner can fold a constant nested in a constant
-# expression into a parameter that carries a different constant, and it can
-# pass a greater-than comparison's operands in the wrong order (see
-# ir_size.py).
+# Each outliner input first goes through `ir_size.py expand-constant-exprs`,
+# `ir_size.py swap-compares`, and `ir_size.py widen-constants`, and each
+# output through `ir_size.py check-outlined`: the outliner can fold a constant
+# nested in a constant expression into a parameter that carries a different
+# constant, pass a greater-than comparison's operands in the wrong order, and
+# replace the constant an exit returns with a parameter (see ir_size.py).
 IR_OUTLINER_FLAGS = (
     "-passes=iroutliner",
 )
+
+# The outliner can also leave an outlined function's output stores where
+# nothing reaches them (`ir_size.py dropped-outputs`). Each round marks the
+# callers of such functions `nooutline` and outlines again from the same
+# input; a function still found after this many rounds fails the build.
+IR_OUTLINER_ROUNDS = 4
 
 # The platform adds the symbols that stay external (`public_api_flags`).
 OUTLINE_CLEANUP_FLAGS = (
@@ -376,9 +382,11 @@ def ir_size_argv(
     toolchain: Toolchain,
     command: str,
     source: pathlib.Path,
-    output: pathlib.Path,
+    output: pathlib.Path | None,
     options: Sequence[str] = (),
 ) -> tuple[str, ...]:
+    """`output` is None for the commands that only read their input,
+    check-outlined and dropped-outputs."""
     return (
         sys.executable,
         str(toolchain.ir_size),
@@ -387,21 +395,7 @@ def ir_size_argv(
         *options,
         command,
         str(source),
-        str(output),
-    )
-
-
-def check_outlined_argv(
-    toolchain: Toolchain,
-    source: pathlib.Path,
-) -> tuple[str, ...]:
-    return (
-        sys.executable,
-        str(toolchain.ir_size),
-        "--libllvm",
-        str(toolchain.libllvm),
-        "check-outlined",
-        str(source),
+        *(() if output is None else (str(output),)),
     )
 
 
@@ -424,9 +418,15 @@ def profile_use_argv(
     paths: PipelinePaths,
     profile_path: pathlib.Path | None = None,
     output: pathlib.Path | None = None,
+    *,
+    production_flags: bool = False,
 ) -> tuple[str, ...]:
+    # A benchmark trained on its own workload uses the higher cold cutoff, so
+    # its IR keeps the functions that workload runs speed-shaped. The measured
+    # benchmark candidates pass `production_flags` to build the way fx does.
     profile = profile_path or paths.merged_profile
-    flags = USE_FLAGS if paths.selector == "fx" else BENCHMARK_USE_FLAGS
+    production = production_flags or paths.selector == "fx"
+    flags = USE_FLAGS if production else BENCHMARK_USE_FLAGS
     return (
         str(toolchain.opt),
         *flags,
@@ -475,12 +475,17 @@ def instrumented_run_argv(
 def candidate_object_argv(
     toolchain: Toolchain,
     paths: PipelinePaths,
+    *,
+    production_flags: bool = False,
 ) -> tuple[str, ...]:
     # A second AArch64 outliner pass can fold sequences exposed by the first,
     # and each size-optimized function saves and restores its callee-saved
-    # registers through a shared frame helper instead of inline. Keep
-    # benchmark artifacts on their established code-generation contract.
-    codegen_flags = FX_CODEGEN_FLAGS if paths.selector == "fx" else ()
+    # registers through a shared frame helper instead of inline. The measured
+    # benchmark candidates pass `production_flags` so the heavy gates measure
+    # the code generation fx ships. A benchmark trained on its own workload
+    # keeps the default code generation.
+    production = production_flags or paths.selector == "fx"
+    codegen_flags = FX_CODEGEN_FLAGS if production else ()
     return (
         str(toolchain.llc),
         "-filetype=obj",
@@ -1114,18 +1119,25 @@ def apply_profile(
     *,
     profile_path: pathlib.Path | None = None,
     no_outline_functions: pathlib.Path | None = None,
+    production_flags: bool = False,
 ) -> pathlib.Path:
     """Apply the profile, then outline and clean up the result.
 
     The functions listed in `no_outline_functions`, one per line, are marked
     `nooutline` first, so neither outliner moves their code into shared
-    helpers placed elsewhere.
+    helpers placed elsewhere. `production_flags` gives a benchmark the
+    production profile-use flags.
     """
     validate_bitcode_hash(paths.bitcode, expected_bitcode_sha256)
     profile = profile_path or paths.merged_profile
     _require_nonempty_file(profile, "merged profile")
     run_checked(
-        profile_use_argv(toolchain, paths, profile),
+        profile_use_argv(
+            toolchain,
+            paths,
+            profile,
+            production_flags=production_flags,
+        ),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,
@@ -1230,22 +1242,99 @@ def _outline_without_folded_constants(
         require_empty_stderr=True,
     )
     _require_bitcode_header(swapped)
+    widened = source.with_name(source.name + ".widened.bc")
     run_checked(
-        outline_ir_argv(toolchain, swapped, output),
+        ir_size_argv(toolchain, "widen-constants", swapped, widened),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,
-        log_path=paths.logs / f"outline-{name}.json",
+        log_path=paths.logs / f"widen-constants-{name}.json",
         require_empty_stderr=True,
     )
-    _require_nonempty_file(output, "outlined IR")
+    _require_bitcode_header(widened)
+    _outline_excluding_dropped_outputs(toolchain, paths, widened, output, name)
     run_checked(
-        check_outlined_argv(toolchain, output),
+        ir_size_argv(toolchain, "check-outlined", output, None),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,
         log_path=paths.logs / f"check-outlined-{name}.json",
         require_empty_stderr=True,
+    )
+
+
+def _outline_excluding_dropped_outputs(
+    toolchain: Toolchain,
+    paths: PipelinePaths,
+    source: pathlib.Path,
+    output: pathlib.Path,
+    name: str,
+) -> None:
+    """Outline `source` into `output`, and while the outliner drops an
+    outlined function's output stores, mark that function's callers
+    `nooutline` and outline `source` again.
+
+    Each round is logged in `outline-rounds-{name}.json`. The caller's
+    check-outlined fails on anything still dropped after the last round.
+    """
+    excluded: list[str] = []
+    excluded_list = paths.logs / f"outline-excluded-{name}.txt"
+    marked = source.with_name(source.name + ".excluded.bc")
+    rounds = []
+    candidate = source
+    for number in range(1, IR_OUTLINER_ROUNDS + 1):
+        run_checked(
+            outline_ir_argv(toolchain, candidate, output),
+            cwd=paths.root,
+            env=os.environ.copy(),
+            timeout_s=900,
+            log_path=paths.logs / f"outline-{name}-round-{number}.json",
+            require_empty_stderr=True,
+        )
+        _require_nonempty_file(output, "outlined IR")
+        result = run_checked(
+            ir_size_argv(toolchain, "dropped-outputs", output, None),
+            cwd=paths.root,
+            env=os.environ.copy(),
+            timeout_s=900,
+            log_path=paths.logs / f"dropped-outputs-{name}-round-{number}.json",
+            require_empty_stderr=True,
+        )
+        try:
+            summary = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise PgsoError(f"dropped-outputs printed no JSON: {result.stdout!r}") from error
+        if (
+            not isinstance(summary, dict)
+            or not isinstance(summary.get("instances"), list)
+            or not isinstance(summary.get("callers"), list)
+            or not all(isinstance(caller, str) for caller in summary["callers"])
+        ):
+            raise PgsoError(f"dropped-outputs printed no instance list: {result.stdout!r}")
+        added = [caller for caller in summary["callers"] if caller not in excluded]
+        rounds.append({
+            "round": number,
+            "outlined_functions": summary.get("outlined_functions"),
+            "dropped_outputs": summary["instances"],
+            "excluded": added if number < IR_OUTLINER_ROUNDS else [],
+        })
+        if not summary["instances"] or not added or number == IR_OUTLINER_ROUNDS:
+            break
+        excluded.extend(added)
+        excluded_list.write_text("".join(f"{caller}\n" for caller in excluded), encoding="utf-8")
+        run_checked(
+            ir_size_argv(toolchain, "no-outline", source, marked, ("--functions", str(excluded_list))),
+            cwd=paths.root,
+            env=os.environ.copy(),
+            timeout_s=900,
+            log_path=paths.logs / f"no-outline-{name}-round-{number}.json",
+            require_empty_stderr=True,
+        )
+        _require_bitcode_header(marked)
+        candidate = marked
+    (paths.logs / f"outline-rounds-{name}.json").write_text(
+        json.dumps({"rounds": rounds, "excluded": excluded}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
 
 
@@ -1277,8 +1366,10 @@ def link_candidate(
     paths: PipelinePaths,
     *,
     require_release_safe_evidence: bool = True,
+    production_flags: bool = False,
 ) -> pathlib.Path:
     _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
+    toolchain.platform.prepare_candidate_bitcode(toolchain, paths)
     run_checked(
         (
             str(toolchain.opt),
@@ -1298,7 +1389,11 @@ def link_candidate(
         verify_release_safe_ir(paths.profile_use_ir)
 
     run_checked(
-        candidate_object_argv(toolchain, paths),
+        candidate_object_argv(
+            toolchain,
+            paths,
+            production_flags=production_flags,
+        ),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,

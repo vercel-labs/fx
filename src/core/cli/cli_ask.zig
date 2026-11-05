@@ -53,6 +53,7 @@ const mcp_elicitation_interaction = @import("../mcp/elicitation_interaction.zig"
 const mcp_elicitation = @import("../mcp/elicitation.zig");
 const mcp_access_policy = @import("../mcp/access_policy.zig");
 const mcp_host = @import("../mcp_host/host.zig");
+const mcp_verbs = @import("../mcp_host/verbs.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const permission_auto_classifier = @import("../permissions/auto_classifier.zig");
@@ -1243,6 +1244,7 @@ fn writeAskUsage(deps: RunDeps, usage: []const u8) !void {
 fn askErrorNotice(err: anyerror) ?[]const u8 {
     if (auth_runtime.preparationFailureNotice(err)) |notice| return notice;
     if (config_runtime.modelNotSelectedMessage(err)) |message| return message;
+    if (mcp_verbs.profileConfigNotice(err)) |notice| return notice;
     return switch (err) {
         error.ImagePreparationFailed => image_attachments.image_preparation_failed_notice,
         error.ModelImageCapabilityUnavailable => image_attachments.model_image_capability_unavailable_notice,
@@ -5743,6 +5745,16 @@ test "image preparation failure has stable text and JSON contracts" {
         "{\"output\":\"\",\"final_output\":\"\",\"exit_code\":1,\"model\":\"\",\"resolved_provider\":null,\"session_id\":\"\",\"steps\":0,\"tool_calls\":[],\"usage\":{\"input_tokens\":null,\"output_tokens\":null},\"error\":\"ImagePreparationFailed\"}\n",
         json,
     );
+}
+
+test "an mcp.json fx can't read gets words in text and keeps its name in JSON" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqualStrings(mcp_verbs.describe(error.McpConfigTooLarge), askErrorNotice(error.McpConfigTooLarge).?);
+    try std.testing.expect(askErrorNotice(error.StreamTooLong) == null);
+
+    const json = try renderErrorJsonResult(alloc, @errorName(error.McpConfigTooLarge), 1);
+    defer alloc.free(json);
+    try std.testing.expect(std.mem.find(u8, json, "\"error\":\"McpConfigTooLarge\"") != null);
 }
 
 test "unresolved image capability has actionable text and stable JSON code" {

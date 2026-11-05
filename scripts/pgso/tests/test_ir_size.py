@@ -175,6 +175,136 @@ class IrSizeTests(LlvmCase):
         self.assertFalse(output.exists())
 
 
+# A struct's default value, 1,064 bytes: 1,024 zero bytes, then an i32, a
+# pointer, padding, and an i64. Its defined bytes are far past sparse-constants' leaf limits.
+DEFAULT_VALUE = (
+    "%Default = type { [128 x i64], i32, ptr, [3 x i32], i64 }\n"
+    "@target = internal global i32 7\n"
+    "@default = internal unnamed_addr constant %Default "
+    "{ [128 x i64] zeroinitializer, i32 7, ptr @target, [3 x i32] zeroinitializer, i64 -1 }, align 8\n"
+    + MEMCPY
+    + "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n"
+)
+# Fill a buffer with 0xAB, copy the default value over it, and exit 0 only
+# when every zero word, the i32, the pointer, and the i64 read back.
+DEFAULT_VALUE_MAIN = (
+    "define i32 @main() {\n"
+    "entry:\n"
+    "  %out = alloca %Default, align 8\n"
+    "  call void @llvm.memset.p0.i64(ptr align 8 %out, i8 171, i64 1064, i1 false)\n"
+    "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %out, ptr align 8 @default, i64 1064, i1 false)\n"
+    "  br label %loop\n"
+    "loop:\n"
+    "  %i = phi i64 [ 0, %entry ], [ %next, %zero ]\n"
+    "  %slot = getelementptr inbounds [128 x i64], ptr %out, i64 0, i64 %i\n"
+    "  %word = load i64, ptr %slot\n"
+    "  %is_zero = icmp eq i64 %word, 0\n"
+    "  br i1 %is_zero, label %zero, label %bad\n"
+    "zero:\n"
+    "  %next = add i64 %i, 1\n"
+    "  %more = icmp ult i64 %next, 128\n"
+    "  br i1 %more, label %loop, label %fields\n"
+    "fields:\n"
+    "  %code_slot = getelementptr inbounds %Default, ptr %out, i32 0, i32 1\n"
+    "  %code = load i32, ptr %code_slot\n"
+    "  %pointer_slot = getelementptr inbounds %Default, ptr %out, i32 0, i32 2\n"
+    "  %pointer = load ptr, ptr %pointer_slot\n"
+    "  %pad_slot = getelementptr inbounds %Default, ptr %out, i32 0, i32 3, i64 2\n"
+    "  %pad = load i32, ptr %pad_slot\n"
+    "  %tail_slot = getelementptr inbounds %Default, ptr %out, i32 0, i32 4\n"
+    "  %tail = load i64, ptr %tail_slot\n"
+    "  %code_ok = icmp eq i32 %code, 7\n"
+    "  %pointer_ok = icmp eq ptr %pointer, @target\n"
+    "  %pad_ok = icmp eq i32 %pad, 0\n"
+    "  %tail_ok = icmp eq i64 %tail, -1\n"
+    "  %a = and i1 %code_ok, %pointer_ok\n"
+    "  %b = and i1 %pad_ok, %tail_ok\n"
+    "  %ok = and i1 %a, %b\n"
+    "  %status = select i1 %ok, i32 0, i32 2\n"
+    "  ret i32 %status\n"
+    "bad:\n"
+    "  ret i32 1\n"
+    "}\n"
+)
+
+
+@unittest.skipUnless(AVAILABLE and (LLVM_BIN / "lli").is_file(), "pinned LLVM with libLLVM and lli is not installed")
+class ZeroFilledCopyTests(LlvmCase):
+    def exit_code(self, bitcode: pathlib.Path) -> int:
+        # LLVM's interpreter runs the module the same way on any host.
+        result = subprocess.run(
+            [str(LLVM_BIN / "lli"), "--force-interpreter", str(bitcode)], capture_output=True, text=True
+        )
+        self.assertEqual("", result.stderr)
+        return result.returncode
+
+    def test_mostly_zero_default_value_copy_becomes_a_zero_fill_and_its_nonzero_stores(self) -> None:
+        source = self.assemble(
+            "default_value",
+            DEFAULT_VALUE + "define void @init(ptr align 8 %out) {\n"
+            "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %out, ptr align 8 @default, i64 1064, i1 false)\n"
+            "  ret void\n}\n",
+        )
+        result, output = self.run_pass("sparse-constants", source)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual(1, summary["zero_filled_constants"])
+        self.assertEqual(1, summary["rewritten_copies"])
+        ir = self.cleaned_ir(output)
+        self.assertNotIn("@default", ir)
+        body = ir.split("define void @init", 1)[1].split("\n}", 1)[0]
+        self.assertNotIn("llvm.memcpy", body)
+        self.assertIn("call void @llvm.memset.p0.i64(ptr align 8 %out, i8 0, i64 1064, i1 false)", body)
+        stores = [line.strip() for line in body.splitlines() if line.strip().startswith("store ")]
+        self.assertEqual(3, len(stores), stores)
+        self.assertTrue(any(store.startswith("store i32 7, ptr") for store in stores), stores)
+        self.assertTrue(any(store.startswith("store ptr @target, ptr") for store in stores), stores)
+        self.assertTrue(any(store.startswith("store i64 -1, ptr") for store in stores), stores)
+
+    def test_zero_filled_copy_reads_back_the_constant(self) -> None:
+        source = self.assemble("default_main", DEFAULT_VALUE + DEFAULT_VALUE_MAIN)
+        self.assertEqual(0, self.exit_code(source))
+        result, output = self.run_pass("sparse-constants", source)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(1, json.loads(result.stdout)["zero_filled_constants"])
+        self.assertEqual(0, self.exit_code(output))
+
+    def test_dense_constant_keeps_its_copy(self) -> None:
+        values = ", ".join(f"i64 {n + 1}" for n in range(65))
+        source = self.assemble(
+            "dense",
+            "@dense = internal unnamed_addr constant { [65 x i64], [128 x i64] } "
+            f"{{ [65 x i64] [{values}], [128 x i64] zeroinitializer }}, align 8\n"
+            + MEMCPY
+            + "define void @init(ptr align 8 %out) {\n"
+            "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %out, ptr align 8 @dense, i64 1544, i1 false)\n"
+            "  ret void\n}\n",
+        )
+        result, output = self.run_pass("sparse-constants", source)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(0, json.loads(result.stdout)["rewritten_copies"])
+        self.assertIn("@dense", self.cleaned_ir(output))
+
+    def test_constants_within_the_leaf_limits_keep_leaf_stores_without_a_zero_fill(self) -> None:
+        source = self.assemble(
+            "small_default",
+            "@small = internal unnamed_addr constant { i64, i64, [48 x i8] } { i64 0, i64 5, [48 x i8] undef }\n"
+            + MEMCPY
+            + "define void @init(ptr align 8 %out) {\n"
+            "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %out, ptr align 8 @small, i64 64, i1 false)\n"
+            "  ret void\n}\n",
+        )
+        result, output = self.run_pass("sparse-constants", source)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(0, json.loads(result.stdout)["zero_filled_constants"])
+        ir = self.cleaned_ir(output)
+        self.assertNotIn("llvm.memset", ir)
+        self.assertIn("store i64 0, ptr %out, align 8", ir)
+
+
 def _blob_layout(ir: str) -> tuple[bytes, dict[str, int]]:
     """The overlaid blob's bytes and each alias's offset into it."""
     line = next(l for l in ir.splitlines() if l.startswith("@pgso.overlaid_constants = "))
@@ -345,6 +475,129 @@ REVERSED_COMPARE = "@sink = global i64 0\n" + "".join(
     )
 )
 
+# Pairs of regions that differ only in one i1 or i16 constant, where the
+# first region's constant equals the value one of its exits returns to tell
+# the caller where to continue. `slash_menu` is the shape of the slash menu
+# test: an optional result, an `orelse` panic, and a bool argument.
+EXIT_SELECTORS = {
+    "slash_menu": """declare void @layout(ptr)
+declare void @widths(ptr, i1)
+declare void @panic()
+""" + "".join(
+        f"""define i32 @{name}(ptr %p) {{
+  call void @layout(ptr %p)
+  %flag = load i8, ptr %p, align 1
+  %set = trunc i8 %flag to i1
+  br i1 %set, label %some, label %none
+some:
+  call void @widths(ptr %p, i1 {value})
+  br label %cont
+cont:
+  ret i32 0
+none:
+  call void @panic()
+  unreachable
+}}
+"""
+        for name, value in (("first", "false"), ("second", "true"))
+    ),
+    "three_exits": """declare void @work(ptr)
+declare void @e1()
+declare void @e2()
+declare void @e3()
+""" + "".join(
+        f"""define void @{name}(ptr %p, i1 %c1, i1 %c2) {{
+  call void @work(ptr %p)
+  br i1 %c1, label %x, label %out1
+x:
+  store i16 {value}, ptr %p, align 2
+  br i1 %c2, label %out2, label %out3
+out1:
+  call void @e1()
+  ret void
+out2:
+  call void @e2()
+  ret void
+out3:
+  call void @e3()
+  ret void
+}}
+"""
+        for name, value in (("first", 1), ("second", 2))
+    ),
+    "phi": """declare void @work(ptr)
+declare void @use(i1)
+declare void @panic()
+""" + "".join(
+        f"""define void @{name}(ptr %p, i1 %c, i1 %d) {{
+  call void @work(ptr %p)
+  br i1 %c, label %a, label %b
+a:
+  call void @work(ptr %p)
+  br label %m
+b:
+  call void @work(ptr %p)
+  br label %m
+m:
+  %v = phi i1 [ {value}, %a ], [ %d, %b ]
+  call void @use(i1 %v)
+  br i1 %d, label %ok, label %bad
+ok:
+  ret void
+bad:
+  call void @panic()
+  unreachable
+}}
+"""
+        for name, value in (("first", "false"), ("second", "true"))
+    ),
+}
+
+# llvm-reduce's reduction of six fx footer functions. The outliner gives the
+# two regions one outlined function with two copies of the exit PHI and two
+# output blocks, and nothing branches to either block, so neither call site's
+# result is ever stored.
+DROPPED_OUTPUT = """declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly captures(none), ptr noalias readonly captures(none), i64, i1 immarg) #0
+define fastcc i16 @row() {
+  br label %a
+a:
+  br i1 false, label %exit, label %b
+b:
+  br i1 false, label %exit, label %exit
+1:
+  br label %exit
+2:
+  br i1 false, label %exit, label %exit
+e:
+  br i1 false, label %exit, label %second
+first:
+  %3 = call fastcc i16 @append(ptr null, i64 0)
+  %ok1 = icmp eq i16 0, 0
+  br i1 false, label %5, label %4
+4:
+  store i32 0, ptr null, align 4
+  br label %exit
+5:
+  call void @llvm.memcpy.p0.p0.i64(ptr null, ptr null, i64 0, i1 false)
+  br label %exit
+second:
+  %6 = call fastcc i16 @append(ptr null, i64 0)
+  %ok2 = icmp eq i16 0, 0
+  br i1 false, label %8, label %7
+7:
+  store i32 0, ptr null, align 4
+  br label %exit
+8:
+  call void @llvm.memcpy.p0.p0.i64(ptr null, ptr null, i64 0, i1 false)
+  br label %exit
+exit:
+  %r = phi i16 [ 0, %2 ], [ 0, %2 ], [ 0, %b ], [ 0, %b ], [ 0, %1 ], [ 0, %5 ], [ 0, %4 ], [ 0, %a ], [ 0, %8 ], [ 0, %7 ], [ 0, %e ]
+  ret i16 0
+}
+declare fastcc i16 @append(ptr, i64)
+attributes #0 = { nocallback nofree nounwind willreturn memory(argmem: readwrite) }
+"""
+
 
 @unittest.skipUnless(AVAILABLE, "pinned LLVM with libLLVM is not installed")
 class OutlinedConstantTests(LlvmCase):
@@ -368,13 +621,54 @@ class OutlinedConstantTests(LlvmCase):
             [str(LLVM_BIN / "llvm-dis"), str(bitcode), "-o", "-"], check=True, capture_output=True, text=True
         ).stdout
 
+    def dropped(self, bitcode: pathlib.Path) -> dict:
+        result = subprocess.run(
+            [sys.executable, str(IR_SIZE_SCRIPT), "--libllvm", str(LIBLLVM), "dropped-outputs", str(bitcode)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_dropped_outputs_names_the_outlined_function_and_its_callers(self) -> None:
+        outlined = self.outline(self.assemble("dropped", DROPPED_OUTPUT))
+        self.assertIn("; No predecessors!", self.text(outlined).split("define internal")[1])
+
+        summary = self.dropped(outlined)
+
+        self.assertEqual(1, summary["outlined_functions"])
+        self.assertEqual(["row"], summary["callers"])
+        [instance] = summary["instances"]
+        self.assertEqual("outlined_ir_func_0", instance["function"])
+        self.assertEqual(["output_block_0_0", "output_block_1_0"], instance["blocks"])
+        self.assertTrue(instance["stores_to_parameter"])
+        self.assertEqual(["row"], instance["callers"])
+
+    def test_check_rejects_output_stores_that_nothing_reaches(self) -> None:
+        result = self.check(self.outline(self.assemble("dropped", DROPPED_OUTPUT)))
+
+        self.assertEqual(1, result.returncode, result.stdout)
+        self.assertIn(
+            "outlined_ir_func_0: output stores in blocks with no predecessors "
+            "(output_block_0_0, output_block_1_0), called from row",
+            result.stderr,
+        )
+
+    def test_dropped_outputs_finds_nothing_in_a_correct_outline(self) -> None:
+        _, widened = self.run_pass("widen-constants", self.assemble("slash_menu", EXIT_SELECTORS["slash_menu"]))
+
+        summary = self.dropped(self.outline(widened))
+
+        self.assertEqual({"callers": [], "instances": [], "outlined_functions": 1, "pass": "dropped-outputs"}, summary)
+
     def test_check_rejects_a_nested_constant_the_outliner_folded_into_a_parameter(self) -> None:
         outlined = self.outline(self.assemble("nested", NESTED_CONSTANT))
 
         result = self.check(outlined)
 
         self.assertEqual(1, result.returncode, result.stdout)
-        self.assertIn("folded a nested constant into a parameter", result.stderr)
+        self.assertIn("IR outliner miscompiled an outlined function", result.stderr)
+        self.assertIn("constant expression", result.stderr)
 
     def test_expanded_expressions_keep_each_region_constant(self) -> None:
         result, expanded = self.run_pass("expand-constant-exprs", self.assemble("nested", NESTED_CONSTANT))
@@ -440,6 +734,89 @@ class OutlinedConstantTests(LlvmCase):
         for predicate in ("ugt", "uge", "sgt", "sge", "ogt", "oge"):
             self.assertNotIn(f" {predicate} ", ir)
 
+    def test_check_rejects_an_exit_that_returns_a_parameter(self) -> None:
+        for name, ir in EXIT_SELECTORS.items():
+            with self.subTest(name):
+                outlined = self.outline(self.assemble(name, ir))
+                self.assertRegex(self.text(outlined), r"ret i(1|16) %")
+
+                result = self.check(outlined)
+
+                self.assertEqual(1, result.returncode, result.stdout)
+                self.assertIn("exit selector replaced by a parameter", result.stderr)
+
+    def test_widened_constants_keep_each_exit_selector(self) -> None:
+        for name in ("slash_menu", "three_exits"):
+            with self.subTest(name):
+                ir = EXIT_SELECTORS[name]
+                result, widened = self.run_pass("widen-constants", self.assemble(name, ir))
+                self.assertEqual(0, result.returncode, result.stderr)
+                outlined = self.outline(widened)
+
+                check = self.check(outlined)
+
+                self.assertEqual(0, check.returncode, check.stderr)
+                self.assertIn('"outlined_functions": 1', check.stdout)
+                text = self.text(outlined)
+                self.assertNotRegex(text, r"ret i(1|16) %")
+                selectors = ("i16 0", "i16 1", "i16 2") if name == "three_exits" else ("i1 true", "i1 false")
+                for selector in selectors:
+                    self.assertIn(f"ret {selector}\n", text)
+                wide = "i32" if name == "three_exits" else "i8"
+                self.assertRegex(text, rf"%pgso\.wide = trunc {wide} %\d+ to i(1|16)")
+
+    def test_check_still_rejects_a_phi_constant_that_becomes_an_exit_selector(self) -> None:
+        result, widened = self.run_pass("widen-constants", self.assemble("phi", EXIT_SELECTORS["phi"]))
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn('"widened_operands": 0', result.stdout)
+
+        check = self.check(self.outline(widened))
+
+        self.assertEqual(1, check.returncode, check.stdout)
+        self.assertIn("exit selector replaced by a parameter", check.stderr)
+
+    def test_widen_constants_keeps_immediates_and_other_types(self) -> None:
+        source = self.assemble(
+            "widen",
+            MEMCPY
+            + "declare { i16, i1 } @llvm.uadd.with.overflow.i16(i16, i16)\n"
+            "declare void @llvm.assume(i1)\n"
+            "declare void @use(i1, i16, i32)\n"
+            "define i16 @f(ptr %out, i16 %x, i8 %k, i1 %c) {\n"
+            "entry:\n"
+            "  call void @llvm.memcpy.p0.p0.i64(ptr %out, ptr %out, i64 8, i1 false)\n"
+            "  call void @llvm.assume(i1 true)\n"
+            "  call void asm sideeffect \"\", \"n\"(i16 7)\n"
+            "  %sum = call { i16, i1 } @llvm.uadd.with.overflow.i16(i16 %x, i16 1)\n"
+            "  call void @use(i1 true, i16 653, i32 5)\n"
+            "  %e = getelementptr inbounds [4 x i8], ptr %out, i16 0, i16 3\n"
+            "  store i16 2, ptr %e, align 2\n"
+            "  switch i8 %k, label %a [ i8 1, label %b ]\n"
+            "a:\n  br i1 %c, label %b, label %b\n"
+            "b:\n"
+            "  %p = phi i16 [ 4, %a ], [ 4, %a ], [ 0, %entry ]\n"
+            "  %q = phi i1 [ true, %a ], [ true, %a ], [ %c, %entry ]\n"
+            "  ret i16 9\n}\n",
+        )
+
+        result, output = self.run_pass("widen-constants", source)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(4, json.loads(result.stdout)["widened_operands"])
+        ir = self.cleaned_ir(output)
+        self.assertIn("i64 8, i1 false)", ir)
+        self.assertIn("call void @llvm.assume(i1 true)", ir)
+        self.assertIn('"n"(i16 7)', ir)
+        self.assertIn("i16 %x, i16 %pgso.wide)", ir)
+        self.assertRegex(ir, r"call void @use\(i1 %pgso\.wide\d*, i16 %pgso\.wide\d*, i32 5\)")
+        self.assertIn("ptr %out, i16 0, i16 3", ir)
+        self.assertRegex(ir, r"store i16 %pgso\.wide\d*, ptr %e")
+        self.assertIn("i8 1, label %b", ir)
+        self.assertIn("%p = phi i16 [ 4, %a ], [ 4, %a ], [ 0, %entry ]", ir)
+        self.assertIn("%q = phi i1 [ true, %a ], [ true, %a ], [ %c, %entry ]", ir)
+        self.assertIn("ret i16 9", ir)
+        self.assertEqual(4, ir.count("= trunc "))
+
     def test_phi_and_intrinsic_expressions_stay_constant_and_call_arguments_expand(self) -> None:
         source = self.assemble(
             "kept",
@@ -491,6 +868,35 @@ class MinsizeFunctionTests(LlvmCase):
             {"pass": "minsize-functions", "defined_functions": 2, "minsize_functions": 1},
             json.loads(result.stdout),
         )
+
+
+@unittest.skipUnless(AVAILABLE, "pinned LLVM with libLLVM is not installed")
+class NameFunctionsTests(LlvmCase):
+    IR = (
+        "define private void @cold() { ret void }\n"
+        "define internal void @kept() { ret void }\n"
+        "define void @exported() {\n"
+        "  call void @cold()\n"
+        "  call void @kept()\n"
+        "  call void @external()\n"
+        "  ret void\n"
+        "}\n"
+        "declare void @external()\n"
+    )
+
+    def test_only_private_definitions_become_internal(self) -> None:
+        result, output = self.run_pass("name-functions", self.assemble("functions", self.IR))
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual({"pass": "name-functions", "named_functions": 1}, json.loads(result.stdout))
+        text = subprocess.run(
+            [str(LLVM_BIN / "llvm-dis"), str(output), "-o", "-"], check=True, capture_output=True, text=True
+        ).stdout
+        self.assertIn("define internal void @cold()", text)
+        self.assertIn("define internal void @kept()", text)
+        self.assertIn("define void @exported()", text)
+        self.assertIn("declare void @external()", text)
+        self.assertNotIn("private", text)
 
 
 @unittest.skipUnless(AVAILABLE, "pinned LLVM with libLLVM is not installed")

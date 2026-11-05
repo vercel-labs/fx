@@ -1,6 +1,6 @@
 //! Agent profiles: named, saved settings for what an agent may do. Main runs
 //! in one profile, `main` unless `fx --profile` names another, and each
-//! subagent starts in the profile main names for it, `agent` by default.
+//! subagent starts in the profile main names for it, `main` by default.
 //!
 //! A profile is a folder, `<name>/profile.json` with an optional
 //! `<name>/prompt.md`. A name resolves from the user's `~/.fx/agents/` first,
