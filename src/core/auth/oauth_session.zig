@@ -302,26 +302,14 @@ const KeychainObservation = union(enum) {
 };
 
 fn observeAuthFile(alloc: Allocator, fx_dir: *std.Io.Dir) !FileObservation {
-    // A path that isn't a regular file, such as a fifo, is unusable without
-    // waiting for a writer.
-    var file = io_mod.openExistingReadOnlyRegularFile(fx_dir.*, auth_file_name, .no_follow) catch |err| switch (err) {
-        error.FileNotFound => return .absent,
-        else => {
-            debug_trace.logf("auth", "session load failed source=file step=open err={s}", .{@errorName(err)});
-            return .unusable;
-        },
-    };
-    defer file.close(io_mod.getIo());
-
-    const stat = file.stat(io_mod.getIo()) catch |err| {
-        debug_trace.logf("auth", "session load failed source=file step=stat err={s}", .{@errorName(err)});
+    var current = (session_presence.openCurrent(fx_dir.*, auth_file_name) catch |err| {
+        debug_trace.logf("auth", "session load failed source=file step=open err={s}", .{@errorName(err)});
         return .unusable;
-    };
-    // Deleted after it was opened, as another fx's logout does.
-    if (stat.nlink == 0) {
-        debug_trace.logf("auth", "session file removed while it was read source=file; none is saved", .{});
-        return .absent;
-    }
+    }) orelse return .absent;
+    defer current.file.close(io_mod.getIo());
+    var file = current.file;
+
+    const stat = current.stat;
     if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
         debug_trace.logf("auth", "session load failed source=file step=permissions err=InsecureAuthFile", .{});
         return .unusable;
@@ -725,33 +713,19 @@ fn loadFromHost(alloc: Allocator, store: js_host_auth.SessionStore) !?Session {
 }
 
 fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) !?Session {
-    // A path that isn't a regular file, such as a fifo, fails without
-    // waiting for a writer.
-    var file = io_mod.openExistingReadOnlyRegularFile(fx_dir.*, auth_file_name, .no_follow) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => {
-            debug_trace.logf("auth", "session load failed step=open_file err={s}", .{@errorName(err)});
-            return session_presence.storageError(auth_file_name, err);
-        },
-    };
-    defer file.close(io_mod.getIo());
-    return loadFromFile(alloc, &file);
-}
+    var current = (session_presence.openCurrent(fx_dir.*, auth_file_name) catch |err| {
+        debug_trace.logf("auth", "session load failed step=open_file err={s}", .{@errorName(err)});
+        return session_presence.storageError(auth_file_name, err);
+    }) orelse return null;
+    defer current.file.close(io_mod.getIo());
 
-/// The session in an opened auth file. One that another fx deleted after this
-/// one opened it, as its logout does, is none saved.
-fn loadFromFile(alloc: Allocator, file: *std.Io.File) !?Session {
-    const stat = file.stat(io_mod.getIo()) catch |err| return session_presence.storageError(auth_file_name, err);
-    if (stat.nlink == 0) {
-        debug_trace.logf("auth", "session file removed while it was read; none is saved", .{});
-        return null;
-    }
+    const stat = current.stat;
     if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
         debug_trace.logf("auth", "session load failed step=permissions err=InsecureAuthFile", .{});
         return error.InsecureAuthFile;
     }
 
-    const bytes = io_mod.readFileToEnd(alloc, file, max_auth_file_bytes) catch |err| return session_presence.storageError(auth_file_name, err);
+    const bytes = io_mod.readFileToEnd(alloc, &current.file, max_auth_file_bytes) catch |err| return session_presence.storageError(auth_file_name, err);
     defer secret.zeroAndFree(alloc, bytes);
     return try parseStoredSession(alloc, bytes);
 }
@@ -1543,19 +1517,6 @@ test "OAuth mutation loads report auth file open failures" {
         error.CredentialStorageUnavailable,
         loadFromDir(std.testing.allocator, &tmp.dir),
     );
-}
-
-test "an auth file another fx deletes while this one reads it is no saved session" {
-    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try writeTestAuthFile(tmp.dir, test_session_json);
-    var file = try tmp.dir.openFile(std.testing.io, auth_file_name, .{});
-    defer file.close(std.testing.io);
-    // Another fx's logout deletes it after this one opened it.
-    try tmp.dir.deleteFile(std.testing.io, auth_file_name);
-
-    try std.testing.expectEqual(@as(?Session, null), try loadFromFile(std.testing.allocator, &file));
 }
 
 test "OAuth mutation distinguishes an invalid session from an absent session" {

@@ -142,23 +142,14 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
         }
 
         fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) !?Session {
-            // A path that isn't a regular file, such as a fifo, fails without
-            // waiting for a writer.
-            var file = io_mod.openExistingReadOnlyRegularFile(fx_dir.*, spec.auth_file_name, .no_follow) catch |err| switch (err) {
-                error.FileNotFound => return null,
-                else => {
-                    debug_trace.logf("auth", spec.trace_label ++ " session load failed step=open_file err={s}", .{@errorName(err)});
-                    return session_presence.storageError(spec.auth_file_name, err);
-                },
-            };
-            defer file.close(io_mod.getIo());
+            var current = (session_presence.openCurrent(fx_dir.*, spec.auth_file_name) catch |err| {
+                debug_trace.logf("auth", spec.trace_label ++ " session load failed step=open_file err={s}", .{@errorName(err)});
+                return session_presence.storageError(spec.auth_file_name, err);
+            }) orelse return null;
+            defer current.file.close(io_mod.getIo());
+            var file = current.file;
 
-            const stat = file.stat(io_mod.getIo()) catch |err| return session_presence.storageError(spec.auth_file_name, err);
-            // Deleted after it was opened, as another fx's logout does.
-            if (stat.nlink == 0) {
-                debug_trace.logf("auth", spec.trace_label ++ " session file removed while it was read; none is saved", .{});
-                return null;
-            }
+            const stat = current.stat;
             if (stat.kind != .file or stat.nlink != 1 or stat.permissions.toMode() & 0o077 != 0) {
                 debug_trace.logf("auth", spec.trace_label ++ " session load failed step=permissions err=InsecureAuthFile", .{});
                 return error.InsecureAuthFile;
