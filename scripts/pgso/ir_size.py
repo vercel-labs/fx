@@ -9,6 +9,7 @@
     ir_size.py --libllvm <libLLVM.dylib> check-outlined <in.bc>
     ir_size.py --libllvm <libLLVM.dylib> minsize-functions <in.bc> <out.json>
     ir_size.py --libllvm <libLLVM.dylib> no-outline <in.bc> <out.bc> --functions <names.txt>
+    ir_size.py --libllvm <libLLVM.dylib> name-functions <in.bc> <out.bc>
 
 outline-helpers marks small shared std helpers as noinline: the allocator's
 slice free, remap, and aligned allocation, the writer's write, writeAll,
@@ -76,6 +77,11 @@ does not cover.
 minsize-functions writes the names of the defined functions, and of those
 that carry `minsize`, to a JSON file. Profile use marks the functions it
 judges cold `minsize`.
+
+name-functions gives each defined private function internal linkage. Zig
+emits every function private, and a private function has no symbol in the
+object, so a link that orders by symbol cannot place it. Internal linkage
+generates the same code and keeps a local symbol, which the final link strips.
 
 no-outline adds `nooutline` to the defined functions listed one per line in
 the --functions file. The IR outliner and llc's machine outliner both skip
@@ -1227,6 +1233,19 @@ def no_outline(llvm: Llvm, source: pathlib.Path, output: pathlib.Path, functions
     return {"pass": "no-outline", "listed_functions": len(names), "marked_functions": marked}
 
 
+def name_functions(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> dict:
+    ctx, mod = llvm.load(source)
+    named = 0
+    fn = llvm.FirstFunction(mod)
+    while fn:
+        if not llvm.IsDeclaration(fn) and llvm.GetLinkage(fn) == PRIVATE_LINKAGE:
+            llvm.SetLinkage(fn, INTERNAL_LINKAGE)
+            named += 1
+        fn = llvm.NextFunction(fn)
+    llvm.save(mod, output)
+    return {"pass": "name-functions", "named_functions": named}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--libllvm", required=True, type=pathlib.Path)
@@ -1243,6 +1262,7 @@ def main(argv: list[str] | None = None) -> int:
             "check-outlined",
             "minsize-functions",
             "no-outline",
+            "name-functions",
         ),
     )
     parser.add_argument("source", type=pathlib.Path)
@@ -1269,6 +1289,7 @@ def main(argv: list[str] | None = None) -> int:
                 "expand-constant-exprs": expand_constant_exprs,
                 "swap-compares": swap_compares,
                 "minsize-functions": minsize_functions,
+                "name-functions": name_functions,
             }[args.command]
             summary = run(llvm, args.source, args.output)
     except (OSError, PassError) as error:

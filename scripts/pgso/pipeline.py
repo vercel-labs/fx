@@ -1279,6 +1279,7 @@ def link_candidate(
     require_release_safe_evidence: bool = True,
 ) -> pathlib.Path:
     _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
+    toolchain.platform.prepare_candidate_bitcode(toolchain, paths)
     run_checked(
         (
             str(toolchain.opt),

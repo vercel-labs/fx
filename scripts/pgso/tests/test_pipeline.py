@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import tempfile
+import types
 import unittest
 
 from scripts.pgso import macos
@@ -822,6 +823,34 @@ pathlib.Path(sys.argv[sys.argv.index('-map') + 1]).write_bytes({link_map!r}.enco
             sha256_file(runtime),
             (self.paths.logs / "candidate-layout.json").read_text(),
         )
+
+    def test_the_platform_prepares_the_bitcode_before_code_generation(self) -> None:
+        actions = self.root / "prepare-actions.txt"
+        tool = self.write_executable(
+            "prepare-tool",
+            f"""import pathlib,sys
+with pathlib.Path({str(actions)!r}).open('a') as stream:
+    stream.write('tool ' + ('-S' if '-S' in sys.argv else '-filetype=obj') + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'artifact')""",
+        )
+
+        def record(step: str):
+            def hook(_toolchain, _paths) -> None:
+                with actions.open("a") as stream:
+                    stream.write(step + "\n")
+            return hook
+
+        platform = types.SimpleNamespace(
+            prepare_candidate_bitcode=record("prepare"),
+            candidate_object_flags=lambda _paths: (),
+            link_candidate_binary=record("link"),
+        )
+        toolchain = self.replace_toolchain(opt=tool, llc=tool, platform=platform)
+        self.paths.profile_use_bitcode.write_bytes(b"bitcode")
+
+        link_candidate(toolchain, self.paths, require_release_safe_evidence=False)
+
+        self.assertEqual(["prepare", "tool -S", "tool -filetype=obj", "link"], actions.read_text().splitlines())
 
     def test_benchmark_candidate_keeps_the_zig_linker(self) -> None:
         paths = PipelinePaths.create(self.root / "benchmark-link", selector="ui_activity")
