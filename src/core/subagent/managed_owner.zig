@@ -43,6 +43,9 @@ const Slot = struct {
     /// Set when the user stops the turn on the child's screen, so its
     /// report says who cancelled it.
     stopped_by_user: bool = false,
+    /// Set when the user closes the child from the agent list, so its
+    /// report says the user closed it.
+    closed_by_user: bool = false,
     /// Set by the host once it has no next work for the slot, which then
     /// finishes. A start for the child waits for that.
     ending: bool = false,
@@ -389,6 +392,24 @@ pub const Owner = struct {
         return null;
     }
 
+    /// The user closed the child from the agent list: ends its running turn
+    /// as the user's own stop does, and its report says the user closed it.
+    /// False when nothing runs.
+    pub fn closeByUser(self: *Owner, child_id: []const u8) bool {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        for (self.slots.items) |slot| {
+            if (!std.mem.eql(u8, slot.child_id, child_id)) continue;
+            if (slot.completion != .running) return false;
+            slot.stopped_by_user = true;
+            slot.closed_by_user = true;
+            slot.cancel.store(true, .seq_cst);
+            stopTurn(slot, .cancel);
+            return true;
+        }
+        return false;
+    }
+
     /// The parent's `stop`: ends the child's running turn, which owes no
     /// report, since the stop call answers it. False when nothing runs.
     pub fn stop(self: *Owner, child_id: []const u8) bool {
@@ -659,7 +680,10 @@ fn slotMain(slot: *Slot) void {
         // Startup must not inspect the old slot between saved and in-memory completion.
         // Take owner before registry, matching cancellation and approval lock ordering.
         owner.mutex.lockUncancelable(io_mod.getIo());
-        const end: child_state.EndFacts = .{ .cause = owner.cancelCause(outcome.outcome, slot.stopped_by_user) };
+        const end: child_state.EndFacts = .{ .cause = if (slot.closed_by_user and outcome.outcome == .cancelled)
+            .user_close
+        else
+            owner.cancelCause(outcome.outcome, slot.stopped_by_user) };
         const finished = owner.finish(slot.child_id, outcome.work_id, outcome.outcome, outcome.failure, slot.stopped_by_parent, end);
         const closing = owner.closed or slot.shutdown.load(.seq_cst);
         // A stop drops the parent's messages, as do a quit and `/close`.
@@ -683,6 +707,7 @@ fn slotMain(slot: *Slot) void {
             slot.cancel.store(false, .seq_cst);
             slot.stopped_by_parent = false;
             slot.stopped_by_user = false;
+            slot.closed_by_user = false;
             slot.metrics = .{};
             owner.mutex.unlock(io_mod.getIo());
             continue;

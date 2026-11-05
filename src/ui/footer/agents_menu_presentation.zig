@@ -1,6 +1,6 @@
 //! The agent list ↓, Ctrl+X, and `/agents` open: one row per open agent, the
 //! instances in launch order, each followed by the subagents it started,
-//! such as "fx 3 · Fix the login bug · reviewer · needs approval".
+//! such as "fx 3 · Fix the login bug · reviewer · needs approval · opus 4-7".
 
 const std = @import("std");
 const picker_presentation = @import("picker_presentation.zig");
@@ -36,22 +36,32 @@ pub fn windowStart(projection: AgentsMenuProjection, row_budget: u16) usize {
     );
 }
 
-/// The text of `row`, before it is clipped to the footer's width. A title
-/// comes from a prompt, which another agent may have written, so it and the
-/// names show their control bytes as escapes. The caller owns it.
+/// The text of `row`, before it is clipped to the footer's width: its name,
+/// title, profile, state, and model, as the status line names the model. A
+/// title comes from a prompt, which another agent may have written, so it
+/// and the names show their control bytes as escapes. The caller owns it.
 pub fn rowText(alloc: Allocator, row: render_input.AgentsMenuRow) ![]u8 {
     const tag = if (row.on_screen) " (on screen)" else "";
     const title = text_utils.terminalSafe(if (row.title.len > 0) row.title else untitled);
     const profile = text_utils.terminalSafe(row.profile);
+    var model_buf: [96]u8 = undefined;
+    const model = text_utils.terminalSafe(ui_render.compactModelLabel(row.model, &model_buf));
+    const model_sep = if (row.model.len > 0) " · " else "";
+    const effort_sep = if (row.model.len > 0 and row.effort.len > 0) " " else "";
+    const effort = text_utils.terminalSafe(if (row.model.len > 0) row.effort else "");
     // A subagent's row sits under its instance's, indented one step.
-    if (row.subagent_name.len > 0) return alloc.print("  {f}{s} · {f} · {f} · {s}", .{
+    if (row.subagent_name.len > 0) return alloc.print("  {f}{s} · {f} · {f} · {s}{s}{f}{s}{f}", .{
         text_utils.terminalSafe(row.subagent_name),
         tag,
         title,
         profile,
         row.state,
+        model_sep,
+        model,
+        effort_sep,
+        effort,
     });
-    return alloc.print("fx {d}{s} · {f} · {f} · {s}", .{ row.number, tag, title, profile, row.state });
+    return alloc.print("fx {d}{s} · {f} · {f} · {s}{s}{f}{s}{f}", .{ row.number, tag, title, profile, row.state, model_sep, model, effort_sep, effort });
 }
 
 pub fn composeAgentsMenuRow(
@@ -76,12 +86,33 @@ pub fn composeAgentsMenuRow(
     return row;
 }
 
-pub const hint_variants = [_][]const u8{
+const hint_variants = [_][]const u8{
     "↑↓ preview     enter switch     esc back",
     "↑↓ preview  enter switch  esc back",
     "↑↓ preview  enter  esc",
     "enter switch  esc back",
 };
+
+const closable_hint_variants = [_][]const u8{
+    "↑↓ preview     enter switch     x close     esc back",
+    "↑↓ preview  enter switch  x close  esc back",
+    "↑↓ preview  enter  x close  esc",
+    "enter switch  esc back",
+};
+
+const armed_hint_variants = [_][]const u8{
+    "x again to close it for good     any other key keeps it",
+    "x again to close it for good  any other key keeps it",
+    "x again to close",
+};
+
+/// The hint row under the list: x closes a subagent's row, and once the
+/// first x armed that close, the row says what the second does.
+pub fn hintVariants(projection: AgentsMenuProjection) []const []const u8 {
+    if (projection.close_armed) return &armed_hint_variants;
+    if (projection.selected_closable) return &closable_hint_variants;
+    return &hint_variants;
+}
 
 test "an agent's row shows its title's control bytes as escapes" {
     const alloc = std.testing.allocator;
@@ -118,17 +149,17 @@ fn testRow(projection: AgentsMenuProjection, row_index: u16, width: u16, row_bud
     return .{ .text = try text.toOwnedSlice(alloc), .selected = selected };
 }
 
-test "the agent list shows each agent's number or name, title, profile, and state" {
+test "the agent list shows each agent's number or name, title, profile, state, and model" {
     const rows = [_]render_input.AgentsMenuRow{
-        .{ .number = 1, .title = "Fix the login bug", .profile = "main", .state = "working", .on_screen = true },
-        .{ .number = 0, .subagent_name = "tester", .title = "Run the auth tests", .profile = "tester", .state = "needs approval", .on_screen = false },
+        .{ .number = 1, .title = "Fix the login bug", .profile = "main", .state = "working", .on_screen = true, .model = "anthropic/claude-opus-4-7", .effort = "high" },
+        .{ .number = 0, .subagent_name = "tester", .title = "Run the auth tests", .profile = "tester", .state = "needs approval", .on_screen = false, .model = "openai/gpt-5.4-mini" },
         .{ .number = 2, .title = "", .profile = "reviewer", .state = "idle", .on_screen = false },
     };
     const projection: AgentsMenuProjection = .{ .rows = &rows, .selected = 1 };
     try std.testing.expectEqual(@as(u16, 3), menuRowCount(projection, max_inline_rows));
     const expected = [_][]const u8{
-        "  fx 1 (on screen) · Fix the login bug · main · working",
-        "    tester · Run the auth tests · tester · needs approval",
+        "  fx 1 (on screen) · Fix the login bug · main · working · opus 4-7 high",
+        "    tester · Run the auth tests · tester · needs approval · gpt-5.4-mini",
         "  fx 2 · new session · reviewer · idle",
     };
     for (expected, 0..) |text, row_index| {

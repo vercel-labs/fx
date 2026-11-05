@@ -548,8 +548,10 @@ pub fn composeHintRow(
         ctx.waiting_note
     else if (ctx.upgrade_status.len > 0)
         ctx.upgrade_status
+    else if (ctx.mcp_status.len > 0)
+        ctx.mcp_status
     else
-        ctx.mcp_status;
+        ctx.working_note;
     var indicated_buf: [max_status_line_len + 192]u8 = undefined;
     const indicated_text = if (ctx.agent_label.len == 0)
         status_text

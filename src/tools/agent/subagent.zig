@@ -29,6 +29,7 @@ pub const message_fields = [_][]const u8{ "action", "agent", "instructions", "me
 pub const wait_fields = [_][]const u8{"action"};
 pub const status_fields = [_][]const u8{ "action", "agent" };
 pub const stop_fields = [_][]const u8{ "action", "agent" };
+pub const close_fields = [_][]const u8{ "action", "agent" };
 
 /// Where a rejected call went wrong, so the correction can name it.
 const Problem = struct {
@@ -91,14 +92,16 @@ fn decodeFailure(
 
 /// Pure: the correction a model sees for a call that failed to decode.
 fn problemText(arena: Allocator, err: DecodeError, problem: Problem) Allocator.Error![]const u8 {
-    const fields = "message takes agent, message, instructions, report, model, effort, and profile; wait takes nothing; status takes an optional agent; stop takes agent.";
+    const fields = "message takes agent, message, instructions, report, model, effort, and profile; wait takes nothing; status takes an optional agent; stop and close take agent.";
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        error.InvalidEnum => "action must be \"message\", \"wait\", \"status\", or \"stop\".",
+        error.InvalidEnum => "action must be \"message\", \"wait\", \"status\", \"stop\", or \"close\".",
         error.MissingField => if (std.mem.eql(u8, problem.field, "action"))
-            "action is required: \"message\" with agent and message, \"wait\", \"status\", or \"stop\" with agent."
+            "action is required: \"message\" with agent and message, \"wait\", \"status\", or \"stop\" or \"close\" with agent."
         else if (std.mem.eql(u8, problem.action, "stop"))
             "stop needs agent."
+        else if (std.mem.eql(u8, problem.action, "close"))
+            "close needs agent."
         else
             "message needs agent and message.",
         error.UnknownField => if (problem.action.len == 0)
@@ -176,6 +179,11 @@ fn parseRoot(value: std.json.Value, problem: *Problem) DecodeError!model_contrac
         problem.action = "stop";
         try rejectUnknown(request, &stop_fields, problem);
         return .{ .stop = .{ .agent = try requiredString(request, "agent", problem) } };
+    }
+    if (std.mem.eql(u8, action, "close")) {
+        problem.action = "close";
+        try rejectUnknown(request, &close_fields, problem);
+        return .{ .close = .{ .agent = try requiredString(request, "agent", problem) } };
     }
     return error.InvalidEnum;
 }
@@ -268,7 +276,7 @@ pub fn call(
 pub fn readsOnly(erased: tool_dispatch.ToolInput) bool {
     return switch (erased.as(Input).request) {
         .wait, .status => true,
-        .message, .stop => false,
+        .message, .stop, .close => false,
     };
 }
 
@@ -369,7 +377,7 @@ test "call executes a validated managed request through the provider" {
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
 }
 
-test "decode accepts the four actions and nothing else" {
+test "decode accepts the five actions and nothing else" {
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\"}}", .message);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"instructions\":\"Review strictly.\",\"message\":\"next\"}}", .message);
     try expectRequestTag("{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"model\":\"gpt-5.6-sol-fast\"}}", .message);
@@ -378,6 +386,7 @@ test "decode accepts the four actions and nothing else" {
     try expectRequestTag("{\"action\":\"status\"}", .status);
     try expectRequestTag("{\"action\":\"status\",\"agent\":\"reviewer\"}", .status);
     try expectRequestTag("{\"action\":\"stop\",\"agent\":\"reviewer\"}", .stop);
+    try expectRequestTag("{\"action\":\"close\",\"agent\":\"reviewer\"}", .close);
     try expectDecodeFailure("{\"request\":{\"action\":\"run\",\"task\":\"do it\"}}", "invalid_enum");
     try expectDecodeFailure("{\"request\":{\"action\":\"stop\",\"child_id\":\"01J00000000000000000000000\"}}", "unknown_field");
     try expectDecodeFailure("{\"request\":{\"action\":\"cancel\",\"child_id\":\"01J00000000000000000000000\"}}", "invalid_enum");
@@ -406,13 +415,14 @@ test "decode accepts flat calls and names what a rejected call got wrong" {
     try expectCorrection("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"task\":\"x\"}", "unknown_field", "task does not apply to message. message takes agent");
     try expectCorrection("{\"action\":\"wait\",\"agent\":\"reviewer\"}", "unknown_field", "agent does not apply to wait.");
     try expectCorrection("{\"action\":\"stop\"}", "missing_field", "stop needs agent.");
+    try expectCorrection("{\"action\":\"close\"}", "missing_field", "close needs agent.");
     try expectCorrection("{\"action\":\"message\",\"agent\":\"reviewer\"}", "missing_field", "message needs agent and message.");
     try expectCorrection("{\"task\":\"x\"}", "missing_field", "action is required");
     try expectCorrection("{\"request\":{\"action\":\"wait\"},\"task\":\"y\"}", "unknown_field", "task cannot sit beside request");
     try expectCorrection("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":7}", "invalid_field_type", "message must be a string.");
     try expectCorrection("{\"request\":null}", "invalid_field_type", "request must be an object");
     try expectCorrection("[]", "invalid_field_type", "must be a JSON object");
-    try expectCorrection("{\"action\":\"run\"}", "invalid_enum", "action must be \"message\", \"wait\", \"status\", or \"stop\"");
+    try expectCorrection("{\"action\":\"run\"}", "invalid_enum", "action must be \"message\", \"wait\", \"status\", \"stop\", or \"close\"");
 }
 
 test "decode rejects invalid creation overrides and report rules" {
