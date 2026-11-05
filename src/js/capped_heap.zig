@@ -77,7 +77,7 @@ comptime {
 /// A block this heap handed out: where it starts, header included, and the
 /// size the caller asked for.
 const Block = struct {
-    base: [*]align(16) u8,
+    base: [*]align(alignment.toByteUnits()) u8,
     size: usize,
 };
 
@@ -88,7 +88,7 @@ fn writeSize(base: [*]u8, size: usize) void {
 
 fn blockOf(ptr: *const anyopaque) Block {
     const user: [*]const u8 = @ptrCast(ptr);
-    const base: [*]align(16) u8 = @ptrCast(@alignCast(@constCast(user - header_bytes)));
+    const base: [*]align(alignment.toByteUnits()) u8 = @ptrCast(@alignCast(@constCast(user - header_bytes)));
     const slot: *const usize = @ptrCast(base);
     return .{ .base = base, .size = slot.* };
 }
