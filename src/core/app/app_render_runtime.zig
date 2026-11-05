@@ -6626,10 +6626,13 @@ test "core.app_render_runtime full transcript defers repaint until its page is r
         "Preparing full detail",
     ));
 
-    for (0..100_000) |_| {
+    // A time limit, not a count of polls: on a busy machine the page-load
+    // thread can stay unscheduled for a long time.
+    const prepared_deadline_ms = io_mod.milliTimestamp() + 10_000;
+    while (io_mod.milliTimestamp() < prepared_deadline_ms) {
         _ = try app.shell.pollFullTranscriptPageLoad();
         if (app.shell.fullTranscriptPreparedForOpen()) break;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
+        io_mod.sleep(std.time.ns_per_ms);
     }
     try std.testing.expect(app.shell.fullTranscriptPreparedForOpen());
     app.shell.render_requests.request(.transcript);
@@ -6701,11 +6704,14 @@ test "core.app_render_runtime full transcript resize defers history reset until 
         "new output while review is open\n",
         true,
     );
-    for (0..100_000) |_| {
+    // A time limit, not a count of polls: on a busy machine the page-load
+    // thread can stay unscheduled for a long time.
+    const prepared_deadline_ms = io_mod.milliTimestamp() + 10_000;
+    while (io_mod.milliTimestamp() < prepared_deadline_ms) {
         try app.shell.prewarmFullTranscriptPage(null, null);
         _ = try app.shell.pollFullTranscriptPageLoad();
         if (app.shell.fullTranscriptPreparedForOpen()) break;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
+        io_mod.sleep(std.time.ns_per_ms);
     }
     try std.testing.expect(app.shell.fullTranscriptPreparedForOpen());
     app.shell.render_requests.request(.transcript);
