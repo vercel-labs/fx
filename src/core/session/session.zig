@@ -102,6 +102,37 @@ pub fn withoutSupersededResumes(history: []const HistoryTurn) []const HistoryTur
     return history[0..end];
 }
 
+/// Whether a turn is a resume fx sent for a request it stopped. Its saved
+/// text is always `resumed_request_prompt`; the projection picks the note.
+fn isResumeTurn(turn: HistoryTurn) bool {
+    const text = switch (turn) {
+        .assistant => |entry| entry.user.text,
+        .interrupted => |entry| entry.user.text,
+        .compacted_summary => return false,
+    };
+    return std.mem.eql(u8, text, resumed_request_prompt);
+}
+
+/// A resume that ran nothing before fx resumed the request again: the later
+/// resume dropped it, so every later request drops it too.
+fn isSupersededResume(history: []const HistoryTurn, index: usize) bool {
+    if (index + 1 >= history.len) return false;
+    return switch (history[index]) {
+        .interrupted => |entry| ranNothing(entry) and isResumeTurn(history[index]) and isResumeTurn(history[index + 1]),
+        else => false,
+    };
+}
+
+/// Whether fx later resumed the request this interrupted turn left
+/// unfinished. Such a turn reads as the resume request read it: with no
+/// abort note, since the request went on.
+fn isResumedLater(history: []const HistoryTurn, index: usize) bool {
+    if (history[index] != .interrupted) return false;
+    var next = index + 1;
+    while (next < history.len and isSupersededResume(history, next)) next += 1;
+    return next < history.len and isResumeTurn(history[next]);
+}
+
 /// The note a resumed request sends. A stopped turn that ran a tool keeps
 /// the caveat that it may have partly run; one that ran nothing is the
 /// user's message, still to answer.
@@ -2163,19 +2194,16 @@ fn appendActiveContextHistoryChatMessagesWithTrailingProjection(
         if (remaining != 0) return error.InvalidContextHistoryStart;
         for (history[retained_start..context_history_start], retained_start..) |turn, index| {
             if (turn == .compacted_summary) continue;
-            try appendHistoryChatMessagesImpl(
-                alloc,
-                messages,
-                history[index .. index + 1],
-                .closed,
-            );
+            try appendHistoryRangeChatMessages(alloc, messages, history, index, index + 1, .closed);
         }
     }
     if (context_history_start + 1 < history.len) {
-        try appendHistoryChatMessagesImpl(
+        try appendHistoryRangeChatMessages(
             alloc,
             messages,
-            history[context_history_start + 1 ..],
+            history,
+            context_history_start + 1,
+            history.len,
             interrupted_projection,
         );
     }
@@ -2256,20 +2284,8 @@ fn appendHistoryChatMessagesWithTrailingProjection(
         return;
     }
 
-    if (history.len > 1) {
-        try appendHistoryChatMessagesImpl(
-            alloc,
-            messages,
-            history[0 .. history.len - 1],
-            .closed,
-        );
-    }
-    try appendHistoryChatMessagesImpl(
-        alloc,
-        messages,
-        history[history.len - 1 ..],
-        trailing_interrupted_projection,
-    );
+    try appendHistoryRangeChatMessages(alloc, messages, history, 0, history.len - 1, .closed);
+    try appendHistoryRangeChatMessages(alloc, messages, history, history.len - 1, history.len, trailing_interrupted_projection);
 }
 
 fn appendHistoryMessagesImpl(
@@ -2540,7 +2556,31 @@ fn appendHistoryChatMessagesImpl(
     history: []const HistoryTurn,
     interrupted_projection: InterruptedChatProjection,
 ) !void {
-    for (history) |turn| {
+    return appendHistoryRangeChatMessages(alloc, messages, history, 0, history.len, interrupted_projection);
+}
+
+/// Projects `history[start..end]`, reading the turns around it so every
+/// request after a resume sees the conversation as the resume request did:
+/// the stopped turn without its abort note, the resume with the note that
+/// fits what ran, and no resume a later one replaced.
+fn appendHistoryRangeChatMessages(
+    alloc: Allocator,
+    messages: *std.ArrayList(core_types.ChatMessage),
+    history: []const HistoryTurn,
+    start: usize,
+    end: usize,
+    trailing_projection: InterruptedChatProjection,
+) !void {
+    for (history[start..end], start..) |turn, index| {
+        if (isSupersededResume(history, index)) continue;
+        const interrupted_projection: InterruptedChatProjection = if (isResumedLater(history, index))
+            .steering_continuation
+        else
+            trailing_projection;
+        const resume_note: ?[]const u8 = if (isResumeTurn(turn))
+            resumedRequestNote(withoutSupersededResumes(history[0..index]))
+        else
+            null;
         switch (turn) {
             .compacted_summary => |entry| {
                 const text = try formatCompactedContinuationMessage(alloc, entry.summary);
@@ -2552,14 +2592,14 @@ fn appendHistoryChatMessagesImpl(
                 });
             },
             .assistant => |entry| {
-                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
+                try messages.append(alloc, .{ .role = .user, .content = resume_note orelse entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
                 if (entry.assistant.len > 0 or entry.provider_replay != null) {
                     try messages.append(alloc, .{ .role = .assistant, .content = entry.assistant, .provider_replay = entry.provider_replay });
                 }
             },
             .interrupted => |entry| {
-                try messages.append(alloc, .{ .role = .user, .content = entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
+                try messages.append(alloc, .{ .role = .user, .content = resume_note orelse entry.user.text, .images = entry.user.images, .context_origin = .user_turn });
                 try appendExecutionMemoryChatMessages(alloc, messages, entry.execution);
                 if (entry.tool_call) |tool_call| {
                     const assistant_content = try formatInterruptedAssistantToolContent(alloc, entry);
@@ -4880,4 +4920,55 @@ test "resume turns that ran nothing are dropped, however many stacked up" {
     try std.testing.expectEqual(@as(usize, 26), withoutSupersededResumes(&with_tool).len);
     // A stopped turn the user wrote is never dropped.
     try std.testing.expectEqual(@as(usize, 1), withoutSupersededResumes(history[0..1]).len);
+}
+
+fn projectedTexts(arena: Allocator, history: []const HistoryTurn) ![]const []const u8 {
+    var messages: std.ArrayList(core_types.ChatMessage) = .empty;
+    try appendActiveContextHistoryChatMessages(arena, &messages, history, 0);
+    const texts = try arena.alloc([]const u8, messages.items.len);
+    for (messages.items, texts) |chat, *text| text.* = chat.content orelse "";
+    return texts;
+}
+
+test "every request after a resume projects the stopped turn as the resume request did" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const resume_text = @constCast(resumed_request_prompt);
+    const history = [_]HistoryTurn{
+        .{ .interrupted = .{ .user = .{ .text = @constCast("Name the capital.") } } },
+        .{ .assistant = .{ .user = .{ .text = resume_text }, .assistant = @constCast("Paris") } },
+        .{ .assistant = .{ .user = .{ .text = @constCast("Name the river.") }, .assistant = @constCast("Seine") } },
+    };
+    const texts = try projectedTexts(arena, &history);
+    try std.testing.expectEqual(@as(usize, 5), texts.len);
+    try std.testing.expectEqualStrings("Name the capital.", texts[0]);
+    // No abort note, and the note that fits a turn that ran nothing.
+    try std.testing.expectEqualStrings(resumed_request_note_no_tool, texts[1]);
+    try std.testing.expectEqualStrings("Paris", texts[2]);
+    for (texts) |text| try std.testing.expect(std.mem.find(u8, text, "<turn_aborted>") == null);
+}
+
+test "a resume closed before it ran anything stays out of every later request" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const resume_text = @constCast(resumed_request_prompt);
+    var completed = [_][]u8{@constCast("read_file")};
+    const history = [_]HistoryTurn{
+        .{ .interrupted = .{ .user = .{ .text = @constCast("List the planets.") }, .completed_tool_names = &completed } },
+        .{ .interrupted = .{ .user = .{ .text = resume_text } } },
+        .{ .assistant = .{ .user = .{ .text = resume_text }, .assistant = @constCast("Mercury") } },
+    };
+    const texts = try projectedTexts(arena, &history);
+    var notes: usize = 0;
+    for (texts) |text| {
+        if (std.mem.startsWith(u8, text, "<session_resumed>")) notes += 1;
+        try std.testing.expect(std.mem.find(u8, text, "<turn_aborted>") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), notes);
+    // The stopped turn ran a tool, so the note keeps its caveat.
+    var found_caveat = false;
+    for (texts) |text| found_caveat = found_caveat or std.mem.eql(u8, text, resumed_request_prompt);
+    try std.testing.expect(found_caveat);
 }

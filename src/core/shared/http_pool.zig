@@ -62,26 +62,33 @@ pub const HttpPool = struct {
     pub fn deinit(self: *HttpPool) DestroyDisposition {
         if (self.deinitialized) return .destroyed;
         self.deinitialized = true;
-        if (self.warm_started.load(.acquire) and !self.warm_done.load(.acquire)) {
-            var waited_ms: u64 = 0;
-            while (!self.warm_done.load(.acquire) and waited_ms < 500) : (waited_ms += 10) {
-                io_mod.sleep(10 * std.time.ns_per_ms);
-            }
-            if (!self.warm_done.load(.acquire)) {
-                debug_trace.logf("gateway", "pool_deinit result=abandoned_warm_flight", .{});
-                return .abandoned_warm_flight;
-            }
+        if (self.warm_started.load(.acquire) and !waitBriefly(self, warmFlightDone)) {
+            debug_trace.logf("gateway", "pool_deinit result=abandoned_warm_flight", .{});
+            return .abandoned_warm_flight;
         }
-        var waited_ms: u64 = 0;
-        while (self.open_jobs.load(.acquire) != 0 and waited_ms < 500) : (waited_ms += 10) {
-            io_mod.sleep(10 * std.time.ns_per_ms);
-        }
-        if (self.open_jobs.load(.acquire) != 0) {
+        if (!waitBriefly(self, openJobsDone)) {
             debug_trace.logf("gateway", "pool_deinit result=abandoned_open_job jobs={d}", .{self.open_jobs.load(.acquire)});
             return .abandoned_open_job;
         }
         self.client.deinit();
         return .destroyed;
+    }
+
+    /// Waits up to 500 ms for `done`; true when it came.
+    fn waitBriefly(self: *const HttpPool, comptime done: fn (*const HttpPool) bool) bool {
+        var waited_ms: u64 = 0;
+        while (!done(self) and waited_ms < 500) : (waited_ms += 10) {
+            io_mod.sleep(10 * std.time.ns_per_ms);
+        }
+        return done(self);
+    }
+
+    fn warmFlightDone(self: *const HttpPool) bool {
+        return self.warm_done.load(.acquire);
+    }
+
+    fn openJobsDone(self: *const HttpPool) bool {
+        return self.open_jobs.load(.acquire) == 0;
     }
 
     pub fn beginOpenJob(self: *HttpPool) void {

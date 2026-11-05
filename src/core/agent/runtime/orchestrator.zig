@@ -4493,12 +4493,12 @@ fn isRetryableModelFailure(kind: agent_stream_provider.FailureKind) bool {
     };
 }
 
-test "every HTTP status retries exactly when it is 429 or a 5xx, and its failure names that status" {
+test "every HTTP status retries exactly when it is 429 or a 5xx other than 501 and 505, and its failure names that status" {
     var code: u16 = 100;
     while (code <= 999) : (code += 1) {
         const status: std.http.Status = @fromBackingInt(@intCast(code));
         const kind = agent_stream_provider.FailureKind.fromHttpStatus(status);
-        try std.testing.expectEqual(code == 429 or (code >= 500 and code <= 599), isRetryableModelFailure(kind));
+        try std.testing.expectEqual(code == 429 or (code >= 500 and code <= 599 and code != 501 and code != 505), isRetryableModelFailure(kind));
         try std.testing.expectEqual(status, failureStatus(.{ .kind = kind, .http_status = status }));
     }
 }
@@ -7953,10 +7953,17 @@ fn processQueuedPromptLoop(
                 const cancel_requested = config.cancel_flag.load(.seq_cst);
                 const consumed_attempts = (request_recovery.attempt() - 1) +
                     @as(usize, @intFromBool(gateway_attempt_evidence.provider_admitted));
-                const network_failure = gateway_attempt_evidence.network_failure;
+                const network_failure = if (gateway_attempt_evidence.network_failure) |evidence| blk: {
+                    if (evidence.cause == .unreadable_reply and request_recovery.unreadableReplyEndsRequest()) {
+                        debug_trace.logf("recovery", "unreadable reply limit reached, ending the turn err={s}", .{@errorName(err)});
+                        break :blk null;
+                    }
+                    break :blk evidence;
+                } else null;
                 const failure_cause: types.ModelRecoveryCause = if (network_failure) |evidence|
                     switch (evidence.cause) {
-                        .transport_interrupted => .network_interrupted,
+                        // Saved sessions name only causes every version reads.
+                        .transport_interrupted, .unreadable_reply => .network_interrupted,
                         .connectivity_lost => .connectivity_lost,
                         .stream_stalled => .provider_stream_timeout,
                     }
@@ -7985,8 +7992,8 @@ fn processQueuedPromptLoop(
                     recovery_strategy == .reconcile_tool and stream_ctx.saw_tool_start;
                 // Network failures wait and resend through the recovery
                 // module. Any other thrown error keeps its terminal path.
-                const failure_kind: ?runtime_request_recovery.Failure.Kind = if (network_failure != null)
-                    runtime_request_recovery.failureKind(failure_cause)
+                const failure_kind: ?runtime_request_recovery.Failure.Kind = if (network_failure) |evidence|
+                    if (evidence.cause == .unreadable_reply) .unreadable else runtime_request_recovery.failureKind(failure_cause)
                 else
                     null;
                 const retryable = !cancel_requested and

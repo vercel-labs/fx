@@ -317,6 +317,14 @@ pub const RouteRecoveryStatusTone = enum {
     danger,
 };
 
+/// Whether a 5xx is a server failure a resend can outlive: every one, 529
+/// (overloaded) and 520-524 (Cloudflare) included, except 501 Not
+/// Implemented and 505 HTTP Version Not Supported, which say this request
+/// can never work there.
+pub fn isRetryableServerStatus(code: u16) bool {
+    return code >= 500 and code <= 599 and code != 501 and code != 505;
+}
+
 pub const ModelRecoveryCause = enum {
     network_interrupted,
     /// The network path is provably down, so nothing was sent.

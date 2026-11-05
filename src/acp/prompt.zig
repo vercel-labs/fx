@@ -2071,22 +2071,23 @@ fn takeSteeringBoundary(
     return .{ .continue_turn = messages };
 }
 
+/// The host closes steering when the user cancels the turn, and the
+/// `session/cancel` it also sends waits on stdin until the prompt returns.
+/// Between sends nothing else carries the cancel, so a retry wait would sit
+/// it out. A host that never opened steering never closes it this way.
+fn cancelOnHostSteeringClosed(ctx: *AcpContext) void {
+    if (!ctx.saw_host_steering_open or ctx.closed_host_steering) return;
+    const session = if (ctx.state.active_session) |*active| active else return;
+    if (session.cancel_flag.swap(true, .seq_cst)) return;
+    debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=host_steering_closed", .{});
+}
+
 /// The web core's cooperative pulse while a model reply streams: steering its
 /// host holds interrupts the reply under the same rule as the native kernel's.
 fn pulseHostSteering(raw_ctx: *anyopaque) anyerror!void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     switch (js_host_steering.state()) {
-        // The host closes steering when the user cancels the turn, and the
-        // `session/cancel` it also sends waits on stdin until the prompt
-        // returns. Between sends nothing else carries the cancel, so a retry
-        // wait would sit it out.
-        .closed => if (ctx.saw_host_steering_open and !ctx.closed_host_steering) {
-            if (ctx.state.active_session) |*session| {
-                if (!session.cancel_flag.swap(true, .seq_cst)) {
-                    debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=host_steering_closed", .{});
-                }
-            }
-        },
+        .closed => cancelOnHostSteeringClosed(ctx),
         .open => |open| {
             ctx.saw_host_steering_open = true;
             if (open.handoff) {

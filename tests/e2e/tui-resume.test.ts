@@ -8565,12 +8565,14 @@ function requestMessages(body: string): string[] {
 }
 
 test.skipIf(!tmuxAvailable())(
-  "a resumed request with no tool running sends the stopped prompt without an abort note",
+  "a resumed request with no tool running sends the stopped prompt without an abort note, and so does the next message",
   async () => {
     const fixture = resumeFixture("fx-auto-resume-plain-");
     let reached: () => void = () => {};
     const inFlight = new Promise<void>((resolve) => (reached = resolve));
     const gateway = startDynamicFakeGateway(async (body) => {
+      // A later message's history holds the resume too, so match it first.
+      if (body.includes("Name the river.")) return fakeGatewayFinalText("FOLLOW_UP_7310");
       if (body.includes(RESUME_NOTE)) return fakeGatewayFinalText("PLAIN_RESUMED_5120");
       if (body.includes("Name the capital.")) {
         reached();
@@ -8599,6 +8601,17 @@ test.skipIf(!tmuxAvailable())(
       // No tool ran, so the note does not ask the model to check one.
       expect(resumed!.body).not.toContain("A tool that was running may have partly run.");
       expect(messages.at(-1)).toContain("Nothing ran. Answer that message now.");
+
+      // The next message sees the resume as the resume request did.
+      await active.sendText("Name the river.");
+      await active.waitForText("FOLLOW_UP_7310", TIMEOUT);
+      const followUp = gateway.requests.find((request) => request.body.includes("Name the river."));
+      expect(followUp).toBeTruthy();
+      const later = requestMessages(followUp!.body);
+      expect(later.filter((text) => text.includes("Name the capital.")).length).toBe(1);
+      expect(later.filter((text) => text.includes("Nothing ran. Answer that message now.")).length).toBe(1);
+      expect(followUp!.body).not.toContain("<turn_aborted>");
+      expect(followUp!.body).not.toContain("A tool that was running may have partly run.");
       expect(readFileSync(second.stderrPath, "utf8")).toBe("");
     } finally {
       await active?.kill();
