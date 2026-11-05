@@ -2207,7 +2207,7 @@ fn resolveModelCapabilities(
         },
         model,
         bundle.fallbackModelCapabilities(model),
-        gateway_provider.catalog_first_load_wait_ms,
+        gateway_provider.catalog_connect_wait_ms,
     );
 }
 
@@ -2238,7 +2238,7 @@ fn resolveModelOverride(
         },
         raw_model,
         bundle.fallbackModelCapabilities(raw_model),
-        gateway_provider.catalog_first_load_wait_ms,
+        gateway_provider.catalog_connect_wait_ms,
     ) catch return .no_catalog;
     const entries = ctx.state.capability_resolver.catalogEntries() orelse return .no_catalog;
     var ids = try gateway_model_catalog.projectModelIds(alloc, entries);
