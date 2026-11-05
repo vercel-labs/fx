@@ -1606,7 +1606,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(compactScrollback).not.toContain("CTRL_O_FIRST_060");
 
       await session.sendKeys("C-o");
-      await session.waitForText("full detail · ctrl+o close", TIMEOUT);
+      await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       // Page to the tail of the second diff; the page count varies with
       // session and network record height at the top of the transcript.
       let fullSecond = await session.capturePane();
@@ -1693,7 +1693,7 @@ describe.skipIf(!tmuxAvailable())("tui: file permissions", () => {
       expect(inline).not.toContain("NEW_WRAP_TAIL");
 
       await session.sendKeys("C-o");
-      await session.waitForText("full detail · ctrl+o close", TIMEOUT);
+      await session.waitForText("esc close · pgup/pgdn scroll", TIMEOUT);
       const full = await session.capturePane();
       expectDiffSentinelOnRail(full, "OLD_WRAP_TAIL");
       expectDiffSentinelOnRail(full, "NEW_WRAP_TAIL");

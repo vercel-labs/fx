@@ -2144,7 +2144,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
             await Bun.sleep(25);
           }
           await capture("before-output");
-          const fullFooter = "full detail · ctrl+o close";
+          const fullFooter = "esc close · pgup/pgdn scroll";
           if (viewerCols) {
             await session.sendHexBytes(["0f"]);
             await session.waitForText(fullFooter, TIMEOUT);

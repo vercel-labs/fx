@@ -15,6 +15,7 @@ const permission_request = @import("../permissions/permission_request.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const shared_theme = @import("../shared/theme.zig");
 const types = @import("../shared/types.zig");
+const full_transcript_metadata = @import("../output/full_transcript_metadata.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const assistant_presentation = @import("../agent/assistant_presentation.zig");
 const assistant_pacer = @import("../../ui/assistant/pacer.zig");
@@ -97,18 +98,32 @@ pub const AssistantTextDrainResult = enum {
     blocked,
 };
 
-/// Writes one full-detail record for a terminal route recovery outcome, which
-/// preserves the failure in the ctrl+o full transcript's detail section. The
-/// recovery module's statuses live only in the status row and refresh every
-/// second, so they are never recorded.
+/// Writes the full-only notice for a terminal route recovery outcome, which
+/// keeps the failure in Ctrl+O where it happened. The recovery module's
+/// statuses live only in the status row and refresh every second, so they
+/// are never recorded.
 fn recordRouteRecoveryNotice(app: anytype, status: types.RouteRecoveryStatus) !void {
     if (status.fromModule() or status.kind == .recovered or status.kind == .failed) return;
     var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
     defer body.deinit();
     try writeRouteRecoveryBody(&body.writer, status);
-    try app.shell.appendFullDetailRecord(app.alloc, .{
+    try app.writeDomainNotice(.{
         .topic = "recovery",
         .tone = routeRecoveryNoticeTone(status),
+        .body = body.written(),
+        .visibility = .full_only,
+    }, true);
+}
+
+/// One settled model call as the full-only notice Ctrl+O shows where it
+/// happened; a failed call shows as an error.
+fn writeModelCallNotice(handlers: WorkerEventHandlers, record: types.ModelCallRecord) !void {
+    var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+    defer body.deinit();
+    try full_transcript_metadata.writeModelCallText(&body.writer, record);
+    try handlers.semantic_notice(handlers.ctx, .{
+        .topic = full_transcript_metadata.model_call_topic,
+        .tone = if (record.outcome == .failed) .@"error" else .neutral,
         .body = body.written(),
         .visibility = .full_only,
     });
@@ -392,7 +407,6 @@ pub fn Runtime(comptime App: type) type {
                 .assistant_presentation,
                 .open_model_picker,
                 .semantic_notice,
-                .full_detail_record,
                 .command_output,
                 .turn_token_update,
                 .turn_phase_update,
@@ -400,6 +414,8 @@ pub fn Runtime(comptime App: type) type {
                 .restore_failed_prompt,
                 => .drop,
                 .route_recovery_status => .drop,
+                // A stopped turn's calls still show where they happened.
+                .model_call => .admit,
                 .command_output_complete => |lifecycle_id| if (cancelledCommandCompletionMatches(presenter, lifecycle_id))
                     .admit
                 else
@@ -1286,8 +1302,15 @@ pub fn Runtime(comptime App: type) type {
                         }
                         try handlers.semantic_notice(handlers.ctx, notice);
                     },
-                    .full_detail_record => |notice| {
-                        try app.shell.appendFullDetailRecord(app.alloc, notice);
+                    .model_call => |record| {
+                        // After the text the call wrote, as the notice that
+                        // carries it lands where it happened.
+                        if (!try requireAssistantTextDrain(handlers)) {
+                            try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
+                            drain_owns_current = false;
+                            break :events;
+                        }
+                        try writeModelCallNotice(handlers, record);
                     },
                     .route_recovery_status => |status| {
                         if (!try requireAssistantTextDrain(handlers)) {
@@ -1986,10 +2009,6 @@ const FakeShell = struct {
     fn appendRawTranscriptEntry(self: *FakeShell, alloc: std.mem.Allocator, line: []const u8) !u32 {
         try self.raw_entries.append(alloc, try alloc.dupe(u8, line));
         return @intCast(self.raw_entries.items.len);
-    }
-
-    fn appendFullDetailRecord(self: *FakeShell, alloc: std.mem.Allocator, notice: types.SemanticNotice) !void {
-        return self.lifecycle.appendFullDetailRecord(alloc, notice);
     }
 
     fn appendRawTranscriptEntryClassified(self: *FakeShell, alloc: std.mem.Allocator, line: []const u8, class: transcript_runtime.RawEntryClass) !u32 {
@@ -3113,7 +3132,7 @@ test "core.app_worker_runtime a recovery leaves no status and no recovered summa
     try std.testing.expect(std.mem.find(u8, app.shell.lifecycle.notebook.entries.items[0].raw_bytes.bytes, "✓ recovered") == null);
 }
 
-test "core.app_worker_runtime records a terminal route recovery as a full-detail record" {
+test "core.app_worker_runtime writes a terminal route recovery where it happened" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
 
@@ -3124,17 +3143,57 @@ test "core.app_worker_runtime records a terminal route recovery as a full-detail
     } });
     try tickNoop(&app);
 
-    try std.testing.expectEqual(@as(usize, 1), app.shell.lifecycle.notebook.full_detail_records.items.len);
-    const record = app.shell.lifecycle.notebook.full_detail_records.items[0].notice;
-    try std.testing.expectEqualStrings("recovery", record.topic);
-    try std.testing.expectEqual(types.NoticeTone.@"error", record.tone);
-    try std.testing.expectEqual(types.NoticeVisibility.full_only, record.visibility);
-    try std.testing.expect(std.mem.find(u8, record.body, "stopped after 2 attempts") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "kind: terminal_provider_error") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "cause: rate_limited") != null);
-    try std.testing.expect(std.mem.find(u8, record.body, "attempt: 2") != null);
-    // The record stays out of the transcript entry store.
-    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.notebook.entries.items.len);
+    const written = app.transcript.items;
+    try std.testing.expect(std.mem.startsWith(u8, written, "recovery:"));
+    try std.testing.expect(std.mem.find(u8, written, "stopped after 2 attempts") != null);
+    try std.testing.expect(std.mem.find(u8, written, "kind: terminal_provider_error") != null);
+    try std.testing.expect(std.mem.find(u8, written, "cause: rate_limited") != null);
+    try std.testing.expect(std.mem.find(u8, written, "attempt: 2") != null);
+}
+
+test "core.app_worker_runtime writes a model call as a full-only notice after the text it follows" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    const Capture = struct {
+        var drained_before_notice: bool = false;
+        var drains: usize = 0;
+        var notice: ?types.SemanticNotice = null;
+        var body: [256]u8 = undefined;
+        var body_len: usize = 0;
+        fn drain(_: *anyopaque) !AssistantTextDrainResult {
+            drains += 1;
+            return .drained;
+        }
+        fn write(_: *anyopaque, value: types.SemanticNotice) !void {
+            drained_before_notice = drains > 0;
+            @memcpy(body[0..value.body.len], value.body);
+            body_len = value.body.len;
+            notice = value;
+        }
+    };
+    var handlers = NoopBridge.handlers(&app);
+    handlers.drain_assistant_text = Capture.drain;
+    handlers.semantic_notice = Capture.write;
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .model_call = .{
+        .at_ms = 1_000,
+        .elapsed_ms = 2_140,
+        .provider = "gateway",
+        .model = "anthropic/claude-opus-4.8",
+        .generation_id = "gen_01JC7P5XQ2M8VZ",
+        .input_tokens = 1_204,
+        .output_tokens = 188,
+    } });
+    try Runtime(FakeApp).tick(&app, app.agent(), handlers);
+
+    try std.testing.expect(Capture.drained_before_notice);
+    const notice = Capture.notice.?;
+    try std.testing.expectEqualStrings(full_transcript_metadata.model_call_topic, notice.topic);
+    try std.testing.expectEqual(types.NoticeVisibility.full_only, notice.visibility);
+    try std.testing.expectEqual(types.NoticeTone.neutral, notice.tone);
+    try std.testing.expectEqualStrings(
+        "claude-opus-4.8 · 2.1 s · in 1,204 · out 188 · gen_01JC7P5XQ2M8VZ",
+        Capture.body[0..Capture.body_len],
+    );
 }
 
 test "core.app_worker_runtime keeps recovery module statuses out of the transcript" {
@@ -3149,7 +3208,7 @@ test "core.app_worker_runtime keeps recovery module statuses out of the transcri
     } });
     try tickNoop(&app);
 
-    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.notebook.full_detail_records.items.len);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "recovery:") == null);
     try std.testing.expect(app.shell.activityProjection() == .none);
 }
 
@@ -3165,7 +3224,7 @@ test "core.app_worker_runtime skips the recovery record for statuses dropped by 
         .attempt = 1,
     } });
     try tickNoop(&app);
-    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.notebook.full_detail_records.items.len);
+    try std.testing.expect(std.mem.find(u8, app.transcript.items, "recovery:") == null);
 }
 
 test "writeRouteRecoveryBody omits absent facts" {

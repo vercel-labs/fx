@@ -58,6 +58,7 @@ const subagent_authority = @import("../subagent/authority.zig");
 const tool_set_contract = @import("../tooling/tool_set.zig");
 const builtin_tools = @import("../../builtins/tools.zig");
 const types = @import("../shared/types.zig");
+const full_transcript_metadata = @import("../output/full_transcript_metadata.zig");
 const history_range = @import("../shared/history_range.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
@@ -3562,35 +3563,37 @@ pub fn Runtime(comptime App: type) type {
                 switch (turn) {
                     .compacted_summary => {},
                     .assistant => |entry| {
-                        if (entry.execution.turn_summary) |summary| {
-                            sink.setCreatedAtMs(summary.started_at_ms);
-                        }
+                        if (promptTime(entry.user, entry.execution.turn_summary)) |at| sink.setCreatedAtMs(at);
                         try appendHistoryUserTurn(sink, entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSink(app, agent, sink, entry.execution, labels);
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.completed_at_ms);
                         }
+                        const final_calls = full_transcript_metadata.stepModelCalls(entry.execution.model_calls, entry.execution.tool_steps.len);
+                        try writeModelCallNotices(sink, final_calls.before);
                         if (entry.assistant.len > 0) {
                             try writeAssistantHistoryMarkdownToSink(app, sink, entry.assistant);
                         }
+                        try writeModelCallNotices(sink, final_calls.after);
                         if (entry.execution.turn_summary) |summary| {
                             try sink.appendTurnSummary(summary);
                         }
                     },
                     .interrupted => |entry| {
-                        if (entry.execution.turn_summary) |summary| {
-                            sink.setCreatedAtMs(summary.started_at_ms);
-                        }
+                        if (promptTime(entry.user, entry.execution.turn_summary)) |at| sink.setCreatedAtMs(at);
                         try appendHistoryUserTurn(sink, entry.user, has_prior_turns.*);
                         has_prior_turns.* = true;
                         try writeExecutionHistoryToSink(app, agent, sink, entry.execution, labels);
                         if (entry.execution.turn_summary) |summary| {
                             sink.setCreatedAtMs(summary.completed_at_ms);
                         }
+                        const final_calls = full_transcript_metadata.stepModelCalls(entry.execution.model_calls, entry.execution.tool_steps.len);
+                        try writeModelCallNotices(sink, final_calls.before);
                         if (entry.assistant) |assistant| {
                             if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
                         }
+                        try writeModelCallNotices(sink, final_calls.after);
                         if (entry.cancelled_command) |presentation| {
                             try writeCancelledCommandPresentation(app, agent, sink, entry.tool_call.?, presentation, labels);
                         }
@@ -3694,9 +3697,12 @@ pub fn Runtime(comptime App: type) type {
                     &steering_index,
                     step_index,
                 );
+                const calls = full_transcript_metadata.stepModelCalls(execution.model_calls, step_index);
+                try writeModelCallNotices(sink, calls.before);
                 if (step.assistant) |assistant| {
                     if (assistant.len > 0) try writeAssistantHistoryMarkdownToSink(app, sink, assistant);
                 }
+                try writeModelCallNotices(sink, calls.after);
 
                 for (step.tool_calls) |call| {
                     if (findPersistedToolResult(step.tool_results, call.id)) |result| {
@@ -3721,6 +3727,31 @@ pub fn Runtime(comptime App: type) type {
                 }
                 if (steering.text.len == 0) continue;
                 try sink.appendUserTurn(savedSteeringTurn(steering.text), true);
+            }
+        }
+
+        /// When a saved turn's message was sent: its own line's time, else its
+        /// summary's start. A turn with neither keeps the clock it finds.
+        fn promptTime(user: types.UserTurn, summary: ?types.TurnSummary) ?i64 {
+            if (user.sent_at_ms > 0) return user.sent_at_ms;
+            const value = summary orelse return null;
+            return value.started_at_ms;
+        }
+
+        /// Writes each call record as the full-only notice Ctrl+O shows, at
+        /// the time the call settled.
+        fn writeModelCallNotices(sink: anytype, records: []const types.ModelCallRecord) !void {
+            for (records) |record| {
+                var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
+                defer body.deinit();
+                try full_transcript_metadata.writeModelCallText(&body.writer, record);
+                sink.setCreatedAtMs(record.at_ms);
+                try sink.appendNotice(.{
+                    .topic = full_transcript_metadata.model_call_topic,
+                    .tone = if (record.outcome == .failed) .@"error" else .neutral,
+                    .body = body.written(),
+                    .visibility = .full_only,
+                });
             }
         }
 

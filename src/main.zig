@@ -5373,8 +5373,10 @@ test {
     _ = @import("builtins/gateway.zig");
     _ = @import("core/shared/debug_trace.zig");
     _ = @import("core/output/diff.zig");
+    _ = @import("core/output/full_transcript_metadata.zig");
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/shared/gateway_error_format.zig");
+    _ = @import("core/shared/history_range.zig");
     _ = @import("core/cli/doctor_runtime.zig");
     _ = @import("core/auth/login_flow.zig");
     _ = @import("core/auth/chatgpt_oauth.zig");

@@ -1053,16 +1053,15 @@ fn composeTranscriptViewerFooterFrame(
             // fits 80 columns.
             "part of older history couldn't be read · fx doctor · esc close"
         else
-            "full detail · ctrl+o close · pgup/pgdn scroll · esc close",
+            "esc close · pgup/pgdn scroll",
         .inline_mode => unreachable,
     };
 
+    // The keys sit under the transcript's own indent, gray, with no bar:
+    // the bar belongs to the composer and to prompts.
     var navigation_row: std.ArrayList(u8) = .empty;
-    try navigation_row.appendSlice(alloc, user_message_card.promptMarkerStyle());
-    try row_text.appendClipped(alloc, &navigation_row, "┃", width);
-    try navigation_row.appendSlice(alloc, ui_render.reset_style);
-    if (width > 1) {
-        try navigation_row.append(alloc, ' ');
+    if (width > 2) {
+        try navigation_row.appendSlice(alloc, "  ");
         try navigation_row.appendSlice(alloc, ui_render.statusline_style);
         try row_text.appendSingleLineEllipsized(alloc, &navigation_row, navigation, width - 2);
         try navigation_row.appendSlice(alloc, ui_render.reset_style);
@@ -1346,7 +1345,7 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
         &frame,
         frame_plan.paint.footer.top_divider,
         shell.layout.cols,
-        "┃ full detail · ctrl+o close · pgup/pgdn scroll · esc close",
+        "  esc close · pgup/pgdn scroll",
     );
     try expectFrameRowTextTrimmed(
         &frame,
@@ -1380,7 +1379,7 @@ test "transcript viewer footer keeps navigation blank row and aligns main status
         &full_frame,
         full_plan.paint.footer.top_divider,
         shell.layout.cols,
-        "┃ full detail · ctrl+o close · pgup/pgdn scroll · esc close",
+        "  esc close · pgup/pgdn scroll",
     );
 }
 
@@ -1417,11 +1416,11 @@ test "transcript viewer footer says when older history could not load or is dama
         .banner_active = false,
     };
     for ([_]struct { failed: bool, damaged: bool, text: []const u8 }{
-        .{ .failed = true, .damaged = false, .text = "┃ couldn't load older history · pgup to retry · esc close" },
+        .{ .failed = true, .damaged = false, .text = "  couldn't load older history · pgup to retry · esc close" },
         // A failed read says to retry even when an earlier read hit damage.
-        .{ .failed = true, .damaged = true, .text = "┃ couldn't load older history · pgup to retry · esc close" },
-        .{ .failed = false, .damaged = true, .text = "┃ part of older history couldn't be read · fx doctor · esc close" },
-        .{ .failed = false, .damaged = false, .text = "┃ full detail · ctrl+o close · pgup/pgdn scroll · esc close" },
+        .{ .failed = true, .damaged = true, .text = "  couldn't load older history · pgup to retry · esc close" },
+        .{ .failed = false, .damaged = true, .text = "  part of older history couldn't be read · fx doctor · esc close" },
+        .{ .failed = false, .damaged = false, .text = "  esc close · pgup/pgdn scroll" },
     }) |case| {
         shell.transcript_archive_failed = case.failed;
         shell.transcript_archive_damaged = case.damaged;
