@@ -1542,6 +1542,7 @@ describe("cli: status", () => {
         mkdirSync(workspace);
         const env = {
           ...NO_GATEWAY_AUTH,
+          FX_DISABLE_KEYCHAIN: "1",
           HOME: realpathSync(home),
           FX_MAX_AGENT_STEPS: "3",
         };
@@ -2048,6 +2049,7 @@ describe("cli: doctor", () => {
           cwd: realpathSync(workspace),
           env: {
             ...NO_GATEWAY_AUTH,
+            FX_DISABLE_KEYCHAIN: "1",
             HOME: realpathSync(home),
           },
           timeoutMs: TIMEOUT,
@@ -2092,6 +2094,7 @@ describe("cli: doctor", () => {
           cwd: realpathSync(workspace),
           env: {
             ...NO_GATEWAY_AUTH,
+            FX_DISABLE_KEYCHAIN: "1",
             HOME: realpathSync(home),
           },
           timeoutMs: TIMEOUT,
@@ -2134,6 +2137,7 @@ describe("cli: doctor", () => {
           cwd: workspaceRoot,
           env: {
             ...NO_GATEWAY_AUTH,
+            FX_DISABLE_KEYCHAIN: "1",
             HOME: home,
           },
           timeoutMs: TIMEOUT,
@@ -2930,6 +2934,7 @@ describe("cli: missing durable home", () => {
         const cwd = realpathSync(workspace);
         const env = {
           ...NO_GATEWAY_AUTH,
+          FX_DISABLE_KEYCHAIN: "1",
           HOME: undefined,
         };
 
@@ -2953,7 +2958,8 @@ describe("cli: missing durable home", () => {
           env,
           timeoutMs: TIMEOUT,
         });
-        expect(doctor.code).toBe(0);
+        // No credential here, so the auth check fails.
+        expect(doctor.code).toBe(1);
         expect(JSON.parse(doctor.stdout).checks).toEqual(
           expect.arrayContaining([
             expect.objectContaining({
@@ -5963,7 +5969,7 @@ describe("cli: MCP profile", () => {
       }),
       { mode: 0o600 },
     );
-    const env = { HOME: home, ...NO_GATEWAY_AUTH };
+    const env = { HOME: home, ...NO_GATEWAY_AUTH, FX_DISABLE_KEYCHAIN: "1" };
     try {
       const status = await runFx(["status", "--json"], { cwd: workspace, env });
       expect(status.code).toBe(0);

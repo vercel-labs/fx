@@ -200,6 +200,7 @@ def run_checked(
     log_path: pathlib.Path,
     require_empty_stderr: bool = False,
     max_capture_chars: int | None = None,
+    allowed_returncodes: Sequence[int] = (0,),
 ) -> CommandResult:
     argv_tuple = tuple(os.fspath(argument) for argument in argv)
     if not argv_tuple:
@@ -372,7 +373,7 @@ def run_checked(
         stdout_truncated=stdout_capture.truncated,
         stderr_truncated=stderr_capture.truncated,
     )
-    if result.returncode != 0:
+    if result.returncode not in allowed_returncodes:
         write_status("failed")
         emit_progress(
             f"command failed in {elapsed_seconds:.3f}s: {command_display} "

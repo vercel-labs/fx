@@ -61,7 +61,8 @@
       "cwd": ".",
       "env_set": {"FX_TEST_SKIP_ONBOARDING": "1"},
       "timeout_seconds": 60,
-      "requires_tmux": false
+      "requires_tmux": false,
+      "expected_exit": 1
     },
     {
       "name": "direct-sessions",
