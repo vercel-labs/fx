@@ -242,6 +242,11 @@ pub const Context = struct {
     /// names. Null when no authority narrows the registry. Each call an
     /// `execute` program makes is checked against it, as a direct call is.
     live_tool_names: ?[]const []const u8 = null,
+    /// Whether `execute` may run: `experimental.code_mode` is on, the setting
+    /// that also decides whether the tool is offered. A call while it is off
+    /// gets the tool's "not available" answer, so naming an unoffered tool
+    /// doesn't reach the sandbox.
+    code_mode_enabled: bool = false,
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     auto_classifier: permission_auto_classifier.Classifier =
         permission_auto_classifier.Classifier.disabled(),
@@ -933,10 +938,12 @@ fn executeRegisteredTool(
             .context = &subagent_provider,
             .execute_fn = executeSubagentProvider,
         },
-        .code_mode => dispatch_ctx.code_mode_provider = .{
-            .ctx = &code_mode_provider,
-            .call_fn = executeNestedToolCall,
-            .cancelled_fn = codeModeCancelled,
+        .code_mode => if (ctx.code_mode_enabled) {
+            dispatch_ctx.code_mode_provider = .{
+                .ctx = &code_mode_provider,
+                .call_fn = executeNestedToolCall,
+                .cancelled_fn = codeModeCancelled,
+            };
         },
     }
     dispatch_ctx.mcp_execution_error_sink = &mcp_execution_error;
@@ -7269,10 +7276,12 @@ test "a program's tool calls stay inside a live tool authority" {
         // The control: with read_file allowed, the same program reads it.
         .{ .tools = &.{ "execute", "read_file" }, .reads = true },
     };
+    var ctx = rt.context();
+    ctx.code_mode_enabled = true;
     for (cases) |case| {
         var arena_state = std.heap.ArenaAllocator.init(alloc);
         defer arena_state.deinit();
-        const result = try executeToolCallAuthorized(rt.context(), .{
+        const result = try executeToolCallAuthorized(ctx, .{
             .call_allocator = arena_state.allocator(),
             .result_allocator = arena_state.allocator(),
             .call = .{ .id = "program", .name = "execute", .arguments_json = program },
@@ -7294,6 +7303,59 @@ test "a program's tool calls stay inside a live tool authority" {
             try expectContains(result.model_output, "top secret");
         } else {
             try expectContains(result.model_output, "refused: read_file isn't available to this agent.");
+            try expectNotContains(result.model_output, "top secret");
+        }
+    }
+}
+
+test "an execute call runs its program only while code mode is on" {
+    const sandbox = @import("../code_mode/sandbox.zig");
+    if (!sandbox.available) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "secret.txt", .data = "top secret" });
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    var rt = TestRuntime{
+        .workspace_root = root,
+        .tool_registry = .{ .tools = &.{ test_builtin_tools.read_file, test_builtin_tools.execute } },
+    };
+    defer rt.deinit(alloc);
+    const program =
+        \\{"code":"return await tools.read_file({ path: 'secret.txt' });"}
+    ;
+    // The model can name `execute` while it isn't offered; the control turns
+    // code mode on and reads the file.
+    for ([_]bool{ false, true }) |enabled| {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        var ctx = rt.context();
+        ctx.code_mode_enabled = enabled;
+        const result = try executeToolCallAuthorized(ctx, .{
+            .call_allocator = arena_state.allocator(),
+            .result_allocator = arena_state.allocator(),
+            .call = .{ .id = "program", .name = "execute", .arguments_json = program },
+            .authority = .ordinary,
+            .session_grants = &.{},
+            .live_authority = .{
+                .generation = 1,
+                .root_id = "root",
+                .tools = &.{ "execute", "read_file" },
+                .integrations = &.{},
+                .rules = .{},
+                .grants = &.{},
+                .permission_mode = .yolo,
+            },
+            .advertised_dynamic_tool_names = &.{},
+            .max_tool_result_bytes = rt.max_tool_result_bytes,
+        });
+        if (enabled) {
+            try expectContains(result.model_output, "top secret");
+        } else {
+            try std.testing.expectEqual(.failure, result.status);
+            try expectContains(result.model_output, "Code mode isn't available here.");
             try expectNotContains(result.model_output, "top secret");
         }
     }
