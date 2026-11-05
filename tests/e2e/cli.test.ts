@@ -618,6 +618,42 @@ describe("cli: version", () => {
   }
 });
 
+describe("cli: output errors", () => {
+  test(
+    "a command that can't write its output says so instead of naming a dropped connection",
+    () => {
+      const home = createIsolatedTestHome();
+      const tracePath = join(home, "trace.log");
+      try {
+        for (const args of [["--version"], ["status"]]) {
+          // `>&-` closes stdout, so every write to it fails.
+          const result = spawnSync("sh", ["-c", 'exec "$0" "$@" >&-', FX_BIN, ...args], {
+            encoding: "utf8",
+            env: {
+              PATH: process.env.PATH,
+              HOME: home,
+              FX_SOUND: "0",
+              FX_AUTO_UPGRADE: "0",
+              FX_DISABLE_KEYCHAIN: "1",
+              FX_TRACE_LOG: tracePath,
+              FX_TRACE_SCOPES: "core",
+            },
+          });
+          expect(result.status, args.join(" ")).toBe(1);
+          expect(result.stderr).toBe("fx: couldn't write the output\n");
+        }
+        // The raw name stays in the trace.
+        const trace = readFileSync(tracePath, "utf8");
+        expect(trace).toContain("command output write failed err=WriteFailed");
+        expect(trace).toContain("command error err=OutputWriteFailed");
+      } finally {
+        cleanupIsolatedTestHome(home);
+      }
+    },
+    TIMEOUT,
+  );
+});
+
 describe("cli: status", () => {
   test(
     "status and doctor expose the MCP profile error that blocks ask startup",
