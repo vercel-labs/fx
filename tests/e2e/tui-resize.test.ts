@@ -166,13 +166,6 @@ function countOccurrences(value: string, needle: string): number {
   }
 }
 
-function textHex(value: string): string[] {
-  return Array.from(
-    Buffer.from(value),
-    (byte) => byte.toString(16).padStart(2, "0"),
-  );
-}
-
 function gatedResizeResponse(
   first: string,
   second: string,
@@ -947,6 +940,17 @@ async function waitForResizeAndInputTapeFrames(
       frames.map((frame) => frame.kind).join(",")
     }`,
   );
+}
+
+function setPaneBackground(session: TmuxSession, colour: string): void {
+  execFileSync("tmux", [
+    "set-option",
+    "-p",
+    "-t",
+    session.name,
+    "window-style",
+    `bg=${colour}`,
+  ]);
 }
 
 function sendRawTmuxBytes(
@@ -4765,9 +4769,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       const inlineMarker = "THEME_RESET_INLINE_CODE";
       const inlineTailMarker = "THEME_RESET_INLINE_TAIL";
-      const responseFence = textHex("\x1b[?1;2c");
-      const darkBackground = textHex("\x1b]11;rgb:0000/0000/0000\x1b\\");
-      const lightBackground = textHex("\x1b]11;rgb:ffff/ffff/ffff\x1b\\");
       const gateway = startFakeGateway([
         fakeGatewayFinalText(
           `THEME_RESET_FIRST_RESPONSE \`${inlineMarker} ${"x".repeat(10_000)}\` ${inlineTailMarker}\n`,
@@ -4833,6 +4834,9 @@ describe.skipIf(SKIP)("tui: resize", () => {
         rawBackgroundRequests,
       );
 
+      // tmux answers fx's background query from the pane's style, as a real
+      // terminal reports its own colors.
+      setPaneBackground(session, "#ffffff");
       sendRawTmuxBytes(
         session,
         "initial-theme-notification",
@@ -4848,12 +4852,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
         "theme_query_requested kind=background",
         backgroundRequests + 1,
       );
-      await session.sendHexBytes([
-        ...responseFence,
-        ...darkBackground,
-        ...lightBackground,
-        ...responseFence,
-      ]);
       await waitForTraceText(tracePath, "theme_update_settled light=true rgb=terminal");
       // The redraw in the new theme clears the screen, and the trace says so.
       await waitForTraceText(tracePath, "event=theme_change_redraw dropped=terminal_screen_and_scrollback");
@@ -4886,6 +4884,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       trace = readFileSync(tracePath, "utf8");
       fenceRequests = countOccurrences(trace, "theme_query_requested kind=response_fence");
       backgroundRequests = countOccurrences(trace, "theme_query_requested kind=background");
+      // The notification says light, but the terminal's dark background wins.
+      setPaneBackground(session, "#000000");
       sendRawTmuxBytes(
         session,
         "theme-notification",
@@ -4899,12 +4899,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
       expect(
         countOccurrences(queryTrace, "theme_query_requested kind=response_fence"),
       ).toBeGreaterThanOrEqual(fenceRequests + 1);
-      await session.sendHexBytes([
-        ...responseFence,
-        ...lightBackground,
-        ...darkBackground,
-        ...responseFence,
-      ]);
       await waitForTraceText(tracePath, "theme_update_settled light=false rgb=terminal");
       expect(
         await waitForTapeOutputCount(tapePath, "\x1b[3J", resetCountBefore + 2),
