@@ -764,6 +764,13 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+// Whether a pid a fixture recorded names one process other than this runner.
+// process.kill(0) signals the runner's own process group, a negative pid
+// signals a whole group, and pid 1 is init.
+function isSingleOtherProcess(pid: number): boolean {
+  return Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid;
+}
+
 async function waitForProcessExit(pid: number, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -9266,8 +9273,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "persistent_sigkill_shell",
           [
             "sleep 30 & descendant=$!",
-            `printf STARTED > ${JSON.stringify(startedPath)}`,
+            // The pids are written in full before the marker the test waits
+            // for, so the test never reads a missing or empty pid file.
             `printf '%s %s %s' "$$" "$PPID" "$descendant" > ${JSON.stringify(pidsPath)}`,
+            `printf STARTED > ${JSON.stringify(startedPath)}`,
             "sleep 3",
             `printf FINISHED > ${JSON.stringify(finishedPath)}`,
             "kill \"$descendant\" 2>/dev/null || true",
@@ -9314,7 +9323,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         .map(Number);
       expect(ownedPids).toHaveLength(3);
       for (const pid of ownedPids) {
-        expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+        expect(isSingleOtherProcess(pid)).toBe(true);
         expect(isProcessAlive(pid)).toBe(true);
       }
 
@@ -9325,6 +9334,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       await Bun.sleep(3_500);
       expect(existsSync(finishedPath)).toBe(false);
       for (const pid of ownedPids) await waitForProcessExit(pid, 3_000);
+      // All three have exited, so cleanup must not signal their pids, which
+      // the system may give to other processes.
+      ownedPids = [];
 
       const latest = await runFx(["session", "last", "--json"], {
         cwd: root.workspace,
@@ -9381,7 +9393,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     } finally {
       if (first.exitCode === null) first.kill("SIGKILL");
       for (const pid of ownedPids) {
-        if (!isProcessAlive(pid)) continue;
+        if (!isSingleOtherProcess(pid) || !isProcessAlive(pid)) continue;
         try {
           process.kill(pid, "SIGKILL");
         } catch {}
