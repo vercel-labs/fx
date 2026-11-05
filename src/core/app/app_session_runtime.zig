@@ -538,22 +538,12 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
-        /// Gives an instance launched in a profile the profile's model, unless
-        /// `--model`, `--provider`, or `FX_MODEL` chose one for the process,
-        /// which still wins, as it does over the first instance's profile.
-        pub fn applyProfileModel(app: *App, agent: *AppAgent, model: []const u8) !void {
-            if (agent.session_persistence.process_model_override != null) return;
-            const preferences = if (agent.session_persistence.session_preferences) |*value| value else return;
-            const owned = try app.alloc.dupe(u8, model);
-            app.alloc.free(preferences.model);
-            preferences.model = owned;
-        }
-
         /// Gives an instance launched after the first the model the launch
         /// chose with `--model`, `--provider`, or `FX_MODEL`, which the first
         /// instance takes through the app's selection at startup. An instance's
         /// model is its own session preference, and its fresh session still
-        /// saves the configured one, as the first instance's does.
+        /// saves the one it started with, its profile's or the configured one,
+        /// as the first instance's does.
         pub fn applyProcessModelOverride(app: *App, agent: *AppAgent) !void {
             const model = agent.session_persistence.process_model_override orelse return;
             const preferences = if (agent.session_persistence.session_preferences) |*value| value else return;
@@ -663,9 +653,23 @@ pub fn Runtime(comptime App: type) type {
 
         /// A v2 session starts in memory; its folder appears with the first
         /// turn (D2), so a launch that never prompts leaves nothing behind.
+        /// A session in a profile starts with, and saves, the profile's model
+        /// and effort, so resuming it brings them back; `--model`, `--effort`,
+        /// and `FX_MODEL` shape only the run that passed them.
         fn beginFreshV2Session(app: *App, agent: *AppAgent, v2_store: *session_adapter.Store) !void {
-            const preferences = agent.session_persistence.workspace_preferences orelse
+            const workspace_preferences = agent.session_persistence.workspace_preferences orelse
                 return error.SessionPreferencesUnavailable;
+            var preferences = try workspace_preferences.dupe(app.alloc);
+            defer preferences.deinit(app.alloc);
+            if (comptime agents.hasAgentField(App, "profile")) {
+                const profile = &agent.profile.profile;
+                if (profile.model) |model| {
+                    const owned = try app.alloc.dupe(u8, model);
+                    app.alloc.free(preferences.model);
+                    preferences.model = owned;
+                }
+                if (profile.effort) |effort| preferences.effort = effort;
+            }
             try replacePreferences(
                 app.alloc,
                 &agent.session_persistence.session_preferences,
