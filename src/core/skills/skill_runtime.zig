@@ -3003,6 +3003,13 @@ fn writeStyledSourceLabel(writer: *std.Io.Writer, styles: SkillSummaryStyles, la
     try writer.print("{s}[{s}]{s}", .{ styles.source_label_style, label, styles.reset_style });
 }
 
+fn listsSameSkill(listed: []const Skill, skill: Skill) bool {
+    for (listed) |other| {
+        if (std.mem.eql(u8, other.name, skill.name) and std.mem.eql(u8, other.description, skill.description)) return true;
+    }
+    return false;
+}
+
 fn buildSkillsSystemPromptSectionWithLimits(
     alloc: Allocator,
     all_skills: []const Skill,
@@ -3027,9 +3034,18 @@ pub fn buildSkillPrompt(
     defer visible.deinit(alloc);
     var identity_scratch = std.heap.ArenaAllocator.init(alloc);
     defer identity_scratch.deinit();
+    var withheld: usize = 0;
     for (skills) |skill| {
         if (!try tool_result_limits.modelProjectionPreservesText(identity_scratch.allocator(), skill.name) or
-            !try tool_result_limits.modelProjectionPreservesText(identity_scratch.allocator(), skill.path)) continue;
+            !try tool_result_limits.modelProjectionPreservesText(identity_scratch.allocator(), skill.path))
+        {
+            withheld += 1;
+            continue;
+        }
+        // A copy with the same name and description as one already listed
+        // gives the model nothing to choose between, so only the first, from
+        // the highest-precedence root, is listed.
+        if (listsSameSkill(visible.items, skill)) continue;
         try visible.append(alloc, skill);
     }
     var section = renderSkillPrompt(alloc, visible.items, limits, context_window, catalog_namespace(visible.items, workspace_root), workspace_root) catch |err| {
@@ -3040,9 +3056,9 @@ pub fn buildSkillPrompt(
     section.locations.diagnostics = diagnostics;
     {
         errdefer section.deinit(alloc);
-        if (visible.items.len < skills.len) {
+        if (withheld > 0) {
             const notice = try alloc.print("{s}[context] {d} skill identities withheld because they cannot be safely represented to the model.\n", .{
-                section.notice orelse "", skills.len - visible.items.len,
+                section.notice orelse "", withheld,
             });
             if (section.notice) |previous| alloc.free(previous);
             section.notice = notice;
@@ -3053,6 +3069,11 @@ pub fn buildSkillPrompt(
         return err;
     };
 }
+
+/// The most of each description the catalog shows by default, so a profile
+/// with hundreds of skills does not fill every request with descriptions. A
+/// configured `skill_description_bytes` replaces it.
+const catalog_description_characters = 200;
 
 const SkillPromptBudget = struct {
     limit: usize,
@@ -3175,7 +3196,7 @@ fn renderSkillPrompt(
         defer alloc.free(safe_description);
         var description_limited = false;
         if (limits.skill_description_bytes.source == .compiled_default) {
-            const end = skillDescriptionPrefix(safe_description, 1024);
+            const end = skillDescriptionPrefix(safe_description, catalog_description_characters);
             try model_context_encoding.writeScalar(&description.writer, safe_description[0..end]);
             description_limited = end < safe_description.len;
         } else {
@@ -4513,8 +4534,10 @@ test "buildSkillsSystemPromptSection includes all visible skills without active 
 
 test "skill catalog uses model capacity and preserves explicit byte overrides" {
     const alloc = std.testing.allocator;
-    var storage: [16][24]u8 = undefined;
-    var skills: [16]Skill = undefined;
+    // Enough skills that both budgets bind with each description at the
+    // catalog's default length.
+    var storage: [64][24]u8 = undefined;
+    var skills: [64]Skill = undefined;
     for (&skills, 0..) |*skill, index| {
         const name = try std.mem.print(&storage[index], "entry-{d}", .{index});
         skill.* = .{ .name = name, .description = text_utils.repeat("useful instructions ", 80), .path = name, .source = .global_fx };
@@ -4534,6 +4557,29 @@ test "skill catalog uses model capacity and preserves explicit byte overrides" {
     defer same.deinit(alloc);
     try std.testing.expectEqualStrings(small.text, same.text);
     try std.testing.expect(small.text.len <= 1600);
+}
+
+test "skill catalog lists one entry for copies with the same name and description" {
+    const alloc = std.testing.allocator;
+    const skills = [_]Skill{
+        .{ .name = "review", .description = "Review a change.", .path = "/workspace/.agents/skills/review", .source = .workspace_agents },
+        .{ .name = "review", .description = "Review a change.", .path = "/home/.fx/skills/review", .source = .global_fx },
+        .{ .name = "review", .description = "Review a pull request as an exam.", .path = "/home/.agents/skills/review", .source = .global_agents },
+    };
+    var result = try buildSkillPrompt(alloc, &skills, &.{}, .{}, null, null);
+    defer result.deinit(alloc);
+
+    // The identical copy from the lower-precedence root is not listed, and
+    // its root gets no index; the copy with its own description stays.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, result.text, "\n- review: "));
+    try std.testing.expect(std.mem.find(u8, result.text, "/home/.fx/skills") == null);
+    try std.testing.expect(std.mem.find(u8, result.text, "Review a pull request as an exam.") != null);
+    try std.testing.expect(result.notice == null);
+    const listed = try alloc.print("skill:{x:0>16}:0/review", .{result.locations.namespace});
+    defer alloc.free(listed);
+    const resolved = try result.locations.resolve(alloc, listed);
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings("/workspace/.agents/skills/review", resolved);
 }
 
 test "skill catalog locations reject a changed identity mapping" {
@@ -4719,8 +4765,10 @@ test "skill catalog one-byte overflow reports every omitted name in stable order
 test "skill catalog omission notices bound hostile names and list length" {
     const alloc = std.testing.allocator;
     const huge_name = text_utils.repeat("n", 4096);
+    var descriptions: [20][8]u8 = undefined;
     var skills: [20]Skill = undefined;
-    for (&skills) |*skill| skill.* = staticSkill(huge_name, "", .workspace_shared);
+    // Distinct descriptions keep the same-name copies from being listed once.
+    for (&skills, 0..) |*skill, index| skill.* = staticSkill(huge_name, try std.mem.print(&descriptions[index], "copy {d}", .{index}), .workspace_shared);
     var limits = context_limits.Values{};
     limits.skill_catalog_bytes = .{ .value = .{ .bytes = 0 }, .source = .command_line };
 

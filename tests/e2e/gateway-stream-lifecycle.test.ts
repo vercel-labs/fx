@@ -9088,7 +9088,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const root = createFixtureRoot("subagent-persistent-resume");
     const resumedWorkspace = join(root.root, "resumed-workspace");
     const smallModel = "fixture/small-context";
-    const skillNames = ["alpha-check", "beta-check", "gamma-check", "delta-check"];
+    // Enough skills that the small model's catalog budget binds even with
+    // each description at the catalog's default length.
+    const skillNames = ["alpha-check", "beta-check", "gamma-check", "delta-check", "epsilon-check", "zeta-check", "eta-check", "theta-check"];
     for (const name of skillNames) {
       const directory = join(resumedWorkspace, ".agents", "skills", name);
       mkdirSync(directory, { recursive: true });

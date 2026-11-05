@@ -26,7 +26,10 @@ const DecodeError = error{
 /// Fields each action takes. The flat model schema for this tool in
 /// src/builtins/tools.zig advertises exactly these, which a test there checks.
 pub const message_fields = [_][]const u8{ "action", "agent", "instructions", "message", "report", "model", "effort", "profile" };
-pub const wait_fields = [_][]const u8{"action"};
+/// wait wakes on the next report or message from any subagent. Models
+/// often name the one they started, so agent is accepted and does not
+/// narrow the wait; the report that arrives names its sender.
+pub const wait_fields = [_][]const u8{ "action", "agent" };
 pub const status_fields = [_][]const u8{ "action", "agent" };
 pub const stop_fields = [_][]const u8{ "action", "agent" };
 pub const close_fields = [_][]const u8{ "action", "agent" };
@@ -92,7 +95,7 @@ fn decodeFailure(
 
 /// Pure: the correction a model sees for a call that failed to decode.
 fn problemText(arena: Allocator, err: DecodeError, problem: Problem) Allocator.Error![]const u8 {
-    const fields = "message takes agent, message, instructions, report, model, effort, and profile; wait takes nothing; status takes an optional agent; stop and close take agent.";
+    const fields = "message takes agent, message, instructions, report, model, effort, and profile; wait and status take an optional agent; stop and close take agent.";
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.InvalidEnum => "action must be \"message\", \"wait\", \"status\", \"stop\", or \"close\".",
@@ -168,6 +171,7 @@ fn parseRoot(value: std.json.Value, problem: *Problem) DecodeError!model_contrac
     if (std.mem.eql(u8, action, "wait")) {
         problem.action = "wait";
         try rejectUnknown(request, &wait_fields, problem);
+        _ = try optionalString(request, "agent", problem);
         return .wait;
     }
     if (std.mem.eql(u8, action, "status")) {
@@ -413,7 +417,9 @@ fn expectCorrection(args_json: []const u8, code: []const u8, correction: []const
 test "decode accepts flat calls and names what a rejected call got wrong" {
     try expectRequestTag("{\"action\":\"message\",\"agent\":\"reviewer\",\"instructions\":\"Review strictly.\",\"message\":\"next\"}", .message);
     try expectCorrection("{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"next\",\"task\":\"x\"}", "unknown_field", "task does not apply to message. message takes agent");
-    try expectCorrection("{\"action\":\"wait\",\"agent\":\"reviewer\"}", "unknown_field", "agent does not apply to wait.");
+    try expectRequestTag("{\"action\":\"wait\",\"agent\":\"reviewer\"}", .wait);
+    try expectCorrection("{\"action\":\"wait\",\"agent\":7}", "invalid_field_type", "agent must be a string.");
+    try expectCorrection("{\"action\":\"wait\",\"message\":\"x\"}", "unknown_field", "message does not apply to wait.");
     try expectCorrection("{\"action\":\"stop\"}", "missing_field", "stop needs agent.");
     try expectCorrection("{\"action\":\"close\"}", "missing_field", "close needs agent.");
     try expectCorrection("{\"action\":\"message\",\"agent\":\"reviewer\"}", "missing_field", "message needs agent and message.");
