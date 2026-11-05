@@ -470,6 +470,7 @@ pub fn Bindings(comptime App: type) type {
                 .append_code_block = workerBridgeAppendCodeBlock,
                 .append_thematic_rule = workerBridgeAppendThematicRule,
                 .drain_assistant_text = workerBridgeDrainAssistantText,
+                .hold_model_call = workerBridgeHoldModelCall,
                 .open_model_picker = workerBridgeOpenModelPicker,
                 .semantic_notice = workerBridgeSemanticNotice,
                 .credential_refreshed = workerBridgeCredentialRefreshed,
@@ -1501,6 +1502,15 @@ pub fn Bindings(comptime App: type) type {
                 app.pacerCallbacks(),
             );
             return .drained;
+        }
+
+        fn workerBridgeHoldModelCall(ctx: *anyopaque, record: types.ModelCallRecord) !bool {
+            const agent: *AppAgent = @ptrCast(@alignCast(ctx));
+            const app = appOf(agent);
+            if (comptime @hasDecl(@TypeOf(app.pacer), "holdModelCall")) {
+                return app.pacer.holdModelCall(app.alloc, record);
+            }
+            return false;
         }
 
         fn workerBridgeOpenModelPicker(ctx: *anyopaque) !void {

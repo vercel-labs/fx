@@ -64,6 +64,9 @@ fn discardCodeBlock(_: *anyopaque, block: assistant_presentation.CodeBlockPayloa
 fn discardThematicRule(_: *anyopaque) !void {}
 fn discardContextCompaction(_: *anyopaque, _: worker_runtime.ContextCompaction) !void {}
 fn discardCredentialRefresh(_: *anyopaque, _: credentials.Credential) !void {}
+fn holdNoModelCall(_: *anyopaque, _: types.ModelCallRecord) !bool {
+    return false;
+}
 
 /// A retained delivery owns its own payload; a settled delivery acknowledges history.
 pub const HistoryDelivery = union(enum) {
@@ -81,6 +84,9 @@ pub const WorkerEventHandlers = struct {
     append_code_block: *const fn (*anyopaque, assistant_presentation.CodeBlockPayload) anyerror!void = discardCodeBlock,
     append_thematic_rule: *const fn (*anyopaque) anyerror!void = discardThematicRule,
     drain_assistant_text: *const fn (*anyopaque) anyerror!AssistantTextDrainResult,
+    /// Holds a call's Ctrl+O line until the paced text before it is shown;
+    /// false when nothing is pending and the line is written now.
+    hold_model_call: *const fn (*anyopaque, types.ModelCallRecord) anyerror!bool = holdNoModelCall,
     open_model_picker: *const fn (*anyopaque) anyerror!void,
     semantic_notice: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
     credential_refreshed: *const fn (*anyopaque, credentials.Credential) anyerror!void = discardCredentialRefresh,
@@ -117,11 +123,15 @@ fn recordRouteRecoveryNotice(app: anytype, status: types.RouteRecoveryStatus) !v
 
 /// One settled model call as the full-only notice Ctrl+O shows where it
 /// happened; a failed call shows as an error.
-fn writeModelCallNotice(handlers: WorkerEventHandlers, record: types.ModelCallRecord) !void {
+pub fn writeModelCallNotice(
+    ctx: *anyopaque,
+    write: *const fn (*anyopaque, types.SemanticNotice) anyerror!void,
+    record: types.ModelCallRecord,
+) !void {
     var body: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
     defer body.deinit();
     try full_transcript_metadata.writeModelCallText(&body.writer, record);
-    try handlers.semantic_notice(handlers.ctx, .{
+    try write(ctx, .{
         .topic = full_transcript_metadata.model_call_topic,
         .tone = if (record.outcome == .failed) .@"error" else .neutral,
         .body = body.written(),
@@ -1303,14 +1313,13 @@ pub fn Runtime(comptime App: type) type {
                         try handlers.semantic_notice(handlers.ctx, notice);
                     },
                     .model_call => |record| {
-                        // After the text the call wrote, as the notice that
-                        // carries it lands where it happened.
-                        if (!try requireAssistantTextDrain(handlers)) {
-                            try retainClaimedEventAndSuffix(agent, &batch, "assistant_text_drain_blocked");
-                            drain_owns_current = false;
-                            break :events;
+                        // After the text the call wrote. The line shows only
+                        // in Ctrl+O, so it waits for text still being paced
+                        // out instead of showing that text early, as in
+                        // front of an approval.
+                        if (!try handlers.hold_model_call(handlers.ctx, record)) {
+                            try writeModelCallNotice(handlers.ctx, handlers.semantic_notice, record);
                         }
-                        try writeModelCallNotice(handlers, record);
                     },
                     .route_recovery_status => |status| {
                         if (!try requireAssistantTextDrain(handlers)) {
@@ -2485,6 +2494,10 @@ const PacedTranscriptBridge = struct {
     finish_count: usize = 0,
     order: [8]u8 = undefined,
     order_len: usize = 0,
+    emitted_bytes: usize = 0,
+    held_call_lines: usize = 0,
+    emitted_when_call_written: usize = 0,
+    entries_when_call_written: usize = 0,
 
     fn init(app: *FakeApp) PacedTranscriptBridge {
         return .{ .app = app };
@@ -2500,6 +2513,7 @@ const PacedTranscriptBridge = struct {
             .emit_fn = emit,
             .finish_ctx = @ptrCast(self),
             .finish_fn = finish,
+            .model_call_fn = writeHeldCall,
         };
     }
 
@@ -2509,6 +2523,7 @@ const PacedTranscriptBridge = struct {
         bridge.write_user_prompt = writeUserPrompt;
         bridge.append_text = appendText;
         bridge.drain_assistant_text = drainAssistantText;
+        bridge.hold_model_call = holdModelCall;
         bridge.semantic_notice = semanticNotice;
         bridge.append_history_turn = appendHistoryTurn;
         return bridge;
@@ -2568,8 +2583,21 @@ const PacedTranscriptBridge = struct {
         return .{ .settled = .committed };
     }
 
+    fn holdModelCall(raw: *anyopaque, call: types.ModelCallRecord) !bool {
+        const self: *PacedTranscriptBridge = @ptrCast(@alignCast(raw));
+        return self.pacer.holdModelCall(self.app.alloc, call);
+    }
+
+    fn writeHeldCall(raw: *anyopaque, _: types.ModelCallRecord) !void {
+        const self: *PacedTranscriptBridge = @ptrCast(@alignCast(raw));
+        self.held_call_lines += 1;
+        self.emitted_when_call_written = self.emitted_bytes;
+        self.entries_when_call_written = self.app.shell.lifecycle.notebook.entries.items.len;
+    }
+
     fn emit(raw: *anyopaque, text: []const u8) !void {
         const self: *PacedTranscriptBridge = @ptrCast(@alignCast(raw));
+        self.emitted_bytes += text.len;
         _ = try self.app.shell.lifecycle.streamAssistantChunk(
             self.app.alloc,
             &self.metrics,
@@ -3151,11 +3179,10 @@ test "core.app_worker_runtime writes a terminal route recovery where it happened
     try std.testing.expect(std.mem.find(u8, written, "attempt: 2") != null);
 }
 
-test "core.app_worker_runtime writes a model call as a full-only notice after the text it follows" {
+test "core.app_worker_runtime writes a model call as a full-only notice without draining paced text" {
     var app = FakeApp.init(std.testing.allocator);
     defer app.deinit();
     const Capture = struct {
-        var drained_before_notice: bool = false;
         var drains: usize = 0;
         var notice: ?types.SemanticNotice = null;
         var body: [256]u8 = undefined;
@@ -3165,7 +3192,6 @@ test "core.app_worker_runtime writes a model call as a full-only notice after th
             return .drained;
         }
         fn write(_: *anyopaque, value: types.SemanticNotice) !void {
-            drained_before_notice = drains > 0;
             @memcpy(body[0..value.body.len], value.body);
             body_len = value.body.len;
             notice = value;
@@ -3185,7 +3211,9 @@ test "core.app_worker_runtime writes a model call as a full-only notice after th
     } });
     try Runtime(FakeApp).tick(&app, app.agent(), handlers);
 
-    try std.testing.expect(Capture.drained_before_notice);
+    // Nothing was pending, so the line is written at once, and never by
+    // showing paced text early.
+    try std.testing.expectEqual(@as(usize, 0), Capture.drains);
     const notice = Capture.notice.?;
     try std.testing.expectEqualStrings(full_transcript_metadata.model_call_topic, notice.topic);
     try std.testing.expectEqual(types.NoticeVisibility.full_only, notice.visibility);
@@ -3194,6 +3222,67 @@ test "core.app_worker_runtime writes a model call as a full-only notice after th
         "claude-opus-4.8 · 2.1 s · in 1,204 · out 188 · gen_01JC7P5XQ2M8VZ",
         Capture.body[0..Capture.body_len],
     );
+}
+
+const test_held_call: types.ModelCallRecord = .{
+    .at_ms = 1_000,
+    .elapsed_ms = 900,
+    .provider = "gateway",
+    .model = "openai/gpt-5.4",
+    .generation_id = "gen_held",
+};
+
+test "app worker holds a model call's line behind paced text instead of showing the text" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.agent().worker.processing = true;
+    var bridge = PacedTranscriptBridge.init(&app);
+    defer bridge.deinit();
+
+    const text = "reply before the call";
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
+        .assistant_presentation = .{ .text = @constCast(text) },
+    });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .model_call = test_held_call });
+    try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
+
+    // An approval opening now would find the text still unshown.
+    try std.testing.expectEqual(@as(usize, 0), bridge.drain_count);
+    try std.testing.expectEqual(@as(usize, 0), bridge.notice_count);
+    try std.testing.expectEqual(@as(usize, 0), bridge.held_call_lines);
+    try std.testing.expectEqual(@as(usize, 0), app.shell.lifecycle.notebook.entries.items.len);
+    try std.testing.expect(bridge.pacer.hasPending());
+
+    try bridge.tickPacer(0);
+    try std.testing.expectEqual(@as(usize, 1), bridge.held_call_lines);
+    try std.testing.expectEqual(text.len, bridge.emitted_when_call_written);
+    try std.testing.expectEqual(@as(usize, 0), bridge.notice_count);
+    try std.testing.expect(!bridge.pacer.hasPending());
+}
+
+test "app worker writes a held model call's line before the tool that shows its text" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.agent().worker.processing = true;
+    var bridge = PacedTranscriptBridge.init(&app);
+    defer bridge.deinit();
+
+    const text = "reading the file";
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{
+        .assistant_presentation = .{ .text = @constCast(text) },
+    });
+    try app.agent().worker.pushEvent(std.heap.c_allocator, .{ .model_call = test_held_call });
+    try queueToolStart(&app, 1, "read_a", "read_file");
+    try Runtime(FakeApp).tick(&app, (&app).agent(), bridge.handlers());
+
+    // The tool's drain shows the text, then the line, then the tool.
+    try std.testing.expectEqual(@as(usize, 1), bridge.drain_count);
+    try std.testing.expectEqual(@as(usize, 1), bridge.held_call_lines);
+    try std.testing.expectEqual(text.len, bridge.emitted_when_call_written);
+    try std.testing.expectEqual(@as(usize, 1), bridge.entries_when_call_written);
+    try std.testing.expectEqual(@as(usize, 2), app.shell.lifecycle.notebook.entries.items.len);
+    try std.testing.expect(app.shell.lifecycle.notebook.entries.items[0] == .assistant_turn);
+    try std.testing.expect(app.shell.lifecycle.notebook.entries.items[1] == .raw_bytes);
 }
 
 test "core.app_worker_runtime keeps recovery module statuses out of the transcript" {

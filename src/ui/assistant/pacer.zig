@@ -37,6 +37,9 @@ pub const TickCallbacks = struct {
     emit_fn: EmitFn,
     finish_ctx: *anyopaque,
     finish_fn: FinishFn,
+    /// Writes the Ctrl+O line of a call held until its text was shown
+    /// (`holdModelCall`), with `emit_ctx`.
+    model_call_fn: ?*const fn (*anyopaque, types.ModelCallRecord) anyerror!void = null,
 };
 
 pub const SgrState = struct {
@@ -158,6 +161,10 @@ pub const AssistantPacer = struct {
     pending: std.ArrayList(u8) = .empty,
     deferred_turn: ?FinishedPrompt = null,
     deferred_started_ns: ?i128 = null,
+    /// Calls whose Ctrl+O lines wait for the text before them, which is still
+    /// pending. Owned; written once that text is shown, before a deferred
+    /// finish.
+    held_calls: std.ArrayList(types.ModelCallRecord) = .empty,
     /// Tracks which SGR attributes the terminal should have active at the
     /// start of the next emit. Other frame-work (footer, body renders)
     /// between ticks can emit their own `\x1b[0m`, so state is restored
@@ -166,6 +173,8 @@ pub const AssistantPacer = struct {
 
     pub fn deinit(self: *AssistantPacer, alloc: Allocator) void {
         self.pending.deinit(alloc);
+        self.dropHeldModelCalls(alloc, "deinit");
+        self.held_calls.deinit(alloc);
         if (self.deferred_turn) |finished| {
             types.freeFinishedPrompt(alloc, finished);
             self.deferred_turn = null;
@@ -174,7 +183,20 @@ pub const AssistantPacer = struct {
     }
 
     pub fn hasPending(self: *const AssistantPacer) bool {
-        return self.pending.items.len > 0 or self.deferred_turn != null;
+        return self.pending.items.len > 0 or self.deferred_turn != null or self.held_calls.items.len > 0;
+    }
+
+    /// Holds a call's Ctrl+O line while the text before it is still pending,
+    /// so writing the line never shows that text early. Returns false when
+    /// nothing is pending and the caller writes the line now.
+    pub fn holdModelCall(self: *AssistantPacer, alloc: Allocator, record: types.ModelCallRecord) !bool {
+        if (self.pending.items.len == 0) return false;
+        const owned = try types.dupeModelCallRecord(alloc, record);
+        self.held_calls.append(alloc, owned) catch |err| {
+            types.freeModelCallRecordStrings(alloc, owned);
+            return err;
+        };
+        return true;
     }
 
     pub fn hasCompletedAssistantPresentationTail(self: *const AssistantPacer) bool {
@@ -237,6 +259,7 @@ pub const AssistantPacer = struct {
 
     pub fn clear(self: *AssistantPacer, alloc: Allocator) void {
         self.pending.clearRetainingCapacity();
+        self.dropHeldModelCalls(alloc, "clear");
         if (self.deferred_turn) |finished| {
             types.freeFinishedPrompt(alloc, finished);
             self.deferred_turn = null;
@@ -256,6 +279,7 @@ pub const AssistantPacer = struct {
         self.deferred_turn = null;
         types.freeFinishedPrompt(alloc, finished);
         self.pending.clearRetainingCapacity();
+        self.dropHeldModelCalls(alloc, "visual_epoch");
         self.deferred_started_ns = null;
         self.sgr = .{};
         return true;
@@ -263,6 +287,7 @@ pub const AssistantPacer = struct {
 
     pub fn tick(self: *AssistantPacer, alloc: Allocator, now_ns: i128, cb: TickCallbacks) !void {
         if (self.pending.items.len == 0) {
+            self.writeHeldModelCalls(alloc, cb);
             try self.fireDeferredFinish(alloc, now_ns, cb);
             return;
         }
@@ -273,6 +298,7 @@ pub const AssistantPacer = struct {
 
         if (try self.emitPendingBlock(cb) == .drained or self.deferred_turn != null) {
             if (self.pending.items.len > 0) try self.neutralizeIncompleteTail(cb);
+            self.writeHeldModelCalls(alloc, cb);
             try self.fireDeferredFinish(alloc, now_ns, cb);
         }
     }
@@ -289,7 +315,35 @@ pub const AssistantPacer = struct {
                 .blocked => try self.neutralizeIncompleteTail(cb),
             }
         }
+        self.writeHeldModelCalls(alloc, cb);
         try self.fireDeferredFinish(alloc, now_ns, cb);
+    }
+
+    /// Writes the held call lines, whose text is now shown. A line that
+    /// can't be written is traced and dropped; the turn saved it already.
+    fn writeHeldModelCalls(self: *AssistantPacer, alloc: Allocator, cb: TickCallbacks) void {
+        if (self.held_calls.items.len == 0) return;
+        std.debug.assert(self.pending.items.len == 0);
+        var calls = self.held_calls;
+        self.held_calls = .empty;
+        defer calls.deinit(alloc);
+        for (calls.items) |record| {
+            defer types.freeModelCallRecordStrings(alloc, record);
+            const write = cb.model_call_fn orelse {
+                debug_trace.logf("ui_activity", "model call line dropped reason=no_writer dropped=live_call_record", .{});
+                continue;
+            };
+            write(cb.emit_ctx, record) catch |err| {
+                debug_trace.logf("ui_activity", "model call line dropped err={s} dropped=live_call_record", .{@errorName(err)});
+            };
+        }
+    }
+
+    fn dropHeldModelCalls(self: *AssistantPacer, alloc: Allocator, reason: []const u8) void {
+        if (self.held_calls.items.len == 0) return;
+        debug_trace.logf("ui_activity", "model call lines dropped reason={s} count={d} dropped=live_call_record", .{ reason, self.held_calls.items.len });
+        for (self.held_calls.items) |record| types.freeModelCallRecordStrings(alloc, record);
+        self.held_calls.clearRetainingCapacity();
     }
 
     fn emitPendingBlock(self: *AssistantPacer, cb: TickCallbacks) !FlushResult {
@@ -435,6 +489,10 @@ const TestCapture = struct {
     emitted: std.ArrayList(u8) = .empty,
     finish_count: usize = 0,
     finish_summary: ?types.TurnSummary = null,
+    /// How much text was out when each held call line was written.
+    call_emitted_lens: [4]usize = undefined,
+    call_count: usize = 0,
+    calls_at_finish: usize = 0,
 
     fn emit(ctx: *anyopaque, text: []const u8) anyerror!void {
         const self: *TestCapture = @ptrCast(@alignCast(ctx));
@@ -445,7 +503,15 @@ const TestCapture = struct {
         const self: *TestCapture = @ptrCast(@alignCast(ctx));
         self.finish_count += 1;
         self.finish_summary = finished.summary;
+        self.calls_at_finish = self.call_count;
         return .committed;
+    }
+
+    fn modelCall(ctx: *anyopaque, record: types.ModelCallRecord) anyerror!void {
+        const self: *TestCapture = @ptrCast(@alignCast(ctx));
+        try std.testing.expectEqualStrings("gen_held", record.generation_id.?);
+        self.call_emitted_lens[self.call_count] = self.emitted.items.len;
+        self.call_count += 1;
     }
 
     fn callbacks(self: *TestCapture) TickCallbacks {
@@ -454,6 +520,7 @@ const TestCapture = struct {
             .emit_fn = TestCapture.emit,
             .finish_ctx = self,
             .finish_fn = TestCapture.finish,
+            .model_call_fn = TestCapture.modelCall,
         };
     }
 
@@ -874,6 +941,79 @@ test "completed assistant summary is the only deferred presentation tail" {
         }));
         try std.testing.expect(!pacer.hasCompletedAssistantPresentationTail());
     }
+}
+
+const held_call: types.ModelCallRecord = .{
+    .at_ms = 1_000,
+    .elapsed_ms = 900,
+    .provider = "gateway",
+    .model = "openai/gpt-5.4",
+    .generation_id = "gen_held",
+};
+
+test "a held call line waits for the text before it and lands before a deferred finish" {
+    const alloc = std.testing.allocator;
+    var pacer = AssistantPacer{};
+    defer pacer.deinit(alloc);
+    var cap = TestCapture{};
+    defer cap.deinit();
+
+    // With nothing pending the caller writes the line itself.
+    try std.testing.expect(!try pacer.holdModelCall(alloc, held_call));
+    try std.testing.expect(!pacer.hasPending());
+
+    try pacer.enqueue(alloc, "reply\x1b[1");
+    try std.testing.expect(try pacer.holdModelCall(alloc, held_call));
+    try pacer.tick(alloc, 0, cap.callbacks());
+    // The incomplete tail is still pending, so the line still waits.
+    try std.testing.expectEqualStrings("reply", cap.emitted.items);
+    try std.testing.expectEqual(@as(usize, 0), cap.call_count);
+    try std.testing.expect(pacer.hasPending());
+
+    const turn = try makeAssistantTurn(alloc);
+    defer types.freeHistoryTurn(alloc, turn);
+    try std.testing.expect(try pacer.deferFinish(alloc, .{ .turn = turn }));
+    try pacer.tick(alloc, 1, cap.callbacks());
+    try std.testing.expectEqual(@as(usize, 1), cap.call_count);
+    try std.testing.expectEqual(cap.emitted.items.len, cap.call_emitted_lens[0]);
+    try std.testing.expectEqual(@as(usize, 1), cap.finish_count);
+    try std.testing.expectEqual(@as(usize, 1), cap.calls_at_finish);
+    try std.testing.expect(!pacer.hasPending());
+}
+
+test "a presentation boundary writes held call lines after the text they waited for" {
+    const alloc = std.testing.allocator;
+    var pacer = AssistantPacer{};
+    defer pacer.deinit(alloc);
+    var cap = TestCapture{};
+    defer cap.deinit();
+
+    try pacer.enqueue(alloc, "first");
+    try std.testing.expect(try pacer.holdModelCall(alloc, held_call));
+    try pacer.enqueue(alloc, " second");
+    try std.testing.expect(try pacer.holdModelCall(alloc, held_call));
+    try pacer.flushPresentationAtBoundary(alloc, 0, cap.callbacks());
+
+    try std.testing.expectEqualStrings("first second", cap.emitted.items);
+    try std.testing.expectEqual(@as(usize, 2), cap.call_count);
+    try std.testing.expectEqual(@as(usize, 12), cap.call_emitted_lens[0]);
+    try std.testing.expectEqual(@as(usize, 12), cap.call_emitted_lens[1]);
+    try std.testing.expect(!pacer.hasPending());
+}
+
+test "clear drops a held call line with the text it waited for" {
+    const alloc = std.testing.allocator;
+    var pacer = AssistantPacer{};
+    defer pacer.deinit(alloc);
+    var cap = TestCapture{};
+    defer cap.deinit();
+
+    try pacer.enqueue(alloc, "text");
+    try std.testing.expect(try pacer.holdModelCall(alloc, held_call));
+    pacer.clear(alloc);
+    try std.testing.expect(!pacer.hasPending());
+    try pacer.tick(alloc, 0, cap.callbacks());
+    try std.testing.expectEqual(@as(usize, 0), cap.call_count);
 }
 
 test "clear drops pending and deferred turn" {
