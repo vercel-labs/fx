@@ -341,14 +341,14 @@ fn appendCompactFacts(
     if (capabilities.max_output_tokens) |tokens| try appendTokenFact(alloc, facts, tokens, "output");
     if (capabilities.intrinsic_fast) try appendMetadataFact(alloc, facts, fast_fact);
     if (capabilities.supports_fast_mode) try appendMetadataFact(alloc, facts, fast_mode_fact);
-    if (capabilities.supports_ultrafast_mode) try appendMetadataFact(alloc, facts, ultra_mode_fact);
+    if (capabilities.supports_ultrafast_mode) try appendMetadataFact(alloc, facts, ultrafast_mode_fact);
 }
 
-// A `-fast` model always runs fast, so it reads "Fast". "Fast mode" and "Ultra mode"
+// A `-fast` model always runs fast, so it reads "Fast". "Fast mode" and "Ultrafast mode"
 // name speed options the model offers, so they are not mistaken for a fast model.
 const fast_fact = "Fast";
 const fast_mode_fact = "Fast mode";
-const ultra_mode_fact = "Ultra mode";
+const ultrafast_mode_fact = "Ultrafast mode";
 
 fn compactFactsWidth(capabilities: model_capabilities.Capabilities) usize {
     var width: usize = 0;
@@ -370,7 +370,7 @@ fn compactFactsWidth(capabilities: model_capabilities.Capabilities) usize {
     }
     if (capabilities.supports_ultrafast_mode) {
         if (width > 0) width += display_width.visibleWidth(" · ");
-        width += display_width.visibleWidth(ultra_mode_fact);
+        width += display_width.visibleWidth(ultrafast_mode_fact);
     }
     return width;
 }
@@ -513,7 +513,7 @@ test "model menu renders provider tabs and compact model facts" {
     try std.testing.expect(std.mem.find(u8, title.items, "anthropic/claude-opus-4.8") != null);
     try std.testing.expect(std.mem.find(u8, title.items, "●") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "○") == null);
-    try std.testing.expect(std.mem.find(u8, title.items, "1M context · 128K output · Fast mode · Ultra mode") != null);
+    try std.testing.expect(std.mem.find(u8, title.items, "1M context · 128K output · Fast mode · Ultrafast mode") != null);
     try std.testing.expect(std.mem.find(u8, title.items, "Anthropic") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Current") == null);
     try std.testing.expect(std.mem.find(u8, title.items, "Reasoning") == null);

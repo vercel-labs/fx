@@ -728,7 +728,12 @@ const App = struct {
             },
             .{
                 .provider = launch.modifiers.provider_override,
-                .model = launch.modifiers.model_override orelse launch_profile.model,
+                .model = app_profile_runtime.launchModel(
+                    launch.modifiers.model_override,
+                    launch.modifiers.provider_override != null,
+                    config_runtime.modelEnvOverride(),
+                    launch_profile.model,
+                ),
                 .effort = launch.modifiers.effort_override orelse launch_profile.effort,
                 .fast = launch.modifiers.fast_override,
                 .ultrafast = launch.modifiers.ultrafast_override,

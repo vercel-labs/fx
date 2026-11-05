@@ -929,7 +929,7 @@ pub fn Commands(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "ultrafast",
                         .tone = .warning,
-                        .body = "Ultra mode is unavailable for this model and may increase cost.",
+                        .body = "Ultrafast mode is unavailable for this model and may increase cost.",
                     }, true);
                 }
                 app.shell.render_requests.request(.footer);
