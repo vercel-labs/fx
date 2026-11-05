@@ -648,6 +648,8 @@ const AskContext = struct {
     managed_executions: managed_execution.Runtime,
     ephemeral_command_replay: command_replay_store.EphemeralStore,
     subagent_host: ?*subagent_tool_host.Runtime = null,
+    /// Resolved `experimental.code_mode`: offer `execute` and let it run.
+    code_mode_enabled: bool = false,
     loaded_skills: app_runtime_setup.LoadedSkills = .{},
     v2_store: ?session_adapter.Store = null,
     v2: ?*session_adapter.Session = null,
@@ -1067,6 +1069,7 @@ const AskContext = struct {
         }
         var tc: tool_runtime.Context = .{
             .workspace_root = self.workspace_root,
+            .code_mode_enabled = self.code_mode_enabled,
             .access_scope = self.workspace_access.scope(self.workspace_root),
             .ignored_list_entries = self.cfg.ignored_list_entries,
             .max_list_entries = self.cfg.max_list_entries,
@@ -1843,11 +1846,12 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     }
     try ctx.checkCancellation();
     const session_child_capability = ctx.sessionChildCapability();
+    ctx.code_mode_enabled = startup.code_mode_enabled;
     var tool_projection = try buildAskGatewayToolProjection(alloc, ctx.cfg.mode_registry, options.deps.tool_set, ctx.mode_id, .{
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
-        .code_mode_available = startup.code_mode_enabled and code_mode_sandbox.available,
+        .code_mode_available = ctx.code_mode_enabled and code_mode_sandbox.available,
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 

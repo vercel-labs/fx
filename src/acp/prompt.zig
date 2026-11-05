@@ -506,6 +506,7 @@ const AcpContext = struct {
         var tc: tool_runtime.Context = .{
             .observer = self.observer,
             .workspace_root = self.state.workspace_root,
+            .code_mode_enabled = self.state.code_mode_enabled,
             .access_scope = self.state.workspace_access.scope(self.state.workspace_root),
             .ignored_list_entries = self.state.cfg.ignored_list_entries,
             .max_list_entries = self.state.cfg.max_list_entries,

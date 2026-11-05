@@ -367,6 +367,7 @@ pub fn Runtime(comptime App: type) type {
                 provider_set.Bundle.Capabilities{};
             var ctx: tool_runtime.Context = .{
                 .workspace_root = workspace.root,
+                .code_mode_enabled = if (comptime @hasField(App, "code_mode_enabled")) app.code_mode_enabled else false,
                 .access_scope = workspace.access_scope,
                 .ignored_list_entries = ignored_list_entries,
                 .max_list_entries = max_list_entries,
