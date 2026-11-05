@@ -523,8 +523,9 @@ fn fuzzMenu(_: void, smith: *std.testing.Smith) anyerror!void {
     // One opening and one closing tag, whatever the entries say.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, "<toolbox>"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, "</toolbox>"));
-    // Escaping at most multiplies each input byte by six.
-    try std.testing.expect(first.len <= intro.len + 256 + 8 * input.len);
+    // Escaping at most multiplies each input byte by six. The fixed text is
+    // the intro and, when the menu lists an MCP server, the `fx mcp call` hint.
+    try std.testing.expect(first.len <= intro.len + mcp_call_hint.len + 256 + 8 * input.len);
 }
 
 test "toolbox menu stays bounded and well formed on fuzzed entries" {
