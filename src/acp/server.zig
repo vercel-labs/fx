@@ -342,6 +342,8 @@ pub const ServerState = struct {
     max_tool_result_bytes: usize = 64 * 1024,
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
+    /// The built-in tools offered through toolbox, fixed for the server.
+    toolbox_behind: config_runtime.tool_placement.Behind = config_runtime.tool_placement.behindToolbox(.{}, &.{}),
     fast_mode: bool = false,
     ultrafast_mode: bool = false,
     configured_ultrafast_mode: bool = false,
@@ -3004,6 +3006,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.auto_compact_percent = startup.auto_compact_percent;
     state.context_limits = startup.context_limits;
     state.context_limits.applyCommandLine(state.cfg.context_limit_overrides);
+    state.toolbox_behind = config_runtime.tool_placement.behindToolbox(startup.tool_placement, state.cfg.tool_placement_overrides);
     state.fast_mode = startup.fast_mode and
         (state.cfg.model_override == null or startup.fast_mode_source != .compiled_default);
     configureUltrafastStartup(state, &startup);

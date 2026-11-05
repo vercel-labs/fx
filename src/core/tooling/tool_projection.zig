@@ -1,4 +1,5 @@
 const std = @import("std");
+const toolbox = @import("toolbox.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const profiles = @import("../profiles/profiles.zig");
 const model_tool_schema = @import("model_tool_schema.zig");
@@ -15,6 +16,8 @@ pub const Options = struct {
     subagent_available: bool = false,
     /// Profiles main can start a subagent in, listed beside the `subagent` tool.
     subagent_profiles: []const profiles.Entry = &.{},
+    /// Built-in tools fx lists in the toolbox menu instead of sending.
+    behind_toolbox: []const []const u8 = &toolbox.default_behind,
 };
 
 /// The longest profile description shown to the model, on one line.
@@ -528,16 +531,17 @@ fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, ki
     errdefer guidance_out.deinit();
 
     var first_custom_guidance = true;
+    const offers_toolbox = toolboxOffered(tool_set, kind, options);
 
     for (tool_set.order) |tool_name| {
         const tool = tool_set.registry.lookup(tool_name) orelse continue;
-        try appendBuiltinTool(alloc, &advertised_names, &advertised_functions, &guidance_out.writer, &first_custom_guidance, tool.*, kind, tool_set, options);
+        try appendBuiltinTool(alloc, &advertised_names, &advertised_functions, &guidance_out.writer, &first_custom_guidance, tool.*, kind, tool_set, options, offers_toolbox);
     }
 
     if (kind == .full) {
         for (tool_set.registry.tools) |tool| {
             if (isCanonicalToolName(tool_set, tool.name)) continue;
-            try appendBuiltinTool(alloc, &advertised_names, &advertised_functions, &guidance_out.writer, &first_custom_guidance, tool, kind, tool_set, options);
+            try appendBuiltinTool(alloc, &advertised_names, &advertised_functions, &guidance_out.writer, &first_custom_guidance, tool, kind, tool_set, options, offers_toolbox);
         }
     }
 
@@ -552,6 +556,16 @@ fn buildToolProjection(alloc: Allocator, tool_set: tool_set_contract.ToolSet, ki
         .custom_guidance = custom_guidance,
     };
 }
+/// Whether this projection sends toolbox, so the tools it replaces and the
+/// ones behind it stay out. Without it they're the only way to reach skills
+/// and MCP tools, so they're sent as before.
+fn toolboxOffered(tool_set: tool_set_contract.ToolSet, kind: BuildKind, options: Options) bool {
+    const tool = tool_set.registry.lookup(toolbox.tool_name) orelse return false;
+    if (!tool.model_visible or !includeBuiltinForKind(tool.name, kind, tool_set)) return false;
+    if (options.permission_mode != .yolo and permissions.rulesDenyAllTargetsForTool(options.permission_rules, tool.name)) return false;
+    return true;
+}
+
 fn appendBuiltinTool(
     alloc: Allocator,
     advertised_names: *std.ArrayList([]const u8),
@@ -562,10 +576,14 @@ fn appendBuiltinTool(
     kind: BuildKind,
     tool_set: tool_set_contract.ToolSet,
     options: Options,
+    offers_toolbox: bool,
 ) !void {
     if (!tool.model_visible) return;
     if (!includeBuiltinForKind(tool.name, kind, tool_set)) return;
     if (std.mem.eql(u8, tool.name, "subagent") and !options.subagent_available) return;
+    // toolbox opens and runs these, so they stay out of the tools list
+    // (`tests/tla/toolbox/Toolbox.tla` ToolsFixed).
+    if (offers_toolbox and (toolbox.isReplaced(tool.name) or toolNameInSet(options.behind_toolbox, tool.name))) return;
     if (std.mem.eql(u8, tool.name, "vision")) return;
     if (options.permission_mode != .yolo) {
         if (tool.provider_executed and !providerExecutionIsAllowed(tool.name, options.permission_rules)) return;
@@ -798,6 +816,32 @@ test "base tool projection includes MCP discovery and explicit selection" {
     defer projection.deinit(alloc);
     try expectContainsName(projection.advertised_names, "capability_search");
     try expectContainsName(projection.advertised_names, "mcp_select_tool");
+}
+
+const test_toolbox = blk: {
+    var spec = test_skill;
+    spec.name = "toolbox";
+    spec.description = "Test toolbox.";
+    spec.model_schema = .{ .name = "toolbox", .description = spec.description };
+    spec.model_visible = true;
+    break :blk spec;
+};
+
+test "a projection that sends toolbox leaves out the tools it replaces and the ones behind it" {
+    const alloc = std.testing.allocator;
+    const tools = test_all_tools ++ [_]tool_dispatch.Tool{test_toolbox};
+    const order = test_order ++ [_][]const u8{"toolbox"};
+    const set = tool_set_contract.ToolSet{
+        .registry = .{ .tools = &tools },
+        .order = &order,
+        .read_only_tool_names = test_read_only_names[0..],
+    };
+    var projection = try buildModelToolProjectionForSet(alloc, set, .{});
+    defer projection.deinit(alloc);
+    try expectContainsName(projection.advertised_names, "toolbox");
+    for ([_][]const u8{ "capability_search", "mcp_select_tool", "skill", "install_skill" }) |name| {
+        try expectNotContainsName(projection.advertised_names, name);
+    }
 }
 
 test "subagent and shell selection follow host capability" {

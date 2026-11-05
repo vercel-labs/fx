@@ -1,4 +1,5 @@
 const std = @import("std");
+const toolbox = @import("../core/tooling/toolbox.zig");
 const acp_types = @import("types.zig");
 const server = @import("server.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
@@ -57,6 +58,17 @@ pub fn describeToolTitle(registry: tool_dispatch.Registry, arena: Allocator, cal
         return arena.print("{s}", .{presentation.action_label});
     }
     return arena.print("{s}", .{call.name});
+}
+
+/// The call an editor is shown for `call`: for a toolbox run, the tool it
+/// runs with that tool's arguments, under the toolbox call's id; any other
+/// call as it is. Opening and searching show as toolbox, an internal tool.
+pub fn shownCall(arena: Allocator, call: ToolCall) Allocator.Error!ToolCall {
+    const run = (try toolbox.carriedCall(arena, call.name, call.arguments_json)) orelse return call;
+    var shown = call;
+    shown.name = run.name;
+    shown.arguments_json = run.arguments_json;
+    return shown;
 }
 
 pub const ToolCallPresentation = struct {

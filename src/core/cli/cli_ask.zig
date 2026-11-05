@@ -1,4 +1,5 @@
 const std = @import("std");
+const toolbox = @import("../tooling/toolbox.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const std_builtin = @import("builtin");
@@ -51,7 +52,6 @@ const output_contracts = @import("../output/output_contracts.zig");
 const mcp_elicitation_interaction = @import("../mcp/elicitation_interaction.zig");
 const mcp_elicitation = @import("../mcp/elicitation.zig");
 const mcp_access_policy = @import("../mcp/access_policy.zig");
-const mcp_model_catalog = @import("../mcp/model_catalog.zig");
 const mcp_host = @import("../mcp_host/host.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
@@ -263,6 +263,7 @@ pub const Config = struct {
     mode_registry: mode_registry.Registry,
     load_mcp_host: ?mcp_host.LoadFn = null,
     context_limit_overrides: []const config_runtime.context_limits.Override = &.{},
+    tool_placement_overrides: []const config_runtime.tool_placement.Override = &.{},
     additional_directories: []const []const u8 = &.{},
     saved_directories_suppressed: bool = false,
 };
@@ -283,10 +284,12 @@ fn runAskChild(
             .permission_mode = admission.permission_mode,
             .permission_rules = admission.rules,
             .subagent_available = true,
+            .behind_toolbox = ctx.toolbox_behind.slice(),
         },
     ) catch return error.OutOfMemory;
     defer child_projection.deinit(ctx.alloc);
     return subagent_agent_adapter.run(.{
+        .toolbox_behind = ctx.toolbox_behind.slice(),
         .host = ctx.subagent_host orelse return error.ProviderFailed,
         .tool_context = ctx.toolContext(),
         .provider_set = ctx.cfg.provider_set,
@@ -617,6 +620,8 @@ const AskContext = struct {
     max_tool_result_bytes: usize = 64 * 1024,
     auto_compact_percent: u8 = compactor.default_percent,
     context_limits: config_runtime.context_limits.Values = .{},
+    /// The built-in tools offered through toolbox, fixed for the run.
+    toolbox_behind: config_runtime.tool_placement.Behind = config_runtime.tool_placement.behindToolbox(.{}, &.{}),
     fast_mode: bool = false,
     /// Profile preference used only when creating a new durable session.
     /// Process and CLI overrides remain per-run and never rewrite this value.
@@ -1640,6 +1645,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
     ctx.auto_compact_percent = startup.auto_compact_percent;
     ctx.context_limits = startup.context_limits;
     ctx.context_limits.applyCommandLine(cfg.context_limit_overrides);
+    ctx.toolbox_behind = config_runtime.tool_placement.behindToolbox(startup.tool_placement, cfg.tool_placement_overrides);
     ctx.fast_mode = startup.fast_mode;
     ctx.persisted_ultrafast_mode = startup.configured_ultrafast_mode;
     ctx.ultrafast_mode = startup.ultrafast_mode;
@@ -1823,6 +1829,7 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         .permission_mode = ctx.permission_mode,
         .permission_rules = ctx.permission_rules,
         .subagent_available = ctx.subagent_host != null,
+        .behind_toolbox = ctx.toolbox_behind.slice(),
     }, session_child_capability != null);
     defer tool_projection.deinit(alloc);
 
@@ -1868,10 +1875,15 @@ fn runPromptInternal(alloc: Allocator, prompt: []const u8, permission_override: 
         options.save_session and ctx.requested_resume == null,
     );
     defer if (title_task) |task| completeAskTitleTask(&ctx, task);
+    var toolbox_arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer toolbox_arena_state.deinit();
+    const toolbox_mcp_servers = try toolboxMcpServerNames(toolbox_arena_state.allocator(), &ctx);
     const turn_config: agent_runtime.Config = .{
         .system_prompt = cfg.prompt_policy.system_prompt,
         .model_prompt_overlay = cfg.prompt_policy.modelPromptOverlay(ctx.model),
         .skill_catalog = .{ .skills = loaded_skills.skills, .diagnostics = loaded_skills.diagnostics },
+        .toolbox_mcp_servers = toolbox_mcp_servers,
+        .toolbox_behind = ctx.toolbox_behind.slice(),
         .gateway_retry_count = cfg.gateway_retry_count,
         .gateway_chat_url = cfg.gateway_chat_url,
         .advertised_tool_names = tool_projection.advertised_names,
@@ -2297,16 +2309,15 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Arr
     try ctx.deps.context_registry.appendDefaultStatic(.{
         .project_context = ctx.modelVisibleProjectContext(),
     }, arena, messages);
-    var snapshot = if (ctx.mcp_host) |h|
-        try h.catalog.modelSnapshot(arena)
-    else
-        try mcp_model_catalog.Snapshot.empty(arena);
-    defer snapshot.deinit(arena);
-    const section = try mcp_model_catalog.render(arena, snapshot);
-    if (section.text.len > 0) {
-        try messages.append(arena, .{ .role = .system, .content = section.text });
-    }
-    if (section.notice) |notice| try pushContextNotice(raw_ctx, notice);
+    // The toolbox menu lists the MCP servers (toolboxMcpServerNames), so
+    // there is no MCP block here.
+}
+
+/// The configured MCP servers by name, for the toolbox menu. The names are
+/// allocated in `arena`.
+fn toolboxMcpServerNames(arena: Allocator, ctx: *AskContext) ![]const []const u8 {
+    const live_host = ctx.mcp_host orelse return &.{};
+    return live_host.catalog.serverNames(arena);
 }
 
 fn snapshotMcpDefinition(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding) !tool_mcp_runtime.DefinitionSnapshot {
@@ -2815,7 +2826,14 @@ fn appendToolCallRecord(
     ctx.tool_call_records_mutex.lockUncancelable(io_mod.getIo());
     defer ctx.tool_call_records_mutex.unlock(io_mod.getIo());
 
-    const name = try ctx.alloc.dupe(u8, call.name);
+    // A toolbox run reports the tool that ran, so a script reading the JSON
+    // sees mcp_linear_create_issue, not toolbox.
+    var run_target_buffer: [16 * 1024]u8 = undefined;
+    const reported_name = if (std.mem.eql(u8, call.name, toolbox.tool_name))
+        toolbox.runTarget(call.arguments_json, &run_target_buffer) orelse call.name
+    else
+        call.name;
+    const name = try ctx.alloc.dupe(u8, reported_name);
     errdefer ctx.alloc.free(name);
     const owned_status = try ctx.alloc.dupe(u8, status);
     errdefer ctx.alloc.free(owned_status);
@@ -4802,15 +4820,15 @@ const TestContextRegistryFixture = struct {
             transient_permission_mode orelse return error.TestExpectedEqual,
         );
 
+        // The toolbox menu lists the MCP servers, so no MCP block follows
+        // the static context.
         if (expected_static_context) |expected_static| {
-            try std.testing.expectEqual(@as(usize, 3), messages.items.len);
-            try std.testing.expectEqualStrings(expected_static, messages.items[0].content.?);
-            try std.testing.expect(std.mem.find(u8, messages.items[1].content.?, "<mcp_servers>") != null);
-            try std.testing.expectEqualStrings(test_registry_transient_context, messages.items[2].content.?);
-        } else {
             try std.testing.expectEqual(@as(usize, 2), messages.items.len);
-            try std.testing.expect(std.mem.find(u8, messages.items[0].content.?, "<mcp_servers>") != null);
+            try std.testing.expectEqualStrings(expected_static, messages.items[0].content.?);
             try std.testing.expectEqualStrings(test_registry_transient_context, messages.items[1].content.?);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+            try std.testing.expectEqualStrings(test_registry_transient_context, messages.items[0].content.?);
         }
 
         try testPushAssistantText(deps, "assistant text");

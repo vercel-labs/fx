@@ -1190,11 +1190,8 @@ const scenarios: Scenario[] = [
         toolName: DYNAMIC_MCP_TOOL_NAME,
         input,
         actions: [
-          {
-            toolName: "mcp_select_tool",
-            input: { name: DYNAMIC_MCP_TOOL_NAME },
-          },
-          { toolName: DYNAMIC_MCP_TOOL_NAME, input },
+          { toolName: "toolbox", input: { open: DYNAMIC_MCP_TOOL_NAME } },
+          { toolName: "toolbox", input: { run: DYNAMIC_MCP_TOOL_NAME, arguments: input } },
         ],
         effectPath,
         expectedExecutionStarts: 2,
@@ -1241,11 +1238,8 @@ const scenarios: Scenario[] = [
         toolName: DYNAMIC_MCP_TOOL_NAME,
         input,
         actions: [
-          {
-            toolName: "mcp_select_tool",
-            input: { name: DYNAMIC_MCP_TOOL_NAME },
-          },
-          { toolName: DYNAMIC_MCP_TOOL_NAME, input },
+          { toolName: "toolbox", input: { open: DYNAMIC_MCP_TOOL_NAME } },
+          { toolName: "toolbox", input: { run: DYNAMIC_MCP_TOOL_NAME, arguments: input } },
         ],
         effectPath,
         expectedExecutionStarts: 2,

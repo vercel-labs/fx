@@ -26,6 +26,7 @@ const shell_impl = @import("../tools/shell/shell.zig");
 const install_skill_impl = @import("../tools/skills/install_skill.zig");
 const skill_impl = @import("../tools/skills/skill.zig");
 const capability_search_impl = @import("../tools/capabilities/capability_search.zig");
+const toolbox_impl = @import("../tools/capabilities/toolbox.zig");
 const web_fetch_impl = @import("../tools/web/fetch.zig");
 const web_search_impl = @import("../tools/web/search.zig");
 
@@ -124,6 +125,46 @@ const shell_process_properties = [_]model_tool_schema.Property{
 
 const skill_description =
     "Load an installed skill's instructions, or one of its files. Paths a skill mentions are relative to the skill, not the workspace.";
+pub const toolbox = ToolSpec{
+    .name = "toolbox",
+    // Opening and searching are fx's own work; a run shows as the tool it
+    // runs (`src/acp/tool_call_presentation.zig` shownCall).
+    .internal = true,
+    .description = toolbox_description,
+    .model_schema = .{
+        .name = "toolbox",
+        .description = toolbox_description,
+        .input_schema = .{
+            .properties = &.{
+                .{ .name = "open", .json_type = .string, .description = "A skill, MCP server, or tool from the toolbox list, to read its instructions, tools, or arguments." },
+                .{ .name = "resource", .json_type = .string, .description = "A file inside the skill you open, such as template.md." },
+                .{ .name = "offset", .json_type = .integer, .description = "Where to continue a skill file whose last result gave next_offset." },
+                .{ .name = "run", .json_type = .string, .description = "A tool's exact name, to run it." },
+                .{ .name = "arguments", .json_type = .object, .description = "The tool's arguments, for run." },
+                .{ .name = "search", .json_type = .string, .description = "What you need, to find a skill or tool the list doesn't show." },
+                .{ .name = "server", .json_type = .string, .description = "With search, an MCP server from the list to search alone." },
+            },
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .toolbox,
+    .activity_kind = .read,
+    .requires_approval = false,
+    // Before its arguments arrive, a toolbox call may open, run, or search.
+    .action_label = "Using",
+    .completed_action_label = "Used",
+    .label_arg_kind = .none,
+    .label_arg_default = "toolbox",
+    .presentation_fn = toolbox_impl.presentation,
+    .permission_target_kind = .none,
+    .decode = toolbox_impl.decode,
+    .validate = toolbox_impl.validate,
+    .call = toolbox_impl.call,
+    .reads_only_fn = toolbox_impl.readsOnly,
+    .irreversible_fn = toolbox_impl.isIrreversible,
+};
+const toolbox_description =
+    "Open, run, or search the skills, MCP servers, and tools in the toolbox list. Pass exactly one of open, run, or search.";
 const capability_search_description =
     "Search installed skills and configured MCP tools for a capability. Matching MCP tools become callable on your next step.";
 const install_skill_description =
@@ -746,6 +787,7 @@ pub const all = [_]tool_dispatch.Tool{
     ask_user_question,
     vision,
     read_tool_result,
+    toolbox,
 };
 
 /// fx's own tools. libfx's Node-API addon never runs them, because its agents
@@ -824,10 +866,7 @@ pub const advertisement_order = [_][]const u8{
     "write_file",
     "shell",
     "subagent",
-    "capability_search",
-    "skill",
-    "install_skill",
-    "mcp_select_tool",
+    "toolbox",
     "ask_user_question",
     "web_fetch",
     "web_search",
@@ -902,7 +941,7 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "fa5ea19713da7e191bbfbc243c5fbe05d6289bfafb68380e7ca344314382abcb"
+            "87b62ba1f5afbdaa0ebb548914fd7fa129904c51462621635d193075d234910a"
         else
             "241f636fc291b72210c79acc9a55c9f9d3a2e88b9a91f16d9b8a0170552ea971",
         &actual_hex,
@@ -970,6 +1009,7 @@ test "built-in tools register exact active local order" {
         "ask_user_question",
         "vision",
         "read_tool_result",
+        "toolbox",
     };
 
     try std.testing.expectEqual(expected_names.len, all.len);
@@ -1819,4 +1859,22 @@ test "production registry keeps vision route-filtered from ordinary projections"
     inline for (&.{ &full, &read_only }) |projection| {
         try std.testing.expect(!tool_projection.containsName(projection.advertised_names, "vision"));
     }
+}
+
+test "every built-in tool but toolbox, the tools it replaces, and vision can move" {
+    const tool_placement = @import("../core/config/tool_placement.zig");
+    const toolbox_core = @import("../core/tooling/toolbox.zig");
+    for (all) |tool| {
+        const fixed = std.mem.eql(u8, tool.name, toolbox_core.tool_name) or
+            toolbox_core.isReplaced(tool.name) or
+            std.mem.eql(u8, tool.name, vision.name);
+        try std.testing.expectEqual(!fixed, tool_placement.Tool.parse(tool.name) != null);
+    }
+    inline for (@typeInfo(tool_placement.Tool).@"enum".field_names) |name| {
+        const found = for (all) |tool| {
+            if (std.mem.eql(u8, tool.name, name)) break true;
+        } else false;
+        try std.testing.expect(found);
+    }
+    for (toolbox_core.default_behind) |name| try std.testing.expect(tool_placement.Tool.parse(name) != null);
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const toolbox = @import("../../tooling/toolbox.zig");
 const testing_allocator = @import("../../shared/testing_allocator.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const managed_execution = @import("../../execution/managed_execution.zig");
@@ -140,14 +141,19 @@ pub const ProvisionalToolStatuses = struct {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const is_skill = std.mem.eql(u8, tool_name, "skill");
-        var observed_label = if (is_skill) null else label_value;
+        // A skill call's row changes only to read a resource. A toolbox
+        // call's row, once its arguments arrive, reads as what it opens,
+        // runs, or searches, since the first string in them may be any of
+        // those.
+        const is_toolbox = std.mem.eql(u8, tool_name, toolbox.tool_name);
+        var observed_label = if (is_skill or is_toolbox) null else label_value;
         var observed_kind = activity_kind;
-        const resource_label: ?[]const u8 = if (is_skill) resource: {
+        const argument_label: ?[]const u8 = if (is_skill or is_toolbox) resource: {
             const json = arguments_json orelse break :resource null;
             const args = tool_args.parseToolArgsObject(scratch.allocator(), json) catch break :resource null;
             const spec = hooks.tool_registry.lookup(tool_name) orelse break :resource null;
             const presentation = tool_dispatch.presentationForArgs(spec.*, args);
-            if (presentation.label_arg_kind != .resource) break :resource null;
+            if (!is_toolbox and presentation.label_arg_kind != .resource) break :resource null;
             const value = tool_dispatch.presentationLabelValue(presentation, args) orelse break :resource null;
             const encoded = text_utils.encodeTerminalSafe(scratch.allocator(), value, buf.len) catch break :resource null;
             if (encoded.truncated) break :resource null;
@@ -156,7 +162,7 @@ pub const ProvisionalToolStatuses = struct {
             observed_kind = presentation.activity_kind;
             break :resource formatted;
         } else null;
-        const label = resource_label orelse try formatProvisionalProgressLabel(&buf, action_label, observed_label);
+        const label = argument_label orelse try formatProvisionalProgressLabel(&buf, action_label, observed_label);
         const recorded = try self.recordTracked(
             alloc,
             tool_id,
@@ -1481,11 +1487,10 @@ fn failureStatusDetail(
         return if (encoded.bytes.len == 0) detail else encoded.bytes;
     }
 
-    if (safe_result.len == 0 or
-        !containsName(advertised_dynamic_tool_names, call.name))
-    {
-        return null;
-    }
+    // An MCP call shows why it failed, made directly or through toolbox.
+    const mcp_call = containsName(advertised_dynamic_tool_names, call.name) or
+        if (try toolbox.carriedCall(arena, call.name, call.arguments_json)) |run| std.mem.startsWith(u8, run.name, "mcp_") else false;
+    if (safe_result.len == 0 or !mcp_call) return null;
     const detail = try mcpFailureEnvelopeText(arena, safe_result) orelse safe_result;
     const masked_detail = try text_utils.maskSecrets(arena, detail);
     const encoded = try text_utils.encodeTerminalSafeInline(arena, masked_detail, 256);
@@ -1671,6 +1676,7 @@ const test_tools = [_]tool_dispatch.Tool{
     test_builtin_tools.shell,
     test_builtin_tools.ask_user_question,
     test_builtin_tools.skill,
+    test_builtin_tools.toolbox,
 };
 const test_tool_registry = tool_dispatch.Registry{ .tools = test_tools[0..] };
 const custom_activity_tool = blk: {
@@ -2036,6 +2042,38 @@ test "provisional skill labels select complete resource arguments and ignore opa
         try std.testing.expectEqualStrings(expected, capture.events.items[1].progress.text);
         if (case.resource) |resource| {
             try std.testing.expectEqualStrings(resource, statuses.tracked.items[0].label_value.?);
+        } else {
+            try std.testing.expect(statuses.tracked.items[0].label_value == null);
+        }
+    }
+}
+
+test "provisional toolbox labels read as what the call opens, runs, or searches" {
+    // The stream's hint is the first string in the arguments, which may name
+    // what a run runs or what a search looks for, so it never labels the row.
+    const cases = [_]struct { arguments_json: ?[]const u8, label: []const u8, value: ?[]const u8 = null }{
+        .{ .arguments_json = null, .label = "Using" },
+        .{ .arguments_json = "{\"run\":\"glob", .label = "Using" },
+        .{ .arguments_json = "{}", .label = "Using" },
+        .{ .arguments_json = "{\"run\":\"glob_files\",\"arguments\":{\"pattern\":\"*.md\"}}", .label = "Running", .value = "glob_files" },
+        .{ .arguments_json = "{\"run\":\"mcp_fixture_echo\",\"arguments\":{}}", .label = tooling_presentation.mcp_running_label, .value = "mcp_fixture_echo" },
+        .{ .arguments_json = "{\"search\":\"list files\"}", .label = "Searching toolbox", .value = "list files" },
+        .{ .arguments_json = "{\"open\":\"fixture\"}", .label = "Opening", .value = "fixture" },
+    };
+    const alloc = std.testing.allocator;
+    for (cases) |case| {
+        var capture = ProvisionalStatusTestCapture{ .alloc = alloc };
+        defer capture.deinit();
+        const hooks = capture.hooks();
+        var statuses = ProvisionalToolStatuses{};
+        defer statuses.deinit(alloc);
+        try statuses.publish(&hooks, alloc, 7, "toolbox_1", toolbox.tool_name, .read, eligibleActionLabel(toolbox.tool_name), "glob_files", case.arguments_json);
+        try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+        var expected_buf: [512]u8 = undefined;
+        const expected = try formatProvisionalProgressLabel(&expected_buf, case.label, case.value);
+        try std.testing.expectEqualStrings(expected, capture.events.items[1].progress.text);
+        if (case.value) |value| {
+            try std.testing.expectEqualStrings(value, statuses.tracked.items[0].label_value.?);
         } else {
             try std.testing.expect(statuses.tracked.items[0].label_value == null);
         }

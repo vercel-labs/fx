@@ -10,6 +10,7 @@
 //! outside the repository, so it cannot read the user's other files.
 
 const std = @import("std");
+const toolbox = @import("../tooling/toolbox.zig");
 const types = @import("../shared/types.zig");
 const io_mod = @import("../shared/io.zig");
 const pathing = @import("../workspace/pathing.zig");
@@ -245,7 +246,16 @@ pub fn parse(
 /// no tools allows every one, leaving its parent's in place.
 pub fn allowsTool(profile: *const Profile, tool: []const u8) bool {
     const tools = profile.tools orelse return true;
-    return listAllows(tools, tool, false);
+    if (listAllows(tools, tool, false)) return true;
+    // A profile written for the tools toolbox replaces keeps what they gave:
+    // toolbox reaches its skills and MCP tools now. What toolbox runs is
+    // still decided against the profile, call by call.
+    if (std.mem.eql(u8, tool, toolbox.tool_name)) {
+        for (toolbox.replaced ++ toolbox.default_behind) |name| {
+            if (listAllows(tools, name, false)) return true;
+        }
+    }
+    return false;
 }
 
 pub fn allowsMcpServer(profile: *const Profile, server: []const u8) bool {

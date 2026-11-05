@@ -417,8 +417,8 @@ fn callAdvertisedDynamicTool(
 }
 pub fn notSelectedOutput(arena: Allocator, name: []const u8) ![]const u8 {
     return arena.print(
-        "Dynamic MCP tool not selected for this model step: {s}. Use capability_search or mcp_select_tool to load its definition; the selected tool can be called on the next model step after its schema is advertised.",
-        .{name},
+        "{s} is not one of the tools in this request. Open it with toolbox to see its arguments, then call toolbox with run: \"{s}\" and those arguments.",
+        .{ name, name },
     );
 }
 test "MCP advertised dynamic tool executes only through its supplied capability" {

@@ -981,6 +981,16 @@ pub const ToolCall = struct {
     /// command whose saved output a `read_tool_result` call reads. Borrowed
     /// only for this action. Copies and durable/provider encodings omit it.
     resolved_display_target: ?[]const u8 = null,
+    /// The tool the model called when this is the call a `toolbox {run}`
+    /// carries: fx prepares, admits, and runs this call, and its result goes
+    /// back under that name. Borrowed only for this action. Copies and
+    /// durable/provider encodings omit it.
+    carried_by: ?[]const u8 = null,
+
+    /// The name the model called, which this call's result goes back under.
+    pub fn calledName(self: ToolCall) []const u8 {
+        return self.carried_by orelse self.name;
+    }
 };
 
 pub const WebSearchProgress = union(enum) {

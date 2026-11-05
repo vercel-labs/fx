@@ -109,11 +109,20 @@ pub fn call(
     erased: tool_dispatch.ToolInput,
 ) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(Input);
+    return search(ctx, input.request());
+}
+
+/// Searches skills and MCP tools for `request`, which capability_search and
+/// toolbox search both answer with. A request that loads schemas reports the
+/// MCP tools it loaded as selected for the next step.
+pub fn search(
+    ctx: tool_dispatch.DispatchContext,
+    request: capability_retrieval.Request,
+) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const output_cap = @min(
         ctx.max_tool_result_bytes,
         result_store.large_result_threshold_bytes,
     );
-    const request = input.request();
     const searches_skills = request.includes(.skill);
     const searches_mcp = request.includes(.mcp);
     const domain_cap = if (searches_skills and searches_mcp and output_cap > 512)

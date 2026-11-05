@@ -15,6 +15,7 @@ const model_preferences = @import("model_preferences.zig");
 const configured_provider = @import("configured_provider.zig");
 const update_target = @import("../upgrade/update_target.zig");
 pub const context_limits = @import("context_limits.zig");
+pub const tool_placement = @import("tool_placement.zig");
 
 const Allocator = std.mem.Allocator;
 const max_settings_bytes: usize = 64 * 1024;
@@ -52,6 +53,8 @@ pub const Settings = struct {
     /// compaction starts. Profile-only.
     auto_compact_percent: ?u8 = null,
     context_limits: context_limits.Overrides = .{},
+    /// Where built-in tools are offered, by tool. Profile-only.
+    tool_placement: tool_placement.Overrides = .{},
     first_call_tool_choice: ?types.ToolChoice = null,
     context: ?bool = null,
     fast_mode: ?bool = null,
@@ -187,6 +190,12 @@ pub const ProviderModelSources = struct {
     }
 };
 
+/// The built-in tools behind toolbox for a run: the defaults, then the
+/// profile with this folder's entry over it, then `--tool-placement`.
+pub fn resolveToolPlacement(settings: *const Settings, command_line: []const tool_placement.Override) tool_placement.Behind {
+    return tool_placement.behindToolbox(settings.tool_placement, command_line);
+}
+
 pub fn resolveContextLimits(settings: *const Settings, command_line: []const context_limits.Override) context_limits.Values {
     var values = context_limits.Values{};
     values.apply(settings.context_limits);
@@ -218,6 +227,7 @@ pub const ConfigDiagnosticCause = enum {
     manual_backup_available,
     retired_skill_match_fuzzy,
     invalid_context_limits,
+    invalid_tool_placement,
     invalid_additional_directories,
     invalid_skill_symlink_authorities,
     invalid_ultrafast_mode_override,
@@ -257,6 +267,9 @@ pub fn writeDiagnosticMetadata(writer: *std.Io.Writer, diagnostic: ConfigDiagnos
     }
     if (diagnostic.cause == .invalid_context_limits) {
         try writer.writeAll("; context_limits keys must be documented limit names with a non-negative integer or \"off\" value");
+    }
+    if (diagnostic.cause == .invalid_tool_placement) {
+        try writer.writeAll("; tool_placement keys must be built-in tools that can move (" ++ tool_placement.movable_list ++ ") with the value \"toolbox\" or \"direct\"");
     }
     if (diagnostic.cause == .invalid_additional_directories) {
         try writer.print(
@@ -991,6 +1004,10 @@ fn diagnosticCauseForParseError(err: anyerror) ConfigDiagnosticCause {
         error.UnknownContextLimit,
         error.InvalidContextLimitValue,
         => .invalid_context_limits,
+        error.InvalidToolPlacementType,
+        error.UnknownToolPlacementTool,
+        error.InvalidToolPlacementValue,
+        => .invalid_tool_placement,
         error.InvalidSkillSymlinkAuthorities => .invalid_skill_symlink_authorities,
         else => .malformed_settings,
     };
@@ -1751,6 +1768,10 @@ fn parseProfileOnlyFields(
         settings.context_limits = try context_limits.parseJsonObject(context_limits_value);
     }
 
+    if (root.object.get("tool_placement")) |tool_placement_value| {
+        settings.tool_placement = try tool_placement.parseJsonObject(tool_placement_value);
+    }
+
     if (root.object.get("first_call_tool_choice")) |first_call_tool_choice_value| {
         const value = first_call_tool_choice_value;
         if (value != .string) return error.InvalidFirstCallToolChoiceType;
@@ -2032,6 +2053,7 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
     if (incoming.max_tool_result_bytes) |value| target.max_tool_result_bytes = value;
     if (incoming.auto_compact_percent) |value| target.auto_compact_percent = value;
     target.context_limits.merge(incoming.context_limits);
+    target.tool_placement.merge(incoming.tool_placement);
     if (incoming.first_call_tool_choice) |value| target.first_call_tool_choice = value;
     if (incoming.context) |value| target.context = value;
     if (incoming.fast_mode) |value| target.fast_mode = value;

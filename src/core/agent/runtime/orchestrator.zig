@@ -1,4 +1,6 @@
 const std = @import("std");
+const sort_utils = @import("../../shared/sort_utils.zig");
+const toolbox = @import("../../tooling/toolbox.zig");
 const testing_allocator = @import("../../shared/testing_allocator.zig");
 const skill_runtime = @import("../../skills/skill_runtime.zig");
 const skill_contract = @import("../../skills/skill_contract.zig");
@@ -2609,6 +2611,62 @@ fn advertiseUnselectedMcpCalls(
         advertised_names.* = names;
         debug_trace.logf("mcp", "loaded unselected MCP tool for direct call tool={s}", .{call.name});
     }
+}
+
+/// The call a `toolbox {run}` carries, which fx prepares, admits, and runs as
+/// the agent's own direct call of it, so a run meets every check a direct
+/// call does (`tests/tla/toolbox/Toolbox.tla` RunNeedsAdmission): the call of
+/// `run` with the toolbox call's id and its `arguments`, whose result goes
+/// back under toolbox (`ToolCall.carried_by`). An MCP tool the request didn't
+/// send is admitted for this step only, in `advertised_tools` and
+/// `advertised_names`, and never joins the tools fx sends (ToolsFixed). Null
+/// when the call isn't a valid toolbox run, or names toolbox itself, a host's
+/// own tool, or nothing fx can find now; that call stays a toolbox run, whose
+/// result says why.
+fn toolboxRunSubject(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    call: ToolCall,
+    advertised_tools: *[]const agent_stream_provider.DynamicFunctionTool,
+    advertised_names: *[][]const u8,
+) !?ToolCall {
+    if (!std.mem.eql(u8, call.name, toolbox.tool_name) or call.argument_integrity != .valid) return null;
+    const run = (try toolbox.carriedCall(arena, call.name, call.arguments_json)) orelse return null;
+    if (std.mem.eql(u8, run.name, toolbox.tool_name)) return null;
+    var subject = call;
+    subject.name = run.name;
+    subject.arguments_json = run.arguments_json;
+    subject.carried_by = call.name;
+    if (deps.tool_registry.lookup(run.name)) |spec| {
+        // A host's own tool is called directly: a durable session reruns it
+        // by its name after a crash, under the host's rerun policy.
+        return if (spec.executor_kind == .host) null else subject;
+    }
+    for (advertised_tools.*) |tool| {
+        if (std.mem.eql(u8, tool.name, run.name)) return if (tool.mcp_binding != null) subject else null;
+    }
+    const resolve = deps.resolve_unselected_mcp_tool orelse return null;
+    const resolved = resolve(deps.ctx, arena, run.name) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("toolbox", "run lookup failed call={s} tool={s} err={s}", .{ call.id, run.name, @errorName(err) });
+            return null;
+        },
+    };
+    const definition = resolved orelse return null;
+    if (!std.mem.eql(u8, definition.name, run.name) or definition.mcp_binding == null) return null;
+    var converted: std.ArrayList(agent_stream_provider.DynamicFunctionTool) = .empty;
+    try runtime_gateway_step.recordSelectedDynamicTool(arena, &converted, definition);
+    const tools = try arena.alloc(agent_stream_provider.DynamicFunctionTool, advertised_tools.len + 1);
+    @memcpy(tools[0..advertised_tools.len], advertised_tools.*);
+    tools[advertised_tools.len] = converted.items[0];
+    const names = try arena.alloc([]const u8, advertised_names.len + 1);
+    @memcpy(names[0..advertised_names.len], advertised_names.*);
+    names[advertised_names.len] = converted.items[0].name;
+    advertised_tools.* = tools;
+    advertised_names.* = names;
+    debug_trace.logf("toolbox", "run admitted for this step call={s} tool={s}", .{ call.id, run.name });
+    return subject;
 }
 
 fn containsString(items: []const []const u8, item: []const u8) bool {
@@ -5715,9 +5773,131 @@ fn prepareSkillCatalog(
         config.workspace_root,
     );
     errdefer section.deinit(alloc);
-    if (section.notice) |notice| try deps.pushContextNotice(notice);
+    // With toolbox the catalog's text isn't sent, so its shortening isn't
+    // news; the menu counts what it leaves out.
+    if (!toolbox.isAdvertised(config.advertised_tool_names)) {
+        if (section.notice) |notice| try deps.pushContextNotice(notice);
+    }
     if (section.diagnostic_notice) |notice| try deps.pushContextNotice(notice);
     return section;
+}
+
+fn lessName(_: void, lhs: []const u8, rhs: []const u8) bool {
+    return std.mem.lessThan(u8, lhs, rhs);
+}
+
+/// The toolbox menu for this request: the one this conversation sent first,
+/// or, on its first request, one rendered from the visible skills, the
+/// configured MCP servers, and the built-in tools behind toolbox. Null when
+/// toolbox isn't advertised. The result lives in `agent`.
+fn toolboxMenu(
+    arena: Allocator,
+    deps: *const AgentRuntimeDeps,
+    config: Config,
+    agent: *runtime_agent.Agent,
+    skill_section: ?*const skill_runtime.BoundedPromptSection,
+    context_window: ?u32,
+    turn_notes: *std.ArrayList(ChatMessage),
+) !?[]const u8 {
+    if (!toolbox.isAdvertised(config.advertised_tool_names)) return null;
+    var entries: std.ArrayList(toolbox.Entry) = .empty;
+    const skills = if (skill_section) |section| section.locations.skills else &.{};
+    var descriptions_limited: usize = 0;
+    for (skills) |skill| {
+        // A name two skills share opens by location, as the catalog has it.
+        const shared = for (skills) |other| {
+            if (other.path.ptr != skill.path.ptr and std.mem.eql(u8, other.name, skill.name)) break true;
+        } else false;
+        const open_as = if (shared) try skill_section.?.locations.locationOf(arena, skill.path) else null;
+        // Sanitized and within skill_description_bytes, as the catalog shows it.
+        const description = try skill_runtime.limitedSkillDescription(arena, skill.description, config.context_limits);
+        if (description.limited) descriptions_limited += 1;
+        try entries.append(arena, .{ .kind = .skill, .name = skill.name, .description = description.text, .open_as = open_as });
+    }
+    if (descriptions_limited > 0) {
+        var notice: std.Io.Writer.Allocating = .init(arena);
+        skill_runtime.writeDescriptionsShortened(&notice.writer, descriptions_limited, config.context_limits) catch return error.OutOfMemory;
+        try deps.pushContextNotice(notice.written());
+    }
+    // Sorted here, so the menu never depends on the order a host lists them.
+    const servers = try arena.dupe([]const u8, config.toolbox_mcp_servers);
+    sort_utils.sort([]const u8, servers, {}, lessName);
+    for (servers) |name| try entries.append(arena, .{ .kind = .mcp_server, .name = name });
+    for (config.toolbox_behind) |name| {
+        const tool = deps.tool_registry.lookup(name) orelse continue;
+        try entries.append(arena, .{ .kind = .tool, .name = name, .description = tool.description });
+    }
+    // A skipped skill is told where the skills are listed, as the catalog did.
+    const lead = (try skill_runtime.discoveryWarningMarker(arena, config.skill_catalog.diagnostics)) orelse "";
+    const decided = try keptToolboxMenu(arena, &agent.toolbox_menu, entries.items, lead, .{
+        .max_bytes = skill_runtime.skillListBudget(config.context_limits, context_window),
+    });
+    if (decided.shortened) {
+        var notice: std.Io.Writer.Allocating = .init(arena);
+        skill_runtime.writeListShortened(&notice.writer, config.context_limits, context_window) catch return error.OutOfMemory;
+        try deps.pushContextNotice(notice.written());
+    }
+    if (decided.note) |note| {
+        // A note in the turn, saved with it, so the model learns of the
+        // change while the menu and everything earlier requests sent stay as
+        // they were (D93).
+        try turn_notes.append(arena, .{ .role = .system, .content = note, .context_note = true });
+        debug_trace.logf("toolbox", "change noted entries={d} bytes={d}", .{ entries.items.len, note.len });
+    }
+    return decided.menu;
+}
+
+/// The menu a request sends, and the note to push when the toolbox holds
+/// something other than the last request knew: the conversation's kept menu
+/// when it has one, so its bytes never change (`Toolbox.tla` MenuFixed),
+/// otherwise a new one rendered from `entries` and kept in `kept`.
+fn keptToolboxMenu(
+    arena: Allocator,
+    kept: *runtime_agent.ToolboxMenu,
+    entries: []const toolbox.Entry,
+    lead: []const u8,
+    limits: toolbox.Limits,
+) !struct { menu: []const u8, note: ?[]const u8, shortened: bool = false } {
+    const hash = toolbox.entriesHash(entries);
+    if (kept.get()) |menu| {
+        if (hash == kept.noted_hash) return .{ .menu = menu, .note = null };
+        kept.noted_hash = hash;
+        return .{ .menu = menu, .note = try toolbox.renderChangeNote(arena, entries) };
+    }
+    const bounded = try toolbox.renderBounded(arena, entries, limits);
+    kept.keep(lead, bounded.menu, hash);
+    debug_trace.logf("toolbox", "menu kept bytes={d} entries={d} shortened={}", .{ bounded.menu.len, entries.len, bounded.shortened });
+    // Only a new menu is news: a kept one shortens nothing again.
+    return .{ .menu = kept.get().?, .note = null, .shortened = bounded.shortened };
+}
+
+test "the toolbox menu stays as first sent, and each change is noted once" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var kept: runtime_agent.ToolboxMenu = .{};
+    const first = [_]toolbox.Entry{.{ .kind = .skill, .name = "review", .description = "Review a change." }};
+    const added = first ++ [_]toolbox.Entry{.{ .kind = .mcp_server, .name = "linear" }};
+
+    const sent = try keptToolboxMenu(arena, &kept, &first, "", .{});
+    try std.testing.expectEqual(@as(?[]const u8, null), sent.note);
+    try std.testing.expect(std.mem.find(u8, sent.menu, "- review") != null);
+    const menu = try arena.dupe(u8, sent.menu);
+
+    // A server added later leaves the menu's bytes alone and is noted.
+    const changed = try keptToolboxMenu(arena, &kept, &added, "", .{});
+    try std.testing.expectEqualStrings(menu, changed.menu);
+    try std.testing.expect(std.mem.find(u8, changed.note.?, "MCP servers: linear") != null);
+
+    // The same change isn't noted twice.
+    const again = try keptToolboxMenu(arena, &kept, &added, "", .{});
+    try std.testing.expectEqualStrings(menu, again.menu);
+    try std.testing.expectEqual(@as(?[]const u8, null), again.note);
+
+    // Going back is a change too, and the menu still doesn't move.
+    const back = try keptToolboxMenu(arena, &kept, &first, "", .{});
+    try std.testing.expectEqualStrings(menu, back.menu);
+    try std.testing.expect(back.note != null);
 }
 
 fn processQueuedPromptInner(
@@ -5929,7 +6109,8 @@ fn processQueuedPromptInner(
             debug_trace.logf("skills", "explicit skill note queued index={d} bytes={d} saved_bytes={d}", .{ explicit_note_index.?, section.text.len, section.used_note.?.len });
         }
     }
-    try appendStablePromptContext(arena, deps, config, if (skill_section) |section| section.text else null, &stable_prefix);
+    const toolbox_menu = try toolboxMenu(arena, deps, config, agent, if (skill_section) |*section| section else null, request_capabilities.context_window, &within_turn_suffix);
+    try appendStablePromptContext(arena, deps, config, toolbox_menu orelse if (skill_section) |section| section.text else null, &stable_prefix);
     const active_history = job.history;
     const history_messages_before = stable_prefix.items.len;
     const interrupted_turns = runtime_interruption.countInterruptedHistory(active_history);
@@ -9444,7 +9625,10 @@ fn processQueuedPromptLoop(
             }
         }
 
-        try advertiseUnselectedMcpCalls(
+        // With toolbox, a direct call of an MCP tool fx didn't send fails and
+        // points the model at toolbox run: listing the tool now would change
+        // the tools every earlier request sent (`Toolbox.tla` ToolsFixed).
+        if (!toolbox.isAdvertised(config.advertised_tool_names)) try advertiseUnselectedMcpCalls(
             deps,
             arena,
             completion.tool_calls,
@@ -9549,6 +9733,13 @@ fn processQueuedPromptLoop(
                 return err;
             };
         }
+        // A toolbox run is prepared, admitted, and run as the call it
+        // carries; the assistant's call and its result stay toolbox.
+        const toolbox_subjects = try arena.alloc(?ToolCall, prepared_tool_calls.len);
+        for (prepared_tool_calls, toolbox_subjects) |prepared_call, *subject| subject.* = switch (prepared_call) {
+            .ready => try toolboxRunSubject(deps, arena, prepared_call.call(), &advertised_dynamic_tools, &advertised_dynamic_tool_names),
+            .blocked, .provider_executed => null,
+        };
         const effective_tool_calls = try arena.alloc(
             ToolCall,
             prepared_tool_calls.len,
@@ -9601,7 +9792,7 @@ fn processQueuedPromptLoop(
                     .ready => {},
                     .blocked, .provider_executed => continue,
                 }
-                const tool_call = prepared_call.call();
+                const tool_call = toolbox_subjects[i] orelse prepared_call.call();
                 preparation_batch.prepare(arena, i, tool_call, .{
                     .tool_registry = deps.tool_registry,
                     .workspace_root = config.workspace_root,
@@ -9634,7 +9825,7 @@ fn processQueuedPromptLoop(
                             finalization,
                             job,
                             partial_assistant,
-                            tool_call,
+                            prepared_call.call(),
                             completed_tool_names.items,
                             &interrupted_persisted,
                             step_ctx,
@@ -9834,7 +10025,10 @@ fn processQueuedPromptLoop(
         var parallel_skip_until: usize = 0;
         for (prepared_tool_calls, 0..) |prepared_tool_call, tool_call_index| {
             if (tool_call_index < parallel_skip_until) continue;
-            var tool_call = prepared_tool_call.call();
+            // What the model called, which an interrupted turn saves; the
+            // call that runs is what a toolbox run carries, when it is one.
+            const identity_call = prepared_tool_call.call();
+            var tool_call = toolbox_subjects[tool_call_index] orelse identity_call;
             tool_call.resolved_display_target = effective_tool_calls[tool_call_index].resolved_display_target;
             const root_live_permission_mode = snapshotRootPermissionMode(deps);
             const root_action_permission_mode = permissionModeForAction(
@@ -10239,6 +10433,7 @@ fn processQueuedPromptLoop(
                         .permission_mode = root_action_permission_mode,
                         .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                         .max_tool_result_bytes = config.max_tool_result_bytes,
+                        .toolbox_behind = config.toolbox_behind,
                         .classification_complete = executable_classification_complete.items,
                         .presentation_group_id = stream_ctx.provisional_statuses.presentation_group_id,
                     };
@@ -10457,7 +10652,7 @@ fn processQueuedPromptLoop(
                     advertised_dynamic_tool_names,
                 );
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, identity_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
             }
@@ -10814,7 +11009,7 @@ fn processQueuedPromptLoop(
                     advertised_dynamic_tool_names,
                 );
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, identity_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
             };
@@ -10963,8 +11158,11 @@ fn processQueuedPromptLoop(
                         break :live null;
                     },
                 };
-                if (liveAuthorityRejectsExecution(resolved)) {
-                    const outcome: []const u8 = if (resolved.decision == .deny)
+                // A toolbox run is decided as the child's own call of what it
+                // carries, so a profile's limits hold through toolbox.
+                const decided = resolved;
+                if (liveAuthorityRejectsExecution(decided)) {
+                    const outcome: []const u8 = if (decided.decision == .deny)
                         "denied"
                     else
                         "unavailable";
@@ -10973,7 +11171,7 @@ fn processQueuedPromptLoop(
                         "live_authority_rejected",
                         step_ctx,
                         "call_id={s} tool_name={s} generation={d} outcome={s}",
-                        .{ tool_call.id, tool_call.name, resolved.authority.generation, outcome },
+                        .{ tool_call.id, tool_call.name, decided.authority.generation, outcome },
                     );
                     if (deps.tool_activity_recorder) |recorder| {
                         recorder.record(tool_call.id, tool_call.name, .denied) catch |err| {
@@ -10998,7 +11196,7 @@ fn processQueuedPromptLoop(
                         &within_turn_suffix,
                         &completed_tool_names,
                         &step_batch,
-                        if (resolved.decision == .deny)
+                        if (decided.decision == .deny)
                             "live_authority_denied"
                         else
                             "live_authority_unavailable",
@@ -11156,7 +11354,7 @@ fn processQueuedPromptLoop(
                     advertised_dynamic_tool_names,
                 );
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, identity_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
             }
@@ -11243,7 +11441,7 @@ fn processQueuedPromptLoop(
                         advertised_dynamic_tool_names,
                     );
                     try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                    try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                    try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, identity_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                     finish_trace.finish("interrupted");
                     return;
                 }
@@ -11538,7 +11736,7 @@ fn processQueuedPromptLoop(
                     advertised_dynamic_tool_names,
                 );
                 try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, tool_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
+                try runtime_interruption.persistInterruptedTurnOnce(deps, finalization, job, partial_assistant, identity_call, completed_tool_names.items, &interrupted_persisted, step_ctx, within_turn_suffix.items, stop_state.retained_candidate, &stop_state.terminal_materializing);
                 finish_trace.finish("interrupted");
                 return;
             }
@@ -11590,6 +11788,7 @@ fn processQueuedPromptLoop(
                 .live_authority = if (live_authority) |resolved| resolved.authority else null,
                 .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
                 .max_tool_result_bytes = config.max_tool_result_bytes,
+                .toolbox_behind = config.toolbox_behind,
                 .expected_mcp_runtime_generation = expected_mcp_runtime_generation,
                 .expected_mcp_binding = for (advertised_dynamic_tools) |tool| {
                     if (std.mem.eql(u8, tool.name, execution_call.name)) break tool.mcp_binding;
@@ -11686,7 +11885,7 @@ fn processQueuedPromptLoop(
                         finalization,
                         job,
                         partial_assistant,
-                        tool_call,
+                        identity_call,
                         completed_tool_names.items,
                         &interrupted_persisted,
                         step_ctx,

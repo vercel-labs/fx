@@ -1059,13 +1059,13 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     "an instance's profile decides which MCP servers it can use",
     async () => {
       const fixture = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
-      // Select the fixture's tool and call it, or call it without selecting
-      // it first, then finish.
+      // Open the fixture's tool and run it, or run it without opening it
+      // first, then finish.
       const respond = (direct: boolean) => (body: string): Response => {
         const request = JSON.parse(body) as { prompt?: Array<{ role?: string }> };
         const results = (request.prompt ?? []).filter((message) => message.role === "tool").length;
-        if (!direct && results === 0) return call("select_mcp", "mcp_select_tool", { name: "mcp_fixture_echo" });
-        if (results === (direct ? 0 : 1)) return call("call_mcp", "mcp_fixture_echo", { text: "hello" });
+        if (!direct && results === 0) return call("select_mcp", "toolbox", { open: "mcp_fixture_echo" });
+        if (results === (direct ? 0 : 1)) return call("call_mcp", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "hello" } });
         return text("mcp_done", "TREE_MCP_DONE");
       };
       for (const [profile, servers, reaches, direct] of [
@@ -1232,8 +1232,8 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
           const request = JSON.parse(body) as { prompt?: Array<{ role?: string }> };
           const results = (request.prompt ?? []).filter((message) => message.role === "tool").length;
           if (userTexts(body).join("\n").includes("CHILD_MCP_TASK")) {
-            if (results === 0) return call("select_mcp", "mcp_select_tool", { name: "mcp_fixture_echo" });
-            if (results === 1) return call("call_mcp", "mcp_fixture_echo", { text: "hello" });
+            if (results === 0) return call("select_mcp", "toolbox", { open: "mcp_fixture_echo" });
+            if (results === 1) return call("call_mcp", "toolbox", { run: "mcp_fixture_echo", arguments: { text: "hello" } });
             return text("child_mcp_done", "CHILD_MCP_DONE");
           }
           // The child's report wakes the parent once its MCP call is done.
@@ -1248,7 +1248,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         // The fixture's answer reached the child after its call.
         expect(child.at(-1) ?? "").toContain("MODERN_MCP_TOOL_RESULT");
         // The child is offered its profile's tools, and no vision fallback.
-        expect(toolNames(child[0])).toEqual(["read_file", "mcp_select_tool"]);
+        expect(toolNames(child[0])).toEqual(["read_file", "toolbox"]);
       } finally {
         cleanupIsolatedTestHome(home);
         rmSync(workspace, { recursive: true, force: true });

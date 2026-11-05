@@ -131,7 +131,10 @@ pub fn rank(
 
     // Schemas are chosen before the page is rendered, so the page can say
     // which tools this search loads in full.
-    var loads = try SchemaLoads.init(alloc, matches, limits);
+    var loads = if (request.load_schemas)
+        try SchemaLoads.init(alloc, matches, limits)
+    else
+        try SchemaLoads.none(alloc, matches.len);
     defer loads.deinit(alloc);
 
     const full_cursor = try page.cursorAfter(alloc, matches.len);
@@ -235,6 +238,13 @@ const SchemaLoads = struct {
             remaining -= payload.model_output.len;
         }
         return loads;
+    }
+
+    /// Loads nothing: every match keeps its whole description on the page.
+    fn none(alloc: Allocator, count: usize) !SchemaLoads {
+        const entries = try alloc.alloc(Entry, count);
+        @memset(entries, .{});
+        return .{ .entries = entries };
     }
 
     fn deinit(loads: *SchemaLoads, alloc: Allocator) void {

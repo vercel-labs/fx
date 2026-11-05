@@ -175,6 +175,9 @@ pub const ToolExecutionRequest = struct {
     expected_mcp_binding: ?types.McpToolBinding = null,
     advertised_dynamic_tool_names: []const []const u8,
     max_tool_result_bytes: usize,
+    /// The built-in tools this agent offers through toolbox, which
+    /// `toolbox {search}` finds by name and description.
+    toolbox_behind: []const []const u8 = &.{},
     /// The owning agent loop already ran its policy-neutral idempotency and
     /// availability classifiers for this exact effective call.
     classification_complete: bool = false,

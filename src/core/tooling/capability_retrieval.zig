@@ -45,6 +45,11 @@ pub const Request = struct {
     limit: usize = default_limit,
     cursor: ?[]const u8 = null,
     relevance_policy: RelevancePolicy = .compatible,
+    /// Whether an MCP search loads the schemas of the tools it finds, so
+    /// they become callable on the next step. A toolbox search loads none:
+    /// what it finds is opened and run through toolbox, and the tools fx
+    /// sends never change.
+    load_schemas: bool = true,
 
     pub fn validate(self: Request) ValidationError!void {
         if (self.limit == 0 or self.limit > max_limit) return error.InvalidLimit;

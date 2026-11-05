@@ -1,4 +1,5 @@
 const std = @import("std");
+const toolbox = @import("toolbox.zig");
 const observation = @import("../agent/runtime/observation.zig");
 const testing_allocator = @import("../shared/testing_allocator.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
@@ -56,6 +57,7 @@ const mcp_call_capability = @import("mcp_call_capability.zig");
 const model_tool_schema = @import("model_tool_schema.zig");
 const auto_classifier_context = @import("../permissions/auto_classifier_context.zig");
 const capability_retrieval = @import("capability_retrieval.zig");
+const sort_utils = @import("../shared/sort_utils.zig");
 const lexical_relevance = @import("../shared/lexical_relevance.zig");
 const mcp_tool_lookup = @import("../mcp/tool_lookup.zig");
 const tool_presentation = @import("tool_presentation.zig");
@@ -232,6 +234,8 @@ pub const Context = struct {
     nested_tool_lifecycle: ?ToolLifecyclePublisher = null,
     subagent_status_renderer: ?types.SubagentStatusRenderer = null,
     advertised_dynamic_tool_names: []const []const u8 = &.{},
+    /// The built-in tools this agent offers through toolbox.
+    toolbox_behind: []const []const u8 = &.{},
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     auto_classifier: permission_auto_classifier.Classifier =
         permission_auto_classifier.Classifier.disabled(),
@@ -419,6 +423,7 @@ pub fn executeToolCallAuthorized(
     };
     var execution_ctx = ctx;
     execution_ctx.observer = request.observer orelse ctx.observer;
+    execution_ctx.toolbox_behind = request.toolbox_behind;
     execution_ctx.skill_locations = request.skill_locations orelse ctx.skill_locations;
     if (request.permission_mode) |permission_mode| {
         execution_ctx.permission_mode = permission_mode;
@@ -876,6 +881,7 @@ fn executeRegisteredTool(
         .completion_sink = &dispatch_metadata.subagent_completion,
     };
     var mcp_call_bridge = McpCallBridgeState{ .runtime = ctx };
+    var toolbox_run = ToolboxRunState{ .runtime = ctx };
     var dispatch_ctx = typedDispatchContextForCall(ctx, arena, call);
     dispatch_metadata.attach(&dispatch_ctx);
     var result_commit_token: ?result_commit.Token = null;
@@ -898,6 +904,7 @@ fn executeRegisteredTool(
     if (ctx.mcp_ctx != null and ctx.mcp_call_tool != null) {
         dispatch_ctx.mcp_call_capability = mcp_call_bridge.capability();
     }
+    dispatch_ctx.toolbox_run = toolbox_run.capability();
     const runtime_provider = if (registry.lookup(call.name)) |tool|
         tool.runtime_provider
     else
@@ -993,31 +1000,127 @@ fn authorizeBridgeCall(
         return .{ .deny = try arena.print("{s} is a built-in tool; fx mcp call runs MCP tools only.", .{tool}) };
     }
     const resolved = (try resolveUnselectedMcpTool(ctx, arena, tool)) orelse {
-        return .{ .deny = try arena.print("No MCP tool named {s} is available to this agent. Find tool names with capability_search.", .{tool}) };
+        return .{ .deny = try arena.print("No MCP tool named {s} is available to this agent. Find tool names with toolbox search.", .{tool}) };
     };
     const call: ToolCall = .{ .id = request_id, .name = tool, .arguments_json = arguments_json };
+    return switch (try checkNestedCall(ctx, arena, call, resolved)) {
+        .allow => .{ .allow = .{ .binding = resolved.mcp_binding } },
+        .deny => |why| .{ .deny = why },
+    };
+}
+
+const NestedCheck = union(enum) {
+    /// The context the call runs in.
+    allow: Context,
+    /// Why not, for the model.
+    deny: []const u8,
+};
+
+/// The permission check of a call the agent makes through another tool, a
+/// shell command's `fx mcp call` or `toolbox {run}`: it is checked as the
+/// agent's own direct call of `call.name`, and the configured and saved
+/// rules, the prompt, and automatic review see exactly this call. An MCP
+/// tool the agent never selected, `mcp`, joins the names the check knows,
+/// with its definition for the review.
+fn checkNestedCall(ctx: Context, arena: Allocator, call: ToolCall, mcp: ?tool_mcp_runtime.SelectedTool) !NestedCheck {
     var check = ctx;
-    const names = try arena.alloc([]const u8, ctx.advertised_dynamic_tool_names.len + 1);
-    @memcpy(names[0..ctx.advertised_dynamic_tool_names.len], ctx.advertised_dynamic_tool_names);
-    names[names.len - 1] = tool;
-    check.advertised_dynamic_tool_names = names;
-    check.mcp_review_schema_json = try bridgeReviewSchema(arena, resolved);
-    check.expected_mcp_binding = resolved.mcp_binding;
+    if (mcp) |resolved| {
+        const names = try arena.alloc([]const u8, ctx.advertised_dynamic_tool_names.len + 1);
+        @memcpy(names[0..ctx.advertised_dynamic_tool_names.len], ctx.advertised_dynamic_tool_names);
+        names[names.len - 1] = call.name;
+        check.advertised_dynamic_tool_names = names;
+        check.mcp_review_schema_json = try bridgeReviewSchema(arena, resolved);
+        check.expected_mcp_binding = resolved.mcp_binding;
+    }
     check.permission_review_turn = .{
         .observer = ctx.observer,
         .model = ctx.model,
         .pending_assistant = .{ .role = .assistant, .tool_calls = try arena.dupe(ToolCall, &.{call}) },
-        .target_call_id = request_id,
+        .target_call_id = call.id,
         .origin = if (ctx.lifecycle_scope.kind == .subagent) .subagent else .root,
         .trusted_root_context = auto_classifier_context.rootUserRequestContext(ctx.root_user_intent_context) orelse "",
         .current_turn_untrusted_messages = ctx.current_turn_messages,
     };
     const outcome = try tool_admission.requestPermissionOutcome(check.admissionInput(), arena, call, ctx.permission_mode, ctx.session_grants);
-    if (!outcome.decision.isDenied() and outcome.tool_failure == null) {
-        return .{ .allow = .{ .binding = resolved.mcp_binding } };
-    }
+    if (!outcome.decision.isDenied() and outcome.tool_failure == null) return .{ .allow = check };
     return .{ .deny = outcome.tool_failure orelse outcome.feedback orelse
-        try arena.print("Permission to run {s} was not granted ({s}).", .{ tool, @tagName(outcome.decision) }) };
+        try arena.print("Permission to run {s} was not granted ({s}).", .{ call.name, @tagName(outcome.decision) }) };
+}
+
+/// Lends this tool call's permission check and execution to `toolbox {run}`
+/// while the call runs (`tool_dispatch.ToolboxRun`).
+const ToolboxRunState = struct {
+    runtime: Context,
+
+    fn capability(self: *ToolboxRunState) tool_dispatch.ToolboxRun {
+        return .{ .context = @ptrCast(self), .explain_fn = explainToolboxRun, .describe_fn = describeToolboxTool, .search_fn = searchToolboxBuiltins };
+    }
+};
+
+/// The definition `toolbox {open}` gives a tool: a built-in's own, or for an
+/// MCP tool the one its selection would have sent, with its full input
+/// schema and its server's instructions.
+fn describeToolboxTool(raw: *anyopaque, arena: Allocator, tool: []const u8) anyerror!?tool_dispatch.ToolboxDescription {
+    const state: *ToolboxRunState = @ptrCast(@alignCast(raw));
+    if (std.mem.eql(u8, tool, toolbox.tool_name)) return null;
+    const spec = state.runtime.tool_registry.lookup(tool) orelse return switch (try lookupToolboxMcpTool(state.runtime, arena, tool)) {
+        .found => |found| .{ .definition = .{ .json = found.tool.schema_json, .notice = found.notice } },
+        .rejected => |why| .{ .unavailable = why },
+        .missing => null,
+    };
+    if (!spec.model_visible) return null;
+    return .{ .definition = .{ .json = try model_tool_schema.builtinFunctionSchemaJsonAlloc(arena, spec.model_schema) } };
+}
+
+/// The built-in tools behind toolbox that match `query`, best first, by
+/// name and description, as the menu lists them.
+fn searchToolboxBuiltins(raw: *anyopaque, arena: Allocator, query: *const lexical_relevance.PreparedQuery) anyerror![]const tool_dispatch.ToolboxMatch {
+    const state: *ToolboxRunState = @ptrCast(@alignCast(raw));
+    const Scored = struct {
+        match: tool_dispatch.ToolboxMatch,
+        score: lexical_relevance.Score,
+
+        fn better(_: void, a: @This(), b: @This()) bool {
+            return lexical_relevance.order(a.score, b.score) == .gt;
+        }
+    };
+    var scored: std.ArrayList(Scored) = .empty;
+    for (state.runtime.toolbox_behind) |name| {
+        const spec = state.runtime.tool_registry.lookup(name) orelse continue;
+        const score = lexical_relevance.score(query, &.{name}, &.{name}, &.{spec.description}) orelse continue;
+        try scored.append(arena, .{
+            .match = .{ .name = name, .description = toolbox.shortLine(spec.description, 100).text },
+            .score = score,
+        });
+    }
+    sort_utils.sort(Scored, scored.items, {}, Scored.better);
+    debug_trace.logf("toolbox", "search builtins behind={d} matches={d}", .{ state.runtime.toolbox_behind.len, scored.items.len });
+    const matches = try arena.alloc(tool_dispatch.ToolboxMatch, scored.items.len);
+    for (scored.items, matches) |item, *match| match.* = item.match;
+    return matches;
+}
+
+/// Why `toolbox {run}` didn't run `tool`. The agent loop runs every tool a
+/// run can carry as its own direct call of it, so what reaches here is
+/// toolbox itself, a host's own tool, or one fx can't find or can't use now.
+fn explainToolboxRun(raw: *anyopaque, arena: Allocator, tool: []const u8) anyerror![]const u8 {
+    const state: *ToolboxRunState = @ptrCast(@alignCast(raw));
+    const ctx = state.runtime;
+    if (std.mem.eql(u8, tool, toolbox.tool_name)) return "toolbox can't run toolbox.";
+    if (ctx.tool_registry.lookup(tool)) |spec| {
+        // A host's own tool is called directly: a durable session reruns it
+        // by its name after a crash, under the host's rerun policy.
+        if (spec.executor_kind == .host) return arena.print("{s} is one of this host's tools; call it directly.", .{tool});
+        return arena.print("{s} didn't run: toolbox runs a tool only as part of the agent's turn.", .{tool});
+    }
+    if (!std.mem.startsWith(u8, tool, "mcp_") and containsName(ctx.advertised_dynamic_tool_names, tool)) {
+        return arena.print("{s} is one of this host's tools; call it directly.", .{tool});
+    }
+    return switch (try lookupToolboxMcpTool(ctx, arena, tool)) {
+        .rejected => |why| why,
+        .found => arena.print("{s} is available now; run it again with toolbox.", .{tool}),
+        .missing => arena.print("No tool named {s} is in the toolbox. Use toolbox search to find it.", .{tool}),
+    };
 }
 
 /// The review schema a selected MCP tool would carry: its name,
@@ -1411,6 +1514,40 @@ pub fn resolveUnselectedMcpTool(ctx: Context, arena: Allocator, name: []const u8
             .mcp_binding = payload.mcp_binding,
         },
         .rejected => null,
+    };
+}
+
+const ToolboxMcpLookup = union(enum) {
+    found: struct {
+        tool: tool_mcp_runtime.SelectedTool,
+        /// What a context limit cut from its schema.
+        notice: ?[]const u8,
+    },
+    /// Why the tool can't be used now, such as its server being unavailable.
+    rejected: []const u8,
+    missing,
+};
+
+/// An MCP tool for toolbox, with the reason when it exists but can't be used
+/// now, which `resolveUnselectedMcpTool` leaves out.
+fn lookupToolboxMcpTool(ctx: Context, arena: Allocator, name: []const u8) !ToolboxMcpLookup {
+    const runtime_context = ctx.mcp_ctx orelse return .missing;
+    const schema_fn = ctx.mcp_tool_schema orelse return .missing;
+    const projection = (schema_fn(
+        runtime_context,
+        arena,
+        name,
+        ctx.permission_rules,
+        ctx.context_limits,
+        ctx.mcp_access,
+        runtimeCancelFlag(ctx),
+    ) catch |err| switch (err) {
+        error.OutOfMemory, error.Cancelled => return err,
+        else => return .missing,
+    }) orelse return .missing;
+    return switch (projection) {
+        .selected => |payload| .{ .found = .{ .tool = .{ .name = name, .schema_json = payload.model_output, .mcp_binding = payload.mcp_binding }, .notice = payload.notice } },
+        .rejected => |payload| .{ .rejected = payload.model_output },
     };
 }
 
@@ -6936,7 +7073,7 @@ test "MCP dynamic tool cannot execute before it is advertised" {
         .arguments_json = "{}",
     });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "not selected");
+    try expectContains(result.model_output, "is not one of the tools in this request");
     try std.testing.expectEqual(@as(usize, 0), counting.calls);
 }
 
@@ -6970,7 +7107,7 @@ test "MCP select does not authorize same-response dynamic execution" {
         .arguments_json = "{}",
     });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "not selected");
+    try expectContains(result.model_output, "is not one of the tools in this request");
     try std.testing.expectEqual(@as(usize, 0), counting.calls);
 }
 
@@ -6993,7 +7130,7 @@ test "MCP unadvertised dynamic names stay unsupported without a runtime call" {
         .arguments_json = "{}",
     });
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "not selected");
+    try expectContains(result.model_output, "is not one of the tools in this request");
 
     var no_rt = TestRuntime{};
     defer no_rt.deinit(std.testing.allocator);

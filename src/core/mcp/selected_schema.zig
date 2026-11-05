@@ -71,7 +71,7 @@ pub const AlwaysLoaded = struct {
     /// Hands the tools over, with a notice when the budget left any out.
     pub fn finish(b: *AlwaysLoaded, alloc: Allocator) !AlwaysLoadedTools {
         const notice = if (b.omitted > 0) try alloc.print(
-            "[context] {d} always-loaded MCP tool{s} exceeded the mcp_selected_schema_bytes budget and stay available through capability_search",
+            "[context] {d} always-loaded MCP tool{s} exceeded the mcp_selected_schema_bytes budget and stay available through toolbox",
             .{ b.omitted, if (b.omitted == 1) "" else "s" },
         ) else null;
         errdefer if (notice) |value| alloc.free(value);

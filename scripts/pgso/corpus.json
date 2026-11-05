@@ -89,6 +89,7 @@
     {"name": "e2e-mcp-http", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-http.test.ts"], "test_file": "mcp-http.test.ts"},
     {"name": "e2e-mcp-legacy-remote", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-legacy-remote.test.ts"], "test_file": "mcp-legacy-remote.test.ts"},
     {"name": "e2e-mcp-stdio", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-stdio.test.ts"], "test_file": "mcp-stdio.test.ts"},
+    {"name": "e2e-toolbox", "argv": ["bun", "test", "--max-concurrency", "1", "./toolbox.test.ts"], "test_file": "toolbox.test.ts"},
     {"name": "e2e-mcp-auth", "argv": ["bun", "test", "--max-concurrency", "1", "./mcp-auth.test.ts"], "test_file": "mcp-auth.test.ts", "allow_keychain": true},
     {"name": "e2e-session-recovery", "argv": ["bun", "test", "--max-concurrency", "1", "./session-recovery.test.ts"], "test_file": "session-recovery.test.ts"},
     {"name": "e2e-tui-startup", "argv": ["bun", "test", "--max-concurrency", "1", "./tui-startup.test.ts"], "test_file": "tui-startup.test.ts"},

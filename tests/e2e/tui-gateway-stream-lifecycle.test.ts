@@ -6030,8 +6030,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             {
               type: "tool-call",
               toolCallId: `select_approval_mcp_${decision}`,
-              toolName: "mcp_select_tool",
-              input: { name: dynamicToolName },
+              toolName: "toolbox",
+              input: { open: dynamicToolName },
             },
             {
               type: "finish",
@@ -6042,8 +6042,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
             {
               type: "tool-call",
               toolCallId: `call_approval_mcp_${decision}`,
-              toolName: dynamicToolName,
-              input: { text: argumentSentinel },
+              toolName: "toolbox",
+              input: { run: dynamicToolName, arguments: { text: argumentSentinel } },
             },
             {
               type: "finish",
@@ -6055,8 +6055,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
               {
                 type: "tool-call",
                 toolCallId: "call_approval_mcp_session_second",
-                toolName: dynamicToolName,
-                input: { text: secondArgumentSentinel },
+                toolName: "toolbox",
+              input: { run: dynamicToolName, arguments: { text: secondArgumentSentinel } },
               },
               {
                 type: "finish",
@@ -6151,8 +6151,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: "select_narrow_approval_mcp",
-            toolName: "mcp_select_tool",
-            input: { name: dynamicToolName },
+            toolName: "toolbox",
+              input: { open: dynamicToolName },
           },
           {
             type: "finish",
@@ -6163,8 +6163,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
           {
             type: "tool-call",
             toolCallId: "call_narrow_approval_mcp",
-            toolName: dynamicToolName,
-            input: { text: overlongText },
+            toolName: "toolbox",
+              input: { run: dynamicToolName, arguments: { text: overlongText } },
           },
           {
             type: "finish",
@@ -6497,7 +6497,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "a shell subagent keeps an MCP tool it selected on its next request",
+    "a shell subagent runs an MCP tool it opened through toolbox, and its tools stay the same",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-subagent-mcp-selected-")));
       const home = join(root, "home");
@@ -6536,9 +6536,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         if (has("child_select")) {
           // Selecting a tool puts its definition on the child's next request.
           offeredAfterSelect = (request.tools ?? []).some((tool) => tool.name === toolName);
-          return fakeGatewayToolCall("child_call", toolName, { text: "selected" });
+          return fakeGatewayToolCall("child_call", "toolbox", { run: toolName, arguments: { text: "selected" } });
         }
-        return fakeGatewayToolCall("child_select", "mcp_select_tool", { name: toolName });
+        return fakeGatewayToolCall("child_select", "toolbox", { open: toolName });
       }, { classifierDecision: "clear" });
       gateway = childGateway;
       session = await TmuxSession.create({
@@ -6562,7 +6562,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText(rootPrompt);
       await session.waitForText("SUBAGENT_SELECTED_PARENT_DONE", TIMEOUT);
-      expect(offeredAfterSelect).toBe(true);
+      // Opening a tool never adds it to the tools the child sends.
+      expect(offeredAfterSelect).toBe(false);
       expect(readFileSync(fixture.callStartedPath, "utf8")).toContain("selected");
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       await session.sendText("/quit");
