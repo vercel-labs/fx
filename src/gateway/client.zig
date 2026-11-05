@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing_allocator = @import("../core/shared/testing_allocator.zig");
+const testing_listener = @import("../core/shared/testing_listener.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const secret = @import("../core/auth/secret.zig");
@@ -2786,11 +2787,8 @@ const SilentBodyServer = struct {
 
     fn stop(self: *SilentBodyServer) void {
         self.stopping.store(true, .seq_cst);
-        const zio = self.io_backend.io();
-        const listener = std.Io.net.Stream{ .socket = self.server.socket };
-        listener.shutdown(zio, .both) catch {};
         if (self.thread) |thread| thread.join();
-        self.server.deinit(zio);
+        self.server.deinit(self.io_backend.io());
     }
 
     fn sleepMs(ms: u64) void {
@@ -2800,7 +2798,7 @@ const SilentBodyServer = struct {
 
     fn run(self: *SilentBodyServer) void {
         const zio = self.io_backend.io();
-        var stream = self.server.accept(zio) catch return;
+        var stream = (testing_listener.acceptUnlessStopping(&self.server, zio, &self.stopping) catch return) orelse return;
         defer stream.close(zio);
         var buffer: [64]u8 = undefined;
         var writer = stream.writer(zio, &buffer);
@@ -2849,6 +2847,14 @@ fn readWatchedBody(server: *SilentBodyServer, cancel_after_ms: ?u64) !WatchedBod
         count += 1;
     };
     return .{ .err = err, .events = count, .elapsed_ms = @intCast(started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds()) };
+}
+
+test "the silent body server stops when no client connects" {
+    var server: SilentBodyServer = .{ .server = undefined, .events = 1, .gap_ms = 0, .close = false };
+    try server.start();
+    // Stop it once its thread is waiting for the client that never comes.
+    SilentBodyServer.sleepMs(50);
+    server.stop();
 }
 
 test "connection watch closes a body that stops sending as stalled" {
@@ -8601,16 +8607,12 @@ const LoopbackGatewayFixture = struct {
     fn deinit(self: *@This()) void {
         if (!self.server_open) return;
 
-        const zio = self.io();
         self.stopping.store(true, .seq_cst);
         if (self.thread) |thread| {
-            const listener = std.Io.net.Stream{ .socket = self.server.socket };
-            listener.shutdown(zio, .both) catch {};
-            self.wakeAccept();
             thread.join();
             self.thread = null;
         }
-        self.server.deinit(zio);
+        self.server.deinit(self.io());
         self.server_open = false;
     }
 
@@ -8620,6 +8622,11 @@ const LoopbackGatewayFixture = struct {
 
     fn io(self: *@This()) std.Io {
         return self.io_backend.io();
+    }
+
+    /// Accepts the next connection, or returns null once teardown starts.
+    fn acceptNext(self: *@This(), zio: std.Io) testing_listener.AcceptError!?std.Io.net.Stream {
+        return testing_listener.acceptUnlessStopping(&self.server, zio, &self.stopping);
     }
 
     fn waitForAcceptStart(self: *@This(), timeout_ms: u64) bool {
@@ -8642,16 +8649,6 @@ const LoopbackGatewayFixture = struct {
             sleepBlocking(1);
         }
         return signal.load(.seq_cst);
-    }
-
-    fn wakeAccept(self: *@This()) void {
-        var wake_io_backend: std.Io.Threaded = .init_single_threaded;
-        const zio = wake_io_backend.io();
-        const address = std.Io.net.IpAddress{ .ip4 = .loopback(self.port()) };
-        var stream = address.connect(zio, .{
-            .mode = .stream,
-        }) catch return;
-        stream.close(zio);
     }
 
     fn sleepBlocking(milliseconds: u64) void {
@@ -8686,7 +8683,6 @@ const LoopbackGatewayFixture = struct {
 
     fn run(self: *@This()) void {
         self.runFallible() catch |err| {
-            if (self.stopping.load(.seq_cst) and err == error.SocketNotListening) return;
             self.failure = err;
         };
     }
@@ -8694,7 +8690,7 @@ const LoopbackGatewayFixture = struct {
     fn runFallible(self: *@This()) !void {
         const zio = self.io();
         self.accept_started.store(true, .seq_cst);
-        var stream = try self.server.accept(zio);
+        var stream = (try self.acceptNext(zio)) orelse return;
         defer stream.close(zio);
         if (self.stopping.load(.seq_cst)) return;
         self.accepted.store(true, .seq_cst);
@@ -8804,7 +8800,7 @@ const LoopbackGatewayFixture = struct {
                         "Connection: close\r\n\r\n",
                 );
 
-                var recovered_stream = try self.server.accept(zio);
+                var recovered_stream = (try self.acceptNext(zio)) orelse return;
                 defer recovered_stream.close(zio);
                 _ = self.accepted_count.fetchAdd(1, .seq_cst);
                 try readLoopbackGatewayRequest(zio, recovered_stream, self);
@@ -8880,7 +8876,7 @@ const LoopbackGatewayFixture = struct {
                 // the next borrow.
                 self.serveKeepAliveOnce(zio, stream);
                 stream.shutdown(zio, .both) catch {};
-                var recovered = try self.server.accept(zio);
+                var recovered = (try self.acceptNext(zio)) orelse return;
                 defer recovered.close(zio);
                 _ = self.accepted_count.fetchAdd(1, .seq_cst);
                 self.serveKeepAliveOnce(zio, recovered);
@@ -9024,12 +9020,9 @@ const LoopbackGatewayFixture = struct {
     }
 
     /// Accepts and counts a connection the client should never open. Returns
-    /// null when teardown wakes or fails the accept instead.
+    /// null when teardown starts first.
     fn acceptUnexpected(self: *@This(), zio: std.Io) !?std.Io.net.Stream {
-        var extra = self.server.accept(zio) catch |err| {
-            if (self.stopping.load(.seq_cst)) return null;
-            return err;
-        };
+        var extra = (try self.acceptNext(zio)) orelse return null;
         if (self.stopping.load(.seq_cst)) {
             extra.close(zio);
             return null;

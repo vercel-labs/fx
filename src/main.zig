@@ -5473,6 +5473,7 @@ test {
     _ = @import("core/app/input_approval_runtime.zig");
     _ = @import("acp/sessions.zig");
     _ = @import("core/shared/text_utils.zig");
+    _ = @import("core/shared/testing_listener.zig");
     _ = @import("core/tooling/tool_projection.zig");
     _ = @import("core/tooling/tool_dispatch.zig");
     _ = @import("core/tooling/tool_set.zig");
