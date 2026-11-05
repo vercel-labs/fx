@@ -446,6 +446,37 @@ test "the parent does not wait on a child that keeps running" {
     }
 }
 
+test "the parent reads a sandbox child's frame or refuses it on fuzzed bytes" {
+    try std.testing.fuzz({}, fuzzFrame, .{
+        .corpus = &(@import("fuzz_seed").slices(.{
+            "{\"outcome\":\"returned\",\"text\":\"[2,4]\"}",
+            "{\"outcome\":\"returned\"}",
+            "{\"outcome\":\"threw\",\"text\":\"Error: x\\u001b[2J\"}",
+            "{\"outcome\":\"timed_out\"}",
+            "{\"outcome\":\"unsettled\",\"text\":null}",
+            "{\"outcome\":\"exploded\"}",
+            "{\"outcome\":\"returned\",\"text\":1}",
+            "\xff\x00{",
+        }) ++ @import("fuzz_corpus").sandbox_frame.*),
+    });
+}
+
+/// The child is untrusted, so whatever bytes it sends must become an outcome
+/// or the one message for a frame fx can't read, and any text is a copy no
+/// longer than the frame it came in.
+fn fuzzFrame(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buffer: [4096]u8 = undefined;
+    const bytes = buffer[0..@intCast(smith.slice(&buffer))];
+    const result = try parseOutcome(std.testing.allocator, bytes);
+    defer result.deinit(std.testing.allocator);
+    switch (result) {
+        .returned => |json| if (json) |text| try std.testing.expect(text.len <= bytes.len),
+        .threw => |text| try std.testing.expect(text.len <= bytes.len),
+        .timed_out, .unsettled => {},
+        .failed => |text| try std.testing.expectEqualStrings(message.bad_outcome, text),
+    }
+}
+
 test "a sandbox child that stops without an outcome gets a reason a model can act on" {
     const cases = [_]struct { term: std.process.Child.Term, reason: []const u8 }{
         .{ .term = .{ .exited = @backingInt(ChildExit.unconfined) }, .reason = message.unconfined },
