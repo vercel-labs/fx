@@ -6,7 +6,9 @@
     ir_size.py --libllvm <libLLVM.dylib> overlay-constants <in.bc> <out.bc>
     ir_size.py --libllvm <libLLVM.dylib> expand-constant-exprs <in.bc> <out.bc>
     ir_size.py --libllvm <libLLVM.dylib> swap-compares <in.bc> <out.bc>
+    ir_size.py --libllvm <libLLVM.dylib> widen-constants <in.bc> <out.bc>
     ir_size.py --libllvm <libLLVM.dylib> check-outlined <in.bc>
+    ir_size.py --libllvm <libLLVM.dylib> dropped-outputs <in.bc>
     ir_size.py --libllvm <libLLVM.dylib> minsize-functions <in.bc> <out.json>
     ir_size.py --libllvm <libLLVM.dylib> no-outline <in.bc> <out.bc> --functions <names.txt>
     ir_size.py --libllvm <libLLVM.dylib> name-functions <in.bc> <out.bc>
@@ -71,11 +73,44 @@ outliner matches only comparisons written the same way. Run it on the
 outliner's input right before `opt -passes=iroutliner`, after
 expand-constant-exprs.
 
+widen-constants rebuilds each i1 and i16 integer constant an instruction uses
+as an operand, such as the `i1 true` in `call void @f(i1 true)`, as a trunc of
+an i8 or i32 constant. When regions differ in a constant, LLVM's IR outliner
+passes it as a parameter and replaces every use of the first region's constant
+in the outlined function, including the constant each exit returns to tell the
+caller where to continue: i1 for two exits, i16 for more. A region that passes
+`true` where the first passed `false` then returns `true` from the `false`
+exit, and the caller takes the other branch. A PGSO build of the unit tests
+took a slash menu test's `orelse` panic this way on a non-null result. With
+those constants rebuilt, the outliner only passes them as i8 and i32
+parameters, which no exit returns. PHI incoming constants keep their
+constants: rebuilding one at the end of its incoming block turns it into a
+value the region must hand back, and the outliner then sometimes drops that
+store. check-outlined catches a PHI constant that becomes an exit's value.
+Intrinsic arguments that must be immediate, assume-like intrinsics, inline
+asm, GEP indices, and switch cases also keep their constants. Run it on the
+outliner's input right before `opt -passes=iroutliner`, after swap-compares.
+The LLVM bug is https://github.com/llvm/llvm-project/issues/239125.
+
 check-outlined fails when an outlined function holds a constant expression
 that the outliner rebuilt from a parameter: an instruction LLVM named
-`constexpr`, or a constant expression with a non-constant operand. After
-expand-constant-exprs neither should exist, so any hit is a form this guard
-does not cover.
+`constexpr`, or a constant expression with a non-constant operand. It also
+fails when an outlined function returns something other than a constant,
+because each exit returns its own constant, and when it has a block other
+than its entry that nothing branches to (see dropped-outputs). After
+expand-constant-exprs and widen-constants the first two should not exist, so
+a hit is a form these guards do not cover.
+
+dropped-outputs prints, as JSON, each outlined function with a block other
+than its entry that nothing branches to, and the functions that call it.
+When two regions store the same outputs in two different ways, LLVM's IR
+outliner needs a switch to pick the stores, but it builds the switch only
+when the stored outputs differ, and the release build skips the assertion
+that catches the case. The stores are left in blocks nothing branches to, so
+each caller reads its output uninitialized. A transformed unit test read a
+garbage error code this way. Nothing else the outliner builds is
+unreachable. The pipeline marks those callers `nooutline` and outlines
+again. The LLVM bug is https://github.com/llvm/llvm-project/issues/239126.
 
 minsize-functions writes the names of the defined functions, and of those
 that carry `minsize`, to a JSON file. Profile use marks the functions it
@@ -157,6 +192,23 @@ OUTLINED_PREFIX = "outlined_ir_func"
 # that LLVM's IR similarity analysis reverses, mapped to its swapped form.
 SWAPPED_INT_PREDICATES = {34: 36, 35: 37, 38: 40, 39: 41}  # ugt, uge, sgt, sge
 SWAPPED_REAL_PREDICATES = {2: 4, 3: 5, 10: 12, 11: 13}  # ogt, oge, ugt, uge
+TRUNC = 30
+# widen-constants: the IR outliner's exit selectors are i1 or i16, so those
+# constants are rebuilt from constants of these widths.
+WIDENED_WIDTHS = {1: 8, 16: 32}
+# The intrinsics LLVM calls assume-like, which the IR outliner never moves.
+ASSUME_LIKE_INTRINSICS = (
+    "llvm.assume",
+    "llvm.sideeffect",
+    "llvm.pseudoprobe",
+    "llvm.dbg.",
+    "llvm.invariant.",
+    "llvm.lifetime.",
+    "llvm.experimental.noalias.scope.decl",
+    "llvm.objectsize.",
+    "llvm.ptr.annotation.",
+    "llvm.var.annotation.",
+)
 
 
 class PassError(Exception):
@@ -315,6 +367,18 @@ class Llvm:
         self.GetNamedAlias = f("LLVMGetNamedGlobalAlias", P, P, C.c_char_p, C.c_size_t)
         self.AliasTarget = f("LLVMAliasGetAliasee", P, P)
         self.IsAFunction = f("LLVMIsAFunction", P, P)
+        self.IsAInlineAsm = f("LLVMIsAInlineAsm", P, P)
+        self.IsATerminator = f("LLVMIsATerminatorInst", P, P)
+        self.IsABranch = f("LLVMIsABranchInst", P, P)
+        self.IsAReturn = f("LLVMIsAReturnInst", P, P)
+        self.NumArgOperands = f("LLVMGetNumArgOperands", C.c_uint, P)
+        self.IntTy = f("LLVMIntTypeInContext", P, P, C.c_uint)
+        self.BlockTerminator = f("LLVMGetBasicBlockTerminator", P, P)
+        self.NumSuccessors = f("LLVMGetNumSuccessors", C.c_uint, P)
+        self.Successor = f("LLVMGetSuccessor", P, P, C.c_uint)
+        self.BlockName = f("LLVMGetBasicBlockName", C.c_char_p, P)
+        self.IsAArgument = f("LLVMIsAArgument", P, P)
+        self.IsAStoreInst = f("LLVMIsAStoreInst", P, P)
 
     def _fn(self, name, res, *args):
         fn = getattr(self.lib, name)
@@ -1201,6 +1265,81 @@ def swap_compares(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> dic
     return summary
 
 
+def _widenable_operands(llvm: Llvm, inst) -> range:
+    """The operands of `inst` that the IR outliner could turn into parameters
+    and that may hold a value other than a constant."""
+    if (
+        # A trunc for a PHI's incoming constant would sit in the incoming
+        # block, and where that block is in a region and the PHI is not, the
+        # outliner can drop the region's store of the PHI's value.
+        llvm.IsAPHINode(inst)
+        or llvm.IsALandingPad(inst)
+        or llvm.IsAAllocaInst(inst)
+        # The outliner only matches GEPs with equal indices, and struct
+        # indices must stay constant.
+        or llvm.IsAGEPInst(inst)
+        # Switch cases must stay constant. Other terminators but `br` never
+        # join a region.
+        or (llvm.IsATerminator(inst) and not llvm.IsABranch(inst))
+    ):
+        return range(0)
+    if not llvm.IsACallInst(inst):
+        return range(llvm.NumOperands(inst))
+    callee = llvm.CalledValue(inst)
+    if llvm.IsAInlineAsm(callee):
+        # An inline asm operand may need an immediate.
+        return range(0)
+    if llvm.IsAIntrinsic(inst) and llvm.name(callee).startswith(ASSUME_LIKE_INTRINSICS):
+        return range(0)
+    return range(llvm.NumArgOperands(inst))
+
+
+def _wide_constant(llvm: Llvm, ctx, constant):
+    """The wider constant `constant` is rebuilt from, or None when it is not
+    an i1 or i16 integer."""
+    if not llvm.IsAConstantInt(constant):
+        return None
+    width = WIDENED_WIDTHS.get(llvm.IntWidth(llvm.TypeOf(constant)))
+    if width is None:
+        return None
+    return llvm.ConstInt(llvm.IntTy(ctx, width), llvm.ConstZExt(constant), 0)
+
+
+def _truncated(llvm: Llvm, builder, wide, narrow_type, before):
+    """`trunc wide to narrow_type` as an instruction before `before`."""
+    llvm.PositionBefore(builder, before)
+    # The builder folds a cast of a constant, so cast a placeholder.
+    placeholder = llvm.BuildFreeze(builder, wide, b"")
+    inst = llvm.BuildCast(builder, TRUNC, placeholder, narrow_type, b"pgso.wide")
+    llvm.SetOperand(inst, 0, wide)
+    llvm.Erase(placeholder)
+    return inst
+
+
+def widen_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> dict:
+    ctx, mod = llvm.load(source)
+    builder = llvm.CreateBuilder(ctx)
+    immarg = llvm.kind("immarg")
+    summary = {"pass": "widen-constants", "widened_operands": 0}
+    fn = llvm.FirstFunction(mod)
+    while fn:
+        if not llvm.IsDeclaration(fn):
+            for inst in _instructions(llvm, fn):
+                callee = llvm.CalledValue(inst) if llvm.IsAIntrinsic(inst) else None
+                for index in _widenable_operands(llvm, inst):
+                    if callee is not None and llvm.GetEnumAttrAt(callee, index + 1, immarg):
+                        continue
+                    constant = llvm.GetOperand(inst, index)
+                    wide = _wide_constant(llvm, ctx, constant)
+                    if wide is None:
+                        continue
+                    llvm.SetOperand(inst, index, _truncated(llvm, builder, wide, llvm.TypeOf(constant), inst))
+                    summary["widened_operands"] += 1
+        fn = llvm.NextFunction(fn)
+    llvm.save(mod, output)
+    return summary
+
+
 def _holds_parameter(llvm: Llvm, expression) -> bool:
     for i in range(llvm.NumOperands(expression)):
         operand = llvm.GetOperand(expression, i)
@@ -1209,6 +1348,81 @@ def _holds_parameter(llvm: Llvm, expression) -> bool:
         if llvm.IsAConstantExpr(operand) and _holds_parameter(llvm, operand):
             return True
     return False
+
+
+def _unreachable_blocks(llvm: Llvm, fn) -> list[tuple[str, bool]]:
+    """The non-entry blocks of `fn` that no terminator branches to, each with
+    whether it stores through one of `fn`'s parameters."""
+    blocks, targets = [], set()
+    block = llvm.FirstBlock(fn)
+    while block:
+        blocks.append(block)
+        terminator = llvm.BlockTerminator(block)
+        if terminator:
+            for index in range(llvm.NumSuccessors(terminator)):
+                targets.add(llvm.Successor(terminator, index))
+        block = llvm.NextBlock(block)
+    found = []
+    for position, block in enumerate(blocks[1:], start=1):
+        if block in targets:
+            continue
+        stores = False
+        inst = llvm.FirstInstruction(block)
+        while inst:
+            if llvm.IsAStoreInst(inst) and llvm.IsAArgument(llvm.GetOperand(inst, 1)):
+                stores = True
+            inst = llvm.NextInstruction(inst)
+        name = llvm.BlockName(block)
+        found.append((name.decode("utf-8", "replace") if name else f"#{position}", stores))
+    return found
+
+
+def _callers(llvm: Llvm, fn) -> list[str]:
+    return sorted({
+        llvm.name(llvm.BlockParent(llvm.InstParent(user)))
+        for user in _users(llvm, fn)
+        if llvm.IsAInstruction(user)
+    })
+
+
+def _dropped_outputs(llvm: Llvm, mod) -> tuple[int, list[dict]]:
+    """The number of outlined functions in `mod`, and those with a non-entry
+    block that nothing branches to.
+
+    The IR outliner leaves such blocks when two regions store the same
+    outputs in two different ways, which needs a switch it only builds when
+    the stored outputs differ. The blocks hold the stores of the region's
+    outputs, so those stores never run and each caller reads its output slot
+    uninitialized. Nothing else the outliner or CodeExtractor builds is
+    unreachable.
+    """
+    count, instances = 0, []
+    fn = llvm.FirstFunction(mod)
+    while fn:
+        name = llvm.name(fn)
+        if not llvm.IsDeclaration(fn) and name.startswith(OUTLINED_PREFIX):
+            count += 1
+            blocks = _unreachable_blocks(llvm, fn)
+            if blocks:
+                instances.append({
+                    "function": name,
+                    "blocks": [block for block, _ in blocks],
+                    "stores_to_parameter": any(stores for _, stores in blocks),
+                    "callers": _callers(llvm, fn),
+                })
+        fn = llvm.NextFunction(fn)
+    return count, instances
+
+
+def dropped_outputs(llvm: Llvm, source: pathlib.Path) -> dict:
+    _, mod = llvm.load(source)
+    count, instances = _dropped_outputs(llvm, mod)
+    return {
+        "pass": "dropped-outputs",
+        "outlined_functions": count,
+        "instances": instances,
+        "callers": sorted({caller for instance in instances for caller in instance["callers"]}),
+    }
 
 
 def check_outlined(llvm: Llvm, source: pathlib.Path) -> dict:
@@ -1223,13 +1437,24 @@ def check_outlined(llvm: Llvm, source: pathlib.Path) -> dict:
             for inst in _instructions(llvm, fn):
                 if llvm.name(inst).startswith("constexpr"):
                     findings.append(f"{name}: rebuilt constant expression {llvm.name(inst)}")
+                if llvm.IsAReturn(inst) and llvm.NumOperands(inst) and not llvm.IsConstant(llvm.GetOperand(inst, 0)):
+                    findings.append(f"{name}: exit selector replaced by a parameter")
                 for index in range(llvm.NumOperands(inst)):
                     operand = llvm.GetOperand(inst, index)
                     if llvm.IsAConstantExpr(operand) and _holds_parameter(llvm, operand):
                         findings.append(f"{name}: constant expression with a parameter operand")
         fn = llvm.NextFunction(fn)
+    for instance in _dropped_outputs(llvm, mod)[1]:
+        findings.append(
+            f"{instance['function']}: output stores in blocks with no predecessors "
+            f"({', '.join(instance['blocks'])}), called from {', '.join(instance['callers']) or 'nothing'}"
+        )
     if findings:
-        raise PassError("IR outliner folded a nested constant into a parameter: " + "; ".join(findings[:8]))
+        raise PassError(
+            "IR outliner miscompiled an outlined function: "
+            + "; ".join(findings[:8])
+            + ". scripts/pgso/README.md describes each case; a caller can be kept out of outlining with no-outline"
+        )
     return summary
 
 
@@ -1300,7 +1525,9 @@ def main(argv: list[str] | None = None) -> int:
             "compact-error-names",
             "expand-constant-exprs",
             "swap-compares",
+            "widen-constants",
             "check-outlined",
+            "dropped-outputs",
             "minsize-functions",
             "no-outline",
             "name-functions",
@@ -1310,14 +1537,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("output", type=pathlib.Path, nargs="?")
     parser.add_argument("--functions", type=pathlib.Path)
     args = parser.parse_args(argv)
-    if (args.output is None) != (args.command == "check-outlined"):
-        parser.error("check-outlined takes only an input; the other commands need an output")
+    if (args.output is None) != (args.command in ("check-outlined", "dropped-outputs")):
+        parser.error("check-outlined and dropped-outputs take only an input; the other commands need an output")
     if (args.functions is None) == (args.command == "no-outline"):
         parser.error("--functions goes with no-outline, and only with it")
     try:
         llvm = Llvm(args.libllvm)
         if args.command == "check-outlined":
             summary = check_outlined(llvm, args.source)
+        elif args.command == "dropped-outputs":
+            summary = dropped_outputs(llvm, args.source)
         elif args.command == "no-outline":
             summary = no_outline(llvm, args.source, args.output, args.functions)
         else:
@@ -1329,6 +1558,7 @@ def main(argv: list[str] | None = None) -> int:
                 "compact-error-names": compact_error_names,
                 "expand-constant-exprs": expand_constant_exprs,
                 "swap-compares": swap_compares,
+                "widen-constants": widen_constants,
                 "minsize-functions": minsize_functions,
                 "name-functions": name_functions,
             }[args.command]

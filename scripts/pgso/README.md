@@ -107,6 +107,38 @@ swap-compares` rewrites each greater-than comparison as the less-than
 comparison with its operands swapped, so the outliner only matches comparisons
 written the same way.
 
+When regions differ in a constant, the IR outliner passes it as a parameter
+and replaces every use of the first region's constant in the outlined
+function. That includes the constant each exit returns to tell the caller
+where to continue, an `i1` for two exits and an `i16` for more, so a region
+that passes `true` where the first passed `false` can return from the wrong
+exit. A transformed unit test build took a slash menu test's `orelse` panic
+this way on a non-null result. After `swap-compares` and before each outliner
+run, `ir_size.py widen-constants` rebuilds each `i1` and `i16` constant that
+an instruction uses as an operand as a `trunc` of an `i8` or `i32` constant,
+so the outliner never passes a constant of an exit's type. PHI incoming
+constants stay as they are, because rebuilding them in the incoming block can
+make the outliner drop a store the region owes its caller. `check-outlined`
+fails the run if an outlined function returns anything but a constant, which
+also catches a PHI constant that the outliner turns into an exit's value.
+This is [llvm/llvm-project#239125](https://github.com/llvm/llvm-project/issues/239125).
+
+The IR outliner can also lose an outlined function's outputs. When two regions
+store the same outputs in two different ways, it needs a switch to pick the
+stores, but it builds the switch only when the stored outputs differ, and the
+release build skips the assertion that catches the case. The stores are left
+in blocks nothing branches to, so each caller reads its output uninitialized.
+A transformed unit test read a garbage error code this way, and an fx
+candidate had one such function on the out-of-memory path of its footer rows.
+After each outliner run, `ir_size.py dropped-outputs` lists the outlined
+functions with a block nothing branches to and the functions that call them.
+Those callers are marked `nooutline`, as startup functions are, which also
+keeps the machine outliner out of them, and the outliner runs again on the
+same input. After four rounds, `check-outlined` fails the run on any that
+remain. `outline-rounds-*.json` in the logs directory records each round's
+outlined functions, the functions it found, and the callers it excluded.
+This is [llvm/llvm-project#239126](https://github.com/llvm/llvm-project/issues/239126).
+
 Four size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
 library. Right after Zig emits bitcode, `outline-helpers` marks small shared
 std helpers `noinline`: the allocator's slice `free`, `remap`, and aligned
