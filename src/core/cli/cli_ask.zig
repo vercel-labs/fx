@@ -2019,11 +2019,13 @@ fn maybeStartAskTitleTask(
     return task;
 }
 
-/// Joins the bounded title task and installs the generated title unless the
-/// session already carries a user-set title.
+/// Gives the title task a short grace after the turn, then installs the
+/// generated title unless the session already carries a user-set title. A
+/// title still pending after the grace is dropped, and the session keeps the
+/// title derived from its first prompt.
 fn completeAskTitleTask(ctx: *AskContext, task: *session_title_generation.Task) void {
     defer task.destroy();
-    task.joinOrCancel(ctx.cancelFlag());
+    task.joinOrCancel(ctx.cancelFlag(), session_title_generation.after_turn_grace_ms);
     const title = task.takeTitle() orelse return;
     defer std.heap.c_allocator.free(title);
     ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
@@ -2249,7 +2251,7 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
         },
         model,
         bundle.fallbackModelCapabilities(model),
-        gateway_provider.catalog_first_load_wait_ms,
+        gateway_provider.catalog_connect_wait_ms,
     );
 }
 
@@ -2278,7 +2280,7 @@ fn resolveModelOverride(raw_ctx: ?*anyopaque, alloc: Allocator, raw_model: []con
         },
         raw_model,
         bundle.fallbackModelCapabilities(raw_model),
-        gateway_provider.catalog_first_load_wait_ms,
+        gateway_provider.catalog_connect_wait_ms,
     ) catch return .no_catalog;
     const entries = ctx.capability_resolver.catalogEntries() orelse return .no_catalog;
     var ids = try model_catalog.projectModelIds(alloc, entries);

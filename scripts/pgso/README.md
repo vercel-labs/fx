@@ -82,18 +82,20 @@ runs LLVM's IR outliner once over the whole optimized program. Generated IR
 helpers are kept in one dense linker cluster ordered by their hottest profiled
 caller so outlining does not scatter startup code across cold pages.
 
-Code generation for the fx candidate runs the AArch64 machine outliner a second
-time and enables LLVM's homogeneous prologue and epilogue. Each function that
-profile use compiled for size then saves and restores its callee-saved
-registers by calling one of a few dozen shared frame helpers instead of
-repeating those loads and stores inline. Functions compiled for speed keep
-inline prologues. fx builds without frame pointers or unwind tables, so the
-helpers change no stack walking. The measured heavy benchmark candidates use
-the same profile-use flags and code generation as the fx candidate, so the
-heavy gates measure the code fx ships. A benchmark trained on its own workload
-keeps the default code generation and a higher cold cutoff, because its
-profile-use IR only selects the functions to transfer into the production
-profile.
+Code generation for the fx candidate runs the machine outliner a second time,
+which can fold sequences the first round exposed. The second round runs
+wherever the outliner runs: on AArch64, and on Linux x86_64 for the cold code
+described below. On AArch64, code generation also enables LLVM's homogeneous
+prologue and epilogue. Each function that profile use compiled for size then
+saves and restores its callee-saved registers by calling one of a few dozen
+shared frame helpers instead of repeating those loads and stores inline.
+Functions compiled for speed keep inline prologues. fx builds without frame
+pointers or unwind tables, so the helpers change no stack walking. The measured
+heavy benchmark candidates use the same profile-use flags and code generation
+as the fx candidate, so the heavy gates measure the code fx ships. A benchmark
+trained on its own workload keeps the default code generation and a higher cold
+cutoff, because its profile-use IR only selects the functions to transfer into
+the production profile.
 
 LLVM runs the machine outliner by default only on AArch64, where it outlines
 the functions profile use compiled for size. Linux x86_64 asks for it with

@@ -18,6 +18,11 @@ pub const max_generated_title_bytes: usize = 60;
 /// Only a bounded excerpt of the first prompt is sent for title generation.
 pub const max_prompt_excerpt_bytes: usize = 2048;
 pub const default_timeout_ms: u32 = 15_000;
+/// How long a turn that has ended still waits for its title before it
+/// cancels the call. The title runs alongside the whole turn, so only a
+/// call slower than the turn waits at all, and a stuck one holds the turn's
+/// end for at most this long instead of `default_timeout_ms`.
+pub const after_turn_grace_ms: u32 = 2_000;
 const max_output_tokens: u32 = 128;
 const content_capture_limit: usize = 4 * 1024;
 
@@ -311,12 +316,21 @@ pub const Task = struct {
         self.cancel_requested.store(true, .release);
     }
 
-    /// Joins like `join`, but cancels the call once `owner_cancel` is set,
-    /// so a cancelled turn does not wait out the title deadline.
-    pub fn joinOrCancel(self: *Task, owner_cancel: *const std.atomic.Value(bool)) void {
+    /// Joins like `join`, but cancels the call once `owner_cancel` is set or
+    /// `grace_ms` has passed, so a finished or cancelled turn does not wait
+    /// out the title deadline. The session then keeps its derived title.
+    pub fn joinOrCancel(self: *Task, owner_cancel: *const std.atomic.Value(bool), grace_ms: u32) void {
+        const zio = io_mod.getIo();
+        const grace_end = std.Io.Clock.Timestamp.fromNow(zio, .{ .clock = .awake, .raw = .fromMilliseconds(grace_ms) });
         while (!self.isDone()) {
-            if (owner_cancel.load(.seq_cst)) {
-                debug_trace.logf("session", "event=title_generation_dropped reason=turn_cancelled session={s}", .{self.session_id});
+            const reason: ?[]const u8 = if (owner_cancel.load(.seq_cst))
+                "turn_cancelled"
+            else if (!std.Io.Clock.Timestamp.now(zio, .awake).compare(.lt, grace_end))
+                "grace_expired"
+            else
+                null;
+            if (reason) |why| {
+                debug_trace.logf("session", "event=title_generation_dropped reason={s} session={s}", .{ why, self.session_id });
                 self.cancel();
                 break;
             }
@@ -684,12 +698,31 @@ test "joinOrCancel cancels a title call when the turn is cancelled" {
     defer task.destroy();
     try task.spawn();
     var turn_cancel = std.atomic.Value(bool).init(true);
-    task.joinOrCancel(&turn_cancel);
+    task.joinOrCancel(&turn_cancel, after_turn_grace_ms);
     try std.testing.expectEqual(Task.Status.unavailable, task.status);
     try std.testing.expectEqual(FailureReason.cancelled, task.failure_reason.?);
 }
 
-test "joinOrCancel waits for the title when the turn is not cancelled" {
+test "joinOrCancel cancels a title call that outlasts the grace after the turn" {
+    const task = try Task.create(.{
+        .session_id = "session-1",
+        .model = "test/title",
+        .prompt_excerpt = "fix the renderer",
+        .api_key = "key",
+        .stream_provider = .{ .stream_fn = HeadWaitProvider.stream },
+    });
+    defer task.destroy();
+    try task.spawn();
+    var turn_cancel = std.atomic.Value(bool).init(false);
+    const started = io_mod.milliTimestamp();
+    task.joinOrCancel(&turn_cancel, 50);
+    // The call itself would have waited out its 15 s deadline.
+    try std.testing.expect(io_mod.milliTimestamp() - started < 2_000);
+    try std.testing.expectEqual(Task.Status.unavailable, task.status);
+    try std.testing.expectEqual(FailureReason.cancelled, task.failure_reason.?);
+}
+
+test "joinOrCancel keeps a title that answers within the grace" {
     const Slow = struct {
         fn stream(_: ?*anyopaque, _: Allocator, request: stream_provider.ModelRequest) anyerror!stream_provider.Result {
             try request.admission.admit();
@@ -710,7 +743,7 @@ test "joinOrCancel waits for the title when the turn is not cancelled" {
     defer task.destroy();
     try task.spawn();
     var turn_cancel = std.atomic.Value(bool).init(false);
-    task.joinOrCancel(&turn_cancel);
+    task.joinOrCancel(&turn_cancel, after_turn_grace_ms);
     try std.testing.expectEqual(Task.Status.generated, task.status);
     const title = task.takeTitle().?;
     defer std.heap.c_allocator.free(title);
