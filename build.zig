@@ -600,9 +600,8 @@ fn jsEngineModule(
     module.addCSourceFiles(.{
         .root = b.path("src/js/quickjs"),
         .files = &.{ "quickjs.c", "libregexp.c", "libunicode.c", "dtoa.c" },
-        // A release build optimizes the C for size: on a JSON, regex, and
-        // sort workload, -Os made the engine 188 KiB smaller and 2% slower
-        // than the default.
+        // A release build optimizes the C for size, which makes the engine
+        // noticeably smaller for a few percent of speed.
         .flags = if (optimize == .debug) &quickjs_flags else &(quickjs_flags ++ [_][]const u8{"-Os"}),
     });
     module.addImport("build_options", options.createModule());
