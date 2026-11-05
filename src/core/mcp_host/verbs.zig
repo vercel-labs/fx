@@ -481,8 +481,19 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
     };
 }
 
+// How fx says an MCP file is unusable, after a subject such as "it" or
+// "~/.fx/mcp.json".
+const not_plain_words = "isn't a plain file; replace it with one";
+const link_loop_words = "is a link that loops or passes through too many links; replace it with a plain file";
+const too_large_words = std.fmt.comptimePrint("is over {d} MB, the most fx reads; make it smaller", .{config_file.max_read_bytes / (1024 * 1024)});
+
 /// Why a write to `path` failed; a link says what it points to.
 fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
+    switch (err) {
+        error.SymLinkLoop => return "it " ++ link_loop_words,
+        error.StreamTooLong => return "it " ++ too_large_words,
+        else => {},
+    }
     // The profile's replace refuses a link itself (DurablePathUnsafe).
     if (err != error.Linked and err != error.DurablePathUnsafe) return describe(err);
     var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -490,7 +501,7 @@ fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
         // Not a link: a regular file with another hard link, or a special
         // file such as a fifo.
         const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = false }) catch return describe(err);
-        if (stat.kind != .file) return "it isn't a plain file; replace it with one";
+        if (stat.kind != .file) return "it " ++ not_plain_words;
         return "it has another hard link, and fx edits only a plain file; edit it by hand";
     };
     const target = try safe(arena, buffer[0..n]);
@@ -507,12 +518,27 @@ pub fn describe(err: anyerror) []const u8 {
         error.NotAnObject => "the file's servers aren't a JSON object; fix it by hand first",
         error.HomeNotSet => io_mod.no_home_dir_reason,
         error.AccessDenied => "permission denied",
-        error.DurablePathUnsafe => "an MCP config file isn't a plain file; replace it with one",
+        error.DurablePathUnsafe => "an MCP config file " ++ not_plain_words,
+        error.SymLinkLoop => "an MCP config file " ++ link_loop_words,
+        error.StreamTooLong => "an MCP config file " ++ too_large_words,
         error.Timeout, error.LockTimeout => "another fx is changing the MCP config; try again",
         error.McpConfigInvalidJson => profile_paths.displayText("~/.fx/mcp.json isn't valid JSON"),
+        error.McpConfigNotPlainFile => profile_paths.displayText("~/.fx/mcp.json " ++ not_plain_words),
+        error.McpConfigLinkLoop => profile_paths.displayText("~/.fx/mcp.json " ++ link_loop_words),
+        error.McpConfigTooLarge => profile_paths.displayText("~/.fx/mcp.json " ++ too_large_words),
         error.McpConfigInvalidHeaders, error.McpConfigAuthorizationHeader => profile_paths.displayText("a server in ~/.fx/mcp.json has headers fx won't send; put a token in bearer_token_env, or sign in with login"),
-        else => if (std.mem.startsWith(u8, @errorName(err), "McpConfig")) profile_paths.displayText("~/.fx/mcp.json has a server entry fx can't read") else "something went wrong",
+        else => if (isProfileConfigError(err)) profile_paths.displayText("~/.fx/mcp.json has a server entry fx can't read") else "something went wrong",
     };
+}
+
+/// fx's words for an error in ~/.fx/mcp.json itself, for a caller that would
+/// otherwise print the error's name; null for any other error.
+pub fn profileConfigNotice(err: anyerror) ?[]const u8 {
+    return if (isProfileConfigError(err)) describe(err) else null;
+}
+
+fn isProfileConfigError(err: anyerror) bool {
+    return std.mem.startsWith(u8, @errorName(err), "McpConfig");
 }
 
 const Paths = struct { profile: []const u8, project: []const u8 };
@@ -1325,4 +1351,31 @@ test "list lines up its columns and keeps hostile names inert" {
         \\{"servers":[{"name":"context7","source":"profile","file":"/h/.fx/mcp.json","transport":"http","status":"ready","error":null,"tools":2}]}
         \\
     , json.written());
+}
+
+test "an MCP file fx can't read gets fx's words, and only mcp.json's own errors name it" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqualStrings(
+        profile_paths.displayText("~/.fx/mcp.json is a link that loops or passes through too many links; replace it with a plain file"),
+        profileConfigNotice(error.McpConfigLinkLoop).?,
+    );
+    try testing.expectEqualStrings(
+        profile_paths.displayText("~/.fx/mcp.json is over 1 MB, the most fx reads; make it smaller"),
+        profileConfigNotice(error.McpConfigTooLarge).?,
+    );
+    try testing.expectEqualStrings(
+        profile_paths.displayText("~/.fx/mcp.json isn't a plain file; replace it with one"),
+        profileConfigNotice(error.McpConfigNotPlainFile).?,
+    );
+    try testing.expectEqualStrings(profile_paths.displayText("~/.fx/mcp.json isn't valid JSON"), profileConfigNotice(error.McpConfigInvalidJson).?);
+    // The same failures from a file this can't name, such as the project's
+    // .mcp.json, keep their own words.
+    try testing.expect(profileConfigNotice(error.SymLinkLoop) == null);
+    try testing.expect(profileConfigNotice(error.AccessDenied) == null);
+    try testing.expectEqualStrings("an MCP config file is a link that loops or passes through too many links; replace it with a plain file", describe(error.SymLinkLoop));
+    try testing.expectEqualStrings("an MCP config file is over 1 MB, the most fx reads; make it smaller", describe(error.StreamTooLong));
+    try testing.expectEqualStrings("it is a link that loops or passes through too many links; replace it with a plain file", try whyNot(a, error.SymLinkLoop, "/example/.mcp.json"));
+    try testing.expectEqualStrings("it is over 1 MB, the most fx reads; make it smaller", try whyNot(a, error.StreamTooLong, "/example/.mcp.json"));
 }
