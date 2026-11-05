@@ -4,6 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { writeChatGptLogin, writeGrokLogin } from "./usage-fakes";
+import { createConfiguredProviderFixture } from "./fixtures/chat-completions";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
 
@@ -223,20 +224,14 @@ describe("fx doctor provider", () => {
   }, TIMEOUT);
 
   test("a configured provider is not asked, so nothing claims it accepted the credential", async () => {
-    const r = makeRoot();
-    let hits = 0;
-    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => {
-      hits += 1;
-      return new Response("unauthorized", { status: 401 });
-    } });
-    cleanups.push(() => server.stop(true));
-    writeFileSync(join(r.home, ".fx", "settings.json"), JSON.stringify({
-      provider: "remote",
-      providers: { remote: { protocol: "openai-chat-completions", base_url: `http://127.0.0.1:${server.port}/v1`, auth: { type: "bearer", env: "DOCTOR_PROVIDER_TOKEN" }, model_metadata: { "remote-model": { context_window: 262144, max_output_tokens: 8192, supports_tool_use: true } } } },
-      models: { remote: "remote-model" },
-    }), { mode: 0o600 });
-    const result = await doctor(r, env(r, { FX_MODEL: undefined, DOCTOR_PROVIDER_TOKEN: "wrong-token" }));
-    expect(hits).toBe(0);
+    const f = createConfiguredProviderFixture();
+    cleanups.push(() => f.close());
+    f.settings.provider = "remote";
+    f.save();
+    const r: Root = { root: f.home, home: f.home, workspace: f.workspace, bin: join(f.home, "bin") };
+    mkdirSync(r.bin, { mode: 0o700 });
+    const result = await doctor(r, env(r, { FX_MODEL: undefined, FX_TEST_PROVIDER_TOKEN: "wrong-token" }));
+    expect(f.requests).toEqual([]);
     expect(result.stdout).not.toContain("accepted the credential");
     expect(result.stdout).not.toMatch(/^\[\w+\] (provider|model): /m);
     expect(result.stdout).toMatch(/^\[ok\] auth: /m);
