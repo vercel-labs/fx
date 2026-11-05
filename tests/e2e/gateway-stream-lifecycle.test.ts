@@ -11703,6 +11703,53 @@ describe("request recovery across statuses and garbled streams", () => {
     }
   }, 30_000);
 
+  // A catalog whose request has connected is waited for, however slowly its
+  // body arrives; only a request that cannot connect is given up on
+  // (`src/core/gateway/gateway_provider.zig` resolveWithin).
+  for (const [label, bodyDelayMs] of [["at once", 0], ["slowly after it connects", 3_000]] as const) {
+    test(`fx ask uses the model catalog's limits when the catalog answers ${label}`, async () => {
+      const root = createFixtureRoot("catalog-limits");
+      const tracePath = join(root.root, "trace.log");
+      const catalogBody = JSON.stringify({
+        data: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 123_456, max_tokens: 7_000 }],
+      });
+      const encoder = new TextEncoder();
+      const timers: Array<ReturnType<typeof setTimeout>> = [];
+      const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("Answered with the catalog's limits."), {
+        models: () => new Response(new ReadableStream({
+          start(controller) {
+            timers.push(setTimeout(() => {
+              controller.enqueue(encoder.encode(catalogBody));
+              controller.close();
+            }, bodyDelayMs));
+          },
+        }), { headers: { "content-type": "application/json" } }),
+      });
+      try {
+        const started = performance.now();
+        const result = await runFx(["ask", "--json", "--auto", "--no-save", "Answer with the catalog's limits."], {
+          cwd: root.workspace,
+          env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,core,gateway,stream,context_compaction" },
+          timeoutMs: 30_000,
+        });
+        const elapsedMs = performance.now() - started;
+        expect(result.code, result.stderr).toBe(0);
+        expect(parseAskJson(result.stdout).output).toBe("Answered with the catalog's limits.");
+        expect(gateway.modelRequests).toHaveLength(1);
+        const trace = readFileSync(tracePath, "utf8");
+        expect(trace).toContain(`model catalog lookup outcome=ready_hit model=${MODEL}`);
+        expect(trace).not.toContain("model catalog first load abandoned");
+        // The request was sized with the catalog's output limit.
+        expect(trace).toMatch(/\[context_compaction\] event=decision .* max_output_tokens=7000\b/);
+        expect(elapsedMs).toBeGreaterThanOrEqual(bodyDelayMs);
+      } finally {
+        for (const timer of timers) clearTimeout(timer);
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 40_000);
+  }
+
   test("fx ask names the status of a failure it does not retry", async () => {
     const root = createFixtureRoot("named-status");
     const tracePath = join(root.root, "trace.log");
