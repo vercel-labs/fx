@@ -5572,6 +5572,26 @@ test "the steering preview leaves out a subagent's mail and keeps the user's ste
     try std.testing.expectEqualStrings("a report", guidance[0].text);
 }
 
+test "a subagent's mail that waits for the next turn stays out of the steering preview" {
+    const alloc = std.testing.allocator;
+    var runtime = WorkerRuntime{};
+    defer runtime.deinit(alloc);
+    runtime.worker_processing = true;
+    runtime.active_turn_id = 9;
+    runtime.requestCancel();
+
+    // During a cancel the report can't join the turn, so it waits for the
+    // next one, which is steering the preview draws as well.
+    try runtime.postMail(alloc, try makePrompt(alloc, "a report", "model"));
+    runtime.queued_prompts.items[0].author = .child;
+    try std.testing.expect(runtime.queued_prompts.items[0].delivery.isContinuation());
+
+    var snapshot = try runtime.snapshotSteeringPresentation(alloc);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.messages.len);
+    try std.testing.expect(!snapshot.waits_for_boundary);
+}
+
 test "late steering keeps admission order when demoted on finish" {
     const alloc = std.testing.allocator;
     var runtime = WorkerRuntime{};
