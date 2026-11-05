@@ -71,28 +71,6 @@ pub fn sort(
             @memcpy(elems[out..][0 .. left_len - left], tmp[left..left_len]);
         }
 
-        fn mergeFromRight(user_ctx: *const anyopaque, base: [*]u8, a: usize, m: usize, b: usize, buf: [*]u8) void {
-            const ctx = userCtx(user_ctx);
-            const elems = typed(base);
-            const tmp = typed(buf);
-            const right_len = b - m;
-            @memcpy(tmp[0..right_len], elems[m..b]);
-            var right = right_len;
-            var left = m;
-            var out = b;
-            while (right > 0 and left > a) {
-                out -= 1;
-                if (lessThanFn(ctx, tmp[right - 1], elems[left - 1])) {
-                    left -= 1;
-                    elems[out] = elems[left];
-                } else {
-                    right -= 1;
-                    elems[out] = tmp[right];
-                }
-            }
-            @memcpy(elems[a..][0..right], tmp[0..right]);
-        }
-
         /// Merges each pair of `width`-long runs of `source` into `dest`.
         fn mergePass(user_ctx: *const anyopaque, source: [*]u8, dest: [*]u8, len: usize, width: usize) void {
             const ctx = userCtx(user_ctx);
@@ -124,7 +102,6 @@ pub fn sort(
             .less = less,
             .insertion = insertion,
             .merge_from_left = mergeFromLeft,
-            .merge_from_right = mergeFromRight,
             .merge_pass = mergePass,
         };
     };
@@ -158,8 +135,6 @@ const Kernels = struct {
     insertion: *const fn (user_ctx: *const anyopaque, base: [*]u8, len: usize) void,
     /// Merges [a, m) and [m, b) through `buf`, which holds the left run.
     merge_from_left: *const fn (user_ctx: *const anyopaque, base: [*]u8, a: usize, m: usize, b: usize, buf: [*]u8) void,
-    /// Merges [a, m) and [m, b) through `buf`, which holds the right run.
-    merge_from_right: *const fn (user_ctx: *const anyopaque, base: [*]u8, a: usize, m: usize, b: usize, buf: [*]u8) void,
     /// Merges each pair of `width`-long runs of `source` into `dest`.
     merge_pass: *const fn (user_ctx: *const anyopaque, source: [*]u8, dest: [*]u8, len: usize, width: usize) void,
 };
@@ -236,7 +211,6 @@ fn merge(view: *const ErasedView, a: usize, m: usize, b: usize, buffer: ?[]u8) v
     const size = view.elem_size;
     if (buffer) |buf| {
         if ((m - a) * size <= buf.len) return view.kernels.merge_from_left(view.user_ctx, view.base, a, m, b, buf.ptr);
-        if ((b - m) * size <= buf.len) return view.kernels.merge_from_right(view.user_ctx, view.base, a, m, b, buf.ptr);
     }
     symMerge(view, a, m, b, buffer);
 }
