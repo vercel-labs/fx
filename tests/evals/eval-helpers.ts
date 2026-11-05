@@ -472,6 +472,7 @@ export interface FxRunResult {
   elapsedMs: number;
   pid: number | null;
   processStateAtTimeout: string;
+  // Empty unless fx timed out or a signal ended it.
   processStateAfterClose: string;
 }
 
@@ -554,7 +555,9 @@ export async function runFx(
         elapsedMs: performance.now() - startedAtMs,
         pid: child.pid ?? null,
         processStateAtTimeout,
-        processStateAfterClose: code === 0 && !timedOut ? "" : captureFxProcessState(),
+        // A system-wide ps can take seconds on a busy machine, so a plain
+        // nonzero exit, which many tests expect, skips it.
+        processStateAfterClose: timedOut || signal !== null ? captureFxProcessState() : "",
       });
     });
   });

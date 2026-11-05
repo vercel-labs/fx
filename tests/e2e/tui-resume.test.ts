@@ -5886,7 +5886,7 @@ test("manual upgrade output links stable notes and dev changes", async () => {
   const home = join(root, "home");
   mkdirSync(home);
   const currentRevision = (await runFx(["status", "--json"], {
-    env: { AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined },
+    env: { AI_GATEWAY_API_KEY: undefined, VERCEL_OIDC_TOKEN: undefined, HOME: home },
   })).stdout;
   const revision = "abcdef0123456789abcdef0123456789abcdef01";
   const release = startUpgradeServer(root, argvLogPath, { revision });
