@@ -6052,7 +6052,7 @@ describe("cli: MCP profile", () => {
       env: { HOME: undefined, ...NO_GATEWAY_AUTH },
     });
     expect(missingHome.code).toBe(1);
-    expect(missingHome.stderr).toBe("fx mcp: HOME isn't set\n");
+    expect(missingHome.stderr).toBe("fx mcp: HOME is not set to an absolute path\n");
 
     // A relative HOME counts as unset: fx fails the same way and saves
     // nothing under the folder it runs in.
@@ -6063,7 +6063,7 @@ describe("cli: MCP profile", () => {
         env: { HOME: "relative/home", ...NO_GATEWAY_AUTH },
       });
       expect(relativeHome.code).toBe(1);
-      expect(relativeHome.stderr).toBe("fx mcp: HOME isn't set\n");
+      expect(relativeHome.stderr).toBe("fx mcp: HOME is not set to an absolute path\n");
       expect(readdirSync(cwd)).toEqual([]);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
