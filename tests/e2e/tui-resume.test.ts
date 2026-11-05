@@ -261,13 +261,13 @@ test.skipIf(!tmuxAvailable())("suspended sessions retain exclusive writer owners
   const home = join(root, "home"), workspace = join(root, "workspace");
   mkdirSync(home, { mode: 0o700 });
   mkdirSync(workspace, { mode: 0o700 });
-  const exitPath = join(root, "exit"), stderr = join(root, "stderr.log");
+  const exitPath = join(root, "exit"), stderr = join(root, "stderr.log"), trace = join(root, "trace.log");
   const gateway = startFakeGateway([
     fakeGatewayFinalText("FIRST_ACCEPTED_TURN"),
     fakeGatewayFinalText("AFTER_FOREGROUND_TURN"),
     fakeGatewayFinalText("COLD_REOPEN_TURN"),
   ]);
-  const env = { ...gatewayEnv(home, gateway), FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1" };
+  const env = { ...gatewayEnv(home, gateway), FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_TRACE_LOG: trace };
   let tui: TmuxSession | undefined;
   try {
     const seeded = await runFx(["ask", "--json", "Remember the original turn."], { cwd: workspace, env, timeoutMs: TIMEOUT });
@@ -297,6 +297,8 @@ test.skipIf(!tmuxAvailable())("suspended sessions retain exclusive writer owners
     await tui.sendKeys("Enter");
     await tui.waitForText("AFTER_FOREGROUND_TURN", TIMEOUT);
     await tui.waitForStableComposer(TIMEOUT);
+    // Coming back from the suspend clears the screen, and the trace says so.
+    expect(readFileSync(trace, "utf8")).toContain("event=job_control_resume_redraw dropped=terminal_screen_and_scrollback");
     expect(gateway.requests.at(-1)?.body).toContain("DRAFT_SURVIVES_SUSPENSION");
     expect(readFileSync(events).subarray(0, accepted.length).equals(accepted)).toBe(true);
     expect(await tui.captureFullScrollback()).not.toContain("InvalidTranscriptTransition");

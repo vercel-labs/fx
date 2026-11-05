@@ -510,6 +510,7 @@ pub fn Runtime(comptime App: type) type {
                 ui_render.initTheme(light, rgb);
             }
             app.shell.setCommandOutputRenderPolicy(shellStyles());
+            debug_trace.logf("theme", "event=theme_change_redraw dropped=terminal_screen_and_scrollback reason=transcript_redrawn_in_new_theme", .{});
             try app.shell.requestTerminalReset(&app.metrics);
             app.shell.render_requests.request(.transcript);
         }
