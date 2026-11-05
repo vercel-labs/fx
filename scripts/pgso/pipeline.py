@@ -481,12 +481,13 @@ def candidate_object_argv(
     *,
     production_flags: bool = False,
 ) -> tuple[str, ...]:
-    # A second AArch64 outliner pass can fold sequences exposed by the first,
-    # and each size-optimized function saves and restores its callee-saved
-    # registers through a shared frame helper instead of inline. The measured
-    # benchmark candidates pass `production_flags` so the heavy gates measure
-    # the code generation fx ships. A benchmark trained on its own workload
-    # keeps the default code generation.
+    # A second outliner pass can fold sequences exposed by the first. It runs
+    # wherever the outliner runs: AArch64, and cold code on Linux x86_64. On
+    # AArch64, each size-optimized function also saves and restores its
+    # callee-saved registers through a shared frame helper instead of inline.
+    # The measured benchmark candidates pass `production_flags` so the heavy
+    # gates measure the code generation fx ships. A benchmark trained on its
+    # own workload keeps the default code generation.
     production = production_flags or paths.selector == "fx"
     codegen_flags = FX_CODEGEN_FLAGS if production else ()
     return (
