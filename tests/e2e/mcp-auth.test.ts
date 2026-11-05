@@ -2091,6 +2091,20 @@ describe("MCP login", () => {
     expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
   }, 60_000);
 
+  test("removing a server whose saved login can't be deleted says so, and fx mcp remove fails", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const storePath = seedV2Credential(root, auth);
+    chmodSync(storePath, 0o400);
+    const done = await runFx(["mcp", "remove", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+    expect(done.stdout).toBe("");
+    expect(done.stderr).toBe("Removed fixture from ~/.fx/mcp.json, but couldn't delete its saved login: ~/.fx/mcp-credentials/credentials-v3.json couldn't be written: fx isn't allowed to write it.\n");
+    expect(done.code).toBe(1);
+    expect(readFileSync(join(root.home, ".fx", "mcp.json"), "utf8")).not.toContain("fixture");
+    expect(readFileSync(storePath, "utf8")).toContain(ACCESS_INITIAL);
+  }, 60_000);
+
   test("a logout while another fx keeps the saved logins busy changes nothing and says so", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);

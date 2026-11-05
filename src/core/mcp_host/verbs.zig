@@ -847,9 +847,25 @@ fn remove(c: Context, arena: Allocator, name: []const u8, only: ?config_file.Fil
     };
     defer if (url) |u| c.gpa.free(u);
     var forgot = false;
+    var kept: ?anyerror = null;
+    const store = credentials.Store.detect(arena, c.home);
     // A `.mcp.json` server's login is its workspace's own.
-    if (url) |u| forgot = credentials.Store.detect(arena, c.home).remove(arena, .{ .name = name, .url = u, .workspace = if (file == .project) c.workspace_root else null }) catch false;
+    if (url) |u| forgot = store.remove(arena, .{ .name = name, .url = u, .workspace = if (file == .project) c.workspace_root else null }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => no: {
+            debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ name, @errorName(err) });
+            kept = err;
+            break :no false;
+        },
+    };
     c.hosts.changed(c.hosts.context);
+    // The server is gone from the config, but every fx that adds it back
+    // would sign in with the login still saved.
+    if (kept) |err| {
+        var buffer: [320]u8 = undefined;
+        try c.err.print("Removed {s} from {s}, but couldn't delete its saved login: {s}.\n", .{ try safe(arena, name), fileLabel(file), store.writeFailure(&buffer, err) });
+        return 1;
+    }
     try c.out.print("Removed {s} from {s}{s}.\n", .{ name, fileLabel(file), if (forgot) ", and deleted its login" else "" });
     return 0;
 }
