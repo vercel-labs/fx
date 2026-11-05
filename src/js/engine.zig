@@ -192,32 +192,43 @@ fn describeThrown(gpa: std.mem.Allocator, ctx: *qjs.Context, thrown: qjs.Value) 
 
     if (jsText(ctx, thrown)) |message| {
         defer qjs.JS_FreeCString(ctx, message.ptr);
-        try text.appendSlice(gpa, message);
+        try appendValidUtf8(gpa, &text, message);
     } else {
         // Its toString threw or ran out of memory; drop that second error.
         qjs.JS_FreeValue(ctx, qjs.JS_GetException(ctx));
         try text.appendSlice(gpa, "a thrown value that cannot be turned into text");
     }
 
-    if (qjs.JS_IsError(thrown)) {
-        const stack = qjs.JS_GetPropertyStr(ctx, thrown, "stack");
-        defer qjs.JS_FreeValue(ctx, stack);
-        if (stack.isException()) {
-            qjs.JS_FreeValue(ctx, qjs.JS_GetException(ctx));
-        } else if (stack.isString()) {
-            if (jsText(ctx, stack)) |trace| {
-                defer qjs.JS_FreeCString(ctx, trace.ptr);
-                const trimmed = std.mem.trimEnd(u8, trace, "\n");
-                if (trimmed.len > 0) {
-                    try text.append(gpa, '\n');
-                    try text.appendSlice(gpa, trimmed);
-                }
-            } else {
-                qjs.JS_FreeValue(ctx, qjs.JS_GetException(ctx));
-            }
-        }
-    }
+    if (qjs.JS_IsError(thrown)) try appendStack(gpa, ctx, thrown, &text);
     return text.toOwnedSlice(gpa);
+}
+
+/// Appends an Error's stack trace on a new line. A `stack` that throws or
+/// isn't a string adds nothing.
+fn appendStack(gpa: std.mem.Allocator, ctx: *qjs.Context, thrown: qjs.Value, text: *std.ArrayList(u8)) error{OutOfMemory}!void {
+    const stack = qjs.JS_GetPropertyStr(ctx, thrown, "stack");
+    defer qjs.JS_FreeValue(ctx, stack);
+    if (stack.isException()) {
+        qjs.JS_FreeValue(ctx, qjs.JS_GetException(ctx));
+        return;
+    }
+    if (!stack.isString()) return;
+    const trace = jsText(ctx, stack) orelse {
+        qjs.JS_FreeValue(ctx, qjs.JS_GetException(ctx));
+        return;
+    };
+    defer qjs.JS_FreeCString(ctx, trace.ptr);
+    const trimmed = std.mem.trimEnd(u8, trace, "\n");
+    if (trimmed.len == 0) return;
+    try text.append(gpa, '\n');
+    try appendValidUtf8(gpa, text, trimmed);
+}
+
+/// QuickJS writes a lone surrogate, which a JavaScript string may hold, as
+/// bytes that aren't UTF-8. Each such sequence becomes U+FFFD, so the text
+/// stays valid for whoever reads it.
+fn appendValidUtf8(gpa: std.mem.Allocator, text: *std.ArrayList(u8), bytes: []const u8) error{OutOfMemory}!void {
+    try text.print(gpa, "{f}", .{std.unicode.fmtUtf8(bytes)});
 }
 
 /// The value converted to UTF-8, borrowed until `JS_FreeCString`, or null
@@ -298,6 +309,16 @@ test "a thrown error names what went wrong and where" {
     try expectThrew("SyntaxError", "return (;", .{});
     try expectThrew("rejected later", "await Promise.reject(new Error('rejected later'));", .{});
     try expectThrew("cannot be turned into text", "throw { toString() { throw 1; } };", .{});
+}
+
+test "thrown text stays valid UTF-8 when the program throws a lone surrogate" {
+    for ([_][]const u8{ "throw '\\ud800';", "throw new Error('half \\udc00 a pair');" }) |source| {
+        const outcome = try run(testing.allocator, testing.io, source, .{});
+        defer outcome.deinit(testing.allocator);
+        try testing.expect(outcome == .threw);
+        try testing.expect(std.unicode.utf8ValidateSlice(outcome.threw));
+        try testing.expect(std.mem.find(u8, outcome.threw, "\u{fffd}") != null);
+    }
 }
 
 test "a return value JSON cannot hold is reported as thrown" {
