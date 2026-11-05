@@ -47,6 +47,13 @@ pub const usage_options = [_]command_specs.OptionDoc{
     json_option,
 };
 
+/// Options for `fx doctor`. Its parser in `src/core/cli/cli_surface.zig`
+/// reads this list, so help and parsing can't disagree.
+pub const doctor_options = [_]command_specs.OptionDoc{
+    json_option,
+    .{ .flag = "--fix", .description = "Remove old terminal and side folders whose session is gone" },
+};
+
 pub const upgrade_options = [_]command_specs.OptionDoc{
     .{ .flag = "--channel <stable|dev>", .description = "Select and remember the release channel" },
     json_option,
@@ -339,9 +346,9 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .doctor,
         .token = "doctor",
-        .usage = "doctor [--json]",
-        .summary = "Run local health and preflight checks",
-        .options = &.{json_option},
+        .usage = "doctor [--json] [--fix]",
+        .summary = "Check that fx can work here, with a fix for each problem",
+        .options = &doctor_options,
     },
     .{
         .kind = .teams,

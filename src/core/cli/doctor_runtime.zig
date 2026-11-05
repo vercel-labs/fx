@@ -12,6 +12,9 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const session_adapter = @import("../session/session_adapter.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
+const safe_git = @import("../shell_command/safe_git.zig");
+const skill_contract = @import("../skills/skill_contract.zig");
+const app_runtime_setup = @import("../app/app_runtime_setup.zig");
 
 const Allocator = std.mem.Allocator;
 const default_session_diagnostics_limit: usize = 64;
@@ -27,9 +30,13 @@ pub const Check = struct {
     status: CheckStatus,
     detail: []const u8,
     owned_detail: ?[]u8 = null,
+    /// What to run or change, for a check that found a problem.
+    fix: ?[]const u8 = null,
+    owned_fix: ?[]u8 = null,
 
     pub fn deinit(self: *Check, alloc: Allocator) void {
         if (self.owned_detail) |detail| alloc.free(detail);
+        if (self.owned_fix) |fix| alloc.free(fix);
         self.* = undefined;
     }
 };
@@ -43,6 +50,8 @@ pub const Snapshot = struct {
     permission_mode: types.PermissionMode,
     agent_step_limit: usize,
     checks: []Check,
+    /// The workspace is in a git repository, where fx pr and fx issue work.
+    in_git_repository: bool = false,
 
     pub fn deinit(self: *Snapshot, alloc: Allocator) void {
         alloc.free(self.workspace_root);
@@ -54,12 +63,23 @@ pub const Snapshot = struct {
     }
 };
 
+pub const CollectOptions = struct {
+    /// `fx doctor --fix`: remove old side folders whose session is gone.
+    remove_orphans: bool = false,
+    version: []const u8 = "",
+    channel: []const u8 = "",
+    skill_root_policy: skill_contract.RootPolicy = .{ .managed_root_source = null },
+};
+
+/// The checks that read only this machine. The network and process checks
+/// live in `doctor_probes.zig`.
 pub fn collect(
     alloc: Allocator,
     secret_store: host.SecretStore,
     default_model: []const u8,
     default_agent_step_limit: usize,
     mcp_config_diagnostic: mcp_contract.ProfileConfigDiagnostic,
+    options: CollectOptions,
 ) !Snapshot {
     const workspace_root = try io_mod.realpathAlloc(alloc, ".");
     debug_trace.configureFromEnv(alloc, workspace_root);
@@ -85,6 +105,7 @@ pub fn collect(
 
     const workspace_detail = try alloc.print("using workspace {s}", .{snapshot.workspace_root});
     try appendCheckOwned(&checks, alloc, "workspace", .ok, workspace_detail);
+    try appendInstallCheck(&checks, alloc, options.version, options.channel);
 
     const paths = try config_runtime.discoverPaths(alloc, snapshot.workspace_root);
     defer {
@@ -99,9 +120,9 @@ pub fn collect(
         try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
         try appendAuthCheck(&checks, alloc, snapshot.auth);
         try appendConfigLoadFailureCheck(&checks, alloc, "startup", "failed to resolve startup settings", err);
-        try appendStateChecks(&checks, alloc);
-        try appendGitCheck(&checks, alloc, snapshot.workspace_root);
-        try appendGhCheck(&checks, alloc);
+        try appendStateChecks(&checks, alloc, options.remove_orphans);
+        snapshot.in_git_repository = try appendGitCheck(&checks, alloc, snapshot.workspace_root);
+        try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
 
         snapshot.checks = try checks.toOwnedSlice(alloc);
         return snapshot;
@@ -119,6 +140,7 @@ pub fn collect(
     try appendConfigCheck(&checks, alloc, paths, detailed.diagnostics);
     try appendConfigDiagnosticChecks(&checks, alloc, detailed.diagnostics);
     try appendUnknownSettingChecks(&checks, alloc, paths);
+    try appendEnvChecks(&checks, alloc, detailed.settings.permission_mode, detailed.settings.max_agent_steps, default_agent_step_limit);
     try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
     try appendAuthCheck(&checks, alloc, snapshot.auth);
     const selection = config_runtime.selectProviderModel(
@@ -131,9 +153,9 @@ pub fn collect(
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,
     }, default_agent_step_limit);
-    try appendStateChecks(&checks, alloc);
-    try appendGitCheck(&checks, alloc, snapshot.workspace_root);
-    try appendGhCheck(&checks, alloc);
+    try appendStateChecks(&checks, alloc, options.remove_orphans);
+    snapshot.in_git_repository = try appendGitCheck(&checks, alloc, snapshot.workspace_root);
+    try appendSkillChecks(&checks, alloc, snapshot.workspace_root, options.skill_root_policy);
 
     snapshot.checks = try checks.toOwnedSlice(alloc);
     return snapshot;
@@ -145,15 +167,24 @@ fn appendConfigDiagnosticChecks(
     diagnostics: []const config_runtime.ConfigDiagnostic,
 ) !void {
     for (diagnostics) |diagnostic| {
+        const file = switch (diagnostic.layer) {
+            .user => profile_paths.displayText("~/.fx/settings.json"),
+            .project => ".fx.json",
+        };
+        const rejected = causeRejectsLayer(diagnostic.cause);
         var detail_writer: std.Io.Writer.Allocating = .init(alloc);
         defer detail_writer.deinit();
         try detail_writer.writer.print(
-            "{s} config diagnostic: {s}",
-            .{ @tagName(diagnostic.layer), @tagName(diagnostic.cause) },
+            "{s}{s}: {s}",
+            .{ file, if (rejected) " is ignored" else "", @tagName(diagnostic.cause) },
         );
         try config_runtime.writeDiagnosticMetadata(&detail_writer.writer, diagnostic);
         const detail = try detail_writer.toOwnedSlice();
-        try appendCheckOwned(checks, alloc, "config", .warn, detail);
+        if (rejected) {
+            try appendCheckOwnedFix(checks, alloc, "config", .fail, detail, try alloc.print("fix or remove {s}, then run fx doctor again", .{file}));
+        } else {
+            try appendCheckOwned(checks, alloc, "config", .warn, detail);
+        }
     }
 }
 
@@ -217,17 +248,16 @@ fn appendConfigCheck(
     paths: config_runtime.Paths,
     diagnostics: []const config_runtime.ConfigDiagnostic,
 ) !void {
-    const user_exists = if (paths.user_settings) |path|
-        try fileExists(path) and !configLayerRejected(diagnostics, .user)
-    else
-        false;
-    const repo_exists = try fileExists(paths.workspace_settings) and
-        !configLayerRejected(diagnostics, .project);
-
-    if (!user_exists and !repo_exists) {
-        try appendCheck(checks, alloc, "config", .warn, "no config files found; using defaults and env overrides");
+    const user_present = if (paths.user_settings) |path| try fileExists(path) else false;
+    const repo_present = try fileExists(paths.workspace_settings);
+    if (!user_present and !repo_present) {
+        try appendCheck(checks, alloc, "config", .ok, "no config files; fx uses its defaults and env overrides");
         return;
     }
+    const user_exists = user_present and !configLayerRejected(diagnostics, .user);
+    const repo_exists = repo_present and !configLayerRejected(diagnostics, .project);
+    // A file that exists but is ignored gets its own fail line.
+    if (!user_exists and !repo_exists) return;
 
     const detail = try formatConfigPresence(alloc, user_exists, repo_exists);
     try appendCheckOwned(checks, alloc, "config", .ok, detail);
@@ -238,8 +268,15 @@ fn configLayerRejected(
     layer: config_runtime.ConfigLayer,
 ) bool {
     for (diagnostics) |diagnostic| {
-        if (diagnostic.layer != layer) continue;
-        switch (diagnostic.cause) {
+        if (diagnostic.layer == layer and causeRejectsLayer(diagnostic.cause)) return true;
+    }
+    return false;
+}
+
+/// Whether startup ignores the whole file for this cause.
+fn causeRejectsLayer(cause: @FieldType(config_runtime.ConfigDiagnostic, "cause")) bool {
+    {
+        switch (cause) {
             .malformed_settings,
             .settings_too_large,
             .durable_path_unsafe,
@@ -255,15 +292,14 @@ fn configLayerRejected(
             .legacy_workspace_preferences,
             .manual_backup_available,
             .private_state_permissions_tightened,
-            => {},
+            => return false,
         }
     }
-    return false;
 }
 
 fn appendAuthCheck(checks: *std.ArrayList(Check), alloc: Allocator, auth: auth_runtime.StatusSnapshot) !void {
     if (auth.missingHelp(.cli)) |help| {
-        try appendCheck(checks, alloc, "auth", .fail, help);
+        try checks.append(alloc, .{ .name = "auth", .status = .fail, .detail = help, .fix = "fx login" });
         return;
     }
 
@@ -311,7 +347,7 @@ fn formatConfigLoadFailure(alloc: Allocator, prefix: []const u8, err: anyerror) 
 
 /// Reports damaged sessions and removes side folders whose session is gone
 /// (D36). Rebuilds nothing.
-fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator) !void {
+fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, remove_orphans: bool) !void {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
         const status: CheckStatus = if (err == error.HomeNotSet) .warn else .fail;
         const detail = try alloc.print("failed to inspect sessions: {s}", .{@errorName(err)});
@@ -319,7 +355,7 @@ fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator) !void {
         return;
     };
     defer store.deinit(alloc);
-    var report = session_adapter.doctor(&store, alloc, default_session_diagnostics_limit, io_mod.milliTimestamp()) catch |err| {
+    var report = session_adapter.doctor(&store, alloc, default_session_diagnostics_limit, io_mod.milliTimestamp(), remove_orphans) catch |err| {
         const detail = try alloc.print("failed to inspect sessions: {s}", .{@errorName(err)});
         try appendCheckOwned(checks, alloc, "state", .fail, detail);
         return;
@@ -337,6 +373,10 @@ fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator) !void {
     }
     // The limit covers v1's unconverted sessions too (D73).
     if (report.checked < report.sessions + report.unconverted) try appendSessionDiagnosticsTruncatedCheck(checks, alloc, report.checked);
+    if (report.removable > 0) {
+        const detail = try alloc.print("{d} old terminal or side folder(s) whose session is gone can be removed", .{report.removable});
+        try appendCheckOwnedFix(checks, alloc, "session", .warn, detail, try alloc.dupe(u8, "fx doctor --fix"));
+    }
     if (report.removed > 0) {
         const detail = try alloc.print("removed {d} terminal or side folder(s) whose session is gone", .{report.removed});
         try appendCheckOwned(checks, alloc, "session", .ok, detail);
@@ -398,7 +438,7 @@ fn appendSessionsCountCheck(
 ) !void {
     if (count == 0) {
         // Sessions only an older fx saved are not "no sessions" (D73).
-        if (!older_saved) try appendCheck(checks, alloc, "sessions", .warn, "no saved sessions yet");
+        if (!older_saved) try appendCheck(checks, alloc, "sessions", .ok, "no saved sessions yet");
         return;
     }
 
@@ -406,20 +446,119 @@ fn appendSessionsCountCheck(
     try appendCheckOwned(checks, alloc, "sessions", .ok, detail);
 }
 
-fn appendGitCheck(checks: *std.ArrayList(Check), alloc: Allocator, workspace_root: []const u8) !void {
-    if (try hasGitMetadata(alloc, workspace_root)) {
-        try appendCheck(checks, alloc, "git", .ok, "git metadata detected for this workspace");
-        return;
+/// Returns whether the workspace is in a git repository.
+fn appendGitCheck(checks: *std.ArrayList(Check), alloc: Allocator, workspace_root: []const u8) !bool {
+    if (!try inGitRepository(alloc, workspace_root)) {
+        try checks.append(alloc, .{ .name = "git", .status = .warn, .detail = "this folder is not in a git repository; fx pr and fx issue need one" });
+        return false;
     }
-    try appendCheck(checks, alloc, "git", .warn, "not a git repository; pr/issue workflows will be limited");
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    switch (try safe_git.prepare(arena_state.allocator(), workspace_root)) {
+        .ready => try appendCheck(checks, alloc, "git", .ok, "git is installed and this folder is in a repository"),
+        .refused => |reason| {
+            const text: struct { []const u8, ?[]const u8 } = switch (reason) {
+                .git_missing => .{ "git was not found where fx looks for it, such as /usr/bin/git; fx pr and fx issue need it", "install git" },
+                .git_version_unknown => .{ "fx could not read the version of git", "git --version" },
+                .git_too_old => .{ "git is too old for fx", "update git" },
+                .repo_config_unavailable => .{ "fx could not read this repository's git config", "git config --list --show-origin" },
+                .unsupported_filter_name => .{ "this repository's git config names a filter fx cannot turn off, so fx does not run git here", null },
+                .repository_mismatch => .{ "git would use a different repository than the one fx read here", "check GIT_DIR and GIT_WORK_TREE" },
+            };
+            try checks.append(alloc, .{ .name = "git", .status = .warn, .detail = text[0], .fix = text[1] });
+        },
+    }
+    return true;
 }
 
-fn appendGhCheck(checks: *std.ArrayList(Check), alloc: Allocator) !void {
-    if (try commandInPath(alloc, "gh")) {
-        try appendCheck(checks, alloc, "gh", .ok, "GitHub CLI found in PATH");
-        return;
+/// Whether `workspace_root` or a folder above it has a `.git` file or folder.
+fn inGitRepository(alloc: Allocator, workspace_root: []const u8) !bool {
+    var dir: ?[]const u8 = workspace_root;
+    while (dir) |current| : (dir = std.Io.Dir.path.dirname(current)) {
+        if (try hasGitMetadata(alloc, current)) return true;
     }
-    try appendCheck(checks, alloc, "gh", .warn, "GitHub CLI not found in PATH; publish workflows unavailable");
+    return false;
+}
+
+/// The running fx, and any other `fx` on PATH that a shell could run instead.
+fn appendInstallCheck(checks: *std.ArrayList(Check), alloc: Allocator, version: []const u8, channel: []const u8) !void {
+    const self_path = std.process.executablePathAlloc(io_mod.getIo(), alloc) catch {
+        try appendCheckOwned(checks, alloc, "install", .warn, try alloc.print("fx {s}; fx could not find its own binary", .{version}));
+        return;
+    };
+    defer alloc.free(self_path);
+    try appendCheckOwned(checks, alloc, "install", .ok, try alloc.print("fx {s} at {s} ({s} channel)", .{ version, self_path, channel }));
+    const self_real = io_mod.realpathAlloc(alloc, self_path) catch try alloc.dupe(u8, self_path);
+    defer alloc.free(self_real);
+    const path_env = io_mod.getenv("PATH") orelse return;
+    var seen: std.ArrayList([]u8) = .empty;
+    defer {
+        for (seen.items) |item| alloc.free(item);
+        seen.deinit(alloc);
+    }
+    var it = std.mem.splitScalar(u8, path_env, std.Io.Dir.path.delimiter);
+    while (it.next()) |entry| {
+        if (entry.len == 0) continue;
+        const candidate = try std.Io.Dir.path.join(alloc, &.{ entry, "fx" });
+        defer alloc.free(candidate);
+        if (!pathExists(candidate)) continue;
+        const real = io_mod.realpathAlloc(alloc, candidate) catch continue;
+        var known = std.mem.eql(u8, real, self_real);
+        for (seen.items) |item| known = known or std.mem.eql(u8, item, real);
+        if (known) {
+            alloc.free(real);
+            continue;
+        }
+        try seen.append(alloc, real);
+        try appendCheckOwnedFix(
+            checks,
+            alloc,
+            "install",
+            .warn,
+            try alloc.print("another fx at {s} is on PATH; a shell may run it instead of this one", .{candidate}),
+            try alloc.dupe(u8, "remove the copy you do not use, so one fx is on PATH"),
+        );
+    }
+}
+
+/// FX_ values that startup cannot read and replaces silently.
+fn appendEnvChecks(
+    checks: *std.ArrayList(Check),
+    alloc: Allocator,
+    configured_mode: ?types.PermissionMode,
+    configured_steps: ?usize,
+    default_steps: usize,
+) !void {
+    if (io_mod.getenv("FX_PERMISSION_MODE")) |raw| if (config_runtime.parsePermissionMode(raw) == null) {
+        const used = permissionModeLabel(configured_mode orelse config_runtime.default_permission_mode);
+        try appendCheckOwnedFix(checks, alloc, "env", .warn, try alloc.print("FX_PERMISSION_MODE={s} is not a mode; fx uses {s}", .{ raw, used }), try alloc.dupe(u8, "set it to ask, auto, or full-access, or unset it"));
+    };
+    if (io_mod.getenv("FX_MAX_AGENT_STEPS")) |raw| if (agent_steps.parseMaxAgentSteps(raw) == null) {
+        const used = agent_steps.resolveMaxAgentSteps(configured_steps, default_steps);
+        const detail = if (used == 0)
+            try alloc.print("FX_MAX_AGENT_STEPS={s} is not a whole number; fx uses no step limit", .{raw})
+        else
+            try alloc.print("FX_MAX_AGENT_STEPS={s} is not a whole number; fx uses {d}", .{ raw, used });
+        try appendCheckOwnedFix(checks, alloc, "env", .warn, detail, try alloc.dupe(u8, "set it to a whole number, or unset it"));
+    };
+}
+
+/// Skill files that skill discovery skips, with their paths.
+fn appendSkillChecks(checks: *std.ArrayList(Check), alloc: Allocator, workspace_root: []const u8, root_policy: skill_contract.RootPolicy) !void {
+    var loaded = try app_runtime_setup.loadSkills(alloc, workspace_root, root_policy);
+    defer loaded.deinit(alloc);
+    for (loaded.diagnostics) |diagnostic| {
+        const why: struct { []const u8, []const u8 } = switch (diagnostic.scope) {
+            .root => .{ "could not be read, so some skills may be missing", "fix access to that folder" },
+            .candidate => switch (diagnostic.cause) {
+                .invalid_metadata => .{ "was skipped: its SKILL.md frontmatter is invalid", "use one safe name and a short description in its frontmatter" },
+                .linked_candidate_unavailable => .{ "was skipped: its link does not lead to a readable folder", "repair or remove the link" },
+                .unreadable => .{ "was skipped: SKILL.md cannot be read", "fix the file type or permissions of SKILL.md" },
+                .oversized => .{ "was skipped: its frontmatter is too large", "shorten its name and description" },
+            },
+        };
+        try appendCheckOwnedFix(checks, alloc, "skills", .warn, try alloc.print("{s} {s}", .{ diagnostic.path, why[0] }), try alloc.dupe(u8, why[1]));
+    }
 }
 
 fn resolvePermissionMode(configured: ?types.PermissionMode) !types.PermissionMode {
@@ -441,6 +580,19 @@ fn appendCheck(checks: *std.ArrayList(Check), alloc: Allocator, name: []const u8
         .name = name,
         .status = status,
         .detail = detail,
+    });
+}
+
+fn appendCheckOwnedFix(checks: *std.ArrayList(Check), alloc: Allocator, name: []const u8, status: CheckStatus, detail: []u8, fix: []u8) !void {
+    errdefer alloc.free(detail);
+    errdefer alloc.free(fix);
+    try checks.append(alloc, .{
+        .name = name,
+        .status = status,
+        .detail = detail,
+        .owned_detail = detail,
+        .fix = fix,
+        .owned_fix = fix,
     });
 }
 
@@ -530,33 +682,6 @@ fn hasGitMetadata(alloc: Allocator, workspace_root: []const u8) !bool {
         return try fileExists(owned);
     };
     return try fileExists(git_path);
-}
-
-fn commandInPath(alloc: Allocator, command_name: []const u8) !bool {
-    const path_env = io_mod.getenv("PATH") orelse return false;
-
-    return commandInPathValue(alloc, command_name, path_env);
-}
-
-fn commandInPathValue(alloc: Allocator, command_name: []const u8, path_env: []const u8) !bool {
-    var it = std.mem.splitScalar(u8, path_env, std.Io.Dir.path.delimiter);
-    while (it.next()) |entry| {
-        if (entry.len == 0) continue;
-
-        var candidate_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const candidate = std.mem.print(&candidate_buf, "{s}" ++ std.Io.Dir.path.sep_str ++ "{s}", .{ entry, command_name }) catch {
-            const owned = try std.Io.Dir.path.join(alloc, &.{ entry, command_name });
-            defer alloc.free(owned);
-            if (pathExists(owned)) return true;
-            continue;
-        };
-
-        if (pathExists(candidate)) {
-            return true;
-        }
-    }
-
-    return false;
 }
 
 fn pathExists(path: []const u8) bool {
@@ -708,7 +833,7 @@ test "session count check preserves empty and latest details" {
 
     try std.testing.expectEqual(@as(usize, 2), checks.items.len);
     try std.testing.expectEqualStrings("sessions", checks.items[0].name);
-    try std.testing.expectEqual(CheckStatus.warn, checks.items[0].status);
+    try std.testing.expectEqual(CheckStatus.ok, checks.items[0].status);
     try std.testing.expectEqualStrings("no saved sessions yet", checks.items[0].detail);
     try std.testing.expectEqualStrings("sessions", checks.items[1].name);
     try std.testing.expectEqual(CheckStatus.ok, checks.items[1].status);
@@ -777,22 +902,4 @@ test "has git metadata detects .git file or directory" {
     defer std.testing.allocator.free(workspace_root);
 
     try std.testing.expect(try hasGitMetadata(std.testing.allocator, workspace_root));
-}
-
-test "command in path checks explicit path entries" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(io_mod.getIo(), "bin");
-    var file = try tmp.dir.createFile(std.testing.io, "bin/gh", .{});
-    file.close(io_mod.getIo());
-
-    const bin_root = try io_mod.dirRealpathAlloc(std.testing.allocator, tmp.dir, "bin");
-    defer std.testing.allocator.free(bin_root);
-
-    const path_env = try std.testing.allocator.print("{s}", .{bin_root});
-    defer std.testing.allocator.free(path_env);
-
-    try std.testing.expect(try commandInPathValue(std.testing.allocator, "gh", path_env));
-    try std.testing.expect(!(try commandInPathValue(std.testing.allocator, "missing-command", path_env)));
 }

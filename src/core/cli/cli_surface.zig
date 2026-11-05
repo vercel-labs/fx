@@ -27,6 +27,8 @@ const profiles = @import("../profiles/profiles.zig");
 const app_profile_runtime = @import("../app/app_profile_runtime.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const doctor_runtime = @import("doctor_runtime.zig");
+const doctor_probes = @import("doctor_probes.zig");
+const mcp_runtime = @import("../mcp_host/runtime.zig");
 const gateway_provider = @import("../gateway/gateway_provider.zig");
 const model_catalog = @import("../gateway/model_catalog.zig");
 const model_catalog_metadata = @import("../gateway/model_catalog_metadata.zig");
@@ -1918,38 +1920,11 @@ fn runNonInteractiveWithDeps(
             return .handled_success;
         },
         .doctor => |rest| {
-            const opts = parseLocalSurfaceArgs(rest) catch |err| {
+            const opts = parseDoctorArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .doctor, "doctor", err, rest);
                 return usage_failure;
             };
-
-            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-            defer alloc.free(workspace_root);
-            var mcp_inspection = try cfg.inspect_mcp_local_config(
-                alloc,
-                workspace_root,
-            );
-            defer mcp_inspection.deinit(alloc);
-            var snapshot = try doctor_runtime.collect(
-                alloc,
-                cfg.secret_store,
-                cfg.default_model,
-                cfg.default_agent_step_limit,
-                mcp_inspection.profile_diagnostic,
-            );
-            defer snapshot.deinit(alloc);
-
-            var output_snapshot = doctorSnapshotFromRuntime(snapshot);
-            output_snapshot.mcp = localMcpView(&mcp_inspection);
-            if (opts.format == .json) {
-                try writeDoctorJsonLine(alloc, deps, output_snapshot);
-                return .handled_success;
-            }
-
-            const text = try output_snapshot.render(alloc, opts.format);
-            defer alloc.free(text);
-            try writeFormattedOutput(deps, text, opts.format);
-            return .handled_success;
+            return runDoctor(alloc, cfg, deps, opts);
         },
         .session => |rest| {
             if (rest.len > 0 and std.mem.eql(u8, rest[0], "recover")) {
@@ -4029,6 +4004,164 @@ fn parseLocalSurfaceArgs(args: []const [:0]const u8) !LocalSurfaceOptions {
         .option => options.format = .json,
     };
     return options;
+}
+
+const DoctorOptions = struct {
+    format: output_contracts.OutputFormat = .text,
+    fix: bool = false,
+};
+const DoctorFlag = enum { json, fix };
+const doctor_flag_ids = cli_flags.idTable(DoctorFlag, &builtin_commands.doctor_options);
+
+fn parseDoctorArgs(args: []const [:0]const u8) !DoctorOptions {
+    var options = DoctorOptions{};
+    var parser: cli_flags.Parser = .init(&builtin_commands.doctor_options, args);
+    while (parser.next() catch return error.InvalidLocalSurfaceArgs) |item| switch (item) {
+        .positional => return error.InvalidLocalSurfaceArgs,
+        .option => |match| switch (doctor_flag_ids[match.index].?) {
+            .json => options.format = .json,
+            .fix => options.fix = true,
+        },
+    };
+    return options;
+}
+
+/// Starts the provider catalog request for `fx doctor`, when the provider has
+/// a catalog. `startup` lives until the process exits.
+fn startDoctorCatalogProbe(cfg: Config, startup: *app_lifecycle.StartupState, model: []const u8, out: *?*doctor_probes.CatalogProbe) !void {
+    const probe_alloc = std.heap.c_allocator;
+    var available = cfg.provider_set;
+    available.definitions = startup.configured_providers.definitions;
+    const catalog = available.select(startup.provider).cli_model_catalog orelse return;
+    const probe = try probe_alloc.create(doctor_probes.CatalogProbe);
+    probe.* = .{
+        .provider = catalog,
+        .access = startup.modelCatalogAccess(),
+        .endpoint = cfg.models_path,
+        .model = try probe_alloc.dupe(u8, model),
+    };
+    try probe.start();
+    out.* = probe;
+}
+
+/// `fx doctor`: the local checks, then the provider, MCP, and gh checks
+/// under one deadline (`doctor_probes.zig`). Exits 1 when a check fails.
+fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) !RunResult {
+    // Everything a probe reads stays alive until the process exits, because
+    // a late probe may still run after the report.
+    const probe_alloc = std.heap.c_allocator;
+    const workspace_root = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(workspace_root);
+    var mcp_inspection = try cfg.inspect_mcp_local_config(alloc, workspace_root);
+    defer mcp_inspection.deinit(alloc);
+    var snapshot = try doctor_runtime.collect(
+        alloc,
+        cfg.secret_store,
+        cfg.default_model,
+        cfg.default_agent_step_limit,
+        mcp_inspection.profile_diagnostic,
+        .{
+            .remove_orphans = opts.fix,
+            .version = cfg.version,
+            .channel = cfg.build_channel.label(),
+            .skill_root_policy = cfg.skill_root_policy,
+        },
+    );
+    defer snapshot.deinit(alloc);
+
+    const deadline_ms = doctor_probes.deadlineMs();
+    const deadline = io_mod.milliTimestamp() + deadline_ms;
+    // An expired login is reported as it is: doctor never refreshes it.
+    var catalog_probe: ?*doctor_probes.CatalogProbe = null;
+    if (snapshot.auth.missingHelp(.cli) == null and !snapshot.auth.expired and snapshot.model.len > 0) {
+        const startup = try probe_alloc.create(app_lifecycle.StartupState);
+        const loaded = if (cfg.auth_mode == .host_managed)
+            deps.load_catalog_startup_state_with_auth_mode(probe_alloc, cfg.secret_store, cfg.default_model, cfg.default_agent_step_limit, cfg.auth_mode, null, null)
+        else
+            deps.load_startup_state(probe_alloc, cfg.gateway_provider.oauth_transport, cfg.secret_store, cfg.default_model, cfg.default_agent_step_limit);
+        if (loaded) |state| {
+            startup.* = state;
+            startDoctorCatalogProbe(cfg, startup, snapshot.model, &catalog_probe) catch |err| {
+                debug_trace.logf("doctor", "provider check skipped: err={s}", .{@errorName(err)});
+            };
+        } else |err| {
+            // Startup itself refuses this setup, and the config check says why.
+            debug_trace.logf("doctor", "provider check skipped: startup state failed err={s}", .{@errorName(err)});
+        }
+    }
+    var processes: std.ArrayList(*doctor_probes.ProcessProbe) = .empty;
+    var mcp_statuses: []const mcp_runtime.Status = &.{};
+    var mcp_children: []*doctor_probes.ProcessProbe = &.{};
+    var mcp_checked = false;
+    if (cfg.load_mcp_host) |load| {
+        // A config doctor cannot load is already a check of its own.
+        const doctor_host = load(probe_alloc, workspace_root, cfg.tool_set.registry, .{}) catch |err| blk: {
+            debug_trace.logf("doctor", "MCP server checks skipped: host failed to load err={s}", .{@errorName(err)});
+            break :blk null;
+        };
+        if (doctor_host) |loaded_host| {
+            mcp_statuses = try loaded_host.runtime.statuses(probe_alloc);
+            const self_exe = try std.process.executablePathAlloc(io_mod.getIo(), probe_alloc);
+            mcp_children = try doctor_probes.startServerChildren(probe_alloc, mcp_statuses, self_exe, deadline);
+            try processes.appendSlice(probe_alloc, mcp_children);
+            mcp_checked = true;
+        }
+    }
+    // gh matters only to fx pr and fx issue, which need a repository; outside
+    // one, doctor does not run it, so gh writes nothing on its behalf. Unit
+    // tests run inside this repository and must not reach GitHub.
+    const gh: ?*doctor_probes.ProcessProbe = if (snapshot.in_git_repository and !builtin.is_test) try doctor_probes.startGh(probe_alloc) else null;
+    if (gh) |probe| try processes.append(probe_alloc, probe);
+    doctor_probes.wait(deadline, catalog_probe, processes.items);
+
+    var probe_checks: std.ArrayList(doctor_runtime.Check) = .empty;
+    defer {
+        for (probe_checks.items) |*entry| entry.deinit(alloc);
+        probe_checks.deinit(alloc);
+    }
+    if (catalog_probe) |probe| try doctor_probes.catalogChecks(&probe_checks, alloc, probe, snapshot.provider, deadline_ms);
+    try doctor_probes.serverStatusChecks(&probe_checks, alloc, mcp_statuses);
+    try doctor_probes.serverChildChecks(&probe_checks, alloc, mcp_children, deadline_ms);
+    if (gh) |probe| try doctor_probes.ghCheck(&probe_checks, alloc, probe, deadline_ms);
+
+    var verified_auth = false;
+    for (probe_checks.items) |entry| verified_auth = verified_auth or std.mem.eql(u8, entry.name, "auth");
+    var checks: std.ArrayList(doctor_runtime.Check) = .empty;
+    defer checks.deinit(alloc);
+    var unconfirmed: ?[]u8 = null;
+    defer if (unconfirmed) |detail| alloc.free(detail);
+    for (snapshot.checks) |entry| {
+        if (std.mem.eql(u8, entry.name, "auth") and entry.status == .ok) {
+            // The provider's answer replaces the line that only saw a credential.
+            if (verified_auth) continue;
+            // A credential the provider never answered for is not confirmed.
+            if (catalog_probe != null) {
+                unconfirmed = try alloc.print("{s}; the provider did not confirm it", .{entry.detail});
+                try checks.append(alloc, .{ .name = entry.name, .status = .warn, .detail = unconfirmed.? });
+                continue;
+            }
+        }
+        try checks.append(alloc, entry);
+    }
+    try checks.appendSlice(alloc, probe_checks.items);
+    var failed = false;
+    for (checks.items) |entry| failed = failed or entry.status == .fail;
+    const result: RunResult = if (failed) .handled_failure else .handled_success;
+
+    var output_snapshot = doctorSnapshotFromRuntime(snapshot);
+    output_snapshot.version = cfg.version;
+    output_snapshot.checks = checks.items;
+    var mcp_view = localMcpView(&mcp_inspection);
+    if (mcp_checked) mcp_view.connection_check = .checked;
+    output_snapshot.mcp = mcp_view;
+    if (opts.format == .json) {
+        try writeDoctorJsonLine(alloc, deps, output_snapshot);
+        return result;
+    }
+    const text = try output_snapshot.render(alloc, opts.format);
+    defer alloc.free(text);
+    try writeFormattedOutput(deps, text, opts.format);
+    return result;
 }
 
 const UpgradeFlag = enum { channel, json };
@@ -6419,7 +6552,8 @@ test "status and doctor inspect MCP configuration once per command" {
         cfg,
         doctor_capture.deps(),
     );
-    try std.testing.expectEqual(RunResult.handled_success, doctor_result);
+    // The broken MCP config is a failed check, so doctor exits 1.
+    try std.testing.expectEqual(RunResult.handled_failure, doctor_result);
     try std.testing.expectEqual(@as(usize, 1), mcp_local_inspection_calls_for_test);
     try std.testing.expectEqual(
         @as(usize, 1),

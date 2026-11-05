@@ -640,6 +640,7 @@ describe("cli: status", () => {
           FX_AUTO_UPGRADE: "0",
           FX_MODEL: FAKE_GATEWAY_MODEL,
           FX_TEST_GATEWAY_CHAT_URL: gateway.chatUrl,
+          FX_TEST_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
         };
         const cwd = realpathSync(workspace);
         const before = snapshotTree(home);
@@ -654,7 +655,7 @@ describe("cli: status", () => {
         );
 
         for (const result of [statusText, statusJsonResult, doctorText, doctorJsonResult]) {
-          expect(result.code).toBe(0);
+          expect(result.code).toBe(result === doctorText || result === doctorJsonResult ? 1 : 0);
           expect(result.stderr).toBe("");
         }
         expect(statusText.stdout).toContain(
@@ -758,7 +759,7 @@ describe("cli: status", () => {
         const env = { ...NO_GATEWAY_AUTH, HOME: home, FX_DISABLE_KEYCHAIN: "1" };
 
         const doctor = await runFx(["doctor", "--json"], { cwd, env });
-        expect(doctor.code).toBe(0);
+        expect(doctor.code).toBe(1);
         const warnings = JSON.parse(doctor.stdout)
           .checks.filter((check: { name: string; status: string }) => check.name === "config" && check.status === "warn")
           .map((check: { detail: string }) => check.detail);
@@ -989,7 +990,7 @@ describe("cli: status", () => {
         const doctor = await runFx(["doctor", "--json"], { env });
 
         expect(status.code).toBe(0);
-        expect(doctor.code).toBe(0);
+        expect(doctor.code).toBe(1);
         const statusJson = JSON.parse(status.stdout.trim());
         const doctorJson = JSON.parse(doctor.stdout.trim());
         expect(statusJson).toMatchObject({
@@ -1006,6 +1007,7 @@ describe("cli: status", () => {
           name: "auth",
           status: "fail",
           detail: MISSING_AUTH_MESSAGE,
+          fix: "fx login",
         });
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -1049,8 +1051,8 @@ describe("cli: status", () => {
           for (const command of ["status", "doctor"]) {
             const text = await runFx([command], options);
             const json = await runFx([command, "--json"], options);
-            expect(text.code).toBe(0);
-            expect(json.code).toBe(0);
+            expect(text.code).toBe(command === "doctor" ? 1 : 0);
+            expect(json.code).toBe(command === "doctor" ? 1 : 0);
             expect(text.stderr).toBe("");
             expect(json.stderr).toBe("");
             expect(text.stdout).toContain(scenario.help);
@@ -1061,7 +1063,7 @@ describe("cli: status", () => {
               expect(value.auth_help).toBe(scenario.help);
             } else {
               expect(value.checks).toContainEqual({
-                name: "auth", status: "fail", detail: scenario.help,
+                name: "auth", status: "fail", detail: scenario.help, fix: "fx login",
               });
             }
           }
@@ -1229,6 +1231,8 @@ describe("cli: status", () => {
           ...NO_GATEWAY_AUTH,
           HOME: realpathSync(home),
           FX_DISABLE_KEYCHAIN: "1",
+          // Doctor asks the provider; a refused local port keeps it offline.
+          FX_TEST_GATEWAY_MODELS_URL: "http://127.0.0.1:9/coding-agent/v1/models",
         };
         const cwd = realpathSync(workspace);
 
@@ -1239,8 +1243,8 @@ describe("cli: status", () => {
 
         expect(statusText.code).toBe(0);
         expect(statusJsonResult.code).toBe(0);
-        expect(doctorText.code).toBe(0);
-        expect(doctorJsonResult.code).toBe(0);
+        expect(doctorText.code).toBe(1);
+        expect(doctorJsonResult.code).toBe(1);
         const expectedAuth = {
           auth: "fx login",
           auth_refreshable: true,
@@ -1555,7 +1559,7 @@ describe("cli: status", () => {
           env,
           timeoutMs: TIMEOUT,
         });
-        expect(doctor.code).toBe(0);
+        expect(doctor.code).toBe(1);
         const startup = JSON.parse(doctor.stdout.trim()).checks.find(
           (check: { name: string }) => check.name === "startup",
         );
@@ -2048,7 +2052,7 @@ describe("cli: doctor", () => {
           },
           timeoutMs: TIMEOUT,
         });
-        expect(r.code).toBe(0);
+        expect(r.code).toBe(1);
         const json = JSON.parse(r.stdout.trim());
         expect(json.kind).toBe("doctor");
         expect(Array.isArray(json.checks)).toBe(true);
@@ -2059,6 +2063,7 @@ describe("cli: doctor", () => {
           name: "auth",
           status: "fail",
           detail: MISSING_AUTH_MESSAGE,
+          fix: "fx login",
         });
         for (const check of json.checks) {
           expect(check).toHaveProperty("name");
@@ -2092,7 +2097,7 @@ describe("cli: doctor", () => {
           timeoutMs: TIMEOUT,
         });
 
-        expect(r.code).toBe(0);
+        expect(r.code).toBe(1);
         expect(JSON.parse(r.stdout.trim()).kind).toBe("doctor");
         expect(existsSync(join(home, ".fx"))).toBe(false);
       } finally {
@@ -2134,7 +2139,7 @@ describe("cli: doctor", () => {
           timeoutMs: TIMEOUT,
         });
 
-        expect(r.code).toBe(0);
+        expect(r.code).toBe(1);
         expect(r.stderr).toBe("");
         expect(r.stdout.length).toBeLessThan(64 * 1024);
         const json = JSON.parse(r.stdout.trim());
@@ -2798,7 +2803,7 @@ describe("cli: read-only no-create matrix", () => {
     { args: ["sessions", "--json"], code: 0, kind: "sessions", count: 0 },
     { args: ["session", "last", "--json"], code: 1, error: "no saved sessions" },
     { args: ["session", "--id", "missing.valid-id", "--json"], code: 1, error: "record not found" },
-    { args: ["doctor", "--json"], code: 0, kind: "doctor" },
+    { args: ["doctor", "--json"], code: 1, kind: "doctor" },
   ] as const;
 
   for (const probe of probes) {
@@ -5937,7 +5942,7 @@ describe("cli: workspace access", () => {
 });
 
 describe("cli: MCP profile", () => {
-  test("status, doctor, and list start no MCP server, and show connects one", async () => {
+  test("status and list start no MCP server, and doctor and show connect it", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-cli-mcp-inspect-")));
     const home = join(root, "home");
     const workspace = join(root, "workspace");
@@ -5973,17 +5978,18 @@ describe("cli: MCP profile", () => {
       });
       expect(existsSync(pidPath)).toBe(false);
 
-      const doctor = await runFx(["doctor", "--json"], { cwd: workspace, env });
-      expect(doctor.code).toBe(0);
-      expect(JSON.parse(doctor.stdout.trim()).mcp.connection_check).toBe(
-        "not_checked",
-      );
-      expect(existsSync(pidPath)).toBe(false);
-
       const listed = await runFx(["mcp", "list"], { cwd: workspace, env });
       expect(listed.code).toBe(0);
       expect(listed.stdout).toMatch(/fixture +~\/\.fx\/mcp\.json +stdio +not started/);
       expect(existsSync(pidPath)).toBe(false);
+
+      // Doctor checks each server in its own `fx mcp show` child.
+      const doctor = await runFx(["doctor", "--json"], { cwd: workspace, env, timeoutMs: TIMEOUT });
+      expect(doctor.code).toBe(1);
+      const doctorJson = JSON.parse(doctor.stdout.trim());
+      expect(doctorJson.mcp.connection_check).toBe("checked");
+      expect(doctorJson.checks).toContainEqual({ name: "mcp", status: "ok", detail: "fixture ready, 1 tool" });
+      expect(existsSync(pidPath)).toBe(true);
 
       const shown = await runFx(
         ["mcp", "show", "fixture"],

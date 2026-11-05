@@ -173,6 +173,10 @@
       "job": "test",
       "stability": "internal"
     },
+    "FX_TEST_DOCTOR_DEADLINE_MS": {
+      "job": "test",
+      "stability": "internal"
+    },
     "FX_TEST_FAIL_ON_DURABLE_MUTATION": {
       "job": "test",
       "stability": "internal"
