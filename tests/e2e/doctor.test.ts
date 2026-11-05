@@ -47,23 +47,31 @@ function gateway(answer: (req: Request) => Response | Promise<Response>) {
 const models = (ids: string[]) => Response.json({ data: ids.map((id) => ({ id, type: "language", tags: ["tool-use"] })) });
 const acceptingGateway = () => gateway(() => models([MODEL]));
 
+/**
+ * Only the parent's locale and temp folder pass through, so no credential in
+ * it, such as GH_TOKEN, GITHUB_TOKEN, or AI_GATEWAY_API_KEY, reaches doctor or
+ * its children. PATH is the test's own bin folder alone, so a gh or fx the
+ * machine has never runs; fixtures name every other tool by its full path.
+ */
+const PASSED_ENV = ["TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TZ"];
+
 function env(r: Root, extra: Record<string, string | undefined> = {}): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (v === undefined) continue;
-    if (k.startsWith("FX_") || k.startsWith("AI_GATEWAY_") || k === "VERCEL_OIDC_TOKEN") continue;
-    out[k] = v;
-  }
   const merged: Record<string, string | undefined> = {
-    ...out,
+    ...Object.fromEntries(PASSED_ENV.map((k) => [k, process.env[k]])),
     HOME: r.home,
-    PATH: `${r.bin}:/usr/bin:/bin`,
+    PATH: r.bin,
     FX_SOUND: "0",
     FX_DISABLE_KEYCHAIN: "1",
     FX_MODEL: MODEL,
     ...extra,
   };
   return Object.fromEntries(Object.entries(merged).filter(([, v]) => v !== undefined)) as Record<string, string>;
+}
+
+/** The warn and fail lines in text output that no `fix:` line follows. */
+function problemsWithoutFix(stdout: string): string[] {
+  const lines = stdout.split("\n");
+  return lines.filter((line, i) => /^\[(warn|fail)\] /.test(line) && !(lines[i + 1] ?? "").startsWith("  fix: "));
 }
 
 async function doctor(r: Root, environment: Record<string, string>, args: string[] = [], cwd = r.workspace) {
@@ -76,7 +84,29 @@ async function doctor(r: Root, environment: Record<string, string>, args: string
     proc.exited,
   ]);
   clearTimeout(killer);
+  // Every problem doctor reports comes with a fix, in text and in JSON.
+  if (code === 0 || code === 1) {
+    if (args.includes("--json")) {
+      const unfixed = JSON.parse(stdout).checks.filter((check: any) => check.status !== "ok" && !check.fix);
+      expect(unfixed).toEqual([]);
+    } else {
+      expect(problemsWithoutFix(stdout)).toEqual([]);
+    }
+  }
   return { stdout, stderr, code, ms: performance.now() - started };
+}
+
+/** Processes whose command line contains `marker`. */
+function running(marker: string): string {
+  return spawnSync("/usr/bin/pgrep", ["-f", marker]).stdout.toString().trim();
+}
+
+/** An fx login with no team, which loads only the public model list. */
+function writeTeamlessFxLogin(home: string) {
+  writeFileSync(join(home, ".fx", "auth.json"), JSON.stringify({
+    version: 1, issuer: "https://vercel.com", client_id: "test-client", access_token: "doctor-teamless-token",
+    refresh_token: "doctor-refresh", expires_at_ms: Date.now() + 3_600_000, scope: "openid", token_type: "Bearer",
+  }) + "\n", { mode: 0o600 });
 }
 
 function writeScript(path: string, body: string) {
@@ -174,6 +204,44 @@ describe("fx doctor provider", () => {
     expect(past.stdout).not.toMatch(/^\[ok\] auth: /m);
   }, TIMEOUT);
 
+  test("a public list does not confirm the credential, and a team-less fx login is told to pick a team", async () => {
+    const r = makeRoot();
+    writeTeamlessFxLogin(r.home);
+    let authorized = 0;
+    let anonymous = 0;
+    const g = gateway((req) => {
+      if (req.headers.get("authorization")) authorized += 1;
+      else anonymous += 1;
+      return models([MODEL]);
+    });
+    const result = await doctor(r, env(r, g));
+    expect(authorized).toBe(0);
+    expect(anonymous).toBe(1);
+    expect(result.stdout).not.toContain("accepted the credential");
+    expect(result.stdout).toMatch(/^\[warn\] auth: AI Gateway sent only its public model list, so the credential is not confirmed\n  fix: fx teams$/m);
+    expect(result.stdout).not.toContain("doctor-teamless-token");
+  }, TIMEOUT);
+
+  test("a configured provider is not asked, so nothing claims it accepted the credential", async () => {
+    const r = makeRoot();
+    let hits = 0;
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => {
+      hits += 1;
+      return new Response("unauthorized", { status: 401 });
+    } });
+    cleanups.push(() => server.stop(true));
+    writeFileSync(join(r.home, ".fx", "settings.json"), JSON.stringify({
+      provider: "remote",
+      providers: { remote: { protocol: "openai-chat-completions", base_url: `http://127.0.0.1:${server.port}/v1`, auth: { type: "bearer", env: "DOCTOR_PROVIDER_TOKEN" }, model_metadata: { "remote-model": { context_window: 262144, max_output_tokens: 8192, supports_tool_use: true } } } },
+      models: { remote: "remote-model" },
+    }), { mode: 0o600 });
+    const result = await doctor(r, env(r, { FX_MODEL: undefined, DOCTOR_PROVIDER_TOKEN: "wrong-token" }));
+    expect(hits).toBe(0);
+    expect(result.stdout).not.toContain("accepted the credential");
+    expect(result.stdout).not.toMatch(/^\[\w+\] (provider|model): /m);
+    expect(result.stdout).toMatch(/^\[ok\] auth: /m);
+  }, TIMEOUT);
+
   test("with no credential the auth check fails without any request", async () => {
     const r = makeRoot();
     let hits = 0;
@@ -210,12 +278,19 @@ describe("fx doctor exit code and output", () => {
     expect(result.code).toBe(1);
   }, TIMEOUT);
 
-  test("--help names --fix and a bad flag still exits 2", async () => {
+  test("--help names --fix and a bad flag still exits 2, named as the flag that is wrong", async () => {
     const r = makeRoot();
     const help = await doctor(r, env(r), ["--help"]);
     expect(help.stdout).toContain("--fix");
     const bad = await doctor(r, env(r), ["--nope"]);
     expect(bad.code).toBe(2);
+    const afterFix = await doctor(r, env(r), ["--fix", "--bogus"]);
+    expect(afterFix.code).toBe(2);
+    expect(afterFix.stderr).toContain("fx doctor: unknown flag --bogus");
+    expect(afterFix.stderr).not.toContain("unknown flag --fix");
+    const json = await doctor(r, env(r), ["--json", "--fix", "--bogus"]);
+    expect(json.code).toBe(2);
+    expect(JSON.parse(json.stdout).error).toBe("unknown flag --bogus");
   }, TIMEOUT);
 });
 
@@ -262,12 +337,34 @@ describe("fx doctor local checks", () => {
     expect(out.stdout).toMatch(/^\[warn\] gh: .*not signed in/m);
     expect(out.stdout).toContain("gh auth login");
 
+    // gh's own child holds nothing doctor waits for, and dies with it.
     const hanging = makeRoot();
     repo(hanging);
-    writeScript(join(hanging.bin, "gh"), "sleep 60");
+    const marker = "sleep 57.6543";
+    writeScript(join(hanging.bin, "gh"), `/bin/${marker}\nexit 0`);
     const hung = await doctor(hanging, env(hanging, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key", FX_TEST_DOCTOR_DEADLINE_MS: "1000" }));
-    expect(hung.ms).toBeLessThan(4_000);
+    expect(hung.ms).toBeLessThan(2_500);
     expect(hung.stdout).toMatch(/^\[warn\] gh: .*did not answer/m);
+    expect(running(marker)).toBe("");
+  }, TIMEOUT);
+
+  test("a signal that ends doctor also ends the checks it started", async () => {
+    for (const signal of ["SIGINT", "SIGTERM"] as const) {
+      const r = makeRoot();
+      expect(spawnSync("/usr/bin/git", ["init", "-q", r.workspace]).status).toBe(0);
+      const marker = `sleep 56.${signal === "SIGINT" ? "1234" : "4321"}`;
+      writeScript(join(r.bin, "gh"), `/bin/${marker}\nexit 0`);
+      const proc = Bun.spawn([FX_BIN, "doctor"], { env: env(r, { FX_TEST_DOCTOR_DEADLINE_MS: "20000" }), cwd: r.workspace, stdout: "ignore", stderr: "ignore" });
+      const started = performance.now();
+      while (running(marker) === "" && performance.now() - started < 10_000) await Bun.sleep(50);
+      expect(running(marker)).not.toBe("");
+      proc.kill(signal);
+      await proc.exited;
+      expect(proc.signalCode).toBe(signal);
+      const stopped = performance.now();
+      while (running(marker) !== "" && performance.now() - stopped < 2_000) await Bun.sleep(50);
+      expect(running(marker)).toBe("");
+    }
   }, TIMEOUT);
 
   test("install shows the version and warns about another fx on PATH", async () => {
@@ -301,7 +398,7 @@ describe("fx doctor MCP", () => {
       },
     }));
     writeFileSync(join(r.workspace, ".mcp.json"), JSON.stringify({
-      mcpServers: { project: { command: "/bin/sh", args: ["-c", `: > '${marker}'; sleep 30`] } },
+      mcpServers: { project: { command: "/bin/sh", args: ["-c", `: > '${marker}'; /bin/sleep 30`] } },
     }));
     const trace = join(r.root, "trace.log");
     const result = await doctor(r, env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key", FX_TEST_DOCTOR_DEADLINE_MS: "3000", FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "doctor" }));
@@ -321,7 +418,7 @@ describe("fx doctor MCP", () => {
   test("servers doctor could not start before its deadline each get a line that says so", async () => {
     const r = makeRoot();
     const marker = join(r.root, "late-server-started");
-    const late = { command: "/bin/sh", args: ["-c", `: > '${marker}'; sleep 30`] };
+    const late = { command: "/bin/sh", args: ["-c", `: > '${marker}'; /bin/sleep 30`] };
     writeFileSync(join(r.home, ".fx", "mcp.json"), JSON.stringify({ mcp: { late1: late, late2: late } }));
     // A 1 ms deadline passes while doctor loads its MCP host, before any child.
     const result = await doctor(r, env(r, { FX_TEST_DOCTOR_DEADLINE_MS: "1" }));
@@ -332,6 +429,28 @@ describe("fx doctor MCP", () => {
     }
     expect(existsSync(marker)).toBe(false);
   });
+
+  test("a healthy server with thousands of tools is ready, however long its answer", async () => {
+    const r = makeRoot();
+    const server = join(r.root, "many-tools.mjs");
+    writeFileSync(server, [
+      'import { createInterface } from "node:readline";',
+      'const tools = Array.from({ length: 3000 }, (_, i) => ({ name: `tool_${i}`, description: "d".repeat(120), inputSchema: { type: "object", properties: {} } }));',
+      'createInterface({ input: process.stdin }).on("line", (line) => {',
+      '  const m = JSON.parse(line);',
+      '  if (m.id === undefined) return;',
+      '  const result = m.method === "initialize" ? { protocolVersion: m.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: "many", version: "1" } } : m.method === "tools/list" ? { tools } : {};',
+      '  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result }) + "\\n");',
+      '});',
+    ].join("\n"));
+    writeFileSync(join(r.home, ".fx", "mcp.json"), JSON.stringify({ mcp: { many: { command: [process.execPath, server] } } }));
+    const e = env(r, { ...acceptingGateway(), AI_GATEWAY_API_KEY: "doctor-key" });
+    const shown = spawnSync(FX_BIN, ["mcp", "show", "many", "--json"], { env: e, cwd: r.workspace });
+    expect(shown.status).toBe(0);
+    expect(shown.stdout.length).toBeGreaterThan(64 * 1024);
+    const result = await doctor(r, e);
+    expect(result.stdout).toMatch(/^\[ok\] mcp: many ready, 3000 tools$/m);
+  }, TIMEOUT);
 
   test("no MCP servers configured adds no MCP line", async () => {
     const r = makeRoot();

@@ -2882,7 +2882,8 @@ fn writeUsageOrJsonError(
 /// absent.
 fn parsedOptions(kind: TopLevelKind) ?[]const command_specs.OptionDoc {
     return switch (kind) {
-        .status, .doctor, .models, .permissions, .credits => &builtin_commands.json_only_options,
+        .status, .models, .permissions, .credits => &builtin_commands.json_only_options,
+        .doctor => &builtin_commands.doctor_options,
         .slack => &command_specs.slack_options,
         .sessions => &builtin_commands.sessions_options,
         .login => &builtin_commands.login_options,
@@ -2929,6 +2930,15 @@ fn flagProblem(alloc: Allocator, kind: TopLevelKind, args: anytype) !?[]u8 {
         return null;
     }
     return try writer.toOwnedSlice();
+}
+
+test "a doctor usage error names the flag that is wrong, not --fix" {
+    const alloc = std.testing.allocator;
+    const args = [_][:0]const u8{ "--fix", "--bogus" };
+    const problem = (try flagProblem(alloc, .doctor, @as([]const [:0]const u8, &args))).?;
+    defer alloc.free(problem);
+    try std.testing.expect(std.mem.find(u8, problem, "--bogus") != null);
+    try std.testing.expect(std.mem.find(u8, problem, "--fix") == null);
 }
 
 fn writeUsageCommandFailure(
@@ -4071,9 +4081,11 @@ fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) 
 
     const deadline_ms = doctor_probes.deadlineMs();
     const deadline = io_mod.milliTimestamp() + deadline_ms;
-    // An expired login is reported as it is: doctor never refreshes it.
+    // An expired login is reported as it is: doctor never refreshes it. A
+    // configured provider's model list comes from its settings, with no
+    // request, so asking it would confirm nothing.
     var catalog_probe: ?*doctor_probes.CatalogProbe = null;
-    if (snapshot.auth.missingHelp(.cli) == null and !snapshot.auth.expired and snapshot.model.len > 0) {
+    if (snapshot.auth.missingHelp(.cli) == null and !snapshot.auth.expired and snapshot.model.len > 0 and snapshot.provider != .configured) {
         const startup = try probe_alloc.create(app_lifecycle.StartupState);
         const loaded = if (cfg.auth_mode == .host_managed)
             deps.load_catalog_startup_state_with_auth_mode(probe_alloc, cfg.secret_store, cfg.default_model, cfg.default_agent_step_limit, cfg.auth_mode, null, null)
@@ -4137,7 +4149,7 @@ fn runDoctor(alloc: Allocator, cfg: Config, deps: RunDeps, opts: DoctorOptions) 
             // A credential the provider never answered for is not confirmed.
             if (catalog_probe != null) {
                 unconfirmed = try alloc.print("{s}; the provider did not confirm it", .{entry.detail});
-                try checks.append(alloc, .{ .name = entry.name, .status = .warn, .detail = unconfirmed.? });
+                try checks.append(alloc, .{ .name = entry.name, .status = .warn, .detail = unconfirmed.?, .fix = "run fx doctor again once the provider check passes" });
                 continue;
             }
         }

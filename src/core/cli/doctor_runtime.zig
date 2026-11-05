@@ -118,7 +118,7 @@ pub fn collect(
         snapshot.auth = try auth_runtime.loadStatusSnapshot(alloc, secret_store, null);
         try appendConfigLoadFailureCheck(&checks, alloc, "config", "failed to load config", err);
         try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
-        try appendAuthCheck(&checks, alloc, snapshot.auth);
+        try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider);
         try appendConfigLoadFailureCheck(&checks, alloc, "startup", "failed to resolve startup settings", err);
         try appendStateChecks(&checks, alloc, options.remove_orphans);
         snapshot.in_git_repository = try appendGitCheck(&checks, alloc, snapshot.workspace_root);
@@ -142,7 +142,7 @@ pub fn collect(
     try appendUnknownSettingChecks(&checks, alloc, paths);
     try appendEnvChecks(&checks, alloc, detailed.settings.permission_mode, detailed.settings.max_agent_steps, default_agent_step_limit);
     try appendMcpConfigCheck(&checks, alloc, mcp_config_diagnostic);
-    try appendAuthCheck(&checks, alloc, snapshot.auth);
+    try appendAuthCheck(&checks, alloc, snapshot.auth, snapshot.provider);
     const selection = config_runtime.selectProviderModel(
         default_model,
         &detailed.settings,
@@ -183,9 +183,24 @@ fn appendConfigDiagnosticChecks(
         if (rejected) {
             try appendCheckOwnedFix(checks, alloc, "config", .fail, detail, try alloc.print("fix or remove {s}, then run fx doctor again", .{file}));
         } else {
-            try appendCheckOwned(checks, alloc, "config", .warn, detail);
+            try appendCheckOwnedFix(checks, alloc, "config", .warn, detail, try configWarningFix(alloc, diagnostic, file));
         }
     }
+}
+
+/// What to change for a diagnostic that leaves its settings file in use.
+fn configWarningFix(alloc: Allocator, diagnostic: config_runtime.ConfigDiagnostic, file: []const u8) ![]u8 {
+    return switch (diagnostic.cause) {
+        .invalid_additional_directories => alloc.print("fix additional_directories in {s}", .{file}),
+        .ignored_project_user_only_setting => alloc.print("move {s} from .fx.json to {s}", .{ diagnostic.setting_key orelse "that setting", profile_paths.displayText("~/.fx/settings.json") }),
+        .legacy_workspace_preferences => alloc.print("move these preferences out of workspaces in {s}", .{file}),
+        .manual_backup_available => if (diagnostic.recovery_path) |path|
+            alloc.print("to go back to the last good settings, copy {s} to {s}", .{ path, file })
+        else
+            alloc.print("fix or remove {s}, then run fx doctor again", .{file}),
+        .private_state_permissions_tightened => alloc.print("check {s} if you did not write it yourself", .{file}),
+        else => alloc.print("fix or remove {s}, then run fx doctor again", .{file}),
+    };
 }
 
 /// Warns about each key fx doesn't know in the profile and project settings
@@ -216,12 +231,16 @@ fn appendUnknownSettingChecksFor(
     const unknown = try settings_keys.findUnknown(alloc, parsed.value, file);
     defer alloc.free(unknown);
     for (unknown) |key| {
-        try appendCheckOwned(checks, alloc, "config", .warn, try settings_messages.formatUnknownSetting(alloc, key, display_path));
+        try appendCheckOwnedFix(checks, alloc, "config", .warn, try settings_messages.formatUnknownSetting(alloc, key, display_path), try alloc.print("rename or remove that key in {s}", .{display_path}));
     }
     const older = try settings_keys.findOlderNames(alloc, parsed.value, file);
     defer alloc.free(older);
     for (older) |entry| {
-        try appendCheckOwned(checks, alloc, "config", .warn, try settings_messages.formatOlderName(alloc, entry, display_path));
+        const fix = if (entry.both)
+            try alloc.print("remove {s} from {s}", .{ entry.older, display_path })
+        else
+            try alloc.print("rename {s} to {s} in {s}", .{ entry.older, entry.current, display_path });
+        try appendCheckOwnedFix(checks, alloc, "config", .warn, try settings_messages.formatOlderName(alloc, entry, display_path), fix);
     }
     if (parsed.value != .object) return;
     try appendOldYolo(checks, alloc, parsed.value.object, null, display_path);
@@ -239,7 +258,7 @@ fn appendUnknownSettingChecksFor(
 fn appendOldYolo(checks: *std.ArrayList(Check), alloc: Allocator, object: std.json.ObjectMap, workspace: ?[]const u8, display_path: []const u8) !void {
     const mode = object.get("permission_mode") orelse return;
     if (mode != .string or !std.mem.eql(u8, mode.string, "yolo")) return;
-    try appendCheckOwned(checks, alloc, "config", .warn, try settings_messages.formatOldYolo(alloc, workspace, display_path));
+    try appendCheckOwnedFix(checks, alloc, "config", .warn, try settings_messages.formatOldYolo(alloc, workspace, display_path), try alloc.print("set permission_mode to full-access in {s}", .{display_path}));
 }
 
 fn appendConfigCheck(
@@ -297,14 +316,29 @@ fn causeRejectsLayer(cause: @FieldType(config_runtime.ConfigDiagnostic, "cause")
     }
 }
 
-fn appendAuthCheck(checks: *std.ArrayList(Check), alloc: Allocator, auth: auth_runtime.StatusSnapshot) !void {
+/// The command that signs in to `provider`.
+pub fn loginCommand(provider: model_provider.ProviderId) []const u8 {
+    return switch (provider) {
+        .gateway => "fx login",
+        .codex => "fx login codex",
+        .grok => "fx login grok",
+        .configured => profile_paths.displayText("check the connection's auth in ~/.fx/settings.json"),
+    };
+}
+
+fn appendAuthCheck(checks: *std.ArrayList(Check), alloc: Allocator, auth: auth_runtime.StatusSnapshot, provider: model_provider.ProviderId) !void {
     if (auth.missingHelp(.cli)) |help| {
-        try checks.append(alloc, .{ .name = "auth", .status = .fail, .detail = help, .fix = "fx login" });
+        try checks.append(alloc, .{ .name = "auth", .status = .fail, .detail = help, .fix = loginCommand(provider) });
         return;
     }
 
     const detail = try auth.formatDoctorDetail(alloc);
-    try appendCheckOwned(checks, alloc, "auth", if (auth.expired) .warn else .ok, detail);
+    if (auth.expired) {
+        errdefer alloc.free(detail);
+        try checks.append(alloc, .{ .name = "auth", .status = .warn, .detail = detail, .owned_detail = detail, .fix = loginCommand(provider) });
+        return;
+    }
+    try appendCheckOwned(checks, alloc, "auth", .ok, detail);
 }
 
 fn appendResolvedStartupCheck(
@@ -322,7 +356,12 @@ fn appendResolvedStartupCheck(
     const selected = selection catch |err| {
         // Startup refuses this provider, so no model would run.
         snapshot.model = "";
-        try appendCheck(checks, alloc, "startup", .fail, config_runtime.modelNotSelectedMessage(err) orelse @errorName(err));
+        const fix: []const u8 = switch (err) {
+            error.CodexModelNotSelected => "fx provider codex",
+            error.GrokModelNotSelected => "fx provider grok",
+            error.ConfiguredModelNotSelected => profile_paths.displayText("save a model under \"models\" in ~/.fx/settings.json"),
+        };
+        try checks.append(alloc, .{ .name = "startup", .status = .fail, .detail = config_runtime.modelNotSelectedMessage(err) orelse @errorName(err), .fix = fix });
         return;
     };
     const model = try alloc.dupe(u8, config_runtime.modelEnvOverride() orelse selected.model);
@@ -338,7 +377,7 @@ fn appendResolvedStartupCheck(
 
 fn appendConfigLoadFailureCheck(checks: *std.ArrayList(Check), alloc: Allocator, name: []const u8, prefix: []const u8, err: anyerror) !void {
     const detail = try formatConfigLoadFailure(alloc, prefix, err);
-    try appendCheckOwned(checks, alloc, name, .fail, detail);
+    try appendCheckOwnedStaticFix(checks, alloc, name, .fail, detail, profile_paths.displayText("check that ~/.fx/settings.json and .fx.json can be read, then run fx doctor again"));
 }
 
 fn formatConfigLoadFailure(alloc: Allocator, prefix: []const u8, err: anyerror) ![]u8 {
@@ -350,21 +389,19 @@ fn formatConfigLoadFailure(alloc: Allocator, prefix: []const u8, err: anyerror) 
 fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, remove_orphans: bool) !void {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
         const status: CheckStatus = if (err == error.HomeNotSet) .warn else .fail;
-        const detail = try alloc.print("failed to inspect sessions: {s}", .{@errorName(err)});
-        try appendCheckOwned(checks, alloc, "state", status, detail);
+        try appendStateFailure(checks, alloc, status, err);
         return;
     };
     defer store.deinit(alloc);
     var report = session_adapter.doctor(&store, alloc, default_session_diagnostics_limit, io_mod.milliTimestamp(), remove_orphans) catch |err| {
-        const detail = try alloc.print("failed to inspect sessions: {s}", .{@errorName(err)});
-        try appendCheckOwned(checks, alloc, "state", .fail, detail);
+        try appendStateFailure(checks, alloc, .fail, err);
         return;
     };
     defer report.deinit(alloc);
     try appendCheck(checks, alloc, "state", .ok, "sessions ready");
     for (report.damaged.items) |id| {
         const detail = try alloc.print("session {s} has a damaged log; `fx session recover {s}` copies its good turns", .{ id, id });
-        try appendCheckOwned(checks, alloc, "session", .warn, detail);
+        try appendCheckOwnedFix(checks, alloc, "session", .warn, detail, try alloc.print("fx session recover {s}", .{id}));
     }
     for (report.stuck.items) |stuck| try appendStuckCheck(checks, alloc, stuck);
     for (report.kept_children) |kept| {
@@ -383,7 +420,7 @@ fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, remove_orp
     }
     if (report.kept > 0) {
         const detail = try alloc.print("{d} terminal or side folder(s) whose session is gone could not be removed", .{report.kept});
-        try appendCheckOwned(checks, alloc, "session", .warn, detail);
+        try appendCheckOwnedStaticFix(checks, alloc, "session", .warn, detail, profile_paths.displayText("check that you own the folders in ~/.fx/session-files and ~/.fx/terminal, then run fx doctor --fix again"));
     }
     if (report.keeps_left_out > 0) {
         const detail = try alloc.print("{d} earlier session folder(s) under ~/.fx/sessions keep files their conversion left out", .{report.keeps_left_out});
@@ -397,9 +434,27 @@ fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, remove_orp
     try appendSessionsCountCheck(checks, alloc, report.sessions, report.latest orelse "", report.unconverted > 0);
 }
 
+/// The sessions could not be inspected at all.
+fn appendStateFailure(checks: *std.ArrayList(Check), alloc: Allocator, status: CheckStatus, err: anyerror) !void {
+    const fix = switch (err) {
+        error.HomeNotSet => "set HOME, then run fx doctor again",
+        error.PrivateStatePermissionsUnsupported => profile_paths.displayText("make ~/.fx private with chmod -R go-rwx ~/.fx, then run fx doctor again"),
+        else => profile_paths.displayText("check that you own ~/.fx and can read it, then run fx doctor again"),
+    };
+    try appendCheckOwnedStaticFix(checks, alloc, "state", status, try alloc.print("failed to inspect sessions: {s}", .{@errorName(err)}), fix);
+}
+
 /// A session an older fx saved that can't be converted, with what
 /// `fx session recover` copies of it (D73). Its v1 folder is kept.
 fn appendStuckCheck(checks: *std.ArrayList(Check), alloc: Allocator, stuck: session_adapter.Doctor.Stuck) !void {
+    if (stuck.recover == .nothing) {
+        // The one problem with no fix: fx can copy nothing out of it.
+        const detail = try alloc.print(
+            "session {s} saved by an older fx can't be converted: {s}; nothing in it can be copied, so it is kept as it is",
+            .{ stuck.id, stuck.reason },
+        );
+        return appendCheckOwned(checks, alloc, "session", .warn, detail);
+    }
     const detail = switch (stuck.recover) {
         .without_rules => try alloc.print(
             "session {s} saved by an older fx can't be converted: {s}; `fx session recover {s}` copies its conversation without its saved permission rules",
@@ -409,12 +464,9 @@ fn appendStuckCheck(checks: *std.ArrayList(Check), alloc: Allocator, stuck: sess
             "session {s} saved by an older fx can't be converted: {s}; `fx session recover {s}` copies its good turns",
             .{ stuck.id, stuck.reason, stuck.id },
         ),
-        .nothing => try alloc.print(
-            "session {s} saved by an older fx can't be converted: {s}; nothing in it can be copied, so it is kept as it is",
-            .{ stuck.id, stuck.reason },
-        ),
+        .nothing => unreachable,
     };
-    try appendCheckOwned(checks, alloc, "session", .warn, detail);
+    try appendCheckOwnedFix(checks, alloc, "session", .warn, detail, try alloc.print("fx session recover {s}", .{stuck.id}));
 }
 
 fn appendSessionDiagnosticsTruncatedCheck(
@@ -426,7 +478,7 @@ fn appendSessionDiagnosticsTruncatedCheck(
         "session diagnostics truncated after {d} session director{s} to keep doctor bounded",
         .{ inspected_count, if (inspected_count == 1) "y" else "ies" },
     );
-    try appendCheckOwned(checks, alloc, "session", .warn, detail);
+    try appendCheckOwnedStaticFix(checks, alloc, "session", .warn, detail, "run fx session ID to check a session doctor did not reach");
 }
 
 fn appendSessionsCountCheck(
@@ -449,7 +501,7 @@ fn appendSessionsCountCheck(
 /// Returns whether the workspace is in a git repository.
 fn appendGitCheck(checks: *std.ArrayList(Check), alloc: Allocator, workspace_root: []const u8) !bool {
     if (!try inGitRepository(alloc, workspace_root)) {
-        try checks.append(alloc, .{ .name = "git", .status = .warn, .detail = "this folder is not in a git repository; fx pr and fx issue need one" });
+        try checks.append(alloc, .{ .name = "git", .status = .warn, .detail = "this folder is not in a git repository; fx pr and fx issue need one", .fix = "run git init here, or run fx in a repository" });
         return false;
     }
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -457,12 +509,12 @@ fn appendGitCheck(checks: *std.ArrayList(Check), alloc: Allocator, workspace_roo
     switch (try safe_git.prepare(arena_state.allocator(), workspace_root)) {
         .ready => try appendCheck(checks, alloc, "git", .ok, "git is installed and this folder is in a repository"),
         .refused => |reason| {
-            const text: struct { []const u8, ?[]const u8 } = switch (reason) {
+            const text: struct { []const u8, []const u8 } = switch (reason) {
                 .git_missing => .{ "git was not found where fx looks for it, such as /usr/bin/git; fx pr and fx issue need it", "install git" },
                 .git_version_unknown => .{ "fx could not read the version of git", "git --version" },
                 .git_too_old => .{ "git is too old for fx", "update git" },
                 .repo_config_unavailable => .{ "fx could not read this repository's git config", "git config --list --show-origin" },
-                .unsupported_filter_name => .{ "this repository's git config names a filter fx cannot turn off, so fx does not run git here", null },
+                .unsupported_filter_name => .{ "this repository's git config names a filter fx cannot turn off, so fx does not run git here", "rename that filter in the repository's git config so its name has no =" },
                 .repository_mismatch => .{ "git would use a different repository than the one fx read here", "check GIT_DIR and GIT_WORK_TREE" },
             };
             try checks.append(alloc, .{ .name = "git", .status = .warn, .detail = text[0], .fix = text[1] });
@@ -483,7 +535,7 @@ fn inGitRepository(alloc: Allocator, workspace_root: []const u8) !bool {
 /// The running fx, and any other `fx` on PATH that a shell could run instead.
 fn appendInstallCheck(checks: *std.ArrayList(Check), alloc: Allocator, version: []const u8, channel: []const u8) !void {
     const self_path = std.process.executablePathAlloc(io_mod.getIo(), alloc) catch {
-        try appendCheckOwned(checks, alloc, "install", .warn, try alloc.print("fx {s}; fx could not find its own binary", .{version}));
+        try appendCheckOwnedStaticFix(checks, alloc, "install", .warn, try alloc.print("fx {s}; fx could not find its own binary", .{version}), "reinstall fx from https://fx.sh, then run fx doctor again");
         return;
     };
     defer alloc.free(self_path);
@@ -596,6 +648,12 @@ fn appendCheckOwnedFix(checks: *std.ArrayList(Check), alloc: Allocator, name: []
     });
 }
 
+/// Like `appendCheckOwnedFix`, for a fix that is not allocated.
+fn appendCheckOwnedStaticFix(checks: *std.ArrayList(Check), alloc: Allocator, name: []const u8, status: CheckStatus, detail: []u8, fix: []const u8) !void {
+    errdefer alloc.free(detail);
+    try checks.append(alloc, .{ .name = name, .status = status, .detail = detail, .owned_detail = detail, .fix = fix });
+}
+
 fn appendCheckOwned(checks: *std.ArrayList(Check), alloc: Allocator, name: []const u8, status: CheckStatus, detail: []u8) !void {
     errdefer alloc.free(detail);
     try checks.append(alloc, .{
@@ -625,13 +683,11 @@ fn appendMcpConfigCheck(
                 " additional_matches={d}",
                 .{warning.additional_matches},
             );
-            try appendCheckOwned(
-                checks,
-                alloc,
-                "mcp_config",
-                .warn,
-                try out.toOwnedSlice(),
-            );
+            const fix = switch (warning.cause) {
+                .ignored_mcp_servers_alias, .suspicious_server_key => profile_paths.displayText("put each server under \"mcp\" in ~/.fx/mcp.json"),
+                .suspicious_key_scan_indeterminate => profile_paths.displayText("check the keys in ~/.fx/mcp.json"),
+            };
+            try appendCheckOwnedStaticFix(checks, alloc, "mcp_config", .warn, try out.toOwnedSlice(), fix);
             return;
         },
         .failed => |err| {
@@ -639,7 +695,7 @@ fn appendMcpConfigCheck(
                 "failed to load {s}/mcp.json: {s}",
                 .{ profile_paths.displayRoot(), @errorName(err) },
             );
-            try appendCheckOwned(checks, alloc, "mcp_config", .fail, detail);
+            try appendCheckOwnedStaticFix(checks, alloc, "mcp_config", .fail, detail, profile_paths.displayText("fix or remove ~/.fx/mcp.json, then run fx doctor again"));
             return;
         },
     }

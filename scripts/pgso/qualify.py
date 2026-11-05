@@ -54,7 +54,6 @@ STARTUP_COMMANDS = (
     ("help", ("help",)),
     ("version", ("--version",)),
     ("status", ("status", "--json")),
-    ("doctor", ("doctor", "--json")),
     ("sessions", ("sessions", "--json")),
 )
 

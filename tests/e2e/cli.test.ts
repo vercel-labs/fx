@@ -679,6 +679,7 @@ describe("cli: status", () => {
             name: "mcp_config",
             status: "fail",
             detail: "failed to load ~/.fx/mcp.json: McpConfigInvalidJson",
+            fix: "fix or remove ~/.fx/mcp.json, then run fx doctor again",
           },
         ]);
         expect(ask.code).toBe(1);
@@ -1024,9 +1025,9 @@ describe("cli: status", () => {
     { name: "an exact OIDC token", provider: "gateway", source: "vercel_oidc_token", help: "VERCEL_OIDC_TOKEN is selected but unavailable. Set VERCEL_OIDC_TOKEN before starting fx; no other credential was selected." },
     { name: "an exact environment key", provider: "gateway", source: "ai_gateway_api_key", help: "AI_GATEWAY_API_KEY is selected but unavailable. Set AI_GATEWAY_API_KEY before starting fx; no other credential was selected." },
     { name: "an exact stored key", provider: "gateway", source: "stored_key", help: "A stored API key is selected but unavailable. Start fx and open /provider to choose an available credential; no other credential was selected." },
-    { name: "Codex", provider: "codex", source: undefined, help: "fx needs a Codex subscription login for this model. Run fx login codex." },
-    { name: "Grok", provider: "grok", source: undefined, help: "fx needs a Grok subscription login for this model. Run fx login grok." },
-  ]) {
+    { name: "Codex", provider: "codex", source: undefined, help: "fx needs a Codex subscription login for this model. Run fx login codex.", fix: "fx login codex" },
+    { name: "Grok", provider: "grok", source: undefined, help: "fx needs a Grok subscription login for this model. Run fx login grok.", fix: "fx login grok" },
+  ] as Array<{ name: string; provider: string; source: string | undefined; help: string; fix?: string }>) {
     test(
       `status and doctor respect ${scenario.name} when credentials are missing`,
       async () => {
@@ -1063,7 +1064,7 @@ describe("cli: status", () => {
               expect(value.auth_help).toBe(scenario.help);
             } else {
               expect(value.checks).toContainEqual({
-                name: "auth", status: "fail", detail: scenario.help, fix: "fx login",
+                name: "auth", status: "fail", detail: scenario.help, fix: scenario.fix ?? "fx login",
               });
             }
           }
@@ -1330,6 +1331,8 @@ describe("cli: status", () => {
           VERCEL_OIDC_TOKEN: undefined,
           AI_GATEWAY_API_KEY: envToken,
           FX_DISABLE_KEYCHAIN: "1",
+          // Doctor asks the provider; a refused local port keeps it offline.
+          FX_TEST_GATEWAY_MODELS_URL: "http://127.0.0.1:9/coding-agent/v1/models",
         };
 
         const status = await runFx(["status", "--json"], { env });
@@ -2425,7 +2428,10 @@ describe("cli: logout", () => {
         const oidcStatus = await runFx(["status", "--json"], { env });
         const apiEnv = { ...env, VERCEL_OIDC_TOKEN: undefined };
         const apiStatus = await runFx(["status", "--json"], { env: apiEnv });
-        const doctor = await runFx(["doctor", "--json"], { env: apiEnv });
+        // Doctor asks the provider; a refused local port keeps it offline.
+        const doctor = await runFx(["doctor", "--json"], {
+          env: { ...apiEnv, FX_TEST_GATEWAY_MODELS_URL: "http://127.0.0.1:9/coding-agent/v1/models" },
+        });
         expect(JSON.parse(oidcStatus.stdout)).toMatchObject({
           auth: "VERCEL_OIDC_TOKEN",
           auth_refreshable: false,
@@ -2827,6 +2833,7 @@ describe("cli: read-only no-create matrix", () => {
             env: {
               ...NO_GATEWAY_AUTH,
               HOME: realpathSync(home),
+              FX_DISABLE_KEYCHAIN: "1",
               FX_TEST_FAIL_ON_DURABLE_MUTATION: "1",
             },
             timeoutMs: TIMEOUT,
