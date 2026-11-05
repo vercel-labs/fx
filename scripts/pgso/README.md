@@ -93,6 +93,13 @@ keeps the default code generation and a higher cold cutoff, because its
 profile-use IR only selects the functions to transfer into the production
 profile.
 
+LLVM runs the machine outliner by default only on AArch64, where it outlines
+the functions profile use compiled for size. Linux x86_64 asks for it with
+`-enable-machine-outliner=conservative-pgo` on every candidate object, fx and
+benchmark alike, so it outlines only code the profile marks cold. Code without
+profile data counts as hot, and the startup functions are `nooutline`, so
+neither moves into shared helpers.
+
 LLVM's IR outliner does not compare constants nested inside a constant
 expression. Two regions that differ only in an instruction's constant can share
 one parameter that also replaces a nested constant, so one of them reads the
