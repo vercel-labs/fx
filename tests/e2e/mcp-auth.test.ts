@@ -678,13 +678,15 @@ function startDelayedToolGateway(delayMs: number, finalText: string) {
   });
 }
 
-function startRefreshRecoveryGateway(delayMs: number) {
+/// Holds the first call to the protected tool until `callAt()`, a wall-clock
+/// time in ms.
+function startRefreshRecoveryGateway(callAt: () => number) {
   return startFakeGateway([
     fakeGatewayToolCall("select_cancel", "mcp_select_tool", {
       name: TOOL_NAME,
     }),
     async () => {
-      await Bun.sleep(delayMs);
+      await Bun.sleep(Math.max(0, callAt() - Date.now()));
       return fakeGatewayToolCall("call_cancel", TOOL_NAME, {
         text: "cancelled",
       });
@@ -2645,7 +2647,9 @@ describe("MCP login", () => {
     // The first renewal never answers.
     auth = startAuthFixture(upstream.url, { stallRefresh: true });
     const root = createRoot(auth);
-    gateway = startRefreshRecoveryGateway(6_000);
+    // Times from the moment the login is saved, below.
+    let savedAt = 0;
+    gateway = startRefreshRecoveryGateway(() => savedAt + 16_000);
     tui = await TmuxSession.create({
       isolated: true,
       cwd: root.workspace,
@@ -2654,11 +2658,13 @@ describe("MCP login", () => {
       env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
     });
     await tui.waitForComposer(15_000);
-    // Renewed 6 s before it expires, 12 s from now: the tool is found
-    // outside that window, and called 6 s later inside it.
-    const store = seedV2Credential(root, auth, { expires_at_ms: Date.now() + 12_000, skew_ms: 6_000 });
+    // Renewed 6 s before it expires, 21 s from now: the tool is found well
+    // before that window, even on a slow machine, and called inside it, 16 s
+    // from now.
+    savedAt = Date.now();
+    const store = seedV2Credential(root, auth, { expires_at_ms: savedAt + 21_000, skew_ms: 6_000 });
     await tui.sendText("Call the protected MCP fixture.");
-    const refreshDeadline = Date.now() + 20_000;
+    const refreshDeadline = Date.now() + 40_000;
     while (auth.refreshes === 0 && Date.now() < refreshDeadline) await Bun.sleep(25);
     expect(auth.refreshes).toBe(1);
 
