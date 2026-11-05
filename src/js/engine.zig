@@ -139,8 +139,9 @@ fn settle(gpa: std.mem.Allocator, rt: *qjs.Runtime, ctx: *qjs.Context, completio
 /// A context with the built-ins code mode keeps. It leaves out Proxy,
 /// WeakRef and FinalizationRegistry, and the typed arrays along with
 /// ArrayBuffer, SharedArrayBuffer, Atomics, and DataView, none of which the
-/// models' programs used. `cut_prelude` then makes those names, `eval`, and
-/// the Function constructors throw an error that says so.
+/// models' programs used. `cut_prelude` then makes those names throw an
+/// error that says so, and swaps in stand-ins for `eval` and the Function
+/// constructors that throw when called.
 fn newContext(rt: *qjs.Runtime) error{OutOfMemory}!*qjs.Context {
     const ctx = qjs.JS_NewContextRaw(rt) orelse return error.OutOfMemory;
     errdefer qjs.JS_FreeContext(ctx);
@@ -174,17 +175,17 @@ fn refuseImport(ctx: ?*qjs.Context, _: [*:0]const u8, _: ?*anyopaque) callconv(.
     return null;
 }
 
-/// Runs before each program. A program can't undo it: the properties it
-/// defines are neither writable nor configurable, and no other path reaches
-/// the Function constructors.
+/// Runs before each program. Reading a cut name throws. `eval` and each
+/// Function constructor become stand-ins, so a program can still use
+/// `instanceof Function`, `typeof eval`, or `fn.constructor.name`, but calling
+/// one throws instead of compiling code. A program can't undo it: the
+/// properties it defines are neither writable nor configurable, and no other
+/// path reaches the real constructors. Direct `eval(...)` compiles code only
+/// when the callee is the real `eval`, which QuickJS keeps out of reach.
 const cut_prelude =
     \\(() => {
     \\  "use strict";
-    \\  const unavailable = (name) => ({
-    \\    get() { throw new TypeError(name + " is not available in code mode"); },
-    \\    enumerable: false,
-    \\    configurable: false,
-    \\  });
+    \\  const fixed = (value) => ({ value, writable: false, enumerable: false, configurable: false });
     \\  const functionPrototypes = [
     \\    Function.prototype,
     \\    Object.getPrototypeOf(async function () {}),
@@ -192,10 +193,27 @@ const cut_prelude =
     \\    Object.getPrototypeOf(async function* () {}),
     \\  ];
     \\  for (const prototype of functionPrototypes) {
-    \\    Object.defineProperty(prototype, "constructor", unavailable("The Function constructor"));
+    \\    const name = prototype.constructor.name;
+    \\    const standIn = {
+    \\      [name]: function (body) {
+    \\        throw new TypeError("The " + name + " constructor is not available in code mode");
+    \\      },
+    \\    }[name];
+    \\    Object.defineProperty(standIn, "prototype", fixed(prototype));
+    \\    Object.defineProperty(prototype, "constructor", fixed(standIn));
     \\  }
+    \\  Object.defineProperty(globalThis, "Function", fixed(Function.prototype.constructor));
+    \\  const evalStandIn = {
+    \\    eval(code) { throw new TypeError("eval is not available in code mode"); },
+    \\  }.eval;
+    \\  Object.defineProperty(globalThis, "eval", fixed(evalStandIn));
+    \\  const unavailable = (name) => ({
+    \\    get() { throw new TypeError(name + " is not available in code mode"); },
+    \\    enumerable: false,
+    \\    configurable: false,
+    \\  });
     \\  const names = [
-    \\    "eval", "Function", "Proxy", "WeakRef", "FinalizationRegistry",
+    \\    "Proxy", "WeakRef", "FinalizationRegistry",
     \\    "ArrayBuffer", "SharedArrayBuffer", "Atomics", "DataView",
     \\    "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
     \\    "Int32Array", "Uint32Array", "Float16Array", "Float32Array", "Float64Array",
@@ -471,13 +489,20 @@ test "deep recursion and deep nesting throw instead of overflowing the stack" {
         \\return JSON.stringify(v).length;
     , .{depth}), .{});
     try expectThrew("Error", std.fmt.comptimePrint("return new RegExp('('.repeat({d}) + 'a' + ')'.repeat({d})).test('a');", .{ depth, depth }), .{});
-    try expectThrew("Error", std.fmt.comptimePrint("return eval('('.repeat({d}) + '1' + ')'.repeat({d}));", .{ depth, depth }), .{});
+    // Code mode has no `eval`, so the nesting goes in the program's own text.
+    var nested: std.ArrayList(u8) = .empty;
+    defer nested.deinit(testing.allocator);
+    try nested.appendSlice(testing.allocator, "return ");
+    try nested.appendNTimes(testing.allocator, '(', depth);
+    try nested.append(testing.allocator, '1');
+    try nested.appendNTimes(testing.allocator, ')', depth);
+    try expectThrew("RangeError: Maximum call stack size exceeded", nested.items, .{});
 }
 
 test "built-ins cut from code mode throw an error that names them" {
     try expectReturned("[]",
         \\const cut = [
-        \\  "eval", "Function", "Proxy", "WeakRef", "FinalizationRegistry",
+        \\  "Proxy", "WeakRef", "FinalizationRegistry",
         \\  "ArrayBuffer", "SharedArrayBuffer", "Atomics", "DataView",
         \\  "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
         \\  "Int32Array", "Uint32Array", "Float16Array", "Float32Array", "Float64Array",
@@ -494,6 +519,8 @@ test "built-ins cut from code mode throw an error that names them" {
     , .{});
     try expectThrew("TypeError: Proxy is not available in code mode", "return new Proxy({}, {});", .{});
     try expectThrew("TypeError: Uint8Array is not available in code mode", "return new Uint8Array(4).length;", .{});
+    // Even `typeof` reads the name, so it throws too.
+    try expectThrew("TypeError: Proxy is not available in code mode", "return typeof Proxy;", .{});
 }
 
 test "no path reaches eval or the Function constructors" {
@@ -506,13 +533,38 @@ test "no path reaches eval or the Function constructors" {
         "return (function* () {}).constructor('yield 1');",
         "return (async function* () {}).constructor('yield 1');",
         "return Reflect.getPrototypeOf(() => 0).constructor('return 1');",
-        "return Object.getOwnPropertyDescriptor(Function.prototype, 'constructor').get();",
+        "return Object.getOwnPropertyDescriptor(Function.prototype, 'constructor').value('return 1');",
+        "return Reflect.construct(Function, ['return 1'])();",
+        "return Function.prototype.constructor.call(null, 'return 1')();",
     };
     for (blocked) |source| try expectThrew("is not available in code mode", source, .{});
+    try expectThrew("TypeError: The Function constructor is not available in code mode", "return Function('return 1');", .{});
+    try expectThrew("TypeError: The AsyncFunction constructor is not available in code mode", "return (async () => {}).constructor('return 1');", .{});
+    try expectThrew("TypeError: eval is not available in code mode", "return eval('1 + 1');", .{});
     // The program can't take the blocks back down.
     try expectThrew("TypeError", "Object.defineProperty(globalThis, 'eval', { value: (s) => s });", .{});
     try expectThrew("TypeError", "'use strict'; delete globalThis.Proxy;", .{});
     try expectThrew("TypeError", "Object.defineProperty(Function.prototype, 'constructor', { value: 1 });", .{});
+}
+
+test "programs can still name eval and the Function constructors" {
+    try expectReturned("[true,true,\"Function\",\"AsyncFunction\",\"GeneratorFunction\",\"AsyncGeneratorFunction\",\"call\",\"function\",\"function\",1,true,[3,4,5]]",
+        \\const f = function (a) { return this.k + a; };
+        \\return [
+        \\  (() => 1) instanceof Function,
+        \\  (() => 1).constructor === Function,
+        \\  (() => 1).constructor.name,
+        \\  (async () => 1).constructor.name,
+        \\  (function* () {}).constructor.name,
+        \\  (async function* () {}).constructor.name,
+        \\  Function.prototype.call.name,
+        \\  typeof eval,
+        \\  typeof Function,
+        \\  Function.length,
+        \\  Object.getPrototypeOf(async () => 1) === (async () => 1).constructor.prototype,
+        \\  [f.call({ k: 1 }, 2), f.apply({ k: 1 }, [3]), f.bind({ k: 1 })(4)],
+        \\];
+    , .{});
 }
 
 test "code mode keeps the built-ins programs use" {
