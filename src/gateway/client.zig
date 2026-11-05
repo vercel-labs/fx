@@ -1235,31 +1235,41 @@ const RequestOpenOperation = struct {
     }
 };
 
-/// A pooled connection open on a thread of its own, so a request can walk
-/// away from a DNS lookup or connect that hangs (`open_job.zig`). Only the
-/// pool's client outlives the request, so only pooled opens run here. The
-/// job owns a copy of the URI, which `client.request` reads while it
+/// A request's connection open, on a thread of its own so the request can
+/// walk away from a DNS lookup or connect that hangs (`open_job.zig`).
+///
+/// A pooled open runs on the pool's client, which the pool keeps until its
+/// jobs are gone (`HttpPool.deinit`). Any other open runs on a client the job
+/// makes for it, because the caller's own client and allocator end with its
+/// attempt, which can come while the job still waits for a lookup. Whichever
+/// side owns the result frees that client: the request once it is done with
+/// the connection, or the job when the request walked away.
+///
+/// The job owns a copy of the URI, which `client.request` reads while it
 /// connects. Headers are only stored in the request, so the job opens
 /// without them and the request puts its own back when it takes the result.
-const PooledOpenJob = struct {
+const OpenJob = struct {
     gpa: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
-    pool: *http_pool.HttpPool,
+    /// The pool whose client the open runs on, or null for the job's own
+    /// client, which is `operation.client`.
+    pool: ?*http_pool.HttpPool,
     operation: RequestOpenOperation,
     handoff: open_job.Handoff = .{},
     result: anyerror!std.http.Client.Request = error.ConnectionSetupTimedOut,
 
     fn start(
-        client: *std.http.Client,
-        pool: *http_pool.HttpPool,
+        pool: ?*http_pool.HttpPool,
         uri: std.Uri,
         options: std.http.Client.RequestOptions,
         request_open_override: ?RequestOpenOverride,
-    ) !*PooledOpenJob {
-        const gpa = pool.client.allocator;
-        const job = try gpa.create(PooledOpenJob);
+    ) !*OpenJob {
+        const gpa = if (pool) |shared| shared.client.allocator else own_client_gpa;
+        const job = try gpa.create(OpenJob);
         job.* = .{ .gpa = gpa, .arena = .init(gpa), .pool = pool, .operation = undefined };
         errdefer job.destroy();
+        const client = if (pool) |shared| &shared.client else try createOwnClient();
+        errdefer if (pool == null) destroyOwnClient(client);
         var job_options = options;
         job_options.headers = .{};
         job_options.extra_headers = &.{};
@@ -1271,69 +1281,127 @@ const PooledOpenJob = struct {
             .options = job_options,
             .request_open_override = request_open_override,
         };
-        pool.beginOpenJob();
-        errdefer pool.endOpenJob();
+        beginOpenJob(pool);
+        errdefer endOpenJob(pool);
         // A detached thread, not an Io task: std.Io cannot cancel a lookup
-        // stuck in getaddrinfo or a connect, so the job has to be able to
-        // outlive the request that started it. It is not unowned: the pool
-        // counts it from here to its last touch in `run`, and
-        // `HttpPool.deinit` waits for the count before freeing the client.
+        // stuck in getaddrinfo, so the job has to be able to outlive the
+        // request that started it. It is not unowned: a counter tracks it
+        // from here to its last touch in `run`, the pool's or
+        // `own_client_open_jobs`, and `HttpPool.deinit` waits for the pool's
+        // before freeing the client.
         const thread = try std.Thread.spawn(.{}, run, .{job});
         thread.detach();
         return job;
     }
 
-    fn run(self: *PooledOpenJob) void {
+    fn run(self: *OpenJob) void {
         const pool = self.pool;
-        self.result = self.operation.run();
+        self.result = self.openUnlessAbandoned();
         switch (self.handoff.publish()) {
             // The request may free the job from here on.
             .hand_over => {},
             .close_late => {
                 if (self.result) |request| {
-                    // Nothing was sent on it, so std returns it to the pool.
+                    // Nothing was sent on it, so std returns it to the pool
+                    // it came from; an own client closes it below.
                     var late = request;
                     late.deinit();
-                    debug_trace.logf("gateway", "open_job late connection released", .{});
+                    debug_trace.logf("gateway", "open_job late connection {s}", .{if (pool == null) "closed" else "released"});
                 } else |err| {
                     debug_trace.logf("gateway", "open_job late open failed err={s}", .{@errorName(err)});
                 }
+                if (pool == null) destroyOwnClient(self.operation.client);
                 self.destroy();
             },
         }
-        pool.endOpenJob();
+        endOpenJob(pool);
     }
 
-    /// Waits for the open, or walks away from it on Esc or at the setup
-    /// deadline. Returns the request with the caller's URI and headers.
+    /// Runs the open as an Io task, so the job can cancel it once the
+    /// request walked away. That ends a connect or TLS setup at once, which
+    /// closes the half-open connection; a lookup cannot be cancelled and
+    /// runs to its end first. With no Io task to spare, the job opens on its
+    /// own thread, where only std ends a stalled connect.
+    fn openUnlessAbandoned(self: *OpenJob) anyerror!std.http.Client.Request {
+        const Event = union(enum) {
+            request: anyerror!std.http.Client.Request,
+            watch: std.Io.Cancelable!select_watch.Outcome,
+        };
+        const Cancel = struct {
+            /// Cancels the open and returns what it ended with: a request
+            /// that finished first, or its error.
+            fn open(select: *std.Io.Select(Event), watch: *RequestGoneWatch) anyerror!std.http.Client.Request {
+                watch.stop(select.io);
+                var result: anyerror!std.http.Client.Request = error.Canceled;
+                while (select.cancel()) |item| switch (item) {
+                    .request => |late| result = late,
+                    .watch => {},
+                };
+                return result;
+            }
+        };
+        var watch: RequestGoneWatch = .{};
+        var buffer: [2]Event = undefined;
+        var select: std.Io.Select(Event) = .init(io_mod.getIo(), &buffer);
+        select.concurrent(.watch, RequestGoneWatch.run, .{ &watch, select.io, RequestGone{ .handoff = &self.handoff } }) catch
+            return self.operation.run();
+        select.concurrent(.request, RequestOpenOperation.run, .{&self.operation}) catch {
+            watch.finish(&select);
+            return self.operation.run();
+        };
+        const event = select.await() catch return Cancel.open(&select, &watch);
+        switch (event) {
+            .request => |result| {
+                watch.finish(&select);
+                return result;
+            },
+            .watch => {
+                debug_trace.logf("gateway", "open_job stopping its open after the request walked away", .{});
+                return Cancel.open(&select, &watch);
+            },
+        }
+    }
+
+    /// Waits for the open, or walks away from it on Esc, at `deadline`, or
+    /// when the task the request runs in is cancelled. Returns the request
+    /// with the caller's URI and headers.
     fn waitForOpen(
-        self: *PooledOpenJob,
+        self: *OpenJob,
         uri: std.Uri,
         options: std.http.Client.RequestOptions,
-        epoch: *const ConnectionSetupEpoch,
+        deadline: std.Io.Clock.Timestamp,
         cancel_flag: *std.atomic.Value(bool),
         reused: *bool,
-    ) anyerror!std.http.Client.Request {
+    ) anyerror!OpenedRequest {
+        const zio = io_mod.getIo();
+        var task_cancelled = false;
         while (true) {
-            const cancelled = cancel_flag.load(.seq_cst);
-            const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-            const expired = !std.Io.Clock.Timestamp.compare(now, .lt, epoch.deadline);
-            if (!cancelled and !expired) switch (self.handoff.poll()) {
+            const now = std.Io.Clock.Timestamp.now(zio, .awake);
+            const stop_reason: ?anyerror = if (task_cancelled)
+                error.Canceled
+            else if (cancel_flag.load(.seq_cst))
+                error.Cancelled
+            else if (!std.Io.Clock.Timestamp.compare(now, .lt, deadline))
+                error.ConnectionSetupTimedOut
+            else
+                null;
+            const stopped = stop_reason orelse switch (self.handoff.poll()) {
                 .wait => {
-                    io_mod.sleep(pooled_open_poll_ms * std.time.ns_per_ms);
+                    zio.sleep(.fromMilliseconds(open_poll_ms), .awake) catch |err| switch (err) {
+                        error.Canceled => task_cancelled = true,
+                    };
                     continue;
                 },
                 .take => return self.take(uri, options, reused),
             };
-            const stopped: anyerror = if (cancelled) error.Cancelled else error.ConnectionSetupTimedOut;
             switch (self.handoff.stop()) {
                 .walk_away => debug_trace.logf("gateway", "open_job walked away err={s}", .{@errorName(stopped)}),
                 .close_handed => {
                     // The open finished as the request stopped, so it closes
                     // the connection itself.
-                    if (self.take(uri, options, reused)) |request| {
-                        var handed = request;
-                        handed.deinit();
+                    if (self.take(uri, options, reused)) |handed| {
+                        var closing = handed;
+                        closing.deinit();
                         debug_trace.logf("gateway", "open_job closed a handed connection err={s}", .{@errorName(stopped)});
                     } else |err| {
                         debug_trace.logf("gateway", "open_job handed open failed err={s} stopped={s}", .{ @errorName(err), @errorName(stopped) });
@@ -1344,31 +1412,98 @@ const PooledOpenJob = struct {
         }
     }
 
+    /// Takes the handed-over result and frees the job. An own client goes
+    /// with the request, or is freed with a failed open.
     fn take(
-        self: *PooledOpenJob,
+        self: *OpenJob,
         uri: std.Uri,
         options: std.http.Client.RequestOptions,
         reused: *bool,
-    ) anyerror!std.http.Client.Request {
+    ) anyerror!OpenedRequest {
+        const own_client: ?*std.http.Client = if (self.pool == null) self.operation.client else null;
         defer self.destroy();
-        var request = try self.result;
+        var request = self.result catch |err| {
+            if (own_client) |client| destroyOwnClient(client);
+            return err;
+        };
         request.uri = uri;
         request.headers = options.headers;
         request.extra_headers = options.extra_headers;
         request.privileged_headers = options.privileged_headers;
         reused.* = self.operation.reused;
-        return request;
+        return .{ .request = request, .own_client = own_client };
     }
 
-    fn destroy(self: *PooledOpenJob) void {
+    fn destroy(self: *OpenJob) void {
         const gpa = self.gpa;
         self.arena.deinit();
         gpa.destroy(self);
     }
+
+    fn beginOpenJob(pool: ?*http_pool.HttpPool) void {
+        if (pool) |shared| return shared.beginOpenJob();
+        _ = own_client_open_jobs.fetchAdd(1, .acq_rel);
+    }
+
+    /// A job's last touch of anything it shares.
+    fn endOpenJob(pool: ?*http_pool.HttpPool) void {
+        if (pool) |shared| return shared.endOpenJob();
+        _ = own_client_open_jobs.fetchSub(1, .acq_rel);
+    }
 };
 
-/// How often a request checks on its pooled open.
-const pooled_open_poll_ms = 2;
+/// How often a request checks on its open job.
+const open_poll_ms = 2;
+
+/// Fires once the request walked away from its open job.
+const RequestGone = struct {
+    handoff: *const open_job.Handoff,
+
+    pub fn cancelled(condition: RequestGone) bool {
+        return condition.handoff.abandoned();
+    }
+
+    pub fn expired(_: RequestGone, _: std.Io) bool {
+        return false;
+    }
+};
+
+const RequestGoneWatch = select_watch.Watch(RequestGone);
+
+/// Where an open job on a client of its own allocates the job and that
+/// client. Not the caller's allocator: that is the attempt's arena
+/// (`gateway_step.zig`), freed when the attempt returns, which can come
+/// while the job still waits for a lookup. Tests use the testing allocator,
+/// so its leak check covers every job.
+const own_client_gpa = if (builtin.is_test) std.testing.allocator else std.heap.c_allocator;
+
+/// Open jobs on clients of their own that are still running. A request may
+/// have walked away from one that waits for a lookup.
+var own_client_open_jobs: std.atomic.Value(u32) = .init(0);
+
+fn createOwnClient() !*std.http.Client {
+    const client = try own_client_gpa.create(std.http.Client);
+    client.* = .{ .allocator = own_client_gpa, .io = io_mod.getIo() };
+    return client;
+}
+
+fn destroyOwnClient(client: *std.http.Client) void {
+    client.deinit();
+    own_client_gpa.destroy(client);
+}
+
+/// A request an open job handed over, with the client it runs on when that
+/// client is the job's own. `deinit` ends the request, then frees the client.
+pub const OpenedRequest = struct {
+    request: std.http.Client.Request,
+    own_client: ?*std.http.Client = null,
+
+    pub fn deinit(self: *OpenedRequest) void {
+        self.request.deinit();
+        if (self.own_client) |client| destroyOwnClient(client);
+        self.* = undefined;
+    }
+};
 
 fn dupeUri(arena: std.mem.Allocator, uri: std.Uri) !std.Uri {
     const Dupe = struct {
@@ -1388,8 +1523,10 @@ fn dupeUri(arena: std.mem.Allocator, uri: std.Uri) !std.Uri {
     return copy;
 }
 
+/// Opens a request's connection on a job (`OpenJob`): on the pool's client
+/// when `pool` is set, and otherwise on a client of the job's own. Esc and
+/// the setup deadline return at once, however long the lookup takes.
 fn openGatewayRequestBounded(
-    client: *std.http.Client,
     pool: ?*http_pool.HttpPool,
     uri: std.Uri,
     options: std.http.Client.RequestOptions,
@@ -1398,7 +1535,7 @@ fn openGatewayRequestBounded(
     cancel_flag: *std.atomic.Value(bool),
     /// Set when the returned request reuses an idle pooled connection.
     reused: *bool,
-) anyerror!std.http.Client.Request {
+) anyerror!OpenedRequest {
     reused.* = false;
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
@@ -1407,85 +1544,23 @@ fn openGatewayRequestBounded(
         return error.ConnectionSetupTimedOut;
     }
 
-    if (comptime !builtin.single_threaded) if (pool) |shared| {
-        const job = try PooledOpenJob.start(client, shared, uri, options, request_open_override);
-        var request = try job.waitForOpen(uri, options, epoch, cancel_flag, reused);
+    if (comptime !builtin.single_threaded) {
+        const job = try OpenJob.start(pool, uri, options, request_open_override);
+        var opened = try job.waitForOpen(uri, options, epoch.deadline, cancel_flag, reused);
         if (cancel_flag.load(.seq_cst)) {
-            request.deinit();
+            opened.deinit();
             return error.Cancelled;
         }
         const result_now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
         if (!std.Io.Clock.Timestamp.compare(result_now, .lt, epoch.deadline)) {
-            request.deinit();
+            opened.deinit();
             return error.ConnectionSetupTimedOut;
         }
-        return request;
-    };
-
-    // A local client is freed when its request ends, so its open cannot be
-    // left running: Esc waits for it here.
-    const Event = union(enum) {
-        request: anyerror!std.http.Client.Request,
-        watch: anyerror!select_watch.Outcome,
-    };
-    const Cleanup = struct {
-        fn drain(select: *std.Io.Select(Event), watch: *BoundedRequestWatch) void {
-            watch.stop(select.io);
-            while (select.cancel()) |item| switch (item) {
-                .request => |request_result| {
-                    var late_request = request_result catch continue;
-                    late_request.deinit();
-                },
-                .watch => {},
-            };
-        }
-    };
-
-    var operation = RequestOpenOperation{
-        .client = client,
-        .pool = pool,
-        .uri = uri,
-        .options = options,
-        .request_open_override = request_open_override,
-    };
-    var watch: BoundedRequestWatch = .{};
-    var select_buffer: [2]Event = undefined;
-    var select: std.Io.Select(Event) = .init(io_mod.getIo(), &select_buffer);
-    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, select.io, RequestCondition{ .cancel_flag = cancel_flag, .deadline = epoch.deadline } }) catch |err| return err;
-    select.concurrent(.request, RequestOpenOperation.run, .{&operation}) catch |err| {
-        watch.finish(&select);
-        return err;
-    };
-
-    const event = select.await() catch |err| {
-        Cleanup.drain(&select, &watch);
-        return err;
-    };
-    switch (event) {
-        .request => |request_result| {
-            watch.finish(&select);
-            if (cancel_flag.load(.seq_cst)) {
-                var cancelled_request = request_result catch return error.Cancelled;
-                cancelled_request.deinit();
-                return error.Cancelled;
-            }
-
-            var owned_request = request_result catch |request_err| return request_err;
-            const result_now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
-            if (!std.Io.Clock.Timestamp.compare(result_now, .lt, epoch.deadline)) {
-                owned_request.deinit();
-                return error.ConnectionSetupTimedOut;
-            }
-            reused.* = operation.reused;
-            return owned_request;
-        },
-        .watch => |watch_result| {
-            Cleanup.drain(&select, &watch);
-            const outcome = try watch_result;
-            if (outcome == .cancelled or cancel_flag.load(.seq_cst)) return error.Cancelled;
-            return error.ConnectionSetupTimedOut;
-        },
+        return opened;
     }
+    // std.Io.Threaded runs no task without threads, so these builds never
+    // had a native open.
+    return error.ConcurrencyUnavailable;
 }
 
 fn sleepGatewaySetupRetry(
@@ -1908,15 +1983,9 @@ fn streamGatewayCompletionCoreWithOptions(
     var setup_epoch: ?ConnectionSetupEpoch = null;
     while (attempt < attempt_limit) : (attempt += 1) {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-        var local_client: std.http.Client = undefined;
-        const client: *std.http.Client = if (request.shared_pool) |pool|
-            pool.clientFor(request_url)
-        else blk: {
-            local_client = .{ .allocator = alloc, .io = io_mod.getIo() };
-            break :blk &local_client;
-        };
-        defer if (request.shared_pool == null) local_client.deinit();
         if (request.shared_pool) |pool| {
+            // Applies the pool's idle-staleness policy before the open.
+            _ = pool.clientFor(request_url);
             debug_trace.eventf("gateway", "pool_borrow", trace_ctx, "attempt={d} free_connections={d}", .{ attempt + 1, pool.freeConnectionCount() });
         }
 
@@ -1934,7 +2003,7 @@ fn streamGatewayCompletionCoreWithOptions(
         debug_trace.eventf("gateway", "before_http_open_connect", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d}", .{ attempt + 1, attempt_limit, attempt });
         debug_trace.eventf("gateway", "before_request_open", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d} payload_bytes={d}", .{ attempt + 1, attempt_limit, attempt, payload.len });
         var reused_connection = false;
-        var req = openGatewayRequestBounded(client, request.shared_pool, uri, .{
+        var opened = openGatewayRequestBounded(request.shared_pool, uri, .{
             .headers = request_headers,
             .extra_headers = extra_headers,
             .keep_alive = request.shared_pool != null,
@@ -1976,17 +2045,18 @@ fn streamGatewayCompletionCoreWithOptions(
         switch (setup_success.action) {
             .succeed => {},
             .fail => |terminal_err| {
-                req.deinit();
+                opened.deinit();
                 return @as(anyerror!StreamResult, terminal_err);
             },
             .cancelled => {
-                req.deinit();
+                opened.deinit();
                 return error.Cancelled;
             },
             .retry => unreachable,
         }
         setup_epoch = null;
-        defer req.deinit();
+        defer opened.deinit();
+        const req = &opened.request;
         debug_trace.eventf("gateway", "after_http_open_connect", trace_ctx, "attempt={d}", .{attempt + 1});
         debug_trace.eventf("gateway", "after_request_open", trace_ctx, "attempt={d}", .{attempt + 1});
 
@@ -2017,9 +2087,9 @@ fn streamGatewayCompletionCoreWithOptions(
         debug_trace.eventf("gateway", "before_request_send", trace_ctx, "attempt={d} payload_bytes={d}", .{ attempt + 1, payload.len });
         request_body_possibly_sent = true;
         if (request.delivery) |delivery| delivery.markPossiblySent();
-        sendGatewayRequestBody(&req, payload, &send_buf) catch |err| {
+        sendGatewayRequestBody(req, payload, &send_buf) catch |err| {
             debug_trace.eventf("gateway", "request_send_error", trace_ctx, "attempt={d} err={s}", .{ attempt + 1, @errorName(err) });
-            markPooledConnectionClosing(&req, request);
+            markPooledConnectionClosing(req, request);
             const reported = connectedIoFailureWithWatch(
                 active_connected_watch,
                 cancel_flag.load(.seq_cst),
@@ -2050,7 +2120,7 @@ fn streamGatewayCompletionCoreWithOptions(
 
         if (active_connected_watch) |watch| {
             if (watch.arm_response_head()) |err| {
-                markPooledConnectionClosing(&req, request);
+                markPooledConnectionClosing(req, request);
                 return @as(anyerror!StreamResult, err);
             }
         }
@@ -2563,52 +2633,62 @@ const GatewayCancelWatcher = struct {
     }
 };
 
-/// One shared concrete opener result so every backend reuses the same
-/// bounded-operation instantiation instead of specializing per file.
-pub const OpenedPost = struct {
-    request: ?std.http.Client.Request,
-
-    pub fn deinit(self: *OpenedPost, _: std.mem.Allocator) void {
-        if (self.request) |*request| request.deinit();
-        self.request = null;
-    }
-
-    pub fn take(self: *OpenedPost) std.http.Client.Request {
-        const request = self.request.?;
-        self.request = null;
-        return request;
-    }
-};
-
-pub const PostOperation = struct {
-    client: *std.http.Client,
+/// A POST that `openBoundedPost` opens. Borrowed until its request ends.
+pub const PostTarget = struct {
     uri: std.Uri,
     authorization: ?[]const u8,
     extra_headers: []const std.http.Header = &.{},
-
-    pub fn run(self: *PostOperation) !OpenedPost {
-        var headers: std.http.Client.Request.Headers = .{
-            .content_type = .{ .override = "application/json" },
-            .accept_encoding = .omit,
-            .user_agent = .{ .override = user_agent },
-        };
-        if (self.authorization) |value| headers.authorization = .{ .override = value };
-        return .{ .request = try self.client.request(.POST, self.uri, .{
-            .headers = headers,
-            .extra_headers = self.extra_headers,
-            .keep_alive = false,
-            .redirect_behavior = .unhandled,
-        }) };
-    }
 };
 
+/// Opens a POST on a client of its own, on an open job (`OpenJob`), so Esc
+/// and `deadline` return at once even while its lookup hangs. Fails with
+/// `error.Cancelled` once `cancel_flag` is set and with `error.Timeout` at
+/// `deadline`. The caller owns the result and frees it with `deinit`.
 pub fn openBoundedPost(
-    alloc: std.mem.Allocator,
     cancel_flag: *std.atomic.Value(bool),
     deadline: std.Io.Clock.Timestamp,
-    operation: *PostOperation,
-) !OpenedPost {
-    return runBoundedHttpOperation(OpenedPost, alloc, cancel_flag, deadline, operation);
+    target: PostTarget,
+) !OpenedRequest {
+    return openBoundedPostWith(cancel_flag, deadline, target, null);
+}
+
+fn openBoundedPostWith(
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: std.Io.Clock.Timestamp,
+    target: PostTarget,
+    request_open_override: ?RequestOpenOverride,
+) !OpenedRequest {
+    input_loop_guard.noteNetworkRequest("bounded_http");
+    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
+    std.debug.assert(deadline.clock == .awake);
+    const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    if (!std.Io.Clock.Timestamp.compare(now, .lt, deadline)) return error.Timeout;
+
+    var headers: std.http.Client.Request.Headers = .{
+        .content_type = .{ .override = "application/json" },
+        .accept_encoding = .omit,
+        .user_agent = .{ .override = user_agent },
+    };
+    if (target.authorization) |value| headers.authorization = .{ .override = value };
+    const options: std.http.Client.RequestOptions = .{
+        .headers = headers,
+        .extra_headers = target.extra_headers,
+        .keep_alive = false,
+        .redirect_behavior = .unhandled,
+    };
+    if (comptime builtin.single_threaded) return error.ConcurrencyUnavailable;
+    const job = try OpenJob.start(null, target.uri, options, request_open_override);
+    var reused = false;
+    var opened = job.waitForOpen(target.uri, options, deadline, cancel_flag, &reused) catch |err| return switch (err) {
+        // The bound error callers of a bounded operation already handle.
+        error.ConnectionSetupTimedOut => error.Timeout,
+        else => err,
+    };
+    if (cancel_flag.load(.seq_cst)) {
+        opened.deinit();
+        return error.Cancelled;
+    }
+    return opened;
 }
 
 /// Watches one provider request on its connection with the lifecycle the
@@ -9123,6 +9203,9 @@ test "direct gateway request-open cancellation interrupts real TLS setup" {
 
     try std.testing.expectError(error.Cancelled, result);
     try std.testing.expect(elapsed_ms < 500);
+    // The request walked away, and its job stops the TLS setup the server
+    // still stalls, so none is left holding the connection.
+    try waitForOwnClientOpenJobs();
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
 }
@@ -9161,6 +9244,7 @@ test "direct gateway request-open deadline interrupts real TLS setup" {
     try std.testing.expectError(error.ConnectionSetupTimedOut, result);
     try std.testing.expect(elapsed_ms < 400);
     try std.testing.expectEqual(DeliveryCertainty.State.definitely_unsent, delivery.load());
+    try waitForOwnClientOpenJobs();
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
 }
@@ -10456,6 +10540,9 @@ fn expectBoundedLoopbackCancellation(
 
     request_done.store(true, .seq_cst);
     cancel_thread.join();
+    // An open the request walked away from stops while the server still
+    // stalls it.
+    try waitForOwnClientOpenJobs();
     fixture.deinit();
 
     try std.testing.expectError(error.Cancelled, request_result);
@@ -11273,10 +11360,15 @@ test "a connection that timed out before opening is offline" {
 }
 
 /// A connection open whose DNS lookup ignores cancellation, as getaddrinfo
-/// does, until the test releases it; it then connects for real.
+/// does, until the test releases it; it then connects for real. A cancel
+/// the lookup sat out ends the open at its next step, as it does once
+/// getaddrinfo returns, unless `connect_after_cancel` is set.
 const StuckLookupOpen = struct {
     entered: std.atomic.Value(bool) = .init(false),
     release: std.atomic.Value(bool) = .init(false),
+    /// Set once the open was cancelled during the lookup.
+    cancelled: std.atomic.Value(bool) = .init(false),
+    connect_after_cancel: bool = false,
 
     fn override(self: *StuckLookupOpen) RequestOpenOverride {
         return .{ .ctx = self, .run = run };
@@ -11290,13 +11382,32 @@ const StuckLookupOpen = struct {
         options: std.http.Client.RequestOptions,
     ) anyerror!std.http.Client.Request {
         const self: *StuckLookupOpen = @ptrCast(@alignCast(raw));
+        const zio = io_mod.getIo();
         self.entered.store(true, .seq_cst);
-        while (!self.release.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+        var cancel_pending = false;
+        while (!self.release.load(.seq_cst)) {
+            zio.sleep(.fromMilliseconds(1), .awake) catch |err| switch (err) {
+                error.Canceled => {
+                    cancel_pending = true;
+                    self.cancelled.store(true, .seq_cst);
+                },
+            };
+        }
+        if (cancel_pending and !self.connect_after_cancel) zio.recancel();
         return client.request(method, uri, options);
     }
 
     fn waitEntered(self: *StuckLookupOpen) void {
         while (!self.entered.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+    }
+
+    /// Waits until the job that runs the open cancelled it.
+    fn waitCancelled(self: *StuckLookupOpen) !void {
+        var waited_ms: usize = 0;
+        while (!self.cancelled.load(.seq_cst)) : (waited_ms += 1) {
+            if (waited_ms > 5_000) return error.TestOpenNeverCancelled;
+            io_mod.sleep(std.time.ns_per_ms);
+        }
     }
 };
 
@@ -11331,15 +11442,10 @@ fn waitForOpenJobs(pool: *http_pool.HttpPool) !void {
     }
 }
 
-test "Esc walks away from a pooled open stuck in its lookup, and the late connection goes back to the pool" {
+/// Walks away from a pooled open stuck in its lookup with Esc, and leaves
+/// the lookup stuck with its job still running.
+fn escFromStuckPooledOpen(pool: *http_pool.HttpPool, url: []const u8, stuck: *StuckLookupOpen) !void {
     const zio = io_mod.getIo();
-    var fixture: PooledOpenFixture = undefined;
-    try fixture.init();
-    defer fixture.deinit();
-    const url = fixture.url;
-    const pool = &fixture.pool;
-
-    var stuck: StuckLookupOpen = .{};
     var cancel_flag = std.atomic.Value(bool).init(false);
     const Esc = struct {
         fn run(lookup: *StuckLookupOpen, flag: *std.atomic.Value(bool)) void {
@@ -11347,11 +11453,11 @@ test "Esc walks away from a pooled open stuck in its lookup, and the late connec
             flag.store(true, .seq_cst);
         }
     };
-    const esc = try std.Thread.spawn(.{}, Esc.run, .{ &stuck, &cancel_flag });
+    const esc = try std.Thread.spawn(.{}, Esc.run, .{ stuck, &cancel_flag });
     var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
     var reused = false;
     const started = std.Io.Clock.Timestamp.now(zio, .awake);
-    const result = openGatewayRequestBounded(&pool.client, pool, try std.Uri.parse(url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+    const result = openGatewayRequestBounded(pool, try std.Uri.parse(url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
     const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
     esc.join();
 
@@ -11360,7 +11466,33 @@ test "Esc walks away from a pooled open stuck in its lookup, and the late connec
     // The lookup is still stuck, and its job still owns the open.
     try std.testing.expectEqual(@as(u32, 1), pool.open_jobs.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
+}
 
+test "Esc walks away from a pooled open stuck in its lookup, and its job stops the open" {
+    var fixture: PooledOpenFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const pool = &fixture.pool;
+
+    var stuck: StuckLookupOpen = .{};
+    try escFromStuckPooledOpen(pool, fixture.url, &stuck);
+    // The job cancels the open; the lookup sits that out, and the open ends
+    // once it returns instead of connecting.
+    try stuck.waitCancelled();
+    stuck.release.store(true, .seq_cst);
+    try waitForOpenJobs(pool);
+    try std.testing.expectEqual(@as(usize, 0), pool.freeConnectionCount());
+}
+
+test "a pooled open that connects after the request walked away goes back to the pool" {
+    var fixture: PooledOpenFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const pool = &fixture.pool;
+
+    var stuck: StuckLookupOpen = .{ .connect_after_cancel = true };
+    try escFromStuckPooledOpen(pool, fixture.url, &stuck);
+    try stuck.waitCancelled();
     stuck.release.store(true, .seq_cst);
     try waitForOpenJobs(pool);
     // Nothing was sent on the late connection, so the job released it to the
@@ -11382,7 +11514,7 @@ test "the setup deadline walks away from a pooled open stuck in its lookup" {
     var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 80 });
     var reused = false;
     const started = std.Io.Clock.Timestamp.now(zio, .awake);
-    const result = openGatewayRequestBounded(&pool.client, pool, try std.Uri.parse(url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+    const result = openGatewayRequestBounded(pool, try std.Uri.parse(url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
     const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
 
     try std.testing.expectError(error.ConnectionSetupTimedOut, result);
@@ -11397,7 +11529,7 @@ fn leaveStuckOpenJob(pool: *http_pool.HttpPool, url: []const u8, stuck: *StuckLo
     var cancel_flag = std.atomic.Value(bool).init(false);
     var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 50 });
     var reused = false;
-    const result = openGatewayRequestBounded(&pool.client, pool, try std.Uri.parse(url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+    const result = openGatewayRequestBounded(pool, try std.Uri.parse(url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
     try std.testing.expectError(error.ConnectionSetupTimedOut, result);
     try std.testing.expectEqual(@as(u32, 1), pool.open_jobs.load(.acquire));
 }
@@ -11465,8 +11597,10 @@ test "a pooled open hands over a request that carries the caller's URI and heade
     var cancel_flag = std.atomic.Value(bool).init(false);
     var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
     var reused = true;
-    var request = try openGatewayRequestBounded(&pool.client, pool, uri, options, stuck.override(), &epoch, &cancel_flag, &reused);
-    defer request.deinit();
+    var opened = try openGatewayRequestBounded(pool, uri, options, stuck.override(), &epoch, &cancel_flag, &reused);
+    defer opened.deinit();
+    const request = &opened.request;
+    try std.testing.expect(opened.own_client == null);
 
     try std.testing.expect(!reused);
     // The job's own copies are freed with it; the request points at the
@@ -11507,7 +11641,7 @@ test "two hundred Esc presses during stuck lookups leave no job or connection be
         const esc = try std.Thread.spawn(.{}, Esc.run, .{ &stuck, &cancel_flag });
         var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
         var reused = false;
-        const result = openGatewayRequestBounded(&pool.client, &pool, try std.Uri.parse(url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+        const result = openGatewayRequestBounded(&pool, try std.Uri.parse(url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
         esc.join();
         // Esc and the late open race: the request either walked away or
         // closed what it was handed. Either way it ends cancelled.
@@ -11517,4 +11651,404 @@ test "two hundred Esc presses during stuck lookups leave no job or connection be
     // Every late connection went back to the pool, which keeps a bounded
     // number; the testing allocator checks no job leaked.
     try std.testing.expect(pool.freeConnectionCount() <= pool.client.connection_pool.free_size);
+}
+
+/// Waits until no open job on a client of its own is left, so the testing
+/// allocator's leak check sees what each job freed.
+fn waitForOwnClientOpenJobs() !void {
+    var waited_ms: usize = 0;
+    while (own_client_open_jobs.load(.acquire) != 0) : (waited_ms += 1) {
+        if (waited_ms > 5_000) return error.TestOpenJobStillRunning;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
+/// Lets a stuck lookup return and waits for its job, so a failed test
+/// leaves no job reading its stack.
+fn releaseOwnClientJob(stuck: *StuckLookupOpen) void {
+    stuck.release.store(true, .seq_cst);
+    waitForOwnClientOpenJobs() catch {};
+}
+
+/// A loopback listener that an unpooled open connects to.
+const UnpooledOpenFixture = struct {
+    server: std.Io.net.Server,
+    url: []u8,
+
+    const Late = enum { none, closed };
+
+    fn init() !UnpooledOpenFixture {
+        const zio = io_mod.getIo();
+        var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        var server = try address.listen(zio, .{ .reuse_address = true });
+        errdefer server.deinit(zio);
+        const url = try std.testing.allocator.print("http://127.0.0.1:{d}/chat", .{server.socket.address.getPort()});
+        return .{ .server = server, .url = url };
+    }
+
+    fn deinit(self: *UnpooledOpenFixture) void {
+        std.testing.allocator.free(self.url);
+        self.server.deinit(io_mod.getIo());
+    }
+
+    /// What became of the connection a finished open may have made: none,
+    /// or one fx already closed. Fails when fx left one open. Waits up to
+    /// `appear_ms` for a connection to arrive.
+    fn lateConnection(self: *UnpooledOpenFixture, appear_ms: i32) !Late {
+        const zio = io_mod.getIo();
+        var listener = [_]std.posix.pollfd{.{ .fd = self.server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        if (try std.posix.poll(&listener, appear_ms) == 0) return .none;
+        var stream = try self.server.accept(zio);
+        defer stream.close(zio);
+        // The close fx already made can reach this end a moment after the
+        // accept; a connection fx left open never reads end of stream.
+        var peer = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        if (try std.posix.poll(&peer, 2_000) == 0) return error.TestConnectionLeftOpen;
+        var buffer: [64]u8 = undefined;
+        var reader = stream.reader(zio, &buffer);
+        var byte: [1]u8 = undefined;
+        const read = reader.interface.readSliceShort(&byte) catch |err| switch (err) {
+            // A reset closes it too.
+            error.ReadFailed => return .closed,
+        };
+        return if (read == 0) .closed else error.TestConnectionLeftOpen;
+    }
+};
+
+/// Sets the cancel flag once the stuck lookup has started.
+const EscDuringLookup = struct {
+    fn run(lookup: *StuckLookupOpen, flag: *std.atomic.Value(bool)) void {
+        lookup.waitEntered();
+        flag.store(true, .seq_cst);
+    }
+};
+
+fn elapsedMsSince(started: std.Io.Clock.Timestamp) i64 {
+    return started.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds();
+}
+
+/// Walks away from an unpooled open stuck in its lookup with Esc, and leaves
+/// the lookup stuck with its job still running.
+fn escFromStuckUnpooledOpen(fixture: *UnpooledOpenFixture, stuck: *StuckLookupOpen) !void {
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const esc = try std.Thread.spawn(.{}, EscDuringLookup.run, .{ stuck, &cancel_flag });
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
+    var reused = false;
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const result = openGatewayRequestBounded(null, try std.Uri.parse(fixture.url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+    const elapsed_ms = elapsedMsSince(started);
+    esc.join();
+
+    try std.testing.expectError(error.Cancelled, result);
+    try std.testing.expect(elapsed_ms < 500);
+    // The lookup is still stuck, and its job still owns the open and the
+    // client it opens on.
+    try std.testing.expectEqual(@as(u32, 1), own_client_open_jobs.load(.acquire));
+}
+
+test "Esc walks away from an unpooled open stuck in its lookup, and its job stops the open" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+    var stuck: StuckLookupOpen = .{};
+    defer releaseOwnClientJob(&stuck);
+
+    try escFromStuckUnpooledOpen(&fixture, &stuck);
+    try stuck.waitCancelled();
+    stuck.release.store(true, .seq_cst);
+    try waitForOwnClientOpenJobs();
+    // The open ended once its lookup returned, without connecting; the
+    // testing allocator checks the job freed its client and itself.
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+}
+
+test "an unpooled open that connects after the request walked away is closed with its client" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+    var stuck: StuckLookupOpen = .{ .connect_after_cancel = true };
+    defer releaseOwnClientJob(&stuck);
+
+    try escFromStuckUnpooledOpen(&fixture, &stuck);
+    try stuck.waitCancelled();
+    stuck.release.store(true, .seq_cst);
+    try waitForOwnClientOpenJobs();
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.closed, try fixture.lateConnection(2_000));
+}
+
+test "the setup deadline walks away from an unpooled open stuck in its lookup" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+    var stuck: StuckLookupOpen = .{};
+    defer releaseOwnClientJob(&stuck);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 80 });
+    var reused = false;
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const result = openGatewayRequestBounded(null, try std.Uri.parse(fixture.url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+    const elapsed_ms = elapsedMsSince(started);
+
+    try std.testing.expectError(error.ConnectionSetupTimedOut, result);
+    try std.testing.expect(elapsed_ms < 400);
+    try stuck.waitCancelled();
+    stuck.release.store(true, .seq_cst);
+    try waitForOwnClientOpenJobs();
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+}
+
+test "an unpooled open hands over a request on its job's own client with the caller's URI and headers" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+
+    const uri = try std.Uri.parse(fixture.url);
+    const extra = [_]std.http.Header{.{ .name = "x-fx-test", .value = "kept" }};
+    const options: std.http.Client.RequestOptions = .{
+        .headers = .{ .authorization = .{ .override = "Bearer test" } },
+        .extra_headers = &extra,
+        .keep_alive = false,
+    };
+    var stuck: StuckLookupOpen = .{};
+    defer releaseOwnClientJob(&stuck);
+    stuck.release.store(true, .seq_cst);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
+    var reused = true;
+    var opened = try openGatewayRequestBounded(null, uri, options, stuck.override(), &epoch, &cancel_flag, &reused);
+
+    try std.testing.expect(!reused);
+    // The request runs on the client its job made, which now goes with it.
+    const own_client = opened.own_client orelse return error.TestExpectedOwnClient;
+    try std.testing.expectEqual(own_client, opened.request.client);
+    const text = struct {
+        fn of(component: std.Uri.Component) []const u8 {
+            return switch (component) {
+                .raw, .percent_encoded => |value| value,
+            };
+        }
+    }.of;
+    try std.testing.expectEqual(text(uri.host.?).ptr, text(opened.request.uri.host.?).ptr);
+    try std.testing.expectEqual(@as([*]const std.http.Header, &extra), opened.request.extra_headers.ptr);
+    try std.testing.expectEqualStrings("Bearer test", opened.request.headers.authorization.override);
+    opened.deinit();
+    try waitForOwnClientOpenJobs();
+    // Ending the request closed its connection along with the client.
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.closed, try fixture.lateConnection(2_000));
+}
+
+test "Esc during a stuck lookup ends an unpooled gateway request at once" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+    var stuck: StuckLookupOpen = .{};
+    defer releaseOwnClientJob(&stuck);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const esc = try std.Thread.spawn(.{}, EscDuringLookup.run, .{ &stuck, &cancel_flag });
+    var callback_ctx: u8 = 0;
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const result = streamGatewayCompletionCoreWithOptions(
+        std.testing.allocator,
+        .{ .api_key = "test-key", .model = "test/model", .retry_count = 3, .chat_url = fixture.url, .payload = "{}" },
+        @ptrCast(&callback_ctx),
+        discardConnectionSetupTestChunk,
+        null,
+        &cancel_flag,
+        null,
+        false,
+        .{ .setup_timing = .{ .timeout_ms = 30_000 }, .request_open_override = stuck.override() },
+    );
+    const elapsed_ms = elapsedMsSince(started);
+    esc.join();
+
+    try std.testing.expectError(error.Cancelled, result);
+    try std.testing.expect(elapsed_ms < 500);
+    try stuck.waitCancelled();
+    stuck.release.store(true, .seq_cst);
+    try waitForOwnClientOpenJobs();
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+}
+
+test "a bounded request's deadline walks away from an unpooled open stuck in its lookup" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+    var stuck: StuckLookupOpen = .{};
+    defer releaseOwnClientJob(&stuck);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    // The request's own setup deadline is far off; the bounded operation
+    // around it cancels its task, which must end the wait as well.
+    const Operation = struct {
+        url: []const u8,
+        stuck: *StuckLookupOpen,
+        cancel_flag: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) !StreamResult {
+            var callback_ctx: u8 = 0;
+            return streamGatewayCompletionCoreWithOptions(
+                std.testing.allocator,
+                .{ .api_key = "test-key", .model = "test/model", .retry_count = 1, .chat_url = self.url, .payload = "{}" },
+                @ptrCast(&callback_ctx),
+                discardConnectionSetupTestChunk,
+                null,
+                self.cancel_flag,
+                null,
+                false,
+                .{ .setup_timing = .{ .timeout_ms = 30_000 }, .request_open_override = self.stuck.override() },
+            );
+        }
+    };
+    var operation: Operation = .{ .url = fixture.url, .stuck = &stuck, .cancel_flag = &cancel_flag };
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const result = runBoundedStreamOperation(std.testing.allocator, &cancel_flag, testAwakeDeadlineAfter(100), &operation);
+    const elapsed_ms = elapsedMsSince(started);
+
+    try std.testing.expectError(error.Timeout, result);
+    try std.testing.expect(elapsed_ms < 600);
+    try stuck.waitCancelled();
+    stuck.release.store(true, .seq_cst);
+    try waitForOwnClientOpenJobs();
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+}
+
+test "Esc walks away from a provider POST stuck in its lookup" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+    var stuck: StuckLookupOpen = .{};
+    defer releaseOwnClientJob(&stuck);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const esc = try std.Thread.spawn(.{}, EscDuringLookup.run, .{ &stuck, &cancel_flag });
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const result = openBoundedPostWith(&cancel_flag, testAwakeDeadlineAfter(30_000), .{
+        .uri = try std.Uri.parse(fixture.url),
+        .authorization = "Bearer test",
+    }, stuck.override());
+    const elapsed_ms = elapsedMsSince(started);
+    esc.join();
+
+    try std.testing.expectError(error.Cancelled, result);
+    try std.testing.expect(elapsed_ms < 500);
+    try std.testing.expectEqual(@as(u32, 1), own_client_open_jobs.load(.acquire));
+    try stuck.waitCancelled();
+    stuck.release.store(true, .seq_cst);
+    try waitForOwnClientOpenJobs();
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+}
+
+test "the connect deadline walks away from a provider POST stuck in its lookup as a timeout" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+    var stuck: StuckLookupOpen = .{};
+    defer releaseOwnClientJob(&stuck);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    const result = openBoundedPostWith(&cancel_flag, testAwakeDeadlineAfter(80), .{
+        .uri = try std.Uri.parse(fixture.url),
+        .authorization = null,
+    }, stuck.override());
+    const elapsed_ms = elapsedMsSince(started);
+
+    try std.testing.expectError(error.Timeout, result);
+    try std.testing.expect(elapsed_ms < 400);
+    try stuck.waitCancelled();
+    stuck.release.store(true, .seq_cst);
+    try waitForOwnClientOpenJobs();
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.none, try fixture.lateConnection(50));
+}
+
+test "a provider POST hands over its request with the provider's headers on its own client" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+
+    const extra = [_]std.http.Header{.{ .name = "accept", .value = "text/event-stream" }};
+    var stuck: StuckLookupOpen = .{};
+    defer releaseOwnClientJob(&stuck);
+    stuck.release.store(true, .seq_cst);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var opened = try openBoundedPostWith(&cancel_flag, testAwakeDeadlineAfter(30_000), .{
+        .uri = try std.Uri.parse(fixture.url),
+        .authorization = "Bearer provider",
+        .extra_headers = &extra,
+    }, stuck.override());
+
+    const own_client = opened.own_client orelse return error.TestExpectedOwnClient;
+    try std.testing.expectEqual(own_client, opened.request.client);
+    try std.testing.expect(!opened.request.keep_alive);
+    try std.testing.expectEqualStrings("Bearer provider", opened.request.headers.authorization.override);
+    try std.testing.expectEqualStrings("application/json", opened.request.headers.content_type.override);
+    try std.testing.expectEqual(@as([*]const std.http.Header, &extra), opened.request.extra_headers.ptr);
+    opened.deinit();
+    try waitForOwnClientOpenJobs();
+    try std.testing.expectEqual(UnpooledOpenFixture.Late.closed, try fixture.lateConnection(2_000));
+}
+
+/// Opens through `pool`, or on a job's own client when it is null, against a
+/// server that accepts and never answers the TLS handshake, walks away with
+/// Esc, and requires the job to end while the server still stalls.
+fn expectWalkAwayStopsStalledTlsSetup(pool: ?*http_pool.HttpPool) !void {
+    var fixture = try LoopbackGatewayFixture.init(.tls_handshake_stall, 10_000);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+    const url = try std.testing.allocator.print("https://127.0.0.1:{d}/chat", .{fixture.port()});
+    defer std.testing.allocator.free(url);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    var request_done = std.atomic.Value(bool).init(false);
+    const Esc = struct {
+        fn run(server: *LoopbackGatewayFixture, flag: *std.atomic.Value(bool), done: *std.atomic.Value(bool)) void {
+            if (server.waitForStageOrDone(done)) flag.store(true, .seq_cst);
+        }
+    };
+    const esc = try std.Thread.spawn(.{}, Esc.run, .{ &fixture, &cancel_flag, &request_done });
+    var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
+    var reused = false;
+    const result = openGatewayRequestBounded(pool, try std.Uri.parse(url), .{}, null, &epoch, &cancel_flag, &reused);
+    request_done.store(true, .seq_cst);
+    esc.join();
+    try std.testing.expectError(error.Cancelled, result);
+
+    const walked_away = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    if (pool) |shared| try waitForOpenJobs(shared) else try waitForOwnClientOpenJobs();
+    // The server holds the handshake for ten seconds; the job stopped it.
+    try std.testing.expect(elapsedMsSince(walked_away) < 3_000);
+    try std.testing.expect(fixture.reached_stage.load(.seq_cst));
+}
+
+test "a job the request walked away from stops a stalled TLS setup on its own client" {
+    try expectWalkAwayStopsStalledTlsSetup(null);
+}
+
+test "a job the request walked away from stops a stalled TLS setup on the pool's client" {
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+    try expectWalkAwayStopsStalledTlsSetup(&pool);
+}
+
+test "two hundred Esc presses during stuck unpooled lookups leave no job, client, or connection behind" {
+    var fixture = try UnpooledOpenFixture.init();
+    defer fixture.deinit();
+
+    const Esc = struct {
+        fn run(lookup: *StuckLookupOpen, flag: *std.atomic.Value(bool)) void {
+            lookup.waitEntered();
+            flag.store(true, .seq_cst);
+            lookup.release.store(true, .seq_cst);
+        }
+    };
+    for (0..200) |_| {
+        var stuck: StuckLookupOpen = .{};
+        defer releaseOwnClientJob(&stuck);
+        var cancel_flag = std.atomic.Value(bool).init(false);
+        const esc = try std.Thread.spawn(.{}, Esc.run, .{ &stuck, &cancel_flag });
+        var epoch = ConnectionSetupEpoch.init(.{ .timeout_ms = 30_000 });
+        var reused = false;
+        const result = openGatewayRequestBounded(null, try std.Uri.parse(fixture.url), .{}, stuck.override(), &epoch, &cancel_flag, &reused);
+        esc.join();
+        // Esc and the late open race: the request walked away, or closed what
+        // it was handed. Either way it ends cancelled, and whatever the open
+        // made is closed.
+        try std.testing.expectError(error.Cancelled, result);
+        try waitForOwnClientOpenJobs();
+        _ = try fixture.lateConnection(0);
+    }
 }
