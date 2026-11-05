@@ -714,6 +714,12 @@ const App = struct {
             }
         }
         const launch_profile = &app.main_agent.profile.profile;
+        const launch_model = app_profile_runtime.launchModel(
+            launch.modifiers.model_override,
+            launch.modifiers.provider_override != null,
+            config_runtime.modelEnvOverride(),
+            launch_profile.model,
+        );
         try BootstrapAppRuntime.bootstrap(
             &app,
             &app.main_agent,
@@ -728,13 +734,10 @@ const App = struct {
             },
             .{
                 .provider = launch.modifiers.provider_override,
-                .model = app_profile_runtime.launchModel(
-                    launch.modifiers.model_override,
-                    launch.modifiers.provider_override != null,
-                    config_runtime.modelEnvOverride(),
-                    launch_profile.model,
-                ),
+                .model = launch_model,
                 .effort = launch.modifiers.effort_override orelse launch_profile.effort,
+                .model_from_profile = launch.modifiers.model_override == null and launch_model != null,
+                .effort_from_profile = launch.modifiers.effort_override == null and launch_profile.effort != null,
                 .fast = launch.modifiers.fast_override,
                 .ultrafast = launch.modifiers.ultrafast_override,
                 .provider_order = launch.modifiers.provider_order_override,

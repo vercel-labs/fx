@@ -1188,6 +1188,46 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
+    "/launch <profile> under fx --profile starts in the launched profile's model and effort",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-launch-in-profile-")));
+      try {
+        writeProfile(home, "first", { description: "The launch profile", model: "other/model", effort: "low" });
+        writeProfile(home, "chooser", { description: "Chooses a model", model: "profile/model", effort: "high" });
+        writeProfile(home, "plain", { description: "Sets no model or effort" });
+        const requests: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { args: "--profile first", env: { FX_MODEL: undefined }, models: PREFERENCE_MODELS, requests, reuse: { home, workspace } }, async ({ session }) => {
+          await promptMarker(session, "FIRST_PROFILE");
+          for (const [command, count, marker] of [
+            ["/launch chooser", 2, "CHOOSER_LAUNCH"],
+            ["/launch plain", 3, "PLAIN_LAUNCH"],
+            ["/launch", 4, "SAME_LAUNCH"],
+          ] as const) {
+            await session.sendText(command);
+            await session.waitForPane((pane) => pane.includes(`fx ${count}/${count}`), 15_000);
+            await session.waitForComposer(15_000);
+            await promptMarker(session, marker);
+          }
+        });
+        expect(preferencesOf(requests, "FIRST_PROFILE")).toMatchObject({ model: "other/model", reasoning: "low" });
+        expect(preferencesOf(requests, "CHOOSER_LAUNCH")).toMatchObject({ model: "profile/model", reasoning: "high" });
+        // A profile without a model or effort starts from the user's, not
+        // the first instance's profile.
+        const plain = preferencesOf(requests, "PLAIN_LAUNCH");
+        expect(plain?.model).not.toBe("other/model");
+        expect(plain?.reasoning).toBeNull();
+        // `/launch` alone starts another instance in the launch profile.
+        expect(preferencesOf(requests, "SAME_LAUNCH")).toMatchObject({ model: "other/model", reasoning: "low" });
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "fx --profile <name> uses the profile's model unless the process chose one",
     async () => {
       for (const [args, fxModel, expected] of [
