@@ -88,7 +88,7 @@ class LinuxPlatformTests(unittest.TestCase):
             "STARTUP_SCENARIOS", "ZIG_CC_LINK_FLAGS", "check_host", "discover_tools",
             "os_versions", "record_control_build", "external_control_strip_argv",
             "read_control_identity", "control_identity_from_evidence", "link_instrumented",
-            "public_api_flags", "candidate_object_flags", "link_candidate_binary",
+            "public_api_flags", "prepare_candidate_bitcode", "candidate_object_flags", "link_candidate_binary",
             "inspect_candidate", "candidate_evidence",
         )
         for platform in (macos, linux.ARM64, linux.X86_64):
@@ -286,6 +286,79 @@ class LinuxPlatformTests(unittest.TestCase):
         api = self.paths.logs / "public-api.txt"
         self.assertEqual((f"-internalize-public-api-file={api}",), flags)
         self.assertEqual("main\nmemcpy\nstrlen\n", api.read_text())
+
+    def test_only_fx_bitcode_names_its_private_functions(self) -> None:
+        toolchain = self.toolchain()
+        toolchain.ir_size = self.root / "ir_size.py"
+        toolchain.libllvm = self.root / "libLLVM.so"
+        self.paths.profile_use_bitcode.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.profile_use_bitcode.write_bytes(b"private functions")
+        benchmark = PipelinePaths.create(self.root / "bench", selector="ui_activity")
+        calls = []
+
+        def run(argv, **_):
+            calls.append(tuple(argv))
+            pathlib.Path(argv[-1]).write_bytes(b"internal functions")
+            return CommandResult(argv=tuple(argv), returncode=0, stdout="", stderr="", elapsed_seconds=0.1)
+
+        with mock.patch.object(linux, "run_checked", side_effect=run):
+            linux.X86_64.prepare_candidate_bitcode(toolchain, self.paths)
+            linux.ARM64.prepare_candidate_bitcode(toolchain, benchmark)
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual(("name-functions", str(self.paths.profile_use_bitcode)), calls[0][-3:-1])
+        self.assertEqual(b"internal functions", self.paths.profile_use_bitcode.read_bytes())
+        self.assertFalse(pathlib.Path(calls[0][-1]).exists())
+
+    def test_the_link_finds_candidate_function_sections_without_a_symbol(self) -> None:
+        obj = self.paths.profile_use_object
+        link_map = "\n".join((
+            f"  1000  1000  20  16         {obj}:(.text.main)",
+            "  1000  1000  20   1                 main",
+            f"  1020  1020  10  16         {obj}:(.text..Lcore.app.run)",
+            f"  1030  1030  10  16         {obj}:(.text.hot..Lc.string.strchrnul)",
+            f"  1040  1040  10  16         {obj}:(.text.unlikely..Lcore.cli.parse)",
+            f"  1050  1050  10   1         {obj}:(.text.OUTLINED_FUNCTION_0)",
+            f"  1060  1060  10  16         {obj}:(.rodata..Lconstant)",
+            "  1070  1070  10  16         /cache/libc.a(memcpy.o):(.text..Lhelper)",
+        ))
+
+        self.assertEqual(
+            [".text..Lcore.app.run", ".text.hot..Lc.string.strchrnul", ".text.unlikely..Lcore.cli.parse"],
+            linux.unnamed_function_sections(link_map, obj),
+        )
+        self.assertEqual([], linux.unnamed_function_sections(link_map.replace("..L", "."), obj))
+
+    def test_the_ordered_link_fails_when_a_candidate_function_has_no_symbol(self) -> None:
+        self.write_control_link(inputs=(self.root / "start.o",))
+        obj = self.paths.profile_use_object
+        self.paths.startup_order.write_text("fx.main\n")
+        self.paths.profile_use_ir.write_text("define internal void @fx.main() {\n  ret void\n}\n")
+        named = f"    1000  1000  10  16         {obj}:(.text.fx.main)\n    1000  1000  10   1                 fx.main\n"
+        unnamed = named + f"    1010  1010  10  16         {obj}:(.text.hot..Lfx.helper)\n"
+
+        def link(link_map: str) -> None:
+            def run(argv, **_):
+                argv = list(argv)
+                stdout = ""
+                if "order" in argv:
+                    pathlib.Path(argv[argv.index("-o") + 1]).write_text("fx.main\n")
+                elif "--symbols" in argv:
+                    stdout = "     1: 0000000000000000    16 FUNC    LOCAL  DEFAULT    3 fx.main\n"
+                else:
+                    map_path = next(item for item in argv if item.startswith("-Map="))
+                    pathlib.Path(map_path.removeprefix("-Map=")).write_text(link_map)
+                    pathlib.Path(argv[argv.index("-o") + 1]).write_bytes(b"candidate")
+                return CommandResult(argv=tuple(argv), returncode=0, stdout=stdout, stderr="", elapsed_seconds=0.1)
+
+            with mock.patch.object(linux, "run_checked", side_effect=run):
+                linux.link_candidate_binary(self.toolchain(), self.paths)
+
+        link(named)
+        layout = json.loads((self.paths.logs / "candidate-layout.json").read_text())
+        self.assertEqual((1, 0), (layout["ordered_in_map"], layout["unmapped_profile_functions"]))
+        with self.assertRaisesRegex(PgsoError, r"1 candidate function sections have no symbol.*\.text\.hot\.\.Lfx\.helper"):
+            link(unnamed)
 
     def test_only_fx_objects_get_function_sections(self) -> None:
         self.assertEqual(("-function-sections",), linux.candidate_object_flags(self.paths))
