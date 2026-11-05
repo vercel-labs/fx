@@ -123,6 +123,10 @@ BENCHMARK_PLANS = (
         function_prefixes=(
             "core.output.diff.",
             "core.permissions.approval_prompt.",
+            # The review rows spend most of their time measuring and encoding
+            # text, so the shared text helpers carry this workload's counts.
+            "core.shared.display_width.",
+            "core.shared.text_utils.",
             "ui.approval_screen.",
             "ui.footer.approval_ui.",
             "ui.render_engine.transcript_blocks.",
