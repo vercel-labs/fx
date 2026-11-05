@@ -120,7 +120,9 @@ but feature work must reconsider whether the existing classification still
 matches the file's product role. When removing a feature or E2E owner, remove
 its stale corpus entry. Normal PR CI loads the corpus and rejects missing,
 duplicate, stale, or unclassified files without running the expensive PGSO
-qualification.
+qualification. It also runs `scripts/pgso/tests/test_corpus.py`, whose
+training, verification, and exclusion lists must name the same files in the
+same order as the corpus.
 
 Every root E2E file also needs a weight in `tests/e2e/ci-shard-weights.json`.
 CI fails on a missing or stale entry.
