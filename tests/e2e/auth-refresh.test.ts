@@ -379,10 +379,26 @@ test(
       releaseRefresh();
 
       const [askResult, logoutResult] = await Promise.all([ask, logout]);
-      expect(
-        askResult.code,
-        `stdout: ${askResult.stdout}\nstderr: ${askResult.stderr}`,
-      ).toBe(0);
+      // fx ask reads its login again just before it sends the request. When
+      // the logout deletes the login between the refresh and that read, the
+      // logout wins and fx ask stops signed out without sending anything.
+      // In either order the login stays deleted.
+      const askOutput = `stdout: ${askResult.stdout}\nstderr: ${askResult.stderr}`;
+      if (askResult.code === 0) {
+        expect(askResult.stdout, askOutput).toContain(
+          "REFRESH_COMPLETED_BEFORE_LOGOUT",
+        );
+        expect(gateway.requests).toHaveLength(1);
+        expect(gateway.requests[0].headers.get("authorization")).toBe(
+          `Bearer ${EXPIRED_REFRESH_TOKEN}`,
+        );
+      } else {
+        expect(askResult.code, askOutput).toBe(1);
+        expect(JSON.parse(askResult.stdout).error, askOutput).toBe(
+          "MissingCredentials",
+        );
+        expect(gateway.requests).toHaveLength(0);
+      }
       expect(
         logoutResult.code,
         `stdout: ${logoutResult.stdout}\nstderr: ${logoutResult.stderr}`,

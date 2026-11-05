@@ -59,6 +59,14 @@ pub fn requireWritableInDir(dir: std.Io.Dir, file_name: []const u8) error{Creden
     return true;
 }
 
+/// Whether an opened credential file lost its last name after it was opened,
+/// as when `fx logout` deletes it while another fx reads it. The sign-in is
+/// gone, so readers treat it as missing, not as broken storage. A file with
+/// more than one name still fails the readers' single-link check.
+pub fn removedSinceOpen(stat: std.Io.File.Stat) bool {
+    return stat.nlink == 0;
+}
+
 fn profileFileFromHome(
     home_value: ?[]const u8,
     file_name: []const u8,
@@ -86,6 +94,7 @@ fn profileFileFromHome(
     defer file.close(io_mod.getIo());
 
     const stat = file.stat(io_mod.getIo()) catch return .unavailable;
+    if (removedSinceOpen(stat)) return .missing;
     if (stat.kind != .file or
         stat.nlink != 1 or
         stat.permissions.toMode() & 0o077 != 0 or
@@ -129,6 +138,35 @@ test "a private sign-in file is present, and a fifo in its place is unavailable 
     const fifo = try std.mem.printSentinel(&path_buf, "{s}/.fx/auth.json", .{home}, 0);
     if (mkfifo(fifo, 0o600) != 0) return error.SkipZigTest;
     try std.testing.expectEqual(host.SecretStorePresence.unavailable, profileFileFromHome(home, "auth.json", 1024));
+}
+
+test "a sign-in file deleted while open counts as removed, and a second name does not" {
+    if (comptime @import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .wasi) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, ".fx");
+    var file = try tmp.dir.createFile(std.testing.io, ".fx/auth.json", .{
+        .read = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "{}");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    try std.testing.expect(!removedSinceOpen(try file.stat(std.testing.io)));
+
+    // A second name is not a deletion, and the single-link check still
+    // rejects the file.
+    try tmp.dir.hardLink(".fx/auth.json", tmp.dir, "auth-link.json", std.testing.io, .{});
+    try std.testing.expect(!removedSinceOpen(try file.stat(std.testing.io)));
+    try std.testing.expectEqual(host.SecretStorePresence.unavailable, profileFileFromHome(home, "auth.json", 1024));
+
+    // A logout that deletes the file while a reader holds it open leaves the
+    // reader a file with no name.
+    try tmp.dir.deleteFile(std.testing.io, "auth-link.json");
+    try tmp.dir.deleteFile(std.testing.io, ".fx/auth.json");
+    try std.testing.expect(removedSinceOpen(try file.stat(std.testing.io)));
 }
 
 test "credential write admission accepts missing files and rejects read-only targets" {
