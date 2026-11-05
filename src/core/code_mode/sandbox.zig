@@ -55,6 +55,9 @@ const max_log_bytes = 32 * 1024;
 /// The most text an outcome carries next to its logs. One byte escapes to at
 /// most six in JSON, so the outcome's frame fits however its text escapes.
 const max_outcome_text_bytes = (max_frame_bytes - 6 * max_log_bytes - 1024) / 6;
+
+/// What a program sees when one tool call's input won't fit in a frame.
+const call_too_large = "This tool call's input is over 8 MiB, the most one call can send. Send less in each call.";
 /// How long past the program's time limit the parent waits, each time it
 /// hands control to the child, before it kills the child.
 const grace_ms = 2000;
@@ -453,9 +456,14 @@ const ChildHost = struct {
     fn call(context: *anyopaque, name: []const u8, args_json: []const u8) engine.CallError!engine.CallResult {
         const host: *ChildHost = @ptrCast(@alignCast(context));
         host.releaseLast();
+        // The parent stops a child that sends a frame over the limit, so the
+        // program gets an error it can repair instead. JSON escaping only
+        // grows the text, so inputs this long are over before it runs.
+        if (name.len + args_json.len > max_frame_bytes) return .{ .ok = false, .text = call_too_large };
         var json: std.Io.Writer.Allocating = .init(host.gpa);
         defer json.deinit();
         std.json.Stringify.value(.{ .kind = "call", .tool = name, .input = args_json }, .{}, &json.writer) catch return error.OutOfMemory;
+        if (json.written().len > max_frame_bytes) return .{ .ok = false, .text = call_too_large };
         writeFrame(host.writer, json.written()) catch return error.Stopped;
         host.last_frame = readFrame(host.gpa, host.reader, max_frame_bytes) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -724,6 +732,28 @@ test "the parent stops waiting for a sandbox child that never reports" {
     var buffer: [4]u8 = undefined;
     const deadline_ms = std.Io.Clock.awake.now(io).toMilliseconds() + 300;
     try std.testing.expectError(error.DeadlinePassed, readFromChild(io, child.stdout.?, &buffer, deadline_ms, null));
+}
+
+test "a sandboxed program's tool call over the frame limit throws instead of being sent" {
+    const programs = [_][]const u8{
+        // Over the limit before it is escaped.
+        \\const input = { data: "x".repeat(9 * 1024 * 1024) };
+        \\try { await tools.read_file(input); return "sent"; } catch (e) { return e.message; }
+        ,
+        // Under it until the frame escapes it a second time.
+        \\const input = { data: '"'.repeat(5 * 512 * 1024) };
+        \\try { await tools.read_file(input); return "sent"; } catch (e) { return e.message; }
+        ,
+    };
+    for (programs) |program| {
+        var fake: FakeCaller = .{ .io = std.testing.io };
+        defer fake.deinit();
+        const report = try runForTest(&fake, program, .{});
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expect(report.result == .returned);
+        try std.testing.expectEqualStrings("\"" ++ call_too_large ++ "\"", report.result.returned.?);
+        try std.testing.expectEqualStrings("", fake.calls.items);
+    }
 }
 
 test "a return value that JSON escaping grows past a frame throws a message the program can act on" {

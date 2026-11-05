@@ -237,6 +237,11 @@ pub const Context = struct {
     nested_tool_lifecycle: ?ToolLifecyclePublisher = null,
     subagent_status_renderer: ?types.SubagentStatusRenderer = null,
     advertised_dynamic_tool_names: []const []const u8 = &.{},
+    /// The built-in tools a live tool authority, such as a child agent's
+    /// profile, allows. Its integrations are the advertised dynamic tool
+    /// names. Null when no authority narrows the registry. Each call an
+    /// `execute` program makes is checked against it, as a direct call is.
+    live_tool_names: ?[]const []const u8 = null,
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     auto_classifier: permission_auto_classifier.Classifier =
         permission_auto_classifier.Classifier.disabled(),
@@ -441,6 +446,7 @@ pub fn executeToolCallAuthorized(
         execution_ctx.session_grants = authority.grants;
         execution_ctx.permission_rules = authority.rules;
         execution_ctx.advertised_dynamic_tool_names = authority.integrations;
+        execution_ctx.live_tool_names = authority.tools;
         execution_ctx.mcp_access = rebindMcpAuthorityGeneration(
             execution_ctx.mcp_access,
             authority.generation,
@@ -1726,6 +1732,12 @@ fn executeNestedToolCall(
     for (code_mode_excluded_tools) |excluded| {
         if (std.mem.eql(u8, name, excluded)) return .{
             .text = try call_arena.print("{s} can't be called from a program. Call it directly instead.", .{name}),
+            .status = .failed,
+        };
+    }
+    if (state.runtime.live_tool_names) |tools| {
+        if (!containsName(tools, name) and !containsName(state.runtime.advertised_dynamic_tool_names, name)) return .{
+            .text = try call_arena.print("{s} isn't available to this agent.", .{name}),
             .status = .failed,
         };
     }
@@ -7232,6 +7244,59 @@ test "MCP dynamic tool executes after its schema was advertised" {
 
     try expectToolOutput(rt.context(), "mcp_fs_read", "{}", "mcp ok");
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
+}
+
+test "a program's tool calls stay inside a live tool authority" {
+    const sandbox = @import("../code_mode/sandbox.zig");
+    if (!sandbox.available) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io_mod.getIo(), .{ .sub_path = "secret.txt", .data = "top secret" });
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+
+    var rt = TestRuntime{
+        .workspace_root = root,
+        .tool_registry = .{ .tools = &.{ test_builtin_tools.read_file, test_builtin_tools.execute } },
+    };
+    defer rt.deinit(alloc);
+    const program =
+        \\{"code":"try { return 'read: ' + await tools.read_file({ path: 'secret.txt' }); } catch (e) { return 'refused: ' + e.message; }"}
+    ;
+    const cases = [_]struct { tools: []const []const u8, reads: bool }{
+        .{ .tools = &.{"execute"}, .reads = false },
+        // The control: with read_file allowed, the same program reads it.
+        .{ .tools = &.{ "execute", "read_file" }, .reads = true },
+    };
+    for (cases) |case| {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const result = try executeToolCallAuthorized(rt.context(), .{
+            .call_allocator = arena_state.allocator(),
+            .result_allocator = arena_state.allocator(),
+            .call = .{ .id = "program", .name = "execute", .arguments_json = program },
+            .authority = .ordinary,
+            .session_grants = &.{},
+            .live_authority = .{
+                .generation = 1,
+                .root_id = "root",
+                .tools = case.tools,
+                .integrations = &.{},
+                .rules = .{},
+                .grants = &.{},
+                .permission_mode = .yolo,
+            },
+            .advertised_dynamic_tool_names = &.{},
+            .max_tool_result_bytes = rt.max_tool_result_bytes,
+        });
+        if (case.reads) {
+            try expectContains(result.model_output, "top secret");
+        } else {
+            try expectContains(result.model_output, "refused: read_file isn't available to this agent.");
+            try expectNotContains(result.model_output, "top secret");
+        }
+    }
 }
 
 test "MCP execution binds the last live action generation before transport" {
