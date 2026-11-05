@@ -7,7 +7,7 @@ import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { bundledAssetUrl } from "./bundled-asset.js";
 import { CoreOutput } from "./core-output.js";
-import { fetchCleanupAction, cleanupTimeoutMs, cleanupByteLimit } from "./fetch-cleanup.js";
+import { fetchCleanupAction, cleanupTimeoutMs, cleanupByteLimit, retryAfterSeconds } from "./fetch-cleanup.js";
 import { createDurableAgentFactory, memory, wakeHandler } from "./durable.js";
 import { fxHarness } from "./fx-harness.js";
 import {
@@ -29,15 +29,6 @@ const nativeCoreApiVersion = 4;
 const fetchOperationStale = 0;
 const fetchOperationApplied = 1;
 const fetchOperationBackpressure = 2;
-
-// A response's Retry-After in whole seconds, read as native fx reads it
-// (digits only), or -1 when it has none. `streamRetryAfter` in
-// wasm-runtime.js reads it the same way for the WebAssembly host.
-function retryAfterSeconds(headers) {
-  const value = headers.get("retry-after")?.trim();
-  if (!value || !/^\d+$/.test(value)) return -1;
-  return Math.min(Number(value), 0x7fffffff);
-}
 
 const nodeRequire = createRequire(import.meta.url);
 let nativeBackendPromise;

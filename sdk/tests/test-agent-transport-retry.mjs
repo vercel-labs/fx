@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFxEngine, supportsJspi } from "../node.js";
+import { retryAfterSeconds } from "../fetch-cleanup.js";
 
 const backend = process.argv[2] || "native";
 if (!new Set(["native", "wasm"]).has(backend)) {
@@ -175,6 +176,15 @@ const finalAnswer = (text) => new Response(new ReadableStream({
     controller.close();
   },
 }), { status: 200, headers: { "content-type": "text/event-stream" } });
+
+// Both hosts read Retry-After as native fx does: digits only, capped at int32.
+for (const [value, seconds] of [
+  [null, -1], ["", -1], [" 5 ", 5], ["0", 0], ["-5", -1], ["+5", -1], ["5.0", -1],
+  ["Wed, 21 Oct 2026 07:28:00 GMT", -1], ["99999999999", 0x7fffffff],
+]) {
+  const headers = new Headers(value === null ? {} : { "retry-after": value });
+  assert.equal(retryAfterSeconds(headers), seconds, `Retry-After ${JSON.stringify(value)}`);
+}
 
 // Both hosts pass a 503's Retry-After to fx, which waits that long rather
 // than its own one-second first step.

@@ -1,6 +1,7 @@
 // The WebAssembly host: WASI, fx's host imports, and starting an fx
 // WebAssembly module. Only the WebAssembly backends load it.
 import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
+import { retryAfterSeconds } from "./fetch-cleanup.js";
 import {
   cancelResponseBody,
   decoder,
@@ -352,12 +353,9 @@ function createRuntime(options) {
       ready ? settled() : 0);
   }
 
-  // A response's Retry-After in whole seconds, read as native fx reads it
-  // (digits only), or -1 when it has none.
   function streamRetryAfter(handle) {
-    const value = streams.get(handle)?.response?.headers.get("retry-after")?.trim();
-    if (!value || !/^\d+$/.test(value)) return -1;
-    return Math.min(Number(value), 0x7fffffff);
+    const response = streams.get(handle)?.response;
+    return response ? retryAfterSeconds(response.headers) : -1;
   }
 
   function streamNext(handle, outPtr, outCap) {

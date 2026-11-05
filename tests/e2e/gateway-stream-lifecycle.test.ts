@@ -11842,7 +11842,7 @@ describe("request recovery across statuses and garbled streams", () => {
       });
       expect(result.code, result.stdout + result.stderr).toBe(0);
       expect(result.stdout).toContain("LOCAL_RECOVERED_GARBLED");
-      expect(result.stderr).toMatch(/^\[notice\] Connection lost · next try in 1s · attempt 1$/m);
+      expect(result.stderr).toMatch(/^\[notice\] Unreadable reply · next try in 1s · attempt 1$/m);
       expect(fixture.requests.filter((request) => request.path === "/v1/chat/completions").length).toBe(2);
     } finally {
       fixture.close();
