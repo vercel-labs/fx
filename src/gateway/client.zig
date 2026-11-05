@@ -86,7 +86,10 @@ fn isRetryableAgentNetworkError(err: anyerror) bool {
 /// A stream event that was not JSON at all: the server answered, so this is
 /// not a lost connection, but the reply was damaged on the way.
 fn isUnreadableReply(err: anyerror) bool {
-    return err == error.MalformedGatewaySseEvent;
+    return err == error.MalformedGatewaySseEvent or
+        err == error.MalformedOpenAICodexSseEvent or
+        err == error.MalformedXaiGrokSseEvent or
+        err == error.MalformedChatCompletionsChunk;
 }
 
 fn connectedIoFailure(
@@ -4616,6 +4619,12 @@ fn consumeSseStreamTraced(
         }
         const root = std.json.parseFromSliceLeaky(std.json.Value, event_arena.allocator(), json_text, .{}) catch |err| {
             if (err == error.OutOfMemory) return err;
+            // A duplicate key is valid JSON that fx refuses, so resending
+            // would get the same event back.
+            if (err == error.DuplicateField) {
+                debug_trace.logf("sse", "event type=duplicate_key bytes={d}", .{json_text.len});
+                return error.InvalidGatewaySseEvent;
+            }
             traceMalformedSseEvent(json_text.len);
             return error.MalformedGatewaySseEvent;
         };
@@ -5349,14 +5358,17 @@ fn fuzzGatewayEventClass(_: void, smith: *std.testing.Smith) !void {
     } else if (std.json.parseFromSliceLeaky(std.json.Value, arena, json_text, .{})) |_| {
         // Readable JSON is never taken for a damaged event.
         if (outcome) |_| {} else |err| try std.testing.expect(err != error.MalformedGatewaySseEvent);
-    } else |_| {
-        // Damaged on the wire: resent like a dropped stream.
+    } else |err| if (err == error.DuplicateField) {
+        // Valid JSON fx refuses: resending would get the same event back.
+        try std.testing.expectError(error.InvalidGatewaySseEvent, outcome);
+    } else {
+        // Damaged on the wire: resent as an unreadable reply.
         try std.testing.expectError(error.MalformedGatewaySseEvent, outcome);
         try std.testing.expect(networkFailureEvidence(error.MalformedGatewaySseEvent, .possibly_sent) != null);
     }
 }
 
-test "a Gateway event that is not JSON is resent, a too-deep one ends the turn, however its bytes arrive" {
+test "a Gateway event that is not JSON is resent, a too-deep or duplicate-key one ends the turn, however its bytes arrive" {
     try std.testing.fuzz({}, fuzzGatewayEventClass, .{
         .corpus = &(.{""} ++ @import("fuzz_corpus").gateway_event_class.*),
     });
@@ -11146,7 +11158,7 @@ test "host-managed Gateway chat omits authentication-owned headers" {
     try std.testing.expectEqualStrings(user_agent, fixture.capturedHeaderValue("user-agent").?);
 }
 
-test "a stream event that is not JSON is an unreadable reply, and a too-deep one still ends" {
+test "a stream event that is not JSON is an unreadable reply, and a too-deep or duplicate-key one still ends" {
     const Noop = struct {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
@@ -11169,6 +11181,27 @@ test "a stream event that is not JSON is an unreadable reply, and a too-deep one
     } else |err| err;
     try std.testing.expectEqual(error.InvalidGatewaySseEvent, too_deep);
     try std.testing.expect(networkFailureEvidence(too_deep, .possibly_sent) == null);
+
+    var duplicate_reader = std.Io.Reader.fixed("data: {\"type\":\"text-delta\",\"type\":\"finish\"}\n\n");
+    const duplicate = if (consumeSseStream(std.testing.allocator, &duplicate_reader, undefined, Noop.chunk, null, &cancel_flag)) |completion| blk: {
+        var owned = completion;
+        deinitGatewayCompletion(std.testing.allocator, &owned);
+        break :blk error.TestExpectedStreamError;
+    } else |err| err;
+    try std.testing.expectEqual(error.InvalidGatewaySseEvent, duplicate);
+    try std.testing.expect(networkFailureEvidence(duplicate, .possibly_sent) == null);
+}
+
+test "an unreadable stream event from any provider is an unreadable reply" {
+    for ([_]anyerror{
+        error.MalformedGatewaySseEvent,
+        error.MalformedOpenAICodexSseEvent,
+        error.MalformedXaiGrokSseEvent,
+        error.MalformedChatCompletionsChunk,
+    }) |err| {
+        const evidence = networkFailureEvidence(err, .possibly_sent) orelse return error.TestExpectedNetworkFailureEvidence;
+        try std.testing.expectEqual(agent_stream_provider.NetworkFailureCause.unreadable_reply, evidence.cause);
+    }
 }
 
 test "a connection that timed out before opening is offline" {

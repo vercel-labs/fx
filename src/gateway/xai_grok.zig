@@ -447,6 +447,7 @@ fn mapReducerError(err: anyerror) anyerror {
         error.EventTooLarge => error.XaiGrokSseEventTooLarge,
         error.StreamTooLarge => error.XaiGrokResourceLimitExceeded,
         error.InvalidEvent => error.InvalidXaiGrokSseEvent,
+        error.MalformedEvent => error.MalformedXaiGrokSseEvent,
         error.StreamIncomplete => error.XaiGrokStreamIncomplete,
         error.ToolCallLimitExceeded => error.XaiGrokToolCallLimitExceeded,
         error.ToolArgumentsTooLarge => error.XaiGrokToolArgumentsTooLarge,
@@ -1156,4 +1157,12 @@ test "xAI Grok SSE reducer cleans up bounded tool arguments and provider state" 
     const excess_state = try buildProviderStateSse(std.testing.allocator, max_provider_state_bytes + 1);
     defer std.testing.allocator.free(excess_state);
     try expectTestSseError(error.XaiGrokResourceLimitExceeded, excess_state);
+}
+
+test "an xAI event that is not JSON resends, and a duplicate key still ends the turn" {
+    const partial = "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial\"}\n\n";
+    try expectTestSseError(error.MalformedXaiGrokSseEvent, partial ++ "data: {not-json}\n\n");
+    try std.testing.expect(gateway_client.networkFailureEvidence(error.MalformedXaiGrokSseEvent, .possibly_sent) != null);
+    try expectTestSseError(error.InvalidXaiGrokSseEvent, partial ++ "data: {\"type\":\"a\",\"type\":\"b\"}\n\n");
+    try std.testing.expect(gateway_client.networkFailureEvidence(error.InvalidXaiGrokSseEvent, .possibly_sent) == null);
 }

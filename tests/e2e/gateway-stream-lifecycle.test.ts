@@ -11806,6 +11806,49 @@ describe("request recovery across statuses and garbled streams", () => {
     }
   });
 
+  test("a stream event with a duplicate key still ends the turn", async () => {
+    const root = createFixtureRoot("duplicate-key-event");
+    const tracePath = join(root.root, "trace.log");
+    const gateway = startGateway(() => sse('data: {"type":"text-start","type":"finish"}\n\n'));
+    try {
+      const result = await runFx(["ask", "--auto", "Read a duplicate-key event."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 20_000,
+      });
+      expect(result.code).not.toBe(0);
+      expect(gateway.requestCount()).toBe(1);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a configured chat-completions provider resends after a chunk that is not JSON", async () => {
+    let calls = 0;
+    const fixture = createConfiguredProviderFixture((body) => {
+      calls += 1;
+      if (calls > 1) return configuredCompletion(body.model, "LOCAL_RECOVERED_GARBLED");
+      const partial = { id: "chat-local", model: body.model, choices: [{ index: 0, delta: { role: "assistant", content: "Partial " }, finish_reason: null }] };
+      return new Response(`data: ${JSON.stringify(partial)}\n\ndata: {"choices":[{"index":0,"delta":{"content":"\u0001broken\n\n`, {
+        headers: { "content-type": "text/event-stream" },
+      });
+    });
+    try {
+      const result = await runFx(["ask", "--auto", "Recover through the local provider."], {
+        cwd: fixture.workspace,
+        env: fixture.env,
+        timeoutMs: 20_000,
+      });
+      expect(result.code, result.stdout + result.stderr).toBe(0);
+      expect(result.stdout).toContain("LOCAL_RECOVERED_GARBLED");
+      expect(result.stderr).toMatch(/^\[notice\] Unreadable reply · next try in 1s · attempt 1$/m);
+      expect(fixture.requests.filter((request) => request.path === "/v1/chat/completions").length).toBe(2);
+    } finally {
+      fixture.close();
+    }
+  });
+
   test("a configured chat-completions provider retries a 529", async () => {
     let calls = 0;
     const fixture = createConfiguredProviderFixture((body) => {

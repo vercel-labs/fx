@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFxEngine, supportsJspi } from "../node.js";
+import { retryAfterSeconds } from "../fetch-cleanup.js";
 
 const backend = process.argv[2] || "native";
 if (!new Set(["native", "wasm"]).has(backend)) {
@@ -176,36 +177,45 @@ const finalAnswer = (text) => new Response(new ReadableStream({
   },
 }), { status: 200, headers: { "content-type": "text/event-stream" } });
 
-// The browser host passes a 503's Retry-After to fx, which waits that long
-// rather than its own one-second first step. The Node addon's fetch bridge
-// does not pass the header yet, so this runs on the WebAssembly backend.
-if (backend === "wasm") {
-  const postedAt = [];
-  const retryAfterAgent = await createFxEngine({
-    backend,
-    wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")),
-    fetch: async (_url, init) => {
-      if (init.method === "GET") return catalogResponse();
-      postedAt.push(performance.now());
-      return postedAt.length === 1 ? unavailable(3) : finalAnswer("waited as asked");
-    },
-    apiKey: "transport-retry-after-key",
-    model: "transport-retry/model",
-  });
-  try {
-    const turn = retryAfterAgent.prompt("wait as the gateway asks");
-    let output = "";
-    for await (const event of turn) if (event.type === "text_delta") output += event.delta;
-    assert.equal((await turn.result).stopReason, "end_turn");
-    assert.equal(output, "waited as asked");
-    assert.equal(postedAt.length, 2);
-    const gap = postedAt[1] - postedAt[0];
-    assert.ok(gap >= 2_900, `the resend must wait the 3 s Retry-After asked for, waited ${Math.round(gap)} ms`);
-  } finally {
-    await retryAfterAgent.close();
-  }
-  console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Agent honored Retry-After`);
+// Both hosts read Retry-After as native fx does: digits only, capped at int32.
+for (const [value, seconds] of [
+  [null, -1], ["", -1], [" 5 ", 5], ["0", 0], ["-5", -1], ["+5", -1], ["5.0", -1],
+  ["Wed, 21 Oct 2026 07:28:00 GMT", -1], ["99999999999", 0x7fffffff],
+]) {
+  const headers = new Headers(value === null ? {} : { "retry-after": value });
+  assert.equal(retryAfterSeconds(headers), seconds, `Retry-After ${JSON.stringify(value)}`);
 }
+
+// Both hosts pass a 503's Retry-After to fx, which waits that long rather
+// than its own one-second first step.
+const postedAt = [];
+const retryAfterAgent = await createFxEngine({
+  backend,
+  nativeAddon: resolve(scriptDir, "../../zig-out/lib/libfx.node"),
+  ...(backend === "wasm"
+    ? { wasm: await readFile(resolve(scriptDir, "../../zig-out/bin/fx-core.wasm")) }
+    : {}),
+  fetch: async (_url, init) => {
+    if (init.method === "GET") return catalogResponse();
+    postedAt.push(performance.now());
+    return postedAt.length === 1 ? unavailable(3) : finalAnswer("waited as asked");
+  },
+  apiKey: "transport-retry-after-key",
+  model: "transport-retry/model",
+});
+try {
+  const turn = retryAfterAgent.prompt("wait as the gateway asks");
+  let output = "";
+  for await (const event of turn) if (event.type === "text_delta") output += event.delta;
+  assert.equal((await turn.result).stopReason, "end_turn");
+  assert.equal(output, "waited as asked");
+  assert.equal(postedAt.length, 2);
+  const gap = postedAt[1] - postedAt[0];
+  assert.ok(gap >= 2_900, `the resend must wait the 3 s Retry-After asked for, waited ${Math.round(gap)} ms`);
+} finally {
+  await retryAfterAgent.close();
+}
+console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Agent honored Retry-After`);
 
 // Cancel during a retry wait ends the turn at once and sends nothing more,
 // however long the wait was.
