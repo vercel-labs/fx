@@ -35,11 +35,12 @@ pub const AccountBuffer = [256]u8;
 const passwd_scratch_bytes = 2048;
 const max_mcp_credentials_bytes: usize = 1024 * 1024;
 const max_oauth_session_bytes: usize = 64 * 1024;
-/// How long one Keychain call may take; the MCP credential store's lease
-/// allows each call this much (`src/core/mcp_host/credentials.zig`).
+/// How long one Keychain call may take, in milliseconds; leased locks held
+/// across Keychain calls allow each call this much (`shared/leased_lock.zig`).
+pub const keychain_call_ms: i64 = 10_000;
 pub const keychain_process_timeout: std.Io.Timeout = .{
     .duration = .{
-        .raw = .{ .nanoseconds = 10 * std.time.ns_per_s },
+        .raw = .{ .nanoseconds = keychain_call_ms * std.time.ns_per_ms },
         .clock = .awake,
     },
 };

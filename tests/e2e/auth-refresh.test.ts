@@ -127,6 +127,62 @@ async function waitForFileText(path: string, text: string): Promise<void> {
   throw new Error(`Timed out waiting for ${text} in ${path}`);
 }
 
+// Two fx whose login expired together: the second waits while the first is
+// still refreshing it, however slowly, and uses the login it saved.
+test(
+  "a second fx waits for another's slow login refresh and uses its login",
+  async () => {
+    const home = mkdtempSync(join(tmpdir(), "fx-auth-refresh-slow-holder-e2e-"));
+    let markRefreshStarted = () => {};
+    const refreshStarted = new Promise<void>((resolve) => {
+      markRefreshStarted = resolve;
+    });
+    let tokenRequestCount = 0;
+    // Answered 5 s late: longer than fx used to wait for the lock.
+    const oauth = startFakeOAuth([ISSUER_A_ACCESS_TOKEN], "", async () => {
+      tokenRequestCount += 1;
+      markRefreshStarted();
+      await Bun.sleep(5_000);
+    });
+    writeFxLogin(home, oauth.issuerUrl);
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("FIRST_ASK_DONE"),
+      fakeGatewayFinalText("SECOND_ASK_DONE"),
+    ]);
+    const env = {
+      HOME: home,
+      AI_GATEWAY_API_KEY: undefined,
+      VERCEL_OIDC_TOKEN: undefined,
+      FX_DISABLE_KEYCHAIN: "1",
+      FX_TEST_SKIP_ONBOARDING: "1",
+      FX_AUTO_UPGRADE: "0",
+      FX_TEST_OAUTH_ISSUER_URL: oauth.issuerUrl,
+      FX_GATEWAY_BASE_URL: gateway.baseUrl,
+      FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+      FX_MODEL: FAKE_GATEWAY_MODEL,
+    };
+
+    try {
+      const first = runFx(["ask", "--json", "--no-save", "first"], { env, timeoutMs: TIMEOUT });
+      await refreshStarted;
+      const second = runFx(["ask", "--json", "--no-save", "second"], { env, timeoutMs: TIMEOUT });
+      const [firstResult, secondResult] = await Promise.all([first, second]);
+      expect(firstResult.code, `stdout: ${firstResult.stdout}\nstderr: ${firstResult.stderr}`).toBe(0);
+      expect(secondResult.code, `stdout: ${secondResult.stdout}\nstderr: ${secondResult.stderr}`).toBe(0);
+      expect(tokenRequestCount).toBe(1);
+      expect(gateway.requests).toHaveLength(2);
+      for (const request of gateway.requests) {
+        expect(request.headers.get("authorization")).toBe(`Bearer ${ISSUER_A_ACCESS_TOKEN}`);
+      }
+    } finally {
+      gateway.stop();
+      oauth.stop();
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT,
+);
+
 test(
   "logout cannot be undone by an in-flight login refresh",
   async () => {

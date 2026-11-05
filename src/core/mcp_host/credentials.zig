@@ -29,6 +29,7 @@ const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const native_keychain = @import("../hosts/native_keychain.zig");
+const leased_lock = @import("../shared/leased_lock.zig");
 const secret = @import("../auth/secret.zig");
 const json_decode = @import("../shared/json_decode.zig");
 
@@ -44,8 +45,8 @@ const lock_deadline_ms: u64 = 2_000;
 /// The Keychain store's lock is leased (`Store.lock`): its holder stamps it
 /// before each Keychain call, and the call ends within `call_budget_ms`, its
 /// own timeout; a waiting fx gives up only `hold_slack_ms` after that.
-const call_budget_ms: i64 = @intCast(@divExact(native_keychain.keychain_process_timeout.duration.raw.nanoseconds, std.time.ns_per_ms));
-const hold_slack_ms: i64 = 2_000;
+const call_budget_ms: i64 = native_keychain.keychain_call_ms;
+const hold_slack_ms: i64 = leased_lock.slack_ms;
 const max_store_bytes: usize = 1024 * 1024;
 
 pub const Backend = enum { keychain, file };
@@ -188,7 +189,7 @@ pub const Store = struct {
             else => return err,
         };
         const now = io_mod.awakeMilliTimestamp();
-        writeStamp(advisory.file, now);
+        leased_lock.writeStamp(advisory.file, now, "mcp");
         debug_trace.logf("mcp", "MCP refresh lock taken stamp={d}", .{now});
         return .{ .dir = dir, .lock = advisory, .lease = .{ .kind = .refresh, .stamp_ms = now } };
     }
@@ -204,7 +205,7 @@ pub const Store = struct {
         var dir = s.openDir() catch return true;
         defer dir.close();
         const name = refreshLockName(key);
-        return refreshWaitExpired(readStamp(&dir, &name), readStamp(&dir, lock_file_name), started_ms, io_mod.awakeMilliTimestamp(), step_ms);
+        return refreshWaitExpired(leased_lock.readStamp(&dir, &name), leased_lock.readStamp(&dir, lock_file_name), started_ms, io_mod.awakeMilliTimestamp(), step_ms);
     }
 
     pub const Locked = struct {
@@ -219,9 +220,10 @@ pub const Store = struct {
         /// Stamps a leased lock again, before the next step its holder takes.
         pub fn restamp(l: *Locked) void {
             const lease = if (l.lease) |*lease| lease else return;
-            lease.stamp_ms = io_mod.awakeMilliTimestamp();
-            writeStamp(l.lock.file, lease.stamp_ms);
-            debug_trace.logf("mcp", "MCP {s} lock stamped stamp={d}", .{ @tagName(lease.kind), lease.stamp_ms });
+            lease.stamp_ms = leased_lock.restamp(l.lock.file, "mcp", switch (lease.kind) {
+                .store => "MCP store",
+                .refresh => "MCP refresh",
+            });
         }
 
         pub fn release(l: *Locked) void {
@@ -245,7 +247,7 @@ pub const Store = struct {
 
     /// The file store's lock waits `lock_deadline_ms`. The Keychain store's
     /// work under its lock is two calls to `osascript` that can each take
-    /// seconds, so that lock is leased (`tests/tla/mcp_host/StoreLockBudget.tla`):
+    /// seconds, so that lock is leased (`leased_lock`, `tests/tla/mcp_host/StoreLockBudget.tla`):
     /// the fx that takes it writes the time, on the awake clock, into the lock
     /// file, and again before each Keychain call (`read`, `write`), and each
     /// call ends within `call_budget_ms` of its stamp. A waiting fx gives up
@@ -262,28 +264,8 @@ pub const Store = struct {
             .dir = dir,
             .lock = try io_mod.acquireTimedAdvisoryLock(&dir, lock_file_name, lock_deadline_ms),
         };
-        const taken = try acquireLease(&dir, io_mod.awakeMilliTimestamp());
+        const taken = try leased_lock.acquire(&dir, lock_file_name, io_mod.awakeMilliTimestamp(), call_budget_ms + hold_slack_ms, .{}, "mcp", "MCP store");
         return .{ .dir = dir, .lock = taken.lock, .lease = .{ .kind = .store, .stamp_ms = taken.stamp_ms } };
-    }
-
-    /// The Keychain store's lock for a waiter that started at `started_ms`,
-    /// or `error.LockBusy` once `waitExpired`.
-    fn acquireLease(dir: *io_mod.VerifiedDir, started_ms: i64) !struct { lock: io_mod.TimedAdvisoryLock, stamp_ms: i64 } {
-        while (true) {
-            if (io_mod.acquireTimedAdvisoryLock(dir, lock_file_name, 0)) |advisory| {
-                const now = io_mod.awakeMilliTimestamp();
-                writeStamp(advisory.file, now);
-                debug_trace.logf("mcp", "MCP store lock taken stamp={d} started={d}", .{ now, started_ms });
-                return .{ .lock = advisory, .stamp_ms = now };
-            } else |err| if (err != error.LockBusy) return err;
-            const stamp = readStamp(dir, lock_file_name);
-            const now = io_mod.awakeMilliTimestamp();
-            if (waitExpired(stamp, started_ms, now)) {
-                debug_trace.logf("mcp", "MCP store lock given up stamp={?d} started={d} at={d}", .{ stamp, started_ms, now });
-                return error.LockBusy;
-            }
-            io_mod.sleep(10 * std.time.ns_per_ms);
-        }
     }
 
     /// The store as saved, empty when there is none. One that doesn't parse or
@@ -323,52 +305,12 @@ pub const Store = struct {
     }
 };
 
-/// Writes a lease's stamp over the lock file's first 8 bytes. A holder whose
-/// stamp didn't land still holds the lock; its waiters time it from an older
-/// stamp or their own start, as with an older fx.
-fn writeStamp(file: std.Io.File, now_ms: i64) void {
-    var bytes: [8]u8 = undefined;
-    std.mem.writeInt(i64, &bytes, now_ms, .little);
-    file.writePositionalAll(io_mod.getIo(), &bytes, 0) catch |err|
-        debug_trace.logf("mcp", "MCP lock stamp not written err={s}", .{@errorName(err)});
-}
-
-/// The stamp the holder of lock file `name` wrote, or null when there is none to read.
-fn readStamp(dir: *io_mod.VerifiedDir, name: []const u8) ?i64 {
-    const io = io_mod.getIo();
-    var file = dir.dir.openFile(io, name, .{
-        .mode = .read_only,
-        .allow_directory = false,
-        .follow_symlinks = false,
-        .resolve_beneath = true,
-    }) catch return null;
-    defer file.close(io);
-    var bytes: [8]u8 = undefined;
-    const n = file.readPositionalAll(io, &bytes, 0) catch return null;
-    if (n != bytes.len) return null;
-    return std.mem.readInt(i64, &bytes, .little);
-}
-
-/// Pure: when a waiter that started at `started_ms` times a holder whose
-/// stamp reads `stamp_ms` from, at `now_ms`. A stamp from before the waiter
-/// started, or from the future (damaged, or from before a reboot), counts as
-/// its start.
-fn stampFrom(stamp_ms: ?i64, started_ms: i64, now_ms: i64) i64 {
-    const t = stamp_ms orelse return started_ms;
-    return if (t > started_ms and t <= now_ms) t else started_ms;
-}
-
-/// Pure: whether a waiter for the store's lock gives up at `now_ms`.
-fn waitExpired(stamp_ms: ?i64, started_ms: i64, now_ms: i64) bool {
-    return now_ms -| stampFrom(stamp_ms, started_ms, now_ms) >= call_budget_ms + hold_slack_ms;
-}
-
 /// Pure: whether a waiter for a refresh lock goes ahead at `now_ms`, with the
 /// refresh lock's stamp `refresh_ms` and the store lock's `store_ms`
 /// (`Store.refreshHolderStopped`).
 fn refreshWaitExpired(refresh_ms: ?i64, store_ms: ?i64, started_ms: i64, now_ms: i64, step_ms: i64) bool {
-    const step_over = stampFrom(refresh_ms, started_ms, now_ms) +| step_ms;
-    const lease_over = stampFrom(store_ms, started_ms, now_ms) +| (call_budget_ms + hold_slack_ms);
+    const step_over = leased_lock.stampFrom(refresh_ms, started_ms, now_ms) +| step_ms;
+    const lease_over = leased_lock.stampFrom(store_ms, started_ms, now_ms) +| (call_budget_ms + hold_slack_ms);
     return now_ms >= @max(step_over, lease_over) +| hold_slack_ms;
 }
 
@@ -742,18 +684,18 @@ test "a waiter gives up only once the holder's stamp, or its own start if later,
     const started: i64 = 1_000_000;
     const wait = call_budget_ms + hold_slack_ms;
     // No stamp: timed from its own start.
-    try testing.expect(!waitExpired(null, started, started + wait - 1));
-    try testing.expect(waitExpired(null, started, started + wait));
+    try testing.expect(!leased_lock.expired(null, started, started + wait - 1, wait));
+    try testing.expect(leased_lock.expired(null, started, started + wait, wait));
     // A holder that took the lock after the waiter started gets its own 12 s.
     const taken = started + 9_000;
-    try testing.expect(!waitExpired(taken, started, taken + wait - 1));
-    try testing.expect(waitExpired(taken, started, taken + wait));
+    try testing.expect(!leased_lock.expired(taken, started, taken + wait - 1, wait));
+    try testing.expect(leased_lock.expired(taken, started, taken + wait, wait));
     // A stamp from before the waiter started, or from the future, counts as its start.
-    try testing.expect(waitExpired(started - 60_000, started, started + wait));
-    try testing.expect(!waitExpired(started - 60_000, started, started + wait - 1));
-    try testing.expect(!waitExpired(started + wait + 5, started, started + wait - 1));
-    try testing.expect(waitExpired(std.math.maxInt(i64), started, started + wait));
-    try testing.expect(waitExpired(std.math.minInt(i64), started, started + wait));
+    try testing.expect(leased_lock.expired(started - 60_000, started, started + wait, wait));
+    try testing.expect(!leased_lock.expired(started - 60_000, started, started + wait - 1, wait));
+    try testing.expect(!leased_lock.expired(started + wait + 5, started, started + wait - 1, wait));
+    try testing.expect(leased_lock.expired(std.math.maxInt(i64), started, started + wait, wait));
+    try testing.expect(leased_lock.expired(std.math.minInt(i64), started, started + wait, wait));
 }
 
 /// For any stamp in the lock file and any time a waiter checks, it gives up
@@ -778,7 +720,7 @@ fn fuzzLockWait(_: void, smith: *std.testing.Smith) !void {
     try testing.expectEqual(stamp, read_back);
 
     const wait = call_budget_ms + hold_slack_ms;
-    const expired = waitExpired(read_back, started, now);
+    const expired = leased_lock.expired(read_back, started, now, wait);
     if (expired) try testing.expect(now - started >= wait);
     const live = if (read_back) |t| t > started and t <= now else false;
     if (live and now - read_back.? < wait) try testing.expect(!expired);
@@ -822,33 +764,33 @@ test "the Keychain store's lock is stamped when taken and before each call, and 
     const before = io_mod.awakeMilliTimestamp();
     var held = try store.lock();
     const after = io_mod.awakeMilliTimestamp();
-    const stamp = readStamp(&held.dir, lock_file_name) orelse return error.TestUnexpectedResult;
+    const stamp = leased_lock.readStamp(&held.dir, lock_file_name) orelse return error.TestUnexpectedResult;
     try testing.expect(stamp >= before and stamp <= after);
     try testing.expectEqual(stamp, held.lease.?.stamp_ms);
     // Each Keychain call gets a fresh stamp: one 11 s into the hold is now.
-    writeStamp(held.lock.file, after - 11_000);
+    leased_lock.writeStamp(held.lock.file, after - 11_000, "mcp");
     held.restamp();
-    const again = readStamp(&held.dir, lock_file_name).?;
+    const again = leased_lock.readStamp(&held.dir, lock_file_name).?;
     try testing.expect(again >= after and again == held.lease.?.stamp_ms);
 
     // A holder frozen with the lock for 13 s, and a waiter that has waited
     // as long: it gives up without waiting more.
-    writeStamp(held.lock.file, after - 13_000);
+    leased_lock.writeStamp(held.lock.file, after - 13_000, "mcp");
     {
         var dir = try store.openDir();
         defer dir.close();
         const asked = io_mod.awakeMilliTimestamp();
-        try testing.expectError(error.LockBusy, Store.acquireLease(&dir, asked - 13_000));
+        try testing.expectError(error.LockBusy, leased_lock.acquire(&dir, lock_file_name, asked - 13_000, call_budget_ms + hold_slack_ms, .{}, "mcp", "MCP store"));
         try testing.expect(io_mod.awakeMilliTimestamp() - asked < 1_000);
         // One that started 1 s ago keeps waiting, for its own 12 s.
-        try testing.expect(!waitExpired(readStamp(&dir, lock_file_name), asked - 1_000, io_mod.awakeMilliTimestamp()));
+        try testing.expect(!leased_lock.expired(leased_lock.readStamp(&dir, lock_file_name), asked - 1_000, io_mod.awakeMilliTimestamp(), call_budget_ms + hold_slack_ms));
     }
     held.release();
 
     // Once it is free, the next holder stamps it again.
     var next = try store.lock();
     defer next.release();
-    try testing.expect(readStamp(&next.dir, lock_file_name).? >= after);
+    try testing.expect(leased_lock.readStamp(&next.dir, lock_file_name).? >= after);
 }
 
 test "the file store's lock writes no stamp, before a call or after" {
@@ -861,7 +803,7 @@ test "the file store's lock writes no stamp, before a call or after" {
     defer held.release();
     try testing.expect(held.lease == null);
     held.restamp();
-    try testing.expectEqual(@as(?i64, null), readStamp(&held.dir, lock_file_name));
+    try testing.expectEqual(@as(?i64, null), leased_lock.readStamp(&held.dir, lock_file_name));
 }
 
 test "a refresh lock is stamped when taken and before each step" {
@@ -875,13 +817,13 @@ test "a refresh lock is stamped when taken and before each step" {
     const before = io_mod.awakeMilliTimestamp();
     var held = (try store.tryRefreshLock(key)) orelse return error.TestUnexpectedResult;
     defer held.release();
-    const taken = readStamp(&held.dir, &name) orelse return error.TestUnexpectedResult;
+    const taken = leased_lock.readStamp(&held.dir, &name) orelse return error.TestUnexpectedResult;
     try testing.expect(taken >= before and taken == held.lease.?.stamp_ms);
-    writeStamp(held.lock.file, before - 40_000);
+    leased_lock.writeStamp(held.lock.file, before - 40_000, "mcp");
     // 40 s old, with no store stamp: a waiter that started as long ago goes ahead.
     try testing.expect(store.refreshHolderStopped(key, before - 40_000, 30_000));
     held.restamp();
-    try testing.expect(readStamp(&held.dir, &name).? >= before);
+    try testing.expect(leased_lock.readStamp(&held.dir, &name).? >= before);
     try testing.expect(!store.refreshHolderStopped(key, before - 40_000, 30_000));
 }
 
