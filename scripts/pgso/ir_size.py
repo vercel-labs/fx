@@ -407,6 +407,23 @@ def _leaves(llvm: Llvm, td, value, base: int, out: list) -> None:
         raise _Skip("too many defined bytes")
 
 
+def _copy_leaves(llvm: Llvm, td, init) -> tuple[list, bool]:
+    """The leaves a rewritten copy of `init` stores, and whether it zero-fills
+    the copied bytes first. A constant within the leaf limits stores every
+    defined leaf, zeros included; a larger one stores only its nonzero leaves
+    after the zero fill."""
+    leaves: list = []
+    try:
+        _leaves(llvm, td, init, 0, leaves)
+        return leaves, False
+    except _Skip as skip:
+        if str(skip) not in ("too many defined bytes", "too many defined leaves", "large defined array"):
+            raise
+    leaves = []
+    _nonzero_leaves(llvm, td, init, 0, leaves, ZERO_FILL_COPY_MAX_LEAVES, ZERO_FILL_COPY_MAX_BYTES)
+    return leaves, True
+
+
 def sparse_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> dict:
     ctx, mod = llvm.load(source)
     td = llvm.CreateTD(llvm.GetDL(mod))
@@ -451,16 +468,7 @@ def sparse_constants(llvm: Llvm, source: pathlib.Path, output: pathlib.Path) -> 
                     raise _Skip("volatile copy")
                 copies.append((user, llvm.ConstZExt(length)))
                 use = llvm.NextUse(use)
-            leaves: list = []
-            zero_fill = False
-            try:
-                _leaves(llvm, td, init, 0, leaves)
-            except _Skip as skip:
-                if str(skip) not in ("too many defined bytes", "too many defined leaves", "large defined array"):
-                    raise
-                leaves = []
-                _nonzero_leaves(llvm, td, init, 0, leaves, ZERO_FILL_COPY_MAX_LEAVES, ZERO_FILL_COPY_MAX_BYTES)
-                zero_fill = True
+            leaves, zero_fill = _copy_leaves(llvm, td, init)
             extra = 0
             for _, length in copies:
                 if any(offset < length < offset + width for offset, _, width, _ in leaves):
