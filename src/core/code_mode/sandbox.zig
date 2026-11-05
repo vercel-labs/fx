@@ -52,9 +52,15 @@ const max_run_frame_bytes = 7 * max_source_bytes;
 const max_frame_bytes = 8 * 1024 * 1024;
 /// Console output kept for one program.
 const max_log_bytes = 32 * 1024;
-/// The most text an outcome carries next to its logs. One byte escapes to at
-/// most six in JSON, so the outcome's frame fits however its text escapes.
+/// The most text a reply carries. One byte escapes to at most six in JSON, so
+/// the reply's frame fits however its text escapes.
+const max_result_text_bytes = (max_frame_bytes - 1024) / 6;
+/// The most text an outcome carries, for the same reason, next to its logs.
 const max_outcome_text_bytes = (max_frame_bytes - 6 * max_log_bytes - 1024) / 6;
+/// Bytes the parent writes to the child at once. A pipe that reports
+/// `POLLOUT` has room for a write this small on Linux and macOS, so the write
+/// can't block.
+const pipe_chunk_bytes = 512;
 
 /// What a program sees when one tool call's input won't fit in a frame.
 const call_too_large = "This tool call's input is over 8 MiB, the most one call can send. Send less in each call.";
@@ -206,18 +212,12 @@ const Parent = struct {
         var call_arena: std.heap.ArenaAllocator = .init(parent.gpa);
         defer call_arena.deinit();
 
-        try parent.send(RunFrame{ .source = source });
+        parent.send(RunFrame{ .source = source }) catch |err| return parent.stopFor(err);
         while (true) {
             const frame = parent.awaitFrame() catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                error.Cancelled => {
-                    debug_trace.logf("code_mode", "stopped sandbox process for a cancelled run calls={d}", .{parent.calls});
-                    return .{ .result = .cancelled };
-                },
-                error.DeadlinePassed => {
-                    debug_trace.logf("code_mode", "killed sandbox process still running grace_ms={d} past time_ms={d}", .{ grace_ms, parent.limits.time_ms });
-                    return .{ .result = .timed_out };
-                },
+                error.Cancelled => return parent.cancelled(),
+                error.DeadlinePassed => return parent.timedOut(),
                 error.FrameTooLarge => {
                     debug_trace.logf("code_mode", "stopped sandbox process that sent a frame over max_bytes={d}", .{max_frame_bytes});
                     return .{ .result = .{ .failed = message.bad_frame } };
@@ -236,29 +236,52 @@ const Parent = struct {
                     parent.calls += 1;
                     const answer = parent.caller.call_fn(parent.caller.context, call_arena.allocator(), parsed.value.tool, parsed.value.input) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
-                        error.Cancelled => {
-                            debug_trace.logf("code_mode", "stopped sandbox process for a cancelled run calls={d}", .{parent.calls});
-                            return .{ .result = .cancelled };
-                        },
+                        error.Cancelled => return parent.cancelled(),
                     };
-                    try parent.send(ResultFrame{ .ok = answer.ok, .text = fitFrame(answer.text) });
+                    parent.send(ResultFrame{ .ok = answer.ok, .text = fitFrame(answer.text) }) catch |err| return parent.stopFor(err);
                     _ = call_arena.reset(.retain_capacity);
                 },
             }
         }
     }
 
-    /// Sends one frame to the child. A failed write means the child already
-    /// exited, and the next read reports why.
-    fn send(parent: *Parent, value: anytype) RunError!void {
-        var json: std.Io.Writer.Allocating = .init(parent.gpa);
-        defer json.deinit();
-        std.json.Stringify.value(value, .{}, &json.writer) catch return error.OutOfMemory;
-        var buffer: [4096]u8 = undefined;
-        var writer = parent.child.stdin.?.writerStreaming(parent.io, &buffer);
-        writeFrame(&writer.interface, json.written()) catch |err| {
-            debug_trace.logf("code_mode", "writing to the sandbox process failed err={t}", .{err});
+    const SendError = error{ OutOfMemory, Cancelled, DeadlinePassed };
+
+    /// Sends one frame to the child. The deadline and cancellation apply as
+    /// they do to a read, so a child that stops reading can't hold the
+    /// parent. A failed write means the child already exited, and the next
+    /// read reports why.
+    fn send(parent: *Parent, value: anytype) SendError!void {
+        var frame: std.Io.Writer.Allocating = .init(parent.gpa);
+        defer frame.deinit();
+        frame.writer.writeAll(&@as([4]u8, @splat(0))) catch return error.OutOfMemory;
+        std.json.Stringify.value(value, .{}, &frame.writer) catch return error.OutOfMemory;
+        const bytes = frame.written();
+        std.mem.writeInt(u32, bytes[0..4], @intCast(bytes.len - 4), .little);
+        const deadline_ms = std.Io.Clock.awake.now(parent.io).toMilliseconds() + parent.limits.time_ms + grace_ms;
+        writeToChild(parent.io, parent.child.stdin.?, bytes, deadline_ms, parent.caller) catch |err| switch (err) {
+            error.Cancelled => return error.Cancelled,
+            error.DeadlinePassed => return error.DeadlinePassed,
+            error.WriteFailed => debug_trace.logf("code_mode", "writing to the sandbox process failed bytes={d}", .{bytes.len}),
         };
+    }
+
+    fn stopFor(parent: *Parent, err: SendError) RunError!Report {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Cancelled => parent.cancelled(),
+            error.DeadlinePassed => parent.timedOut(),
+        };
+    }
+
+    fn cancelled(parent: *Parent) Report {
+        debug_trace.logf("code_mode", "stopped sandbox process for a cancelled run calls={d}", .{parent.calls});
+        return .{ .result = .cancelled };
+    }
+
+    fn timedOut(parent: *Parent) Report {
+        debug_trace.logf("code_mode", "killed sandbox process still running grace_ms={d} past time_ms={d}", .{ grace_ms, parent.limits.time_ms });
+        return .{ .result = .timed_out };
     }
 
     const AwaitError = error{ OutOfMemory, Cancelled, DeadlinePassed, EndOfStream, ReadFailed, FrameTooLarge };
@@ -309,11 +332,31 @@ fn readFromChild(io: std.Io, file: std.Io.File, buffer: []u8, deadline_ms: i64, 
     }
 }
 
-/// Text that fits in one frame along with its JSON wrapping. A tool result
-/// this large has already passed the tool's own output limit.
+/// Writes `bytes` to the child a chunk at a time, each once the pipe has room
+/// for it, so no write blocks past the deadline or a cancellation.
+fn writeToChild(io: std.Io, file: std.Io.File, bytes: []const u8, deadline_ms: i64, caller: ?Caller) error{ Cancelled, DeadlinePassed, WriteFailed }!void {
+    var sent: usize = 0;
+    while (sent < bytes.len) {
+        if (caller) |c| if (c.cancelled_fn(c.context)) return error.Cancelled;
+        const remaining = deadline_ms - std.Io.Clock.awake.now(io).toMilliseconds();
+        if (remaining <= 0) return error.DeadlinePassed;
+        var fds = [_]std.posix.pollfd{.{ .fd = file.handle, .events = std.posix.POLL.OUT, .revents = 0 }};
+        const ready = std.posix.poll(&fds, @intCast(@min(remaining, cancel_poll_ms))) catch return error.WriteFailed;
+        if (ready == 0) continue;
+        const chunk = bytes[sent..][0..@min(bytes.len - sent, pipe_chunk_bytes)];
+        const rc = std.c.write(file.handle, chunk.ptr, chunk.len);
+        if (rc < 0) switch (std.c.errno(rc)) {
+            .INTR, .AGAIN => continue,
+            else => return error.WriteFailed,
+        };
+        sent += @intCast(rc);
+    }
+}
+
+/// Text that fits in one frame however JSON escapes it. A tool result this
+/// large has already passed the tool's own output limit.
 fn fitFrame(text: []const u8) []const u8 {
-    const room = max_frame_bytes / 2;
-    return if (text.len <= room) text else text[0..room];
+    return text_utils.utf8PrefixByBytes(text, max_result_text_bytes);
 }
 
 fn startChild(gpa: std.mem.Allocator, io: std.Io, limits: Limits) !std.process.Child {
@@ -577,6 +620,19 @@ const FakeCaller = struct {
     fn answerHello(_: []const u8, _: []const u8) CallResult {
         return .{ .ok = true, .text = "hello" };
     }
+
+    /// More than a pipe holds, so the parent's write waits on the child.
+    fn answerPlainMiB(_: []const u8, _: []const u8) CallResult {
+        return .{ .ok = true, .text = &plain_answer };
+    }
+
+    /// Bytes JSON escapes to six each.
+    fn answerEscaped(_: []const u8, _: []const u8) CallResult {
+        return .{ .ok = true, .text = &escaped_answer };
+    }
+
+    const plain_answer: [1024 * 1024]u8 = @splat('x');
+    const escaped_answer: [2 * 1024 * 1024]u8 = @splat(1);
 };
 
 /// Runs `source` in a real child. A run that fails fails the test here, so a
@@ -756,6 +812,16 @@ test "a sandboxed program's tool call over the frame limit throws instead of bei
     }
 }
 
+test "a reply that JSON escaping grows still reaches the program" {
+    var fake: FakeCaller = .{ .io = std.testing.io, .answer_fn = FakeCaller.answerEscaped };
+    defer fake.deinit();
+    const report = try runForTest(&fake, "return (await tools.read_file({})).length;", .{});
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expect(report.result == .returned);
+    var expected: [16]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.mem.print(&expected, "{d}", .{max_result_text_bytes}), report.result.returned.?);
+}
+
 test "a return value that JSON escaping grows past a frame throws a message the program can act on" {
     var fake: FakeCaller = .{ .io = std.testing.io };
     defer fake.deinit();
@@ -773,6 +839,30 @@ test "a thrown error's text is cut to fit a frame" {
     try std.testing.expect(report.result == .threw);
     try std.testing.expect(std.mem.startsWith(u8, report.result.threw, "Error: xxx"));
     try std.testing.expect(report.result.threw.len <= max_outcome_text_bytes);
+}
+
+test "the parent stops writing to a child that stops reading" {
+    if (!supported) return error.SkipZigTest;
+    const io = std.testing.io;
+    const call = "{\"kind\":\"call\",\"tool\":\"read_file\",\"input\":\"{}\"}";
+    var script_buffer: [160]u8 = undefined;
+    // Sends one call, then never reads the reply.
+    const script = try std.mem.print(&script_buffer, "printf '\\{o:0>3}\\000\\000\\000%s' '{s}'; exec sleep 30", .{ call.len, call });
+    var fake: FakeCaller = .{ .io = io, .answer_fn = FakeCaller.answerPlainMiB };
+    defer fake.deinit();
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", script },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    var parent: Parent = .{ .gpa = std.testing.allocator, .io = io, .child = &child, .limits = .{ .time_ms = 500 }, .caller = fake.caller() };
+    const started_ms = std.Io.Clock.awake.now(io).toMilliseconds();
+    const report = try parent.drive("return 1;");
+    defer report.deinit(std.testing.allocator);
+    child.kill(io);
+    try std.testing.expect(std.Io.Clock.awake.now(io).toMilliseconds() - started_ms < 10_000);
+    try std.testing.expect(report.result == .timed_out);
 }
 
 test "the parent does not wait on a child that keeps running" {
