@@ -13,6 +13,7 @@ const PgsoArtifact = enum {
     file_index,
     ui_activity,
     approval_review,
+    unit_tests,
 };
 
 const NapiSurface = enum {
@@ -113,6 +114,16 @@ pub fn build(b: *std.Build) void {
     test_paths.addOptionPathUntracked("source_root", b.path("src"));
     const test_paths_module = test_paths.createModule();
     exe.root_module.addImport("test_paths", test_paths_module);
+    // The unit tests for the Linux PGSO step that relinks them from
+    // transformed code. It builds them position independent: a test there
+    // defines the wasm host's `extern "fx"` functions itself, and Zig rejects
+    // a library extern in a static executable that is not. `install-test`
+    // does not install fx, so the build links only the tests. Run it from the
+    // repository root after `zig build` with the same prefix.
+    const pgso_tests = b.addTest(.{ .root_module = exe.root_module });
+    pgso_tests.pie = true;
+    const install_pgso_tests = b.addInstallArtifact(pgso_tests, .{ .dest_sub_path = "fx-test" });
+    b.step("install-test", "Install the unit test executable without running it").dependOn(&install_pgso_tests.step);
 
     // The session manager's own tests, as fx compiles it (no hooks).
     const session_manager_tests = b.addTest(.{ .root_module = session_manager });
@@ -325,18 +336,22 @@ pub fn build(b: *std.Build) void {
             .file_index => file_index_bench,
             .ui_activity => ui_activity_bench,
             .approval_review => approval_review_bench,
+            .unit_tests => pgso_tests,
         };
         const output_name = switch (artifact) {
             .fx => "pgso/fx.bc",
             .file_index => "pgso/file-index.bc",
             .ui_activity => "pgso/ui-activity.bc",
             .approval_review => "pgso/approval-review.bc",
+            .unit_tests => "pgso/unit-tests.bc",
         };
         const install_ir = b.addInstallFile(
             selected.getEmittedLlvmBc(),
             output_name,
         );
         pgso_ir_step.dependOn(&install_ir.step);
+        // The tests launch the fx installed under this build's prefix.
+        if (artifact == .unit_tests) pgso_ir_step.dependOn(b.getInstallStep());
     } else {
         const missing_artifact = b.addFail(
             "pgso-ir requires -Dpgso-artifact",

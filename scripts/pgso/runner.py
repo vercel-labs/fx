@@ -201,7 +201,13 @@ def run_checked(
     require_empty_stderr: bool = False,
     max_capture_chars: int | None = None,
     allowed_returncodes: Sequence[int] = (0,),
+    stdin_pipe: bool = False,
 ) -> CommandResult:
+    """Run `argv`, logging its output to `log_path`.
+
+    `stdin_pipe` gives the command a stdin pipe that stays open, with nothing
+    written to it, until the command exits. Otherwise it inherits stdin.
+    """
     argv_tuple = tuple(os.fspath(argument) for argument in argv)
     if not argv_tuple:
         raise PgsoError("cannot run an empty command")
@@ -219,6 +225,7 @@ def run_checked(
             argv_tuple,
             cwd=cwd,
             env=None if env is None else dict(env),
+            stdin=subprocess.PIPE if stdin_pipe else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -331,6 +338,9 @@ def run_checked(
         )
         emit_progress(f"command cancelled after {elapsed_seconds:.3f}s: {command_display}")
         raise
+    finally:
+        if process.stdin is not None:
+            process.stdin.close()
 
     elapsed_seconds = completed_at - started
     stdout_thread.join()

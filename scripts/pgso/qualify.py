@@ -524,7 +524,7 @@ def measure_alternating(
     )
 
 
-def measure_with_one_retry(
+def _measure_with_one_retry(
     measure: Callable[[pathlib.Path], MeasurementResult],
     logs: pathlib.Path,
 ) -> MeasurementResult:
@@ -1017,7 +1017,7 @@ def measure_startup(
             )
 
         results.append(
-            measure_with_one_retry(measure_command, logs)
+            _measure_with_one_retry(measure_command, logs)
             if retry_speed_failures
             else measure_command(logs)
         )
@@ -1222,7 +1222,7 @@ def measure_heavy_workloads(
                     sample_runner=sample_runner,
                 )
 
-            results.append(measure_with_one_retry(measure_workload, logs / workload.name))
+            results.append(_measure_with_one_retry(measure_workload, logs / workload.name))
     return tuple(results)
 
 

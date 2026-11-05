@@ -282,14 +282,6 @@ pub fn streamPrepared(
         .session_id = request.session_id,
     });
 
-    var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
-    defer client.deinit();
-    var open_operation = gateway_client.PostOperation{
-        .client = &client,
-        .uri = uri,
-        .authorization = auth_headers.authorization,
-        .extra_headers = extra_headers,
-    };
     var connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromMilliseconds(connect_timeout_ms),
@@ -300,14 +292,13 @@ pub fn streamPrepared(
         }
     }
     try request.admission.admit();
-    var opened = try gateway_client.openBoundedPost(
-        alloc,
-        request.cancel_flag,
-        connect_deadline,
-        &open_operation,
-    );
-    var http_request = opened.take();
-    defer http_request.deinit();
+    var opened = try gateway_client.openBoundedPost(request.cancel_flag, connect_deadline, .{
+        .uri = uri,
+        .authorization = auth_headers.authorization,
+        .extra_headers = extra_headers,
+    });
+    defer opened.deinit();
+    const http_request = &opened.request;
     var watch: gateway_client.ConnectionWatch = .init(.{
         .patient = true,
         .stall_timeout_ms = gateway_client.ConnectionWatch.bodyStallTimeoutMs(request.deadline),

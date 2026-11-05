@@ -57,6 +57,17 @@ class PgsoCliTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     parse_args([command])
 
+    def test_unit_tests_command_takes_a_linux_target(self) -> None:
+        arguments = parse_args([*self.required_arguments("unit-tests"), "--target", "x86_64-linux"])
+
+        self.assertEqual("unit-tests", arguments.command)
+        self.assertEqual("x86_64-linux", arguments.target)
+        self.assertEqual("stable", arguments.update_channel)
+        self.assertEqual("zig", arguments.zig)
+        for target in (None, "aarch64-macos"):
+            with self.subTest(target=target), self.assertRaises(SystemExit):
+                parse_args([*self.required_arguments("unit-tests"), *(("--target", target) if target else ())])
+
     def test_qualification_rejects_fewer_than_fifty_samples(self) -> None:
         for command in ("all",):
             with self.subTest(command=command):

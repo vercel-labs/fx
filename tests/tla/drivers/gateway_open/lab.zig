@@ -4,10 +4,12 @@
 //! to the file named by its second.
 //!
 //! The lab plays both sides the way `src/gateway/client.zig` does and knows
-//! nothing about the model: the job's open returns when the driver says, the
-//! job then publishes and closes a late connection when told to, and the
-//! waiting request polls with Esc as the driver set it. After every
-//! operation it reports what each side holds.
+//! nothing about the model: the job's lookup and connect return when the
+//! driver says, the job's watch stops a connect once the request walked
+//! away, the job then publishes and closes a late connection and frees its
+//! client when told to, and the waiting request polls with Esc as the driver
+//! set it and frees the client once it is done with what it took. After
+//! every operation it reports what each side holds.
 const std = @import("std");
 const open_job = @import("open_job");
 
@@ -19,6 +21,7 @@ const StateOut = struct {
     worker: []const u8,
     job: []const u8,
     conn: []const u8,
+    client: []const u8,
     state: []const u8,
     cancelled: bool,
 };
@@ -30,10 +33,17 @@ const Result = struct {
 
 const Lab = struct {
     handoff: open_job.Handoff = .{},
-    worker: enum { waiting, returned, using } = .waiting,
-    job: enum { lookup, finished, published } = .lookup,
+    worker: enum { waiting, returned, using, done } = .waiting,
+    job: enum { lookup, connect, finished, published } = .lookup,
     conn: enum { none, open, closed } = .none,
+    client: enum { live, freed } = .live,
     cancelled: bool = false,
+
+    /// Closes the connection, if one is open, and frees the client.
+    fn closeAndFree(lab: *Lab) void {
+        if (lab.conn == .open) lab.conn = .closed;
+        lab.client = .freed;
+    }
 };
 
 fn run(lab: *Lab, op: Op, result: *Result) void {
@@ -47,28 +57,41 @@ fn run(lab: *Lab, op: Op, result: *Result) void {
     } else if (is(op.op, "cancel")) {
         lab.cancelled = true;
     } else if (is(op.op, "lookup_returns")) {
-        if (lab.job != .lookup) result.@"error" = "the open already returned";
-        lab.job = .finished;
+        if (lab.job != .lookup) result.@"error" = "the lookup already returned";
+        lab.job = .connect;
         lab.conn = .open;
+    } else if (is(op.op, "connect_returns")) {
+        if (lab.job != .connect) result.@"error" = "no connect to finish";
+        lab.job = .finished;
+    } else if (is(op.op, "job_watch")) {
+        // A lookup cannot be stopped; a connect ends, closing its socket.
+        if (lab.job == .connect and lab.handoff.abandoned()) {
+            lab.job = .finished;
+            lab.conn = .closed;
+        }
     } else if (is(op.op, "job_publish")) {
         if (lab.job != .finished) result.@"error" = "nothing to publish";
         lab.job = .published;
         switch (lab.handoff.publish()) {
             .hand_over => {},
-            .close_late => lab.conn = .closed,
+            .close_late => lab.closeAndFree(),
         }
     } else if (is(op.op, "worker_poll")) {
         if (lab.worker != .waiting) result.@"error" = "the request is not waiting";
         if (lab.cancelled) switch (lab.handoff.stop()) {
             .walk_away => lab.worker = .returned,
             .close_handed => {
-                lab.conn = .closed;
+                lab.closeAndFree();
                 lab.worker = .returned;
             },
         } else switch (lab.handoff.poll()) {
             .wait => {},
             .take => lab.worker = .using,
         }
+    } else if (is(op.op, "worker_done")) {
+        if (lab.worker != .using) result.@"error" = "the request holds no connection";
+        lab.closeAndFree();
+        lab.worker = .done;
     } else {
         result.@"error" = "unknown op";
     }
@@ -79,6 +102,7 @@ fn stateOut(lab: *const Lab) StateOut {
         .worker = @tagName(lab.worker),
         .job = @tagName(lab.job),
         .conn = @tagName(lab.conn),
+        .client = @tagName(lab.client),
         .state = @tagName(lab.handoff.state.load(.acquire)),
         .cancelled = lab.cancelled,
     };

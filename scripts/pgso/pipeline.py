@@ -109,6 +109,9 @@ ARTIFACT_LAYOUTS = {
         "approval-review-bench",
         "approval-review.bc",
     ),
+    # Linux only: scripts/pgso/unit_tests.py runs the unit tests on
+    # transformed code.
+    "unit_tests": ("install-test", "fx-test", "unit-tests.bc"),
 }
 
 
@@ -478,12 +481,13 @@ def candidate_object_argv(
     *,
     production_flags: bool = False,
 ) -> tuple[str, ...]:
-    # A second AArch64 outliner pass can fold sequences exposed by the first,
-    # and each size-optimized function saves and restores its callee-saved
-    # registers through a shared frame helper instead of inline. The measured
-    # benchmark candidates pass `production_flags` so the heavy gates measure
-    # the code generation fx ships. A benchmark trained on its own workload
-    # keeps the default code generation.
+    # A second outliner pass can fold sequences exposed by the first. It runs
+    # wherever the outliner runs: AArch64, and cold code on Linux x86_64. On
+    # AArch64, each size-optimized function also saves and restores its
+    # callee-saved registers through a shared frame helper instead of inline.
+    # The measured benchmark candidates pass `production_flags` so the heavy
+    # gates measure the code generation fx ships. A benchmark trained on its
+    # own workload keeps the default code generation.
     production = production_flags or paths.selector == "fx"
     codegen_flags = FX_CODEGEN_FLAGS if production else ()
     return (
@@ -498,6 +502,11 @@ def candidate_object_argv(
     )
 
 
+# A ReleaseSafe build of fx takes about 7 minutes on the PGSO runners and the
+# unit test executable up to about 13, so this only ends a build that hangs.
+ZIG_BUILD_TIMEOUT_S = 1800
+
+
 def build_control(
     toolchain: Toolchain,
     spec: ArtifactSpec,
@@ -510,7 +519,7 @@ def build_control(
         ),
         cwd=spec.repo_root,
         env=zig_build_env(paths),
-        timeout_s=900,
+        timeout_s=ZIG_BUILD_TIMEOUT_S,
         log_path=paths.logs / "build-control.json",
     )
     _require_nonempty_file(paths.control_binary, "ReleaseSafe control")
@@ -529,7 +538,7 @@ def emit_bitcode(
         zig_build_argv(toolchain, spec, paths, emit_ir=True),
         cwd=spec.repo_root,
         env=zig_build_env(paths),
-        timeout_s=900,
+        timeout_s=ZIG_BUILD_TIMEOUT_S,
         log_path=paths.logs / "emit-bitcode.json",
     )
     _require_nonempty_file(paths.bitcode, "ReleaseSafe LLVM bitcode")

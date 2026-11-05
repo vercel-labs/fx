@@ -226,6 +226,47 @@ DEFAULT_VALUE_MAIN = (
     "  ret i32 1\n"
     "}\n"
 )
+# Copy only the first 1,048 bytes of the default value, which end inside its
+# zero [3 x i32] and leave out its i64, over a buffer filled with 0xAB. Copy
+# the same bytes of @reference, an external constant the pass leaves alone,
+# over a second such buffer, and exit 0 only when the two buffers match byte
+# for byte. The four padding bytes after the i32 (1,028 to 1,031) are
+# undefined in both constants, and the interpreter leaves whatever memory held
+# there, so the comparison skips them.
+PARTIAL_COPY_MAIN = (
+    "@reference = constant %Default "
+    "{ [128 x i64] zeroinitializer, i32 7, ptr @target, [3 x i32] zeroinitializer, i64 -1 }, align 8\n"
+    "define i32 @main() {\n"
+    "entry:\n"
+    "  %out = alloca %Default, align 8\n"
+    "  %expected = alloca %Default, align 8\n"
+    "  call void @llvm.memset.p0.i64(ptr align 8 %out, i8 171, i64 1064, i1 false)\n"
+    "  call void @llvm.memset.p0.i64(ptr align 8 %expected, i8 171, i64 1064, i1 false)\n"
+    "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %out, ptr align 8 @default, i64 1048, i1 false)\n"
+    "  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %expected, ptr align 8 @reference, i64 1048, i1 false)\n"
+    "  br label %loop\n"
+    "loop:\n"
+    "  %i = phi i64 [ 0, %entry ], [ %next, %same ]\n"
+    "  %out_byte = getelementptr inbounds i8, ptr %out, i64 %i\n"
+    "  %expected_byte = getelementptr inbounds i8, ptr %expected, i64 %i\n"
+    "  %got = load i8, ptr %out_byte\n"
+    "  %want = load i8, ptr %expected_byte\n"
+    "  %equal = icmp eq i8 %got, %want\n"
+    "  %after_code = icmp uge i64 %i, 1028\n"
+    "  %before_pointer = icmp ult i64 %i, 1032\n"
+    "  %padding = and i1 %after_code, %before_pointer\n"
+    "  %matches = or i1 %equal, %padding\n"
+    "  br i1 %matches, label %same, label %bad\n"
+    "same:\n"
+    "  %next = add i64 %i, 1\n"
+    "  %more = icmp ult i64 %next, 1064\n"
+    "  br i1 %more, label %loop, label %ok\n"
+    "ok:\n"
+    "  ret i32 0\n"
+    "bad:\n"
+    "  ret i32 1\n"
+    "}\n"
+)
 
 
 @unittest.skipUnless(AVAILABLE and (LLVM_BIN / "lli").is_file(), "pinned LLVM with libLLVM and lli is not installed")
@@ -268,6 +309,18 @@ class ZeroFilledCopyTests(LlvmCase):
         result, output = self.run_pass("sparse-constants", source)
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual(1, json.loads(result.stdout)["zero_filled_constants"])
+        self.assertEqual(0, self.exit_code(output))
+
+    def test_partial_zero_filled_copy_leaves_the_bytes_past_its_length(self) -> None:
+        source = self.assemble("partial_copy", DEFAULT_VALUE + PARTIAL_COPY_MAIN)
+        self.assertEqual(0, self.exit_code(source))
+        result, output = self.run_pass("sparse-constants", source)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(1, json.loads(result.stdout)["zero_filled_constants"])
+        ir = self.cleaned_ir(output)
+        self.assertIn("call void @llvm.memset.p0.i64(ptr align 8 %out, i8 0, i64 1048, i1 false)", ir)
+        self.assertNotIn("store i64 -1", ir)
         self.assertEqual(0, self.exit_code(output))
 
     def test_dense_constant_keeps_its_copy(self) -> None:

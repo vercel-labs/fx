@@ -537,6 +537,9 @@ fn refreshSession(
     try form.append(&body.writer, "grant_type", "refresh_token");
     try form.append(&body.writer, "client_id", client_id);
     try form.append(&body.writer, "refresh_token", session.refresh_token);
+    // Each request has its whole budget from a fresh stamp, so another fx
+    // waits for this one however slowly xAI answers.
+    mutation.restamp();
     var token = requestRefreshToken(alloc, transport, body.written()) catch |err| switch (err) {
         error.CredentialRefreshRejected,
         error.InvalidGrokOAuthResponse,
@@ -549,6 +552,8 @@ fn refreshSession(
     };
     defer token.deinit(alloc);
 
+    // The replacement asks xAI for the account the new token belongs to.
+    mutation.restamp();
     var replacement = refreshReplacement(alloc, transport, &token, session.*) catch |err| {
         if (err == error.OutOfMemory) return err;
         debug_trace.logf("auth", "retiring unusable Grok refresh reason={s}", .{@errorName(err)});

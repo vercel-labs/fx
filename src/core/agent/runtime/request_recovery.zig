@@ -23,7 +23,8 @@
 //! (`responseRecord`); any other save is written at once. A launch reads the
 //! newest one to resume the request (`tests/tla/recovery/Resume.tla`). One
 //! request at a time registers for `closeActive`, which SIGHUP and SIGTERM
-//! call from the closer thread.
+//! call from the closer thread, and a terminal that hangs up calls from the
+//! main thread.
 //!
 //! The module retries every transient failure for as long as it lasts, and fx
 //! adds no limit of its own: only Esc ends a request whose failures keep
@@ -189,10 +190,11 @@ pub const RequestRecovery = struct {
         self.writeRecordLocked();
     }
 
-    /// SIGHUP or SIGTERM: delivers `closing` to the registered request and
-    /// writes the clean record it returns, so the next launch resumes the
-    /// request without counting a death (`tests/tla/recovery/Resume.tla`
-    /// NoFalseCrashQuestion). Waits at most `close_wait_ms` for each lock.
+    /// SIGHUP, SIGTERM, or a terminal that hangs up: delivers `closing` to the
+    /// registered request and writes the clean record it returns, so the next
+    /// launch resumes the request without counting a death
+    /// (`tests/tla/recovery/Resume.tla` NoFalseCrashQuestion). Waits at most
+    /// `close_wait_ms` for each lock.
     /// Returns whether a record was written.
     pub fn closeActive() bool {
         const io = io_mod.getIo();

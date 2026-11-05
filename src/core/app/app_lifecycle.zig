@@ -89,7 +89,8 @@ fn tmuxAbnormalExitHandler(sig: std.posix.SIG) callconv(.c) void {
 /// resumes it without counting a crash (`RequestRecovery.closeActive`,
 /// `tests/tla/recovery/Resume.tla` NoFalseCrashQuestion). It then restores
 /// the terminal and re-raises as the handler did before. Without that
-/// thread, the handler restores and re-raises itself.
+/// thread, the handler restores and re-raises itself. A terminal that hangs
+/// up closes fx the same way (`closeOnHangup`).
 var close_pipe: [2]std.posix.fd_t = .{ -1, -1 };
 var close_signal: std.atomic.Value(i32) = .init(0);
 var closer_tmux = false;
@@ -118,6 +119,27 @@ fn closerMain() void {
     } else {
         abnormalExitHandlerWithRestore(abnormal_exit_restore, sig);
     }
+}
+
+/// A terminal that hangs up is a closed window too, and fx often sees the
+/// hang-up before SIGHUP. With a turn running, fx closes here as `closerMain`
+/// does: it saves the request in flight marked clean and ends by SIGHUP, so
+/// the turn stays open and the next launch resumes it
+/// (`tests/tla/recovery/Resume.tla` Close). A graceful shutdown would cancel
+/// the turn as Esc does, and nothing would send it again. Returns only when
+/// no turn is running.
+pub fn closeOnHangup(turn_running: bool) void {
+    if (!turn_running) return;
+    const saved = request_recovery.RequestRecovery.closeActive();
+    debug_trace.logf("app", "event=closing cause=hangup record_saved={} turn=left_open", .{saved});
+    if (io_mod.getenv("TMUX") != null) {
+        abnormalExitHandlerWithRestore(tmux_abnormal_exit_restore, std.posix.SIG.HUP);
+    } else {
+        abnormalExitHandlerWithRestore(abnormal_exit_restore, std.posix.SIG.HUP);
+    }
+    // SIGHUP is blocked in this thread: end at once, with the status it
+    // gives, as a death by SIGHUP would.
+    std.c._exit(128 + @as(c_int, @intCast(@backingInt(std.posix.SIG.HUP))));
 }
 
 /// Starts the closer once per process. False when it cannot run.

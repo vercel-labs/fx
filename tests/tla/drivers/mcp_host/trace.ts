@@ -53,6 +53,8 @@ const substitutions: Record<string, string[]> = {
   ElicitationRouting: ["Versions", "MaxQ", "Slots", "Guard"],
   UrlRetry: ["Urls", "Slots", "MaxCalls", "Guard"],
   MixedBuilds: ["RevokeOnReplay"],
+  StoreLockBudget: ["Budget", "Slack", "Tolerance"],
+  RefreshLease: ["RefreshMax", "Budget", "Slack", "Tolerance"],
 };
 
 function wrapperCfg(module: string, invariant: string): string {
