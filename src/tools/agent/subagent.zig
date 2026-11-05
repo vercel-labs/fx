@@ -3,6 +3,7 @@ const model_contract = @import("../../core/subagent/model_contract.zig");
 const tool_provider = @import("../../core/subagent/tool_provider.zig");
 const tool_dispatch = @import("../../core/tooling/tool_dispatch.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
+const tool_args = @import("../../core/tooling/tool_args.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -171,7 +172,13 @@ fn parseRoot(value: std.json.Value, problem: *Problem) DecodeError!model_contrac
     if (std.mem.eql(u8, action, "wait")) {
         problem.action = "wait";
         try rejectOutsideAction(request, &wait_fields, problem);
-        _ = try optionalString(request, "agent", problem);
+        if (try optionalString(request, "agent", problem)) |agent| {
+            debug_trace.logf(
+                "subagent",
+                "wait ignored agent=\"{f}\": wait returns the next report from any subagent",
+                .{std.zig.fmtString(agent)},
+            );
+        }
         return .wait;
     }
     if (std.mem.eql(u8, action, "status")) {
@@ -247,7 +254,7 @@ fn rejectOutsideAction(
     while (fields.next()) |entry| {
         const name = entry.key_ptr.*;
         if (listsField(allowed, name)) continue;
-        if (listsField(message_fields[1..], name) and asksForNothing(entry.value_ptr.*)) continue;
+        if (listsField(message_fields[1..], name) and tool_args.isEmptyArgumentValue(entry.value_ptr.*)) continue;
         problem.field = name;
         return error.UnknownField;
     }
@@ -258,14 +265,6 @@ fn listsField(names: []const []const u8, name: []const u8) bool {
         if (std.mem.eql(u8, listed, name)) return true;
     }
     return false;
-}
-
-fn asksForNothing(value: std.json.Value) bool {
-    return switch (value) {
-        .bool => |flag| !flag,
-        .string => |text| text.len == 0,
-        else => false,
-    };
 }
 
 pub fn validate(

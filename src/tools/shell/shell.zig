@@ -104,10 +104,10 @@ pub fn actionFieldContract(action: Action) ActionFieldContract {
 /// (`tests/tla/shell_command/ShellContract.tla` AdmissionConsistency).
 pub fn inferAction(object: std.json.ObjectMap) ?[]const u8 {
     if (object.get("action") != null) return null;
-    return switch (fittingAction(object, false)) {
+    return switch (fittingAction(object, .counted)) {
         .one => |action| @tagName(action),
         .several => null,
-        .none => switch (fittingAction(object, true)) {
+        .none => switch (fittingAction(object, .ignored_outside_action)) {
             .one => |action| @tagName(action),
             .several, .none => null,
         },
@@ -116,22 +116,26 @@ pub fn inferAction(object: std.json.ObjectMap) ?[]const u8 {
 
 const Fit = union(enum) { none, one: Action, several };
 
-fn fittingAction(object: std.json.ObjectMap, ignore_empty_outside: bool) Fit {
+/// Whether an empty field the action does not take stops the action from
+/// fitting (`counted`) or is skipped as decode would drop it.
+const EmptyFields = enum { counted, ignored_outside_action };
+
+fn fittingAction(object: std.json.ObjectMap, empty_fields: EmptyFields) Fit {
     var found: ?Action = null;
     for (std.enums.values(Action)) |action| {
-        if (!fieldsFitAction(object, actionFieldContract(action), ignore_empty_outside)) continue;
+        if (!fieldsFitAction(object, actionFieldContract(action), empty_fields)) continue;
         if (found != null) return .several;
         found = action;
     }
     return if (found) |action| .{ .one = action } else .none;
 }
 
-fn fieldsFitAction(object: std.json.ObjectMap, contract: ActionFieldContract, ignore_empty_outside: bool) bool {
+fn fieldsFitAction(object: std.json.ObjectMap, contract: ActionFieldContract, empty_fields: EmptyFields) bool {
     var fields = object.iterator();
     while (fields.next()) |entry| {
         if (isAbsentValue(entry.value_ptr.*)) continue;
         if (containsFieldName(contract.allowed, entry.key_ptr.*)) continue;
-        if (ignore_empty_outside and isDroppableOutsideAction(entry.key_ptr.*, entry.value_ptr.*)) continue;
+        if (empty_fields == .ignored_outside_action and isDroppableOutsideAction(entry.key_ptr.*, entry.value_ptr.*)) continue;
         return false;
     }
     for (contract.required) |name| {
@@ -147,18 +151,12 @@ fn isAbsentValue(value: std.json.Value) bool {
         (value == .string and tool_args.isNullPlaceholderText(value.string));
 }
 
-/// A known shell field set to an empty string or false asks for nothing, so
-/// for an action that does not take the field it means the same as leaving
-/// it out. Some models fill every advertised field this way. Unknown names
-/// and any other value still reach the field check, since they can carry
-/// intent that dropping would lose.
+/// A known shell field with an empty value (`tool_args.isEmptyArgumentValue`)
+/// means the same as leaving it out for an action that does not take it.
+/// Unknown names still reach the field check, since they can carry intent
+/// that dropping would lose.
 fn isDroppableOutsideAction(name: []const u8, value: std.json.Value) bool {
-    if (!containsFieldName(public_field_names[1..], name)) return false;
-    return switch (value) {
-        .bool => |flag| !flag,
-        .string => |text| text.len == 0,
-        else => false,
-    };
+    return containsFieldName(public_field_names[1..], name) and tool_args.isEmptyArgumentValue(value);
 }
 
 /// A run without a terminal uses the login shell and `profile`, which is
@@ -189,6 +187,11 @@ fn elideLoginShellOnPlainRun(object: *std.json.ObjectMap, action: Action, login_
         if (clean_start != .bool) return;
         if (clean_start.bool and !std.mem.eql(u8, profile orelse "user", "clean")) return;
     }
+    debug_trace.logf(
+        "shell",
+        "run without tty ignored shell field: it names the login shell path=\"{f}\"",
+        .{std.zig.fmtString(login)},
+    );
     _ = object.orderedRemove("shell");
 }
 
@@ -2433,37 +2436,37 @@ test "shell decoder preserves null omission and rejects cross action fields" {
     }
 }
 
+/// Decodes arguments a test expects to decode, printing the failure text
+/// when they do not.
+fn decodeOrFail(ctx: tool_dispatch.DispatchContext, args_json: []const u8) !tool_dispatch.ToolInput {
+    return switch (try decode(ctx, args_json)) {
+        .input => |input| input,
+        .failure => |failure| {
+            defer ctx.allocator.free(failure);
+            std.debug.print("{s}\n", .{failure});
+            return error.TestUnexpectedResult;
+        },
+    };
+}
+
 test "shell decoder drops empty fields the action does not take" {
     const alloc = std.testing.allocator;
     const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
     // Every advertised field filled in, the unused ones empty.
-    const filled = try decode(
-        ctx,
-        "{\"action\":\"run\",\"command\":\"true\",\"chars\":\"\",\"session_id\":\"\",\"force\":false,\"reload\":false,\"tty\":false}",
-    );
-    switch (filled) {
-        .failure => |failure| {
-            defer alloc.free(failure);
-            std.debug.print("{s}\n", .{failure});
-            return error.TestUnexpectedResult;
-        },
-        .input => |input| {
-            defer input.deinit(alloc);
-            const value = input.as(OwnedInput).value;
-            try std.testing.expect(isCapturedCommand(input));
-            try std.testing.expect(value.chars == null and value.session_id == null and !value.force);
-        },
+    {
+        const input = try decodeOrFail(
+            ctx,
+            "{\"action\":\"run\",\"command\":\"true\",\"chars\":\"\",\"session_id\":\"\",\"force\":false,\"reload\":false,\"tty\":false}",
+        );
+        defer input.deinit(alloc);
+        const value = input.as(OwnedInput).value;
+        try std.testing.expect(isCapturedCommand(input));
+        try std.testing.expect(value.chars == null and value.session_id == null and !value.force);
     }
-    const stop = try decode(ctx, "{\"action\":\"stop\",\"session_id\":\"shell-1\",\"command\":\"\",\"tty\":false}");
-    switch (stop) {
-        .failure => |failure| {
-            defer alloc.free(failure);
-            return error.TestUnexpectedResult;
-        },
-        .input => |input| {
-            defer input.deinit(alloc);
-            try std.testing.expectEqual(Action.stop, input.as(OwnedInput).value.action);
-        },
+    {
+        const stop = try decodeOrFail(ctx, "{\"action\":\"stop\",\"session_id\":\"shell-1\",\"command\":\"\",\"tty\":false}");
+        defer stop.deinit(alloc);
+        try std.testing.expectEqual(Action.stop, stop.as(OwnedInput).value.action);
     }
     // Text to type, a true flag, or an unknown name still does not belong to run.
     for ([_][]const u8{
@@ -2524,19 +2527,11 @@ test "shell decoder runs a call that names the login shell" {
     const ctx = tool_dispatch.DispatchContext{ .allocator = alloc };
     const args = try std.mem.concat(alloc, u8, &.{ "{\"action\":\"run\",\"command\":\"true\",\"profile\":\"clean\",\"shell\":{\"kind\":\"executable\",\"path\":\"", login, "\"},\"tty\":false}" });
     defer alloc.free(args);
-    switch (try decode(ctx, args)) {
-        .failure => |failure| {
-            defer alloc.free(failure);
-            std.debug.print("{s}\n", .{failure});
-            return error.TestUnexpectedResult;
-        },
-        .input => |input| {
-            defer input.deinit(alloc);
-            const value = input.as(OwnedInput).value;
-            try std.testing.expect(value.shell == null);
-            try std.testing.expectEqual(command_environment.Profile.clean, value.profile.?);
-        },
-    }
+    const input = try decodeOrFail(ctx, args);
+    defer input.deinit(alloc);
+    const value = input.as(OwnedInput).value;
+    try std.testing.expect(value.shell == null);
+    try std.testing.expectEqual(command_environment.Profile.clean, value.profile.?);
 }
 
 test "shell decoder applies action specific observation defaults" {

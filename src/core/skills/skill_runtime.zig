@@ -3045,7 +3045,14 @@ pub fn buildSkillPrompt(
         // A copy with the same name and description as one already listed
         // gives the model nothing to choose between, so only the first copy
         // in discovery order is listed.
-        if (listsSameSkill(visible.items, skill)) continue;
+        if (listsSameSkill(visible.items, skill)) {
+            debug_trace.logf(
+                "skills",
+                "catalog omitted identical copy name=\"{f}\" path=\"{f}\": an earlier copy with the same name and description is listed",
+                .{ std.zig.fmtString(skill.name), std.zig.fmtString(skill.path) },
+            );
+            continue;
+        }
         try visible.append(alloc, skill);
     }
     var section = renderSkillPrompt(alloc, visible.items, limits, context_window, catalog_namespace(visible.items, workspace_root), workspace_root) catch |err| {
@@ -3069,11 +3076,6 @@ pub fn buildSkillPrompt(
         return err;
     };
 }
-
-/// The most of each description the catalog shows by default, so a profile
-/// with hundreds of skills does not fill every request with descriptions. A
-/// configured `skill_description_bytes` replaces it.
-const catalog_description_characters = 200;
 
 const SkillPromptBudget = struct {
     limit: usize,
@@ -3196,7 +3198,7 @@ fn renderSkillPrompt(
         defer alloc.free(safe_description);
         var description_limited = false;
         if (limits.skill_description_bytes.source == .compiled_default) {
-            const end = skillDescriptionPrefix(safe_description, catalog_description_characters);
+            const end = skillDescriptionPrefix(safe_description, context_limits.catalog_skill_description_characters);
             try model_context_encoding.writeScalar(&description.writer, safe_description[0..end]);
             description_limited = end < safe_description.len;
         } else {
