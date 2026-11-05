@@ -4276,6 +4276,22 @@ test "auth runtime detects only credential sources that exist" {
     try std.testing.expect(!inventory.contains(.stored_key));
 }
 
+/// How long a test waits for a background source-inventory refresh. A busy
+/// machine can leave the refresh thread unscheduled for a long time, so this
+/// is a time limit, not a count of polls; a refresh that lands returns at once.
+const test_inventory_wait_ms: i64 = 10_000;
+
+/// Polls until the started inventory refresh finishes, or returns null if it
+/// does not finish within `test_inventory_wait_ms`.
+fn waitForSourceInventoryRefreshForTest(runtime: *Runtime) ?InventoryRefreshResult {
+    const deadline_ms = io_mod.milliTimestamp() + test_inventory_wait_ms;
+    while (true) {
+        if (runtime.takeSourceInventoryRefresh()) |result| return result;
+        if (io_mod.milliTimestamp() >= deadline_ms) return null;
+        io_mod.sleep(std.time.ns_per_ms);
+    }
+}
+
 test "auth inventory skips unavailable sources and keeps later sources" {
     const Probe = struct {
         unavailable: bool = true,
@@ -4304,12 +4320,7 @@ test "auth inventory skips unavailable sources and keeps later sources" {
         .{ .provider = .gateway },
         .{ .ctx = &probe, .probe = Probe.exists },
     ));
-    var result: ?InventoryRefreshResult = null;
-    for (0..100_000) |_| {
-        result = runtime.takeSourceInventoryRefresh();
-        if (result != null) break;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
+    const result = waitForSourceInventoryRefreshForTest(&runtime);
     try std.testing.expect(result != null);
     try std.testing.expect(result.? == .ready);
     try std.testing.expectEqual(expected, runtime.source_inventory);
@@ -4348,12 +4359,7 @@ test "auth inventory worker publishes one current action and preserves state on 
             .probe = Probe.exists,
         }),
     );
-    var first: ?InventoryRefreshResult = null;
-    for (0..100_000) |_| {
-        first = runtime.takeSourceInventoryRefresh();
-        if (first != null) break;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
+    const first = waitForSourceInventoryRefreshForTest(&runtime);
     try std.testing.expect(first != null);
     switch (first.?) {
         .ready => |ready| try std.testing.expectEqual(
@@ -4373,12 +4379,7 @@ test "auth inventory worker publishes one current action and preserves state on 
             .probe = Probe.exists,
         }),
     );
-    var second: ?InventoryRefreshResult = null;
-    for (0..100_000) |_| {
-        second = runtime.takeSourceInventoryRefresh();
-        if (second != null) break;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
+    const second = waitForSourceInventoryRefreshForTest(&runtime);
     try std.testing.expect(second != null);
     switch (second.?) {
         .failed => {},
