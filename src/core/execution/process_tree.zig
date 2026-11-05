@@ -79,6 +79,9 @@ const Identity = union(enum) {
 const TrackedProcess = struct {
     pid: std.posix.pid_t,
     identity: Identity,
+    /// A stop pass stopped this process, and this tracker has not killed or
+    /// resumed it since.
+    stopped: bool = false,
 };
 
 const ProcessSnapshot = struct {
@@ -297,7 +300,8 @@ pub const Tracker = struct {
 
     /// Stops every tracked process, parents first, for a caller that kills
     /// some of them another way, such as by process group, before this
-    /// tracker kills the rest.
+    /// tracker kills the rest. That kill resumes any stopped process that
+    /// neither kill reached.
     pub fn stopAll(self: *Tracker) void {
         self.stopProcessesWith(null, SystemSignalEffects);
     }
@@ -336,8 +340,13 @@ pub const Tracker = struct {
         preserved_group: ?std.posix.pid_t,
         comptime Effects: type,
     ) DeliverySummary {
-        if (signal == std.posix.SIG.KILL) self.stopProcessesWith(preserved_group, Effects);
-        return self.signalProcessesOnceWith(signal, preserved_group, Effects);
+        if (signal != std.posix.SIG.KILL) {
+            return self.signalProcessesOnceWith(signal, preserved_group, Effects);
+        }
+        self.stopProcessesWith(preserved_group, Effects);
+        const summary = self.signalProcessesOnceWith(signal, preserved_group, Effects);
+        self.resumeStoppedWith(Effects);
+        return summary;
     }
 
     /// Stops every tracked process before a SIGKILL. A parent whose child
@@ -351,10 +360,10 @@ pub const Tracker = struct {
         comptime Effects: type,
     ) void {
         var summary: DeliverySummary = .{};
-        if (self.root) |root| {
+        if (self.root) |*root| {
             self.signalTrackedProcessWith(root, std.posix.SIG.STOP, preserved_group, &summary, Effects);
         }
-        for (self.processes.items) |process| {
+        for (self.processes.items) |*process| {
             self.signalTrackedProcessWith(process, std.posix.SIG.STOP, preserved_group, &summary, Effects);
         }
     }
@@ -371,14 +380,14 @@ pub const Tracker = struct {
         while (index > 0) {
             index -= 1;
             self.signalTrackedProcessWith(
-                self.processes.items[index],
+                &self.processes.items[index],
                 signal,
                 preserved_group,
                 &summary,
                 Effects,
             );
         }
-        if (self.root) |root| {
+        if (self.root) |*root| {
             self.signalTrackedProcessWith(
                 root,
                 signal,
@@ -390,9 +399,32 @@ pub const Tracker = struct {
         return summary;
     }
 
+    /// Resumes each process a stop pass stopped that the kill after it
+    /// skipped, so a stop never outlasts its kill. A process can leave the
+    /// command's session or process group after the stop pass reads it but
+    /// before its SIGSTOP lands, and the kill then leaves it alone.
+    fn resumeStoppedWith(self: *Tracker, comptime Effects: type) void {
+        var summary: DeliverySummary = .{};
+        if (self.root) |*root| self.resumeIfStoppedWith(root, &summary, Effects);
+        for (self.processes.items) |*process| {
+            self.resumeIfStoppedWith(process, &summary, Effects);
+        }
+    }
+
+    fn resumeIfStoppedWith(
+        self: *Tracker,
+        process: *TrackedProcess,
+        summary: *DeliverySummary,
+        comptime Effects: type,
+    ) void {
+        if (!process.stopped) return;
+        process.stopped = false;
+        self.signalTrackedProcessWith(process, std.posix.SIG.CONT, null, summary, Effects);
+    }
+
     fn signalTrackedProcessWith(
         self: *Tracker,
-        process: TrackedProcess,
+        process: *TrackedProcess,
         signal: std.posix.SIG,
         preserved_group: ?std.posix.pid_t,
         summary: *DeliverySummary,
@@ -421,6 +453,8 @@ pub const Tracker = struct {
             },
         };
         summary.delivered += 1;
+        if (signal == std.posix.SIG.STOP) process.stopped = true;
+        if (signal == std.posix.SIG.KILL) process.stopped = false;
     }
 
     pub fn anyAlive(self: *Tracker) bool {
@@ -461,8 +495,13 @@ pub const Tracker = struct {
         command_session: std.posix.pid_t,
         comptime Effects: type,
     ) CompletionDelivery {
-        if (signal == std.posix.SIG.KILL) self.stopAttachedWith(command_session, Effects);
-        return self.signalAttachedOnceWith(signal, command_session, Effects);
+        if (signal != std.posix.SIG.KILL) {
+            return self.signalAttachedOnceWith(signal, command_session, Effects);
+        }
+        self.stopAttachedWith(command_session, Effects);
+        const result = self.signalAttachedOnceWith(signal, command_session, Effects);
+        self.resumeStoppedWith(Effects);
+        return result;
     }
 
     /// Stops the attached processes, parents first, for the reasons
@@ -473,10 +512,10 @@ pub const Tracker = struct {
         comptime Effects: type,
     ) void {
         var result: CompletionDelivery = .{};
-        if (self.root) |root| {
+        if (self.root) |*root| {
             self.signalIfAttachedWith(root, std.posix.SIG.STOP, command_session, &result, Effects);
         }
-        for (self.processes.items) |process| {
+        for (self.processes.items) |*process| {
             self.signalIfAttachedWith(process, std.posix.SIG.STOP, command_session, &result, Effects);
         }
     }
@@ -492,14 +531,14 @@ pub const Tracker = struct {
         while (index > 0) {
             index -= 1;
             self.signalIfAttachedWith(
-                self.processes.items[index],
+                &self.processes.items[index],
                 signal,
                 command_session,
                 &result,
                 Effects,
             );
         }
-        if (self.root) |root| {
+        if (self.root) |*root| {
             self.signalIfAttachedWith(root, signal, command_session, &result, Effects);
         }
         return result;
@@ -507,13 +546,13 @@ pub const Tracker = struct {
 
     fn signalIfAttachedWith(
         self: *Tracker,
-        process: TrackedProcess,
+        process: *TrackedProcess,
         signal: std.posix.SIG,
         command_session: std.posix.pid_t,
         result: *CompletionDelivery,
         comptime Effects: type,
     ) void {
-        switch (self.completionStandingWith(process, command_session, Effects)) {
+        switch (self.completionStandingWith(process.*, command_session, Effects)) {
             .attached => self.signalTrackedProcessWith(
                 process,
                 signal,
@@ -1050,7 +1089,8 @@ test "natural completion detaches only processes that left the command session" 
 
 test "natural completion stops attached processes and keeps detached daemons" {
     const FakeEffects = struct {
-        var sent: [16]std.posix.pid_t = undefined;
+        var pids: [16]std.posix.pid_t = undefined;
+        var signals: [16]std.posix.SIG = undefined;
         var sent_count: usize = 0;
 
         fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
@@ -1082,10 +1122,8 @@ test "natural completion stops attached processes and keeps detached daemons" {
         }
 
         fn send(pid: std.posix.pid_t, signal: std.posix.SIG) std.posix.KillError!void {
-            // The stop pass before each kill is covered by "a kill stops
-            // every tracked process before killing any".
-            if (signal != std.posix.SIG.KILL) return;
-            sent[sent_count] = pid;
+            pids[sent_count] = pid;
+            signals[sent_count] = signal;
             sent_count += 1;
         }
     };
@@ -1101,10 +1139,19 @@ test "natural completion stops attached processes and keeps detached daemons" {
 
     FakeEffects.sent_count = 0;
     const completed = tracker.signalAttachedWith(std.posix.SIG.KILL, 500, FakeEffects);
+    // The attached processes stop and then die. The daemons 31 and 33 get
+    // no signal at all, not even the stop.
+    const stop = std.posix.SIG.STOP;
+    const kill = std.posix.SIG.KILL;
     try std.testing.expectEqualSlices(
         std.posix.pid_t,
-        &.{ 37, 32, 30 },
-        FakeEffects.sent[0..FakeEffects.sent_count],
+        &.{ 30, 32, 37, 37, 32, 30 },
+        FakeEffects.pids[0..FakeEffects.sent_count],
+    );
+    try std.testing.expectEqualSlices(
+        std.posix.SIG,
+        &.{ stop, stop, stop, kill, kill, kill },
+        FakeEffects.signals[0..FakeEffects.sent_count],
     );
     try std.testing.expectEqual(@as(usize, 3), completed.delivery.delivered);
     try std.testing.expectEqual(@as(usize, 2), completed.kept_detached);
@@ -1185,6 +1232,102 @@ test "a kill stops every tracked process before killing any" {
     FakeEffects.sent_count = 0;
     _ = tracker.signalProcessesWith(std.posix.SIG.TERM, null, FakeEffects);
     try std.testing.expectEqual(@as(usize, 3), FakeEffects.sent_count);
+}
+
+test "a kill resumes the processes it stopped but did not kill" {
+    const FakeEffects = struct {
+        var session_reads: usize = 0;
+        var group_reads: usize = 0;
+        var pids: [8]std.posix.pid_t = undefined;
+        var signals: [8]std.posix.SIG = undefined;
+        var sent_count: usize = 0;
+
+        fn capture(_: Allocator, pid: std.posix.pid_t) !ProcessSnapshot {
+            return .{ .identity = .{ .linux_start_ticks = @intCast(pid) }, .parent_pid = 1 };
+        }
+
+        // 71 joins process group 700 just after the stop pass reads its
+        // group. 72 is always in it.
+        fn processGroup(pid: std.posix.pid_t) ProcessGroupState {
+            switch (pid) {
+                71 => {
+                    group_reads += 1;
+                    return .{ .found = if (group_reads == 1) 71 else 700 };
+                },
+                72 => return .{ .found = 700 },
+                else => return .{ .found = pid },
+            }
+        }
+
+        // 71 calls setsid() just after the stop pass reads its session.
+        fn session(pid: std.posix.pid_t) SessionState {
+            if (pid != 71) return .{ .found = 500 };
+            session_reads += 1;
+            return .{ .found = if (session_reads == 1) 500 else 71 };
+        }
+
+        fn send(pid: std.posix.pid_t, signal: std.posix.SIG) std.posix.KillError!void {
+            pids[sent_count] = pid;
+            signals[sent_count] = signal;
+            sent_count += 1;
+        }
+
+        fn reset() void {
+            session_reads = 0;
+            group_reads = 0;
+            sent_count = 0;
+        }
+
+        fn expectSent(expected_pids: []const std.posix.pid_t, expected_signals: []const std.posix.SIG) !void {
+            try std.testing.expectEqualSlices(std.posix.pid_t, expected_pids, pids[0..sent_count]);
+            try std.testing.expectEqualSlices(std.posix.SIG, expected_signals, signals[0..sent_count]);
+        }
+    };
+
+    // The root 70 runs 71.
+    var tracker = Tracker{
+        .alloc = std.testing.allocator,
+        .root = .{ .pid = 70, .identity = .{ .linux_start_ticks = 70 } },
+    };
+    defer tracker.deinit();
+    try tracker.processes.append(std.testing.allocator, .{
+        .pid = 71,
+        .identity = .{ .linux_start_ticks = 71 },
+    });
+    const stop = std.posix.SIG.STOP;
+    const kill = std.posix.SIG.KILL;
+    const cont = std.posix.SIG.CONT;
+    // 71 stops, then the kill skips it, so it is resumed instead of being
+    // left stopped.
+    const pids = [_]std.posix.pid_t{ 70, 71, 70, 71 };
+    const signals = [_]std.posix.SIG{ stop, stop, kill, cont };
+
+    // A forced kill that spares process group 700.
+    FakeEffects.reset();
+    const summary = tracker.signalProcessesWith(kill, 700, FakeEffects);
+    try FakeEffects.expectSent(&pids, &signals);
+    try std.testing.expectEqual(@as(usize, 1), summary.delivered);
+
+    // Natural-completion cleanup, which keeps 71 running as a daemon once
+    // it has left the command's session.
+    FakeEffects.reset();
+    const completed = tracker.signalAttachedWith(kill, 500, FakeEffects);
+    try FakeEffects.expectSent(&pids, &signals);
+    try std.testing.expectEqual(@as(usize, 1), completed.delivery.delivered);
+    try std.testing.expectEqual(@as(usize, 1), completed.kept_detached);
+
+    // `stopAll` stops 72, the caller's own kill of group 700 misses it, and
+    // the kill of everything outside that group resumes it.
+    var grouped = Tracker{ .alloc = std.testing.allocator };
+    defer grouped.deinit();
+    try grouped.processes.append(std.testing.allocator, .{
+        .pid = 72,
+        .identity = .{ .linux_start_ticks = 72 },
+    });
+    FakeEffects.reset();
+    grouped.stopProcessesWith(null, FakeEffects);
+    _ = grouped.signalProcessesWith(kill, 700, FakeEffects);
+    try FakeEffects.expectSent(&.{ 72, 72 }, &.{ stop, cont });
 }
 
 test "natural completion keeps an unreadable process attached and reports it" {

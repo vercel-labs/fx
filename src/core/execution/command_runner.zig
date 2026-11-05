@@ -2705,6 +2705,46 @@ test "zsh commands keep words that start with = literal in every captured profil
     try std.testing.expectEqualStrings("loaded\nloaded\n", try readAbsoluteFile(arena, loads_path, 4096));
 }
 
+test "a startup file's builtin function never runs in place of fx's shell setup" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    // zsh and bash run a function before a builtin of the same name, so this
+    // one would run in place of every `\builtin` line fx adds. It leaves a log
+    // each time it runs.
+    const rc = "builtin() { echo hijacked >> \"$HOME/hijack.log\"; }\n";
+    const command = "echo before; echo ======; echo after";
+    const expected = "exit_code=0\n<stdout>\nbefore\n======\nafter\n</stdout>\n";
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+    const Shell = struct { name: []const u8, rc_name: []const u8 };
+    for ([_]Shell{
+        .{ .name = "zsh", .rc_name = ".zshrc" },
+        .{ .name = "bash", .rc_name = ".bash_profile" },
+    }) |shell| {
+        const real = try std.mem.concat(std.testing.allocator, u8, &.{ "/bin/", shell.name });
+        defer std.testing.allocator.free(real);
+        std.Io.Dir.accessAbsolute(io_mod.getIo(), real, .{}) catch continue;
+
+        var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const paths = try writeSnapshotTestShellFor(arena, &tmp, shell.name, shell.rc_name, rc);
+        const log_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "hijack.log" });
+
+        shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+        const snapshot = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+        try std.testing.expectEqualStrings(expected, snapshot.output);
+
+        shell_snapshot.resetProcessOwnerForTest(brokenReplayCapture);
+        const full_startup = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+        try std.testing.expectEqualStrings(expected, full_startup.output);
+
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io_mod.getIo(), log_path, .{}));
+    }
+}
+
 fn formatOutput(alloc: Allocator, command: []const u8, cwd: []const u8, term: std.process.Child.Term, stdout_raw: []const u8, stderr_raw: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {
     return formatOutputWithStatus(
         alloc,
@@ -6684,8 +6724,11 @@ test "runtime cancellation observed at the timeout deadline stays graceful" {
         defer alloc.free(term_path);
         const quoted_term = try shellQuote(alloc, term_path);
         defer alloc.free(quoted_term);
+        // `wait` lets the trap run as soon as TERM arrives. A shell defers it
+        // while a foreground `sleep` runs, and a `sleep` that starts after
+        // fx's last look at the process tree outlasts the grace period.
         const command = try alloc.print(
-            "trap 'printf TERM > {s}; sleep 3; exit 130' TERM; printf 'TIE-READY\n'; while :; do sleep 1; done",
+            "trap 'printf TERM > {s}; sleep 3; exit 130' TERM; printf 'TIE-READY\n'; while :; do sleep 1 & wait $!; done",
             .{quoted_term},
         );
         defer alloc.free(command);

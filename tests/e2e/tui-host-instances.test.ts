@@ -564,7 +564,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         const printed = await quitWith(session, "/exit");
         const second = sessionHolding(home, "HOST_ANSWER_B");
         expect(second).not.toBeNull();
-        expect(printed).toContain(`Continue session with: fx --resume ${second}`);
+        expect(printed).toContain(`Resume this session with:\nfx --resume ${second}\n`);
         expect(printed).not.toContain(`fx --resume ${sessionHolding(home, "HOST_ANSWER_A")}`);
       });
     },
@@ -592,7 +592,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         });
         const saved = sessionHolding(home, "HOST_ANSWER_A");
         expect(saved).not.toBeNull();
-        expect(printed).toContain(`Continue session with: fx --resume ${saved}`);
+        expect(printed).toContain(`Resume this session with:\nfx --resume ${saved}\n`);
         // Resuming it brings back fx 1 alone, with no notice about the others.
         await withHost(answerByLetter, { args: `--resume ${saved}`, reuse: { home, workspace } }, async ({ session }) => {
           const pane = await session.waitForPane((value) => value.includes("HOST_ANSWER_A"), 30_000);
@@ -619,7 +619,7 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         const printed = await quitWith(session, "/close");
         const last = sessionHolding(home, "HOST_ANSWER_B");
         expect(last).not.toBeNull();
-        expect(printed).toContain(`Continue session with: fx --resume ${last}`);
+        expect(printed).toContain(`Resume this session with:\nfx --resume ${last}\n`);
       });
     },
     TIMEOUT,
@@ -958,10 +958,14 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
     "a subagent without a profile copies its instance, and one with a profile gets what the profile says",
     async () => {
       let home = "";
+      let builderAsked = false;
       const bodies = await withHost((body) => {
         const texts = userTexts(body).join("\n");
         if (texts.includes("TREE_PLAIN_TASK")) return text("plain_done", "TREE_PLAIN_DONE");
-        if (texts.includes("TREE_BUILDER_TASK")) return text("builder_done", "TREE_BUILDER_DONE");
+        if (texts.includes("TREE_BUILDER_TASK")) {
+          builderAsked = true;
+          return text("builder_done", "TREE_BUILDER_DONE");
+        }
         const last = userTexts(body).at(-1) ?? "";
         if (last.includes("TREE_USER_PLAIN")) {
           if (answered(body)) return text("plain_final", "TREE_PLAIN_FINAL");
@@ -984,6 +988,10 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
         await session.waitForComposer(15_000);
         await session.sendText("TREE_USER_BUILDER start a builder");
         await session.waitForText("TREE_BUILDER_FINAL", 45_000);
+        // Main answers as soon as its call returns, which can be before the
+        // builder's own request is out.
+        const deadline = Date.now() + 15_000;
+        while (!builderAsked && Date.now() < deadline) await Bun.sleep(25);
       });
       const holding = (marker: string) => bodies.filter((body) => userTexts(body).join("\n").includes(marker));
       // fx 2 runs in its profile, without the shell.
@@ -1177,6 +1185,35 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
       }
     },
     TIMEOUT * 2,
+  );
+
+  test(
+    "fx --profile <name> uses the profile's model unless the process chose one",
+    async () => {
+      for (const [args, fxModel, expected] of [
+        ["--profile chooser", undefined, "profile/model"],
+        ["--profile chooser", "openai/gpt-5", "openai/gpt-5"],
+        ["--profile chooser --model other/model", "openai/gpt-5", "other/model"],
+      ] as const) {
+        const label = `${args} FX_MODEL=${fxModel}`;
+        const home = createIsolatedTestHome();
+        const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-profile-model-")));
+        try {
+          writeProfile(home, "chooser", { description: "Chooses a model", model: "profile/model", effort: "high" });
+          const requests: Array<{ body: string; headers: Headers }> = [];
+          await withHost(echoMarker, { args, env: { FX_MODEL: fxModel }, models: PREFERENCE_MODELS, requests, reuse: { home, workspace } }, async ({ session }) => {
+            await promptMarker(session, "PROFILE_START");
+          });
+          const started = preferencesOf(requests, "PROFILE_START");
+          expect(started?.model, label).toBe(expected);
+          expect(started?.reasoning, label).toBe("high");
+        } finally {
+          cleanupIsolatedTestHome(home);
+          rmSync(workspace, { recursive: true, force: true });
+        }
+      }
+    },
+    TIMEOUT * 3,
   );
 
   test(

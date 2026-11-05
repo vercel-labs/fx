@@ -226,8 +226,9 @@ for (const variant of ["joined", "stopped", "late"] as const) test.skipIf(!tmuxA
       await session.waitForStableComposer(TIMEOUT);
       const resumed = await session.captureFullScrollback();
       expect(resumed).toContain("reviewer feedback queued");
-      // A report turn comes back as its card, never as the user's prompt.
-      expect(resumed).toContain("Report from reviewer: completed (ctrl+o to view)");
+      // A report turn comes back as its subagent row, never as the user's prompt.
+      expect(resumed).toContain("reviewer completed");
+      expect(resumed).not.toContain("Subagent report (untrusted");
       expect(host.requests.length).toBe(requestsBeforeResume);
       await session.sendText("/quit");
       await waitForCondition(() => session!.paneStatus().dead, "resumed fx exit");
@@ -6669,7 +6670,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(work().spawns).toBe(4);
         const scrollback = await session.captureFullScrollback();
         expect(scrollback).toContain("sent to reviewer");
-        expect(scrollback).toContain("Report from reviewer: completed (ctrl+o to view)");
+        expect(scrollback).toContain("reviewer completed");
         expect(scrollback).not.toContain("child_busy");
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await session.sendText("/quit");
@@ -6773,15 +6774,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         releaseFirst(fakeGatewayFinalText("PARALLEL_FIRST_DONE"));
         await session.waitForText("FIRST_REPORT_READ", TIMEOUT);
         const partial = await session.captureFullScrollback();
-        expect(partial).toContain("Report from first: completed (ctrl+o to view)");
-        expect(partial).not.toContain("Report from second");
+        expect(partial).toContain("first completed");
+        expect(partial).not.toContain("second completed");
         expect(reportTurns).toHaveLength(1);
 
         releaseSecond(fakeGatewayFinalText("PARALLEL_SECOND_DONE"));
         await session.waitForText("SECOND_REPORT_READ", TIMEOUT);
         const completed = await session.captureFullScrollback();
-        expect(countOccurrences(completed, "Report from first: completed")).toBe(1);
-        expect(countOccurrences(completed, "Report from second: completed")).toBe(1);
+        expect(countOccurrences(completed, "first completed")).toBe(1);
+        expect(countOccurrences(completed, "second completed")).toBe(1);
         expect(reportTurns).toHaveLength(2);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         await session.sendText("/quit");
@@ -6880,7 +6881,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(compact).not.toContain("sent to Invalid Agent");
         for (let index = 0; index < tasks.length; index += 1) {
           expect(countOccurrences(compact, rowSent(index))).toBe(1);
-          expect(countOccurrences(compact, `Report from ${rowAgents[index]}: completed (ctrl+o to view)`)).toBe(1);
+          expect(countOccurrences(compact, `${rowAgents[index]} completed`)).toBe(1);
         }
         expect(compact).not.toContain("Managed subagent");
         await session.resizeWindow(45, 30);
@@ -6914,7 +6915,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         expect(resumed).toContain("sent to helper · Check one-off cleanup");
         expect(resumed).toContain("sent to checker · Check replay again");
         for (const agent of rowAgents) {
-          expect(countOccurrences(resumed, `Report from ${agent}: completed (ctrl+o to view)`)).toBe(1);
+          expect(countOccurrences(resumed, `${agent} completed`)).toBe(1);
         }
         expect(rowGateway.requests.length).toBe(requestCount);
         expect(readFileSync(join(root, "resumed-stderr.log"), "utf8")).toBe("");
@@ -6926,7 +6927,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "a report that joins a running turn shows as its card, is saved with the turn, and resumes the same",
+    "a report that joins a running turn shows as its subagent row, is saved with the turn, and resumes the same",
     async () => {
       root = realpathSync(mkdtempSync(join(tmpdir(), "fx-joined-report-")));
       const home = join(root, "home");
@@ -6979,15 +6980,15 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         FX_E2E_GATEWAY_CHAT_URL: joinedGateway.chatUrl,
         FX_MODEL: MODEL,
       };
-      const card = "Report from helper: completed (ctrl+o to view)";
+      const row = "helper completed";
       session = await TmuxSession.create({ cwd: workspace, env, width: 110, height: 35, stderrPath });
       try {
         await session.waitForComposer(TIMEOUT);
         await session.sendText(rootPrompt);
         await session.waitForText("MAIN_SAW_JOINED_REPORT", TIMEOUT);
-        await session.waitForText(card, TIMEOUT);
+        await session.waitForText(row, TIMEOUT);
         const live = await session.captureFullScrollback();
-        expect(countOccurrences(live, card)).toBe(1);
+        expect(countOccurrences(live, row)).toBe(1);
         // The frame is the subagent's, never drawn as the user's prompt.
         expect(live).not.toContain(header);
         expect(live).not.toContain("REPORT_NEVER_JOINED");
@@ -6998,9 +6999,9 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
         session = await TmuxSession.create({ cmd: `${FX_BIN} --resume last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
         await session.waitForText("MAIN_SAW_JOINED_REPORT", TIMEOUT);
-        await session.waitForText(card, TIMEOUT);
+        await session.waitForText(row, TIMEOUT);
         const resumed = await session.captureFullScrollback();
-        expect(countOccurrences(resumed, card)).toBe(1);
+        expect(countOccurrences(resumed, row)).toBe(1);
         expect(resumed).not.toContain(header);
         // The saved turn kept the report, in its own frame.
         await session.sendText("AFTER_RESUME_PROMPT");

@@ -55,6 +55,52 @@ function userTexts(body: string): string[] {
   });
 }
 
+// The tab title once it has held still for half a second.
+async function stablePaneTitle(session: TmuxSession, ms = 15_000): Promise<string> {
+  const deadline = Date.now() + ms;
+  let last = await session.paneTitle();
+  let since = Date.now();
+  while (Date.now() < deadline) {
+    await Bun.sleep(100);
+    const now = await session.paneTitle();
+    if (now !== last) {
+      last = now;
+      since = Date.now();
+    } else if (Date.now() - since >= 500) {
+      return now;
+    }
+  }
+  return last;
+}
+
+async function waitForPaneTitle(session: TmuxSession, done: (title: string) => boolean, ms = 15_000): Promise<string> {
+  const deadline = Date.now() + ms;
+  let title = "";
+  while (Date.now() < deadline) {
+    title = await session.paneTitle();
+    if (done(title)) return title;
+    await Bun.sleep(50);
+  }
+  throw new Error(`pane title never matched; last saw ${JSON.stringify(title)}`);
+}
+
+// Every child line in the profile's saved session logs.
+function childLogLines(home: string): Array<{ kind?: string; work_id?: string; data?: { by?: string } }> {
+  const sessions = join(home, ".fx", "sessions", "v2");
+  if (!existsSync(sessions)) return [];
+  return readdirSync(sessions).flatMap((id) => {
+    const log = join(sessions, id, "log.jsonl");
+    if (!existsSync(log)) return [];
+    return readFileSync(log, "utf8").split("\n").filter((line) => line.includes('"child_')).map((line) => JSON.parse(line));
+  });
+}
+
+// The tools a request offered the model, by name.
+function toolNames(body: string): string[] {
+  const request = JSON.parse(body) as { tools?: Array<{ name?: string }> };
+  return (request.tools ?? []).map((tool) => tool.name ?? "");
+}
+
 function latestUserText(body: string): string {
   return userTexts(body).at(-1) ?? "";
 }
@@ -200,8 +246,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         expect(main).not.toContain("SWITCH_CHILD_REPLY");
         // The footer names main, not the subagent.
         expect(main).not.toMatch(/^reviewer \u00b7 /m);
-        // The subagent's report of main's message shows as a card.
-        expect(main).toContain("Report from reviewer: completed (ctrl+o to view)");
+        // The subagent's report of main's message shows as a subagent row.
+        expect(main).toContain("reviewer completed");
       });
 
       // Main's model never sees the answer to a message it did not send: its
@@ -321,6 +367,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           });
         }
         if (mainCalls === 2) {
+          // Sent once the subagent's request is out, so the message waits in
+          // its turn. Sent sooner, the turn takes it into that request, and
+          // the stop then drops nothing.
+          await until("the subagent's turn", () => childCalls >= 1);
           return toolCall("main_more", "subagent", {
             request: { action: "message", agent: "worker", message: "SWITCH_MORE one more thing" },
           });
@@ -441,8 +491,9 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
   );
 
   test(
-    "a subagent knows who started it, so a turn typed on its screen can message main",
+    "a subagent knows who started it, so a turn typed on its screen can message main, which sees the user started that turn",
     async () => {
+      let markedByUser = false;
       await withFx((body) => {
         if (!isMainRequest(body)) {
           if (latestUserText(body).includes("SWITCH_TELL_MAIN") || body.includes('"child_up"')) {
@@ -459,7 +510,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
           }
           return text("child_answer", "SWITCH_CHILD_FIRST");
         }
-        if (body.includes("SWITCH_HI_FROM_CHILD")) return text("main_got_hi", "SWITCH_MAIN_GOT_HI");
+        if (body.includes("SWITCH_HI_FROM_CHILD")) {
+          markedByUser = userTexts(body).some((t) => t.includes("SWITCH_HI_FROM_CHILD") && t.includes('"started_by":"user"'));
+          return text("main_got_hi", "SWITCH_MAIN_GOT_HI");
+        }
         if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
         if (!body.includes('"main_sub"')) {
           return toolCall("main_sub", "subagent", {
@@ -479,6 +533,173 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await moveAgent(session, -1);
         await session.waitForText("SWITCH_MAIN_GOT_HI", 30_000);
       });
+      expect(markedByUser).toBe(true);
+    },
+    TIMEOUT,
+  );
+  test(
+    "a task with terminal escapes shows them as text on the subagent's screen and never sends them",
+    async () => {
+      // A parent model's message could carry these: a title change, a color,
+      // and a C1 control that clears the screen.
+      const HOSTILE = "SWITCH_TASK \u001b]2;pwned\u0007 \u001b[31mred\u001b[0m \u009b2J tail";
+      await withFx((body) => {
+        if (!isMainRequest(body)) return text("child_answer", "SWITCH_CHILD_FIRST");
+        if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", { request: { action: "message", agent: "reviewer", message: HOSTILE } });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session, { tape }) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
+        await session.waitForComposer(15_000);
+        await moveAgent(session, 1);
+        const pane = await session.waitForPane((value) => value.includes("SWITCH_CHILD_FIRST"), 15_000);
+        // The subagent's screen shows the task with its escapes as text.
+        expect(pane).toContain("SWITCH_TASK \\x1b]2;pwned\\x07 \\x1b[31mred\\x1b[0m \\u{009b}2J tail");
+        expect(await session.paneTitle()).not.toBe("pwned");
+        await moveAgent(session, -1);
+        await session.waitForComposer(15_000);
+        // fx never wrote the sequences themselves to the terminal.
+        const written = readFileSync(tape).toString("latin1");
+        expect(written).not.toContain("\u001b]2;pwned");
+        expect(written).not.toContain("\u001b[31mred");
+        expect(written).not.toContain("\u00c2\u009b2J");
+      }, () => {}, true);
+    },
+    TIMEOUT,
+  );
+  test(
+    "the tab title names the agent on screen, and a subagent's title never takes over main's",
+    async () => {
+      await withFx((body) => {
+        if (!isMainRequest(body)) return text("child_answer", "SWITCH_CHILD_FIRST");
+        if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "reviewer", message: "SWITCH_TASK look for nothing" },
+          });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
+        await session.waitForComposer(15_000);
+        // The subagent's title arrived after main's, and main is still on screen.
+        const mainTitle = await stablePaneTitle(session);
+        expect(mainTitle).not.toBe("");
+        await moveAgent(session, 1);
+        await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
+        const childTitle = await waitForPaneTitle(session, (title) => title !== "" && title !== mainTitle);
+        await moveAgent(session, -1);
+        await waitForPaneTitle(session, (title) => title === mainTitle);
+        expect(childTitle).not.toBe(mainTitle);
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an Enter with nothing typed on a subagent's screen opens no turn there",
+    async () => {
+      await withFx((body) => {
+        if (!isMainRequest(body)) {
+          if (latestUserText(body).includes("SWITCH_TYPED")) return text("child_typed", "SWITCH_CHILD_TYPED");
+          return text("child_answer", "SWITCH_CHILD_FIRST");
+        }
+        if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
+        if (!body.includes('"main_sub"')) {
+          return toolCall("main_sub", "subagent", {
+            request: { action: "message", agent: "reviewer", message: "SWITCH_TASK look for nothing" },
+          });
+        }
+        return text("main_done", "SWITCH_MAIN_DONE");
+      }, async (session, { home }) => {
+        await session.sendText("SWITCH_USER");
+        await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
+        await session.waitForComposer(15_000);
+        await moveAgent(session, 1);
+        await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
+        await session.waitForComposer(15_000);
+        await session.sendKeys("Enter");
+        await session.sendText("SWITCH_TYPED a real turn");
+        await session.waitForText("SWITCH_CHILD_TYPED", 30_000);
+        // Only the turn that ran opened a work in main's log, and it says the
+        // user started it, so a restart can still tell.
+        const spawns = childLogLines(home).filter((line) => line.kind === "child_spawned" && line.work_id?.startsWith("fxuser:"));
+        expect(spawns).toHaveLength(1);
+        expect(spawns[0]!.data?.by).toBe("user");
+      });
+    },
+    TIMEOUT,
+  );
+  test(
+    "a turn typed on a subagent's screen that fx dies during reaches main after a resume as the user's",
+    async () => {
+      const typed = held();
+      let typedReached = false;
+      let reports: string[] = [];
+      try {
+        await withFx(async (body) => {
+          if (!isMainRequest(body)) {
+            if (latestUserText(body).includes("SWITCH_TYPED")) {
+              typedReached = true;
+              await typed.promise;
+              return text("child_typed", "SWITCH_CHILD_TYPED");
+            }
+            return text("child_answer", "SWITCH_CHILD_FIRST");
+          }
+          const interrupted = userTexts(body).filter((t) => t.includes('"child_id"') && t.includes('"outcome":"interrupted"'));
+          if (interrupted.length > 0) {
+            reports = interrupted;
+            return text("main_saw_report", "SWITCH_MAIN_SAW_REPORT");
+          }
+          if (body.includes("SWITCH_CHILD_FIRST")) return text("main_saw_first", "SWITCH_MAIN_SAW_FIRST");
+          if (!body.includes('"main_sub"')) {
+            return toolCall("main_sub", "subagent", { request: { action: "message", agent: "reviewer", message: "SWITCH_TASK look for nothing" } });
+          }
+          return text("main_done", "SWITCH_MAIN_DONE");
+        }, async (session, { home, launch }) => {
+          await session.sendText("SWITCH_USER");
+          await session.waitForText("SWITCH_MAIN_SAW_FIRST", 30_000);
+          await session.waitForComposer(15_000);
+          await moveAgent(session, 1);
+          await session.waitForPane((pane) => pane.includes("SWITCH_CHILD_FIRST"), 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("SWITCH_TYPED a turn the crash cuts off");
+          await until("the typed turn's request", () => typedReached);
+
+          // Kill fx while that turn's request is out, as a crash would.
+          const pid = session.processPid();
+          process.kill(pid, "SIGKILL");
+          const deadline = Date.now() + 10_000;
+          while (Date.now() < deadline) {
+            try { process.kill(pid, 0); } catch { break; }
+            await Bun.sleep(25);
+          }
+          await session.kill();
+
+          const sessions = join(home, ".fx", "sessions", "v2");
+          const holds = (path: string, marker: string): boolean => readdirSync(path).some((entry) => {
+            const full = join(path, entry);
+            return statSync(full).isDirectory() ? holds(full, marker) : readFileSync(full, "latin1").includes(marker);
+          });
+          const parents = readdirSync(sessions).filter((id) =>
+            !id.startsWith(".") && statSync(join(sessions, id)).isDirectory() && holds(join(sessions, id), "SWITCH_MAIN_SAW_FIRST"));
+          expect(parents).toHaveLength(1);
+          const resumed = await launch(`--resume ${parents[0]}`);
+          await resumed.waitForText("SWITCH_MAIN_SAW_REPORT", 30_000);
+          await resumed.waitForComposer(15_000);
+          await resumed.sendText("/quit");
+          expect(await resumed.waitForSessionEnd(15_000)).toBe(true);
+        });
+      } finally {
+        typed.release();
+      }
+      // Main hears of the cut-off turn once, as the user's, not its own.
+      expect(reports).toHaveLength(1);
+      expect(reports[0]).toContain('"started_by":"user"');
     },
     TIMEOUT,
   );
@@ -537,15 +758,20 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       let leadReported = false;
       let helperRole = false;
       let leadRole = false;
+      let helperNests = false;
+      let leadNests = false;
       await withFx(async (body) => {
         if (!isMainRequest(body)) {
           if (userTexts(body).some((text) => text.includes("SWITCH_HELPER_TASK"))) {
             helperRole ||= body.includes('You are the subagent \\"helper\\", started by \\"lead\\"');
+            // fx nests two levels: lead's own subagent starts none.
+            helperNests ||= toolNames(body).includes("subagent");
             // The helper answers once lead's turn has ended, so its report wakes lead.
             await until("lead's report", () => leadReported);
             return text("helper", "SWITCH_HELPER_DONE");
           }
           leadRole ||= body.includes('You are the subagent \\"lead\\", started by \\"main\\"');
+          leadNests ||= toolNames(body).includes("subagent");
           if (body.includes("SWITCH_HELPER_DONE")) return text("lead_after", "SWITCH_LEAD_SAW_HELPER");
           if (!body.includes('"lead_sub"')) {
             return toolCall("lead_sub", "subagent", {
@@ -570,6 +796,8 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
       // Each subagent's system prompt names it and the agent that started it.
       expect(leadRole).toBe(true);
       expect(helperRole).toBe(true);
+      expect(leadNests).toBe(true);
+      expect(helperNests).toBe(false);
     },
     TIMEOUT,
   );
@@ -758,7 +986,7 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         first.release();
         // Main's turn ended with the receipt; the report comes once the
         // subagent's write is done.
-        await session.waitForText("Report from follower: completed", 30_000);
+        await session.waitForText("follower completed", 30_000);
         expect(readFileSync(join(workspace, "followed.txt"), "utf8")).toBe("FOLLOWED\n");
         expect(await session.captureFullScrollback()).not.toContain("needs permission");
 
@@ -1021,7 +1249,10 @@ describe.skipIf(!tmuxAvailable())("TUI agent switching", () => {
         await session.sendLiteral("Y");
         const stayed = await session.waitForPane((pane) => pane.includes("Yhello Zworld"), 10_000);
         expect(stayed).toContain("main \u00b7 ctrl+x");
-        expect(stayed).not.toContain("EDGE_CHILD_ANSWER");
+        // Main's screen holds the user's prompt; the subagent's opens with
+        // main's task as its prompt.
+        expect(stayed).toMatch(/^┃ SWITCH_USER_EDGE/m);
+        expect(stayed).not.toMatch(/^┃ EDGE_TASK/m);
         expect(stayed).not.toContain(LIST_HINT);
       });
     },

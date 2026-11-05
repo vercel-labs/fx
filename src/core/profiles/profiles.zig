@@ -14,6 +14,7 @@ const types = @import("../shared/types.zig");
 const io_mod = @import("../shared/io.zig");
 const pathing = @import("../workspace/pathing.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const sort_utils = @import("../shared/sort_utils.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -332,7 +333,7 @@ pub fn list(arena: Allocator, roots: Roots) ![]Entry {
         const profile = builtin(name).?;
         try entries.append(arena, .{ .name = profile.name, .description = profile.description, .source = .builtin });
     }
-    std.mem.sort(Entry, entries.items, {}, entryLessThan);
+    sort_utils.sort(Entry, entries.items, {}, entryLessThan);
     return entries.items;
 }
 

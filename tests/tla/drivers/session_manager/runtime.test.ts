@@ -167,13 +167,17 @@ test("TLC accepts actual parent/child work and retains every expected child log"
   for (let iteration = 0; iteration < repetitions; iteration++) {
     const run = fixture("child-work");
     const gateway = startDynamicFakeGateway((body: string) => {
-      if (!body.includes('"name":"subagent"')) return fakeGatewayFinalText("TLC_CHILD_ANSWER");
+      // The child's own turn, the parent's turn its report starts, the
+      // parent after the child's receipt, and the parent's first turn.
+      if (body.includes("Report the child marker.") && !body.includes('"toolCallId":"tlc-delegate"')) return fakeGatewayFinalText("TLC_CHILD_ANSWER");
       if (body.includes("TLC_CHILD_ANSWER")) return fakeGatewayFinalText("TLC_PARENT_DONE");
-      return fakeGatewayToolCall("tlc-delegate", "subagent", { request: { action: "run", task: "Report the child marker." } });
+      if (body.includes('"toolCallId":"tlc-delegate"')) return fakeGatewayFinalText("TLC_PARENT_WAITING");
+      return fakeGatewayToolCall("tlc-delegate", "subagent", { request: { action: "message", agent: "marker", message: "Report the child marker." } });
     }, { classifierDecision: "clear" });
     try {
       const result = await run.ask(gateway, ["Delegate the TLC marker report."]);
-      expect(result.json.output).toBe("TLC_PARENT_DONE");
+      // The child's report starts the parent's last turn.
+      expect(result.json.final_output).toBe("TLC_PARENT_DONE");
       const parent = result.json.session_id;
       const childEvents = run.lines(parent).filter(line => line.kind === "child_spawned" || line.kind === "child_finished");
       expect(childEvents.map(line => [line.kind, line.outcome ?? null])).toEqual([["child_spawned", null], ["child_finished", "ok"]]);

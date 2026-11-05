@@ -1,5 +1,6 @@
 const std = @import("std");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
+const ascii_case = @import("../core/shared/ascii_case.zig");
 
 pub fn capabilitiesForModel(model: []const u8) model_capabilities.Capabilities {
     var capabilities = model_capabilities.capabilitiesForModel(model);
@@ -89,7 +90,7 @@ pub fn contextWindowSize(model: []const u8) ?u32 {
         return 200_000;
     }
     if (std.mem.startsWith(u8, model, "openai/")) {
-        if (containsIgnoreCase(model, "gpt-5")) return 256_000;
+        if (ascii_case.hasMajorVersionAtLeast(model, "gpt-", 5)) return 256_000;
         if (containsIgnoreCase(model, "o3") or
             containsIgnoreCase(model, "o4") or
             containsIgnoreCase(model, "o1")) return 200_000;
@@ -118,4 +119,11 @@ test "Vercel fallback policy owns vendor model heuristics" {
     try std.testing.expect(!capabilitiesForModel("moonshotai/kimi-k3-fast").supports_fast_mode);
     try std.testing.expectEqual(@as(?u32, 1_000_000), contextWindowSize("anthropic/claude-opus-4.8"));
     try std.testing.expectEqual(@as(?bool, true), capabilitiesForModel("xai/grok-4").parallel_tool_calls);
+}
+
+test "fallback context window covers every GPT major from 5" {
+    for ([_][]const u8{ "openai/gpt-5.4", "openai/gpt-6-sol", "openai/gpt-6.1-sol" }) |model| {
+        try std.testing.expectEqual(@as(?u32, 256_000), contextWindowSize(model));
+    }
+    try std.testing.expectEqual(@as(?u32, 128_000), contextWindowSize("openai/gpt-4o"));
 }

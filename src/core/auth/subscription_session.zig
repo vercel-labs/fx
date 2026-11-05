@@ -125,12 +125,9 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
         }
 
         fn loadFromDir(alloc: Allocator, fx_dir: *std.Io.Dir) !?Session {
-            var file = fx_dir.openFile(io_mod.getIo(), spec.auth_file_name, .{
-                .mode = .read_only,
-                .allow_directory = false,
-                .follow_symlinks = false,
-                .resolve_beneath = true,
-            }) catch |err| switch (err) {
+            // A path that isn't a regular file, such as a fifo, fails without
+            // waiting for a writer.
+            var file = io_mod.openExistingReadOnlyRegularFile(fx_dir.*, spec.auth_file_name, .no_follow) catch |err| switch (err) {
                 error.FileNotFound => return null,
                 else => {
                     debug_trace.logf("auth", spec.trace_label ++ " session load failed step=open_file err={s}", .{@errorName(err)});

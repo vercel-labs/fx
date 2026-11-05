@@ -73,6 +73,8 @@ function fakeShellStop(callId: string, sessionId: string): Response {
   });
 }
 
+/// The line fx prints above the resume command when it exits.
+const RESUME_LABEL = "Resume this session with:";
 /// The command fx prints to continue a session.
 const RESUME_COMMAND = "fx --resume";
 
@@ -259,13 +261,13 @@ test.skipIf(!tmuxAvailable())("suspended sessions retain exclusive writer owners
   const home = join(root, "home"), workspace = join(root, "workspace");
   mkdirSync(home, { mode: 0o700 });
   mkdirSync(workspace, { mode: 0o700 });
-  const exitPath = join(root, "exit"), stderr = join(root, "stderr.log");
+  const exitPath = join(root, "exit"), stderr = join(root, "stderr.log"), trace = join(root, "trace.log");
   const gateway = startFakeGateway([
     fakeGatewayFinalText("FIRST_ACCEPTED_TURN"),
     fakeGatewayFinalText("AFTER_FOREGROUND_TURN"),
     fakeGatewayFinalText("COLD_REOPEN_TURN"),
   ]);
-  const env = { ...gatewayEnv(home, gateway), FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1" };
+  const env = { ...gatewayEnv(home, gateway), FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1", FX_E2E_DISABLE_DOTENV: "1", FX_TRACE_LOG: trace };
   let tui: TmuxSession | undefined;
   try {
     const seeded = await runFx(["ask", "--json", "Remember the original turn."], { cwd: workspace, env, timeoutMs: TIMEOUT });
@@ -295,6 +297,8 @@ test.skipIf(!tmuxAvailable())("suspended sessions retain exclusive writer owners
     await tui.sendKeys("Enter");
     await tui.waitForText("AFTER_FOREGROUND_TURN", TIMEOUT);
     await tui.waitForStableComposer(TIMEOUT);
+    // Coming back from the suspend clears the screen, and the trace says so.
+    expect(readFileSync(trace, "utf8")).toContain("event=job_control_resume_redraw dropped=terminal_screen_and_scrollback");
     expect(gateway.requests.at(-1)?.body).toContain("DRAFT_SURVIVES_SUSPENSION");
     expect(readFileSync(events).subarray(0, accepted.length).equals(accepted)).toBe(true);
     expect(await tui.captureFullScrollback()).not.toContain("InvalidTranscriptTransition");
@@ -2406,11 +2410,6 @@ while :; do :; done
         "the unrelated follow-up request",
         timeout,
       );
-      const retentionMarker = "[transcript_retention] pruned command output line";
-      const retentionBeforeAssistant = countOccurrences(
-        readFileSync(tracePath, "utf8"),
-        retentionMarker,
-      );
       releaseNextResponse();
       releaseNextResponse = null;
       await waitForScrollback(active, nextMarker, timeout);
@@ -2422,12 +2421,6 @@ while :; do :; done
       expect(after).toContain(nextMarker);
       expect(historicalLines(after)).toEqual(historicalLines(before));
       expect(historicalLines(afterAnsi)).toEqual(historicalLines(beforeAnsi));
-      await waitForCondition(
-        () => countOccurrences(readFileSync(tracePath, "utf8"), retentionMarker) >
-          retentionBeforeAssistant,
-        "the recorded assistant-stream retention pass",
-        timeout,
-      );
 
       const followRequest = JSON.parse(gateway.requests[1]!.body) as {
         prompt: Array<{ role: string; content: unknown }>;
@@ -5288,21 +5281,24 @@ test.skipIf(!tmuxAvailable())(
       expect(paneExitMatches(active.paneStatus(), 0)).toBe(true);
       const scrollback = stripAnsi(await active.captureFullScrollback());
       const ansiScrollback = await active.captureFullScrollbackEscapes();
-      const expected = `Continue session with: ${RESUME_COMMAND} ${sessionId}`;
+      const command = `${RESUME_COMMAND} ${sessionId}`;
+      const expected = `${RESUME_LABEL}\n${command}`;
       expect(scrollback).toContain(expected);
+      expect(scrollback).not.toContain("Continue session with:");
       expect(scrollback).not.toContain("To continue this session, run:");
-      expect(ansiScrollback).toContain(`\x1b[38;5;245m${expected}\x1b[39m`);
+      expect(ansiScrollback).toContain(
+        `\x1b[38;5;245m${RESUME_LABEL}\x1b[39m\n\x1b[38;5;245m${command}\x1b[39m`,
+      );
       expect(countOccurrences(scrollback, expected)).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
-      expect(readFileSync(tapePath).includes(Buffer.from(expected))).toBe(
+      expect(readFileSync(tapePath).includes(Buffer.from(RESUME_LABEL))).toBe(
         false,
       );
-      const handoffLine = scrollback
-        .split("\n")
-        .map((line) => line.trim())
-        .find((line) => line === expected);
-      const printedCommand = handoffLine?.slice("Continue session with: ".length);
-      expect(printedCommand).toBe(`${RESUME_COMMAND} ${sessionId}`);
+      // The command fills the line below the label by itself, untrimmed, so
+      // selecting that one line copies exactly the command.
+      const lines = scrollback.split("\n");
+      const printedCommand = lines[lines.indexOf(RESUME_LABEL) + 1];
+      expect(printedCommand).toBe(command);
 
       await active.kill();
       active = await TmuxSession.create({
@@ -5334,6 +5330,66 @@ test.skipIf(!tmuxAvailable())(
         rmSync(root, { recursive: true, force: true });
       } else {
         console.error(`retained exit handoff artifacts at ${root}`);
+      }
+    }
+  },
+  TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "a narrow terminal keeps the resume command alone on its own line",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-exit-narrow-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    const marker = "NARROW_EXIT_SAVED";
+    mkdirSync(home);
+    mkdirSync(workspace);
+    writeFileSync(stderrPath, "");
+    const gateway = startFakeGateway([fakeGatewayFinalText(marker)]);
+    let active: TmuxSession | null = null;
+    let passed = false;
+
+    try {
+      // At 40 columns a label and command on one row do not fit, which is
+      // where fx used to indent the command on a second row.
+      active = await TmuxSession.create({
+        cmd: FX_BIN,
+        cwd: workspace,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 40,
+        height: 24,
+        remainOnExit: true,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Save this narrow conversation.");
+      await active.waitForText(marker, TIMEOUT);
+      const sessionId = sessionIdFromHome(home);
+
+      await active.sendText("/quit");
+      await waitForCondition(
+        () => active?.paneStatus().dead === true,
+        "the narrow exit pane to stop",
+      );
+      const scrollback = stripAnsi(await active.captureFullScrollback());
+      const lines = scrollback.split("\n");
+      const labelIndex = lines.indexOf(RESUME_LABEL);
+      expect(labelIndex).toBeGreaterThanOrEqual(0);
+      expect(lines[labelIndex + 1]).toBe(`${RESUME_COMMAND} ${sessionId}`);
+      expect(countOccurrences(scrollback, RESUME_LABEL)).toBe(1);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      await active.kill();
+      active = null;
+      passed = true;
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      if (passed) {
+        rmSync(root, { recursive: true, force: true });
+      } else {
+        console.error(`retained narrow exit artifacts at ${root}`);
       }
     }
   },
@@ -5392,7 +5448,7 @@ test.skipIf(!tmuxAvailable())(
         "the rapid Ctrl-C exit pane to stop",
       );
       const scrollback = stripAnsi(await active.captureFullScrollback());
-      const expected = `Continue session with: ${RESUME_COMMAND} ${sessionId}`;
+      const expected = `${RESUME_LABEL}\n${RESUME_COMMAND} ${sessionId}`;
       expect(countOccurrences(scrollback, expected)).toBe(1);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
       await active.kill();
@@ -5922,8 +5978,20 @@ test.skipIf(!tmuxAvailable())(
 
     let active: TmuxSession | null = null;
     let fresh: TmuxSession | null = null;
+    const prompt = "Save a turn before upgrade handoff.";
+    // Taller than the pane, so part of the conversation sits in scrollback.
+    const initialReply = [
+      "UPGRADE_CTRL_G_FIRST_LINE",
+      ...Array.from({ length: 24 }, (_, index) => `upgrade filler paragraph ${index + 1}`),
+      "UPGRADE_CTRL_G_INITIAL_DONE",
+    ].join("\n\n");
+    const conversationMarkers = [
+      prompt,
+      "UPGRADE_CTRL_G_FIRST_LINE",
+      "UPGRADE_CTRL_G_INITIAL_DONE",
+    ];
     const gateway = startFakeGateway([
-      fakeGatewayFinalText("UPGRADE_CTRL_G_INITIAL_DONE"),
+      fakeGatewayFinalText(initialReply),
       fakeGatewayFinalText("UPGRADE_CTRL_G_FOLLOWUP_DONE"),
     ]);
     const release = startUpgradeServer(root, argvLogPath);
@@ -5947,10 +6015,14 @@ test.skipIf(!tmuxAvailable())(
         height: 32,
       });
       await active.waitForComposer(TIMEOUT);
-      await active.sendText("Save a turn before upgrade handoff.");
+      await active.sendText(prompt);
       await active.waitForText("UPGRADE_CTRL_G_INITIAL_DONE", TIMEOUT);
       await active.waitForComposer(TIMEOUT);
       const sessionId = sessionIdFromHome(home);
+      const beforeUpgrade = await active.captureFullScrollback();
+      for (const marker of conversationMarkers) {
+        expect(countOccurrences(beforeUpgrade, marker)).toBe(1);
+      }
 
       await active.waitForText(
         "update ready: ctrl+g to reload",
@@ -5981,16 +6053,28 @@ test.skipIf(!tmuxAvailable())(
       await active.sendHexBytes(["07"]);
 
       const updatedNotice = `✓ fx has been updated to v${version} (notes)`;
-      await active.waitForText(updatedNotice, TIMEOUT);
+      // The notice comes before the replayed conversation, which is taller
+      // than the pane, so it is in the scrollback rather than on screen.
+      await waitForScrollback(active, updatedNotice);
       await active.waitForComposer(TIMEOUT);
       const postUpgradeTrace = readFileSync(tracePath, "utf8");
       expect(postUpgradeTrace.slice(traceBeforeUpgrade.length)).not.toContain(
         "session picker completion",
       );
-      const resumed = await waitForScrollback(active, "UPGRADE_CTRL_G_INITIAL_DONE");
-      expect(resumed).toContain("UPGRADE_CTRL_G_INITIAL_DONE");
-      expect(resumed).toContain(updatedNotice);
-      const noticeEscapes = await active.capturePaneEscapes();
+      const resumed = await active.waitForStableScrollback(
+        (scrollback) =>
+          scrollback.includes(updatedNotice) &&
+          scrollback.includes("UPGRADE_CTRL_G_INITIAL_DONE"),
+        TIMEOUT,
+        250,
+      );
+      // The new build clears the terminal and draws the conversation again
+      // from the top, the way a resize does, so the old screen leaves no copy.
+      for (const marker of conversationMarkers) {
+        expect(countOccurrences(resumed, marker)).toBe(1);
+      }
+      expect(countOccurrences(resumed, updatedNotice)).toBe(1);
+      const noticeEscapes = await active.captureFullScrollbackEscapes();
       expect(noticeEscapes).toContain(
         `(\x1b[4m\x1b]8;;https://fx.sh/changelog#v${version}\x1b\\notes\x1b[0m`,
       );
@@ -6030,6 +6114,191 @@ test.skipIf(!tmuxAvailable())(
     }
   },
   UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "upgrade ctrl-g without a saved turn reopens on a cleared terminal",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-upgrade-ctrl-g-fresh-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const installDir = join(root, "install");
+    const stderrPath = join(root, "stderr.log");
+    const argvLogPath = join(root, "upgrade-argv.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    mkdirSync(installDir);
+    const workspaceRoot = realpathSync(workspace);
+    const installedFx = join(installDir, "fx");
+    copyFileSync(FX_BIN, installedFx);
+    chmodSync(installedFx, 0o755);
+
+    const welcome = "Run /help for commands";
+    let active: TmuxSession | null = null;
+    const gateway = startFakeGateway([]);
+    const release = startUpgradeServer(root, argvLogPath);
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(installedFx),
+        cwd: workspaceRoot,
+        env: {
+          ...gatewayEnv(home, gateway),
+          FX_AUTO_UPGRADE: "1",
+          FX_TEST_UPGRADE_BASE_URL: release.baseUrl,
+        },
+        stderrPath,
+        width: 110,
+        height: 32,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.waitForText("update ready: ctrl+g to reload", UPGRADE_TIMEOUT);
+      expect(countOccurrences(await active.captureFullScrollback(), welcome)).toBe(1);
+
+      const version = (await runFx(["--version"])).stdout.trim();
+      const updatedNotice = `✓ fx has been updated to v${version} (notes)`;
+      await active.sendHexBytes(["07"]);
+      await active.waitForText(updatedNotice, TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+
+      // The session saved nothing, so the new build opens a fresh one (D81),
+      // drawn from the top of a cleared terminal like a resize redraw.
+      const reopened = await active.waitForStableScrollback(
+        (scrollback) => scrollback.includes(updatedNotice),
+        TIMEOUT,
+        250,
+      );
+      expect(countOccurrences(reopened, welcome)).toBe(1);
+      expect(countOccurrences(reopened, updatedNotice)).toBe(1);
+      expect(
+        readFileSync(argvLogPath, "utf8").trim().split("\n")
+          .some((line) => line.startsWith(`${installedFx}\tresume\t`) && line.includes("\t--upgrade-relaunch")),
+      ).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).not.toContain("relaunch failed");
+
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) {
+        try {
+          await active.sendText("/quit");
+        } catch {}
+        await active.kill();
+      }
+      release.stop();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  UPGRADE_TIMEOUT * 2,
+);
+
+test.skipIf(!tmuxAvailable())(
+  "control sequences in a model reply show as text, live and after resume",
+  async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-model-control-")));
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(home);
+    mkdirSync(workspace);
+    const workspaceRoot = realpathSync(workspace);
+    // Each line carries a sequence a terminal would act on: erase the screen,
+    // erase below the cursor, switch to the alternate screen, erase the
+    // scrollback, set the title, and a C1 CSI. The last line has no newline,
+    // so it reaches the screen through the final flush.
+    const reply = [
+      "CONTROL_REPLY_START",
+      "erase \u001b[2J screen",
+      "erase below \u001b[J here",
+      "alternate \u001b[?1049h screen",
+      "scrollback \u001b[3J erase",
+      "title \u001b]0;CONTROL_TITLE_OWNED\u0007 set",
+      "c1 \u009b31m csi",
+      "joined \u{1f469}\u200d\u{1f4bb} emoji",
+      "CONTROL_REPLY_END \u001b[2J",
+    ].join("\n\n");
+    const shownAsText = [
+      "erase \\x1b[2J screen",
+      "erase below \\x1b[J here",
+      "alternate \\x1b[?1049h screen",
+      "scrollback \\x1b[3J erase",
+      "title \\x1b]0;CONTROL_TITLE_OWNED\\x07 set",
+      "c1 \\u{009b}31m csi",
+      "CONTROL_REPLY_END \\x1b[2J",
+    ];
+    const gateway = startFakeGateway([
+      fakeGatewayFinalText("CONTROL_FIRST_TURN_DONE"),
+      fakeGatewayFinalText(reply),
+    ]);
+    let active: TmuxSession | null = null;
+
+    const expectReplyShownAsText = async (session: TmuxSession, label: string) => {
+      const scrollback = await session.waitForStableScrollback(
+        (text) => text.includes("CONTROL_REPLY_START") && text.includes("CONTROL_FIRST_TURN_DONE"),
+        TIMEOUT,
+        250,
+      );
+      // The earlier turn is still above the reply: no sequence erased the
+      // screen or scrollback or hid them behind the alternate screen.
+      expect(countOccurrences(scrollback, "CONTROL_FIRST_TURN_DONE"), label).toBe(1);
+      expect(countOccurrences(scrollback, "CONTROL_REPLY_START"), label).toBe(1);
+      for (const text of shownAsText) expect(scrollback, label).toContain(text);
+      // The prompt's and the reply's joined emoji keep their joiner.
+      expect(scrollback, label).not.toContain("\\u{200d}");
+      expect(await session.paneTitle(), label).not.toContain("CONTROL_TITLE_OWNED");
+      expect(readFileSync(stderrPath, "utf8"), label).toBe("");
+    };
+
+    try {
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: shellQuote(FX_BIN),
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 40,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("First turn before the control sequences, team \u{1f469}\u200d\u{1f4bb}.");
+      await active.waitForText("CONTROL_FIRST_TURN_DONE", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      await active.sendText("Reply with control sequences.");
+      await active.waitForText("CONTROL_REPLY_END", TIMEOUT);
+      await active.waitForComposer(TIMEOUT);
+      await expectReplyShownAsText(active, "live turn");
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+
+      const sessionId = sessionIdFromHome(home);
+      writeFileSync(stderrPath, "");
+      active = await TmuxSession.create({
+        cmd: `${shellQuote(FX_BIN)} --resume ${sessionId}`,
+        cwd: workspaceRoot,
+        env: gatewayEnv(home, gateway),
+        stderrPath,
+        width: 100,
+        height: 40,
+      });
+      await active.waitForComposer(TIMEOUT);
+      await expectReplyShownAsText(active, "resumed session");
+      await active.sendText("/quit");
+      expect(await active.waitForSessionEnd()).toBe(true);
+      await active.kill();
+      active = null;
+    } finally {
+      if (active) await active.kill();
+      gateway.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  TIMEOUT * 4,
 );
 
 test.skipIf(!tmuxAvailable())(

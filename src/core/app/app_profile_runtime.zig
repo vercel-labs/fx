@@ -45,12 +45,30 @@ pub fn failureReason(alloc: std.mem.Allocator, name: []const u8) !?[]u8 {
     return null;
 }
 
+/// The model the first instance starts with: `--model`, else the launch
+/// profile's, unless `--provider` or `FX_MODEL` chose the process's model, as
+/// `applyProfileModel` decides for `/launch <profile>`. Null leaves the choice
+/// to startup.
+pub fn launchModel(model_flag: ?[]const u8, provider_flag: bool, env_model: ?[]const u8, profile_model: ?[]const u8) ?[]const u8 {
+    if (model_flag) |model| return model;
+    if (provider_flag or env_model != null) return null;
+    return profile_model;
+}
+
+test "the launch profile's model gives way to the model the process chose" {
+    try std.testing.expectEqualStrings("profile/model", launchModel(null, false, null, "profile/model").?);
+    try std.testing.expect(launchModel(null, false, "env/model", "profile/model") == null);
+    try std.testing.expect(launchModel(null, true, null, "profile/model") == null);
+    try std.testing.expectEqualStrings("flag/model", launchModel("flag/model", true, "env/model", "profile/model").?);
+    try std.testing.expect(launchModel(null, false, null, null) == null);
+}
+
 pub fn Runtime(comptime App: type) type {
     return struct {
         const AppAgent = agents.Agent;
         /// Loads main's profile before startup, so its model and effort reach
-        /// startup like `--model` and `--effort`, which still win. Narrows
-        /// main's tools to the profile.
+        /// startup. `--model`, `--provider`, `FX_MODEL`, and `--effort` still
+        /// win, as `launchModel` decides. Narrows main's tools to the profile.
         pub fn applyLaunchProfile(
             app: *App,
             name: []const u8,

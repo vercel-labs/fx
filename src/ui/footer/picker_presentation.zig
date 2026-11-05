@@ -1151,11 +1151,7 @@ pub fn prepareSlashMenu(
     };
     errdefer prepared.deinit(alloc);
 
-    if (command_specs.argCompletionAnchor(prefix) != 0 or
-        prefix.len == 0 or prefix[0] != '/' or skills.len == 0)
-    {
-        return prepared;
-    }
+    if (!slashMenuListsSkills(registry, prefix) or skills.len == 0) return prepared;
 
     try prepared.skill_matches.resize(alloc, skills.len);
     const written = skill_runtime.fillSkillMenuRangeAtQuery(
@@ -1171,9 +1167,18 @@ pub fn prepareSlashMenu(
 
 pub fn mixedSlashCompletionCount(registry: command_specs.SlashRegistry, prefix: []const u8, skills: []const skill_runtime.Skill) usize {
     const command_count = command_specs.slashCompletionCount(registry, prefix);
-    if (command_specs.argCompletionAnchor(prefix) != 0) return command_count;
-    if (prefix.len == 0 or prefix[0] != '/') return command_count;
+    if (!slashMenuListsSkills(registry, prefix)) return command_count;
     return command_count + skill_runtime.skillMenuFilterQueryCount(skills, .all, prefix[1..]);
+}
+
+/// Skills join the slash menu only while the text can still name one: not
+/// under a command's own argument completion, and not once a known command
+/// and whitespace are typed, since the rest is that command's argument.
+fn slashMenuListsSkills(registry: command_specs.SlashRegistry, prefix: []const u8) bool {
+    if (prefix.len == 0 or prefix[0] != '/') return false;
+    if (command_specs.argCompletionAnchor(prefix) != 0) return false;
+    const command_end = std.mem.findAny(u8, prefix, " \t\r\n") orelse return true;
+    return registry.lookup(prefix[0..command_end]) == null;
 }
 
 pub fn mixedSlashCompletionIsSkill(registry: command_specs.SlashRegistry, prefix: []const u8, skills: []const skill_runtime.Skill, n: usize) bool {
@@ -1215,8 +1220,7 @@ pub fn mixedSlashCompletionCommandColumnWidth(
 fn mixedSlashCompletionEntry(registry: command_specs.SlashRegistry, prefix: []const u8, skills: []const skill_runtime.Skill, n: usize) ?MixedSlashCompletionEntry {
     const command_count = command_specs.slashCompletionCount(registry, prefix);
     if (n < command_count) return .{ .command = n };
-    if (command_specs.argCompletionAnchor(prefix) != 0) return null;
-    if (prefix.len == 0 or prefix[0] != '/') return null;
+    if (!slashMenuListsSkills(registry, prefix)) return null;
     const skill = skill_runtime.skillMenuSkillAtQuery(skills, .all, prefix[1..], n - command_count) orelse return null;
     return .{ .skill = skill };
 }

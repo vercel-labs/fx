@@ -5059,6 +5059,107 @@ describe("gateway stream lifecycle", () => {
     }
   });
 
+  // The repeated shell failure guard (`ShellExecutionFailureRetryState` in
+  // src/core/agent/runtime/tool_admission.zig) ends a turn only when the same
+  // command fails in three steps in a row with no file change in between.
+  const SHELL_FAILURE_STOP = "Repeated identical shell failures stopped the tool loop.";
+  const FAILING_SCRIPT = "echo 'label is 84 chars, max 80' >&2\nexit 1\n";
+  const RERUN = { action: "run", command: "sh check.sh", profile: "clean" };
+
+  function toolCallStep(...calls: Array<[id: string, name: string, input: object]>): Response {
+    return fakeGatewaySse([
+      ...calls.map(([toolCallId, toolName, input]) => ({ type: "tool-call", toolCallId, toolName, input })),
+      { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+    ]);
+  }
+
+  async function runScriptedSteps(label: string, steps: Array<() => Response>, script?: string) {
+    const root = createFixtureRoot(label);
+    const tracePath = join(root.root, "trace.log");
+    if (script) writeFileSync(join(root.workspace, "check.sh"), script);
+    const bodies: string[] = [];
+    const gateway = startGateway(((body: string) => {
+      bodies.push(body);
+      const step = steps[bodies.length - 1];
+      return step ? step() : fakeGatewayFinalText("UNEXPECTED_EXTRA_STEP");
+    }) as () => Response);
+    try {
+      const result = await runFx(["ask", "--json", "--yolo", "Fix the diagram script and run it."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,tool", FX_SOUND: "0" },
+        timeoutMs: 30_000,
+      });
+      return { result, bodies, trace: readFileSync(tracePath, "utf8") };
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }
+
+  test("shell failure after a file change goes back to the model instead of ending the turn", async () => {
+    // A user's session: write a script, run it, edit it, run the same command
+    // again. A third edit and rerun shows the edit restarts the count, not
+    // just a higher limit.
+    const { result, bodies, trace } = await runScriptedSteps("shell-failure-after-edit", [
+      () => toolCallStep(
+        ["write_1", "write_file", { path: "check.sh", content: FAILING_SCRIPT }],
+        ["run_1", "shell", RERUN],
+      ),
+      () => toolCallStep(
+        ["edit_2", "edit_file", { path: "check.sh", old_string: "84 chars", new_string: "82 chars" }],
+        ["run_2", "shell", RERUN],
+      ),
+      () => toolCallStep(
+        ["edit_3", "edit_file", { path: "check.sh", old_string: "82 chars", new_string: "81 chars" }],
+        ["run_3", "shell", RERUN],
+      ),
+      () => fakeGatewayFinalText("SPEC_WRITTEN"),
+    ]);
+    expect(result.stderr).not.toContain(SHELL_FAILURE_STOP);
+    expect(bodies).toHaveLength(4);
+    expect(toolResultOutput(bodies[2]!, "run_2")).toContain("82 chars");
+    expect(toolResultOutput(bodies[3]!, "run_3")).toContain("81 chars");
+    expect(result.code).toBe(0);
+    const json = parseAskJson(result.stdout);
+    expect(json.final_output).toContain("SPEC_WRITTEN");
+    expect(json.tool_calls.filter((call) => call.name === "shell" && call.status === "error")).toHaveLength(3);
+    expect(trace).not.toContain("repeated_shell_execution_failure");
+  });
+
+  test("unchanged shell failures end the turn on the third step in a row", async () => {
+    const rerun = (id: string) => () => toolCallStep([id, "shell", RERUN]);
+    const { result, bodies, trace } = await runScriptedSteps(
+      "shell-failure-unchanged",
+      [rerun("run_1"), rerun("run_2"), rerun("run_3")],
+      FAILING_SCRIPT,
+    );
+    expect(bodies).toHaveLength(3);
+    // The second failure already told the model not to retry unchanged.
+    expect(toolResultOutput(bodies[2]!, "run_2")).toContain("already failed 2 times");
+    expect(result.stderr).toContain(SHELL_FAILURE_STOP);
+    expect(result.stdout).not.toContain("UNEXPECTED_EXTRA_STEP");
+    expect(trace).toContain("repeated_shell_execution_failure");
+    expect(result.stderr).not.toMatch(/panic/i);
+  });
+
+  test("a failed edit is not a file change for repeated shell failures", async () => {
+    const missingEdit = { path: "check.sh", old_string: "NOT_IN_THE_SCRIPT", new_string: "x" };
+    const { result, bodies, trace } = await runScriptedSteps(
+      "shell-failure-failed-edit",
+      [
+        () => toolCallStep(["run_1", "shell", RERUN]),
+        () => toolCallStep(["edit_2", "edit_file", missingEdit], ["run_2", "shell", RERUN]),
+        () => toolCallStep(["edit_3", "edit_file", missingEdit], ["run_3", "shell", RERUN]),
+      ],
+      FAILING_SCRIPT,
+    );
+    expect(bodies).toHaveLength(3);
+    expect(toolResultOutput(bodies[2]!, "edit_2")).toMatch(/not found|no match|did not match/i);
+    expect(result.stderr).toContain(SHELL_FAILURE_STOP);
+    expect(result.stdout).not.toContain("UNEXPECTED_EXTRA_STEP");
+    expect(trace).toContain("repeated_shell_execution_failure");
+  });
+
   test("no-save shell timeout returns a readable process-scoped replay handle", async () => {
     const root = createFixtureRoot("terminal-timeout-replay");
     const tracePath = join(root.root, "trace.log");

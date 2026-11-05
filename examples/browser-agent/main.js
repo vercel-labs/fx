@@ -1,4 +1,4 @@
-import { createFxAgent, supportsJspi } from 'libfx/browser'
+import { createFxEngine, supportsJspi } from 'libfx/browser'
 import { model } from '../shared/model.mjs'
 
 const form = document.querySelector('form')
@@ -26,7 +26,7 @@ form.addEventListener('submit', async (event) => {
       await agent?.close()
       agent = undefined
     }
-    agent ??= await createFxAgent({
+    agent ??= await createFxEngine({
       apiKey: apiKey || 'demo', model,
       fetch(url, init) {
         if (apiKey) return fetch(url, init)
