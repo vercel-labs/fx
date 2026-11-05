@@ -2082,20 +2082,20 @@ describe("MCP login", () => {
     // withdrawn; the second calls once the first's refresh is out.
     let second: ReturnType<typeof startFakeGateway> | null = null;
     gateway = startFakeGateway([
-      fakeGatewayToolCall("select_first", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("select_first", "toolbox", { open: TOOL_NAME }),
       async () => {
         await until("the second fx to connect", () => (second?.requests.length ?? 0) >= 2);
         activeAuth.validTokens.delete(ACCESS_INITIAL);
-        return fakeGatewayToolCall("first", TOOL_NAME, { text: "first" });
+        return fakeGatewayToolCall("first", "toolbox", { run: TOOL_NAME, arguments: { text: "first" } });
       },
       fakeGatewayFinalText("First call done."),
     ], models);
     const first = gateway;
     second = startFakeGateway([
-      fakeGatewayToolCall("select_second", "mcp_select_tool", { name: TOOL_NAME }),
+      fakeGatewayToolCall("select_second", "toolbox", { open: TOOL_NAME }),
       async () => {
         await until("the first fx's refresh", () => activeAuth.refreshes >= 1);
-        return fakeGatewayToolCall("second", TOOL_NAME, { text: "second" });
+        return fakeGatewayToolCall("second", "toolbox", { run: TOOL_NAME, arguments: { text: "second" } });
       },
       fakeGatewayFinalText("Second call done."),
     ], models);
@@ -2324,8 +2324,8 @@ describe("MCP login", () => {
       FX_NO_OPEN_BROWSER: undefined, FX_TRACE_SCOPES: "mcp,keychain",
     };
     const call = (id: string, done: string) => [
-      fakeGatewayToolCall(`select_${id}`, "mcp_select_tool", { name: TOOL_NAME }),
-      fakeGatewayToolCall(`call_${id}`, TOOL_NAME, { text: id }),
+      fakeGatewayToolCall(`select_${id}`, "toolbox", { open: TOOL_NAME }),
+      fakeGatewayToolCall(`call_${id}`, "toolbox", { run: TOOL_NAME, arguments: { text: id } }),
       fakeGatewayFinalText(done),
     ];
     const models = [{ id: MODEL, type: "language", tags: ["tool-use"] }];
