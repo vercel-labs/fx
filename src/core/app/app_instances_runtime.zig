@@ -289,7 +289,7 @@ pub fn Runtime(comptime App: type) type {
                 try AgentsRuntime.visit(app, child, id, resumeInContext);
                 child.view_built = true;
             } else {
-                try SessionRuntime.beginFreshPersistedSession(app, agent);
+                try SessionRuntime.beginInstanceSession(app, agent);
                 SessionRuntime.enableSessionStores(app, agent);
                 // A fresh session starts in its profile's model; `--model`,
                 // `--provider`, or `FX_MODEL` still wins for this run.

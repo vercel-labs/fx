@@ -614,6 +614,21 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn beginFreshPersistedSession(app: *App, agent: *AppAgent) !void {
+            return beginFresh(app, agent, .later);
+        }
+
+        /// Starts the session an instance opens with. In a profile, it starts
+        /// with and saves the profile's model and effort, so resuming it
+        /// brings them back; `--model`, `--effort`, and `FX_MODEL` shape only
+        /// the run that passed them. A fresh session started later, such as
+        /// `/new`'s, keeps the instance's settings as they are by then.
+        pub fn beginInstanceSession(app: *App, agent: *AppAgent) !void {
+            return beginFresh(app, agent, .instance_start);
+        }
+
+        const FreshStart = enum { instance_start, later };
+
+        fn beginFresh(app: *App, agent: *AppAgent, start: FreshStart) !void {
             closeWritableSession(app, agent);
             // A fresh session starts with no usage, whether or not it persists.
             agent.total_input_tokens = 0;
@@ -625,7 +640,7 @@ pub fn Runtime(comptime App: type) type {
             defer syncTranscriptWindowSaveMode(app, agent);
             defer syncTranscriptArchiveAvailable(app, agent);
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
-            if (agent.session_persistence.v2_store) |v2_store| try beginFreshV2Session(app, agent, v2_store);
+            if (agent.session_persistence.v2_store) |v2_store| try beginFreshV2Session(app, agent, v2_store, start);
         }
 
         /// The transcript window drops entries only once the session log holds
@@ -653,22 +668,21 @@ pub fn Runtime(comptime App: type) type {
 
         /// A v2 session starts in memory; its folder appears with the first
         /// turn (D2), so a launch that never prompts leaves nothing behind.
-        /// A session in a profile starts with, and saves, the profile's model
-        /// and effort, so resuming it brings them back; `--model`, `--effort`,
-        /// and `FX_MODEL` shape only the run that passed them.
-        fn beginFreshV2Session(app: *App, agent: *AppAgent, v2_store: *session_adapter.Store) !void {
+        fn beginFreshV2Session(app: *App, agent: *AppAgent, v2_store: *session_adapter.Store, start: FreshStart) !void {
             const workspace_preferences = agent.session_persistence.workspace_preferences orelse
                 return error.SessionPreferencesUnavailable;
             var preferences = try workspace_preferences.dupe(app.alloc);
             defer preferences.deinit(app.alloc);
             if (comptime agents.hasAgentField(App, "profile")) {
-                const profile = &agent.profile.profile;
-                if (profile.model) |model| {
-                    const owned = try app.alloc.dupe(u8, model);
-                    app.alloc.free(preferences.model);
-                    preferences.model = owned;
+                if (start == .instance_start) {
+                    const profile = &agent.profile.profile;
+                    if (profile.model) |model| {
+                        const owned = try app.alloc.dupe(u8, model);
+                        app.alloc.free(preferences.model);
+                        preferences.model = owned;
+                    }
+                    if (profile.effort) |effort| preferences.effort = effort;
                 }
-                if (profile.effort) |effort| preferences.effort = effort;
             }
             try replacePreferences(
                 app.alloc,
@@ -1857,7 +1871,8 @@ pub fn Runtime(comptime App: type) type {
             cancelSessionPicker(app, agent);
             if (comptime !agents.hasAgentField(App, "session")) return;
             if (agent.session_persistence.v2 != null) return;
-            beginFreshPersistedSession(app, agent) catch |err| {
+            // With no session yet, this is the one the instance opens with.
+            beginInstanceSession(app, agent) catch |err| {
                 debug_trace.logf(
                     "session",
                     "fresh session after picker cancel unavailable err={s}",
