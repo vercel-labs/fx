@@ -13,7 +13,7 @@
 // runs check the lock, and tests/e2e/mcp-auth.test.ts checks fx processes
 // already connected.
 import { expect, test } from "bun:test";
-import { dlopen, FFIType } from "bun:ffi";
+import { dlopen, FFIType, ptr } from "bun:ffi";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { artifacts, binary } from "../lib/context";
@@ -27,14 +27,21 @@ const SLACK = 2_000;
 /** Scheduling noise allowed around every deadline. */
 const TOLERANCE = 600;
 
-// fx times its stamps on Zig's awake clock: CLOCK_UPTIME_RAW on macOS, which
-// Bun's hrtime isn't, and CLOCK_MONOTONIC on Linux, which it is.
+// fx times its stamps on Zig's awake clock, CLOCK_UPTIME_RAW on macOS and
+// CLOCK_MONOTONIC on Linux. Bun's hrtime is neither, so both are read from libc.
 const uptime = process.platform === "darwin"
   ? dlopen("/usr/lib/libSystem.B.dylib", { clock_gettime_nsec_np: { args: [FFIType.i32], returns: FFIType.u64 } }).symbols
   : null;
-const awakeMs = () => uptime
-  ? Number(BigInt(uptime.clock_gettime_nsec_np(8)) / 1_000_000n)
-  : Number(process.hrtime.bigint() / 1_000_000n);
+const libc = process.platform === "linux"
+  ? dlopen("libc.so.6", { clock_gettime: { args: [FFIType.i32, FFIType.ptr], returns: FFIType.i32 } }).symbols
+  : null;
+const timespec = new BigInt64Array(2);
+const CLOCK_MONOTONIC = 1;
+function awakeMs(): number {
+  if (uptime) return Number(BigInt(uptime.clock_gettime_nsec_np(8)) / 1_000_000n);
+  if (libc && libc.clock_gettime(CLOCK_MONOTONIC, ptr(timespec)) === 0) return Number(timespec[0]! * 1000n + timespec[1]! / 1_000_000n);
+  throw new Error("no awake clock to read on this platform");
+}
 
 interface Proc { label: string; child: ReturnType<typeof Bun.spawn>; trace: string; done: Promise<{ code: number; out: string; err: string }> }
 interface Scene { f: Fixture; fake: Awaited<ReturnType<typeof startFake>>; t0: number; records: TraceRecord[]; procs: Proc[]; holders: ReturnType<typeof Bun.spawn>[] }
@@ -82,20 +89,25 @@ function start(s: Scene, label: string): Proc {
   return p;
 }
 
-interface Seen { takes: number[]; stamps: number[]; releases: number[]; goaheads: { at: number; started: number }[] }
+interface Seen { takes: number[]; stamps: number[]; releases: number[]; goaheads: { at: number; started: number }[]; events: { event: string; at: number; started?: number }[] }
 
+/** The process's refresh lock lines, on the scene's clock, also in the order it wrote them. */
 function seen(s: Scene, p: Proc): Seen {
   const text = existsSync(p.trace) ? readFileSync(p.trace, "utf8") : "";
-  const out: Seen = { takes: [], stamps: [], releases: [], goaheads: [] };
+  const out: Seen = { takes: [], stamps: [], releases: [], goaheads: [], events: [] };
   for (const line of text.split("\n")) {
     let m = /MCP refresh lock taken stamp=(\d+)/.exec(line);
-    if (m) out.takes.push(Number(m[1]) - s.t0);
+    if (m) out.events.push({ event: "take", at: Number(m[1]) - s.t0 });
     m = /MCP refresh lock stamped stamp=(\d+)/.exec(line);
-    if (m) out.stamps.push(Number(m[1]) - s.t0);
+    if (m) out.events.push({ event: "stamp", at: Number(m[1]) - s.t0 });
     m = /MCP refresh lock released stamp=\d+ at=(\d+)/.exec(line);
-    if (m) out.releases.push(Number(m[1]) - s.t0);
+    if (m) out.events.push({ event: "release", at: Number(m[1]) - s.t0 });
     m = /MCP refresh went ahead server=\S+ reason=another fx stopped refreshing started=(\d+) at=(\d+)/.exec(line);
-    if (m) out.goaheads.push({ started: Number(m[1]) - s.t0, at: Number(m[2]) - s.t0 });
+    if (m) out.events.push({ event: "goahead", started: Number(m[1]) - s.t0, at: Number(m[2]) - s.t0 });
+  }
+  for (const e of out.events) {
+    if (e.event === "goahead") out.goaheads.push({ at: e.at, started: e.started! });
+    else ({ take: out.takes, stamp: out.stamps, release: out.releases } as Record<string, number[]>)[e.event]!.push(e.at);
   }
   return out;
 }
@@ -109,16 +121,17 @@ async function finish(s: Scene): Promise<{ verdict: Verdict; seen: Seen[]; resul
   const results = await Promise.all(s.procs.map((p) => p.done));
   const all = s.procs.map((p) => seen(s, p));
   for (const [k, p] of s.procs.entries()) {
-    const v = all[k]!;
-    const push = (event: string, at: number, extra: Record<string, number> = {}) => s.records.push({ event, data: { p: p.label, at, ...extra }, at });
-    for (const at of v.takes) push("take", at);
-    for (const at of v.stamps) push("stamp", at);
-    for (const at of v.releases) push("release", at);
-    for (const g of v.goaheads) push("goahead", g.at, { started: g.started });
+    for (const e of all[k]!.events) {
+      s.records.push({ event: e.event, data: { p: p.label, at: e.at, ...(e.started === undefined ? {} : { started: e.started }) }, at: e.at });
+    }
   }
-  // Time order; at the same millisecond a release comes before a take.
+  // Time order. One process's lines keep the order it wrote them; between
+  // processes, at the same millisecond a release comes before a take.
   const rank: Record<string, number> = { kill: 0, release: 0, foreign_release: 0, thaw: 1, freeze: 2, goahead: 3, take: 4, foreign: 4, stamp: 5 };
-  s.records.sort((a, b) => (a.at ?? 0) - (b.at ?? 0) || (rank[a.event] ?? 6) - (rank[b.event] ?? 6));
+  const order = new Map(s.records.map((r, k) => [r, k]));
+  const who = (r: TraceRecord) => (r.data as { p?: string } | undefined)?.p;
+  s.records.sort((a, b) => (a.at ?? 0) - (b.at ?? 0)
+    || (who(a) === who(b) ? order.get(a)! - order.get(b)! : (rank[a.event] ?? 6) - (rank[b.event] ?? 6)));
   const verdict = await checkTrace({
     module: "RefreshLease", records: s.records, dir: join(s.f.base, "trace"),
     constants: { ObsRefreshMax: REFRESH_MAX, ObsBudget: BUDGET, ObsSlack: SLACK, ObsTolerance: TOLERANCE },
