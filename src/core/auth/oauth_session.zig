@@ -824,11 +824,8 @@ fn lockMutation(open_fx_dir: io_mod.VerifiedDir) !Mutation {
     );
 }
 
-/// Every profile reads the same Keychain session, whatever `FX_HOME` says,
-/// and a refresh rotates its refresh token. A profile that `FX_HOME` moved
-/// therefore locks `auth.lock` in the default `~/.fx`, where a profile that
-/// was not moved locks it, so two profiles never refresh one session at
-/// once. Null when the session is a profile file or `~/.fx` is the profile.
+/// Every profile shares the Keychain session, so a profile that `FX_HOME`
+/// moved takes `auth.lock` in the default `~/.fx`. Null otherwise.
 fn openSharedKeychainLockDir(backend: StorageBackend) !?io_mod.VerifiedDir {
     if (backend != .macos_keychain) return null;
     const parent = profile_paths.sharedRootParent(io_mod.getenv("HOME")) orelse return null;
@@ -854,7 +851,7 @@ fn lockMutationWithOps(
     );
 }
 
-/// Locks `auth.lock` in `lock_dir`, or in the profile when it is null.
+/// Locks `auth.lock` in `lock_dir`, or in the profile when null.
 fn lockMutationWithBackend(
     open_fx_dir: io_mod.VerifiedDir,
     lock_dir: ?*io_mod.VerifiedDir,
@@ -1701,7 +1698,6 @@ test "OAuth Keychain mutations from two profiles share one lock folder" {
             fake.backend(),
         ),
     );
-    // The profile keeps its own files; only the lock moved.
     _ = try tmp.dir.statFile(std.testing.io, "default/" ++ mutation_lock_file_name, .{});
     try std.testing.expectError(
         error.FileNotFound,

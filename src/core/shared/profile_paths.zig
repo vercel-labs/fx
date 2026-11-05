@@ -114,10 +114,8 @@ pub fn rootName() []const u8 {
     return std.Io.Dir.path.basename(root);
 }
 
-/// The folder that holds the default `~/.fx` while `FX_HOME` moves fx's
-/// folder: `home`, when it is an absolute path. Null without `FX_HOME`,
-/// where `rootParent` already names it. State that every profile shares,
-/// such as the lock on the one Keychain session, lives in `.fx` there.
+/// The folder that holds the default `~/.fx` while `FX_HOME` is set: `home`,
+/// when it is absolute. Null without `FX_HOME`.
 pub fn sharedRootParent(home: ?[]const u8) ?[]const u8 {
     if (fx_home == null) return null;
     const path = home orelse return null;
