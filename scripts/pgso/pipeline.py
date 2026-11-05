@@ -418,9 +418,15 @@ def profile_use_argv(
     paths: PipelinePaths,
     profile_path: pathlib.Path | None = None,
     output: pathlib.Path | None = None,
+    *,
+    production_flags: bool = False,
 ) -> tuple[str, ...]:
+    # A benchmark trained on its own workload uses the higher cold cutoff, so
+    # its IR keeps the functions that workload runs speed-shaped. The measured
+    # benchmark candidates pass `production_flags` to build the way fx does.
     profile = profile_path or paths.merged_profile
-    flags = USE_FLAGS if paths.selector == "fx" else BENCHMARK_USE_FLAGS
+    production = production_flags or paths.selector == "fx"
+    flags = USE_FLAGS if production else BENCHMARK_USE_FLAGS
     return (
         str(toolchain.opt),
         *flags,
@@ -469,12 +475,17 @@ def instrumented_run_argv(
 def candidate_object_argv(
     toolchain: Toolchain,
     paths: PipelinePaths,
+    *,
+    production_flags: bool = False,
 ) -> tuple[str, ...]:
     # A second AArch64 outliner pass can fold sequences exposed by the first,
     # and each size-optimized function saves and restores its callee-saved
-    # registers through a shared frame helper instead of inline. Keep
-    # benchmark artifacts on their established code-generation contract.
-    codegen_flags = FX_CODEGEN_FLAGS if paths.selector == "fx" else ()
+    # registers through a shared frame helper instead of inline. The measured
+    # benchmark candidates pass `production_flags` so the heavy gates measure
+    # the code generation fx ships. A benchmark trained on its own workload
+    # keeps the default code generation.
+    production = production_flags or paths.selector == "fx"
+    codegen_flags = FX_CODEGEN_FLAGS if production else ()
     return (
         str(toolchain.llc),
         "-filetype=obj",
@@ -1108,18 +1119,25 @@ def apply_profile(
     *,
     profile_path: pathlib.Path | None = None,
     no_outline_functions: pathlib.Path | None = None,
+    production_flags: bool = False,
 ) -> pathlib.Path:
     """Apply the profile, then outline and clean up the result.
 
     The functions listed in `no_outline_functions`, one per line, are marked
     `nooutline` first, so neither outliner moves their code into shared
-    helpers placed elsewhere.
+    helpers placed elsewhere. `production_flags` gives a benchmark the
+    production profile-use flags.
     """
     validate_bitcode_hash(paths.bitcode, expected_bitcode_sha256)
     profile = profile_path or paths.merged_profile
     _require_nonempty_file(profile, "merged profile")
     run_checked(
-        profile_use_argv(toolchain, paths, profile),
+        profile_use_argv(
+            toolchain,
+            paths,
+            profile,
+            production_flags=production_flags,
+        ),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,
@@ -1348,6 +1366,7 @@ def link_candidate(
     paths: PipelinePaths,
     *,
     require_release_safe_evidence: bool = True,
+    production_flags: bool = False,
 ) -> pathlib.Path:
     _require_nonempty_file(paths.profile_use_bitcode, "profile-use bitcode")
     toolchain.platform.prepare_candidate_bitcode(toolchain, paths)
@@ -1370,7 +1389,11 @@ def link_candidate(
         verify_release_safe_ir(paths.profile_use_ir)
 
     run_checked(
-        candidate_object_argv(toolchain, paths),
+        candidate_object_argv(
+            toolchain,
+            paths,
+            production_flags=production_flags,
+        ),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,

@@ -986,8 +986,11 @@ class PgsoQualificationTests(unittest.TestCase):
                 return_value=(raw_profile,),
             ) as instrument,
             mock.patch("scripts.pgso.qualify.merge_profile_batch", return_value=1),
-            mock.patch("scripts.pgso.qualify.apply_profile"),
-            mock.patch("scripts.pgso.qualify.link_candidate", return_value=candidate),
+            mock.patch("scripts.pgso.qualify.apply_profile") as apply,
+            mock.patch(
+                "scripts.pgso.qualify.link_candidate",
+                return_value=candidate,
+            ) as link,
         ):
             pair = build_benchmark_pair(
                 types.SimpleNamespace(platform=macos, target=macos.TARGET), self.root, output, plan,
@@ -996,6 +999,10 @@ class PgsoQualificationTests(unittest.TestCase):
         self.assertEqual(external, pair.control_binary)
         self.assertEqual(external, read_identity.call_args.args[1])
         self.assertEqual({"minimum_macos": "15.0"}, instrument.call_args.args[2])
+        # The supplement build keeps the benchmark profile-use flags and the
+        # default code generation.
+        self.assertNotIn("production_flags", apply.call_args.kwargs)
+        self.assertNotIn("production_flags", link.call_args.kwargs)
 
     def test_builds_all_profile_linked_benchmarks_before_candidate_link(self) -> None:
         paths = PipelinePaths.create(self.root / "run")
@@ -1092,17 +1099,23 @@ class PgsoQualificationTests(unittest.TestCase):
                 "scripts.pgso.qualify.create_mapped_benchmark_profile",
                 side_effect=fake_map,
             ),
-            mock.patch("scripts.pgso.qualify.apply_profile"),
+            mock.patch("scripts.pgso.qualify.apply_profile") as apply,
             mock.patch(
                 "scripts.pgso.qualify.link_candidate",
                 side_effect=fake_link,
-            ),
+            ) as link,
         ):
             linked = relink_profile_linked_benchmarks(
                 object(),
                 paths,
                 linked,
             )
+
+        # The measured candidates build with the production flags.
+        self.assertEqual(len(BENCHMARK_PLANS), apply.call_count)
+        self.assertEqual(len(BENCHMARK_PLANS), link.call_count)
+        for call in (*apply.call_args_list, *link.call_args_list):
+            self.assertIs(True, call.kwargs["production_flags"])
 
         with mock.patch(
             "scripts.pgso.qualify.verify_supplement_functions",
