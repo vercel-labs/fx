@@ -8,7 +8,11 @@
 //! owns the result, so both never do: the job publishes with a swap from
 //! `running` to `handed`, and the request walks away with a swap from
 //! `running` to `abandoned`. Whichever swap fails learns that the other side
-//! went first. `tests/tla/gateway_open/OpenCancel.tla` models it, and
+//! went first. Once the request walked away, the job stops a connect or TLS
+//! setup it is still in; only the lookup runs to its end. The side that owns
+//! the result also frees the job's memory, including a client the job made
+//! for an unpooled open, so it is never freed while the job still uses it.
+//! `tests/tla/gateway_open/OpenCancel.tla` models it, and
 //! `tests/tla/drivers/gateway_open/` walks this file along that model.
 const std = @import("std");
 
@@ -59,6 +63,12 @@ pub const Handoff = struct {
         return if (self.state.load(.acquire) == .handed) .take else .wait;
     }
 
+    /// The job's check while its open runs: true once the request walked
+    /// away, so the job stops the open (OpenCancel.tla JobStopConnect).
+    pub fn abandoned(self: *const Handoff) bool {
+        return self.state.load(.acquire) == .abandoned;
+    }
+
     /// The request stops waiting (OpenCancel.tla WorkerAbandonAtomic).
     pub fn stop(self: *Handoff) StopMove {
         return if (self.state.cmpxchgStrong(.running, .abandoned, .acq_rel, .acquire) == null)
@@ -80,8 +90,17 @@ test "an open that returns first is handed over, and a stop after it closes it" 
 
 test "a request that stops first walks away, and the late open is closed by its job" {
     var handoff: Handoff = .{};
+    try std.testing.expect(!handoff.abandoned());
     try std.testing.expectEqual(StopMove.walk_away, handoff.stop());
+    try std.testing.expect(handoff.abandoned());
     try std.testing.expectEqual(JobAfterOpen.close_late, handoff.publish());
+}
+
+test "the job sees no walk-away once its open was handed over" {
+    var handoff: Handoff = .{};
+    try std.testing.expectEqual(JobAfterOpen.hand_over, handoff.publish());
+    try std.testing.expectEqual(StopMove.close_handed, handoff.stop());
+    try std.testing.expect(!handoff.abandoned());
 }
 
 test "racing threads leave exactly one owner of every open" {

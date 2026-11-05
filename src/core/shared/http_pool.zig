@@ -34,7 +34,7 @@ pub const HttpPool = struct {
     warm_started: std.atomic.Value(bool) = .init(false),
     warm_done: std.atomic.Value(bool) = .init(false),
     /// Connection opens running on their own threads (src/gateway/client.zig
-    /// PooledOpenJob). One a request walked away from may still be inside a
+    /// OpenJob). One a request walked away from may still be inside a
     /// DNS lookup that never returns.
     open_jobs: std.atomic.Value(u32) = .init(0),
     deinitialized: bool = false,

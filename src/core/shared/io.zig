@@ -597,6 +597,14 @@ pub noinline fn nanoTimestamp() i128 {
     return @intCast(ts.nanoseconds);
 }
 
+/// Milliseconds on the awake clock, which every process on the machine shares
+/// and which stops while the machine sleeps (mach uptime on macOS). For
+/// timeouts one process sets and another reads.
+pub fn awakeMilliTimestamp() i64 {
+    const ts = std.Io.Timestamp.now(getIo(), .awake);
+    return @intCast(@divFloor(ts.nanoseconds, 1_000_000));
+}
+
 pub fn writeFileAtomic(alloc: std.mem.Allocator, path: []const u8, text: []const u8) !void {
     e2eFailIfDurableMutationAttempted();
     const maybe_existing_permissions = existingFilePermissions(path);

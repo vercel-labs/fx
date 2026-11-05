@@ -1228,6 +1228,87 @@ describe.skipIf(!tmuxAvailable())("TUI host instances", () => {
   );
 
   test(
+    "a group started in profiles resumes in each profile's model and effort, not the run's --effort",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-resume-profiles-")));
+      try {
+        writeProfile(home, "first", { description: "The launch profile", model: "other/model", effort: "low" });
+        writeProfile(home, "chooser", { description: "Chooses a model", model: "profile/model", effort: "high" });
+        const before: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { args: "--profile first --effort medium", env: { FX_MODEL: undefined }, models: PREFERENCE_MODELS, requests: before, remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
+          await promptMarker(session, "SAVED_FIRST");
+          await session.sendText("/launch chooser");
+          await session.waitForPane((pane) => pane.includes("fx 2/2"), 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "SAVED_CHOOSER");
+          await quitWith(session, "/exit");
+        });
+        expect(preferencesOf(before, "SAVED_FIRST")).toMatchObject({ model: "other/model", reasoning: "medium" });
+        expect(preferencesOf(before, "SAVED_CHOOSER")).toMatchObject({ model: "profile/model", reasoning: "medium" });
+        const first = sessionHolding(home, "DONE_SAVED_FIRST")!;
+        const after: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { args: `--resume ${first}`, env: { FX_MODEL: undefined }, models: PREFERENCE_MODELS, requests: after, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("DONE_SAVED_FIRST"), 30_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "RESUMED_FIRST");
+          await switchAgent(session, "next");
+          await session.waitForPane((pane) => pane.includes("DONE_SAVED_CHOOSER"), 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "RESUMED_CHOOSER");
+        });
+        // Each session saved its profile's model and effort when it started;
+        // `--effort` shaped only the run that passed it.
+        expect(preferencesOf(after, "RESUMED_FIRST")).toMatchObject({ model: "other/model", reasoning: "low" });
+        expect(preferencesOf(after, "RESUMED_CHOOSER")).toMatchObject({ model: "profile/model", reasoning: "high" });
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "/new under fx --profile keeps a /model choice, and its session resumes in it",
+    async () => {
+      const home = createIsolatedTestHome();
+      const workspace = realpathSync(mkdtempSync(join(tmpdir(), "fx-host-new-in-profile-")));
+      try {
+        writeProfile(home, "first", { description: "The launch profile", model: "other/model", effort: "low" });
+        const before: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { args: "--profile first", env: { FX_MODEL: undefined }, models: PREFERENCE_MODELS, requests: before, remainOnExit: true, reuse: { home, workspace } }, async ({ session }) => {
+          await promptMarker(session, "PROFILE_TURN");
+          await session.sendText("/model profile/model medium normal");
+          await session.waitForText("Switched to profile/model", 15_000);
+          await session.waitForComposer(15_000);
+          await session.sendText("/new");
+          await session.waitForPane((pane) => !pane.includes("DONE_PROFILE_TURN"), 15_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "NEW_TURN");
+          await quitWith(session, "/exit");
+        });
+        expect(preferencesOf(before, "PROFILE_TURN")).toMatchObject({ model: "other/model", reasoning: "low" });
+        expect(preferencesOf(before, "NEW_TURN")).toMatchObject({ model: "profile/model", reasoning: "medium" });
+        const id = sessionHolding(home, "DONE_NEW_TURN")!;
+        const after: Array<{ body: string; headers: Headers }> = [];
+        await withHost(echoMarker, { args: `--resume ${id}`, env: { FX_MODEL: undefined }, models: PREFERENCE_MODELS, requests: after, reuse: { home, workspace } }, async ({ session }) => {
+          await session.waitForPane((pane) => pane.includes("DONE_NEW_TURN"), 30_000);
+          await session.waitForComposer(15_000);
+          await promptMarker(session, "RESUMED_TURN");
+        });
+        // Only the session an instance opens with starts in its profile; this
+        // one ran in the model and effort chosen before it.
+        expect(preferencesOf(after, "RESUMED_TURN")).toMatchObject({ model: "profile/model", reasoning: "medium" });
+      } finally {
+        cleanupIsolatedTestHome(home);
+        rmSync(workspace, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
     "fx --profile <name> uses the profile's model unless the process chose one",
     async () => {
       for (const [args, fxModel, expected] of [

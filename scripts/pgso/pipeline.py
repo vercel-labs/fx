@@ -109,6 +109,9 @@ ARTIFACT_LAYOUTS = {
         "approval-review-bench",
         "approval-review.bc",
     ),
+    # Linux only: scripts/pgso/unit_tests.py runs the unit tests on
+    # transformed code.
+    "unit_tests": ("install-test", "fx-test", "unit-tests.bc"),
 }
 
 
@@ -498,6 +501,11 @@ def candidate_object_argv(
     )
 
 
+# A ReleaseSafe build of fx takes about 7 minutes on the PGSO runners and the
+# unit test executable up to about 13, so this only ends a build that hangs.
+ZIG_BUILD_TIMEOUT_S = 1800
+
+
 def build_control(
     toolchain: Toolchain,
     spec: ArtifactSpec,
@@ -510,7 +518,7 @@ def build_control(
         ),
         cwd=spec.repo_root,
         env=zig_build_env(paths),
-        timeout_s=900,
+        timeout_s=ZIG_BUILD_TIMEOUT_S,
         log_path=paths.logs / "build-control.json",
     )
     _require_nonempty_file(paths.control_binary, "ReleaseSafe control")
@@ -529,7 +537,7 @@ def emit_bitcode(
         zig_build_argv(toolchain, spec, paths, emit_ir=True),
         cwd=spec.repo_root,
         env=zig_build_env(paths),
-        timeout_s=900,
+        timeout_s=ZIG_BUILD_TIMEOUT_S,
         log_path=paths.logs / "emit-bitcode.json",
     )
     _require_nonempty_file(paths.bitcode, "ReleaseSafe LLVM bitcode")

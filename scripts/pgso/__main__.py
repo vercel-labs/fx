@@ -36,7 +36,7 @@ from scripts.pgso.qualify import (
     require_measurements_passed,
 )
 from scripts.pgso.runner import cancellation_guard, run_checked
-from scripts.pgso import platforms
+from scripts.pgso import platforms, unit_tests
 from scripts.pgso.toolchain import DEFAULT_TARGET
 from scripts.pgso.toolchain import Toolchain
 
@@ -122,13 +122,22 @@ def _parser() -> argparse.ArgumentParser:
         help="Print an existing eligible manifest without modifying it",
     )
     report_parser.add_argument("--output-dir", required=True, type=pathlib.Path)
+    unit_tests_parser = subparsers.add_parser(
+        "unit-tests",
+        help="Run the Zig unit tests on code built through the candidate's transforms",
+    )
+    unit_tests_parser.add_argument("--llvm-bin", required=True)
+    unit_tests_parser.add_argument("--output-dir", required=True, type=pathlib.Path)
+    unit_tests_parser.add_argument("--target", required=True, choices=unit_tests.TARGETS)
+    unit_tests_parser.add_argument("--update-channel", choices=("stable", "dev"), default="stable")
+    unit_tests_parser.add_argument("--zig", default="zig")
     return parser
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = _parser()
     arguments = parser.parse_args(argv)
-    if arguments.command == "report":
+    if arguments.command in ("report", "unit-tests"):
         return arguments
     if arguments.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
@@ -588,6 +597,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             if arguments.command == "report":
                 payload = load_read_only_manifest(arguments.output_dir)
                 print(json.dumps(payload, indent=2, sort_keys=True))
+                return 0
+            if arguments.command == "unit-tests":
+                output_dir = ensure_fresh_output(arguments.output_dir)
+                toolchain = Toolchain.discover(arguments.zig, arguments.llvm_bin, arguments.target)
+                summary = unit_tests.transformed_unit_tests(
+                    toolchain,
+                    REPO_ROOT,
+                    output_dir,
+                    update_channel=arguments.update_channel,
+                )
+                print(json.dumps(summary, indent=2, sort_keys=True))
                 return 0
             manifest_path = run_command(arguments)
             print(manifest_path)

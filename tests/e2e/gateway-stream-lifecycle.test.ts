@@ -764,6 +764,13 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+// Whether a pid a fixture recorded names one process other than this runner.
+// process.kill(0) signals the runner's own process group, a negative pid
+// signals a whole group, and pid 1 is init.
+function isSingleOtherProcess(pid: number): boolean {
+  return Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid;
+}
+
 async function waitForProcessExit(pid: number, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -9266,8 +9273,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           "persistent_sigkill_shell",
           [
             "sleep 30 & descendant=$!",
-            `printf STARTED > ${JSON.stringify(startedPath)}`,
+            // The pids are written in full before the marker the test waits
+            // for, so the test never reads a missing or empty pid file.
             `printf '%s %s %s' "$$" "$PPID" "$descendant" > ${JSON.stringify(pidsPath)}`,
+            `printf STARTED > ${JSON.stringify(startedPath)}`,
             "sleep 3",
             `printf FINISHED > ${JSON.stringify(finishedPath)}`,
             "kill \"$descendant\" 2>/dev/null || true",
@@ -9314,7 +9323,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         .map(Number);
       expect(ownedPids).toHaveLength(3);
       for (const pid of ownedPids) {
-        expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+        expect(isSingleOtherProcess(pid)).toBe(true);
         expect(isProcessAlive(pid)).toBe(true);
       }
 
@@ -9325,6 +9334,9 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       await Bun.sleep(3_500);
       expect(existsSync(finishedPath)).toBe(false);
       for (const pid of ownedPids) await waitForProcessExit(pid, 3_000);
+      // All three have exited, so cleanup must not signal their pids, which
+      // the system may give to other processes.
+      ownedPids = [];
 
       const latest = await runFx(["session", "last", "--json"], {
         cwd: root.workspace,
@@ -9381,7 +9393,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     } finally {
       if (first.exitCode === null) first.kill("SIGKILL");
       for (const pid of ownedPids) {
-        if (!isProcessAlive(pid)) continue;
+        if (!isSingleOtherProcess(pid) || !isProcessAlive(pid)) continue;
         try {
           process.kill(pid, "SIGKILL");
         } catch {}
@@ -11703,6 +11715,53 @@ describe("request recovery across statuses and garbled streams", () => {
     }
   }, 30_000);
 
+  // A catalog whose request has connected is waited for, however slowly its
+  // body arrives; only a request that cannot connect is given up on
+  // (`src/core/gateway/gateway_provider.zig` resolveWithin).
+  for (const [label, bodyDelayMs] of [["at once", 0], ["slowly after it connects", 3_000]] as const) {
+    test(`fx ask uses the model catalog's limits when the catalog answers ${label}`, async () => {
+      const root = createFixtureRoot("catalog-limits");
+      const tracePath = join(root.root, "trace.log");
+      const catalogBody = JSON.stringify({
+        data: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 123_456, max_tokens: 7_000 }],
+      });
+      const encoder = new TextEncoder();
+      const timers: Array<ReturnType<typeof setTimeout>> = [];
+      const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("Answered with the catalog's limits."), {
+        models: () => new Response(new ReadableStream({
+          start(controller) {
+            timers.push(setTimeout(() => {
+              controller.enqueue(encoder.encode(catalogBody));
+              controller.close();
+            }, bodyDelayMs));
+          },
+        }), { headers: { "content-type": "application/json" } }),
+      });
+      try {
+        const started = performance.now();
+        const result = await runFx(["ask", "--json", "--auto", "--no-save", "Answer with the catalog's limits."], {
+          cwd: root.workspace,
+          env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,core,gateway,stream,context_compaction" },
+          timeoutMs: 30_000,
+        });
+        const elapsedMs = performance.now() - started;
+        expect(result.code, result.stderr).toBe(0);
+        expect(parseAskJson(result.stdout).output).toBe("Answered with the catalog's limits.");
+        expect(gateway.modelRequests).toHaveLength(1);
+        const trace = readFileSync(tracePath, "utf8");
+        expect(trace).toContain(`model catalog lookup outcome=ready_hit model=${MODEL}`);
+        expect(trace).not.toContain("model catalog first load abandoned");
+        // The request was sized with the catalog's output limit.
+        expect(trace).toMatch(/\[context_compaction\] event=decision .* max_output_tokens=7000\b/);
+        expect(elapsedMs).toBeGreaterThanOrEqual(bodyDelayMs);
+      } finally {
+        for (const timer of timers) clearTimeout(timer);
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    }, 40_000);
+  }
+
   test("fx ask names the status of a failure it does not retry", async () => {
     const root = createFixtureRoot("named-status");
     const tracePath = join(root.root, "trace.log");
@@ -11761,7 +11820,8 @@ describe("request recovery across statuses and garbled streams", () => {
       expect(result.code).not.toBe(0);
       expect(gateway.requestCount()).toBe(3);
       expect(result.stderr).toMatch(/^\[notice\] Unreadable reply · next try in .* · attempt 2$/m);
-      expect(result.stderr).toContain("unreadable reply");
+      expect(result.stderr).toMatch(/^fx: unreadable reply$/m);
+      expect(result.stderr).not.toContain("MalformedGatewaySseEvent");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -11800,6 +11860,9 @@ describe("request recovery across statuses and garbled streams", () => {
       });
       expect(result.code).not.toBe(0);
       expect(gateway.requestCount()).toBe(1);
+      // The error reads as words; its name stays in the trace.
+      expect(result.stderr).toBe("fx: unreadable reply\n");
+      expect(readFileSync(tracePath, "utf8")).toContain("command error err=InvalidGatewaySseEvent");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });
@@ -11818,6 +11881,7 @@ describe("request recovery across statuses and garbled streams", () => {
       });
       expect(result.code).not.toBe(0);
       expect(gateway.requestCount()).toBe(1);
+      expect(result.stderr).toBe("fx: unreadable reply\n");
     } finally {
       gateway.stop();
       rmSync(root.root, { recursive: true, force: true });

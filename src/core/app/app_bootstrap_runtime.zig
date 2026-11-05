@@ -270,7 +270,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn beginFreshPersistedSessionDefault(app: *App) !void {
-            try app_session_runtime.Runtime(App).beginFreshPersistedSession(app, &app.main_agent);
+            try app_session_runtime.Runtime(App).beginInstanceSession(app, &app.main_agent);
         }
 
         fn enableSessionStoresDefault(app: *App) void {
