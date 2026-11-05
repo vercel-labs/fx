@@ -17,6 +17,7 @@ const confine = @import("confine.zig");
 const json_decode = @import("../shared/json_decode.zig");
 const self_exe = @import("../shared/self_exe.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const text_utils = @import("../shared/text_utils.zig");
 
 /// Whether code mode can run here. Without a sandbox it never runs.
 pub const supported = confine.supported;
@@ -31,6 +32,9 @@ const child_argument = "__fx_sandbox__";
 const max_source_bytes = 1024 * 1024;
 /// Largest outcome the child sends back.
 const max_outcome_bytes = 8 * 1024 * 1024;
+/// The most text an outcome carries. One byte escapes to at most six in JSON,
+/// so the outcome's frame fits however its text escapes.
+const max_outcome_text_bytes = (max_outcome_bytes - 1024) / 6;
 /// How long past the program's time limit the parent waits for the child to
 /// start, report, and exit.
 const grace_ms = 2000;
@@ -293,11 +297,11 @@ fn writeFrame(writer: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!voi
 fn writeOutcome(gpa: std.mem.Allocator, writer: *std.Io.Writer, outcome: engine.Outcome) error{ OutOfMemory, WriteFailed }!void {
     var too_large_buffer: [160]u8 = undefined;
     const frame: OutcomeFrame = switch (outcome) {
-        .returned => |json| if (json != null and json.?.len > max_outcome_bytes - 1024) .{
+        .returned => |json| if (json != null and json.?.len > max_outcome_text_bytes) .{
             .outcome = .threw,
-            .text = std.mem.print(&too_large_buffer, "The return value is {d} bytes, over the 8 MiB limit. Return less, such as a summary or the first items.", .{json.?.len}) catch unreachable,
+            .text = std.mem.print(&too_large_buffer, "The return value is {d} bytes as JSON, over the {d}-byte limit. Return less, such as a summary or the first items.", .{ json.?.len, max_outcome_text_bytes }) catch unreachable,
         } else .{ .outcome = .returned, .text = json },
-        .threw => |text| .{ .outcome = .threw, .text = text },
+        .threw => |text| .{ .outcome = .threw, .text = text_utils.utf8PrefixByBytes(text, max_outcome_text_bytes) },
         .timed_out => .{ .outcome = .timed_out },
         .unsettled => .{ .outcome = .unsettled },
     };
@@ -352,6 +356,21 @@ test "the sandbox applies the program's heap limit" {
     , .{ .heap_bytes = 4 * 1024 * 1024 });
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.find(u8, result.threw, "out of memory") != null);
+}
+
+test "a return value that JSON escaping grows past a frame throws a message the program can act on" {
+    const result = try runForTest("return \"\\x01\".repeat(1200 * 1024);", .{});
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result == .threw);
+    try std.testing.expect(std.mem.find(u8, result.threw, "Return less") != null);
+}
+
+test "a thrown error's text is cut to fit a frame" {
+    const result = try runForTest("throw new Error('x'.repeat(9 * 1024 * 1024));", .{});
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result == .threw);
+    try std.testing.expect(std.mem.startsWith(u8, result.threw, "Error: xxx"));
+    try std.testing.expect(result.threw.len <= max_outcome_text_bytes);
 }
 
 test "the sandbox child refuses a frame over its limit" {
