@@ -379,6 +379,14 @@ pub const CapabilityResolver = struct {
     }
 };
 
+/// How long a request waits for the model catalog's first load to connect,
+/// for `CapabilityResolver.resolveWithin`. A healthy network connects well
+/// within this, and a connected load is waited for until it ends. On a dead
+/// network the load would hold the request until its DNS lookup or connect
+/// timed out, 20 to 30 seconds, before the request could report Offline and
+/// start recovering.
+pub const catalog_first_load_wait_ms: i64 = 2_000;
+
 /// How often `CapabilityResolver.resolveWithin` checks on a first load.
 const first_load_poll_ns = 2 * std.time.ns_per_ms;
 

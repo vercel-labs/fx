@@ -2222,13 +2222,6 @@ fn optionalCredentialFieldEqual(left: ?[]const u8, right: ?[]const u8) bool {
     return std.mem.eql(u8, left.?, right.?);
 }
 
-/// How long a request waits for the model catalog's first load to connect.
-/// A healthy network connects well within this, and a connected load is
-/// waited for until it ends. On a dead network the load would hold the first
-/// request until its DNS lookup or connect timed out, 20 to 30 seconds,
-/// before the request could report Offline and start recovering.
-const catalog_first_load_wait_ms: i64 = 2_000;
-
 fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8) model_capabilities.ResolveError!model_capabilities.Capabilities {
     const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
     const bundle = ctx.cfg.provider_set.select(ctx.provider);
@@ -2243,7 +2236,7 @@ fn resolveModelCapabilities(raw_ctx: *anyopaque, _: Allocator, model: []const u8
         },
         model,
         bundle.fallbackModelCapabilities(model),
-        catalog_first_load_wait_ms,
+        gateway_provider.catalog_first_load_wait_ms,
     );
 }
 
@@ -2272,7 +2265,7 @@ fn resolveModelOverride(raw_ctx: ?*anyopaque, alloc: Allocator, raw_model: []con
         },
         raw_model,
         bundle.fallbackModelCapabilities(raw_model),
-        catalog_first_load_wait_ms,
+        gateway_provider.catalog_first_load_wait_ms,
     ) catch return .no_catalog;
     const entries = ctx.capability_resolver.catalogEntries() orelse return .no_catalog;
     var ids = try model_catalog.projectModelIds(alloc, entries);
