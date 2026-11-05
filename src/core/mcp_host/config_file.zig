@@ -118,6 +118,10 @@ pub fn update(alloc: Allocator, profile_path: []const u8, file: File, path: []co
     }
 }
 
+/// The most of an MCP config file `read` takes; a larger one fails with
+/// StreamTooLong.
+pub const max_read_bytes: usize = 1024 * 1024;
+
 /// The file's text, or null when it doesn't exist; owned by `alloc`. A path
 /// that isn't a regular file, such as a fifo, fails with DurablePathUnsafe
 /// instead of waiting for a writer.
@@ -127,7 +131,7 @@ pub fn read(alloc: Allocator, path: []const u8) !?[]u8 {
         else => return err,
     };
     defer f.close(io_mod.getIo());
-    return try io_mod.readFileToEnd(alloc, &f, 1024 * 1024);
+    return try io_mod.readFileToEnd(alloc, &f, max_read_bytes);
 }
 
 const profile_lock_deadline_ms: u64 = 2_000;

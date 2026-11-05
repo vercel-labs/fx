@@ -6059,7 +6059,7 @@ describe("cli: MCP profile", () => {
         label: "link loop",
         make: (path: string) => symlinkSync("mcp.json", path),
         list: `fx mcp: ${linkLoop}\n`,
-        add: "Couldn't add probe to ~/.fx/mcp.json: it's a link that leads back to itself; replace it with a plain file.\n",
+        add: "Couldn't add probe to ~/.fx/mcp.json: it is a link that leads back to itself; replace it with a plain file.\n",
         ask: `fx ask: ${linkLoop}\n`,
       },
       {
@@ -6067,7 +6067,7 @@ describe("cli: MCP profile", () => {
         make: (path: string) =>
           writeFileSync(path, JSON.stringify({ mcpServers: {}, pad: "x".repeat(1024 * 1024) }), { mode: 0o600 }),
         list: `fx mcp: ${tooLarge}\n`,
-        add: "Couldn't add probe to ~/.fx/mcp.json: it's over 1 MB, the most fx reads; make it smaller.\n",
+        add: "Couldn't add probe to ~/.fx/mcp.json: it is over 1 MB, the most fx reads; make it smaller.\n",
         ask: `fx ask: ${tooLarge}\n`,
       },
       {

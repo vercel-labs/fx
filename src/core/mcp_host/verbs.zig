@@ -481,11 +481,17 @@ fn runParsed(c: Context, arena: Allocator, args: []const []const u8) !u8 {
     };
 }
 
+// How fx says an MCP file is unusable, after a subject such as "it" or
+// "~/.fx/mcp.json".
+const not_plain_words = "isn't a plain file; replace it with one";
+const link_loop_words = "is a link that leads back to itself; replace it with a plain file";
+const too_large_words = std.fmt.comptimePrint("is over {d} MB, the most fx reads; make it smaller", .{config_file.max_read_bytes / (1024 * 1024)});
+
 /// Why a write to `path` failed; a link says what it points to.
 fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
     switch (err) {
-        error.SymLinkLoop => return "it's a link that leads back to itself; replace it with a plain file",
-        error.StreamTooLong => return "it's over 1 MB, the most fx reads; make it smaller",
+        error.SymLinkLoop => return "it " ++ link_loop_words,
+        error.StreamTooLong => return "it " ++ too_large_words,
         else => {},
     }
     // The profile's replace refuses a link itself (DurablePathUnsafe).
@@ -495,7 +501,7 @@ fn whyNot(arena: Allocator, err: anyerror, path: []const u8) ![]const u8 {
         // Not a link: a regular file with another hard link, or a special
         // file such as a fifo.
         const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = false }) catch return describe(err);
-        if (stat.kind != .file) return "it isn't a plain file; replace it with one";
+        if (stat.kind != .file) return "it " ++ not_plain_words;
         return "it has another hard link, and fx edits only a plain file; edit it by hand";
     };
     const target = try safe(arena, buffer[0..n]);
@@ -512,14 +518,14 @@ pub fn describe(err: anyerror) []const u8 {
         error.NotAnObject => "the file's servers aren't a JSON object; fix it by hand first",
         error.HomeNotSet => io_mod.no_home_dir_reason,
         error.AccessDenied => "permission denied",
-        error.DurablePathUnsafe => "an MCP config file isn't a plain file; replace it with one",
-        error.SymLinkLoop => "an MCP config file is a link that leads back to itself; replace it with a plain file",
-        error.StreamTooLong => "an MCP config file is over 1 MB, the most fx reads; make it smaller",
+        error.DurablePathUnsafe => "an MCP config file " ++ not_plain_words,
+        error.SymLinkLoop => "an MCP config file " ++ link_loop_words,
+        error.StreamTooLong => "an MCP config file " ++ too_large_words,
         error.Timeout, error.LockTimeout => "another fx is changing the MCP config; try again",
         error.McpConfigInvalidJson => profile_paths.displayText("~/.fx/mcp.json isn't valid JSON"),
-        error.McpConfigNotPlainFile => profile_paths.displayText("~/.fx/mcp.json isn't a plain file; replace it with one"),
-        error.McpConfigLinkLoop => profile_paths.displayText("~/.fx/mcp.json is a link that leads back to itself; replace it with a plain file"),
-        error.McpConfigTooLarge => profile_paths.displayText("~/.fx/mcp.json is over 1 MB, the most fx reads; make it smaller"),
+        error.McpConfigNotPlainFile => profile_paths.displayText("~/.fx/mcp.json " ++ not_plain_words),
+        error.McpConfigLinkLoop => profile_paths.displayText("~/.fx/mcp.json " ++ link_loop_words),
+        error.McpConfigTooLarge => profile_paths.displayText("~/.fx/mcp.json " ++ too_large_words),
         error.McpConfigInvalidHeaders, error.McpConfigAuthorizationHeader => profile_paths.displayText("a server in ~/.fx/mcp.json has headers fx won't send; put a token in bearer_token_env, or sign in with login"),
         else => if (isProfileConfigError(err)) profile_paths.displayText("~/.fx/mcp.json has a server entry fx can't read") else "something went wrong",
     };
@@ -1370,6 +1376,6 @@ test "an MCP file fx can't read gets fx's words, and only mcp.json's own errors 
     try testing.expect(profileConfigNotice(error.AccessDenied) == null);
     try testing.expectEqualStrings("an MCP config file is a link that leads back to itself; replace it with a plain file", describe(error.SymLinkLoop));
     try testing.expectEqualStrings("an MCP config file is over 1 MB, the most fx reads; make it smaller", describe(error.StreamTooLong));
-    try testing.expectEqualStrings("it's a link that leads back to itself; replace it with a plain file", try whyNot(a, error.SymLinkLoop, "/example/.mcp.json"));
-    try testing.expectEqualStrings("it's over 1 MB, the most fx reads; make it smaller", try whyNot(a, error.StreamTooLong, "/example/.mcp.json"));
+    try testing.expectEqualStrings("it is a link that leads back to itself; replace it with a plain file", try whyNot(a, error.SymLinkLoop, "/example/.mcp.json"));
+    try testing.expectEqualStrings("it is over 1 MB, the most fx reads; make it smaller", try whyNot(a, error.StreamTooLong, "/example/.mcp.json"));
 }
