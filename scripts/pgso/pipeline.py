@@ -382,9 +382,11 @@ def ir_size_argv(
     toolchain: Toolchain,
     command: str,
     source: pathlib.Path,
-    output: pathlib.Path,
+    output: pathlib.Path | None,
     options: Sequence[str] = (),
 ) -> tuple[str, ...]:
+    """`output` is None for the commands that only read their input,
+    check-outlined and dropped-outputs."""
     return (
         sys.executable,
         str(toolchain.ir_size),
@@ -393,35 +395,7 @@ def ir_size_argv(
         *options,
         command,
         str(source),
-        str(output),
-    )
-
-
-def check_outlined_argv(
-    toolchain: Toolchain,
-    source: pathlib.Path,
-) -> tuple[str, ...]:
-    return (
-        sys.executable,
-        str(toolchain.ir_size),
-        "--libllvm",
-        str(toolchain.libllvm),
-        "check-outlined",
-        str(source),
-    )
-
-
-def dropped_outputs_argv(
-    toolchain: Toolchain,
-    source: pathlib.Path,
-) -> tuple[str, ...]:
-    return (
-        sys.executable,
-        str(toolchain.ir_size),
-        "--libllvm",
-        str(toolchain.libllvm),
-        "dropped-outputs",
-        str(source),
+        *(() if output is None else (str(output),)),
     )
 
 
@@ -1262,7 +1236,7 @@ def _outline_without_folded_constants(
     _require_bitcode_header(widened)
     _outline_excluding_dropped_outputs(toolchain, paths, widened, output, name)
     run_checked(
-        check_outlined_argv(toolchain, output),
+        ir_size_argv(toolchain, "check-outlined", output, None),
         cwd=paths.root,
         env=os.environ.copy(),
         timeout_s=900,
@@ -1301,15 +1275,23 @@ def _outline_excluding_dropped_outputs(
         )
         _require_nonempty_file(output, "outlined IR")
         result = run_checked(
-            dropped_outputs_argv(toolchain, output),
+            ir_size_argv(toolchain, "dropped-outputs", output, None),
             cwd=paths.root,
             env=os.environ.copy(),
             timeout_s=900,
             log_path=paths.logs / f"dropped-outputs-{name}-round-{number}.json",
             require_empty_stderr=True,
         )
-        summary = json.loads(result.stdout)
-        if not isinstance(summary.get("instances"), list) or not isinstance(summary.get("callers"), list):
+        try:
+            summary = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise PgsoError(f"dropped-outputs printed no JSON: {result.stdout!r}") from error
+        if (
+            not isinstance(summary, dict)
+            or not isinstance(summary.get("instances"), list)
+            or not isinstance(summary.get("callers"), list)
+            or not all(isinstance(caller, str) for caller in summary["callers"])
+        ):
             raise PgsoError(f"dropped-outputs printed no instance list: {result.stdout!r}")
         added = [caller for caller in summary["callers"] if caller not in excluded]
         rounds.append({

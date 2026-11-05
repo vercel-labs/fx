@@ -86,6 +86,7 @@ store. check-outlined catches a PHI constant that becomes an exit's value.
 Intrinsic arguments that must be immediate, assume-like intrinsics, inline
 asm, GEP indices, and switch cases also keep their constants. Run it on the
 outliner's input right before `opt -passes=iroutliner`, after swap-compares.
+The LLVM bug is https://github.com/llvm/llvm-project/issues/239125.
 
 check-outlined fails when an outlined function holds a constant expression
 that the outliner rebuilt from a parameter: an instruction LLVM named
@@ -105,7 +106,7 @@ that catches the case. The stores are left in blocks nothing branches to, so
 each caller reads its output uninitialized. A transformed unit test read a
 garbage error code this way. Nothing else the outliner builds is
 unreachable. The pipeline marks those callers `nooutline` and outlines
-again.
+again. The LLVM bug is https://github.com/llvm/llvm-project/issues/239126.
 
 minsize-functions writes the names of the defined functions, and of those
 that carry `minsize`, to a JSON file. Profile use marks the functions it
@@ -1330,14 +1331,11 @@ def _unreachable_blocks(llvm: Llvm, fn) -> list[tuple[str, bool]]:
 
 
 def _callers(llvm: Llvm, fn) -> list[str]:
-    names = set()
-    use = llvm.FirstUse(fn)
-    while use:
-        user = llvm.GetUser(use)
-        if llvm.IsAInstruction(user):
-            names.add(llvm.name(llvm.BlockParent(llvm.InstParent(user))))
-        use = llvm.NextUse(use)
-    return sorted(names)
+    return sorted({
+        llvm.name(llvm.BlockParent(llvm.InstParent(user)))
+        for user in _users(llvm, fn)
+        if llvm.IsAInstruction(user)
+    })
 
 
 def _dropped_outputs(llvm: Llvm, mod) -> tuple[int, list[dict]]:
@@ -1405,7 +1403,11 @@ def check_outlined(llvm: Llvm, source: pathlib.Path) -> dict:
             f"({', '.join(instance['blocks'])}), called from {', '.join(instance['callers']) or 'nothing'}"
         )
     if findings:
-        raise PassError("IR outliner miscompiled an outlined function: " + "; ".join(findings[:8]))
+        raise PassError(
+            "IR outliner miscompiled an outlined function: "
+            + "; ".join(findings[:8])
+            + ". scripts/pgso/README.md describes each case; a caller can be kept out of outlining with no-outline"
+        )
     return summary
 
 

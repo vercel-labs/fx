@@ -121,6 +121,7 @@ constants stay as they are, because rebuilding them in the incoming block can
 make the outliner drop a store the region owes its caller. `check-outlined`
 fails the run if an outlined function returns anything but a constant, which
 also catches a PHI constant that the outliner turns into an exit's value.
+This is [llvm/llvm-project#239125](https://github.com/llvm/llvm-project/issues/239125).
 
 The IR outliner can also lose an outlined function's outputs. When two regions
 store the same outputs in two different ways, it needs a switch to pick the
@@ -136,6 +137,7 @@ keeps the machine outliner out of them, and the outliner runs again on the
 same input. After four rounds, `check-outlined` fails the run on any that
 remain. `outline-rounds-*.json` in the logs directory records each round's
 outlined functions, the functions it found, and the callers it excluded.
+This is [llvm/llvm-project#239126](https://github.com/llvm/llvm-project/issues/239126).
 
 Four size passes in [`ir_size.py`](ir_size.py) run through the pinned LLVM C
 library. Right after Zig emits bitcode, `outline-helpers` marks small shared
