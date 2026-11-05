@@ -16,7 +16,7 @@ import {
   truncateSync,
   writeFileSync,
 } from "node:fs";
-import { createServer } from "node:net";
+import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
@@ -25,6 +25,12 @@ import { fakeGatewaySse, fakeGatewayTitleDefault, hasEmptyComposer, TITLE_GENERA
 import { copyV1Fixture, rootSessionIds, savedText, sessionDir } from "./saved-sessions";
 
 const TIMEOUT = 15_000;
+/** What fx says when it cannot connect to the model catalog and withholds
+ * earlier images (`catalogDownNotice` in `src/core/agent/runtime/orchestrator.zig`). */
+const CATALOG_CONNECT_IMAGE_NOTICE =
+  "fx couldn't connect to AI Gateway to load the model catalog, so earlier images aren't reaching the model until it loads. Check your network connection or firewall.";
+const CATALOG_CONNECT_IMAGE_FAST_NOTICE =
+  "fx couldn't connect to AI Gateway to load the model catalog, so earlier images aren't reaching the model and fast mode is off until it loads. Check your network connection or firewall.";
 const GLM_MODEL = "zai/glm-5.2-fast";
 const GEMINI_MODEL = "google/gemini-2.5-flash";
 const KIMI_MODEL = "moonshotai/kimi-k3";
@@ -260,6 +266,16 @@ function startImageGateway(
       server.stop(true);
     },
   };
+}
+
+/** A loopback URL whose port refuses connections: a server takes a free port
+ * and closes it again. */
+async function refusedLoopbackUrl(path: string): Promise<string> {
+  const server = createServer();
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  await new Promise<void>(resolve => server.close(() => resolve()));
+  return `http://127.0.0.1:${port}${path}`;
 }
 
 function createIsolatedRoot() {
@@ -1885,6 +1901,64 @@ describe("Vision route fake Gateway", () => {
       }
     },
     TIMEOUT,
+  );
+
+  test(
+    "a resumed turn names the connection failure once when the catalog cannot connect, with and without fast mode",
+    async () => {
+      const root = createIsolatedRoot();
+      const fixture = createScopedImageFixture(root);
+      const imageData = readFileSync(fixture.imagePath).toString("base64");
+      const up = startImageGateway([sseText("It shows a logo.")]);
+      const down = startImageGateway([sseText("Standard turn answered"), sseText("Fast turn answered")]);
+      try {
+        const first = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--image", fixture.imagePath, "Describe the attached image."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, up, KIMI_MODEL), timeoutMs: TIMEOUT },
+        );
+        const firstJson = parseFxJson(first);
+        expect(firstJson.exit_code).toBe(0);
+
+        // Each later turn runs in a new process whose catalog port refuses
+        // connections, the first one with fast mode off.
+        const env = {
+          ...fakeGatewayEnv(root, down, KIMI_MODEL),
+          FX_TEST_GATEWAY_MODELS_URL: await refusedLoopbackUrl("/coding-agent/v1/models"),
+        };
+        const standard = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--resume", firstJson.session_id, "Testing"],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(standard).output).toContain("Standard turn answered");
+        expect(standard.stderr.split(CATALOG_CONNECT_IMAGE_NOTICE)).toHaveLength(2);
+        expect(standard.stderr).not.toContain("fast mode");
+        expect(standard.stderr).not.toContain("Earlier images aren't reaching the model right now");
+
+        // The resumed session keeps its own preferences, so --fast turns fast
+        // mode on for this run.
+        const fast = await runFx(
+          ["ask", "--json", "--auto", "--no-color", "--fast", "--resume", firstJson.session_id, "Testing again"],
+          { cwd: root.workspace, env, timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(fast).output).toContain("Fast turn answered");
+        // One line names the connection, the image, and fast mode together.
+        expect(fast.stderr.split(CATALOG_CONNECT_IMAGE_FAST_NOTICE)).toHaveLength(2);
+        expect(fast.stderr.split("couldn't connect")).toHaveLength(2);
+        expect(fast.stderr).not.toContain("Fast mode is unavailable");
+        expect(fast.stderr).not.toContain("Earlier images aren't reaching the model right now");
+
+        expect(down.chatRequests).toHaveLength(2);
+        for (const request of down.chatRequests) {
+          expect(request.body).not.toContain(imageData);
+          expect(request.body).toContain("[Image #1 was not sent with this request: fx could not confirm image input support");
+        }
+      } finally {
+        up.stop();
+        down.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT * 2,
   );
 
   test(

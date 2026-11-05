@@ -2375,6 +2375,10 @@ const App = struct {
         return self.model_cache.isFailed();
     }
 
+    pub fn modelCacheFailure(self: *App) ?model_catalog.FailureCategory {
+        return self.model_cache.downFailure();
+    }
+
     pub fn snapshotCachedModelIds(self: *App, alloc: Allocator) !?std.ArrayList([]u8) {
         return self.model_cache.snapshotCachedModelIds(alloc);
     }

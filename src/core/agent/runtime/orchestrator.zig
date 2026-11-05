@@ -7,6 +7,7 @@ const builtin = @import("builtin");
 const agent_steps = @import("../../config/agent_steps.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
 const model_provider = @import("../../config/model_provider.zig");
+const model_catalog = @import("../../gateway/model_catalog.zig");
 const types = @import("../../shared/types.zig");
 const history_range = @import("../../shared/history_range.zig");
 const worker_runtime = @import("../worker_runtime.zig");
@@ -6271,13 +6272,157 @@ test "requestUserImages splits kept images at the turn's own message" {
     try std.testing.expectEqual(RequestUserImages{ .this_turn = true, .earlier = false }, requestUserImages(&now, 2));
 }
 
-/// What the user hears, once per turn, when a down catalog withholds images.
-fn catalogDownNotice(chosen: image_route.Decision) []const u8 {
+/// What a down model catalog held back from one request, for the notice that
+/// tells the user once per turn.
+const CatalogDownNotice = struct {
+    /// Why the catalog is down.
+    failure: model_catalog.FailureCategory,
+    /// Who serves the catalog, as the notice names it.
+    service: []const u8,
+    /// The request's image decision, when the image route asked to tell the
+    /// user about images it withheld.
+    images: ?image_route.Decision = null,
+    /// Fast mode dropped for the first time this turn.
+    fast_off: bool = false,
+};
+
+/// At most one line for images and one for fast mode.
+const CatalogDownLines = struct {
+    buffer: [2][]const u8 = .{ "", "" },
+    len: usize = 0,
+
+    fn append(self: *CatalogDownLines, line: []const u8) void {
+        self.buffer[self.len] = line;
+        self.len += 1;
+    }
+
+    fn slice(self: *const CatalogDownLines) []const []const u8 {
+        return self.buffer[0..self.len];
+    }
+};
+
+/// The lines that tell the user what a down model catalog held back. When fx
+/// could not connect to the catalog at all, one line names the connection
+/// first, since the same fault usually blocks the model request too. Any other
+/// failure keeps one line for each thing held back. Lines are static or live
+/// in `arena`.
+fn catalogDownNotice(arena: Allocator, notice: CatalogDownNotice) Allocator.Error!CatalogDownLines {
+    var lines: CatalogDownLines = .{};
+    const images = if (notice.images) |chosen| withheldImageSubject(chosen) else null;
+    if (notice.failure == .transport) {
+        const held_back = if (images) |subject|
+            if (notice.fast_off)
+                try arena.print("{s} aren't reaching the model and fast mode is off", .{subject})
+            else
+                try arena.print("{s} aren't reaching the model", .{subject})
+        else if (notice.fast_off)
+            "fast mode is off"
+        else
+            return lines;
+        lines.append(try arena.print(
+            "fx couldn't connect to {s} to load the model catalog, so {s} until it loads. Check your network connection or firewall.",
+            .{ notice.service, held_back },
+        ));
+        return lines;
+    }
+    if (notice.images) |chosen| if (images != null) lines.append(catalogDownImageText(chosen));
+    if (notice.fast_off) lines.append("Fast mode is unavailable for this model right now; continuing at standard speed.");
+    return lines;
+}
+
+/// The images a down catalog withheld from a request, as the notice names
+/// them, or null when it withheld none.
+fn withheldImageSubject(chosen: image_route.Decision) ?[]const u8 {
+    const tools = chosen.tool_images == .withheld_unknown;
+    const earlier = chosen.earlier_images == .withheld_unknown;
+    if (earlier and tools) return "earlier images and images from tools";
+    if (earlier) return "earlier images";
+    if (tools) return "images from tools";
+    return null;
+}
+
+/// What the user hears when a catalog that answered with a failure withholds
+/// images. `tests/tla/drivers/image_route/binary-to-spec.ts` detects this
+/// line and the connection line by "aren't reaching the model".
+fn catalogDownImageText(chosen: image_route.Decision) []const u8 {
     const tools = chosen.tool_images == .withheld_unknown;
     const earlier = chosen.earlier_images == .withheld_unknown;
     if (earlier and tools) return "Earlier images and images from tools aren't reaching the model right now because image support couldn't be confirmed (model catalog unavailable). fx will retry automatically as the catalog recovers.";
     if (earlier) return "Earlier images aren't reaching the model right now because image support couldn't be confirmed (model catalog unavailable). fx will retry automatically as the catalog recovers.";
     return "Images from tools aren't reaching the model right now because image support couldn't be confirmed (model catalog unavailable). fx will retry automatically as the catalog recovers.";
+}
+
+/// Who serves the catalog for `provider`, as a catalog notice names it.
+fn catalogService(provider: model_provider.ProviderId) []const u8 {
+    return if (provider == .gateway) "AI Gateway" else "the model provider";
+}
+
+test "catalogDownNotice names a failed connection in one line and keeps the other failures' lines" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fast_line = "Fast mode is unavailable for this model right now; continuing at standard speed.";
+    const withheld = [_]struct { tools: image_route.ToolImages, earlier: image_route.ToolImages }{
+        .{ .tools = .none, .earlier = .none },
+        .{ .tools = .none, .earlier = .withheld_unknown },
+        .{ .tools = .withheld_unknown, .earlier = .none },
+        .{ .tools = .withheld_unknown, .earlier = .withheld_unknown },
+    };
+    // Every input: each failure, no image decision or each withheld mix, and
+    // fast mode dropped or not.
+    for (std.enums.values(model_catalog.FailureCategory)) |failure| {
+        for ([_]?usize{ null, 0, 1, 2, 3 }) |mix| {
+            for ([_]bool{ false, true }) |fast_off| {
+                const images: ?image_route.Decision = if (mix) |index| .{
+                    .route = .unavailable,
+                    .mode = .unavailable,
+                    .tool_images = withheld[index].tools,
+                    .earlier_images = withheld[index].earlier,
+                } else null;
+                const subject = if (images) |chosen| withheldImageSubject(chosen) else null;
+                const lines = try catalogDownNotice(arena, .{ .failure = failure, .service = "AI Gateway", .images = images, .fast_off = fast_off });
+                if (failure == .transport) {
+                    if (subject == null and !fast_off) {
+                        try std.testing.expectEqual(@as(usize, 0), lines.len);
+                        continue;
+                    }
+                    try std.testing.expectEqual(@as(usize, 1), lines.len);
+                    const line = lines.slice()[0];
+                    try std.testing.expect(std.mem.startsWith(u8, line, "fx couldn't connect to AI Gateway to load the model catalog, so "));
+                    try std.testing.expect(std.mem.endsWith(u8, line, " until it loads. Check your network connection or firewall."));
+                    try std.testing.expect(std.mem.findScalar(u8, line, '\n') == null);
+                    try std.testing.expectEqual(fast_off, std.mem.find(u8, line, "fast mode is off") != null);
+                    try std.testing.expectEqual(subject != null, std.mem.find(u8, line, "aren't reaching the model") != null);
+                    if (subject) |words| try std.testing.expect(std.mem.find(u8, line, words) != null);
+                    continue;
+                }
+                var expected: CatalogDownLines = .{};
+                if (subject != null) expected.append(catalogDownImageText(images.?));
+                if (fast_off) expected.append(fast_line);
+                try std.testing.expectEqual(expected.len, lines.len);
+                for (expected.slice(), lines.slice()) |want, got| {
+                    try std.testing.expectEqualStrings(want, got);
+                    try std.testing.expect(std.mem.find(u8, got, "couldn't connect") == null);
+                }
+            }
+        }
+    }
+
+    const both = try catalogDownNotice(arena, .{
+        .failure = .transport,
+        .service = catalogService(.gateway),
+        .images = .{ .route = .unavailable, .mode = .unavailable, .tool_images = .none, .earlier_images = .withheld_unknown },
+        .fast_off = true,
+    });
+    try std.testing.expectEqualStrings(
+        "fx couldn't connect to AI Gateway to load the model catalog, so earlier images aren't reaching the model and fast mode is off until it loads. Check your network connection or firewall.",
+        both.slice()[0],
+    );
+    const codex = try catalogDownNotice(arena, .{ .failure = .transport, .service = catalogService(.codex), .fast_off = true });
+    try std.testing.expectEqualStrings(
+        "fx couldn't connect to the model provider to load the model catalog, so fast mode is off until it loads. Check your network connection or firewall.",
+        codex.slice()[0],
+    );
 }
 
 /// Whether a tool image in `messages` still reaches the request: one the
@@ -7411,13 +7556,14 @@ fn processQueuedPromptLoop(
             // decision it returns (`tests/tla/image_route/spec/ImageRoute.tla`
             // OneSnapshot).
             const user_images = requestUserImages(recovery_source_messages, current_user_message_index);
+            const request_catalog_failure = if (deps.model_catalog_failure) |failure| failure(deps.ctx) else null;
             var image_event: image_route.Event = .{ .request_ready = .{
                 .user_images = job.images.len > 0 or user_images.this_turn,
                 .earlier_images = user_images.earlier,
                 .pending_images = pending_image_ids.len > 0,
                 .tool_images = requestHasToolImages(recovery_source_messages),
                 .fallback = config.provider_capabilities.vision_fallback and deps.tool_registry.lookup("vision") != null,
-                .catalog_down = if (deps.model_catalog_unavailable) |unavailable| unavailable(deps.ctx) else false,
+                .catalog_down = request_catalog_failure != null,
             } };
             var image_decision: ?image_route.Decision = null;
             var image_failure: ?image_route.FailReason = null;
@@ -7569,15 +7715,6 @@ fn processQueuedPromptLoop(
             if (request_messages.ptr != noted_messages.ptr) {
                 debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{noted_messages.len});
             }
-            // Images withheld because the catalog could not confirm image
-            // input are invisible in the transcript otherwise. The core asks
-            // to tell the user once per turn, and only when the catalog itself
-            // is known to be down; a confirmed model without image input
-            // relies on the model-facing notice instead.
-            if (notify_catalog_down) {
-                try deps.push_text(deps.ctx, .{ .operational = catalogDownNotice(image_choice) });
-                try deps.push_text(deps.ctx, .{ .operational = "\n" });
-            }
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
             var provider_opts = try model_capabilities.resolveUltrafastProviderOptions(request_capabilities, job.provider, gateway_model, step_effort, attempt_fast_mode, config.ultrafast_mode);
             provider_opts.prompt_caching = config.provider_capabilities.gateway_prompt_caching;
@@ -7588,12 +7725,30 @@ fn processQueuedPromptLoop(
             // Tell the user once per turn, but only when the catalog itself is
             // known to be down; a reachable catalog that simply lacks fast
             // metadata for the model stays quiet.
-            if (attempt_fast_mode and !provider_opts.fast and !fast_unavailable_notified and
-                deps.model_catalog_unavailable != null and deps.model_catalog_unavailable.?(deps.ctx))
-            {
-                fast_unavailable_notified = true;
-                try deps.push_text(deps.ctx, .{ .operational = "Fast mode is unavailable for this model right now; continuing at standard speed." });
-                try deps.push_text(deps.ctx, .{ .operational = "\n" });
+            const fast_catalog_failure = if (attempt_fast_mode and !provider_opts.fast and !fast_unavailable_notified)
+                if (deps.model_catalog_failure) |failure| failure(deps.ctx) else null
+            else
+                null;
+            if (fast_catalog_failure != null) fast_unavailable_notified = true;
+            // Images withheld because the catalog could not confirm image
+            // input are invisible in the transcript otherwise. The core asks
+            // to tell the user once per turn, and only when the catalog itself
+            // is known to be down; a confirmed model without image input
+            // relies on the model-facing notice instead.
+            if (notify_catalog_down or fast_catalog_failure != null) {
+                const lines = try catalogDownNotice(overlay_arena, .{
+                    // The later reading is fresher. The image route asks to
+                    // notify only when the earlier one saw the catalog down
+                    // (`tests/tla/image_route/spec/ImageRoute.tla` NotifyOnlyWhenDown).
+                    .failure = fast_catalog_failure orelse request_catalog_failure orelse .runtime,
+                    .service = catalogService(job.provider),
+                    .images = if (notify_catalog_down) image_choice else null,
+                    .fast_off = fast_catalog_failure != null,
+                });
+                for (lines.slice()) |line| {
+                    try deps.push_text(deps.ctx, .{ .operational = line });
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                }
             }
             const tool_choice: types.ToolChoice = if (recovery_strategy == .reconcile_tool)
                 .none

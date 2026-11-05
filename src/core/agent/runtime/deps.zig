@@ -8,6 +8,7 @@ const session_codec = @import("../../session/session_codec.zig");
 const command_admission = @import("../../permissions/command_admission.zig");
 const permission_auto_classifier = @import("../../permissions/auto_classifier.zig");
 const model_capabilities = @import("../../config/model_capabilities.zig");
+const model_catalog = @import("../../gateway/model_catalog.zig");
 const types = @import("../../shared/types.zig");
 const worker_runtime = @import("../worker_runtime.zig");
 const file_mutation = @import("../../tooling/file_mutation.zig");
@@ -287,10 +288,12 @@ pub const AgentRuntimeDeps = struct {
     ask_out_of_credits: ?*const fn (ctx: *anyopaque) anyerror!OutOfCreditsChoice = null,
     available_model_capabilities: *const fn (ctx: *anyopaque, model: []const u8) model_capabilities.Capabilities = localAvailableModelCapabilities,
     resolve_model_capabilities: *const fn (ctx: *anyopaque, arena: Allocator, model: []const u8) anyerror!model_capabilities.Capabilities = localModelCapabilities,
-    /// Reports that the model catalog is known to be failed or unreachable, so
-    /// capability drops are provenance-attributed instead of silent. Null means
-    /// the host cannot tell, and capability drops stay quiet.
-    model_catalog_unavailable: ?*const fn (ctx: *anyopaque) bool = null,
+    /// The failure that keeps the model catalog down, so capability drops are
+    /// provenance-attributed instead of silent and the notice can name the
+    /// cause. Returns null while the catalog loads, after it loaded, or when a
+    /// failed refresh kept an earlier copy. A null callback means the host
+    /// cannot tell, and capability drops stay quiet.
+    model_catalog_failure: ?*const fn (ctx: *anyopaque) ?model_catalog.FailureCategory = null,
     format_tool_execution_error: *const fn (ctx: *anyopaque, arena: Allocator, tool_name: []const u8, err: anyerror) anyerror![]const u8,
     record_tool_call_rejected: ?*const fn (ctx: *anyopaque, arena: Allocator, call: ToolCall, model_output: []const u8, command_result_json: ?[]const u8) anyerror!void = null,
     /// Records a call that reached the tool's own preflight/content checks and
