@@ -92,6 +92,18 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, source: []const u8, limits: Limit
 
     const completion = qjs.JS_Eval(ctx, program.ptr, program.len, "<program>", qjs.eval_type_global);
     defer qjs.JS_FreeValue(ctx, completion);
+    const outcome = try settle(gpa, rt, ctx, completion, &deadline);
+    // Turning the result or the error into text runs the program's own
+    // `toJSON` or `toString`, which the deadline stops too.
+    if (deadline.hit and outcome != .timed_out) {
+        outcome.deinit(gpa);
+        return .timed_out;
+    }
+    return outcome;
+}
+
+/// Runs the program's promise jobs and reports how its completion settled.
+fn settle(gpa: std.mem.Allocator, rt: *qjs.Runtime, ctx: *qjs.Context, completion: qjs.Value, deadline: *Deadline) RunError!Outcome {
     if (deadline.hit) return .timed_out;
     if (completion.isException()) return .{ .threw = try thrownText(gpa, ctx) };
 
@@ -309,6 +321,9 @@ test "the deadline stops loops, runaway regular expressions, and endless jobs" {
     try expectOutcome(.timed_out, "try { while (true) {} } catch (e) { return 'caught'; }", quick);
     try expectOutcome(.timed_out, "return /^(a+)+$/.test('a'.repeat(40) + 'b');", quick);
     try expectOutcome(.timed_out, "for (;;) await null;", quick);
+    // Turning the result or the error into text runs the program's code too.
+    try expectOutcome(.timed_out, "return { toJSON() { for (;;) {} } };", quick);
+    try expectOutcome(.timed_out, "throw { toString() { for (;;) {} } };", quick);
 }
 
 test "the deadline stops built-ins that loop over a huge length" {
