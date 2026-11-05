@@ -468,11 +468,13 @@ fn writeUpgradeRelaunchFailure(
     err: std.process.ReplaceError,
     session_id: []const u8,
 ) void {
+    debug_trace.logf("core", "upgrade relaunch failed err={s}", .{@errorName(err)});
     var buffer: [768]u8 = undefined;
+    var words: [128]u8 = undefined;
     const message = std.mem.print(
         &buffer,
         "fx: upgrade installed, but relaunch failed: {s}\nResume this session with:\nfx --resume {s}\n",
-        .{ @errorName(err), session_id },
+        .{ types.plainErrorText(@errorName(err), &words), session_id },
     ) catch "fx: upgrade installed, but relaunch failed; run `fx doctor`.\n";
     writeStderr(deps, message);
 }
@@ -545,10 +547,13 @@ fn formatResumeHandoff(buffer: []u8, session_id: []const u8) ![]const u8 {
     return std.mem.print(buffer, "Resume this session with:\nfx --resume {s}\n", .{session_id});
 }
 
+/// An error that ended the interactive session, in plain words
+/// (`types.plainErrorText`) unless fx has a message of its own for it.
 fn formatUnexpectedError(buffer: []u8, err: anyerror) ![]const u8 {
+    var words: [128]u8 = undefined;
     const message = config_runtime.modelNotSelectedMessage(err) orelse
         mcp_verbs.profileConfigNotice(err) orelse
-        @errorName(err);
+        types.plainErrorText(@errorName(err), &words);
     return std.mem.print(buffer, "fx: {s}\n", .{message});
 }
 
@@ -564,7 +569,9 @@ fn v2StorageFaultMessage(err: anyerror) ?[]const u8 {
     };
 }
 
+/// The raw error name goes only to the trace.
 fn reportUnexpectedInteractiveError(deps: RunDeps, err: anyerror) void {
+    debug_trace.logf("core", "interactive error err={s}", .{@errorName(err)});
     var buffer: [256]u8 = undefined;
     const message = deps.format_unexpected_error(&buffer, err) catch return;
     deps.write_stderr(deps.stderr_ctx, message) catch {};
@@ -1109,12 +1116,12 @@ test "app entry relaunches only after teardown with the validated handoff" {
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),
-        "relaunch failed: InvalidExe",
+        "relaunch failed: invalid exe",
     ) != null);
     try std.testing.expect(std.mem.find(
         u8,
         capture.stderr.written(),
-        "relaunch failed: InvalidExe\nResume this session with:\nfx --resume session-123\n",
+        "relaunch failed: invalid exe\nResume this session with:\nfx --resume session-123\n",
     ) != null);
     try expectEvents(&.{
         "init:none",
@@ -1223,9 +1230,19 @@ test "app entry reports unexpected init errors once and preserves identity" {
     capture.record_stderr_event = true;
 
     try std.testing.expectError(error.TestInitFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("fx: TestInitFailed\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("fx: test init failed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     try expectEvents(&.{ "init:none", "stderr-attempt" });
+}
+
+test "app entry reports an error that ends startup in plain words, not its name" {
+    const alloc = std.testing.allocator;
+    var capture = TestCapture.init(.{ .interactive = .{} });
+    defer capture.deinit();
+    capture.init_error = error.UnknownHostName;
+
+    try std.testing.expectError(error.UnknownHostName, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
+    try std.testing.expectEqualStrings("fx: cannot resolve host\n", capture.stderr.written());
 }
 
 test "app entry says what's wrong with ~/.fx/mcp.json instead of naming the error" {
@@ -1250,20 +1267,21 @@ test "app entry releases terminal before reporting worker start errors" {
     capture.record_stderr_event = true;
 
     try std.testing.expectError(error.TestWorkerStartFailed, runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("fx: TestWorkerStartFailed\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("fx: test worker start failed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "terminal-release", "stderr-attempt", "deinit" });
 }
 
 test "app entry releases terminal before reporting initial context failures exactly" {
     const alloc = std.testing.allocator;
-    const errors = [_]context_contract.ProviderError{
-        error.OutOfMemory,
-        error.NoSpaceLeft,
-        error.WriteFailed,
+    const cases = [_]struct { err: context_contract.ProviderError, stderr: []const u8 }{
+        .{ .err = error.OutOfMemory, .stderr = "fx: out of memory\n" },
+        .{ .err = error.NoSpaceLeft, .stderr = "fx: the disk is full\n" },
+        .{ .err = error.WriteFailed, .stderr = "fx: connection dropped\n" },
     };
 
-    for (errors) |expected_error| {
+    for (cases) |case| {
+        const expected_error = case.err;
         var capture = TestCapture.init(.{ .interactive = .{} });
         defer capture.deinit();
         capture.run_error = expected_error;
@@ -1273,13 +1291,7 @@ test "app entry releases terminal before reporting initial context failures exac
             expected_error,
             runWithDeps(TestApp, alloc, &.{}, testConfig(), capture.deps()),
         );
-        var expected_stderr_buf: [64]u8 = undefined;
-        const expected_stderr = try std.mem.print(
-            &expected_stderr_buf,
-            "fx: {s}\n",
-            .{@errorName(expected_error)},
-        );
-        try std.testing.expectEqualStrings(expected_stderr, capture.stderr.written());
+        try std.testing.expectEqualStrings(case.stderr, capture.stderr.written());
         try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
         try expectEvents(&.{
             "init:none",
@@ -1304,7 +1316,7 @@ test "app entry reports run errors before deinit and outer cleanup" {
     capture.record_stderr_event = true;
 
     try std.testing.expectError(error.TestRunFailed, runWithOuterCleanup(TestApp, alloc, &.{}, testConfig(), capture.deps()));
-    try std.testing.expectEqualStrings("fx: TestRunFailed\n", capture.stderr.written());
+    try std.testing.expectEqualStrings("fx: test run failed\n", capture.stderr.written());
     try std.testing.expectEqual(@as(usize, 1), capture.stderr_calls);
     try std.testing.expectEqual(@as(usize, 0), capture.stdout_calls);
     try expectEvents(&.{ "init:none", "rebind-after-init", "auto-upgrade", "file-index", "worker-thread", "model-cache", "run", "terminal-release", "stderr-attempt", "deinit", "outer-defer" });
